@@ -23,6 +23,19 @@ public static unsafe class MatMul
     private const int StackAllocThreshold = 8192;
 
     /// <summary>
+    /// Computes the number of weight rows per tile that fits within ~50% of a typical 512KB L2 cache.
+    /// Result is aligned down to 4 rows for efficient VecDot batching.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ComputeTileM(int rowBytes)
+    {
+        const int L2Budget = 256 * 1024; // 50% of typical 512KB L2
+        int tileM = L2Budget / rowBytes;
+        tileM = (tileM / 4) * 4; // align to 4-row VecDot batch
+        return Math.Clamp(tileM, 4, 256);
+    }
+
+    /// <summary>
     /// f32 GEMV: <c>result[m] = dot(A[m,:], x)</c>.
     /// A is [M,K] row-major, x is [K], result is [M].
     /// </summary>
@@ -107,7 +120,7 @@ public static unsafe class MatMul
 
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static void ComputeRows(byte* weightsQ8, byte* xQ8, float* result, int m, int blockCount)
+    internal static void ComputeRows(byte* weightsQ8, byte* xQ8, float* result, int m, int blockCount)
     {
         int rowBytes = blockCount * Q8_0BlockBytes;
 
@@ -521,8 +534,13 @@ public static unsafe class MatMul
     /// <param name="elementCount">Number of float elements. Must be a multiple of 32.</param>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    internal static void QuantizeF32ToQ8_0(float* src, byte* dest, int elementCount)
+    public static void QuantizeF32ToQ8_0(float* src, byte* dest, int elementCount)
     {
+        if (elementCount % Q8_0GroupSize != 0)
+            throw new ArgumentException(
+                $"elementCount must be a multiple of {Q8_0GroupSize}, got {elementCount}",
+                nameof(elementCount));
+
         if (Avx512BW.IsSupported)
             QuantizeF32ToQ8_0Avx512(src, dest, elementCount);
         else if (Avx2.IsSupported)
@@ -693,6 +711,216 @@ public static unsafe class MatMul
 
                 permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)qs));
             }
+        }
+    }
+
+    // ──────────────────── Tiled GEMM helpers ────────────────────
+
+    /// <summary>
+    /// Cache-tiled Q8_0 GEMM core. Iterates weight-tile-first so that a tile of weight rows
+    /// (~256KB) stays in L2 cache while all N tokens are computed against it.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void ComputeGemmTiled(byte* weightsQ8, byte* inputQ8, float* c,
+                                         int m, int n, int blockCount)
+    {
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int tileM = ComputeTileM(q8RowBytes);
+
+        for (int mStart = 0; mStart < m; mStart += tileM)
+        {
+            int tileRows = Math.Min(tileM, m - mStart);
+            byte* tileWeights = weightsQ8 + (long)mStart * q8RowBytes;
+
+            for (int t = 0; t < n; t++)
+                ComputeRows(tileWeights, inputQ8 + t * q8RowBytes,
+                            c + t * m + mStart, tileRows, blockCount);
+        }
+    }
+
+    // ──────────────────── GEMM ────────────────────
+
+    /// <summary>
+    /// Scalar f32 GEMM reference: <c>C[N,M] = B[N,K] × A[M,K]^T</c>.
+    /// A is [M,K] row-major (weights), B is [N,K] row-major (inputs), C is [N,M] row-major (outputs).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemmF32Scalar(float* a, float* b, float* c, int m, int k, int n)
+    {
+        for (int t = 0; t < n; t++)
+        {
+            float* inputRow = b + t * k;
+            float* outputRow = c + t * m;
+            GemvF32Scalar(a, inputRow, outputRow, m, k);
+        }
+    }
+
+    /// <summary>
+    /// Optimized f32 GEMM: <c>C[N,M] = B[N,K] × A[M,K]^T</c>.
+    /// Uses cache-tiled traversal: weight-tile-first so tiles stay in L2 across tokens.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void GemmF32(float* a, float* b, float* c, int m, int k, int n)
+    {
+        int rowBytes = k * sizeof(float);
+        int tileM = ComputeTileM(rowBytes);
+
+        for (int mStart = 0; mStart < m; mStart += tileM)
+        {
+            int tileRows = Math.Min(tileM, m - mStart);
+            float* tileWeights = a + (long)mStart * k;
+
+            for (int t = 0; t < n; t++)
+                GemvF32(tileWeights, b + t * k, c + t * m + mStart, tileRows, k);
+        }
+    }
+
+    /// <summary>
+    /// Q8_0 GEMM: <c>C[N,M] = B[N,K] × A[M,K]^T</c> where A is Q8_0 weights, B is f32 inputs.
+    /// Quantizes all N input rows to Q8_0 once, then calls <see cref="ComputeRows"/> per token.
+    /// When N==1, delegates to <see cref="GemvQ8_0"/>.
+    /// </summary>
+    /// <param name="weightsQ8">Q8_0 weight matrix [M,K]. Each row is K/32 blocks of 34 bytes.</param>
+    /// <param name="b">f32 input matrix [N,K], row-major.</param>
+    /// <param name="c">f32 output matrix [N,M], row-major.</param>
+    /// <param name="m">Number of weight rows (output dimension).</param>
+    /// <param name="k">Number of columns (input dimension). Must be a multiple of 32.</param>
+    /// <param name="n">Number of input tokens (batch size).</param>
+    /// <param name="preQuantizedInput">Optional pre-quantized Q8_0 input [N * q8RowBytes].
+    /// When non-null, skips quantization (caller pre-quantized for reuse across projections).</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void GemmQ8_0(byte* weightsQ8, float* b, float* c, int m, int k, int n,
+                                byte* preQuantizedInput = null)
+    {
+        if (k % Q8_0GroupSize != 0)
+            throw new ArgumentException(
+                $"k must be a multiple of {Q8_0GroupSize}, got {k}", nameof(k));
+
+        if (n == 1)
+        {
+            if (preQuantizedInput != null)
+            {
+                // Use pre-quantized input directly.
+                int blockCount = k / Q8_0GroupSize;
+                ComputeRows(weightsQ8, preQuantizedInput, c, m, blockCount);
+            }
+            else
+            {
+                GemvQ8_0(weightsQ8, b, c, m, k);
+            }
+            return;
+        }
+
+        int blockCount2 = k / Q8_0GroupSize;
+        int q8RowBytes = blockCount2 * Q8_0BlockBytes;
+
+        if (preQuantizedInput != null)
+        {
+            // Pre-quantized path: tiled compute directly.
+            ComputeGemmTiled(weightsQ8, preQuantizedInput, c, m, n, blockCount2);
+            return;
+        }
+
+        // Quantize all input rows, then tiled compute.
+        int totalQ8Bytes = n * q8RowBytes;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(totalQ8Bytes);
+        fixed (byte* rentedPtr = rented)
+        {
+            for (int t = 0; t < n; t++)
+                QuantizeF32ToQ8_0(b + t * k, rentedPtr + t * q8RowBytes, k);
+
+            ComputeGemmTiled(weightsQ8, rentedPtr, c, m, n, blockCount2);
+        }
+        ArrayPool<byte>.Shared.Return(rented);
+    }
+
+    // ──────────────────── F16 GEMV / GEMM ────────────────────
+
+    /// <summary>
+    /// F16 GEMV: dequantize each row to f32 scratch, then dot product.
+    /// A is [M,K] F16 row-major (weights), x is [K] f32, result is [M] f32.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void GemvF16(nint weights, float* x, float* y, int m, int k)
+    {
+        const int stackThreshold = 2048; // 8KB of floats
+        Half* weightsHalf = (Half*)weights;
+
+        if (k <= stackThreshold)
+        {
+            float* rowBuf = stackalloc float[k];
+            for (int row = 0; row < m; row++)
+            {
+                var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                var destRow = new Span<float>(rowBuf, k);
+                TensorPrimitives.ConvertToSingle(srcRow, destRow);
+                y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));
+            }
+        }
+        else
+        {
+            float[] rented = ArrayPool<float>.Shared.Rent(k);
+            try
+            {
+                for (int row = 0; row < m; row++)
+                {
+                    var srcRow = new ReadOnlySpan<Half>(weightsHalf + row * k, k);
+                    var destRow = rented.AsSpan(0, k);
+                    TensorPrimitives.ConvertToSingle(srcRow, destRow);
+                    y[row] = TensorPrimitives.Dot(destRow, new ReadOnlySpan<float>(x, k));
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+    }
+
+    /// <summary>
+    /// F16 GEMM: <c>C[N,M] = B[N,K] × A[M,K]^T</c> where A is F16 weights.
+    /// Uses cache-tiled traversal: weight-tile-first so tiles stay in L2 across tokens.
+    /// Rents one scratch buffer for dequantization, avoiding per-call ArrayPool churn.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void GemmF16(nint weights, float* b, float* c, int m, int k, int n)
+    {
+        int rowBytes = k * sizeof(Half);
+        int tileM = ComputeTileM(rowBytes);
+        Half* weightsHalf = (Half*)weights;
+
+        float[] rented = ArrayPool<float>.Shared.Rent(k);
+        try
+        {
+            fixed (float* rowBuf = rented)
+            {
+                for (int mStart = 0; mStart < m; mStart += tileM)
+                {
+                    int tileRows = Math.Min(tileM, m - mStart);
+                    Half* tileWeightsHalf = weightsHalf + (long)mStart * k;
+
+                    for (int t = 0; t < n; t++)
+                    {
+                        float* xPtr = b + t * k;
+                        float* outPtr = c + t * m + mStart;
+                        var xSpan = new ReadOnlySpan<float>(xPtr, k);
+                        var destRow = new Span<float>(rowBuf, k);
+
+                        for (int row = 0; row < tileRows; row++)
+                        {
+                            var srcRow = new ReadOnlySpan<Half>(tileWeightsHalf + row * k, k);
+                            TensorPrimitives.ConvertToSingle(srcRow, destRow);
+                            outPtr[row] = TensorPrimitives.Dot(destRow, xSpan);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rented);
         }
     }
 
