@@ -2,12 +2,12 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
-using DotLLM.Models.Architectures;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine;
@@ -18,7 +18,7 @@ namespace DotLLM.Engine;
 /// </summary>
 public sealed class TextGenerator
 {
-    private readonly LlamaModel _model;
+    private readonly IModel _model;
     private readonly ITokenizer _tokenizer;
 
     /// <summary>
@@ -26,7 +26,7 @@ public sealed class TextGenerator
     /// </summary>
     /// <param name="model">The model to use for forward passes.</param>
     /// <param name="tokenizer">The tokenizer for encoding/decoding text.</param>
-    public TextGenerator(LlamaModel model, ITokenizer tokenizer)
+    public TextGenerator(IModel model, ITokenizer tokenizer)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -127,7 +127,7 @@ public sealed class TextGenerator
 
         // Check stop conditions for first token
         generatedIds.Add(firstTokenId);
-        string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds));
+        string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
 
         var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, decodedText);
         if (stopResult != StopResult.Continue)
@@ -169,7 +169,7 @@ public sealed class TextGenerator
             }
 
             generatedIds.Add(nextTokenId);
-            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds));
+            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
 
             stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decodedText);
             if (stopResult != StopResult.Continue)
@@ -280,7 +280,7 @@ public sealed class TextGenerator
 
         // Check stop conditions for first token
         generatedIds.Add(firstTokenId);
-        string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds));
+        string decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
 
         var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, decodedText);
         if (stopResult != StopResult.Continue)
@@ -345,7 +345,7 @@ public sealed class TextGenerator
             }
 
             generatedIds.Add(nextTokenId);
-            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds));
+            decodedText = _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false);
 
             stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decodedText);
             if (stopResult != StopResult.Continue)
@@ -417,7 +417,7 @@ public sealed class TextGenerator
         FinishReason finishReason, long prefillTicks, long decodeTicks, long samplerTicks)
     {
         string text = generatedIds.Count > 0
-            ? _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds))
+            ? _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false)
             : string.Empty;
 
         return new InferenceResponse

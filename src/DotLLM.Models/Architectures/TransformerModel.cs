@@ -13,10 +13,10 @@ using DotLLM.Models.Gguf;
 namespace DotLLM.Models.Architectures;
 
 /// <summary>
-/// Llama-family forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
+/// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class LlamaModel : IModel
+public sealed unsafe class TransformerModel : IModel
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = 34;
@@ -24,10 +24,12 @@ public sealed unsafe class LlamaModel : IModel
     /// <summary>Elements per Q8_0 block.</summary>
     private const int Q8_0GroupSize = 32;
 
-    private readonly LlamaWeights _weights;
-    private readonly LlamaForwardState _state;
+    private readonly TransformerWeights _weights;
+    private readonly TransformerForwardState _state;
     private readonly GgufFile _gguf; // prevent premature GC of mmap
     private readonly int _ropeDim;
+    private readonly RoPEType _ropeType;
+    private readonly int? _slidingWindowSize;
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
 
@@ -37,39 +39,43 @@ public sealed unsafe class LlamaModel : IModel
     /// <summary>Total bytes allocated for inference scratch buffers.</summary>
     public long ComputeMemoryBytes => _state.AllocatedBytes;
 
-    private LlamaModel(ModelConfig config, LlamaWeights weights, LlamaForwardState state,
-                       GgufFile gguf, int ropeDim, ComputeThreadPool? threadPool, bool ownsPool)
+    private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
+                       GgufFile gguf, int ropeDim, RoPEType ropeType,
+                       ComputeThreadPool? threadPool, bool ownsPool)
     {
         Config = config;
         _weights = weights;
         _state = state;
         _gguf = gguf;
         _ropeDim = ropeDim;
+        _ropeType = ropeType;
+        _slidingWindowSize = config.SlidingWindowSize;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
     }
 
     /// <summary>
-    /// Loads a Llama model from an opened GGUF file (single-threaded).
+    /// Loads a transformer model from an opened GGUF file (single-threaded).
     /// The <paramref name="gguf"/> must remain alive for the lifetime of the returned model.
     /// </summary>
-    public static LlamaModel LoadFromGguf(GgufFile gguf, ModelConfig config)
+    public static TransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config)
         => LoadFromGguf(gguf, config, ThreadingConfig.SingleThreaded);
 
     /// <summary>
-    /// Loads a Llama model from an opened GGUF file with threading configuration.
+    /// Loads a transformer model from an opened GGUF file with threading configuration.
     /// When <paramref name="threading"/> is parallel, creates a <see cref="ComputeThreadPool"/>
     /// owned by this model (disposed with the model).
     /// </summary>
-    public static LlamaModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
+    public static TransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
     {
-        var weights = LlamaWeights.LoadFromGguf(gguf, config);
+        var weights = TransformerWeights.LoadFromGguf(gguf, config);
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
 
-        var state = new LlamaForwardState(
+        var state = new TransformerForwardState(
             config.HiddenSize,
             config.NumAttentionHeads,
             config.NumKvHeads,
@@ -84,7 +90,7 @@ public sealed unsafe class LlamaModel : IModel
             ? new ComputeThreadPool(threading.EffectiveThreadCount)
             : null;
 
-        return new LlamaModel(config, weights, state, gguf, ropeDim, pool, ownsPool: pool is not null);
+        return new TransformerModel(config, weights, state, gguf, ropeDim, ropeType, pool, ownsPool: pool is not null);
     }
 
     /// <inheritdoc/>
@@ -174,13 +180,19 @@ public sealed unsafe class LlamaModel : IModel
             AddBias(lw.KBias, k, lw.KOutputDim, seqLen);
             AddBias(lw.VBias, v, lw.VOutputDim, seqLen);
 
+            // Optional QK-norms (Qwen3-style): per-head RMSNorm on Q/K after projection, before RoPE
+            if (lw.QNormWeight is not null)
+                ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, seqLen, eps);
+            if (lw.KNormWeight is not null)
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeads, headDim, seqLen, eps);
+
             // d. RoPE (in-place on Q and K for all tokens)
             RoPE.Execute(
                 new Span<float>(q, seqLen * numHeads * headDim),
                 new Span<float>(k, seqLen * kvStride),
                 positions,
                 numHeads, numKvHeads, headDim, _ropeDim,
-                _state.CosTable, _state.SinTable);
+                _state.CosTable, _state.SinTable, _ropeType);
 
             // e. Attention — with or without KV-cache
             if (kvCache is not null)
@@ -196,12 +208,14 @@ public sealed unsafe class LlamaModel : IModel
                 var cachedV = kvCache.GetValuesRef(layer);
 
                 Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool);
+                    seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                    _slidingWindowSize);
             }
             else
             {
                 Attention.Execute(q, k, v, attnOut,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, _threadPool);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, _threadPool,
+                    _slidingWindowSize);
             }
 
             // f. Batched O projection
@@ -303,6 +317,28 @@ public sealed unsafe class LlamaModel : IModel
             new Span<float>((void*)result.DataPointer, vocabSize));
 
         return result;
+    }
+
+    /// <summary>
+    /// Applies RMSNorm per attention head to a Q or K tensor [seqLen, numHeads * headDim].
+    /// Used for QK-norm (Qwen3-style) where each head vector is independently normalized
+    /// after projection and before RoPE.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ApplyPerHeadNorm(float[] normWeight, float* qk,
+        int numHeads, int headDim, int seqLen, float eps)
+    {
+        int stride = numHeads * headDim;
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                float* head = qk + t * stride + h * headDim;
+                var input = new ReadOnlySpan<float>(head, headDim);
+                var output = new Span<float>(head, headDim);
+                RmsNorm.Execute(input, normWeight, eps, output);
+            }
+        }
     }
 
     /// <summary>
