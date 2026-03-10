@@ -101,7 +101,7 @@ Prefill is compute-bound (GEMM). dotLLM uses batched GEMM but llama.cpp's matmul
 | ~~Batched GEMM for prefill~~ | ~~5-10× prefill speedup~~ | ~~Phase 2, Step 11~~ :white_check_mark: |
 | ~~Multi-threaded inference~~ | ~~4-8× on multi-core~~ | ~~Phase 2, Step 20~~ :white_check_mark: |
 | Cache-tiled GEMM | ~1.5-2× prefill improvement | Phase 2, optimization |
-| CUDA GPU backend | 10-50× prefill, 3-10× decode | Phase 3, Step 29 |
+| CUDA GPU backend | 10-50× prefill, 3-10× decode | Phase 4, Step 31 |
 
 ---
 

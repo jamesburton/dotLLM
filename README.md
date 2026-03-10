@@ -105,11 +105,12 @@ There is no NuGet package yet — the project is in early development. Follow th
 | Phase | Description | Status |
 |-------|-------------|--------|
 | **1 — End-to-End Generation** | GGUF loading, dequantization, CPU ops, tokenizer, attention, forward pass, KV-cache, sampling | Done (9/9) |
-| **2 — Practical Local Inference** | Engine metrics, inference benchmarks, Q4_K_M, chat templates, streaming, hooks, logit lens, more architectures | In Progress (9/13) |
-| **2B — CPU Performance** | Decode dispatch optimization, Q8_1 input format, weight repacking, outer-product GEMM, tiled attention, fast exp, operator fusion, NUMA | Planned (0/8) |
-| **3 — GPU Acceleration** | CUDA backend, CPU/GPU hybrid, KV-cache quantization | Planned |
-| **4 — Production Serving** | OpenAI API, continuous batching, paged KV-cache, structured output, tool calling | Planned |
-| **5 — Expand** | LoRA, MLA, SAE, multi-GPU tensor parallelism, ROCm | Planned |
+| **2 — Practical Local Inference** | Engine metrics, benchmarks, Q4_K_M, chat templates, streaming, multi-threading, more architectures | In Progress (9/10) |
+| **3 — CPU Performance** | Decode dispatch, Q8_1 input, weight repacking, outer-product GEMM, tiled attention, fast exp, fusion, NUMA | Planned (0/8) |
+| **4 — GPU Acceleration** | CUDA backend, CPU/GPU hybrid, KV-cache quantization | Planned |
+| **5 — Constrained Decoding & API** | JSON mode, JSON Schema, regex/CFG, tool calling, logit bias, OpenAI API server | Planned |
+| **6 — Production Serving** | Continuous batching, paged KV-cache, prompt caching, speculative decoding, metrics | Planned |
+| **7 — Expand** | Hooks, logit lens, LoRA, MLA, SAE, multi-GPU, ROCm | Planned |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed steps, dependencies, and milestones.
 
