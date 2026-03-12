@@ -541,7 +541,8 @@ public sealed unsafe class TransformerModel : IModel
 
     /// <summary>
     /// GEMM using R4-interleaved repacked weights. For single-token (n=1) uses interleaved ComputeRows.
-    /// Multi-token falls back to original Gemm (tiled GEMM integration deferred to Step 26).
+    /// Multi-token (n&gt;1) falls back to original Gemm — outer-product microkernels don't win on AVX2
+    /// due to RyuJIT register pressure (12 YMM accumulators spill with only 16 registers available).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GemmInterleaved(nint origWeights, QuantizationType qt, float* b, float* c,
@@ -550,7 +551,7 @@ public sealed unsafe class TransformerModel : IModel
     {
         if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
         {
-            // Multi-token or small row stride: use original path
+            // Multi-token or small row stride: use original tiled GEMM path
             Gemm(origWeights, qt, b, c, m, k, n, preQuantizedInput);
             return;
         }
