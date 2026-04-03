@@ -8,7 +8,7 @@ const state = {
     messages: [],       // {role, content, stats?, rawPrompt?, rawResponse?}
     config: null,       // from /props
     isGenerating: false,
-    verbose: false,
+    verbose: true,
     systemPrompt: '',
     abortController: null,
     toolsEnabled: false,
@@ -424,6 +424,9 @@ function createStatsBar(stats) {
     if (stats.usage) {
         parts.push(`${stats.usage.prompt_tokens} prompt`);
         parts.push(`${stats.usage.completion_tokens} gen`);
+    }
+    if (stats.timings?.cached_tokens > 0) {
+        parts.push(`${stats.timings.cached_tokens} cached`);
     }
     if (stats.ttftMs != null) {
         parts.push(`${stats.ttftMs.toFixed(0)}ms TTFT`);
@@ -1160,6 +1163,8 @@ function handleClear() {
     messagesEl.innerHTML = '';
     welcomeEl.classList.remove('hidden');
     saveConversation();
+    // Clear server-side prompt cache so stale KV-cache state isn't reused
+    fetch('/v1/cache/clear', { method: 'POST' }).catch(() => {});
 }
 
 // ── EXPORT ──
@@ -1238,6 +1243,7 @@ function buildExportMarkdown() {
                 parts.push(`${s.usage.prompt_tokens} prompt tokens`);
                 parts.push(`${s.usage.completion_tokens} generated tokens`);
             }
+            if (s.timings?.cached_tokens > 0) parts.push(`${s.timings.cached_tokens} cached tokens`);
             if (s.ttftMs != null) parts.push(`TTFT: ${s.ttftMs.toFixed(0)}ms`);
             if (s.timings) {
                 const t = s.timings;
@@ -1317,7 +1323,7 @@ function loadConversation() {
     try {
         const msgs = JSON.parse(localStorage.getItem('dotllm-messages') || '[]');
         state.systemPrompt = localStorage.getItem('dotllm-system-prompt') || '';
-        state.verbose = localStorage.getItem('dotllm-verbose') === '1';
+        state.verbose = localStorage.getItem('dotllm-verbose') !== '0';
         state.toolsEnabled = localStorage.getItem('dotllm-tools-enabled') === '1';
         const savedToolsJson = localStorage.getItem('dotllm-tools-json');
         // Auto-upgrade: if saved JSON is the old sample (no response_example), replace with new sample

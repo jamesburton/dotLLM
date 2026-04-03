@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
@@ -31,6 +32,9 @@ public sealed class ServerState : IDisposable
 
     /// <summary>KV-cache factory for the loaded model/device.</summary>
     public Func<ModelConfig, int, IKvCache>? KvCacheFactory { get; set; }
+
+    /// <summary>Prefix cache for prompt caching (null when disabled).</summary>
+    public PrefixCache? PrefixCache { get; set; }
 
     /// <summary>Whether a model is loaded and ready to accept requests.</summary>
     public bool IsReady { get; set; }
@@ -79,6 +83,8 @@ public sealed class ServerState : IDisposable
         IsReady = false;
         try
         {
+            PrefixCache?.Dispose();
+            PrefixCache = null;
             Model?.Dispose();
             CurrentGguf?.Dispose();
             CurrentGguf = null;
@@ -92,6 +98,7 @@ public sealed class ServerState : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        PrefixCache?.Dispose();
         Model?.Dispose();
         CurrentGguf?.Dispose();
         _requestGate.Dispose();
@@ -106,7 +113,7 @@ public sealed class ServerState : IDisposable
 public sealed record SamplingDefaults
 {
     /// <summary>Sampling temperature. 0 = greedy.</summary>
-    public float Temperature { get; init; } = 0.7f;
+    public float Temperature { get; init; } = 0.0f;
 
     /// <summary>Top-P (nucleus) sampling threshold.</summary>
     public float TopP { get; init; } = 1.0f;
