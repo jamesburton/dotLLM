@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dotLLM</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        mono: ['"JetBrains Mono"', '"Fira Code"', '"Cascadia Code"', 'Consolas', 'monospace'],
+                    },
+                    colors: {
+                        accent: { DEFAULT: '#22d3ee', dim: '#0e7490' },
+                    },
+                },
+            },
+        };
+    </script>
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body class="bg-zinc-900 text-zinc-100 font-mono h-screen flex flex-col overflow-hidden">
+
+    <!-- Header -->
+    <header class="flex items-center justify-between px-4 py-2 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur shrink-0">
+        <div class="flex items-center gap-3">
+            <span class="text-accent font-bold text-lg tracking-tight">dotLLM</span>
+            <span id="model-badge" class="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">loading...</span>
+            <button id="reload-model-btn" class="text-xs px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-500 hover:text-zinc-200 hover:border-zinc-500 transition" title="Load / change model">&#x21bb;</button>
+        </div>
+        <div class="flex items-center gap-2">
+            <span id="status-indicator" class="text-xs text-zinc-500">...</span>
+            <button id="clear-btn" class="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition" title="Clear chat">Clear</button>
+            <div class="relative">
+                <button id="export-btn" class="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition" title="Export chat">Export</button>
+                <div id="export-dropdown" class="hidden absolute right-0 top-full mt-1 w-56 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl p-3 space-y-2" style="z-index: 70;">
+                    <div class="text-[10px] uppercase tracking-wider text-zinc-500 mb-1">Include in export</div>
+                    <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                        <input type="checkbox" id="exp-stats" checked class="accent-cyan-500"><span>Performance stats</span>
+                    </label>
+                    <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                        <input type="checkbox" id="exp-raw" checked class="accent-cyan-500"><span>Raw prompt / response</span>
+                    </label>
+                    <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                        <input type="checkbox" id="exp-model" checked class="accent-cyan-500"><span>Model &amp; configuration</span>
+                    </label>
+                    <button id="export-download-btn" class="w-full mt-1 py-1 rounded text-xs bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition">Download .md</button>
+                </div>
+            </div>
+            <button id="tools-btn" class="p-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition" title="Tools">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655 5.653a2.548 2.548 0 11-3.586-3.586l6.837-5.63m5.108-.233c.55-.164 1.163-.188 1.743-.14a4.5 4.5 0 004.486-6.336l-3.276 3.277a3.004 3.004 0 01-2.25-2.25l3.276-3.276a4.5 4.5 0 00-6.336 4.486c.091 1.076-.071 2.264-.904 2.95l-.102.085"/></svg>
+            </button>
+            <button id="settings-btn" class="p-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition" title="Settings">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <!-- Chat area -->
+    <main id="chat-container" class="flex-1 overflow-y-auto px-4 py-4">
+        <div id="messages" class="max-w-3xl mx-auto space-y-4"></div>
+        <div id="welcome" class="max-w-3xl mx-auto flex flex-col items-center justify-center h-full text-zinc-500">
+            <div class="text-4xl mb-4 opacity-30">&#x2726;</div>
+            <p class="text-sm">Start a conversation</p>
+        </div>
+    </main>
+
+    <!-- Input area -->
+    <footer class="border-t border-zinc-800 bg-zinc-950/80 backdrop-blur px-4 py-3 shrink-0">
+        <!-- System prompt (collapsible) -->
+        <div id="system-prompt-bar" class="max-w-3xl mx-auto mb-2 hidden">
+            <div class="flex items-center gap-2 mb-1">
+                <span class="text-[10px] uppercase tracking-wider text-zinc-500">System Prompt</span>
+                <button id="system-prompt-clear" class="text-[10px] text-zinc-600 hover:text-zinc-400">[clear]</button>
+            </div>
+            <textarea id="system-prompt" rows="2" class="w-full bg-zinc-800/50 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 resize-none focus:outline-none focus:border-zinc-500" placeholder="You are a helpful assistant."></textarea>
+        </div>
+        <div class="max-w-3xl mx-auto flex gap-2 items-end">
+            <button id="system-prompt-toggle" class="shrink-0 p-2 rounded text-zinc-500 hover:text-zinc-300 transition" title="Toggle system prompt">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            </button>
+            <textarea id="user-input" rows="1" class="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm resize-none focus:outline-none focus:border-accent/50 placeholder-zinc-600 max-h-40" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+            <button id="send-btn" class="shrink-0 px-4 py-2 rounded-lg bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed" title="Send">Send</button>
+            <button id="stop-btn" class="shrink-0 px-4 py-2 rounded-lg bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition text-sm font-medium hidden">Stop</button>
+        </div>
+    </footer>
+
+    <!-- Settings panel (slide from right) -->
+    <div id="settings-overlay" class="fixed inset-0 bg-black/40 z-40 hidden"></div>
+    <aside id="settings-panel" class="fixed top-0 right-0 h-full w-80 bg-zinc-950 border-l border-zinc-800 z-50 transform translate-x-full transition-transform duration-200 overflow-y-auto">
+        <div class="p-4">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-zinc-400">Settings</h2>
+                <button id="settings-close" class="text-zinc-500 hover:text-zinc-300 text-lg">&times;</button>
+            </div>
+
+            <!-- Sampling section -->
+            <section class="mb-6">
+                <h3 class="text-[10px] uppercase tracking-wider text-zinc-500 mb-3">Sampling</h3>
+                <div class="space-y-3">
+                    <div>
+                        <label class="flex justify-between text-xs text-zinc-400 mb-1">
+                            <span>Temperature</span><span id="temp-val" class="text-zinc-500">0.70</span>
+                        </label>
+                        <input id="opt-temperature" type="range" min="0" max="2" step="0.05" value="0.7" class="w-full accent-cyan-500">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-zinc-400 mb-1">
+                            <span>Top-P</span><span id="topp-val" class="text-zinc-500">1.00</span>
+                        </label>
+                        <input id="opt-top-p" type="range" min="0" max="1" step="0.01" value="1.0" class="w-full accent-cyan-500">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-zinc-400 mb-1">
+                            <span>Top-K</span><span id="topk-val" class="text-zinc-500">0</span>
+                        </label>
+                        <input id="opt-top-k" type="number" min="0" max="500" value="0" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-zinc-400 mb-1">
+                            <span>Min-P</span><span id="minp-val" class="text-zinc-500">0.00</span>
+                        </label>
+                        <input id="opt-min-p" type="range" min="0" max="1" step="0.01" value="0" class="w-full accent-cyan-500">
+                    </div>
+                    <div>
+                        <label class="flex justify-between text-xs text-zinc-400 mb-1">
+                            <span>Rep. Penalty</span><span id="rep-val" class="text-zinc-500">1.00</span>
+                        </label>
+                        <input id="opt-rep-penalty" type="range" min="1" max="2" step="0.01" value="1.0" class="w-full accent-cyan-500">
+                    </div>
+                    <div>
+                        <label class="text-xs text-zinc-400 mb-1 block">Max Tokens</label>
+                        <input id="opt-max-tokens" type="number" min="1" max="32768" value="2048" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                    </div>
+                    <div>
+                        <label class="text-xs text-zinc-400 mb-1 block">Seed <span class="text-zinc-600">(empty = random)</span></label>
+                        <input id="opt-seed" type="number" min="0" placeholder="random" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                    </div>
+                    <button id="apply-config-btn" class="w-full mt-1 py-1.5 rounded text-xs bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition">Apply Defaults</button>
+                </div>
+            </section>
+
+            <!-- Display section -->
+            <section class="mb-6">
+                <h3 class="text-[10px] uppercase tracking-wider text-zinc-500 mb-3">Display</h3>
+                <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                    <input id="opt-verbose" type="checkbox" class="accent-cyan-500">
+                    <span>Verbose diagnostics (show full prompt)</span>
+                </label>
+            </section>
+        </div>
+    </aside>
+
+    <!-- Tools panel (slide from right) -->
+    <div id="tools-overlay" class="fixed inset-0 bg-black/40 z-40 hidden"></div>
+    <aside id="tools-panel" class="fixed top-0 right-0 h-full w-96 bg-zinc-950 border-l border-zinc-800 z-50 transform translate-x-full transition-transform duration-200 overflow-y-auto">
+        <div class="p-4">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-zinc-400">Tools</h2>
+                <button id="tools-close" class="text-zinc-500 hover:text-zinc-300 text-lg">&times;</button>
+            </div>
+
+            <!-- Enable toggle -->
+            <section class="mb-4">
+                <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                    <input id="tools-enabled" type="checkbox" class="accent-cyan-500">
+                    <span>Enable tool calling</span>
+                </label>
+                <p class="text-[10px] text-zinc-600 mt-1">When enabled, tool definitions below are sent with each request. The model can invoke these tools in its response. Add <code class="bg-zinc-800 px-0.5 rounded">response_example</code> to pre-fill fake results.</p>
+            </section>
+
+            <!-- Tool definitions JSON -->
+            <section>
+                <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Tool Definitions (OpenAI format)</label>
+                <textarea id="tools-json" rows="24" spellcheck="false" class="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-xs text-zinc-300 font-mono resize-y focus:outline-none focus:border-zinc-500 leading-relaxed" placeholder="[{...}]"></textarea>
+                <div id="tools-json-error" class="text-[10px] text-red-400 mt-1 hidden"></div>
+                <div class="flex gap-2 mt-2">
+                    <button id="tools-reset-btn" class="flex-1 py-1 rounded text-[10px] border border-zinc-700 text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 transition">Reset to sample</button>
+                    <button id="tools-validate-btn" class="flex-1 py-1 rounded text-[10px] bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition">Validate JSON</button>
+                </div>
+            </section>
+        </div>
+    </aside>
+
+    <!-- Model Load Modal (centered overlay) -->
+    <div id="model-modal-overlay" class="fixed inset-0 bg-black/60 hidden items-center justify-center" style="z-index: 60;">
+        <div class="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl w-[600px] max-h-[85vh] flex flex-col overflow-hidden">
+            <!-- Modal header -->
+            <div class="flex items-center justify-between px-5 py-3 border-b border-zinc-800 shrink-0">
+                <h2 class="text-sm font-bold uppercase tracking-wider text-zinc-300">Load Model</h2>
+                <button id="model-modal-close" class="text-zinc-500 hover:text-zinc-300 text-lg leading-none">&times;</button>
+            </div>
+
+            <!-- Modal body -->
+            <div class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+
+                <!-- Model selector (dropdown) -->
+                <div>
+                    <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Model File</label>
+                    <p class="text-[10px] text-zinc-600 mb-1.5">Select a locally downloaded GGUF model. Use <code class="bg-zinc-800 px-1 rounded">dotllm model pull</code> to download more.</p>
+                    <select id="modal-model-select" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                        <option value="">Loading models...</option>
+                    </select>
+                    <div id="modal-model-info" class="mt-1.5 text-[10px] text-zinc-600 hidden"></div>
+                </div>
+
+                <!-- Options (shown after selecting a model) -->
+                <div id="modal-options" class="hidden space-y-4 border-t border-zinc-800 pt-4">
+
+                    <!-- Compute device -->
+                    <div>
+                        <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">Compute Device</label>
+                        <p class="text-[10px] text-zinc-600 mb-1.5">CPU is universal. GPU requires an NVIDIA GPU with enough VRAM.</p>
+                        <div class="flex items-center gap-4">
+                            <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
+                                <input type="radio" name="modal-device" value="cpu" class="accent-cyan-500" checked>
+                                <span>CPU</span>
+                            </label>
+                            <label class="flex items-center gap-1.5 text-xs text-zinc-400 cursor-pointer">
+                                <input type="radio" name="modal-device" value="gpu" class="accent-cyan-500">
+                                <span>GPU</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- GPU offloading (shown when GPU selected) -->
+                    <div id="modal-gpu-section" class="hidden">
+                        <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">GPU Offloading</label>
+                        <p class="text-[10px] text-zinc-600 mb-1.5">Slide right to offload more layers to GPU. More layers = faster but needs more VRAM. All layers = full GPU inference.</p>
+                        <div class="flex items-center gap-3">
+                            <span class="text-[10px] text-zinc-600 shrink-0">0</span>
+                            <input id="modal-gpu-layers" type="range" min="0" max="32" value="32" class="flex-1 accent-cyan-500">
+                            <span id="modal-gpu-layers-max" class="text-[10px] text-zinc-600 shrink-0">32</span>
+                        </div>
+                        <div class="flex justify-between mt-1">
+                            <span class="text-[10px] text-zinc-600">CPU only</span>
+                            <span id="modal-gpu-layers-val" class="text-[10px] text-accent font-medium">32 layers on GPU</span>
+                            <span class="text-[10px] text-zinc-600">Full GPU</span>
+                        </div>
+                        <div id="modal-size-estimate" class="mt-2 text-[10px] text-zinc-500 bg-zinc-800/50 rounded px-2 py-1.5"></div>
+                    </div>
+
+                    <!-- KV-Cache options -->
+                    <div>
+                        <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">KV-Cache Quantization</label>
+                        <p class="text-[10px] text-zinc-600 mb-1.5">Compress the attention cache to fit longer contexts. Lower precision = less memory but slightly lower quality. f32 is full precision.</p>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="text-[10px] text-zinc-500 block mb-0.5">Keys</label>
+                                <select id="modal-cache-k" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                                    <option value="f32" selected>f32 (full precision)</option>
+                                    <option value="q8_0">q8_0 (2x compression)</option>
+                                    <option value="q4_0">q4_0 (4x compression)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-zinc-500 block mb-0.5">Values</label>
+                                <select id="modal-cache-v" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500">
+                                    <option value="f32" selected>f32 (full precision)</option>
+                                    <option value="q8_0">q8_0 (2x compression)</option>
+                                    <option value="q4_0">q4_0 (4x compression)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- CPU Threads -->
+                    <div>
+                        <label class="text-[10px] uppercase tracking-wider text-zinc-500 block mb-1">CPU Threads</label>
+                        <p class="text-[10px] text-zinc-600 mb-1.5">Number of threads for compute. 0 = auto-detect (uses all cores). Decode threads are auto-capped to memory channel count.</p>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="text-[10px] text-zinc-500 block mb-0.5">Prefill threads</label>
+                                <input id="modal-threads" type="number" min="0" max="256" value="0" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500" placeholder="0 = auto">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-zinc-500 block mb-0.5">Decode threads</label>
+                                <input id="modal-decode-threads" type="number" min="0" max="256" value="0" class="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500" placeholder="0 = auto">
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- Modal footer -->
+            <div class="flex items-center justify-between px-5 py-3 border-t border-zinc-800 shrink-0">
+                <div id="modal-status" class="text-xs text-zinc-500 flex items-center gap-2"></div>
+                <div class="flex items-center gap-2">
+                    <button id="modal-cancel-btn" class="text-xs px-3 py-1.5 rounded border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition">Cancel</button>
+                    <button id="modal-load-btn" class="text-xs px-4 py-1.5 rounded bg-accent/20 text-accent border border-accent/30 hover:bg-accent/30 transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>Load Model</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

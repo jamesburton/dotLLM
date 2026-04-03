@@ -372,7 +372,8 @@ internal sealed class JinjaEvaluator
                 {
                     1 => Enumerable.Range(0, ToInt(args[0])).Cast<object?>().ToList(),
                     2 => Enumerable.Range(ToInt(args[0]), Math.Max(0, ToInt(args[1]) - ToInt(args[0]))).Cast<object?>().ToList(),
-                    _ => throw new JinjaException("range() takes 1 or 2 arguments")
+                    3 => RangeWithStep(ToInt(args[0]), ToInt(args[1]), ToInt(args[2])),
+                    _ => throw new JinjaException("range() takes 1 to 3 arguments")
                 };
             }
 
@@ -459,6 +460,28 @@ internal sealed class JinjaEvaluator
                           args.Count >= 2 ? args[1] : null,
                 "update" => UpdateDict(dict, args),
                 _ => throw new JinjaException($"Unknown dict method: {expr.MethodName}")
+            };
+        }
+
+        // Fallback: coerce to string for string-like methods
+        if (obj is not null && expr.MethodName is "strip" or "lstrip" or "rstrip"
+                or "upper" or "lower" or "startswith" or "endswith" or "replace" or "split")
+        {
+            var str = Stringify(obj);
+            return expr.MethodName switch
+            {
+                "strip" => str.Trim(),
+                "lstrip" => str.TrimStart(),
+                "rstrip" => str.TrimEnd(),
+                "upper" => str.ToUpperInvariant(),
+                "lower" => str.ToLowerInvariant(),
+                "startswith" => args.Count > 0 && str.StartsWith(Stringify(args[0]), StringComparison.Ordinal),
+                "endswith" => args.Count > 0 && str.EndsWith(Stringify(args[0]), StringComparison.Ordinal),
+                "replace" => args.Count >= 2 ? str.Replace(Stringify(args[0]), Stringify(args[1])) : str,
+                "split" => args.Count > 0
+                    ? str.Split(Stringify(args[0])).Cast<object?>().ToList()
+                    : (object)str.Split().Cast<object?>().ToList(),
+                _ => str,
             };
         }
 
@@ -772,6 +795,17 @@ internal sealed class JinjaEvaluator
     private static double ToDouble(object? v) => Convert.ToDouble(v);
 
     private static int ToInt(object? v) => Convert.ToInt32(v);
+
+    private static List<object?> RangeWithStep(int start, int stop, int step)
+    {
+        if (step == 0) throw new JinjaException("range() step must not be zero");
+        var result = new List<object?>();
+        if (step > 0)
+            for (int i = start; i < stop; i += step) result.Add(i);
+        else
+            for (int i = start; i > stop; i += step) result.Add(i);
+        return result;
+    }
 
     private static object? GetLength(object? v)
     {

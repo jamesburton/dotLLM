@@ -18,6 +18,13 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(DetokenizeRequest))]
 [JsonSerializable(typeof(DetokenizeResponse))]
 [JsonSerializable(typeof(ModelListResponse))]
+[JsonSerializable(typeof(PropsResponse))]
+[JsonSerializable(typeof(SamplingDefaultsDto))]
+[JsonSerializable(typeof(AvailableModelsResponse))]
+[JsonSerializable(typeof(ModelLoadRequest))]
+[JsonSerializable(typeof(ModelLoadResponse))]
+[JsonSerializable(typeof(TimingsDto))]
+[JsonSerializable(typeof(ModelInspectResponse))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

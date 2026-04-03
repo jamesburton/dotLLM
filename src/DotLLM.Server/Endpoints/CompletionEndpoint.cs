@@ -16,13 +16,20 @@ public static class CompletionEndpoint
 
     private static async Task HandleAsync(
         CompletionRequest request,
-        TextGenerator generator,
         ServerState state,
         HttpContext httpContext)
     {
+        if (!state.IsReady || state.Generator is null)
+        {
+            httpContext.Response.StatusCode = 503;
+            await httpContext.Response.WriteAsJsonAsync(new { error = "No model loaded" }, httpContext.RequestAborted);
+            return;
+        }
+
         var ct = httpContext.RequestAborted;
         var requestId = RequestConverter.GenerateRequestId();
         var modelId = state.Options.ModelId;
+        var generator = state.Generator;
 
         var options = RequestConverter.ToInferenceOptions(request,
             new DotLLM.Core.Configuration.ThreadingConfig(
