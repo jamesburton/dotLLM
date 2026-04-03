@@ -135,6 +135,10 @@ public static class ServerStartup
             : null;
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache);
 
+        // Warm-up: JIT pre-compilation + CUDA kernel loading
+        WarmupRunner.Run(generator, tokenizer, options.Warmup);
+        prefixCache?.Clear(); // Discard warm-up KV-cache entries
+
         return new ServerState
         {
             Options = options,
