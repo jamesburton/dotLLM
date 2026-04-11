@@ -527,10 +527,13 @@ app.UseAuthentication();
 app.MapGet("/hello", () => "hi");
 
 // Load a model and mount dotLLM's OpenAI-compatible endpoints:
-var state = ServerStartup.LoadModel("llama-3.2-3b.Q4_K_M.gguf", new ServerOptions
+var modelPath = "llama-3.2-3b.Q4_K_M.gguf";
+var state = ServerStartup.LoadModel(modelPath, new ServerOptions
 {
+    Model = modelPath,
     Device = "cpu",
     PromptCacheEnabled = true,
+    ModelId = "llama-3.2-3b",
 });
 app.MapDotLLMEndpoints(serveUi: false);
 
