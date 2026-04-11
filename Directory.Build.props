@@ -19,6 +19,7 @@
     <RepositoryUrl>https://github.com/kkokosa/dotLLM</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
     <PackageTags>llm;inference;transformer;llama;mistral;phi;qwen;gguf;cuda;simd;ai</PackageTags>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
@@ -33,5 +34,6 @@
 
   <ItemGroup Condition="'$(IsPackable)' != 'false'">
     <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Condition="Exists('$(MSBuildThisFileDirectory)README.md')" />
+    <None Include="$(MSBuildThisFileDirectory)docs\icon.png" Pack="true" PackagePath="\" Condition="Exists('$(MSBuildThisFileDirectory)docs\icon.png')" />
   </ItemGroup>
 </Project>
