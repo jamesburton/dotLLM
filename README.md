@@ -19,7 +19,7 @@
 
 dotLLM is a ground-up LLM inference engine for .NET — not a wrapper around llama.cpp or Python libraries. All orchestration, model loading, tokenization, sampling, and CPU compute are implemented in pure C#, with CUDA GPU acceleration via PTX kernels loaded through the CUDA Driver API (no native shared library). It targets transformer-based models (Llama, Mistral, Phi, Qwen, DeepSeek) with SIMD-optimized CPU and CUDA GPU backends.
 
-> **Status**: Phase 5 complete — OpenAI-compatible API server with built-in chat UI, constrained decoding (JSON/schema/regex/grammar), tool calling, and prompt caching for fast multi-turn conversations. CUDA GPU backend with CPU/GPU hybrid offloading, KV-cache quantization. SIMD-optimized CPU inference with Q4_K_M, chat templates, streaming, multi-threading, NUMA pinning. Supports Llama, Mistral, Phi, Qwen. See [Roadmap](#roadmap).
+> **Status**: Phase 6 complete — speculative decoding, paged KV-cache, Native AOT, and startup warm-up on top of the OpenAI-compatible API server, built-in chat UI, constrained decoding (JSON/schema/regex/grammar), tool calling, and prompt caching. CUDA GPU backend with CPU/GPU hybrid offloading and KV-cache quantization. SIMD-optimized CPU inference with Q4_K_M, chat templates, streaming, multi-threading, NUMA pinning. Supports Llama, Mistral, Phi, Qwen. Phase 7 (diagnostics & interpretability) in progress — logprobs landed. See [Roadmap](#roadmap).
 
 ## Key Features
 
@@ -80,7 +80,12 @@ Pick one of three install options.
 
 ```bash
 dotnet tool install -g DotLLM.Cli
+
+# Download a model once, then use it anywhere
+dotllm model pull QuantFactory/SmolLM-135M-GGUF
+
 dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
+dotllm serve QuantFactory/SmolLM-135M-GGUF               # OpenAI-compatible API + chat UI
 ```
 
 **Option B — download a self-contained binary** (no .NET install needed — the runtime is bundled):
@@ -97,14 +102,16 @@ Unpack and run:
 # Linux / macOS
 tar -xzf dotllm-<version>-linux-x64.tar.gz
 cd dotllm-<version>-linux-x64
+./dotllm model pull QuantFactory/SmolLM-135M-GGUF
 ./dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
-./dotllm serve QuantFactory/SmolLM-135M-GGUF          # OpenAI-compatible API + chat UI
+./dotllm serve QuantFactory/SmolLM-135M-GGUF             # OpenAI-compatible API + chat UI
 ```
 
 ```powershell
 # Windows
 Expand-Archive dotllm-<version>-win-x64.zip -DestinationPath .
 cd dotllm-<version>-win-x64
+.\dotllm.exe model pull QuantFactory/SmolLM-135M-GGUF
 .\dotllm.exe run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
 ```
 
@@ -114,52 +121,84 @@ cd dotllm-<version>-win-x64
 
 ### Build from source
 
-Clone the repository and build with the .NET 10 SDK. The remainder of this section (Prerequisites, Build, Run, CLI reference, Debug, Tests, Benchmarks) covers the from-source workflow.
+Clone the repository and build with the .NET 10 SDK.
 
-### Prerequisites
+**Prerequisites:**
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
-- [Python 3.10+](https://www.python.org/) with `pip install rich InquirerPy` (for benchmark scripts)
-- *Optional:* [llama.cpp](https://github.com/ggerganov/llama.cpp) for comparison benchmarks (see [llama.cpp setup](#llamacpp-setup) below)
-
-### Build
+- [Python 3.10+](https://www.python.org/) with `pip install rich InquirerPy` — only needed for the benchmark scripts under `scripts/`
+- *Optional:* [llama.cpp](https://github.com/ggerganov/llama.cpp) for comparison benchmarks (see [llama.cpp setup](#llamacpp-setup))
 
 ```bash
 git clone https://github.com/kkokosa/dotLLM.git
 cd dotLLM
-dotnet build
+dotnet build -c Release
 ```
 
-### Run
+When built from source, replace `dotllm <subcommand>` in the [Usage](#usage) examples below with `dotnet run --project src/DotLLM.Cli -c Release -- <subcommand>`.
 
-dotLLM provides a CLI tool (`DotLLM.Cli`) with two generation modes. Models are specified by local GGUF file path or HuggingFace repo ID (auto-downloaded to `~/.dotllm/models/` on first use).
+## Usage
 
-**Single-shot generation** (`run`) — encode a prompt, stream tokens, print performance summary:
+dotLLM ships a single CLI tool with four command groups:
+
+- **`dotllm model`** — download, list, search, and inspect GGUF models
+- **`dotllm run`** — single-shot text generation with a performance summary
+- **`dotllm chat`** — interactive multi-turn REPL with chat template formatting
+- **`dotllm serve`** — OpenAI-compatible HTTP API with a built-in web chat UI
+
+Models are identified by a local `.gguf` path or a HuggingFace repo ID (e.g., `QuantFactory/SmolLM-135M-GGUF`). **Models must be downloaded explicitly with `dotllm model pull` before they can be used** — `run`, `chat`, and `serve` read from `~/.dotllm/models/` and do not auto-fetch.
+
+### Manage models
 
 ```bash
-# Greedy generation (default: temperature=0)
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    --prompt "The capital of France is" --max-tokens 64
+# Search HuggingFace for GGUF repos
+dotllm model search llama --limit 5
 
-# Sampled generation with temperature
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    -p "Once upon a time" -n 128 -t 0.7 --top-k 40 --top-p 0.95
+# Download a repo (streams the .gguf files + tokenizer metadata into ~/.dotllm/models/)
+dotllm model pull QuantFactory/SmolLM-135M-GGUF
+
+# List everything cached locally
+dotllm model list
+
+# Show architecture, quantizations, and tokenizer info for a cached repo
+dotllm model info QuantFactory/SmolLM-135M-GGUF
+
+# Remove a cached repo
+dotllm model delete QuantFactory/SmolLM-135M-GGUF
+```
+
+### Run — single-shot generation
+
+Encodes a prompt, streams tokens to stdout, and prints a performance + memory summary.
+
+```bash
+# Greedy generation (default: temperature=0, max-tokens=128)
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" -n 64
+
+# Sampled generation
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "Once upon a time" -n 128 -t 0.7 --top-k 40 --top-p 0.95
 
 # JSON output (for scripting / piping)
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    -p "Hello" --json
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "Hello" --json
 
-# Select a specific quantization variant
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    -p "Test" -q Q8_0
+# Select a specific quantization when a repo has multiple .gguf files
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "Test" -q Q8_0
 
 # GPU inference (requires NVIDIA GPU + CUDA Toolkit)
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    -p "The capital of France is" --device gpu
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "The capital of France is" --device gpu
 
-# Threading options (CPU)
-dotnet run --project src/DotLLM.Cli -c Release -- run QuantFactory/SmolLM-135M-GGUF \
-    -p "Test" --threads 8 --decode-threads 4 --numa-pin
+# NUMA / P-core aware CPU threading
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "Test" --threads 8 --decode-threads 4 --numa-pin
+
+# KV-cache quantization (Q8_0 / Q4_0) to fit longer contexts in memory
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "..." --cache-type-k q8_0 --cache-type-v q8_0
+
+# Constrained JSON output
+dotllm run QuantFactory/SmolLM-135M-GGUF -p "List 3 colors as JSON." --response-format json_object
+
+# Speculative decoding with a smaller draft model (must share vocabulary)
+dotllm run bartowski/Llama-3.2-3B-Instruct-GGUF -p "Explain ..." \
+    --speculative-model QuantFactory/SmolLM-135M-GGUF --speculative-k 5
 ```
 
 Sample output:
@@ -191,18 +230,22 @@ The capital of France is Paris. Paris is a city of romance and culture,
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
-**Interactive chat** (`chat`) — multi-turn conversation REPL with chat template formatting:
+### Chat — interactive REPL
+
+Multi-turn chat with persistent history, using the model's built-in chat template (falling back to ChatML). Prompt caching reuses KV-cache state across turns so subsequent turns skip redundant prefill.
 
 ```bash
-# Basic chat (uses model's built-in chat template, falls back to ChatML)
-dotnet run --project src/DotLLM.Cli -c Release -- chat QuantFactory/SmolLM-135M-GGUF
+# Basic chat
+dotllm chat QuantFactory/SmolLM-135M-GGUF
 
-# With system prompt and sampling
-dotnet run --project src/DotLLM.Cli -c Release -- chat QuantFactory/SmolLM-135M-GGUF \
-    --system "You are a helpful assistant." -t 0.8 --top-p 0.95
+# With a system prompt and sampling
+dotllm chat QuantFactory/SmolLM-135M-GGUF --system "You are a helpful assistant." -t 0.8 --top-p 0.95
+
+# GPU + KV-cache quantization for long contexts
+dotllm chat bartowski/Llama-3.2-3B-Instruct-GGUF --device gpu --cache-type-k q8_0 --cache-type-v q8_0
 ```
 
-In-session commands: `/exit` or `/quit` to leave, `/clear` to reset history (keeps system prompt), `/system <text>` to change the system prompt.
+In-session commands: `/exit` or `/quit` to leave, `/clear` to reset history (keeps the system prompt), `/system <text>` to change the system prompt.
 
 Sample session:
 
@@ -223,38 +266,112 @@ History cleared.
 >>> /exit
 ```
 
-**CLI option reference** (both `run` and `chat`):
+### Serve — OpenAI-compatible API + chat UI
+
+Starts a local HTTP server exposing an OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/tokenize`, streaming SSE, tool calling) plus a built-in single-page web chat UI. Paged KV-cache, prompt caching, and startup warm-up are on by default. The browser opens automatically unless `--no-browser` is set.
+
+```bash
+# Start the server with a loaded model and open the chat UI
+dotllm serve QuantFactory/SmolLM-135M-GGUF
+
+# Bind a public interface, custom port, API-only, no auto-browser
+dotllm serve QuantFactory/SmolLM-135M-GGUF --host 0.0.0.0 --port 9000 --no-ui --no-browser
+
+# Start without a model — pick one from the chat UI
+dotllm serve
+
+# GPU with partial hybrid offload and more warm-up iterations
+dotllm serve bartowski/Llama-3.2-3B-Instruct-GGUF --device gpu --gpu-layers 24 --warmup-iterations 5
+
+# Speculative decoding
+dotllm serve bartowski/Llama-3.2-3B-Instruct-GGUF \
+    --speculative-model QuantFactory/SmolLM-135M-GGUF --speculative-k 5
+```
+
+Any OpenAI-compatible client works against the running server:
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "SmolLM-135M",
+    "messages": [{"role":"user","content":"Say hi in one word."}],
+    "stream": true
+  }'
+```
+
+To embed the same endpoints inside your own ASP.NET Core app, see [Host the OpenAI API in your ASP.NET app](#host-the-openai-api-in-your-aspnet-app) below.
+
+### CLI option reference
+
+**Common options** (shared by `run`, `chat`, and `serve`):
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--prompt` | `-p` | *(required for `run`)* | Input prompt |
-| `--system` | `-s` | *(none)* | System prompt (`chat` only) |
-| `--max-tokens` | `-n` | 128 / 512 | Max tokens to generate |
-| `--temp` | `-t` | 0 | Sampling temperature (0 = greedy) |
-| `--top-k` | | 0 | Top-K sampling (0 = disabled) |
-| `--top-p` | | 1.0 | Top-P (nucleus) threshold |
-| `--min-p` | | 0 | Min-P threshold (0 = disabled) |
-| `--repeat-penalty` | | 1.0 | Repetition penalty (1.0 = disabled) |
-| `--repeat-last-n` | | 0 | Penalty lookback window (0 = full) |
-| `--seed` | `-s` | *(random)* | Random seed for reproducibility |
-| `--threads` | | 0 | CPU threads (0 = auto/all cores) |
-| `--decode-threads` | | 0 | Decode threads (0 = auto) |
-| `--numa-pin` | | false | Pin to NUMA-local cores |
-| `--pcore-only` | | false | Pin to P-cores only (Intel hybrid) |
-| `--quant` | `-q` | *(auto)* | Quantization filter (e.g., Q4_K_M) |
-| `--device` | `-d` | cpu | Compute device: `cpu`, `gpu`, `gpu:0`, `gpu:1` |
-| `--json` | | false | JSON output (`run` only) |
+| `--device` | `-d` | `cpu` | Compute device: `cpu`, `gpu`, `gpu:0`, `gpu:1` |
+| `--gpu-layers` | | *(all if `gpu`, 0 if `cpu`)* | Transformer layers on GPU (hybrid offload) |
+| `--threads` | | 0 (auto) | CPU threads for inference |
+| `--decode-threads` | | 0 (auto) | Decode threads (capped at memory channels) |
+| `--numa-pin` | | false | Pin workers to NUMA-local cores (multi-socket) |
+| `--pcore-only` | | false | Pin workers to P-cores only (Intel hybrid) |
+| `--quant` | `-q` | *(auto)* | Quant filter when a repo has multiple `.gguf` files (e.g., `Q4_K_M`) |
+| `--cache-type-k` | | `f32` | KV-cache key quant: `f32`, `q8_0`, `q4_0` |
+| `--cache-type-v` | | `f32` | KV-cache value quant: `f32`, `q8_0`, `q4_0` |
+| `--speculative-model` | | *(none)* | Draft model for speculative decoding (must share vocab) |
+| `--speculative-k` | | 5 | Draft tokens per speculative step |
 
-**Model management** (`model`) — search, download, and list GGUF models from HuggingFace:
+**Sampling & constraints** (shared by `run` and `chat`):
 
-```bash
-dotnet run --project src/DotLLM.Cli -c Release -- model search llama --limit 5
-dotnet run --project src/DotLLM.Cli -c Release -- model pull QuantFactory/SmolLM-135M-GGUF
-dotnet run --project src/DotLLM.Cli -c Release -- model list
-dotnet run --project src/DotLLM.Cli -c Release -- model info QuantFactory/SmolLM-135M-GGUF
-```
+| Option | Short | Default (`run`) | Default (`chat`) | Description |
+|--------|-------|-----------------|------------------|-------------|
+| `--max-tokens` | `-n` | 128 | 512 | Max tokens per generation |
+| `--temp` | `-t` | 0 (greedy) | 0 (greedy) | Sampling temperature |
+| `--top-k` | | 0 (off) | 0 (off) | Top-K sampling |
+| `--top-p` | | 1.0 | 1.0 | Nucleus threshold |
+| `--min-p` | | 0 (off) | 0 (off) | Min-P threshold |
+| `--repeat-penalty` | | 1.0 | 1.0 | Repetition penalty |
+| `--repeat-last-n` | | 0 (full) | 0 (full) | Penalty lookback window |
+| `--seed` | `-s` (run only) | *(random)* | *(random)* | Random seed for reproducibility |
+| `--cache-window` | | 0 | 0 | Full-precision tail window for KV quant |
+| `--paged` | | off | off | Use paged (block-based) KV-cache |
+| `--response-format` | | `text` | `text` | `text`, `json_object`, `json_schema`, `regex`, `grammar` |
+| `--schema` | | — | — | JSON Schema (or `@file.json`) for `json_schema` |
+| `--pattern` | | — | — | Regex pattern for `regex` |
+| `--grammar` | | — | — | GBNF grammar (or `@file.gbnf`) for `grammar` |
+| `--tools` | | — | — | Tool definitions JSON (or `@file.json`) |
 
-### Debug Build
+**`run`-only:**
+
+- `--prompt` / `-p` — input prompt (**required**)
+- `--json` — emit a single JSON result object (suppresses formatted output)
+
+**`chat`-only:**
+
+- `--system` / `-s` — system prompt
+- `--tool-choice` — `auto` (default), `none`, `required`, or a function name
+- `--no-prompt-cache` — disable KV-cache reuse across turns
+- `--prompt-cache-size` — max cached sessions (default: `1`)
+- `--verbose` / `-v` — debug output (finish reason, raw text, tool-call details)
+
+**`serve`-only:**
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--host` | | `localhost` | Bind address |
+| `--port` | `-p` | `8080` | Port to listen on |
+| `--no-ui` | | false | Disable the built-in chat UI (API only) |
+| `--no-browser` | | false | Don't auto-open the browser |
+| `--no-paged` | | false | Disable paged KV-cache (paged is **on** by default for `serve`) |
+| `--no-prompt-cache` | | false | Disable KV-cache reuse across requests |
+| `--prompt-cache-size` | | `4` | Max cached sessions |
+| `--no-warmup` | | false | Disable startup warm-up passes |
+| `--warmup-iterations` | | `3` | Warm-up iteration count |
+
+> **Short-flag gotcha:** `-p` is **prompt** under `run` but **port** under `serve`. `-s` is **seed** under `run` but **system** under `chat`. When in doubt, use the long form.
+
+## Development
+
+### Debug build
 
 Building in `Debug` configuration (`-c Debug`) enables a `debug` command group with diagnostic tools for inspecting GGUF files and model internals. These commands are excluded from Release builds via `#if DEBUG`.
 
