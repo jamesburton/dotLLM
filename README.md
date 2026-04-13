@@ -79,7 +79,7 @@ Pick one of three install options.
 **Option A — install as a global .NET tool** (requires .NET 10 runtime):
 
 ```bash
-dotnet tool install -g DotLLM.Cli
+dotnet tool install -g DotLLM.Cli --prerelease
 
 # Download a model once, then use it anywhere
 dotllm model pull QuantFactory/SmolLM-135M-GGUF
