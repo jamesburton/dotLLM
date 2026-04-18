@@ -18,10 +18,6 @@ namespace DotLLM.Models.Architectures;
 ///   - GQA multi-head attention, or
 ///   - squared-ReLU MLP (no gate).
 /// with a single RMSNorm before and one residual add after.
-///
-/// This class owns weight loading and layout classification; the Forward pass is
-/// implemented in stages — see DESIGN.md and the per-branch TODOs inside
-/// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>.
 /// </summary>
 public sealed unsafe class NemotronHTransformerModel : IModel
 {
@@ -33,7 +29,6 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private readonly NemotronHLayerWeights[] _layers;
     private readonly float[] _outputNormWeight;
 
-    // Global weights (embeddings + LM head). Stored as raw pointers.
     private readonly nint _tokenEmbedWeight;
     private readonly QuantizationType _tokenEmbedQuantType;
     private readonly nint _outputWeight;
@@ -43,13 +38,31 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
     private readonly HybridLayerLayout _layout;
     private readonly MambaSsmConfig _ssm;
+
+    // Sparse KV-cache mapping: physical layer index -> slot in a cache sized to
+    // the attention-layer count. -1 for non-attention layers.
+    private readonly int[] _kvSlotForLayer;
+    private readonly int _attentionLayerCount;
+
+    // Ordinal mapping: physical layer index -> index into _ssmCache for SSM layers; -1 otherwise.
+    private readonly int[] _ssmLayerOrdinal;
+    private readonly int _numSsmLayers;
+
+    private readonly float[] _ropeCosTable;
+    private readonly float[] _ropeSinTable;
+    private readonly int _ropeDim;
+
     private readonly NemotronHForwardState _state;
+    private readonly SsmStateCache _ssmCache;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
     /// <inheritdoc/>
-    public long ComputeMemoryBytes => _state.AllocatedBytes;
+    public long ComputeMemoryBytes => _state.AllocatedBytes + _ssmCache.AllocatedBytes;
+
+    /// <summary>Number of attention layers — the matching sparse KV-cache slot count.</summary>
+    public int AttentionLayerCount => _attentionLayerCount;
 
     private NemotronHTransformerModel(
         ModelConfig config,
@@ -57,7 +70,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         NemotronHLayerWeights[] layers,
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
-        nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim)
+        nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
+        int[] kvSlotForLayer, int attentionLayerCount,
+        float[] ropeCosTable, float[] ropeSinTable, int ropeDim)
     {
         Config = config;
         _gguf = gguf;
@@ -71,6 +86,21 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         _outputInputDim = outputInputDim;
         _layout = config.HybridLayout!;
         _ssm = config.SsmConfig!.Value;
+        _kvSlotForLayer = kvSlotForLayer;
+        _attentionLayerCount = attentionLayerCount;
+        _ropeCosTable = ropeCosTable;
+        _ropeSinTable = ropeSinTable;
+        _ropeDim = ropeDim;
+
+        _ssmLayerOrdinal = new int[config.NumLayers];
+        int ssmOrdinal = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            _ssmLayerOrdinal[i] = _layout.LayerKind[i] == HybridLayerKind.Ssm
+                ? ssmOrdinal++
+                : -1;
+        }
+        _numSsmLayers = ssmOrdinal;
 
         int maxIntermediate = 0;
         for (int i = 0; i < _layers.Length; i++)
@@ -79,10 +109,21 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             if (ffn is not null && ffn.UpOutputDim > maxIntermediate)
                 maxIntermediate = ffn.UpOutputDim;
         }
-        // Intermediate scratch must be non-zero even for all-SSM debug builds.
         if (maxIntermediate == 0) maxIntermediate = config.HiddenSize;
 
-        _state = new NemotronHForwardState(config.HiddenSize, maxIntermediate, config.VocabSize);
+        _state = new NemotronHForwardState(
+            hiddenSize: config.HiddenSize,
+            maxIntermediateSize: maxIntermediate,
+            vocabSize: config.VocabSize,
+            qElems: config.NumAttentionHeads * config.HeadDim,
+            kvElems: config.NumKvHeads * config.HeadDim,
+            inputProjectionDim: _ssm.InputProjectionDim,
+            convDim: _ssm.ConvDim,
+            dConv: _ssm.DConv,
+            dInner: _ssm.DInner,
+            nHead: _ssm.NHead);
+
+        _ssmCache = new SsmStateCache(_ssm, _numSsmLayers);
     }
 
     /// <summary>
@@ -105,12 +146,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         var layout = config.HybridLayout;
         var ssm = config.SsmConfig.Value;
 
-        // --- global tensors ---
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase + (nint)embDesc.DataOffset;
 
         var outNormDesc = tensors["output_norm.weight"];
-        float[] outputNormWeight = DequantizeNorm(dataBase, outNormDesc, config.HiddenSize);
+        float[] outputNormWeight = DequantizeF32(dataBase, outNormDesc, config.HiddenSize);
 
         nint outputPtr;
         QuantizationType outputQt;
@@ -124,24 +164,57 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         }
         else
         {
-            // Tied — not observed in the 4B checkpoint, but support it for completeness.
             outputPtr = embPtr;
             outputQt = embDesc.QuantizationType;
             outputK = embDesc.Shape[0];
             outputM = embDesc.Shape[1];
         }
 
-        // --- per-layer ---
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
+        if (ropeDim <= 0)
+            throw new InvalidDataException(
+                "NemotronH requires rope.dimension_count in GGUF metadata (expected 78 for Nemotron-3).");
+
         var layers = new NemotronHLayerWeights[config.NumLayers];
+        var kvSlotForLayer = new int[config.NumLayers];
+        int attentionLayerCount = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = LoadLayer(i, dataBase, tensors, config, layout, ssm);
+
+            if (layout.LayerKind[i] == HybridLayerKind.Attention)
+            {
+                // Partial RoPE correctness hinges on head_dim=128, rope_dim=78 for Nemotron-3.
+                if (config.HeadDim != 128)
+                    throw new InvalidDataException(
+                        $"NemotronH attention layer {i}: head_dim={config.HeadDim}, expected 128.");
+                if (ropeDim != 78)
+                    throw new InvalidDataException(
+                        $"NemotronH attention layer {i}: rope_dim={ropeDim}, expected 78 (partial RoPE).");
+                if ((ropeDim & 1) != 0)
+                    throw new InvalidDataException(
+                        $"NemotronH rope_dim={ropeDim} must be even for pair-wise rotation.");
+
+                kvSlotForLayer[i] = attentionLayerCount++;
+            }
+            else
+            {
+                kvSlotForLayer[i] = -1;
+            }
         }
+
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        int halfRope = ropeDim / 2;
+        var ropeCos = new float[config.MaxSequenceLength * halfRope];
+        var ropeSin = new float[config.MaxSequenceLength * halfRope];
+        RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
 
         return new NemotronHTransformerModel(
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
-            outputPtr, outputQt, outputM, outputK);
+            outputPtr, outputQt, outputM, outputK,
+            kvSlotForLayer, attentionLayerCount,
+            ropeCos, ropeSin, ropeDim);
     }
 
     private static NemotronHLayerWeights LoadLayer(
@@ -157,7 +230,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
         // Pre-sublayer RMSNorm is always named attn_norm in GGUF, even on FFN and SSM layers.
         var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
-        float[] attnNormWeight = DequantizeNorm(dataBase, attnNormDesc, hiddenSize);
+        float[] attnNormWeight = DequantizeF32(dataBase, attnNormDesc, hiddenSize);
 
         return layout.LayerKind[layerIdx] switch
         {
@@ -187,15 +260,14 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         MambaSsmConfig ssm)
     {
         var inDesc = tensors[$"{prefix}.ssm_in.weight"];
-        var conv1dWDesc = tensors[$"{prefix}.ssm_conv1d.weight"]; // [d_conv, conv_dim]
-        var conv1dBDesc = tensors[$"{prefix}.ssm_conv1d.bias"];   // [conv_dim]
-        var aDesc = tensors[$"{prefix}.ssm_a"];     // [1, n_head]
-        var dDesc = tensors[$"{prefix}.ssm_d"];     // [1, n_head]
-        var dtBDesc = tensors[$"{prefix}.ssm_dt.bias"]; // [n_head]
-        var normDesc = tensors[$"{prefix}.ssm_norm.weight"]; // [d_inner/n_group, n_group]
-        var outDesc = tensors[$"{prefix}.ssm_out.weight"];   // [d_inner, hidden]
+        var conv1dWDesc = tensors[$"{prefix}.ssm_conv1d.weight"];
+        var conv1dBDesc = tensors[$"{prefix}.ssm_conv1d.bias"];
+        var aDesc = tensors[$"{prefix}.ssm_a"];
+        var dDesc = tensors[$"{prefix}.ssm_d"];
+        var dtBDesc = tensors[$"{prefix}.ssm_dt.bias"];
+        var normDesc = tensors[$"{prefix}.ssm_norm.weight"];
+        var outDesc = tensors[$"{prefix}.ssm_out.weight"];
 
-        // Dimension sanity — mirror llama.cpp assertions so we fail loudly, not silently.
         if (inDesc.Shape[1] != ssm.InputProjectionDim)
             throw new InvalidDataException(
                 $"{prefix}.ssm_in.weight shape[1]={inDesc.Shape[1]}, expected {ssm.InputProjectionDim}.");
@@ -308,15 +380,18 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
-        _ = _ssm;       // consumed by stage 7
-        _ = kvCache;    // consumed by stage 6
-
         int seqLen = tokenIds.Length;
+        if (seqLen == 0 || seqLen != positions.Length)
+            throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
+
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
         float eps = Config.NormEpsilon;
-
         int maxSeq = Config.MaxSequenceLength;
+
         for (int i = 0; i < positions.Length; i++)
         {
             if ((uint)positions[i] >= (uint)maxSeq)
@@ -332,6 +407,10 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         float* ffnMid = (float*)_state.FfnIntermediate;
         float* logits = (float*)_state.Logits;
         byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
+        float* q = (float*)_state.QScratch;
+        float* k = (float*)_state.KScratch;
+        float* v = (float*)_state.VScratch;
+        float* attnOut = (float*)_state.AttnOutput;
 
         EmbedTokens(tokenIds, hidden, hiddenSize);
 
@@ -339,20 +418,41 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         for (int layer = 0; layer < _layers.Length; layer++)
         {
             var lw = _layers[layer];
+
+            // Save residual snapshot and pre-norm into normOut (shared by all three sub-layers).
+            new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+            for (int t = 0; t < seqLen; t++)
+            {
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                    lw.AttnNormWeight, eps,
+                    new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
             switch (kinds[layer])
             {
                 case HybridLayerKind.Ffn:
-                    ForwardFfnLayer(lw, seqLen, hiddenSize, eps,
-                                    hidden, residual, normOut, ffnMid, inputQ8Scratch);
+                    ForwardFfnBody(lw.Ffn!, seqLen, hiddenSize, normOut, ffnMid, inputQ8Scratch);
+                    break;
+                case HybridLayerKind.Attention:
+                    ForwardAttentionBody(lw.Attention!, layer, seqLen, positions,
+                        normOut, q, k, v, attnOut,
+                        numHeads, numKvHeads, headDim, kvCache);
                     break;
                 case HybridLayerKind.Ssm:
-                case HybridLayerKind.Attention:
-                    throw new NotImplementedException(
-                        $"Nemotron-H {kinds[layer]} layer (index {layer}) — " +
-                        "stage 6/7 of feature/mamba-3");
+                    ForwardSsmBody(lw.Ssm!, layer, seqLen, hiddenSize, normOut, eps);
+                    break;
                 default:
                     throw new InvalidOperationException(
                         $"Unknown HybridLayerKind {kinds[layer]} at layer {layer}.");
+            }
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                Add.Execute(
+                    new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                    new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
         }
 
@@ -376,24 +476,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ForwardFfnLayer(NemotronHLayerWeights lw, int seqLen, int hiddenSize, float eps,
-                                 float* hidden, float* residual, float* normOut, float* ffnMid,
-                                 byte* inputQ8Scratch)
+    private static void ForwardFfnBody(NemotronHFfnWeights ffn, int seqLen, int hiddenSize,
+                                       float* normOut, float* ffnMid, byte* inputQ8Scratch)
     {
-        var ffn = lw.Ffn!;
         int intermediateSize = ffn.UpOutputDim;
 
-        new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
-
-        for (int t = 0; t < seqLen; t++)
-        {
-            RmsNorm.Execute(
-                new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
-                lw.AttnNormWeight, eps,
-                new Span<float>(normOut + t * hiddenSize, hiddenSize));
-        }
-
-        // Pre-quantize normed input once because Q-typed matmuls expect a packed input representation.
         byte* preQuantUp = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, seqLen, ffn.UpQuantType);
         Gemm(ffn.UpWeight, ffn.UpQuantType, normOut, ffnMid,
              ffn.UpOutputDim, ffn.UpInputDim, seqLen, preQuantUp);
@@ -408,14 +495,212 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         byte* preQuantDown = QuantizeInput(ffnMid, inputQ8Scratch, intermediateSize, seqLen, ffn.DownQuantType);
         Gemm(ffn.DownWeight, ffn.DownQuantType, ffnMid, normOut,
              ffn.DownOutputDim, ffn.DownInputDim, seqLen, preQuantDown);
+    }
 
+    private void ForwardAttentionBody(
+        NemotronHAttentionWeights attn, int layer, int seqLen, ReadOnlySpan<int> positions,
+        float* normOut, float* q, float* k, float* v, float* attnOut,
+        int numHeads, int numKvHeads, int headDim, IKvCache? kvCache)
+    {
+        int kvStride = numKvHeads * headDim;
+
+        Gemm(attn.QWeight, attn.QQuantType, normOut, q, attn.QOutputDim, attn.QInputDim, seqLen, preQuantizedInput: null);
+        Gemm(attn.KWeight, attn.KQuantType, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen, preQuantizedInput: null);
+        Gemm(attn.VWeight, attn.VQuantType, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen, preQuantizedInput: null);
+
+        // Partial RoPE: rotates the first _ropeDim=78 dims of each head, leaves the remainder untouched.
+        RoPE.Execute(
+            new Span<float>(q, seqLen * numHeads * headDim),
+            new Span<float>(k, seqLen * kvStride),
+            positions,
+            numHeads, numKvHeads, headDim, _ropeDim,
+            _ropeCosTable, _ropeSinTable, RoPEType.Norm);
+
+        if (kvCache is not null)
+        {
+            int kvSlot = _kvSlotForLayer[layer];
+            if (kvSlot < 0)
+                throw new InvalidOperationException(
+                    $"Layer {layer} has no KV-cache slot (not an attention layer).");
+
+            var kRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)k);
+            var vRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)v);
+            kvCache.Update(kRef, vRef, positions, kvSlot);
+
+            int seqKv = kvCache.CurrentLength;
+            var cachedK = kvCache.GetKeysRef(kvSlot);
+            var cachedV = kvCache.GetValuesRef(kvSlot);
+
+            Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], pool: null,
+                slidingWindowSize: null);
+        }
+        else
+        {
+            Attention.Execute(q, k, v, attnOut,
+                seqLen, seqLen, numHeads, numKvHeads, headDim, 0, pool: null,
+                slidingWindowSize: null);
+        }
+
+        Gemm(attn.OWeight, attn.OQuantType, attnOut, normOut, attn.OOutputDim, attn.OInputDim, seqLen, preQuantizedInput: null);
+    }
+
+    /// <summary>
+    /// Mamba2 SSM sub-layer forward (DESIGN.md §4). Reads pre-normed activations from
+    /// <paramref name="normOut"/> and writes the ssm_out projection back to the same buffer.
+    /// Advances the per-layer conv/SSM state in place.
+    /// </summary>
+    [SkipLocalsInit]
+    private void ForwardSsmBody(NemotronHSsmWeights ssmW, int absoluteLayerIndex, int seqLen,
+                                int hiddenSize, float* normOut, float eps)
+    {
+        int ssmOrdinal = _ssmLayerOrdinal[absoluteLayerIndex];
+
+        int dInner = _ssm.DInner;
+        int dConv = _ssm.DConv;
+        int nHead = _ssm.NHead;
+        int headDim = _ssm.HeadDim;
+        int dState = _ssm.DState;
+        int nGroup = _ssm.NGroup;
+        int convDim = _ssm.ConvDim;
+        int groupDim = dInner / nGroup;
+        int inProjDim = _ssm.InputProjectionDim;
+
+        float* zxbcdt = (float*)_state.Zxbcdt;
+        float* convInput = (float*)_state.ConvInput;
+        float* xbc = (float*)_state.XBC;
+        float* dtBuf = (float*)_state.DtBuffer;
+        float* yBuf = (float*)_state.SsmY;
+
+        // 1. ssm_in GEMM
+        Gemm(ssmW.InWeight, ssmW.InQuantType, normOut, zxbcdt,
+             inProjDim, hiddenSize, seqLen, preQuantizedInput: null);
+
+        // 2. conv_input = concat(conv_state, xBC rows from zxbcdt)
+        var convState = _ssmCache.GetConvState(ssmOrdinal);
+        convState.CopyTo(new Span<float>(convInput, (dConv - 1) * convDim));
         for (int t = 0; t < seqLen; t++)
         {
-            Add.Execute(
-                new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
-                new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
-                new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            var src = new ReadOnlySpan<float>(zxbcdt + t * inProjDim + dInner, convDim);
+            var dst = new Span<float>(convInput + (dConv - 1 + t) * convDim, convDim);
+            src.CopyTo(dst);
         }
+
+        // 3. Conv1d + SiLU
+        int convInputElems = (dConv - 1 + seqLen) * convDim;
+        int xbcElems = seqLen * convDim;
+        Conv1dCausal.Execute(
+            input: new ReadOnlySpan<float>(convInput, convInputElems),
+            weight: ssmW.Conv1dWeight,
+            bias: ssmW.Conv1dBias,
+            output: new Span<float>(xbc, xbcElems),
+            dConv: dConv,
+            channels: convDim,
+            seqLen: seqLen);
+
+        SiLu.Execute(
+            new ReadOnlySpan<float>(xbc, xbcElems),
+            new Span<float>(xbc, xbcElems));
+
+        // 4. Save last (d_conv-1) rows of conv_input (pre-SiLU) back into conv_state.
+        for (int r = 0; r < dConv - 1; r++)
+        {
+            var src = new ReadOnlySpan<float>(
+                convInput + (seqLen + r) * convDim, convDim);
+            var dst = convState.Slice(r * convDim, convDim);
+            src.CopyTo(dst);
+        }
+
+        // 5. dt = zxbcdt[:, dtOffset..] + ssm_dt.bias
+        int dtOffset = 2 * dInner + 2 * nGroup * dState;
+        for (int t = 0; t < seqLen; t++)
+        {
+            var src = new ReadOnlySpan<float>(zxbcdt + t * inProjDim + dtOffset, nHead);
+            var dst = new Span<float>(dtBuf + t * nHead, nHead);
+            TensorPrimitives.Add(src, ssmW.DtBias, dst);
+        }
+
+        // 6. Selective scan — pack contiguous x/B/C scratch (xbc rows interleave them).
+        int xElems = seqLen * dInner;
+        int bElems = seqLen * nGroup * dState;
+        int cElems = seqLen * nGroup * dState;
+
+        float[] xScratch = ArrayPool<float>.Shared.Rent(xElems);
+        float[] bScratch = ArrayPool<float>.Shared.Rent(bElems);
+        float[] cScratch = ArrayPool<float>.Shared.Rent(cElems);
+        try
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                ReadOnlySpan<float> row = new(xbc + t * convDim, convDim);
+                row.Slice(0, dInner).CopyTo(xScratch.AsSpan(t * dInner, dInner));
+                row.Slice(dInner, nGroup * dState).CopyTo(bScratch.AsSpan(t * nGroup * dState, nGroup * dState));
+                row.Slice(dInner + nGroup * dState, nGroup * dState).CopyTo(cScratch.AsSpan(t * nGroup * dState, nGroup * dState));
+            }
+
+            var ssmState = _ssmCache.GetSsmState(ssmOrdinal);
+
+            Mamba2SelectiveScan.Execute(
+                state: ssmState,
+                x: xScratch.AsSpan(0, xElems),
+                dt: new ReadOnlySpan<float>(dtBuf, seqLen * nHead),
+                a: ssmW.A,
+                b: bScratch.AsSpan(0, bElems),
+                c: cScratch.AsSpan(0, cElems),
+                y: new Span<float>(yBuf, xElems),
+                nHead: nHead,
+                headDim: headDim,
+                dState: dState,
+                nGroup: nGroup,
+                seqLen: seqLen);
+
+            // 7. y += x * D[h] (broadcast D per head across head_dim)
+            for (int t = 0; t < seqLen; t++)
+            {
+                int tBase = t * dInner;
+                for (int h = 0; h < nHead; h++)
+                {
+                    float dh = ssmW.D[h];
+                    int rowBase = tBase + h * headDim;
+                    for (int iHead = 0; iHead < headDim; iHead++)
+                    {
+                        yBuf[rowBase + iHead] += xScratch[rowBase + iHead] * dh;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xScratch);
+            ArrayPool<float>.Shared.Return(bScratch);
+            ArrayPool<float>.Shared.Return(cScratch);
+        }
+
+        // 8. SwiGLU gating: y = SiLU(z) * y, z = zxbcdt[:, 0..dInner)
+        for (int t = 0; t < seqLen; t++)
+        {
+            var z = new ReadOnlySpan<float>(zxbcdt + t * inProjDim, dInner);
+            var yRow = new Span<float>(yBuf + t * dInner, dInner);
+            FusedOps.SwiGLU(z, yRow, yRow);
+        }
+
+        // 9. Group RMSNorm
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int g = 0; g < nGroup; g++)
+            {
+                int off = t * dInner + g * groupDim;
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(yBuf + off, groupDim),
+                    ssmW.NormWeight.AsSpan(g * groupDim, groupDim),
+                    eps,
+                    new Span<float>(yBuf + off, groupDim));
+            }
+        }
+
+        // 10. ssm_out projection into normOut
+        Gemm(ssmW.OutWeight, ssmW.OutQuantType, yBuf, normOut,
+             hiddenSize, dInner, seqLen, preQuantizedInput: null);
     }
 
     private void EmbedTokens(ReadOnlySpan<int> tokenIds, float* hidden, int hiddenSize)
@@ -456,22 +741,33 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private static void Gemm(nint weights, QuantizationType qt, float* b, float* c,
                               int m, int k, int n, byte* preQuantizedInput)
     {
-        if (qt == QuantizationType.Q8_0)
-            MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
-        else if (qt == QuantizationType.Q5_0)
-            MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
-        else if (qt == QuantizationType.Q4_K)
-            MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
-        else if (qt == QuantizationType.Q5_K)
-            MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
-        else if (qt == QuantizationType.Q6_K)
-            MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
-        else if (qt == QuantizationType.F32)
-            MatMul.GemmF32((float*)weights, b, c, m, k, n);
-        else if (qt == QuantizationType.F16)
-            MatMul.GemmF16(weights, b, c, m, k, n);
-        else
-            GemmDequantFallback(weights, qt, b, c, m, k, n);
+        switch (qt)
+        {
+            case QuantizationType.Q8_0:
+                MatMul.GemmQ8_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q5_0:
+                MatMul.GemmQ5_0((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q4_K:
+                MatMul.GemmQ4_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q5_K:
+                MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.Q6_K:
+                MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, preQuantizedInput);
+                return;
+            case QuantizationType.F32:
+                MatMul.GemmF32((float*)weights, b, c, m, k, n);
+                return;
+            case QuantizationType.F16:
+                MatMul.GemmF16(weights, b, c, m, k, n);
+                return;
+            default:
+                GemmDequantFallback(weights, qt, b, c, m, k, n);
+                return;
+        }
     }
 
     private static void GemmDequantFallback(nint weights, QuantizationType qt, float* b, float* c,
@@ -535,11 +831,9 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     public void Dispose()
     {
         _state.Dispose();
+        _ssmCache.Dispose();
         GC.SuppressFinalize(this);
     }
-
-    private static float[] DequantizeNorm(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
-        => DequantizeF32(dataBase, desc, expectedSize);
 
     private static float[] DequantizeF32(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
     {
