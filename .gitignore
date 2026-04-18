@@ -429,3 +429,5 @@ tests/.models/
 # Scratch files used during nemotron_h research (do not commit)
 _*.cpp
 _*.txt
+.mamba3-reference/
+.mamba3-python-venv/
