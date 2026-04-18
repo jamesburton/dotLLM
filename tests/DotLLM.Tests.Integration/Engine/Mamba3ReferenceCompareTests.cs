@@ -76,6 +76,75 @@ public class Mamba3ReferenceCompareTests
         AssertCloseElementwise("gamma", expGamma, gamma);
     }
 
+    [SkippableFact]
+    public void QkNorm_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath())),
+            "fixture.json missing — run capture_fixtures.py");
+
+        var f = LoadFixture();
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        const float eps = 1e-5f;
+
+        // Reference QK-norm uses a single RMSNorm(bc_dim) layer before group split;
+        // in SISO bc_dim == d_state and there is no group dim, so our [T, nGroup=1, dState] layout matches.
+        int nGroup = 1;
+        float[] bIn = (float[])f.Inputs["B_raw"].Data.Clone();
+        float[] cIn = (float[])f.Inputs["C_raw"].Data.Clone();
+        float[] bWeight = f.Inputs["B_norm_weight"].Data;
+        float[] cWeight = f.Inputs["C_norm_weight"].Data;
+
+        Mamba3QkNorm.Execute(bIn, bWeight, eps, seqlen, nGroup, dState);
+        Mamba3QkNorm.Execute(cIn, cWeight, eps, seqlen, nGroup, dState);
+
+        AssertCloseElementwise("B_qkn", f.Expected["B_qkn"].Data, bIn);
+        AssertCloseElementwise("C_qkn", f.Expected["C_qkn"].Data, cIn);
+    }
+
+    [SkippableFact]
+    public void SelectiveScan_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath())),
+            "fixture.json missing — run capture_fixtures.py");
+
+        var f = LoadFixture();
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int nGroup = nHead;   // post-BC-bias-broadcast, B/C are per-head
+        int dInner = nHead * headDim;
+
+        // Inputs to the scan: pre-computed α/β/γ and post-RoPE B/C from the fixture.
+        float[] alpha = f.Expected["alpha"].Data;
+        float[] beta = f.Expected["beta"].Data;
+        float[] gamma = f.Expected["gamma"].Data;
+        float[] bRoped = f.Expected["B_roped"].Data;   // (b=1, l, nHead, dState) flat
+        float[] cRoped = f.Expected["C_roped"].Data;
+
+        // Reference flattens x as (b, l, h, p); our scan expects [T, dInner=h*p] row-major.
+        // Since x_heads in the fixture is stored (1, seqlen, nHead, headDim) row-major, a flat
+        // reinterpret is exactly [seqlen, nHead*headDim] = [seqlen, dInner]. ✓
+        float[] x = f.Inputs["x"].Data;
+
+        float[] state = new float[nHead * headDim * dState];
+        float[] prevBx = new float[nHead * headDim * dState];
+        float[] y = new float[seqlen * dInner];
+
+        Mamba3SelectiveScan.Execute(state, prevBx, x, alpha, beta, gamma, bRoped, cRoped, y,
+            nHead, headDim, dState, nGroup, seqlen);
+
+        // Reference y_scan has shape (b=1, l, h, p) row-major — same flat layout as [seqlen, dInner].
+        AssertCloseElementwise("y_scan", f.Expected["y_scan"].Data, y);
+
+        // Recurrent state sanity: last_Bx should equal our prev_Bx after the scan.
+        AssertCloseElementwise("prev_Bx == last_Bx", f.Expected["last_Bx"].Data, prevBx);
+
+        // ssm_state shape in reference is (b=1, h, p, n) — our state is [h, p, n]; same flat layout.
+        AssertCloseElementwise("ssm_state", f.Expected["ssm_state"].Data, state);
+    }
+
     private static void AssertCloseElementwise(string label, float[] expected, float[] actual)
     {
         Assert.Equal(expected.Length, actual.Length);
