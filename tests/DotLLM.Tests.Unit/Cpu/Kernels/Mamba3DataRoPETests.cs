@@ -56,7 +56,7 @@ public sealed class Mamba3DataRoPETests
         const int seqLen = 3;
         const int nHead = 1;
         const int dState = 2;
-        int halfDState = dState / 2;
+        // halfDState == 1, implicit in the 1-entry theta array below.
 
         float[] b = new float[seqLen * nHead * dState];
         float[] c = new float[seqLen * nHead * dState];
