@@ -181,6 +181,38 @@ Commit-granular; each stage builds green and adds tests.
 
 ### Stage B — PyTorch reference fixtures
 
+**Schema decisions (derived from reading `.mamba3-reference/mamba3-minimal/mamba3.py`):**
+
+The Mamba-3 block input projection produces seven splits, not five:
+`z, x, B, C, dt_raw, lam_raw, theta` — where `theta` (shape `[T, dState/2]`)
+is **per-token data-dependent**, not a learned per-head table. `dt` is then
+`softplus(dt_raw + dt_bias)`, `lam` is `sigmoid(lam_raw)`. `A` comes from
+`-exp(A_log)` (per-head, always negative). BC-bias is learned per-head,
+per-channel (init 1.0), added *after* QK-Norm, *before* RoPE. For SISO the
+scan input is `B` shape `[T, nHead, dState]` (post-bias-broadcast) and our
+`Mamba3SelectiveScan` accepts `nGroup=nHead` in that layout.
+
+**Fixture capture points for the Stage B golden file:**
+1. Inputs: `u` (post-pre-norm hidden), all weights (`in_proj`, `A_log`,
+   `dt_bias`, `B_bias`, `C_bias`, `D`, `out_proj`, `B_norm.weight`,
+   `C_norm.weight`).
+2. Post-split intermediates: `z, x, B_raw, C_raw, dt_raw, lam_raw, theta`.
+3. Post-activation: `dt` (softplus), `lam` (sigmoid).
+4. Computed discretization: `dA, alpha, beta, gamma`.
+5. Post-QK-Norm: `B_qkn, C_qkn`.
+6. Post-BC-bias add (per-head broadcast): `B_biased, C_biased`.
+7. Cum angles: `cum_angles` shape `[T, nHead, dState/2]`.
+8. Post-RoPE: `B_roped, C_roped` shape `[T, nHead, dState]`.
+9. Post-scan: `y_scan` (pre-D), `ssm_state`, `last_Bx`.
+10. Post-D + gate: `y_gated` (after `y + x*D` and `y * silu(z)`).
+
+**Format:** single `fixture.json` with tensor name → flat F32 array +
+shape tuple. Simple for C# to parse (no NPZ/zip machinery). Config:
+tiny model (d_model=8, nheads=2, headdim=4, dState=4, seqLen=4, SISO
+first then MIMO R=2).
+
+
+
 Script (Python) that runs `VikramKarLex/mamba3-minimal` on a fixed seed
 and dumps:
 - A single-layer forward's input (hidden state, weights) as `.bin` files
