@@ -21,7 +21,7 @@ public class Mamba3ReferenceCompareTests
     public Mamba3ReferenceCompareTests(ITestOutputHelper output) => _output = output;
 
     private static string FixturePath() =>
-        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "Fixtures", "Mamba3", "fixture.json");
+        Path.Combine(AppContext.BaseDirectory, "Fixtures", "Mamba3", "fixture.json");
 
     private static Fixture LoadFixture()
     {
