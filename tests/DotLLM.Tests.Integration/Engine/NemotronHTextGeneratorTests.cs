@@ -137,12 +137,21 @@ public class NemotronHTextGeneratorTests
 
         string decoded = tokenizer.DecodeToken(argmax);
 
-        // Surface the predicted token for eyeballing — "Paris" or " Paris" means the model
-        // is actually doing its job end-to-end, a random-looking token means there's still
-        // a math bug somewhere even though logits are finite.
         _output.WriteLine($"Prompt tokens: [{string.Join(",", promptIds)}]");
         _output.WriteLine($"Predicted next token: id={argmax} decoded={decoded.Replace("\n", "\\n")}");
         _output.WriteLine($"Last-row logit range: [{TensorPrimitives.Min(lastRow):F2}, {TensorPrimitives.Max(lastRow):F2}]");
+
+        // Dump top-20 so we can compare against a known-good implementation.
+        var indexed = new (int id, float logit)[config.VocabSize];
+        for (int i = 0; i < lastRow.Length; i++) indexed[i] = (i, lastRow[i]);
+        Array.Sort(indexed, (a, b) => b.logit.CompareTo(a.logit));
+        _output.WriteLine("Top-20 predictions (id | logit | decoded):");
+        for (int i = 0; i < 20; i++)
+        {
+            var (id, logit) = indexed[i];
+            string tok = tokenizer.DecodeToken(id).Replace("\n", "\\n");
+            _output.WriteLine($"  {id,7} | {logit,8:F3} | {tok}");
+        }
 
         Assert.False(string.IsNullOrEmpty(decoded),
             $"Argmax token id {argmax} decoded to empty string.");
