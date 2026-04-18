@@ -12,15 +12,17 @@ namespace DotLLM.Cpu.Kernels;
 /// For each <c>(t, h)</c> pair with <c>t ∈ [0, T)</c>, <c>h ∈ [0, n_head)</c>:
 /// </para>
 /// <code>
-/// α[t, h] = exp(dt[t, h] * A[h])              // decay, same as Mamba-2
-/// γ[t, h] = λ[h] * dt[t, h]                   // current-step (right-endpoint) weight
-/// β[t, h] = (1 - λ[h]) * dt[t, h] * α[t, h]   // previous-step (left-endpoint) weight
+/// α[t, h] = exp(dt[t, h] * A[h])                    // decay, same as Mamba-2
+/// γ[t, h] = λ[t, h] * dt[t, h]                      // current-step (right-endpoint) weight
+/// β[t, h] = (1 - λ[t, h]) * dt[t, h] * α[t, h]      // previous-step (left-endpoint) weight
 /// </code>
 /// <para>
 /// Inputs are all post-activation: <c>dt</c> is already softplus'd by the caller, and
-/// <c>λ</c> is already sigmoid'd into <c>[0, 1]</c>. <c>A</c> is the learned
-/// per-head decay parameter (negative-valued by convention so that <c>exp(dt·A)</c>
-/// decays toward 0).
+/// <c>λ</c> is already sigmoid'd into <c>[0, 1]</c>. Both <c>dt</c> and <c>λ</c> are
+/// per-token, per-head (shape <c>[T, n_head]</c>) because the reference derives them
+/// from the input projection per-token, not from a learned per-head table. <c>A</c>
+/// is the learned per-head decay parameter (negative-valued by convention so that
+/// <c>exp(dt·A)</c> decays toward 0) and is the only per-head-only input.
 /// </para>
 /// <para>
 /// <b>Alias safety:</b> the three output buffers (<c>alpha</c>,
@@ -44,8 +46,9 @@ public static class Mamba3Discretize
     /// convention so that <c>exp(dt · A)</c> decays toward 0.
     /// </param>
     /// <param name="lambda_">
-    /// Per-head trapezoidal interpolation parameter <c>λ</c> in <c>[0, 1]</c>
-    /// (post-sigmoid), length <c>n_head</c>.
+    /// Trapezoidal interpolation parameter <c>λ</c> in <c>[0, 1]</c> (post-sigmoid),
+    /// shape <c>[T, n_head]</c> row-major, length <c>T * n_head</c>. Per-token per-head
+    /// — derived from the input projection per-token in the Mamba-3 reference.
     /// </param>
     /// <param name="alpha">
     /// Destination for <c>α</c>, shape <c>[T, n_head]</c> row-major. MUST NOT alias
@@ -82,9 +85,9 @@ public static class Mamba3Discretize
         if (a.Length < nHead)
             throw new ArgumentException(
                 $"a length {a.Length} < n_head = {nHead}.", nameof(a));
-        if (lambda_.Length < nHead)
+        if (lambda_.Length < expected)
             throw new ArgumentException(
-                $"lambda length {lambda_.Length} < n_head = {nHead}.", nameof(lambda_));
+                $"lambda length {lambda_.Length} < T*n_head = {expected}.", nameof(lambda_));
         if (alpha.Length < expected)
             throw new ArgumentException(
                 $"alpha length {alpha.Length} < T*n_head = {expected}.", nameof(alpha));
@@ -115,6 +118,7 @@ public static class Mamba3Discretize
         {
             int rowBase = t * nHead;
             ReadOnlySpan<float> dtRow = dt.Slice(rowBase, nHead);
+            ReadOnlySpan<float> lamRow = lambda_.Slice(rowBase, nHead);
             Span<float> alphaRow = alpha.Slice(rowBase, nHead);
             Span<float> betaRow = beta.Slice(rowBase, nHead);
             Span<float> gammaRow = gamma.Slice(rowBase, nHead);
@@ -123,8 +127,8 @@ public static class Mamba3Discretize
             TensorPrimitives.Multiply(dtRow, a[..nHead], alphaRow);
             TensorPrimitives.Exp(alphaRow, alphaRow);
 
-            // gamma = lambda * dt
-            TensorPrimitives.Multiply(dtRow, lambda_[..nHead], gammaRow);
+            // gamma = lambda * dt (both per-token per-head)
+            TensorPrimitives.Multiply(dtRow, lamRow, gammaRow);
 
             // beta = (1 - lambda) * dt * alpha  =  (dt - gamma) * alpha
             // Scalar inner loop keeps the (1-λ)·dt·α compound in a single FMA-shaped pass
@@ -162,7 +166,7 @@ public static class Mamba3Discretize
             {
                 float dtv = dt[rowBase + h];
                 float av = MathF.Exp(dtv * a[h]);
-                float lam = lambda_[h];
+                float lam = lambda_[rowBase + h];
                 float gv = lam * dtv;
                 float bv = (1.0f - lam) * dtv * av;
                 alpha[rowBase + h] = av;

@@ -32,7 +32,10 @@ public sealed class Mamba3DiscretizeTests
 
         float[] dt = [0.25f, 0.5f, 0.4f, 0.1f, 0.6f, 0.8f]; // [T, H]
         float[] a = [-0.5f, -1.0f];
-        float[] lambda_ = [0f, 0f];
+        // λ broadcast across T (signature takes per-(t,h) since the reference derives
+        // λ per-token from the input projection; existing scalar tests broadcast a
+        // single per-head row to every timestep for equivalence with the original intent).
+        float[] lambda_ = [0f, 0f, 0f, 0f, 0f, 0f];
         float[] alpha = new float[T * H];
         float[] beta = new float[T * H];
         float[] gamma = new float[T * H];
@@ -66,7 +69,7 @@ public sealed class Mamba3DiscretizeTests
 
         float[] dt = [0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f];
         float[] a = [-0.25f, -0.5f, -1.0f];
-        float[] lambda_ = [1f, 1f, 1f];
+        float[] lambda_ = [1f, 1f, 1f, 1f, 1f, 1f];  // broadcast across T=2
         float[] alpha = new float[T * H];
         float[] beta = new float[T * H];
         float[] gamma = new float[T * H];
@@ -105,7 +108,7 @@ public sealed class Mamba3DiscretizeTests
             1.0f, 0.5f,   // t=1
         ];
         float[] a = [-1.0f, -2.0f];
-        float[] lambda_ = [0.3f, 0.7f];
+        float[] lambda_ = [0.3f, 0.7f, 0.3f, 0.7f];  // broadcast across T=2
 
         float[] alpha = new float[T * H];
         float[] beta = new float[T * H];
@@ -175,9 +178,10 @@ public sealed class Mamba3DiscretizeTests
         float[] a = new float[H];
         for (int h = 0; h < H; h++)
             a[h] = -(rng.NextSingle() * 2.0f + 0.1f); // strictly negative
-        float[] lambda_ = new float[H];
-        for (int h = 0; h < H; h++)
-            lambda_[h] = rng.NextSingle(); // in [0, 1)
+        // λ is per-(t, h) per the reference — fill the full T*H buffer.
+        float[] lambda_ = new float[T * H];
+        for (int i = 0; i < lambda_.Length; i++)
+            lambda_[i] = rng.NextSingle(); // in [0, 1)
 
         float[] alphaExec = new float[T * H];
         float[] betaExec = new float[T * H];
@@ -212,7 +216,7 @@ public sealed class Mamba3DiscretizeTests
 
         float[] dt = [0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f];
         float[] a = [-0.3f, -0.6f, -1.2f];
-        float[] lambda_ = [0.2f, 0.5f, 0.8f];
+        float[] lambda_ = [0.2f, 0.5f, 0.8f, 0.2f, 0.5f, 0.8f, 0.2f, 0.5f, 0.8f, 0.2f, 0.5f, 0.8f];  // broadcast across T=4
 
         // Three distinct buffers.
         float[] alpha = new float[T * H];
