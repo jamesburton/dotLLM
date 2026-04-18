@@ -13,8 +13,13 @@ namespace DotLLM.Tests.Integration.Engine;
 /// </summary>
 public class Mamba3ReferenceCompareTests
 {
-    private const float AbsTol = 1e-5f;
-    private const float RelTol = 1e-4f;
+    // Tolerances are deliberately strict. A pure-Python reimplementation of all three
+    // kernels (verify_algorithm.py, same fixture) measured max_abs ~ 6e-7, max_rel ~ 5e-7
+    // across α/β/γ, B/C qkn, y_scan, ssm_state, prev_Bx. 1e-6 / 1e-5 leaves roughly a 2×
+    // margin for C# <-> Python F32 rounding noise. If either tolerance tightens in future
+    // kernel revisions, update the Python verifier first and revisit here.
+    private const float AbsTol = 1e-6f;
+    private const float RelTol = 1e-5f;
 
     private readonly ITestOutputHelper _output;
 
