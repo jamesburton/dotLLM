@@ -186,16 +186,15 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
             if (layout.LayerKind[i] == HybridLayerKind.Attention)
             {
-                // Partial RoPE correctness hinges on head_dim=128, rope_dim=78 for Nemotron-3.
-                if (config.HeadDim != 128)
-                    throw new InvalidDataException(
-                        $"NemotronH attention layer {i}: head_dim={config.HeadDim}, expected 128.");
-                if (ropeDim != 78)
-                    throw new InvalidDataException(
-                        $"NemotronH attention layer {i}: rope_dim={ropeDim}, expected 78 (partial RoPE).");
+                // RoPE preconditions: even, ≤ head_dim. A strict rope_dim == 78 check was the
+                // Nemotron-3 4B Q4_K_M case from DESIGN.md §2, but other nemotron_h variants
+                // (e.g., the Ollama nemotron-3-nano 4B) use full-head RoPE with rope_dim == head_dim.
                 if ((ropeDim & 1) != 0)
                     throw new InvalidDataException(
                         $"NemotronH rope_dim={ropeDim} must be even for pair-wise rotation.");
+                if (ropeDim > config.HeadDim)
+                    throw new InvalidDataException(
+                        $"NemotronH attention layer {i}: rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.");
 
                 kvSlotForLayer[i] = attentionLayerCount++;
             }

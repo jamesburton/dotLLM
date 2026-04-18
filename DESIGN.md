@@ -1,8 +1,20 @@
 # DESIGN — Nemotron-3 (`nemotron_h`) support in dotLLM
 
-Branch: `feature/mamba-3` (worktree: `C:/Development/dotLLM-mamba3`).
+Branch: `feature/nemotron-and-mamba-2` (worktree: `C:/Development/dotLLM-mamba3`).
 Target model: `NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf` (2.7 GB).
 Goal: load and generate tokens with the dotLLM CPU backend.
+
+> **Note on scope.** This work was started under a branch originally named
+> `feature/mamba-3` with the intent of implementing the **Mamba-3** algorithm
+> (Lahoti et al., [arXiv 2603.15569](https://hf.co/papers/2603.15569),
+> Mar 2026 — complex-valued state updates, MIMO formulation). The plan below
+> was then (wrongly) written against the **Mamba-2**-based `nemotron_h`
+> hybrid architecture that NVIDIA ships in every Nemotron-3 family member
+> (Nano 4B / Nano 30B-A3B MoE / Super / Ultra). The "3" in Nemotron-3 is
+> the model family version, not the Mamba generation. Having already built
+> out most of this path, we finish the Mamba-2 / `nemotron_h` implementation
+> on the renamed branch and land it, *then* open a fresh `feature/mamba-3`
+> for the actual Mamba-3 algorithm as a separate workstream.
 
 ## 1. Architecture summary
 
