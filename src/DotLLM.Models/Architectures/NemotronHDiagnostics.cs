@@ -38,8 +38,10 @@ internal static class NemotronHDiagnostics
         => TraceSsm && (TraceSsmLayerOnly < 0 || TraceSsmLayerOnly == layer);
 
     /// <summary>
-    /// Writes a one-line stats summary (rms, absMax, range, nan count) for the
-    /// given float buffer to stderr, prefixed with <paramref name="label"/>.
+    /// Writes a one-line stats summary (rms, absMax, range, algebraic sum, NaN count) for
+    /// the given float buffer to stderr, prefixed with <paramref name="label"/>.
+    /// The algebraic <c>sum</c> and the first/last three values mirror the format emitted
+    /// by llama.cpp's <c>llama-eval-callback</c> so the two can be diffed side-by-side.
     /// </summary>
     public static unsafe void DumpStats(string label, float* data, int length)
     {
@@ -50,6 +52,7 @@ internal static class NemotronHDiagnostics
         }
 
         double sumSq = 0;
+        double sum = 0;
         float absMax = 0f;
         float min = float.PositiveInfinity, max = float.NegativeInfinity;
         int nan = 0;
@@ -57,6 +60,7 @@ internal static class NemotronHDiagnostics
         {
             float v = data[i];
             if (float.IsNaN(v) || float.IsInfinity(v)) { nan++; continue; }
+            sum += v;
             sumSq += (double)v * v;
             if (v > max) max = v;
             if (v < min) min = v;
@@ -64,7 +68,15 @@ internal static class NemotronHDiagnostics
             if (a > absMax) absMax = a;
         }
         double rms = Math.Sqrt(sumSq / length);
+
+        string head = length >= 3
+            ? $"[{data[0]:F4}, {data[1]:F4}, {data[2]:F4}"
+            : $"[{data[0]:F4}";
+        string tail = length >= 6
+            ? $"..., {data[length - 3]:F4}, {data[length - 2]:F4}, {data[length - 1]:F4}]"
+            : length > 3 ? $"..., {data[length - 1]:F4}]" : "]";
+
         Console.Error.WriteLine(
-            $"[trace] {label,-40} n={length,7} rms={rms:F4} absMax={absMax:F4} range=[{min:F3},{max:F3}] nan={nan}");
+            $"[trace] {label,-40} n={length,7} rms={rms:F4} absMax={absMax:F4} range=[{min:F3},{max:F3}] sum={sum:F4} nan={nan} {head}, {tail}");
     }
 }

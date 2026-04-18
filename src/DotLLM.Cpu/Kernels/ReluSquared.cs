@@ -18,16 +18,13 @@ public static class ReluSquared
     [SkipLocalsInit]
     public static void Execute(ReadOnlySpan<float> input, Span<float> result)
     {
-        // 1. Square first (always safe).
-        TensorPrimitives.Multiply(input, input, result);
-        // 2. Zero-out where input < 0 by multiplying with an indicator: sign(max(input, 0)) is 1 for
-        //    x > 0 and 0 for x <= 0. TensorPrimitives does not expose that directly in a zero-alloc way
-        //    across all runtimes, so fall back to a tight scalar loop for the mask step. The squared
-        //    result is already in 'result'; we flip to zero where the original input was non-positive.
-        for (int i = 0; i < input.Length; i++)
-        {
-            if (input[i] <= 0.0f) result[i] = 0.0f;
-        }
+        // relu(x) = max(x, 0). Both TensorPrimitives ops are element-wise so aliased
+        // (input == result) is safe — each lane reads then writes the same position.
+        // A previous version did Multiply(input,input,result) first and then a scalar
+        // zero-out step that read input[i], but in-place that read saw the already-
+        // squared (non-negative) value and the zero-out became a no-op; fixed here.
+        TensorPrimitives.Max(input, 0.0f, result);
+        TensorPrimitives.Multiply(result, result, result);
     }
 
     /// <summary>Scalar reference for correctness verification.</summary>

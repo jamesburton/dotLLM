@@ -98,6 +98,31 @@ public class NemotronHTextGeneratorTests
     }
 
     [SkippableFact]
+    public void Forward_SingleTokenThe_ForDiagnosticCompareVsLlamaCpp()
+    {
+        // Mirrors llama-eval-callback with --prompt "The". Used for side-by-side
+        // layer-by-layer tensor comparison. Run with DOTLLM_TRACE_LAYERS=1 and/or
+        // DOTLLM_TRACE_SSM=1 to produce the dotLLM side of the diff.
+        string? path = TryResolveModelPath();
+        Skip.If(path is null, $"Set {ModelPathEnvVar} to a Nemotron-H GGUF to run this test.");
+
+        using var gguf = GgufFile.Open(path!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        int[] promptIds = tokenizer.Encode("The");
+        Assert.Single(promptIds);
+        _output.WriteLine($"Single token for 'The': {promptIds[0]}");
+
+        int[] positions = [0];
+        using ITensor logits = model.Forward(promptIds, positions, deviceId: 0);
+
+        Assert.Equal(1, logits.Shape[0]);
+        Assert.Equal(config.VocabSize, logits.Shape[1]);
+    }
+
+    [SkippableFact]
     public void Forward_RealPrompt_ArgmaxDecodesToNonEmptyString()
     {
         string? path = TryResolveModelPath();
