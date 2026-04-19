@@ -104,9 +104,10 @@ def main():
 
         last_Bx = torch.einsum("bhn,bhp->bhpn", B_roped[:, -1], x_heads[:, -1])
 
-        # Post-D skip + gate (not a kernel under test, but useful for block-level later)
+        # Post-D skip + gate + out_proj → full block output
         y_with_d = y_scan + x_heads * layer.D.view(1, 1, -1, 1)
         y_gated = rearrange(y_with_d, "b l h p -> b l (h p)") * F.silu(z)
+        y_final = layer.out_proj(y_gated)  # (b, l, d_model)
 
     # ── Fixture payload ──
     fixture = {
@@ -119,6 +120,9 @@ def main():
         },
         # Inputs we'll feed into our kernels
         "inputs": {
+            "u": tensor_to_fixture(u),                     # (b, l, d_model) — block input
+            "in_proj_weight": tensor_to_fixture(layer.in_proj.weight),   # (d_in_proj, d_model)
+            "out_proj_weight": tensor_to_fixture(layer.out_proj.weight), # (d_model, d_inner)
             "A": tensor_to_fixture(A),                     # (nheads,)
             "dt_raw": tensor_to_fixture(dt_raw),            # (b, l, nheads)
             "dt_bias": tensor_to_fixture(layer.dt_bias),    # (nheads,)
@@ -155,6 +159,7 @@ def main():
             "ssm_state": tensor_to_fixture(ssm_state),
             "last_Bx": tensor_to_fixture(last_Bx),
             "y_gated_pre_outproj": tensor_to_fixture(y_gated),
+            "y_final": tensor_to_fixture(y_final),
         },
     }
 
