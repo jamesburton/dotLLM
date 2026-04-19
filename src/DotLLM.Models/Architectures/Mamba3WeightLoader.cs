@@ -50,7 +50,7 @@ public static class Mamba3WeightLoader
     /// <param name="file">An opened safetensors file. Must outlive the returned weights.</param>
     /// <returns>A populated <see cref="Mamba3Weights"/> with structured diagnostics.</returns>
     /// <exception cref="ArgumentException"><paramref name="config"/> is not a Mamba-3 config.</exception>
-    public static Mamba3Weights Load(ModelConfig config, SafetensorsFile file)
+    public static Mamba3Weights Load(ModelConfig config, ISafetensorsTensorSource file)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(file);
@@ -178,7 +178,7 @@ public static class Mamba3WeightLoader
     /// </summary>
     [SkipLocalsInit]
     private static unsafe Mamba3TensorHandle ResolveRequired(
-        SafetensorsFile file,
+        ISafetensorsTensorSource file,
         string name,
         ReadOnlySpan<int> expectedShape,
         List<Mamba3TensorDiagnostic> diagnostics)
@@ -210,7 +210,7 @@ public static class Mamba3WeightLoader
             return Mamba3TensorHandle.Empty;
         }
 
-        nint ptr = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        nint ptr = file.GetTensorPointer(name);
 
         // Mmap-backed data inherits whatever alignment the OS grants (page
         // aligned — so 4 KiB / 16 KiB, strictly >= 64). If that ever stops

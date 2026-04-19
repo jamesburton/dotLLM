@@ -39,61 +39,67 @@ public static class ModelLoader
     }
 
     /// <summary>
-    /// Loads a model from a HuggingFace safetensors checkpoint. The directory
-    /// containing <paramref name="safetensorsPath"/> is scanned for a
+    /// Loads a model from a HuggingFace safetensors checkpoint. Accepts any of
+    /// three forms for <paramref name="safetensorsPath"/>:
+    /// <list type="bullet">
+    /// <item>A <c>*.safetensors</c> file — single-shard ingest, as before.</item>
+    /// <item>A <c>model.safetensors.index.json</c> file — multi-shard ingest driven
+    /// by the index's <c>weight_map</c>.</item>
+    /// <item>A directory — probed for <c>model.safetensors.index.json</c> first
+    /// (multi-shard), then a single <c>*.safetensors</c> (single-shard).</item>
+    /// </list>
+    /// In every case the directory containing the weights is scanned for a
     /// <c>config.json</c> which drives both architecture dispatch and
     /// <see cref="ModelConfig"/> population.
     /// </summary>
-    /// <param name="safetensorsPath">Absolute path to a <c>*.safetensors</c> file.</param>
+    /// <param name="safetensorsPath">
+    /// A <c>*.safetensors</c> file, a <c>model.safetensors.index.json</c>, or a
+    /// directory containing one of the above.
+    /// </param>
     /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
-    /// <returns>The loaded model, safetensors file handle, and model configuration.</returns>
+    /// <returns>The loaded model, safetensors source, and model configuration.</returns>
     /// <exception cref="FileNotFoundException">
-    /// <paramref name="safetensorsPath"/> or an accompanying <c>config.json</c> is missing.
+    /// The path or an accompanying <c>config.json</c> is missing.
     /// </exception>
     /// <exception cref="InvalidDataException">
-    /// <c>config.json</c> is malformed or declares an unsupported architecture.
+    /// <c>config.json</c> is malformed or declares an unsupported architecture,
+    /// or a multi-shard index references files missing on disk.
     /// </exception>
-    public static (IModel Model, SafetensorsFile Safetensors, ModelConfig Config) LoadFromSafetensors(
+    public static (IModel Model, ISafetensorsTensorSource Safetensors, ModelConfig Config) LoadFromSafetensors(
         string safetensorsPath, ThreadingConfig? threading = null)
     {
-        if (!File.Exists(safetensorsPath))
-            throw new FileNotFoundException(
-                $"Safetensors file not found: {safetensorsPath}", safetensorsPath);
+        ArgumentNullException.ThrowIfNull(safetensorsPath);
 
-        string? directory = Path.GetDirectoryName(safetensorsPath);
-        if (directory is null)
-            throw new InvalidDataException(
-                $"Could not determine directory of safetensors path '{safetensorsPath}'.");
-        string configPath = Path.Combine(directory, "config.json");
-        if (!File.Exists(configPath))
-            throw new FileNotFoundException(
-                $"Expected HuggingFace config.json next to '{safetensorsPath}', but '{configPath}' does not exist.",
-                configPath);
+        (ISafetensorsTensorSource source, string weightsDir) = OpenSafetensorsSource(safetensorsPath);
 
-        // Peek at the architecture so we can dispatch before fully extracting config.
-        string configJson = File.ReadAllText(configPath);
-        using var doc = JsonDocument.Parse(configJson);
-        Architecture arch;
         try
         {
-            arch = HfConfigExtractor.ResolveArchitecture(doc.RootElement);
-        }
-        catch (InvalidDataException)
-        {
-            // Fall through to Mamba-3 probe: model_type=mamba3 is handled by a
-            // dedicated extractor, not HfConfigExtractor.
-            string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt)
-                                && mt.ValueKind == JsonValueKind.String
-                ? mt.GetString()
-                : null;
-            if (!string.Equals(modelType, "mamba3", StringComparison.Ordinal))
-                throw;
-            arch = Architecture.Mamba3;
-        }
+            string configPath = Path.Combine(weightsDir, "config.json");
+            if (!File.Exists(configPath))
+                throw new FileNotFoundException(
+                    $"Expected HuggingFace config.json next to the safetensors weights, but '{configPath}' does not exist.",
+                    configPath);
 
-        var file = SafetensorsFile.Open(safetensorsPath);
-        try
-        {
+            string configJson = File.ReadAllText(configPath);
+            using var doc = JsonDocument.Parse(configJson);
+            Architecture arch;
+            try
+            {
+                arch = HfConfigExtractor.ResolveArchitecture(doc.RootElement);
+            }
+            catch (InvalidDataException)
+            {
+                // Fall through to Mamba-3 probe: model_type=mamba3 is handled by a
+                // dedicated extractor, not HfConfigExtractor.
+                string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt)
+                                    && mt.ValueKind == JsonValueKind.String
+                    ? mt.GetString()
+                    : null;
+                if (!string.Equals(modelType, "mamba3", StringComparison.Ordinal))
+                    throw;
+                arch = Architecture.Mamba3;
+            }
+
             ModelConfig config = arch switch
             {
                 Architecture.Mamba3 => Mamba3ConfigExtractor.Extract(doc.RootElement),
@@ -104,21 +110,81 @@ public static class ModelLoader
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
                     or Architecture.Mixtral
-                    => TransformerModel.LoadFromSafetensors(file, config, threading ?? ThreadingConfig.SingleThreaded),
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
                 Architecture.Mamba3
-                    => Mamba3TransformerModel.LoadFromSafetensors(file, config),
+                    => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
                     + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, Mamba3."),
             };
 
-            return (model, file, config);
+            return (model, source, config);
         }
         catch
         {
-            file.Dispose();
+            source.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="path"/> to an opened
+    /// <see cref="ISafetensorsTensorSource"/> (single- or multi-shard) and the
+    /// directory that contains it. Extracted from
+    /// <see cref="LoadFromSafetensors"/> so the auto-detection logic is
+    /// testable in isolation.
+    /// </summary>
+    private static (ISafetensorsTensorSource Source, string WeightsDir) OpenSafetensorsSource(string path)
+    {
+        // Case 1: directory — probe for index.json first, single shard second.
+        if (Directory.Exists(path))
+        {
+            string indexPath = Path.Combine(path, "model.safetensors.index.json");
+            if (File.Exists(indexPath))
+                return (MultiShardSafetensorsFile.Open(indexPath), path);
+
+            string[] candidates = Directory.GetFiles(path, "*.safetensors", SearchOption.TopDirectoryOnly);
+            // Filter out any pre-shard artefact we don't want to treat as single-shard.
+            // (e.g. stale 'model.safetensors' sitting next to an incomplete shard set.)
+            if (candidates.Length == 1)
+                return (SafetensorsFile.Open(candidates[0]), path);
+            if (candidates.Length == 0)
+                throw new FileNotFoundException(
+                    $"Directory '{path}' contains no *.safetensors and no model.safetensors.index.json.",
+                    indexPath);
+            // Multiple .safetensors files but no index.json is unusual — we reject
+            // rather than guess, because every candidate is a plausible single-shard
+            // root and picking the wrong one would silently load partial weights.
+            throw new InvalidDataException(
+                $"Directory '{path}' contains {candidates.Length} *.safetensors files "
+                + "but no model.safetensors.index.json to arbitrate between them.");
+        }
+
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"Safetensors path not found: {path}", path);
+
+        // Case 2: an index.json file.
+        if (path.EndsWith(".safetensors.index.json", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetFileName(path), "model.safetensors.index.json", StringComparison.OrdinalIgnoreCase))
+        {
+            string dir = Path.GetDirectoryName(path)
+                         ?? throw new InvalidDataException(
+                             $"Could not determine parent directory of index file '{path}'.");
+            return (MultiShardSafetensorsFile.Open(path), dir);
+        }
+
+        // Case 3: a single *.safetensors file. If a sibling index.json exists,
+        // prefer the multi-shard path — it is authoritative and the caller just
+        // happens to have pointed at one shard.
+        string? weightsDir = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(weightsDir))
+            throw new InvalidDataException(
+                $"Could not determine directory of safetensors path '{path}'.");
+        string siblingIndex = Path.Combine(weightsDir, "model.safetensors.index.json");
+        if (File.Exists(siblingIndex))
+            return (MultiShardSafetensorsFile.Open(siblingIndex), weightsDir);
+
+        return (SafetensorsFile.Open(path), weightsDir);
     }
 
     /// <summary>

@@ -121,7 +121,7 @@ public sealed unsafe class Mamba3TransformerModel : IModel
     /// safetensors file. Caller can introspect
     /// <c>Mamba3WeightLoader.Load(config, file).Report</c> for a pre-check.
     /// </exception>
-    public static Mamba3TransformerModel LoadFromSafetensors(SafetensorsFile file, ModelConfig config)
+    public static Mamba3TransformerModel LoadFromSafetensors(ISafetensorsTensorSource file, ModelConfig config)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);

@@ -325,6 +325,119 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
         AssertAllFinite(logits);
     }
 
+    /// <summary>
+    /// Multi-shard variant: writes a Llama fixture across 2 shards + an
+    /// index.json, loads it through <see cref="MultiShardSafetensorsFile"/>
+    /// and runs a forward pass. Validates the interface refactor end-to-end.
+    /// </summary>
+    [Fact]
+    public void MultiShard_LlamaFixture_ForwardProducesFiniteVocabLogits()
+    {
+        const int hidden = 64;
+        const int numHeads = 4;
+        const int headDim = 16;
+        const int intermediate = 128;
+        const int vocab = 32;
+        const int numLayers = 2;
+
+        var rng = new Random(7);
+
+        // Shard 1: embedding, norm, lm_head, and all of layer 0.
+        string shard1 = Path.Combine(_scratch, "model-00001-of-00002.safetensors");
+        var b1 = new SafetensorsFixtureBuilder()
+            .AddFloat32("model.embed_tokens.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f))
+            .AddFloat32("model.norm.weight", [hidden], Ones(hidden))
+            .AddFloat32("lm_head.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+        AppendLayer(b1, 0, hidden, numHeads, headDim, intermediate, rng);
+        b1.WriteTo(shard1);
+
+        // Shard 2: layer 1.
+        string shard2 = Path.Combine(_scratch, "model-00002-of-00002.safetensors");
+        var b2 = new SafetensorsFixtureBuilder();
+        AppendLayer(b2, 1, hidden, numHeads, headDim, intermediate, rng);
+        b2.WriteTo(shard2);
+
+        // Index: all layer-0 + globals → shard1; layer-1 → shard2.
+        string indexPath = Path.Combine(_scratch, "model.safetensors.index.json");
+        var weightMap = new Dictionary<string, string>
+        {
+            ["model.embed_tokens.weight"] = "model-00001-of-00002.safetensors",
+            ["model.norm.weight"]         = "model-00001-of-00002.safetensors",
+            ["lm_head.weight"]            = "model-00001-of-00002.safetensors",
+        };
+        AddLayerToMap(weightMap, 0, "model-00001-of-00002.safetensors");
+        AddLayerToMap(weightMap, 1, "model-00002-of-00002.safetensors");
+        File.WriteAllText(indexPath, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            metadata = new { total_size = 1 },
+            weight_map = weightMap,
+        }));
+
+        using var src = MultiShardSafetensorsFile.Open(indexPath);
+        Assert.Equal(2, src.ShardCount);
+
+        var config = BuildLlamaConfig(tieEmbeddings: false) with { NumLayers = numLayers };
+        using var model = TransformerModel.LoadFromSafetensors(src, config);
+        using var logits = model.Forward(
+            tokenIds: [0, 1, 2],
+            positions: [0, 1, 2],
+            deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(3, logits.Shape[0]);
+        Assert.Equal(config.VocabSize, logits.Shape[1]);
+        AssertAllFinite(logits);
+
+        // Sanity-check shard routing: layer-0 and layer-1 q_proj live in
+        // different shards, proving the loader really is pulling tensors
+        // from both.
+        Assert.NotEqual(
+            src.GetShardIndexFor("model.layers.0.self_attn.q_proj.weight"),
+            src.GetShardIndexFor("model.layers.1.self_attn.q_proj.weight"));
+    }
+
+    private static void AppendLayer(
+        SafetensorsFixtureBuilder b, int i, int hidden, int numHeads, int headDim,
+        int intermediate, Random rng)
+    {
+        string p = $"model.layers.{i}";
+        b.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+        b.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+        b.AddFloat32($"{p}.self_attn.q_proj.weight",
+            [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+        b.AddFloat32($"{p}.self_attn.k_proj.weight",
+            [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+        b.AddFloat32($"{p}.self_attn.v_proj.weight",
+            [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+        b.AddFloat32($"{p}.self_attn.o_proj.weight",
+            [hidden, numHeads * headDim], RandomVec(rng, hidden * numHeads * headDim, 0.05f));
+        b.AddFloat32($"{p}.mlp.gate_proj.weight",
+            [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+        b.AddFloat32($"{p}.mlp.up_proj.weight",
+            [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+        b.AddFloat32($"{p}.mlp.down_proj.weight",
+            [hidden, intermediate], RandomVec(rng, hidden * intermediate, 0.05f));
+    }
+
+    private static void AddLayerToMap(Dictionary<string, string> map, int i, string shardName)
+    {
+        string p = $"model.layers.{i}";
+        foreach (var suffix in new[] {
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        })
+        {
+            map[$"{p}.{suffix}"] = shardName;
+        }
+    }
+
     private static unsafe void AssertAllFinite(ITensor logits)
     {
         int n = 1;
