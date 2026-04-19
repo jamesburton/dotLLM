@@ -133,4 +133,104 @@ public sealed class HfConfigExtractorTests
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
         Assert.Contains("Unsupported HF architecture", ex.Message);
     }
+
+    /// <summary>
+    /// Mixtral config is detected from <c>architectures[0] = "MixtralForCausalLM"</c>
+    /// AND populates <see cref="Core.Models.MoeConfig"/> from
+    /// <c>num_local_experts</c> / <c>num_experts_per_tok</c>. Copy of the
+    /// <c>yujiepan/mixtral-tiny-random</c> config (2026-04).
+    /// </summary>
+    [Fact]
+    public void Mixtral_TinyRandom_PopulatesMoeConfig()
+    {
+        const string json = """
+        {
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 8,
+            "vocab_size": 32000,
+            "max_position_embeddings": 32768,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-5,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+            "tie_word_embeddings": false,
+            "sliding_window": null
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.Mixtral, cfg.Architecture);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(8, cfg.Moe!.NumExperts);
+        Assert.Equal(2, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(8, cfg.Moe.MoeIntermediateSize); // defaults to intermediate_size
+        // Attention path stays GQA/RoPE — nothing Mixtral-specific there.
+        Assert.Equal(4, cfg.NumAttentionHeads);
+        Assert.Equal(2, cfg.NumKvHeads);
+        Assert.Equal(1, cfg.HeadDim); // 4 / 4
+        Assert.Equal(RoPEType.Norm, cfg.RoPEConfig!.Value.Type);
+    }
+
+    /// <summary>
+    /// When <c>moe_intermediate_size</c> is declared explicitly (Phi-3.5-MoE
+    /// convention), <see cref="Core.Models.MoeConfig.MoeIntermediateSize"/>
+    /// should reflect that value, not the top-level <c>intermediate_size</c>.
+    /// </summary>
+    [Fact]
+    public void Mixtral_OverrideMoeIntermediateSize_UsedOverTopLevel()
+    {
+        const string json = """
+        {
+            "architectures": ["MixtralForCausalLM"],
+            "model_type": "mixtral",
+            "hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "intermediate_size": 64, "moe_intermediate_size": 32,
+            "vocab_size": 100, "max_position_embeddings": 128,
+            "num_local_experts": 4, "num_experts_per_tok": 2
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(32, cfg.Moe!.MoeIntermediateSize);
+        Assert.Equal(64, cfg.IntermediateSize);
+    }
+
+    /// <summary>
+    /// Non-MoE configs must leave <c>ModelConfig.Moe</c> null — the dense
+    /// FFN path keys off that.
+    /// </summary>
+    [Fact]
+    public void DenseLlama_NoMoeConfig()
+    {
+        const string json = """
+        {"architectures": ["LlamaForCausalLM"], "model_type": "llama",
+         "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+         "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128}
+        """;
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Null(cfg.Moe);
+    }
+
+    /// <summary>
+    /// Declaring experts without a top-k should throw — misconfigured MoE is
+    /// never silently ignored.
+    /// </summary>
+    [Fact]
+    public void Mixtral_MissingNumExpertsPerTok_Throws()
+    {
+        const string json = """
+        {"architectures": ["MixtralForCausalLM"], "model_type": "mixtral",
+         "hidden_size": 4, "num_hidden_layers": 1, "num_attention_heads": 4,
+         "intermediate_size": 8, "vocab_size": 100, "max_position_embeddings": 128,
+         "num_local_experts": 8}
+        """;
+        var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
+        Assert.Contains("num_experts_per_tok", ex.Message);
+    }
 }

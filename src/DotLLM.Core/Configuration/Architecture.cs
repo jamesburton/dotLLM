@@ -33,5 +33,16 @@ public enum Architecture
     /// GGUF has no upstream mapping as of 2026-04-19, so loading is
     /// safetensors-first (see <see cref="DotLLM.Core.Models.Mamba3Config"/>).
     /// </summary>
-    Mamba3
+    Mamba3,
+
+    /// <summary>
+    /// Mistral Mixtral family — dense transformer with top-k MoE FFN in every
+    /// layer. HF <c>model_type</c>: <c>mixtral</c>. Same attention path as
+    /// <see cref="Mistral"/> (GQA, RoPE, no sliding window by default); the
+    /// MLP is replaced by <c>num_local_experts</c> parallel SwiGLU experts
+    /// with <c>num_experts_per_tok</c> active per token. Shared experts are
+    /// <b>not</b> a Mixtral thing (DeepSeek-V3 / old Qwen1.5-MoE territory,
+    /// tracked separately). See <see cref="DotLLM.Core.Models.MoeConfig"/>.
+    /// </summary>
+    Mixtral
 }

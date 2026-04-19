@@ -84,6 +84,14 @@ public record ModelConfig
     /// </summary>
     public Mamba3Config? Mamba3Config { get; init; }
 
+    /// <summary>
+    /// Mixture-of-Experts configuration. Non-null when the per-layer FFN is
+    /// replaced by top-k dense routing over <see cref="MoeConfig.NumExperts"/>
+    /// experts. Present on <see cref="DotLLM.Core.Configuration.Architecture.Mixtral"/>
+    /// today; extensible to Qwen*-MoE and Phi-3.5-MoE via the same record.
+    /// </summary>
+    public MoeConfig? Moe { get; init; }
+
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
 }

@@ -100,12 +100,13 @@ public static class ModelLoader
             IModel model = config.Architecture switch
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
+                    or Architecture.Mixtral
                     => TransformerModel.LoadFromSafetensors(file, config, threading ?? ThreadingConfig.SingleThreaded),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(file, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, Mamba3."),
             };
 
             return (model, file, config);
