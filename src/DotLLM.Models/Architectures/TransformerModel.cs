@@ -9,6 +9,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 
 namespace DotLLM.Models.Architectures;
 
@@ -29,7 +30,12 @@ public sealed unsafe class TransformerModel : IModel
 
     private readonly TransformerWeights _weights;
     private readonly TransformerForwardState _state;
-    private readonly GgufFile _gguf; // prevent premature GC of mmap
+    // Lifetime anchor for the underlying mmap-backed weight file. Holds a
+    // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
+    // while weight pointers are still in use. Not null for any loaded model.
+#pragma warning disable IDE0052, CA1823 // field used only as a GC root
+    private readonly object _mmapAnchor;
+#pragma warning restore IDE0052, CA1823
     private readonly int _ropeDim;
     private readonly RoPEType _ropeType;
     private readonly int? _slidingWindowSize;
@@ -46,13 +52,13 @@ public sealed unsafe class TransformerModel : IModel
     internal int DebugMaxLayers { get; set; }
 
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
-                       GgufFile gguf, int ropeDim, RoPEType ropeType,
+                       object mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
     {
         Config = config;
         _weights = weights;
         _state = state;
-        _gguf = gguf;
+        _mmapAnchor = mmapAnchor;
         _ropeDim = ropeDim;
         _ropeType = ropeType;
         _slidingWindowSize = config.SlidingWindowSize;
@@ -115,6 +121,65 @@ public sealed unsafe class TransformerModel : IModel
         }
 
         return new TransformerModel(config, weights, state, gguf, ropeDim, ropeType, pool, ownsPool: pool is not null);
+    }
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention
+    /// safetensors file (single-threaded). The <paramref name="file"/> must
+    /// remain alive for the lifetime of the returned model — internally
+    /// anchored to prevent GC, but the caller must still dispose it after
+    /// disposing the model.
+    /// </summary>
+    public static TransformerModel LoadFromSafetensors(SafetensorsFile file, ModelConfig config)
+        => LoadFromSafetensors(file, config, ThreadingConfig.SingleThreaded);
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention
+    /// safetensors file with threading configuration.
+    /// </summary>
+    public static TransformerModel LoadFromSafetensors(
+        SafetensorsFile file, ModelConfig config, ThreadingConfig threading)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        weights.RepackWeights();
+
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+
+        var state = new TransformerForwardState(
+            config.HiddenSize,
+            config.NumAttentionHeads,
+            config.NumKvHeads,
+            config.HeadDim,
+            config.IntermediateSize,
+            config.VocabSize,
+            config.MaxSequenceLength,
+            ropeDim,
+            ropeTheta);
+
+        ComputeThreadPool? pool = null;
+        if (threading.IsParallel)
+        {
+            int effectiveThreads = threading.EffectiveThreadCount;
+            if (threading.EnableNumaPinning || threading.EnablePCorePinning)
+            {
+                var topology = NumaTopology.Detect();
+                if (threading.EnablePCorePinning && topology.IsHybrid)
+                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                pool = new ComputeThreadPool(effectiveThreads, topology, threading);
+            }
+            else
+            {
+                pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
+            }
+        }
+
+        return new TransformerModel(config, weights, state, file, ropeDim, ropeType, pool, ownsPool: pool is not null);
     }
 
     /// <inheritdoc/>
@@ -816,7 +881,7 @@ public sealed unsafe class TransformerModel : IModel
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();
-        _weights.Dispose(); // free R4-interleaved weight buffers
-        // _gguf is not owned by us — caller manages GgufFile lifetime.
+        _weights.Dispose(); // free R4-interleaved weight buffers and any owned bf16→F32 scratch
+        // _mmapAnchor is not owned by us — caller disposes the GgufFile / SafetensorsFile.
     }
 }
