@@ -111,8 +111,9 @@ public class Mamba3ConfigExtractorTests
 
         // Derived quantities.
         Assert.Equal(32 * 64, m3.DInner);   // 2048
-        Assert.Equal(128, m3.BcDim);        // SISO → d_state
-        // d_in_proj = 2*2048 + 2*128 + 2*32 + 64 = 4480 — matches HF in_proj row count.
+        Assert.Equal(128, m3.BcDim);        // SISO → d_state·G·R with G=R=1
+        Assert.Equal(32, m3.NumRopeAngles); // int(128 * 0.5) / 2
+        // d_in_proj = 2*2048 + 2*128 + 3*32 + 32 = 4480 — matches HF in_proj row count.
         Assert.Equal(4480, m3.InputProjectionDim);
     }
 

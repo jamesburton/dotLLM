@@ -25,9 +25,16 @@ namespace DotLLM.Models.Architectures;
 /// on a missing tensor. It emits a
 /// <see cref="Mamba3TensorIssueKind.Missing"/> diagnostic and leaves the
 /// corresponding <see cref="Mamba3TensorHandle"/> as
-/// <see cref="Mamba3TensorHandle.Empty"/>. This is the mechanism through
-/// which <see cref="Mamba3TensorMapping.ReferenceKeys.ALog"/> (absent from
-/// the HF checkpoint) surfaces to Stage D3.
+/// <see cref="Mamba3TensorHandle.Empty"/>.
+/// </para>
+/// <para>
+/// <b>A_log is not loaded.</b> Canonical Mamba-3
+/// (<c>state-spaces/mamba</c>) does not store <c>A_log</c>: the decay
+/// <c>A</c> is per-token per-head, derived at forward time from
+/// <c>dd_A</c> (a slice of <c>in_proj(u)</c>) as
+/// <c>-softplus(dd_A)</c> clamped to <c>&lt;= -A_floor</c>. The
+/// minimal-reference name <c>A_log</c> used during Stage A-C has no
+/// canonical analogue, so the loader no longer probes for it.
 /// </para>
 /// </remarks>
 public static class Mamba3WeightLoader
@@ -136,30 +143,9 @@ public static class Mamba3WeightLoader
                 DtBias: dtBias);
         }
 
-        // --- A_log probe ---
-        // A_log is absent from the HF 370M checkpoint but is a required
-        // parameter of the algorithm. Stage D2 surfaces this structurally
-        // so Stage D3 can decide how to synthesize it (derive from A_floor,
-        // re-split from in_proj, etc). Checked once at the whole-model
-        // level, not per-layer, because a single hit proves the drift.
-        bool anyALog = false;
-        for (int i = 0; i < numLayers; i++)
-        {
-            if (file.TensorsByName.ContainsKey(Mamba3TensorMapping.ReferenceKeys.ALog(i)))
-            {
-                anyALog = true;
-                break;
-            }
-        }
-        if (!anyALog)
-        {
-            entries.Add(new Mamba3TensorDiagnostic(
-                Mamba3TensorMapping.ReferenceKeys.ALog(0),
-                Mamba3TensorIssueKind.Missing,
-                $"A_log is absent from the safetensors file across all {numLayers} layers. " +
-                "Stage D3 must synthesize A (e.g. from Mamba3Config.AFloor) before any forward pass.",
-                IsRequired: true));
-        }
+        // Canonical Mamba-3 has no A_log parameter — A is data-derived from
+        // dd_A at forward time (see Mamba3Block.Forward). Stage P2b retired
+        // the pre-canonical A_log probe that used to live here.
 
         int loaded = 0;
         int missingRequired = 0;

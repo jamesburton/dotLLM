@@ -10,7 +10,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <remarks>
 /// <para>
 /// Structurally this is <b>not</b> the trapezoidal-rule α/β/γ recurrence used by
-/// the minimal reference (<see cref="Mamba3SelectiveScan"/>). The canonical
+/// the (now-retired) minimal-reference Mamba3SelectiveScan kernel. The canonical
 /// kernel instead runs an attention-like decay-state update fused with a
 /// pre-rotation QK-dot skip:
 /// </para>

@@ -31,7 +31,10 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
     private const int StateSize = 8; // even, pairs for RoPE
     private const int DInner = NumHeads * HeadDim;              // 16
     private const int BcDim = StateSize;                        // SISO (is_mimo=false)
-    private const int DInProj = 2 * DInner + 2 * BcDim + 2 * NumHeads + StateSize / 2; // 60
+    // Canonical 8-slice in_proj layout: [z, x, B, C, dd_dt, dd_A, trap, angles].
+    // num_rope_angles = StateSize * RopeFraction / 2 = 8*0.5/2 = 2.
+    private const int NumRopeAngles = 2;
+    private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles; // 62
 
     public Mamba3WeightLoaderTests()
     {
@@ -123,16 +126,20 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
             Assert.True(layer.DtBias.IsPopulated);
         }
 
-        // Every required tensor loaded successfully except A_log (structural miss).
-        // LoadedCount = 3 globals + 9 * numLayers per-layer = 21 for NumLayers=2.
+        // Every required tensor loaded successfully. Canonical Mamba-3 has no
+        // A_log (A is derived from dd_A at forward time), so we no longer
+        // emit a Missing diagnostic for it — all 3 globals + 9 per-layer are OK.
         Assert.Equal(3 + 9 * NumLayers, w.Report.LoadedCount);
-        Assert.True(w.Report.HasMissingRequired);
-        Assert.Equal(1, w.Report.MissingRequiredCount); // A_log probe
+        Assert.False(w.Report.HasMissingRequired);
+        Assert.Equal(0, w.Report.MissingRequiredCount);
     }
 
     [Fact]
-    public void Load_ALog_Absent_EmitsMissingDiagnostic()
+    public void Load_ALog_Absent_IsNotFlagged()
     {
+        // Canonical Mamba-3 does not store A_log — A is per-token per-head and
+        // derived from dd_A (a slice of in_proj(u)) at forward time. Stage P2b
+        // retired the pre-canonical A_log probe that used to fire here.
         string path = Scratch("no-alog.safetensors");
         SafetensorsFixtureBuilder.WriteTinyMamba3Fixture(
             path, NumLayers, HiddenSize, VocabSize, NumHeads, HeadDim,
@@ -141,20 +148,17 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
         using var sf = SafetensorsFile.Open(path);
         using var w = Mamba3WeightLoader.Load(BuildConfig(), sf);
 
-        var miss = w.Report.Problems
-            .Where(p => p.Kind == Mamba3TensorIssueKind.Missing &&
-                        p.TensorName.EndsWith(".A_log", StringComparison.Ordinal))
-            .ToArray();
-        Assert.Single(miss);
-        Assert.True(miss[0].IsRequired);
-        Assert.Contains("A_log is absent", miss[0].Detail, StringComparison.Ordinal);
+        Assert.False(w.Report.HasMissingRequired);
+        Assert.DoesNotContain(w.Report.Problems,
+            p => p.TensorName.EndsWith(".A_log", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void Load_ALog_Present_SuppressesMissingDiagnostic()
+    public void Load_ALog_Present_IsIgnored()
     {
-        // A_log lives on the reference but not the HF checkpoint — this test
-        // proves the probe doesn't fire when the tensor *is* there.
+        // If a checkpoint happens to ship a stray A_log tensor, the loader
+        // silently ignores it (it's not in the canonical mapping). No OK
+        // entry either — the mapping never asks for it.
         string path = Scratch("with-alog.safetensors");
         SafetensorsFixtureBuilder.WriteTinyMamba3Fixture(
             path, NumLayers, HiddenSize, VocabSize, NumHeads, HeadDim,

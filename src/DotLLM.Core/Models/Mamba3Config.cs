@@ -153,18 +153,37 @@ public sealed record Mamba3Config
     public int DInner => NumHeads * HeadDim;
 
     /// <summary>
-    /// Per-block B/C width at the <c>in_proj</c> output: <c>state_size</c> for
-    /// SISO, <c>state_size * mimo_rank</c> for MIMO. Matches the reference
-    /// <c>self.bc_dim</c>.
+    /// Per-block B/C width at the <c>in_proj</c> output:
+    /// <c>state_size · num_bc_heads · effective_rank</c>, where
+    /// <c>effective_rank = mimo_rank</c> in MIMO and <c>1</c> in SISO.
+    /// Matches canonical <c>state-spaces/mamba</c> <c>self.bc_dim</c>.
     /// </summary>
-    public int BcDim => IsMimo ? StateSize * MimoRank : StateSize;
+    public int BcDim => StateSize * NumGroups * (IsMimo ? MimoRank : 1);
 
     /// <summary>
-    /// Width of the <c>in_proj.weight</c> output (and the split-7 concat of
-    /// <c>[z | x | B | C | dt | λ | θ]</c>):
-    /// <c>2*d_inner + 2*bc_dim + 2*num_heads + state_size/2</c>.
-    /// For the 370M HF checkpoint this is <c>4480</c>.
+    /// Number of rotary pairs carried through data-RoPE —
+    /// <c>int(state_size · rope_fraction) / 2</c> (rounded down to the nearest
+    /// even value). <c>rope_fraction = 1.0</c> rotates the full state; <c>0.5</c>
+    /// rotates half. For the 370M HF checkpoint (state_size=128, rope_fraction=0.5)
+    /// this is <c>32</c>.
+    /// </summary>
+    public int NumRopeAngles
+    {
+        get
+        {
+            int splitSize = (int)(StateSize * RopeFraction);
+            if ((splitSize & 1) != 0) splitSize -= 1;
+            return splitSize / 2;
+        }
+    }
+
+    /// <summary>
+    /// Width of the <c>in_proj.weight</c> output — the canonical 8-slice
+    /// concat <c>[z | x | B | C | dd_dt | dd_A | trap | angles]</c>:
+    /// <c>2·d_inner + 2·bc_dim + 3·num_heads + num_rope_angles</c>.
+    /// For the 370M HF checkpoint (d_inner=2048, bc_dim=128, num_heads=32,
+    /// num_rope_angles=32) this is <c>4480</c>.
     /// </summary>
     public int InputProjectionDim =>
-        2 * DInner + 2 * BcDim + 2 * NumHeads + StateSize / 2;
+        2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles;
 }

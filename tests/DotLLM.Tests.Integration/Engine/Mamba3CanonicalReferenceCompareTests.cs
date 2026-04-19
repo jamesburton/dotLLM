@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Models.Architectures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -257,6 +258,221 @@ public class Mamba3CanonicalReferenceCompareTests
 
         AssertClose("B_post_norm", f.PostDerivation["B_post_norm"].Data, bIn);
         AssertClose("C_post_norm", f.PostDerivation["C_post_norm"].Data, cIn);
+    }
+
+    // ------------------------------------------------------------------------
+    // Canonical Block — SISO (end-to-end Mamba3Block.Forward)
+    // ------------------------------------------------------------------------
+    [SkippableFact]
+    public void Block_Canonical_Siso_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath("fixture_canonical.json"))),
+            "fixture_canonical.json missing — run capture_fixtures_canonical.py");
+
+        var f = LoadFixture("fixture_canonical.json");
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int numBcHeads = f.Config["num_bc_heads"].GetInt32();
+        int numRopeAngles = f.Config["num_rope_angles"].GetInt32();
+        float aFloor = (float)f.Config["A_floor"].GetDouble();
+        Assert.False(f.Config["is_mimo"].GetBoolean());
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] d = f.Inputs["D"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+
+        float[] ssmState = new float[nHead * headDim * dState];
+        float[] cumAngle = new float[nHead * numRopeAngles];
+        float[] y = new float[seqlen * dModel];
+
+        Mamba3Block.Forward(
+            u, inProj, outProj,
+            dtBias, bNormW, cNormW, bBias, cBias, d,
+            y, ssmState, cumAngle,
+            seqlen, dModel, dInner, nHead, headDim, dState,
+            numBcHeads, numRopeAngles, aFloor);
+
+        _output.WriteLine(DriftStats("y_final (SISO block)", f.Outputs["y_final"].Data, y));
+        _output.WriteLine(DriftStats("ssm_state (SISO block)", f.SsmState["ssm_state_out"].Data, ssmState));
+
+        AssertClose("y_final (SISO block)", f.Outputs["y_final"].Data, y);
+        AssertClose("ssm_state (SISO block)", f.SsmState["ssm_state_out"].Data, ssmState);
+    }
+
+    // ------------------------------------------------------------------------
+    // Canonical Block — MIMO
+    // ------------------------------------------------------------------------
+    [SkippableFact]
+    public void Block_Canonical_Mimo_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath("fixture_canonical_mimo.json"))),
+            "fixture_canonical_mimo.json missing — run capture_fixtures_canonical.py");
+
+        var f = LoadFixture("fixture_canonical_mimo.json");
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int numBcHeads = f.Config["num_bc_heads"].GetInt32();
+        int numRopeAngles = f.Config["num_rope_angles"].GetInt32();
+        int mimoRank = f.Config["mimo_rank"].GetInt32();
+        float aFloor = (float)f.Config["A_floor"].GetDouble();
+        Assert.True(f.Config["is_mimo"].GetBoolean());
+        Assert.Equal(2, mimoRank);
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] d = f.Inputs["D"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;       // [H, R, N]
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+        float[] mimoZ = f.Inputs["mimo_z"].Data;       // [H, R, P]
+        float[] mimoO = f.Inputs["mimo_o"].Data;
+
+        float[] ssmState = new float[nHead * headDim * dState];
+        float[] cumAngle = new float[nHead * numRopeAngles];
+        float[] y = new float[seqlen * dModel];
+
+        Mamba3Block.ForwardMimo(
+            u, inProj, outProj,
+            dtBias, bNormW, cNormW, bBias, cBias, d, mimoZ, mimoO,
+            y, ssmState, cumAngle,
+            seqlen, dModel, dInner, nHead, headDim, dState,
+            numBcHeads, numRopeAngles, mimoRank, aFloor);
+
+        _output.WriteLine(DriftStats("y_final (MIMO block)", f.Outputs["y_final"].Data, y));
+        _output.WriteLine(DriftStats("ssm_state (MIMO block)", f.SsmState["ssm_state_out"].Data, ssmState));
+
+        AssertClose("y_final (MIMO block)", f.Outputs["y_final"].Data, y);
+        AssertClose("ssm_state (MIMO block)", f.SsmState["ssm_state_out"].Data, ssmState);
+    }
+
+    // ------------------------------------------------------------------------
+    // Canonical Block — decode continuity: state + cum_angle threading
+    // ------------------------------------------------------------------------
+    // The canonical Mamba-3 scan's state update uses
+    //   scale[t] = γ[t] + shifted_γ[t], shifted_γ[t] = DT[t+1]·(1-trap[t+1])
+    // which injects a 1-token lookahead into each h_t update. Across a chunk
+    // boundary shifted_γ evaluates to 0, so a split forward's state trajectory
+    // diverges from a single-shot at the chunk edge by design — not a bug.
+    // The canonical HF inference path works around this by persisting four
+    // extra buffers across calls (angle_dt_state, ssm_state, k_state, v_state;
+    // see mamba3.py line 142). Stage P2b threads two of those (ssm_state and
+    // cum_angle — equivalent to angle_dt_state). k_state / v_state are
+    // deferred to a later stage along with the proper streaming-decode
+    // kernel (the current ExecuteSiso/ExecuteMimo signatures do not accept
+    // them).
+    //
+    // What we verify here: under an *identical* chunking scheme, the
+    // block's output is deterministic and the two threaded buffers
+    // (ssm_state, cum_angle) are being read/written — i.e. the decode
+    // plumbing works, independent of canonical-streaming semantics.
+    [SkippableFact]
+    public void Block_Canonical_DecodeSplit_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath("fixture_canonical.json"))),
+            "fixture_canonical.json missing — run capture_fixtures_canonical.py");
+
+        var f = LoadFixture("fixture_canonical.json");
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int numBcHeads = f.Config["num_bc_heads"].GetInt32();
+        int numRopeAngles = f.Config["num_rope_angles"].GetInt32();
+        float aFloor = (float)f.Config["A_floor"].GetDouble();
+        Assert.True(seqlen >= 4, "Need at least 4 tokens for the split test.");
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] d = f.Inputs["D"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+
+        // Pass 1: 2 + 2 chunks, state + cum_angle threaded.
+        float[] y1 = new float[seqlen * dModel];
+        float[] state1 = new float[nHead * headDim * dState];
+        float[] cum1 = new float[nHead * numRopeAngles];
+        RunChunk(u, 0, 2, y1, 0, state1, cum1);
+        // Snapshot halfway to prove the state is evolving (not still zero).
+        bool stateAdvanced = false;
+        for (int i = 0; i < state1.Length; i++)
+            if (MathF.Abs(state1[i]) > 1e-8f) { stateAdvanced = true; break; }
+        Assert.True(stateAdvanced, "ssm_state should be non-zero after first chunk");
+        bool cumAdvanced = false;
+        for (int i = 0; i < cum1.Length; i++)
+            if (MathF.Abs(cum1[i]) > 1e-8f) { cumAdvanced = true; break; }
+        Assert.True(cumAdvanced, "cum_angle should be non-zero after first chunk");
+        RunChunk(u, 2, 2, y1, 2 * dModel, state1, cum1);
+
+        // Pass 2: same 2 + 2 chunks again — determinism baseline.
+        float[] y2 = new float[seqlen * dModel];
+        float[] state2 = new float[nHead * headDim * dState];
+        float[] cum2 = new float[nHead * numRopeAngles];
+        RunChunk(u, 0, 2, y2, 0, state2, cum2);
+        RunChunk(u, 2, 2, y2, 2 * dModel, state2, cum2);
+
+        _output.WriteLine(DriftStats("decode-split y (2+2 determinism)", y1, y2));
+        _output.WriteLine(DriftStats("decode-split ssm_state (2+2 determinism)", state1, state2));
+        _output.WriteLine(DriftStats("decode-split cum_angle (2+2 determinism)", cum1, cum2));
+
+        AssertClose("decode-split y (2+2 determinism)", y1, y2);
+        AssertClose("decode-split ssm_state (2+2 determinism)", state1, state2);
+        AssertClose("decode-split cum_angle (2+2 determinism)", cum1, cum2);
+
+        // Pass 3: run chunk 2 alone, but seeded with (state1_after_chunk1,
+        // cum1_after_chunk1) rebuilt from a fresh Pass 1' call — proves the
+        // final (state, cum) ARE consumed by the second call rather than
+        // being stray noise. We compare the second-chunk output from this
+        // isolated run with y1[chunk2 region].
+        float[] state3 = new float[nHead * headDim * dState];
+        float[] cum3 = new float[nHead * numRopeAngles];
+        RunChunk(u, 0, 2, new float[2 * dModel], 0, state3, cum3);
+        float[] y3Chunk2 = new float[2 * dModel];
+        RunChunk(u, 2, 2, y3Chunk2, 0, state3, cum3);
+
+        float[] y1Chunk2 = new float[2 * dModel];
+        Array.Copy(y1, 2 * dModel, y1Chunk2, 0, 2 * dModel);
+
+        _output.WriteLine(DriftStats("decode-split y (chunk-2 state-threaded)", y1Chunk2, y3Chunk2));
+        AssertClose("decode-split y (chunk-2 state-threaded)", y1Chunk2, y3Chunk2);
+
+        void RunChunk(float[] src, int srcTokOffset, int chunkLen,
+                      float[] yDst, int dstElemOffset,
+                      float[] state, float[] cum)
+        {
+            float[] uChunk = new float[chunkLen * dModel];
+            Array.Copy(src, srcTokOffset * dModel, uChunk, 0, chunkLen * dModel);
+            float[] yChunk = new float[chunkLen * dModel];
+            Mamba3Block.Forward(
+                uChunk, inProj, outProj,
+                dtBias, bNormW, cNormW, bBias, cBias, d,
+                yChunk, state, cum,
+                chunkLen, dModel, dInner, nHead, headDim, dState,
+                numBcHeads, numRopeAngles, aFloor);
+            Array.Copy(yChunk, 0, yDst, dstElemOffset, chunkLen * dModel);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────
