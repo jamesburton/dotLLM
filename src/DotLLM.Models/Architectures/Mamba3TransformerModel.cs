@@ -16,14 +16,25 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Prefill-only scope.</b> Each <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/>
-/// call allocates a fresh per-layer <c>ssm_state</c> (<c>[n_head, head_dim, d_state]</c>)
-/// and a fresh per-layer <c>cum_angle</c> (<c>[n_head, num_rope_angles]</c>), runs one
-/// <see cref="Mamba3Block.Forward"/> / <see cref="Mamba3Block.ForwardMimo"/>
-/// per layer, and discards the state at return. There is no decode-state
-/// persistence across calls — that lives in a later stage alongside the
-/// generation loop.
+/// <b>Forward shapes.</b> Two flavours share the same implementation:
 /// </para>
+/// <list type="bullet">
+///   <item><description>
+///     <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/> /
+///     <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache)"/>
+///     — one-shot prefill; the model allocates an ephemeral zero-initialised
+///     <see cref="Mamba3State"/>, runs every layer, and disposes the state at
+///     return.
+///   </description></item>
+///   <item><description>
+///     <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, Mamba3State)"/>
+///     — prefill-or-decode with persistent state. The caller owns a
+///     <see cref="Mamba3State"/>; each layer reads its <c>ssm_state</c>
+///     (<c>[n_head, head_dim, d_state]</c>) and <c>cum_angle</c>
+///     (<c>[n_head, num_rope_angles]</c>) at entry and writes the updated
+///     buffers back in place at exit, so subsequent calls resume the sequence.
+///   </description></item>
+/// </list>
 /// <para>
 /// <b>Weight ownership.</b> <see cref="Mamba3Weights"/> is owned by this model
 /// and disposed on <see cref="Dispose"/>. The underlying
@@ -156,7 +167,63 @@ public sealed unsafe class Mamba3TransformerModel : IModel
                            int deviceId, IKvCache? kvCache)
     {
         _ = kvCache; // Mamba-3 uses SSM state, not KV-cache. Ignore.
+        // Ephemeral state: allocate, run, dispose. Equivalent to a fresh sequence
+        // — zero SSM state and zero cum_angle at entry — exactly the previous
+        // prefill-only behaviour.
+        using var scratch = new Mamba3State(Config);
+        return ForwardCore(tokenIds, positions, deviceId, scratch);
+    }
 
+    /// <summary>
+    /// Runs a forward pass that reads and writes a persistent
+    /// <see cref="Mamba3State"/>. Enables prefill-then-decode sequences: the
+    /// state is updated in place by every layer, so a subsequent call resumes
+    /// where the previous one left off. The first call on a freshly constructed
+    /// (or <see cref="Mamba3State.Reset"/>ed) state is equivalent to a
+    /// one-shot prefill over the same tokens.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step (prefill chunk or single decode token).</param>
+    /// <param name="positions">Position indices, same length as <paramref name="tokenIds"/>.</param>
+    /// <param name="deviceId">Target device for the output tensor (-1 for CPU).</param>
+    /// <param name="state">
+    /// Persistent per-layer recurrent state. Allocated via
+    /// <c>new Mamba3State(config)</c> by the caller; the model reads each
+    /// layer's <c>ssm_state</c> / <c>cum_angle</c> at entry and writes the
+    /// updated buffers at exit. Must have been constructed from a
+    /// <see cref="ModelConfig"/> with matching layer count and Mamba-3 dims.
+    /// </param>
+    /// <returns>Logits <c>[seqLen, vocab_size]</c> for every token in this call.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="state"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="state"/> does not match this model's layer / head / d_state dims.
+    /// </exception>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, Mamba3State state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (state.NumLayers != Config.NumLayers)
+            throw new ArgumentException(
+                $"Mamba3State has {state.NumLayers} layers but model has {Config.NumLayers}.",
+                nameof(state));
+        int expectedSsm = _m3.NumHeads * _m3.HeadDim * _m3.StateSize;
+        int expectedCum = _m3.NumHeads * _m3.NumRopeAngles;
+        if (state.SsmStateElementsPerLayer != expectedSsm)
+            throw new ArgumentException(
+                $"Mamba3State SSM layout mismatch: state has {state.SsmStateElementsPerLayer} "
+                + $"elements/layer, model expects {expectedSsm}.", nameof(state));
+        if (state.CumAngleElementsPerLayer != expectedCum)
+            throw new ArgumentException(
+                $"Mamba3State cum_angle layout mismatch: state has {state.CumAngleElementsPerLayer} "
+                + $"elements/layer, model expects {expectedCum}.", nameof(state));
+
+        return ForwardCore(tokenIds, positions, deviceId, state);
+    }
+
+    [SkipLocalsInit]
+    private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                int deviceId, Mamba3State state)
+    {
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
@@ -214,9 +281,11 @@ public sealed unsafe class Mamba3TransformerModel : IModel
                     new Span<float>(normOut, t * hiddenSize, hiddenSize));
             }
 
-            // Per-layer SSM state & cum_angle (prefill-only: start from zero).
-            float[] ssmState = new float[nHead * headDim * dState];
-            float[] cumAngle = new float[nHead * numRopeAngles];
+            // Per-layer SSM state & cum_angle — read/written in place on the
+            // caller's persistent state. A freshly constructed (or Reset()ed)
+            // state is all-zero, reproducing the prior prefill-only behaviour.
+            Span<float> ssmState = state.SsmState(layer);
+            Span<float> cumAngle = state.CumAngle(layer);
 
             ReadOnlySpan<float> inProj = SpanFromHandle(lw.InProj, dInProj * hiddenSize);
             ReadOnlySpan<float> outProj = SpanFromHandle(lw.OutProj, hiddenSize * dInner);
