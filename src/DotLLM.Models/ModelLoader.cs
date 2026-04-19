@@ -5,6 +5,9 @@ using DotLLM.Core.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Models.SafeTensors;
+using DotLLM.Tokenizers;
+using DotLLM.Tokenizers.Bpe;
+using DotLLM.Tokenizers.Hf;
 
 namespace DotLLM.Models;
 
@@ -154,6 +157,36 @@ public static class ModelLoader
                 throw new InvalidDataException(
                     $"Cannot determine model format for '{path}'. Expected .gguf or .safetensors.");
         }
+    }
+
+    /// <summary>
+    /// Loads a HuggingFace <c>tokenizer.json</c> from a checkpoint directory
+    /// and returns it as an <see cref="ITokenizer"/>. Accepts either the
+    /// checkpoint directory path or a path to a file inside it (e.g. the
+    /// <c>model.safetensors</c> path).
+    /// </summary>
+    /// <param name="directoryOrFilePath">
+    /// A checkpoint directory or a path to a file in that directory. The
+    /// parent directory is scanned for <c>tokenizer.json</c>.
+    /// </param>
+    /// <returns>
+    /// A ready-to-use tokenizer, or <see langword="null"/> when the directory
+    /// contains no <c>tokenizer.json</c>.
+    /// </returns>
+    /// <remarks>
+    /// Pairs with <see cref="LoadFromSafetensors"/> — HF checkpoints ship the
+    /// tokenizer alongside the weights, but we surface it via a separate call
+    /// so existing <c>(IModel, IDisposable, ModelConfig)</c> tuple contracts
+    /// do not change. Callers that want weights and tokenizer in one call
+    /// invoke both and compose the result.
+    /// </remarks>
+    public static ITokenizer? LoadTokenizerFromHfDirectory(string directoryOrFilePath)
+    {
+        ArgumentNullException.ThrowIfNull(directoryOrFilePath);
+        string dir = Directory.Exists(directoryOrFilePath)
+            ? directoryOrFilePath
+            : Path.GetDirectoryName(directoryOrFilePath) ?? directoryOrFilePath;
+        return HfBpeTokenizerFactory.TryLoadFromDirectory(dir);
     }
 
     private enum LoadFormat { Unknown, Gguf, Safetensors }
