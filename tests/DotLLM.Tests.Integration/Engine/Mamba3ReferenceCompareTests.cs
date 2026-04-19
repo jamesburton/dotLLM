@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Models.Architectures;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -148,6 +149,49 @@ public class Mamba3ReferenceCompareTests
 
         // ssm_state shape in reference is (b=1, h, p, n) — our state is [h, p, n]; same flat layout.
         AssertCloseElementwise("ssm_state", f.Expected["ssm_state"].Data, state);
+    }
+
+    [SkippableFact]
+    public void Block_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath())),
+            "fixture.json missing — run capture_fixtures.py");
+
+        var f = LoadFixture();
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] a = f.Inputs["A"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] dVec = f.Inputs["D"].Data;
+
+        float[] state = new float[nHead * headDim * dState];
+        float[] prevBx = new float[nHead * headDim * dState];
+        float[] y = new float[seqlen * dModel];
+
+        Mamba3Block.Forward(
+            u, inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            y, state, prevBx,
+            seqlen, dModel, dInner, nHead, headDim, dState);
+
+        AssertCloseElementwise("y_final", f.Expected["y_final"].Data, y);
+
+        // Also confirm final SSM state and prev_Bx match — confirms the block
+        // kept the recurrent caches correctly through the whole pipeline.
+        AssertCloseElementwise("ssm_state (after block)", f.Expected["ssm_state"].Data, state);
+        AssertCloseElementwise("prev_Bx (after block)", f.Expected["last_Bx"].Data, prevBx);
     }
 
     private static void AssertCloseElementwise(string label, float[] expected, float[] actual)
