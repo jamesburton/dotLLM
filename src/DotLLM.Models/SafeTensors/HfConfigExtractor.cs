@@ -72,12 +72,17 @@ public static class HfConfigExtractor
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
         // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
-        // Llama/Mistral use interleaved (Norm); Qwen/Phi use non-interleaved (NeoX).
+        // Llama/Mistral/Mixtral use interleaved (Norm); Qwen/Phi use non-interleaved (NeoX).
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.Phi => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
+
+        // MoE — Mixtral, Qwen*-MoE, Phi-3.5-MoE all expose num_local_experts +
+        // num_experts_per_tok. Shared experts (DeepSeek-V3, old Qwen1.5-MoE)
+        // add more fields and are explicitly out of scope here.
+        MoeConfig? moe = ExtractMoeConfig(root, intermediateSize);
 
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
@@ -103,7 +108,47 @@ public static class HfConfigExtractor
             NormEpsilon = normEps,
             TiedEmbeddings = tieEmbeddings,
             SlidingWindowSize = slidingWindow,
+            Moe = moe,
             ChatTemplate = null,
+        };
+    }
+
+    /// <summary>
+    /// Detects MoE from a HF <c>config.json</c> and returns a
+    /// <see cref="MoeConfig"/> when present, else null. Recognises:
+    /// <list type="bullet">
+    ///   <item><c>num_local_experts</c> (Mixtral) or <c>num_experts</c> (Qwen-MoE, DBRX) &gt; 0</item>
+    ///   <item><c>num_experts_per_tok</c> (top-k)</item>
+    ///   <item><c>moe_intermediate_size</c> override (Phi-3.5-MoE); falls back to <paramref name="defaultIntermediateSize"/></item>
+    /// </list>
+    /// Returns null if neither expert-count key is present — the model is
+    /// treated as dense.
+    /// </summary>
+    private static MoeConfig? ExtractMoeConfig(JsonElement root, int defaultIntermediateSize)
+    {
+        int numExperts = GetInt32OrDefault(root, "num_local_experts", 0);
+        if (numExperts <= 0)
+            numExperts = GetInt32OrDefault(root, "num_experts", 0);
+        if (numExperts <= 0)
+            return null;
+
+        int numExpertsPerTok = GetInt32OrDefault(root, "num_experts_per_tok", 0);
+        if (numExpertsPerTok <= 0)
+            throw new InvalidDataException(
+                $"HF config.json declares {numExperts} MoE experts but is missing or has invalid 'num_experts_per_tok'.");
+        if (numExpertsPerTok > numExperts)
+            throw new InvalidDataException(
+                $"HF config.json has num_experts_per_tok={numExpertsPerTok} > num_experts={numExperts}.");
+
+        // Phi-3.5-MoE exposes moe_intermediate_size. Mixtral / Qwen-MoE reuse
+        // intermediate_size for the expert width.
+        int moeIntermediateSize = GetInt32OrDefault(root, "moe_intermediate_size", defaultIntermediateSize);
+
+        return new MoeConfig
+        {
+            NumExperts = numExperts,
+            NumExpertsPerTok = numExpertsPerTok,
+            MoeIntermediateSize = moeIntermediateSize,
         };
     }
 
@@ -128,6 +173,12 @@ public static class HfConfigExtractor
 
         return (archName?.ToLowerInvariant(), modelType?.ToLowerInvariant()) switch
         {
+            // Mixtral must be checked before generic "mistral" — the architecture
+            // class name is 'MixtralForCausalLM' but the organization namespace
+            // is mistralai, so a substring match for "mistral" would otherwise
+            // shadow it.
+            (var a, _) when a is not null && a.Contains("mixtral") => Architecture.Mixtral,
+            (_, "mixtral") => Architecture.Mixtral,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,

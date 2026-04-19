@@ -233,6 +233,98 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
         AssertAllFinite(logits);
     }
 
+    /// <summary>
+    /// Synthetic Mixtral-convention fixture: 2 layers, 4 experts, top-2 gating,
+    /// GQA (2 KV heads), F32. Exercises the Mixtral tensor-name resolution path
+    /// in <see cref="TransformerWeightsSafetensorsLoader"/> and confirms the
+    /// forward pass dispatches through <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/>.
+    /// </summary>
+    [Fact]
+    public void MixtralMoe_SyntheticFixture_ForwardProducesFiniteVocabLogits()
+    {
+        const int hidden = 16;
+        const int numHeads = 4;
+        const int numKvHeads = 2;
+        const int headDim = 4;
+        const int intermediate = 32;
+        const int vocab = 32;
+        const int numLayers = 2;
+        const int numExperts = 4;
+        const int topK = 2;
+
+        var rng = new Random(1337);
+
+        var b = new SafetensorsFixtureBuilder();
+        b.AddFloat32("model.embed_tokens.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+        b.AddFloat32("model.norm.weight", [hidden], Ones(hidden));
+        b.AddFloat32("lm_head.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            string p = $"model.layers.{i}";
+            b.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.self_attn.q_proj.weight",
+                [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.k_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.v_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.o_proj.weight",
+                [hidden, numHeads * headDim], RandomVec(rng, hidden * numHeads * headDim, 0.05f));
+
+            // Mixtral MoE FFN: router gate + (w1, w2, w3) per expert.
+            b.AddFloat32($"{p}.block_sparse_moe.gate.weight",
+                [numExperts, hidden], RandomVec(rng, numExperts * hidden, 0.05f));
+            for (int e = 0; e < numExperts; e++)
+            {
+                b.AddFloat32($"{p}.block_sparse_moe.experts.{e}.w1.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.block_sparse_moe.experts.{e}.w2.weight",
+                    [hidden, intermediate], RandomVec(rng, hidden * intermediate, 0.05f));
+                b.AddFloat32($"{p}.block_sparse_moe.experts.{e}.w3.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+            }
+        }
+
+        string path = Path.Combine(_scratch, "mixtral.safetensors");
+        b.WriteTo(path);
+
+        using var file = SafetensorsFile.Open(path);
+        var config = new ModelConfig
+        {
+            Architecture = Architecture.Mixtral,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = intermediate,
+            NumLayers = numLayers,
+            NumAttentionHeads = numHeads,
+            NumKvHeads = numKvHeads,
+            HeadDim = headDim,
+            MaxSequenceLength = 128,
+            NormEpsilon = 1e-5f,
+            TiedEmbeddings = false,
+            RoPEConfig = new RoPEConfig(Theta: 1_000_000.0f, DimensionCount: headDim, Type: RoPEType.Norm),
+            Moe = new MoeConfig
+            {
+                NumExperts = numExperts,
+                NumExpertsPerTok = topK,
+                MoeIntermediateSize = intermediate,
+            },
+        };
+
+        using var model = TransformerModel.LoadFromSafetensors(file, config);
+        using var logits = model.Forward(
+            tokenIds: [0, 1, 2],
+            positions: [0, 1, 2],
+            deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(3, logits.Shape[0]);
+        Assert.Equal(vocab, logits.Shape[1]);
+        AssertAllFinite(logits);
+    }
+
     private static unsafe void AssertAllFinite(ITensor logits)
     {
         int n = 1;

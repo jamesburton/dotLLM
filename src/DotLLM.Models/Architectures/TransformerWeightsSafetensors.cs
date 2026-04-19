@@ -135,7 +135,30 @@ internal static class TransformerWeightsSafetensorsLoader
         // Post-attention (pre-FFN) RMSNorm
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
 
-        // FFN projections — HF SwiGLU names: gate_proj, up_proj, down_proj.
+        // FFN — dense (Llama/Mistral/Qwen) or MoE (Mixtral, future Qwen-MoE/Phi-3.5-MoE).
+        if (config.Moe is not null)
+        {
+            MoeLayerWeights moe = LoadMixtralMoeLayer(layerIdx, file, config, owned);
+            // The dense gate/up/down slots stay zeroed — the forward pass keys off
+            // Moe != null and skips them. Pass a harmless (ptr=0, quant=F32) block
+            // through the ctor so TransformerLayerWeights stays immutable-shaped.
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias, kBias, vBias, oBias,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight: qNorm, kNormWeight: kNorm,
+                moe: moe);
+        }
+
+        // Dense FFN — HF SwiGLU names: gate_proj, up_proj, down_proj.
         var (gatePtr, gateQt, gateM, gateK) = ResolveLinear(file, $"{prefix}.mlp.gate_proj.weight", owned);
         var (upPtr, upQt, upM, upK) = ResolveLinear(file, $"{prefix}.mlp.up_proj.weight", owned);
         var (downPtr, downQt, downM, downK) = ResolveLinear(file, $"{prefix}.mlp.down_proj.weight", owned);
@@ -157,6 +180,129 @@ internal static class TransformerWeightsSafetensorsLoader
             qBias, kBias, vBias, oBias,
             gateBias: null, upBias: null, downBias: null,
             qNormWeight: qNorm, kNormWeight: kNorm);
+    }
+
+    /// <summary>
+    /// Loads Mixtral-convention MoE weights for one transformer layer:
+    /// <c>model.layers.{i}.block_sparse_moe.gate.weight</c> and
+    /// <c>model.layers.{i}.block_sparse_moe.experts.{j}.(w1|w2|w3).weight</c>.
+    /// Router gate is resolved into a managed <c>float[]</c> (tiny —
+    /// numExperts × hiddenSize). Per-expert weights are F32 pointers; bf16/
+    /// F16 tensors are upcast at load time into 64-byte-aligned scratch and
+    /// registered in <paramref name="owned"/>.
+    /// </summary>
+    private static MoeLayerWeights LoadMixtralMoeLayer(
+        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadMixtralMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.block_sparse_moe";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router gate — F32 [E, H].
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            // w1 (gate_proj): [intermediate, hidden]
+            (w1[e], _, int w1M, int w1K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w1.weight", owned);
+            ValidateProjectionShape(w1M, w1K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.w1.weight");
+            // w3 (up_proj): [intermediate, hidden]
+            (w3[e], _, int w3M, int w3K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w3.weight", owned);
+            ValidateProjectionShape(w3M, w3K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.w3.weight");
+            // w2 (down_proj): [hidden, intermediate]
+            (w2[e], _, int w2M, int w2K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w2.weight", owned);
+            ValidateProjectionShape(w2M, w2K, hiddenSize, intermediateSize,
+                $"{prefix}.experts.{e}.w2.weight");
+        }
+
+        return new MoeLayerWeights(
+            gate: gate,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize);
+    }
+
+    /// <summary>
+    /// Resolves a rank-2 tensor as a managed <c>float[]</c>, up-casting F16 /
+    /// BF16 on the way in. Used for small weights (router gate) where a copy
+    /// costs nothing and is simpler than tracking owned allocations.
+    /// </summary>
+    private static unsafe float[] ResolveDense2D(
+        SafetensorsFile file, string name, int expectedM, int expectedK)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+        if (m != expectedM || k != expectedK)
+            throw new InvalidDataException(
+                $"Tensor '{name}' shape [{m},{k}] does not match expected [{expectedM},{expectedK}].");
+
+        int count = m * k;
+        var result = new float[count];
+        nint src = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        DecodeFloatTensor(src, desc.DType, count, result, name);
+        return result;
+    }
+
+    /// <summary>
+    /// Resolves a rank-2 projection weight as an F32 pointer. F32 tensors are
+    /// returned zero-copy; F16 and BF16 tensors are upcast into 64-byte-aligned
+    /// owned scratch and registered in <paramref name="owned"/>. Similar to
+    /// <see cref="ResolveLinear"/> but always hands back F32 — MoE kernels
+    /// expect F32 today (per-expert quantised GEMM is a follow-up).
+    /// </summary>
+    private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsF32(
+        SafetensorsFile file, string name, List<nint> owned)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+
+        int m = desc.Shape[0], k = desc.Shape[1];
+        long count = (long)m * k;
+        nint srcPtr = file.DataBasePointer + (nint)desc.DataBeginOffset;
+
+        switch (desc.DType)
+        {
+            case SafetensorsDType.F32:
+                return (srcPtr, QuantizationType.F32, m, k);
+
+            case SafetensorsDType.BF16:
+            {
+                nint dst = AllocBf16ToF32(srcPtr, count);
+                owned.Add(dst);
+                return (dst, QuantizationType.F32, m, k);
+            }
+
+            case SafetensorsDType.F16:
+            {
+                nuint byteCount = checked((nuint)count * sizeof(float));
+                nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
+                owned.Add(dst);
+                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<Half>((void*)srcPtr, (int)count),
+                    new Span<float>((void*)dst, (int)count));
+                return (dst, QuantizationType.F32, m, k);
+            }
+
+            default:
+                throw new NotSupportedException(
+                    $"Tensor '{name}' has dtype {desc.DType} — MoE loader supports F32/F16/BF16 only.");
+        }
     }
 
     private static void ValidateProjectionShape(int actualM, int actualK, int expectedM, int expectedK, string name)
