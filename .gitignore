@@ -430,4 +430,5 @@ tests/.models/
 _*.cpp
 _*.txt
 .mamba3-reference/
+.mamba3-reference-canonical/
 .mamba3-python-venv/
