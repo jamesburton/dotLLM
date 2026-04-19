@@ -198,6 +198,130 @@ public class Mamba3ReferenceCompareTests
         AssertCloseElementwise("prev_Bx (after block)", f.Expected["last_Bx"].Data, prevBx);
     }
 
+    /// <summary>
+    /// Decode-path cum_angle continuity: splitting a prefill of <c>T</c> tokens
+    /// into two back-to-back forward calls (<c>T1 + T2 = T</c>) with the
+    /// recurrent state triplet <c>(state, prev_Bx, cum_angle)</c> threaded
+    /// between them must reproduce the single-shot forward bit-for-bit (within
+    /// our usual F32 tolerance). The cum_angle is the load-bearing piece of
+    /// this test — without it, the second half of the output would see a
+    /// rotation phase reset to 0, producing arbitrarily wrong B/C rotations.
+    /// </summary>
+    [SkippableFact]
+    public void Block_DecodeSplit_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(FixturePath())),
+            "fixture.json missing — run capture_fixtures.py");
+
+        var f = LoadFixture();
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int halfDState = dState / 2;
+
+        // Need at least 2 tokens to be able to split.
+        Assert.True(seqlen >= 2, $"Fixture seqlen={seqlen} too small for split test");
+
+        // Split point: first half T1, second half T2. For seqlen=4 this gives 2+2.
+        int t1 = seqlen / 2;
+        int t2 = seqlen - t1;
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] a = f.Inputs["A"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] dVec = f.Inputs["D"].Data;
+
+        // Persistent-state triplet, zeroed at start of "generation".
+        float[] state = new float[nHead * headDim * dState];
+        float[] prevBx = new float[nHead * headDim * dState];
+        float[] cumAngle = new float[nHead * halfDState];
+
+        float[] ySplit = new float[seqlen * dModel];
+
+        // Call 1: tokens [0, t1). u slice is u[0 .. t1 * dModel].
+        Mamba3Block.Forward(
+            u.AsSpan(0, t1 * dModel),
+            inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            ySplit.AsSpan(0, t1 * dModel),
+            state, prevBx, cumAngle,
+            t1, dModel, dInner, nHead, headDim, dState);
+
+        // Call 2: tokens [t1, seqlen). State triplet threaded through.
+        Mamba3Block.Forward(
+            u.AsSpan(t1 * dModel, t2 * dModel),
+            inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            ySplit.AsSpan(t1 * dModel, t2 * dModel),
+            state, prevBx, cumAngle,
+            t2, dModel, dInner, nHead, headDim, dState);
+
+        // Compare concatenated output to the single-shot reference.
+        float[] expectedY = f.Expected["y_final"].Data;
+        _output.WriteLine($"Decode-split ({t1}+{t2}) y_final " +
+                          $"{DriftStats("y_final", expectedY, ySplit)}");
+        _output.WriteLine($"Decode-split ssm_state " +
+                          $"{DriftStats("ssm_state", f.Expected["ssm_state"].Data, state)}");
+        _output.WriteLine($"Decode-split prev_Bx " +
+                          $"{DriftStats("prev_Bx", f.Expected["last_Bx"].Data, prevBx)}");
+
+        AssertCloseElementwise("y_final (decode-split)", expectedY, ySplit);
+
+        // Terminal recurrent state must also match — the whole point of
+        // threading cum_angle is that it keeps B/C rotations aligned so the
+        // scan's state update is identical to the single-shot path.
+        AssertCloseElementwise("ssm_state (decode-split)", f.Expected["ssm_state"].Data, state);
+        AssertCloseElementwise("prev_Bx (decode-split)", f.Expected["last_Bx"].Data, prevBx);
+
+        // Sanity guard: without cum_angle threading, the rotation phase would
+        // reset between calls. Re-run with a zero'd cum_angle between calls
+        // and assert that the output DIFFERS by more than tolerance — i.e.
+        // the threading is actually load-bearing, not a no-op that we'd miss
+        // if someone accidentally removes the cumAngle plumbing.
+        float[] state2 = new float[state.Length];
+        float[] prevBx2 = new float[prevBx.Length];
+        float[] cumAngle2 = new float[cumAngle.Length];
+        float[] yBroken = new float[seqlen * dModel];
+
+        Mamba3Block.Forward(
+            u.AsSpan(0, t1 * dModel),
+            inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            yBroken.AsSpan(0, t1 * dModel),
+            state2, prevBx2, cumAngle2,
+            t1, dModel, dInner, nHead, headDim, dState);
+
+        // Deliberately reset cumAngle2 to simulate the old bug.
+        Array.Clear(cumAngle2);
+
+        Mamba3Block.Forward(
+            u.AsSpan(t1 * dModel, t2 * dModel),
+            inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            yBroken.AsSpan(t1 * dModel, t2 * dModel),
+            state2, prevBx2, cumAngle2,
+            t2, dModel, dInner, nHead, headDim, dState);
+
+        // Pick the second-half of the broken run and confirm it drifts from
+        // the reference. The first half will still match (no state to reset).
+        float maxAbsSecondHalf = 0f;
+        for (int i = t1 * dModel; i < seqlen * dModel; i++)
+            maxAbsSecondHalf = MathF.Max(maxAbsSecondHalf, MathF.Abs(expectedY[i] - yBroken[i]));
+        _output.WriteLine($"Sanity (cum_angle reset between calls) second-half max_abs = {maxAbsSecondHalf:E3}");
+        Assert.True(maxAbsSecondHalf > AbsTol,
+            $"cum_angle threading is not load-bearing: second-half diff {maxAbsSecondHalf:E3} <= AbsTol {AbsTol:E0}. "
+            + "Either the fixture is degenerate (θ≈0) or the cumAngle plumbing is not being exercised.");
+    }
+
     [SkippableFact]
     public void Block_MIMO_MatchesReference()
     {

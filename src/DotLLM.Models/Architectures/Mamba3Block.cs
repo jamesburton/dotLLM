@@ -93,6 +93,47 @@ public static class Mamba3Block
         int headDim,
         int dState,
         float normEps = 1e-5f)
+        => Forward(u, inProjWeight, outProjWeight, a, dtBias, bNormWeight, cNormWeight,
+                   bBias, cBias, d, y, state, prevBx, cumAngle: Span<float>.Empty,
+                   seqLen, dModel, dInner, nHead, headDim, dState, normEps);
+
+    /// <summary>
+    /// Decode-aware overload: threads a third persistent state <paramref name="cumAngle"/>
+    /// (the DataRoPE cumulative angle) alongside <paramref name="state"/> and
+    /// <paramref name="prevBx"/>. Pass an empty span to get the original prefill
+    /// behaviour (start from zeros, do not export final). Pass a buffer of length
+    /// <c>n_head · d_state/2</c> for autoregressive decode: the kernel reads it
+    /// at entry (as the starting angle) and overwrites it at exit with the
+    /// final-token angle, so the next call resumes the rotation phase rather
+    /// than resetting to 0.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <c>VikramKarLex/mamba3-minimal</c>'s <c>InferenceCache.cum_angle</c>
+    /// field, which has shape <c>(batch, n_head, d_state/2)</c>. Batch is 1 here.
+    /// </remarks>
+    [SkipLocalsInit]
+    public static void Forward(
+        ReadOnlySpan<float> u,
+        ReadOnlySpan<float> inProjWeight,
+        ReadOnlySpan<float> outProjWeight,
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> bNormWeight,
+        ReadOnlySpan<float> cNormWeight,
+        ReadOnlySpan<float> bBias,
+        ReadOnlySpan<float> cBias,
+        ReadOnlySpan<float> d,
+        Span<float> y,
+        Span<float> state,
+        Span<float> prevBx,
+        Span<float> cumAngle,
+        int seqLen,
+        int dModel,
+        int dInner,
+        int nHead,
+        int headDim,
+        int dState,
+        float normEps = 1e-5f)
     {
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (dInner != nHead * headDim)
@@ -184,8 +225,14 @@ public static class Mamba3Block
 
         // ── Step 6: data-dependent RoPE on B, C ─────────────────────────────
         // Mamba3DataRoPE (per agent B's doc) takes theta shape [T, dState/2],
-        // rotates B/C treated as [T, nHead, dState] per-head.
-        Mamba3DataRoPE.Execute(bBroad, cBroad, dt, theta, seqLen, nHead, dState);
+        // rotates B/C treated as [T, nHead, dState] per-head. If the caller
+        // passed a cum_angle persistent-state buffer, thread it through so the
+        // rotation phase continues from the previous call's last token.
+        Mamba3DataRoPE.Execute(
+            bBroad, cBroad, dt, theta,
+            cumAnglePrev: cumAngle,
+            cumAngleOut: cumAngle,
+            seqLen, nHead, dState);
 
         // ── Step 7: Selective scan ──────────────────────────────────────────
         // x slice from proj: [T, dInner] at offset dInner per token
@@ -223,7 +270,7 @@ public static class Mamba3Block
     }
 
     /// <summary>
-    /// MIMO variant of <see cref="Forward"/> (Lahoti et al., §3.3 + Appendix D).
+    /// MIMO variant of <c>Forward</c> (Lahoti et al., §3.3 + Appendix D).
     /// Rank-<paramref name="mimoRank"/> factorization of <c>B</c>, <c>C</c>, and <c>x</c>
     /// improves hardware utilisation and yields +1.2 accuracy pts over SISO at the
     /// same state width (paper, Table 4).
@@ -306,6 +353,46 @@ public static class Mamba3Block
         Span<float> y,
         Span<float> state,
         Span<float> prevBx,
+        int seqLen,
+        int dModel,
+        int dInner,
+        int nHead,
+        int headDim,
+        int dState,
+        int mimoRank,
+        float normEps = 1e-5f)
+        => ForwardMimo(u, inProjWeight, outProjWeight, a, dtBias, bNormWeight, cNormWeight,
+                       bBias, cBias, d, mimoXProj, mimoZProj, mimoDown,
+                       y, state, prevBx, cumAngle: Span<float>.Empty,
+                       seqLen, dModel, dInner, nHead, headDim, dState, mimoRank, normEps);
+
+    /// <summary>
+    /// Decode-aware MIMO overload: threads <paramref name="cumAngle"/> (shape
+    /// <c>[n_head, d_state/2]</c>) through the forward alongside
+    /// <paramref name="state"/> and <paramref name="prevBx"/>. See the SISO
+    /// <see cref="Forward(ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, Span{float}, Span{float}, Span{float}, int, int, int, int, int, int, float)"/>
+    /// overload for the cum_angle contract; the MIMO path broadcasts the same
+    /// cum_angle across the rank axis, so the state shape is identical to SISO.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void ForwardMimo(
+        ReadOnlySpan<float> u,
+        ReadOnlySpan<float> inProjWeight,
+        ReadOnlySpan<float> outProjWeight,
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> bNormWeight,
+        ReadOnlySpan<float> cNormWeight,
+        ReadOnlySpan<float> bBias,
+        ReadOnlySpan<float> cBias,
+        ReadOnlySpan<float> d,
+        ReadOnlySpan<float> mimoXProj,
+        ReadOnlySpan<float> mimoZProj,
+        ReadOnlySpan<float> mimoDown,
+        Span<float> y,
+        Span<float> state,
+        Span<float> prevBx,
+        Span<float> cumAngle,
         int seqLen,
         int dModel,
         int dInner,
@@ -421,13 +508,22 @@ public static class Mamba3Block
         // per-(t, h, k) is identical across ranks. We reuse Mamba3DataRoPE once
         // per rank. R is small (typically 2–4) so the cost of re-running the
         // cum_angles recurrence R times is negligible.
+        //
+        // Decode continuity: every rank starts from the SAME cumAngle (the
+        // previous call's last-token angle). Only the last rank writes the
+        // final angle back out — all ranks produce identical final angles so
+        // it doesn't matter which one writes, but avoiding the redundant
+        // writes keeps the semantics crisp.
         for (int r = 0; r < R; r++)
         {
             int offset = r * rankStride;
             Mamba3DataRoPE.Execute(
                 bMimo.AsSpan(offset, rankStride),
                 cMimo.AsSpan(offset, rankStride),
-                dt, theta, seqLen, nHead, dState);
+                dt, theta,
+                cumAnglePrev: cumAngle,
+                cumAngleOut: r == R - 1 ? cumAngle : Span<float>.Empty,
+                seqLen, nHead, dState);
         }
 
         // ── Step 7: expand x to rank-R via Mamba3MimoProject ────────────────

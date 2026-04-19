@@ -102,6 +102,59 @@ public static class Mamba3DataRoPE
         int seqLen,
         int nHead,
         int dState)
+        => Execute(b, c, dt, theta, cumAnglePrev: ReadOnlySpan<float>.Empty,
+                   cumAngleOut: Span<float>.Empty, seqLen, nHead, dState);
+
+    /// <summary>
+    /// Applies Mamba-3 data-dependent RoPE with explicit cumulative-angle continuity.
+    /// Pass the previous call's final cum_angle via <paramref name="cumAnglePrev"/>
+    /// and receive this call's final cum_angle via <paramref name="cumAngleOut"/>;
+    /// this is what lets autoregressive decode resume the rotation phase where
+    /// the previous call left off rather than resetting to 0 every step.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Semantics mirror <c>VikramKarLex/mamba3-minimal</c>'s <c>InferenceCache.cum_angle</c>:
+    /// </para>
+    /// <code>
+    /// cum_angles[t, h, k] = cumAnglePrev[h, k] − Σ_{s=0..t} dt[s, h] · theta[s, k]
+    /// cumAngleOut[h, k]   = cum_angles[T-1, h, k]
+    /// </code>
+    /// <para>
+    /// Pass an empty span for <paramref name="cumAnglePrev"/> to start from zeros
+    /// (prefill / single-shot behaviour). Pass an empty span for
+    /// <paramref name="cumAngleOut"/> if the caller does not need the final angle.
+    /// When non-empty, both must have length <c>n_head · d_state/2</c> and row-major
+    /// layout <c>[n_head, d_state/2]</c>. <paramref name="cumAnglePrev"/> and
+    /// <paramref name="cumAngleOut"/> may alias (same buffer is fine — it is read in
+    /// full before any writes).
+    /// </para>
+    /// </remarks>
+    /// <param name="b">As in the no-offset overload.</param>
+    /// <param name="c">As in the no-offset overload.</param>
+    /// <param name="dt">As in the no-offset overload.</param>
+    /// <param name="theta">As in the no-offset overload.</param>
+    /// <param name="cumAnglePrev">
+    /// Starting cum_angle, shape <c>[n_head, d_state/2]</c>. Empty span = start from 0.
+    /// </param>
+    /// <param name="cumAngleOut">
+    /// Receives the final cum_angle after the last token, shape <c>[n_head, d_state/2]</c>.
+    /// Empty span = do not write.
+    /// </param>
+    /// <param name="seqLen">Number of tokens <c>T</c>.</param>
+    /// <param name="nHead">Number of SSM heads.</param>
+    /// <param name="dState">State width (must be even).</param>
+    [SkipLocalsInit]
+    public static void Execute(
+        Span<float> b,
+        Span<float> c,
+        ReadOnlySpan<float> dt,
+        ReadOnlySpan<float> theta,
+        ReadOnlySpan<float> cumAnglePrev,
+        Span<float> cumAngleOut,
+        int seqLen,
+        int nHead,
+        int dState)
     {
         if (seqLen < 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (nHead <= 0) throw new ArgumentOutOfRangeException(nameof(nHead));
@@ -113,6 +166,7 @@ public static class Mamba3DataRoPE
         long bcLen = (long)seqLen * nHead * dState;
         long dtLen = (long)seqLen * nHead;
         long thetaLen = (long)seqLen * halfDState;
+        int cumLen = nHead * halfDState;
 
         if (b.Length < bcLen)
             throw new ArgumentException($"b length {b.Length} < T*n_head*d_state = {bcLen}.", nameof(b));
@@ -122,14 +176,33 @@ public static class Mamba3DataRoPE
             throw new ArgumentException($"dt length {dt.Length} < T*n_head = {dtLen}.", nameof(dt));
         if (theta.Length < thetaLen)
             throw new ArgumentException($"theta length {theta.Length} < T*d_state/2 = {thetaLen}.", nameof(theta));
+        if (!cumAnglePrev.IsEmpty && cumAnglePrev.Length < cumLen)
+            throw new ArgumentException(
+                $"cumAnglePrev length {cumAnglePrev.Length} < n_head*d_state/2 = {cumLen}.",
+                nameof(cumAnglePrev));
+        if (!cumAngleOut.IsEmpty && cumAngleOut.Length < cumLen)
+            throw new ArgumentException(
+                $"cumAngleOut length {cumAngleOut.Length} < n_head*d_state/2 = {cumLen}.",
+                nameof(cumAngleOut));
 
-        if (seqLen == 0) return;
+        if (seqLen == 0)
+        {
+            // Pass-through: final angle equals the starting angle.
+            if (!cumAngleOut.IsEmpty)
+            {
+                if (!cumAnglePrev.IsEmpty)
+                    cumAnglePrev.Slice(0, cumLen).CopyTo(cumAngleOut.Slice(0, cumLen));
+                else
+                    cumAngleOut.Slice(0, cumLen).Clear();
+            }
+            return;
+        }
 
         // Scratch for cum_angles of ONE time step at a time: [n_head, halfDState].
         // The recurrence is along time, so we can't vectorize cumsum across t without
         // materializing the whole table. We maintain the running cumulative angles in
         // a single [n_head * halfDState] buffer and reuse it across tokens.
-        int scratchLen = nHead * halfDState;
+        int scratchLen = cumLen;
         int trigLen = scratchLen; // cos/sin computed from the same buffer shape per step
 
         // Stack vs pool based on total bytes needed (cum + cos + sin).
@@ -137,14 +210,16 @@ public static class Mamba3DataRoPE
         if (totalFloats <= StackAllocFloatThreshold)
         {
             Span<float> scratch = stackalloc float[totalFloats];
-            ExecuteInto(b, c, dt, theta, seqLen, nHead, halfDState, scratch);
+            ExecuteInto(b, c, dt, theta, cumAnglePrev, cumAngleOut,
+                        seqLen, nHead, halfDState, scratch);
         }
         else
         {
             float[] rented = ArrayPool<float>.Shared.Rent(totalFloats);
             try
             {
-                ExecuteInto(b, c, dt, theta, seqLen, nHead, halfDState,
+                ExecuteInto(b, c, dt, theta, cumAnglePrev, cumAngleOut,
+                            seqLen, nHead, halfDState,
                             rented.AsSpan(0, totalFloats));
             }
             finally
@@ -161,6 +236,8 @@ public static class Mamba3DataRoPE
         Span<float> c,
         ReadOnlySpan<float> dt,
         ReadOnlySpan<float> theta,
+        ReadOnlySpan<float> cumAnglePrev,
+        Span<float> cumAngleOut,
         int seqLen,
         int nHead,
         int halfDState,
@@ -170,7 +247,13 @@ public static class Mamba3DataRoPE
         Span<float> cumAngles = scratch.Slice(0, scratchLen);
         Span<float> cosTable  = scratch.Slice(scratchLen, scratchLen);
         Span<float> sinTable  = scratch.Slice(2 * scratchLen, scratchLen);
-        cumAngles.Clear();
+
+        // Seed cumulative angles from the caller's previous final angle (if provided)
+        // so decode continuity works: cum_angles[t=0, h, k] = cumAnglePrev[h, k] − dt[0,h]·theta[0,k].
+        if (cumAnglePrev.IsEmpty)
+            cumAngles.Clear();
+        else
+            cumAnglePrev.Slice(0, scratchLen).CopyTo(cumAngles);
 
         int dState = halfDState * 2;
         int bcRowStride = nHead * dState;    // stride to the next token in B / C
@@ -215,6 +298,10 @@ public static class Mamba3DataRoPE
                 ApplyPairRotation(cHead, cosSlice, sinSlice, halfDState);
             }
         }
+
+        // Export final cum_angle so the next call (decode step) can resume from here.
+        if (!cumAngleOut.IsEmpty)
+            cumAngles.CopyTo(cumAngleOut.Slice(0, scratchLen));
     }
 
     /// <summary>
@@ -243,7 +330,8 @@ public static class Mamba3DataRoPE
 
     /// <summary>
     /// Scalar reference implementation kept for unit-test pinning. Identical numerics
-    /// to <see cref="Execute"/> but without the <see cref="TensorPrimitives"/>
+    /// to <see cref="Execute(Span{float}, Span{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, int, int, int)"/>
+    /// but without the <see cref="TensorPrimitives"/>
     /// fused-multiply-add or batched trig calls — every operation is a plain scalar
     /// floating-point op, so this is the ground truth.
     /// </summary>
