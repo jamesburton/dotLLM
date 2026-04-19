@@ -5,6 +5,29 @@ using System.Runtime.CompilerServices;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
+/// Rotation convention selector for <see cref="Mamba3DataRoPE"/>'s canonical
+/// entry points. The minimal-reference path (kept for regression) always uses
+/// <see cref="Pairwise"/> over the full <c>d_state</c>; the canonical
+/// <c>state-spaces/mamba</c> kernels select between Pairwise (SISO,
+/// <c>mamba3_siso_combined</c>) and <see cref="Halved"/> (MIMO,
+/// <c>mamba3_mimo_combined</c>), and rotate only the first
+/// <c>2 * num_rope_angles</c> channels when <c>rope_fraction &lt; 1</c>.
+/// </summary>
+public enum Mamba3RoPEMode
+{
+    /// <summary>
+    /// Interleaved adjacent pairs <c>(x[2k], x[2k+1])</c>. SISO canonical and
+    /// the minimal reference both use this convention.
+    /// </summary>
+    Pairwise = 0,
+
+    /// <summary>
+    /// Halved pairs <c>(x[k], x[k + d_state/2])</c>. Canonical MIMO kernel.
+    /// </summary>
+    Halved = 1,
+}
+
+/// <summary>
 /// Data-dependent 2-D rotation applied to the Mamba-3 <c>B</c> and <c>C</c>
 /// coefficients. Absorbs the block-diagonal complex rotation matrix <c>R_t</c>
 /// from Proposition 3 of Lahoti et al. (ICLR 2026, arXiv 2603.15569) into the
@@ -414,5 +437,288 @@ public static class Mamba3DataRoPE
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Canonical (state-spaces/mamba) entry point.
+    //
+    // The canonical Mamba-3 RoPE differs from the minimal reference in four
+    // ways that are all expressed as parameters here:
+    //
+    //   1. Raw angles enter the kernel as a per-token projection
+    //      (angles_raw, shape [T, num_rope_angles]) and are broadcast to
+    //      [T, nHead, num_rope_angles] before use — the kernel always wraps
+    //      them through tanh(·)·π first (see angle_dt.py:97-101 and
+    //      mamba3_mimo_rotary_step.py:255).
+    //   2. The cumulative sum is positive-sign (canonical kernel convention;
+    //      sign is absorbed into the projection head rather than the kernel).
+    //   3. After cumulation the angle is reduced mod 2π inline (canonical
+    //      angle_dt.py:108 — purely a numeric-drift guard, mathematically a
+    //      no-op).
+    //   4. Only the first 2*num_rope_angles channels are rotated
+    //      (partial rotation when rope_fraction < 1); the remainder of
+    //      d_state is passed through unchanged.
+    //
+    // The kernel additionally exposes a rank axis to match canonical's
+    // (B, L, R, H, N) layout for MIMO — set nRank=1 for SISO. The rotation
+    // mode (pairwise vs halved) is selected by <paramref name="mode"/>.
+    // Cumulative-angle continuity semantics mirror the minimal path so the
+    // block can thread a cumAngle buffer across decode steps.
+    //
+    // Kept as a separate entry point because the minimal reference and the
+    // minimal-baselined Block composer still call the original Execute.
+    // Deletion of the minimal path is deferred to Stage P2b (Block rewrite).
+    // ------------------------------------------------------------------------
+
+    /// <summary>
+    /// Applies canonical Mamba-3 data-dependent RoPE to <paramref name="b"/>
+    /// and <paramref name="c"/> in place. Both are shape
+    /// <c>[T, nRank, nHead, dState]</c> row-major (nRank=1 for SISO).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Angle computation</b> (per canonical's <c>angle_dt_fwd</c>):
+    /// </para>
+    /// <code>
+    /// vals[t, h, s]   = tanh(angles_raw[t, s]) * π * dt[t, h]
+    /// cum[t, h, s]    = cumAnglePrev[h, s] + Σ_{u=0..t} vals[u, h, s]   // cumsum (positive)
+    /// cum[t, h, s]   %= 2π                                              // mod 2π inline
+    /// </code>
+    /// <para>
+    /// <b>Rotation</b>: only the first <c>rotary_dim = 2 * numRopeAngles</c>
+    /// channels of each <c>[dState]</c> slice are rotated; the tail is passed
+    /// through. When <paramref name="mode"/> is <see cref="Mamba3RoPEMode.Pairwise"/>,
+    /// the rotated region is split into interleaved pairs <c>(v[2k], v[2k+1])</c>.
+    /// When <see cref="Mamba3RoPEMode.Halved"/>, the full <c>dState</c> is split in
+    /// halves and the first <c>numRopeAngles</c> lanes of each half are rotated
+    /// as pairs <c>(v[k], v[k + dState/2])</c>; the rotary tail of each half
+    /// passes through unchanged (i.e. cos=1, sin=0 pad).
+    /// </para>
+    /// </remarks>
+    /// <param name="b">B coefficient, shape <c>[T, nRank, nHead, dState]</c>. Modified in place.</param>
+    /// <param name="c">C coefficient, shape <c>[T, nRank, nHead, dState]</c>. Modified in place.</param>
+    /// <param name="anglesRaw">Per-token angle projection, shape <c>[T, numRopeAngles]</c> (shared across rank &amp; head).</param>
+    /// <param name="dt">Post-softplus timestep, shape <c>[T, nHead]</c>.</param>
+    /// <param name="cumAnglePrev">Seed cum_angle, shape <c>[nHead, numRopeAngles]</c>. Empty = start from 0.</param>
+    /// <param name="cumAngleOut">Final cum_angle after last token, shape <c>[nHead, numRopeAngles]</c>. Empty = don't write.</param>
+    /// <param name="seqLen">Number of tokens T.</param>
+    /// <param name="nRank">MIMO rank R (SISO = 1).</param>
+    /// <param name="nHead">Number of SSM heads.</param>
+    /// <param name="dState">State width.</param>
+    /// <param name="numRopeAngles">Rotated-pair count — rotates first <c>2 * numRopeAngles</c> channels.</param>
+    /// <param name="mode">Pair ordering (Pairwise for SISO, Halved for MIMO).</param>
+    [SkipLocalsInit]
+    public static void ExecuteCanonical(
+        Span<float> b,
+        Span<float> c,
+        ReadOnlySpan<float> anglesRaw,
+        ReadOnlySpan<float> dt,
+        ReadOnlySpan<float> cumAnglePrev,
+        Span<float> cumAngleOut,
+        int seqLen,
+        int nRank,
+        int nHead,
+        int dState,
+        int numRopeAngles,
+        Mamba3RoPEMode mode)
+    {
+        if (seqLen < 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+        if (nRank <= 0) throw new ArgumentOutOfRangeException(nameof(nRank));
+        if (nHead <= 0) throw new ArgumentOutOfRangeException(nameof(nHead));
+        if (dState <= 0) throw new ArgumentOutOfRangeException(nameof(dState));
+        if (numRopeAngles <= 0) throw new ArgumentOutOfRangeException(nameof(numRopeAngles));
+        int rotaryDim = 2 * numRopeAngles;
+        if (rotaryDim > dState)
+            throw new ArgumentException($"2*numRopeAngles ({rotaryDim}) > dState ({dState}).", nameof(numRopeAngles));
+        if (mode == Mamba3RoPEMode.Halved && (dState & 1) != 0)
+            throw new ArgumentException($"Halved mode requires even dState, got {dState}.", nameof(dState));
+
+        long bcLen = (long)seqLen * nRank * nHead * dState;
+        long angLen = (long)seqLen * numRopeAngles;
+        long dtLen = (long)seqLen * nHead;
+        int cumLen = nHead * numRopeAngles;
+
+        if (b.Length < bcLen)
+            throw new ArgumentException($"b length {b.Length} < T*R*H*N = {bcLen}.", nameof(b));
+        if (c.Length < bcLen)
+            throw new ArgumentException($"c length {c.Length} < T*R*H*N = {bcLen}.", nameof(c));
+        if (anglesRaw.Length < angLen)
+            throw new ArgumentException($"anglesRaw length {anglesRaw.Length} < T*numRopeAngles = {angLen}.", nameof(anglesRaw));
+        if (dt.Length < dtLen)
+            throw new ArgumentException($"dt length {dt.Length} < T*nHead = {dtLen}.", nameof(dt));
+        if (!cumAnglePrev.IsEmpty && cumAnglePrev.Length < cumLen)
+            throw new ArgumentException($"cumAnglePrev length {cumAnglePrev.Length} < nHead*numRopeAngles = {cumLen}.", nameof(cumAnglePrev));
+        if (!cumAngleOut.IsEmpty && cumAngleOut.Length < cumLen)
+            throw new ArgumentException($"cumAngleOut length {cumAngleOut.Length} < nHead*numRopeAngles = {cumLen}.", nameof(cumAngleOut));
+
+        if (seqLen == 0)
+        {
+            if (!cumAngleOut.IsEmpty)
+            {
+                if (!cumAnglePrev.IsEmpty)
+                    cumAnglePrev.Slice(0, cumLen).CopyTo(cumAngleOut.Slice(0, cumLen));
+                else
+                    cumAngleOut.Slice(0, cumLen).Clear();
+            }
+            return;
+        }
+
+        // scratch: running cum[nHead, numRopeAngles] + tanh(angles_raw)*π slab [numRopeAngles] + cos/sin tables [nHead, numRopeAngles]
+        int cumSize = cumLen;
+        int trigSize = cumLen;
+        int vecSize = numRopeAngles;
+        int totalFloats = cumSize + trigSize * 2 + vecSize;
+
+        if (totalFloats <= StackAllocFloatThreshold)
+        {
+            Span<float> scratch = stackalloc float[totalFloats];
+            ExecuteCanonicalInto(
+                b, c, anglesRaw, dt, cumAnglePrev, cumAngleOut,
+                seqLen, nRank, nHead, dState, numRopeAngles, mode,
+                scratch);
+        }
+        else
+        {
+            float[] rented = ArrayPool<float>.Shared.Rent(totalFloats);
+            try
+            {
+                ExecuteCanonicalInto(
+                    b, c, anglesRaw, dt, cumAnglePrev, cumAngleOut,
+                    seqLen, nRank, nHead, dState, numRopeAngles, mode,
+                    rented.AsSpan(0, totalFloats));
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+        }
+    }
+
+    [SkipLocalsInit]
+    private static void ExecuteCanonicalInto(
+        Span<float> b,
+        Span<float> c,
+        ReadOnlySpan<float> anglesRaw,
+        ReadOnlySpan<float> dt,
+        ReadOnlySpan<float> cumAnglePrev,
+        Span<float> cumAngleOut,
+        int seqLen,
+        int nRank,
+        int nHead,
+        int dState,
+        int numRopeAngles,
+        Mamba3RoPEMode mode,
+        Span<float> scratch)
+    {
+        int cumSize = nHead * numRopeAngles;
+        int trigSize = cumSize;
+        int vecSize = numRopeAngles;
+
+        Span<float> cum = scratch.Slice(0, cumSize);
+        Span<float> cosTable = scratch.Slice(cumSize, trigSize);
+        Span<float> sinTable = scratch.Slice(cumSize + trigSize, trigSize);
+        Span<float> tanhPiVec = scratch.Slice(cumSize + trigSize * 2, vecSize);
+
+        // Seed cum from caller.
+        if (cumAnglePrev.IsEmpty)
+            cum.Clear();
+        else
+            cumAnglePrev.Slice(0, cumSize).CopyTo(cum);
+
+        // Strides (row-major).
+        int rotaryDim = 2 * numRopeAngles;
+        int bcHeadStride = dState;
+        int bcRankStride = nHead * dState;
+        int bcTokenStride = nRank * bcRankStride;
+        const float twoPi = 2f * MathF.PI;
+        const float invTwoPi = 1f / twoPi;
+        int halfDState = dState >> 1;                    // only used in halved mode
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            // tanh(angles_raw[t]) * π  →  a slab of [numRopeAngles]
+            ReadOnlySpan<float> angRow = anglesRaw.Slice(t * numRopeAngles, numRopeAngles);
+            TensorPrimitives.Tanh(angRow, tanhPiVec);
+            TensorPrimitives.Multiply(tanhPiVec, MathF.PI, tanhPiVec);
+
+            // For each head: cum[h] += dt[t,h] * tanhPiVec  (positive cumsum)
+            ReadOnlySpan<float> dtRow = dt.Slice(t * nHead, nHead);
+            for (int h = 0; h < nHead; h++)
+            {
+                Span<float> cumRow = cum.Slice(h * numRopeAngles, numRopeAngles);
+                float dth = dtRow[h];
+                TensorPrimitives.MultiplyAdd(tanhPiVec, dth, cumRow, cumRow);
+                // mod 2π lane-wise — scalar loop is fine for typical numRopeAngles (32..64).
+                for (int k = 0; k < numRopeAngles; k++)
+                {
+                    float v = cumRow[k];
+                    float floored = MathF.Floor(v * invTwoPi);
+                    cumRow[k] = v - twoPi * floored;
+                }
+            }
+
+            TensorPrimitives.Cos(cum, cosTable);
+            TensorPrimitives.Sin(cum, sinTable);
+
+            // Apply rotation to b and c for this token across all rank slices.
+            int tokenBase = t * bcTokenStride;
+            for (int r = 0; r < nRank; r++)
+            {
+                int rankBase = tokenBase + r * bcRankStride;
+                for (int h = 0; h < nHead; h++)
+                {
+                    int bcBase = rankBase + h * bcHeadStride;
+                    int trigBase = h * numRopeAngles;
+                    Span<float> bSlice = b.Slice(bcBase, dState);
+                    Span<float> cSlice = c.Slice(bcBase, dState);
+                    ReadOnlySpan<float> cosSlice = cosTable.Slice(trigBase, numRopeAngles);
+                    ReadOnlySpan<float> sinSlice = sinTable.Slice(trigBase, numRopeAngles);
+
+                    if (mode == Mamba3RoPEMode.Pairwise)
+                    {
+                        ApplyPairRotation(bSlice.Slice(0, rotaryDim), cosSlice, sinSlice, numRopeAngles);
+                        ApplyPairRotation(cSlice.Slice(0, rotaryDim), cosSlice, sinSlice, numRopeAngles);
+                        // Channels [rotaryDim..dState) are pass-through (untouched).
+                    }
+                    else
+                    {
+                        ApplyHalvedRotation(bSlice, cosSlice, sinSlice, numRopeAngles, halfDState);
+                        ApplyHalvedRotation(cSlice, cosSlice, sinSlice, numRopeAngles, halfDState);
+                    }
+                }
+            }
+        }
+
+        if (!cumAngleOut.IsEmpty)
+            cum.CopyTo(cumAngleOut.Slice(0, cumSize));
+    }
+
+    /// <summary>
+    /// Halved rotation: pairs are <c>(x[k], x[k + dState/2])</c>. Rotates only
+    /// the first <paramref name="numRopeAngles"/> lanes of each half; the
+    /// remaining <c>halfDState - numRopeAngles</c> lanes of each half pass
+    /// through unchanged (canonical's cos=1 / sin=0 padding). Operates in place.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [SkipLocalsInit]
+    private static void ApplyHalvedRotation(
+        Span<float> vec,
+        ReadOnlySpan<float> cos,
+        ReadOnlySpan<float> sin,
+        int numRopeAngles,
+        int halfDState)
+    {
+        // Read both halves into locals before writing the first half, so the
+        // update is alias-safe on the same buffer.
+        for (int k = 0; k < numRopeAngles; k++)
+        {
+            float a = vec[k];
+            float bval = vec[halfDState + k];
+            float co = cos[k];
+            float si = sin[k];
+            vec[k] = co * a - si * bval;
+            vec[halfDState + k] = si * a + co * bval;
+        }
+        // Tail lanes [numRopeAngles..halfDState) pass through unchanged.
     }
 }
