@@ -29,9 +29,13 @@ public class Mamba3ReferenceCompareTests
     private static string FixturePath() =>
         Path.Combine(AppContext.BaseDirectory, "Fixtures", "Mamba3", "fixture.json");
 
-    private static Fixture LoadFixture()
+    private static string MimoFixturePath() =>
+        Path.Combine(AppContext.BaseDirectory, "Fixtures", "Mamba3", "fixture_mimo.json");
+
+    private static Fixture LoadFixture() => LoadFixtureFrom(FixturePath());
+
+    private static Fixture LoadFixtureFrom(string path)
     {
-        string path = FixturePath();
         string fullPath = Path.GetFullPath(path);
         if (!File.Exists(fullPath))
             throw new FileNotFoundException($"Mamba-3 fixture not found at {fullPath}. Run capture_fixtures.py first.");
@@ -192,6 +196,75 @@ public class Mamba3ReferenceCompareTests
         // kept the recurrent caches correctly through the whole pipeline.
         AssertCloseElementwise("ssm_state (after block)", f.Expected["ssm_state"].Data, state);
         AssertCloseElementwise("prev_Bx (after block)", f.Expected["last_Bx"].Data, prevBx);
+    }
+
+    [SkippableFact]
+    public void Block_MIMO_MatchesReference()
+    {
+        Skip.IfNot(File.Exists(Path.GetFullPath(MimoFixturePath())),
+            "fixture_mimo.json missing — run capture_fixtures.py");
+
+        var f = LoadFixtureFrom(MimoFixturePath());
+        int seqlen = f.Config["seqlen"].GetInt32();
+        int dModel = f.Config["d_model"].GetInt32();
+        int dInner = f.Config["d_inner"].GetInt32();
+        int nHead = f.Config["nheads"].GetInt32();
+        int headDim = f.Config["headdim"].GetInt32();
+        int dState = f.Config["d_state"].GetInt32();
+        int R = f.Config["mimo_rank"].GetInt32();
+        Assert.True(f.Config["use_mimo"].GetBoolean(), "Expected use_mimo=true fixture");
+        Assert.Equal(2, R);
+
+        float[] u = f.Inputs["u"].Data;
+        float[] inProj = f.Inputs["in_proj_weight"].Data;
+        float[] outProj = f.Inputs["out_proj_weight"].Data;
+        float[] a = f.Inputs["A"].Data;
+        float[] dtBias = f.Inputs["dt_bias"].Data;
+        float[] bNormW = f.Inputs["B_norm_weight"].Data;
+        float[] cNormW = f.Inputs["C_norm_weight"].Data;
+        float[] bBias = f.Inputs["B_bias"].Data;
+        float[] cBias = f.Inputs["C_bias"].Data;
+        float[] dVec = f.Inputs["D"].Data;
+        float[] mimoXProj = f.Inputs["mimo_x_proj"].Data;
+        float[] mimoZProj = f.Inputs["mimo_z_proj"].Data;
+        float[] mimoDown = f.Inputs["mimo_down"].Data;
+
+        float[] state = new float[nHead * headDim * dState];
+        float[] prevBx = new float[nHead * headDim * dState];
+        float[] y = new float[seqlen * dModel];
+
+        Mamba3Block.ForwardMimo(
+            u, inProj, outProj,
+            a, dtBias, bNormW, cNormW, bBias, cBias, dVec,
+            mimoXProj, mimoZProj, mimoDown,
+            y, state, prevBx,
+            seqlen, dModel, dInner, nHead, headDim, dState, R);
+
+        _output.WriteLine($"MIMO y_final max_abs/max_rel: {DriftStats("y_final", f.Expected["y_final"].Data, y)}");
+        _output.WriteLine($"MIMO ssm_state max_abs/max_rel: {DriftStats("ssm_state", f.Expected["ssm_state"].Data, state)}");
+        _output.WriteLine($"MIMO prev_Bx max_abs/max_rel: {DriftStats("prev_Bx", f.Expected["last_Bx"].Data, prevBx)}");
+
+        AssertCloseElementwise("y_final (MIMO)", f.Expected["y_final"].Data, y);
+
+        // Recurrent caches — shape identical to SISO because rank is contracted
+        // in the MIMO scan's B·x term.
+        AssertCloseElementwise("ssm_state (MIMO, after block)", f.Expected["ssm_state"].Data, state);
+        AssertCloseElementwise("prev_Bx (MIMO, after block)", f.Expected["last_Bx"].Data, prevBx);
+    }
+
+    private static string DriftStats(string _, float[] expected, float[] actual)
+    {
+        float maxAbs = 0f, maxRel = 0f;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i];
+            float aa = actual[i];
+            float d = MathF.Abs(e - aa);
+            float r = d / (MathF.Abs(e) + 1e-12f);
+            if (d > maxAbs) maxAbs = d;
+            if (r > maxRel) maxRel = r;
+        }
+        return $"max_abs={maxAbs:E3} max_rel={maxRel:E3}";
     }
 
     private static void AssertCloseElementwise(string label, float[] expected, float[] actual)
