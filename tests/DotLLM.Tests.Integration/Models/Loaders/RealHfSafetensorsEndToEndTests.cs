@@ -1,0 +1,253 @@
+using System.Diagnostics;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
+using DotLLM.Models;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace DotLLM.Tests.Integration.Models.Loaders;
+
+/// <summary>
+/// End-to-end verification that <see cref="ModelLoader.LoadFromSafetensors"/>
+/// loads real HuggingFace checkpoints (not tiny-random) for architectures dotLLM
+/// now claims to support: dense multi-shard transformers (Phi-3.5-mini) and
+/// Mixtral-family MoE with shared experts (Qwen1.5-MoE-A2.7B). Each test is
+/// gated on an env-var checkpoint path or a conventional
+/// <c>C:/temp/dotllm-&lt;family&gt;/</c> directory; when neither resolves the test
+/// skips gracefully so CI stays green.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Checkpoint sizes.</b> The real weights are not committed and not fetched
+/// by CI. Expected footprints:
+/// </para>
+/// <list type="bullet">
+///   <item><description><c>microsoft/Phi-3.5-mini-instruct</c> — ~7.6 GB, 2
+///   safetensors shards, dense Llama-family.</description></item>
+///   <item><description><c>Qwen/Qwen1.5-MoE-A2.7B</c> — ~14 GB, 8 shards, 60
+///   routed experts top-4 + shared expert + <c>norm_topk_prob=false</c>.</description></item>
+/// </list>
+/// <para>
+/// <b>To run locally.</b> Either place the checkpoint at the conventional path
+/// or set the env var to the safetensors index JSON or its directory:
+/// <code>
+///   $env:DOTLLM_PHI35_CHECKPOINT_PATH = "C:/temp/dotllm-phi35-mini"
+///   $env:DOTLLM_QWEN15MOE_CHECKPOINT_PATH = "C:/temp/dotllm-qwen15-moe"
+///   dotnet test tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj `
+///     --filter FullyQualifiedName~RealHfSafetensorsEndToEnd
+/// </code>
+/// </para>
+/// </remarks>
+public sealed class RealHfSafetensorsEndToEndTests
+{
+    private readonly ITestOutputHelper _output;
+
+    public RealHfSafetensorsEndToEndTests(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Phi-3.5-mini-instruct
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Phi35Mini_LoadsAndForwardsEndToEnd()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-phi35-mini");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads} "
+                + $"head_dim={config.HeadDim} tied={config.TiedEmbeddings}");
+
+            // Phi-3.5-mini-instruct: Phi3ForCausalLM, 32 layers, hidden=3072, 32 heads, vocab=32064
+            Assert.True(
+                config.Architecture == Architecture.Phi,
+                $"Expected Phi architecture, got {config.Architecture}");
+            Assert.Equal(32, config.NumLayers);
+            Assert.Equal(3072, config.HiddenSize);
+            Assert.Equal(32, config.NumAttentionHeads);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Qwen1.5-MoE-A2.7B
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Qwen15MoeA27B_LoadsAndForwardsEndToEnd()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_QWEN15MOE_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-qwen15-moe");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Qwen1.5-MoE-A2.7B checkpoint not found. Set DOTLLM_QWEN15MOE_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-qwen15-moe/");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads}");
+            if (config.Moe is not null)
+            {
+                _output.WriteLine(
+                    $"MoE: num_experts={config.Moe.NumExperts} top_k={config.Moe.NumExpertsPerTok} "
+                    + $"intermediate={config.Moe.MoeIntermediateSize} "
+                    + $"shared_intermediate={config.Moe.SharedExpertIntermediateSize} "
+                    + $"norm_topk_prob={config.Moe.NormTopKProb}");
+            }
+
+            // Qwen1.5-MoE-A2.7B: Qwen2MoeForCausalLM, 24 layers, hidden=2048, 16 heads
+            Assert.Equal(Architecture.QwenMoe, config.Architecture);
+            Assert.NotNull(config.Moe);
+            Assert.True(config.Moe!.NumExperts >= 16, "Qwen1.5-MoE-A2.7B expects ≥16 experts");
+            Assert.True(config.Moe.NumExpertsPerTok >= 2, "top_k >= 2");
+            // Qwen1.5-MoE-A2.7B has a shared expert; assert it's discoverable.
+            Assert.NotNull(config.Moe.SharedExpertIntermediateSize);
+            Assert.True(config.Moe.SharedExpertIntermediateSize!.Value > 0);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ────────────────────────────────────────────────────────────────────
+
+    private static string? ResolveCheckpointRoot(string envVar, string conventional)
+    {
+        string? env = Environment.GetEnvironmentVariable(envVar);
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            if (ContainsSafetensorsCheckpoint(env)) return env;
+        }
+        if (ContainsSafetensorsCheckpoint(conventional)) return conventional;
+        return null;
+    }
+
+    private static bool ContainsSafetensorsCheckpoint(string path)
+    {
+        if (File.Exists(path) && path.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!Directory.Exists(path)) return false;
+        // Skip if HF cache still has incomplete downloads (in-flight snapshot_download)
+        string cacheDir = Path.Combine(path, ".cache", "huggingface", "download");
+        if (Directory.Exists(cacheDir) && Directory.GetFiles(cacheDir, "*.incomplete").Length > 0)
+            return false;
+        if (File.Exists(Path.Combine(path, "model.safetensors.index.json")))
+        {
+            // Verify all shards referenced by the index actually exist
+            try
+            {
+                string indexJson = File.ReadAllText(Path.Combine(path, "model.safetensors.index.json"));
+                using var doc = System.Text.Json.JsonDocument.Parse(indexJson);
+                if (doc.RootElement.TryGetProperty("weight_map", out var weightMap))
+                {
+                    var shards = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var prop in weightMap.EnumerateObject())
+                        shards.Add(prop.Value.GetString()!);
+                    foreach (var shard in shards)
+                        if (!File.Exists(Path.Combine(path, shard))) return false;
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+        if (File.Exists(Path.Combine(path, "model.safetensors"))) return true;
+        if (Directory.GetFiles(path, "model-*-of-*.safetensors").Length > 0) return true;
+        return false;
+    }
+
+    private unsafe void AssertFiniteLogits(ITensor logits, int vocabSize)
+    {
+        int seqLen = logits.Shape[0];
+        int total = seqLen * vocabSize;
+        int finite = 0;
+        float min = float.PositiveInfinity, max = float.NegativeInfinity;
+        double sumSq = 0, sum = 0;
+        var data = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+        for (int i = 0; i < total; i++)
+        {
+            float v = data[i];
+            if (float.IsFinite(v))
+            {
+                finite++;
+                if (v < min) min = v;
+                if (v > max) max = v;
+                sum += v;
+                sumSq += (double)v * v;
+            }
+        }
+        double mean = sum / total;
+        double variance = sumSq / total - mean * mean;
+        double stddev = Math.Sqrt(Math.Max(0, variance));
+        _output.WriteLine(
+            $"Logits: finite={finite}/{total} min={min:F3} max={max:F3} mean={mean:F4} stddev={stddev:F4}");
+        Assert.Equal(total, finite);
+        Assert.True(stddev > 0, "Logits have zero variance — degenerate output.");
+    }
+}
