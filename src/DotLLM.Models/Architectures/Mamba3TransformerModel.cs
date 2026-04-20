@@ -312,15 +312,20 @@ public sealed unsafe class Mamba3TransformerModel : IModel
 
             if (isMimo)
             {
-                // Canonical MIMO has mimo_z / mimo_o tensors in the checkpoint
-                // (shape [H, R, P]). Stage D2's loader does not yet carry those
-                // fields on Mamba3LayerWeights — see risk notes in
-                // mamba3_canonical_pivot.md. Surface a clear error instead of
-                // silently degrading to SISO.
+                // Canonical MIMO has mimo_x / mimo_z / mimo_o tensors in the
+                // checkpoint (shape [H, R, P]) and a [H, R, N] B_bias / C_bias
+                // layout. Stage D2's loader does not yet carry those fields on
+                // Mamba3LayerWeights — surface a clear error instead of
+                // silently degrading to SISO. The MIMO kernel path (ForwardMimo
+                // + ExecuteMimoStreaming) and Mamba3State are fully plumbed
+                // for streaming decode — only the weight loader extension is
+                // missing. See Mamba3BlockStreamingMimoTests for coverage of
+                // the kernel-level MIMO state threading.
                 throw new NotSupportedException(
                     "Mamba-3 MIMO checkpoints are not yet supported end-to-end: "
-                    + "Mamba3WeightLoader does not carry mimo_z / mimo_o tensors or the "
-                    + "[H, R, N] B_bias / C_bias shape. Track via the MIMO follow-up.");
+                    + "Mamba3WeightLoader does not carry mimo_x / mimo_z / mimo_o tensors "
+                    + "or the [H, R, N] B_bias / C_bias shape. Mamba3Block.ForwardMimo "
+                    + "(state-threaded) is ready for wiring once the loader is extended.");
             }
 
             Mamba3Block.Forward(

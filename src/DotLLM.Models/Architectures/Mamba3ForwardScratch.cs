@@ -7,7 +7,7 @@ namespace DotLLM.Models.Architectures;
 /// <summary>
 /// Pre-allocated, 64-byte-aligned scratch buffers for the per-call temporaries
 /// used by <see cref="Mamba3Block"/>.Forward and
-/// <see cref="Mamba3Block.ForwardMimo"/>. Mirrors the
+/// <see cref="Mamba3Block"/>.ForwardMimo. Mirrors the
 /// <see cref="NemotronHForwardState"/> pattern: one owned instance per model,
 /// grown in power-of-two steps by <see cref="EnsureCapacity"/>, freed on
 /// <see cref="Dispose"/>.

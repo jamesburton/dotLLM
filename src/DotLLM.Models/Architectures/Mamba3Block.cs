@@ -479,6 +479,52 @@ public static class Mamba3Block
         int mimoRank,
         float aFloor,
         float normEps = 1e-5f)
+        => ForwardMimo(
+            scratch, u, inProjWeight, outProjWeight,
+            dtBias, bNormWeight, cNormWeight, bBias, cBias, d, mimoZ, mimoO,
+            y, ssmState, cumAngle,
+            kState: Span<float>.Empty, vState: Span<float>.Empty,
+            seqLen, dModel, dInner, nHead, headDim, dState,
+            numBcHeads, numRopeAngles, mimoRank, aFloor, normEps);
+
+    /// <summary>
+    /// Streaming-aware overload of <see cref="ForwardMimo(Mamba3ForwardScratch, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, Span{float}, Span{float}, int, int, int, int, int, int, int, int, int, float, float)"/>.
+    /// Threads <paramref name="kState"/> (<c>[mimoRank, nHead, dState]</c>) and
+    /// <paramref name="vState"/> (<c>[nHead, headDim]</c>) across calls so that
+    /// a split schedule reproduces a one-shot MIMO forward to F32-reorder
+    /// noise. See <see cref="Mamba3CanonicalSsd.ExecuteMimoStreaming"/> for
+    /// the boundary math.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void ForwardMimo(
+        Mamba3ForwardScratch scratch,
+        ReadOnlySpan<float> u,
+        ReadOnlySpan<float> inProjWeight,
+        ReadOnlySpan<float> outProjWeight,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> bNormWeight,
+        ReadOnlySpan<float> cNormWeight,
+        ReadOnlySpan<float> bBias,
+        ReadOnlySpan<float> cBias,
+        ReadOnlySpan<float> d,
+        ReadOnlySpan<float> mimoZ,
+        ReadOnlySpan<float> mimoO,
+        Span<float> y,
+        Span<float> ssmState,
+        Span<float> cumAngle,
+        Span<float> kState,
+        Span<float> vState,
+        int seqLen,
+        int dModel,
+        int dInner,
+        int nHead,
+        int headDim,
+        int dState,
+        int numBcHeads,
+        int numRopeAngles,
+        int mimoRank,
+        float aFloor,
+        float normEps = 1e-5f)
     {
         ArgumentNullException.ThrowIfNull(scratch);
         ValidateCommon(seqLen, dModel, dInner, nHead, headDim, dState,
@@ -626,10 +672,14 @@ public static class Mamba3Block
             seqLen, nRank: R, nHead, dState, numRopeAngles,
             Mamba3RoPEMode.Halved);
 
-        // ── Step 6: MIMO SSD scan ───────────────────────────────────────────
-        Mamba3CanonicalSsd.ExecuteMimo(
+        // ── Step 6: MIMO SSD scan (streaming-aware) ────────────────────────
+        // ExecuteMimoStreaming applies the canonical chunk-boundary correction
+        // at entry (when kState/vState are non-empty) and writes the last-token
+        // K/V at exit. With empty kState/vState it is bit-equal to ExecuteMimo.
+        Mamba3CanonicalSsd.ExecuteMimoStreaming(
             ssmState, xBuf, cRHN, bRHN, qkPreDotSum,
-            scale, gamma, adt, d, zBuf, mimoZ, mimoO,
+            scale, gamma, adt, dt, trap, d, zBuf, mimoZ, mimoO,
+            kState, vState,
             yScan, yPerRank: Span<float>.Empty,
             seqLen, R, nHead, headDim, dState);
 
