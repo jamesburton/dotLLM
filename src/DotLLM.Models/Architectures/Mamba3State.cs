@@ -34,12 +34,19 @@ namespace DotLLM.Models.Architectures;
 ///   <item>
 ///     <description>
 ///       <c>k_state</c> — the previous chunk's last-token post-RoPE,
-///       pre-scale K tensor, shape <c>[n_head, d_state]</c> row-major.
-///       Consumed at the NEXT chunk's first token to reconstruct the
+///       pre-scale K tensor. For SISO the layout is
+///       <c>[n_head, d_state]</c> row-major; for MIMO (rank <c>R &gt; 1</c>)
+///       it expands to <c>[mimo_rank, n_head, d_state]</c> to mirror the
+///       canonical <c>(batch, R, nheads, d_state)</c> <c>k_state</c> produced
+///       by the MIMO combined kernel (see
+///       <c>state-spaces/mamba</c> <c>mamba3.py:434-445</c> and
+///       <c>mamba3_mimo_fwd.py:275-279</c>). Consumed at the NEXT chunk's
+///       first token to reconstruct the
 ///       <c>shifted_γ[T_prev-1] = DT[0_new]·(1-trap[0_new])</c> term that a
 ///       one-shot forward would have folded in at the chunk edge. Matches
 ///       canonical <c>final_k_state</c> / <c>input_k_state</c> from
-///       <c>mamba3_siso_fwd.py:318-322,341-343</c>.
+///       <c>mamba3_siso_fwd.py:318-322,341-343</c> (SISO) and the MIMO
+///       rank-sum boundary analog (<c>Mamba3CanonicalSsd.ExecuteMimoStreaming</c>).
 ///     </description>
 ///   </item>
 ///   <item>
@@ -89,7 +96,12 @@ public sealed unsafe class Mamba3State : IDisposable
     /// <summary>Elements per layer in the cumulative RoPE angle buffer (<c>n_head · num_rope_angles</c>).</summary>
     public int CumAngleElementsPerLayer => _cumAngleElementsPerLayer;
 
-    /// <summary>Elements per layer in the K state (<c>n_head · d_state</c>) — the previous chunk's last-token post-RoPE K.</summary>
+    /// <summary>
+    /// Elements per layer in the K state. For SISO this is <c>n_head · d_state</c>
+    /// (<c>[H, N]</c> layout); for MIMO this is <c>mimo_rank · n_head · d_state</c>
+    /// (<c>[R, H, N]</c> layout) — the previous chunk's last-token post-RoPE K
+    /// per rank, mirroring canonical <c>k_state (B, R, H, N)</c>.
+    /// </summary>
     public int KStateElementsPerLayer => _kStateElementsPerLayer;
 
     /// <summary>Elements per layer in the V state (<c>n_head · head_dim</c>) — the previous chunk's last-token V.</summary>
@@ -115,9 +127,15 @@ public sealed unsafe class Mamba3State : IDisposable
                 nameof(config));
 
         _numLayers = config.NumLayers;
+        // MIMO k_state carries a rank axis (canonical mamba3.py:434-445):
+        //   is_mimo=False → [H, N]   (R == 1 implicit)
+        //   is_mimo=True  → [R, H, N]
+        // Everything else (SSM state, cum_angle, v_state) is rank-free in the
+        // canonical decode cache.
+        int kRank = (m3.IsMimo ? m3.MimoRank : 1);
         _ssmStateElementsPerLayer = m3.NumHeads * m3.HeadDim * m3.StateSize;
         _cumAngleElementsPerLayer = m3.NumHeads * m3.NumRopeAngles;
-        _kStateElementsPerLayer = m3.NumHeads * m3.StateSize;
+        _kStateElementsPerLayer = kRank * m3.NumHeads * m3.StateSize;
         _vStateElementsPerLayer = m3.NumHeads * m3.HeadDim;
 
         if (_numLayers <= 0)

@@ -231,6 +231,36 @@ public sealed class Mamba3TransformerModelDecodeTests : IDisposable
     }
 
     [Fact]
+    public void Mamba3State_MimoKStateIsRankExpanded()
+    {
+        // Canonical mamba3.py:434-445: when is_mimo=True the decode cache's
+        // k_state carries a rank axis ([R, H, N]); the other buffers are
+        // rank-free. A SISO config (covered by Mamba3State_ZeroedOnConstruct)
+        // keeps k_state at [H, N].
+        const int mimoRank = 3;
+        ModelConfig cfg = BuildConfig() with
+        {
+            Mamba3Config = BuildConfig().Mamba3Config! with
+            {
+                IsMimo = true,
+                MimoRank = mimoRank,
+            },
+        };
+        using var state = new Mamba3State(cfg);
+
+        Assert.Equal(NumHeads * HeadDim * StateSize, state.SsmStateElementsPerLayer);
+        Assert.Equal(NumHeads * NumRopeAngles, state.CumAngleElementsPerLayer);
+        Assert.Equal(mimoRank * NumHeads * StateSize, state.KStateElementsPerLayer);
+        Assert.Equal(NumHeads * HeadDim, state.VStateElementsPerLayer);
+
+        for (int layer = 0; layer < NumLayers; layer++)
+        {
+            Assert.Equal(mimoRank * NumHeads * StateSize, state.KState(layer).Length);
+            foreach (float v in state.KState(layer)) Assert.Equal(0f, v);
+        }
+    }
+
+    [Fact]
     public void StateThreading_KAndVStateAdvance_AtChunkEnd()
     {
         // After a prefill, k_state / v_state must be non-zero (the previous
