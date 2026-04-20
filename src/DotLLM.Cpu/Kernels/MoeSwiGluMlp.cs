@@ -30,10 +30,11 @@ namespace DotLLM.Cpu.Kernels;
 /// behaviour on the forward-order CPU path.
 /// </para>
 /// <para>
-/// <b>Scalar-first PoC.</b> The per-expert GEMV uses the single-threaded
-/// F32 <c>MatMul.GemvF32</c> overload directly — no per-expert quantisation,
-/// no fused GroupedGEMM. That is fine for validation; a fused kernel is a
-/// follow-up when a real Mixtral-scale model is wired up.
+/// <b>GroupedGEMM execution.</b> The kernel buckets tokens by their assigned
+/// expert, runs one batched SwiGLU GEMM per expert (gather → GEMM → SwiGLU →
+/// GEMM → scatter), and finally accumulates each token's output by walking
+/// its top-k slots in order. The per-(token,slot) accumulation order is
+/// identical to the original scalar path, so the output is bit-identical.
 /// </para>
 /// <para>
 /// <b>Weight layout.</b> Expert weights are passed as three flat arrays of
@@ -77,7 +78,7 @@ public static unsafe class MoeSwiGluMlp
     {
         // Default overload keeps the Mixtral contract: always renormalise top-k,
         // no shared expert. Qwen-MoE callers go through ExecuteWithSharedExpert.
-        ExecuteCore(
+        ExecuteCoreGrouped(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
             numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
             normTopKProb: true,
@@ -135,7 +136,7 @@ public static unsafe class MoeSwiGluMlp
         int sharedIntermediateSize,
         ReadOnlySpan<float> sharedExpertGate)
     {
-        ExecuteCore(
+        ExecuteCoreGrouped(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
             numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
             normTopKProb,
@@ -143,8 +144,15 @@ public static unsafe class MoeSwiGluMlp
             sharedIntermediateSize, sharedExpertGate);
     }
 
+    /// <summary>
+    /// GroupedGEMM MoE core: routes once, buckets tokens per expert, runs one
+    /// batched SwiGLU GEMM per active expert, then scatters the per-(token,slot)
+    /// "down" outputs back into a dense table. The final accumulation walks
+    /// <c>(t, slot=0..k-1)</c> in order — same accumulation order as the
+    /// scalar per-token loop, so the output is bit-identical.
+    /// </summary>
     [SkipLocalsInit]
-    private static void ExecuteCore(
+    private static void ExecuteCoreGrouped(
         ReadOnlySpan<float> hidden,
         ReadOnlySpan<float> gateWeights,
         ReadOnlySpan<nint> expertsW1,
@@ -175,143 +183,317 @@ public static unsafe class MoeSwiGluMlp
         if (expertsW1.Length != numExperts || expertsW2.Length != numExperts || expertsW3.Length != numExperts)
             throw new ArgumentException("Expert weight arrays must each have numExperts entries.");
 
+        if (seqLen == 0) return;
+
         bool hasSharedExpert = sharedIntermediateSize > 0
                                && sharedGateProj is not null
                                && sharedUpProj is not null
                                && sharedDownProj is not null;
         bool hasSharedGate = hasSharedExpert && sharedExpertGate.Length >= hiddenSize;
 
-        // Scratch buffers — rented from the pool so per-call allocations are free.
-        // The per-token 'acc' buffer is the MoE output for that token; it
-        // accumulates expert contributions without touching 'output' until the
-        // end of the token, which keeps this kernel safe to call with
-        // <c>hidden</c> and <c>output</c> aliasing.
-        //
-        // Intermediate scratch (gate/up/silu) is sized for the MAX of routed-
-        // expert and shared-expert intermediate widths so a single rent covers
-        // both paths.
+        int totalAssignments = seqLen * numExpertsPerTok;
+
+        // ────────────── Pooled scratch buffers ──────────────
+        // All per-call allocations routed through ArrayPool — zero sustained
+        // heap traffic. .AsSpan(0, actualCount) because Rent may return larger.
+
+        // Router scratch (per-token): gate logits & full softmax.
+        float[] gateLogitsBuf = ArrayPool<float>.Shared.Rent(seqLen * numExperts);
+        float[] routingBuf = ArrayPool<float>.Shared.Rent(seqLen * numExperts);
+
+        // Per-assignment (token × slot) routing results.
+        int[] assignExpertBuf = ArrayPool<int>.Shared.Rent(totalAssignments);
+        float[] assignWeightBuf = ArrayPool<float>.Shared.Rent(totalAssignments);
+
+        // Per-expert buckets: for expert e, tokens are stored at indices
+        // [expertOffset[e], expertOffset[e+1]). Each entry stores
+        // (tokenIdx, slot) packed so the scatter can walk a single stream.
+        int[] expertCountBuf = ArrayPool<int>.Shared.Rent(numExperts + 1);
+        int[] expertTokenBuf = ArrayPool<int>.Shared.Rent(totalAssignments);
+        int[] expertSlotBuf = ArrayPool<int>.Shared.Rent(totalAssignments);
+
+        // Gathered per-expert batched inputs + batched GEMM scratch. Sized
+        // for the worst-case batch = totalAssignments (an expert can appear in
+        // every slot of every token). Intermediate widths cover both routed
+        // and shared paths so one rent serves both.
         int maxIntermediate = hasSharedExpert
             ? Math.Max(intermediateSize, sharedIntermediateSize)
             : intermediateSize;
-        float[] gateLogitsBuf = ArrayPool<float>.Shared.Rent(numExperts);
-        float[] routingBuf = ArrayPool<float>.Shared.Rent(numExperts);
-        float[] gateBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
-        float[] upBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
-        float[] siluBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
-        float[] downBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+        int maxRoutedBatch = totalAssignments;
+
+        float[] batchInBuf = ArrayPool<float>.Shared.Rent(maxRoutedBatch * hiddenSize);
+        float[] gateBatchBuf = ArrayPool<float>.Shared.Rent(maxRoutedBatch * maxIntermediate);
+        float[] upBatchBuf = ArrayPool<float>.Shared.Rent(maxRoutedBatch * maxIntermediate);
+        float[] siluBatchBuf = ArrayPool<float>.Shared.Rent(maxRoutedBatch * maxIntermediate);
+        float[] downBatchBuf = ArrayPool<float>.Shared.Rent(maxRoutedBatch * hiddenSize);
+
+        // Per-(token,slot) down-projected outputs, keyed by t*k + slot. This
+        // is the table we index from during the final in-order accumulation.
+        float[] scatterDownBuf = ArrayPool<float>.Shared.Rent(totalAssignments * hiddenSize);
+
+        // Shared-expert scratch: batched across all seqLen tokens at once.
+        int sharedBatch = hasSharedExpert ? seqLen : 0;
+        float[]? sharedGateBatchBuf = null;
+        float[]? sharedUpBatchBuf = null;
+        float[]? sharedSiluBatchBuf = null;
+        float[]? sharedDownBatchBuf = null;
+        float[]? sharedScaleBuf = null;
+        if (hasSharedExpert)
+        {
+            sharedGateBatchBuf = ArrayPool<float>.Shared.Rent(sharedBatch * sharedIntermediateSize);
+            sharedUpBatchBuf = ArrayPool<float>.Shared.Rent(sharedBatch * sharedIntermediateSize);
+            sharedSiluBatchBuf = ArrayPool<float>.Shared.Rent(sharedBatch * sharedIntermediateSize);
+            sharedDownBatchBuf = ArrayPool<float>.Shared.Rent(sharedBatch * hiddenSize);
+            sharedScaleBuf = ArrayPool<float>.Shared.Rent(sharedBatch);
+        }
+
+        // Per-token accumulator (same role as the scalar kernel's acc buffer).
+        // Keeping 'output' untouched until the very end lets callers alias
+        // hidden and output.
         float[] accBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+
         Span<int> topkIdx = stackalloc int[numExpertsPerTok];
         Span<float> topkProb = stackalloc float[numExpertsPerTok];
 
         try
         {
-            var gateLogits = gateLogitsBuf.AsSpan(0, numExperts);
-            var routing = routingBuf.AsSpan(0, numExperts);
-            var down = downBuf.AsSpan(0, hiddenSize);
-            var acc = accBuf.AsSpan(0, hiddenSize);
+            Span<int> expertCount = expertCountBuf.AsSpan(0, numExperts + 1);
+            expertCount.Clear();
 
+            // ────────────── 1) Routing (per-token, unchanged) ──────────────
+            // Gate-logit GEMV + softmax + top-k + optional renormalise. We
+            // deliberately keep these as per-token calls to preserve the
+            // exact reduction order of the scalar kernel (softmax, sort, etc.).
             fixed (float* hiddenPtr = hidden)
             fixed (float* gateWPtr = gateWeights)
-            fixed (float* outPtr = output)
-            fixed (float* gateBufPtr = gateBuf)
-            fixed (float* upBufPtr = upBuf)
-            fixed (float* siluBufPtr = siluBuf)
-            fixed (float* downBufPtr = down)
-            fixed (float* logitsPtr = gateLogits)
-            fixed (float* sharedGatePtr = sharedExpertGate)
+            fixed (float* logitsAllPtr = gateLogitsBuf)
             {
                 for (int t = 0; t < seqLen; t++)
                 {
                     float* x = hiddenPtr + t * hiddenSize;
-                    float* y = outPtr + t * hiddenSize;
+                    float* logits = logitsAllPtr + t * numExperts;
+                    MatMul.GemvF32(gateWPtr, x, logits, numExperts, hiddenSize);
+                }
+            }
 
-                    // 1) Router: gate_logits[e] = gate.weight[e, :] . x
-                    //    gate.weight is [E, H] row-major, so this is a plain GEMV.
-                    MatMul.GemvF32(gateWPtr, x, logitsPtr, numExperts, hiddenSize);
+            for (int t = 0; t < seqLen; t++)
+            {
+                var logitsSpan = gateLogitsBuf.AsSpan(t * numExperts, numExperts);
+                var routingSpan = routingBuf.AsSpan(t * numExperts, numExperts);
+                Softmax.Execute(logitsSpan, routingSpan);
 
-                    // 2) Full softmax over E experts.
-                    Softmax.Execute(gateLogits, routing);
+                SelectTopK(routingSpan, topkIdx, topkProb);
 
-                    // 3) Top-k selection: partial max-scan. numExperts is small
-                    //    (8-64 in practice), so O(E*k) is fine and avoids a
-                    //    temporary sort allocation.
-                    SelectTopK(routing, topkIdx, topkProb);
+                if (normTopKProb)
+                {
+                    float sum = 0f;
+                    for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
+                    float invSum = sum > 0f ? 1.0f / sum : 0f;
+                    for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
+                }
 
-                    // 4) Optionally renormalise the top-k probabilities by sum
-                    //    (Mixtral + Qwen3-MoE convention). Qwen1.5-MoE leaves
-                    //    them as raw softmax values — their sum < 1 softens
-                    //    the routed contribution before the shared-expert add.
-                    if (normTopKProb)
+                // Record assignments in (token, slot) order. Also bump the
+                // per-expert occupancy count so we can build the histogram.
+                for (int slot = 0; slot < numExpertsPerTok; slot++)
+                {
+                    int e = topkIdx[slot];
+                    int assignIdx = t * numExpertsPerTok + slot;
+                    assignExpertBuf[assignIdx] = e;
+                    assignWeightBuf[assignIdx] = topkProb[slot];
+                    expertCount[e]++;
+                }
+            }
+
+            // ────────────── 2) Build per-expert token buckets ──────────────
+            // Exclusive-prefix-sum turns the histogram into offsets into
+            // expertTokenBuf / expertSlotBuf. expertCount[numExperts] holds
+            // the running cursor during fill; we reset it to the starts after.
+            int running = 0;
+            for (int e = 0; e <= numExperts; e++)
+            {
+                int c = expertCount[e];
+                expertCount[e] = running;
+                running += c;
+            }
+            // expertCount is now the exclusive-scan offset array.
+            // Use a temporary cursor array for the fill phase.
+            // We overload expertCountBuf by keeping the scan in 'expertCount'
+            // but we need per-expert write cursors; use a local stack alloc
+            // for typical small E (<=256), else rent.
+            int[]? cursorRented = null;
+            Span<int> cursor = numExperts <= 256
+                ? stackalloc int[numExperts]
+                : (cursorRented = ArrayPool<int>.Shared.Rent(numExperts)).AsSpan(0, numExperts);
+            for (int e = 0; e < numExperts; e++) cursor[e] = expertCount[e];
+
+            try
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    for (int slot = 0; slot < numExpertsPerTok; slot++)
                     {
-                        float sum = 0f;
-                        for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
-                        float invSum = sum > 0f ? 1.0f / sum : 0f;
-                        for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
+                        int assignIdx = t * numExpertsPerTok + slot;
+                        int e = assignExpertBuf[assignIdx];
+                        int pos = cursor[e]++;
+                        expertTokenBuf[pos] = t;
+                        expertSlotBuf[pos] = slot;
+                    }
+                }
+            }
+            finally
+            {
+                if (cursorRented is not null) ArrayPool<int>.Shared.Return(cursorRented);
+            }
+
+            // ────────────── 3) Per-expert batched SwiGLU ──────────────
+            // For each expert with B>0 assignments: gather B token rows into
+            // batchIn, run two [B,I] GEMMs for gate/up, SwiGLU fuse, then one
+            // [B,H] GEMM for down. The resulting down rows are scattered into
+            // scatterDown[(tokenIdx*k + slot) * H : +H] so the final
+            // accumulation can walk (t, slot) in order.
+            fixed (float* hiddenPtr = hidden)
+            fixed (float* batchInPtr = batchInBuf)
+            fixed (float* gateBatchPtr = gateBatchBuf)
+            fixed (float* upBatchPtr = upBatchBuf)
+            fixed (float* siluBatchPtr = siluBatchBuf)
+            fixed (float* downBatchPtr = downBatchBuf)
+            fixed (float* scatterDownPtr = scatterDownBuf)
+            {
+                for (int e = 0; e < numExperts; e++)
+                {
+                    int start = expertCount[e];
+                    int end = expertCount[e + 1];
+                    int batch = end - start;
+                    if (batch == 0) continue;
+
+                    // Gather hidden[tokenIdx] → batchIn[0..batch, :]
+                    for (int b = 0; b < batch; b++)
+                    {
+                        int t = expertTokenBuf[start + b];
+                        Buffer.MemoryCopy(
+                            hiddenPtr + (long)t * hiddenSize,
+                            batchInPtr + (long)b * hiddenSize,
+                            hiddenSize * sizeof(float),
+                            hiddenSize * sizeof(float));
                     }
 
-                    // 5) Accumulate weighted expert outputs into 'acc'. Starts
-                    //    zeroed; aliasing 'hidden' with 'output' is safe because
-                    //    we only write to 'output' at the end of each token,
-                    //    after all reads from 'x' are complete.
-                    acc.Clear();
-                    var routedGate = new Span<float>(gateBufPtr, intermediateSize);
-                    var routedUp = new Span<float>(upBufPtr, intermediateSize);
-                    var routedSilu = new Span<float>(siluBufPtr, intermediateSize);
-                    for (int i = 0; i < numExpertsPerTok; i++)
+                    float* w1 = (float*)expertsW1[e];
+                    float* w2 = (float*)expertsW2[e];
+                    float* w3 = (float*)expertsW3[e];
+
+                    // GemmF32 computes C[N,M] = B[N,K] × A[M,K]^T.
+                    //   gate[batch,I] = batchIn[batch,H] × w1[I,H]^T
+                    MatMul.GemmF32(w1, batchInPtr, gateBatchPtr, intermediateSize, hiddenSize, batch);
+                    MatMul.GemmF32(w3, batchInPtr, upBatchPtr, intermediateSize, hiddenSize, batch);
+
+                    // Per-row SwiGLU (fuse identical to scalar path).
+                    var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
+                    var upBatchSpan = new Span<float>(upBatchPtr, batch * intermediateSize);
+                    var siluBatchSpan = new Span<float>(siluBatchPtr, batch * intermediateSize);
+                    for (int b = 0; b < batch; b++)
                     {
-                        int eIdx = topkIdx[i];
-                        float w = topkProb[i];
-                        if (w == 0f) continue;
-
-                        float* w1 = (float*)expertsW1[eIdx];
-                        float* w2 = (float*)expertsW2[eIdx];
-                        float* w3 = (float*)expertsW3[eIdx];
-
-                        // gate = w1 @ x   [I]
-                        // up   = w3 @ x   [I]
-                        MatMul.GemvF32(w1, x, gateBufPtr, intermediateSize, hiddenSize);
-                        MatMul.GemvF32(w3, x, upBufPtr, intermediateSize, hiddenSize);
-
-                        // silu = SwiGLU(gate, up) = sigmoid(gate) * gate * up
-                        FusedOps.SwiGLU(routedGate, routedUp, routedSilu);
-
-                        // down = w2 @ silu    [H]
-                        MatMul.GemvF32(w2, siluBufPtr, downBufPtr, hiddenSize, intermediateSize);
-
-                        // acc += w * down
-                        TensorPrimitives.MultiplyAdd(down, w, acc, acc);
+                        int off = b * intermediateSize;
+                        FusedOps.SwiGLU(
+                            gateBatchSpan.Slice(off, intermediateSize),
+                            upBatchSpan.Slice(off, intermediateSize),
+                            siluBatchSpan.Slice(off, intermediateSize));
                     }
 
-                    // 6) Optional shared-expert branch — dense SwiGLU MLP that
-                    //    runs on every token (no routing), with optional
-                    //    sigmoid scalar gate. Output is added to 'acc' before
-                    //    write-back. Qwen1.5-MoE-A2.7B convention.
-                    if (hasSharedExpert)
+                    //   down[batch,H] = silu[batch,I] × w2[H,I]^T
+                    MatMul.GemmF32(w2, siluBatchPtr, downBatchPtr, hiddenSize, intermediateSize, batch);
+
+                    // Scatter each row of down to scatterDown[(t*k + slot)*H].
+                    for (int b = 0; b < batch; b++)
                     {
-                        var sharedGateSpan = new Span<float>(gateBufPtr, sharedIntermediateSize);
-                        var sharedUpSpan = new Span<float>(upBufPtr, sharedIntermediateSize);
-                        var sharedSiluSpan = new Span<float>(siluBufPtr, sharedIntermediateSize);
+                        int t = expertTokenBuf[start + b];
+                        int slot = expertSlotBuf[start + b];
+                        Buffer.MemoryCopy(
+                            downBatchPtr + (long)b * hiddenSize,
+                            scatterDownPtr + (long)(t * numExpertsPerTok + slot) * hiddenSize,
+                            hiddenSize * sizeof(float),
+                            hiddenSize * sizeof(float));
+                    }
+                }
 
-                        MatMul.GemvF32(sharedGateProj, x, gateBufPtr, sharedIntermediateSize, hiddenSize);
-                        MatMul.GemvF32(sharedUpProj, x, upBufPtr, sharedIntermediateSize, hiddenSize);
-                        FusedOps.SwiGLU(sharedGateSpan, sharedUpSpan, sharedSiluSpan);
-                        MatMul.GemvF32(sharedDownProj, siluBufPtr, downBufPtr, hiddenSize, sharedIntermediateSize);
+            }
 
-                        float sharedScale = 1.0f;
+            // ────────────── 4) Shared-expert batched compute ──────────────
+            // Hoisted out of the routed-expert fixed-scope so the shared-expert
+            // down-batch pinning can span into the final accumulation loop.
+            if (hasSharedExpert)
+            {
+                fixed (float* hiddenPtr = hidden)
+                fixed (float* sgBatch = sharedGateBatchBuf)
+                fixed (float* suBatch = sharedUpBatchBuf)
+                fixed (float* ssBatch = sharedSiluBatchBuf)
+                fixed (float* sdBatch = sharedDownBatchBuf)
+                fixed (float* sharedGatePtr = sharedExpertGate)
+                {
+                    //   gate_shared[T,sI] = hidden[T,H] × sharedW1[sI,H]^T
+                    MatMul.GemmF32(sharedGateProj, hiddenPtr, sgBatch,
+                        sharedIntermediateSize, hiddenSize, seqLen);
+                    MatMul.GemmF32(sharedUpProj, hiddenPtr, suBatch,
+                        sharedIntermediateSize, hiddenSize, seqLen);
+
+                    var sharedGateSpanBatch = new Span<float>(sgBatch, seqLen * sharedIntermediateSize);
+                    var sharedUpSpanBatch = new Span<float>(suBatch, seqLen * sharedIntermediateSize);
+                    var sharedSiluSpanBatch = new Span<float>(ssBatch, seqLen * sharedIntermediateSize);
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int off = t * sharedIntermediateSize;
+                        FusedOps.SwiGLU(
+                            sharedGateSpanBatch.Slice(off, sharedIntermediateSize),
+                            sharedUpSpanBatch.Slice(off, sharedIntermediateSize),
+                            sharedSiluSpanBatch.Slice(off, sharedIntermediateSize));
+                    }
+
+                    //   down_shared[T,H] = silu[T,sI] × sharedW2[H,sI]^T
+                    MatMul.GemmF32(sharedDownProj, ssBatch, sdBatch,
+                        hiddenSize, sharedIntermediateSize, seqLen);
+
+                    // Per-token sigmoid gate logit — same scalar loop as the
+                    // original kernel so the resulting scale is bit-identical.
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        float scale = 1.0f;
                         if (hasSharedGate)
                         {
-                            // sigmoid(hidden . SharedExpertGate) — per-token scalar ∈ (0,1).
+                            float* x = hiddenPtr + t * hiddenSize;
                             float logit = 0f;
                             for (int j = 0; j < hiddenSize; j++)
                                 logit += sharedGatePtr[j] * x[j];
-                            sharedScale = 1.0f / (1.0f + MathF.Exp(-logit));
+                            scale = 1.0f / (1.0f + MathF.Exp(-logit));
                         }
-
-                        TensorPrimitives.MultiplyAdd(down, sharedScale, acc, acc);
+                        sharedScaleBuf![t] = scale;
                     }
+                }
+            }
 
-                    // 7) Write accumulated output for this token.
-                    acc.CopyTo(new Span<float>(y, hiddenSize));
+            // ────────────── 5) Final in-order accumulation ──────────────
+            // For each token: acc = 0; for slot 0..k-1: acc += w * down; then
+            // if shared: acc += sharedScale * sharedDown. This is the exact
+            // sequence the scalar kernel ran, so every TensorPrimitives
+            // .MultiplyAdd fires on the same operands in the same order.
+            var acc = accBuf.AsSpan(0, hiddenSize);
+            fixed (float* outPtr = output)
+            fixed (float* scatterDownPtr = scatterDownBuf)
+            {
+                if (hasSharedExpert)
+                {
+                    fixed (float* sdPtr = sharedDownBatchBuf)
+                    {
+                        FinalAccumulate(
+                            scatterDownPtr, sdPtr, sharedScaleBuf!,
+                            assignWeightBuf, outPtr, acc,
+                            seqLen, numExpertsPerTok, hiddenSize, hasShared: true);
+                    }
+                }
+                else
+                {
+                    FinalAccumulate(
+                        scatterDownPtr, null, null,
+                        assignWeightBuf, outPtr, acc,
+                        seqLen, numExpertsPerTok, hiddenSize, hasShared: false);
                 }
             }
         }
@@ -319,11 +501,68 @@ public static unsafe class MoeSwiGluMlp
         {
             ArrayPool<float>.Shared.Return(gateLogitsBuf);
             ArrayPool<float>.Shared.Return(routingBuf);
-            ArrayPool<float>.Shared.Return(gateBuf);
-            ArrayPool<float>.Shared.Return(upBuf);
-            ArrayPool<float>.Shared.Return(siluBuf);
-            ArrayPool<float>.Shared.Return(downBuf);
+            ArrayPool<int>.Shared.Return(assignExpertBuf);
+            ArrayPool<float>.Shared.Return(assignWeightBuf);
+            ArrayPool<int>.Shared.Return(expertCountBuf);
+            ArrayPool<int>.Shared.Return(expertTokenBuf);
+            ArrayPool<int>.Shared.Return(expertSlotBuf);
+            ArrayPool<float>.Shared.Return(batchInBuf);
+            ArrayPool<float>.Shared.Return(gateBatchBuf);
+            ArrayPool<float>.Shared.Return(upBatchBuf);
+            ArrayPool<float>.Shared.Return(siluBatchBuf);
+            ArrayPool<float>.Shared.Return(downBatchBuf);
+            ArrayPool<float>.Shared.Return(scatterDownBuf);
+            if (sharedGateBatchBuf is not null) ArrayPool<float>.Shared.Return(sharedGateBatchBuf);
+            if (sharedUpBatchBuf is not null) ArrayPool<float>.Shared.Return(sharedUpBatchBuf);
+            if (sharedSiluBatchBuf is not null) ArrayPool<float>.Shared.Return(sharedSiluBatchBuf);
+            if (sharedDownBatchBuf is not null) ArrayPool<float>.Shared.Return(sharedDownBatchBuf);
+            if (sharedScaleBuf is not null) ArrayPool<float>.Shared.Return(sharedScaleBuf);
             ArrayPool<float>.Shared.Return(accBuf);
+        }
+    }
+
+    /// <summary>
+    /// Per-token final accumulation: walks slots 0..k-1 in order and
+    /// (optionally) applies the shared-expert contribution, matching the
+    /// scalar kernel's accumulation sequence exactly for bit-identity.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FinalAccumulate(
+        float* scatterDownPtr,
+        float* sharedDownPtr,
+        float[]? sharedScale,
+        float[] assignWeight,
+        float* outPtr,
+        Span<float> acc,
+        int seqLen,
+        int numExpertsPerTok,
+        int hiddenSize,
+        bool hasShared)
+    {
+        for (int t = 0; t < seqLen; t++)
+        {
+            acc.Clear();
+            for (int slot = 0; slot < numExpertsPerTok; slot++)
+            {
+                int assignIdx = t * numExpertsPerTok + slot;
+                float w = assignWeight[assignIdx];
+                if (w == 0f) continue;
+
+                var downRow = new ReadOnlySpan<float>(
+                    scatterDownPtr + (long)assignIdx * hiddenSize, hiddenSize);
+                TensorPrimitives.MultiplyAdd(downRow, w, acc, acc);
+            }
+
+            if (hasShared)
+            {
+                float scale = sharedScale![t];
+                var sdRow = new ReadOnlySpan<float>(
+                    sharedDownPtr + (long)t * hiddenSize, hiddenSize);
+                TensorPrimitives.MultiplyAdd(sdRow, scale, acc, acc);
+            }
+
+            acc.CopyTo(new Span<float>(outPtr + (long)t * hiddenSize, hiddenSize));
         }
     }
 
