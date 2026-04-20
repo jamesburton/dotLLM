@@ -1,5 +1,6 @@
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Models.Architectures;
@@ -63,8 +64,12 @@ namespace DotLLM.Models.Architectures;
 /// <para>
 /// <b>Alias safety.</b> All <c>ReadOnlySpan</c> inputs are read-only. <c>y</c>
 /// must not overlap any input. <c>ssmState</c> and <c>cumAngle</c> are
-/// read/written in place. Scratch is allocated per-call (<c>new float[]</c>) —
-/// a pooled-scratch follow-up is tracked against a future stage, not this one.
+/// read/written in place. Per-call temporaries (in_proj output, split slices,
+/// DT / ADT / gamma / scale, biased B / C, qk_pre_dot, yScan) are drawn from
+/// the caller-owned <see cref="Mamba3ForwardScratch"/>; the scratch is
+/// allocated once by the model and reused across every layer / every Forward
+/// call, eliminating the per-call managed-array allocations from earlier
+/// stages.
 /// </para>
 /// </remarks>
 public static class Mamba3Block
@@ -100,8 +105,15 @@ public static class Mamba3Block
     /// <param name="numRopeAngles">Number of rotated pairs S (rotates first <c>2·S</c> channels).</param>
     /// <param name="aFloor">Floor for <c>-A</c> clamp (<c>A ≤ -aFloor</c>). Typical <c>1e-4</c>.</param>
     /// <param name="normEps">RMSNorm stabilising constant (default 1e-5).</param>
+    /// <param name="scratch">
+    /// Caller-owned pooled scratch. Sized on demand via
+    /// <see cref="Mamba3ForwardScratch.EnsureCapacity(int)"/>. Safe to share a
+    /// single instance across every layer and every Forward call for a given
+    /// model.
+    /// </param>
     [SkipLocalsInit]
     public static void Forward(
+        Mamba3ForwardScratch scratch,
         ReadOnlySpan<float> u,
         ReadOnlySpan<float> inProjWeight,
         ReadOnlySpan<float> outProjWeight,
@@ -125,6 +137,7 @@ public static class Mamba3Block
         float aFloor,
         float normEps = 1e-5f)
     {
+        ArgumentNullException.ThrowIfNull(scratch);
         ValidateCommon(seqLen, dModel, dInner, nHead, headDim, dState,
                        numBcHeads, numRopeAngles);
 
@@ -133,22 +146,30 @@ public static class Mamba3Block
         int dInProj = 2 * dInner + 2 * bcPerToken + 3 * nHead + numRopeAngles;
 
         // ── Scratch ─────────────────────────────────────────────────────────
-        float[] proj = new float[seqLen * dInProj];
-        float[] xBuf = new float[seqLen * dInner];                    // [T, H*P]
-        float[] zBuf = new float[seqLen * dInner];                    // [T, H*P]
-        float[] dt = new float[seqLen * nHead];                       // DT
-        float[] adt = new float[seqLen * nHead];                      // _A · DT
-        float[] trap = new float[seqLen * nHead];
-        float[] gamma = new float[seqLen * nHead];
-        float[] scale = new float[seqLen * nHead];
-        float[] anglesRaw = new float[seqLen * numRopeAngles];
+        // Pooled, 64-byte-aligned, owned by the caller. Span views are sized
+        // to the current seqLen — the backing allocation may be larger
+        // (power-of-two growth) but that does not affect any slice maths.
+        scratch.EnsureCapacity(seqLen);
+        Span<float> proj = scratch.Proj(seqLen);
+        Span<float> xBuf = scratch.X(seqLen);                          // [T, H*P]
+        Span<float> zBuf = scratch.Z(seqLen);                          // [T, H*P]
+        Span<float> dt = scratch.Dt(seqLen);                           // DT
+        Span<float> adt = scratch.Adt(seqLen);                         // _A · DT
+        Span<float> trap = scratch.Trap(seqLen);
+        Span<float> gamma = scratch.Gamma(seqLen);
+        Span<float> scale = scratch.Scale(seqLen);
+        Span<float> anglesRaw = scratch.AnglesRaw(seqLen);
         // Expanded to nHead during SSD — canonical forward keeps B/C as
         // [T, R=1, H, N] because num_bc_heads==1 is expanded to H by the SSD
         // kernel. We materialise the expanded form here (R=1 collapsed away).
-        float[] bHRN = new float[seqLen * nHead * dState];            // [T, H, N]
-        float[] cHRN = new float[seqLen * nHead * dState];
-        float[] qkPreDot = new float[seqLen * nHead];                 // [T, H]
-        float[] yScan = new float[seqLen * dInner];                   // [T, H*P]
+        // Scratch sizes B / C at T·max(1,mimoRank)·H·N — for a SISO model
+        // this is exactly T·H·N so we take the span as-is; a SISO Forward on
+        // a scratch built for a MIMO model would never run (MIMO dispatches
+        // via ForwardMimo).
+        Span<float> bHRN = scratch.B(seqLen).Slice(0, seqLen * nHead * dState);
+        Span<float> cHRN = scratch.C(seqLen).Slice(0, seqLen * nHead * dState);
+        Span<float> qkPreDot = scratch.QkPreDot(seqLen);               // [T, H]
+        Span<float> yScan = scratch.YScan(seqLen);                     // [T, H*P]
 
         // ── Step 1: in_proj GEMM ─────────────────────────────────────────────
         GemmF32(inProjWeight, u, proj, m: dInProj, k: dModel, n: seqLen);
@@ -181,8 +202,8 @@ public static class Mamba3Block
             int src = t * dInProj;
 
             // z, x copies for the current token.
-            new Span<float>(proj, src + ofsZ, dInner).CopyTo(zBuf.AsSpan(t * dInner, dInner));
-            new Span<float>(proj, src + ofsX, dInner).CopyTo(xBuf.AsSpan(t * dInner, dInner));
+            proj.Slice(src + ofsZ, dInner).CopyTo(zBuf.Slice(t * dInner, dInner));
+            proj.Slice(src + ofsX, dInner).CopyTo(xBuf.Slice(t * dInner, dInner));
 
             // DT[t,h] = softplus(dd_dt[t,h] + dt_bias[h])
             // _A[t,h] = max(-aFloor, -softplus(dd_A[t,h]))
@@ -207,8 +228,8 @@ public static class Mamba3Block
 
             // angles_raw[t,:] (shared across heads; rotation multiplies by DT per head
             // inside ExecuteCanonical).
-            new Span<float>(proj, src + ofsAngles, numRopeAngles)
-                .CopyTo(anglesRaw.AsSpan(t * numRopeAngles, numRopeAngles));
+            proj.Slice(src + ofsAngles, numRopeAngles)
+                .CopyTo(anglesRaw.Slice(t * numRopeAngles, numRopeAngles));
 
             // B/C per-(G,N) slice normalization + broadcast to [H, N] + bias add.
             // Canonical layout of B_raw within a token is [R=1, G, N] row-major.
@@ -219,9 +240,9 @@ public static class Mamba3Block
                 int bSrcBase = src + ofsB + g * dState;
                 int cSrcBase = src + ofsC + g * dState;
                 // RMSNorm(slice[N]) · norm_weight
-                RmsNormInto(proj.AsSpan(bSrcBase, dState), bNormWeight, normEps,
+                RmsNormInto(proj.Slice(bSrcBase, dState), bNormWeight, normEps,
                             out float bInvRms);
-                RmsNormInto(proj.AsSpan(cSrcBase, dState), cNormWeight, normEps,
+                RmsNormInto(proj.Slice(cSrcBase, dState), cNormWeight, normEps,
                             out float cInvRms);
 
                 // Broadcast every group slice to the H heads it maps to
@@ -253,8 +274,8 @@ public static class Mamba3Block
             int baseT = t * nHead * dState;
             for (int h = 0; h < nHead; h++)
             {
-                ReadOnlySpan<float> bh = bHRN.AsSpan(baseT + h * dState, dState);
-                ReadOnlySpan<float> ch = cHRN.AsSpan(baseT + h * dState, dState);
+                ReadOnlySpan<float> bh = bHRN.Slice(baseT + h * dState, dState);
+                ReadOnlySpan<float> ch = cHRN.Slice(baseT + h * dState, dState);
                 qkPreDot[t * nHead + h] = TensorPrimitives.Dot(ch, bh);
             }
         }
@@ -331,8 +352,14 @@ public static class Mamba3Block
     /// <param name="mimoRank">MIMO rank R ≥ 2.</param>
     /// <param name="aFloor">Floor for <c>-A</c> clamp.</param>
     /// <param name="normEps">RMSNorm stabilising constant.</param>
+    /// <param name="scratch">
+    /// Caller-owned pooled scratch. Must be sized to at least the widest
+    /// <c>mimoRank</c> the model will use (the constructor takes this from
+    /// <see cref="Mamba3Config"/>). Shared across layers and Forward calls.
+    /// </param>
     [SkipLocalsInit]
     public static void ForwardMimo(
+        Mamba3ForwardScratch scratch,
         ReadOnlySpan<float> u,
         ReadOnlySpan<float> inProjWeight,
         ReadOnlySpan<float> outProjWeight,
@@ -359,6 +386,7 @@ public static class Mamba3Block
         float aFloor,
         float normEps = 1e-5f)
     {
+        ArgumentNullException.ThrowIfNull(scratch);
         ValidateCommon(seqLen, dModel, dInner, nHead, headDim, dState,
                        numBcHeads, numRopeAngles);
         if (mimoRank < 1) throw new ArgumentOutOfRangeException(nameof(mimoRank));
@@ -368,20 +396,26 @@ public static class Mamba3Block
         int dInProj = 2 * dInner + 2 * bcPerToken + 3 * nHead + numRopeAngles;
 
         // ── Scratch ─────────────────────────────────────────────────────────
-        float[] proj = new float[seqLen * dInProj];
-        float[] xBuf = new float[seqLen * dInner];                    // [T, H, P]
-        float[] zBuf = new float[seqLen * dInner];                    // [T, H, P]
-        float[] dt = new float[seqLen * nHead];
-        float[] adt = new float[seqLen * nHead];
-        float[] trap = new float[seqLen * nHead];
-        float[] gamma = new float[seqLen * nHead];
-        float[] scale = new float[seqLen * nHead];
-        float[] anglesRaw = new float[seqLen * numRopeAngles];
-        // Canonical layout for the SSD kernel: [T, R, H, N].
-        float[] bRHN = new float[(long)seqLen * R * nHead * dState];
-        float[] cRHN = new float[(long)seqLen * R * nHead * dState];
-        float[] qkPreDotSum = new float[seqLen * nHead];              // Σ_r per (t,h)
-        float[] yScan = new float[seqLen * dInner];
+        // Pooled, 64-byte-aligned, owned by the caller. Span views are sized
+        // to the current seqLen — the backing allocation may be larger
+        // (power-of-two growth) but that does not affect any slice maths.
+        scratch.EnsureCapacity(seqLen);
+        Span<float> proj = scratch.Proj(seqLen);
+        Span<float> xBuf = scratch.X(seqLen);                          // [T, H, P]
+        Span<float> zBuf = scratch.Z(seqLen);                          // [T, H, P]
+        Span<float> dt = scratch.Dt(seqLen);
+        Span<float> adt = scratch.Adt(seqLen);
+        Span<float> trap = scratch.Trap(seqLen);
+        Span<float> gamma = scratch.Gamma(seqLen);
+        Span<float> scale = scratch.Scale(seqLen);
+        Span<float> anglesRaw = scratch.AnglesRaw(seqLen);
+        // Canonical layout for the SSD kernel: [T, R, H, N]. Scratch sizes
+        // B / C at T·R_max·H·N — sliced here to the exact T·R·H·N footprint
+        // the current MIMO rank demands.
+        Span<float> bRHN = scratch.B(seqLen).Slice(0, seqLen * R * nHead * dState);
+        Span<float> cRHN = scratch.C(seqLen).Slice(0, seqLen * R * nHead * dState);
+        Span<float> qkPreDotSum = scratch.QkPreDot(seqLen);            // Σ_r per (t,h)
+        Span<float> yScan = scratch.YScan(seqLen);
 
         // ── Step 1: in_proj GEMM ─────────────────────────────────────────────
         GemmF32(inProjWeight, u, proj, m: dInProj, k: dModel, n: seqLen);
@@ -400,8 +434,8 @@ public static class Mamba3Block
         {
             int src = t * dInProj;
 
-            new Span<float>(proj, src + ofsZ, dInner).CopyTo(zBuf.AsSpan(t * dInner, dInner));
-            new Span<float>(proj, src + ofsX, dInner).CopyTo(xBuf.AsSpan(t * dInner, dInner));
+            proj.Slice(src + ofsZ, dInner).CopyTo(zBuf.Slice(t * dInner, dInner));
+            proj.Slice(src + ofsX, dInner).CopyTo(xBuf.Slice(t * dInner, dInner));
 
             for (int h = 0; h < nHead; h++)
             {
@@ -420,8 +454,8 @@ public static class Mamba3Block
                 gamma[t * nHead + h] = dtv * tv;
             }
 
-            new Span<float>(proj, src + ofsAngles, numRopeAngles)
-                .CopyTo(anglesRaw.AsSpan(t * numRopeAngles, numRopeAngles));
+            proj.Slice(src + ofsAngles, numRopeAngles)
+                .CopyTo(anglesRaw.Slice(t * numRopeAngles, numRopeAngles));
 
             // B_raw / C_raw per-token layout is [R, G, N] row-major.
             // We RMS-normalize each (R, G) [N] slice, broadcast G → H, and
@@ -435,9 +469,9 @@ public static class Mamba3Block
                 {
                     int bSrcBase = src + ofsB + (r * numBcHeads + g) * dState;
                     int cSrcBase = src + ofsC + (r * numBcHeads + g) * dState;
-                    RmsNormInto(proj.AsSpan(bSrcBase, dState), bNormWeight, normEps,
+                    RmsNormInto(proj.Slice(bSrcBase, dState), bNormWeight, normEps,
                                 out float bInvRms);
-                    RmsNormInto(proj.AsSpan(cSrcBase, dState), cNormWeight, normEps,
+                    RmsNormInto(proj.Slice(cSrcBase, dState), cNormWeight, normEps,
                                 out float cInvRms);
 
                     for (int hInGroup = 0; hInGroup < headsPerGroup; hInGroup++)
@@ -467,8 +501,8 @@ public static class Mamba3Block
                 for (int r = 0; r < R; r++)
                 {
                     int baseIdx = ((t * R + r) * nHead + h) * dState;
-                    ReadOnlySpan<float> bh = bRHN.AsSpan(baseIdx, dState);
-                    ReadOnlySpan<float> ch = cRHN.AsSpan(baseIdx, dState);
+                    ReadOnlySpan<float> bh = bRHN.Slice(baseIdx, dState);
+                    ReadOnlySpan<float> ch = cRHN.Slice(baseIdx, dState);
                     sum += TensorPrimitives.Dot(ch, bh);
                 }
                 qkPreDotSum[t * nHead + h] = sum;
