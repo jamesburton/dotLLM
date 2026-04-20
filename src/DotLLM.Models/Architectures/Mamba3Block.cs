@@ -79,6 +79,46 @@ public static class Mamba3Block
     // ────────────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Overload of <see cref="Forward(Mamba3ForwardScratch, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, Span{float}, Span{float}, Span{float}, Span{float}, int, int, int, int, int, int, int, int, float, float)"/>
+    /// that omits the <c>kState</c>/<c>vState</c> streaming-boundary buffers.
+    /// Equivalent to passing empty spans for both — so one-shot prefill (or
+    /// split prefills that accept the canonical chunk-edge shifted_γ=0 drift)
+    /// can keep using the shorter call signature.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void Forward(
+        Mamba3ForwardScratch scratch,
+        ReadOnlySpan<float> u,
+        ReadOnlySpan<float> inProjWeight,
+        ReadOnlySpan<float> outProjWeight,
+        ReadOnlySpan<float> dtBias,
+        ReadOnlySpan<float> bNormWeight,
+        ReadOnlySpan<float> cNormWeight,
+        ReadOnlySpan<float> bBias,
+        ReadOnlySpan<float> cBias,
+        ReadOnlySpan<float> d,
+        Span<float> y,
+        Span<float> ssmState,
+        Span<float> cumAngle,
+        int seqLen,
+        int dModel,
+        int dInner,
+        int nHead,
+        int headDim,
+        int dState,
+        int numBcHeads,
+        int numRopeAngles,
+        float aFloor,
+        float normEps = 1e-5f)
+        => Forward(
+            scratch, u, inProjWeight, outProjWeight,
+            dtBias, bNormWeight, cNormWeight, bBias, cBias, d,
+            y, ssmState, cumAngle,
+            kState: Span<float>.Empty, vState: Span<float>.Empty,
+            seqLen, dModel, dInner, nHead, headDim, dState,
+            numBcHeads, numRopeAngles, aFloor, normEps);
+
+    /// <summary>
     /// Runs one canonical Mamba-3 SISO block forward.
     /// </summary>
     /// <param name="u">Input, shape <c>[T, d_model]</c> row-major.</param>
@@ -95,6 +135,24 @@ public static class Mamba3Block
     /// <param name="ssmState">SSM hidden state, shape <c>[n_head, head_dim, d_state]</c>. In-place.</param>
     /// <param name="cumAngle">Cumulative RoPE angle, shape <c>[n_head, num_rope_angles]</c>. In-place.
     /// Pass an empty span to start from zero and discard the final angle.</param>
+    /// <param name="kState">
+    /// Previous chunk's last-token post-RoPE (pre-scale) K, shape
+    /// <c>[n_head, d_state]</c>. In-place. When non-empty, the block applies
+    /// the canonical chunk-boundary adjustment
+    /// <c>ssm_state += v_state · k_state · DT[0] · (1 - trap[0])</c>
+    /// BEFORE running the SSD scan (matches
+    /// <c>mamba3_siso_fwd.py:341-352</c>), and writes this chunk's last-token
+    /// post-RoPE K on exit. Pass an empty span to disable streaming-decode
+    /// boundary handling — equivalent to a one-shot forward with no prior
+    /// chunk. On the first chunk of a sequence <c>kState</c> is all-zero, so
+    /// the adjustment is a no-op by construction.
+    /// </param>
+    /// <param name="vState">
+    /// Previous chunk's last-token V (= <c>x</c>), shape
+    /// <c>[n_head, head_dim]</c>. Paired with <paramref name="kState"/> in the
+    /// boundary adjustment. Same empty-span semantics. Updated to this chunk's
+    /// last-token V on exit.
+    /// </param>
     /// <param name="seqLen">Token count T.</param>
     /// <param name="dModel">Model dimension.</param>
     /// <param name="dInner">Inner dimension (<c>n_head · head_dim</c>).</param>
@@ -126,6 +184,8 @@ public static class Mamba3Block
         Span<float> y,
         Span<float> ssmState,
         Span<float> cumAngle,
+        Span<float> kState,
+        Span<float> vState,
         int seqLen,
         int dModel,
         int dInner,
@@ -304,12 +364,46 @@ public static class Mamba3Block
             seqLen, nRank: R, nHead, dState, numRopeAngles,
             Mamba3RoPEMode.Pairwise);
 
+        // ── Step 5.5: streaming-decode chunk-boundary adjustment ────────────
+        // Canonical mamba3_siso_fwd.py:341-352: at the start of a chunk that
+        // carries a prior (k_state, v_state) pair, inject
+        //   ssm_state += v_state · k_state · DT[0] · (1 - trap[0])
+        // BEFORE the scan. This is the deferred shifted_γ[T_prev-1] term from
+        // the previous chunk's last token — a one-shot forward would have
+        // folded it in at token T_prev via scale[T_prev-1] = γ + shifted_γ;
+        // the split forward sees shifted_γ[T_prev-1] = 0 (no lookahead across
+        // the call) and compensates here. On the first chunk both buffers are
+        // zero so the update is a no-op.
+        if (!kState.IsEmpty && !vState.IsEmpty && seqLen > 0)
+        {
+            ApplyChunkBoundaryAdjustment(
+                ssmState, kState, vState, dt, trap,
+                nHead, headDim, dState);
+        }
+
         // ── Step 6: SISO SSD scan ───────────────────────────────────────────
         // xBuf layout is [T, dInner] row-major == [T, H, P] row-major.
         Mamba3CanonicalSsd.ExecuteSiso(
             ssmState, xBuf, cHRN, bHRN, qkPreDot,
             scale, gamma, adt, d, zBuf, yScan,
             seqLen, nHead, headDim, dState);
+
+        // ── Step 6.5: persist chunk-boundary buffers for the next call ──────
+        // Canonical final_k_state (mamba3_siso_fwd.py:318-322) stores the last
+        // token's POST-RoPE, PRE-SCALE K. Our bHRN is exactly that — the SSD
+        // kernel applies `scale` inline as `k[n] * scl` without mutating bHRN.
+        // Canonical final_v_state stores the raw V (x) of the last token; our
+        // xBuf holds that directly.
+        if (!kState.IsEmpty && !vState.IsEmpty && seqLen > 0)
+        {
+            int lastTok = seqLen - 1;
+            // bHRN[lastTok, h, :] → kState[h, :]  (layout: [T, H, N] → [H, N]).
+            ReadOnlySpan<float> lastK = bHRN.Slice(lastTok * nHead * dState, nHead * dState);
+            lastK.CopyTo(kState);
+            // xBuf[lastTok, h, :] → vState[h, :]  (layout: [T, H, P] → [H, P]).
+            ReadOnlySpan<float> lastV = xBuf.Slice(lastTok * nHead * headDim, nHead * headDim);
+            lastV.CopyTo(vState);
+        }
 
         // ── Step 7: out_proj GEMM ───────────────────────────────────────────
         GemmF32(outProjWeight, yScan, y, m: dModel, k: dInner, n: seqLen);
@@ -603,6 +697,52 @@ public static class Mamba3Block
         }
         float mean = (float)(acc / slice.Length);
         invRms = 1f / MathF.Sqrt(mean + eps);
+    }
+
+    /// <summary>
+    /// Applies the canonical chunk-boundary state adjustment:
+    /// <c>ssm_state[h, p, n] += v_state[h, p] · k_state[h, n] · DT[0, h] · (1 - trap[0, h])</c>.
+    /// Mirrors <c>mamba3_siso_fwd.py:352</c>. No-op when <paramref name="kState"/>
+    /// and <paramref name="vState"/> are all-zero (first chunk of a sequence).
+    /// </summary>
+    /// <param name="ssmState">SSM state <c>[H, P, N]</c>, mutated in place.</param>
+    /// <param name="kState">Previous chunk's last-token post-RoPE K, <c>[H, N]</c>.</param>
+    /// <param name="vState">Previous chunk's last-token V, <c>[H, P]</c>.</param>
+    /// <param name="dt">Per-(T, H) DT table. Only <c>dt[0, :]</c> is read.</param>
+    /// <param name="trap">Per-(T, H) trap (sigmoid) table. Only <c>trap[0, :]</c> is read.</param>
+    /// <param name="nHead">Head count H.</param>
+    /// <param name="headDim">Channels per head P.</param>
+    /// <param name="dState">State width N.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ApplyChunkBoundaryAdjustment(
+        Span<float> ssmState,
+        ReadOnlySpan<float> kState,
+        ReadOnlySpan<float> vState,
+        ReadOnlySpan<float> dt,
+        ReadOnlySpan<float> trap,
+        int nHead, int headDim, int dState)
+    {
+        // dt / trap laid out as [T, H]; we only need the t=0 slice.
+        for (int h = 0; h < nHead; h++)
+        {
+            float coef = dt[h] * (1f - trap[h]);
+            if (coef == 0f) continue;           // trap≈1 at t=0 → pure self term, no carry.
+
+            int kBase = h * dState;
+            int vBase = h * headDim;
+            int stateBase = h * headDim * dState;
+
+            for (int p = 0; p < headDim; p++)
+            {
+                float vpC = vState[vBase + p] * coef;
+                if (vpC == 0f) continue;
+                int row = stateBase + p * dState;
+                for (int n = 0; n < dState; n++)
+                {
+                    ssmState[row + n] += vpC * kState[kBase + n];
+                }
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

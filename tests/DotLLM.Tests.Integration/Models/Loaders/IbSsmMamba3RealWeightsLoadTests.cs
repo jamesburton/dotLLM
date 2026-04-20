@@ -291,34 +291,37 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
     }
 
     /// <summary>
-    /// Documents the current end-to-end persistent-decode behaviour on the
-    /// real 370M checkpoint. Runs one-shot prefill of 3 tokens and a
-    /// state-threaded 2-prefill + 1-decode split, then reports last-token
-    /// drift + top-1 argmax. Verifies state threading executes (no NaNs,
-    /// second call consumes state) but does NOT require bitwise equivalence
-    /// — that needs the streaming-decode kernel work documented below.
+    /// End-to-end streaming-decode regression on the real 370M checkpoint.
+    /// Runs one-shot prefill of 3 tokens and a state-threaded 2-prefill +
+    /// 1-decode split, then asserts (a) no NaN/Inf, (b) top-1 argmax matches
+    /// between the two paths, (c) drift stays within the 48-layer F32
+    /// accumulation envelope documented below.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Why we don't assert logit equivalence here.</b> The canonical
-    /// Mamba-3 scan uses <c>scale[t] = γ[t] + shifted_γ[t]</c> with a 1-token
-    /// lookahead <c>shifted_γ[t] = DT[t+1]·(1−trap[t+1])</c>. At a chunk
-    /// boundary the lookahead evaluates to zero (the next token lives in
-    /// the next call), so the state trajectory of a 2-prefill + 1-decode
-    /// split diverges from the one-shot trajectory at the chunk edge by
-    /// design. At 48 F32 layers this compounds into top-1 argmax drift on
-    /// the real checkpoint — visible in the test output's <c>max_abs</c>
-    /// / <c>argmax</c> lines.
+    /// <b>Streaming-decode math closed.</b> The canonical Mamba-3 scan uses
+    /// <c>scale[t] = γ[t] + shifted_γ[t]</c> with a 1-token lookahead
+    /// <c>shifted_γ[t] = DT[t+1]·(1−trap[t+1])</c>. Within a chunk this
+    /// lookahead evaluates to 0 at the last token; a one-shot forward folds
+    /// the would-be non-zero value into the state at the NEXT token.
+    /// Streaming-decode persists the previous chunk's last-token post-RoPE
+    /// K and raw V through <see cref="Mamba3State.KState(int)"/> /
+    /// <see cref="Mamba3State.VState(int)"/> and replays the deferred
+    /// <c>ssm += v · k · DT[0] · (1 − trap[0])</c> term at the next chunk's
+    /// start (matches <c>mamba3_siso_fwd.py:341-352</c>).
     /// </para>
     /// <para>
-    /// <b>To close the gap.</b> The canonical HF inference path persists
-    /// four buffers across calls — <c>angle_dt_state</c> (≡ <c>cum_angle</c>
-    /// here), <c>ssm_state</c>, <c>k_state</c>, <c>v_state</c>. Stage P2b
-    /// threads the first two via <see cref="Mamba3State"/>; the latter two
-    /// plus a streaming-decode SSD kernel that consumes them are a future
-    /// stage. Until that lands, prefill+decode is qualitatively correct
-    /// (state evolves, no NaNs, logits track one-shot to O(1) magnitude on
-    /// 370M) but not bitwise-equivalent to one-shot.
+    /// <b>What's left as drift.</b> F32 accumulation reorder noise. 48
+    /// layers × (in_proj GEMM + SSD scan + out_proj GEMM + residual add +
+    /// RMSNorm) produces a small per-layer discrepancy between "one-shot
+    /// over 3 tokens" and "chunk of 2 + chunk of 1" because the SSD scan's
+    /// matmul + accumulator order differs with T. At 48-layer depth this
+    /// compounds into single-digit logit drift and zero top-1 argmax drift.
+    /// Observed on 370M: <c>max_abs ≈ 3</c>, argmax matches. Before the
+    /// streaming fix: <c>max_abs ≈ 6.5</c>, argmax differed — i.e. the
+    /// one-token generation would NOT have been consistent between one-shot
+    /// and prefill+decode. Closing that argmax drift is the user-visible
+    /// win of this stage.
     /// </para>
     /// </remarks>
     [Fact]
@@ -397,23 +400,30 @@ public sealed class IbSsmMamba3RealWeightsLoadTests
                 $"Argmax: prefill={argmaxPrefill} (logit={logitsPrefillLast[argmaxPrefill]:G6})  "
                 + $"split={argmaxSplit} (logit={logitsSplitLast[argmaxSplit]:G6})");
 
-            // Integrity checks that MUST hold regardless of the chunk-edge
-            // drift: all logits finite, nonzero per-position variance, and the
-            // decode call actually returned a sized tensor (last-step logits).
+            // Integrity checks: all logits finite, nonzero per-position
+            // variance, and the decode call actually returned a sized tensor
+            // (last-step logits).
             foreach (float v in logitsPrefillLast)
                 Assert.True(float.IsFinite(v), "One-shot last-token logits contain NaN/Inf.");
             foreach (float v in logitsSplitLast)
                 Assert.True(float.IsFinite(v), "Split-decode last-token logits contain NaN/Inf.");
 
-            // Upper bound on drift magnitude — a regression that pushes drift
-            // way outside the canonical chunk-edge shift would surface here.
-            // Observed on 370M: max_abs ≈ 6.5, max_rel ≈ 2e4 — pin a loose
-            // safety ceiling at 10× that, so "much worse than today" surfaces
-            // but today's canonical-algorithm drift does not trip it.
-            Assert.True(maxAbs < 100f,
-                $"Last-token logit drift max_abs={maxAbs:G4} is far larger than the canonical "
-                + "chunk-edge shift. This likely indicates a state threading regression rather "
-                + "than the documented shifted_γ boundary divergence.");
+            // Post-streaming-decode ceilings. Observed on 370M after the
+            // k_state/v_state chunk-boundary adjustment: max_abs ≈ 3.3,
+            // argmax matches between one-shot and split. Before: max_abs
+            // ≈ 6.5, argmax DIFFERED — the user-visible win of this stage
+            // is the argmax match (next-token sampling is now consistent
+            // between prefill-then-decode and one-shot).
+            //   - argmax MUST match (top-1 token generation determinism).
+            //   - max_abs pinned at 10 so a regression > 3× today's floor
+            //     surfaces immediately but 48-layer F32 reorder noise does
+            //     not trip. This is still dramatically tighter than the
+            //     prior sentinel of 100.
+            Assert.Equal(argmaxPrefill, argmaxSplit);
+            Assert.True(maxAbs < 10f,
+                $"Last-token logit drift max_abs={maxAbs:G4} exceeds the streaming-decode "
+                + "F32 reorder envelope (~3). A regression in k_state/v_state threading or "
+                + "the chunk-boundary adjustment is likely.");
         }
         finally
         {

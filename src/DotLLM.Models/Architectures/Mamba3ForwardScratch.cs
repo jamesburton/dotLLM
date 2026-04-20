@@ -6,7 +6,7 @@ namespace DotLLM.Models.Architectures;
 
 /// <summary>
 /// Pre-allocated, 64-byte-aligned scratch buffers for the per-call temporaries
-/// used by <see cref="Mamba3Block.Forward"/> and
+/// used by <see cref="Mamba3Block"/>.Forward and
 /// <see cref="Mamba3Block.ForwardMimo"/>. Mirrors the
 /// <see cref="NemotronHForwardState"/> pattern: one owned instance per model,
 /// grown in power-of-two steps by <see cref="EnsureCapacity"/>, freed on
@@ -20,7 +20,7 @@ namespace DotLLM.Models.Architectures;
 /// — <c>in_proj</c> output, split slices, DT / ADT / trap / gamma / scale,
 /// the biased + broadcast B / C buffers, pre-RoPE qk dot, and the SSD scan
 /// output — all of which were previously <c>new float[]</c>-allocated on
-/// every <see cref="Mamba3Block.Forward"/> call.
+/// every <see cref="Mamba3Block"/>.Forward call.
 /// </para>
 /// <para>
 /// Sizing is data-dependent on <c>seqLen</c>. The forward-scratch instance
@@ -96,7 +96,7 @@ public sealed unsafe class Mamba3ForwardScratch : IDisposable
     /// <summary>
     /// Constructs a zero-capacity scratch sized for the given Mamba-3 config.
     /// Buffers are allocated lazily on the first <see cref="EnsureCapacity(int)"/>
-    /// call (or transitively, on the first <see cref="Mamba3Block.Forward"/>
+    /// call (or transitively, on the first <see cref="Mamba3Block"/>.Forward
     /// invocation that threads this scratch).
     /// </summary>
     /// <param name="config">Model config carrying the Mamba-3 hyperparameters.</param>

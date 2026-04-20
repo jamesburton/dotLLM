@@ -371,25 +371,23 @@ public class Mamba3CanonicalReferenceCompareTests
     }
 
     // ------------------------------------------------------------------------
-    // Canonical Block — decode continuity: state + cum_angle threading
+    // Canonical Block — decode continuity: streaming state threading
     // ------------------------------------------------------------------------
     // The canonical Mamba-3 scan's state update uses
     //   scale[t] = γ[t] + shifted_γ[t], shifted_γ[t] = DT[t+1]·(1-trap[t+1])
-    // which injects a 1-token lookahead into each h_t update. Across a chunk
-    // boundary shifted_γ evaluates to 0, so a split forward's state trajectory
-    // diverges from a single-shot at the chunk edge by design — not a bug.
-    // The canonical HF inference path works around this by persisting four
-    // extra buffers across calls (angle_dt_state, ssm_state, k_state, v_state;
-    // see mamba3.py line 142). Stage P2b threads two of those (ssm_state and
-    // cum_angle — equivalent to angle_dt_state). k_state / v_state are
-    // deferred to a later stage along with the proper streaming-decode
-    // kernel (the current ExecuteSiso/ExecuteMimo signatures do not accept
-    // them).
+    // which injects a 1-token lookahead into each h_t update. At the last
+    // token of a chunk shifted_γ evaluates to 0; the canonical streaming
+    // kernel (mamba3_siso_fwd.py:341-352) compensates by persisting the
+    // previous chunk's last-token post-RoPE K and V and replaying the
+    // deferred `ssm += v · k · DT[0] · (1-trap[0])` term at the start of
+    // the next chunk. All four buffers (angle_dt_state ≡ cum_angle,
+    // ssm_state, k_state, v_state — mamba3.py line 142) are threaded by
+    // Mamba3State through Mamba3Block.Forward.
     //
-    // What we verify here: under an *identical* chunking scheme, the
-    // block's output is deterministic and the two threaded buffers
-    // (ssm_state, cum_angle) are being read/written — i.e. the decode
-    // plumbing works, independent of canonical-streaming semantics.
+    // What we verify here: under an *identical* chunking scheme, the block's
+    // output and every threaded state buffer is deterministic across runs,
+    // and the isolated chunk-2 run (seeded with chunk-1's final state)
+    // reproduces the chunk-2 slice of a full 2+2 split.
     [SkippableFact]
     public void Block_Canonical_DecodeSplit_MatchesReference()
     {

@@ -289,11 +289,16 @@ public sealed unsafe class Mamba3TransformerModel : IModel
                     new Span<float>(normOut, t * hiddenSize, hiddenSize));
             }
 
-            // Per-layer SSM state & cum_angle — read/written in place on the
-            // caller's persistent state. A freshly constructed (or Reset()ed)
-            // state is all-zero, reproducing the prior prefill-only behaviour.
+            // Per-layer SSM state & cum_angle & k_state & v_state — read/written
+            // in place on the caller's persistent state. A freshly constructed
+            // (or Reset()ed) state is all-zero, reproducing the prior
+            // prefill-only behaviour (no chunk-boundary adjustment applied).
+            // k_state + v_state close the canonical shifted_γ lookahead gap at
+            // chunk edges — see Mamba3Block.Forward doc for the math.
             Span<float> ssmState = state.SsmState(layer);
             Span<float> cumAngle = state.CumAngle(layer);
+            Span<float> kState = state.KState(layer);
+            Span<float> vState = state.VState(layer);
 
             ReadOnlySpan<float> inProj = SpanFromHandle(lw.InProj, dInProj * hiddenSize);
             ReadOnlySpan<float> outProj = SpanFromHandle(lw.OutProj, hiddenSize * dInner);
@@ -332,6 +337,8 @@ public sealed unsafe class Mamba3TransformerModel : IModel
                 y: blockOut,
                 ssmState: ssmState,
                 cumAngle: cumAngle,
+                kState: kState,
+                vState: vState,
                 seqLen: seqLen,
                 dModel: hiddenSize,
                 dInner: dInner,
