@@ -387,4 +387,199 @@ public static class Mamba3CanonicalSsd
             }
         }
     }
+
+    /// <summary>
+    /// MIMO streaming variant — rank-aware analog of the SISO streaming path.
+    /// Applies the canonical <c>shifted_γ[T_prev-1]</c> boundary adjustment
+    /// BEFORE the scan (using the previous chunk's <c>kState</c> and
+    /// <c>vState</c>), then runs the same rank-summed state update as
+    /// <see cref="ExecuteMimo"/>, then persists this chunk's last-token
+    /// post-RoPE (pre-scale) K / V on exit.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Derivation.</b> The canonical MIMO tilelang kernel
+    /// (<c>mamba3_mimo_fwd.py:275-279,391-407</c>) writes <c>FINAL_K</c> as the
+    /// last row of every rank slice of the rotated K and returns
+    /// <c>FINAL_V = V[:, -1]</c> (no rank axis). Its internal state update is
+    /// <c>states[n, p] += Σ_{cs} exp(dA_cs_rev) · Σ_r K_r[cs, n] · Ψ[r, p] · V[cs, p]</c>
+    /// — the same <c>k_sum over r</c> that <see cref="ExecuteMimo"/> applies.
+    /// The canonical kernel forcibly drops <c>shifted_γ[T-1] = 0</c>, so a
+    /// split call misses the contribution
+    /// <c>v_last · (Σ_r k_last[r]) · DT[0_new] · (1-trap[0_new])</c>
+    /// that a single-shot forward would have folded into the last-token state
+    /// update at the previous chunk. Injecting that term at the start of the
+    /// current chunk (BEFORE the per-chunk scan) restores bit-equivalence,
+    /// in line with the SISO streaming path.
+    /// </para>
+    /// <para>
+    /// Cross-coupling between ranks is absent: the canonical MIMO k_state
+    /// stores independent per-rank K vectors (<c>k_state [R, H, N]</c>) and
+    /// the boundary equation only ever sums them to contribute to the single
+    /// <c>ssm_state [H, P, N]</c> buffer. No <c>mimo_o</c> / <c>mimo_z</c>
+    /// appear in the boundary update — they act at output time, not on the
+    /// state carry.
+    /// </para>
+    /// <para>
+    /// <b>Alias safety.</b> <paramref name="kState"/> and <paramref name="vState"/>
+    /// are read at entry and written at exit; they must not overlap any other
+    /// span. Passing empty spans is equivalent to <see cref="ExecuteMimo"/>
+    /// with <c>shifted_γ[T-1] = 0</c> (one-shot semantics).
+    /// </para>
+    /// </remarks>
+    /// <param name="state">SSM hidden state <c>[H, P, N]</c>. In-place.</param>
+    /// <param name="v">V per head <c>[T, H, P]</c>.</param>
+    /// <param name="qRoped">Rotated biased C per rank <c>[T, R, H, N]</c>.</param>
+    /// <param name="kRoped">Rotated biased B per rank <c>[T, R, H, N]</c>.</param>
+    /// <param name="qkPreDotSum">Σ_r pre-rotation QK dot, <c>[T, H]</c>.</param>
+    /// <param name="scale">γ + shifted_γ, <c>[T, H]</c>. Caller assembles.</param>
+    /// <param name="gamma">DT·trap, <c>[T, H]</c>.</param>
+    /// <param name="adt">_A·DT, <c>[T, H]</c>.</param>
+    /// <param name="dt">DT only, <c>[T, H]</c>. Used for the boundary
+    /// adjustment coefficient (<c>DT[0] · (1-trap[0])</c>).</param>
+    /// <param name="trap">trap only, <c>[T, H]</c>. Same as above.</param>
+    /// <param name="d">Per-head skip coefficient <c>[H]</c>.</param>
+    /// <param name="z">Gate <c>[T, H, P]</c> or empty.</param>
+    /// <param name="mimoZ">Gate rank expansion <c>[H, R, P]</c>.</param>
+    /// <param name="mimoO">Output rank contraction <c>[H, R, P]</c>.</param>
+    /// <param name="kState">
+    /// Previous chunk's last-token post-RoPE K per rank, <c>[R, H, N]</c>.
+    /// Read at entry (consumed by the boundary adjustment) and written at
+    /// exit (this chunk's last-token K). Pass empty span to disable the
+    /// streaming boundary — equivalent to <see cref="ExecuteMimo"/>.
+    /// </param>
+    /// <param name="vState">
+    /// Previous chunk's last-token V, <c>[H, P]</c>. Paired with
+    /// <paramref name="kState"/>. Same empty-span semantics.
+    /// </param>
+    /// <param name="y">Output <c>[T, H, P]</c>. Written.</param>
+    /// <param name="yPerRank">Optional per-rank output <c>[T, R, H, P]</c> or empty.</param>
+    /// <param name="seqLen">Token count T for this chunk.</param>
+    /// <param name="nRank">MIMO rank R.</param>
+    /// <param name="nHead">Head count H.</param>
+    /// <param name="headDim">Channels per head P.</param>
+    /// <param name="dState">State width N.</param>
+    [SkipLocalsInit]
+    public static void ExecuteMimoStreaming(
+        Span<float> state,
+        ReadOnlySpan<float> v,
+        ReadOnlySpan<float> qRoped,
+        ReadOnlySpan<float> kRoped,
+        ReadOnlySpan<float> qkPreDotSum,
+        ReadOnlySpan<float> scale,
+        ReadOnlySpan<float> gamma,
+        ReadOnlySpan<float> adt,
+        ReadOnlySpan<float> dt,
+        ReadOnlySpan<float> trap,
+        ReadOnlySpan<float> d,
+        ReadOnlySpan<float> z,
+        ReadOnlySpan<float> mimoZ,
+        ReadOnlySpan<float> mimoO,
+        Span<float> kState,
+        Span<float> vState,
+        Span<float> y,
+        Span<float> yPerRank,
+        int seqLen,
+        int nRank,
+        int nHead,
+        int headDim,
+        int dState)
+    {
+        if (nRank <= 0) throw new ArgumentOutOfRangeException(nameof(nRank));
+        if (nHead <= 0) throw new ArgumentOutOfRangeException(nameof(nHead));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        if (dState <= 0) throw new ArgumentOutOfRangeException(nameof(dState));
+        if (seqLen < 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
+
+        long hdrElems = (long)seqLen * nHead;
+        if (dt.Length < hdrElems) throw new ArgumentException("dt too small.", nameof(dt));
+        if (trap.Length < hdrElems) throw new ArgumentException("trap too small.", nameof(trap));
+
+        if (!kState.IsEmpty || !vState.IsEmpty)
+        {
+            long kStateElems = (long)nRank * nHead * dState;
+            long vStateElems = (long)nHead * headDim;
+            if (kState.Length < kStateElems)
+                throw new ArgumentException("kState too small.", nameof(kState));
+            if (vState.Length < vStateElems)
+                throw new ArgumentException("vState too small.", nameof(vState));
+        }
+
+        // ── Chunk-boundary adjustment (canonical mamba3_mimo_fwd rank-sum form) ──
+        // ssm_state[h, p, n] += v_state[h, p] · (Σ_r k_state[r, h, n]) · DT[0, h] · (1 - trap[0, h])
+        // Mirrors the SISO boundary (Mamba3Block.ApplyChunkBoundaryAdjustment)
+        // with the rank dimension summed — same contract as the MIMO forward
+        // scan's state update (ExecuteMimo line "kSum += kRoped[...]").
+        if (!kState.IsEmpty && !vState.IsEmpty && seqLen > 0)
+        {
+            // kState layout: [R, H, N] row-major.
+            int kRankStride = nHead * dState;
+            int kHeadStride = dState;
+            int vHeadStride = headDim;
+            int stateHeadStride = headDim * dState;
+
+            for (int h = 0; h < nHead; h++)
+            {
+                float coef = dt[h] * (1f - trap[h]);
+                if (coef == 0f) continue;
+
+                int vBase = h * vHeadStride;
+                int stateBase = h * stateHeadStride;
+
+                for (int p = 0; p < headDim; p++)
+                {
+                    float vpC = vState[vBase + p] * coef;
+                    if (vpC == 0f) continue;
+                    int row = stateBase + p * dState;
+                    for (int n = 0; n < dState; n++)
+                    {
+                        float kSum = 0f;
+                        for (int r = 0; r < nRank; r++)
+                        {
+                            kSum += kState[r * kRankStride + h * kHeadStride + n];
+                        }
+                        state[row + n] += vpC * kSum;
+                    }
+                }
+            }
+        }
+
+        // ── Per-chunk MIMO scan — delegate to the existing ExecuteMimo body ──
+        // The scan itself is identical in math to ExecuteMimo; re-using it
+        // avoids a second parallel copy of the per-token rank-sum loop and
+        // guarantees the one-shot == streaming identity when the boundary
+        // buffers are all-zero on the first chunk.
+        ExecuteMimo(
+            state, v, qRoped, kRoped, qkPreDotSum,
+            scale, gamma, adt, d, z, mimoZ, mimoO,
+            y, yPerRank,
+            seqLen, nRank, nHead, headDim, dState);
+
+        // ── Persist chunk-boundary buffers for the next call ──
+        // Canonical final_k_state: post-RoPE, pre-scale K of the last token
+        // per rank. Our kRoped spans are exactly that — the scan applies
+        // `scale` inline without mutating kRoped. Canonical final_v_state:
+        // raw V of the last token (no rank axis).
+        if (!kState.IsEmpty && !vState.IsEmpty && seqLen > 0)
+        {
+            int lastTok = seqLen - 1;
+            // kRoped layout: [T, R, H, N] row-major.
+            int kTokStride = nRank * nHead * dState;
+            int kSrcRankStride = nHead * dState;
+            int kDstRankStride = nHead * dState;
+            int kHeadStride = dState;
+            for (int r = 0; r < nRank; r++)
+            {
+                ReadOnlySpan<float> src = kRoped.Slice(
+                    lastTok * kTokStride + r * kSrcRankStride,
+                    nHead * dState);
+                Span<float> dst = kState.Slice(r * kDstRankStride, nHead * dState);
+                src.CopyTo(dst);
+            }
+            // vState: [H, P] from v[lastTok, :, :] which is [T, H, P] row-major.
+            ReadOnlySpan<float> vSrc = v.Slice(lastTok * nHead * headDim, nHead * headDim);
+            vSrc.CopyTo(vState);
+            _ = kHeadStride; // stride kept for documentation/alignment parity; loop indexes directly.
+        }
+    }
 }
