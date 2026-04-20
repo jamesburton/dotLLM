@@ -359,4 +359,136 @@ public sealed class HfConfigExtractorTests
         Assert.False(cfg.Moe.IsMoeLayer(2));  // forced dense
         Assert.True(cfg.Moe.IsMoeLayer(3));
     }
+
+    [Fact]
+    public void DeepSeekV2Lite_PopulatesMlaAndMoe()
+    {
+        // Schema from deepseek-ai/DeepSeek-V2-Lite config.json. Truncated for the
+        // fields the extractor consumes — verifies MLA detection, MlaConfig
+        // population, MoE plumbing (n_routed_experts + moe_intermediate_size
+        // + n_shared_experts), and first_k_dense_replace folded into
+        // MlpOnlyLayers so IsMoeLayer reflects the dense-prefix convention.
+        const string json = """
+        {
+            "architectures": ["DeepseekV2ForCausalLM"],
+            "model_type": "deepseek_v2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 10944,
+            "vocab_size": 102400,
+            "max_position_embeddings": 163840,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 0,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1408,
+            "n_shared_experts": 2,
+            "first_k_dense_replace": 1,
+            "norm_topk_prob": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.DeepSeekV2, cfg.Architecture);
+        Assert.Equal(AttentionType.MLA, cfg.AttentionType);
+
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(512, cfg.MlaConfig!.KvLoraRank);
+        Assert.Equal(0, cfg.MlaConfig.QLoraRank);
+        Assert.Equal(128, cfg.MlaConfig.QkNopeHeadDim);
+        Assert.Equal(64, cfg.MlaConfig.QkRopeHeadDim);
+        Assert.Equal(128, cfg.MlaConfig.VHeadDim);
+        Assert.Equal(192, cfg.MlaConfig.QkHeadDim);  // 128 + 64
+        Assert.Equal(192, cfg.HeadDim);              // HeadDim reuses qk_head_dim
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(6, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // n_shared_experts (2) × moe_intermediate_size (1408) = 2816
+        Assert.Equal(2816, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate); // DeepSeek does NOT gate
+
+        // first_k_dense_replace=1 → layer 0 is dense, 1..26 are MoE
+        Assert.False(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+        Assert.True(cfg.Moe.IsMoeLayer(26));
+    }
+
+    [Fact]
+    public void DeepSeekV2_WithQLoraRank_PopulatesQFactorisationRank()
+    {
+        // DeepSeek-V2 full (non-Lite) uses q_lora_rank = 1536.
+        const string json = """
+        {
+            "architectures": ["DeepseekV2ForCausalLM"],
+            "model_type": "deepseek_v2",
+            "hidden_size": 5120,
+            "num_hidden_layers": 60,
+            "num_attention_heads": 128,
+            "num_key_value_heads": 128,
+            "intermediate_size": 12288,
+            "vocab_size": 102400,
+            "max_position_embeddings": 163840,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "n_routed_experts": 160,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1536,
+            "first_k_dense_replace": 1
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.DeepSeekV2, cfg.Architecture);
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(1536, cfg.MlaConfig!.QLoraRank);
+        Assert.Equal(192, cfg.MlaConfig.QkHeadDim);
+    }
+
+    [Fact]
+    public void DeepSeekV3_DetectedByArchitectureName()
+    {
+        const string json = """
+        {
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "model_type": "deepseek_v3",
+            "hidden_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "intermediate_size": 256, "vocab_size": 100,
+            "max_position_embeddings": 128,
+            "kv_lora_rank": 32, "q_lora_rank": 24,
+            "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16,
+            "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64, "n_shared_experts": 1,
+            "first_k_dense_replace": 0
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.DeepSeekV3, cfg.Architecture);
+        Assert.Equal(AttentionType.MLA, cfg.AttentionType);
+        Assert.NotNull(cfg.MlaConfig);
+        Assert.Equal(32, cfg.MlaConfig!.KvLoraRank);
+        Assert.Equal(24, cfg.MlaConfig.QLoraRank);
+
+        // first_k_dense_replace = 0 means every layer is MoE.
+        Assert.NotNull(cfg.Moe);
+        Assert.True(cfg.Moe!.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+    }
 }

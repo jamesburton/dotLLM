@@ -62,7 +62,27 @@ public static class HfConfigExtractor
         int intermediateSize = GetInt32(root, "intermediate_size");
         int vocabSize = GetInt32(root, "vocab_size");
         int maxSeqLen = GetInt32OrDefault(root, "max_position_embeddings", 2048);
-        int headDim = GetInt32OrDefault(root, "head_dim", hiddenSize / numAttentionHeads);
+
+        bool isMla = architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3;
+
+        // MLA surfaces head_dim via a non-standard split: the Q/K "head_dim"
+        // is qk_nope_head_dim + qk_rope_head_dim, while V has its own
+        // v_head_dim. The ModelConfig.HeadDim field is reused to carry
+        // qk_head_dim so downstream KV-cache / shape logic sees a single
+        // number per head; attention callers gate on MlaConfig != null for
+        // the MLA-specific per-head splits.
+        int headDim;
+        MlaConfig? mla;
+        if (isMla)
+        {
+            mla = ExtractMlaConfig(root);
+            headDim = mla!.QkHeadDim;
+        }
+        else
+        {
+            mla = null;
+            headDim = GetInt32OrDefault(root, "head_dim", hiddenSize / numAttentionHeads);
+        }
 
         float normEps = GetFloatOrDefault(root, "rms_norm_eps",
             GetFloatOrDefault(root, "layer_norm_eps", 1e-5f));
@@ -72,17 +92,19 @@ public static class HfConfigExtractor
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
         // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
-        // Llama/Mistral/Mixtral use interleaved (Norm); Qwen/Qwen-MoE/Phi use non-interleaved (NeoX).
+        // Llama/Mistral/Mixtral/DeepSeek-V2 use interleaved (Norm); Qwen/Qwen-MoE/Phi use non-interleaved (NeoX).
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 
-        // MoE — Mixtral, Qwen*-MoE, Phi-3.5-MoE all expose num_local_experts +
-        // num_experts_per_tok. Shared experts (DeepSeek-V3, old Qwen1.5-MoE)
-        // add more fields and are explicitly out of scope here.
-        MoeConfig? moe = ExtractMoeConfig(root, intermediateSize);
+        // MoE — Mixtral, Qwen*-MoE, Phi-3.5-MoE, DeepSeek-V2/V3 all expose
+        // num_local_experts/num_experts + num_experts_per_tok. DeepSeek adds
+        // first_k_dense_replace (dense MLP for first K layers) and
+        // moe_intermediate_size × n_shared_experts shared branch (single-
+        // shared-expert PoC only — multi-shared is a follow-up).
+        MoeConfig? moe = ExtractMoeConfig(root, intermediateSize, numLayers, architecture);
 
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
@@ -100,7 +122,7 @@ public static class HfConfigExtractor
             NumKvHeads = numKvHeads,
             HeadDim = headDim,
             MaxSequenceLength = maxSeqLen,
-            AttentionType = AttentionType.GQA,
+            AttentionType = isMla ? AttentionType.MLA : AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = ropeConfig,
             ActivationFunction = ActivationFunction.SiLU,
@@ -108,8 +130,76 @@ public static class HfConfigExtractor
             NormEpsilon = normEps,
             TiedEmbeddings = tieEmbeddings,
             SlidingWindowSize = slidingWindow,
+            MlaConfig = mla,
             Moe = moe,
             ChatTemplate = null,
+        };
+    }
+
+    /// <summary>
+    /// Extracts <see cref="MlaConfig"/> from a DeepSeek-V2/V3 HF config.json.
+    /// Required fields: <c>kv_lora_rank</c>, <c>qk_nope_head_dim</c>,
+    /// <c>qk_rope_head_dim</c>, <c>v_head_dim</c>. <c>q_lora_rank</c> is
+    /// optional (0 / null means a monolithic <c>q_proj</c> is used instead).
+    /// YaRN rope scaling fields are captured but not yet consumed by the
+    /// attention kernel — see <see cref="MlaConfig.RopeScalingFactor"/>.
+    /// </summary>
+    private static MlaConfig ExtractMlaConfig(JsonElement root)
+    {
+        int kvLoraRank = GetInt32(root, "kv_lora_rank");
+        int qkNope = GetInt32(root, "qk_nope_head_dim");
+        int qkRope = GetInt32(root, "qk_rope_head_dim");
+        int vHead = GetInt32(root, "v_head_dim");
+
+        // q_lora_rank may be absent (V3 variants skip Q factorisation) or null.
+        int qLora = 0;
+        if (root.TryGetProperty("q_lora_rank", out var qLoraProp)
+            && qLoraProp.ValueKind == JsonValueKind.Number
+            && qLoraProp.TryGetInt32(out int qLoraVal)
+            && qLoraVal > 0)
+        {
+            qLora = qLoraVal;
+        }
+
+        float ropeTheta = GetFloatOrDefault(root, "rope_theta", 10000.0f);
+
+        // Optional rope_scaling (YaRN) — surface but do not yet apply.
+        float? scalingFactor = null;
+        float? scalingMscale = null;
+        float? scalingMscaleAllDim = null;
+        int? scalingOriginalMax = null;
+        if (root.TryGetProperty("rope_scaling", out var rs) && rs.ValueKind == JsonValueKind.Object)
+        {
+            if (rs.TryGetProperty("factor", out var f)
+                && f.ValueKind == JsonValueKind.Number
+                && f.TryGetSingle(out float fv))
+                scalingFactor = fv;
+            if (rs.TryGetProperty("mscale", out var m)
+                && m.ValueKind == JsonValueKind.Number
+                && m.TryGetSingle(out float mv))
+                scalingMscale = mv;
+            if (rs.TryGetProperty("mscale_all_dim", out var mad)
+                && mad.ValueKind == JsonValueKind.Number
+                && mad.TryGetSingle(out float madv))
+                scalingMscaleAllDim = madv;
+            if (rs.TryGetProperty("original_max_position_embeddings", out var om)
+                && om.ValueKind == JsonValueKind.Number
+                && om.TryGetInt32(out int omv))
+                scalingOriginalMax = omv;
+        }
+
+        return new MlaConfig
+        {
+            KvLoraRank = kvLoraRank,
+            QLoraRank = qLora,
+            QkNopeHeadDim = qkNope,
+            QkRopeHeadDim = qkRope,
+            VHeadDim = vHead,
+            RopeTheta = ropeTheta,
+            RopeScalingFactor = scalingFactor,
+            RopeScalingMscale = scalingMscale,
+            RopeScalingMscaleAllDim = scalingMscaleAllDim,
+            RopeScalingOriginalMaxPositionEmbeddings = scalingOriginalMax,
         };
     }
 
@@ -128,9 +218,14 @@ public static class HfConfigExtractor
     /// Returns null if neither expert-count key is present — the model is
     /// treated as dense.
     /// </summary>
-    private static MoeConfig? ExtractMoeConfig(JsonElement root, int defaultIntermediateSize)
+    private static MoeConfig? ExtractMoeConfig(
+        JsonElement root, int defaultIntermediateSize, int numLayers, Architecture architecture)
     {
+        bool isDeepSeek = architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3;
+
         int numExperts = GetInt32OrDefault(root, "num_local_experts", 0);
+        if (numExperts <= 0)
+            numExperts = GetInt32OrDefault(root, "n_routed_experts", 0); // DeepSeek convention
         if (numExperts <= 0)
             numExperts = GetInt32OrDefault(root, "num_experts", 0);
         if (numExperts <= 0)
@@ -144,29 +239,67 @@ public static class HfConfigExtractor
             throw new InvalidDataException(
                 $"HF config.json has num_experts_per_tok={numExpertsPerTok} > num_experts={numExperts}.");
 
-        // Phi-3.5-MoE + Qwen-MoE expose moe_intermediate_size. Mixtral reuses
-        // intermediate_size for the expert width.
+        // Phi-3.5-MoE + Qwen-MoE + DeepSeek-V2/V3 expose moe_intermediate_size.
+        // Mixtral reuses intermediate_size for the expert width.
         int moeIntermediateSize = GetInt32OrDefault(root, "moe_intermediate_size", defaultIntermediateSize);
 
-        // Qwen-MoE: norm_topk_prob governs whether top-k probs are renormalised
-        // to sum to 1. Mixtral always does this so its config never ships the
-        // key — default to true to preserve Mixtral behaviour.
+        // Qwen-MoE / DeepSeek: norm_topk_prob governs whether top-k probs are
+        // renormalised to sum to 1. Mixtral always does this so its config
+        // never ships the key — default to true to preserve Mixtral behaviour.
         bool normTopKProb = GetBoolOrDefault(root, "norm_topk_prob", true);
 
-        // Qwen1.5-MoE-A2.7B ships shared_expert_intermediate_size; absent on
-        // Mixtral, Phi-3.5-MoE, and Qwen3-MoE.
-        int? sharedExpertIntermediate = GetInt32NullableIfPositive(root, "shared_expert_intermediate_size");
-        // shared_expert_gate is a tensor (not a config key), so we default to
-        // "present iff the model declares a shared expert" — the safetensors
-        // loader turns this back off if the tensor is missing. Qwen1.5-MoE
-        // always ships it when shared_expert_intermediate_size is set.
-        bool hasSharedGate = sharedExpertIntermediate is not null;
+        // Shared-expert intermediate width.
+        // Qwen1.5-MoE-A2.7B: ships `shared_expert_intermediate_size` directly.
+        // DeepSeek-V2/V3: expresses it as moe_intermediate_size × n_shared_experts.
+        // DeepSeek multi-shared-expert support is out of scope for this PoC —
+        // if n_shared_experts > 1 we fold the total width into one shared-expert
+        // slot but warn via the ShareExpertGate flag (HasSharedExpertGate stays
+        // false for DeepSeek — DeepSeek does not use the sigmoid shared gate).
+        int? sharedExpertIntermediate;
+        bool hasSharedGate;
+        if (isDeepSeek)
+        {
+            int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
+            sharedExpertIntermediate = nShared > 0
+                ? nShared * moeIntermediateSize
+                : (int?)null;
+            hasSharedGate = false; // DeepSeek does NOT gate the shared expert.
+        }
+        else
+        {
+            sharedExpertIntermediate = GetInt32NullableIfPositive(root, "shared_expert_intermediate_size");
+            // shared_expert_gate is a tensor (not a config key) — default on
+            // when shared_expert_intermediate_size is set (Qwen1.5-MoE always
+            // ships the gate when the shared expert is present).
+            hasSharedGate = sharedExpertIntermediate is not null;
+        }
 
         // Qwen3-MoE layer-level sparsity: decoder_sparse_step (default 1 —
         // every layer is MoE) and mlp_only_layers (force-dense overrides).
         int decoderSparseStep = GetInt32OrDefault(root, "decoder_sparse_step", 1);
         if (decoderSparseStep <= 0) decoderSparseStep = 1;
         IReadOnlyList<int>? mlpOnlyLayers = GetInt32ArrayOrDefault(root, "mlp_only_layers");
+
+        // DeepSeek uses first_k_dense_replace: layers [0..K) are dense MLP,
+        // [K..num_layers) are MoE. We fold this into the mlp_only_layers list
+        // so IsMoeLayer() resolves correctly without a DeepSeek-specific branch.
+        if (isDeepSeek)
+        {
+            int firstKDense = GetInt32OrDefault(root, "first_k_dense_replace", 0);
+            if (firstKDense > 0 && numLayers > 0)
+            {
+                var denseList = new List<int>(capacity: firstKDense);
+                int bound = Math.Min(firstKDense, numLayers);
+                for (int i = 0; i < bound; i++) denseList.Add(i);
+                if (mlpOnlyLayers is not null)
+                {
+                    foreach (int idx in mlpOnlyLayers)
+                        if (!denseList.Contains(idx))
+                            denseList.Add(idx);
+                }
+                mlpOnlyLayers = denseList;
+            }
+        }
 
         return new MoeConfig
         {
@@ -219,6 +352,12 @@ public static class HfConfigExtractor
 
         return (archName?.ToLowerInvariant(), modelType?.ToLowerInvariant()) switch
         {
+            // DeepSeek-V3 must be checked before V2 and before any Llama/Mistral
+            // fallback — architectures[0] = 'DeepseekV3ForCausalLM'.
+            (var a, _) when a is not null && a.Contains("deepseekv3") => Architecture.DeepSeekV3,
+            (_, "deepseek_v3") => Architecture.DeepSeekV3,
+            (var a, _) when a is not null && a.Contains("deepseekv2") => Architecture.DeepSeekV2,
+            (_, "deepseek_v2") => Architecture.DeepSeekV2,
             // Mixtral must be checked before generic "mistral" — the architecture
             // class name is 'MixtralForCausalLM' but the organization namespace
             // is mistralai, so a substring match for "mistral" would otherwise
