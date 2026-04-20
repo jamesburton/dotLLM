@@ -177,16 +177,175 @@ public sealed unsafe class MoeSwiGluMlpTests
         }
     }
 
+    /// <summary>
+    /// Qwen-MoE with shared expert (no sigmoid gate) and
+    /// <c>norm_topk_prob=true</c>: output must equal Mixtral routed output +
+    /// dense SwiGLU shared-expert output, added per token.
+    /// </summary>
+    [Fact]
+    public void ExecuteWithSharedExpert_UnGated_AddsDenseSharedToRouted()
+    {
+        const int sharedIntermediate = 12; // deliberately != Intermediate so we catch mis-sized scratch
+        var rng = new Random(77);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.3f, 0.3f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.3f, 0.3f);
+        }
+        float[] sharedW1 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW3 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW2 = RandomF32(rng, Hidden * sharedIntermediate, -0.3f, 0.3f);
+
+        // Reference: Mixtral routed (renormalised) + per-token shared SwiGLU, no sigmoid.
+        float[] expected = ReferenceMoe(hidden, gate, w1, w2, w3, TopK);
+        for (int t = 0; t < SeqLen; t++)
+        {
+            float[] x = hidden.AsSpan(t * Hidden, Hidden).ToArray();
+            float[] s = DenseSwiGluVar(x, sharedW1, sharedW2, sharedW3, Hidden, sharedIntermediate);
+            for (int h = 0; h < Hidden; h++) expected[t * Hidden + h] += s[h];
+        }
+
+        float[] actual = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        fixed (float* s1 = sharedW1)
+        fixed (float* s2 = sharedW2)
+        fixed (float* s3 = sharedW3)
+        {
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, actual,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: true,
+                sharedGateProj: s1, sharedUpProj: s3, sharedDownProj: s2,
+                sharedIntermediateSize: sharedIntermediate,
+                sharedExpertGate: ReadOnlySpan<float>.Empty);
+        }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) < 1e-4f,
+                $"[i={i}] actual={actual[i]} expected={expected[i]} diff={actual[i] - expected[i]}");
+    }
+
+    /// <summary>
+    /// Qwen1.5-MoE variant: shared expert <b>with</b> a per-token sigmoid gate
+    /// (<c>sigmoid(hidden . shared_expert_gate)</c> scales the shared output)
+    /// and <c>norm_topk_prob=false</c> (raw softmax values as gating weights).
+    /// </summary>
+    [Fact]
+    public void ExecuteWithSharedExpert_WithSigmoidGate_AndNoRenorm_MatchesReference()
+    {
+        const int sharedIntermediate = 12;
+        var rng = new Random(123);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.3f, 0.3f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.3f, 0.3f);
+        }
+        float[] sharedW1 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW3 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW2 = RandomF32(rng, Hidden * sharedIntermediate, -0.3f, 0.3f);
+        float[] sharedGate = RandomF32(rng, Hidden, -0.5f, 0.5f);
+
+        // Reference: routed with normTopKProb=false (raw softmax sums), plus
+        // sigmoid(hidden . sharedGate) * dense shared expert per token.
+        float[] expected = ReferenceMoe(hidden, gate, w1, w2, w3, TopK, normTopKProb: false);
+        for (int t = 0; t < SeqLen; t++)
+        {
+            float[] x = hidden.AsSpan(t * Hidden, Hidden).ToArray();
+            float[] s = DenseSwiGluVar(x, sharedW1, sharedW2, sharedW3, Hidden, sharedIntermediate);
+            float logit = 0f;
+            for (int h = 0; h < Hidden; h++) logit += sharedGate[h] * x[h];
+            float scale = 1.0f / (1.0f + MathF.Exp(-logit));
+            for (int h = 0; h < Hidden; h++) expected[t * Hidden + h] += scale * s[h];
+        }
+
+        float[] actual = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        fixed (float* s1 = sharedW1)
+        fixed (float* s2 = sharedW2)
+        fixed (float* s3 = sharedW3)
+        {
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, actual,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: false,
+                sharedGateProj: s1, sharedUpProj: s3, sharedDownProj: s2,
+                sharedIntermediateSize: sharedIntermediate,
+                sharedExpertGate: sharedGate);
+        }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) < 1e-4f,
+                $"[i={i}] actual={actual[i]} expected={expected[i]} diff={actual[i] - expected[i]}");
+    }
+
+    /// <summary>
+    /// Calling <see cref="MoeSwiGluMlp.ExecuteWithSharedExpert"/> with
+    /// <c>sharedIntermediateSize=0</c> and null pointers must produce an
+    /// output byte-identical to the plain Mixtral path — the shared-expert
+    /// overload is a strict superset of the routed-only kernel.
+    /// </summary>
+    [Fact]
+    public void ExecuteWithSharedExpert_DisabledShared_MatchesMixtral()
+    {
+        var rng = new Random(999);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.3f, 0.3f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.3f, 0.3f);
+        }
+
+        float[] plain = new float[SeqLen * Hidden];
+        float[] shared = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        {
+            MoeSwiGluMlp.Execute(
+                hidden, gate, pin.W1, pin.W2, pin.W3, plain,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen);
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, shared,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: true,
+                sharedGateProj: null, sharedUpProj: null, sharedDownProj: null,
+                sharedIntermediateSize: 0,
+                sharedExpertGate: ReadOnlySpan<float>.Empty);
+        }
+
+        for (int i = 0; i < plain.Length; i++)
+            Assert.Equal(plain[i], shared[i]);
+    }
+
     // ──────────────────── Reference implementation ────────────────────
 
     /// <summary>
     /// Scalar-loop reference: exact replica of Mixtral's MoE block for
     /// cross-checking. Not performance-tuned — just algorithmically correct.
+    /// When <paramref name="normTopKProb"/> is false, the raw softmax-derived
+    /// top-k probabilities are used directly as gating weights (no renormalisation)
+    /// — this is the Qwen1.5-MoE convention.
     /// </summary>
     private static float[] ReferenceMoe(
         float[] hidden, float[] gate,
         float[][] w1, float[][] w2, float[][] w3,
-        int topk)
+        int topk,
+        bool normTopKProb = true)
     {
         int seqLen = hidden.Length / Hidden;
         float[] output = new float[seqLen * Hidden];
@@ -217,10 +376,14 @@ public sealed unsafe class MoeSwiGluMlpTests
                 idx[slot] = bestI; p[slot] = bestV;
             }
 
-            // Renormalise top-k by sum.
-            float sum = 0f;
-            for (int s = 0; s < topk; s++) sum += p[s];
-            for (int s = 0; s < topk; s++) p[s] = sum > 0 ? p[s] / sum : 0f;
+            // Renormalise top-k by sum (Mixtral + Qwen3-MoE). Qwen1.5-MoE
+            // leaves the raw values.
+            if (normTopKProb)
+            {
+                float sum = 0f;
+                for (int s = 0; s < topk; s++) sum += p[s];
+                for (int s = 0; s < topk; s++) p[s] = sum > 0 ? p[s] / sum : 0f;
+            }
 
             // Sum weighted expert outputs.
             Span<float> acc = output.AsSpan(t * Hidden, Hidden);
@@ -232,6 +395,42 @@ public sealed unsafe class MoeSwiGluMlpTests
             }
         }
         return output;
+    }
+
+    /// <summary>
+    /// Dense SwiGLU MLP with explicit hidden / intermediate sizes — mirrors
+    /// <see cref="DenseSwiGlu"/> but parametric so we can use a different
+    /// intermediate width for the shared-expert branch.
+    /// </summary>
+    private static float[] DenseSwiGluVar(float[] x, float[] w1, float[] w2, float[] w3,
+                                          int hidden, int intermediate)
+    {
+        float[] gate = new float[intermediate];
+        float[] up = new float[intermediate];
+        for (int i = 0; i < intermediate; i++)
+        {
+            float g = 0f, u = 0f;
+            for (int h = 0; h < hidden; h++)
+            {
+                g += w1[i * hidden + h] * x[h];
+                u += w3[i * hidden + h] * x[h];
+            }
+            gate[i] = g; up[i] = u;
+        }
+        float[] silu = new float[intermediate];
+        for (int i = 0; i < intermediate; i++)
+        {
+            float s = gate[i] * (1f / (1f + MathF.Exp(-gate[i])));
+            silu[i] = s * up[i];
+        }
+        float[] outBuf = new float[hidden];
+        for (int h = 0; h < hidden; h++)
+        {
+            float d = 0f;
+            for (int i = 0; i < intermediate; i++) d += w2[h * intermediate + i] * silu[i];
+            outBuf[h] = d;
+        }
+        return outBuf;
     }
 
     private static float[] DenseSwiGlu(float[] x, float[] w1, float[] w2, float[] w3)

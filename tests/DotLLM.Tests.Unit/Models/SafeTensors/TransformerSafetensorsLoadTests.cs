@@ -326,6 +326,207 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
     }
 
     /// <summary>
+    /// Synthetic Qwen-MoE fixture (Qwen3-MoE convention, no shared expert,
+    /// no interleaved dense layers) — 2 layers of routed MoE with the HF
+    /// Llama-style expert tensor names (<c>mlp.experts.{e}.{gate,up,down}_proj</c>)
+    /// and a router gate at <c>mlp.gate</c>. Proves the Qwen-MoE tensor-name
+    /// loader path goes through <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/>
+    /// and yields finite logits.
+    /// </summary>
+    [Fact]
+    public void QwenMoe_SyntheticFixture_ForwardProducesFiniteVocabLogits()
+    {
+        const int hidden = 16;
+        const int numHeads = 4;
+        const int numKvHeads = 2;
+        const int headDim = 4;
+        const int intermediate = 32;
+        const int vocab = 32;
+        const int numLayers = 2;
+        const int numExperts = 4;
+        const int topK = 2;
+
+        var rng = new Random(2026);
+
+        var b = new SafetensorsFixtureBuilder();
+        b.AddFloat32("model.embed_tokens.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+        b.AddFloat32("model.norm.weight", [hidden], Ones(hidden));
+        b.AddFloat32("lm_head.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            string p = $"model.layers.{i}";
+            b.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.self_attn.q_proj.weight",
+                [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.k_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.v_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.o_proj.weight",
+                [hidden, numHeads * headDim], RandomVec(rng, hidden * numHeads * headDim, 0.05f));
+
+            // Qwen-MoE MoE FFN: mlp.gate + mlp.experts.{e}.{gate,up,down}_proj.
+            b.AddFloat32($"{p}.mlp.gate.weight",
+                [numExperts, hidden], RandomVec(rng, numExperts * hidden, 0.05f));
+            for (int e = 0; e < numExperts; e++)
+            {
+                b.AddFloat32($"{p}.mlp.experts.{e}.gate_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.down_proj.weight",
+                    [hidden, intermediate], RandomVec(rng, hidden * intermediate, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.up_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+            }
+        }
+
+        string path = Path.Combine(_scratch, "qwen-moe.safetensors");
+        b.WriteTo(path);
+
+        using var file = SafetensorsFile.Open(path);
+        var config = new ModelConfig
+        {
+            Architecture = Architecture.QwenMoe,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = intermediate,
+            NumLayers = numLayers,
+            NumAttentionHeads = numHeads,
+            NumKvHeads = numKvHeads,
+            HeadDim = headDim,
+            MaxSequenceLength = 128,
+            NormEpsilon = 1e-5f,
+            TiedEmbeddings = false,
+            RoPEConfig = new RoPEConfig(Theta: 1_000_000.0f, DimensionCount: headDim, Type: RoPEType.NeoX),
+            Moe = new MoeConfig
+            {
+                NumExperts = numExperts,
+                NumExpertsPerTok = topK,
+                MoeIntermediateSize = intermediate,
+                NormTopKProb = true,
+                DecoderSparseStep = 1,
+            },
+        };
+
+        using var model = TransformerModel.LoadFromSafetensors(file, config);
+        using var logits = model.Forward(
+            tokenIds: [0, 1, 2],
+            positions: [0, 1, 2],
+            deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(3, logits.Shape[0]);
+        Assert.Equal(vocab, logits.Shape[1]);
+        AssertAllFinite(logits);
+    }
+
+    /// <summary>
+    /// Qwen1.5-MoE-A2.7B fixture: 1 MoE layer, 4 routed experts top-2, a
+    /// shared expert (<c>mlp.shared_expert.*</c>) with a sigmoid gate
+    /// (<c>mlp.shared_expert_gate.weight</c>), and <c>norm_topk_prob=false</c>.
+    /// Proves the shared-expert + no-renorm path wires up end-to-end.
+    /// </summary>
+    [Fact]
+    public void QwenMoe_SharedExpertFixture_ForwardProducesFiniteVocabLogits()
+    {
+        const int hidden = 16;
+        const int numHeads = 4;
+        const int numKvHeads = 2;
+        const int headDim = 4;
+        const int intermediate = 32;
+        const int sharedIntermediate = 24;   // deliberately != intermediate
+        const int vocab = 32;
+        const int numLayers = 1;
+        const int numExperts = 4;
+        const int topK = 2;
+
+        var rng = new Random(4711);
+
+        var b = new SafetensorsFixtureBuilder();
+        b.AddFloat32("model.embed_tokens.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+        b.AddFloat32("model.norm.weight", [hidden], Ones(hidden));
+        b.AddFloat32("lm_head.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            string p = $"model.layers.{i}";
+            b.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.self_attn.q_proj.weight",
+                [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.k_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.v_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.o_proj.weight",
+                [hidden, numHeads * headDim], RandomVec(rng, hidden * numHeads * headDim, 0.05f));
+
+            b.AddFloat32($"{p}.mlp.gate.weight",
+                [numExperts, hidden], RandomVec(rng, numExperts * hidden, 0.05f));
+            for (int e = 0; e < numExperts; e++)
+            {
+                b.AddFloat32($"{p}.mlp.experts.{e}.gate_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.down_proj.weight",
+                    [hidden, intermediate], RandomVec(rng, hidden * intermediate, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.up_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+            }
+            // Shared expert (dense SwiGLU) + sigmoid gate.
+            b.AddFloat32($"{p}.mlp.shared_expert.gate_proj.weight",
+                [sharedIntermediate, hidden], RandomVec(rng, sharedIntermediate * hidden, 0.05f));
+            b.AddFloat32($"{p}.mlp.shared_expert.up_proj.weight",
+                [sharedIntermediate, hidden], RandomVec(rng, sharedIntermediate * hidden, 0.05f));
+            b.AddFloat32($"{p}.mlp.shared_expert.down_proj.weight",
+                [hidden, sharedIntermediate], RandomVec(rng, hidden * sharedIntermediate, 0.05f));
+            b.AddFloat32($"{p}.mlp.shared_expert_gate.weight",
+                [1, hidden], RandomVec(rng, hidden, 0.1f));
+        }
+
+        string path = Path.Combine(_scratch, "qwen-moe-shared.safetensors");
+        b.WriteTo(path);
+
+        using var file = SafetensorsFile.Open(path);
+        var config = new ModelConfig
+        {
+            Architecture = Architecture.QwenMoe,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = intermediate,
+            NumLayers = numLayers,
+            NumAttentionHeads = numHeads,
+            NumKvHeads = numKvHeads,
+            HeadDim = headDim,
+            MaxSequenceLength = 128,
+            NormEpsilon = 1e-5f,
+            TiedEmbeddings = false,
+            RoPEConfig = new RoPEConfig(Theta: 1_000_000.0f, DimensionCount: headDim, Type: RoPEType.NeoX),
+            Moe = new MoeConfig
+            {
+                NumExperts = numExperts,
+                NumExpertsPerTok = topK,
+                MoeIntermediateSize = intermediate,
+                NormTopKProb = false, // Qwen1.5-MoE convention
+                SharedExpertIntermediateSize = sharedIntermediate,
+                HasSharedExpertGate = true,
+                DecoderSparseStep = 1,
+            },
+        };
+
+        using var model = TransformerModel.LoadFromSafetensors(file, config);
+        using var logits = model.Forward(
+            tokenIds: [0, 1, 2],
+            positions: [0, 1, 2],
+            deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(3, logits.Shape[0]);
+        Assert.Equal(vocab, logits.Shape[1]);
+        AssertAllFinite(logits);
+    }
+
+    /// <summary>
     /// Multi-shard variant: writes a Llama fixture across 2 shards + an
     /// index.json, loads it through <see cref="MultiShardSafetensorsFile"/>
     /// and runs a forward pass. Validates the interface refactor end-to-end.

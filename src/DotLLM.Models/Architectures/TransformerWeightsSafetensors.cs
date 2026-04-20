@@ -135,27 +135,48 @@ internal static class TransformerWeightsSafetensorsLoader
         // Post-attention (pre-FFN) RMSNorm
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
 
-        // FFN — dense (Llama/Mistral/Qwen) or MoE (Mixtral, future Qwen-MoE/Phi-3.5-MoE).
+        // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
+        // Qwen-MoE-convention MoE (possibly interleaved with dense layers via
+        // decoder_sparse_step / mlp_only_layers).
         if (config.Moe is not null)
         {
-            MoeLayerWeights moe = LoadMixtralMoeLayer(layerIdx, file, config, owned);
-            // The dense gate/up/down slots stay zeroed — the forward pass keys off
-            // Moe != null and skips them. Pass a harmless (ptr=0, quant=F32) block
-            // through the ctor so TransformerLayerWeights stays immutable-shaped.
-            return new TransformerLayerWeights(
-                attnNorm,
-                qPtr, qQt, qM, qK,
-                kPtr, kQt, kM, kK,
-                vPtr, vQt, vM, vK,
-                oPtr, oQt, oM, oK,
-                ffnNorm,
-                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
-                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
-                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
-                qBias, kBias, vBias, oBias,
-                gateBias: null, upBias: null, downBias: null,
-                qNormWeight: qNorm, kNormWeight: kNorm,
-                moe: moe);
+            MoeLayerWeights? moe = null;
+            bool useRoutedMoE = config.Architecture switch
+            {
+                // Mixtral: every layer is MoE.
+                DotLLM.Core.Configuration.Architecture.Mixtral => true,
+                // Qwen-MoE: per-layer decision based on decoder_sparse_step
+                // and mlp_only_layers. A "dense" Qwen-MoE layer uses the
+                // standard Llama-style mlp.{gate,up,down}_proj names — fall
+                // through to the dense path below.
+                DotLLM.Core.Configuration.Architecture.QwenMoe => config.Moe.IsMoeLayer(layerIdx),
+                _ => true,
+            };
+
+            if (useRoutedMoE)
+            {
+                moe = config.Architecture switch
+                {
+                    DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
+                };
+                return new TransformerLayerWeights(
+                    attnNorm,
+                    qPtr, qQt, qM, qK,
+                    kPtr, kQt, kM, kK,
+                    vPtr, vQt, vM, vK,
+                    oPtr, oQt, oM, oK,
+                    ffnNorm,
+                    gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                    upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                    downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                    qBias, kBias, vBias, oBias,
+                    gateBias: null, upBias: null, downBias: null,
+                    qNormWeight: qNorm, kNormWeight: kNorm,
+                    moe: moe);
+            }
+            // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
+            // the Llama-style dense SwiGLU resolution below.
         }
 
         // Dense FFN — HF SwiGLU names: gate_proj, up_proj, down_proj.
@@ -180,6 +201,99 @@ internal static class TransformerWeightsSafetensorsLoader
             qBias, kBias, vBias, oBias,
             gateBias: null, upBias: null, downBias: null,
             qNormWeight: qNorm, kNormWeight: kNorm);
+    }
+
+    /// <summary>
+    /// Loads Qwen-MoE-convention MoE weights for one transformer layer:
+    /// <c>model.layers.{i}.mlp.gate.weight</c> and
+    /// <c>model.layers.{i}.mlp.experts.{j}.{gate_proj,up_proj,down_proj}.weight</c>
+    /// — math-identical to Mixtral but with HF Llama-style tensor names.
+    /// When <see cref="MoeConfig.SharedExpertIntermediateSize"/> is set the
+    /// parallel shared-expert branch (<c>mlp.shared_expert.*</c>) and
+    /// optionally the <c>mlp.shared_expert_gate.weight</c> sigmoid gate are
+    /// resolved too. Everything lands in F32 via
+    /// <see cref="ResolveLinearAsF32"/> so the kernel is uniform in dtype.
+    /// </summary>
+    private static MoeLayerWeights LoadQwenMoeLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadQwenMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.mlp";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router gate — F32 [E, H].
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            // w1 ≡ gate_proj: [intermediate, hidden]
+            (w1[e], _, int w1M, int w1K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.gate_proj.weight", owned);
+            ValidateProjectionShape(w1M, w1K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.gate_proj.weight");
+            // w3 ≡ up_proj: [intermediate, hidden]
+            (w3[e], _, int w3M, int w3K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.up_proj.weight", owned);
+            ValidateProjectionShape(w3M, w3K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.up_proj.weight");
+            // w2 ≡ down_proj: [hidden, intermediate]
+            (w2[e], _, int w2M, int w2K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.down_proj.weight", owned);
+            ValidateProjectionShape(w2M, w2K, hiddenSize, intermediateSize,
+                $"{prefix}.experts.{e}.down_proj.weight");
+        }
+
+        // Shared expert (Qwen1.5-MoE-A2.7B). The HF modelling code declares a
+        // shared_expert when shared_expert_intermediate_size is set; if the
+        // tensors are missing despite the config flag, we fall back silently
+        // to routed-only.
+        nint sharedGate = nint.Zero, sharedUp = nint.Zero, sharedDown = nint.Zero;
+        int sharedIntermediate = 0;
+        float[]? sharedExpertGate = null;
+        if (moe.SharedExpertIntermediateSize is int sharedI
+            && file.TensorsByName.ContainsKey($"{prefix}.shared_expert.gate_proj.weight"))
+        {
+            sharedIntermediate = sharedI;
+            (sharedGate, _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                $"{prefix}.shared_expert.gate_proj.weight", owned);
+            ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                $"{prefix}.shared_expert.gate_proj.weight");
+            (sharedUp, _, int suM, int suK) = ResolveLinearAsF32(file,
+                $"{prefix}.shared_expert.up_proj.weight", owned);
+            ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                $"{prefix}.shared_expert.up_proj.weight");
+            (sharedDown, _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                $"{prefix}.shared_expert.down_proj.weight", owned);
+            ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                $"{prefix}.shared_expert.down_proj.weight");
+
+            // Optional sigmoid gate — HF stores it as [1, hiddenSize] (a plain
+            // Linear(hidden -> 1, bias=False)). ElementCount == hiddenSize, so
+            // ResolveNorm slots in cleanly.
+            string gateName = $"{prefix}.shared_expert_gate.weight";
+            if (moe.HasSharedExpertGate && file.TensorsByName.ContainsKey(gateName))
+            {
+                sharedExpertGate = ResolveNorm(file, gateName, hiddenSize);
+            }
+        }
+
+        return new MoeLayerWeights(
+            gate: gate,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: sharedGate,
+            sharedUpProj: sharedUp,
+            sharedDownProj: sharedDown,
+            sharedIntermediateSize: sharedIntermediate,
+            sharedExpertGate: sharedExpertGate);
     }
 
     /// <summary>

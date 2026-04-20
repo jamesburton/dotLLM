@@ -397,18 +397,49 @@ public sealed unsafe class TransformerModel : IModel
                 }
 
                 MoeLayerWeights moe = lw.Moe!;
-                MoeSwiGluMlp.Execute(
-                    hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
-                    gateWeights: moe.Gate,
-                    expertsW1: moe.W1,
-                    expertsW2: moe.W2,
-                    expertsW3: moe.W3,
-                    output: new Span<float>(normOut, seqLen * hiddenSize),
-                    numExperts: moe.NumExperts,
-                    numExpertsPerTok: moe.NumExpertsPerTok,
-                    hiddenSize: hiddenSize,
-                    intermediateSize: moe.IntermediateSize,
-                    seqLen: seqLen);
+                // Route through the shared-expert-aware overload iff we need
+                // shared-expert addition OR the raw-softmax (non-renormalised)
+                // Qwen1.5-MoE gating. The simple Mixtral path stays the call
+                // target for the common case.
+                if (moe.HasSharedExpert || !moe.NormTopKProb)
+                {
+                    ReadOnlySpan<float> sharedGateSpan = moe.SharedExpertGate is not null
+                        ? moe.SharedExpertGate.AsSpan()
+                        : ReadOnlySpan<float>.Empty;
+                    MoeSwiGluMlp.ExecuteWithSharedExpert(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        expertsW1: moe.W1,
+                        expertsW2: moe.W2,
+                        expertsW3: moe.W3,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen,
+                        normTopKProb: moe.NormTopKProb,
+                        sharedGateProj: (float*)moe.SharedGateProj,
+                        sharedUpProj: (float*)moe.SharedUpProj,
+                        sharedDownProj: (float*)moe.SharedDownProj,
+                        sharedIntermediateSize: moe.SharedIntermediateSize,
+                        sharedExpertGate: sharedGateSpan);
+                }
+                else
+                {
+                    MoeSwiGluMlp.Execute(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        expertsW1: moe.W1,
+                        expertsW2: moe.W2,
+                        expertsW3: moe.W3,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen);
+                }
 
                 // Residual add (per token) → hidden. Same as dense path.
                 for (int t = 0; t < seqLen; t++)

@@ -9,11 +9,23 @@ namespace DotLLM.Models.Architectures;
 /// <summary>
 /// Per-layer dense-routing MoE weight bundle. Present on a
 /// <see cref="TransformerLayerWeights"/> when the layer replaces its FFN
-/// with a Mixtral-convention MoE block. All pointers are F32 row-major —
-/// bf16 and F16 tensors are upcast at load time so the MoE kernel can
-/// feed <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/> directly without
-/// per-call dequant.
+/// with a Mixtral-convention or Qwen-MoE-convention MoE block. All pointers
+/// are F32 row-major — bf16 and F16 tensors are upcast at load time so the
+/// MoE kernel can feed <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/>
+/// directly without per-call dequant.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Qwen-MoE adds optional shared-expert pointers (<see cref="SharedGateProj"/>,
+/// <see cref="SharedUpProj"/>, <see cref="SharedDownProj"/>) and an optional
+/// sigmoid gate (<see cref="SharedExpertGate"/>). When
+/// <see cref="HasSharedExpert"/> is true, the forward pass runs a dense
+/// SwiGLU over the token and adds its (optionally gated) output to the
+/// routed top-k sum. The <see cref="NormTopKProb"/> flag controls whether
+/// the selected top-k probabilities are renormalised to sum to 1.0 (Mixtral
+/// + Qwen3-MoE) or left as raw softmax values (Qwen1.5-MoE-A2.7B).
+/// </para>
+/// </remarks>
 internal sealed class MoeLayerWeights
 {
     /// <summary>Router gate.weight as F32 [numExperts, hiddenSize] row-major.</summary>
@@ -33,10 +45,53 @@ internal sealed class MoeLayerWeights
     public readonly int HiddenSize;
     public readonly int IntermediateSize;
 
+    /// <summary>
+    /// When <c>true</c>, the kernel renormalises the selected top-k
+    /// probabilities to sum to 1.0 (Mixtral + Qwen3-MoE). When <c>false</c>,
+    /// the raw softmax probabilities are used as gating weights (Qwen1.5-MoE).
+    /// </summary>
+    public readonly bool NormTopKProb;
+
+    /// <summary>Optional shared-expert <c>gate_proj</c> pointer — F32 [sharedIntermediateSize, hiddenSize].</summary>
+    public readonly nint SharedGateProj;
+    /// <summary>Optional shared-expert <c>up_proj</c> pointer — F32 [sharedIntermediateSize, hiddenSize].</summary>
+    public readonly nint SharedUpProj;
+    /// <summary>Optional shared-expert <c>down_proj</c> pointer — F32 [hiddenSize, sharedIntermediateSize].</summary>
+    public readonly nint SharedDownProj;
+    /// <summary>Shared-expert intermediate width (0 when no shared expert).</summary>
+    public readonly int SharedIntermediateSize;
+    /// <summary>
+    /// Optional shared-expert sigmoid gate weight — F32 [hiddenSize]. When
+    /// present, per-token <c>sigmoid(hidden . SharedExpertGate)</c> scales
+    /// the shared-expert output before it's added to the routed sum
+    /// (Qwen1.5-MoE convention). Null = no gate, shared-expert output added
+    /// unscaled.
+    /// </summary>
+    public readonly float[]? SharedExpertGate;
+
+    /// <summary>True iff a shared-expert branch is present on this layer.</summary>
+    public bool HasSharedExpert => SharedIntermediateSize > 0;
+
+    /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
         float[] gate,
         nint[] w1, nint[] w2, nint[] w3,
         int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize)
+        : this(gate, w1, w2, w3, numExperts, numExpertsPerTok, hiddenSize, intermediateSize,
+               normTopKProb: true,
+               sharedGateProj: nint.Zero, sharedUpProj: nint.Zero, sharedDownProj: nint.Zero,
+               sharedIntermediateSize: 0, sharedExpertGate: null)
+    {
+    }
+
+    /// <summary>Full ctor covering Qwen-MoE extensions (shared expert + <c>norm_topk_prob</c> flag).</summary>
+    public MoeLayerWeights(
+        float[] gate,
+        nint[] w1, nint[] w2, nint[] w3,
+        int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize,
+        bool normTopKProb,
+        nint sharedGateProj, nint sharedUpProj, nint sharedDownProj,
+        int sharedIntermediateSize, float[]? sharedExpertGate)
     {
         Gate = gate;
         W1 = w1; W2 = w2; W3 = w3;
@@ -44,6 +99,12 @@ internal sealed class MoeLayerWeights
         NumExpertsPerTok = numExpertsPerTok;
         HiddenSize = hiddenSize;
         IntermediateSize = intermediateSize;
+        NormTopKProb = normTopKProb;
+        SharedGateProj = sharedGateProj;
+        SharedUpProj = sharedUpProj;
+        SharedDownProj = sharedDownProj;
+        SharedIntermediateSize = sharedIntermediateSize;
+        SharedExpertGate = sharedExpertGate;
     }
 }
 
