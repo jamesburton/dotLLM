@@ -72,10 +72,10 @@ public static class HfConfigExtractor
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
         // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
-        // Llama/Mistral/Mixtral use interleaved (Norm); Qwen/Phi use non-interleaved (NeoX).
+        // Llama/Mistral/Mixtral use interleaved (Norm); Qwen/Qwen-MoE/Phi use non-interleaved (NeoX).
         RoPEType ropeType = architecture switch
         {
-            Architecture.Qwen or Architecture.Phi => RoPEType.NeoX,
+            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 
@@ -119,7 +119,11 @@ public static class HfConfigExtractor
     /// <list type="bullet">
     ///   <item><c>num_local_experts</c> (Mixtral) or <c>num_experts</c> (Qwen-MoE, DBRX) &gt; 0</item>
     ///   <item><c>num_experts_per_tok</c> (top-k)</item>
-    ///   <item><c>moe_intermediate_size</c> override (Phi-3.5-MoE); falls back to <paramref name="defaultIntermediateSize"/></item>
+    ///   <item><c>moe_intermediate_size</c> override (Phi-3.5-MoE, Qwen-MoE per-expert width);
+    ///     falls back to <paramref name="defaultIntermediateSize"/></item>
+    ///   <item><c>norm_topk_prob</c> (Qwen-MoE top-k renormalisation flag; defaults to true — Mixtral behaviour)</item>
+    ///   <item><c>shared_expert_intermediate_size</c> (Qwen1.5-MoE shared-expert width); absent → no shared expert</item>
+    ///   <item><c>decoder_sparse_step</c> and <c>mlp_only_layers</c> (Qwen3-MoE layer-level sparsity)</item>
     /// </list>
     /// Returns null if neither expert-count key is present — the model is
     /// treated as dense.
@@ -140,16 +144,58 @@ public static class HfConfigExtractor
             throw new InvalidDataException(
                 $"HF config.json has num_experts_per_tok={numExpertsPerTok} > num_experts={numExperts}.");
 
-        // Phi-3.5-MoE exposes moe_intermediate_size. Mixtral / Qwen-MoE reuse
+        // Phi-3.5-MoE + Qwen-MoE expose moe_intermediate_size. Mixtral reuses
         // intermediate_size for the expert width.
         int moeIntermediateSize = GetInt32OrDefault(root, "moe_intermediate_size", defaultIntermediateSize);
+
+        // Qwen-MoE: norm_topk_prob governs whether top-k probs are renormalised
+        // to sum to 1. Mixtral always does this so its config never ships the
+        // key — default to true to preserve Mixtral behaviour.
+        bool normTopKProb = GetBoolOrDefault(root, "norm_topk_prob", true);
+
+        // Qwen1.5-MoE-A2.7B ships shared_expert_intermediate_size; absent on
+        // Mixtral, Phi-3.5-MoE, and Qwen3-MoE.
+        int? sharedExpertIntermediate = GetInt32NullableIfPositive(root, "shared_expert_intermediate_size");
+        // shared_expert_gate is a tensor (not a config key), so we default to
+        // "present iff the model declares a shared expert" — the safetensors
+        // loader turns this back off if the tensor is missing. Qwen1.5-MoE
+        // always ships it when shared_expert_intermediate_size is set.
+        bool hasSharedGate = sharedExpertIntermediate is not null;
+
+        // Qwen3-MoE layer-level sparsity: decoder_sparse_step (default 1 —
+        // every layer is MoE) and mlp_only_layers (force-dense overrides).
+        int decoderSparseStep = GetInt32OrDefault(root, "decoder_sparse_step", 1);
+        if (decoderSparseStep <= 0) decoderSparseStep = 1;
+        IReadOnlyList<int>? mlpOnlyLayers = GetInt32ArrayOrDefault(root, "mlp_only_layers");
 
         return new MoeConfig
         {
             NumExperts = numExperts,
             NumExpertsPerTok = numExpertsPerTok,
             MoeIntermediateSize = moeIntermediateSize,
+            NormTopKProb = normTopKProb,
+            SharedExpertIntermediateSize = sharedExpertIntermediate,
+            HasSharedExpertGate = hasSharedGate,
+            DecoderSparseStep = decoderSparseStep,
+            MlpOnlyLayers = mlpOnlyLayers,
         };
+    }
+
+    private static IReadOnlyList<int>? GetInt32ArrayOrDefault(JsonElement root, string key)
+    {
+        if (!root.TryGetProperty(key, out var prop) || prop.ValueKind != JsonValueKind.Array)
+            return null;
+        int len = prop.GetArrayLength();
+        if (len == 0) return null;
+        var result = new int[len];
+        int i = 0;
+        foreach (var el in prop.EnumerateArray())
+        {
+            if (el.ValueKind != JsonValueKind.Number || !el.TryGetInt32(out int v))
+                return null;
+            result[i++] = v;
+        }
+        return result;
     }
 
     /// <summary>
@@ -179,6 +225,12 @@ public static class HfConfigExtractor
             // shadow it.
             (var a, _) when a is not null && a.Contains("mixtral") => Architecture.Mixtral,
             (_, "mixtral") => Architecture.Mixtral,
+            // Qwen-MoE variants must be checked before generic "qwen" — the
+            // architecture class name is Qwen{2,3}MoeForCausalLM.
+            (var a, _) when a is not null && (a.Contains("qwen2moe") || a.Contains("qwen3moe")
+                || a.Contains("qwen2_moe") || a.Contains("qwen3_moe")
+                || a.Contains("qwenmoe") || a.Contains("qwen_moe")) => Architecture.QwenMoe,
+            (_, "qwen2_moe" or "qwen3_moe" or "qwen_moe") => Architecture.QwenMoe,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,

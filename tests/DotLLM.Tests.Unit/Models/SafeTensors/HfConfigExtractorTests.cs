@@ -233,4 +233,130 @@ public sealed class HfConfigExtractorTests
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
         Assert.Contains("num_experts_per_tok", ex.Message);
     }
+
+    /// <summary>
+    /// Qwen3-MoE detection path — copy of the real
+    /// <c>yujiepan/qwen3-moe-tiny-random</c> config (2026-04). Must resolve
+    /// to <see cref="Architecture.QwenMoe"/>, populate MoE fields, use NeoX
+    /// RoPE (Qwen family), leave shared-expert fields null, and carry the
+    /// <c>decoder_sparse_step=2</c> layer-level sparsity across.
+    /// </summary>
+    [Fact]
+    public void Qwen3Moe_TinyRandom_PopulatesMoeConfig_NoSharedExpert()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 128,
+            "vocab_size": 151936,
+            "max_position_embeddings": 40960,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "decoder_sparse_step": 2,
+            "mlp_only_layers": [],
+            "tie_word_embeddings": true
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(8, cfg.Moe!.NumExperts);
+        Assert.Equal(2, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(128, cfg.Moe.MoeIntermediateSize);
+        Assert.True(cfg.Moe.NormTopKProb);
+        Assert.Null(cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate);
+        Assert.Equal(2, cfg.Moe.DecoderSparseStep);
+        // decoder_sparse_step=2 ⇒ layer 0 is dense, layer 1 is MoE.
+        Assert.False(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+    }
+
+    /// <summary>
+    /// Qwen1.5-MoE-A2.7B config (2026-04) — has a shared expert with sigmoid
+    /// gate and <c>norm_topk_prob=false</c>. Must surface all three via the
+    /// extracted <see cref="Core.Models.MoeConfig"/>.
+    /// </summary>
+    [Fact]
+    public void Qwen15Moe_A27B_PopulatesSharedExpertAndRawTopKProb()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "model_type": "qwen2_moe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 5632,
+            "moe_intermediate_size": 1408,
+            "shared_expert_intermediate_size": 5632,
+            "vocab_size": 151936,
+            "max_position_embeddings": 8192,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": 60,
+            "num_experts_per_tok": 4,
+            "norm_topk_prob": false,
+            "decoder_sparse_step": 1,
+            "tie_word_embeddings": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(60, cfg.Moe!.NumExperts);
+        Assert.Equal(4, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        Assert.Equal(5632, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.True(cfg.Moe.HasSharedExpertGate);
+        Assert.Equal(1, cfg.Moe.DecoderSparseStep);
+        // decoder_sparse_step=1 ⇒ every layer is MoE.
+        Assert.True(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(23));
+    }
+
+    /// <summary>
+    /// Qwen-MoE <c>mlp_only_layers</c> override: forces listed layer indices
+    /// to be dense MLPs even if the sparsity stride would otherwise mark
+    /// them MoE.
+    /// </summary>
+    [Fact]
+    public void QwenMoe_MlpOnlyLayersOverride_RespectedByIsMoeLayer()
+    {
+        const string json = """
+        {
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "model_type": "qwen3_moe",
+            "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 32,
+            "intermediate_size": 128, "vocab_size": 100,
+            "max_position_embeddings": 128,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [2]
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.Moe);
+        Assert.True(cfg.Moe!.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(1));
+        Assert.False(cfg.Moe.IsMoeLayer(2));  // forced dense
+        Assert.True(cfg.Moe.IsMoeLayer(3));
+    }
 }
