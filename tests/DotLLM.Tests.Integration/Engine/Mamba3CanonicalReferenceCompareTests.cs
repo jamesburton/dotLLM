@@ -295,7 +295,11 @@ public class Mamba3CanonicalReferenceCompareTests
         float[] cumAngle = new float[nHead * numRopeAngles];
         float[] y = new float[seqlen * dModel];
 
+        using var scratch = Mamba3ForwardScratch.FromDimensions(
+            dInner, nHead, dState, numBcHeads, numRopeAngles, mimoRank: 1);
+
         Mamba3Block.Forward(
+            scratch,
             u, inProj, outProj,
             dtBias, bNormW, cNormW, bBias, cBias, d,
             y, ssmState, cumAngle,
@@ -348,7 +352,11 @@ public class Mamba3CanonicalReferenceCompareTests
         float[] cumAngle = new float[nHead * numRopeAngles];
         float[] y = new float[seqlen * dModel];
 
+        using var scratch = Mamba3ForwardScratch.FromDimensions(
+            dInner, nHead, dState, numBcHeads, numRopeAngles, mimoRank);
+
         Mamba3Block.ForwardMimo(
+            scratch,
             u, inProj, outProj,
             dtBias, bNormW, cNormW, bBias, cBias, d, mimoZ, mimoO,
             y, ssmState, cumAngle,
@@ -411,6 +419,9 @@ public class Mamba3CanonicalReferenceCompareTests
         float[] cNormW = f.Inputs["C_norm_weight"].Data;
 
         // Pass 1: 2 + 2 chunks, state + cum_angle threaded.
+        using var scratch = Mamba3ForwardScratch.FromDimensions(
+            dInner, nHead, dState, numBcHeads, numRopeAngles, mimoRank: 1);
+
         float[] y1 = new float[seqlen * dModel];
         float[] state1 = new float[nHead * headDim * dState];
         float[] cum1 = new float[nHead * numRopeAngles];
@@ -466,6 +477,7 @@ public class Mamba3CanonicalReferenceCompareTests
             Array.Copy(src, srcTokOffset * dModel, uChunk, 0, chunkLen * dModel);
             float[] yChunk = new float[chunkLen * dModel];
             Mamba3Block.Forward(
+                scratch,
                 uChunk, inProj, outProj,
                 dtBias, bNormW, cNormW, bBias, cBias, d,
                 yChunk, state, cum,

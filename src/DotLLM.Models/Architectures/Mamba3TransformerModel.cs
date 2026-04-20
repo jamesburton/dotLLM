@@ -54,6 +54,10 @@ public sealed unsafe class Mamba3TransformerModel : IModel
 {
     private readonly Mamba3Weights _weights;
     private readonly Mamba3Config _m3;
+    // Pooled per-Forward scratch — 64-byte-aligned unmanaged buffers sized to
+    // the widest seqLen seen so far. Grown power-of-two on demand, freed on
+    // Dispose. Shared across every layer of every Forward call.
+    private readonly Mamba3ForwardScratch _scratch;
     // Lifetime anchor — prevents GC of the mmap-backed safetensors file while
     // weight pointers from _weights are in flight. Not null for any loaded
     // model. Consumers still must dispose the SafetensorsFile themselves.
@@ -66,7 +70,7 @@ public sealed unsafe class Mamba3TransformerModel : IModel
     public ModelConfig Config { get; }
 
     /// <inheritdoc/>
-    public long ComputeMemoryBytes => 0;   // Per-call scratch (Mamba3Block allocates internally).
+    public long ComputeMemoryBytes => _scratch.AllocatedBytes;
 
     private Mamba3TransformerModel(ModelConfig config, Mamba3Weights weights, object? anchor)
     {
@@ -77,6 +81,10 @@ public sealed unsafe class Mamba3TransformerModel : IModel
                   "ModelConfig.Mamba3Config must be populated for Mamba3TransformerModel.",
                   nameof(config));
         _mmapAnchor = anchor;
+        // Lazy-initial capacity: the first Forward call sizes the scratch to
+        // its seqLen (rounded up to the next power of two), and subsequent
+        // Forwards at that-or-smaller length reuse the same allocation.
+        _scratch = new Mamba3ForwardScratch(config, initialCapacity: 0);
     }
 
     /// <summary>
@@ -311,6 +319,7 @@ public sealed unsafe class Mamba3TransformerModel : IModel
             }
 
             Mamba3Block.Forward(
+                scratch: _scratch,
                 u: normOut,
                 inProjWeight: inProj,
                 outProjWeight: outProj,
@@ -433,6 +442,7 @@ public sealed unsafe class Mamba3TransformerModel : IModel
     {
         if (_disposed) return;
         _disposed = true;
+        _scratch.Dispose();
         _weights.Dispose();
     }
 }
