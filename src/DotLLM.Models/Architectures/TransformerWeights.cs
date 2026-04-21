@@ -228,6 +228,20 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly MoeLayerWeights? Moe;
 
+    // ──────────────────────────── MLA attention ────────────────────────────
+    // DeepSeek-V2/V3 replaces the monolithic Q/K/V/O projections with a
+    // low-rank-factorised set. When <see cref="Mla"/> is non-null, the
+    // forward pass routes through MlaAttention and ignores the legacy
+    // Q/K/V slots above (O is still used as the output projection).
+
+    /// <summary>
+    /// Non-null on DeepSeek-V2/V3 MLA layers. Carries all MLA-specific
+    /// projection pointers + hyperparameters (qk nope/rope dims, v_head_dim,
+    /// q/kv LoRA ranks). When present, <see cref="QWeight"/>/<see cref="KWeight"/>/
+    /// <see cref="VWeight"/> are zeroed and the forward pass takes the MLA branch.
+    /// </summary>
+    public readonly MlaLayerWeights? Mla;
+
     public TransformerLayerWeights(
         float[] attnNormWeight,
         nint qWeight, QuantizationType qQuantType, int qOutputDim, int qInputDim,
@@ -241,7 +255,8 @@ internal readonly struct TransformerLayerWeights
         float[]? qBias = null, float[]? kBias = null, float[]? vBias = null, float[]? oBias = null,
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
         float[]? qNormWeight = null, float[]? kNormWeight = null,
-        MoeLayerWeights? moe = null)
+        MoeLayerWeights? moe = null,
+        MlaLayerWeights? mla = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -255,6 +270,76 @@ internal readonly struct TransformerLayerWeights
         UpWeight = upWeight; UpQuantType = upQuantType; UpOutputDim = upOutputDim; UpInputDim = upInputDim; UpBias = upBias;
         DownWeight = downWeight; DownQuantType = downQuantType; DownOutputDim = downOutputDim; DownInputDim = downInputDim; DownBias = downBias;
         Moe = moe;
+        Mla = mla;
+    }
+}
+
+/// <summary>
+/// Per-layer MLA (Multi-head Latent Attention) weight bundle for DeepSeek-V2/V3.
+/// All projection pointers are F32 row-major — F16 / BF16 tensors are upcast at
+/// load time (via <c>ResolveLinearAsF32</c>) so the kernel can consume a uniform
+/// F32 layout matching <see cref="DotLLM.Cpu.Kernels.MlaAttention.Execute"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Exactly one of the Q paths is populated:
+/// <list type="bullet">
+///   <item>LoRA-factored Q (<see cref="QLoraRank"/> &gt; 0): <see cref="QAProj"/>,
+///     <see cref="QALayernormWeight"/>, <see cref="QBProj"/> are all non-zero;
+///     <see cref="QProj"/> is zero.</item>
+///   <item>Monolithic Q (<see cref="QLoraRank"/> == 0): <see cref="QProj"/> is
+///     non-zero; <see cref="QAProj"/>, <see cref="QBProj"/> are zero and
+///     <see cref="QALayernormWeight"/> is null.</item>
+/// </list>
+/// The KV path is always LoRA-factored (<see cref="KvAProjWithMqa"/>,
+/// <see cref="KvALayernormWeight"/>, <see cref="KvBProj"/>).
+/// </para>
+/// </remarks>
+internal sealed class MlaLayerWeights
+{
+    /// <summary>Q down-projection [qLoraRank, hidden]. Zero when <see cref="QLoraRank"/>==0.</summary>
+    public readonly nint QAProj;
+    /// <summary>Q LoRA RMSNorm weight [qLoraRank]. Null when <see cref="QLoraRank"/>==0.</summary>
+    public readonly float[]? QALayernormWeight;
+    /// <summary>Q up-projection [numHeads * qkHeadDim, qLoraRank]. Zero when <see cref="QLoraRank"/>==0.</summary>
+    public readonly nint QBProj;
+    /// <summary>Monolithic Q projection [numHeads * qkHeadDim, hidden]. Zero when <see cref="QLoraRank"/>&gt;0.</summary>
+    public readonly nint QProj;
+
+    /// <summary>KV down-projection with shared-rope-K [kvLoraRank + qkRopeHeadDim, hidden].</summary>
+    public readonly nint KvAProjWithMqa;
+    /// <summary>KV LoRA RMSNorm weight [kvLoraRank].</summary>
+    public readonly float[] KvALayernormWeight;
+    /// <summary>KV up-projection [numHeads * (qkNopeHeadDim + vHeadDim), kvLoraRank].</summary>
+    public readonly nint KvBProj;
+
+    // Hyperparameters (mirrors MlaConfig, carried on the layer for forward-path convenience).
+    public readonly int NumHeads;
+    public readonly int QkNopeHeadDim;
+    public readonly int QkRopeHeadDim;
+    public readonly int VHeadDim;
+    public readonly int QLoraRank;
+    public readonly int KvLoraRank;
+
+    public MlaLayerWeights(
+        nint qAProj, float[]? qALayernormWeight, nint qBProj, nint qProj,
+        nint kvAProjWithMqa, float[] kvALayernormWeight, nint kvBProj,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int qLoraRank, int kvLoraRank)
+    {
+        QAProj = qAProj;
+        QALayernormWeight = qALayernormWeight;
+        QBProj = qBProj;
+        QProj = qProj;
+        KvAProjWithMqa = kvAProjWithMqa;
+        KvALayernormWeight = kvALayernormWeight;
+        KvBProj = kvBProj;
+        NumHeads = numHeads;
+        QkNopeHeadDim = qkNopeHeadDim;
+        QkRopeHeadDim = qkRopeHeadDim;
+        VHeadDim = vHeadDim;
+        QLoraRank = qLoraRank;
+        KvLoraRank = kvLoraRank;
     }
 }
 
@@ -421,12 +506,16 @@ internal sealed class TransformerWeights : IDisposable
             // without R4 interleaving (the per-expert GEMMs are tiny and
             // the win would be microscopic).
             bool isMoe = lw.Moe is not null;
+            // MLA layers don't populate the legacy Q/K/V slots either — the
+            // MLA forward takes its weights from lw.Mla and calls the scalar
+            // MlaAttention kernel which does not consume R4 repacks.
+            bool isMla = lw.Mla is not null;
             repacked[i] = new RepackedLayerWeights
             {
-                Q = TryRepack(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim),
-                K = TryRepack(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim),
-                V = TryRepack(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim),
-                O = TryRepack(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim),
+                Q = isMla ? default : TryRepack(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim),
+                K = isMla ? default : TryRepack(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim),
+                V = isMla ? default : TryRepack(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim),
+                O = isMla ? default : TryRepack(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim),
                 Gate = isMoe ? default : TryRepack(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim),
                 Up = isMoe ? default : TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
                 Down = isMoe ? default : TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),

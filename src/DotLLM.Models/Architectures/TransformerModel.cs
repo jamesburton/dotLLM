@@ -147,9 +147,15 @@ public sealed unsafe class TransformerModel : IModel
         var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
         weights.RepackWeights();
 
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        // For MLA (DeepSeek-V2/V3) RoPE applies only to the decoupled
+        // qk_rope_head_dim sub-dimension — NOT the full qk_head_dim carried
+        // in ModelConfig.HeadDim. Size the RoPE table accordingly so the MLA
+        // kernel's [pos, qk_rope_head_dim / 2] indexing lines up.
+        int ropeDim = config.MlaConfig is not null
+            ? config.MlaConfig.QkRopeHeadDim
+            : (config.RoPEConfig?.DimensionCount ?? config.HeadDim);
         if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        float ropeTheta = config.MlaConfig?.RopeTheta ?? config.RoPEConfig?.Theta ?? 10000.0f;
         RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
 
         var state = new TransformerForwardState(
@@ -253,12 +259,96 @@ public sealed unsafe class TransformerModel : IModel
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
 
+            // Declared once for the whole layer so both the GQA and MLA
+            // paths share the same input-quantisation scratch region.
+            byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
+
             // a. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
-            // b. RMSNorm + Pre-quantize + Q/K/V projections
-            byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
+            // ── MLA branch (DeepSeek-V2/V3) ──────────────────────────────
+            // Routes through the standalone MlaAttention kernel: RMSNorm → Q
+            // path (LoRA or monolithic) → KV path (LoRA + MQA-shared rope-K)
+            // → decoupled RoPE on the rope sub-dim only → per-head
+            // scaled-dot-product attention with causal mask → o_proj. No
+            // KV-cache in this PoC (kvCache argument is ignored for MLA layers).
+            if (lw.Mla is not null)
+            {
+                // RMSNorm per token into normOut (MLA kernel consumes the
+                // normalised hidden state).
+                for (int t = 0; t < seqLen; t++)
+                {
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                        lw.AttnNormWeight, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                }
 
+                MlaLayerWeights mlaW = lw.Mla!;
+                int qTotalElems = mlaW.NumHeads * (mlaW.QkNopeHeadDim + mlaW.QkRopeHeadDim);
+                int kvAElems = mlaW.KvLoraRank + mlaW.QkRopeHeadDim;
+                int kvBElems = mlaW.NumHeads * (mlaW.QkNopeHeadDim + mlaW.VHeadDim);
+                int oElems = hiddenSize * (mlaW.NumHeads * mlaW.VHeadDim);
+                int qAElems = mlaW.QLoraRank > 0 ? mlaW.QLoraRank * hiddenSize : 0;
+                int qBElems = mlaW.QLoraRank > 0 ? qTotalElems * mlaW.QLoraRank : 0;
+                int qMonoElems = mlaW.QLoraRank > 0 ? 0 : qTotalElems * hiddenSize;
+
+                int ropeHalf = mlaW.QkRopeHeadDim / 2;
+                int ropeTableLen = _state.CosTable.Length;
+
+                MlaAttention.Execute(
+                    hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                    output: new Span<float>(attnOut, seqLen * hiddenSize),
+                    seqLen: seqLen,
+                    positionOffset: positions[0],
+                    hiddenSize: hiddenSize,
+                    numHeads: mlaW.NumHeads,
+                    qkNopeHeadDim: mlaW.QkNopeHeadDim,
+                    qkRopeHeadDim: mlaW.QkRopeHeadDim,
+                    vHeadDim: mlaW.VHeadDim,
+                    qLoraRank: mlaW.QLoraRank,
+                    kvLoraRank: mlaW.KvLoraRank,
+                    rmsNormEps: eps,
+                    ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
+                    ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
+                    qAProj: qAElems > 0
+                        ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems)
+                        : ReadOnlySpan<float>.Empty,
+                    qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
+                    qBProj: qBElems > 0
+                        ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems)
+                        : ReadOnlySpan<float>.Empty,
+                    qProj: qMonoElems > 0
+                        ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems)
+                        : ReadOnlySpan<float>.Empty,
+                    kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
+                    kvALayernormWeight: mlaW.KvALayernormWeight,
+                    kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
+                    oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems));
+
+                // Bias on o_proj (rare — DeepSeek doesn't ship one by default).
+                AddBias(lw.OBias, attnOut, hiddenSize, seqLen);
+
+                // Residual add: attnOut + residual → hidden
+                for (int t = 0; t < seqLen; t++)
+                {
+                    Add.Execute(
+                        new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                        new ReadOnlySpan<float>(attnOut + t * hiddenSize, hiddenSize),
+                        new Span<float>(hidden + t * hiddenSize, hiddenSize));
+                }
+
+                // Prepare residual for FFN.
+                new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+
+                // Fall through to the standard FFN branch (dense OR MoE,
+                // decided by lw.Moe). Keep the original code path below by
+                // goto-less control: set a flag and skip the GQA attention
+                // code.
+                goto FfnBranch;
+            }
+
+            // b. RMSNorm + Pre-quantize + Q/K/V projections
             if (seqLen == 1 && _threadPool != null)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
@@ -379,6 +469,7 @@ public sealed unsafe class TransformerModel : IModel
             // h. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
+            FfnBranch:
             // ── MoE branch ──────────────────────────────────────────────
             // Mixtral-convention top-k dense routing replaces the dense FFN
             // block entirely. Takes post-attn hidden + FFN RMSNorm weight,

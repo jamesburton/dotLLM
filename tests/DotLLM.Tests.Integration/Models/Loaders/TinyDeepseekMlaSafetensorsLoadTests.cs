@@ -1,4 +1,5 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Tensors;
 using DotLLM.HuggingFace;
 using DotLLM.Models;
 using DotLLM.Models.SafeTensors;
@@ -26,15 +27,12 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// </list>
 /// </para>
 /// <para>
-/// <b>Forward pass is out of scope for this agent.</b> The MLA kernel
-/// (<see cref="DotLLM.Cpu.Kernels.MlaAttention"/>) is landed as a standalone
-/// correctness-verified kernel; wiring it into
-/// <see cref="DotLLM.Models.Architectures.TransformerModel"/>'s highly-tuned
-/// decode path (fused RmsNorm+Quantize, R4 interleaving, FusedDecodeGemv,
-/// quantised KV-cache) is a follow-up PR. Until then,
-/// <see cref="ModelLoader.LoadFromSafetensors"/> throws
-/// <see cref="NotSupportedException"/> for DeepSeek — a behaviour this test
-/// also asserts.
+/// With the MLA integration PR, <see cref="ModelLoader.LoadFromSafetensors"/>
+/// now dispatches DeepSeek-V2/V3 into <see cref="DotLLM.Models.Architectures.TransformerModel.LoadFromSafetensors"/>
+/// which routes attention through the MLA branch backed by
+/// <see cref="DotLLM.Cpu.Kernels.MlaAttention"/>. The PoC skips the KV-cache
+/// optimisation (the scalar kernel re-runs the full MLA forward per call);
+/// that is tracked as a follow-up.
 /// </para>
 /// <para>
 /// Cache location: <c>~/.dotllm/test-cache/&lt;repo&gt;/</c>. 50 MB cap.
@@ -120,29 +118,92 @@ public sealed class TinyDeepseekMlaSafetensorsLoadTests
     }
 
     /// <summary>
-    /// Asserts the expected forward-path contract during the MLA kernel
-    /// integration gap: <see cref="ModelLoader.LoadFromSafetensors"/>
-    /// currently throws <see cref="NotSupportedException"/> for DeepSeek
-    /// because the TransformerModel decode path is not wired for MLA yet.
-    /// When a follow-up PR lands MLA into the forward pass, this test should
-    /// be inverted into a full forward-pass + finite-logit assertion (see
-    /// <see cref="TinyMixtralSafetensorsLoadTests"/> for the shape).
+    /// End-to-end: load a tiny-random DeepSeek-V2/V3 checkpoint, run a prefill
+    /// forward pass, and assert the resulting logits are finite with non-zero
+    /// variance. Exercises the full MLA load + dispatch path:
+    /// <see cref="HfConfigExtractor"/> → <see cref="ModelLoader.LoadFromSafetensors"/>
+    /// → <see cref="DotLLM.Models.Architectures.TransformerModel.LoadFromSafetensors"/>
+    /// (<c>LoadDeepSeekMlaLayer</c> per layer) →
+    /// <see cref="DotLLM.Cpu.Kernels.MlaAttention.Execute"/> per layer.
     /// </summary>
     [SkippableFact]
-    public void DeepseekLoadFromSafetensors_ThrowsNotSupported_UntilMlaIsWired()
+    public void DeepseekLoadFromSafetensors_Forward_ProducesFiniteLogits()
     {
         var located = TryEnsureTinyDeepseek(out string? skipReason);
         Skip.If(located is null, skipReason ?? "tiny-random DeepSeek download unavailable");
-        var (modelPath, _) = located.Value;
+        var (modelPath, expectedArch) = located.Value;
 
-        var ex = Assert.Throws<NotSupportedException>(() =>
+        var (model, file, cfg) = ModelLoader.LoadFromSafetensors(modelPath);
+        try
         {
-            var (_, file, _) = ModelLoader.LoadFromSafetensors(modelPath);
+            Assert.Equal(expectedArch, cfg.Architecture);
+            Assert.Equal(AttentionType.MLA, cfg.AttentionType);
+            Assert.NotNull(cfg.MlaConfig);
+
+            // Clamp the prompt to the model's supported context. Tiny-random
+            // checkpoints usually keep max_position_embeddings small (2k–163k
+            // for V3) so 4 is safe everywhere.
+            int[] tokenIds = [1, 2, 3, 4];
+            int[] positions = [0, 1, 2, 3];
+
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+
+            Assert.Equal(2, logits.Shape.Rank);
+            Assert.Equal(tokenIds.Length, logits.Shape[0]);
+            Assert.Equal(cfg.VocabSize, logits.Shape[1]);
+
+            var stats = ComputeStats(logits);
+            _output.WriteLine(
+                $"MLA forward: shape=[{logits.Shape[0]},{logits.Shape[1]}] "
+              + $"finite={stats.FiniteCount}/{stats.TotalCount} "
+              + $"mean={stats.Mean:F4} std={stats.StdDev:F4} "
+              + $"min={stats.Min:F4} max={stats.Max:F4} argmax={stats.ArgmaxFirstRow}");
+            Assert.Equal(stats.TotalCount, stats.FiniteCount);
+            Assert.True(stats.StdDev > 0.0f,
+                $"Logits degenerate: std={stats.StdDev} — MLA branch wired incorrectly.");
+        }
+        finally
+        {
+            (model as IDisposable)?.Dispose();
             file.Dispose();
-        });
-        _output.WriteLine($"Expected NotSupportedException: {ex.Message}");
-        Assert.Contains("DeepSeek", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
     }
+
+    private static unsafe LogitStats ComputeStats(ITensor logits)
+    {
+        int rows = logits.Shape[0];
+        int cols = logits.Shape[1];
+        int total = rows * cols;
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+
+        int finite = 0;
+        double sum = 0, sumSq = 0;
+        float min = float.PositiveInfinity, max = float.NegativeInfinity;
+        foreach (float v in span)
+        {
+            if (float.IsFinite(v))
+            {
+                finite++;
+                sum += v;
+                sumSq += (double)v * v;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+        double mean = finite > 0 ? sum / finite : 0.0;
+        double variance = finite > 0 ? (sumSq / finite) - (mean * mean) : 0.0;
+        double stddev = Math.Sqrt(Math.Max(0.0, variance));
+
+        int argmax = 0;
+        float best = float.NegativeInfinity;
+        for (int i = 0; i < cols; i++)
+            if (span[i] > best) { best = span[i]; argmax = i; }
+
+        return new LogitStats(total, finite, (float)mean, (float)stddev, min, max, argmax);
+    }
+
+    private readonly record struct LogitStats(
+        int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max, int ArgmaxFirstRow);
 
     /// <summary>
     /// Downloads a tiny-random DeepSeek-V2 or V3 repo into the local cache.
