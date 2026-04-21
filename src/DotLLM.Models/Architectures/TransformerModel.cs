@@ -419,9 +419,9 @@ public sealed unsafe class TransformerModel : IModel
                         intermediateSize: moe.IntermediateSize,
                         seqLen: seqLen,
                         normTopKProb: moe.NormTopKProb,
-                        sharedGateProj: (float*)moe.SharedGateProj,
-                        sharedUpProj: (float*)moe.SharedUpProj,
-                        sharedDownProj: (float*)moe.SharedDownProj,
+                        sharedGateProj: moe.SharedGateProj,
+                        sharedUpProj: moe.SharedUpProj,
+                        sharedDownProj: moe.SharedDownProj,
                         sharedIntermediateSize: moe.SharedIntermediateSize,
                         sharedExpertGate: sharedGateSpan);
                 }

@@ -213,15 +213,13 @@ public sealed unsafe class MoeSwiGluMlpTests
 
         float[] actual = new float[SeqLen * Hidden];
         using (var pin = new Pinned(w1, w2, w3))
-        fixed (float* s1 = sharedW1)
-        fixed (float* s2 = sharedW2)
-        fixed (float* s3 = sharedW3)
+        using (var sharedPin = new PinnedShared(sharedW1, sharedW2, sharedW3))
         {
             MoeSwiGluMlp.ExecuteWithSharedExpert(
                 hidden, gate, pin.W1, pin.W2, pin.W3, actual,
                 NumExperts, TopK, Hidden, Intermediate, SeqLen,
                 normTopKProb: true,
-                sharedGateProj: s1, sharedUpProj: s3, sharedDownProj: s2,
+                sharedGateProj: sharedPin.W1, sharedUpProj: sharedPin.W3, sharedDownProj: sharedPin.W2,
                 sharedIntermediateSize: sharedIntermediate,
                 sharedExpertGate: ReadOnlySpan<float>.Empty);
         }
@@ -272,15 +270,13 @@ public sealed unsafe class MoeSwiGluMlpTests
 
         float[] actual = new float[SeqLen * Hidden];
         using (var pin = new Pinned(w1, w2, w3))
-        fixed (float* s1 = sharedW1)
-        fixed (float* s2 = sharedW2)
-        fixed (float* s3 = sharedW3)
+        using (var sharedPin = new PinnedShared(sharedW1, sharedW2, sharedW3))
         {
             MoeSwiGluMlp.ExecuteWithSharedExpert(
                 hidden, gate, pin.W1, pin.W2, pin.W3, actual,
                 NumExperts, TopK, Hidden, Intermediate, SeqLen,
                 normTopKProb: false,
-                sharedGateProj: s1, sharedUpProj: s3, sharedDownProj: s2,
+                sharedGateProj: sharedPin.W1, sharedUpProj: sharedPin.W3, sharedDownProj: sharedPin.W2,
                 sharedIntermediateSize: sharedIntermediate,
                 sharedExpertGate: sharedGate);
         }
@@ -292,9 +288,9 @@ public sealed unsafe class MoeSwiGluMlpTests
 
     /// <summary>
     /// Calling <see cref="MoeSwiGluMlp.ExecuteWithSharedExpert"/> with
-    /// <c>sharedIntermediateSize=0</c> and null pointers must produce an
-    /// output byte-identical to the plain Mixtral path — the shared-expert
-    /// overload is a strict superset of the routed-only kernel.
+    /// <c>sharedIntermediateSize=0</c> and empty shared pointer spans must
+    /// produce an output byte-identical to the plain Mixtral path — the
+    /// shared-expert overload is a strict superset of the routed-only kernel.
     /// </summary>
     [Fact]
     public void ExecuteWithSharedExpert_DisabledShared_MatchesMixtral()
@@ -323,13 +319,140 @@ public sealed unsafe class MoeSwiGluMlpTests
                 hidden, gate, pin.W1, pin.W2, pin.W3, shared,
                 NumExperts, TopK, Hidden, Intermediate, SeqLen,
                 normTopKProb: true,
-                sharedGateProj: null, sharedUpProj: null, sharedDownProj: null,
+                sharedGateProj: ReadOnlySpan<nint>.Empty,
+                sharedUpProj: ReadOnlySpan<nint>.Empty,
+                sharedDownProj: ReadOnlySpan<nint>.Empty,
                 sharedIntermediateSize: 0,
                 sharedExpertGate: ReadOnlySpan<float>.Empty);
         }
 
         for (int i = 0; i < plain.Length; i++)
             Assert.Equal(plain[i], shared[i]);
+    }
+
+    /// <summary>
+    /// DeepSeek-V2/V3 convention: multiple shared experts with no sigmoid gate.
+    /// Output must equal Mixtral routed sum + sum of dense SwiGLU outputs across
+    /// all shared experts, added per token.
+    /// </summary>
+    [Fact]
+    public void MoeSwiGluMlp_MultiSharedExpert_SumsOverSharedExperts()
+    {
+        const int sharedIntermediate = 12;
+        const int numSharedExperts = 2;
+        var rng = new Random(88);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.3f, 0.3f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.3f, 0.3f);
+        }
+        // Per-shared-expert SwiGLU weights (different for each).
+        float[][] sharedW1 = new float[numSharedExperts][];
+        float[][] sharedW2 = new float[numSharedExperts][];
+        float[][] sharedW3 = new float[numSharedExperts][];
+        for (int k = 0; k < numSharedExperts; k++)
+        {
+            sharedW1[k] = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+            sharedW3[k] = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+            sharedW2[k] = RandomF32(rng, Hidden * sharedIntermediate, -0.3f, 0.3f);
+        }
+
+        // Reference: Mixtral routed (renormalised) + SUM over shared experts (no gate).
+        float[] expected = ReferenceMoe(hidden, gate, w1, w2, w3, TopK);
+        for (int t = 0; t < SeqLen; t++)
+        {
+            float[] x = hidden.AsSpan(t * Hidden, Hidden).ToArray();
+            for (int k = 0; k < numSharedExperts; k++)
+            {
+                float[] s = DenseSwiGluVar(x, sharedW1[k], sharedW2[k], sharedW3[k],
+                    Hidden, sharedIntermediate);
+                for (int h = 0; h < Hidden; h++) expected[t * Hidden + h] += s[h];
+            }
+        }
+
+        float[] actual = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        using (var sharedPin = new PinnedSharedMulti(sharedW1, sharedW2, sharedW3))
+        {
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, actual,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: true,
+                sharedGateProj: sharedPin.W1, sharedUpProj: sharedPin.W3, sharedDownProj: sharedPin.W2,
+                sharedIntermediateSize: sharedIntermediate,
+                sharedExpertGate: ReadOnlySpan<float>.Empty);
+        }
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) < 1e-4f,
+                $"[i={i}] actual={actual[i]} expected={expected[i]} diff={actual[i] - expected[i]}");
+    }
+
+    /// <summary>
+    /// With one shared expert in array form, the output must match the
+    /// single-shared-expert semantics exactly (bit-identical) — proves the
+    /// numSharedExperts=1 path in the array-based kernel is a faithful
+    /// rewrite of the pre-migration scalar shared path.
+    /// </summary>
+    [Fact]
+    public void MoeSwiGluMlp_MultiSharedExpert_MatchesSingleSharedReference()
+    {
+        const int sharedIntermediate = 12;
+        var rng = new Random(54321);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.3f, 0.3f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.3f, 0.3f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.3f, 0.3f);
+        }
+        float[] sharedW1 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW3 = RandomF32(rng, sharedIntermediate * Hidden, -0.3f, 0.3f);
+        float[] sharedW2 = RandomF32(rng, Hidden * sharedIntermediate, -0.3f, 0.3f);
+
+        // Single-shared path (the existing Qwen-style call).
+        float[] singleShared = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        using (var sharedPin = new PinnedShared(sharedW1, sharedW2, sharedW3))
+        {
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, singleShared,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: true,
+                sharedGateProj: sharedPin.W1, sharedUpProj: sharedPin.W3, sharedDownProj: sharedPin.W2,
+                sharedIntermediateSize: sharedIntermediate,
+                sharedExpertGate: ReadOnlySpan<float>.Empty);
+        }
+
+        // Multi-shared path with length-1 arrays — must be bit-identical.
+        float[] multiSharedK1 = new float[SeqLen * Hidden];
+        float[][] sharedW1Arr = new[] { sharedW1 };
+        float[][] sharedW2Arr = new[] { sharedW2 };
+        float[][] sharedW3Arr = new[] { sharedW3 };
+        using (var pin = new Pinned(w1, w2, w3))
+        using (var sharedPin = new PinnedSharedMulti(sharedW1Arr, sharedW2Arr, sharedW3Arr))
+        {
+            MoeSwiGluMlp.ExecuteWithSharedExpert(
+                hidden, gate, pin.W1, pin.W2, pin.W3, multiSharedK1,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                normTopKProb: true,
+                sharedGateProj: sharedPin.W1, sharedUpProj: sharedPin.W3, sharedDownProj: sharedPin.W2,
+                sharedIntermediateSize: sharedIntermediate,
+                sharedExpertGate: ReadOnlySpan<float>.Empty);
+        }
+
+        for (int i = 0; i < singleShared.Length; i++)
+            Assert.Equal(singleShared[i], multiSharedK1[i]);
     }
 
     // ──────────────────── Reference implementation ────────────────────
@@ -513,6 +636,68 @@ public sealed unsafe class MoeSwiGluMlpTests
                 _handles[h] = GCHandle.Alloc(w3[e], GCHandleType.Pinned);
                 W3[e] = _handles[h].AddrOfPinnedObject();
                 h++;
+            }
+        }
+        public void Dispose()
+        {
+            foreach (var h in _handles) if (h.IsAllocated) h.Free();
+        }
+    }
+
+    /// <summary>
+    /// Pins a single shared-expert's three weight arrays and exposes them as
+    /// length-1 nint arrays — the kernel's shared-expert API takes pointer
+    /// spans whether there's one or many experts.
+    /// </summary>
+    private sealed class PinnedShared : IDisposable
+    {
+        private readonly GCHandle[] _handles;
+        public readonly nint[] W1;
+        public readonly nint[] W2;
+        public readonly nint[] W3;
+        public PinnedShared(float[] w1, float[] w2, float[] w3)
+        {
+            _handles = new GCHandle[3];
+            _handles[0] = GCHandle.Alloc(w1, GCHandleType.Pinned);
+            _handles[1] = GCHandle.Alloc(w2, GCHandleType.Pinned);
+            _handles[2] = GCHandle.Alloc(w3, GCHandleType.Pinned);
+            W1 = [_handles[0].AddrOfPinnedObject()];
+            W2 = [_handles[1].AddrOfPinnedObject()];
+            W3 = [_handles[2].AddrOfPinnedObject()];
+        }
+        public void Dispose()
+        {
+            foreach (var h in _handles) if (h.IsAllocated) h.Free();
+        }
+    }
+
+    /// <summary>
+    /// Pins an arbitrary number of shared-expert weight triples and exposes
+    /// them as parallel nint arrays — used to exercise the multi-shared-expert
+    /// code path (DeepSeek-V2/V3 <c>n_shared_experts &gt; 1</c>).
+    /// </summary>
+    private sealed class PinnedSharedMulti : IDisposable
+    {
+        private readonly GCHandle[] _handles;
+        public readonly nint[] W1;
+        public readonly nint[] W2;
+        public readonly nint[] W3;
+        public PinnedSharedMulti(float[][] w1, float[][] w2, float[][] w3)
+        {
+            int n = w1.Length;
+            _handles = new GCHandle[n * 3];
+            W1 = new nint[n];
+            W2 = new nint[n];
+            W3 = new nint[n];
+            int h = 0;
+            for (int k = 0; k < n; k++)
+            {
+                _handles[h] = GCHandle.Alloc(w1[k], GCHandleType.Pinned);
+                W1[k] = _handles[h].AddrOfPinnedObject(); h++;
+                _handles[h] = GCHandle.Alloc(w2[k], GCHandleType.Pinned);
+                W2[k] = _handles[h].AddrOfPinnedObject(); h++;
+                _handles[h] = GCHandle.Alloc(w3[k], GCHandleType.Pinned);
+                W3[k] = _handles[h].AddrOfPinnedObject(); h++;
             }
         }
         public void Dispose()

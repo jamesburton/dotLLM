@@ -527,6 +527,123 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
     }
 
     /// <summary>
+    /// DeepSeek-V2/V3 convention fixture: Qwen-MoE tensor naming for routed
+    /// experts (<c>mlp.experts.{e}.*</c>) plus the PLURAL
+    /// <c>mlp.shared_experts.{k}.*</c> shared-expert naming with
+    /// <c>n_shared_experts = 2</c> and <b>no</b> sigmoid gate. Exercises the
+    /// multi-shared-expert loader path; the forward pass is driven through
+    /// <see cref="Architecture.QwenMoe"/> as a stand-in (DeepSeek-V2/V3 uses
+    /// MLA attention which is not yet wired into TransformerModel — tracked
+    /// separately). This proves the MoE weight loader correctly resolves the
+    /// plural tensor names into the <c>MoeLayerWeights</c> arrays.
+    /// </summary>
+    [Fact]
+    public void DeepSeekStyleMoE_PluralSharedExperts_LoadsAndProducesFiniteLogits()
+    {
+        const int hidden = 16;
+        const int numHeads = 4;
+        const int numKvHeads = 2;
+        const int headDim = 4;
+        const int intermediate = 32;
+        const int sharedIntermediate = 20; // == moe_intermediate_size per shared
+        const int vocab = 32;
+        const int numLayers = 1;
+        const int numExperts = 4;
+        const int topK = 2;
+        const int numSharedExperts = 2;
+
+        var rng = new Random(20260419);
+
+        var b = new SafetensorsFixtureBuilder();
+        b.AddFloat32("model.embed_tokens.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+        b.AddFloat32("model.norm.weight", [hidden], Ones(hidden));
+        b.AddFloat32("lm_head.weight", [vocab, hidden], RandomVec(rng, vocab * hidden, 0.05f));
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            string p = $"model.layers.{i}";
+            b.AddFloat32($"{p}.input_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.post_attention_layernorm.weight", [hidden], Ones(hidden));
+            b.AddFloat32($"{p}.self_attn.q_proj.weight",
+                [numHeads * headDim, hidden], RandomVec(rng, numHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.k_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.v_proj.weight",
+                [numKvHeads * headDim, hidden], RandomVec(rng, numKvHeads * headDim * hidden, 0.05f));
+            b.AddFloat32($"{p}.self_attn.o_proj.weight",
+                [hidden, numHeads * headDim], RandomVec(rng, hidden * numHeads * headDim, 0.05f));
+
+            b.AddFloat32($"{p}.mlp.gate.weight",
+                [numExperts, hidden], RandomVec(rng, numExperts * hidden, 0.05f));
+            for (int e = 0; e < numExperts; e++)
+            {
+                b.AddFloat32($"{p}.mlp.experts.{e}.gate_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.down_proj.weight",
+                    [hidden, intermediate], RandomVec(rng, hidden * intermediate, 0.05f));
+                b.AddFloat32($"{p}.mlp.experts.{e}.up_proj.weight",
+                    [intermediate, hidden], RandomVec(rng, intermediate * hidden, 0.05f));
+            }
+            // Plural shared experts (DeepSeek naming): mlp.shared_experts.{k}.*
+            for (int k = 0; k < numSharedExperts; k++)
+            {
+                b.AddFloat32($"{p}.mlp.shared_experts.{k}.gate_proj.weight",
+                    [sharedIntermediate, hidden], RandomVec(rng, sharedIntermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.mlp.shared_experts.{k}.up_proj.weight",
+                    [sharedIntermediate, hidden], RandomVec(rng, sharedIntermediate * hidden, 0.05f));
+                b.AddFloat32($"{p}.mlp.shared_experts.{k}.down_proj.weight",
+                    [hidden, sharedIntermediate], RandomVec(rng, hidden * sharedIntermediate, 0.05f));
+            }
+        }
+
+        string path = Path.Combine(_scratch, "deepseek-style-plural.safetensors");
+        b.WriteTo(path);
+
+        using var file = SafetensorsFile.Open(path);
+        // Drive through QwenMoe arch so the existing TransformerModel forward
+        // path handles the MoE plumbing end-to-end (DeepSeek's MLA attention
+        // is out of scope for this test — we're verifying the multi-shared
+        // LOADER contract, not the DeepSeek attention kernel).
+        var config = new ModelConfig
+        {
+            Architecture = Architecture.QwenMoe,
+            VocabSize = vocab,
+            HiddenSize = hidden,
+            IntermediateSize = intermediate,
+            NumLayers = numLayers,
+            NumAttentionHeads = numHeads,
+            NumKvHeads = numKvHeads,
+            HeadDim = headDim,
+            MaxSequenceLength = 128,
+            NormEpsilon = 1e-5f,
+            TiedEmbeddings = false,
+            RoPEConfig = new RoPEConfig(Theta: 1_000_000.0f, DimensionCount: headDim, Type: RoPEType.NeoX),
+            Moe = new MoeConfig
+            {
+                NumExperts = numExperts,
+                NumExpertsPerTok = topK,
+                MoeIntermediateSize = intermediate,
+                NormTopKProb = false,
+                SharedExpertIntermediateSize = sharedIntermediate,
+                NumSharedExperts = numSharedExperts,
+                HasSharedExpertGate = false, // DeepSeek: no gate
+                DecoderSparseStep = 1,
+            },
+        };
+
+        using var model = TransformerModel.LoadFromSafetensors(file, config);
+        using var logits = model.Forward(
+            tokenIds: [0, 1, 2],
+            positions: [0, 1, 2],
+            deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(3, logits.Shape[0]);
+        Assert.Equal(vocab, logits.Shape[1]);
+        AssertAllFinite(logits);
+    }
+
+    /// <summary>
     /// Multi-shard variant: writes a Llama fixture across 2 shards + an
     /// index.json, loads it through <see cref="MultiShardSafetensorsFile"/>
     /// and runs a forward pass. Validates the interface refactor end-to-end.

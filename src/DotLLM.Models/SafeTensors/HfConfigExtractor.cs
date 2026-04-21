@@ -248,21 +248,30 @@ public static class HfConfigExtractor
         // never ships the key — default to true to preserve Mixtral behaviour.
         bool normTopKProb = GetBoolOrDefault(root, "norm_topk_prob", true);
 
-        // Shared-expert intermediate width.
-        // Qwen1.5-MoE-A2.7B: ships `shared_expert_intermediate_size` directly.
-        // DeepSeek-V2/V3: expresses it as moe_intermediate_size × n_shared_experts.
-        // DeepSeek multi-shared-expert support is out of scope for this PoC —
-        // if n_shared_experts > 1 we fold the total width into one shared-expert
-        // slot but warn via the ShareExpertGate flag (HasSharedExpertGate stays
-        // false for DeepSeek — DeepSeek does not use the sigmoid shared gate).
+        // Shared-expert intermediate width and count.
+        // Qwen1.5-MoE-A2.7B: ships `shared_expert_intermediate_size` directly
+        // with a single shared expert (singular `mlp.shared_expert.*`).
+        // DeepSeek-V2/V3: ships `moe_intermediate_size` per shared expert with
+        // `n_shared_experts` plural shared experts (tensor naming
+        // `mlp.shared_experts.{k}.*`). Each shared expert is
+        // moe_intermediate_size wide; outputs are summed (equally weighted,
+        // no sigmoid gate). Preserve the per-shared-expert width so the MoE
+        // kernel can loop over individual experts.
         int? sharedExpertIntermediate;
+        int numSharedExperts = 1;
         bool hasSharedGate;
         if (isDeepSeek)
         {
             int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
-            sharedExpertIntermediate = nShared > 0
-                ? nShared * moeIntermediateSize
-                : (int?)null;
+            if (nShared > 0)
+            {
+                sharedExpertIntermediate = moeIntermediateSize;
+                numSharedExperts = nShared;
+            }
+            else
+            {
+                sharedExpertIntermediate = null;
+            }
             hasSharedGate = false; // DeepSeek does NOT gate the shared expert.
         }
         else
@@ -272,6 +281,7 @@ public static class HfConfigExtractor
             // when shared_expert_intermediate_size is set (Qwen1.5-MoE always
             // ships the gate when the shared expert is present).
             hasSharedGate = sharedExpertIntermediate is not null;
+            // Qwen1.5-MoE ships a single shared expert; keep the default of 1.
         }
 
         // Qwen3-MoE layer-level sparsity: decoder_sparse_step (default 1 —
@@ -308,6 +318,7 @@ public static class HfConfigExtractor
             MoeIntermediateSize = moeIntermediateSize,
             NormTopKProb = normTopKProb,
             SharedExpertIntermediateSize = sharedExpertIntermediate,
+            NumSharedExperts = numSharedExperts,
             HasSharedExpertGate = hasSharedGate,
             DecoderSparseStep = decoderSparseStep,
             MlpOnlyLayers = mlpOnlyLayers,

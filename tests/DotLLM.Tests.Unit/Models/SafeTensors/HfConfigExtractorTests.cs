@@ -414,8 +414,9 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(6, cfg.Moe.NumExpertsPerTok);
         Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
         Assert.False(cfg.Moe.NormTopKProb);
-        // n_shared_experts (2) × moe_intermediate_size (1408) = 2816
-        Assert.Equal(2816, cfg.Moe.SharedExpertIntermediateSize);
+        // Each shared expert is moe_intermediate_size wide; count = n_shared_experts.
+        Assert.Equal(1408, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.Equal(2, cfg.Moe.NumSharedExperts);
         Assert.False(cfg.Moe.HasSharedExpertGate); // DeepSeek does NOT gate
 
         // first_k_dense_replace=1 → layer 0 is dense, 1..26 are MoE
