@@ -67,9 +67,22 @@ public static class Mamba3WeightLoader
         int numHeads = m3.NumHeads;
         int dState = m3.StateSize;
         int dInner = m3.DInner;
+        int headDim = m3.HeadDim;
         int dInProj = m3.InputProjectionDim;
+        bool isMimo = m3.IsMimo;
+        int mimoRank = m3.MimoRank;
+        // B_bias / C_bias shape depends on MIMO flag:
+        //   SISO: [num_heads, 1, state_size]        (HF 370M convention; middle axis is a
+        //                                            singleton broadcast slot).
+        //   MIMO: [num_heads, mimo_rank, state_size] (canonical per-rank bias; matches
+        //                                            `mamba3_mimo_fwd.py` and capture script
+        //                                            `tests/.../Fixtures/Mamba3/capture_fixtures_canonical.py`).
+        int bcBiasMiddle = isMimo ? mimoRank : 1;
+        int perLayer = isMimo
+            ? Mamba3TensorMapping.PerLayerMimoTensorCount
+            : Mamba3TensorMapping.PerLayerTensorCount;
 
-        var entries = new List<Mamba3TensorDiagnostic>(3 + numLayers * Mamba3TensorMapping.PerLayerTensorCount);
+        var entries = new List<Mamba3TensorDiagnostic>(3 + numLayers * perLayer);
 
         // --- globals ---
         var emb = ResolveRequired(
@@ -119,17 +132,33 @@ public static class Mamba3WeightLoader
                 file, Mamba3TensorMapping.BNorm(i), [dState], entries);
             var cNorm = ResolveRequired(
                 file, Mamba3TensorMapping.CNorm(i), [dState], entries);
-            // B_bias / C_bias on the HF checkpoint are stored 3-D with a
-            // singleton middle axis — preserved verbatim here; the block
-            // consumer squeezes axis 1 when it uses them.
+            // B_bias / C_bias shape depends on MIMO: SISO uses a [H, 1, N]
+            // HF-convention layout with a singleton middle axis (block consumer
+            // squeezes it); MIMO uses the canonical rank-expanded [H, R, N].
             var bBias = ResolveRequired(
-                file, Mamba3TensorMapping.BBias(i), [numHeads, 1, dState], entries);
+                file, Mamba3TensorMapping.BBias(i), [numHeads, bcBiasMiddle, dState], entries);
             var cBias = ResolveRequired(
-                file, Mamba3TensorMapping.CBias(i), [numHeads, 1, dState], entries);
+                file, Mamba3TensorMapping.CBias(i), [numHeads, bcBiasMiddle, dState], entries);
             var d = ResolveRequired(
                 file, Mamba3TensorMapping.D(i), [numHeads], entries);
             var dtBias = ResolveRequired(
                 file, Mamba3TensorMapping.DtBias(i), [numHeads], entries);
+
+            Mamba3TensorHandle mimoX = Mamba3TensorHandle.Empty;
+            Mamba3TensorHandle mimoZ = Mamba3TensorHandle.Empty;
+            Mamba3TensorHandle mimoO = Mamba3TensorHandle.Empty;
+            if (isMimo)
+            {
+                // Canonical MIMO per-rank weights — shape [H, R, P]. All three
+                // are required when is_mimo=true; missing tensors surface via
+                // the diagnostics report like any other required tensor.
+                mimoX = ResolveRequired(
+                    file, Mamba3TensorMapping.MimoX(i), [numHeads, mimoRank, headDim], entries);
+                mimoZ = ResolveRequired(
+                    file, Mamba3TensorMapping.MimoZ(i), [numHeads, mimoRank, headDim], entries);
+                mimoO = ResolveRequired(
+                    file, Mamba3TensorMapping.MimoO(i), [numHeads, mimoRank, headDim], entries);
+            }
 
             layers[i] = new Mamba3LayerWeights(
                 Norm: norm,
@@ -140,7 +169,10 @@ public static class Mamba3WeightLoader
                 BBias: bBias,
                 CBias: cBias,
                 D: d,
-                DtBias: dtBias);
+                DtBias: dtBias,
+                MimoX: mimoX,
+                MimoZ: mimoZ,
+                MimoO: mimoO);
         }
 
         // Canonical Mamba-3 has no A_log parameter — A is data-derived from
