@@ -116,15 +116,37 @@ internal static class TransformerWeightsSafetensorsLoader
         // Input (pre-attention) RMSNorm
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
 
-        // Q / K / V / O projections
-        var (qPtr, qQt, qM, qK) = ResolveLinear(file, $"{prefix}.self_attn.q_proj.weight", owned);
-        var (kPtr, kQt, kM, kK) = ResolveLinear(file, $"{prefix}.self_attn.k_proj.weight", owned);
-        var (vPtr, vQt, vM, vK) = ResolveLinear(file, $"{prefix}.self_attn.v_proj.weight", owned);
-        var (oPtr, oQt, oM, oK) = ResolveLinear(file, $"{prefix}.self_attn.o_proj.weight", owned);
-
-        ValidateProjectionShape(qM, qK, qOut, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
-        ValidateProjectionShape(kM, kK, kvOut, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
-        ValidateProjectionShape(vM, vK, kvOut, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
+        // Q / K / V / O projections.
+        // Phi-3 convention fuses QKV into a single `self_attn.qkv_proj.weight`
+        // of shape [qOut + 2*kvOut, hidden] (row-major, Q top → K → V). Split
+        // per-layer into three owned F32 allocations so downstream forward
+        // path sees the standard Q/K/V slots. Falls through to per-tensor
+        // resolution when the fused tensor is absent (vanilla Llama/Mistral/
+        // Qwen convention).
+        nint qPtr, kPtr, vPtr, oPtr;
+        QuantizationType qQt, kQt, vQt, oQt;
+        int qM, qK, kM, kK, vM, vK, oM, oK;
+        string fusedQkvName = $"{prefix}.self_attn.qkv_proj.weight";
+        if (file.TensorsByName.ContainsKey(fusedQkvName))
+        {
+            SplitFusedProjection(
+                file, fusedQkvName, new[] { qOut, kvOut, kvOut }, hiddenSize, owned,
+                out var qkvPtrs);
+            qPtr = qkvPtrs[0]; kPtr = qkvPtrs[1]; vPtr = qkvPtrs[2];
+            qQt = kQt = vQt = QuantizationType.F32;
+            qM = qOut; kM = kvOut; vM = kvOut;
+            qK = kK = vK = hiddenSize;
+        }
+        else
+        {
+            (qPtr, qQt, qM, qK) = ResolveLinear(file, $"{prefix}.self_attn.q_proj.weight", owned);
+            (kPtr, kQt, kM, kK) = ResolveLinear(file, $"{prefix}.self_attn.k_proj.weight", owned);
+            (vPtr, vQt, vM, vK) = ResolveLinear(file, $"{prefix}.self_attn.v_proj.weight", owned);
+            ValidateProjectionShape(qM, qK, qOut, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
+            ValidateProjectionShape(kM, kK, kvOut, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
+            ValidateProjectionShape(vM, vK, kvOut, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
+        }
+        (oPtr, oQt, oM, oK) = ResolveLinear(file, $"{prefix}.self_attn.o_proj.weight", owned);
         ValidateProjectionShape(oM, oK, hiddenSize, qOut, $"{prefix}.self_attn.o_proj.weight");
 
         // Optional projection biases (Qwen2 has q/k/v biases; Llama does not)
@@ -186,12 +208,34 @@ internal static class TransformerWeightsSafetensorsLoader
         }
 
         // Dense FFN — HF SwiGLU names: gate_proj, up_proj, down_proj.
-        var (gatePtr, gateQt, gateM, gateK) = ResolveLinear(file, $"{prefix}.mlp.gate_proj.weight", owned);
-        var (upPtr, upQt, upM, upK) = ResolveLinear(file, $"{prefix}.mlp.up_proj.weight", owned);
-        var (downPtr, downQt, downM, downK) = ResolveLinear(file, $"{prefix}.mlp.down_proj.weight", owned);
-
-        ValidateProjectionShape(gateM, gateK, config.IntermediateSize, hiddenSize, $"{prefix}.mlp.gate_proj.weight");
-        ValidateProjectionShape(upM, upK, config.IntermediateSize, hiddenSize, $"{prefix}.mlp.up_proj.weight");
+        // Phi-3 convention fuses gate+up into `mlp.gate_up_proj.weight` of
+        // shape [2*intermediate, hidden] (row-major, gate rows [0..I),
+        // up rows [I..2I)). Split per-layer into two owned F32 allocations
+        // when the fused form is present; otherwise fall through to per-
+        // tensor resolution (Llama/Mistral/Qwen convention).
+        nint gatePtr, upPtr, downPtr;
+        QuantizationType gateQt, upQt, downQt;
+        int gateM, gateK, upM, upK, downM, downK;
+        string fusedGateUpName = $"{prefix}.mlp.gate_up_proj.weight";
+        if (file.TensorsByName.ContainsKey(fusedGateUpName))
+        {
+            SplitFusedProjection(
+                file, fusedGateUpName,
+                new[] { config.IntermediateSize, config.IntermediateSize }, hiddenSize, owned,
+                out var gateUpPtrs);
+            gatePtr = gateUpPtrs[0]; upPtr = gateUpPtrs[1];
+            gateQt = upQt = QuantizationType.F32;
+            gateM = upM = config.IntermediateSize;
+            gateK = upK = hiddenSize;
+        }
+        else
+        {
+            (gatePtr, gateQt, gateM, gateK) = ResolveLinear(file, $"{prefix}.mlp.gate_proj.weight", owned);
+            (upPtr, upQt, upM, upK) = ResolveLinear(file, $"{prefix}.mlp.up_proj.weight", owned);
+            ValidateProjectionShape(gateM, gateK, config.IntermediateSize, hiddenSize, $"{prefix}.mlp.gate_proj.weight");
+            ValidateProjectionShape(upM, upK, config.IntermediateSize, hiddenSize, $"{prefix}.mlp.up_proj.weight");
+        }
+        (downPtr, downQt, downM, downK) = ResolveLinear(file, $"{prefix}.mlp.down_proj.weight", owned);
         ValidateProjectionShape(downM, downK, hiddenSize, config.IntermediateSize, $"{prefix}.mlp.down_proj.weight");
 
         return new TransformerLayerWeights(
@@ -617,6 +661,85 @@ internal static class TransformerWeightsSafetensorsLoader
             default:
                 throw new NotSupportedException(
                     $"Tensor '{name}' has dtype {desc.DType} — MoE loader supports F32/F16/BF16 only.");
+        }
+    }
+
+    /// <summary>
+    /// Splits a row-fused HF tensor of shape <c>[sum(partRows), hidden]</c>
+    /// into <paramref name="partRows"/>.Length independent F32 allocations
+    /// (one per part) and returns their pointers in order. Supports F32 /
+    /// BF16 / F16 source dtypes; BF16 is upcast to F32, F16 is decoded to
+    /// F32 as well to keep the downstream kernel uniform (quantised splits
+    /// would force per-expert dequant, out of scope).
+    /// </summary>
+    /// <remarks>
+    /// Used by the Phi-3 loader path to split
+    /// <c>self_attn.qkv_proj.weight</c> into Q/K/V and
+    /// <c>mlp.gate_up_proj.weight</c> into gate/up. Each allocation is
+    /// 64-byte-aligned and registered in <paramref name="owned"/> for the
+    /// caller's Dispose unwind.
+    /// </remarks>
+    private static unsafe void SplitFusedProjection(
+        ISafetensorsTensorSource file,
+        string name,
+        int[] partRows,
+        int expectedCols,
+        List<nint> owned,
+        out nint[] partPtrs)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException(
+                $"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+
+        int totalRows = 0;
+        for (int i = 0; i < partRows.Length; i++) totalRows += partRows[i];
+        int m = desc.Shape[0], k = desc.Shape[1];
+        if (m != totalRows || k != expectedCols)
+            throw new InvalidDataException(
+                $"Tensor '{name}' shape [{m},{k}] does not match expected fused shape [{totalRows},{expectedCols}].");
+
+        nint srcPtr = file.GetTensorPointer(name);
+        partPtrs = new nint[partRows.Length];
+        int rowCursor = 0;
+        for (int i = 0; i < partRows.Length; i++)
+        {
+            int rows = partRows[i];
+            long partCount = (long)rows * expectedCols;
+            nuint byteCount = checked((nuint)partCount * sizeof(float));
+            nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
+            owned.Add(dst);
+
+            switch (desc.DType)
+            {
+                case SafetensorsDType.F32:
+                {
+                    float* srcRow = (float*)srcPtr + (long)rowCursor * expectedCols;
+                    new ReadOnlySpan<float>(srcRow, (int)partCount)
+                        .CopyTo(new Span<float>((void*)dst, (int)partCount));
+                    break;
+                }
+                case SafetensorsDType.BF16:
+                {
+                    ushort* srcRow = (ushort*)srcPtr + (long)rowCursor * expectedCols;
+                    DecodeBf16(srcRow, (int)partCount, new Span<float>((void*)dst, (int)partCount));
+                    break;
+                }
+                case SafetensorsDType.F16:
+                {
+                    Half* srcRow = (Half*)srcPtr + (long)rowCursor * expectedCols;
+                    System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
+                        new ReadOnlySpan<Half>(srcRow, (int)partCount),
+                        new Span<float>((void*)dst, (int)partCount));
+                    break;
+                }
+                default:
+                    throw new NotSupportedException(
+                        $"Tensor '{name}' has dtype {desc.DType} — fused-split path supports F32/F16/BF16 only.");
+            }
+            partPtrs[i] = dst;
+            rowCursor += rows;
         }
     }
 
