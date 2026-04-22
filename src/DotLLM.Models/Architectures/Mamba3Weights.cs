@@ -82,6 +82,9 @@ public sealed class Mamba3Weights : IDisposable
             FreeIfOwned(layer.CBias);
             FreeIfOwned(layer.D);
             FreeIfOwned(layer.DtBias);
+            FreeIfOwned(layer.MimoX);
+            FreeIfOwned(layer.MimoZ);
+            FreeIfOwned(layer.MimoO);
         }
     }
 
@@ -94,12 +97,23 @@ public sealed class Mamba3Weights : IDisposable
 
 /// <summary>
 /// Per-layer Mamba-3 mixer + norm weight handles, matching the 9-entry
-/// per-layer signature declared in <see cref="Mamba3TensorMapping"/>.
+/// SISO (or 12-entry MIMO) per-layer signature declared in
+/// <see cref="Mamba3TensorMapping"/>.
 /// </summary>
 /// <remarks>
-/// <see cref="BBias"/> / <see cref="CBias"/> carry their on-disk 3-D shape
-/// (<c>[num_heads, 1, state_size]</c>); the block-level consumer is
-/// responsible for squeezing the singleton middle axis when it uses them.
+/// <para>
+/// <b>SISO layout.</b> <see cref="BBias"/> / <see cref="CBias"/> carry their
+/// HF on-disk 3-D shape (<c>[num_heads, 1, state_size]</c>); the block-level
+/// consumer squeezes the singleton middle axis when it uses them.
+/// <see cref="MimoX"/> / <see cref="MimoZ"/> / <see cref="MimoO"/> are
+/// <see cref="Mamba3TensorHandle.Empty"/> for SISO.
+/// </para>
+/// <para>
+/// <b>MIMO layout.</b> <see cref="BBias"/> / <see cref="CBias"/> carry the
+/// rank-expanded shape <c>[num_heads, mimo_rank, state_size]</c>.
+/// <see cref="MimoX"/> / <see cref="MimoZ"/> / <see cref="MimoO"/> are each
+/// populated with shape <c>[num_heads, mimo_rank, head_dim]</c>.
+/// </para>
 /// </remarks>
 public readonly record struct Mamba3LayerWeights(
     Mamba3TensorHandle Norm,
@@ -110,7 +124,10 @@ public readonly record struct Mamba3LayerWeights(
     Mamba3TensorHandle BBias,
     Mamba3TensorHandle CBias,
     Mamba3TensorHandle D,
-    Mamba3TensorHandle DtBias);
+    Mamba3TensorHandle DtBias,
+    Mamba3TensorHandle MimoX = default,
+    Mamba3TensorHandle MimoZ = default,
+    Mamba3TensorHandle MimoO = default);
 
 /// <summary>
 /// Opaque pointer + shape metadata for a single Mamba-3 weight tensor.

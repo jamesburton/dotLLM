@@ -93,10 +93,23 @@ public static class Mamba3TensorMapping
 
     /// <summary>
     /// Per-head learned bias added to B after QK-Norm and before DataRoPE.
-    /// HF shape: <c>[num_heads, 1, state_size]</c> (the singleton second
-    /// axis reads as a rank-1 broadcast slot regardless of
-    /// <c>is_mimo</c>); the reference uses <c>[num_heads, state_size]</c>
-    /// in SISO or <c>[num_heads, state_size, mimo_rank]</c> in MIMO.
+    /// Shape depends on <c>is_mimo</c>:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <description>
+    ///       <b>SISO</b>: <c>[num_heads, 1, state_size]</c> — the HF 370M
+    ///       convention with a singleton middle axis (the block squeezes it).
+    ///     </description>
+    ///   </item>
+    ///   <item>
+    ///     <description>
+    ///       <b>MIMO</b>: <c>[num_heads, mimo_rank, state_size]</c> — the
+    ///       canonical rank-expanded layout. Matches <c>B_bias</c> as produced
+    ///       by the canonical capture script at
+    ///       <c>tests/.../Fixtures/Mamba3/capture_fixtures_canonical.py</c>.
+    ///     </description>
+    ///   </item>
+    /// </list>
     /// </summary>
     public static string BBias(int layerIndex) =>
         $"backbone.layers.{layerIndex}.mixer.B_bias";
@@ -121,21 +134,58 @@ public static class Mamba3TensorMapping
         $"backbone.layers.{layerIndex}.mixer.dt_bias";
 
     /// <summary>
+    /// MIMO-only per-rank V expansion weight, shape
+    /// <c>[num_heads, mimo_rank, head_dim]</c>. Canonical init: <c>1/R</c>.
+    /// Present only when the config has <see cref="DotLLM.Core.Models.Mamba3Config.IsMimo"/>.
+    /// Consumed by <c>canonical_mimo_scan</c>'s <c>V_mimo[...,r] = V · mimo_x[h,r,p]</c>;
+    /// dotLLM's canonical kernel folds this into the rank-summed <c>K.sum</c>
+    /// state update, so the tensor is loaded for compatibility with canonical
+    /// checkpoints but not consumed directly by the forward today. See
+    /// <c>state-spaces/mamba</c> <c>mamba3.py</c> and the canonical capture
+    /// script at <c>tests/.../Fixtures/Mamba3/capture_fixtures_canonical.py</c>.
+    /// </summary>
+    public static string MimoX(int layerIndex) =>
+        $"backbone.layers.{layerIndex}.mixer.mimo_x";
+
+    /// <summary>
+    /// MIMO-only per-rank gate expansion weight, shape
+    /// <c>[num_heads, mimo_rank, head_dim]</c>. Canonical init: <c>1</c>.
+    /// Consumed by <see cref="Mamba3Block.ForwardMimo(Mamba3ForwardScratch, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, Span{float}, Span{float}, int, int, int, int, int, int, int, int, int, float, float)"/>
+    /// to rank-expand the gate <c>z</c> per rank before the silu gate.
+    /// </summary>
+    public static string MimoZ(int layerIndex) =>
+        $"backbone.layers.{layerIndex}.mixer.mimo_z";
+
+    /// <summary>
+    /// MIMO-only per-rank output contraction weight, shape
+    /// <c>[num_heads, mimo_rank, head_dim]</c>. Canonical init: <c>1/R</c>.
+    /// Contracts the per-rank SSD output back to <c>[n_head, head_dim]</c>
+    /// after the scan.
+    /// </summary>
+    public static string MimoO(int layerIndex) =>
+        $"backbone.layers.{layerIndex}.mixer.mimo_o";
+
+    /// <summary>
     /// Enumerates every tensor name expected for a <paramref name="numLayers"/>-layer
-    /// Mamba-3 checkpoint (three globals + nine per-layer). Order: globals first,
-    /// then layers in ascending index with per-layer tensors in declaration order.
+    /// Mamba-3 checkpoint. For a SISO checkpoint (<paramref name="isMimo"/> = false)
+    /// this is three globals + nine per-layer tensors. For a MIMO checkpoint the
+    /// per-layer count increases by three (<c>mimo_x</c>, <c>mimo_z</c>,
+    /// <c>mimo_o</c>). Order: globals first, then layers in ascending index
+    /// with per-layer tensors in declaration order.
     /// </summary>
     /// <param name="numLayers">Number of <c>backbone.layers.*</c> blocks.</param>
+    /// <param name="isMimo">Whether the checkpoint carries the MIMO-only per-rank weights.</param>
     /// <returns>
     /// A fresh read-only list — does NOT cache across calls since the expected
     /// count depends on <paramref name="numLayers"/>.
     /// </returns>
-    public static IReadOnlyList<string> ExpectedTensorNames(int numLayers)
+    public static IReadOnlyList<string> ExpectedTensorNames(int numLayers, bool isMimo = false)
     {
         if (numLayers < 0)
             throw new ArgumentOutOfRangeException(nameof(numLayers));
 
-        var names = new List<string>(3 + numLayers * PerLayerTensorCount);
+        int perLayer = isMimo ? PerLayerMimoTensorCount : PerLayerTensorCount;
+        var names = new List<string>(3 + numLayers * perLayer);
         names.Add(TokenEmbedding);
         names.Add(FinalNorm);
         names.Add(LmHead);
@@ -150,17 +200,30 @@ public static class Mamba3TensorMapping
             names.Add(CBias(i));
             names.Add(D(i));
             names.Add(DtBias(i));
+            if (isMimo)
+            {
+                names.Add(MimoX(i));
+                names.Add(MimoZ(i));
+                names.Add(MimoO(i));
+            }
         }
         return new ReadOnlyCollection<string>(names);
     }
 
     /// <summary>
-    /// Number of tensors contributed by a single Mamba-3 block. Currently
-    /// <c>9</c>: <c>norm + {in_proj, out_proj, B_norm, C_norm, B_bias,
+    /// Number of tensors contributed by a single SISO Mamba-3 block:
+    /// <c>9</c> — <c>norm + {in_proj, out_proj, B_norm, C_norm, B_bias,
     /// C_bias, D, dt_bias}</c>. Does not include any MLP tensors (the HF
     /// 370M checkpoint has none).
     /// </summary>
     public const int PerLayerTensorCount = 9;
+
+    /// <summary>
+    /// Number of tensors contributed by a single MIMO Mamba-3 block:
+    /// <see cref="PerLayerTensorCount"/> plus three MIMO-only per-rank weights
+    /// (<c>mimo_x</c>, <c>mimo_z</c>, <c>mimo_o</c>).
+    /// </summary>
+    public const int PerLayerMimoTensorCount = PerLayerTensorCount + 3;
 
     /// <summary>
     /// Reference (<c>VikramKarLex/mamba3-minimal</c>) state_dict key shapes,
