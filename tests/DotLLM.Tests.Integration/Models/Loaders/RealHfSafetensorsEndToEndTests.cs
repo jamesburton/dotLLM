@@ -180,6 +180,124 @@ public sealed class RealHfSafetensorsEndToEndTests
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Qwen2.5-0.5B (dense, byte-level BPE tokenizer, heavy GQA)
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Qwen25_0_5B_LoadsAndForwardsEndToEnd()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
+            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+                + "or ensure the HF snapshot is present at the conventional path.");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads} "
+                + $"head_dim={config.HeadDim} tied={config.TiedEmbeddings} "
+                + $"sliding_window={config.SlidingWindowSize}");
+
+            // Qwen2.5-0.5B: Qwen2ForCausalLM, 24 layers, hidden=896, 14 heads,
+            // 2 kv heads (heavy GQA), vocab=151936, tied_embeddings=true,
+            // sliding_window=32768, rope_theta=1e6.
+            Assert.Equal(Architecture.Qwen, config.Architecture);
+            Assert.Equal(24, config.NumLayers);
+            Assert.Equal(896, config.HiddenSize);
+            Assert.Equal(14, config.NumAttentionHeads);
+            Assert.Equal(2, config.NumKvHeads);
+            Assert.True(config.TiedEmbeddings);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // TinyLlama-1.1B-Chat-v1.0 (small real Llama, cheap validation)
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void TinyLlama_11B_LoadsAndForwardsEndToEnd()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-tinyllama");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads}");
+
+            // TinyLlama-1.1B-Chat-v1.0: LlamaForCausalLM, 22 layers, hidden=2048,
+            // 32 heads, 4 kv heads (GQA), vocab=32000.
+            Assert.Equal(Architecture.Llama, config.Architecture);
+            Assert.Equal(22, config.NumLayers);
+            Assert.Equal(2048, config.HiddenSize);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Helpers
     // ────────────────────────────────────────────────────────────────────
 
