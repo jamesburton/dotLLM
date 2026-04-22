@@ -212,95 +212,28 @@ internal static class TransformerWeightsSafetensorsLoader
 
     /// <summary>
     /// Loads one transformer layer for a DeepSeek-V2 / DeepSeek-V3 checkpoint.
-    /// Routes the attention projections through the MLA-specific tensor
-    /// naming (<c>q_a_proj</c> / <c>q_b_proj</c> or monolithic <c>q_proj</c>,
-    /// <c>kv_a_proj_with_mqa</c>, <c>kv_b_proj</c>, their layernorms, and
-    /// <c>o_proj</c>), and routes the FFN either through a Llama-style dense
-    /// SwiGLU (first <c>first_k_dense_replace</c> layers) or the DeepSeek
-    /// MoE branch (plural <c>mlp.shared_experts.{k}.*</c>, no sigmoid gate).
-    /// All MLA tensors are coerced to F32 via
-    /// <see cref="ResolveLinearAsF32"/>; the scalar MLA kernel consumes F32
-    /// row-major throughout.
+    /// Delegates the attention projections to
+    /// <see cref="AttentionTensorLoader"/> with the MLA variant (LoRA-
+    /// factored <c>q_a_proj</c>/<c>q_b_proj</c> or monolithic <c>q_proj</c>;
+    /// LoRA-factored <c>kv_a_proj_with_mqa</c>/<c>kv_b_proj</c> with shared
+    /// rope-K; <c>o_proj</c>; all coerced to F32). Routes the FFN either
+    /// through a Llama-style dense SwiGLU (first
+    /// <c>first_k_dense_replace</c> layers) or the DeepSeek MoE branch
+    /// (plural <c>mlp.shared_experts.{k}.*</c>, no sigmoid gate).
     /// </summary>
     private static TransformerLayerWeights LoadDeepSeekMlaLayer(
         int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
-        var mlaCfg = config.MlaConfig
-                     ?? throw new InvalidOperationException(
-                         "LoadDeepSeekMlaLayer called but ModelConfig.MlaConfig is null.");
-
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int numHeads = config.NumAttentionHeads;
-        int qkNope = mlaCfg.QkNopeHeadDim;
-        int qkRope = mlaCfg.QkRopeHeadDim;
-        int qkHead = qkNope + qkRope;
-        int vHead = mlaCfg.VHeadDim;
-        int qLoraRank = mlaCfg.QLoraRank;
-        int kvLoraRank = mlaCfg.KvLoraRank;
-        int qTotalOut = numHeads * qkHead;
-        int kvBOut = numHeads * (qkNope + vHead);
-        int oInputDim = numHeads * vHead;
 
-        // Pre-attention RMSNorm (standard Llama-style input_layernorm).
+        // Pre-attention RMSNorm (standard Llama-style input_layernorm) + all
+        // MLA-specific Q/KV/O projections (LoRA-factored on V2/V3, monolithic
+        // Q on V2-Lite). Coerces every projection to F32 — the scalar MLA
+        // kernel consumes F32 row-major throughout.
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
-
-        // Q path: LoRA-factored (V2 full, V3) or monolithic (V2-Lite). The
-        // kernel decides which path to take based on qLoraRank; we pass zero
-        // pointers for the unused set.
-        nint qAProj = 0, qBProj = 0, qProj = 0;
-        float[]? qALayernorm = null;
-        if (qLoraRank > 0)
-        {
-            (qAProj, _, int qAm, int qAk) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_a_proj.weight", owned);
-            ValidateProjectionShape(qAm, qAk, qLoraRank, hiddenSize,
-                $"{prefix}.self_attn.q_a_proj.weight");
-            qALayernorm = ResolveNorm(file, $"{prefix}.self_attn.q_a_layernorm.weight", qLoraRank);
-            (qBProj, _, int qBm, int qBk) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_b_proj.weight", owned);
-            ValidateProjectionShape(qBm, qBk, qTotalOut, qLoraRank,
-                $"{prefix}.self_attn.q_b_proj.weight");
-        }
-        else
-        {
-            (qProj, _, int qM, int qK) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_proj.weight", owned);
-            ValidateProjectionShape(qM, qK, qTotalOut, hiddenSize,
-                $"{prefix}.self_attn.q_proj.weight");
-        }
-
-        // KV path: always LoRA-factored. kv_a_proj_with_mqa emits
-        // [kvLoraRank + qkRopeHeadDim] per token — the first kvLoraRank rows
-        // feed kv_a_layernorm then kv_b_proj, the last qkRopeHeadDim rows are
-        // the MQA-shared rope-K. No separate LayerNorm on the rope-K side.
-        int kvADim = kvLoraRank + qkRope;
-        (nint kvAProj, _, int kvaM, int kvaK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.kv_a_proj_with_mqa.weight", owned);
-        ValidateProjectionShape(kvaM, kvaK, kvADim, hiddenSize,
-            $"{prefix}.self_attn.kv_a_proj_with_mqa.weight");
-        float[] kvALayernorm = ResolveNorm(
-            file, $"{prefix}.self_attn.kv_a_layernorm.weight", kvLoraRank);
-        (nint kvBProj, _, int kvbM, int kvbK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.kv_b_proj.weight", owned);
-        ValidateProjectionShape(kvbM, kvbK, kvBOut, kvLoraRank,
-            $"{prefix}.self_attn.kv_b_proj.weight");
-
-        // Output projection: hidden ← n_heads * v_head_dim. Kept in the
-        // existing O slot (not MLA-specific) because the forward path still
-        // applies bias (if any) through the same AddBias logic.
-        var (oPtr, oQt, oM, oK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.o_proj.weight", owned);
-        ValidateProjectionShape(oM, oK, hiddenSize, oInputDim,
-            $"{prefix}.self_attn.o_proj.weight");
-        float[]? oBias = ResolveOptionalBias(file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
-
-        var mla = new MlaLayerWeights(
-            qAProj: qAProj, qALayernormWeight: qALayernorm, qBProj: qBProj, qProj: qProj,
-            kvAProjWithMqa: kvAProj, kvALayernormWeight: kvALayernorm, kvBProj: kvBProj,
-            numHeads: numHeads,
-            qkNopeHeadDim: qkNope, qkRopeHeadDim: qkRope, vHeadDim: vHead,
-            qLoraRank: qLoraRank, kvLoraRank: kvLoraRank);
+        var attn = AttentionTensorLoader.Load(AttentionVariant.Mla, file, config, layerIdx, owned);
+        var mla = attn.Mla!; // Guaranteed non-null for AttentionVariant.Mla.
 
         // Post-attention RMSNorm (shared with Llama convention).
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
@@ -316,12 +249,12 @@ internal static class TransformerWeightsSafetensorsLoader
                 qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
                 kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
                 vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
-                oPtr, oQt, oM, oK,
+                attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
                 ffnNorm,
                 gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
                 upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
                 downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
-                qBias: null, kBias: null, vBias: null, oBias: oBias,
+                qBias: null, kBias: null, vBias: null, oBias: attn.OBias,
                 gateBias: null, upBias: null, downBias: null,
                 qNormWeight: null, kNormWeight: null,
                 moe: moe,
@@ -347,12 +280,12 @@ internal static class TransformerWeightsSafetensorsLoader
             qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
             kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
             vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
-            oPtr, oQt, oM, oK,
+            attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
             ffnNorm,
             gatePtr, gateQt, gateM, gateK,
             upPtr, upQt, upM, upK,
             downPtr, downQt, downM, downK,
-            qBias: null, kBias: null, vBias: null, oBias: oBias,
+            qBias: null, kBias: null, vBias: null, oBias: attn.OBias,
             gateBias: null, upBias: null, downBias: null,
             qNormWeight: null, kNormWeight: null,
             moe: null,
