@@ -95,6 +95,32 @@ public sealed class BpeTokenizer : ITokenizer
             specialTokens, bosId, eosId, tokens.Length);
     }
 
+    /// <summary>
+    /// Creates a tiktoken BPE tokenizer with an explicit, pre-compiled
+    /// pre-tokenization regex. Used by the HuggingFace <c>tokenizer.json</c>
+    /// adapter when the model declares a <c>Split</c> regex that is not
+    /// one of the built-in GGUF presets (e.g., Qwen2's custom
+    /// <c>(?i:'s|'t|...)|\p{N}|...</c> pattern).
+    /// </summary>
+    /// <param name="tokens">Vocabulary strings indexed by token ID.</param>
+    /// <param name="merges">Merge table entries in "A B" format; index = rank (lower = applied first).</param>
+    /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
+    /// <param name="bosId">Beginning-of-sequence token ID.</param>
+    /// <param name="eosId">End-of-sequence token ID.</param>
+    /// <param name="preRegex">
+    /// Compiled pre-tokenization regex. <see langword="null"/> means no
+    /// pre-splitting — the whole input is fed to BPE as one segment.
+    /// </param>
+    public static BpeTokenizer CreateTiktokenWithRegex(
+        string[] tokens, string[] merges, int[]? tokenTypes,
+        int bosId, int eosId, System.Text.RegularExpressions.Regex? preRegex)
+    {
+        var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        return new BpeTokenizer(
+            new Gpt2TiktokenEncoding(tokens, merges, tokenTypes, preRegex),
+            specialTokens, bosId, eosId, tokens.Length);
+    }
+
     /// <inheritdoc/>
     public int[] Encode(string text)
     {

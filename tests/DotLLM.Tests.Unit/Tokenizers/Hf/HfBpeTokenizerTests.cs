@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.Bpe;
 using DotLLM.Tokenizers.Hf;
 using Xunit;
@@ -142,7 +143,7 @@ public class HfBpeTokenizerTests
     [Fact]
     public void EncodeDecode_RoundTrip_Ascii()
     {
-        BpeTokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
+        ITokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
 
         int[] ids = tok.Encode("Hello world");
         Assert.NotEmpty(ids);
@@ -159,7 +160,7 @@ public class HfBpeTokenizerTests
     public void EncodeDecode_RoundTrip_NonAscii_UsesByteFallback()
     {
         // Non-ASCII string with chars outside the tiny vocab — must hit the byte-fallback path.
-        BpeTokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
+        ITokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
 
         const string input = "Hello \u00e9"; // é = 0xC3 0xA9 in UTF-8
         int[] ids = tok.Encode(input);
@@ -177,7 +178,7 @@ public class HfBpeTokenizerTests
     [Fact]
     public void SpecialTokens_AreLookupNotSplit()
     {
-        BpeTokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
+        ITokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
 
         int[] ids = tok.Encode("<s>");
         // <s> is a special token (length > 1) → emitted directly as ID 1.
@@ -194,7 +195,7 @@ public class HfBpeTokenizerTests
     [Fact]
     public void BosEos_AutoDetected_FromAddedTokens()
     {
-        BpeTokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
+        ITokenizer tok = HfBpeTokenizerFactory.Create(MinimalTokenizerJson);
         Assert.Equal(1, tok.BosTokenId);
         Assert.Equal(2, tok.EosTokenId);
     }
@@ -202,13 +203,14 @@ public class HfBpeTokenizerTests
     [Fact]
     public void Create_UnsupportedPreTokenizer_Throws()
     {
-        const string byteLevel = """
+        // Whitespace isn't wired in the factory — only Metaspace / ByteLevel are.
+        const string whitespace = """
         {
-          "pre_tokenizer": {"type":"ByteLevel"},
+          "pre_tokenizer": {"type":"Whitespace"},
           "model": {"type":"BPE","vocab": {"a":0},"merges":[]}
         }
         """;
         Assert.Throws<InvalidDataException>(() =>
-            HfBpeTokenizerFactory.Create(byteLevel));
+            HfBpeTokenizerFactory.Create(whitespace));
     }
 }

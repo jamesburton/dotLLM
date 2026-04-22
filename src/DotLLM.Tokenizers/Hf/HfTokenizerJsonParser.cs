@@ -15,10 +15,20 @@ public enum HfPreTokenizerKind
     /// <see cref="Bpe.BpeTokenizer.CreateSentencePiece"/> semantics.
     /// </summary>
     Metaspace,
-    /// <summary>GPT-2 byte-level pre-tokenizer (not yet implemented in this adapter).</summary>
+    /// <summary>
+    /// GPT-2 byte-level pre-tokenizer (Qwen, Llama-3, Granite dense, GPT-2/4).
+    /// When present, routes through <see cref="ByteLevelPreTokenizer"/> +
+    /// <see cref="Bpe.BpeTokenizer.CreateTiktoken"/>.
+    /// </summary>
     ByteLevel,
     /// <summary>Whitespace splitting (not yet implemented).</summary>
     Whitespace,
+    /// <summary>
+    /// A <c>Sequence</c> wrapper of pre-tokenizers. Currently only the
+    /// <c>[Split, ByteLevel]</c> composition (Qwen2/Qwen2.5) is fully wired —
+    /// see <see cref="HfTokenizerSpec.ByteLevelSplitRegex"/>.
+    /// </summary>
+    Sequence,
     /// <summary>An unrecognised pre-tokenizer type — caller may warn or fall back.</summary>
     Unknown,
 }
@@ -39,8 +49,33 @@ public enum HfDecoderStage
     Fuse,
     /// <summary>Strip leading/trailing whitespace.</summary>
     Strip,
+    /// <summary>
+    /// GPT-2 byte-level decoder: reverse the byte-to-unicode map and
+    /// concatenate. See <see cref="ByteLevelDecoder"/>.
+    /// </summary>
+    ByteLevel,
     /// <summary>Sequence wrapper (unwrapped).</summary>
     Sequence,
+}
+
+/// <summary>
+/// HuggingFace text normalizer kind. Only variants dotLLM understands are
+/// enumerated; anything else surfaces as <see cref="Unknown"/>.
+/// </summary>
+public enum HfNormalizerKind
+{
+    /// <summary>No normalizer declared.</summary>
+    None = 0,
+    /// <summary>Unicode NFC normalization (Qwen2/Qwen2.5).</summary>
+    Nfc,
+    /// <summary>Unicode NFD normalization.</summary>
+    Nfd,
+    /// <summary>Unicode NFKC normalization.</summary>
+    Nfkc,
+    /// <summary>Unicode NFKD normalization.</summary>
+    Nfkd,
+    /// <summary>Declared but unrecognised.</summary>
+    Unknown,
 }
 
 /// <summary>
@@ -62,11 +97,10 @@ public readonly record struct HfAddedToken(int Id, string Content, bool Special)
 /// <see cref="HfBpeTokenizerFactory.Create(HfTokenizerSpec, int, int)"/>.
 /// </summary>
 /// <remarks>
-/// Only the fields dotLLM currently uses are materialised. Normalizer and
-/// post-processor sections are not represented — normalizer is null for
-/// Llama-style tokenizers (the only variant supported today), and the
-/// post-processor's BOS insertion is handled by callers who know their prompt
-/// conventions.
+/// Only the fields dotLLM currently uses are materialised. Normalizer kind is
+/// captured to apply NFC to the input where required (Qwen2/Qwen2.5). The
+/// post-processor section is not represented — BOS/EOS insertion is handled
+/// by callers who know their prompt conventions.
 /// </remarks>
 public sealed class HfTokenizerSpec
 {
@@ -99,6 +133,28 @@ public sealed class HfTokenizerSpec
     /// </summary>
     public required string? MetaspacePrependScheme { get; init; }
 
+    /// <summary>
+    /// When <see cref="PreTokenizerKind"/> is <see cref="HfPreTokenizerKind.ByteLevel"/>,
+    /// whether the declared ByteLevel pre-tokenizer applies the default GPT-2
+    /// regex (<c>use_regex: true</c>). Null otherwise.
+    /// </summary>
+    public required bool? ByteLevelUseRegex { get; init; }
+
+    /// <summary>
+    /// When <see cref="PreTokenizerKind"/> is <see cref="HfPreTokenizerKind.ByteLevel"/>,
+    /// whether the declared ByteLevel pre-tokenizer forces a leading space
+    /// (<c>add_prefix_space: true</c>). Null otherwise.
+    /// </summary>
+    public required bool? ByteLevelAddPrefixSpace { get; init; }
+
+    /// <summary>
+    /// When the pre-tokenizer is a <c>Sequence[Split, ByteLevel]</c> (Qwen2
+    /// / Qwen2.5 style), the Split step's regex pattern string. The
+    /// consumer compiles this and uses it in place of the default GPT-2
+    /// regex. Null when there is no Sequence or no Split regex.
+    /// </summary>
+    public required string? ByteLevelSplitRegex { get; init; }
+
     /// <summary>Decoder stages in declared order; only the kind flag matters today.</summary>
     public required IReadOnlyList<HfDecoderStage> DecoderStages { get; init; }
 
@@ -108,18 +164,26 @@ public sealed class HfTokenizerSpec
     /// used to render UTF-8 bytes that don't tokenize.
     /// </summary>
     public required bool ByteFallback { get; init; }
+
+    /// <summary>
+    /// Normalizer kind declared at the top of the tokenizer pipeline. When
+    /// not <see cref="HfNormalizerKind.None"/>, the input text must be
+    /// normalized before encoding (Qwen2 requires NFC).
+    /// </summary>
+    public required HfNormalizerKind NormalizerKind { get; init; }
 }
 
 /// <summary>
 /// Parses HuggingFace <c>tokenizer.json</c> files into an
 /// <see cref="HfTokenizerSpec"/>. Supports the SentencePiece-style BPE layout
 /// used by Llama 1/2 derivatives (including Mamba-3 ib-ssm 370M): <c>model.type
-/// = "BPE"</c>, Metaspace pre-tokenizer, ByteFallback decoder.
+/// = "BPE"</c>, Metaspace pre-tokenizer, ByteFallback decoder — and the
+/// GPT-2 / ByteLevel layout used by Qwen, Llama-3, Granite dense, and GPT-2.
 /// </summary>
 /// <remarks>
-/// The parser is intentionally minimal — normalizer / post-processor sections
-/// are skipped because they add no information for the encode/decode path the
-/// adapter drives. Both HF merge serialisations are accepted:
+/// The parser is intentionally minimal — post-processor sections are skipped
+/// because they add no information for the encode/decode path the adapter
+/// drives. Both HF merge serialisations are accepted:
 /// <list type="bullet">
 ///   <item><description>Space-separated string form (<c>"a b"</c>) — older tokenizer versions.</description></item>
 ///   <item><description>JSON array form (<c>["a", "b"]</c>) — tokenizers ≥ 0.15.</description></item>
@@ -225,25 +289,19 @@ public static class HfTokenizerJsonParser
         HfPreTokenizerKind preKind = HfPreTokenizerKind.None;
         string? metaReplacement = null;
         string? metaPrepend = null;
+        bool? byteLevelUseRegex = null;
+        bool? byteLevelAddPrefixSpace = null;
+        string? byteLevelSplitRegex = null;
+
         if (root.TryGetProperty("pre_tokenizer", out JsonElement pre) &&
-            pre.ValueKind == JsonValueKind.Object &&
-            pre.TryGetProperty("type", out JsonElement preType) &&
-            preType.ValueKind == JsonValueKind.String)
+            pre.ValueKind == JsonValueKind.Object)
         {
-            preKind = preType.GetString() switch
-            {
-                "Metaspace" => HfPreTokenizerKind.Metaspace,
-                "ByteLevel" => HfPreTokenizerKind.ByteLevel,
-                "Whitespace" => HfPreTokenizerKind.Whitespace,
-                _ => HfPreTokenizerKind.Unknown,
-            };
-            if (preKind == HfPreTokenizerKind.Metaspace)
-            {
-                if (pre.TryGetProperty("replacement", out JsonElement r) && r.ValueKind == JsonValueKind.String)
-                    metaReplacement = r.GetString();
-                if (pre.TryGetProperty("prepend_scheme", out JsonElement ps) && ps.ValueKind == JsonValueKind.String)
-                    metaPrepend = ps.GetString();
-            }
+            ParsePreTokenizer(
+                pre,
+                out preKind,
+                out metaReplacement, out metaPrepend,
+                out byteLevelUseRegex, out byteLevelAddPrefixSpace,
+                out byteLevelSplitRegex);
         }
 
         var stages = new List<HfDecoderStage>();
@@ -260,6 +318,8 @@ public static class HfTokenizerJsonParser
             byteFallback = true;
         }
 
+        HfNormalizerKind normalizerKind = ParseNormalizerKind(root);
+
         return new HfTokenizerSpec
         {
             Vocab = vocab,
@@ -268,8 +328,187 @@ public static class HfTokenizerJsonParser
             PreTokenizerKind = preKind,
             MetaspaceReplacement = metaReplacement,
             MetaspacePrependScheme = metaPrepend,
+            ByteLevelUseRegex = byteLevelUseRegex,
+            ByteLevelAddPrefixSpace = byteLevelAddPrefixSpace,
+            ByteLevelSplitRegex = byteLevelSplitRegex,
             DecoderStages = stages,
             ByteFallback = byteFallback,
+            NormalizerKind = normalizerKind,
+        };
+    }
+
+    /// <summary>
+    /// Parses the pre_tokenizer object. Handles <c>Metaspace</c>,
+    /// <c>ByteLevel</c> (standalone), and <c>Sequence[Split, ByteLevel]</c>
+    /// (Qwen2 style) — the last collapses into
+    /// <see cref="HfPreTokenizerKind.ByteLevel"/> with
+    /// <see cref="HfTokenizerSpec.ByteLevelSplitRegex"/> populated so the
+    /// factory can use the Split's regex instead of the default GPT-2
+    /// pattern. Other kinds surface as <see cref="HfPreTokenizerKind.Unknown"/>
+    /// or <see cref="HfPreTokenizerKind.Sequence"/>.
+    /// </summary>
+    private static void ParsePreTokenizer(
+        JsonElement pre,
+        out HfPreTokenizerKind kind,
+        out string? metaspaceReplacement,
+        out string? metaspacePrepend,
+        out bool? byteLevelUseRegex,
+        out bool? byteLevelAddPrefixSpace,
+        out string? byteLevelSplitRegex)
+    {
+        kind = HfPreTokenizerKind.None;
+        metaspaceReplacement = null;
+        metaspacePrepend = null;
+        byteLevelUseRegex = null;
+        byteLevelAddPrefixSpace = null;
+        byteLevelSplitRegex = null;
+
+        if (!pre.TryGetProperty("type", out JsonElement preType) ||
+            preType.ValueKind != JsonValueKind.String)
+            return;
+
+        string? typeStr = preType.GetString();
+        switch (typeStr)
+        {
+            case "Metaspace":
+                kind = HfPreTokenizerKind.Metaspace;
+                if (pre.TryGetProperty("replacement", out JsonElement r) && r.ValueKind == JsonValueKind.String)
+                    metaspaceReplacement = r.GetString();
+                if (pre.TryGetProperty("prepend_scheme", out JsonElement ps) && ps.ValueKind == JsonValueKind.String)
+                    metaspacePrepend = ps.GetString();
+                break;
+
+            case "ByteLevel":
+                kind = HfPreTokenizerKind.ByteLevel;
+                byteLevelUseRegex = ReadBoolProp(pre, "use_regex");
+                byteLevelAddPrefixSpace = ReadBoolProp(pre, "add_prefix_space");
+                break;
+
+            case "Whitespace":
+                kind = HfPreTokenizerKind.Whitespace;
+                break;
+
+            case "Sequence":
+                ParsePreTokenizerSequence(
+                    pre,
+                    out kind,
+                    out byteLevelUseRegex,
+                    out byteLevelAddPrefixSpace,
+                    out byteLevelSplitRegex);
+                break;
+
+            default:
+                kind = HfPreTokenizerKind.Unknown;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Parses a <c>Sequence</c> pre-tokenizer. Recognised shape is
+    /// <c>[Split(regex), ByteLevel(use_regex:false)]</c> as used by Qwen2 —
+    /// this resolves to <see cref="HfPreTokenizerKind.ByteLevel"/> with the
+    /// Split regex captured. Any other composition becomes
+    /// <see cref="HfPreTokenizerKind.Sequence"/> and is rejected by the
+    /// factory as unsupported.
+    /// </summary>
+    private static void ParsePreTokenizerSequence(
+        JsonElement sequence,
+        out HfPreTokenizerKind kind,
+        out bool? byteLevelUseRegex,
+        out bool? byteLevelAddPrefixSpace,
+        out string? byteLevelSplitRegex)
+    {
+        kind = HfPreTokenizerKind.Sequence;
+        byteLevelUseRegex = null;
+        byteLevelAddPrefixSpace = null;
+        byteLevelSplitRegex = null;
+
+        JsonElement subs = default;
+        // HF ships both keys ("pretokenizers" and "pre_tokenizers") across versions.
+        if (!sequence.TryGetProperty("pretokenizers", out subs) &&
+            !sequence.TryGetProperty("pre_tokenizers", out subs))
+            return;
+        if (subs.ValueKind != JsonValueKind.Array)
+            return;
+
+        // Qwen2 shape: exactly one Split then one ByteLevel.
+        string? splitRegex = null;
+        bool sawByteLevel = false;
+        bool? blUseRegex = null;
+        bool? blAddPrefix = null;
+        int stepCount = 0;
+
+        foreach (JsonElement step in subs.EnumerateArray())
+        {
+            stepCount++;
+            if (step.ValueKind != JsonValueKind.Object) return;
+            if (!step.TryGetProperty("type", out JsonElement st) || st.ValueKind != JsonValueKind.String) return;
+            string? stepType = st.GetString();
+
+            if (stepType == "Split")
+            {
+                if (splitRegex is not null || sawByteLevel) return; // only the first Split ahead of ByteLevel
+                splitRegex = ReadSplitRegex(step);
+                if (splitRegex is null) return;
+            }
+            else if (stepType == "ByteLevel")
+            {
+                sawByteLevel = true;
+                blUseRegex = ReadBoolProp(step, "use_regex");
+                blAddPrefix = ReadBoolProp(step, "add_prefix_space");
+            }
+            else
+            {
+                // Unknown composition — bail to Sequence (factory will reject).
+                return;
+            }
+        }
+
+        if (sawByteLevel && stepCount >= 1)
+        {
+            kind = HfPreTokenizerKind.ByteLevel;
+            byteLevelSplitRegex = splitRegex; // may be null if the sequence was [ByteLevel] alone
+            byteLevelUseRegex = blUseRegex;
+            byteLevelAddPrefixSpace = blAddPrefix;
+        }
+    }
+
+    private static string? ReadSplitRegex(JsonElement split)
+    {
+        if (!split.TryGetProperty("pattern", out JsonElement pattern) ||
+            pattern.ValueKind != JsonValueKind.Object)
+            return null;
+        if (pattern.TryGetProperty("Regex", out JsonElement rx) && rx.ValueKind == JsonValueKind.String)
+            return rx.GetString();
+        // We do not (yet) support literal-String or Char patterns here.
+        return null;
+    }
+
+    private static bool? ReadBoolProp(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out JsonElement v)) return null;
+        return v.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => (bool?)null,
+        };
+    }
+
+    private static HfNormalizerKind ParseNormalizerKind(JsonElement root)
+    {
+        if (!root.TryGetProperty("normalizer", out JsonElement norm) ||
+            norm.ValueKind != JsonValueKind.Object)
+            return HfNormalizerKind.None;
+        if (!norm.TryGetProperty("type", out JsonElement t) || t.ValueKind != JsonValueKind.String)
+            return HfNormalizerKind.Unknown;
+        return t.GetString() switch
+        {
+            "NFC" => HfNormalizerKind.Nfc,
+            "NFD" => HfNormalizerKind.Nfd,
+            "NFKC" => HfNormalizerKind.Nfkc,
+            "NFKD" => HfNormalizerKind.Nfkd,
+            _ => HfNormalizerKind.Unknown,
         };
     }
 
@@ -295,6 +534,7 @@ public static class HfTokenizerJsonParser
             "ByteFallback" => HfDecoderStage.ByteFallback,
             "Fuse" => HfDecoderStage.Fuse,
             "Strip" => HfDecoderStage.Strip,
+            "ByteLevel" => HfDecoderStage.ByteLevel,
             _ => HfDecoderStage.Unknown,
         };
         stages.Add(stage);
