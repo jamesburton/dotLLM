@@ -109,56 +109,12 @@ internal static class TransformerWeightsSafetensorsLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int headDim = config.HeadDim;
-        int qOut = config.NumAttentionHeads * headDim;
-        int kvOut = config.NumKvHeads * headDim;
 
-        // Input (pre-attention) RMSNorm
+        // Pre-attention RMSNorm + all attention projections (Llama-style GQA
+        // or Phi-3 fused-QKV, auto-selected by tensor presence; optional
+        // Qwen2 biases; optional Qwen3 QK-norms).
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
-
-        // Q / K / V / O projections.
-        // Phi-3 convention fuses QKV into a single `self_attn.qkv_proj.weight`
-        // of shape [qOut + 2*kvOut, hidden] (row-major, Q top → K → V). Split
-        // per-layer into three owned F32 allocations so downstream forward
-        // path sees the standard Q/K/V slots. Falls through to per-tensor
-        // resolution when the fused tensor is absent (vanilla Llama/Mistral/
-        // Qwen convention).
-        nint qPtr, kPtr, vPtr, oPtr;
-        QuantizationType qQt, kQt, vQt, oQt;
-        int qM, qK, kM, kK, vM, vK, oM, oK;
-        string fusedQkvName = $"{prefix}.self_attn.qkv_proj.weight";
-        if (file.TensorsByName.ContainsKey(fusedQkvName))
-        {
-            SplitFusedProjection(
-                file, fusedQkvName, new[] { qOut, kvOut, kvOut }, hiddenSize, owned,
-                out var qkvPtrs);
-            qPtr = qkvPtrs[0]; kPtr = qkvPtrs[1]; vPtr = qkvPtrs[2];
-            qQt = kQt = vQt = QuantizationType.F32;
-            qM = qOut; kM = kvOut; vM = kvOut;
-            qK = kK = vK = hiddenSize;
-        }
-        else
-        {
-            (qPtr, qQt, qM, qK) = ResolveLinear(file, $"{prefix}.self_attn.q_proj.weight", owned);
-            (kPtr, kQt, kM, kK) = ResolveLinear(file, $"{prefix}.self_attn.k_proj.weight", owned);
-            (vPtr, vQt, vM, vK) = ResolveLinear(file, $"{prefix}.self_attn.v_proj.weight", owned);
-            ValidateProjectionShape(qM, qK, qOut, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
-            ValidateProjectionShape(kM, kK, kvOut, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
-            ValidateProjectionShape(vM, vK, kvOut, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
-        }
-        (oPtr, oQt, oM, oK) = ResolveLinear(file, $"{prefix}.self_attn.o_proj.weight", owned);
-        ValidateProjectionShape(oM, oK, hiddenSize, qOut, $"{prefix}.self_attn.o_proj.weight");
-
-        // Optional projection biases (Qwen2 has q/k/v biases; Llama does not)
-        float[]? qBias = ResolveOptionalBias(file, $"{prefix}.self_attn.q_proj.bias", qOut);
-        float[]? kBias = ResolveOptionalBias(file, $"{prefix}.self_attn.k_proj.bias", kvOut);
-        float[]? vBias = ResolveOptionalBias(file, $"{prefix}.self_attn.v_proj.bias", kvOut);
-        float[]? oBias = ResolveOptionalBias(file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
-
-        // Optional QK-norms (Qwen3 per-head RMSNorm). Not emitted by vanilla HF
-        // Llama/Mistral/Qwen2. Qwen3 names them {q_norm,k_norm}.weight.
-        float[]? qNorm = ResolveOptionalNorm(file, $"{prefix}.self_attn.q_norm.weight", headDim);
-        float[]? kNorm = ResolveOptionalNorm(file, $"{prefix}.self_attn.k_norm.weight", headDim);
+        var attn = AttentionTensorLoader.Load(AttentionVariant.Gqa, file, config, layerIdx, owned);
 
         // Post-attention (pre-FFN) RMSNorm
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
@@ -191,17 +147,17 @@ internal static class TransformerWeightsSafetensorsLoader
                 };
                 return new TransformerLayerWeights(
                     attnNorm,
-                    qPtr, qQt, qM, qK,
-                    kPtr, kQt, kM, kK,
-                    vPtr, vQt, vM, vK,
-                    oPtr, oQt, oM, oK,
+                    attn.QWeight, attn.QQuantType, attn.QOutputDim, attn.QInputDim,
+                    attn.KWeight, attn.KQuantType, attn.KOutputDim, attn.KInputDim,
+                    attn.VWeight, attn.VQuantType, attn.VOutputDim, attn.VInputDim,
+                    attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
                     ffnNorm,
                     gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
                     upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
                     downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
-                    qBias, kBias, vBias, oBias,
+                    attn.QBias, attn.KBias, attn.VBias, attn.OBias,
                     gateBias: null, upBias: null, downBias: null,
-                    qNormWeight: qNorm, kNormWeight: kNorm,
+                    qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
                     moe: moe);
             }
             // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
@@ -241,17 +197,17 @@ internal static class TransformerWeightsSafetensorsLoader
 
         return new TransformerLayerWeights(
             attnNorm,
-            qPtr, qQt, qM, qK,
-            kPtr, kQt, kM, kK,
-            vPtr, vQt, vM, vK,
-            oPtr, oQt, oM, oK,
+            attn.QWeight, attn.QQuantType, attn.QOutputDim, attn.QInputDim,
+            attn.KWeight, attn.KQuantType, attn.KOutputDim, attn.KInputDim,
+            attn.VWeight, attn.VQuantType, attn.VOutputDim, attn.VInputDim,
+            attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
             ffnNorm,
             gatePtr, gateQt, gateM, gateK,
             upPtr, upQt, upM, upK,
             downPtr, downQt, downM, downK,
-            qBias, kBias, vBias, oBias,
+            attn.QBias, attn.KBias, attn.VBias, attn.OBias,
             gateBias: null, upBias: null, downBias: null,
-            qNormWeight: qNorm, kNormWeight: kNorm);
+            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight);
     }
 
     /// <summary>
