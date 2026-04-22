@@ -11,9 +11,10 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// <summary>
 /// End-to-end verification that <see cref="ModelLoader.LoadFromSafetensors"/>
 /// loads real HuggingFace checkpoints (not tiny-random) for architectures dotLLM
-/// now claims to support: dense multi-shard transformers (Phi-3.5-mini) and
-/// Mixtral-family MoE with shared experts (Qwen1.5-MoE-A2.7B). Each test is
-/// gated on an env-var checkpoint path or a conventional
+/// now claims to support: dense multi-shard transformers with fused qkv/gate-up
+/// (Phi-3.5-mini) and Granite-3.x-family MoE with fused-per-expert
+/// input_linear/output_linear tensors (Granite-3.0-3B-A800M-instruct). Each test
+/// is gated on an env-var checkpoint path or a conventional
 /// <c>C:/temp/dotllm-&lt;family&gt;/</c> directory; when neither resolves the test
 /// skips gracefully so CI stays green.
 /// </summary>
@@ -24,16 +25,19 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 /// </para>
 /// <list type="bullet">
 ///   <item><description><c>microsoft/Phi-3.5-mini-instruct</c> — ~7.6 GB, 2
-///   safetensors shards, dense Llama-family.</description></item>
-///   <item><description><c>Qwen/Qwen1.5-MoE-A2.7B</c> — ~14 GB, 8 shards, 60
-///   routed experts top-4 + shared expert + <c>norm_topk_prob=false</c>.</description></item>
+///   safetensors shards, dense Llama-family with fused qkv_proj /
+///   gate_up_proj.</description></item>
+///   <item><description><c>ibm-granite/granite-3.0-3b-a800m-instruct</c> —
+///   ~6.3 GB, 2 shards, 40 routed experts top-8, no shared expert,
+///   fused per-layer input_linear [E, 2*I, H] / output_linear [E, H, I]
+///   tensors.</description></item>
 /// </list>
 /// <para>
 /// <b>To run locally.</b> Either place the checkpoint at the conventional path
 /// or set the env var to the safetensors index JSON or its directory:
 /// <code>
 ///   $env:DOTLLM_PHI35_CHECKPOINT_PATH = "C:/temp/dotllm-phi35-mini"
-///   $env:DOTLLM_QWEN15MOE_CHECKPOINT_PATH = "C:/temp/dotllm-qwen15-moe"
+///   $env:DOTLLM_GRANITE3_CHECKPOINT_PATH = "C:/temp/dotllm-granite3-moe"
 ///   dotnet test tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj `
 ///     --filter FullyQualifiedName~RealHfSafetensorsEndToEnd
 /// </code>
@@ -108,20 +112,20 @@ public sealed class RealHfSafetensorsEndToEndTests
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Qwen1.5-MoE-A2.7B
+    // Granite-3.0-3B-A800M-instruct
     // ────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void Qwen15MoeA27B_LoadsAndForwardsEndToEnd()
+    public void Granite3Moe_LoadsAndForwardsEndToEnd()
     {
         string? root = ResolveCheckpointRoot(
-            envVar: "DOTLLM_QWEN15MOE_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-qwen15-moe");
+            envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-granite3-moe");
         if (root is null)
         {
             _output.WriteLine(
-                "[SKIP] Qwen1.5-MoE-A2.7B checkpoint not found. Set DOTLLM_QWEN15MOE_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-qwen15-moe/");
+                "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-granite3-moe/");
             return;
         }
 
@@ -146,14 +150,15 @@ public sealed class RealHfSafetensorsEndToEndTests
                     + $"norm_topk_prob={config.Moe.NormTopKProb}");
             }
 
-            // Qwen1.5-MoE-A2.7B: Qwen2MoeForCausalLM, 24 layers, hidden=2048, 16 heads
-            Assert.Equal(Architecture.QwenMoe, config.Architecture);
+            // Granite-3.0-3B-A800M-instruct: GraniteMoeForCausalLM, 32 layers,
+            // hidden=1536, 24 heads, 8 kv heads (GQA), 40 experts top-8,
+            // intermediate_size=512, vocab=49155. No shared expert.
+            Assert.Equal(Architecture.GraniteMoe, config.Architecture);
+            Assert.Equal(32, config.NumLayers);
             Assert.NotNull(config.Moe);
-            Assert.True(config.Moe!.NumExperts >= 16, "Qwen1.5-MoE-A2.7B expects ≥16 experts");
-            Assert.True(config.Moe.NumExpertsPerTok >= 2, "top_k >= 2");
-            // Qwen1.5-MoE-A2.7B has a shared expert; assert it's discoverable.
-            Assert.NotNull(config.Moe.SharedExpertIntermediateSize);
-            Assert.True(config.Moe.SharedExpertIntermediateSize!.Value > 0);
+            Assert.Equal(40, config.Moe!.NumExperts);
+            Assert.Equal(8, config.Moe.NumExpertsPerTok);
+            Assert.Null(config.Moe.SharedExpertIntermediateSize);
 
             int[] tokenIds = [0, 1, 2];
             int[] positions = [0, 1, 2];

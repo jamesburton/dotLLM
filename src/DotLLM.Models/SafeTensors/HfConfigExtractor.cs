@@ -381,6 +381,12 @@ public static class HfConfigExtractor
                 || a.Contains("qwen2_moe") || a.Contains("qwen3_moe")
                 || a.Contains("qwenmoe") || a.Contains("qwen_moe")) => Architecture.QwenMoe,
             (_, "qwen2_moe" or "qwen3_moe" or "qwen_moe") => Architecture.QwenMoe,
+            // Granite-3.x MoE — `GraniteMoeForCausalLM` / `model_type=granitemoe`.
+            // Must be checked before `Llama` / `Mistral` fall-throughs because the
+            // base "Granite" name doesn't collide but the MoE-specific tensor
+            // layout requires its own loader path.
+            (var a, _) when a is not null && a.Contains("granitemoe") => Architecture.GraniteMoe,
+            (_, "granitemoe" or "granite_moe") => Architecture.GraniteMoe,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,

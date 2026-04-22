@@ -81,5 +81,20 @@ public enum Architecture
     /// <c>decoder_sparse_step</c> and <c>mlp_only_layers</c>. See
     /// <see cref="DotLLM.Core.Models.MoeConfig"/> for the per-layer flags.
     /// </summary>
-    QwenMoe
+    QwenMoe,
+
+    /// <summary>
+    /// IBM Granite-3.x MoE family — Granite-3.0-3B-A800M-instruct and larger
+    /// variants (<c>model_type=granitemoe</c>,
+    /// <c>architectures[0]=GraniteMoeForCausalLM</c>). Standard GQA attention
+    /// (separate <c>q/k/v/o_proj</c>) paired with a Mixtral-shaped top-k MoE
+    /// FFN whose per-expert weights are packed as three fused tensors:
+    /// <c>block_sparse_moe.router.layer.weight [E, H]</c>,
+    /// <c>block_sparse_moe.input_linear.weight [E, 2*I, H]</c> (per-expert
+    /// w1 rows [0:I) + w3 rows [I:2*I)), and
+    /// <c>block_sparse_moe.output_linear.weight [E, H, I]</c> (per-expert w2).
+    /// No shared expert; top-k is unusually large (8 of 40 for the 3B-A800M
+    /// SKU). See <see cref="DotLLM.Core.Models.MoeConfig"/>.
+    /// </summary>
+    GraniteMoe
 }

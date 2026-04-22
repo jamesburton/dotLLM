@@ -109,14 +109,14 @@ public static class ModelLoader
             IModel model = config.Architecture switch
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
-                    or Architecture.Mixtral or Architecture.QwenMoe
+                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, DeepSeekV2, DeepSeekV3, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, Mamba3."),
             };
 
             return (model, source, config);

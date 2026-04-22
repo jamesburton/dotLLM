@@ -186,6 +186,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 moe = config.Architecture switch
                 {
                     DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.GraniteMoe => LoadGraniteMoeLayer(layerIdx, file, config, owned),
                     _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
                 };
                 return new TransformerLayerWeights(
@@ -590,6 +591,154 @@ internal static class TransformerWeightsSafetensorsLoader
             numExpertsPerTok: moe.NumExpertsPerTok,
             hiddenSize: hiddenSize,
             intermediateSize: intermediateSize);
+    }
+
+    /// <summary>
+    /// Loads Granite-3.x-convention MoE weights for one transformer layer.
+    /// Unlike Mixtral / Qwen-MoE which store each expert's projections as
+    /// individual tensors, Granite packs ALL experts of one layer into three
+    /// fused rank-3 tensors:
+    /// <list type="bullet">
+    ///   <item><c>mlp.block_sparse_moe.router.layer.weight [E, H]</c> — router gate.</item>
+    ///   <item><c>mlp.block_sparse_moe.input_linear.weight [E, 2*I, H]</c> —
+    ///     per-expert w1 (gate_proj) in rows [0..I), w3 (up_proj) in rows
+    ///     [I..2*I). One expert = a flat [2*I, H] slab.</item>
+    ///   <item><c>mlp.block_sparse_moe.output_linear.weight [E, H, I]</c> —
+    ///     per-expert w2 (down_proj), already a [H, I] slab per expert.</item>
+    /// </list>
+    /// The kernel (<see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/>) requires
+    /// per-expert F32 row-major pointers. We therefore allocate one F32
+    /// buffer per expert per matrix (w1/w2/w3) and upcast from the fused BF16
+    /// source — mmap'd zero-copy is not viable because (a) kernels expect
+    /// F32, and (b) pointing mid-way into a BF16 tensor would skip the
+    /// dtype-conversion layer. Allocations are registered in
+    /// <paramref name="owned"/> for deterministic cleanup.
+    /// </summary>
+    private static unsafe MoeLayerWeights LoadGraniteMoeLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadGraniteMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.block_sparse_moe";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router gate — fused [E, H] but shape-compatible with the flat
+        // [numExperts, hiddenSize] router gate expected by the MoE kernel.
+        // ResolveDense2D already upcasts BF16/F16 to F32 into a managed array.
+        float[] gate = ResolveDense2D(file, $"{prefix}.router.layer.weight", numExperts, hiddenSize);
+
+        // input_linear: [E, 2*I, H]. Per expert e:
+        //   rows [0..I)       = w1 (gate_proj)  — shape [I, H]
+        //   rows [I..2*I)     = w3 (up_proj)    — shape [I, H]
+        string inputName = $"{prefix}.input_linear.weight";
+        if (!file.TensorsByName.TryGetValue(inputName, out var inputDesc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{inputName}'.");
+        if (inputDesc.Shape.Length != 3
+            || inputDesc.Shape[0] != numExperts
+            || inputDesc.Shape[1] != 2 * intermediateSize
+            || inputDesc.Shape[2] != hiddenSize)
+            throw new InvalidDataException(
+                $"Tensor '{inputName}' shape [{string.Join(',', inputDesc.Shape)}] "
+                + $"does not match expected [{numExperts},{2 * intermediateSize},{hiddenSize}].");
+        nint inputSrc = file.GetTensorPointer(inputName);
+
+        // output_linear: [E, H, I]. Per expert e: shape [H, I] = w2 slab.
+        string outputName = $"{prefix}.output_linear.weight";
+        if (!file.TensorsByName.TryGetValue(outputName, out var outputDesc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{outputName}'.");
+        if (outputDesc.Shape.Length != 3
+            || outputDesc.Shape[0] != numExperts
+            || outputDesc.Shape[1] != hiddenSize
+            || outputDesc.Shape[2] != intermediateSize)
+            throw new InvalidDataException(
+                $"Tensor '{outputName}' shape [{string.Join(',', outputDesc.Shape)}] "
+                + $"does not match expected [{numExperts},{hiddenSize},{intermediateSize}].");
+        nint outputSrc = file.GetTensorPointer(outputName);
+
+        long inputPerExpert = (long)(2 * intermediateSize) * hiddenSize;  // elements
+        long outputPerExpert = (long)hiddenSize * intermediateSize;       // elements
+        long w1Elements = (long)intermediateSize * hiddenSize;
+        long w3Elements = (long)intermediateSize * hiddenSize;
+
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            // Source byte offsets into the fused tensors. Element type drives
+            // the stride: for BF16/F16 the dtype is 2 bytes/element; for F32
+            // it's 4. We compute via pointer casts per-dtype to avoid a
+            // bytes-based math bug.
+            long inputExpertStart = e * inputPerExpert;      // start of expert slab (elements)
+            long w1Start = inputExpertStart;                 // first I rows
+            long w3Start = inputExpertStart + w1Elements;    // next I rows
+            long outputExpertStart = e * outputPerExpert;
+
+            w1[e] = AllocPartAsF32(inputSrc, inputDesc.DType, w1Start, w1Elements, owned, inputName);
+            w3[e] = AllocPartAsF32(inputSrc, inputDesc.DType, w3Start, w3Elements, owned, inputName);
+            w2[e] = AllocPartAsF32(outputSrc, outputDesc.DType, outputExpertStart, outputPerExpert, owned, outputName);
+        }
+
+        return new MoeLayerWeights(
+            gate: gate,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null);
+    }
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned F32 buffer of <paramref name="elements"/>
+    /// elements, filling it from the fused source pointer starting at
+    /// <paramref name="sourceElementOffset"/>. BF16 and F16 sources are
+    /// upcast / decoded; F32 sources are copied.
+    /// </summary>
+    private static unsafe nint AllocPartAsF32(
+        nint source, SafetensorsDType dtype, long sourceElementOffset, long elements,
+        List<nint> owned, string sourceName)
+    {
+        nuint byteCount = checked((nuint)elements * sizeof(float));
+        nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
+        owned.Add(dst);
+
+        switch (dtype)
+        {
+            case SafetensorsDType.F32:
+            {
+                float* srcRow = (float*)source + sourceElementOffset;
+                new ReadOnlySpan<float>(srcRow, (int)elements)
+                    .CopyTo(new Span<float>((void*)dst, (int)elements));
+                break;
+            }
+            case SafetensorsDType.BF16:
+            {
+                ushort* srcRow = (ushort*)source + sourceElementOffset;
+                DecodeBf16(srcRow, (int)elements, new Span<float>((void*)dst, (int)elements));
+                break;
+            }
+            case SafetensorsDType.F16:
+            {
+                Half* srcRow = (Half*)source + sourceElementOffset;
+                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
+                    new ReadOnlySpan<Half>(srcRow, (int)elements),
+                    new Span<float>((void*)dst, (int)elements));
+                break;
+            }
+            default:
+                throw new NotSupportedException(
+                    $"Tensor '{sourceName}' has dtype {dtype} — Granite-MoE split path supports F32/F16/BF16 only.");
+        }
+        return dst;
     }
 
     /// <summary>
