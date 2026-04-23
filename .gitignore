@@ -3,9 +3,10 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
-# Claude Code local config (machine-specific paths, agent memory)
+# Claude Code local config (machine-specific paths, agent memory, session lock)
 .claude/local-paths.md
 .claude/agent-memory/
+.claude/scheduled_tasks.lock
 
 # User-specific files
 *.rsuser
