@@ -463,12 +463,12 @@ public sealed class RealHfSafetensorsEndToEndTests
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-granite3-moe");
+            conventional: "C:/temp/dotllm-granite31-moe");
         if (root is null)
         {
             _output.WriteLine(
                 "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite3-moe/");
+                + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
             return;
         }
 
