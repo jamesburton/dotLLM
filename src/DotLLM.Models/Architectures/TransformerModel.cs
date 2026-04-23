@@ -324,7 +324,11 @@ public sealed unsafe class TransformerModel : IModel
                     kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
                     kvALayernormWeight: mlaW.KvALayernormWeight,
                     kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
-                    oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems));
+                    oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
+                    // YaRN softmax-scale correction (mscale²). Returns 1.0f
+                    // when rope_scaling is absent or factor <= 1 — so no
+                    // behavioural change for pre-YaRN checkpoints.
+                    attnScaleMultiplier: Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier());
 
                 // Bias on o_proj (rare — DeepSeek doesn't ship one by default).
                 AddBias(lw.OBias, attnOut, hiddenSize, seqLen);

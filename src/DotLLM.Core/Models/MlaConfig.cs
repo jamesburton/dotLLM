@@ -134,4 +134,36 @@ public sealed record MlaConfig
     /// Used for the attention scale <c>1 / sqrt(qk_head_dim)</c>.
     /// </summary>
     public int QkHeadDim => QkNopeHeadDim + QkRopeHeadDim;
+
+    /// <summary>
+    /// Compute the YaRN softmax-scale multiplier to fold into the attention
+    /// scale: returns <c>mscale² = (yarn_get_mscale(factor, mscale_all_dim))²</c>
+    /// when YaRN scaling is configured and active (<c>factor &gt; 1</c>), else
+    /// <c>1.0f</c>. The caller applies this as
+    /// <c>softmax_scale = 1/sqrt(qk_head_dim) * multiplier</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors the HF reference <c>modeling_deepseek.yarn_get_mscale</c>:
+    /// <code>
+    ///   def yarn_get_mscale(scale=1, mscale=1):
+    ///       if scale &lt;= 1: return 1.0
+    ///       return 0.1 * mscale * math.log(scale) + 1.0
+    /// </code>
+    /// and the softmax correction <c>scale *= mscale * mscale</c>. Uses
+    /// <see cref="RopeScalingMscaleAllDim"/>, NOT <see cref="RopeScalingMscale"/> —
+    /// the V2 reference applies <c>mscale_all_dim</c> to the softmax scale and
+    /// uses <c>mscale</c> only for RoPE frequency scaling (not wired here yet).
+    /// </para>
+    /// </remarks>
+    public float ComputeYarnSoftmaxScaleMultiplier()
+    {
+        if (RopeScalingFactor is not float factor || factor <= 1.0f)
+            return 1.0f;
+        if (RopeScalingMscaleAllDim is not float mscaleAllDim || mscaleAllDim == 0.0f)
+            return 1.0f;
+
+        float mscale = 0.1f * mscaleAllDim * MathF.Log(factor) + 1.0f;
+        return mscale * mscale;
+    }
 }
