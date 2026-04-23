@@ -1,8 +1,8 @@
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Models.SafeTensors;
+using static DotLLM.Models.Architectures.SafetensorsTensorResolver;
 
 namespace DotLLM.Models.Architectures;
 
@@ -109,56 +109,12 @@ internal static class TransformerWeightsSafetensorsLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int headDim = config.HeadDim;
-        int qOut = config.NumAttentionHeads * headDim;
-        int kvOut = config.NumKvHeads * headDim;
 
-        // Input (pre-attention) RMSNorm
+        // Pre-attention RMSNorm + all attention projections (Llama-style GQA
+        // or Phi-3 fused-QKV, auto-selected by tensor presence; optional
+        // Qwen2 biases; optional Qwen3 QK-norms).
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
-
-        // Q / K / V / O projections.
-        // Phi-3 convention fuses QKV into a single `self_attn.qkv_proj.weight`
-        // of shape [qOut + 2*kvOut, hidden] (row-major, Q top → K → V). Split
-        // per-layer into three owned F32 allocations so downstream forward
-        // path sees the standard Q/K/V slots. Falls through to per-tensor
-        // resolution when the fused tensor is absent (vanilla Llama/Mistral/
-        // Qwen convention).
-        nint qPtr, kPtr, vPtr, oPtr;
-        QuantizationType qQt, kQt, vQt, oQt;
-        int qM, qK, kM, kK, vM, vK, oM, oK;
-        string fusedQkvName = $"{prefix}.self_attn.qkv_proj.weight";
-        if (file.TensorsByName.ContainsKey(fusedQkvName))
-        {
-            SplitFusedProjection(
-                file, fusedQkvName, new[] { qOut, kvOut, kvOut }, hiddenSize, owned,
-                out var qkvPtrs);
-            qPtr = qkvPtrs[0]; kPtr = qkvPtrs[1]; vPtr = qkvPtrs[2];
-            qQt = kQt = vQt = QuantizationType.F32;
-            qM = qOut; kM = kvOut; vM = kvOut;
-            qK = kK = vK = hiddenSize;
-        }
-        else
-        {
-            (qPtr, qQt, qM, qK) = ResolveLinear(file, $"{prefix}.self_attn.q_proj.weight", owned);
-            (kPtr, kQt, kM, kK) = ResolveLinear(file, $"{prefix}.self_attn.k_proj.weight", owned);
-            (vPtr, vQt, vM, vK) = ResolveLinear(file, $"{prefix}.self_attn.v_proj.weight", owned);
-            ValidateProjectionShape(qM, qK, qOut, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
-            ValidateProjectionShape(kM, kK, kvOut, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
-            ValidateProjectionShape(vM, vK, kvOut, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
-        }
-        (oPtr, oQt, oM, oK) = ResolveLinear(file, $"{prefix}.self_attn.o_proj.weight", owned);
-        ValidateProjectionShape(oM, oK, hiddenSize, qOut, $"{prefix}.self_attn.o_proj.weight");
-
-        // Optional projection biases (Qwen2 has q/k/v biases; Llama does not)
-        float[]? qBias = ResolveOptionalBias(file, $"{prefix}.self_attn.q_proj.bias", qOut);
-        float[]? kBias = ResolveOptionalBias(file, $"{prefix}.self_attn.k_proj.bias", kvOut);
-        float[]? vBias = ResolveOptionalBias(file, $"{prefix}.self_attn.v_proj.bias", kvOut);
-        float[]? oBias = ResolveOptionalBias(file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
-
-        // Optional QK-norms (Qwen3 per-head RMSNorm). Not emitted by vanilla HF
-        // Llama/Mistral/Qwen2. Qwen3 names them {q_norm,k_norm}.weight.
-        float[]? qNorm = ResolveOptionalNorm(file, $"{prefix}.self_attn.q_norm.weight", headDim);
-        float[]? kNorm = ResolveOptionalNorm(file, $"{prefix}.self_attn.k_norm.weight", headDim);
+        var attn = AttentionTensorLoader.Load(AttentionVariant.Gqa, file, config, layerIdx, owned);
 
         // Post-attention (pre-FFN) RMSNorm
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
@@ -191,17 +147,17 @@ internal static class TransformerWeightsSafetensorsLoader
                 };
                 return new TransformerLayerWeights(
                     attnNorm,
-                    qPtr, qQt, qM, qK,
-                    kPtr, kQt, kM, kK,
-                    vPtr, vQt, vM, vK,
-                    oPtr, oQt, oM, oK,
+                    attn.QWeight, attn.QQuantType, attn.QOutputDim, attn.QInputDim,
+                    attn.KWeight, attn.KQuantType, attn.KOutputDim, attn.KInputDim,
+                    attn.VWeight, attn.VQuantType, attn.VOutputDim, attn.VInputDim,
+                    attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
                     ffnNorm,
                     gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
                     upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
                     downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
-                    qBias, kBias, vBias, oBias,
+                    attn.QBias, attn.KBias, attn.VBias, attn.OBias,
                     gateBias: null, upBias: null, downBias: null,
-                    qNormWeight: qNorm, kNormWeight: kNorm,
+                    qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
                     moe: moe);
             }
             // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
@@ -241,110 +197,43 @@ internal static class TransformerWeightsSafetensorsLoader
 
         return new TransformerLayerWeights(
             attnNorm,
-            qPtr, qQt, qM, qK,
-            kPtr, kQt, kM, kK,
-            vPtr, vQt, vM, vK,
-            oPtr, oQt, oM, oK,
+            attn.QWeight, attn.QQuantType, attn.QOutputDim, attn.QInputDim,
+            attn.KWeight, attn.KQuantType, attn.KOutputDim, attn.KInputDim,
+            attn.VWeight, attn.VQuantType, attn.VOutputDim, attn.VInputDim,
+            attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
             ffnNorm,
             gatePtr, gateQt, gateM, gateK,
             upPtr, upQt, upM, upK,
             downPtr, downQt, downM, downK,
-            qBias, kBias, vBias, oBias,
+            attn.QBias, attn.KBias, attn.VBias, attn.OBias,
             gateBias: null, upBias: null, downBias: null,
-            qNormWeight: qNorm, kNormWeight: kNorm);
+            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight);
     }
 
     /// <summary>
     /// Loads one transformer layer for a DeepSeek-V2 / DeepSeek-V3 checkpoint.
-    /// Routes the attention projections through the MLA-specific tensor
-    /// naming (<c>q_a_proj</c> / <c>q_b_proj</c> or monolithic <c>q_proj</c>,
-    /// <c>kv_a_proj_with_mqa</c>, <c>kv_b_proj</c>, their layernorms, and
-    /// <c>o_proj</c>), and routes the FFN either through a Llama-style dense
-    /// SwiGLU (first <c>first_k_dense_replace</c> layers) or the DeepSeek
-    /// MoE branch (plural <c>mlp.shared_experts.{k}.*</c>, no sigmoid gate).
-    /// All MLA tensors are coerced to F32 via
-    /// <see cref="ResolveLinearAsF32"/>; the scalar MLA kernel consumes F32
-    /// row-major throughout.
+    /// Delegates the attention projections to
+    /// <see cref="AttentionTensorLoader"/> with the MLA variant (LoRA-
+    /// factored <c>q_a_proj</c>/<c>q_b_proj</c> or monolithic <c>q_proj</c>;
+    /// LoRA-factored <c>kv_a_proj_with_mqa</c>/<c>kv_b_proj</c> with shared
+    /// rope-K; <c>o_proj</c>; all coerced to F32). Routes the FFN either
+    /// through a Llama-style dense SwiGLU (first
+    /// <c>first_k_dense_replace</c> layers) or the DeepSeek MoE branch
+    /// (plural <c>mlp.shared_experts.{k}.*</c>, no sigmoid gate).
     /// </summary>
     private static TransformerLayerWeights LoadDeepSeekMlaLayer(
         int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
-        var mlaCfg = config.MlaConfig
-                     ?? throw new InvalidOperationException(
-                         "LoadDeepSeekMlaLayer called but ModelConfig.MlaConfig is null.");
-
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int numHeads = config.NumAttentionHeads;
-        int qkNope = mlaCfg.QkNopeHeadDim;
-        int qkRope = mlaCfg.QkRopeHeadDim;
-        int qkHead = qkNope + qkRope;
-        int vHead = mlaCfg.VHeadDim;
-        int qLoraRank = mlaCfg.QLoraRank;
-        int kvLoraRank = mlaCfg.KvLoraRank;
-        int qTotalOut = numHeads * qkHead;
-        int kvBOut = numHeads * (qkNope + vHead);
-        int oInputDim = numHeads * vHead;
 
-        // Pre-attention RMSNorm (standard Llama-style input_layernorm).
+        // Pre-attention RMSNorm (standard Llama-style input_layernorm) + all
+        // MLA-specific Q/KV/O projections (LoRA-factored on V2/V3, monolithic
+        // Q on V2-Lite). Coerces every projection to F32 — the scalar MLA
+        // kernel consumes F32 row-major throughout.
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
-
-        // Q path: LoRA-factored (V2 full, V3) or monolithic (V2-Lite). The
-        // kernel decides which path to take based on qLoraRank; we pass zero
-        // pointers for the unused set.
-        nint qAProj = 0, qBProj = 0, qProj = 0;
-        float[]? qALayernorm = null;
-        if (qLoraRank > 0)
-        {
-            (qAProj, _, int qAm, int qAk) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_a_proj.weight", owned);
-            ValidateProjectionShape(qAm, qAk, qLoraRank, hiddenSize,
-                $"{prefix}.self_attn.q_a_proj.weight");
-            qALayernorm = ResolveNorm(file, $"{prefix}.self_attn.q_a_layernorm.weight", qLoraRank);
-            (qBProj, _, int qBm, int qBk) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_b_proj.weight", owned);
-            ValidateProjectionShape(qBm, qBk, qTotalOut, qLoraRank,
-                $"{prefix}.self_attn.q_b_proj.weight");
-        }
-        else
-        {
-            (qProj, _, int qM, int qK) = ResolveLinearAsF32(
-                file, $"{prefix}.self_attn.q_proj.weight", owned);
-            ValidateProjectionShape(qM, qK, qTotalOut, hiddenSize,
-                $"{prefix}.self_attn.q_proj.weight");
-        }
-
-        // KV path: always LoRA-factored. kv_a_proj_with_mqa emits
-        // [kvLoraRank + qkRopeHeadDim] per token — the first kvLoraRank rows
-        // feed kv_a_layernorm then kv_b_proj, the last qkRopeHeadDim rows are
-        // the MQA-shared rope-K. No separate LayerNorm on the rope-K side.
-        int kvADim = kvLoraRank + qkRope;
-        (nint kvAProj, _, int kvaM, int kvaK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.kv_a_proj_with_mqa.weight", owned);
-        ValidateProjectionShape(kvaM, kvaK, kvADim, hiddenSize,
-            $"{prefix}.self_attn.kv_a_proj_with_mqa.weight");
-        float[] kvALayernorm = ResolveNorm(
-            file, $"{prefix}.self_attn.kv_a_layernorm.weight", kvLoraRank);
-        (nint kvBProj, _, int kvbM, int kvbK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.kv_b_proj.weight", owned);
-        ValidateProjectionShape(kvbM, kvbK, kvBOut, kvLoraRank,
-            $"{prefix}.self_attn.kv_b_proj.weight");
-
-        // Output projection: hidden ← n_heads * v_head_dim. Kept in the
-        // existing O slot (not MLA-specific) because the forward path still
-        // applies bias (if any) through the same AddBias logic.
-        var (oPtr, oQt, oM, oK) = ResolveLinearAsF32(
-            file, $"{prefix}.self_attn.o_proj.weight", owned);
-        ValidateProjectionShape(oM, oK, hiddenSize, oInputDim,
-            $"{prefix}.self_attn.o_proj.weight");
-        float[]? oBias = ResolveOptionalBias(file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
-
-        var mla = new MlaLayerWeights(
-            qAProj: qAProj, qALayernormWeight: qALayernorm, qBProj: qBProj, qProj: qProj,
-            kvAProjWithMqa: kvAProj, kvALayernormWeight: kvALayernorm, kvBProj: kvBProj,
-            numHeads: numHeads,
-            qkNopeHeadDim: qkNope, qkRopeHeadDim: qkRope, vHeadDim: vHead,
-            qLoraRank: qLoraRank, kvLoraRank: kvLoraRank);
+        var attn = AttentionTensorLoader.Load(AttentionVariant.Mla, file, config, layerIdx, owned);
+        var mla = attn.Mla!; // Guaranteed non-null for AttentionVariant.Mla.
 
         // Post-attention RMSNorm (shared with Llama convention).
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
@@ -360,12 +249,12 @@ internal static class TransformerWeightsSafetensorsLoader
                 qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
                 kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
                 vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
-                oPtr, oQt, oM, oK,
+                attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
                 ffnNorm,
                 gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
                 upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
                 downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
-                qBias: null, kBias: null, vBias: null, oBias: oBias,
+                qBias: null, kBias: null, vBias: null, oBias: attn.OBias,
                 gateBias: null, upBias: null, downBias: null,
                 qNormWeight: null, kNormWeight: null,
                 moe: moe,
@@ -391,12 +280,12 @@ internal static class TransformerWeightsSafetensorsLoader
             qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
             kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
             vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
-            oPtr, oQt, oM, oK,
+            attn.OWeight, attn.OQuantType, attn.OOutputDim, attn.OInputDim,
             ffnNorm,
             gatePtr, gateQt, gateM, gateK,
             upPtr, upQt, upM, upK,
             downPtr, downQt, downM, downK,
-            qBias: null, kBias: null, vBias: null, oBias: oBias,
+            qBias: null, kBias: null, vBias: null, oBias: attn.OBias,
             gateBias: null, upBias: null, downBias: null,
             qNormWeight: null, kNormWeight: null,
             moe: null,
@@ -697,344 +586,4 @@ internal static class TransformerWeightsSafetensorsLoader
             sharedExpertGate: null);
     }
 
-    /// <summary>
-    /// Allocates a 64-byte-aligned F32 buffer of <paramref name="elements"/>
-    /// elements, filling it from the fused source pointer starting at
-    /// <paramref name="sourceElementOffset"/>. BF16 and F16 sources are
-    /// upcast / decoded; F32 sources are copied.
-    /// </summary>
-    private static unsafe nint AllocPartAsF32(
-        nint source, SafetensorsDType dtype, long sourceElementOffset, long elements,
-        List<nint> owned, string sourceName)
-    {
-        nuint byteCount = checked((nuint)elements * sizeof(float));
-        nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
-        owned.Add(dst);
-
-        switch (dtype)
-        {
-            case SafetensorsDType.F32:
-            {
-                float* srcRow = (float*)source + sourceElementOffset;
-                new ReadOnlySpan<float>(srcRow, (int)elements)
-                    .CopyTo(new Span<float>((void*)dst, (int)elements));
-                break;
-            }
-            case SafetensorsDType.BF16:
-            {
-                ushort* srcRow = (ushort*)source + sourceElementOffset;
-                DecodeBf16(srcRow, (int)elements, new Span<float>((void*)dst, (int)elements));
-                break;
-            }
-            case SafetensorsDType.F16:
-            {
-                Half* srcRow = (Half*)source + sourceElementOffset;
-                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
-                    new ReadOnlySpan<Half>(srcRow, (int)elements),
-                    new Span<float>((void*)dst, (int)elements));
-                break;
-            }
-            default:
-                throw new NotSupportedException(
-                    $"Tensor '{sourceName}' has dtype {dtype} — Granite-MoE split path supports F32/F16/BF16 only.");
-        }
-        return dst;
-    }
-
-    /// <summary>
-    /// Resolves a rank-2 tensor as a managed <c>float[]</c>, up-casting F16 /
-    /// BF16 on the way in. Used for small weights (router gate) where a copy
-    /// costs nothing and is simpler than tracking owned allocations.
-    /// </summary>
-    private static unsafe float[] ResolveDense2D(
-        ISafetensorsTensorSource file, string name, int expectedM, int expectedK)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc))
-            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
-        if (desc.Shape.Length != 2)
-            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
-        int m = desc.Shape[0], k = desc.Shape[1];
-        if (m != expectedM || k != expectedK)
-            throw new InvalidDataException(
-                $"Tensor '{name}' shape [{m},{k}] does not match expected [{expectedM},{expectedK}].");
-
-        int count = m * k;
-        var result = new float[count];
-        nint src = file.GetTensorPointer(name);
-        DecodeFloatTensor(src, desc.DType, count, result, name);
-        return result;
-    }
-
-    /// <summary>
-    /// Resolves a rank-2 projection weight as an F32 pointer. F32 tensors are
-    /// returned zero-copy; F16 and BF16 tensors are upcast into 64-byte-aligned
-    /// owned scratch and registered in <paramref name="owned"/>. Similar to
-    /// <see cref="ResolveLinear"/> but always hands back F32 — MoE kernels
-    /// expect F32 today (per-expert quantised GEMM is a follow-up).
-    /// </summary>
-    private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsF32(
-        ISafetensorsTensorSource file, string name, List<nint> owned)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc))
-            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
-        if (desc.Shape.Length != 2)
-            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
-
-        int m = desc.Shape[0], k = desc.Shape[1];
-        long count = (long)m * k;
-        nint srcPtr = file.GetTensorPointer(name);
-
-        switch (desc.DType)
-        {
-            case SafetensorsDType.F32:
-                return (srcPtr, QuantizationType.F32, m, k);
-
-            case SafetensorsDType.BF16:
-            {
-                nint dst = AllocBf16ToF32(srcPtr, count);
-                owned.Add(dst);
-                return (dst, QuantizationType.F32, m, k);
-            }
-
-            case SafetensorsDType.F16:
-            {
-                nuint byteCount = checked((nuint)count * sizeof(float));
-                nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
-                owned.Add(dst);
-                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
-                    new ReadOnlySpan<Half>((void*)srcPtr, (int)count),
-                    new Span<float>((void*)dst, (int)count));
-                return (dst, QuantizationType.F32, m, k);
-            }
-
-            default:
-                throw new NotSupportedException(
-                    $"Tensor '{name}' has dtype {desc.DType} — MoE loader supports F32/F16/BF16 only.");
-        }
-    }
-
-    /// <summary>
-    /// Splits a row-fused HF tensor of shape <c>[sum(partRows), hidden]</c>
-    /// into <paramref name="partRows"/>.Length independent F32 allocations
-    /// (one per part) and returns their pointers in order. Supports F32 /
-    /// BF16 / F16 source dtypes; BF16 is upcast to F32, F16 is decoded to
-    /// F32 as well to keep the downstream kernel uniform (quantised splits
-    /// would force per-expert dequant, out of scope).
-    /// </summary>
-    /// <remarks>
-    /// Used by the Phi-3 loader path to split
-    /// <c>self_attn.qkv_proj.weight</c> into Q/K/V and
-    /// <c>mlp.gate_up_proj.weight</c> into gate/up. Each allocation is
-    /// 64-byte-aligned and registered in <paramref name="owned"/> for the
-    /// caller's Dispose unwind.
-    /// </remarks>
-    private static unsafe void SplitFusedProjection(
-        ISafetensorsTensorSource file,
-        string name,
-        int[] partRows,
-        int expectedCols,
-        List<nint> owned,
-        out nint[] partPtrs)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc))
-            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
-        if (desc.Shape.Length != 2)
-            throw new InvalidDataException(
-                $"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
-
-        int totalRows = 0;
-        for (int i = 0; i < partRows.Length; i++) totalRows += partRows[i];
-        int m = desc.Shape[0], k = desc.Shape[1];
-        if (m != totalRows || k != expectedCols)
-            throw new InvalidDataException(
-                $"Tensor '{name}' shape [{m},{k}] does not match expected fused shape [{totalRows},{expectedCols}].");
-
-        nint srcPtr = file.GetTensorPointer(name);
-        partPtrs = new nint[partRows.Length];
-        int rowCursor = 0;
-        for (int i = 0; i < partRows.Length; i++)
-        {
-            int rows = partRows[i];
-            long partCount = (long)rows * expectedCols;
-            nuint byteCount = checked((nuint)partCount * sizeof(float));
-            nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
-            owned.Add(dst);
-
-            switch (desc.DType)
-            {
-                case SafetensorsDType.F32:
-                {
-                    float* srcRow = (float*)srcPtr + (long)rowCursor * expectedCols;
-                    new ReadOnlySpan<float>(srcRow, (int)partCount)
-                        .CopyTo(new Span<float>((void*)dst, (int)partCount));
-                    break;
-                }
-                case SafetensorsDType.BF16:
-                {
-                    ushort* srcRow = (ushort*)srcPtr + (long)rowCursor * expectedCols;
-                    DecodeBf16(srcRow, (int)partCount, new Span<float>((void*)dst, (int)partCount));
-                    break;
-                }
-                case SafetensorsDType.F16:
-                {
-                    Half* srcRow = (Half*)srcPtr + (long)rowCursor * expectedCols;
-                    System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
-                        new ReadOnlySpan<Half>(srcRow, (int)partCount),
-                        new Span<float>((void*)dst, (int)partCount));
-                    break;
-                }
-                default:
-                    throw new NotSupportedException(
-                        $"Tensor '{name}' has dtype {desc.DType} — fused-split path supports F32/F16/BF16 only.");
-            }
-            partPtrs[i] = dst;
-            rowCursor += rows;
-        }
-    }
-
-    private static void ValidateProjectionShape(int actualM, int actualK, int expectedM, int expectedK, string name)
-    {
-        if (actualM != expectedM || actualK != expectedK)
-            throw new InvalidDataException(
-                $"{name} shape [M={actualM}, K={actualK}] does not match expected [M={expectedM}, K={expectedK}].");
-    }
-
-    /// <summary>
-    /// Resolves a safetensors tensor as a linear projection weight:
-    /// HF shape <c>[out_features, in_features]</c> → (ptr, dtype, M, K).
-    /// F32 tensors are zero-copy; BF16 tensors are upcast into an owned
-    /// 64-byte-aligned scratch buffer and registered in
-    /// <paramref name="owned"/>.
-    /// </summary>
-    private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinear(
-        ISafetensorsTensorSource file, string name, List<nint> owned)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc))
-            throw new InvalidDataException(
-                $"Safetensors file is missing required tensor '{name}'.");
-
-        if (desc.Shape.Length != 2)
-            throw new InvalidDataException(
-                $"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
-
-        int m = desc.Shape[0];
-        int k = desc.Shape[1];
-
-        nint srcPtr = file.GetTensorPointer(name);
-
-        switch (desc.DType)
-        {
-            case SafetensorsDType.F32:
-                return (srcPtr, QuantizationType.F32, m, k);
-
-            case SafetensorsDType.BF16:
-            {
-                long elementCount = (long)m * k;
-                nint dst = AllocBf16ToF32(srcPtr, elementCount);
-                owned.Add(dst);
-                return (dst, QuantizationType.F32, m, k);
-            }
-
-            case SafetensorsDType.F16:
-            {
-                // Keep as F16 (kernels support it directly). No copy.
-                return (srcPtr, QuantizationType.F16, m, k);
-            }
-
-            default:
-                throw new NotSupportedException(
-                    $"Tensor '{name}' has dtype {desc.DType} which is not yet supported by the safetensors transformer loader (F32/F16/BF16 only).");
-        }
-    }
-
-    /// <summary>
-    /// Resolves a norm weight tensor into a managed <c>float[]</c>. Norms
-    /// are small and read once per forward call, so the load-time copy has
-    /// no measurable inference cost.
-    /// </summary>
-    private static float[] ResolveNorm(ISafetensorsTensorSource file, string name, int expectedSize)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc))
-            throw new InvalidDataException(
-                $"Safetensors file is missing required tensor '{name}'.");
-
-        long elementCount = desc.ElementCount;
-        if (elementCount != expectedSize)
-            throw new InvalidDataException(
-                $"Tensor '{name}' has {elementCount} elements, expected {expectedSize}.");
-
-        var result = new float[expectedSize];
-        nint src = file.GetTensorPointer(name);
-        DecodeFloatTensor(src, desc.DType, expectedSize, result, name);
-        return result;
-    }
-
-    private static float[]? ResolveOptionalNorm(ISafetensorsTensorSource file, string name, int expectedSize)
-    {
-        if (!file.TensorsByName.ContainsKey(name)) return null;
-        return ResolveNorm(file, name, expectedSize);
-    }
-
-    private static float[]? ResolveOptionalBias(ISafetensorsTensorSource file, string name, int expectedSize)
-    {
-        if (!file.TensorsByName.TryGetValue(name, out var desc)) return null;
-
-        long elementCount = desc.ElementCount;
-        if (elementCount != expectedSize)
-            throw new InvalidDataException(
-                $"Bias tensor '{name}' has {elementCount} elements, expected {expectedSize}.");
-
-        var result = new float[expectedSize];
-        nint src = file.GetTensorPointer(name);
-        DecodeFloatTensor(src, desc.DType, expectedSize, result, name);
-        return result;
-    }
-
-    private static unsafe void DecodeFloatTensor(
-        nint src, SafetensorsDType dtype, int elementCount, float[] dest, string name)
-    {
-        switch (dtype)
-        {
-            case SafetensorsDType.F32:
-                new ReadOnlySpan<float>((void*)src, elementCount).CopyTo(dest);
-                break;
-            case SafetensorsDType.F16:
-                System.Numerics.Tensors.TensorPrimitives.ConvertToSingle(
-                    new ReadOnlySpan<Half>((void*)src, elementCount), dest);
-                break;
-            case SafetensorsDType.BF16:
-                DecodeBf16((ushort*)src, elementCount, dest);
-                break;
-            default:
-                throw new NotSupportedException(
-                    $"Tensor '{name}' has dtype {dtype} which is not supported for norm/bias load (F32/F16/BF16 only).");
-        }
-    }
-
-    /// <summary>
-    /// Upcasts a bf16 tensor to a 64-byte-aligned F32 buffer owned by the
-    /// caller. bf16 is "the high 16 bits of an IEEE-754 binary32", so the
-    /// upcast is a shift-left-by-16-bits reinterpret — identical to what
-    /// llama.cpp does when it normalises HF checkpoints to F32.
-    /// </summary>
-    private static unsafe nint AllocBf16ToF32(nint srcBf16, long elementCount)
-    {
-        nuint byteCount = checked((nuint)elementCount * sizeof(float));
-        nint dst = (nint)NativeMemory.AlignedAlloc(byteCount, 64);
-        DecodeBf16((ushort*)srcBf16, (int)elementCount, new Span<float>((void*)dst, (int)elementCount));
-        return dst;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void DecodeBf16(ushort* src, int count, Span<float> dest)
-    {
-        // bf16 → f32: shift the 16 bits into the high half of a 32-bit word,
-        // then reinterpret as float. NaN/Inf bit patterns transfer cleanly.
-        fixed (float* dstPtr = dest)
-        {
-            uint* dw = (uint*)dstPtr;
-            for (int i = 0; i < count; i++)
-                dw[i] = (uint)src[i] << 16;
-        }
-    }
 }
