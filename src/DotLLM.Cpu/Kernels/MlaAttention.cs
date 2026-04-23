@@ -64,8 +64,10 @@ namespace DotLLM.Cpu.Kernels;
 /// <para>
 /// <b>Out of scope.</b> No "absorption" optimisation (precomputing
 /// <c>W_q_nope @ W_k_nope^T</c>), no latent KV-cache, no quantised weights,
-/// no YaRN mscale correction. This implementation targets correctness
-/// against a Python / HF reference.
+/// and no YaRN RoPE frequency rescaling (only the YaRN softmax-scale
+/// mscale² correction — applied via the optional
+/// <c>attnScaleMultiplier</c> parameter). This implementation targets
+/// correctness against a Python / HF reference.
 /// </para>
 /// </remarks>
 public static class MlaAttention
@@ -104,6 +106,13 @@ public static class MlaAttention
     /// <param name="kvALayernormWeight">KV LoRA LayerNorm weight [kvLoraRank].</param>
     /// <param name="kvBProj">KV up-projection weight [numHeads * (qkNopeHeadDim + vHeadDim), kvLoraRank].</param>
     /// <param name="oProj">Output projection [hiddenSize, numHeads * vHeadDim].</param>
+    /// <param name="attnScaleMultiplier">
+    /// Softmax-scale multiplier applied on top of the default
+    /// <c>1 / sqrt(qk_head_dim)</c>. Pass <c>1.0f</c> (the default) for the
+    /// plain DeepSeek-V2 case. For YaRN context extension, pass
+    /// <see cref="DotLLM.Core.Models.MlaConfig.ComputeYarnSoftmaxScaleMultiplier"/>
+    /// which returns <c>mscale²</c> per the DeepSeek-V2 YaRN recipe.
+    /// </param>
     public static void Execute(
         ReadOnlySpan<float> hidden,
         Span<float> output,
@@ -126,7 +135,8 @@ public static class MlaAttention
         ReadOnlySpan<float> kvAProjWithMqa,
         ReadOnlySpan<float> kvALayernormWeight,
         ReadOnlySpan<float> kvBProj,
-        ReadOnlySpan<float> oProj)
+        ReadOnlySpan<float> oProj,
+        float attnScaleMultiplier = 1.0f)
     {
         ValidateArgs(seqLen, hiddenSize, numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
                      qLoraRank, kvLoraRank, hidden, output);
@@ -134,7 +144,7 @@ public static class MlaAttention
         int qkHeadDim = qkNopeHeadDim + qkRopeHeadDim;
         int qTotal = numHeads * qkHeadDim;
         int kvBOutputDim = numHeads * (qkNopeHeadDim + vHeadDim);
-        float scale = 1.0f / MathF.Sqrt(qkHeadDim);
+        float scale = attnScaleMultiplier / MathF.Sqrt(qkHeadDim);
 
         // Scratch allocations. For PoC we rent managed arrays — the kernel is
         // correctness-first and the hot path will migrate to caller-provided
