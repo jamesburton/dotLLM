@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
+using DotLLM.Tokenizers;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -385,6 +386,277 @@ public sealed class RealHfSafetensorsEndToEndTests
             model.Dispose();
             (source as IDisposable)?.Dispose();
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Generation-loop tests (P2.1) — tokenize → iterative forward → argmax
+    // → decode. Each test prefills a short prompt, then runs a fixed number
+    // of decode steps by re-forwarding the full growing context. This is
+    // O(N²) on the number of tokens but uses the uncached `Forward` path
+    // (matching <see cref="IbSsmMamba3GenerationTests"/>) so the public
+    // API contract is exercised end-to-end without KV-cache plumbing.
+    // ════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public void TinyLlama_11B_GeneratesText_FromTokenizedPrompt()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-tinyllama");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] TinyLlama-1.1B checkpoint not found. Set DOTLLM_TINYLLAMA_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-tinyllama/");
+            return;
+        }
+
+        RunGenerationLoop(
+            root,
+            expectedArch: Architecture.Llama,
+            prompt: "The capital of France is",
+            decodeSteps: 5,
+            timeoutSeconds: 180);
+    }
+
+    [Fact]
+    public void Qwen25_0_5B_GeneratesText_FromTokenizedPrompt()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
+            conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Qwen2.5-0.5B checkpoint not found. Set DOTLLM_QWEN25_CHECKPOINT_PATH "
+                + "or ensure the HF snapshot is present at the conventional path.");
+            return;
+        }
+
+        RunGenerationLoop(
+            root,
+            expectedArch: Architecture.Qwen,
+            prompt: "The capital of France is",
+            decodeSteps: 5,
+            timeoutSeconds: 180);
+    }
+
+    [Fact]
+    public void Phi35Mini_GeneratesText_FromTokenizedPrompt()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-phi35-mini");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Phi-3.5-mini checkpoint not found. Set DOTLLM_PHI35_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-phi35-mini/");
+            return;
+        }
+
+        RunGenerationLoop(
+            root,
+            expectedArch: Architecture.Phi,
+            prompt: "The capital of France is",
+            decodeSteps: 5,
+            timeoutSeconds: 180);
+    }
+
+    [Fact]
+    public void Granite3Moe_GeneratesText_FromTokenizedPrompt()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-granite3-moe");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
+                + "or place the snapshot at C:/temp/dotllm-granite3-moe/");
+            return;
+        }
+
+        RunGenerationLoop(
+            root,
+            expectedArch: Architecture.GraniteMoe,
+            prompt: "The capital of France is",
+            decodeSteps: 5,
+            timeoutSeconds: 180);
+    }
+
+    /// <summary>
+    /// Shared generation-loop driver. Loads model + tokenizer from the same
+    /// HF checkpoint directory, encodes the prompt, then for each decode step
+    /// re-runs the uncached <see cref="IModel.Forward"/> over the entire
+    /// growing context (O(N²) per-call cost, but doesn't depend on KV-cache
+    /// plumbing through the public API). Argmax's the last-row logits and
+    /// appends the resulting token to the context. Skips gracefully when
+    /// the tokenizer is missing (e.g. Granite HF repo ships no
+    /// <c>tokenizer.json</c> — only <c>vocab.json</c>+<c>merges.txt</c>).
+    /// </summary>
+    private void RunGenerationLoop(
+        string root,
+        Architecture expectedArch,
+        string prompt,
+        int decodeSteps,
+        double timeoutSeconds)
+    {
+        _output.WriteLine($"Root: {root}");
+
+        // Load tokenizer first — if missing, skip before spending ~seconds on weights.
+        ITokenizer? tok = ModelLoader.LoadTokenizerFromHfDirectory(root);
+        if (tok is null)
+        {
+            _output.WriteLine(
+                $"[SKIP] No tokenizer.json found under {root}. "
+                + "This repo ships vocab.json + merges.txt but no tokenizer.json — "
+                + "the HF ByteLevel factory path (P0.1) requires tokenizer.json.");
+            return;
+        }
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads} "
+                + $"tied={config.TiedEmbeddings}");
+            Assert.Equal(expectedArch, config.Architecture);
+            // Tokenizer's advertised vocab should match model config, modulo pad
+            // rows (Qwen2 has VocabSize=151936 but tokenizer actually has ~151665
+            // explicit ids — only enforce tokenizer.VocabSize <= config.VocabSize).
+            Assert.True(tok.VocabSize <= config.VocabSize,
+                $"Tokenizer vocab {tok.VocabSize} exceeds model vocab {config.VocabSize}.");
+
+            int[] promptIds = tok.Encode(prompt);
+            Assert.NotEmpty(promptIds);
+            foreach (int id in promptIds) Assert.InRange(id, 0, config.VocabSize - 1);
+            _output.WriteLine($"Prompt: \"{prompt}\"");
+            _output.WriteLine(
+                $"Encoded prompt ({promptIds.Length} tokens): [{string.Join(", ", promptIds)}]");
+
+            var tokens = new List<int>(promptIds.Length + decodeSteps);
+            tokens.AddRange(promptIds);
+
+            var generated = new List<int>(decodeSteps);
+            var perStepMs = new List<double>(decodeSteps);
+            int eosId = tok.EosTokenId;
+            bool hitEos = false;
+
+            var totalWatch = Stopwatch.StartNew();
+            for (int step = 0; step < decodeSteps; step++)
+            {
+                int[] positions = new int[tokens.Count];
+                for (int i = 0; i < positions.Length; i++) positions[i] = i;
+
+                var stepWatch = Stopwatch.StartNew();
+                using ITensor logits = model.Forward(
+                    tokens.ToArray(), positions, deviceId: -1);
+                stepWatch.Stop();
+                perStepMs.Add(stepWatch.Elapsed.TotalMilliseconds);
+
+                Assert.Equal(2, logits.Shape.Rank);
+                Assert.Equal(tokens.Count, logits.Shape[0]);
+                Assert.Equal(config.VocabSize, logits.Shape[1]);
+
+                int next = LastTokenArgMaxChecked(logits, config.VocabSize);
+                Assert.InRange(next, 0, config.VocabSize - 1);
+
+                generated.Add(next);
+                tokens.Add(next);
+
+                if (next == eosId)
+                {
+                    hitEos = true;
+                    _output.WriteLine($"  step {step}: argmax={next} (EOS) — stopping early");
+                    break;
+                }
+            }
+            totalWatch.Stop();
+
+            Assert.True(totalWatch.Elapsed.TotalSeconds < timeoutSeconds,
+                $"Generation took {totalWatch.Elapsed.TotalSeconds:F1}s, "
+                + $"exceeds the {timeoutSeconds:F0}s ceiling.");
+
+            string decodedFull = tok.Decode(tokens.ToArray());
+            string decodedSuffix = tok.Decode(generated.ToArray(), stripBosSpace: false);
+
+            _output.WriteLine(
+                $"Generated IDs ({generated.Count}): [{string.Join(", ", generated)}]");
+            for (int i = 0; i < perStepMs.Count; i++)
+                _output.WriteLine($"  step {i}: {perStepMs[i] / 1000.0:F2} s");
+            _output.WriteLine(
+                $"Total: {totalWatch.Elapsed.TotalSeconds:F2} s, "
+                + $"avg={totalWatch.Elapsed.TotalMilliseconds / Math.Max(1, generated.Count) / 1000.0:F2} s/token");
+            _output.WriteLine($"Full decoded: \"{decodedFull}\"");
+            _output.WriteLine($"Suffix decoded: \"{decodedSuffix}\"");
+
+            // Sanity: at least one non-EOS token generated (unless we EOS'd
+            // on the very first step, which on an instruct-tuned base can
+            // happen — surface without failing).
+            if (hitEos && generated.Count == 1)
+            {
+                _output.WriteLine(
+                    "[INFO] Immediate EOS on step 0. Valid model behaviour "
+                    + "(undertrained or instruct model with no BOS conditioning); "
+                    + "not a pipeline failure.");
+            }
+            else
+            {
+                Assert.Contains(generated, id => id != eosId);
+                // At least one decoded token should carry visible text — guards
+                // against a pipeline that only emits the tokenizer's whitespace /
+                // byte-fallback padding tokens.
+                bool hasVisible = false;
+                foreach (int id in generated)
+                {
+                    if (id == eosId) continue;
+                    string piece = tok.DecodeToken(id);
+                    if (!string.IsNullOrWhiteSpace(piece.Trim()))
+                    {
+                        hasVisible = true;
+                        break;
+                    }
+                }
+                Assert.True(hasVisible,
+                    "All generated tokens decoded to whitespace. "
+                    + $"Generated IDs=[{string.Join(", ", generated)}].");
+            }
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Argmax over the final row of a [seqLen, vocab] logits tensor, with a
+    /// finiteness sweep in the same pass so NaN/Inf surfaces as a clear
+    /// assertion failure rather than a silently-wrong argmax.
+    /// </summary>
+    private static unsafe int LastTokenArgMaxChecked(ITensor logits, int vocabSize)
+    {
+        int seqLen = logits.Shape[0];
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, seqLen * vocabSize);
+        ReadOnlySpan<float> last = span.Slice((seqLen - 1) * vocabSize, vocabSize);
+        int best = 0;
+        float bestVal = last[0];
+        Assert.True(float.IsFinite(bestVal),
+            "Last-token logits contain NaN/Inf at vocab index 0 — forward pass broke.");
+        for (int i = 1; i < last.Length; i++)
+        {
+            float v = last[i];
+            Assert.True(float.IsFinite(v),
+                $"Last-token logit at vocab index {i} is not finite (value={v}).");
+            if (v > bestVal) { bestVal = v; best = i; }
+        }
+        return best;
     }
 
     // ────────────────────────────────────────────────────────────────────
