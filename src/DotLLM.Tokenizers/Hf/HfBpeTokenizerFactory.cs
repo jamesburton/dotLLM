@@ -92,21 +92,34 @@ public static class HfBpeTokenizerFactory
         => Create(HfTokenizerJsonParser.Parse(jsonContent), bosId, eosId);
 
     /// <summary>
-    /// Loads <c>tokenizer.json</c> from a HuggingFace checkpoint directory
-    /// and builds a tokenizer. Returns <see langword="null"/> when
-    /// <paramref name="directory"/> has no <c>tokenizer.json</c>.
+    /// Loads a HuggingFace tokenizer from a checkpoint directory. Tries the
+    /// consolidated <c>tokenizer.json</c> first (the modern layout used by
+    /// most post-2023 checkpoints). When that is absent, falls back to the
+    /// legacy trio — <c>vocab.json</c> + <c>merges.txt</c> + optionally
+    /// <c>tokenizer_config.json</c> — used by GPT-2 proper and older Granite /
+    /// Llama-family repos. Returns <see langword="null"/> when neither layout
+    /// is present.
     /// </summary>
-    /// <param name="directory">Directory containing <c>tokenizer.json</c>.</param>
+    /// <param name="directory">Checkpoint directory.</param>
     /// <param name="bosId">Override BOS token ID, or -1 to auto-detect.</param>
     /// <param name="eosId">Override EOS token ID, or -1 to auto-detect.</param>
-    /// <returns>An <see cref="ITokenizer"/>, or <see langword="null"/> if no file was found.</returns>
+    /// <returns>An <see cref="ITokenizer"/>, or <see langword="null"/> if no recognised tokenizer files were found.</returns>
     public static ITokenizer? TryLoadFromDirectory(string directory, int bosId = -1, int eosId = -1)
     {
         ArgumentNullException.ThrowIfNull(directory);
-        string path = Path.Combine(directory, "tokenizer.json");
-        if (!File.Exists(path)) return null;
-        string content = File.ReadAllText(path);
-        return Create(content, bosId, eosId);
+
+        // Preferred path: the consolidated tokenizer.json.
+        string jsonPath = Path.Combine(directory, "tokenizer.json");
+        if (File.Exists(jsonPath))
+        {
+            string content = File.ReadAllText(jsonPath);
+            return Create(content, bosId, eosId);
+        }
+
+        // Legacy fallback: vocab.json + merges.txt + tokenizer_config.json
+        // (GPT-2, IBM Granite-3.0 MoE, older Llama / Mistral checkpoints).
+        HfTokenizerSpec? legacySpec = HfLegacyBpeLoader.TryLoad(directory);
+        return legacySpec is null ? null : Create(legacySpec, bosId, eosId);
     }
 
     // -------------------------------------------------------------------------
