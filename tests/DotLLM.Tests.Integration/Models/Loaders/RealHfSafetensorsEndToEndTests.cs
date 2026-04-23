@@ -28,17 +28,19 @@ namespace DotLLM.Tests.Integration.Models.Loaders;
 ///   <item><description><c>microsoft/Phi-3.5-mini-instruct</c> — ~7.6 GB, 2
 ///   safetensors shards, dense Llama-family with fused qkv_proj /
 ///   gate_up_proj.</description></item>
-///   <item><description><c>ibm-granite/granite-3.0-3b-a800m-instruct</c> —
+///   <item><description><c>ibm-granite/granite-3.1-3b-a800m-instruct</c> —
 ///   ~6.3 GB, 2 shards, 40 routed experts top-8, no shared expert,
 ///   fused per-layer input_linear [E, 2*I, H] / output_linear [E, H, I]
-///   tensors.</description></item>
+///   tensors. Same architecture as granite-3.0 but ships the
+///   consolidated <c>tokenizer.json</c> required by the generation tests
+///   (3.0 only publishes legacy <c>vocab.json</c> + <c>merges.txt</c>).</description></item>
 /// </list>
 /// <para>
 /// <b>To run locally.</b> Either place the checkpoint at the conventional path
 /// or set the env var to the safetensors index JSON or its directory:
 /// <code>
 ///   $env:DOTLLM_PHI35_CHECKPOINT_PATH = "C:/temp/dotllm-phi35-mini"
-///   $env:DOTLLM_GRANITE3_CHECKPOINT_PATH = "C:/temp/dotllm-granite3-moe"
+///   $env:DOTLLM_GRANITE3_CHECKPOINT_PATH = "C:/temp/dotllm-granite31-moe"
 ///   dotnet test tests/DotLLM.Tests.Integration/DotLLM.Tests.Integration.csproj `
 ///     --filter FullyQualifiedName~RealHfSafetensorsEndToEnd
 /// </code>
@@ -121,12 +123,12 @@ public sealed class RealHfSafetensorsEndToEndTests
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-granite3-moe");
+            conventional: "C:/temp/dotllm-granite31-moe");
         if (root is null)
         {
             _output.WriteLine(
                 "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite3-moe/");
+                + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
             return;
         }
 
@@ -151,9 +153,11 @@ public sealed class RealHfSafetensorsEndToEndTests
                     + $"norm_topk_prob={config.Moe.NormTopKProb}");
             }
 
-            // Granite-3.0-3B-A800M-instruct: GraniteMoeForCausalLM, 32 layers,
+            // Granite-3.1-3B-A800M-instruct: GraniteMoeForCausalLM, 32 layers,
             // hidden=1536, 24 heads, 8 kv heads (GQA), 40 experts top-8,
-            // intermediate_size=512, vocab=49155. No shared expert.
+            // intermediate_size=512, vocab=49155. No shared expert. Same
+            // topology as granite-3.0; 3.1 updates context length + training
+            // recipe and ships the consolidated tokenizer.json.
             Assert.Equal(Architecture.GraniteMoe, config.Architecture);
             Assert.Equal(32, config.NumLayers);
             Assert.NotNull(config.Moe);
@@ -468,12 +472,12 @@ public sealed class RealHfSafetensorsEndToEndTests
     {
         string? root = ResolveCheckpointRoot(
             envVar: "DOTLLM_GRANITE3_CHECKPOINT_PATH",
-            conventional: "C:/temp/dotllm-granite3-moe");
+            conventional: "C:/temp/dotllm-granite31-moe");
         if (root is null)
         {
             _output.WriteLine(
                 "[SKIP] Granite-3 MoE checkpoint not found. Set DOTLLM_GRANITE3_CHECKPOINT_PATH "
-                + "or place the snapshot at C:/temp/dotllm-granite3-moe/");
+                + "or place the snapshot at C:/temp/dotllm-granite31-moe/");
             return;
         }
 
