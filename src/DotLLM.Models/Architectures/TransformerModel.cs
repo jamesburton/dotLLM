@@ -340,15 +340,11 @@ public sealed unsafe class TransformerModel : IModel
 
                 // Prepare residual for FFN.
                 new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
-
-                // Fall through to the standard FFN branch (dense OR MoE,
-                // decided by lw.Moe). Keep the original code path below by
-                // goto-less control: set a flag and skip the GQA attention
-                // code.
-                goto FfnBranch;
             }
-
-            // b. RMSNorm + Pre-quantize + Q/K/V projections
+            else
+            {
+                // ── GQA branch ──────────────────────────────────────────────
+                // b. RMSNorm + Pre-quantize + Q/K/V projections
             if (seqLen == 1 && _threadPool != null)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
@@ -468,8 +464,8 @@ public sealed unsafe class TransformerModel : IModel
 
             // h. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+            }
 
-            FfnBranch:
             // ── MoE branch ──────────────────────────────────────────────
             // Mixtral-convention top-k dense routing replaces the dense FFN
             // block entirely. Takes post-attn hidden + FFN RMSNorm weight,
