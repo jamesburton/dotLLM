@@ -130,6 +130,20 @@ existing BDN suite and commit deltas.
   PLANS.md or separate doc.
 - **Deps**: none. **Parallel**: yes (separate artifact).
 
+**Pre-W2 baseline captured at commit `5ff5312`** (post P1.1+P0.1+P0.3+P0.4
+merges, before P1.2/P2.2/P2.3 land):
+
+| Benchmark | Config | Pre-W2 baseline |
+|---|---|---|
+| `InferenceBenchmarks` E2E | SmolLM-135M Q8_0, CPU, single-thread, 20-token decode | **prefill 233.8 tok/s**, **decode 16.8 tok/s**, E2E 1.191 s ± 0.025 s (5 iter, 2 warmup) |
+| `SpecialTokenEncodeBenchmarks` | 1024 chars, 5/20/100 specials | ~40 μs, 57.63 KB allocated |
+| `SpecialTokenEncodeBenchmarks` | 8192 chars, 5/20/100 specials | ~320 μs, 467.09 KB allocated |
+
+**Note on tokenizer allocation**: the ~467 KB-per-call at 8192 chars is consistent
+with P0.1's new one-string-per-regex-match pattern in `Gpt2TiktokenEncoding.ByteMap`
+(see follow-up note in P1.4). Pre-P0.1 numbers weren't captured; first regression
+check vs these numbers after W2 lands.
+
 ### P1.4 Analyzer / style pass
 Spot-check for IDE warnings, CA-analyzer hits, stale XML doc references,
 unused using statements accumulated over the session's many commits.
