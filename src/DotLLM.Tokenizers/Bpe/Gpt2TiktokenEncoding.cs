@@ -122,39 +122,52 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
 
     public int[] Encode(string text)
     {
-        // Convert text to GPT-2 byte-level Unicode encoding:
-        // each UTF-8 byte of the input maps to a specific Unicode char (byte_encoder in GPT-2).
-        // Uses ArrayPool for both byte[] and char[] to avoid heap allocations.
+        // HF-compatible order: regex split the raw text first, then byte-encode
+        // each match, then BPE-encode each byte-encoded chunk. The regex is
+        // written against the raw Unicode categories (\p{L} is 'é', not the
+        // byte-mapped 'Ã©'); applying it after byte-encoding would
+        // misclassify multi-byte chars and split them into per-byte segments,
+        // preventing the BPE merge table (which encodes byte pairs as a
+        // single token) from firing on non-ASCII input.
+        if (_preRegex is null)
+        {
+            // No pre-tokenization: byte-map the whole string and feed it as one
+            // segment. Only hit by ByteLevel(use_regex:false) with no
+            // upstream Split — an uncommon configuration.
+            return EncodeSegment(ByteMap(text));
+        }
+
+        var result = new List<int>(Math.Max(16, text.Length));
+        foreach (var match in _preRegex.EnumerateMatches(text))
+        {
+            ReadOnlySpan<char> rawChunk = text.AsSpan(match.Index, match.Length);
+            if (rawChunk.IsEmpty) continue;
+            EncodeSegmentInto(ByteMap(rawChunk), result);
+        }
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// UTF-8 encodes <paramref name="text"/> and applies the GPT-2
+    /// bytes_to_unicode mapping. Allocates a new <see cref="string"/> per
+    /// call — one string per regex match on the encode hot path. Could be
+    /// replaced by a rented-buffer variant if allocation profiles show this
+    /// dominating; for now, regex matches are short and this keeps the
+    /// code readable.
+    /// </summary>
+    private static string ByteMap(ReadOnlySpan<char> text)
+    {
+        if (text.IsEmpty) return string.Empty;
         int utf8Len = Encoding.UTF8.GetByteCount(text);
         byte[] rentedUtf8 = ArrayPool<byte>.Shared.Rent(utf8Len);
         try
         {
             Encoding.UTF8.GetBytes(text, rentedUtf8);
-            char[] rentedGpt2 = ArrayPool<char>.Shared.Rent(utf8Len);
-            try
+            return string.Create(utf8Len, rentedUtf8, static (dst, src) =>
             {
-                for (int i = 0; i < utf8Len; i++)
-                    rentedGpt2[i] = Gpt2ByteToUnicode[rentedUtf8[i]];
-                ReadOnlySpan<char> gpt2Text = rentedGpt2.AsSpan(0, utf8Len);
-
-                if (_preRegex is null)
-                    return EncodeSegment(gpt2Text);
-
-                // Pre-tokenize: split at word/punctuation boundaries using the model's regex,
-                // then BPE each segment independently so merges cannot cross boundaries.
-                // Tokens are collected directly into the list — no intermediate int[] per segment.
-                var result = new List<int>(gpt2Text.Length);
-                foreach (var match in _preRegex.EnumerateMatches(gpt2Text))
-                {
-                    var segment = gpt2Text.Slice(match.Index, match.Length);
-                    EncodeSegmentInto(segment, result);
-                }
-                return result.ToArray();
-            }
-            finally
-            {
-                ArrayPool<char>.Shared.Return(rentedGpt2);
-            }
+                for (int i = 0; i < dst.Length; i++)
+                    dst[i] = Gpt2ByteToUnicode[src[i]];
+            });
         }
         finally
         {
