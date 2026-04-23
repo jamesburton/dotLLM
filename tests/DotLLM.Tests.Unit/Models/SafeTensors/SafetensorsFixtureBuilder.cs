@@ -189,4 +189,120 @@ internal sealed class SafetensorsFixtureBuilder
         long headerLen = b.WriteTo(path);
         return (path, headerLen);
     }
+
+    /// <summary>
+    /// Builds a tiny Mamba-3 MIMO fixture: the canonical 9 SISO per-layer
+    /// tensors plus the three MIMO-only per-rank weights
+    /// (<c>mimo_x</c>, <c>mimo_z</c>, <c>mimo_o</c>), with <c>B_bias</c>
+    /// and <c>C_bias</c> reshaped to the canonical rank-expanded
+    /// <c>[num_heads, mimo_rank, state_size]</c> layout. Element values are
+    /// small-amplitude seeded cosines so the forward stays numerically stable
+    /// on any rank; no network access, no downloads.
+    /// </summary>
+    /// <param name="path">Destination safetensors path.</param>
+    /// <param name="numLayers">Backbone layer count.</param>
+    /// <param name="hiddenSize">Model hidden dim.</param>
+    /// <param name="vocabSize">Vocabulary size.</param>
+    /// <param name="numHeads">Number of SSM heads H.</param>
+    /// <param name="headDim">Channels per head P.</param>
+    /// <param name="stateSize">State width N.</param>
+    /// <param name="dInProj">In-projection output width (must match
+    ///     <c>2·d_inner + 2·(state_size · num_bc_heads · mimo_rank) + 3·n_head + num_rope_angles</c>).</param>
+    /// <param name="dInner">Inner dim (<c>num_heads · head_dim</c>).</param>
+    /// <param name="mimoRank">MIMO rank R.</param>
+    /// <param name="includeLmHead">If false, the LM head is omitted (tied embeddings).</param>
+    /// <param name="seed">Fixture seed — determines the cosine phase.</param>
+    /// <returns>The written path + the header length.</returns>
+    public static (string Path, long HeaderLength) WriteTinyMamba3MimoFixture(
+        string path,
+        int numLayers,
+        int hiddenSize,
+        int vocabSize,
+        int numHeads,
+        int headDim,
+        int stateSize,
+        int dInProj,
+        int dInner,
+        int mimoRank,
+        bool includeLmHead = true,
+        int seed = 0xC3A1)
+    {
+        var b = new SafetensorsFixtureBuilder();
+
+        AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.TokenEmbedding,
+            [vocabSize, hiddenSize], 0.05f, seed + 0);
+        AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.FinalNorm,
+            [hiddenSize], 0.5f, seed + 1);
+        if (includeLmHead)
+        {
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.LmHead,
+                [vocabSize, hiddenSize], 0.05f, seed + 2);
+        }
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            int sBase = seed + 100 * (i + 1);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.LayerNorm(i),
+                [hiddenSize], 0.5f, sBase + 0);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.InProj(i),
+                [dInProj, hiddenSize], 0.02f, sBase + 1);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.OutProj(i),
+                [hiddenSize, dInner], 0.05f, sBase + 2);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.BNorm(i),
+                [stateSize], 0.5f, sBase + 3);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.CNorm(i),
+                [stateSize], 0.5f, sBase + 4);
+            // MIMO-specific: [H, R, N] layout for B_bias / C_bias.
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.BBias(i),
+                [numHeads, mimoRank, stateSize], 0.02f, sBase + 5);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.CBias(i),
+                [numHeads, mimoRank, stateSize], 0.02f, sBase + 6);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.D(i),
+                [numHeads], 0.1f, sBase + 7);
+            AddSeededCosines(b, DotLLM.Models.Architectures.Mamba3TensorMapping.DtBias(i),
+                [numHeads], 0.02f, sBase + 8);
+            // MIMO-only per-rank weights — all three required when is_mimo=true.
+            // Canonical inits are mimo_x = 1/R, mimo_z = 1, mimo_o = 1/R
+            // (see capture_fixtures_canonical.py); we perturb with a small
+            // cosine ramp on top so the forward pass is non-trivial but still
+            // a close neighbour of the canonical identity.
+            AddSeededCosinesAround(b, DotLLM.Models.Architectures.Mamba3TensorMapping.MimoX(i),
+                [numHeads, mimoRank, headDim], 0.05f, 1f / mimoRank, sBase + 9);
+            AddSeededCosinesAround(b, DotLLM.Models.Architectures.Mamba3TensorMapping.MimoZ(i),
+                [numHeads, mimoRank, headDim], 0.05f, 1f, sBase + 10);
+            AddSeededCosinesAround(b, DotLLM.Models.Architectures.Mamba3TensorMapping.MimoO(i),
+                [numHeads, mimoRank, headDim], 0.05f, 1f / mimoRank, sBase + 11);
+        }
+
+        long headerLen = b.WriteTo(path);
+        return (path, headerLen);
+    }
+
+    private static void AddSeededCosines(SafetensorsFixtureBuilder b, string name,
+                                         int[] shape, float amplitude, int seed)
+    {
+        long n = 1;
+        for (int i = 0; i < shape.Length; i++) n *= shape[i];
+        float[] values = new float[n];
+        for (long i = 0; i < n; i++)
+        {
+            float phi = 0.61803398875f * (i + 1) + seed * 0.37f;
+            values[i] = amplitude * MathF.Cos(phi);
+        }
+        b.AddFloat32(name, shape, values);
+    }
+
+    private static void AddSeededCosinesAround(SafetensorsFixtureBuilder b, string name,
+                                               int[] shape, float amplitude, float center, int seed)
+    {
+        long n = 1;
+        for (int i = 0; i < shape.Length; i++) n *= shape[i];
+        float[] values = new float[n];
+        for (long i = 0; i < n; i++)
+        {
+            float phi = 0.61803398875f * (i + 1) + seed * 0.37f;
+            values[i] = center + amplitude * MathF.Cos(phi);
+        }
+        b.AddFloat32(name, shape, values);
+    }
 }

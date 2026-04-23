@@ -312,48 +312,79 @@ public sealed unsafe class Mamba3TransformerModel : IModel
 
             if (isMimo)
             {
-                // Canonical MIMO has mimo_x / mimo_z / mimo_o tensors in the
-                // checkpoint (shape [H, R, P]) and a [H, R, N] B_bias / C_bias
-                // layout. Stage D2's loader does not yet carry those fields on
-                // Mamba3LayerWeights — surface a clear error instead of
-                // silently degrading to SISO. The MIMO kernel path (ForwardMimo
-                // + ExecuteMimoStreaming) and Mamba3State are fully plumbed
-                // for streaming decode — only the weight loader extension is
-                // missing. See Mamba3BlockStreamingMimoTests for coverage of
-                // the kernel-level MIMO state threading.
-                throw new NotSupportedException(
-                    "Mamba-3 MIMO checkpoints are not yet supported end-to-end: "
-                    + "Mamba3WeightLoader does not carry mimo_x / mimo_z / mimo_o tensors "
-                    + "or the [H, R, N] B_bias / C_bias shape. Mamba3Block.ForwardMimo "
-                    + "(state-threaded) is ready for wiring once the loader is extended.");
-            }
+                // MIMO path: rank-expanded B/C biases are already shaped
+                // [H, R, N] on the handle (the loader validated this at
+                // ingest), and the per-rank gate / output contraction weights
+                // live on lw.MimoZ / lw.MimoO. The canonical SSD kernel folds
+                // mimo_x (V's per-rank expansion) into the rank-summed K·V
+                // state update inside ExecuteMimo, so the forward does not
+                // consume it directly — but the loader carries it for future
+                // checkpoints that may need explicit per-rank V dispatch.
+                // State plumbing (ssm/cum/k/v) is identical to SISO: Mamba3State
+                // sizes k_state as [R, H, N] when IsMimo=true so a single
+                // per-layer Span<float> just works in ForwardMimo.
+                ReadOnlySpan<float> mimoZ = SpanFromHandle(lw.MimoZ, nHead * mimoRank * headDim);
+                ReadOnlySpan<float> mimoO = SpanFromHandle(lw.MimoO, nHead * mimoRank * headDim);
 
-            Mamba3Block.Forward(
-                scratch: _scratch,
-                u: normOut,
-                inProjWeight: inProj,
-                outProjWeight: outProj,
-                dtBias: dtBias,
-                bNormWeight: bNormW,
-                cNormWeight: cNormW,
-                bBias: bBias,
-                cBias: cBias,
-                d: dSkip,
-                y: blockOut,
-                ssmState: ssmState,
-                cumAngle: cumAngle,
-                kState: kState,
-                vState: vState,
-                seqLen: seqLen,
-                dModel: hiddenSize,
-                dInner: dInner,
-                nHead: nHead,
-                headDim: headDim,
-                dState: dState,
-                numBcHeads: numBcHeads,
-                numRopeAngles: numRopeAngles,
-                aFloor: aFloor,
-                normEps: eps);
+                Mamba3Block.ForwardMimo(
+                    scratch: _scratch,
+                    u: normOut,
+                    inProjWeight: inProj,
+                    outProjWeight: outProj,
+                    dtBias: dtBias,
+                    bNormWeight: bNormW,
+                    cNormWeight: cNormW,
+                    bBias: bBias,
+                    cBias: cBias,
+                    d: dSkip,
+                    mimoZ: mimoZ,
+                    mimoO: mimoO,
+                    y: blockOut,
+                    ssmState: ssmState,
+                    cumAngle: cumAngle,
+                    kState: kState,
+                    vState: vState,
+                    seqLen: seqLen,
+                    dModel: hiddenSize,
+                    dInner: dInner,
+                    nHead: nHead,
+                    headDim: headDim,
+                    dState: dState,
+                    numBcHeads: numBcHeads,
+                    numRopeAngles: numRopeAngles,
+                    mimoRank: mimoRank,
+                    aFloor: aFloor,
+                    normEps: eps);
+            }
+            else
+            {
+                Mamba3Block.Forward(
+                    scratch: _scratch,
+                    u: normOut,
+                    inProjWeight: inProj,
+                    outProjWeight: outProj,
+                    dtBias: dtBias,
+                    bNormWeight: bNormW,
+                    cNormWeight: cNormW,
+                    bBias: bBias,
+                    cBias: cBias,
+                    d: dSkip,
+                    y: blockOut,
+                    ssmState: ssmState,
+                    cumAngle: cumAngle,
+                    kState: kState,
+                    vState: vState,
+                    seqLen: seqLen,
+                    dModel: hiddenSize,
+                    dInner: dInner,
+                    nHead: nHead,
+                    headDim: headDim,
+                    dState: dState,
+                    numBcHeads: numBcHeads,
+                    numRopeAngles: numRopeAngles,
+                    aFloor: aFloor,
+                    normEps: eps);
+            }
 
             // Residual add: hidden = residual + blockOut (per token).
             for (int t = 0; t < seqLen; t++)
