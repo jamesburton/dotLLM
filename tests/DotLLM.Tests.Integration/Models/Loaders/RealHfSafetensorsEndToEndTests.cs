@@ -298,6 +298,96 @@ public sealed class RealHfSafetensorsEndToEndTests
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // DeepSeek-V2-Lite (MLA + MoE, monolithic Q, KV-LoRA, YaRN, 2 shared experts)
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void DeepSeekV2Lite_LoadsAndForwardsEndToEnd()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-deepseek-v2-lite");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
+                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot "
+                + "at C:/temp/dotllm-deepseek-v2-lite/");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads} "
+                + $"tied={config.TiedEmbeddings}");
+            if (config.MlaConfig is not null)
+            {
+                _output.WriteLine(
+                    $"MLA: q_lora={config.MlaConfig.QLoraRank} kv_lora={config.MlaConfig.KvLoraRank} "
+                    + $"qk_nope={config.MlaConfig.QkNopeHeadDim} qk_rope={config.MlaConfig.QkRopeHeadDim} "
+                    + $"v_head={config.MlaConfig.VHeadDim}");
+            }
+            if (config.Moe is not null)
+            {
+                _output.WriteLine(
+                    $"MoE: routed={config.Moe.NumExperts} top_k={config.Moe.NumExpertsPerTok} "
+                    + $"intermediate={config.Moe.MoeIntermediateSize} "
+                    + $"shared_intermediate={config.Moe.SharedExpertIntermediateSize}");
+            }
+
+            // DeepSeek-V2-Lite: DeepseekV2ForCausalLM, 27 layers, hidden=2048,
+            // 16 heads, 16 kv heads (no GQA; MLA factorises KV instead),
+            // q_lora_rank=null → monolithic q_proj, kv_lora_rank=512,
+            // qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+            // 64 routed experts top-6, 2 shared experts, moe_intermediate=1408,
+            // first_k_dense_replace=1 (layer 0 dense), vocab=102400,
+            // tied_embeddings=false, YaRN rope_scaling (factor=40, mscale=0.707).
+            Assert.Equal(Architecture.DeepSeekV2, config.Architecture);
+            Assert.Equal(27, config.NumLayers);
+            Assert.Equal(2048, config.HiddenSize);
+            Assert.Equal(16, config.NumAttentionHeads);
+            Assert.Equal(102400, config.VocabSize);
+            Assert.False(config.TiedEmbeddings);
+
+            Assert.NotNull(config.MlaConfig);
+            Assert.Equal(512, config.MlaConfig!.KvLoraRank);
+            Assert.Equal(128, config.MlaConfig.QkNopeHeadDim);
+            Assert.Equal(64, config.MlaConfig.QkRopeHeadDim);
+            Assert.Equal(128, config.MlaConfig.VHeadDim);
+
+            Assert.NotNull(config.Moe);
+            Assert.Equal(64, config.Moe!.NumExperts);
+            Assert.Equal(6, config.Moe.NumExpertsPerTok);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Helpers
     // ────────────────────────────────────────────────────────────────────
 
