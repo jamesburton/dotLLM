@@ -425,4 +425,66 @@ public sealed class RoPETests
         Assert.Equal(MathF.Cos(angle63), cos[5 * halfDim + 63], 1e-5f);
         Assert.Equal(MathF.Sin(angle63), sin[5 * halfDim + 63], 1e-5f);
     }
+
+    /// <summary>
+    /// Locks the HF-Llama RoPE convention. HuggingFace <c>modeling_llama.apply_rotary_pos_emb</c>
+    /// computes <c>q' = (q * cos) + (rotate_half(q) * sin)</c> where
+    /// <c>rotate_half([a, b, c, d]) = [-c, -d, a, b]</c> — i.e. it rotates HALVES,
+    /// not adjacent-pairs. This matches dotLLM's <see cref="RoPE.ApplyRotationNeoX"/>
+    /// (pairs <c>(i, i+halfDim)</c>), NOT <see cref="RoPE.ApplyRotation"/>
+    /// (pairs <c>(2i, 2i+1)</c>). This test fixes that fact as a regression lock.
+    /// </summary>
+    [Fact]
+    public void NeoXRotation_MatchesHuggingFaceRotateHalfConvention_HeadDim4()
+    {
+        // Fixed input vector and cos/sin pair. Cos/sin length = halfDim = 2 because
+        // HF stores the first-half frequencies once; the second half is the same
+        // freqs duplicated (torch.cat([freqs, freqs], dim=-1)), so for our kernels'
+        // halved tables the two conventions see identical cos/sin values.
+        const int headDim = 4;
+        Span<float> dotllmNeoX = stackalloc float[headDim] { 1.0f, 2.0f, 3.0f, 4.0f };
+        Span<float> dotllmNorm = stackalloc float[headDim] { 1.0f, 2.0f, 3.0f, 4.0f };
+        Span<float> hfRef = stackalloc float[headDim] { 1.0f, 2.0f, 3.0f, 4.0f };
+
+        ReadOnlySpan<float> cos = stackalloc float[2] { 0.5f, 0.8f };
+        ReadOnlySpan<float> sin = stackalloc float[2] { 0.866025f, 0.6f };
+
+        // dotLLM NeoX rotation: pairs (i, i+halfDim).
+        RoPE.ApplyRotationNeoXScalar(dotllmNeoX, cos, sin, headDim);
+
+        // dotLLM Norm rotation: pairs (2i, 2i+1).
+        RoPE.ApplyRotationScalar(dotllmNorm, cos, sin, headDim);
+
+        // HF reference — translate rotate_half directly:
+        //   rotate_half([a,b,c,d]) = [-c, -d, a, b]
+        //   cos_full = [cos[0], cos[1], cos[0], cos[1]]   (torch.cat([cos, cos], -1))
+        //   sin_full = [sin[0], sin[1], sin[0], sin[1]]
+        //   q' = q * cos_full + rotate_half(q) * sin_full
+        float[] cosFull = [cos[0], cos[1], cos[0], cos[1]];
+        float[] sinFull = [sin[0], sin[1], sin[0], sin[1]];
+        float[] rotatedHalf = [-hfRef[2], -hfRef[3], hfRef[0], hfRef[1]];
+        Span<float> hfExpected = stackalloc float[headDim];
+        for (int i = 0; i < headDim; i++)
+            hfExpected[i] = hfRef[i] * cosFull[i] + rotatedHalf[i] * sinFull[i];
+
+        // dotLLM NeoX must match HF exactly.
+        for (int i = 0; i < headDim; i++)
+            Assert.Equal(hfExpected[i], dotllmNeoX[i], 1e-5f);
+
+        // dotLLM Norm must differ from HF — this proves the two conventions are
+        // materially different, not just near-equal noise.
+        bool anyDiffers = false;
+        for (int i = 0; i < headDim; i++)
+        {
+            if (MathF.Abs(dotllmNorm[i] - hfExpected[i]) > 0.05f)
+            {
+                anyDiffers = true;
+                break;
+            }
+        }
+        Assert.True(anyDiffers,
+            "RoPEType.Norm (interleaved pairs) must produce different output than HF "
+            + "rotate_half (halves). If this assertion fires, either the conventions "
+            + "converged by coincidence for this input or the Norm kernel regressed.");
+    }
 }

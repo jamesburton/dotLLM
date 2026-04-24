@@ -71,13 +71,28 @@ public static class HfConfigExtractor
 
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
-        // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
-        // Llama/Mistral use interleaved (Norm); Qwen/Phi use non-interleaved (NeoX).
-        RoPEType ropeType = architecture switch
-        {
-            Architecture.Qwen or Architecture.Phi => RoPEType.NeoX,
-            _ => RoPEType.Norm,
-        };
+        // RoPE element-pairing convention for HF safetensors.
+        //
+        // CRITICAL: This extractor differs from GgufModelConfigExtractor because HF
+        // safetensors ship raw HuggingFace weights with NO permutation. In contrast,
+        // the llama.cpp GGUF converter physically permutes Llama/Mistral Q/K weights
+        // so that their original rotate_half (halves) convention can be expressed
+        // via adjacent-pair rotation ("Norm"). For raw HF weights the model still
+        // mathematically uses HF's rotate_half — which is the halves-style that
+        // dotLLM implements as RoPEType.NeoX (pairs (i, i+halfDim)).
+        //
+        // Reference: transformers/models/llama/modeling_llama.py — rotate_half
+        //   def rotate_half(x):
+        //       x1 = x[..., : x.shape[-1] // 2]
+        //       x2 = x[..., x.shape[-1] // 2 :]
+        //       return torch.cat((-x2, x1), dim=-1)
+        //   def apply_rotary_pos_emb(q, k, cos, sin, ...):
+        //       q_embed = (q * cos) + (rotate_half(q) * sin)
+        //
+        // Mistral, Qwen, Phi (and the Llama-descended families that share
+        // modeling_llama.py via copy-paste) all inherit this convention, so every
+        // HF checkpoint we support is rotate_half = NeoX.
+        RoPEType ropeType = RoPEType.NeoX;
 
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
