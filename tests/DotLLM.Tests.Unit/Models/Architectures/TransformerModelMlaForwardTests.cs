@@ -66,6 +66,114 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
         RunAndAssertFinite(qLoraRank: 8, seqLen: 1, seed: 123);
     }
 
+    [Fact]
+    public void Forward_SplitPrefillDecode_MatchesSingleCall_LoRAQ()
+    {
+        AssertSplitCallMatchesSingle(qLoraRank: 8, seed: 314);
+    }
+
+    [Fact]
+    public void Forward_SplitPrefillDecode_MatchesSingleCall_MonolithicQ()
+    {
+        // V2-Lite's q_lora_rank=0 path, which is what DeepSeek-V2-Lite
+        // actually uses in production.
+        AssertSplitCallMatchesSingle(qLoraRank: 0, seed: 271);
+    }
+
+    /// <summary>
+    /// The decisive P2.3-Phase-A correctness check: a single-call forward
+    /// over <c>[tokens 0..N-1]</c> must produce the same logits per row as
+    /// a multi-call sequence that prefills <c>[0..P-1]</c> and then decodes
+    /// <c>[P]</c>, <c>[P+1]</c>, … one at a time, with the MLA KV-cache
+    /// carrying state across calls. If the cache is wired correctly, each
+    /// decode step's logits equal the corresponding row of the single-call
+    /// logits (bit-identical modulo floating-point reordering; tolerance
+    /// ≤ 1e-4 for the tiny synthetic fixture).
+    /// </summary>
+    private void AssertSplitCallMatchesSingle(int qLoraRank, int seed)
+    {
+        string path = Path.Combine(_scratch, $"mla-split-q{qLoraRank}.safetensors");
+        WriteFixture(path, qLoraRank, seed);
+
+        ModelConfig config = BuildConfig(qLoraRank);
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int fullLen = tokenIds.Length;
+        int prefillLen = 3;
+
+        // ── Pass A: single call over the whole sequence (oracle) ────────
+        float[] fullLogits;
+        using (var sfA = SafetensorsFile.Open(path))
+        using (var modelA = TransformerModel.LoadFromSafetensors(sfA, config))
+        {
+            int[] positions = [0, 1, 2, 3, 4];
+            using ITensor logits = modelA.Forward(tokenIds, positions, deviceId: -1);
+            Assert.Equal(fullLen, logits.Shape[0]);
+            Assert.Equal(VocabSize, logits.Shape[1]);
+            fullLogits = CopyLogits(logits);
+        }
+
+        // ── Pass B: prefill then step-by-step decode ────────────────────
+        using (var sfB = SafetensorsFile.Open(path))
+        using (var modelB = TransformerModel.LoadFromSafetensors(sfB, config))
+        {
+            // Prefill positions [0..prefillLen-1]. Last row is the
+            // "last-token logits" the caller would argmax off at step 0.
+            float[] prefillLastRow;
+            {
+                int[] ptids = tokenIds.AsSpan(0, prefillLen).ToArray();
+                int[] ppos = Enumerable.Range(0, prefillLen).ToArray();
+                using ITensor logits = modelB.Forward(ptids, ppos, deviceId: -1);
+                prefillLastRow = CopyRow(logits, prefillLen - 1);
+            }
+            AssertRowClose(fullLogits, rowIndex: prefillLen - 1, expected: prefillLastRow,
+                           tolerance: 1e-4f, label: $"prefill last row (qLoraRank={qLoraRank})");
+
+            // Decode one token at a time, comparing each against the
+            // matching row in the single-call oracle.
+            for (int t = prefillLen; t < fullLen; t++)
+            {
+                int[] dtids = [tokenIds[t]];
+                int[] dpos = [t];
+                using ITensor logits = modelB.Forward(dtids, dpos, deviceId: -1);
+                Assert.Equal(1, logits.Shape[0]);
+                float[] decodeRow = CopyRow(logits, 0);
+                AssertRowClose(fullLogits, rowIndex: t, expected: decodeRow,
+                               tolerance: 1e-4f, label: $"decode t={t} (qLoraRank={qLoraRank})");
+            }
+        }
+    }
+
+    private static unsafe float[] CopyLogits(ITensor logits)
+    {
+        int total = checked(logits.Shape[0] * logits.Shape[1]);
+        float[] copy = new float[total];
+        new ReadOnlySpan<float>((void*)logits.DataPointer, total).CopyTo(copy);
+        return copy;
+    }
+
+    private static unsafe float[] CopyRow(ITensor logits, int rowIndex)
+    {
+        int cols = logits.Shape[1];
+        float[] row = new float[cols];
+        new ReadOnlySpan<float>(
+            (void*)(logits.DataPointer + (nint)((long)rowIndex * cols * sizeof(float))),
+            cols).CopyTo(row);
+        return row;
+    }
+
+    private static void AssertRowClose(float[] fullLogits, int rowIndex, float[] expected,
+                                       float tolerance, string label)
+    {
+        int cols = expected.Length;
+        for (int c = 0; c < cols; c++)
+        {
+            float fullValue = fullLogits[rowIndex * cols + c];
+            float diff = MathF.Abs(fullValue - expected[c]);
+            Assert.True(diff <= tolerance,
+                $"{label}: col {c} diverges: single-call={fullValue:F6} vs split-call={expected[c]:F6} (|diff|={diff:E3} > {tolerance:E3})");
+        }
+    }
+
     // ───────────────────────── core runner ─────────────────────────
 
     private void RunAndAssertFinite(int qLoraRank, int seqLen, int seed)
