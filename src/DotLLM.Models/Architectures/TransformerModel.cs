@@ -265,13 +265,19 @@ public sealed unsafe class TransformerModel : IModel
         // MLA cache lifecycle: allocated lazily on the first MLA forward
         // pass, reset when positions[0] == 0 so successive unrelated calls
         // (integration tests, multiple prompts, …) don't reuse stale KV.
-        // Phase A (default) uses MlaExpandedKvState; Phase B uses the
-        // smaller MlaLatentKvState when Config.MlaConfig.UseLatentCache is
-        // set. Non-MLA models leave both null forever.
+        // Phase A (default) uses MlaExpandedKvState; Phase B / Phase C use
+        // the smaller MlaLatentKvState. Phase C (UseHybridMlaCache) shares
+        // the Phase B cache layout verbatim — the only difference is which
+        // kernel consumes it (absorbed decode, expand-then-MHA prefill).
+        // UseLatentCache and UseHybridMlaCache are mutually exclusive.
         if (Config.MlaConfig is not null)
         {
             var mla = Config.MlaConfig;
-            if (mla.UseLatentCache)
+            if (mla.UseLatentCache && mla.UseHybridMlaCache)
+                throw new InvalidOperationException(
+                    "MlaConfig.UseLatentCache and MlaConfig.UseHybridMlaCache are mutually exclusive.");
+
+            if (mla.UseLatentCache || mla.UseHybridMlaCache)
             {
                 if (_mlaLatentKvState is null)
                 {
@@ -355,34 +361,70 @@ public sealed unsafe class TransformerModel : IModel
                 float mlaScaleMultiplier = Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier();
                 if (_mlaLatentKvState is not null)
                 {
-                    // Phase B — latent cache + absorbed attention.
-                    MlaAttention.ExecuteLatent(
-                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
-                        output: new Span<float>(attnOut, seqLen * hiddenSize),
-                        seqLen: seqLen,
-                        positionOffset: positions[0],
-                        hiddenSize: hiddenSize,
-                        numHeads: mlaW.NumHeads,
-                        qkNopeHeadDim: mlaW.QkNopeHeadDim,
-                        qkRopeHeadDim: mlaW.QkRopeHeadDim,
-                        vHeadDim: mlaW.VHeadDim,
-                        qLoraRank: mlaW.QLoraRank,
-                        kvLoraRank: mlaW.KvLoraRank,
-                        rmsNormEps: eps,
-                        ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
-                        ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
-                        qAProj: qAElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems) : ReadOnlySpan<float>.Empty,
-                        qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
-                        qBProj: qBElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems) : ReadOnlySpan<float>.Empty,
-                        qProj: qMonoElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems) : ReadOnlySpan<float>.Empty,
-                        kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
-                        kvALayernormWeight: mlaW.KvALayernormWeight,
-                        kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
-                        oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
-                        cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
-                        cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
-                        cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
-                        attnScaleMultiplier: mlaScaleMultiplier);
+                    // Phase B (pure absorbed) OR Phase C (hybrid
+                    // expand-prefill / absorbed-decode) — both share the
+                    // latent cache layout; the config flag picks the kernel.
+                    bool hybrid = Config.MlaConfig!.UseHybridMlaCache;
+                    if (hybrid)
+                    {
+                        MlaAttention.ExecuteLatentHybrid(
+                            hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                            output: new Span<float>(attnOut, seqLen * hiddenSize),
+                            seqLen: seqLen,
+                            positionOffset: positions[0],
+                            hiddenSize: hiddenSize,
+                            numHeads: mlaW.NumHeads,
+                            qkNopeHeadDim: mlaW.QkNopeHeadDim,
+                            qkRopeHeadDim: mlaW.QkRopeHeadDim,
+                            vHeadDim: mlaW.VHeadDim,
+                            qLoraRank: mlaW.QLoraRank,
+                            kvLoraRank: mlaW.KvLoraRank,
+                            rmsNormEps: eps,
+                            ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
+                            ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
+                            qAProj: qAElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems) : ReadOnlySpan<float>.Empty,
+                            qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
+                            qBProj: qBElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems) : ReadOnlySpan<float>.Empty,
+                            qProj: qMonoElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems) : ReadOnlySpan<float>.Empty,
+                            kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
+                            kvALayernormWeight: mlaW.KvALayernormWeight,
+                            kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
+                            oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
+                            cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
+                            cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
+                            cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
+                            attnScaleMultiplier: mlaScaleMultiplier);
+                    }
+                    else
+                    {
+                        MlaAttention.ExecuteLatent(
+                            hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                            output: new Span<float>(attnOut, seqLen * hiddenSize),
+                            seqLen: seqLen,
+                            positionOffset: positions[0],
+                            hiddenSize: hiddenSize,
+                            numHeads: mlaW.NumHeads,
+                            qkNopeHeadDim: mlaW.QkNopeHeadDim,
+                            qkRopeHeadDim: mlaW.QkRopeHeadDim,
+                            vHeadDim: mlaW.VHeadDim,
+                            qLoraRank: mlaW.QLoraRank,
+                            kvLoraRank: mlaW.KvLoraRank,
+                            rmsNormEps: eps,
+                            ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
+                            ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
+                            qAProj: qAElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems) : ReadOnlySpan<float>.Empty,
+                            qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
+                            qBProj: qBElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems) : ReadOnlySpan<float>.Empty,
+                            qProj: qMonoElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems) : ReadOnlySpan<float>.Empty,
+                            kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
+                            kvALayernormWeight: mlaW.KvALayernormWeight,
+                            kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
+                            oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
+                            cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
+                            cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
+                            cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
+                            attnScaleMultiplier: mlaScaleMultiplier);
+                    }
                     _mlaLatentKvState.Advance(layer, seqLen);
                 }
                 else
