@@ -425,3 +425,6 @@ FodyWeavers.xsd
 
 # dotLLM test model cache
 tests/.models/
+
+# Python venvs used for HF reference comparison scripts
+.venv-pyref/
