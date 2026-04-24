@@ -726,4 +726,121 @@ public sealed class VulkanDevice : IDisposable
             _instance = 0;
         }
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Forward-pass command submission
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reusable command-buffer + fence pair used by the fence-pipelined
+    /// forward pass. One instance per <see cref="VulkanTransformerModel"/>;
+    /// <see cref="Begin"/> resets and opens the buffer, <see cref="SubmitAndWait"/>
+    /// submits and waits on the fence, leaving both ready for the next forward.
+    /// </summary>
+    public sealed class SubmitContext : IDisposable
+    {
+        private readonly VulkanDevice _device;
+        private nint _cmdBuf;
+        private nint _fence;
+        private bool _disposed;
+
+        /// <summary>Underlying command buffer. Valid between <see cref="Begin"/> and <see cref="SubmitAndWait"/>.</summary>
+        public nint CommandBuffer => _cmdBuf;
+
+        internal SubmitContext(VulkanDevice device, nint cmdBuf, nint fence)
+        {
+            _device = device;
+            _cmdBuf = cmdBuf;
+            _fence = fence;
+        }
+
+        /// <summary>
+        /// Resets the command buffer (and the fence) and opens the buffer for
+        /// recording. Call once at the start of each forward pass.
+        /// </summary>
+        public void Begin()
+        {
+            VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer");
+            var begin = new VkCommandBufferBeginInfo
+            {
+                sType = VkStructureType.CommandBufferBeginInfo,
+                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+            };
+            VulkanApi.vkBeginCommandBuffer(_cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
+        }
+
+        /// <summary>
+        /// Ends the command buffer, submits on the queue, waits on the fence,
+        /// resets the fence for reuse. Call once at the end of each forward
+        /// pass.
+        /// </summary>
+        public unsafe void SubmitAndWait()
+        {
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer");
+
+            nint cmdBufLocal = _cmdBuf;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence).ThrowOnError("vkQueueSubmit SubmitContext");
+
+            nint fenceLocal = _fence;
+            VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
+                .ThrowOnError("vkWaitForFences SubmitContext");
+            VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            if (_fence != 0)
+            {
+                VulkanApi.vkDestroyFence(_device._device, _fence, 0);
+                _fence = 0;
+            }
+            if (_cmdBuf != 0)
+            {
+                nint local = _cmdBuf;
+                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
+                _cmdBuf = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Allocates one command buffer and one fence bound to the compute
+    /// queue. The returned <see cref="SubmitContext"/> is intended to live
+    /// for the lifetime of the caller (e.g. <see cref="VulkanTransformerModel"/>)
+    /// and be reused <see cref="SubmitContext.Begin"/>-&gt;record-&gt;
+    /// <see cref="SubmitContext.SubmitAndWait"/> once per forward pass.
+    /// </summary>
+    public SubmitContext CreateSubmitContext()
+    {
+        var cbai = new VkCommandBufferAllocateInfo
+        {
+            sType = VkStructureType.CommandBufferAllocateInfo,
+            commandPool = _commandPool,
+            level = VkCommandBufferLevel.Primary,
+            commandBufferCount = 1,
+        };
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
+            .ThrowOnError("vkAllocateCommandBuffers CreateSubmitContext");
+
+        var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
+        int r = VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence);
+        if (r < 0)
+        {
+            nint local = cmdBuf;
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, local);
+            r.ThrowOnError("vkCreateFence CreateSubmitContext");
+        }
+
+        return new SubmitContext(this, cmdBuf, fence);
+    }
 }

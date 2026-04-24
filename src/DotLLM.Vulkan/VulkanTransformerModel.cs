@@ -22,15 +22,18 @@ namespace DotLLM.Vulkan;
 /// <remarks>
 /// <para>
 /// Scope: F32-only. Quantised weights are dequantised to FP32 at
-/// construction time via <see cref="VulkanWeights.Upload"/>. The model
-/// assumes a pure-Transformer Llama-family architecture — MLA, MoE, and
-/// SSM layers are rejected at load time.
+/// construction time via <see cref="VulkanWeights.Upload"/> and uploaded
+/// to device-local (VRAM) memory. The model assumes a pure-Transformer
+/// Llama-family architecture — MLA, MoE, and SSM layers are rejected at
+/// load time.
 /// </para>
 /// <para>
-/// The forward pass is synchronous: every kernel dispatch in the chain
-/// ends in <c>vkQueueWaitIdle</c> (inherited from the wave-1 kernels). That
-/// is correct but slow; fence-based pipelining is deferred to the
-/// perf-polish wave per the scaffold discipline.
+/// Forward pass is fence-pipelined: a single persistent command buffer
+/// records every kernel dispatch + inter-kernel pipeline barrier for the
+/// whole forward, submits once per forward, and waits on a single fence
+/// before downloading logits. Legacy synchronous kernel launches (one
+/// <c>vkQueueWaitIdle</c> per kernel) are only used by the standalone
+/// unit tests.
 /// </para>
 /// <para>
 /// Architectural parallel with <c>DotLLM.Cuda.CudaTransformerModel</c>:
@@ -56,6 +59,12 @@ public sealed class VulkanTransformerModel : IModel
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
 
+    // Persistent command buffer + fence used by Forward. One SubmitContext
+    // per model — reset+begin at the start of each forward, submit+wait at
+    // the end. Bias host-side steps split the forward into multiple submits
+    // but each submit still batches many dispatches behind one fence.
+    private readonly VulkanDevice.SubmitContext _submit;
+
     private readonly TransformerWeights _cpuWeights; // retained for embedding lookup
     private readonly GgufFile? _gguf;
     private readonly float _ropeTheta;
@@ -80,6 +89,7 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
+        VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow)
     {
@@ -95,6 +105,7 @@ public sealed class VulkanTransformerModel : IModel
         _attention = attention;
         _swiglu = swiglu;
         _add = add;
+        _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
@@ -174,6 +185,8 @@ public sealed class VulkanTransformerModel : IModel
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
 
+        var submit = device.CreateSubmitContext();
+
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
@@ -186,6 +199,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, rmsnorm, rope, attention, swiglu, add,
+            submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
     }
@@ -223,53 +237,82 @@ public sealed class VulkanTransformerModel : IModel
 
         _state.EnsureCapacity(seqLen);
 
-        // 1. Embedding lookup on the host: copy one row per token from the already-FP32 embedding
-        //    table into a scratch buffer, then upload. (A kernel would be nicer; cost is 576*4*seqLen
-        //    bytes — ~2.3 KB/token for SmolLM — which is trivial for prompts we care about.)
-        UploadEmbeddings(tokenIds);
+        // Reset all kernel descriptor pools so this forward can allocate
+        // fresh sets. The previous forward's sets were consumed by that
+        // forward's submit-and-wait, so the reset is safe.
+        ResetKernelDescriptors();
 
-        // 2. Upload positions for RoPE.
+        // 1. Host-side upload of per-token embedding rows + positions. Both
+        //    land in host-visible host-coherent buffers; a HOST→COMPUTE
+        //    barrier at the start of the recorded command buffer makes the
+        //    writes visible to the first compute kernel without an explicit
+        //    vkQueueWaitIdle.
+        UploadEmbeddings(tokenIds);
         UploadPositions(positions);
 
-        // 3. Main transformer forward.
+        // 2. Begin the single per-forward command buffer and record the
+        //    whole transformer. Bias-add host steps split the forward into
+        //    multiple submits (one per distinct set of biases we need to
+        //    pause for); everything else stays inside the pipelined path.
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+            ref readonly var cpuLw = ref _cpuWeights.Layers[layer];
 
-            // Copy hidden -> residual (for later add). Host-side copy via mapped memory.
-            CopyDeviceBuffer(_state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
+            // Residual snapshot (pre-attention): HiddenState → Residual.
+            RecordCopyBuffer(cmdBuf, _state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
+            KernelSupport.ComputeToComputeBarrier(cmdBuf); // TRANSFER→COMPUTE would be tighter; COMPUTE→COMPUTE covers both paths
 
-            // ── Attention block ──────────────────────────────────────────
-
-            // a. RMSNorm attn_in
-            _rmsnorm.Launch(_state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+            // Attn RMSNorm
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
                 rowCount: seqLen, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // b. Q/K/V projections (matmul [M,K] x [N,K]^T -> [N,M])
-            _matmul.Launch(lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
-            _matmul.Launch(lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
-            _matmul.Launch(lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            // Q/K/V projections
+            _matmul.Record(cmdBuf, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _matmul.Record(cmdBuf, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _matmul.Record(cmdBuf, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
 
-            // c. Optional biases.
-            if (lw.QBias is { } qb) AddBiasRows(_state.Q, qb, lw.QOutputDim, seqLen);
-            if (lw.KBias is { } kb) AddBiasRows(_state.K, kb, lw.KOutputDim, seqLen);
-            if (lw.VBias is { } vb) AddBiasRows(_state.V, vb, lw.VOutputDim, seqLen);
+            // Optional QKV biases — host path. Submit, wait, write, re-begin.
+            if (cpuLw.QBias is not null || cpuLw.KBias is not null || cpuLw.VBias is not null)
+            {
+                KernelSupport.ComputeToHostBarrier(cmdBuf);
+                _submit.SubmitAndWait();
+                if (cpuLw.QBias is { } qb) AddBiasRows(_state.Q, qb, lw.QOutputDim, seqLen);
+                if (cpuLw.KBias is { } kb) AddBiasRows(_state.K, kb, lw.KOutputDim, seqLen);
+                if (cpuLw.VBias is { } vb) AddBiasRows(_state.V, vb, lw.VOutputDim, seqLen);
+                _submit.Begin();
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+            }
+            else
+            {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
-            // d. RoPE on Q and K.
-            _rope.Launch(_state.Q, _state.K, _state.PositionsBuffer,
+            // RoPE on Q and K
+            _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
                 variant: _ropeVariant);
 
-            // e. Attention: either over the current seqLen window (no cache)
-            //    or over the cached sequence (prefill fills the cache, decode
-            //    reads from it).
+            // Attention input buffers: either the uncached K/V window or the full KV cache.
             VulkanDevice.Buffer kSrc, vSrc;
             int seqKv;
             int positionOffset;
             if (kvCache is VulkanKvCache vkCache)
             {
-                vkCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer);
+                // RoPE writes K; attention (via the cache buffers) reads K.
+                // Barrier the RoPE → KV copy, then the KV copy → attention.
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
                 kSrc = vkCache.GetKeysBuffer(layer);
                 vSrc = vkCache.GetValuesBuffer(layer);
                 seqKv = vkCache.CurrentLength;
@@ -277,65 +320,124 @@ public sealed class VulkanTransformerModel : IModel
             }
             else
             {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 kSrc = _state.K;
                 vSrc = _state.V;
                 seqKv = seqLen;
                 positionOffset = 0;
             }
 
-            _attention.Launch(_state.Q, kSrc, vSrc, _state.AttnOutput,
+            _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: _slidingWindow);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // f. Output projection -> NormOutput (reuse slot).
-            _matmul.Launch(lw.O, _state.AttnOutput, _state.NormOutput,
+            // Output projection → NormOutput (reuse slot).
+            _matmul.Record(cmdBuf, lw.O, _state.AttnOutput, _state.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
-            if (lw.OBias is { } ob) AddBiasRows(_state.NormOutput, ob, lw.OOutputDim, seqLen);
 
-            // g. Residual add: hidden = residual + attn_out (written to NormOutput above).
-            //    Add kernel forbids output aliasing; write into AddScratch, then swap.
-            _add.Launch(_state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
-            CopyDeviceBuffer(_state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+            if (cpuLw.OBias is { } ob)
+            {
+                KernelSupport.ComputeToHostBarrier(cmdBuf);
+                _submit.SubmitAndWait();
+                AddBiasRows(_state.NormOutput, ob, lw.OOutputDim, seqLen);
+                _submit.Begin();
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+            }
+            else
+            {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
-            // Refresh residual (copy of the post-attention hidden state) for the FFN residual.
-            CopyDeviceBuffer(_state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
+            // Residual add #1: AddScratch = Residual + NormOutput; then AddScratch → HiddenState.
+            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordCopyBuffer(cmdBuf, _state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // ── FFN block ───────────────────────────────────────────────
+            // Residual snapshot (pre-FFN): HiddenState → Residual.
+            RecordCopyBuffer(cmdBuf, _state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // h. RMSNorm ffn_in
-            _rmsnorm.Launch(_state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+            // FFN RMSNorm
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
                 rowCount: seqLen, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // i. Gate/Up projections
-            _matmul.Launch(lw.Gate, _state.NormOutput, _state.FfnGate,
+            // Gate/Up projections
+            _matmul.Record(cmdBuf, lw.Gate, _state.NormOutput, _state.FfnGate,
                 lw.GateOutputDim, lw.GateInputDim, seqLen);
-            _matmul.Launch(lw.Up, _state.NormOutput, _state.FfnUp,
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _matmul.Record(cmdBuf, lw.Up, _state.NormOutput, _state.FfnUp,
                 lw.UpOutputDim, lw.UpInputDim, seqLen);
-            if (lw.GateBias is { } gb) AddBiasRows(_state.FfnGate, gb, lw.GateOutputDim, seqLen);
-            if (lw.UpBias is { } ub) AddBiasRows(_state.FfnUp, ub, lw.UpOutputDim, seqLen);
 
-            // j. SwiGLU: silu(gate) * up -> SiluOutput
-            _swiglu.Launch(_state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+            if (cpuLw.GateBias is not null || cpuLw.UpBias is not null)
+            {
+                KernelSupport.ComputeToHostBarrier(cmdBuf);
+                _submit.SubmitAndWait();
+                if (cpuLw.GateBias is { } gb) AddBiasRows(_state.FfnGate, gb, lw.GateOutputDim, seqLen);
+                if (cpuLw.UpBias is { } ub) AddBiasRows(_state.FfnUp, ub, lw.UpOutputDim, seqLen);
+                _submit.Begin();
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+            }
+            else
+            {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
-            // k. Down projection -> NormOutput
-            _matmul.Launch(lw.Down, _state.SiluOutput, _state.NormOutput,
+            // SwiGLU
+            _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // Down projection
+            _matmul.Record(cmdBuf, lw.Down, _state.SiluOutput, _state.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
-            if (lw.DownBias is { } db) AddBiasRows(_state.NormOutput, db, lw.DownOutputDim, seqLen);
 
-            // l. Residual add: hidden = residual + ffn_out
-            _add.Launch(_state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
-            CopyDeviceBuffer(_state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+            if (cpuLw.DownBias is { } db)
+            {
+                KernelSupport.ComputeToHostBarrier(cmdBuf);
+                _submit.SubmitAndWait();
+                AddBiasRows(_state.NormOutput, db, lw.DownOutputDim, seqLen);
+                _submit.Begin();
+                cmdBuf = _submit.CommandBuffer;
+                KernelSupport.HostToComputeBarrier(cmdBuf);
+            }
+            else
+            {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
+            // Residual add #2: AddScratch = Residual + NormOutput; then AddScratch → HiddenState.
+            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordCopyBuffer(cmdBuf, _state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+
+            // COMPUTE→COMPUTE between layers — next iteration's first op is the HiddenState→Residual copy.
+            if (layer < Config.NumLayers - 1)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        // 4. Final RMSNorm on the last token only, then LM head.
-        //    Copy just the last token's hidden state into a single-row view via NormOutput.
-        CopyLastTokenSlice(_state.HiddenState, _state.NormOutput, seqLen, hiddenSize);
-        _rmsnorm.Launch(_state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
-            rowCount: 1, n: hiddenSize, eps: eps);
+        // 3. Final RMSNorm on the last token only, then LM head.
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        _matmul.Launch(_weights.OutputWeight, _state.NormOutput, _state.Logits,
+        _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
+            rowCount: 1, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _matmul.Record(cmdBuf, _weights.OutputWeight, _state.NormOutput, _state.Logits,
             _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+
+        // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
 
         // 5. Return logits as a host-resident UnmanagedTensor [1, vocabSize].
         var shape = new TensorShape(1, vocabSize);
@@ -348,49 +450,31 @@ public sealed class VulkanTransformerModel : IModel
         return result;
     }
 
-    /// <summary>
-    /// Copies <paramref name="byteCount"/> bytes from <paramref name="src"/> to
-    /// <paramref name="dst"/> via host-mapped pointers. Scaffold path — the
-    /// proper implementation issues <c>vkCmdCopyBuffer</c> on the compute
-    /// queue, but while all buffers are host-visible host-coherent this is
-    /// both correct and serialised against prior kernel launches (each of
-    /// which ends in <c>vkQueueWaitIdle</c>).
-    /// </summary>
-    private unsafe void CopyDeviceBuffer(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long byteCount)
+    private void ResetKernelDescriptors()
     {
-        VulkanApi.vkMapMemory(_device.Handle, src.Memory, 0, (ulong)byteCount, 0, out nint srcMapped)
-            .ThrowOnError("vkMapMemory CopyDeviceBuffer.src");
-        VulkanApi.vkMapMemory(_device.Handle, dst.Memory, 0, (ulong)byteCount, 0, out nint dstMapped)
-            .ThrowOnError("vkMapMemory CopyDeviceBuffer.dst");
-        try
-        {
-            System.Buffer.MemoryCopy((void*)srcMapped, (void*)dstMapped, byteCount, byteCount);
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, dst.Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, src.Memory);
-        }
+        _matmul.ResetDescriptors();
+        _rmsnorm.ResetDescriptors();
+        _rope.ResetDescriptors();
+        _attention.ResetDescriptors();
+        _swiglu.ResetDescriptors();
+        _add.ResetDescriptors();
     }
 
-    private unsafe void CopyLastTokenSlice(VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int seqLen, int hiddenSize)
-    {
-        long rowBytes = (long)hiddenSize * sizeof(float);
-        long srcOffset = (long)(seqLen - 1) * rowBytes;
+    /// <summary>
+    /// Records a device-to-device <c>vkCmdCopyBuffer</c> of
+    /// <paramref name="byteCount"/> bytes from the start of <paramref name="src"/>
+    /// to the start of <paramref name="dst"/>. Replaces the scaffold's
+    /// host-mapped memcpy which required a submit boundary on every call.
+    /// </summary>
+    private static void RecordCopyBuffer(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long byteCount)
+        => RecordCopyBufferRange(cmdBuf, src, dst, srcOffset: 0, dstOffset: 0, size: (ulong)byteCount);
 
-        VulkanApi.vkMapMemory(_device.Handle, src.Memory, 0, (ulong)(srcOffset + rowBytes), 0, out nint srcMapped)
-            .ThrowOnError("vkMapMemory CopyLastTokenSlice.src");
-        VulkanApi.vkMapMemory(_device.Handle, dst.Memory, 0, (ulong)rowBytes, 0, out nint dstMapped)
-            .ThrowOnError("vkMapMemory CopyLastTokenSlice.dst");
-        try
-        {
-            System.Buffer.MemoryCopy((byte*)srcMapped + srcOffset, (void*)dstMapped, rowBytes, rowBytes);
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, dst.Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, src.Memory);
-        }
+    private static void RecordCopyBufferRange(
+        nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst,
+        ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
     }
 
     /// <summary>
@@ -400,28 +484,27 @@ public sealed class VulkanTransformerModel : IModel
     /// adding a dedicated "bias_add" compute kernel is out of scope for the
     /// correctness wave.
     /// </summary>
-    private unsafe void AddBiasRows(VulkanDevice.Buffer output, VulkanDevice.Buffer bias, int outputDim, int seqLen)
+    private unsafe void AddBiasRows(VulkanDevice.Buffer output, float[] bias, int outputDim, int seqLen)
     {
         long biasBytes = (long)outputDim * sizeof(float);
         long outBytes = biasBytes * seqLen;
 
         VulkanApi.vkMapMemory(_device.Handle, output.Memory, 0, (ulong)outBytes, 0, out nint outMapped)
             .ThrowOnError("vkMapMemory AddBiasRows.output");
-        VulkanApi.vkMapMemory(_device.Handle, bias.Memory, 0, (ulong)biasBytes, 0, out nint biasMapped)
-            .ThrowOnError("vkMapMemory AddBiasRows.bias");
         try
         {
             float* o = (float*)outMapped;
-            float* b = (float*)biasMapped;
-            for (int t = 0; t < seqLen; t++)
+            fixed (float* b = bias)
             {
-                for (int i = 0; i < outputDim; i++)
-                    o[t * outputDim + i] += b[i];
+                for (int t = 0; t < seqLen; t++)
+                {
+                    for (int i = 0; i < outputDim; i++)
+                        o[t * outputDim + i] += b[i];
+                }
             }
         }
         finally
         {
-            VulkanApi.vkUnmapMemory(_device.Handle, bias.Memory);
             VulkanApi.vkUnmapMemory(_device.Handle, output.Memory);
         }
     }
@@ -491,6 +574,7 @@ public sealed class VulkanTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();
 

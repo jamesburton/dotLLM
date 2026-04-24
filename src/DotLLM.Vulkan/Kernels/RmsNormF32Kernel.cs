@@ -113,7 +113,7 @@ public sealed class RmsNormF32Kernel : IDisposable
             }
         }
 
-        nint pool = CreateDescriptorPool(device);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         return new RmsNormF32Kernel(
             device, sharedModule, sharedPipeline,
             subgroupModule, subgroupPipeline, pool, useSubgroup);
@@ -134,22 +134,8 @@ public sealed class RmsNormF32Kernel : IDisposable
             pushConstantBytes: PushConstantBytes);
     }
 
-    private static unsafe nint CreateDescriptorPool(VulkanDevice device)
-    {
-        var poolSize = new VkDescriptorPoolSize
-        {
-            type = VkDescriptorType.StorageBuffer,
-            descriptorCount = 3,
-        };
-        VkDescriptorPoolCreateInfo ci = default;
-        ci.sType = VkStructureType.DescriptorPoolCreateInfo;
-        ci.maxSets = 1;
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes = (nint)(&poolSize);
-        VulkanApi.vkCreateDescriptorPool(device.Handle, ci, 0, out nint pool)
-            .ThrowOnError("vkCreateDescriptorPool");
-        return pool;
-    }
+    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
+    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
 
     /// <summary>
     /// Dispatches RMS norm over <paramref name="rowCount"/> rows of length
@@ -161,7 +147,20 @@ public sealed class RmsNormF32Kernel : IDisposable
     /// <param name="rowCount">Number of rows to normalize.</param>
     /// <param name="n">Row length (number of features).</param>
     /// <param name="eps">Epsilon under the square root. Typical: 1e-5 or 1e-6.</param>
-    public unsafe void Launch(
+    public void Launch(
+        VulkanDevice.Buffer input, VulkanDevice.Buffer weight, VulkanDevice.Buffer output,
+        int rowCount, int n, float eps)
+    {
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        Record(ctx.CommandBuffer, input, weight, output, rowCount, n, eps);
+        ctx.SubmitAndWait();
+        ResetDescriptors();
+    }
+
+    /// <summary>Records RMSNorm into <paramref name="cmdBuf"/> without submitting.</summary>
+    public unsafe void Record(
+        nint cmdBuf,
         VulkanDevice.Buffer input, VulkanDevice.Buffer weight, VulkanDevice.Buffer output,
         int rowCount, int n, float eps)
     {
@@ -175,102 +174,28 @@ public sealed class RmsNormF32Kernel : IDisposable
 
         ComputePipeline pipeline = (_useSubgroup && _subgroupPipeline != null) ? _subgroupPipeline : _sharedPipeline;
 
-        // 1. Allocate descriptor set.
-        nint setLayout = pipeline.DescriptorSetLayout;
-        var dsai = new VkDescriptorSetAllocateInfo
-        {
-            sType = VkStructureType.DescriptorSetAllocateInfo,
-            descriptorPool = _descriptorPool,
-            descriptorSetCount = 1,
-            pSetLayouts = (nint)(&setLayout),
-        };
-        VulkanApi.vkAllocateDescriptorSets(_device.Handle, dsai, out nint descriptorSet)
-            .ThrowOnError("vkAllocateDescriptorSets");
+        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, pipeline.DescriptorSetLayout);
+        Span<nint> buffers = stackalloc nint[3] { input.Handle, weight.Handle, output.Handle };
+        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
 
-        // 2. Bind buffers.
-        Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[3];
-        bufferInfos[0] = new VkDescriptorBufferInfo { buffer = input.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[1] = new VkDescriptorBufferInfo { buffer = weight.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[2] = new VkDescriptorBufferInfo { buffer = output.Handle, offset = 0, range = ulong.MaxValue };
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
 
-        Span<VkWriteDescriptorSet> writes = stackalloc VkWriteDescriptorSet[3];
-        fixed (VkDescriptorBufferInfo* bufPtr = bufferInfos)
+        // Push constants: uint n, float eps (8 bytes total).
+        Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes, (uint)n);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[4..], eps);
+        fixed (byte* pcPtr = pcBytes)
         {
-            for (int i = 0; i < 3; i++)
-            {
-                writes[i] = new VkWriteDescriptorSet
-                {
-                    sType = VkStructureType.WriteDescriptorSet,
-                    dstSet = descriptorSet,
-                    dstBinding = (uint)i,
-                    descriptorCount = 1,
-                    descriptorType = VkDescriptorType.StorageBuffer,
-                    pBufferInfo = (nint)(bufPtr + i),
-                };
-            }
-            fixed (VkWriteDescriptorSet* writesPtr = writes)
-            {
-                VulkanApi.vkUpdateDescriptorSets(_device.Handle, 3, (nint)writesPtr, 0, 0);
-            }
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
+                0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // 3. Record and submit.
-        var cbai = new VkCommandBufferAllocateInfo
-        {
-            sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _device.CommandPool,
-            level = VkCommandBufferLevel.Primary,
-            commandBufferCount = 1,
-        };
-        VulkanApi.vkAllocateCommandBuffers(_device.Handle, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers");
-
-        try
-        {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
-
-            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
-            VulkanApi.vkCmdBindDescriptorSets(
-                cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
-                0, 1, descriptorSet, 0, 0);
-
-            // Push constants: uint n, float eps (8 bytes total).
-            Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes, (uint)n);
-            System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[4..], eps);
-            fixed (byte* pcPtr = pcBytes)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, PushConstantBytes, (nint)pcPtr);
-            }
-
-            // One workgroup per row.
-            VulkanApi.vkCmdDispatch(cmdBuf, (uint)rowCount, 1, 1);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer");
-
-            var submit = new VkSubmitInfo
-            {
-                sType = VkStructureType.SubmitInfo,
-                commandBufferCount = 1,
-                pCommandBuffers = (nint)(&cmdBuf),
-            };
-            VulkanApi.vkQueueSubmit(_device.Queue, 1, submit, 0).ThrowOnError("vkQueueSubmit");
-            VulkanApi.vkQueueWaitIdle(_device.Queue).ThrowOnError("vkQueueWaitIdle");
-        }
-        finally
-        {
-            VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
-            // Pool-reset after the queue wait frees the descriptor set for the next Launch();
-            // without this the single-set pool exhausts on the second invocation.
-            VulkanApi.vkResetDescriptorPool(_device.Handle, _descriptorPool, 0);
-        }
+        // One workgroup per row.
+        VulkanApi.vkCmdDispatch(cmdBuf, (uint)rowCount, 1, 1);
     }
 
     /// <inheritdoc/>

@@ -78,30 +78,16 @@ public sealed class RopeF32Kernel : IDisposable
             throw;
         }
 
-        nint pool = CreateDescriptorPool(device);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         return new RopeF32Kernel(device, module, pipeline, pool);
     }
 
-    private static unsafe nint CreateDescriptorPool(VulkanDevice device)
-    {
-        var poolSize = new VkDescriptorPoolSize
-        {
-            type = VkDescriptorType.StorageBuffer,
-            descriptorCount = 3,
-        };
-        VkDescriptorPoolCreateInfo ci = default;
-        ci.sType = VkStructureType.DescriptorPoolCreateInfo;
-        ci.maxSets = 1;
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes = (nint)(&poolSize);
-        VulkanApi.vkCreateDescriptorPool(device.Handle, ci, 0, out nint pool)
-            .ThrowOnError("vkCreateDescriptorPool");
-        return pool;
-    }
+    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
+    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
 
     /// <summary>
     /// Applies RoPE to Q and K in place. Synchronous — returns after
-    /// <c>vkQueueWaitIdle</c>.
+    /// <c>vkQueueWaitIdle</c>. Legacy wrapper around <see cref="Record"/>.
     /// </summary>
     /// <param name="q">Query buffer (FP32), layout <c>[seqLen, numHeads * headDim]</c>.</param>
     /// <param name="k">Key buffer (FP32), layout <c>[seqLen, numKvHeads * headDim]</c>.</param>
@@ -113,7 +99,21 @@ public sealed class RopeF32Kernel : IDisposable
     /// <param name="ropeDim">Number of dims to rotate per head (even, &lt;= headDim).</param>
     /// <param name="theta">RoPE base (typical 10000 for Llama-2, 500000 for Llama-3).</param>
     /// <param name="variant">Pair-layout variant.</param>
-    public unsafe void Launch(
+    public void Launch(
+        VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta,
+        Variant variant = Variant.Norm)
+    {
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        Record(ctx.CommandBuffer, q, k, positions, seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, variant);
+        ctx.SubmitAndWait();
+        ResetDescriptors();
+    }
+
+    /// <summary>Records RoPE into <paramref name="cmdBuf"/> without submitting.</summary>
+    public unsafe void Record(
+        nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
         int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta,
         Variant variant = Variant.Norm)
@@ -137,107 +137,33 @@ public sealed class RopeF32Kernel : IDisposable
         long totalK = (long)seqLen * numKvHeads * halfRope;
         long maxPairs = Math.Max(totalQ, totalK);
 
-        // 1. Allocate descriptor set.
-        nint setLayout = _pipeline.DescriptorSetLayout;
-        var dsai = new VkDescriptorSetAllocateInfo
-        {
-            sType = VkStructureType.DescriptorSetAllocateInfo,
-            descriptorPool = _descriptorPool,
-            descriptorSetCount = 1,
-            pSetLayouts = (nint)(&setLayout),
-        };
-        VulkanApi.vkAllocateDescriptorSets(_device.Handle, dsai, out nint descriptorSet)
-            .ThrowOnError("vkAllocateDescriptorSets");
+        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
+        Span<nint> buffers = stackalloc nint[3] { q.Handle, k.Handle, positions.Handle };
+        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
 
-        // 2. Bind buffers.
-        Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[3];
-        bufferInfos[0] = new VkDescriptorBufferInfo { buffer = q.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[1] = new VkDescriptorBufferInfo { buffer = k.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[2] = new VkDescriptorBufferInfo { buffer = positions.Handle, offset = 0, range = ulong.MaxValue };
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
 
-        Span<VkWriteDescriptorSet> writes = stackalloc VkWriteDescriptorSet[3];
-        fixed (VkDescriptorBufferInfo* bufPtr = bufferInfos)
+        // Push constants: 6 uint + 1 float = 28 bytes.
+        Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[0..],  (uint)seqLen);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[4..],  (uint)numHeads);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[8..],  (uint)numKvHeads);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[12..], (uint)headDim);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[16..], (uint)ropeDim);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[20..], (uint)variant);
+        System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[24..], theta);
+        fixed (byte* pcPtr = pcBytes)
         {
-            for (int i = 0; i < 3; i++)
-            {
-                writes[i] = new VkWriteDescriptorSet
-                {
-                    sType = VkStructureType.WriteDescriptorSet,
-                    dstSet = descriptorSet,
-                    dstBinding = (uint)i,
-                    descriptorCount = 1,
-                    descriptorType = VkDescriptorType.StorageBuffer,
-                    pBufferInfo = (nint)(bufPtr + i),
-                };
-            }
-            fixed (VkWriteDescriptorSet* writesPtr = writes)
-            {
-                VulkanApi.vkUpdateDescriptorSets(_device.Handle, 3, (nint)writesPtr, 0, 0);
-            }
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // 3. Record and submit.
-        var cbai = new VkCommandBufferAllocateInfo
-        {
-            sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _device.CommandPool,
-            level = VkCommandBufferLevel.Primary,
-            commandBufferCount = 1,
-        };
-        VulkanApi.vkAllocateCommandBuffers(_device.Handle, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers");
-
-        try
-        {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
-
-            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
-            VulkanApi.vkCmdBindDescriptorSets(
-                cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
-                0, 1, descriptorSet, 0, 0);
-
-            // Push constants: 6 uint + 1 float = 28 bytes.
-            Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[0..],  (uint)seqLen);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[4..],  (uint)numHeads);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[8..],  (uint)numKvHeads);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[12..], (uint)headDim);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[16..], (uint)ropeDim);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[20..], (uint)variant);
-            System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[24..], theta);
-            fixed (byte* pcPtr = pcBytes)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, PushConstantBytes, (nint)pcPtr);
-            }
-
-            uint groups = (uint)((maxPairs + WorkgroupSize - 1) / WorkgroupSize);
-            VulkanApi.vkCmdDispatch(cmdBuf, groups, 1, 1);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer");
-
-            var submit = new VkSubmitInfo
-            {
-                sType = VkStructureType.SubmitInfo,
-                commandBufferCount = 1,
-                pCommandBuffers = (nint)(&cmdBuf),
-            };
-            VulkanApi.vkQueueSubmit(_device.Queue, 1, submit, 0).ThrowOnError("vkQueueSubmit");
-            VulkanApi.vkQueueWaitIdle(_device.Queue).ThrowOnError("vkQueueWaitIdle");
-        }
-        finally
-        {
-            VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
-            // Pool-reset after the queue wait frees the descriptor set for the next Launch();
-            // without this the single-set pool exhausts on the second invocation.
-            VulkanApi.vkResetDescriptorPool(_device.Handle, _descriptorPool, 0);
-        }
+        uint groups = (uint)((maxPairs + WorkgroupSize - 1) / WorkgroupSize);
+        VulkanApi.vkCmdDispatch(cmdBuf, groups, 1, 1);
     }
 
     /// <inheritdoc/>
