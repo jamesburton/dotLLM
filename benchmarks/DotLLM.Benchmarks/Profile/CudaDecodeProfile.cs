@@ -39,6 +39,15 @@ internal static class CudaDecodeProfile
             return 2;
         }
 
+        // --graph        : run only the CUDA-Graphs decode path
+        // --compare      : run BOTH eager and graph back-to-back, side-by-side report
+        // --no-profiling : measure eager wall WITHOUT cuEventRecord overhead so the
+        //                  comparison vs graph is true-apples-to-apples
+        // (default)      : eager only (prior behaviour)
+        bool useGraph = args.Contains("--graph");
+        bool compare = args.Contains("--compare");
+        bool noProfiling = args.Contains("--no-profiling");
+
         string modelPath = ResolveModelPath();
         Console.WriteLine($"Model: {modelPath}");
         Console.WriteLine($"Device: {CudaDevice.GetDevice(0)}");
@@ -46,32 +55,63 @@ internal static class CudaDecodeProfile
         using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0);
-
         int[] promptTokens = tokenizer.Encode(DefaultPrompt).ToArray();
         Console.WriteLine($"Prompt tokens: {promptTokens.Length} (using up to {DefaultPrefillTokens})");
+
+        if (compare)
+        {
+            Console.WriteLine();
+            Console.WriteLine("════════ EAGER (with per-category profiling) ════════");
+            var eagerResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: false);
+            Console.WriteLine();
+            Console.WriteLine("════════ EAGER (no profiling — true wall) ════════");
+            var eagerCleanResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: true);
+            Console.WriteLine();
+            Console.WriteLine("════════ CUDA GRAPH (capture+replay) ════════");
+            var graphResult = RunOne(gguf, config, promptTokens, useGraphCapture: true, disableProfiling: true);
+            Console.WriteLine();
+            Console.WriteLine("════════ SUMMARY ════════");
+            Console.WriteLine($"  eager+profile  median tok/s = {1000.0 / eagerResult.MedianWallMs,7:F1}  (wall {eagerResult.MedianWallMs:F2} ms)");
+            Console.WriteLine($"  eager (clean)  median tok/s = {1000.0 / eagerCleanResult.MedianWallMs,7:F1}  (wall {eagerCleanResult.MedianWallMs:F2} ms)");
+            Console.WriteLine($"  graph          median tok/s = {1000.0 / graphResult.MedianWallMs,7:F1}  (wall {graphResult.MedianWallMs:F2} ms)");
+            Console.WriteLine($"  speedup vs clean eager      = {eagerCleanResult.MedianWallMs / graphResult.MedianWallMs,7:F2}×");
+            return 0;
+        }
+
+        var single = RunOne(gguf, config, promptTokens, useGraphCapture: useGraph, disableProfiling: noProfiling);
+        return 0;
+    }
+
+    private readonly struct DecodeStats
+    {
+        public required double MedianWallMs { get; init; }
+        public required double MedianGpuMs { get; init; }
+    }
+
+    private static DecodeStats RunOne(GgufFile gguf, DotLLM.Core.Models.ModelConfig config,
+                                       int[] promptTokens, bool useGraphCapture,
+                                       bool disableProfiling = false)
+    {
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0);
+        model.UseGraphCapture = useGraphCapture;
 
         int prefillLen = Math.Min(promptTokens.Length, DefaultPrefillTokens);
         int[] prefill = promptTokens[..prefillLen];
 
-        // Capacity: prefill + warmup + measured decode steps.
         int kvCapacity = prefillLen + DefaultWarmupTokens + DefaultDecodeTokens + 8;
         using var kv = (IKvCache)model.CreateKvCache(kvCapacity);
 
-        // ── Prefill (untimed; populates KV cache) ──
         int[] prefillPositions = new int[prefillLen];
         for (int i = 0; i < prefillLen; i++) prefillPositions[i] = i;
         using (var _ = model.Forward(prefill, prefillPositions, deviceId: 0, kv))
         { }
 
         int nextPos = prefillLen;
-        int currentToken = promptTokens[prefillLen - 1]; // last prompt token; sampler is greedy + we don't care which
+        int currentToken = promptTokens[prefillLen - 1];
 
-        // Reused single-element scratch — Forward only reads .Length for seqLen=1 decode.
         int[] tokBuf = new int[1];
         int[] posBuf = new int[1];
 
-        // ── Warmup decode (untimed) ──
         for (int i = 0; i < DefaultWarmupTokens; i++)
         {
             tokBuf[0] = currentToken;
@@ -81,34 +121,64 @@ internal static class CudaDecodeProfile
             nextPos++;
         }
 
-        // ── Measured decode loop ──
-        model.ProfilingEnabled = true;
+        // Per-category profiling is disabled on the graph path (event-record between
+        // launches breaks stream capture). For the graph path we still get wall-clock
+        // and a single GPU bracket via the cuEvent on entry/exit of the graph launch.
+        int categoryCount = CudaTransformerModel.ProfileCategoryCount;
         var wallTimes = new double[DefaultDecodeTokens];
         var gpuTimes = new double[DefaultDecodeTokens];
-        int categoryCount = CudaTransformerModel.ProfileCategoryCount;
         var categoryTimes = new double[categoryCount, DefaultDecodeTokens];
         var sw = new Stopwatch();
 
-        for (int i = 0; i < DefaultDecodeTokens; i++)
+        if (!useGraphCapture && !disableProfiling)
         {
-            tokBuf[0] = currentToken;
-            posBuf[0] = nextPos;
-
-            sw.Restart();
-            using var t = model.Forward(tokBuf, posBuf, deviceId: 0, kv);
-            sw.Stop();
-
-            wallTimes[i] = sw.Elapsed.TotalMilliseconds;
-            gpuTimes[i] = model.LastGpuLaunchMs;
-            for (int c = 0; c < categoryCount; c++)
-                categoryTimes[c, i] = model.LastCategoryMs[c];
-
-            currentToken = ArgmaxFirstRow(t);
-            nextPos++;
+            // Eager: full per-category profiling.
+            model.ProfilingEnabled = true;
+            for (int i = 0; i < DefaultDecodeTokens; i++)
+            {
+                tokBuf[0] = currentToken;
+                posBuf[0] = nextPos;
+                sw.Restart();
+                using var t = model.Forward(tokBuf, posBuf, deviceId: 0, kv);
+                sw.Stop();
+                wallTimes[i] = sw.Elapsed.TotalMilliseconds;
+                gpuTimes[i] = model.LastGpuLaunchMs;
+                for (int c = 0; c < categoryCount; c++)
+                    categoryTimes[c, i] = model.LastCategoryMs[c];
+                currentToken = ArgmaxFirstRow(t);
+                nextPos++;
+            }
+        }
+        else
+        {
+            // Graph, or eager with profiling disabled: wall only.
+            model.ProfilingEnabled = false;
+            for (int i = 0; i < DefaultDecodeTokens; i++)
+            {
+                tokBuf[0] = currentToken;
+                posBuf[0] = nextPos;
+                sw.Restart();
+                using var t = model.Forward(tokBuf, posBuf, deviceId: 0, kv);
+                sw.Stop();
+                wallTimes[i] = sw.Elapsed.TotalMilliseconds;
+                gpuTimes[i] = double.NaN;
+                currentToken = ArgmaxFirstRow(t);
+                nextPos++;
+            }
         }
 
-        Report(wallTimes, gpuTimes, categoryTimes, prefillLen, kvCapacity, config.NumLayers, config.HiddenSize);
-        return 0;
+        // Reporting: show per-category breakdown only when we captured it.
+        // hideCategoryBreakdown is semantically what Report's last arg means in practice.
+        bool hadProfiling = !useGraphCapture && !disableProfiling;
+        Report(wallTimes, gpuTimes, categoryTimes, prefillLen, kvCapacity,
+               config.NumLayers, config.HiddenSize,
+               useGraphCapture: useGraphCapture, hideCategory: !hadProfiling);
+
+        var sortedWall = (double[])wallTimes.Clone();
+        Array.Sort(sortedWall);
+        var sortedGpu = (double[])gpuTimes.Clone();
+        Array.Sort(sortedGpu);
+        return new DecodeStats { MedianWallMs = Median(sortedWall), MedianGpuMs = Median(sortedGpu) };
     }
 
     private static unsafe int ArgmaxFirstRow(DotLLM.Core.Tensors.ITensor logits)
@@ -133,7 +203,8 @@ internal static class CudaDecodeProfile
     };
 
     private static void Report(double[] wall, double[] gpu, double[,] categoryTimes,
-                                int prefillLen, int kvCapacity, int layers, int hidden)
+                                int prefillLen, int kvCapacity, int layers, int hidden,
+                                bool useGraphCapture = false, bool hideCategory = false)
     {
         Array.Sort(wall);
         var gpuSorted = (double[])gpu.Clone();
@@ -153,17 +224,34 @@ internal static class CudaDecodeProfile
 
         Console.WriteLine();
         Console.WriteLine("──────── CUDA decode profile ────────");
-        Console.WriteLine($"Layers={layers}  Hidden={hidden}  Prefill={prefillLen}  KvCapacity={kvCapacity}");
+        string pathLabel = useGraphCapture ? "GRAPH" : (hideCategory ? "EAGER (no profiling)" : "EAGER");
+        Console.WriteLine($"Layers={layers}  Hidden={hidden}  Prefill={prefillLen}  KvCapacity={kvCapacity}  Path={pathLabel}");
         Console.WriteLine($"Iterations: {wall.Length} timed (after {DefaultWarmupTokens} warmup)");
         Console.WriteLine();
         Console.WriteLine($"             {"min",8} {"p10",8} {"p50",8} {"p90",8}");
         Console.WriteLine($"  wall ms   {wallMin,8:F3} {wallP10,8:F3} {wallMedian,8:F3} {wallP90,8:F3}");
-        Console.WriteLine($"  gpu  ms   {gpuMin,8:F3} {gpuP10,8:F3} {gpuMedian,8:F3} {gpuP90,8:F3}");
+        if (!hideCategory)
+        {
+            Console.WriteLine($"  gpu  ms   {gpuMin,8:F3} {gpuP10,8:F3} {gpuMedian,8:F3} {gpuP90,8:F3}");
+        }
         Console.WriteLine();
-        Console.WriteLine($"  median wall − gpu  = {overhead,7:F3} ms  (host dispatch + sync + D2H)");
-        Console.WriteLine($"  median gpu / wall  = {gpuFraction,7:P1}");
+        if (!hideCategory)
+        {
+            Console.WriteLine($"  median wall − gpu  = {overhead,7:F3} ms  (host dispatch + sync + D2H)");
+            Console.WriteLine($"  median gpu / wall  = {gpuFraction,7:P1}");
+        }
         Console.WriteLine($"  median tok/s       = {tokPerSec,7:F1}");
         Console.WriteLine();
+
+        if (hideCategory)
+        {
+            if (useGraphCapture)
+                Console.WriteLine("Per-category breakdown disabled in graph mode (event-record between launches breaks stream capture).");
+            else
+                Console.WriteLine("Per-category breakdown disabled (run without --no-profiling for the full breakdown).");
+            Console.WriteLine("─────────────────────────────────────");
+            return;
+        }
 
         // Per-category breakdown — sort by median time descending.
         int categoryCount = categoryTimes.GetLength(0);
