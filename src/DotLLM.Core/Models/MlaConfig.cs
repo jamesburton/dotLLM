@@ -136,6 +136,23 @@ public sealed record MlaConfig
     public int QkHeadDim => QkNopeHeadDim + QkRopeHeadDim;
 
     /// <summary>
+    /// When <see langword="true"/>, the forward pass uses the latent MLA
+    /// KV-cache (<c>MlaLatentKvState</c>) and the absorbed-form attention
+    /// kernel — <c>Q_latent[h] = W_UK[h]^T @ Q_nope[h]</c>, scores against
+    /// the shared latent, output expanded via <c>W_UV</c>. Storage drops
+    /// ~7× vs the Phase A expanded cache (see <c>docs/KV_CACHE.md</c>).
+    /// </summary>
+    /// <remarks>
+    /// Default <see langword="false"/> = Phase A cache (expanded per-head
+    /// K_nope/V, the numerical oracle). Flip to <see langword="true"/>
+    /// once the Phase B path is validated against Phase A within 1e-3 on
+    /// the target checkpoint. Set per-config, not globally — an integration
+    /// test can load the same model twice with different settings and
+    /// diff the logits.
+    /// </remarks>
+    public bool UseLatentCache { get; init; }
+
+    /// <summary>
     /// Compute the YaRN softmax-scale multiplier to fold into the attention
     /// scale: returns <c>mscale² = (yarn_get_mscale(factor, mscale_all_dim))²</c>
     /// when YaRN scaling is configured and active (<c>factor &gt; 1</c>), else
