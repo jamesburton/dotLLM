@@ -336,12 +336,18 @@ internal static class TransformerWeightsSafetensorsLoader
                 $"{prefix}.experts.{e}.down_proj.weight");
         }
 
-        // Shared expert(s). Two naming conventions:
+        // Shared expert(s). Three naming conventions in the wild:
         //   - Qwen1.5-MoE-A2.7B: singular mlp.shared_expert.{gate,up,down}_proj
         //     (always exactly one shared expert; optionally gated by
         //     mlp.shared_expert_gate.weight).
-        //   - DeepSeek-V2/V3: plural mlp.shared_experts.{k}.{gate,up,down}_proj
-        //     (n_shared_experts >= 1, summed, no gate).
+        //   - DeepSeek-V2/V3: a SINGLE fused MLP at
+        //     mlp.shared_experts.{gate,up,down}_proj (plural, NO numeric index)
+        //     with intermediate_size = moe_intermediate * n_shared_experts.
+        //     HfConfigExtractor represents this as NumSharedExperts=1,
+        //     SharedExpertIntermediateSize=moe_intermediate*n_shared_experts.
+        //   - Indexed-plural (forward-compat) mlp.shared_experts.{k}.{gate,up,down}_proj
+        //     — not used by any shipped checkpoint we've seen but kept as a
+        //     fallback for future model families.
         // We resolve whichever set of tensors the file actually contains; the
         // kernel sees a uniform pointer-array API. If the config flags a shared
         // expert but the tensors are absent, we silently fall back to routed-only.
@@ -353,15 +359,42 @@ internal static class TransformerWeightsSafetensorsLoader
         if (moe.SharedExpertIntermediateSize is int sharedI)
         {
             int numShared = moe.NumSharedExperts;
-            // Detect the tensor-name convention. Prefer plural (DeepSeek) when
-            // present — this is the forward-compatible format. Fall back to
-            // singular (Qwen1.5-MoE) when only that exists.
-            bool hasPlural = numShared >= 1
+            // Detect the tensor-name convention.
+            // Priority: DeepSeek fused-plural (no index) first — that's the
+            // actually-shipped format for DeepSeek-V2/V3. Then indexed-plural.
+            // Then singular (Qwen1.5-MoE).
+            bool hasFusedPlural = numShared == 1
+                && file.TensorsByName.ContainsKey($"{prefix}.shared_experts.gate_proj.weight");
+            bool hasIndexedPlural = !hasFusedPlural
+                && numShared >= 1
                 && file.TensorsByName.ContainsKey($"{prefix}.shared_experts.0.gate_proj.weight");
-            bool hasSingular = numShared == 1
+            bool hasSingular = !hasFusedPlural && !hasIndexedPlural
+                && numShared == 1
                 && file.TensorsByName.ContainsKey($"{prefix}.shared_expert.gate_proj.weight");
 
-            if (hasPlural)
+            if (hasFusedPlural)
+            {
+                // DeepSeek-V2/V3: single fused-intermediate shared MLP. Matches
+                // HF's DeepseekV2MoE.__init__ which builds one DeepseekV2MLP
+                // with intermediate_size = moe_intermediate * n_shared_experts.
+                sharedIntermediate = sharedI;
+                sharedGate = new nint[1];
+                sharedUp = new nint[1];
+                sharedDown = new nint[1];
+                (sharedGate[0], _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_experts.gate_proj.weight", owned);
+                ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                    $"{prefix}.shared_experts.gate_proj.weight");
+                (sharedUp[0], _, int suM, int suK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_experts.up_proj.weight", owned);
+                ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                    $"{prefix}.shared_experts.up_proj.weight");
+                (sharedDown[0], _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_experts.down_proj.weight", owned);
+                ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                    $"{prefix}.shared_experts.down_proj.weight");
+            }
+            else if (hasIndexedPlural)
             {
                 sharedIntermediate = sharedI;
                 sharedGate = new nint[numShared];

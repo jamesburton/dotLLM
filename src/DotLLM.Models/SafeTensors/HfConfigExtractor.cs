@@ -91,13 +91,28 @@ public static class HfConfigExtractor
 
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
-        // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
-        // Llama/Mistral/Mixtral/DeepSeek-V2 use interleaved (Norm); Qwen/Qwen-MoE/Phi use non-interleaved (NeoX).
-        RoPEType ropeType = architecture switch
-        {
-            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi => RoPEType.NeoX,
-            _ => RoPEType.Norm,
-        };
+        // RoPE element-pairing convention for HF safetensors.
+        //
+        // CRITICAL: This extractor differs from GgufModelConfigExtractor because HF
+        // safetensors ship raw HuggingFace weights with NO permutation. In contrast,
+        // the llama.cpp GGUF converter physically permutes Llama/Mistral Q/K weights
+        // so that their original rotate_half (halves) convention can be expressed
+        // via adjacent-pair rotation ("Norm"). For raw HF weights the model still
+        // mathematically uses HF's rotate_half — which is the halves-style that
+        // dotLLM implements as RoPEType.NeoX (pairs (i, i+halfDim)).
+        //
+        // Reference: transformers/models/llama/modeling_llama.py — rotate_half
+        //   def rotate_half(x):
+        //       x1 = x[..., : x.shape[-1] // 2]
+        //       x2 = x[..., x.shape[-1] // 2 :]
+        //       return torch.cat((-x2, x1), dim=-1)
+        //   def apply_rotary_pos_emb(q, k, cos, sin, ...):
+        //       q_embed = (q * cos) + (rotate_half(q) * sin)
+        //
+        // Mistral, Mixtral, Qwen, Qwen-MoE, Phi, Granite (Llama-descended), Granite-MoE,
+        // and DeepSeek-V2/V3 all inherit this convention from modeling_llama.py via
+        // copy-paste, so every HF checkpoint we support is rotate_half = NeoX.
+        RoPEType ropeType = RoPEType.NeoX;
 
         // MoE — Mixtral, Qwen*-MoE, Phi-3.5-MoE, DeepSeek-V2/V3 all expose
         // num_local_experts/num_experts + num_experts_per_tok. DeepSeek adds
@@ -251,12 +266,18 @@ public static class HfConfigExtractor
         // Shared-expert intermediate width and count.
         // Qwen1.5-MoE-A2.7B: ships `shared_expert_intermediate_size` directly
         // with a single shared expert (singular `mlp.shared_expert.*`).
-        // DeepSeek-V2/V3: ships `moe_intermediate_size` per shared expert with
-        // `n_shared_experts` plural shared experts (tensor naming
-        // `mlp.shared_experts.{k}.*`). Each shared expert is
-        // moe_intermediate_size wide; outputs are summed (equally weighted,
-        // no sigmoid gate). Preserve the per-shared-expert width so the MoE
-        // kernel can loop over individual experts.
+        // DeepSeek-V2/V3: at the HF-module level <c>self.shared_experts</c> is a
+        // SINGLE <c>DeepseekV2MLP</c> with
+        // <c>intermediate_size = moe_intermediate_size * n_shared_experts</c>
+        // (modeling_deepseek.py: <c>self.shared_experts = DeepseekV2MLP(
+        // config=config, intermediate_size=intermediate_size)</c>). The on-disk
+        // tensor names reflect that — <c>mlp.shared_experts.{gate,up,down}_proj</c>
+        // WITHOUT a numeric expert index. Mathematically equivalent to
+        // <c>n_shared_experts</c> identical-sized experts summed, but the
+        // checkpoint stores the fused form. So we represent DeepSeek's
+        // shared-expert branch as a single MLP (<c>NumSharedExperts = 1</c>)
+        // with <c>SharedExpertIntermediateSize = moe_intermediate_size *
+        // n_shared_experts</c>, which matches the actual tensor layout.
         int? sharedExpertIntermediate;
         int numSharedExperts = 1;
         bool hasSharedGate;
@@ -265,8 +286,12 @@ public static class HfConfigExtractor
             int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
             if (nShared > 0)
             {
-                sharedExpertIntermediate = moeIntermediateSize;
-                numSharedExperts = nShared;
+                // Fused single-MLP representation: one shared expert sized
+                // n_shared_experts * moe_intermediate. Matches the on-disk
+                // layout (mlp.shared_experts.{gate,up,down}_proj with no
+                // numeric index) AND HF's DeepseekV2MoE.__init__ exactly.
+                sharedExpertIntermediate = moeIntermediateSize * nShared;
+                numSharedExperts = 1;
             }
             else
             {

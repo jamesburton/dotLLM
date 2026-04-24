@@ -793,8 +793,12 @@ public sealed class RealHfSafetensorsEndToEndTests
             return;
         }
 
+        // After the HfConfigExtractor RoPE fix (HF Llama is rotate_half = NeoX,
+        // not adjacent-pairs Norm) the F32+eager reference matches 5/5 argmax
+        // with max_abs_diff ~0.13, mean ~0.011 — well inside Tight. Keeping
+        // Tight here forces a regression check if the Llama path drifts.
         RunLogitsReferenceTest(root, referencePath, Architecture.Llama,
-            tolerances: DriftTolerances.LlamaObserved);
+            tolerances: DriftTolerances.Tight);
     }
 
     [Fact]
@@ -1016,14 +1020,23 @@ public sealed class RealHfSafetensorsEndToEndTests
         };
 
         /// <summary>
-        /// TinyLlama-1.1B observed baseline. F32+eager reference: 3/5 argmax,
-        /// max_abs_diff ~4.22, mean ~0.46. Critically: the 2 mismatching
-        /// rows produce FAR-APART wrong tokens (e.g. 2791 vs 310), not
-        /// near-ties — this is a real structural bug in our Llama path,
-        /// NOT SDPA/bf16 accounting. Under investigation as a P2.6
-        /// follow-up. Candidate cause: Llama uses <c>rotate_half</c>
-        /// (halves convention) for RoPE, we may be using adjacent-pairs
-        /// (Norm convention) per <c>docs/POSITION_ENCODING.md</c>.
+        /// <para>
+        /// TinyLlama-1.1B historic baseline prior to the HfConfigExtractor RoPE
+        /// fix: 3/5 argmax, max_abs_diff ~4.22, mean ~0.46 with FAR-APART
+        /// wrong tokens. Root cause: HF Llama uses <c>rotate_half</c> (halves
+        /// convention, dotLLM's <c>RoPEType.NeoX</c>), but we were routing HF
+        /// Llama through adjacent-pair <c>RoPEType.Norm</c> — a historical
+        /// copy-paste from <see cref="DotLLM.Models.Gguf.GgufModelConfigExtractor"/>
+        /// where Norm IS correct because the GGUF converter permutes Q/K
+        /// weights ahead of time.
+        /// </para>
+        /// <para>
+        /// After the fix (HF path → NeoX for all Llama-family descendants)
+        /// TinyLlama matches 5/5 argmax with max_abs_diff ~0.13, mean ~0.011
+        /// and the active test uses <see cref="Tight"/>. This record is
+        /// retained as a regression marker and a fallback should future bf16
+        /// reference regenerations loosen things.
+        /// </para>
         /// </summary>
         public static DriftTolerances LlamaObserved => new()
         {

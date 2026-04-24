@@ -45,12 +45,14 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(PositionEncodingType.RoPE, cfg.PositionEncodingType);
         Assert.NotNull(cfg.RoPEConfig);
         Assert.Equal(500000.0f, cfg.RoPEConfig!.Value.Theta);
-        Assert.Equal(RoPEType.Norm, cfg.RoPEConfig.Value.Type);
+        // HF Llama uses rotate_half (halves convention), which dotLLM calls NeoX.
+        // Only the GGUF path's permuted weights use Norm.
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig.Value.Type);
         Assert.False(cfg.TiedEmbeddings);
     }
 
     [Fact]
-    public void Mistral_UsesNormRoPE()
+    public void Mistral_UsesNeoXRoPE()
     {
         const string json = """
         {
@@ -64,7 +66,8 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(Architecture.Mistral, cfg.Architecture);
         Assert.Equal(4, cfg.NumKvHeads); // defaults to num_attention_heads
         Assert.Equal(64, cfg.SlidingWindowSize);
-        Assert.Equal(RoPEType.Norm, cfg.RoPEConfig!.Value.Type);
+        // HF Mistral copies Llama's apply_rotary_pos_emb (rotate_half = halves = NeoX).
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
     }
 
     [Fact]
@@ -173,7 +176,8 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(4, cfg.NumAttentionHeads);
         Assert.Equal(2, cfg.NumKvHeads);
         Assert.Equal(1, cfg.HeadDim); // 4 / 4
-        Assert.Equal(RoPEType.Norm, cfg.RoPEConfig!.Value.Type);
+        // HF Mixtral copies Llama's apply_rotary_pos_emb (rotate_half = halves = NeoX).
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
     }
 
     /// <summary>
