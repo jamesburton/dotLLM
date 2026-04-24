@@ -177,6 +177,35 @@ public sealed unsafe class TransformerModel : IModel
             ropeDim,
             ropeTheta);
 
+        // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
+        // using per-dim ramped inverse frequencies. Plain precompute above is a
+        // no-op for positions < original_max_position_embeddings, but the two
+        // paths diverge beyond that threshold — the ramp mixes the original
+        // base (fast rotations — extrapolation) with the scaled base (slow
+        // rotations — interpolation). See DeepSeek-V2 paper §3.2.
+        if (config.MlaConfig is { RopeScalingFactor: float scalingFactor } mla
+            && scalingFactor > 1.0f
+            && mla.RopeScalingOriginalMaxPositionEmbeddings is int originalMaxPos
+            && originalMaxPos > 0)
+        {
+            // HF multiplies cos/sin by yarn_get_mscale(factor, mscale) /
+            // yarn_get_mscale(factor, mscale_all_dim). For V2-Lite mscale ==
+            // mscale_all_dim so the ratio is 1.0 — we still compute it to
+            // track configs where they diverge.
+            float mscaleNum = (mla.RopeScalingMscale is float m && m != 0.0f)
+                ? 0.1f * m * MathF.Log(scalingFactor) + 1.0f : 1.0f;
+            float mscaleDen = (mla.RopeScalingMscaleAllDim is float mad && mad != 0.0f)
+                ? 0.1f * mad * MathF.Log(scalingFactor) + 1.0f : 1.0f;
+            float mscaleMultiplier = mscaleNum / mscaleDen;
+
+            DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableYarn(
+                config.MaxSequenceLength, ropeDim, ropeTheta,
+                scalingFactor, originalMaxPos,
+                mla.RopeScalingBetaFast, mla.RopeScalingBetaSlow,
+                mscaleMultiplier,
+                state.CosTable, state.SinTable);
+        }
+
         ComputeThreadPool? pool = null;
         if (threading.IsParallel)
         {
