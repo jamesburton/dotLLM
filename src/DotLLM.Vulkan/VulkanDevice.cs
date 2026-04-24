@@ -59,6 +59,24 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasSubgroupArithmetic { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_KHR_cooperative_matrix</c>,
+    /// the <c>cooperativeMatrix</c> feature bit is set, and the driver reports
+    /// at least one F16×F16→F32 (or Sint8×Sint8→Sint32) tile shape ≥ 16×16×16 at
+    /// subgroup scope. This is the prerequisite for the coopmat GEMM path
+    /// (<c>MatMulQ8_0GemmCoopmatKernel</c>); scalar GEMM remains the safe
+    /// fallback when <c>false</c>.
+    /// </summary>
+    public bool HasCooperativeMatrix { get; }
+
+    /// <summary>
+    /// All cooperative-matrix tile shapes reported by the driver, in the
+    /// order returned by <c>vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR</c>.
+    /// Empty when <see cref="HasCooperativeMatrix"/> is <c>false</c>. Kernels
+    /// typically pick a 16×16×16 F16/F16/F32 entry at shader-compile time.
+    /// </summary>
+    public IReadOnlyList<CooperativeMatrixShape> SupportedCooperativeMatrixProperties { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -67,7 +85,8 @@ public sealed class VulkanDevice : IDisposable
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
         nint commandPool, string name, uint vendor, int type, uint queueFamily,
-        uint subgroupSize, bool hasSubgroupArithmetic)
+        uint subgroupSize, bool hasSubgroupArithmetic,
+        bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -80,6 +99,8 @@ public sealed class VulkanDevice : IDisposable
         QueueFamilyIndex = queueFamily;
         SubgroupSize = subgroupSize;
         HasSubgroupArithmetic = hasSubgroupArithmetic;
+        HasCooperativeMatrix = hasCooperativeMatrix;
+        SupportedCooperativeMatrixProperties = coopmatShapes;
     }
 
     /// <summary>
@@ -141,7 +162,20 @@ public sealed class VulkanDevice : IDisposable
         {
             nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type, out uint apiVersion);
             uint queueFamily = SelectComputeQueueFamily(physical);
-            nint device = CreateLogicalDevice(physical, queueFamily);
+
+            // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
+            // Vulkan 1.0 drivers — SubgroupSize=0, HasSubgroupArithmetic=false.
+            ProbeSubgroup(physical, apiVersion, out uint subgroupSize, out bool hasArithmetic);
+
+            // Probe VK_KHR_cooperative_matrix. Requires the device extension
+            // to be enabled at vkCreateDevice time for the shader to use it,
+            // so we must decide support *before* creating the logical device.
+            // Skipped gracefully on Vulkan 1.0 — returns empty shape list.
+            ProbeCooperativeMatrix(
+                instance, physical, apiVersion,
+                out bool hasCoopmat, out var coopmatShapes);
+
+            nint device = CreateLogicalDevice(physical, queueFamily, hasCoopmat);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -154,14 +188,10 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkCreateCommandPool(device, cpInfo, 0, out nint pool)
                 .ThrowOnError("vkCreateCommandPool");
 
-            // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
-            // Vulkan 1.0 drivers — SubgroupSize=0, HasSubgroupArithmetic=false.
-            ProbeSubgroup(physical, apiVersion, out uint subgroupSize, out bool hasArithmetic);
-
             // Transfer ownership of instance to the device on success.
             var result = new VulkanDevice(
                 instance, physical, device, queue, pool, name, vendor, type, queueFamily,
-                subgroupSize, hasArithmetic);
+                subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes);
             instance = 0;
             return result;
         }
@@ -297,6 +327,173 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// Probes <c>VK_KHR_cooperative_matrix</c> support. Enumerates the device
+    /// extensions, chains the <c>VkPhysicalDeviceCooperativeMatrixFeaturesKHR</c>
+    /// feature bit through <c>vkGetPhysicalDeviceFeatures2</c>, and
+    /// dynamically resolves <c>vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR</c>
+    /// via <c>vkGetInstanceProcAddr</c> to list every driver-supported tile
+    /// shape. Support is declared when at least one F16×F16→F32 (or
+    /// Sint8×Sint8→Sint32) shape of at least 16×16×16 at subgroup scope is
+    /// reported. Safe on Vulkan 1.0 / non-coopmat drivers: returns
+    /// <c>false</c> + empty list without throwing.
+    /// </summary>
+    private static unsafe void ProbeCooperativeMatrix(
+        nint instance, nint physical, uint apiVersion,
+        out bool hasCoopmat, out IReadOnlyList<CooperativeMatrixShape> shapes)
+    {
+        hasCoopmat = false;
+        shapes = Array.Empty<CooperativeMatrixShape>();
+
+        // vkGetPhysicalDeviceFeatures2 is core in Vulkan 1.1. Drivers that
+        // only report 1.0 definitely don't support VK_KHR_cooperative_matrix
+        // anyway (the extension requires 1.1 + subgroup_basic).
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            // 1. Confirm the device advertises the extension.
+            if (!HasDeviceExtension(physical, "VK_KHR_cooperative_matrix"u8))
+                return;
+
+            // 2. Confirm the `cooperativeMatrix` feature bit is actually set.
+            VkPhysicalDeviceCooperativeMatrixFeaturesKhr coopFeatures = default;
+            coopFeatures.sType = VkStructureType.PhysicalDeviceCooperativeMatrixFeaturesKhr;
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&coopFeatures);
+
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+            if (coopFeatures.cooperativeMatrix == 0)
+                return;
+
+            // 3. Resolve vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR via
+            //    vkGetInstanceProcAddr — it's instance-level but registered by
+            //    the driver's extension dispatch table rather than the core
+            //    loader, so a static P/Invoke would fail on non-coopmat drivers.
+            nint fn = VulkanApi.vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+            if (fn == 0) return;
+
+            var getCoopmatProps = Marshal.GetDelegateForFunctionPointer<VkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(fn);
+
+            // 4. Two-pass enumeration (spec idiom).
+            uint count = 0;
+            int r = getCoopmatProps(physical, ref count, 0);
+            if (r < 0 || count == 0) return;
+
+            var props = new VkCooperativeMatrixPropertiesKhr[count];
+            for (int i = 0; i < count; i++)
+                props[i].sType = VkStructureType.CooperativeMatrixPropertiesKhr;
+
+            fixed (VkCooperativeMatrixPropertiesKhr* pPtr = props)
+            {
+                r = getCoopmatProps(physical, ref count, (nint)pPtr);
+                if (r < 0) return;
+            }
+
+            // 5. Convert to the public shape list and check for a usable entry.
+            var shapeList = new List<CooperativeMatrixShape>((int)count);
+            bool foundUsable = false;
+            for (int i = 0; i < count; i++)
+            {
+                var p = props[i];
+                shapeList.Add(new CooperativeMatrixShape(
+                    (int)p.MSize, (int)p.NSize, (int)p.KSize,
+                    p.AType, p.BType, p.CType, p.ResultType,
+                    p.scope));
+
+                if (p.scope != VkScopeKhr.Subgroup) continue;
+                if (p.MSize < 16u || p.NSize < 16u || p.KSize < 16u) continue;
+
+                // F16 × F16 → F32 accumulator (the main dotLLM coopmat path).
+                bool f16f32 =
+                    p.AType == VkComponentTypeKhr.Float16 &&
+                    p.BType == VkComponentTypeKhr.Float16 &&
+                    p.CType == VkComponentTypeKhr.Float32 &&
+                    p.ResultType == VkComponentTypeKhr.Float32;
+
+                // Sint8 × Sint8 → Sint32 (future Q8_0-direct int tile path).
+                bool i8i32 =
+                    p.AType == VkComponentTypeKhr.Sint8 &&
+                    p.BType == VkComponentTypeKhr.Sint8 &&
+                    p.CType == VkComponentTypeKhr.Sint32 &&
+                    p.ResultType == VkComponentTypeKhr.Sint32;
+
+                if (f16f32 || i8i32) foundUsable = true;
+            }
+
+            shapes = shapeList;
+            hasCoopmat = foundUsable;
+        }
+        catch
+        {
+            // Loader / driver behaved unexpectedly — disable coopmat and
+            // fall back to the scalar GEMM path on every shape.
+            hasCoopmat = false;
+            shapes = Array.Empty<CooperativeMatrixShape>();
+        }
+    }
+
+    // Delegate matching vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR for
+    // dynamic resolution via vkGetInstanceProcAddr. Standalone function-pointer
+    // type keeps the signature colocated with its sole use.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int VkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+        nint physicalDevice, ref uint pPropertyCount, nint pProperties);
+
+    /// <summary>
+    /// Returns <c>true</c> when <paramref name="physical"/> advertises the
+    /// given device extension. <paramref name="name"/> must be the
+    /// NUL-terminated UTF-8 extension name (e.g. <c>"VK_KHR_cooperative_matrix\0"u8</c>).
+    /// </summary>
+    private static unsafe bool HasDeviceExtension(nint physical, ReadOnlySpan<byte> name)
+    {
+        uint count = 0;
+        VulkanApi.vkEnumerateDeviceExtensionProperties(physical, 0, ref count, 0);
+        if (count == 0) return false;
+
+        // VkExtensionProperties = char extensionName[256] + uint specVersion.
+        // Total stride 260 bytes per entry. Allocate from unmanaged memory —
+        // safer than a large stackalloc when count is driver-dependent.
+        const int entrySize = 256 + 4;
+        nint ptr = (nint)NativeMemory.Alloc((nuint)entrySize * count);
+        try
+        {
+            int r = VulkanApi.vkEnumerateDeviceExtensionProperties(physical, 0, ref count, ptr);
+            if (r < 0) return false;
+
+            byte* p = (byte*)ptr;
+            for (uint i = 0; i < count; i++)
+            {
+                byte* entry = p + (nint)i * entrySize;
+                if (EqualsUtf8CString(entry, name))
+                    return true;
+            }
+            return false;
+        }
+        finally
+        {
+            NativeMemory.Free((void*)ptr);
+        }
+    }
+
+    /// <summary>
+    /// Compares a NUL-terminated C string at <paramref name="p"/> against a
+    /// NUL-terminated <paramref name="needle"/> span. Returns true on exact
+    /// match (including matching NULs).
+    /// </summary>
+    private static unsafe bool EqualsUtf8CString(byte* p, ReadOnlySpan<byte> needle)
+    {
+        for (int i = 0; i < needle.Length; i++)
+        {
+            if (p[i] != needle[i]) return false;
+            if (needle[i] == 0) return true;
+        }
+        return p[needle.Length] == 0;
+    }
+
     // Vendor IDs are PCI SIG assignments. 0x10DE=NVIDIA, 0x1002=AMD, 0x8086=Intel, 0x13B5=ARM, 0x5143=Qualcomm.
     private static int ScoreDevice(int deviceType, uint vendorId)
     {
@@ -346,7 +543,7 @@ public sealed class VulkanDevice : IDisposable
         throw new VulkanException(-3, "No queue family with COMPUTE capability.");
     }
 
-    private static unsafe nint CreateLogicalDevice(nint physical, uint queueFamily)
+    private static unsafe nint CreateLogicalDevice(nint physical, uint queueFamily, bool enableCoopmat)
     {
         float priority = 1.0f;
 
@@ -362,6 +559,40 @@ public sealed class VulkanDevice : IDisposable
         ci.sType = VkStructureType.DeviceCreateInfo;
         ci.queueCreateInfoCount = 1;
         ci.pQueueCreateInfos = (nint)(&qci);
+
+        // VK_KHR_cooperative_matrix requires:
+        //   • The device extension itself to be enabled.
+        //   • The feature bit `cooperativeMatrix=VK_TRUE` chained through pNext.
+        // llama.cpp reference: enables the extension only after the probe
+        // confirms at least one usable tile shape. We mirror that — caller
+        // decides enablement via <paramref name="enableCoopmat"/>.
+        if (enableCoopmat)
+        {
+            // Stack-allocate a NUL-terminated "VK_KHR_cooperative_matrix"
+            // string plus a one-element char** array pointing at it; both
+            // live for the duration of this function's stack frame, which
+            // bounds the vkCreateDevice call below.
+            ReadOnlySpan<byte> name = "VK_KHR_cooperative_matrix\0"u8;
+            byte* extBytes = stackalloc byte[name.Length];
+            for (int i = 0; i < name.Length; i++) extBytes[i] = name[i];
+
+            nint extNamePtr = (nint)extBytes;
+
+            var coopmatFeatures = new VkPhysicalDeviceCooperativeMatrixFeaturesKhr
+            {
+                sType = VkStructureType.PhysicalDeviceCooperativeMatrixFeaturesKhr,
+                cooperativeMatrix = 1, // VK_TRUE
+                cooperativeMatrixRobustBufferAccess = 0,
+            };
+
+            ci.enabledExtensionCount = 1;
+            ci.ppEnabledExtensionNames = (nint)(&extNamePtr);
+            ci.pNext = (nint)(&coopmatFeatures);
+
+            VulkanApi.vkCreateDevice(physical, ci, 0, out nint devCoopmat)
+                .ThrowOnError("vkCreateDevice (coopmat)");
+            return devCoopmat;
+        }
 
         VulkanApi.vkCreateDevice(physical, ci, 0, out nint dev)
             .ThrowOnError("vkCreateDevice");
@@ -844,3 +1075,22 @@ public sealed class VulkanDevice : IDisposable
         return new SubmitContext(this, cmdBuf, fence);
     }
 }
+
+/// <summary>
+/// One cooperative-matrix tile shape reported by the Vulkan driver, mirroring
+/// <c>VkCooperativeMatrixPropertiesKHR</c>. Component types are
+/// <c>VkComponentTypeKHR</c> values (0=Float16, 1=Float32, 3=Sint8, 5=Sint32,
+/// etc.); scope is a <c>VkScopeKHR</c> value (3=Subgroup).
+/// </summary>
+/// <param name="MSize">First tile dimension (rows of the A and C/Result tiles).</param>
+/// <param name="NSize">Second tile dimension (cols of the B and C/Result tiles).</param>
+/// <param name="KSize">Inner tile dimension (cols of A / rows of B).</param>
+/// <param name="AType">Component type of the A (MatrixUseA) operand.</param>
+/// <param name="BType">Component type of the B (MatrixUseB) operand.</param>
+/// <param name="CType">Component type of the C (MatrixUseAccumulator input) operand.</param>
+/// <param name="ResultType">Component type of the accumulator output.</param>
+/// <param name="Scope">VkScopeKHR value — on KHR (non-NV) always Subgroup.</param>
+public readonly record struct CooperativeMatrixShape(
+    int MSize, int NSize, int KSize,
+    int AType, int BType, int CType, int ResultType,
+    int Scope);
