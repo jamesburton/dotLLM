@@ -28,6 +28,7 @@ public sealed class RmsNormF32Kernel : IDisposable
     private readonly VulkanModule? _subgroupModule;
     private readonly ComputePipeline? _subgroupPipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private readonly bool _useSubgroup;
     private bool _disposed;
 
@@ -51,6 +52,10 @@ public sealed class RmsNormF32Kernel : IDisposable
         _subgroupPipeline = subgroupPipeline;
         _descriptorPool = pool;
         _useSubgroup = useSubgroup;
+        // Cache keyed on the active pipeline's descriptor-set layout. Since
+        // _useSubgroup is fixed at construction, one cache per kernel is enough.
+        ComputePipeline active = (useSubgroup && subgroupPipeline != null) ? subgroupPipeline : sharedPipeline;
+        _descriptorCache = new DescriptorSetCache(device, pool, active.DescriptorSetLayout, buffersPerSet: 3);
     }
 
     /// <summary>
@@ -134,8 +139,8 @@ public sealed class RmsNormF32Kernel : IDisposable
             pushConstantBytes: PushConstantBytes);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches RMS norm over <paramref name="rowCount"/> rows of length
@@ -155,7 +160,6 @@ public sealed class RmsNormF32Kernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, input, weight, output, rowCount, n, eps);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>Records RMSNorm into <paramref name="cmdBuf"/> without submitting.</summary>
@@ -174,9 +178,8 @@ public sealed class RmsNormF32Kernel : IDisposable
 
         ComputePipeline pipeline = (_useSubgroup && _subgroupPipeline != null) ? _subgroupPipeline : _sharedPipeline;
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[3] { input.Handle, weight.Handle, output.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

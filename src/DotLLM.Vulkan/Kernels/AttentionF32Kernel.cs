@@ -37,6 +37,7 @@ public sealed class AttentionF32Kernel : IDisposable
     private readonly VulkanModule? _subgroupModule;
     private readonly ComputePipeline? _subgroupPipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private readonly bool _useSubgroup;
     private bool _disposed;
 
@@ -60,6 +61,8 @@ public sealed class AttentionF32Kernel : IDisposable
         _subgroupPipeline = subgroupPipeline;
         _descriptorPool = pool;
         _useSubgroup = useSubgroup;
+        ComputePipeline active = (useSubgroup && subgroupPipeline != null) ? subgroupPipeline : sharedPipeline;
+        _descriptorCache = new DescriptorSetCache(device, pool, active.DescriptorSetLayout, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -137,8 +140,8 @@ public sealed class AttentionF32Kernel : IDisposable
             pushConstantBytes: PushConstantBytes);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches attention: <c>output = softmax((Q K^T)/sqrt(headDim) + mask) V</c>
@@ -165,7 +168,6 @@ public sealed class AttentionF32Kernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>Records attention into <paramref name="cmdBuf"/> without submitting.</summary>
@@ -200,9 +202,8 @@ public sealed class AttentionF32Kernel : IDisposable
 
         ComputePipeline pipeline = (_useSubgroup && _subgroupPipeline != null) ? _subgroupPipeline : _sharedPipeline;
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

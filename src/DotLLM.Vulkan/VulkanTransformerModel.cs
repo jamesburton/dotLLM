@@ -235,12 +235,15 @@ public sealed class VulkanTransformerModel : IModel
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
 
-        _state.EnsureCapacity(seqLen);
+        bool scratchResized = _state.EnsureCapacity(seqLen);
 
-        // Reset all kernel descriptor pools so this forward can allocate
-        // fresh sets. The previous forward's sets were consumed by that
-        // forward's submit-and-wait, so the reset is safe.
-        ResetKernelDescriptors();
+        // Descriptor sets cache buffer handles. When scratch is re-allocated
+        // every cached set becomes stale and must be dropped — otherwise the
+        // next dispatch binds a dangling VkBuffer. In steady-state decode
+        // (seqLen = 1 after the initial prefill) scratch never grows, so the
+        // cache stays warm across forwards.
+        if (scratchResized)
+            InvalidateKernelCaches();
 
         // 1. Host-side upload of per-token embedding rows + positions. Both
         //    land in host-visible host-coherent buffers; a HOST→COMPUTE
@@ -450,14 +453,14 @@ public sealed class VulkanTransformerModel : IModel
         return result;
     }
 
-    private void ResetKernelDescriptors()
+    private void InvalidateKernelCaches()
     {
-        _matmul.ResetDescriptors();
-        _rmsnorm.ResetDescriptors();
-        _rope.ResetDescriptors();
-        _attention.ResetDescriptors();
-        _swiglu.ResetDescriptors();
-        _add.ResetDescriptors();
+        _matmul.InvalidateDescriptorCache();
+        _rmsnorm.InvalidateDescriptorCache();
+        _rope.InvalidateDescriptorCache();
+        _attention.InvalidateDescriptorCache();
+        _swiglu.InvalidateDescriptorCache();
+        _add.InvalidateDescriptorCache();
     }
 
     /// <summary>

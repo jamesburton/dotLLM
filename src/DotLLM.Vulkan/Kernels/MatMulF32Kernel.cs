@@ -26,6 +26,7 @@ public sealed class MatMulF32Kernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private MatMulF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -34,6 +35,7 @@ public sealed class MatMulF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
     }
 
     /// <summary>Loads <c>matmul_f32.spv</c> from the given directory and creates the pipeline.</summary>
@@ -67,8 +69,15 @@ public sealed class MatMulF32Kernel : IDisposable
         return new MatMulF32Kernel(device, module, pipeline, pool);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>
+    /// Drops every cached descriptor set and resets the underlying pool.
+    /// Call when the caller has externally invalidated the buffers bound
+    /// to cached sets — e.g. <see cref="VulkanForwardState.EnsureCapacity"/>
+    /// re-allocated the scratch buffers that previous descriptor sets
+    /// pointed at. Do NOT call this on every forward; the cache's whole
+    /// point is to survive across forwards.
+    /// </summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches the matmul: <c>C[N,M] = B[N,K] @ A[M,K]^T</c>.
@@ -83,7 +92,6 @@ public sealed class MatMulF32Kernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, weightsA, inputB, outputC, m, k, n);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>
@@ -116,9 +124,8 @@ public sealed class MatMulF32Kernel : IDisposable
         if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[3] { weightsA.Handle, inputB.Handle, outputC.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

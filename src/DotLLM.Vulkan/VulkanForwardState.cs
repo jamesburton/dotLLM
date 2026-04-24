@@ -71,12 +71,15 @@ internal sealed class VulkanForwardState : IDisposable
     /// Ensures all scratch buffers are large enough to host <paramref name="seqLen"/> tokens.
     /// Grows monotonically; never shrinks.
     /// </summary>
-    public void EnsureCapacity(int seqLen)
+    /// <returns><c>true</c> when scratch was re-allocated (so every cached VkBuffer handle
+    /// is now stale); <c>false</c> when existing capacity was already sufficient.</returns>
+    public bool EnsureCapacity(int seqLen)
     {
-        if (seqLen <= _capacitySeqLen) return;
+        if (seqLen <= _capacitySeqLen) return false;
 
         ReleaseLayerScratch();
         AllocateForCapacity(seqLen);
+        return true;
     }
 
     private void AllocateForCapacity(int seqLen)
