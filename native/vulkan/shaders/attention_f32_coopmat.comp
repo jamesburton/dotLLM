@@ -1,0 +1,294 @@
+#version 450
+// Cooperative-matrix (KHR) variant of attention_f32.comp.
+//
+// Same flash-attention online-softmax math as the shared-memory reference
+// (attention_f32.comp), but QK^T and PV are computed with
+// VK_KHR_cooperative_matrix tiles instead of a scalar dot-product inner loop.
+//
+// Dispatch: one workgroup per (query-row-block, query-head) pair, where each
+// workgroup handles Br = 16 contiguous query rows. For decode (seqQ=1) 15 of
+// those rows are zero-padded; the multiply still runs in full hardware shape
+// (the wasted lanes are not a correctness issue) and only row 0 is written
+// back. For prefill (seqQ=64, SmolLM shape) all 16 rows in each block do
+// useful work.
+//
+// groupCount.x = ceil(seqQ / Br) * numHeads
+// local_size_x = 32 (one subgroup, matching AMD RDNA3/3.5 WMMA + NVIDIA)
+//
+// Tile shape: 16 × 16 × 16 with f16 A / f16 B / f32 C — the portable KHR
+// shape supported by AMD RDNA3+ (gfx11+), NVIDIA Ampere+, and Intel Arc.
+// The C# binding probes vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR at
+// startup; if no matching tile is exposed the pipeline is skipped and
+// dispatch falls back to attention_f32_sg.spv / attention_f32.spv.
+//
+// Numerical tolerance vs CPU reference: abs 1e-4 / rel 1e-3 — same as the
+// other attention variants. F32 non-associativity means the exact values
+// differ slightly between the coopmat and shared-mem paths; that is
+// expected and accommodated by the tolerance.
+
+#extension GL_KHR_cooperative_matrix          : require
+#extension GL_KHR_memory_scope_semantics      : require
+#extension GL_KHR_shader_subgroup_basic       : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage        : require
+
+#define Br              16
+#define Bc              16
+#define D_TILE          16
+#define MAX_HEAD_DIM    256
+// Workgroup size must match (or exceed) the driver's subgroupSize so the
+// coopmat subgroup-scope tiles span exactly one subgroup. AMD RDNA3.5 iGPU
+// reports subgroupSize=64; NVIDIA Ampere+ reports 32. We pick 64 as the
+// upper bound — on 32-wide GPUs the driver runs one coopmat across 32 lanes
+// and the extra 32 lanes sit idle or form a second subgroup that runs the
+// same tile (driver-defined; still correct).
+#define WG_SIZE         64
+#define NEG_INF         (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seqQ,  numHeads    * headDim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufK   { float k[]; };    // [seqKv, numKvHeads  * headDim]
+layout(set = 0, binding = 2, std430) readonly  buffer BufV   { float v[]; };    // [seqKv, numKvHeads  * headDim]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seqQ,  numHeads    * headDim]
+
+layout(push_constant) uniform PushConstants {
+    uint seqQ;
+    uint seqKv;
+    uint numHeads;
+    uint numKvHeads;
+    uint headDim;
+    uint positionOffset;
+    uint slidingWindow;   // 0 = disabled
+} pc;
+
+// Q tile [Br × MAX_HEAD_DIM] f16, K tile [Bc × MAX_HEAD_DIM] f16, V tile [Bc × MAX_HEAD_DIM] f16.
+// S tile [Br × Bc] f32 scratch. O accumulator [Br × MAX_HEAD_DIM] f32.
+// Per-row online-softmax state: running max + running sum for each of Br rows.
+shared float16_t qTile[Br * MAX_HEAD_DIM];
+shared float16_t kTile[Bc * MAX_HEAD_DIM];
+shared float16_t vTile[Bc * MAX_HEAD_DIM];
+shared float16_t pTile[Br * Bc];        // exp(S - newMax), fed back into PV coopmat
+shared float     sTile[Br * Bc];        // output of QK^T, then exp & softmax scratch
+shared float     oTile[Br * MAX_HEAD_DIM];
+shared float     rowMax[Br];
+shared float     rowSum[Br];
+shared uint      validRows;             // min(Br, seqQ - qBlock * Br) — rows written back
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    uint totalQBlocks = (pc.seqQ + uint(Br) - 1u) / uint(Br);
+    uint blockId = gl_WorkGroupID.x;
+    if (blockId >= totalQBlocks * pc.numHeads) return;
+
+    uint qBlock = blockId / pc.numHeads;
+    uint hq     = blockId - qBlock * pc.numHeads;
+    uint qStart = qBlock * uint(Br);
+
+    uint groupSize = pc.numHeads / pc.numKvHeads;
+    uint hkv = hq / groupSize;
+
+    uint qStride  = pc.numHeads   * pc.headDim;
+    uint kvStride = pc.numKvHeads * pc.headDim;
+
+    float scale = inversesqrt(float(pc.headDim));
+
+    // ── 1. Initialise per-row online-softmax state & O accumulator ──────
+    if (tid < uint(Br)) {
+        rowMax[tid] = NEG_INF;
+        rowSum[tid] = 0.0;
+    }
+    if (tid == 0u) {
+        uint rowsLeft = (pc.seqQ > qStart) ? (pc.seqQ - qStart) : 0u;
+        validRows = rowsLeft < uint(Br) ? rowsLeft : uint(Br);
+    }
+    for (uint i = tid; i < uint(Br) * pc.headDim; i += uint(WG_SIZE)) {
+        oTile[i] = 0.0;
+    }
+
+    // ── 2. Load Br × MAX_HEAD_DIM Q tile in f16 ─────────────────────────
+    //
+    // qTile physical layout is Br × MAX_HEAD_DIM (row-stride MAX_HEAD_DIM)
+    // so coopMatLoad with stride=MAX_HEAD_DIM picks up the expected row.
+    // Elements past headDim in each row are zeroed so coopmat multiplies
+    // over the full 16-lane inner dim never read garbage. The softmax
+    // scale (1/sqrt(headDim)) is applied to the f32 S accumulator after
+    // the coopmat multiply — keeping Q at full f16 precision.
+    for (uint i = tid; i < uint(Br) * uint(MAX_HEAD_DIM); i += uint(WG_SIZE)) {
+        uint r = i / uint(MAX_HEAD_DIM);
+        uint d = i - r * uint(MAX_HEAD_DIM);
+        uint tq = qStart + r;
+        float val = 0.0;
+        if (tq < pc.seqQ && d < pc.headDim) {
+            val = q[tq * qStride + hq * pc.headDim + d];
+        }
+        qTile[r * uint(MAX_HEAD_DIM) + d] = float16_t(val);
+    }
+    barrier();
+
+    // ── 3. KV tile loop. Each iteration consumes Bc keys/values. ────────
+    for (uint jStart = 0u; jStart < pc.seqKv; jStart += uint(Bc)) {
+        uint jEnd = jStart + uint(Bc);
+        if (jEnd > pc.seqKv) jEnd = pc.seqKv;
+        uint tileLen = jEnd - jStart;
+
+        // 3a. Load Bc × MAX_HEAD_DIM K and V tiles in f16 with row-stride
+        //     MAX_HEAD_DIM (matches coopMatLoad stride below). Out-of-range
+        //     columns (jStart + c >= seqKv) and d past headDim are zero-
+        //     filled; the score mask below takes care of softmax weighting.
+        for (uint i = tid; i < uint(Bc) * uint(MAX_HEAD_DIM); i += uint(WG_SIZE)) {
+            uint c = i / uint(MAX_HEAD_DIM);
+            uint d = i - c * uint(MAX_HEAD_DIM);
+            uint tkv = jStart + c;
+            float kv = 0.0;
+            float vv = 0.0;
+            if (tkv < pc.seqKv && d < pc.headDim) {
+                kv = k[tkv * kvStride + hkv * pc.headDim + d];
+                vv = v[tkv * kvStride + hkv * pc.headDim + d];
+            }
+            kTile[c * uint(MAX_HEAD_DIM) + d] = float16_t(kv);
+            vTile[c * uint(MAX_HEAD_DIM) + d] = float16_t(vv);
+        }
+        barrier();
+
+        // 3b. Compute S = Q × K^T via coopmat accumulation over headDim
+        //     chunks of D_TILE = 16. Br × D_TILE × Bc.
+        //
+        //     Q is row-major [Br × headDim], stride MAX_HEAD_DIM — load
+        //     as MatUseA.
+        //     K is row-major [Bc × headDim], stride MAX_HEAD_DIM. We want
+        //     K^T for the multiply, i.e. B matrix with rows indexed by
+        //     head_dim and columns by Bc — load as MatUseB with
+        //     ColumnMajor layout so the logical (d, c) lookup maps to
+        //     kTile[c * stride + d].
+        coopmat<float,     gl_ScopeSubgroup, Br, Bc,     gl_MatrixUseAccumulator> accS =
+            coopmat<float, gl_ScopeSubgroup, Br, Bc,     gl_MatrixUseAccumulator>(0.0);
+
+        uint headChunks = (pc.headDim + uint(D_TILE) - 1u) / uint(D_TILE);
+        for (uint ck = 0u; ck < headChunks; ck++) {
+            coopmat<float16_t, gl_ScopeSubgroup, Br,     D_TILE, gl_MatrixUseA> matQ;
+            coopmat<float16_t, gl_ScopeSubgroup, D_TILE, Bc,     gl_MatrixUseB> matKt;
+            uint dOff = ck * uint(D_TILE);
+            coopMatLoad(matQ,  qTile, dOff,                    uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matKt, kTile, dOff,                    uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutColumnMajor);
+            accS = coopMatMulAdd(matQ, matKt, accS);
+        }
+        coopMatStore(accS, sTile, 0, uint(Bc), gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // 3c. Apply scale + causal + sliding-window masks + out-of-range
+        //     column masks. 256 scalar cells per tile — 4 cells per thread
+        //     at WG=64. Scores are scaled by 1/sqrt(headDim) here; masked
+        //     cells override to NEG_INF so softmax ignores them.
+        for (uint idx = tid; idx < uint(Br) * uint(Bc); idx += uint(WG_SIZE)) {
+            uint r = idx / uint(Bc);
+            uint c = idx - r * uint(Bc);
+            uint tq  = qStart + r;
+            uint tkv = jStart + c;
+            bool oob = (tq >= pc.seqQ) || (c >= tileLen);
+            uint posQ = pc.positionOffset + tq;
+            bool masked = (tkv > posQ) ||
+                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) > pc.slidingWindow);
+            if (oob || masked) {
+                sTile[idx] = NEG_INF;
+            } else {
+                sTile[idx] = sTile[idx] * scale;
+            }
+        }
+        barrier();
+
+        // 3d. Per-row online softmax update + rescale O.
+        //
+        // One thread per row handles the reduction. Br = 16 rows fit easily
+        // in the 32-thread workgroup; remaining threads no-op.
+        if (tid < uint(Br)) {
+            uint r = tid;
+            float oldMax = rowMax[r];
+            float localMax = NEG_INF;
+            for (uint c = 0u; c < uint(Bc); c++) {
+                localMax = max(localMax, sTile[r * uint(Bc) + c]);
+            }
+            float newMax = max(oldMax, localMax);
+            float corr;
+            if (oldMax > NEG_INF * 0.5) {
+                corr = exp(oldMax - newMax);
+            } else {
+                corr = 0.0;
+            }
+            float localSum = 0.0;
+            for (uint c = 0u; c < uint(Bc); c++) {
+                float s = sTile[r * uint(Bc) + c];
+                float w = (s > NEG_INF * 0.5) ? exp(s - newMax) : 0.0;
+                // P is fed as f16 into the PV coopmat below.
+                pTile[r * uint(Bc) + c] = float16_t(w);
+                localSum += w;
+            }
+            rowSum[r] = rowSum[r] * corr + localSum;
+            rowMax[r] = newMax;
+            // Stash the correction in rowSum's sibling — reuse sTile[r * Bc]
+            // as a per-row scratch slot (overwritten next iteration anyway)
+            sTile[r * uint(Bc)] = corr;
+        }
+        barrier();
+
+        // 3e. Rescale existing O accumulator by per-row correction. Each
+        //     thread handles a stride of head_dim cells across all Br rows.
+        for (uint i = tid; i < uint(Br) * pc.headDim; i += uint(WG_SIZE)) {
+            uint r = i / pc.headDim;
+            uint d = i - r * pc.headDim;
+            float corr = sTile[r * uint(Bc)];
+            oTile[r * pc.headDim + d] *= corr;
+        }
+        // Also zero-pad the P tile's unused columns (tileLen..Bc) for the PV
+        // multiply — the masked branch above already set scores to NEG_INF,
+        // but exp(NEG_INF) is 0 so pTile at those columns is already 0.
+        barrier();
+
+        // 3f. Accumulate O += P × V via coopmat.
+        //
+        //     P is [Br × Bc] f16 — MatUseA.
+        //     V is [Bc × headDim] f16, stride MAX_HEAD_DIM — MatUseB,
+        //     RowMajor. We loop over head_dim chunks of 16 on the output
+        //     side.
+        for (uint dOut = 0u; dOut < pc.headDim; dOut += uint(D_TILE)) {
+            coopmat<float,     gl_ScopeSubgroup, Br, D_TILE, gl_MatrixUseAccumulator> accO =
+                coopmat<float, gl_ScopeSubgroup, Br, D_TILE, gl_MatrixUseAccumulator>(0.0);
+
+            coopmat<float16_t, gl_ScopeSubgroup, Br, Bc,     gl_MatrixUseA> matP;
+            coopmat<float16_t, gl_ScopeSubgroup, Bc, D_TILE, gl_MatrixUseB> matV;
+            coopMatLoad(matP, pTile, 0,   uint(Bc),         gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matV, vTile, dOut, uint(MAX_HEAD_DIM), gl_CooperativeMatrixLayoutRowMajor);
+            accO = coopMatMulAdd(matP, matV, accO);
+
+            // Add accO to oTile[r, dOut:dOut+16] — coopMatStore into a
+            // scratch slice, then each thread fuses into oTile.
+            //
+            // To avoid extra shared memory, reuse the tail end of sTile
+            // (which we've already consumed) as a Br × D_TILE scratch.
+            // sTile is Br * Bc = 16 * 16 = 256 floats — exactly enough.
+            coopMatStore(accO, sTile, 0, uint(D_TILE), gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            for (uint i = tid; i < uint(Br) * uint(D_TILE); i += uint(WG_SIZE)) {
+                uint r = i / uint(D_TILE);
+                uint dd = i - r * uint(D_TILE);
+                uint dGlobal = dOut + dd;
+                if (dGlobal < pc.headDim) {
+                    oTile[r * pc.headDim + dGlobal] += sTile[i];
+                }
+            }
+            barrier();
+        }
+    }
+
+    // ── 4. Normalise and write output rows 0..validRows-1 ───────────────
+    uint vRows = validRows;
+    for (uint i = tid; i < vRows * pc.headDim; i += uint(WG_SIZE)) {
+        uint r = i / pc.headDim;
+        uint d = i - r * pc.headDim;
+        uint tq = qStart + r;
+        float s = rowSum[r];
+        float invSum = (s > 1e-10) ? (1.0 / s) : 0.0;
+        outp[tq * qStride + hq * pc.headDim + d] = oTile[r * pc.headDim + d] * invSum;
+    }
+}
