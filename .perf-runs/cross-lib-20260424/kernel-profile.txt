@@ -1,0 +1,270 @@
+Opening .perf-runs/cross-lib-20260424/etl-extract/dotllm-kernel.etl...
+  Session: 16:45:31.298  16:46:00.604
+  Processes: 412, Events: 5970336
+  CPU samples for dotnet: 100059 (no-stack: 1665)
+
+=== top 200 by self ===
+   66.43%       65362  coreclr!0x7FFF17B42B64
+    3.97%        3908  DotLLM.Cpu!DotLLM.Cpu.Threading.ComputeThreadPool.WorkerLoop(class System.Object)
+    1.75%        1718  kernel32!0x7FFFB0D42B00
+    1.37%        1350  kernel32!0x7FFFB0D42B07
+    1.32%        1302  coreclr!0x7FFF17B42B6F
+    1.24%        1223  coreclr!0x7FFF17B42B6E
+    0.86%         843  coreclr!0x7FFF17B42B47
+    0.84%         827  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.VecDotQ8_0Avx512_4Rows(unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,int32,float32*)
+    0.83%         818  ntoskrnl!0xFFFFF8039D64C4FA
+    0.61%         598  ntoskrnl!0xFFFFF8039D676CE5
+    0.50%         496  coreclr!0x7FFF17B42B68
+    0.37%         368  ntoskrnl!0xFFFFF8039DAA7655
+    0.34%         333  coreclr!0x7FFF17B42B35
+    0.33%         323  ntoskrnl!0xFFFFF8039D671D9F
+    0.32%         310  ntoskrnl!0xFFFFF8039D67897B
+    0.31%         306  ntoskrnl!0xFFFFF8039D6B61E2
+    0.29%         290  ntoskrnl!0xFFFFF8039DAA3279
+    0.29%         281  ntdll!0x7FFFB1F42344
+    0.29%         281  ntoskrnl!0xFFFFF8039DAA769E
+    0.28%         275  ntoskrnl!0xFFFFF8039D671D9C
+    0.27%         266  ntoskrnl!0xFFFFF8039D677B35
+    0.27%         265  coreclr!0x7FFF17B42B4E
+    0.25%         248  ntoskrnl!0xFFFFF8039D74514E
+    0.23%         229  ntoskrnl!0xFFFFF8039D677BA4
+    0.23%         225  ntoskrnl!0xFFFFF8039D72876F
+    0.22%         216  coreclr!0x7FFF17B42B25
+    0.21%         211  kernel32!0x7FFFB0D42B1A
+    0.21%         207  ntoskrnl!0xFFFFF8039D6B7DE4
+    0.21%         204  ntoskrnl!0xFFFFF8039D676CFD
+    0.19%         191  ntoskrnl!0xFFFFF8039D74471F
+    0.19%         186  ntoskrnl!0xFFFFF8039D676CCA
+    0.18%         182  ntoskrnl!0xFFFFF8039D677EBF
+    0.17%         169  ntoskrnl!0xFFFFF8039D6B7D75
+    0.16%         161  ntoskrnl!0xFFFFF8039D82293D
+    0.16%         160  ntoskrnl!0xFFFFF8039D7453FE
+    0.16%         157  ntoskrnl!0xFFFFF8039D676CD6
+    0.15%         149  coreclr!0x7FFF17B42B20
+    0.15%         144  ntoskrnl!0xFFFFF8039D6B7D55
+    0.14%         142  ntoskrnl!0xFFFFF8039D6795E8
+    0.14%         140  ntoskrnl!0xFFFFF8039D677B93
+    0.14%         137  ntoskrnl!0xFFFFF8039D72891C
+    0.14%         135  ntoskrnl!0xFFFFF8039DAA6D0A
+    0.13%         132  ntoskrnl!0xFFFFF8039D6B7F24
+    0.13%         132  ntoskrnl!0xFFFFF8039DAA7766
+    0.13%         129  ntoskrnl!0xFFFFF8039D676E9B
+    0.13%         126  ntoskrnl!0xFFFFF8039D671DAA
+    0.12%         122  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0R4Worker(int,int32,int32)
+    0.12%         122  ntoskrnl!0xFFFFF8039DAB1EB4
+    0.12%         118  ntoskrnl!0xFFFFF8039D76112E
+    0.12%         118  ntoskrnl!0xFFFFF8039D6796BD
+    0.11%         112  ntoskrnl!0xFFFFF8039D676CEE
+    0.11%         111  ntoskrnl!0xFFFFF8039DAA6E8F
+    0.11%         104  ntoskrnl!0xFFFFF8039D676CD0
+    0.10%         103  ntoskrnl!0xFFFFF8039D677CDF
+    0.10%          99  ntoskrnl!0xFFFFF8039D742460
+    0.10%          98  ntoskrnl!0xFFFFF8039D6B2497
+    0.10%          97  ntoskrnl!0xFFFFF8039D8227E9
+    0.10%          96  ntoskrnl!0xFFFFF8039D676C7A
+    0.09%          91  ntoskrnl!0xFFFFF8039D677D52
+    0.09%          89  System.Private.CoreLib!System.Threading.SpinWait.SpinOnce(int32)
+    0.09%          88  ntoskrnl!0xFFFFF8039D677B45
+    0.09%          87  ntoskrnl!0xFFFFF8039D74AFDA
+    0.09%          86  ntoskrnl!0xFFFFF8039D676CE3
+    0.09%          85  ntoskrnl!0xFFFFF8039D677B5C
+    0.09%          85  ntoskrnl!0xFFFFF8039D6742DB
+    0.09%          84  ntoskrnl!0xFFFFF8039D675F32
+    0.08%          82  ntoskrnl!0xFFFFF8039D677F15
+    0.08%          82  ntoskrnl!0xFFFFF8039D76104F
+    0.08%          79  ntoskrnl!0xFFFFF8039D677B54
+    0.08%          79  ntoskrnl!0xFFFFF8039D676BC5
+    0.08%          77  ntoskrnl!0xFFFFF8039D6B7D0D
+    0.07%          72  ntoskrnl!0xFFFFF8039DAA6DC3
+    0.07%          71  ntoskrnl!0xFFFFF8039D64FE84
+    0.07%          68  ntoskrnl!0xFFFFF8039D81A08D
+    0.07%          68  ntoskrnl!0xFFFFF8039D677D34
+    0.07%          67  ntoskrnl!0xFFFFF8039D728691
+    0.07%          67  ntoskrnl!0xFFFFF8039D676EA7
+    0.07%          66  ntoskrnl!0xFFFFF8039D64A355
+    0.07%          64  ntoskrnl!0xFFFFF8039D677DEA
+    0.06%          63  ntoskrnl!0xFFFFF8039D742BDF
+    0.06%          62  ntoskrnl!0xFFFFF8039D674CB5
+    0.06%          62  ntoskrnl!0xFFFFF8039D676CDE
+    0.06%          61  ntoskrnl!0xFFFFF8039D66AA70
+    0.06%          60  ntoskrnl!0xFFFFF8039D677D02
+    0.06%          58  ntoskrnl!0xFFFFF8039D674CB2
+    0.06%          58  ntoskrnl!0xFFFFF8039D675F85
+    0.06%          58  coreclr!0x7FFF17B42B62
+    0.06%          57  ntoskrnl!0xFFFFF8039D677D09
+    0.06%          57  System.Private.CoreLib!System.Threading.ManualResetEventSlim.get_IsSet()
+    0.06%          56  ntoskrnl!0xFFFFF8039D677ED9
+    0.06%          55  ntoskrnl!0xFFFFF8039D675F5F
+    0.05%          54  ntoskrnl!0xFFFFF8039DAA6E41
+    0.05%          54  ntoskrnl!0xFFFFF8039D677D54
+    0.05%          54  ntoskrnl!0xFFFFF8039DAA764A
+    0.05%          54  ntoskrnl!0xFFFFF8039D677BF6
+    0.05%          52  ntoskrnl!0xFFFFF8039D677C00
+    0.05%          52  ntoskrnl!0xFFFFF8039D7D2788
+    0.05%          51  ntoskrnl!0xFFFFF8039D677CD7
+    0.05%          50  ntoskrnl!0xFFFFF8039D760BD7
+    0.05%          50  ntoskrnl!0xFFFFF8039D760C4D
+    0.05%          49  ntoskrnl!0xFFFFF8039D677D14
+    0.05%          48  ntoskrnl!0xFFFFF8039D728685
+    0.05%          48  ntoskrnl!0xFFFFF8039D6B2476
+    0.05%          48  ntoskrnl!0xFFFFF8039DAA6CC3
+    0.05%          47  ntoskrnl!0xFFFFF8039D676C93
+    0.05%          45  ntoskrnl!0xFFFFF8039DAA6EC6
+    0.04%          44  ntoskrnl!0xFFFFF8039D677D0C
+    0.04%          44  ntoskrnl!0xFFFFF8039DAA6C67
+    0.04%          44  ntoskrnl!0xFFFFF8039D82290F
+    0.04%          44  ntoskrnl!0xFFFFF8039D6788C8
+    0.04%          44  ntoskrnl!0xFFFFF8039D66AD0D
+    0.04%          44  ntoskrnl!0xFFFFF8039D760B48
+    0.04%          44  ntoskrnl!0xFFFFF8039D676CD3
+    0.04%          44  ntoskrnl!0xFFFFF8039D760F5C
+    0.04%          43  coreclr!0x7FFF17B42B30
+    0.04%          43  ntdll!0x7FFFB1EAEF34
+    0.04%          43  ntoskrnl!0xFFFFF8039D677BC4
+    0.04%          41  ntoskrnl!0xFFFFF8039DAB2060
+    0.04%          40  ntoskrnl!0xFFFFF8039D677E0A
+    0.04%          39  coreclr!0x7FFF17B42B29
+    0.04%          39  ntoskrnl!0xFFFFF8039D6747A3
+    0.04%          38  ntoskrnl!0xFFFFF8039D676035
+    0.04%          38  ntoskrnl!0xFFFFF8039D64A397
+    0.04%          38  ntoskrnl!0xFFFFF8039DAA7769
+    0.04%          38  ntoskrnl!0xFFFFF8039D676D0A
+    0.04%          38  ntoskrnl!0xFFFFF8039D675298
+    0.04%          37  ntoskrnl!0xFFFFF8039D6B7CD8
+    0.04%          37  ntoskrnl!0xFFFFF8039D677D28
+    0.04%          36  ntoskrnl!0xFFFFF8039D6B7C5D
+    0.04%          36  ntoskrnl!0xFFFFF8039D760C78
+    0.04%          36  ntoskrnl!0xFFFFF8039D677CA1
+    0.04%          36  ntoskrnl!0xFFFFF8039D677DE2
+    0.04%          35  ntoskrnl!0xFFFFF8039D677BAB
+    0.04%          35  ntoskrnl!0xFFFFF8039D675EC7
+    0.04%          35  ntoskrnl!0xFFFFF8039D675EC0
+    0.03%          33  coreclr!0x7FFF17B64DC3
+    0.03%          33  ntoskrnl!0xFFFFF8039DAA763A
+    0.03%          33  ntoskrnl!0xFFFFF8039D6B25CF
+    0.03%          32  ntoskrnl!0xFFFFF8039D676BE7
+    0.03%          31  ntoskrnl!0xFFFFF8039D675F0F
+    0.03%          30  ntoskrnl!0xFFFFF8039D676CDA
+    0.03%          30  ntoskrnl!0xFFFFF8039D677B3F
+    0.03%          29  ntoskrnl!0xFFFFF8039D677FB1
+    0.03%          29  ntoskrnl!0xFFFFF8039D7450EC
+    0.03%          29  ntoskrnl!0xFFFFF8039D677B60
+    0.03%          28  ntoskrnl!0xFFFFF8039D676CC7
+    0.03%          28  ntoskrnl!0xFFFFF8039D677C36
+    0.03%          28  coreclr!0x7FFF17AD1D62
+    0.03%          27  ntoskrnl!0xFFFFF8039D6747FE
+    0.03%          27  ntoskrnl!0xFFFFF8039D676F57
+    0.03%          27  ntoskrnl!0xFFFFF8039D676CF3
+    0.03%          27  ntoskrnl!0xFFFFF8039D676E42
+    0.03%          26  ntoskrnl!0xFFFFF8039D803AA1
+    0.03%          26  kernelbase!0x7FFFAF2135D0
+    0.03%          26  ntoskrnl!0xFFFFF8039D676CBA
+    0.03%          26  ntoskrnl!0xFFFFF8039D676E1A
+    0.03%          26  ntoskrnl!0xFFFFF8039D742D18
+    0.03%          26  ntoskrnl!0xFFFFF8039D678854
+    0.03%          25  ntoskrnl!0xFFFFF8039D6795B4
+    0.03%          25  ntoskrnl!0xFFFFF8039D676C78
+    0.03%          25  ntoskrnl!0xFFFFF8039D82286F
+    0.03%          25  ntoskrnl!0xFFFFF8039D677D9F
+    0.03%          25  ntoskrnl!0xFFFFF8039DAA5C10
+    0.03%          25  ntoskrnl!0xFFFFF8039D677CCC
+    0.03%          25  ntoskrnl!0xFFFFF8039D677AED
+    0.03%          25  ntoskrnl!0xFFFFF8039D677F70
+    0.03%          25  ntoskrnl!0xFFFFF8039DAA6E3F
+    0.02%          24  ntoskrnl!0xFFFFF8039D676BC0
+    0.02%          24  coreclr!0x7FFF17B4964F
+    0.02%          24  ntoskrnl!0xFFFFF8039D676C4B
+    0.02%          24  ntoskrnl!0xFFFFF8039D819BAD
+    0.02%          24  ntoskrnl!0xFFFFF8039D677B7A
+    0.02%          23  kernelbase!0x7FFFAF2135B0
+    0.02%          23  ntoskrnl!0xFFFFF8039D676CE8
+    0.02%          23  ntoskrnl!0xFFFFF8039D677D3D
+    0.02%          22  ntoskrnl!0xFFFFF8039D677DD8
+    0.02%          22  ntoskrnl!0xFFFFF8039D676F86
+    0.02%          22  coreclr!0x7FFF17B49649
+    0.02%          22  ntoskrnl!0xFFFFF8039D677B71
+    0.02%          22  ntoskrnl!0xFFFFF8039D677B83
+    0.02%          21  ntoskrnl!0xFFFFF8039D742B71
+    0.02%          21  ntoskrnl!0xFFFFF8039D675309
+    0.02%          21  ntoskrnl!0xFFFFF8039D675F97
+    0.02%          21  ntoskrnl!0xFFFFF8039D675EE5
+    0.02%          20  ntoskrnl!0xFFFFF8039D742679
+    0.02%          20  ntoskrnl!0xFFFFF8039D760B0A
+    0.02%          20  ntoskrnl!0xFFFFF8039D677B37
+    0.02%          20  ntoskrnl!0xFFFFF8039D82290C
+    0.02%          20  ntoskrnl!0xFFFFF8039D677D62
+    0.02%          20  ntoskrnl!0xFFFFF8039D677DFE
+    0.02%          19  ntoskrnl!0xFFFFF8039DAA7684
+    0.02%          19  ntoskrnl!0xFFFFF8039D677BE1
+    0.02%          19  ntoskrnl!0xFFFFF8039D677C13
+    0.02%          19  coreclr!0x7FFF17B42B3B
+    0.02%          19  ntoskrnl!0xFFFFF8039D675ECE
+    0.02%          19  ntoskrnl!0xFFFFF8039DC4CD62
+    0.02%          19  ntoskrnl!0xFFFFF8039D676EFF
+    0.02%          19  ntoskrnl!0xFFFFF8039D8F78E2
+    0.02%          18  ntoskrnl!0xFFFFF8039D677CFE
+    0.02%          18  ntoskrnl!0xFFFFF8039D675FAB
+
+=== top 200 by self (DotLLM) (any of: DotLLM) ===
+    3.97%        3908  DotLLM.Cpu!DotLLM.Cpu.Threading.ComputeThreadPool.WorkerLoop(class System.Object)
+    0.84%         827  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.VecDotQ8_0Avx512_4Rows(unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,int32,float32*)
+    0.12%         122  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0R4Worker(int,int32,int32)
+    0.01%          10  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRows(unsigned int8*,unsigned int8*,float32*,int32,int32)
+    0.01%           7  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.AttentionWorker(int,int32,int32)
+    0.00%           4  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.GemmInterleaved(int,value class DotLLM.Core.Configuration.QuantizationType,float32*,float32*,int32,int32,int32,unsigned int8*,value class RepackedWeight&)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsWorker(int,int32,int32)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Threading.ComputeThreadPool.Dispatch(int,fnptr void(int,int32,int32))
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.FusedDecode2Worker(int,int32,int32)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0Interleaved(unsigned int8*,unsigned int8*,float32*,int32,int32,int32,class DotLLM.Cpu.Threading.ComputeThreadPool)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.QuantizeF32ToQ8_0Avx512(float32*,unsigned int8*,int32)
+    0.00%           1  DotLLM.Engine!DotLLM.Engine.TextGenerator.Generate(class System.String,class DotLLM.Core.Configuration.InferenceOptions,class System.Action`1<int32>)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.Execute(float32*,float32*,float32*,float32*,int32,int32,int32,int32,int32,int32,float32,class DotLLM.Cpu.Threading.ComputeThreadPool,value class System.Nullable`1<int32>)
+    0.00%           1  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.FusedGateUpDecode(value class DotLLM.Models.Architectures.TransformerLayerWeights&,float32*,unsigned int8*,float32*,float32*)
+    0.00%           1  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.QuantizeInput(float32*,unsigned int8*,int32,int32,value class DotLLM.Core.Configuration.QuantizationType)
+
+=== top 200 by inclusive (DotLLM) (any of: DotLLM) ===
+    6.73%       97384  DotLLM.Cpu!DotLLM.Cpu.Threading.ComputeThreadPool.WorkerLoop(class System.Object)
+    0.06%         939  DotLLM.Engine!DotLLM.Engine.TextGenerator.Generate(class System.String,class DotLLM.Core.Configuration.InferenceOptions,class System.Action`1<int32>)
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint+<>c__DisplayClass3_0+<<HandleNonStreamingAsync>b__0>d.MoveNext()
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint+<>c__DisplayClass3_0.<HandleNonStreamingAsync>b__0()
+    0.06%         939  DotLLM.Server!DotLLM.Server.ServerState+<ExecuteAsync>d__73.MoveNext()
+    0.06%         939  DotLLM.Server!DotLLM.Server.ServerState.ExecuteAsync(class System.Func`1<class System.Threading.Tasks.Task>,value class System.Threading.CancellationToken)
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint+<HandleNonStreamingAsync>d__3.MoveNext()
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint.HandleNonStreamingAsync(class DotLLM.Server.Models.ChatCompletionRequest,class DotLLM.Engine.TextGenerator,class DotLLM.Server.ServerState,class Microsoft.AspNetCore.Http.HttpContext,class System.String,class DotLLM.Core.Configuration.InferenceOptions,class System.String,class System.String,class DotLLM.Tokenizers.ToolDefinition[],value class System.Threading.CancellationToken)
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint+<HandleAsync>d__2.MoveNext()
+    0.06%         939  DotLLM.Server!DotLLM.Server.Endpoints.ChatCompletionEndpoint.HandleAsync(class DotLLM.Server.Models.ChatCompletionRequest,class DotLLM.Server.ServerState,class Microsoft.AspNetCore.Http.HttpContext)
+    0.06%         938  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.Forward(value class System.ReadOnlySpan`1<int32>,value class System.ReadOnlySpan`1<int32>,int32,class DotLLM.Core.Attention.IKvCache)
+    0.06%         845  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.VecDotQ8_0Avx512_4Rows(unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,int32,float32*)
+    0.03%         459  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRows(unsigned int8*,unsigned int8*,float32*,int32,int32)
+    0.03%         398  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsWorker(int,int32,int32)
+    0.03%         383  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.GemmInterleaved(int,value class DotLLM.Core.Configuration.QuantizationType,float32*,float32*,int32,int32,int32,unsigned int8*,value class RepackedWeight&)
+    0.02%         323  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.FusedDecode2Worker(int,int32,int32)
+    0.01%         197  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.FusedGateUpDecode(value class DotLLM.Models.Architectures.TransformerLayerWeights&,float32*,unsigned int8*,float32*,float32*)
+    0.01%         194  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0Interleaved(unsigned int8*,unsigned int8*,float32*,int32,int32,int32,class DotLLM.Cpu.Threading.ComputeThreadPool)
+    0.01%         174  DotLLM.Cpu!DotLLM.Cpu.Threading.ComputeThreadPool.Dispatch(int,fnptr void(int,int32,int32))
+    0.01%         174  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.FusedQkvDecode(value class DotLLM.Models.Architectures.TransformerLayerWeights&,float32*,unsigned int8*,float32*,float32*,float32*)
+    0.01%         168  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.Execute(float32*,float32*,float32*,float32*,int32,int32,int32,int32,int32,int32,float32,class DotLLM.Cpu.Threading.ComputeThreadPool,value class System.Nullable`1<int32>)
+    0.01%         168  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.Execute(float32*,float32*,float32*,float32*,int32,int32,int32,int32,int32,int32,class DotLLM.Cpu.Threading.ComputeThreadPool,value class System.Nullable`1<int32>)
+    0.01%         138  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.FusedDecode3Worker(int,int32,int32)
+    0.01%         122  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0R4Worker(int,int32,int32)
+    0.00%          26  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.AttentionWorker(int,int32,int32)
+    0.00%          10  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.GemvQ8_0(unsigned int8*,float32*,float32*,int32,int32,class DotLLM.Cpu.Threading.ComputeThreadPool)
+    0.00%           5  DotLLM.Engine!DotLLM.Engine.KvCache.PagedKvCache.GetValuesRef(int32)
+    0.00%           2  DotLLM.Engine!DotLLM.Engine.KvCache.PagedKvCache.GetKeysRef(int32)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.FusedOps.RmsNormQuantizeQ8_0(float32*,value class System.ReadOnlySpan`1<float32>,float32,unsigned int8*,int32)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.FusedOps.RmsNormQuantize(float32*,value class System.ReadOnlySpan`1<float32>,float32,unsigned int8*,int32,value class DotLLM.Core.Configuration.QuantizationType)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.FusedOps.SwiGLU(value class System.ReadOnlySpan`1<float32>,value class System.ReadOnlySpan`1<float32>,value class System.Span`1<float32>)
+    0.00%           2  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.QuantizeInput(float32*,unsigned int8*,int32,int32,value class DotLLM.Core.Configuration.QuantizationType)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.QuantizeF32ToQ8_0Avx512(float32*,unsigned int8*,int32)
+
+=== top 200 by self (VecDot/Quantize/Attention/Matmul) (any of: VecDot, Quantize, Attention, MatMul) ===
+    0.84%         827  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.VecDotQ8_0Avx512_4Rows(unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,unsigned int8*,int32,float32*)
+    0.12%         122  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0R4Worker(int,int32,int32)
+    0.01%          10  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRows(unsigned int8*,unsigned int8*,float32*,int32,int32)
+    0.01%           7  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.AttentionWorker(int,int32,int32)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsWorker(int,int32,int32)
+    0.00%           2  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.FusedDecode2Worker(int,int32,int32)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.ComputeRowsQ8_0Interleaved(unsigned int8*,unsigned int8*,float32*,int32,int32,int32,class DotLLM.Cpu.Threading.ComputeThreadPool)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.MatMul.QuantizeF32ToQ8_0Avx512(float32*,unsigned int8*,int32)
+    0.00%           1  DotLLM.Cpu!DotLLM.Cpu.Kernels.Attention.Execute(float32*,float32*,float32*,float32*,int32,int32,int32,int32,int32,int32,float32,class DotLLM.Cpu.Threading.ComputeThreadPool,value class System.Nullable`1<int32>)
+    0.00%           1  DotLLM.Models!DotLLM.Models.Architectures.TransformerModel.QuantizeInput(float32*,unsigned int8*,int32,int32,value class DotLLM.Core.Configuration.QuantizationType)

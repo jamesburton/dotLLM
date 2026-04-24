@@ -434,3 +434,18 @@ _*.txt
 .mamba3-reference-canonical/
 .mamba3-python-venv/
 .venv-pyref/
+
+# Performance profiling artefacts
+# Track the small text summaries + JSON for reproducibility, exclude the
+# large binary traces (hundreds of MB).
+.perf-runs/**/*.etl
+.perf-runs/**/*.etl.zip
+.perf-runs/**/*.etl.new
+.perf-runs/**/*.etl.zip.new
+.perf-runs/**/*.kernel.etl
+.perf-runs/**/*.nettrace
+.perf-runs/**/*.speedscope.json
+.perf-runs/**/etl-extract/
+.perf-runs/tools/PerfView.exe
+.perf-runs/tools/**/bin/
+.perf-runs/tools/**/obj/
