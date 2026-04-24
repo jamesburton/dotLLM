@@ -2101,19 +2101,56 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledQ8Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
 
-        for (int tile = startTile; tile < endTile; tile++)
+        // 2D partition: when totalTiles < threadCount (common for small models
+        // with narrow projections like SmolLM-135M QKV at 576×576), pure
+        // row-tile partition leaves threads idle. Split each tile across a
+        // subset of threads along N (the token dimension), preserving the
+        // L2-resident weight tile while restoring full parallelism.
+        if (totalTiles >= threadCount)
         {
-            int mStart = tile * ctx.TileM;
-            int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
-            byte* tileWeights = ctx.WeightsQ8 + (long)mStart * ctx.Q8RowBytes;
-            for (int t = 0; t < ctx.N; t++)
-                ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
-                            ctx.C + t * ctx.M + mStart, tileRows, ctx.BlockCount);
+            // Row-only partition — enough tiles for every thread.
+            int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
+            int startTile = threadIdx * tilesPerThread;
+            int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+
+            for (int tile = startTile; tile < endTile; tile++)
+            {
+                int mStart = tile * ctx.TileM;
+                int tileRows = Math.Min(ctx.TileM, ctx.M - mStart);
+                byte* tileWeights = ctx.WeightsQ8 + (long)mStart * ctx.Q8RowBytes;
+                for (int t = 0; t < ctx.N; t++)
+                    ComputeRows(tileWeights, ctx.InputQ8 + t * ctx.Q8RowBytes,
+                                ctx.C + t * ctx.M + mStart, tileRows, ctx.BlockCount);
+            }
+            return;
         }
+
+        // 2D partition: evenly split M into `totalTiles` row-groups (may differ
+        // from TileM when M % TileM ≠ 0 — balances per-thread work), then split
+        // each row-group's N tokens across the threads assigned to it.
+        int rowGroup = threadIdx % totalTiles;
+        int tokenGroup = threadIdx / totalTiles;
+        int threadsInRowGroup = (threadCount - rowGroup + totalTiles - 1) / totalTiles;
+
+        // Uniform row partition: rowsPerGroup * totalTiles may exceed M so the
+        // last row-group's tail clips naturally via Math.Min below. Align to 4
+        // so each group still hits the 4-row VecDot batch path.
+        int rowsPerGroup = ((ctx.M + totalTiles - 1) / totalTiles + 3) & ~3;
+        int mStart2 = rowGroup * rowsPerGroup;
+        if (mStart2 >= ctx.M) return;
+        int tileRows2 = Math.Min(rowsPerGroup, ctx.M - mStart2);
+        byte* tileWeights2 = ctx.WeightsQ8 + (long)mStart2 * ctx.Q8RowBytes;
+
+        // Partition [0, N) across the threads in this row-group.
+        int tokensPerGroup = (ctx.N + threadsInRowGroup - 1) / threadsInRowGroup;
+        int tStart = tokenGroup * tokensPerGroup;
+        if (tStart >= ctx.N) return;
+        int tEnd = Math.Min(tStart + tokensPerGroup, ctx.N);
+
+        for (int t = tStart; t < tEnd; t++)
+            ComputeRows(tileWeights2, ctx.InputQ8 + t * ctx.Q8RowBytes,
+                        ctx.C + t * ctx.M + mStart2, tileRows2, ctx.BlockCount);
     }
 
     private static void GemmTiledF32Worker(nint ctxPtr, int threadIdx, int threadCount)
@@ -2302,9 +2339,15 @@ public static unsafe partial class MatMul
         int tileM = ComputeTileM(q8RowBytes);
         int totalTiles = (m + tileM - 1) / tileM;
 
+        // Only skip dispatch when a single token on a single tile isn't worth
+        // the Dispatch round-trip. `GemmTiledQ8Worker` handles totalTiles=1 via
+        // the 2D (row × token) partition, so totalTiles=1 with N>1 still wins
+        // from parallelism (SmolLM-135M K/V is 192×576×512, totalTiles=1).
+        bool singleThread = totalTiles < 2 && n < 4;
+
         if (preQuantizedInput != null)
         {
-            if (totalTiles < 2)
+            if (singleThread)
             {
                 ComputeGemmTiled(weightsQ8, preQuantizedInput, c, m, n, blockCount2);
                 return;
@@ -2326,7 +2369,7 @@ public static unsafe partial class MatMul
             for (int t = 0; t < n; t++)
                 QuantizeF32ToQ8_0(b + t * k, rentedPtr + t * q8RowBytes, k);
 
-            if (totalTiles < 2)
+            if (singleThread)
             {
                 ComputeGemmTiled(weightsQ8, rentedPtr, c, m, n, blockCount2);
             }
