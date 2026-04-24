@@ -46,6 +46,14 @@ internal static partial class VulkanApi
         nint physicalDevice, ref uint pQueueFamilyPropertyCount,
         [Out] VkQueueFamilyProperties[]? pQueueFamilyProperties);
 
+    // Vulkan 1.1 core entry point: chain-aware property query. We use it to
+    // fetch VkPhysicalDeviceSubgroupProperties via pNext. On Vulkan 1.0-only
+    // drivers this symbol may be missing; VulkanDevice guards the call by
+    // inspecting the reported apiVersion before invoking.
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceProperties2(
+        nint physicalDevice, ref VkPhysicalDeviceProperties2 pProperties);
+
     // ── Logical device ──────────────────────────────────────────────
 
     [LibraryImport(LibName)]
