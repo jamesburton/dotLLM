@@ -1,10 +1,22 @@
 @echo off
-REM Build all CUDA kernels to PTX via VS 2026 + CUDA 11.8.
+REM Build all CUDA kernels to PTX.
+REM Requires: %CUDA_PATH% set to a CUDA toolkit that supports the host MSVC
+REM (CUDA 13.x supports VS 2022/2026 MSVC; CUDA 11.8 does not).
 REM Usage: build_ptx.bat [arch]     (default: compute_61)
 setlocal EnableDelayedExpansion
 
 set ARCH=%1
 if "%ARCH%"=="" set ARCH=compute_61
+
+if not defined CUDA_PATH (
+    echo CUDA_PATH is not set. Install a CUDA toolkit and ensure CUDA_PATH points at it.
+    exit /b 1
+)
+set "NVCC=%CUDA_PATH%\bin\nvcc.exe"
+if not exist "%NVCC%" (
+    echo nvcc.exe not found at %NVCC%
+    exit /b 1
+)
 
 REM Locate latest MSVC toolchain under VS 2026
 set VSROOT=E:\Program Files\Microsoft Visual Studio\18\Community
@@ -26,12 +38,13 @@ set KERNEL_DIR=%SCRIPT_DIR%kernels
 set OUT_DIR=%SCRIPT_DIR%ptx
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 
+echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
 
 set FAIL=0
 for %%F in ("%KERNEL_DIR%\*.cu") do (
     set BASE=%%~nF
-    nvcc -ptx -arch=%ARCH% --use_fast_math -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
+    "%NVCC%" -ptx -arch=%ARCH% --use_fast_math -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
     if errorlevel 1 (
         echo FAILED: %%~nxF
         set FAIL=1
