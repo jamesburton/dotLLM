@@ -86,6 +86,14 @@ def main() -> int:
              "(required for DeepSeek-V2/V3 and other checkpoints that "
              "declare an auto_map for custom classes).",
     )
+    parser.add_argument(
+        "--attn-impl",
+        default=None,
+        choices=["eager", "sdpa", "flash_attention_2"],
+        help="HF attention kernel to force. Default: HF's automatic choice "
+             "(sdpa on recent versions). Pass 'eager' for the reference "
+             "loop-based kernel when diagnosing SDPA-vs-manual drift.",
+    )
     args = parser.parse_args()
 
     # Deferred imports so `--help` works without torch installed.
@@ -113,14 +121,19 @@ def main() -> int:
         str(model_path), trust_remote_code=args.trust_remote_code)
 
     print(f"Loading model from {model_path} (dtype={args.dtype}, "
-          f"trust_remote_code={args.trust_remote_code}) ...")
+          f"trust_remote_code={args.trust_remote_code}, "
+          f"attn_impl={args.attn_impl or 'auto'}) ...")
     # low_cpu_mem_usage requires `accelerate`; we keep the dep surface small
     # and take the higher peak-RSS hit — 0.5 B params in bf16 is ~1 GiB and
     # fits comfortably in RAM on any dev box that can run this script.
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path),
+    model_kwargs = dict(
         torch_dtype=torch_dtype,
         trust_remote_code=args.trust_remote_code,
+    )
+    if args.attn_impl is not None:
+        model_kwargs["attn_implementation"] = args.attn_impl
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_path), **model_kwargs,
     )
     model.eval()
 
@@ -157,6 +170,7 @@ def main() -> int:
         "logits_shape": [int(seq_len), int(vocab_size)],
         "logits": logits_f32.tolist(),
         "dtype": args.dtype,
+        "attn_impl": args.attn_impl or "auto",
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
