@@ -82,6 +82,65 @@ public class VulkanRopeF32KernelTests
         AssertClose(kExpected, kActual, "K");
     }
 
+    [SkippableTheory]
+    // NeoX / rotate-half variant — pair (i, i+halfRope). This is the HF
+    // safetensors convention (Llama-family via HF, Qwen2, Phi-3); the shader
+    // already supports it via is_neox push-constant but only Norm had an
+    // explicit parity test. The end-to-end VulkanTransformerModel calls this
+    // variant only when loading from HF safetensors (GGUF Llama uses Norm),
+    // but we validate it here to unblock non-GGUF model paths.
+    [InlineData(4, 2, 2, 64, 10000f)]
+    [InlineData(4, 9, 3, 64, 10000f)]
+    [InlineData(256, 9, 3, 64, 10000f)]
+    [InlineData(1, 32, 8, 128, 500000f)]
+    public void Launch_MatchesCpuReference_NeoX(int seqLen, int numHeads, int numKvHeads, int headDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int ropeDim = headDim;
+        int halfDim = ropeDim / 2;
+
+        var rng = new Random(0xBEEF + seqLen * 13 + numHeads * 7 + headDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        float[] cosTable = new float[seqLen * halfDim];
+        float[] sinTable = new float[seqLen * halfDim];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.Execute(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable,
+            DotLLM.Core.Configuration.RoPEType.NeoX);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.NeoX);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static float[] RandomFloats(Random rng, int count)
