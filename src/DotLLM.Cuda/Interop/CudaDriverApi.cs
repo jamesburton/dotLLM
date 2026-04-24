@@ -132,6 +132,26 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuStreamSynchronize(nint stream);
 
+    // ── Events (used for GPU-side profiling) ────────────────────────
+
+    /// <summary>Default flags. Use for profiling: blocking-sync isn't needed when we cuEventSynchronize host-side.</summary>
+    internal const uint CU_EVENT_DEFAULT = 0;
+
+    [LibraryImport(LibName)]
+    internal static partial int cuEventCreate(out nint evt, uint flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuEventDestroy_v2(nint evt);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuEventRecord(nint evt, nint stream);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuEventSynchronize(nint evt);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuEventElapsedTime(out float milliseconds, nint start, nint end);
+
     // ── Error ───────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]

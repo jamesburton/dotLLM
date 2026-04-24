@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -45,6 +46,49 @@ public sealed unsafe class CudaTransformerModel : IModel
 
     /// <summary>Debug: skip bias add operations.</summary>
     internal bool DebugSkipBias { get; set; }
+
+    /// <summary>
+    /// When true, <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// brackets the kernel-launch sequence with CUDA events so <see cref="LastGpuLaunchMs"/>
+    /// reports the GPU-side wallclock between the first and last kernel of the forward pass.
+    /// Wall time is measured by the caller; <c>wall - LastGpuLaunchMs</c> bounds the
+    /// host-dispatch + sync + D2H overhead. Off by default — events themselves are cheap
+    /// but the read after sync adds a little host-side serialisation.
+    /// </summary>
+    internal bool ProfilingEnabled { get; set; }
+
+    /// <summary>GPU wallclock (ms) of the most recent <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> when <see cref="ProfilingEnabled"/> is on. NaN otherwise.</summary>
+    internal float LastGpuLaunchMs { get; private set; } = float.NaN;
+
+    /// <summary>Per-category GPU time (ms) for the most recent profiled forward, indexed by <see cref="ProfileCategory"/>.</summary>
+    internal float[] LastCategoryMs => _categoryMsLast;
+
+    private nint _evtStart;
+    private nint _evtEnd;
+
+    // ── per-category profiling state (only allocated when ProfilingEnabled is set) ──
+    internal const int ProfileCategoryCount = 12;
+    private nint[]? _profEvents;        // event pool, allocated lazily
+    private byte[]? _profEventCategory; // category id of the interval ENDING at event[i] (i>0)
+    private int _profEventCursor;
+    private readonly float[] _categoryMsLast = new float[ProfileCategoryCount];
+
+    /// <summary>Buckets used by per-category profiling. Order matches <see cref="LastCategoryMs"/> indices.</summary>
+    internal enum ProfileCategory : byte
+    {
+        Embed = 0,
+        QkvProj = 1,
+        RopeAndExtras = 2,   // bias adds + QK norms + RoPE
+        KvUpdate = 3,
+        Attention = 4,
+        OProj = 5,
+        Norm = 6,            // initial rmsnorm + every fused-add-rmsnorm + final rmsnorm
+        MlpUp = 7,           // gate + up projections
+        Swiglu = 8,
+        MlpDown = 9,
+        LmHead = 10,
+        Convert = 11,        // FP16 logits → FP32 + final residual add for the last layer
+    }
 
     private CudaTransformerModel(
         ModelConfig config, CudaWeights weights, CudaForwardState state,
@@ -174,6 +218,38 @@ public sealed unsafe class CudaTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
+    /// <summary>
+    /// Records an event on the stream tagged with the given category. The interval
+    /// (previous event → this event) is attributed to <paramref name="cat"/> when
+    /// per-category timings are aggregated after stream sync. No-op when profiling
+    /// is disabled — kept tight enough for the JIT to drop it from the hot path.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkProfile(ProfileCategory cat)
+    {
+        if (!ProfilingEnabled) return;
+        EnsureProfileCapacity(_profEventCursor + 1);
+        CudaDriverApi.cuEventRecord(_profEvents![_profEventCursor], _stream.Handle).ThrowOnError();
+        _profEventCategory![_profEventCursor] = (byte)cat;
+        _profEventCursor++;
+    }
+
+    private void EnsureProfileCapacity(int needed)
+    {
+        if (_profEvents != null && _profEvents.Length >= needed) return;
+
+        int newCap = Math.Max(needed, _profEvents?.Length * 2 ?? 512);
+        var newEvents = new nint[newCap];
+        var newCats = new byte[newCap];
+        int oldLen = _profEvents?.Length ?? 0;
+        if (_profEvents != null) Array.Copy(_profEvents, newEvents, oldLen);
+        if (_profEventCategory != null) Array.Copy(_profEventCategory, newCats, oldLen);
+        for (int i = oldLen; i < newCap; i++)
+            CudaDriverApi.cuEventCreate(out newEvents[i], CudaDriverApi.CU_EVENT_DEFAULT).ThrowOnError();
+        _profEvents = newEvents;
+        _profEventCategory = newCats;
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
@@ -195,6 +271,16 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         _state.EnsureCapacity(seqLen);
 
+        if (ProfilingEnabled)
+        {
+            if (_evtStart == 0)
+            {
+                CudaDriverApi.cuEventCreate(out _evtStart, CudaDriverApi.CU_EVENT_DEFAULT).ThrowOnError();
+                CudaDriverApi.cuEventCreate(out _evtEnd, CudaDriverApi.CU_EVENT_DEFAULT).ThrowOnError();
+            }
+            CudaDriverApi.cuEventRecord(_evtStart, s).ThrowOnError();
+        }
+
         // 1. Upload tokenIds + positions to device
         fixed (int* tokenPtr = tokenIds)
             CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
@@ -208,12 +294,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
             _state.TokenIdsDevice, _state.HiddenState,
             seqLen, hiddenSize, s);
+        MarkProfile(ProfileCategory.Embed);
 
         // 3. Layer 0 setup: copy hidden→residual, RmsNorm→NormOutput
         long hiddenBytes = (long)seqLen * hiddenSize * h;
         CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
         _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
             hiddenSize, eps, seqLen, s);
+        MarkProfile(ProfileCategory.Norm);
 
         // 4. Transformer layers — FP16 activations, cuBLAS GEMM for prefill, quantized GEMV for decode,
         //    FusedAddRmsNorm at residual junctions to avoid FP16 truncation.
@@ -240,6 +328,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
             Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
             Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            MarkProfile(ProfileCategory.QkvProj);
 
             // Optional biases (FP16)
             if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
@@ -257,6 +346,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
                 seqLen, numHeads, numKvHeads, headDim,
                 _ropeDim, _ropeTheta, effectiveRopeType, s);
+            MarkProfile(ProfileCategory.RopeAndExtras);
 
             // KV-cache update + Attention (FP16)
             if (kvCache is CudaQuantizedKvCache cudaQKvCache)
@@ -266,6 +356,7 @@ public sealed unsafe class CudaTransformerModel : IModel
 
                 // Dequant quantized region + copy window → scratch, then regular attention
                 var (kPtr, vPtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
+                MarkProfile(ProfileCategory.KvUpdate);
                 _kernels.LaunchAttention(_state.Q, kPtr, vPtr, _state.AttnOutput,
                     seqLen, seqKv, numHeads, numKvHeads, headDim,
                     positions[0], slidingWindow, s);
@@ -274,6 +365,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 cudaKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
                 int seqKv = cudaKvCache.CurrentLength;
+                MarkProfile(ProfileCategory.KvUpdate);
 
                 _kernels.LaunchAttention(_state.Q, cudaKvCache.GetKeysPtr(layer),
                     cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
@@ -282,19 +374,23 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             else
             {
+                MarkProfile(ProfileCategory.KvUpdate);
                 _kernels.LaunchAttention(_state.Q, _state.K, _state.V, _state.AttnOutput,
                     seqLen, seqLen, numHeads, numKvHeads, headDim,
                     0, slidingWindow, s);
             }
+            MarkProfile(ProfileCategory.Attention);
 
             // O projection → NormOutput
             Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
+            MarkProfile(ProfileCategory.OProj);
 
             // ── FUSED: attention residual + FFN norm ──
             // residual = residual + NormOutput (via FP32), NormOutput = rmsnorm(new_residual, ffnNormWeight)
             _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
                 hiddenSize, eps, seqLen, s);
+            MarkProfile(ProfileCategory.Norm);
 
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
@@ -304,14 +400,17 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+            MarkProfile(ProfileCategory.MlpUp);
 
             // SwiGLU (FP16)
             _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput,
                 intermediateSize, seqLen, s);
+            MarkProfile(ProfileCategory.Swiglu);
 
             // Down projection → NormOutput
             Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
+            MarkProfile(ProfileCategory.MlpDown);
 
             // ── FUSED: FFN residual + next layer's attention norm ──
             if (layer < numLayers - 1)
@@ -326,21 +425,46 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
                     seqLen * hiddenSize, s);
             }
+            MarkProfile(ProfileCategory.Norm);
         }
 
         // 5. Final RmsNorm (last token only)
         nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
         _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
             hiddenSize, eps, 1, s);
+        MarkProfile(ProfileCategory.Norm);
 
         // 6. LM head (last token only) → FP16 logits, then convert to FP32
         Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
             _state.NormOutput, _state.LogitsF16,
             _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+        MarkProfile(ProfileCategory.LmHead);
+
         _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+        MarkProfile(ProfileCategory.Convert);
+
+        if (ProfilingEnabled)
+            CudaDriverApi.cuEventRecord(_evtEnd, s).ThrowOnError();
 
         // 7. Stream sync (single sync point for entire forward pass)
         _stream.Synchronize();
+
+        if (ProfilingEnabled)
+        {
+            CudaDriverApi.cuEventElapsedTime(out float gpuMs, _evtStart, _evtEnd).ThrowOnError();
+            LastGpuLaunchMs = gpuMs;
+
+            // Walk per-category events: interval (prev → events[i]) is attributed to category[i].
+            Array.Clear(_categoryMsLast);
+            nint prev = _evtStart;
+            for (int i = 0; i < _profEventCursor; i++)
+            {
+                CudaDriverApi.cuEventElapsedTime(out float ms, prev, _profEvents![i]).ThrowOnError();
+                _categoryMsLast[_profEventCategory![i]] += ms;
+                prev = _profEvents[i];
+            }
+            _profEventCursor = 0;
+        }
 
         // 8. D2H copy FP32 logits to CPU UnmanagedTensor
         var shape = new TensorShape(1, vocabSize);
@@ -416,6 +540,13 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        if (_evtStart != 0) CudaDriverApi.cuEventDestroy_v2(_evtStart);
+        if (_evtEnd != 0) CudaDriverApi.cuEventDestroy_v2(_evtEnd);
+        if (_profEvents != null)
+        {
+            for (int i = 0; i < _profEvents.Length; i++)
+                if (_profEvents[i] != 0) CudaDriverApi.cuEventDestroy_v2(_profEvents[i]);
+        }
         _state.Dispose();
         _weights.Dispose();
         _kernels.Dispose();
