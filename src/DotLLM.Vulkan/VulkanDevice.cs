@@ -416,9 +416,31 @@ public sealed class VulkanDevice : IDisposable
 
     /// <summary>
     /// Allocates a storage buffer of <paramref name="bytes"/> bytes backed by
-    /// host-visible, host-coherent device memory.
+    /// host-visible, host-coherent device memory. The returned buffer can be
+    /// mapped directly from the host — use for activations / scratch the
+    /// forward pass reads/writes from the host between kernel launches.
     /// </summary>
-    public Buffer Allocate(long bytes)
+    public Buffer Allocate(long bytes) => AllocateInternal(bytes, deviceLocal: false);
+
+    /// <summary>
+    /// Allocates a storage buffer of <paramref name="bytes"/> bytes backed by
+    /// device-local memory. The buffer is <b>not</b> host-mappable; use this
+    /// for immutable weights and the KV cache, populating the contents via
+    /// <see cref="UploadToDeviceLocal"/> (weights) or <c>vkCmdCopyBuffer</c>
+    /// between a host-visible source and this device-local destination
+    /// (KV cache update path).
+    /// </summary>
+    /// <remarks>
+    /// On discrete GPUs this puts the data in VRAM — reads from a compute
+    /// shader hit the driver's native tiled layout rather than going over
+    /// PCIe / DF at host-memory bandwidth. On UMA parts (iGPU, APU) the
+    /// bytes still physically sit in shared DDR, but the driver picks a
+    /// swizzled storage layout that reads significantly faster from a
+    /// compute shader than host-coherent linear memory. Always measure.
+    /// </remarks>
+    public Buffer AllocateDeviceLocal(long bytes) => AllocateInternal(bytes, deviceLocal: true);
+
+    private Buffer AllocateInternal(long bytes, bool deviceLocal)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
@@ -436,10 +458,31 @@ public sealed class VulkanDevice : IDisposable
 
         VulkanApi.vkGetBufferMemoryRequirements(_device, buffer, out var req);
 
-        // Find a memory type that is host-visible + host-coherent (simplest path).
-        uint typeIndex = FindMemoryType(
-            req.memoryTypeBits,
-            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent);
+        VkMemoryPropertyFlags required = deviceLocal
+            ? VkMemoryPropertyFlags.DeviceLocal
+            : VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent;
+
+        // On UMA drivers (AMD integrated, Intel) every memory type may expose
+        // DEVICE_LOCAL + HOST_VISIBLE simultaneously. For weights we prefer a
+        // strictly device-local-only type (driver is free to use a tiled /
+        // swizzled layout — see AllocateDeviceLocal remarks). Fall back to a
+        // DEVICE_LOCAL-that-is-also-host-visible type when the GPU only
+        // exposes the combined pool (older Intel, some mobile).
+        uint typeIndex;
+        if (deviceLocal)
+        {
+            if (!TryFindMemoryType(req.memoryTypeBits,
+                    required: VkMemoryPropertyFlags.DeviceLocal,
+                    excluded: VkMemoryPropertyFlags.HostVisible,
+                    out typeIndex))
+            {
+                typeIndex = FindMemoryType(req.memoryTypeBits, VkMemoryPropertyFlags.DeviceLocal);
+            }
+        }
+        else
+        {
+            typeIndex = FindMemoryType(req.memoryTypeBits, required);
+        }
 
         var mai = new VkMemoryAllocateInfo
         {
@@ -465,7 +508,118 @@ public sealed class VulkanDevice : IDisposable
         return new Buffer(this, buffer, memory, bytes);
     }
 
+    /// <summary>
+    /// Copies <paramref name="source"/> bytes from host memory into
+    /// <paramref name="dst"/> (which may be device-local, i.e. not
+    /// host-mappable) via an intermediate <paramref name="staging"/> buffer.
+    /// Records a <c>vkCmdCopyBuffer</c> on a transient command buffer and
+    /// waits on a fence. <paramref name="staging"/> must be host-visible
+    /// host-coherent and at least <paramref name="source"/>.Length bytes.
+    /// </summary>
+    /// <remarks>
+    /// This is the weight-upload path. Callers pre-allocate one staging
+    /// buffer sized for the largest single weight row/matrix and reuse it
+    /// across all <c>vkCmdCopyBuffer</c> uploads — saves the per-upload
+    /// <c>vkAllocateMemory</c>/<c>vkCreateBuffer</c> cost that would dominate
+    /// at 30 layers × 7 matrices.
+    /// </remarks>
+    public unsafe void UploadToDeviceLocal(ReadOnlySpan<byte> source, Buffer staging, Buffer dst)
+    {
+        if (source.Length > staging.Size)
+            throw new ArgumentException("Staging buffer too small.", nameof(staging));
+        if (source.Length > dst.Size)
+            throw new ArgumentException("Destination buffer too small.", nameof(dst));
+
+        // 1. Copy host → staging.
+        VulkanApi.vkMapMemory(_device, staging.Memory, 0, (ulong)source.Length, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory staging");
+        try
+        {
+            source.CopyTo(new Span<byte>((void*)mapped, source.Length));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(_device, staging.Memory);
+        }
+
+        // 2. Record + submit staging → dst copy, wait on fence.
+        CopyBufferSynchronous(staging, dst, (ulong)source.Length);
+    }
+
+    /// <summary>
+    /// Records a one-shot <c>vkCmdCopyBuffer</c> from offset 0 of
+    /// <paramref name="src"/> to offset 0 of <paramref name="dst"/> and waits
+    /// for it on a fence. Used by the device-local weight-upload path.
+    /// </summary>
+    public void CopyBufferSynchronous(Buffer src, Buffer dst, ulong size)
+        => CopyBufferRangeSynchronous(src, dst, srcOffset: 0, dstOffset: 0, size: size);
+
+    /// <summary>
+    /// Records a one-shot <c>vkCmdCopyBuffer</c> between arbitrary offsets
+    /// and waits for it on a fence. Used by the synchronous KV-cache update
+    /// path (the fence-pipelined path uses <c>vkCmdCopyBuffer</c> directly
+    /// against the forward pass's shared command buffer).
+    /// </summary>
+    public unsafe void CopyBufferRangeSynchronous(Buffer src, Buffer dst, ulong srcOffset, ulong dstOffset, ulong size)
+    {
+        var cbai = new VkCommandBufferAllocateInfo
+        {
+            sType = VkStructureType.CommandBufferAllocateInfo,
+            commandPool = _commandPool,
+            level = VkCommandBufferLevel.Primary,
+            commandBufferCount = 1,
+        };
+        VulkanApi.vkAllocateCommandBuffers(_device, cbai, out nint cmdBuf)
+            .ThrowOnError("vkAllocateCommandBuffers CopyBufferRangeSynchronous");
+
+        var fenceCi = new VkFenceCreateInfo { sType = VkStructureType.FenceCreateInfo };
+        VulkanApi.vkCreateFence(_device, fenceCi, 0, out nint fence)
+            .ThrowOnError("vkCreateFence CopyBufferRangeSynchronous");
+
+        try
+        {
+            var begin = new VkCommandBufferBeginInfo
+            {
+                sType = VkStructureType.CommandBufferBeginInfo,
+                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+            };
+            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer CopyBufferRangeSynchronous");
+
+            var region = new VkBufferCopy { srcOffset = srcOffset, dstOffset = dstOffset, size = size };
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, src.Handle, dst.Handle, 1, region);
+
+            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer CopyBufferRangeSynchronous");
+
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBuf),
+            };
+            VulkanApi.vkQueueSubmit(_queue, 1, submit, fence).ThrowOnError("vkQueueSubmit CopyBufferRangeSynchronous");
+
+            nint fenceLocal = fence;
+            VulkanApi.vkWaitForFences(_device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
+                .ThrowOnError("vkWaitForFences CopyBufferRangeSynchronous");
+        }
+        finally
+        {
+            VulkanApi.vkDestroyFence(_device, fence, 0);
+            VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
+        }
+    }
+
     private unsafe uint FindMemoryType(uint typeBits, VkMemoryPropertyFlags required)
+    {
+        if (TryFindMemoryType(typeBits, required, excluded: default, out uint idx))
+            return idx;
+        throw new VulkanException(-3,
+            $"No memory type satisfies typeBits=0x{typeBits:X8} and flags={required}.");
+    }
+
+    private unsafe bool TryFindMemoryType(
+        uint typeBits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags excluded,
+        out uint memoryTypeIndex)
     {
         VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
         // memoryTypes is an array of 8-byte entries: u32 propertyFlags, u32 heapIndex.
@@ -474,11 +628,13 @@ public sealed class VulkanDevice : IDisposable
         {
             if ((typeBits & (1u << (int)i)) == 0) continue;
             var flags = (VkMemoryPropertyFlags)types[i * 2];
-            if ((flags & required) == required)
-                return i;
+            if ((flags & required) != required) continue;
+            if (excluded != default && (flags & excluded) != 0) continue;
+            memoryTypeIndex = i;
+            return true;
         }
-        throw new VulkanException(-3,
-            $"No memory type satisfies typeBits=0x{typeBits:X8} and flags={required}.");
+        memoryTypeIndex = 0;
+        return false;
     }
 
     /// <summary>Copies <paramref name="source"/> from host memory into the start of <paramref name="dst"/>.</summary>

@@ -27,6 +27,7 @@ internal static class VkStructureType
     internal const int CommandPoolCreateInfo = 39;
     internal const int CommandBufferAllocateInfo = 40;
     internal const int CommandBufferBeginInfo = 42;
+    internal const int MemoryBarrier = 46;
     // Vulkan 1.1 core structure types (used by vkGetPhysicalDeviceProperties2).
     internal const int PhysicalDeviceProperties2 = 1000059001;
     internal const int PhysicalDeviceSubgroupProperties = 1000094000;
@@ -419,6 +420,55 @@ internal struct VkSubmitInfo
     internal nint pCommandBuffers;
     internal uint signalSemaphoreCount;
     internal nint pSignalSemaphores;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkBufferCopy
+{
+    internal ulong srcOffset;
+    internal ulong dstOffset;
+    internal ulong size;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryBarrier
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint srcAccessMask;
+    internal uint dstAccessMask;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkFenceCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+}
+
+// VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
+// we need in the compute-only hot loop are listed.
+internal static class VkPipelineStageFlags
+{
+    internal const uint TopOfPipe = 0x00000001;
+    internal const uint Transfer = 0x00001000;
+    internal const uint ComputeShader = 0x00000800;
+    internal const uint BottomOfPipe = 0x00002000;
+    internal const uint Host = 0x00004000;
+}
+
+// VkAccessFlagBits — memory access masks for vkCmdPipelineBarrier.
+internal static class VkAccessFlags
+{
+    internal const uint ShaderRead = 0x00000020;
+    internal const uint ShaderWrite = 0x00000040;
+    internal const uint TransferRead = 0x00000800;
+    internal const uint TransferWrite = 0x00001000;
+    internal const uint HostRead = 0x00002000;
+    internal const uint HostWrite = 0x00004000;
+    internal const uint MemoryRead = 0x00008000;
+    internal const uint MemoryWrite = 0x00010000;
 }
 
 // VkPhysicalDeviceSubgroupProperties — returned by vkGetPhysicalDeviceProperties2

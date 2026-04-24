@@ -225,9 +225,50 @@ internal static partial class VulkanApi
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
 
     [LibraryImport(LibName)]
+    internal static partial void vkCmdCopyBuffer(
+        nint commandBuffer, nint srcBuffer, nint dstBuffer,
+        uint regionCount, in VkBufferCopy pRegions);
+
+    // Inserts an execution / memory dependency between commands. Used on the
+    // hot forward path to chain kernel dispatches without a host wait: a
+    // SHADER_WRITE -> SHADER_READ memory barrier between kernels is enough to
+    // keep each kernel reading the previous kernel's outputs.
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdPipelineBarrier(
+        nint commandBuffer,
+        uint srcStageMask, uint dstStageMask, uint dependencyFlags,
+        uint memoryBarrierCount, in VkMemoryBarrier pMemoryBarriers,
+        uint bufferMemoryBarrierCount, nint pBufferMemoryBarriers,
+        uint imageMemoryBarrierCount, nint pImageMemoryBarriers);
+
+    [LibraryImport(LibName)]
     internal static partial int vkQueueSubmit(
         nint queue, uint submitCount, in VkSubmitInfo pSubmits, nint fence);
 
     [LibraryImport(LibName)]
     internal static partial int vkQueueWaitIdle(nint queue);
+
+    // ── Fences ──────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateFence(
+        nint device, in VkFenceCreateInfo pCreateInfo,
+        nint pAllocator, out nint pFence);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyFence(
+        nint device, nint fence, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkWaitForFences(
+        nint device, uint fenceCount, in nint pFences,
+        [MarshalAs(UnmanagedType.U4)] uint waitAll, ulong timeout);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkResetFences(
+        nint device, uint fenceCount, in nint pFences);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkResetCommandBuffer(
+        nint commandBuffer, uint flags);
 }
