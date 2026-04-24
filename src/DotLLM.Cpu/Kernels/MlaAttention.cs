@@ -113,7 +113,33 @@ public static class MlaAttention
     /// <see cref="DotLLM.Core.Models.MlaConfig.ComputeYarnSoftmaxScaleMultiplier"/>
     /// which returns <c>mscale²</c> per the DeepSeek-V2 YaRN recipe.
     /// </param>
-    public static void Execute(
+    /// <param name="cachedKNope">
+    /// Optional native pointer to a persistent per-layer K_nope buffer of
+    /// shape <c>[maxSeqLen, numHeads * qk_nope_head_dim]</c>. When non-zero,
+    /// the kernel appends the new <paramref name="seqLen"/> tokens' K_nope
+    /// at offset <paramref name="cachedLength"/> and the attention loop
+    /// iterates over all <c>cachedLength + seqLen</c> cached positions.
+    /// </param>
+    /// <param name="cachedV">
+    /// Optional native pointer to a persistent per-layer V buffer of shape
+    /// <c>[maxSeqLen, numHeads * v_head_dim]</c>. Must be supplied whenever
+    /// <paramref name="cachedKNope"/> is supplied.
+    /// </param>
+    /// <param name="cachedKPe">
+    /// Optional native pointer to a persistent per-layer K_pe buffer of
+    /// shape <c>[maxSeqLen, qk_rope_head_dim]</c> (single MQA rope-K,
+    /// RoPE-already-applied — we cache the post-rotation value). Must be
+    /// supplied whenever <paramref name="cachedKNope"/> is supplied.
+    /// </param>
+    /// <param name="cachedLength">
+    /// Number of positions already present in the cache for this layer. The
+    /// new tokens sit at <c>[cachedLength, cachedLength + seqLen)</c>; the
+    /// attention loop attends over all <c>cachedLength + seqLen</c>
+    /// positions. Must equal <paramref name="positionOffset"/> in the typical
+    /// autoregressive case — the two are distinct in the signature only to
+    /// keep the cache-less call path untouched.
+    /// </param>
+    public static unsafe void Execute(
         ReadOnlySpan<float> hidden,
         Span<float> output,
         int seqLen,
@@ -136,8 +162,17 @@ public static class MlaAttention
         ReadOnlySpan<float> kvALayernormWeight,
         ReadOnlySpan<float> kvBProj,
         ReadOnlySpan<float> oProj,
-        float attnScaleMultiplier = 1.0f)
+        float attnScaleMultiplier = 1.0f,
+        nint cachedKNope = 0,
+        nint cachedV = 0,
+        nint cachedKPe = 0,
+        int cachedLength = 0)
     {
+        bool useCache = cachedKNope != 0;
+        if (useCache && (cachedV == 0 || cachedKPe == 0))
+            throw new ArgumentException(
+                "cachedV and cachedKPe must be supplied together with cachedKNope.");
+
         ValidateArgs(seqLen, hiddenSize, numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
                      qLoraRank, kvLoraRank, hidden, output);
 
@@ -244,6 +279,34 @@ public static class MlaAttention
             ApplyRopeNormInPlace(kPe, cosRow, sinRow);
         }
 
+        // If a cache is provided, memcpy the seqLen newly-computed K_nope /
+        // V / K_pe rows into the persistent per-layer store at offset
+        // `cachedLength`. Subsequent attention reads then see the full
+        // history (0..cachedLength + seqLen) via the cache spans built
+        // below. The managed scratch arrays (kNopeBuf / vBuf / kPeBuf) are
+        // still used as the source; only the *read* side of attention
+        // switches to the cache.
+        if (useCache)
+        {
+            int kNopePerTok = numHeads * qkNopeHeadDim;
+            int vPerTok = numHeads * vHeadDim;
+
+            var dstKNope = new Span<float>(
+                (void*)(cachedKNope + (nint)((long)cachedLength * kNopePerTok * sizeof(float))),
+                seqLen * kNopePerTok);
+            kNopeBuf.AsSpan(0, seqLen * kNopePerTok).CopyTo(dstKNope);
+
+            var dstV = new Span<float>(
+                (void*)(cachedV + (nint)((long)cachedLength * vPerTok * sizeof(float))),
+                seqLen * vPerTok);
+            vBuf.AsSpan(0, seqLen * vPerTok).CopyTo(dstV);
+
+            var dstKPe = new Span<float>(
+                (void*)(cachedKPe + (nint)((long)cachedLength * qkRopeHeadDim * sizeof(float))),
+                seqLen * qkRopeHeadDim);
+            kPeBuf.AsSpan(0, seqLen * qkRopeHeadDim).CopyTo(dstKPe);
+        }
+
         // Attention per head with causal mask
         // Q_h[t] = concat(q_nope_h[t], q_pe_h[t]) — already adjacent in qBuf
         // K_h[s] = concat(k_nope_h[s], k_pe_shared[s])
@@ -251,10 +314,23 @@ public static class MlaAttention
         // Score[t, s] = Q_h[t] . K_h[s] * scale
         // Mask: s <= positionOffset + t
         //   Output per head at t: softmax(score[t, :]) . V_h[:]
+        //
+        // When useCache: read K_nope / V / K_pe from the native cache so the
+        // attention loop sees all (cachedLength + seqLen) positions. When
+        // not: read from the per-call managed scratch arrays and attend
+        // only over seqLen (the historical no-cache PoC path).
+        int seqKv = useCache ? cachedLength + seqLen : seqLen;
+        int queryPosBase = useCache ? cachedLength : positionOffset;
 
-        // We compute attention with the Q/K/V in place — no cache for this PoC.
-        // Layout assumption for self-attention prefill: seqKv = seqLen.
-        int seqKv = seqLen;
+        ReadOnlySpan<float> kNopeReadAll = useCache
+            ? new ReadOnlySpan<float>((void*)cachedKNope, seqKv * numHeads * qkNopeHeadDim)
+            : kNopeBuf.AsSpan(0, seqLen * numHeads * qkNopeHeadDim);
+        ReadOnlySpan<float> vReadAll = useCache
+            ? new ReadOnlySpan<float>((void*)cachedV, seqKv * numHeads * vHeadDim)
+            : vBuf.AsSpan(0, seqLen * numHeads * vHeadDim);
+        ReadOnlySpan<float> kPeReadAll = useCache
+            ? new ReadOnlySpan<float>((void*)cachedKPe, seqKv * qkRopeHeadDim)
+            : kPeBuf.AsSpan(0, seqLen * qkRopeHeadDim);
 
         // Scratch scores reused across all heads.
         float[] scores = new float[seqLen * seqKv];
@@ -267,20 +343,23 @@ public static class MlaAttention
                 var qNopeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim, qkNopeHeadDim);
                 var qPeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim + qkNopeHeadDim, qkRopeHeadDim);
 
+                // Absolute position of query t in the full causal window.
+                int queryPos = queryPosBase + t;
+
                 for (int s = 0; s < seqKv; s++)
                 {
-                    // Causal mask: s > positionOffset + t → -inf
-                    if (s > positionOffset + t)
+                    // Causal mask: s > queryPos → -inf
+                    if (s > queryPos)
                     {
                         scores[t * seqKv + s] = float.NegativeInfinity;
                         continue;
                     }
 
                     // K_h[s] = concat(k_nope_h[s], k_pe_shared[s])
-                    var kNopeH = kNopeBuf.AsSpan(
+                    var kNopeH = kNopeReadAll.Slice(
                         s * numHeads * qkNopeHeadDim + h * qkNopeHeadDim,
                         qkNopeHeadDim);
-                    var kPeS = kPeBuf.AsSpan(s * qkRopeHeadDim, qkRopeHeadDim);
+                    var kPeS = kPeReadAll.Slice(s * qkRopeHeadDim, qkRopeHeadDim);
 
                     float dot = 0f;
                     for (int d = 0; d < qkNopeHeadDim; d++)
@@ -297,11 +376,11 @@ public static class MlaAttention
                 // Weighted sum over V_h
                 var outH = attnOutBuf.AsSpan(t * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
                 outH.Clear();
-                for (int s = 0; s <= positionOffset + t && s < seqKv; s++)
+                for (int s = 0; s <= queryPos && s < seqKv; s++)
                 {
                     float w = scores[t * seqKv + s];
                     if (w == 0f) continue;
-                    var vH = vBuf.AsSpan(s * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
+                    var vH = vReadAll.Slice(s * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
                     for (int d = 0; d < vHeadDim; d++)
                         outH[d] += w * vH[d];
                 }

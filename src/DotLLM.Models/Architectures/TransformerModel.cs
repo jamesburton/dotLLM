@@ -30,6 +30,11 @@ public sealed unsafe class TransformerModel : IModel
 
     private readonly TransformerWeights _weights;
     private readonly TransformerForwardState _state;
+    // Persistent K_nope / V / K_pe cache for MLA layers. Lazily constructed
+    // on the first MLA forward and reset when the caller signals a fresh
+    // sequence by passing positions[0] == 0. Null for non-MLA models. See
+    // MlaExpandedKvState for the rationale on not implementing IKvCache.
+    private MlaExpandedKvState? _mlaKvState;
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
@@ -254,6 +259,29 @@ public sealed unsafe class TransformerModel : IModel
             _ => Math.Min(DebugMaxLayers, Config.NumLayers)
         };
 
+        // MLA cache lifecycle: allocated lazily on the first MLA forward
+        // pass, reset when positions[0] == 0 so successive unrelated calls
+        // (integration tests, multiple prompts, …) don't reuse stale K/V.
+        // For incremental autoregressive generation the caller passes
+        // positions[0] > 0 and we preserve state. Non-MLA models leave
+        // _mlaKvState null forever.
+        if (Config.MlaConfig is not null)
+        {
+            if (_mlaKvState is null)
+            {
+                var mla = Config.MlaConfig;
+                _mlaKvState = new MlaExpandedKvState(
+                    numLayers: Config.NumLayers,
+                    maxSeqLen: Config.MaxSequenceLength,
+                    numHeads: Config.NumAttentionHeads,
+                    qkNopeHeadDim: mla.QkNopeHeadDim,
+                    vHeadDim: mla.VHeadDim,
+                    qkRopeHeadDim: mla.QkRopeHeadDim);
+            }
+            if (positions[0] == 0)
+                _mlaKvState.Reset();
+        }
+
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -270,8 +298,17 @@ public sealed unsafe class TransformerModel : IModel
             // Routes through the standalone MlaAttention kernel: RMSNorm → Q
             // path (LoRA or monolithic) → KV path (LoRA + MQA-shared rope-K)
             // → decoupled RoPE on the rope sub-dim only → per-head
-            // scaled-dot-product attention with causal mask → o_proj. No
-            // KV-cache in this PoC (kvCache argument is ignored for MLA layers).
+            // scaled-dot-product attention with causal mask → o_proj.
+            //
+            // Cache: the kernel writes new K_nope / V / K_pe into the
+            // persistent per-layer _mlaKvState store at offset
+            // currentLength[layer] and attends over all (currentLength +
+            // seqLen) tokens. This is the "non-absorbed reference" path per
+            // the P2.3 plan — it matches the cacheless kernel numerically
+            // and unblocks generation-loop tests on DeepSeek. Phase B
+            // (latent compression + W_UK absorption) will layer on top,
+            // using this as the correctness oracle. The caller-supplied
+            // IKvCache is still ignored for MLA layers (shape-incompatible).
             if (lw.Mla is not null)
             {
                 // RMSNorm per token into normOut (MLA kernel consumes the
@@ -328,7 +365,19 @@ public sealed unsafe class TransformerModel : IModel
                     // YaRN softmax-scale correction (mscale²). Returns 1.0f
                     // when rope_scaling is absent or factor <= 1 — so no
                     // behavioural change for pre-YaRN checkpoints.
-                    attnScaleMultiplier: Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier());
+                    attnScaleMultiplier: Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier(),
+                    // Persistent KV cache pointers for this layer (see
+                    // MlaExpandedKvState). On a fresh sequence, positions[0]
+                    // was 0 and Reset() cleared currentLength to 0 above.
+                    cachedKNope: _mlaKvState!.GetKNopePointer(layer),
+                    cachedV: _mlaKvState.GetVPointer(layer),
+                    cachedKPe: _mlaKvState.GetKPePointer(layer),
+                    cachedLength: _mlaKvState.GetCurrentLength(layer));
+
+                // Commit the seqLen new positions into the cache for this
+                // layer so the next call sees them. Kernel already copied
+                // the K_nope / V / K_pe rows; this just advances the length.
+                _mlaKvState.Advance(layer, seqLen);
 
                 // Bias on o_proj (rare — DeepSeek doesn't ship one by default).
                 AddBias(lw.OBias, attnOut, hiddenSize, seqLen);
@@ -1046,6 +1095,7 @@ public sealed unsafe class TransformerModel : IModel
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();
+        _mlaKvState?.Dispose();
         _weights.Dispose(); // free R4-interleaved weight buffers and any owned bf16→F32 scratch
         // _mmapAnchor is not owned by us — caller disposes the GgufFile / SafetensorsFile.
     }
