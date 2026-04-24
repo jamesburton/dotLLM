@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.Hf;
@@ -271,6 +272,84 @@ public class HfByteLevelBpeTokenizerTests
 
         HfTokenizerSpec spec = HfTokenizerJsonParser.Parse(json);
         Assert.Equal(HfPreTokenizerKind.Sequence, spec.PreTokenizerKind);
+    }
+
+    // =====================================================================
+    // NormalizingTokenizer — short-circuits when input is already normalized.
+    // Regression guard for the P0.1 follow-up that avoids the allocation from
+    // string.Normalize(form) when text.IsNormalized(form) would be true.
+    // =====================================================================
+
+    [Fact]
+    public void NormalizingTokenizer_AlreadyNormalizedAscii_SkipsNormalizeCall()
+    {
+        var inner = new RecordingTokenizer();
+        var decorated = new NormalizingTokenizer(inner, NormalizationForm.FormC);
+
+        // ASCII is always NFC-normalized — the decorator must pass the
+        // original string reference through untouched (no Normalize allocation).
+        const string Ascii = "Hello, world!";
+        _ = decorated.Encode(Ascii);
+
+        Assert.Single(inner.ReceivedInputs);
+        Assert.Same(Ascii, inner.ReceivedInputs[0]);
+    }
+
+    [Fact]
+    public void NormalizingTokenizer_EmptyString_SkipsNormalizeCall()
+    {
+        var inner = new RecordingTokenizer();
+        var decorated = new NormalizingTokenizer(inner, NormalizationForm.FormC);
+
+        string empty = string.Empty;
+        _ = decorated.Encode(empty);
+
+        Assert.Single(inner.ReceivedInputs);
+        Assert.Same(empty, inner.ReceivedInputs[0]);
+    }
+
+    [Fact]
+    public void NormalizingTokenizer_NonNormalizedInput_StillNormalizes()
+    {
+        var inner = new RecordingTokenizer();
+        var decorated = new NormalizingTokenizer(inner, NormalizationForm.FormC);
+
+        // "e" + combining acute accent (U+0301) is NFD, NOT NFC. The
+        // decorator must call Normalize and forward the NFC result.
+        string nfd = "é";
+        Assert.False(nfd.IsNormalized(NormalizationForm.FormC));
+
+        _ = decorated.Encode(nfd);
+
+        Assert.Single(inner.ReceivedInputs);
+        Assert.NotSame(nfd, inner.ReceivedInputs[0]);
+        Assert.Equal(nfd.Normalize(NormalizationForm.FormC), inner.ReceivedInputs[0]);
+    }
+
+    /// <summary>
+    /// Test-only <see cref="ITokenizer"/> that records each input string it
+    /// receives via <see cref="Encode"/> so the surrounding test can assert
+    /// reference-identity (i.e. whether the decorator skipped the Normalize
+    /// allocation).
+    /// </summary>
+    private sealed class RecordingTokenizer : ITokenizer
+    {
+        public List<string> ReceivedInputs { get; } = new();
+
+        public int VocabSize => 0;
+        public int BosTokenId => -1;
+        public int EosTokenId => -1;
+
+        public int[] Encode(string text)
+        {
+            ReceivedInputs.Add(text);
+            return [];
+        }
+
+        public string Decode(ReadOnlySpan<int> tokenIds) => string.Empty;
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => string.Empty;
+        public string DecodeToken(int tokenId) => string.Empty;
+        public int CountTokens(string text) => 0;
     }
 
     // =====================================================================

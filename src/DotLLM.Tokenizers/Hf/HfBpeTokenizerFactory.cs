@@ -338,7 +338,9 @@ internal sealed class NormalizingTokenizer(ITokenizer inner, NormalizationForm f
     public int EosTokenId => _inner.EosTokenId;
 
     public int[] Encode(string text) =>
-        text.Length == 0 ? _inner.Encode(text) : _inner.Encode(text.Normalize(form));
+        text.Length == 0 || text.IsNormalized(form)
+            ? _inner.Encode(text)
+            : _inner.Encode(text.Normalize(form));
 
     public string Decode(ReadOnlySpan<int> tokenIds) => _inner.Decode(tokenIds);
     public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => _inner.Decode(tokenIds, stripBosSpace);

@@ -129,45 +129,73 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
         // misclassify multi-byte chars and split them into per-byte segments,
         // preventing the BPE merge table (which encodes byte pairs as a
         // single token) from firing on non-ASCII input.
+        //
+        // The byte-mapped segment buffer is rented once up-front — UTF-8
+        // byte count of the whole text is an upper bound for any chunk — to
+        // eliminate the per-regex-match string allocation that the previous
+        // ByteMap-returns-string implementation incurred.
         if (_preRegex is null)
         {
             // No pre-tokenization: byte-map the whole string and feed it as one
             // segment. Only hit by ByteLevel(use_regex:false) with no
             // upstream Split — an uncommon configuration.
-            return EncodeSegment(ByteMap(text));
+            int wholeMaxChars = Encoding.UTF8.GetMaxByteCount(text.Length);
+            char[] wholeBuf = ArrayPool<char>.Shared.Rent(wholeMaxChars);
+            try
+            {
+                ByteMapIntoSpan(text, wholeBuf, out int wholeWritten);
+                return EncodeSegment(wholeBuf.AsSpan(0, wholeWritten));
+            }
+            finally
+            {
+                ArrayPool<char>.Shared.Return(wholeBuf);
+            }
         }
 
         var result = new List<int>(Math.Max(16, text.Length));
-        foreach (var match in _preRegex.EnumerateMatches(text))
+        int maxChars = Encoding.UTF8.GetMaxByteCount(text.Length);
+        char[] byteMapBuf = ArrayPool<char>.Shared.Rent(maxChars);
+        try
         {
-            ReadOnlySpan<char> rawChunk = text.AsSpan(match.Index, match.Length);
-            if (rawChunk.IsEmpty) continue;
-            EncodeSegmentInto(ByteMap(rawChunk), result);
+            foreach (var match in _preRegex.EnumerateMatches(text))
+            {
+                ReadOnlySpan<char> rawChunk = text.AsSpan(match.Index, match.Length);
+                if (rawChunk.IsEmpty) continue;
+                ByteMapIntoSpan(rawChunk, byteMapBuf, out int written);
+                EncodeSegmentInto(byteMapBuf.AsSpan(0, written), result);
+            }
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(byteMapBuf);
         }
         return result.ToArray();
     }
 
     /// <summary>
     /// UTF-8 encodes <paramref name="text"/> and applies the GPT-2
-    /// bytes_to_unicode mapping. Allocates a new <see cref="string"/> per
-    /// call — one string per regex match on the encode hot path. Could be
-    /// replaced by a rented-buffer variant if allocation profiles show this
-    /// dominating; for now, regex matches are short and this keeps the
-    /// code readable.
+    /// bytes_to_unicode mapping into a caller-provided destination. Returns
+    /// the number of chars written via <paramref name="written"/>. The
+    /// destination must be large enough — <c>Encoding.UTF8.GetMaxByteCount(length)</c>
+    /// of the input char length is a safe upper bound. Allocation-free on
+    /// the hot path; replaces the former <c>string</c>-returning variant
+    /// that allocated one string per regex match in <see cref="Encode"/>.
     /// </summary>
-    private static string ByteMap(ReadOnlySpan<char> text)
+    private static void ByteMapIntoSpan(ReadOnlySpan<char> text, Span<char> dest, out int written)
     {
-        if (text.IsEmpty) return string.Empty;
+        if (text.IsEmpty)
+        {
+            written = 0;
+            return;
+        }
         int utf8Len = Encoding.UTF8.GetByteCount(text);
         byte[] rentedUtf8 = ArrayPool<byte>.Shared.Rent(utf8Len);
         try
         {
-            Encoding.UTF8.GetBytes(text, rentedUtf8);
-            return string.Create(utf8Len, rentedUtf8, static (dst, src) =>
-            {
-                for (int i = 0; i < dst.Length; i++)
-                    dst[i] = Gpt2ByteToUnicode[src[i]];
-            });
+            int actual = Encoding.UTF8.GetBytes(text, rentedUtf8);
+            for (int i = 0; i < actual; i++)
+                dest[i] = Gpt2ByteToUnicode[rentedUtf8[i]];
+            written = actual;
         }
         finally
         {
