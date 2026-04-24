@@ -418,9 +418,14 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(6, cfg.Moe.NumExpertsPerTok);
         Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
         Assert.False(cfg.Moe.NormTopKProb);
-        // Each shared expert is moe_intermediate_size wide; count = n_shared_experts.
-        Assert.Equal(1408, cfg.Moe.SharedExpertIntermediateSize);
-        Assert.Equal(2, cfg.Moe.NumSharedExperts);
+        // DeepSeek-V2 fuses n_shared_experts shared experts into a SINGLE
+        // DeepseekV2MLP(intermediate_size = moe_intermediate_size *
+        // n_shared_experts) per modeling_deepseek.py. The checkpoint reflects
+        // that — tensors are mlp.shared_experts.{gate,up,down}_proj with no
+        // numeric expert index. We represent this as NumSharedExperts=1 with
+        // fused SharedExpertIntermediateSize=1408*2=2816.
+        Assert.Equal(1408 * 2, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.Equal(1, cfg.Moe.NumSharedExperts);
         Assert.False(cfg.Moe.HasSharedExpertGate); // DeepSeek does NOT gate
 
         // first_k_dense_replace=1 → layer 0 is dense, 1..26 are MoE
