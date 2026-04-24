@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>HIP/ROCm GPU backend for dotLLM — AMD GPU path via P/Invoke against libamdhip64 + hipBLAS. Code objects (.co) loaded through the HIP runtime module API. Proof-of-pipeline scaffold; kernels port mechanically from DotLLM.Cuda via hipify-perl.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotLLM.Tests.Unit" />
+    <InternalsVisibleTo Include="DotLLM.Tests.Integration" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\native\hip\co\*.co" Link="co\%(Filename)%(Extension)" Condition="Exists('..\..\native\hip\co\')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- HIP code-object compilation: .hip to .co via 'hipcc genco'.
+       Skipped when ROCm is not installed (end users can ship with pre-compiled .co files).
+       Incremental build: only recompiles kernels when source is newer than .co output. -->
+  <PropertyGroup>
+    <HipKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'kernels'))</HipKernelDir>
+    <HipCoOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'hip', 'co'))</HipCoOutputDir>
+    <!-- gfx1030 = RDNA2 (RX 6000), gfx1100 = RDNA3 (RX 7000). Extend as needed. -->
+    <HipOffloadArchs>--offload-arch=gfx1030 --offload-arch=gfx1100</HipOffloadArchs>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <HipKernel Include="$(HipKernelDir)\*.hip" />
+  </ItemGroup>
+
+  <Target Name="CompileHipCodeObjects"
+          BeforeTargets="BeforeBuild"
+          Inputs="@(HipKernel)"
+          Outputs="@(HipKernel->'$(HipCoOutputDir)\%(Filename).co')">
+    <Exec Command="hipcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_HipccExitCode" />
+    </Exec>
+    <Message Condition="'$(_HipccExitCode)' != '0'" Importance="high"
+             Text="WARNING: .hip source newer than .co but hipcc not found in PATH. Pre-compiled code objects may be stale. Install ROCm to auto-compile kernels." />
+
+    <MakeDir Condition="'$(_HipccExitCode)' == '0'" Directories="$(HipCoOutputDir)" />
+    <Message Condition="'$(_HipccExitCode)' == '0'" Importance="high" Text="Compiling %(HipKernel.Filename).hip to code object" />
+    <Exec Condition="'$(_HipccExitCode)' == '0'"
+          Command="hipcc --genco $(HipOffloadArchs) -o &quot;$(HipCoOutputDir)/%(HipKernel.Filename).co&quot; &quot;%(HipKernel.FullPath)&quot;"
+          StandardOutputImportance="low" />
+  </Target>
+
+</Project>
