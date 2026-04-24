@@ -361,11 +361,9 @@ public static class MlaAttention
                         qkNopeHeadDim);
                     var kPeS = kPeReadAll.Slice(s * qkRopeHeadDim, qkRopeHeadDim);
 
-                    float dot = 0f;
-                    for (int d = 0; d < qkNopeHeadDim; d++)
-                        dot += qNopeH[d] * kNopeH[d];
-                    for (int d = 0; d < qkRopeHeadDim; d++)
-                        dot += qPeH[d] * kPeS[d];
+                    // Score = Q_nope · K_nope + Q_pe · K_pe_shared — vectorised.
+                    float dot = TensorPrimitives.Dot(qNopeH, kNopeH)
+                              + TensorPrimitives.Dot(qPeH, kPeS);
 
                     scores[t * seqKv + s] = dot * scale;
                 }
@@ -373,7 +371,8 @@ public static class MlaAttention
                 // Softmax row t
                 SoftmaxRowInPlace(scores.AsSpan(), t, seqKv);
 
-                // Weighted sum over V_h
+                // Weighted sum over V_h — SAXPY via MultiplyAdd
+                // (outH = v_h * w + outH).
                 var outH = attnOutBuf.AsSpan(t * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
                 outH.Clear();
                 for (int s = 0; s <= queryPos && s < seqKv; s++)
@@ -381,8 +380,7 @@ public static class MlaAttention
                     float w = scores[t * seqKv + s];
                     if (w == 0f) continue;
                     var vH = vReadAll.Slice(s * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
-                    for (int d = 0; d < vHeadDim; d++)
-                        outH[d] += w * vH[d];
+                    TensorPrimitives.MultiplyAdd(vH, w, outH, outH);
                 }
             }
         }
@@ -600,12 +598,13 @@ public static class MlaAttention
                 var qNopeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim, qkNopeHeadDim);
                 var qAbsH = qAbsorbedBuf.AsSpan(t * numHeads * kvLoraRank + h * kvLoraRank, kvLoraRank);
                 qAbsH.Clear();
+                // SAXPY accumulation: qAbsH += qNopeH[j] * W_UK[h][j] for each j.
+                // TensorPrimitives.MultiplyAdd(wRow, qj, qAbsH, qAbsH) vectorises
+                // the inner kvLoraRank-wide loop.
                 for (int j = 0; j < qkNopeHeadDim; j++)
                 {
-                    float qj = qNopeH[j];
                     var wRow = kvBProj.Slice((wUkBaseRow + j) * kvLoraRank, kvLoraRank);
-                    for (int k = 0; k < kvLoraRank; k++)
-                        qAbsH[k] += qj * wRow[k];
+                    TensorPrimitives.MultiplyAdd(wRow, qNopeH[j], qAbsH, qAbsH);
                 }
             }
         }
@@ -641,17 +640,16 @@ public static class MlaAttention
                     var cKvS = latentReadAll.Slice(s * kvLoraRank, kvLoraRank);
                     var kPeS = kPeReadAll.Slice(s * qkRopeHeadDim, qkRopeHeadDim);
 
-                    float dot = 0f;
-                    for (int k = 0; k < kvLoraRank; k++)
-                        dot += qAbsH[k] * cKvS[k];
-                    for (int d = 0; d < qkRopeHeadDim; d++)
-                        dot += qPeH[d] * kPeS[d];
+                    // Absorbed score = Q_latent · c_kv + Q_pe · k_pe — both vectorised.
+                    float dot = TensorPrimitives.Dot(qAbsH, cKvS)
+                              + TensorPrimitives.Dot(qPeH, kPeS);
 
                     scores[t * seqKv + s] = dot * scale;
                 }
 
                 SoftmaxRowInPlace(scores.AsSpan(), t, seqKv);
 
+                // Weighted sum over latent — SAXPY via MultiplyAdd.
                 var outLatentH = attnOutLatentBuf.AsSpan(
                     t * numHeads * kvLoraRank + h * kvLoraRank, kvLoraRank);
                 outLatentH.Clear();
@@ -660,8 +658,7 @@ public static class MlaAttention
                     float w = scores[t * seqKv + s];
                     if (w == 0f) continue;
                     var cKvS = latentReadAll.Slice(s * kvLoraRank, kvLoraRank);
-                    for (int k = 0; k < kvLoraRank; k++)
-                        outLatentH[k] += w * cKvS[k];
+                    TensorPrimitives.MultiplyAdd(cKvS, w, outLatentH, outLatentH);
                 }
             }
         }
