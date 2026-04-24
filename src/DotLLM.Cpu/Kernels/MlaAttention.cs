@@ -693,6 +693,291 @@ public static class MlaAttention
     }
 
     /// <summary>
+    /// Phase C — hybrid dispatch over the Phase B latent KV-cache. The
+    /// persistent storage is identical to <see cref="ExecuteLatent"/>
+    /// (<c>c_kv</c> + <c>k_pe</c> per token — the ~7× memory win), but the
+    /// attention kernel is selected per call based on <paramref name="seqLen"/>:
+    /// <list type="bullet">
+    ///   <item><b>Prefill</b> (<c>seqLen &gt; 1</c>): expand the latent rows
+    ///     (both newly computed and any historically cached) through
+    ///     <c>W_UK</c>/<c>W_UV</c> into a local scratch buffer, then run the
+    ///     standard per-head 192-dim MHA loop. The seqKv × seqLen attention
+    ///     is compute-bound at prefill, where the 192-dim path is cheaper
+    ///     than the 576-dim absorbed form.</item>
+    ///   <item><b>Decode</b> (<c>seqLen == 1</c>): delegate to
+    ///     <see cref="ExecuteLatent"/> — the absorbed 576-dim MQA-style
+    ///     loop that reads the compact latent cache directly
+    ///     (bandwidth-bound at decode).</item>
+    /// </list>
+    /// Mirrors vLLM's production MLA backend dispatch.
+    /// </summary>
+    /// <remarks>
+    /// <b>Cache invariant.</b> Regardless of which path executed prefill,
+    /// the on-disk cache holds the latent form (<c>c_kv</c> + <c>k_pe</c>).
+    /// A subsequent decode step therefore sees the same latents a pure
+    /// Phase B prefill would have written, and can run the absorbed
+    /// 576-dim kernel over them without re-expansion. Phase A's
+    /// expanded-per-head scratch is local-only here — allocated, used for
+    /// the prefill attention loop, and discarded.
+    /// </remarks>
+    /// <param name="hidden">See <see cref="Execute"/>.</param>
+    /// <param name="output">See <see cref="Execute"/>.</param>
+    /// <param name="seqLen">See <see cref="Execute"/>.</param>
+    /// <param name="positionOffset">See <see cref="Execute"/>.</param>
+    /// <param name="hiddenSize">See <see cref="Execute"/>.</param>
+    /// <param name="numHeads">See <see cref="Execute"/>.</param>
+    /// <param name="qkNopeHeadDim">See <see cref="Execute"/>.</param>
+    /// <param name="qkRopeHeadDim">See <see cref="Execute"/>.</param>
+    /// <param name="vHeadDim">See <see cref="Execute"/>.</param>
+    /// <param name="qLoraRank">See <see cref="Execute"/>.</param>
+    /// <param name="kvLoraRank">See <see cref="Execute"/>.</param>
+    /// <param name="rmsNormEps">See <see cref="Execute"/>.</param>
+    /// <param name="ropeCosTable">See <see cref="Execute"/>.</param>
+    /// <param name="ropeSinTable">See <see cref="Execute"/>.</param>
+    /// <param name="qAProj">See <see cref="Execute"/>.</param>
+    /// <param name="qALayernormWeight">See <see cref="Execute"/>.</param>
+    /// <param name="qBProj">See <see cref="Execute"/>.</param>
+    /// <param name="qProj">See <see cref="Execute"/>.</param>
+    /// <param name="kvAProjWithMqa">See <see cref="Execute"/>.</param>
+    /// <param name="kvALayernormWeight">See <see cref="Execute"/>.</param>
+    /// <param name="kvBProj">See <see cref="ExecuteLatent"/>.</param>
+    /// <param name="oProj">See <see cref="Execute"/>.</param>
+    /// <param name="cachedLatent">See <see cref="ExecuteLatent"/>.</param>
+    /// <param name="cachedKPe">See <see cref="ExecuteLatent"/>.</param>
+    /// <param name="cachedLength">See <see cref="ExecuteLatent"/>.</param>
+    /// <param name="attnScaleMultiplier">See <see cref="Execute"/>.</param>
+    public static unsafe void ExecuteLatentHybrid(
+        ReadOnlySpan<float> hidden,
+        Span<float> output,
+        int seqLen,
+        int positionOffset,
+        int hiddenSize,
+        int numHeads,
+        int qkNopeHeadDim,
+        int qkRopeHeadDim,
+        int vHeadDim,
+        int qLoraRank,
+        int kvLoraRank,
+        float rmsNormEps,
+        ReadOnlySpan<float> ropeCosTable,
+        ReadOnlySpan<float> ropeSinTable,
+        ReadOnlySpan<float> qAProj,
+        ReadOnlySpan<float> qALayernormWeight,
+        ReadOnlySpan<float> qBProj,
+        ReadOnlySpan<float> qProj,
+        ReadOnlySpan<float> kvAProjWithMqa,
+        ReadOnlySpan<float> kvALayernormWeight,
+        ReadOnlySpan<float> kvBProj,
+        ReadOnlySpan<float> oProj,
+        nint cachedLatent,
+        nint cachedKPe,
+        int cachedLength,
+        float attnScaleMultiplier = 1.0f)
+    {
+        // Decode (seqLen == 1): absorbed kernel is the bandwidth-optimal
+        // choice. Delegate unchanged — the persistent latent cache is
+        // consumed directly.
+        if (seqLen == 1)
+        {
+            ExecuteLatent(
+                hidden, output, seqLen, positionOffset, hiddenSize, numHeads,
+                qkNopeHeadDim, qkRopeHeadDim, vHeadDim, qLoraRank, kvLoraRank,
+                rmsNormEps, ropeCosTable, ropeSinTable,
+                qAProj, qALayernormWeight, qBProj, qProj,
+                kvAProjWithMqa, kvALayernormWeight, kvBProj, oProj,
+                cachedLatent, cachedKPe, cachedLength, attnScaleMultiplier);
+            return;
+        }
+
+        // Prefill (seqLen > 1): expand-then-MHA path.
+        ValidateArgs(seqLen, hiddenSize, numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
+                     qLoraRank, kvLoraRank, hidden, output);
+        if (cachedLatent == 0 || cachedKPe == 0)
+            throw new ArgumentException(
+                "ExecuteLatentHybrid requires non-zero cachedLatent and cachedKPe.");
+
+        int qkHeadDim = qkNopeHeadDim + qkRopeHeadDim;
+        int qTotal = numHeads * qkHeadDim;
+        int perHeadKvBOut = qkNopeHeadDim + vHeadDim;
+        int kvBOutputDim = numHeads * perHeadKvBOut;
+        float scale = attnScaleMultiplier / MathF.Sqrt(qkHeadDim);
+
+        // Scratch.
+        float[] qBuf = new float[seqLen * qTotal];
+        float[] kPeBuf = new float[seqLen * qkRopeHeadDim];
+        float[] compressedKvBuf = new float[seqLen * (kvLoraRank + qkRopeHeadDim)];
+        float[] kvLatentNormBuf = new float[seqLen * kvLoraRank];
+        float[] qLatentBuf = qLoraRank > 0 ? new float[seqLen * qLoraRank] : Array.Empty<float>();
+        float[] qLatentNormBuf = qLoraRank > 0 ? new float[seqLen * qLoraRank] : Array.Empty<float>();
+        float[] attnOutBuf = new float[seqLen * numHeads * vHeadDim];
+
+        // ── Q projection (identical to ExecuteLatent / Execute) ────────
+        for (int t = 0; t < seqLen; t++)
+        {
+            var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
+            var qRow = qBuf.AsSpan(t * qTotal, qTotal);
+
+            if (qLoraRank > 0)
+            {
+                var latent = qLatentBuf.AsSpan(t * qLoraRank, qLoraRank);
+                MatVec(qAProj, hiddenRow, latent, qLoraRank, hiddenSize);
+                var latentNorm = qLatentNormBuf.AsSpan(t * qLoraRank, qLoraRank);
+                RmsNormScalar(latent, qALayernormWeight, rmsNormEps, latentNorm);
+                MatVec(qBProj, latentNorm, qRow, qTotal, qLoraRank);
+            }
+            else
+            {
+                MatVec(qProj, hiddenRow, qRow, qTotal, hiddenSize);
+            }
+        }
+
+        // ── KV down-projection + split (identical to ExecuteLatent) ────
+        int compressedKvDim = kvLoraRank + qkRopeHeadDim;
+        for (int t = 0; t < seqLen; t++)
+        {
+            var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
+            var compRow = compressedKvBuf.AsSpan(t * compressedKvDim, compressedKvDim);
+            MatVec(kvAProjWithMqa, hiddenRow, compRow, compressedKvDim, hiddenSize);
+
+            var latent = compRow.Slice(0, kvLoraRank);
+            var kPe = compRow.Slice(kvLoraRank, qkRopeHeadDim);
+
+            var latentNorm = kvLatentNormBuf.AsSpan(t * kvLoraRank, kvLoraRank);
+            RmsNormScalar(latent, kvALayernormWeight, rmsNormEps, latentNorm);
+
+            kPe.CopyTo(kPeBuf.AsSpan(t * qkRopeHeadDim, qkRopeHeadDim));
+        }
+
+        // ── RoPE on Q.rope and shared K_pe (identical to ExecuteLatent) ─
+        int halfRope = qkRopeHeadDim / 2;
+        for (int t = 0; t < seqLen; t++)
+        {
+            int pos = positionOffset + t;
+            var cosRow = ropeCosTable.Slice(pos * halfRope, halfRope);
+            var sinRow = ropeSinTable.Slice(pos * halfRope, halfRope);
+
+            for (int h = 0; h < numHeads; h++)
+            {
+                var qPe = qBuf.AsSpan(
+                    t * qTotal + h * qkHeadDim + qkNopeHeadDim,
+                    qkRopeHeadDim);
+                ApplyRopeNormInPlace(qPe, cosRow, sinRow);
+            }
+
+            var kPe = kPeBuf.AsSpan(t * qkRopeHeadDim, qkRopeHeadDim);
+            ApplyRopeNormInPlace(kPe, cosRow, sinRow);
+        }
+
+        // ── Cache write: append latentNorm + k_pe at offset cachedLength.
+        // Same on-disk layout as ExecuteLatent — a subsequent decode step
+        // will consume exactly what a pure-Phase-B prefill would have
+        // written.
+        {
+            var dstLatent = new Span<float>(
+                (void*)(cachedLatent + (nint)((long)cachedLength * kvLoraRank * sizeof(float))),
+                seqLen * kvLoraRank);
+            kvLatentNormBuf.AsSpan(0, seqLen * kvLoraRank).CopyTo(dstLatent);
+
+            var dstKPe = new Span<float>(
+                (void*)(cachedKPe + (nint)((long)cachedLength * qkRopeHeadDim * sizeof(float))),
+                seqLen * qkRopeHeadDim);
+            kPeBuf.AsSpan(0, seqLen * qkRopeHeadDim).CopyTo(dstKPe);
+        }
+
+        // ── Expand ALL seqKv latent rows into per-head K_nope/V scratch ─
+        // The cache now holds cachedLength + seqLen latent rows. We expand
+        // every row through kv_b_proj once so the attention loop below
+        // reads the same [seqKv, numHeads*qkNope] / [seqKv, numHeads*vHead]
+        // layouts Phase A operates on. The expanded scratch is THROWN AWAY
+        // at the end of this call — the persistent cache stays latent.
+        int seqKv = cachedLength + seqLen;
+        float[] kNopeExpanded = new float[seqKv * numHeads * qkNopeHeadDim];
+        float[] vExpanded = new float[seqKv * numHeads * vHeadDim];
+
+        ReadOnlySpan<float> latentReadAll =
+            new ReadOnlySpan<float>((void*)cachedLatent, seqKv * kvLoraRank);
+        ReadOnlySpan<float> kPeReadAll =
+            new ReadOnlySpan<float>((void*)cachedKPe, seqKv * qkRopeHeadDim);
+
+        {
+            float[] kvBExpandedRowBuf = new float[kvBOutputDim];
+            for (int s = 0; s < seqKv; s++)
+            {
+                var latentRow = latentReadAll.Slice(s * kvLoraRank, kvLoraRank);
+                MatVec(kvBProj, latentRow, kvBExpandedRowBuf, kvBOutputDim, kvLoraRank);
+
+                for (int h = 0; h < numHeads; h++)
+                {
+                    var headBlock = kvBExpandedRowBuf.AsSpan(h * perHeadKvBOut, perHeadKvBOut);
+                    headBlock.Slice(0, qkNopeHeadDim)
+                             .CopyTo(kNopeExpanded.AsSpan(
+                                 s * numHeads * qkNopeHeadDim + h * qkNopeHeadDim,
+                                 qkNopeHeadDim));
+                    headBlock.Slice(qkNopeHeadDim, vHeadDim)
+                             .CopyTo(vExpanded.AsSpan(
+                                 s * numHeads * vHeadDim + h * vHeadDim,
+                                 vHeadDim));
+                }
+            }
+        }
+
+        // ── Standard per-head MHA attention on the expanded scratch ─────
+        // Identical math to MlaAttention.Execute's attention loop, now
+        // reading from the locally-expanded kNopeExpanded / vExpanded
+        // instead of Phase A's persistent expanded cache.
+        int queryPosBase = cachedLength;
+        float[] scores = new float[seqLen * seqKv];
+        for (int h = 0; h < numHeads; h++)
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                var qNopeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim, qkNopeHeadDim);
+                var qPeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim + qkNopeHeadDim, qkRopeHeadDim);
+
+                int queryPos = queryPosBase + t;
+
+                for (int s = 0; s < seqKv; s++)
+                {
+                    if (s > queryPos)
+                    {
+                        scores[t * seqKv + s] = float.NegativeInfinity;
+                        continue;
+                    }
+                    var kNopeH = kNopeExpanded.AsSpan(
+                        s * numHeads * qkNopeHeadDim + h * qkNopeHeadDim, qkNopeHeadDim);
+                    var kPeS = kPeReadAll.Slice(s * qkRopeHeadDim, qkRopeHeadDim);
+
+                    float dot = TensorPrimitives.Dot(qNopeH, kNopeH)
+                              + TensorPrimitives.Dot(qPeH, kPeS);
+                    scores[t * seqKv + s] = dot * scale;
+                }
+
+                SoftmaxRowInPlace(scores.AsSpan(), t, seqKv);
+
+                var outH = attnOutBuf.AsSpan(t * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
+                outH.Clear();
+                for (int s = 0; s <= queryPos && s < seqKv; s++)
+                {
+                    float w = scores[t * seqKv + s];
+                    if (w == 0f) continue;
+                    var vH = vExpanded.AsSpan(
+                        s * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
+                    TensorPrimitives.MultiplyAdd(vH, w, outH, outH);
+                }
+            }
+        }
+
+        // ── o_proj (identical to Execute / ExecuteLatent) ──────────────
+        int oInputDim = numHeads * vHeadDim;
+        for (int t = 0; t < seqLen; t++)
+        {
+            var attnRow = attnOutBuf.AsSpan(t * oInputDim, oInputDim);
+            var outRow = output.Slice(t * hiddenSize, hiddenSize);
+            MatVec(oProj, attnRow, outRow, hiddenSize, oInputDim);
+        }
+    }
+
+    /// <summary>
     /// Standard <c>y = W @ x</c> matvec. <c>W</c> is row-major with shape
     /// <c>[m, k]</c>, <c>x</c> has length <c>k</c>, <c>y</c> has length <c>m</c>.
     /// </summary>

@@ -97,6 +97,24 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
         AssertPhaseBSplitCallMatchesPhaseASingle(qLoraRank: 0, seed: 112);
     }
 
+    [Fact]
+    public void Forward_PhaseC_HybridCache_MatchesPhaseASingleCall_LoRAQ()
+    {
+        // Phase C correctness check: the hybrid dispatch (expand-prefill /
+        // absorbed-decode) must match the Phase A single-call oracle
+        // within 1e-3. The decisive check is the first decode step after
+        // a 3-token prefill — its logits must match the 4th row of the
+        // single-call forward, proving that the cache written in Phase C
+        // prefill is consumable by Phase C decode.
+        AssertPhaseCSplitCallMatchesPhaseASingle(qLoraRank: 8, seed: 515);
+    }
+
+    [Fact]
+    public void Forward_PhaseC_HybridCache_MatchesPhaseASingleCall_MonolithicQ()
+    {
+        AssertPhaseCSplitCallMatchesPhaseASingle(qLoraRank: 0, seed: 616);
+    }
+
     /// <summary>
     /// Decisive P2.3 Phase B correctness check. Compares a Phase B
     /// (UseLatentCache = true) split-call prefill+decode sequence against
@@ -152,6 +170,74 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
                 float[] decodeRow = CopyRow(logits, 0);
                 AssertRowClose(fullLogits, rowIndex: t, expected: decodeRow,
                                tolerance: 1e-3f, label: $"[Phase B] decode t={t} (qLoraRank={qLoraRank})");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decisive P2.3 Phase C correctness check. Compares a Phase C
+    /// (UseHybridMlaCache = true) split-call prefill+decode sequence
+    /// against a Phase A single-call forward over the combined range.
+    /// Tolerance: 1e-3 per logit (the absorption identity in the decode
+    /// step reorders a dot-product summation; the expand-prefill path is
+    /// mathematically identical to Phase A but writes only latents to the
+    /// cache, so the first decode depends on reconstructed K_nope/V from
+    /// that latent — the invariant under test).
+    /// </summary>
+    private void AssertPhaseCSplitCallMatchesPhaseASingle(int qLoraRank, int seed)
+    {
+        string path = Path.Combine(_scratch, $"mla-pc-q{qLoraRank}.safetensors");
+        WriteFixture(path, qLoraRank, seed);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int fullLen = tokenIds.Length;
+        int prefillLen = 3;
+
+        // ── Pass A (Phase A, single call) — oracle ──────────────────────
+        float[] fullLogits;
+        {
+            ModelConfig configA = BuildConfig(qLoraRank); // default flags
+            using var sfA = SafetensorsFile.Open(path);
+            using var modelA = TransformerModel.LoadFromSafetensors(sfA, configA);
+            int[] positions = [0, 1, 2, 3, 4];
+            using ITensor logits = modelA.Forward(tokenIds, positions, deviceId: -1);
+            Assert.Equal(fullLen, logits.Shape[0]);
+            fullLogits = CopyLogits(logits);
+        }
+
+        // ── Pass C (Phase C, split call) — under test ───────────────────
+        ModelConfig configC = BuildConfig(qLoraRank) with
+        {
+            MlaConfig = BuildConfig(qLoraRank).MlaConfig! with { UseHybridMlaCache = true }
+        };
+        using (var sfC = SafetensorsFile.Open(path))
+        using (var modelC = TransformerModel.LoadFromSafetensors(sfC, configC))
+        {
+            // Prefill — takes the expand-then-MHA path inside
+            // ExecuteLatentHybrid; writes c_kv + k_pe latents to the cache.
+            float[] prefillLastRow;
+            {
+                int[] ptids = tokenIds.AsSpan(0, prefillLen).ToArray();
+                int[] ppos = Enumerable.Range(0, prefillLen).ToArray();
+                using ITensor logits = modelC.Forward(ptids, ppos, deviceId: -1);
+                prefillLastRow = CopyRow(logits, prefillLen - 1);
+            }
+            AssertRowClose(fullLogits, rowIndex: prefillLen - 1, expected: prefillLastRow,
+                           tolerance: 1e-3f, label: $"[Phase C] prefill last row (qLoraRank={qLoraRank})");
+
+            // Decode — takes the absorbed kernel path inside
+            // ExecuteLatentHybrid, reading the latents the prefill wrote.
+            // This step is the real test of "prefill-written cache is
+            // consumable by decode".
+            for (int t = prefillLen; t < fullLen; t++)
+            {
+                int[] dtids = [tokenIds[t]];
+                int[] dpos = [t];
+                using ITensor logits = modelC.Forward(dtids, dpos, deviceId: -1);
+                Assert.Equal(1, logits.Shape[0]);
+                float[] decodeRow = CopyRow(logits, 0);
+                AssertRowClose(fullLogits, rowIndex: t, expected: decodeRow,
+                               tolerance: 1e-3f, label: $"[Phase C] decode t={t} (qLoraRank={qLoraRank})");
             }
         }
     }
