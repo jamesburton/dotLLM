@@ -46,6 +46,38 @@ internal static partial class VulkanApi
         nint physicalDevice, ref uint pQueueFamilyPropertyCount,
         [Out] VkQueueFamilyProperties[]? pQueueFamilyProperties);
 
+    // Vulkan 1.1 core entry point: chain-aware property query. We use it to
+    // fetch VkPhysicalDeviceSubgroupProperties via pNext. On Vulkan 1.0-only
+    // drivers this symbol may be missing; VulkanDevice guards the call by
+    // inspecting the reported apiVersion before invoking.
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceProperties2(
+        nint physicalDevice, ref VkPhysicalDeviceProperties2 pProperties);
+
+    // Vulkan 1.1 core: chain-aware feature query. Used by the cooperative
+    // matrix probe to check the VkPhysicalDeviceCooperativeMatrixFeaturesKHR
+    // bit after the extension is verified.
+    [LibraryImport(LibName)]
+    internal static partial void vkGetPhysicalDeviceFeatures2(
+        nint physicalDevice, ref VkPhysicalDeviceFeatures2 pFeatures);
+
+    // Enumerates device extensions reported by a physical device. Used by the
+    // cooperative-matrix probe to gate on VK_KHR_cooperative_matrix before
+    // attempting to resolve the associated function pointer — drivers that
+    // don't advertise the extension may not implement the query at all.
+    [LibraryImport(LibName)]
+    internal static partial int vkEnumerateDeviceExtensionProperties(
+        nint physicalDevice, nint pLayerName,
+        ref uint pPropertyCount, nint pProperties);
+
+    // vkGetInstanceProcAddr — Vulkan 1.0 core loader function. Returns a
+    // native function pointer for an instance-level entry point. Used for
+    // dynamically resolving extension functions (e.g.
+    // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) that aren't linked
+    // statically through the loader's symbol table on every driver.
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint vkGetInstanceProcAddr(nint instance, string pName);
+
     // ── Logical device ──────────────────────────────────────────────
 
     [LibraryImport(LibName)]

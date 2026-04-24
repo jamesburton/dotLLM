@@ -28,6 +28,57 @@ internal static class VkStructureType
     internal const int CommandBufferAllocateInfo = 40;
     internal const int CommandBufferBeginInfo = 42;
     internal const int MemoryBarrier = 46;
+    // Vulkan 1.1 core structure types (used by vkGetPhysicalDeviceProperties2).
+    internal const int PhysicalDeviceProperties2 = 1000059001;
+    internal const int PhysicalDeviceFeatures2 = 1000059000;
+    internal const int PhysicalDeviceSubgroupProperties = 1000094000;
+    // VK_KHR_cooperative_matrix extension structures.
+    internal const int PhysicalDeviceCooperativeMatrixFeaturesKhr = 1000506000;
+    internal const int CooperativeMatrixPropertiesKhr = 1000506001;
+    internal const int PhysicalDeviceCooperativeMatrixPropertiesKhr = 1000506002;
+}
+
+// VkComponentTypeKHR — component type of an element in a cooperative matrix.
+// Values from the VK_KHR_cooperative_matrix specification.
+internal static class VkComponentTypeKhr
+{
+    internal const int Float16 = 0;
+    internal const int Float32 = 1;
+    internal const int Float64 = 2;
+    internal const int Sint8   = 3;
+    internal const int Sint16  = 4;
+    internal const int Sint32  = 5;
+    internal const int Sint64  = 6;
+    internal const int Uint8   = 7;
+    internal const int Uint16  = 8;
+    internal const int Uint32  = 9;
+    internal const int Uint64  = 10;
+}
+
+// VkScopeKHR — scope at which a cooperative matrix is allocated. For
+// VK_KHR_cooperative_matrix (KHR, not NV) only Subgroup scope is standardised.
+internal static class VkScopeKhr
+{
+    internal const int Device     = 1;
+    internal const int Workgroup  = 2;
+    internal const int Subgroup   = 3;
+    internal const int QueueFamily = 5;
+}
+
+// VkSubgroupFeatureFlagBits — capabilities advertised by the driver for a given
+// subgroup size. ARITHMETIC is the one we care about (subgroupAdd, subgroupMax,
+// subgroupMin, etc.). Others listed for reference; matching the spec bit values.
+[Flags]
+internal enum VkSubgroupFeatureFlags : uint
+{
+    Basic        = 0x00000001,
+    Vote         = 0x00000002,
+    Arithmetic   = 0x00000004,
+    Ballot       = 0x00000008,
+    Shuffle      = 0x00000010,
+    ShuffleRelative = 0x00000020,
+    Clustered    = 0x00000040,
+    Quad         = 0x00000080,
 }
 
 // VkPhysicalDeviceType (chosen enum values)
@@ -450,4 +501,87 @@ internal static class VkAccessFlags
     internal const uint HostWrite = 0x00004000;
     internal const uint MemoryRead = 0x00008000;
     internal const uint MemoryWrite = 0x00010000;
+}
+
+// VkPhysicalDeviceSubgroupProperties — returned by vkGetPhysicalDeviceProperties2
+// on Vulkan 1.1+ when chained via pNext. `subgroupSize` is the hardware-fixed
+// wave/warp width (32 on NVIDIA/Intel, 64 on AMD GCN/RDNA pre-3, 32-or-64 on
+// RDNA3+). `supportedStages` tells us which shader stages may use subgroup ops,
+// and `supportedOperations` is the VkSubgroupFeatureFlags bitmask.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSize;
+    internal uint supportedStages;       // VkShaderStageFlags bitmask
+    internal uint supportedOperations;   // VkSubgroupFeatureFlags bitmask
+    internal uint quadOperationsInAllStages; // VkBool32
+}
+
+// VkPhysicalDeviceProperties2 — Vulkan 1.1 core. We only read the `sType`
+// (driver ignores) and `pNext` (chain). `properties` is a VkPhysicalDeviceProperties
+// which is large; we reserve the full upper-bound byte tail exactly as in the
+// 1.0 struct to guarantee the driver has room to write without stack issues.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceProperties2
+{
+    internal int sType;
+    internal nint pNext;
+    // Inline VkPhysicalDeviceProperties body — same layout as the 1.0 struct.
+    internal uint apiVersion;
+    internal uint driverVersion;
+    internal uint vendorID;
+    internal uint deviceID;
+    internal int deviceType;
+    internal fixed byte deviceName[256];
+    internal fixed byte pipelineCacheUUID[16];
+    internal fixed byte tail[2048];
+}
+
+// VkPhysicalDeviceFeatures2 — Vulkan 1.1 core feature-query header. `features`
+// is a VkPhysicalDeviceFeatures (55 VkBool32 fields = 220 bytes). We reserve a
+// generously-oversized byte tail rather than spelling out every feature bit;
+// no kernel actually reads from this struct after the driver writes it — we
+// only set the sType/pNext chain for feature-extension queries (e.g. the
+// cooperative-matrix feature struct chained off pNext).
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceFeatures2
+{
+    internal int sType;
+    internal nint pNext;
+    // 55 VkBool32 fields. Oversize to 512 bytes for forward-compat safety;
+    // any driver that writes fewer bytes is still covered.
+    internal fixed byte features[512];
+}
+
+// VkPhysicalDeviceCooperativeMatrixFeaturesKHR — feature bits from the
+// VK_KHR_cooperative_matrix extension. Chained off VkPhysicalDeviceFeatures2
+// via pNext for feature-enable at device creation.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceCooperativeMatrixFeaturesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint cooperativeMatrix;                // VkBool32
+    internal uint cooperativeMatrixRobustBufferAccess; // VkBool32
+}
+
+// VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape
+// returned by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Values are
+// used to pick the (MSize, NSize, KSize) baked into the compiled coopmat shader.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkCooperativeMatrixPropertiesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint MSize;
+    internal uint NSize;
+    internal uint KSize;
+    internal int AType;                    // VkComponentTypeKHR
+    internal int BType;                    // VkComponentTypeKHR
+    internal int CType;                    // VkComponentTypeKHR
+    internal int ResultType;               // VkComponentTypeKHR
+    internal uint saturatingAccumulation;  // VkBool32
+    internal int scope;                    // VkScopeKHR
 }
