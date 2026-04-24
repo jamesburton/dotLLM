@@ -836,52 +836,45 @@ public sealed class RealHfSafetensorsEndToEndTests
 
     /// <summary>
     /// <para>
-    /// <b>Currently skipped — known divergence from HF reference.</b>
+    /// Verifies the DeepSeek-V2-Lite MLA + MoE forward pass matches HF's
+    /// PyTorch reference within <see cref="DriftTolerances.Tight"/>.
     /// </para>
     /// <para>
-    /// First run observed on this machine (2026-04-24, commit following
-    /// the P2.6 multi-arch expansion):
-    /// <c>max_abs_diff=44.16, mean_abs_diff=8.88, argmax_match_rate=1/5=0.2</c>.
-    /// That is not numerical drift — that's a forward-pass difference.
+    /// <b>Initial observation (2026-04-24).</b>
+    /// <c>max_abs_diff=44.16, mean_abs_diff=8.88, argmax_match_rate=1/5=0.2</c>
+    /// — a forward-pass algorithm mismatch, not numerical drift.
     /// </para>
     /// <para>
-    /// Internally, dotLLM MLA is self-consistent: Phase A / Phase B / Phase C
-    /// all agree within <c>1e-3 .. 1e-4</c> on the split-call oracle, and
-    /// DeepSeek-V2-Lite's cacheless real-weight forward has been passing
-    /// the finite-logit + nonzero-variance tier since <c>5ff5312</c>. So
-    /// the gap is dotLLM-MLA vs HF-MLA, not an intra-dotLLM bug.
+    /// <b>Root cause.</b> Our MoE loader scanned only for the indexed-plural
+    /// <c>mlp.shared_experts.{k}.*</c> and singular <c>mlp.shared_expert.*</c>
+    /// tensor names. DeepSeek-V2 actually ships a SINGLE fused shared MLP at
+    /// <c>mlp.shared_experts.{gate,up,down}_proj</c> (plural, NO numeric
+    /// index) with <c>intermediate_size = moe_intermediate * n_shared_experts</c>
+    /// (2816 for V2-Lite). This matches HF's <c>DeepseekV2MoE.__init__</c>:
+    /// <code>
+    ///   intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+    ///   self.shared_experts = DeepseekV2MLP(config, intermediate_size=intermediate_size)
+    /// </code>
+    /// Neither of our loader's existing name patterns matched, so the shared
+    /// branch silently fell back to routed-only — the shared-expert
+    /// contribution was entirely missing from every MoE layer (layers 1..26),
+    /// producing the ~44× drift.
     /// </para>
     /// <para>
-    /// Candidate causes to investigate (ordered by my guess at likelihood):
-    /// </para>
+    /// <b>Fix.</b>
     /// <list type="bullet">
-    ///   <item>DeepSeek's shared-expert routing (<c>mlp.shared_experts</c>)
-    ///     — our MoE loader may mix or weight shared vs routed experts
-    ///     differently than HF's reference.</item>
-    ///   <item>YaRN RoPE <b>frequency</b> rescaling (deferred in P2.2; only
-    ///     the softmax <c>mscale²</c> correction is wired today). HF applies
-    ///     YaRN rescaling to the per-dimension RoPE frequencies too; we
-    ///     still use plain RoPE. For a 5-token prompt this shouldn't cause
-    ///     8.88 mean drift unless something else compounds.</item>
-    ///   <item>MLA decoupled-RoPE pairing convention (Norm pairs vs NeoX
-    ///     halves) — HF's <c>apply_rotary_pos_emb_mla</c> might use a
-    ///     different pairing than what <see cref="DotLLM.Cpu.Kernels.MlaAttention"/>
-    ///     assumes.</item>
-    ///   <item>First-k-dense-replace handling — we fold the first dense
-    ///     MLP into MlpOnlyLayers. Ordering / topology mismatch would
-    ///     show up as a big prefix-layer disagreement.</item>
+    ///   <item><c>HfConfigExtractor</c>: for DeepSeek, represent the shared
+    ///     branch as one fused MLP with combined intermediate width
+    ///     (<c>moe_intermediate * n_shared_experts</c>).</item>
+    ///   <item><c>TransformerWeightsSafetensorsLoader</c>: detect the
+    ///     fused-plural tensor-name variant (no numeric index) and route
+    ///     it through the single-shared-expert pointer slot.</item>
     /// </list>
-    /// <para>
-    /// Fix approach: run the Python script with <c>output_hidden_states=True</c>
-    /// to capture per-layer outputs, same in dotLLM, diff layer-by-layer
-    /// until the divergence appears. The reference JSON is kept in tree
-    /// so this test resumes when a fix lands.
+    /// Post-fix drift: <c>max_abs_diff=0.48, mean_abs_diff=0.051,
+    /// argmax=5/5=1.0</c> — comfortably inside <see cref="DriftTolerances.Tight"/>.
     /// </para>
     /// </summary>
-    [Fact(Skip = "Known divergence — dotLLM MLA vs HF reference diverges " +
-                 "significantly on DeepSeek-V2-Lite (max_abs_diff=44, " +
-                 "argmax 1/5). Under investigation. Reference JSON + test " +
-                 "preserved for future re-enablement.")]
+    [Fact]
     public void DeepSeekV2Lite_LogitsMatchPyTorchReference()
     {
         string? root = ResolveCheckpointRoot(
@@ -912,9 +905,10 @@ public sealed class RealHfSafetensorsEndToEndTests
         // Config.MlaConfig.UseLatentCache is toggled at load time) against
         // HF transformers. This is the strongest correctness signal for
         // the MLA path; if this passes, MLA is provably right against the
-        // reference implementation.
+        // reference implementation. Observed post-fix: max_abs_diff=0.48,
+        // mean=0.051, argmax=5/5 — comfortably inside Tight.
         RunLogitsReferenceTest(root, referencePath, Architecture.DeepSeekV2,
-            tolerances: DriftTolerances.DeepSeekInitial);
+            tolerances: DriftTolerances.Tight);
     }
 
     /// <summary>
