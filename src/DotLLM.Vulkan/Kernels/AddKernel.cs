@@ -181,6 +181,9 @@ public sealed class AddKernel : IDisposable
         finally
         {
             VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
+            // Pool-reset after the queue wait frees the descriptor set for the next Launch();
+            // without this the single-set pool exhausts on the second invocation.
+            VulkanApi.vkResetDescriptorPool(_device.Handle, _descriptorPool, 0);
         }
     }
 
