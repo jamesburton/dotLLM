@@ -3,8 +3,9 @@
 # Requires: nvcc (CUDA Toolkit)
 # Output: native/ptx/*.ptx
 #
-# PTX is forward-compatible: compute_61 PTX runs on all GPUs from Pascal onward.
+# PTX is forward-compatible: compute_75 PTX runs on all GPUs from Turing onward.
 # The CUDA driver JIT-compiles PTX → SASS for the specific GPU at load time.
+# CUDA 13 dropped Pascal (SM 6.x) and Volta (SM 7.0); Turing (SM 7.5) is the floor.
 
 set -e
 
@@ -14,9 +15,9 @@ KERNEL_DIR="$SCRIPT_DIR/kernels"
 
 mkdir -p "$OUT_DIR"
 
-# Target the lowest compute capability we support (Pascal / GTX 10xx).
-# The driver will JIT to the actual GPU's native ISA at load time.
-ARCH="compute_61"
+# Target the CUDA-13 floor (Turing / RTX 20xx). Driver JITs to the actual GPU's
+# native ISA at load time (Ampere / Ada / Hopper / Blackwell all derive from this).
+ARCH="compute_75"
 
 # Kernels where --use_fast_math is safe (element-wise ops, no precision-sensitive math):
 FAST_MATH_KERNELS="add add_f32 swiglu swiglu_f32 convert bias_add bias_add_f32 embedding embedding_f32out dequant quant_kv"
