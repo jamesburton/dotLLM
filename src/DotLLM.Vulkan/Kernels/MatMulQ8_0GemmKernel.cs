@@ -49,6 +49,7 @@ public sealed class MatMulQ8_0GemmKernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private MatMulQ8_0GemmKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -57,6 +58,7 @@ public sealed class MatMulQ8_0GemmKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
     }
 
     /// <summary>Loads <c>matmul_q8_0_gemm.spv</c> from the given directory and creates the pipeline.</summary>
@@ -90,8 +92,8 @@ public sealed class MatMulQ8_0GemmKernel : IDisposable
         return new MatMulQ8_0GemmKernel(device, module, pipeline, pool);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches the batched GEMM: <c>C[N, M] = B[N, K] @ W_q8[M, K]^T</c>.
@@ -106,7 +108,6 @@ public sealed class MatMulQ8_0GemmKernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, weightsQ8, inputB, outputC, m, k, n);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>Records the Q8_0 GEMM into <paramref name="cmdBuf"/> without submitting.</summary>
@@ -144,9 +145,8 @@ public sealed class MatMulQ8_0GemmKernel : IDisposable
         if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[3] { weightsQ8.Handle, inputB.Handle, outputC.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

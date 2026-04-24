@@ -39,6 +39,7 @@ public sealed class MatMulQ8_0Kernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private MatMulQ8_0Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -47,6 +48,7 @@ public sealed class MatMulQ8_0Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
     }
 
     /// <summary>Loads <c>matmul_q8_0.spv</c> from the given directory and creates the pipeline.</summary>
@@ -80,8 +82,8 @@ public sealed class MatMulQ8_0Kernel : IDisposable
         return new MatMulQ8_0Kernel(device, module, pipeline, pool);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches the GEMV: <c>y[M] = W[M,K] @ x[K]</c> with FP16-scaled int8 weights.
@@ -96,7 +98,6 @@ public sealed class MatMulQ8_0Kernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, weightsQ8, x, y, m, k);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>
@@ -134,9 +135,8 @@ public sealed class MatMulQ8_0Kernel : IDisposable
         if (y.Size < (long)m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[3] { weightsQ8.Handle, x.Handle, y.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

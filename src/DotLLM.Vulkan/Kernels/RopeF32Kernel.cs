@@ -41,6 +41,7 @@ public sealed class RopeF32Kernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private RopeF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -49,6 +50,7 @@ public sealed class RopeF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
     }
 
     /// <summary>Loads <c>rope_f32.spv</c> from the given directory and creates the pipeline.</summary>
@@ -82,8 +84,8 @@ public sealed class RopeF32Kernel : IDisposable
         return new RopeF32Kernel(device, module, pipeline, pool);
     }
 
-    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
-    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Applies RoPE to Q and K in place. Synchronous — returns after
@@ -108,7 +110,6 @@ public sealed class RopeF32Kernel : IDisposable
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, positions, seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, variant);
         ctx.SubmitAndWait();
-        ResetDescriptors();
     }
 
     /// <summary>Records RoPE into <paramref name="cmdBuf"/> without submitting.</summary>
@@ -137,9 +138,8 @@ public sealed class RopeF32Kernel : IDisposable
         long totalK = (long)seqLen * numKvHeads * halfRope;
         long maxPairs = Math.Max(totalQ, totalK);
 
-        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
         Span<nint> buffers = stackalloc nint[3] { q.Handle, k.Handle, positions.Handle };
-        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(

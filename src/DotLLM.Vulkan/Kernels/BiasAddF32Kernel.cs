@@ -17,6 +17,7 @@ public sealed class BiasAddF32Kernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
     private BiasAddF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
@@ -25,6 +26,7 @@ public sealed class BiasAddF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 2);
     }
 
     /// <summary>Loads <c>bias_add_f32.spv</c> from <paramref name="spvDir"/>.</summary>
@@ -53,38 +55,35 @@ public sealed class BiasAddF32Kernel : IDisposable
             throw;
         }
 
-        nint pool = CreateDescriptorPool(device);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 2);
         return new BiasAddF32Kernel(device, module, pipeline, pool);
     }
 
-    private static unsafe nint CreateDescriptorPool(VulkanDevice device)
-    {
-        var poolSize = new VkDescriptorPoolSize
-        {
-            type = VkDescriptorType.StorageBuffer,
-            descriptorCount = 2,
-        };
-        VkDescriptorPoolCreateInfo ci = default;
-        ci.sType = VkStructureType.DescriptorPoolCreateInfo;
-        ci.maxSets = 1;
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes = (nint)(&poolSize);
-        VulkanApi.vkCreateDescriptorPool(device.Handle, ci, 0, out nint pool)
-            .ThrowOnError("vkCreateDescriptorPool");
-        return pool;
-    }
+    /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
+    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
     /// Dispatches the in-place bias add. <paramref name="output"/> is
     /// <c>[seqLen, outputDim]</c> row-major FP32; <paramref name="bias"/>
     /// is <c>[outputDim]</c>. Synchronous — returns after
-    /// <c>vkQueueWaitIdle</c>.
+    /// <c>vkQueueWaitIdle</c>. Legacy wrapper around <see cref="Record"/>.
     /// </summary>
     /// <param name="output">FP32 output buffer, <c>[seqLen, outputDim]</c> row-major.</param>
     /// <param name="bias">FP32 per-feature bias, <c>[outputDim]</c>.</param>
     /// <param name="seqLen">Number of rows (tokens).</param>
     /// <param name="outputDim">Row length (number of features).</param>
-    public unsafe void Launch(
+    public void Launch(
+        VulkanDevice.Buffer output, VulkanDevice.Buffer bias, int seqLen, int outputDim)
+    {
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        Record(ctx.CommandBuffer, output, bias, seqLen, outputDim);
+        ctx.SubmitAndWait();
+    }
+
+    /// <summary>Records the in-place bias add into <paramref name="cmdBuf"/> without submitting.</summary>
+    public unsafe void Record(
+        nint cmdBuf,
         VulkanDevice.Buffer output, VulkanDevice.Buffer bias, int seqLen, int outputDim)
     {
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
@@ -95,100 +94,29 @@ public sealed class BiasAddF32Kernel : IDisposable
         if (output.Size < outBytes) throw new ArgumentException("output buffer too small.", nameof(output));
         if (bias.Size < biasBytes) throw new ArgumentException("bias buffer too small.", nameof(bias));
 
-        // 1. Allocate descriptor set.
-        nint setLayout = _pipeline.DescriptorSetLayout;
-        var dsai = new VkDescriptorSetAllocateInfo
-        {
-            sType = VkStructureType.DescriptorSetAllocateInfo,
-            descriptorPool = _descriptorPool,
-            descriptorSetCount = 1,
-            pSetLayouts = (nint)(&setLayout),
-        };
-        VulkanApi.vkAllocateDescriptorSets(_device.Handle, dsai, out nint descriptorSet)
-            .ThrowOnError("vkAllocateDescriptorSets");
+        Span<nint> buffers = stackalloc nint[2] { output.Handle, bias.Handle };
+        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
-        // 2. Bind buffers.
-        Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[2];
-        bufferInfos[0] = new VkDescriptorBufferInfo { buffer = output.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[1] = new VkDescriptorBufferInfo { buffer = bias.Handle, offset = 0, range = ulong.MaxValue };
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
 
-        Span<VkWriteDescriptorSet> writes = stackalloc VkWriteDescriptorSet[2];
-        fixed (VkDescriptorBufferInfo* bufPtr = bufferInfos)
+        // Push constants: uint seqLen, uint outputDim (8 bytes total).
+        Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes, (uint)seqLen);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[4..], (uint)outputDim);
+        fixed (byte* pcPtr = pcBytes)
         {
-            for (int i = 0; i < 2; i++)
-            {
-                writes[i] = new VkWriteDescriptorSet
-                {
-                    sType = VkStructureType.WriteDescriptorSet,
-                    dstSet = descriptorSet,
-                    dstBinding = (uint)i,
-                    descriptorCount = 1,
-                    descriptorType = VkDescriptorType.StorageBuffer,
-                    pBufferInfo = (nint)(bufPtr + i),
-                };
-            }
-            fixed (VkWriteDescriptorSet* writesPtr = writes)
-            {
-                VulkanApi.vkUpdateDescriptorSets(_device.Handle, 2, (nint)writesPtr, 0, 0);
-            }
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // 3. Record and submit.
-        var cbai = new VkCommandBufferAllocateInfo
-        {
-            sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _device.CommandPool,
-            level = VkCommandBufferLevel.Primary,
-            commandBufferCount = 1,
-        };
-        VulkanApi.vkAllocateCommandBuffers(_device.Handle, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers");
-
-        try
-        {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
-
-            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
-            VulkanApi.vkCmdBindDescriptorSets(
-                cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
-                0, 1, descriptorSet, 0, 0);
-
-            // Push constants: uint seqLen, uint outputDim (8 bytes total).
-            Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes, (uint)seqLen);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[4..], (uint)outputDim);
-            fixed (byte* pcPtr = pcBytes)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, PushConstantBytes, (nint)pcPtr);
-            }
-
-            // One thread per output element, 256 threads per workgroup.
-            long total = (long)seqLen * outputDim;
-            uint groupCount = (uint)((total + WorkgroupSize - 1) / WorkgroupSize);
-            VulkanApi.vkCmdDispatch(cmdBuf, groupCount, 1, 1);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer");
-
-            var submit = new VkSubmitInfo
-            {
-                sType = VkStructureType.SubmitInfo,
-                commandBufferCount = 1,
-                pCommandBuffers = (nint)(&cmdBuf),
-            };
-            VulkanApi.vkQueueSubmit(_device.Queue, 1, submit, 0).ThrowOnError("vkQueueSubmit");
-            VulkanApi.vkQueueWaitIdle(_device.Queue).ThrowOnError("vkQueueWaitIdle");
-        }
-        finally
-        {
-            VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
-        }
+        // One thread per output element, 256 threads per workgroup.
+        long total = (long)seqLen * outputDim;
+        uint groupCount = (uint)((total + WorkgroupSize - 1) / WorkgroupSize);
+        VulkanApi.vkCmdDispatch(cmdBuf, groupCount, 1, 1);
     }
 
     /// <inheritdoc/>
