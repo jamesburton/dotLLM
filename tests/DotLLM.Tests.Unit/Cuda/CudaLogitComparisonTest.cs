@@ -22,15 +22,20 @@ public class CudaLogitComparisonTest
     public CudaLogitComparisonTest(ITestOutputHelper output) => _out = output;
 
     [SkippableFact]
-    public unsafe void CompareLogits_PrefillAndDecode()
+    public unsafe void CompareLogits_PrefillAndDecode() => RunCompareLogits("SmolLM-135M.Q8_0.gguf");
+
+    [SkippableFact]
+    public unsafe void CompareLogits_PrefillAndDecode_Q4KM() => RunCompareLogits("SmolLM-135M.Q4_K_M.gguf");
+
+    private unsafe void RunCompareLogits(string ggufFile)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
         string modelPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", ggufFile);
         string? ggufPath = File.Exists(modelPath) ? modelPath : null;
-        Skip.If(ggufPath == null, "SmolLM-135M Q8_0 GGUF not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF -q Q8_0)");
+        Skip.If(ggufPath == null, $"{ggufFile} not found (run: dotllm run QuantFactory/SmolLM-135M-GGUF)");
 
         var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
