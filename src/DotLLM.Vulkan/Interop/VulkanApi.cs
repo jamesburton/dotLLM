@@ -166,6 +166,11 @@ internal static partial class VulkanApi
         nint device, in VkDescriptorSetAllocateInfo pAllocateInfo,
         out nint pDescriptorSets);
 
+    /// <summary>Returns all descriptor sets from the pool to the pool's free list; safe once no command buffer using them is still in flight.</summary>
+    [LibraryImport(LibName)]
+    internal static partial int vkResetDescriptorPool(
+        nint device, nint descriptorPool, uint flags);
+
     [LibraryImport(LibName)]
     internal static partial void vkUpdateDescriptorSets(
         nint device, uint descriptorWriteCount,

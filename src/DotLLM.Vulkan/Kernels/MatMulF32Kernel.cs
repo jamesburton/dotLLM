@@ -199,6 +199,11 @@ public sealed class MatMulF32Kernel : IDisposable
         finally
         {
             VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
+            // The queue wait above guarantees the descriptor set is no longer in flight; reset
+            // the pool so the next Launch() can allocate fresh. Without this the single-set
+            // descriptor pool would exhaust on the second invocation (VK_ERROR_OUT_OF_POOL_MEMORY),
+            // which the end-to-end forward pass hits within the first layer.
+            VulkanApi.vkResetDescriptorPool(_device.Handle, _descriptorPool, 0);
         }
     }
 
