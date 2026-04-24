@@ -10,22 +10,29 @@ using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
+using QuantType = DotLLM.Core.Configuration.QuantizationType;
+
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// End-to-end F32 Vulkan forward pass for Llama-family transformer models.
-/// Implements <see cref="IModel"/> using only the six wave-1/wave-2 Vulkan
-/// compute kernels: <see cref="MatMulF32Kernel"/>, <see cref="RmsNormF32Kernel"/>,
-/// <see cref="RopeF32Kernel"/>, <see cref="AttentionF32Kernel"/>,
-/// <see cref="SwiGluF32Kernel"/>, plus <see cref="AddKernel"/> for residuals.
+/// End-to-end Vulkan forward pass for Llama-family transformer models.
+/// Implements <see cref="IModel"/> using the wave-1/wave-2 Vulkan compute
+/// kernels: <see cref="MatMulF32Kernel"/> plus the Q8_0 matmul kernels
+/// (<see cref="MatMulQ8_0Kernel"/> for decode-path GEMV,
+/// <see cref="MatMulQ8_0GemmKernel"/> for batched prefill),
+/// <see cref="RmsNormF32Kernel"/>, <see cref="RopeF32Kernel"/>,
+/// <see cref="AttentionF32Kernel"/>, <see cref="SwiGluF32Kernel"/>, and
+/// <see cref="AddKernel"/> for residuals.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Scope: F32-only. Quantised weights are dequantised to FP32 at
-/// construction time via <see cref="VulkanWeights.Upload"/> and uploaded
-/// to device-local (VRAM) memory. The model assumes a pure-Transformer
-/// Llama-family architecture — MLA, MoE, and SSM layers are rejected at
-/// load time.
+/// Q8_0 weights stay on device as 34-byte blocks and are consumed directly
+/// by the Q8_0 matmul kernels — 4× less VRAM and 4× less bytes-per-forward
+/// on the weight read vs the legacy dequantise-at-load path. Other quant
+/// types (F16, K-quants) still dequantise to FP32 at load. All non-matmul
+/// kernels remain F32; only the weight storage changes. The model assumes
+/// a pure-Transformer Llama-family architecture — MLA, MoE, and SSM layers
+/// are rejected at load time.
 /// </para>
 /// <para>
 /// Forward pass is fence-pipelined: a single persistent command buffer
@@ -38,9 +45,10 @@ namespace DotLLM.Vulkan;
 /// <para>
 /// Architectural parallel with <c>DotLLM.Cuda.CudaTransformerModel</c>:
 /// upload weights once at construction, reuse a single
-/// <see cref="VulkanForwardState"/> for scratch, and drive every linear
-/// projection through one <c>matmul_f32</c> call — no prefill / decode
-/// split because there is no quantised GEMV kernel yet. Logits come back
+/// <see cref="VulkanForwardState"/> for scratch. Each linear projection
+/// dispatches through <see cref="RecordMatmul"/> which picks
+/// <c>matmul_q8_0</c> / <c>matmul_q8_0_gemm</c> / <c>matmul_f32</c> based on
+/// the weight's device-side quant type and <c>seqLen</c>. Logits come back
 /// as a single <see cref="UnmanagedTensor"/> of shape <c>[1, vocabSize]</c>
 /// matching the CUDA return convention.
 /// </para>
@@ -53,6 +61,8 @@ public sealed class VulkanTransformerModel : IModel
 
     // Kernels — one instance each, pipelines are reused across all launches.
     private readonly MatMulF32Kernel _matmul;
+    private readonly MatMulQ8_0Kernel _matmulQ8;
+    private readonly MatMulQ8_0GemmKernel _matmulQ8Gemm;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -87,7 +97,8 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice device, bool ownsDevice,
         ModelConfig config, VulkanWeights weights, TransformerWeights cpuWeights,
         VulkanForwardState state,
-        MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
+        MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
+        RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
@@ -100,6 +111,8 @@ public sealed class VulkanTransformerModel : IModel
         _cpuWeights = cpuWeights;
         _state = state;
         _matmul = matmul;
+        _matmulQ8 = matmulQ8;
+        _matmulQ8Gemm = matmulQ8Gemm;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -171,11 +184,10 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
     {
-        // Step 1: weights can now stay as Q8_0 blocks on device. Until the
-        // forward-side routing lands (Step 2), keep the legacy all-F32 upload
-        // by forcing dequantToFp32=true — flipping to false without the kernel
-        // routing would bind Q8_0 blobs to the F32 matmul kernel.
-        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, dequantToFp32: true);
+        // Q8_0 matrices stay on device as 34-byte blocks — the forward pass
+        // below dispatches them through the Q8_0 GEMV / GEMM kernels. Other
+        // quant types are still dequantised to FP32 at upload.
+        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
 
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
@@ -183,6 +195,8 @@ public sealed class VulkanTransformerModel : IModel
             initialSeqLen: 1);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
+        var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
+        var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -202,7 +216,7 @@ public sealed class VulkanTransformerModel : IModel
         return new VulkanTransformerModel(
             device, ownsDevice,
             config, weights, cpuWeights, state,
-            matmul, rmsnorm, rope, attention, swiglu, add,
+            matmul, matmulQ8, matmulQ8Gemm, rmsnorm, rope, attention, swiglu, add,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
@@ -280,11 +294,14 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Q/K/V projections
-            _matmul.Record(cmdBuf, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+            RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+                lw.QOutputDim, lw.QInputDim, seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            _matmul.Record(cmdBuf, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                lw.KOutputDim, lw.KInputDim, seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            _matmul.Record(cmdBuf, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                lw.VOutputDim, lw.VInputDim, seqLen);
 
             // Optional QKV biases — host path. Submit, wait, write, re-begin.
             if (cpuLw.QBias is not null || cpuLw.KBias is not null || cpuLw.VBias is not null)
@@ -341,7 +358,7 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Output projection → NormOutput (reuse slot).
-            _matmul.Record(cmdBuf, lw.O, _state.AttnOutput, _state.NormOutput,
+            RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
 
             if (cpuLw.OBias is { } ob)
@@ -374,10 +391,10 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Gate/Up projections
-            _matmul.Record(cmdBuf, lw.Gate, _state.NormOutput, _state.FfnGate,
+            RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
                 lw.GateOutputDim, lw.GateInputDim, seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            _matmul.Record(cmdBuf, lw.Up, _state.NormOutput, _state.FfnUp,
+            RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
                 lw.UpOutputDim, lw.UpInputDim, seqLen);
 
             if (cpuLw.GateBias is not null || cpuLw.UpBias is not null)
@@ -400,7 +417,7 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Down projection
-            _matmul.Record(cmdBuf, lw.Down, _state.SiluOutput, _state.NormOutput,
+            RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
 
             if (cpuLw.DownBias is { } db)
@@ -439,8 +456,9 @@ public sealed class VulkanTransformerModel : IModel
             rowCount: 1, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        _matmul.Record(cmdBuf, _weights.OutputWeight, _state.NormOutput, _state.Logits,
-            _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, _state.Logits,
+            _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: 1);
 
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
         KernelSupport.ComputeToHostBarrier(cmdBuf);
@@ -460,11 +478,52 @@ public sealed class VulkanTransformerModel : IModel
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
+        _matmulQ8.InvalidateDescriptorCache();
+        _matmulQ8Gemm.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// Dispatches a matmul for a single linear projection: chooses
+    /// <see cref="MatMulQ8_0Kernel"/> (decode-path GEMV) when the device-side
+    /// weight is Q8_0 and <paramref name="seqLen"/>==1, the batched
+    /// <see cref="MatMulQ8_0GemmKernel"/> when Q8_0 and <paramref name="seqLen"/>&gt;1,
+    /// and <see cref="MatMulF32Kernel"/> for every non-Q8_0 weight.
+    /// </summary>
+    /// <remarks>
+    /// All Q8_0 kernels require <paramref name="inputDim"/> to be a multiple
+    /// of 32 (the Q8_0 group size). Llama-family projections satisfy this by
+    /// construction; the Q8_0 kernels still validate at dispatch so a
+    /// surprise non-aligned model fails loud.
+    /// </remarks>
+    private void RecordMatmul(
+        nint cmdBuf,
+        VulkanDevice.Buffer weights, QuantType weightQt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (weightQt == QuantType.Q8_0)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ8.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ8Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else
+        {
+            _matmul.Record(cmdBuf, weights, input, output,
+                outputDim, inputDim, seqLen);
+        }
     }
 
     /// <summary>
@@ -590,6 +649,8 @@ public sealed class VulkanTransformerModel : IModel
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ8Gemm.Dispose();
+        _matmulQ8.Dispose();
         _matmul.Dispose();
 
         _cpuWeights.Dispose();
