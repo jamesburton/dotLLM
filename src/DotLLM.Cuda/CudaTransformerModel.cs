@@ -364,26 +364,48 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // ── ATTENTION BLOCK (NormOutput has normalized input) ──
 
-            // Q/K/V projections: prefill → cuBLAS HGEMM, decode → quantized GEMV
-            Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
-            Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
-            Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            // Q/K/V projections. For decode (seqLen=1) with a pre-packed quantized
+            // QKV weight, one fused GEMV produces [n_q|n_kv|n_kv] contiguously in
+            // _state.QkvPacked; downstream kernels take pointers so they can read
+            // slices directly. For prefill or mixed-quant fallback, keep the 3-call
+            // path. Aliases qPtr/kPtr/vPtr hide the path choice from the rest of
+            // the layer body.
+            nint qPtr, kPtr, vPtr;
+            bool fusedQkv = seqLen == 1 && lw.QkvPacked != 0;
+            if (fusedQkv)
+            {
+                _kernels.LaunchQuantizedGemv(lw.QkvPacked, lw.QkvPackedQuantType,
+                    _state.NormOutput, _state.QkvPacked,
+                    lw.QkvPackedOutputDim, lw.QInputDim, s);
+                qPtr = _state.QkvPacked;
+                kPtr = _state.QkvPacked + (nint)((long)lw.QOutputDim * h);
+                vPtr = _state.QkvPacked + (nint)((long)(lw.QOutputDim + lw.KOutputDim) * h);
+            }
+            else
+            {
+                Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+                Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+                Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+                qPtr = _state.Q;
+                kPtr = _state.K;
+                vPtr = _state.V;
+            }
             MarkProfile(ProfileCategory.QkvProj);
 
             // Optional biases (FP16)
-            if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
-            if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.K, lw.KBias, lw.KOutputDim, seqLen, s);
-            if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.V, lw.VBias, lw.VOutputDim, seqLen, s);
+            if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(qPtr, lw.QBias, lw.QOutputDim, seqLen, s);
+            if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(kPtr, lw.KBias, lw.KOutputDim, seqLen, s);
+            if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
 
             // Optional QK-norms (FP16)
             if (lw.QNormWeight != 0)
-                _kernels.LaunchPerHeadRmsNorm(_state.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
             if (lw.KNormWeight != 0)
-                _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
             // RoPE (FP16, in-place on Q and K)
             int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
-            _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
+            _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                 seqLen, numHeads, numKvHeads, headDim,
                 _ropeDim, _ropeTheta, effectiveRopeType, s);
             MarkProfile(ProfileCategory.RopeAndExtras);
@@ -391,23 +413,23 @@ public sealed unsafe class CudaTransformerModel : IModel
             // KV-cache update + Attention (FP16)
             if (kvCache is CudaQuantizedKvCache cudaQKvCache)
             {
-                cudaQKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s, _kernels);
+                cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
                 int seqKv = cudaQKvCache.CurrentLength;
 
                 // Dequant quantized region + copy window → scratch, then regular attention
-                var (kPtr, vPtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
+                var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
                 MarkProfile(ProfileCategory.KvUpdate);
-                _kernels.LaunchAttention(_state.Q, kPtr, vPtr, _state.AttnOutput,
+                _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                     seqLen, seqKv, numHeads, numKvHeads, headDim,
                     positions[0], slidingWindow, s);
             }
             else if (kvCache is CudaKvCache cudaKvCache)
             {
-                cudaKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
+                cudaKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
 
-                _kernels.LaunchAttention(_state.Q, cudaKvCache.GetKeysPtr(layer),
+                _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
                     cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
                     seqLen, seqKv, numHeads, numKvHeads, headDim,
                     positions[0], slidingWindow, s);
@@ -415,7 +437,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             else
             {
                 MarkProfile(ProfileCategory.KvUpdate);
-                _kernels.LaunchAttention(_state.Q, _state.K, _state.V, _state.AttnOutput,
+                _kernels.LaunchAttention(qPtr, kPtr, vPtr, _state.AttnOutput,
                     seqLen, seqLen, numHeads, numKvHeads, headDim,
                     0, slidingWindow, s);
             }
@@ -434,16 +456,32 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
-            // Gate/Up projections
-            Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-            Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+            // Gate/Up projections — fused into a single GEMV when packed weights
+            // are available (decode-only). Same packing strategy as QKV.
+            nint gatePtr, upPtr;
+            bool fusedGateUp = seqLen == 1 && lw.GateUpPacked != 0;
+            if (fusedGateUp)
+            {
+                _kernels.LaunchQuantizedGemv(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                    _state.NormOutput, _state.GateUpPacked,
+                    lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                gatePtr = _state.GateUpPacked;
+                upPtr = _state.GateUpPacked + (nint)((long)lw.GateOutputDim * h);
+            }
+            else
+            {
+                Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+                gatePtr = _state.FfnGate;
+                upPtr = _state.FfnUp;
+            }
 
-            if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
-            if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+            if (lw.GateBias != 0) _kernels.LaunchBiasAdd(gatePtr, lw.GateBias, lw.GateOutputDim, seqLen, s);
+            if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
             MarkProfile(ProfileCategory.MlpUp);
 
             // SwiGLU (FP16)
-            _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput,
+            _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput,
                 intermediateSize, seqLen, s);
             MarkProfile(ProfileCategory.Swiglu);
 

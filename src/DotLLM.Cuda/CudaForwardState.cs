@@ -34,6 +34,14 @@ internal sealed class CudaForwardState : IDisposable
     public nint FfnUp;          // [seqLen, intermediateSize]
     public nint SiluOutput;     // [seqLen, intermediateSize]
 
+    // Fused-projection scratches — written by a single packed quantized GEMV
+    // when the layer has CudaLayerWeights.QkvPacked / GateUpPacked set.
+    // Decode-only: only safe when seqLen==1 because consumers downstream
+    // (RoPE, KV update, attention, SwiGLU) read each slice with the per-tensor
+    // stride, not the packed (n_q+2*n_kv) / (2*intermediate) stride.
+    public nint QkvPacked;      // [n_q + 2 * n_kv] (seqLen=1 decode only)
+    public nint GateUpPacked;   // [2 * intermediateSize] (seqLen=1 decode only)
+
     // Logits — FP16 on device, then converted to FP32
     public nint LogitsF16;      // [vocabSize] FP16
     public nint LogitsF32;      // [vocabSize] FP32
@@ -71,6 +79,12 @@ internal sealed class CudaForwardState : IDisposable
             (long)Math.Max(numHeads * headDim, numKvHeads * headDim) * hiddenSize,
             (long)intermediateSize * hiddenSize);
         DequantScratch = AllocDevice(maxProjectionElements * sizeof(ushort));
+
+        // Fused decode scratches (seqLen=1 only). Sized once — tiny.
+        long qkvPackedFp16Bytes = (long)(numHeads * headDim + 2 * numKvHeads * headDim) * sizeof(ushort);
+        long gateUpPackedFp16Bytes = (long)(2 * intermediateSize) * sizeof(ushort);
+        QkvPacked = AllocDevice(qkvPackedFp16Bytes);
+        GateUpPacked = AllocDevice(gateUpPackedFp16Bytes);
 
         // Initial allocation for decode (seqLen=1)
         EnsureCapacity(1);
@@ -151,6 +165,8 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref LogitsF16);
         FreeIfNonZero(ref LogitsF32);
         FreeIfNonZero(ref DequantScratch);
+        FreeIfNonZero(ref QkvPacked);
+        FreeIfNonZero(ref GateUpPacked);
         _currentSeqLen = 0;
     }
 }
