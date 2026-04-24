@@ -298,22 +298,29 @@ public sealed class VulkanTransformerModel : IModel
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
 
+        // Canonicalise the hidden-slot rotation to slot 0 so the embedding
+        // gather below writes into the same physical buffer every forward
+        // (keeps kernel descriptor-set caches warm across decode steps).
+        _state.ResetHiddenSlot();
+
         // Gather one embedding row per token from the device-local
         // TokenEmbedding buffer into HiddenState[t, :]. The first consumer
-        // is the TRANSFER copy (HiddenState → Residual) at the top of the
-        // layer loop; the second is the first RMSNorm's COMPUTE read — so
-        // we need both TransferRead and ShaderRead visibility.
+        // is the first RMSNorm's COMPUTE read on HiddenState — hidden/residual
+        // now alias (no TRANSFER copy in between) so a TRANSFER→COMPUTE
+        // barrier is all we need.
         RecordEmbeddingGather(cmdBuf, tokenIds);
-        KernelSupport.TransferToTransferAndComputeBarrier(cmdBuf);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
             ref readonly var cpuLw = ref _cpuWeights.Layers[layer];
 
-            // Residual snapshot (pre-attention): HiddenState → Residual.
-            RecordCopyBuffer(cmdBuf, _state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
-            KernelSupport.ComputeToComputeBarrier(cmdBuf); // TRANSFER→COMPUTE would be tighter; COMPUTE→COMPUTE covers both paths
+            // Pre-attention residual snapshot: Residual aliases HiddenState
+            // (same physical buffer), so no copy is needed. The barrier from
+            // the previous layer's final residual add (or the embedding
+            // gather's TRANSFER→COMPUTE on layer 0) has already made the
+            // hidden-state writes visible to this rmsnorm.
 
             // Attn RMSNorm
             _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
@@ -402,15 +409,19 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
 
-            // Residual add #1: AddScratch = Residual + NormOutput; then AddScratch → HiddenState.
+            // Residual add #1: AddScratch = Residual + NormOutput. The add
+            // reads from HiddenState (which aliases Residual — same slot)
+            // and writes to AddScratch (the alternate slot). After the
+            // rotate, HiddenState = old AddScratch and AddScratch = old
+            // HiddenState — no copies, just a label swap. The single
+            // ComputeToComputeBarrier covers the shader_write→shader_read
+            // ordering the FFN rmsnorm needs to see the new hidden state.
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            RecordCopyBuffer(cmdBuf, _state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+            _state.RotateHiddenSlot();
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // Residual snapshot (pre-FFN): HiddenState → Residual.
-            RecordCopyBuffer(cmdBuf, _state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // Pre-FFN residual snapshot: Residual aliases HiddenState (same
+            // slot); no copy needed.
 
             // FFN RMSNorm
             _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
@@ -461,23 +472,32 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
 
-            // Residual add #2: AddScratch = Residual + NormOutput; then AddScratch → HiddenState.
+            // Residual add #2: AddScratch = Residual + NormOutput; then rotate
+            // the slot so the new hidden state lives in the buffer we just
+            // wrote. See residual add #1 comment above for why no copy is
+            // needed.
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            RecordCopyBuffer(cmdBuf, _state.AddScratch, _state.HiddenState, (long)seqLen * hiddenSize * sizeof(float));
+            _state.RotateHiddenSlot();
 
-            // COMPUTE→COMPUTE between layers — next iteration's first op is the HiddenState→Residual copy.
+            // COMPUTE→COMPUTE between layers — next iteration's first op is
+            // the attention RMSNorm, which reads the freshly-rotated
+            // HiddenState written by the add.
             if (layer < Config.NumLayers - 1)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
         // 3. Final RMSNorm on the last token only, then LM head.
+        //    The last hidden state was just written by the final layer's
+        //    residual add (compute shader). The following single-row copy
+        //    runs in TRANSFER, so we need a compute→transfer barrier — a
+        //    plain ComputeToComputeBarrier does NOT synchronise transfer
+        //    reads against prior compute writes.
         long rowBytes = (long)hiddenSize * sizeof(float);
         long lastRowOffset = (long)(seqLen - 1) * rowBytes;
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
         RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
             srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: 1, n: hiddenSize, eps: eps);
@@ -562,14 +582,13 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
-    /// Records a device-to-device <c>vkCmdCopyBuffer</c> of
-    /// <paramref name="byteCount"/> bytes from the start of <paramref name="src"/>
-    /// to the start of <paramref name="dst"/>. Replaces the scaffold's
-    /// host-mapped memcpy which required a submit boundary on every call.
+    /// Records a single-region device-to-device <c>vkCmdCopyBuffer</c>. The
+    /// residual-shuffle copies that used to run here were eliminated via
+    /// hidden-slot rotation (<see cref="VulkanForwardState.RotateHiddenSlot"/>).
+    /// Remaining callers: the last-row extraction before the LM-head RMSNorm
+    /// (offset copy of one row), the embedding gather, and the KV-cache
+    /// update — none of which can be turned into a label swap.
     /// </summary>
-    private static void RecordCopyBuffer(nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst, long byteCount)
-        => RecordCopyBufferRange(cmdBuf, src, dst, srcOffset: 0, dstOffset: 0, size: (ulong)byteCount);
-
     private static void RecordCopyBufferRange(
         nint cmdBuf, VulkanDevice.Buffer src, VulkanDevice.Buffer dst,
         ulong srcOffset, ulong dstOffset, ulong size)

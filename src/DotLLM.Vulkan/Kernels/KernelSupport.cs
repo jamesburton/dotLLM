@@ -216,6 +216,31 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// Inserts a <c>COMPUTE_SHADER → TRANSFER</c> barrier so a later
+    /// <c>vkCmdCopyBuffer</c> (TRANSFER stage) can read data a compute
+    /// kernel just wrote. Used after the last transformer layer's residual
+    /// add when the next op is the single-row copy that extracts the final
+    /// hidden state into the LM-head scratch.
+    /// </summary>
+    internal static unsafe void ComputeToTransferBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.TransferRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.Transfer,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → HOST</c> barrier so the host can read
     /// back a compute kernel's output (specifically the final LM-head
     /// logits) after the submit completes.
