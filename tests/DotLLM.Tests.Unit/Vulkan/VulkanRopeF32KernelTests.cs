@@ -20,6 +20,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// default (<c>rope_type != 1</c>).
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanRopeF32KernelTests
 {
     private const float AbsTol = 1e-4f;

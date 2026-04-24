@@ -29,6 +29,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanMatMulQ8_0KernelTests
 {
     private const int Q8_0BlockBytes = 34;
