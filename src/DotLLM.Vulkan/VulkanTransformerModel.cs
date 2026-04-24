@@ -171,7 +171,11 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
     {
-        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
+        // Step 1: weights can now stay as Q8_0 blocks on device. Until the
+        // forward-side routing lands (Step 2), keep the legacy all-F32 upload
+        // by forcing dequantToFp32=true — flipping to false without the kernel
+        // routing would bind Q8_0 blobs to the F32 matmul kernel.
+        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, dequantToFp32: true);
 
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
