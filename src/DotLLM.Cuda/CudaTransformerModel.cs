@@ -411,29 +411,25 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (lw.KNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
-            // RoPE (FP16, in-place on Q and K)
+            // RoPE + KV-cache write. For decode (seqLen=1) against a standard
+            // CudaKvCache with the fused kernel available, fold both into a single
+            // launch — saves 2 launches/layer (rope + 2× cuMemcpyDtoDAsync) → 1.
             int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
-            _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
-                seqLen, numHeads, numKvHeads, headDim,
-                _ropeDim, _ropeTheta, effectiveRopeType, s);
-            MarkProfile(ProfileCategory.RopeAndExtras);
+            bool useFusedRopeKv = seqLen == 1
+                && kvCache is CudaKvCache
+                && _kernels.HasFusedRopeKvWriteKernel;
 
-            // KV-cache update + Attention (FP16)
-            if (kvCache is CudaQuantizedKvCache cudaQKvCache)
+            if (useFusedRopeKv)
             {
-                cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
-                int seqKv = cudaQKvCache.CurrentLength;
-
-                // Dequant quantized region + copy window → scratch, then regular attention
-                var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
-                MarkProfile(ProfileCategory.KvUpdate);
-                _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s);
-            }
-            else if (kvCache is CudaKvCache cudaKvCache)
-            {
-                cudaKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
+                var cudaKvCache = (CudaKvCache)kvCache!;
+                cudaKvCache.FusedRopeAndUpdateDevice(
+                    qPtr, kPtr, vPtr,
+                    _state.PositionsDevice, positions[0],
+                    layer,
+                    numHeads, numKvHeads, headDim,
+                    _ropeDim, _ropeTheta, effectiveRopeType,
+                    s, _kernels);
+                MarkProfile(ProfileCategory.RopeAndExtras);
                 int seqKv = cudaKvCache.CurrentLength;
                 MarkProfile(ProfileCategory.KvUpdate);
 
@@ -444,10 +440,42 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             else
             {
-                MarkProfile(ProfileCategory.KvUpdate);
-                _kernels.LaunchAttention(qPtr, kPtr, vPtr, _state.AttnOutput,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim,
-                    0, slidingWindow, s);
+                // Eager fallback path (prefill seqLen>1, quantized KV, or no fused kernel).
+                _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
+                    seqLen, numHeads, numKvHeads, headDim,
+                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+                MarkProfile(ProfileCategory.RopeAndExtras);
+
+                if (kvCache is CudaQuantizedKvCache cudaQKvCache)
+                {
+                    cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
+                    int seqKv = cudaQKvCache.CurrentLength;
+
+                    // Dequant quantized region + copy window → scratch, then regular attention
+                    var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s);
+                }
+                else if (kvCache is CudaKvCache cudaKvCache)
+                {
+                    cudaKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
+                    int seqKv = cudaKvCache.CurrentLength;
+                    MarkProfile(ProfileCategory.KvUpdate);
+
+                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s);
+                }
+                else
+                {
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    _kernels.LaunchAttention(qPtr, kPtr, vPtr, _state.AttnOutput,
+                        seqLen, seqLen, numHeads, numKvHeads, headDim,
+                        0, slidingWindow, s);
+                }
             }
             MarkProfile(ProfileCategory.Attention);
 

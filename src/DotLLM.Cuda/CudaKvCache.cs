@@ -146,6 +146,60 @@ public sealed class CudaKvCache : IKvCache
         if (newLength > _currentLength) _currentLength = newLength;
     }
 
+    /// <summary>
+    /// Decode-step fused RoPE + KV-cache write. Replaces a separate
+    /// <see cref="CudaKernels.LaunchRoPE"/> followed by two
+    /// <c>cuMemcpyDtoDAsync</c>s with a single launch.
+    /// Q is rotated in place on <paramref name="qSrc"/>; rotated K is written to
+    /// <c>K_cache[layer] + position * kvStride</c>; V is plain-copied to
+    /// <c>V_cache[layer] + position * kvStride</c>. Updates host-side length.
+    /// </summary>
+    /// <param name="qSrc">Device pointer to Q (in-place rotation target).</param>
+    /// <param name="kSrc">Device pointer to K projection scratch.</param>
+    /// <param name="vSrc">Device pointer to V projection scratch.</param>
+    /// <param name="positionsDevice">Device int[1] holding the RoPE position.</param>
+    /// <param name="position">Host-side absolute position (used for cache row + length update).</param>
+    /// <param name="layerIndex">Layer index.</param>
+    /// <param name="numHeads">Number of Q heads.</param>
+    /// <param name="numKvHeads">Number of KV heads.</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="ropeDim">RoPE rotation width (≤ headDim).</param>
+    /// <param name="ropeTheta">RoPE base.</param>
+    /// <param name="ropeType">0 = standard pairs, 1 = NeoX split halves.</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <param name="kernels">Kernel dispatcher.</param>
+    internal void FusedRopeAndUpdateDevice(
+        nint qSrc, nint kSrc, nint vSrc,
+        nint positionsDevice, int position,
+        int layerIndex,
+        int numHeads, int numKvHeads, int headDim,
+        int ropeDim, float ropeTheta, int ropeType,
+        nint stream, CudaKernels kernels)
+    {
+        if ((uint)position >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(position),
+                $"Position {position} exceeds max KV-cache length {_maxSeqLen}.");
+
+        kernels.LaunchFusedRopeKvWriteF16(
+            qSrc, kSrc, vSrc,
+            _keys[layerIndex], _values[layerIndex],
+            positionsDevice, position,
+            numHeads, numKvHeads, headDim,
+            ropeDim, _kvStride, ropeTheta, ropeType,
+            stream);
+
+        int newLength = position + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
+    /// <summary>
+    /// Returns true when the fused-RoPE+KV-write kernel is loaded on
+    /// <paramref name="kernels"/>. Used to gate the fused decode path.
+    /// </summary>
+    internal static bool SupportsFusedRopeAndUpdate(CudaKernels kernels) =>
+        kernels.HasFusedRopeKvWriteKernel;
+
     // ── IKvCache interface implementation ─────────────────────────────
 
     /// <inheritdoc/>

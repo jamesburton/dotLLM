@@ -105,6 +105,13 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _kvDequantQ4_0DynFunc;
     private readonly nint _kvWindowToScratchDynFunc;
 
+    // Fused decode-step RoPE + KV-cache write. Replaces three eager launches per
+    // layer (rope_f16 + 2× cuMemcpyDtoDAsync) with one. Eager-only; the graph
+    // path keeps a separate dyn variant.
+    private readonly CudaModule? _fusedRopeKvWriteModule;
+    private readonly nint _fusedRopeKvWriteF16Func;
+    private readonly nint _fusedRopeKvWriteF16DynFunc;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -197,6 +204,15 @@ public sealed unsafe class CudaKernels : IDisposable
             _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
             _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
             _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
+        }
+
+        // Fused decode-step RoPE + KV-cache write (optional — eager decode optimization).
+        string fusedRopeKvWritePath = Path.Combine(ptxDir, "fused_rope_kv_write.ptx");
+        if (File.Exists(fusedRopeKvWritePath))
+        {
+            _fusedRopeKvWriteModule = CudaModule.LoadFromFile(fusedRopeKvWritePath);
+            _fusedRopeKvWriteF16Func = _fusedRopeKvWriteModule.GetFunction("fused_rope_kv_write_f16");
+            _fusedRopeKvWriteF16DynFunc = _fusedRopeKvWriteModule.GetFunction("fused_rope_kv_write_f16_dyn");
         }
     }
 
@@ -678,6 +694,105 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>True when the fused decode-step RoPE+KV-write kernel is loaded (PTX present).</summary>
+    public bool HasFusedRopeKvWriteKernel => _fusedRopeKvWriteModule != null;
+
+    /// <summary>
+    /// Fused decode-step (seqLen=1) RoPE + KV-cache write.
+    /// Replaces three eager launches per layer (rope_f16 + 2× cuMemcpyDtoDAsync) with one.
+    /// Q is rotated in place on <paramref name="qSrc"/>; K is rotated and the rotated row
+    /// is written to <paramref name="kCacheBase"/><c> + cachePos * kvStride</c>; V is plain-copied
+    /// to <paramref name="vCacheBase"/><c> + cachePos * kvStride</c>.
+    /// </summary>
+    public void LaunchFusedRopeKvWriteF16(
+        nint qSrc, nint kSrc, nint vSrc,
+        nint kCacheBase, nint vCacheBase,
+        nint positionsDevice, int cachePos,
+        int numHeads, int numKvHeads, int headDim,
+        int ropeDim, int kvStride, float theta, int ropeType,
+        nint stream)
+    {
+        if (_fusedRopeKvWriteModule == null)
+            throw new InvalidOperationException(
+                "Fused RoPE+KV-write kernel not available. Compile native/kernels/fused_rope_kv_write.cu to PTX.");
+
+        nint qArg = qSrc, kArg = kSrc, vArg = vSrc;
+        nint kCacheArg = kCacheBase, vCacheArg = vCacheBase;
+        nint posArg = positionsDevice;
+        int cachePosArg = cachePos;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int rdArg = ropeDim, kvStrideArg = kvStride;
+        float thetaArg = theta;
+        int rtArg = ropeType;
+
+        void** args = stackalloc void*[] {
+            &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
+            &posArg, &cachePosArg,
+            &nhArg, &nkvArg, &hdArg,
+            &rdArg, &kvStrideArg,
+            &thetaArg, &rtArg
+        };
+
+        int halfRope = ropeDim / 2;
+        int tail = headDim - ropeDim;
+        int totalThreads = numHeads * halfRope                     // Q rotation pairs
+                         + numKvHeads * halfRope                   // K rotation pairs
+                         + numKvHeads * tail                       // K tail copy
+                         + numKvHeads * headDim;                   // V copy
+        uint gridDim = (uint)((totalThreads + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_fusedRopeKvWriteF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Graph-friendly variant of <see cref="LaunchFusedRopeKvWriteF16"/>: <c>cachePos</c>
+    /// is read from a device pointer (<paramref name="cachePosPtr"/>) so its value can
+    /// change between <c>cuGraphLaunch</c> replays without re-instantiating the graph.
+    /// </summary>
+    public void LaunchFusedRopeKvWriteF16Dyn(
+        nint qSrc, nint kSrc, nint vSrc,
+        nint kCacheBase, nint vCacheBase,
+        nint positionsDevice, nint cachePosPtr,
+        int numHeads, int numKvHeads, int headDim,
+        int ropeDim, int kvStride, float theta, int ropeType,
+        nint stream)
+    {
+        if (_fusedRopeKvWriteModule == null)
+            throw new InvalidOperationException(
+                "Fused RoPE+KV-write kernel not available. Compile native/kernels/fused_rope_kv_write.cu to PTX.");
+
+        nint qArg = qSrc, kArg = kSrc, vArg = vSrc;
+        nint kCacheArg = kCacheBase, vCacheArg = vCacheBase;
+        nint posArg = positionsDevice;
+        nint cachePosPtrArg = cachePosPtr;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int rdArg = ropeDim, kvStrideArg = kvStride;
+        float thetaArg = theta;
+        int rtArg = ropeType;
+
+        void** args = stackalloc void*[] {
+            &qArg, &kArg, &vArg, &kCacheArg, &vCacheArg,
+            &posArg, &cachePosPtrArg,
+            &nhArg, &nkvArg, &hdArg,
+            &rdArg, &kvStrideArg,
+            &thetaArg, &rtArg
+        };
+
+        int halfRope = ropeDim / 2;
+        int tail = headDim - ropeDim;
+        int totalThreads = numHeads * halfRope
+                         + numKvHeads * halfRope
+                         + numKvHeads * tail
+                         + numKvHeads * headDim;
+        uint gridDim = (uint)((totalThreads + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_fusedRopeKvWriteF16DynFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Bias add: output[t, :] += bias[:]. half2 vectorized (2 elements/thread).</summary>
     public void LaunchBiasAdd(nint output, nint bias, int dim, int seqLen, nint stream)
     {
@@ -976,5 +1091,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvF32InModule.Dispose();
         _quantKvModule?.Dispose();
         _kvWriteModule?.Dispose();
+        _fusedRopeKvWriteModule?.Dispose();
     }
 }
