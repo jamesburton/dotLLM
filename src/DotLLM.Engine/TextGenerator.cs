@@ -845,9 +845,11 @@ public sealed class TextGenerator
                         goto cacheMiss;
                 }
 
-                // Verify the cache is large enough for the new prompt + generation
+                // Verify the cache is large enough for the new prompt + generation.
+                // Reusing a cache that can only fit the prompt but not the requested generation
+                // causes silent truncation once pos >= MaxLength in the decode loop.
                 int requiredSize = promptLen + maxTokens;
-                if (entry.KvCache.MaxLength >= requiredSize || entry.KvCache.MaxLength >= promptLen)
+                if (entry.KvCache.MaxLength >= requiredSize)
                     return (entry.KvCache, matchedTokens, false);
 
                 // Cache too small — fall through to allocate fresh
