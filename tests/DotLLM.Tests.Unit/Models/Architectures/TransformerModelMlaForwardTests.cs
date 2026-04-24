@@ -80,6 +80,82 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
         AssertSplitCallMatchesSingle(qLoraRank: 0, seed: 271);
     }
 
+    [Fact]
+    public void Forward_PhaseB_LatentCache_MatchesPhaseASingleCall_LoRAQ()
+    {
+        // Decisive Phase B correctness check: the latent KV-cache + absorbed
+        // attention kernel must reproduce Phase A's logits within 1e-3 (the
+        // only deviation is the summation order of Q_nope · K_nope via the
+        // absorption identity). Exercises BOTH cache correctness across a
+        // split call AND the absorption math.
+        AssertPhaseBSplitCallMatchesPhaseASingle(qLoraRank: 8, seed: 424);
+    }
+
+    [Fact]
+    public void Forward_PhaseB_LatentCache_MatchesPhaseASingleCall_MonolithicQ()
+    {
+        AssertPhaseBSplitCallMatchesPhaseASingle(qLoraRank: 0, seed: 112);
+    }
+
+    /// <summary>
+    /// Decisive P2.3 Phase B correctness check. Compares a Phase B
+    /// (UseLatentCache = true) split-call prefill+decode sequence against
+    /// a Phase A single-call forward over the combined range. Tolerance:
+    /// 1e-3 per logit, matching PLANS.md P2.3 acceptance.
+    /// </summary>
+    private void AssertPhaseBSplitCallMatchesPhaseASingle(int qLoraRank, int seed)
+    {
+        string path = Path.Combine(_scratch, $"mla-pb-q{qLoraRank}.safetensors");
+        WriteFixture(path, qLoraRank, seed);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int fullLen = tokenIds.Length;
+        int prefillLen = 3;
+
+        // ── Pass A (Phase A, single call) — oracle ──────────────────────
+        float[] fullLogits;
+        {
+            ModelConfig configA = BuildConfig(qLoraRank); // UseLatentCache default false
+            using var sfA = SafetensorsFile.Open(path);
+            using var modelA = TransformerModel.LoadFromSafetensors(sfA, configA);
+            int[] positions = [0, 1, 2, 3, 4];
+            using ITensor logits = modelA.Forward(tokenIds, positions, deviceId: -1);
+            Assert.Equal(fullLen, logits.Shape[0]);
+            fullLogits = CopyLogits(logits);
+        }
+
+        // ── Pass B (Phase B, split call) — under test ───────────────────
+        ModelConfig configB = BuildConfig(qLoraRank) with
+        {
+            MlaConfig = BuildConfig(qLoraRank).MlaConfig! with { UseLatentCache = true }
+        };
+        using (var sfB = SafetensorsFile.Open(path))
+        using (var modelB = TransformerModel.LoadFromSafetensors(sfB, configB))
+        {
+            // Prefill
+            float[] prefillLastRow;
+            {
+                int[] ptids = tokenIds.AsSpan(0, prefillLen).ToArray();
+                int[] ppos = Enumerable.Range(0, prefillLen).ToArray();
+                using ITensor logits = modelB.Forward(ptids, ppos, deviceId: -1);
+                prefillLastRow = CopyRow(logits, prefillLen - 1);
+            }
+            AssertRowClose(fullLogits, rowIndex: prefillLen - 1, expected: prefillLastRow,
+                           tolerance: 1e-3f, label: $"[Phase B] prefill last row (qLoraRank={qLoraRank})");
+
+            for (int t = prefillLen; t < fullLen; t++)
+            {
+                int[] dtids = [tokenIds[t]];
+                int[] dpos = [t];
+                using ITensor logits = modelB.Forward(dtids, dpos, deviceId: -1);
+                Assert.Equal(1, logits.Shape[0]);
+                float[] decodeRow = CopyRow(logits, 0);
+                AssertRowClose(fullLogits, rowIndex: t, expected: decodeRow,
+                               tolerance: 1e-3f, label: $"[Phase B] decode t={t} (qLoraRank={qLoraRank})");
+            }
+        }
+    }
+
     /// <summary>
     /// The decisive P2.3-Phase-A correctness check: a single-call forward
     /// over <c>[tokens 0..N-1]</c> must produce the same logits per row as

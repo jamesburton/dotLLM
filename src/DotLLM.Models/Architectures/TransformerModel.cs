@@ -30,11 +30,14 @@ public sealed unsafe class TransformerModel : IModel
 
     private readonly TransformerWeights _weights;
     private readonly TransformerForwardState _state;
-    // Persistent K_nope / V / K_pe cache for MLA layers. Lazily constructed
-    // on the first MLA forward and reset when the caller signals a fresh
-    // sequence by passing positions[0] == 0. Null for non-MLA models. See
-    // MlaExpandedKvState for the rationale on not implementing IKvCache.
+    // Persistent KV cache for MLA layers. Exactly one of these is non-null
+    // at any time, selected by Config.MlaConfig.UseLatentCache at first use.
+    // Both are lazily constructed on the first MLA forward and reset when
+    // the caller signals a fresh sequence via positions[0] == 0. See
+    // MlaExpandedKvState / MlaLatentKvState docstrings for the Phase A vs
+    // Phase B distinction (correctness oracle vs ~7× memory win).
     private MlaExpandedKvState? _mlaKvState;
+    private MlaLatentKvState? _mlaLatentKvState;
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
@@ -261,25 +264,41 @@ public sealed unsafe class TransformerModel : IModel
 
         // MLA cache lifecycle: allocated lazily on the first MLA forward
         // pass, reset when positions[0] == 0 so successive unrelated calls
-        // (integration tests, multiple prompts, …) don't reuse stale K/V.
-        // For incremental autoregressive generation the caller passes
-        // positions[0] > 0 and we preserve state. Non-MLA models leave
-        // _mlaKvState null forever.
+        // (integration tests, multiple prompts, …) don't reuse stale KV.
+        // Phase A (default) uses MlaExpandedKvState; Phase B uses the
+        // smaller MlaLatentKvState when Config.MlaConfig.UseLatentCache is
+        // set. Non-MLA models leave both null forever.
         if (Config.MlaConfig is not null)
         {
-            if (_mlaKvState is null)
+            var mla = Config.MlaConfig;
+            if (mla.UseLatentCache)
             {
-                var mla = Config.MlaConfig;
-                _mlaKvState = new MlaExpandedKvState(
-                    numLayers: Config.NumLayers,
-                    maxSeqLen: Config.MaxSequenceLength,
-                    numHeads: Config.NumAttentionHeads,
-                    qkNopeHeadDim: mla.QkNopeHeadDim,
-                    vHeadDim: mla.VHeadDim,
-                    qkRopeHeadDim: mla.QkRopeHeadDim);
+                if (_mlaLatentKvState is null)
+                {
+                    _mlaLatentKvState = new MlaLatentKvState(
+                        numLayers: Config.NumLayers,
+                        maxSeqLen: Config.MaxSequenceLength,
+                        kvLoraRank: mla.KvLoraRank,
+                        qkRopeHeadDim: mla.QkRopeHeadDim);
+                }
+                if (positions[0] == 0)
+                    _mlaLatentKvState.Reset();
             }
-            if (positions[0] == 0)
-                _mlaKvState.Reset();
+            else
+            {
+                if (_mlaKvState is null)
+                {
+                    _mlaKvState = new MlaExpandedKvState(
+                        numLayers: Config.NumLayers,
+                        maxSeqLen: Config.MaxSequenceLength,
+                        numHeads: Config.NumAttentionHeads,
+                        qkNopeHeadDim: mla.QkNopeHeadDim,
+                        vHeadDim: mla.VHeadDim,
+                        qkRopeHeadDim: mla.QkRopeHeadDim);
+                }
+                if (positions[0] == 0)
+                    _mlaKvState.Reset();
+            }
         }
 
         for (int layer = 0; layer < numLayers; layer++)
@@ -333,51 +352,72 @@ public sealed unsafe class TransformerModel : IModel
                 int ropeHalf = mlaW.QkRopeHeadDim / 2;
                 int ropeTableLen = _state.CosTable.Length;
 
-                MlaAttention.Execute(
-                    hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
-                    output: new Span<float>(attnOut, seqLen * hiddenSize),
-                    seqLen: seqLen,
-                    positionOffset: positions[0],
-                    hiddenSize: hiddenSize,
-                    numHeads: mlaW.NumHeads,
-                    qkNopeHeadDim: mlaW.QkNopeHeadDim,
-                    qkRopeHeadDim: mlaW.QkRopeHeadDim,
-                    vHeadDim: mlaW.VHeadDim,
-                    qLoraRank: mlaW.QLoraRank,
-                    kvLoraRank: mlaW.KvLoraRank,
-                    rmsNormEps: eps,
-                    ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
-                    ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
-                    qAProj: qAElems > 0
-                        ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems)
-                        : ReadOnlySpan<float>.Empty,
-                    qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
-                    qBProj: qBElems > 0
-                        ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems)
-                        : ReadOnlySpan<float>.Empty,
-                    qProj: qMonoElems > 0
-                        ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems)
-                        : ReadOnlySpan<float>.Empty,
-                    kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
-                    kvALayernormWeight: mlaW.KvALayernormWeight,
-                    kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
-                    oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
-                    // YaRN softmax-scale correction (mscale²). Returns 1.0f
-                    // when rope_scaling is absent or factor <= 1 — so no
-                    // behavioural change for pre-YaRN checkpoints.
-                    attnScaleMultiplier: Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier(),
-                    // Persistent KV cache pointers for this layer (see
-                    // MlaExpandedKvState). On a fresh sequence, positions[0]
-                    // was 0 and Reset() cleared currentLength to 0 above.
-                    cachedKNope: _mlaKvState!.GetKNopePointer(layer),
-                    cachedV: _mlaKvState.GetVPointer(layer),
-                    cachedKPe: _mlaKvState.GetKPePointer(layer),
-                    cachedLength: _mlaKvState.GetCurrentLength(layer));
-
-                // Commit the seqLen new positions into the cache for this
-                // layer so the next call sees them. Kernel already copied
-                // the K_nope / V / K_pe rows; this just advances the length.
-                _mlaKvState.Advance(layer, seqLen);
+                float mlaScaleMultiplier = Config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier();
+                if (_mlaLatentKvState is not null)
+                {
+                    // Phase B — latent cache + absorbed attention.
+                    MlaAttention.ExecuteLatent(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        output: new Span<float>(attnOut, seqLen * hiddenSize),
+                        seqLen: seqLen,
+                        positionOffset: positions[0],
+                        hiddenSize: hiddenSize,
+                        numHeads: mlaW.NumHeads,
+                        qkNopeHeadDim: mlaW.QkNopeHeadDim,
+                        qkRopeHeadDim: mlaW.QkRopeHeadDim,
+                        vHeadDim: mlaW.VHeadDim,
+                        qLoraRank: mlaW.QLoraRank,
+                        kvLoraRank: mlaW.KvLoraRank,
+                        rmsNormEps: eps,
+                        ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
+                        ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
+                        qAProj: qAElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems) : ReadOnlySpan<float>.Empty,
+                        qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
+                        qBProj: qBElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems) : ReadOnlySpan<float>.Empty,
+                        qProj: qMonoElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems) : ReadOnlySpan<float>.Empty,
+                        kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
+                        kvALayernormWeight: mlaW.KvALayernormWeight,
+                        kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
+                        oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
+                        cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
+                        cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
+                        cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
+                        attnScaleMultiplier: mlaScaleMultiplier);
+                    _mlaLatentKvState.Advance(layer, seqLen);
+                }
+                else
+                {
+                    // Phase A — expanded cache + standard per-head attention.
+                    MlaAttention.Execute(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        output: new Span<float>(attnOut, seqLen * hiddenSize),
+                        seqLen: seqLen,
+                        positionOffset: positions[0],
+                        hiddenSize: hiddenSize,
+                        numHeads: mlaW.NumHeads,
+                        qkNopeHeadDim: mlaW.QkNopeHeadDim,
+                        qkRopeHeadDim: mlaW.QkRopeHeadDim,
+                        vHeadDim: mlaW.VHeadDim,
+                        qLoraRank: mlaW.QLoraRank,
+                        kvLoraRank: mlaW.KvLoraRank,
+                        rmsNormEps: eps,
+                        ropeCosTable: _state.CosTable.AsSpan(0, ropeTableLen),
+                        ropeSinTable: _state.SinTable.AsSpan(0, ropeTableLen),
+                        qAProj: qAElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QAProj, qAElems) : ReadOnlySpan<float>.Empty,
+                        qALayernormWeight: mlaW.QALayernormWeight ?? (ReadOnlySpan<float>)ReadOnlySpan<float>.Empty,
+                        qBProj: qBElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QBProj, qBElems) : ReadOnlySpan<float>.Empty,
+                        qProj: qMonoElems > 0 ? new ReadOnlySpan<float>((void*)mlaW.QProj, qMonoElems) : ReadOnlySpan<float>.Empty,
+                        kvAProjWithMqa: new ReadOnlySpan<float>((void*)mlaW.KvAProjWithMqa, kvAElems * hiddenSize),
+                        kvALayernormWeight: mlaW.KvALayernormWeight,
+                        kvBProj: new ReadOnlySpan<float>((void*)mlaW.KvBProj, kvBElems * mlaW.KvLoraRank),
+                        oProj: new ReadOnlySpan<float>((void*)lw.OWeight, oElems),
+                        attnScaleMultiplier: mlaScaleMultiplier,
+                        cachedKNope: _mlaKvState!.GetKNopePointer(layer),
+                        cachedV: _mlaKvState.GetVPointer(layer),
+                        cachedKPe: _mlaKvState.GetKPePointer(layer),
+                        cachedLength: _mlaKvState.GetCurrentLength(layer));
+                    _mlaKvState.Advance(layer, seqLen);
+                }
 
                 // Bias on o_proj (rare — DeepSeek doesn't ship one by default).
                 AddBias(lw.OBias, attnOut, hiddenSize, seqLen);
@@ -1096,6 +1136,7 @@ public sealed unsafe class TransformerModel : IModel
             _threadPool?.Dispose();
         _state.Dispose();
         _mlaKvState?.Dispose();
+        _mlaLatentKvState?.Dispose();
         _weights.Dispose(); // free R4-interleaved weight buffers and any owned bf16→F32 scratch
         // _mmapAnchor is not owned by us — caller disposes the GgufFile / SafetensorsFile.
     }
