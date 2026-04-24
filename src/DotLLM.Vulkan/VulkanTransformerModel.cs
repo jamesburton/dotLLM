@@ -4,7 +4,6 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
-using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
@@ -263,12 +262,12 @@ public sealed class VulkanTransformerModel : IModel
         if (scratchResized)
             InvalidateKernelCaches();
 
-        // 1. Host-side upload of per-token embedding rows + positions. Both
-        //    land in host-visible host-coherent buffers; a HOST→COMPUTE
-        //    barrier at the start of the recorded command buffer makes the
-        //    writes visible to the first compute kernel without an explicit
-        //    vkQueueWaitIdle.
-        UploadEmbeddings(tokenIds);
+        // 1. Validate token IDs (done host-side; cheap), then upload only
+        //    positions host→device. The embedding table is device-local and
+        //    populated once at construction; per-token rows are gathered into
+        //    HiddenState via vkCmdCopyBuffer recorded on the same command
+        //    buffer (see RecordEmbeddingGather below).
+        ValidateTokenIds(tokenIds);
         UploadPositions(positions);
 
         // 2. Begin the single per-forward command buffer and record the
@@ -278,6 +277,14 @@ public sealed class VulkanTransformerModel : IModel
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        // Gather one embedding row per token from the device-local
+        // TokenEmbedding buffer into HiddenState[t, :]. The first consumer
+        // is the TRANSFER copy (HiddenState → Residual) at the top of the
+        // layer loop; the second is the first RMSNorm's COMPUTE read — so
+        // we need both TransferRead and ShaderRead visibility.
+        RecordEmbeddingGather(cmdBuf, tokenIds);
+        KernelSupport.TransferToTransferAndComputeBarrier(cmdBuf);
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
@@ -576,56 +583,55 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
-    /// Resolves each token ID into its FP32 embedding row and packs the
-    /// result into <see cref="VulkanForwardState.HiddenState"/>. Does a
-    /// row-by-row dequant when the table was Q8_0 / F16 / other (GGUF often
-    /// quantises the embedding table alongside the weights).
+    /// Validates every token id is in range <c>[0, vocabSize)</c>. Separated
+    /// from <see cref="RecordEmbeddingGather"/> so the check happens before
+    /// we begin recording the command buffer — a bad id throws cleanly
+    /// without leaving the submit context half-written.
     /// </summary>
-    private unsafe void UploadEmbeddings(ReadOnlySpan<int> tokenIds)
+    private void ValidateTokenIds(ReadOnlySpan<int> tokenIds)
+    {
+        int vocab = Config.VocabSize;
+        for (int t = 0; t < tokenIds.Length; t++)
+        {
+            int id = tokenIds[t];
+            if ((uint)id >= (uint)vocab)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
+        }
+    }
+
+    /// <summary>
+    /// Records N device-local <c>vkCmdCopyBuffer</c> calls (one per input
+    /// token) that gather per-token rows from the already-resident
+    /// <see cref="VulkanWeights.TokenEmbedding"/> buffer into
+    /// <see cref="VulkanForwardState.HiddenState"/>. The embedding table was
+    /// dequantised to F32 and uploaded to device-local VRAM at construction
+    /// time (see <see cref="VulkanWeights.Upload"/>), so the only
+    /// per-forward cost here is <c>seqLen</c> cheap on-device copy commands
+    /// — no host-mapped write, no host→device transfer bandwidth.
+    /// </summary>
+    /// <remarks>
+    /// Vulkan's <c>vkCmdCopyBuffer</c> does accept a regions array, but the
+    /// current P/Invoke surface takes a single region (matching the
+    /// KV-cache-update path in <see cref="VulkanKvCache.RecordUpdate"/>).
+    /// For <c>seqLen=1</c> decode this is one call; for prefill it's
+    /// <c>promptLen</c> calls, still dwarfed by the per-layer matmul cost.
+    /// </remarks>
+    private void RecordEmbeddingGather(nint cmdBuf, ReadOnlySpan<int> tokenIds)
     {
         int hiddenSize = Config.HiddenSize;
-        int vocab = Config.VocabSize;
-        int seqLen = tokenIds.Length;
-        var qt = _cpuWeights.TokenEmbedQuantType;
-
         long rowBytes = (long)hiddenSize * sizeof(float);
-        VulkanApi.vkMapMemory(_device.Handle, _state.HiddenState.Memory, 0, (ulong)(seqLen * rowBytes), 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadEmbeddings");
-        try
+        var srcBuf = _weights.TokenEmbedding.Handle;
+        var dstBuf = _state.HiddenState.Handle;
+        for (int t = 0; t < tokenIds.Length; t++)
         {
-            float* dst = (float*)mapped;
-
-            if (qt == QuantizationType.F32)
+            int id = tokenIds[t];
+            var region = new VkBufferCopy
             {
-                // Direct memcpy from mmap.
-                float* src = (float*)_cpuWeights.TokenEmbedWeight;
-                for (int t = 0; t < seqLen; t++)
-                {
-                    int id = tokenIds[t];
-                    if ((uint)id >= (uint)vocab)
-                        throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
-                    new ReadOnlySpan<float>(src + (long)id * hiddenSize, hiddenSize)
-                        .CopyTo(new Span<float>(dst + (long)t * hiddenSize, hiddenSize));
-                }
-            }
-            else
-            {
-                // Dequantize one row per token into mapped hidden-state region.
-                long tableRowBytes = Dequantize.RowByteSize(hiddenSize, qt);
-                for (int t = 0; t < seqLen; t++)
-                {
-                    int id = tokenIds[t];
-                    if ((uint)id >= (uint)vocab)
-                        throw new ArgumentOutOfRangeException(nameof(tokenIds), $"Token id {id} is out of range");
-                    nint rowPtr = _cpuWeights.TokenEmbedWeight + (nint)(id * tableRowBytes);
-                    Dequantize.ToFloat32(rowPtr, hiddenSize, qt,
-                        new Span<float>(dst + (long)t * hiddenSize, hiddenSize));
-                }
-            }
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, _state.HiddenState.Memory);
+                srcOffset = (ulong)((long)id * rowBytes),
+                dstOffset = (ulong)((long)t * rowBytes),
+                size = (ulong)rowBytes,
+            };
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, srcBuf, dstBuf, 1, region);
         }
     }
 

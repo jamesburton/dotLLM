@@ -159,11 +159,13 @@ internal sealed class VulkanWeights : IDisposable
         long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32);
         using var staging = device.Allocate(stagingBytes);
 
-        // Token embedding table: [vocabSize, hiddenSize]. Always dequantised to
-        // F32 for now — UploadEmbeddings in VulkanTransformerModel re-reads the
-        // table from CPU memory during forward (token indexing is awkward on
-        // a raw Q8_0 blob), so the device-side embedding buffer is effectively
-        // a pad slot. Keeping it F32 matches the pre-existing behaviour.
+        // Token embedding table: [vocabSize, hiddenSize]. Uploaded once as a
+        // device-local F32 buffer so VulkanTransformerModel.Forward can gather
+        // per-token rows via vkCmdCopyBuffer onto the shared command buffer —
+        // no per-forward host→device write. Quantised tables (Q8_0, F16, etc.)
+        // are dequantised to F32 at construction time; keeping them as raw
+        // Q8_0 blocks on device would need a GPU gather-and-dequant kernel,
+        // which is out of scope for this change.
         var tokenEmbed = UploadMatrix(device, staging,
             weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
             weights.VocabSize, weights.HiddenSize,
