@@ -487,4 +487,106 @@ public sealed class RoPETests
             + "rotate_half (halves). If this assertion fires, either the conventions "
             + "converged by coincidence for this input or the Norm kernel regressed.");
     }
+
+    /// <summary>
+    /// DeepSeek-V2-Lite YaRN config:
+    ///   rope_theta=10000, qk_rope_head_dim=64, factor=40,
+    ///   original_max_position_embeddings=4096, beta_fast=32, beta_slow=1,
+    ///   mscale=0.707, mscale_all_dim=0.707 (ratio → 1.0, cos/sin unscaled).
+    /// Verifies inv_freq[i] = freq_inter * mask + freq_extra * (1 - mask) against
+    /// a hand-computed reference that mirrors HF's DeepseekV2YarnRotaryEmbedding.
+    /// Also asserts YaRN is a no-op within the original context window (pos &lt;
+    /// original_max_position_embeddings) for fast-rotation dims where mask == 0
+    /// — i.e. the plain-RoPE path and YaRN path agree on the first few tokens
+    /// for high-frequency dims (dims near 0).
+    /// </summary>
+    [Fact]
+    public void YarnFrequencyRescale_MatchesDeepSeekV2LiteFormula()
+    {
+        const int headDim = 64;
+        const float theta = 10000f;
+        const float factor = 40f;
+        const int origMaxPos = 4096;
+        const float betaFast = 32f;
+        const float betaSlow = 1f;
+        const float mscaleMultiplier = 1.0f; // V2-Lite: mscale == mscale_all_dim
+        const int maxSeqLen = 8;
+        int halfDim = headDim / 2;
+
+        float[] cos = new float[maxSeqLen * halfDim];
+        float[] sin = new float[maxSeqLen * halfDim];
+
+        RoPE.PrecomputeFrequencyTableYarn(
+            maxSeqLen, headDim, theta, factor, origMaxPos, betaFast, betaSlow,
+            mscaleMultiplier, cos, sin);
+
+        // Hand-compute the ramp bounds per HF yarn_find_correction_range.
+        // yarn_find_correction_dim(r, dim, base, maxPos) =
+        //     dim * log(maxPos / (r * 2 * pi)) / (2 * log(base))
+        double lowReal = headDim * Math.Log(origMaxPos / (betaFast * 2.0 * Math.PI)) / (2.0 * Math.Log(theta));
+        double highReal = headDim * Math.Log(origMaxPos / (betaSlow * 2.0 * Math.PI)) / (2.0 * Math.Log(theta));
+        float low = MathF.Max((float)Math.Floor(lowReal), 0f);
+        float high = MathF.Min((float)Math.Ceiling(highReal), headDim - 1);
+        if (low == high) high += 0.001f;
+
+        // Build reference inv_freq and cos/sin.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            for (int i = 0; i < halfDim; i++)
+            {
+                float exponent = 2.0f * i / headDim;
+                float freqExtra = 1.0f / MathF.Pow(theta, exponent);
+                float freqInter = 1.0f / (factor * MathF.Pow(theta, exponent));
+                float linear = (i - low) / (high - low);
+                float mask = linear < 0f ? 0f : (linear > 1f ? 1f : linear);
+                float invFreq = freqInter * mask + freqExtra * (1.0f - mask);
+                float angle = pos * invFreq;
+
+                Assert.Equal(MathF.Cos(angle), cos[pos * halfDim + i], 1e-5f);
+                Assert.Equal(MathF.Sin(angle), sin[pos * halfDim + i], 1e-5f);
+            }
+        }
+    }
+
+    /// <summary>
+    /// For the fast-rotation dims (mask == 0, i.e. i &lt; low), YaRN uses
+    /// freq_extra exactly — so plain RoPE and YaRN must agree bit-for-bit on
+    /// those dims. This guards against accidental rescaling of the original
+    /// context window.
+    /// </summary>
+    [Fact]
+    public void YarnFrequencyRescale_FastRotationDims_AgreeWithPlainRope()
+    {
+        const int headDim = 64;
+        const float theta = 10000f;
+        const float factor = 40f;
+        const int origMaxPos = 4096;
+        const int maxSeqLen = 16;
+        int halfDim = headDim / 2;
+
+        float[] cosYarn = new float[maxSeqLen * halfDim];
+        float[] sinYarn = new float[maxSeqLen * halfDim];
+        float[] cosPlain = new float[maxSeqLen * halfDim];
+        float[] sinPlain = new float[maxSeqLen * halfDim];
+
+        RoPE.PrecomputeFrequencyTableYarn(
+            maxSeqLen, headDim, theta, factor, origMaxPos, 32f, 1f,
+            mscaleMultiplier: 1.0f, cosYarn, sinYarn);
+        RoPE.PrecomputeFrequencyTable(maxSeqLen, headDim, theta, cosPlain, sinPlain);
+
+        // Find 'low' per HF yarn_find_correction_range(beta_fast=32, ...).
+        double lowReal = headDim * Math.Log(origMaxPos / (32.0 * 2.0 * Math.PI)) / (2.0 * Math.Log(theta));
+        int low = Math.Max((int)Math.Floor(lowReal), 0);
+
+        // Dims 0..low-1 should match plain exactly; dims above 'high' should
+        // use freq_inter (i.e. differ). We only assert the agreement side.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            for (int i = 0; i < low; i++)
+            {
+                Assert.Equal(cosPlain[pos * halfDim + i], cosYarn[pos * halfDim + i], 1e-6f);
+                Assert.Equal(sinPlain[pos * halfDim + i], sinYarn[pos * halfDim + i], 1e-6f);
+            }
+        }
+    }
 }

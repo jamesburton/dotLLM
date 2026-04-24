@@ -912,6 +912,68 @@ public sealed class RealHfSafetensorsEndToEndTests
     }
 
     /// <summary>
+    /// Long-context DeepSeek-V2-Lite: exercises positions past
+    /// <c>original_max_position_embeddings=4096</c>, where YaRN frequency
+    /// rescaling actively diverges from plain RoPE. The short-context test
+    /// above stays at positions 0..4 where YaRN is a no-op; this test forces
+    /// the ramped inv_freq path. Gated on a separate long-prompt reference
+    /// JSON which must be regenerated when MLA config changes — the short
+    /// reference would not cover the ramped region.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reference generation:
+    /// <code>
+    /// python tests/scripts/compare_logits_py_reference.py \
+    ///   --model-path "C:/temp/dotllm-deepseek-v2-lite" \
+    ///   --prompt-file tests/scripts/long_prompt_5k.txt \
+    ///   --output-path tests/DotLLM.Tests.Integration/Models/Loaders/references/deepseek-v2-lite-longctx-reference.json \
+    ///   --dtype bfloat16 --trust-remote-code
+    /// </code>
+    /// The long prompt should tokenise to ~4500+ tokens so the ramp
+    /// activates. Suggested: a Wikipedia passage or repeated pattern.
+    /// </para>
+    /// <para>
+    /// Target drift: <see cref="DriftTolerances.Tight"/>. If F32-vs-bf16
+    /// drift compounds at long context, fall back to
+    /// <see cref="DriftTolerances.DeepSeekInitial"/> — record honestly
+    /// rather than silently relaxing, and flag as follow-up.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public void DeepSeekV2Lite_LongContext_LogitsMatchPyTorchReference()
+    {
+        string? root = ResolveCheckpointRoot(
+            envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-deepseek-v2-lite");
+        if (root is null)
+        {
+            _output.WriteLine(
+                "[SKIP] DeepSeek-V2-Lite checkpoint not found. Set "
+                + "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH or place the snapshot at "
+                + "C:/temp/dotllm-deepseek-v2-lite/");
+            return;
+        }
+
+        string? referencePath = ResolveReferenceJsonPath("deepseek-v2-lite-longctx-reference.json");
+        if (referencePath is null || !File.Exists(referencePath))
+        {
+            _output.WriteLine(
+                "[SKIP] Long-context PyTorch reference JSON not found "
+                + "(expected deepseek-v2-lite-longctx-reference.json). "
+                + "Generate a >=4500-token reference via compare_logits_py_reference.py "
+                + "with --trust-remote-code to activate YaRN ramped freqs.");
+            return;
+        }
+
+        // Expect positions >4096 to exercise ramped inv_freq. If drift blows
+        // up (argmax_match_rate < 0.8), treat as a secondary follow-up — do
+        // NOT silently relax tolerances.
+        RunLogitsReferenceTest(root, referencePath, Architecture.DeepSeekV2,
+            tolerances: DriftTolerances.Tight);
+    }
+
+    /// <summary>
     /// Shared harness for the *_LogitsMatchPyTorchReference tests. Loads
     /// the checkpoint via <see cref="ModelLoader.LoadFromSafetensors"/>,
     /// asserts architecture + shape match the reference, runs a forward

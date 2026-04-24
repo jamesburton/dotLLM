@@ -183,6 +183,8 @@ public static class HfConfigExtractor
         float? scalingMscale = null;
         float? scalingMscaleAllDim = null;
         int? scalingOriginalMax = null;
+        float betaFast = 32.0f;
+        float betaSlow = 1.0f;
         if (root.TryGetProperty("rope_scaling", out var rs) && rs.ValueKind == JsonValueKind.Object)
         {
             if (rs.TryGetProperty("factor", out var f)
@@ -201,6 +203,14 @@ public static class HfConfigExtractor
                 && om.ValueKind == JsonValueKind.Number
                 && om.TryGetInt32(out int omv))
                 scalingOriginalMax = omv;
+            if (rs.TryGetProperty("beta_fast", out var bf)
+                && bf.ValueKind == JsonValueKind.Number
+                && bf.TryGetSingle(out float bfv))
+                betaFast = bfv;
+            if (rs.TryGetProperty("beta_slow", out var bs)
+                && bs.ValueKind == JsonValueKind.Number
+                && bs.TryGetSingle(out float bsv))
+                betaSlow = bsv;
         }
 
         return new MlaConfig
@@ -215,6 +225,8 @@ public static class HfConfigExtractor
             RopeScalingMscale = scalingMscale,
             RopeScalingMscaleAllDim = scalingMscaleAllDim,
             RopeScalingOriginalMaxPositionEmbeddings = scalingOriginalMax,
+            RopeScalingBetaFast = betaFast,
+            RopeScalingBetaSlow = betaSlow,
         };
     }
 

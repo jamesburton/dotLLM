@@ -86,6 +86,107 @@ public static class RoPE
     }
 
     /// <summary>
+    /// Pre-computes cos/sin frequency tables using the YaRN ramped per-dim
+    /// inverse-frequency mixing used by DeepSeek-V2/V3. Mirrors HF
+    /// <c>DeepseekV2YarnRotaryEmbedding._set_cos_sin_cache</c>:
+    /// <code>
+    /// freq_extra[i] = 1 / (base ^ (2i/headDim))
+    /// freq_inter[i] = 1 / (scalingFactor * base ^ (2i/headDim))
+    /// (low, high)   = yarn_find_correction_range(betaFast, betaSlow, headDim,
+    ///                                            base, originalMaxPositionEmbeddings)
+    /// mask[i]       = clamp((i - low) / (high - low), 0, 1)     // linear ramp
+    /// inv_freq[i]   = freq_inter[i] * mask[i] + freq_extra[i] * (1 - mask[i])
+    /// cos/sin[pos,i] = cos/sin(pos * inv_freq[i]) * mscaleMultiplier
+    /// </code>
+    /// Note HF multiplies cos/sin by
+    /// <c>yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)</c>
+    /// — for V2-Lite (mscale == mscale_all_dim) this ratio is 1.0 so the caller
+    /// normally passes <c>mscaleMultiplier = 1.0f</c>.
+    /// </summary>
+    /// <param name="maxSeqLen">Maximum sequence length to pre-compute.</param>
+    /// <param name="headDim">Dimension per attention head (must be even).</param>
+    /// <param name="theta">Base frequency (e.g. 10000.0).</param>
+    /// <param name="scalingFactor">YaRN context-length scaling factor (HF <c>rope_scaling.factor</c>, e.g. 40 for V2-Lite).</param>
+    /// <param name="originalMaxPositionEmbeddings">Baseline context length YaRN ramps around (HF <c>original_max_position_embeddings</c>).</param>
+    /// <param name="betaFast">Rotation threshold above which dims extrapolate at the original base (default HF 32).</param>
+    /// <param name="betaSlow">Rotation threshold below which dims interpolate at the scaled base (default HF 1).</param>
+    /// <param name="mscaleMultiplier">Scalar applied to cos/sin values (HF <c>_mscale</c>, default 1.0).</param>
+    /// <param name="cosTable">Destination cosine table; length &gt;= maxSeqLen * headDim / 2.</param>
+    /// <param name="sinTable">Destination sine table; length &gt;= maxSeqLen * headDim / 2.</param>
+    [SkipLocalsInit]
+    public static void PrecomputeFrequencyTableYarn(
+        int maxSeqLen, int headDim, float theta,
+        float scalingFactor, int originalMaxPositionEmbeddings,
+        float betaFast, float betaSlow, float mscaleMultiplier,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (headDim <= 0 || headDim % 2 != 0)
+            throw new ArgumentException($"headDim must be a positive even number, got {headDim}", nameof(headDim));
+        if (scalingFactor <= 1.0f)
+            throw new ArgumentException($"YaRN scalingFactor must be > 1, got {scalingFactor}", nameof(scalingFactor));
+        if (originalMaxPositionEmbeddings <= 0)
+            throw new ArgumentException(
+                $"originalMaxPositionEmbeddings must be positive, got {originalMaxPositionEmbeddings}",
+                nameof(originalMaxPositionEmbeddings));
+
+        int halfDim = headDim / 2;
+
+        // yarn_find_correction_range in HF returns clamped integer bounds in the
+        // FULL-dim space [0, headDim-1], but the linear ramp is applied over
+        // dim // 2 entries (i.e. halfDim). That matches the mixing formula
+        // because freq tables are indexed by half-dim i in [0, halfDim).
+        float low = MathF.Floor(YarnFindCorrectionDim(betaFast, headDim, theta, originalMaxPositionEmbeddings));
+        float high = MathF.Ceiling(YarnFindCorrectionDim(betaSlow, headDim, theta, originalMaxPositionEmbeddings));
+        low = MathF.Max(low, 0.0f);
+        high = MathF.Min(high, headDim - 1.0f);
+        if (low == high) high += 0.001f; // prevent divide-by-zero per HF yarn_linear_ramp_mask
+
+        // Build per-halfDim inv_freq[i].
+        Span<float> invFreq = halfDim * sizeof(float) <= StackAllocThreshold
+            ? stackalloc float[halfDim]
+            : new float[halfDim];
+        for (int i = 0; i < halfDim; i++)
+        {
+            float exponent = 2.0f * i / headDim;
+            float freqExtra = 1.0f / MathF.Pow(theta, exponent);
+            float freqInter = 1.0f / (scalingFactor * MathF.Pow(theta, exponent));
+            // Linear ramp on [low, high] in half-dim index space.
+            float linear = (i - low) / (high - low);
+            float mask = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
+            // HF: inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+            // where inv_freq_mask = 1 - linear_ramp_mask. Expanding:
+            //   inv_freq = freq_inter * linear_ramp + freq_extra * (1 - linear_ramp)
+            invFreq[i] = freqInter * mask + freqExtra * (1.0f - mask);
+        }
+
+        // Fill cos/sin with optional mscale pre-multiply.
+        for (int pos = 0; pos < maxSeqLen; pos++)
+        {
+            int tableBase = pos * halfDim;
+            for (int i = 0; i < halfDim; i++)
+            {
+                float angle = pos * invFreq[i];
+                cosTable[tableBase + i] = MathF.Cos(angle) * mscaleMultiplier;
+                sinTable[tableBase + i] = MathF.Sin(angle) * mscaleMultiplier;
+            }
+        }
+    }
+
+    /// <summary>
+    /// HF <c>yarn_find_correction_dim</c>: returns the (real-valued) head-dim
+    /// index at which a rotation count of <paramref name="numRotations"/> is
+    /// reached given the base sequence length.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float YarnFindCorrectionDim(float numRotations, int dim, float theta, int maxPositionEmbeddings)
+    {
+        // dim * log(maxPos / (numRotations * 2 * pi)) / (2 * log(base))
+        double numerator = dim * Math.Log(maxPositionEmbeddings / (numRotations * 2.0 * Math.PI));
+        double denominator = 2.0 * Math.Log(theta);
+        return (float)(numerator / denominator);
+    }
+
+    /// <summary>
     /// Scalar reference implementation of <see cref="PrecomputeFrequencyTable"/> for correctness verification.
     /// </summary>
     [SkipLocalsInit]
