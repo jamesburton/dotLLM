@@ -130,6 +130,20 @@ public sealed record MlaConfig
     public int? RopeScalingOriginalMaxPositionEmbeddings { get; init; }
 
     /// <summary>
+    /// YaRN beta_fast — controls the rotation count above which dimensions
+    /// extrapolate at the original base (fast rotations). Mirrors HF
+    /// <c>rope_scaling.beta_fast</c> (default 32 per DeepseekV2YarnRotaryEmbedding).
+    /// </summary>
+    public float RopeScalingBetaFast { get; init; } = 32.0f;
+
+    /// <summary>
+    /// YaRN beta_slow — controls the rotation count below which dimensions
+    /// interpolate via scaling_factor (slow rotations). Mirrors HF
+    /// <c>rope_scaling.beta_slow</c> (default 1 per DeepseekV2YarnRotaryEmbedding).
+    /// </summary>
+    public float RopeScalingBetaSlow { get; init; } = 1.0f;
+
+    /// <summary>
     /// Per-head Q·K total dimension: <c>qk_nope_head_dim + qk_rope_head_dim</c>.
     /// Used for the attention scale <c>1 / sqrt(qk_head_dim)</c>.
     /// </summary>
