@@ -31,6 +31,22 @@ internal readonly struct CudaLayerWeights
     public readonly nint QBias, KBias, VBias, OBias;
     public readonly nint GateBias, UpBias, DownBias;
 
+    // ── Fused Q/K/V projection weight (decode-only, single-call quantized GEMV) ──
+    // Packed along the N (output) dim: rows 0..QOutputDim-1 = Q, then K, then V.
+    // Each row is independently quantized along K, so byte-concatenating the three
+    // quantized tensors yields a valid single weight in the SAME layout — every
+    // existing per-row GEMV kernel works unchanged with N = QOutputDim+2*KvOutputDim.
+    // 0 when fusion is not possible (mixed quant types, or quant kernel missing).
+    public readonly nint QkvPacked;
+    public readonly QuantizationType QkvPackedQuantType;
+    public readonly int QkvPackedOutputDim; // QOutputDim + KOutputDim + VOutputDim
+
+    // ── Fused Gate/Up projection weight (decode-only) ──
+    // Packed along N: rows 0..GateOutputDim-1 = Gate, then Up.
+    public readonly nint GateUpPacked;
+    public readonly QuantizationType GateUpPackedQuantType;
+    public readonly int GateUpPackedOutputDim; // GateOutputDim + UpOutputDim
+
     public CudaLayerWeights(
         nint q, int qOut, int qIn, nint k, int kOut, int kIn,
         nint v, int vOut, int vIn, nint o, int oOut, int oIn,
@@ -43,7 +59,9 @@ internal readonly struct CudaLayerWeights
         nint qQuant, QuantizationType qQt, nint kQuant, QuantizationType kQt,
         nint vQuant, QuantizationType vQt, nint oQuant, QuantizationType oQt,
         nint gateQuant, QuantizationType gateQt, nint upQuant, QuantizationType upQt,
-        nint downQuant, QuantizationType downQt)
+        nint downQuant, QuantizationType downQt,
+        nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut,
+        nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut)
     {
         Q = q; QOutputDim = qOut; QInputDim = qIn;
         K = k; KOutputDim = kOut; KInputDim = kIn;
@@ -61,6 +79,8 @@ internal readonly struct CudaLayerWeights
         GateQuant = gateQuant; GateQuantType = gateQt;
         UpQuant = upQuant; UpQuantType = upQt;
         DownQuant = downQuant; DownQuantType = downQt;
+        QkvPacked = qkvPacked; QkvPackedQuantType = qkvPackedQt; QkvPackedOutputDim = qkvPackedOut;
+        GateUpPacked = gateUpPacked; GateUpPackedQuantType = gateUpPackedQt; GateUpPackedOutputDim = gateUpPackedOut;
     }
 }
 
@@ -198,6 +218,23 @@ internal sealed class CudaWeights : IDisposable
             nint upBias = UploadBias(lw.UpBias, allocs, kernels, stream);
             nint downBias = UploadBias(lw.DownBias, allocs, kernels, stream);
 
+            // ── Build fused QkvPacked / GateUpPacked weights (decode-only optimization) ──
+            // Conditions: all three Q/K/V (or both Gate/Up) share the same quant type,
+            // share the same input dim, and a custom quantized-GEMV kernel exists for
+            // that type. The packed buffer is a byte-concatenation along N (output dim);
+            // every per-row GEMV kernel iterates rows independently so this is a
+            // trivial reuse — we just call the existing kernel with a larger N.
+            (nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut) = TryPackThree(
+                qQuant, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
+                kQuant, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                vQuant, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                allocs, stream);
+
+            (nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut) = TryPackTwo(
+                gateQuant, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
+                upQuant, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
+                allocs, stream);
+
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
                 v, lw.VOutputDim, lw.VInputDim, o, lw.OOutputDim, lw.OInputDim,
@@ -208,7 +245,9 @@ internal sealed class CudaWeights : IDisposable
                 qQuant, lw.QQuantType, kQuant, lw.KQuantType,
                 vQuant, lw.VQuantType, oQuant, lw.OQuantType,
                 gateQuant, lw.GateQuantType, upQuant, lw.UpQuantType,
-                downQuant, lw.DownQuantType);
+                downQuant, lw.DownQuantType,
+                qkvPacked, qkvPackedQt, qkvPackedOut,
+                gateUpPacked, gateUpPackedQt, gateUpPackedOut);
         }
 
         // Sync to ensure all uploads are complete
@@ -235,6 +274,70 @@ internal sealed class CudaWeights : IDisposable
 
         long quantBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
         return AllocAndUpload(hostPtr, quantBytes, allocs);
+    }
+
+    /// <summary>
+    /// Allocates a single packed device buffer holding the byte-concatenation of three
+    /// already-uploaded quantized weight tensors along the N (output row) dimension.
+    /// Returns (0, F32, 0) when fusion is not possible — callers should fall back to
+    /// the per-tensor path. Conditions for fusion:
+    ///  - all three have the same quantization type
+    ///  - that type has a custom quantized-GEMV kernel
+    ///  - the three quantized device pointers are all non-zero (i.e., weights are
+    ///    actually quantized; F16/F32 have <c>UploadQuantized → 0</c>)
+    ///  - the input dim (K) matches across all three
+    /// The packed buffer is logically <c>[(qOut+kOut+vOut), inputDim]</c> in the same
+    /// row-major-of-quantized-rows layout used by the per-row GEMV kernels.
+    /// </summary>
+    private static (nint Ptr, QuantizationType Qt, int OutputDim) TryPackThree(
+        nint qQuant, QuantizationType qQt, int qOut, int qIn,
+        nint kQuant, QuantizationType kQt, int kOut, int kIn,
+        nint vQuant, QuantizationType vQt, int vOut, int vIn,
+        List<nint> allocs, nint stream)
+    {
+        if (qQuant == 0 || kQuant == 0 || vQuant == 0) return (0, QuantizationType.F32, 0);
+        if (qQt != kQt || qQt != vQt) return (0, QuantizationType.F32, 0);
+        if (!CudaKernels.HasQuantizedGemv(qQt)) return (0, QuantizationType.F32, 0);
+        if (qIn != kIn || qIn != vIn) return (0, QuantizationType.F32, 0);
+
+        long rowBytes = Dequantize.RowByteSize(qIn, qQt);
+        long qBytes = rowBytes * qOut;
+        long kBytes = rowBytes * kOut;
+        long vBytes = rowBytes * vOut;
+        long totalBytes = qBytes + kBytes + vBytes;
+
+        CudaDriverApi.cuMemAlloc_v2(out nint packed, (nuint)totalBytes).ThrowOnError();
+        allocs.Add(packed);
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed, qQuant, (nuint)qBytes, stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)qBytes, kQuant, (nuint)kBytes, stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)(qBytes + kBytes), vQuant, (nuint)vBytes, stream).ThrowOnError();
+        return (packed, qQt, qOut + kOut + vOut);
+    }
+
+    /// <summary>
+    /// Two-tensor variant of <see cref="TryPackThree"/>. Used to fuse Gate + Up
+    /// projections into a single decode-time GEMV.
+    /// </summary>
+    private static (nint Ptr, QuantizationType Qt, int OutputDim) TryPackTwo(
+        nint aQuant, QuantizationType aQt, int aOut, int aIn,
+        nint bQuant, QuantizationType bQt, int bOut, int bIn,
+        List<nint> allocs, nint stream)
+    {
+        if (aQuant == 0 || bQuant == 0) return (0, QuantizationType.F32, 0);
+        if (aQt != bQt) return (0, QuantizationType.F32, 0);
+        if (!CudaKernels.HasQuantizedGemv(aQt)) return (0, QuantizationType.F32, 0);
+        if (aIn != bIn) return (0, QuantizationType.F32, 0);
+
+        long rowBytes = Dequantize.RowByteSize(aIn, aQt);
+        long aBytes = rowBytes * aOut;
+        long bBytes = rowBytes * bOut;
+        long totalBytes = aBytes + bBytes;
+
+        CudaDriverApi.cuMemAlloc_v2(out nint packed, (nuint)totalBytes).ThrowOnError();
+        allocs.Add(packed);
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed, aQuant, (nuint)aBytes, stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)aBytes, bQuant, (nuint)bBytes, stream).ThrowOnError();
+        return (packed, aQt, aOut + bOut);
     }
 
     /// <summary>Upload quantized weight to GPU, then dequantize to FP16 on device.</summary>
