@@ -163,6 +163,33 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// Inserts a <c>TRANSFER → (TRANSFER | COMPUTE_SHADER)</c> barrier with
+    /// <c>TRANSFER_WRITE → (TRANSFER_READ | SHADER_READ)</c> access. Used
+    /// when a <c>vkCmdCopyBuffer</c> writer is followed by both a
+    /// <c>vkCmdCopyBuffer</c> reader and a later compute-shader reader on
+    /// the same buffer — e.g. the embedding-table gather into HiddenState,
+    /// which is immediately copied to Residual (TRANSFER) and then read
+    /// by the first RMSNorm (COMPUTE).
+    /// </summary>
+    internal static unsafe void TransferToTransferAndComputeBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.TransferRead | VkAccessFlags.ShaderRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.Transfer | VkPipelineStageFlags.ComputeShader,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>HOST → COMPUTE_SHADER</c> barrier so compute kernels see
     /// host writes to host-visible host-coherent buffers that were made
     /// before the submit. Vulkan's host-coherent guarantee covers visibility
