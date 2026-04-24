@@ -115,17 +115,34 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>
     /// Uploads the given CPU-resident <see cref="TransformerWeights"/> to the
-    /// Vulkan device. All quantized weights are dequantized to FP32 row-by-row
-    /// into a pooled scratch buffer before upload; this keeps the host memory
-    /// footprint bounded at one row per upload even when the whole model
-    /// wouldn't fit dequantized in RAM.
+    /// Vulkan device as immutable device-local buffers. Weights are staged
+    /// through a single reusable host-visible staging buffer (sized to the
+    /// largest single matrix), dequantized to FP32 as needed, and copied
+    /// via <c>vkCmdCopyBuffer</c> to VRAM.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On both discrete and UMA parts, a DEVICE_LOCAL-only memory type lets
+    /// the driver pick a tiled / swizzled layout that is substantially
+    /// faster to read from a compute shader than the host-coherent linear
+    /// memory the scaffold used. See <see cref="VulkanDevice.AllocateDeviceLocal"/>.
+    /// </para>
+    /// <para>
+    /// The staging buffer is sized at construction to fit the widest matrix
+    /// (typically the LM head at <c>vocab × hidden</c>) so weight upload is
+    /// one staging copy per matrix — no malloc/free loop per row.
+    /// </para>
+    /// </remarks>
     public static VulkanWeights Upload(VulkanDevice device, TransformerWeights weights, int numLayers)
     {
         long totalBytes = 0;
 
+        // Size the reusable staging buffer to the largest single weight upload.
+        long stagingBytes = ComputeMaxMatrixBytes(weights, numLayers);
+        using var staging = device.Allocate(stagingBytes);
+
         // Token embedding table: [vocabSize, hiddenSize] FP32.
-        var tokenEmbed = UploadMatrix(device, weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
+        var tokenEmbed = UploadMatrix(device, staging, weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
             weights.VocabSize, weights.HiddenSize);
         totalBytes += (long)weights.VocabSize * weights.HiddenSize * sizeof(float);
 
@@ -134,27 +151,27 @@ internal sealed class VulkanWeights : IDisposable
         {
             ref readonly var lw = ref weights.Layers[i];
 
-            var attnNorm = UploadNormVec(device, lw.AttnNormWeight);
+            var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
 
-            var q = UploadMatrix(device, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim);
-            var k = UploadMatrix(device, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim);
-            var v = UploadMatrix(device, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim);
-            var o = UploadMatrix(device, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim);
+            var q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim);
+            var k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim);
+            var v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim);
+            var o = UploadMatrix(device, staging, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim);
 
-            var qBias = UploadOptionalVec(device, lw.QBias);
-            var kBias = UploadOptionalVec(device, lw.KBias);
-            var vBias = UploadOptionalVec(device, lw.VBias);
-            var oBias = UploadOptionalVec(device, lw.OBias);
+            var qBias = UploadOptionalVec(device, staging, lw.QBias);
+            var kBias = UploadOptionalVec(device, staging, lw.KBias);
+            var vBias = UploadOptionalVec(device, staging, lw.VBias);
+            var oBias = UploadOptionalVec(device, staging, lw.OBias);
 
-            var ffnNorm = UploadNormVec(device, lw.FfnNormWeight);
+            var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
 
-            var gate = UploadMatrix(device, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim);
-            var up = UploadMatrix(device, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim);
-            var down = UploadMatrix(device, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim);
+            var gate = UploadMatrix(device, staging, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim);
+            var up = UploadMatrix(device, staging, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim);
+            var down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim);
 
-            var gateBias = UploadOptionalVec(device, lw.GateBias);
-            var upBias = UploadOptionalVec(device, lw.UpBias);
-            var downBias = UploadOptionalVec(device, lw.DownBias);
+            var gateBias = UploadOptionalVec(device, staging, lw.GateBias);
+            var upBias = UploadOptionalVec(device, staging, lw.UpBias);
+            var downBias = UploadOptionalVec(device, staging, lw.DownBias);
 
             layerBuffers[i] = new LayerBuffers(
                 attnNorm,
@@ -178,8 +195,8 @@ internal sealed class VulkanWeights : IDisposable
             totalBytes += (long)lw.DownOutputDim * lw.DownInputDim * sizeof(float);
         }
 
-        var outputNorm = UploadNormVec(device, weights.OutputNormWeight);
-        var outputWeight = UploadMatrix(device, weights.OutputWeight, weights.OutputQuantType,
+        var outputNorm = UploadNormVec(device, staging, weights.OutputNormWeight);
+        var outputWeight = UploadMatrix(device, staging, weights.OutputWeight, weights.OutputQuantType,
             weights.OutputOutputDim, weights.OutputInputDim);
         totalBytes += (long)weights.OutputOutputDim * weights.OutputInputDim * sizeof(float);
 
@@ -190,77 +207,91 @@ internal sealed class VulkanWeights : IDisposable
             totalBytes);
     }
 
-    private static VulkanDevice.Buffer UploadMatrix(VulkanDevice device, nint srcPtr, QuantizationType qt,
-        int outputDim, int inputDim)
+    private static long ComputeMaxMatrixBytes(TransformerWeights weights, int numLayers)
     {
-        long elems = (long)outputDim * inputDim;
-        var buf = device.Allocate(elems * sizeof(float));
-
-        if (qt == QuantizationType.F32)
+        long max = (long)weights.VocabSize * weights.HiddenSize;
+        max = Math.Max(max, (long)weights.OutputOutputDim * weights.OutputInputDim);
+        for (int i = 0; i < numLayers; i++)
         {
-            // Direct upload from mmap.
-            unsafe
-            {
-                var srcSpan = new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems));
-                device.Upload(srcSpan, buf);
-            }
-            return buf;
+            ref readonly var lw = ref weights.Layers[i];
+            max = Math.Max(max, (long)lw.QOutputDim * lw.QInputDim);
+            max = Math.Max(max, (long)lw.KOutputDim * lw.KInputDim);
+            max = Math.Max(max, (long)lw.VOutputDim * lw.VInputDim);
+            max = Math.Max(max, (long)lw.OOutputDim * lw.OInputDim);
+            max = Math.Max(max, (long)lw.GateOutputDim * lw.GateInputDim);
+            max = Math.Max(max, (long)lw.UpOutputDim * lw.UpInputDim);
+            max = Math.Max(max, (long)lw.DownOutputDim * lw.DownInputDim);
         }
-
-        // Dequantize row-by-row into a pooled scratch array (bounded host footprint).
-        float[] scratch = System.Buffers.ArrayPool<float>.Shared.Rent(inputDim);
-        try
-        {
-            long rowBytes = Dequantize.RowByteSize(inputDim, qt);
-            // Map once, write all rows, unmap. Faster than the generic
-            // VulkanDevice.Upload helper which maps/unmaps per call.
-            UploadRowsDequantized(device, buf, srcPtr, outputDim, inputDim, qt, rowBytes, scratch);
-        }
-        finally
-        {
-            System.Buffers.ArrayPool<float>.Shared.Return(scratch);
-        }
-        return buf;
+        return max * sizeof(float);
     }
 
-    private static unsafe void UploadRowsDequantized(
-        VulkanDevice device, VulkanDevice.Buffer dst,
-        nint srcPtr, int outputDim, int inputDim,
-        QuantizationType qt, long rowBytes, float[] scratch)
+    private static unsafe VulkanDevice.Buffer UploadMatrix(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, QuantizationType qt, int outputDim, int inputDim)
     {
-        long totalBytes = (long)outputDim * inputDim * sizeof(float);
-        DotLLM.Vulkan.Interop.VulkanApi.vkMapMemory(device.Handle, dst.Memory, 0, (ulong)totalBytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix");
+        long elems = (long)outputDim * inputDim;
+        long bytes = elems * sizeof(float);
+        var buf = device.AllocateDeviceLocal(bytes);
+
+        // 1. Write FP32 bytes into the host-visible staging buffer (dequantizing if needed).
+        DotLLM.Vulkan.Interop.VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging");
         try
         {
             float* d = (float*)mapped;
-            for (int row = 0; row < outputDim; row++)
+            if (qt == QuantizationType.F32)
             {
-                nint rowSrc = srcPtr + (nint)(row * rowBytes);
-                Dequantize.ToFloat32(rowSrc, inputDim, qt, scratch.AsSpan(0, inputDim));
-                new ReadOnlySpan<float>(scratch, 0, inputDim)
-                    .CopyTo(new Span<float>(d + (long)row * inputDim, inputDim));
+                // Bulk copy from mmap → staging.
+                new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
+                    .CopyTo(new Span<float>(d, checked((int)elems)));
+            }
+            else
+            {
+                long rowBytes = Dequantize.RowByteSize(inputDim, qt);
+                for (int row = 0; row < outputDim; row++)
+                {
+                    nint rowSrc = srcPtr + (nint)(row * rowBytes);
+                    Dequantize.ToFloat32(rowSrc, inputDim, qt,
+                        new Span<float>(d + (long)row * inputDim, inputDim));
+                }
             }
         }
         finally
         {
-            DotLLM.Vulkan.Interop.VulkanApi.vkUnmapMemory(device.Handle, dst.Memory);
+            DotLLM.Vulkan.Interop.VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
         }
-    }
 
-    private static VulkanDevice.Buffer UploadNormVec(VulkanDevice device, float[] normWeight)
-    {
-        var buf = device.Allocate((long)normWeight.Length * sizeof(float));
-        device.Upload(normWeight.AsSpan(), buf);
+        // 2. Record + submit vkCmdCopyBuffer(staging → device-local), wait on fence.
+        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
         return buf;
     }
 
-    private static VulkanDevice.Buffer? UploadOptionalVec(VulkanDevice device, float[]? vec)
+    private static unsafe VulkanDevice.Buffer UploadNormVec(
+        VulkanDevice device, VulkanDevice.Buffer staging, float[] normWeight)
+    {
+        long bytes = (long)normWeight.Length * sizeof(float);
+        var buf = device.AllocateDeviceLocal(bytes);
+
+        DotLLM.Vulkan.Interop.VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory VulkanWeights.UploadNormVec staging");
+        try
+        {
+            normWeight.AsSpan().CopyTo(new Span<float>((void*)mapped, normWeight.Length));
+        }
+        finally
+        {
+            DotLLM.Vulkan.Interop.VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+
+        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        return buf;
+    }
+
+    private static VulkanDevice.Buffer? UploadOptionalVec(
+        VulkanDevice device, VulkanDevice.Buffer staging, float[]? vec)
     {
         if (vec is null) return null;
-        var buf = device.Allocate((long)vec.Length * sizeof(float));
-        device.Upload(vec.AsSpan(), buf);
-        return buf;
+        return UploadNormVec(device, staging, vec);
     }
 
     public void Dispose()

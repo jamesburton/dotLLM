@@ -6,9 +6,13 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// Vulkan-side KV cache. Per-layer device-resident buffers of shape
-/// <c>[maxSeqLen, numKvHeads * headDim]</c> FP32, host-visible and
-/// host-coherent (scaffold memory type — no staging ring yet).
+/// Vulkan-side KV cache. Per-layer device-local buffers of shape
+/// <c>[maxSeqLen, numKvHeads * headDim]</c> FP32. The host never touches
+/// cached K/V — updates are recorded as <c>vkCmdCopyBuffer</c> from the
+/// host-visible activation buffers to the device-local cache, either
+/// synchronously (legacy <see cref="UpdateDevice"/>) or appended to a caller-
+/// supplied command buffer (<see cref="RecordUpdate"/>, used by the
+/// fence-pipelined forward pass).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -69,8 +73,8 @@ public sealed class VulkanKvCache : IKvCache
         long bytesPerLayer = (long)maxSeqLen * _kvStride * sizeof(float);
         for (int i = 0; i < numLayers; i++)
         {
-            _keys[i] = device.Allocate(bytesPerLayer);
-            _values[i] = device.Allocate(bytesPerLayer);
+            _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
+            _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
         }
     }
 
@@ -82,17 +86,13 @@ public sealed class VulkanKvCache : IKvCache
 
     /// <summary>
     /// Copies new <paramref name="kDev"/> / <paramref name="vDev"/> rows into
-    /// the cached K/V buffers at the given positions. Both inputs are
-    /// device-resident FP32 buffers with shape <c>[seqLen, kvStride]</c>.
+    /// the device-local cached K/V buffers at the given positions. Source
+    /// buffers are the current forward pass's host-visible K/V activations;
+    /// the cache destination is device-local (VRAM on a dGPU, driver-tiled on
+    /// UMA). Issues a synchronous <c>vkCmdCopyBuffer</c> + fence wait.
+    /// Prefer <see cref="RecordUpdate"/> from the fence-pipelined forward pass.
     /// </summary>
-    /// <remarks>
-    /// The scaffold path writes via host-mapped pointers: both the source and
-    /// destination buffers are host-visible host-coherent, so a single
-    /// <c>Buffer.MemoryCopy</c> per position suffices. A proper implementation
-    /// would use <c>vkCmdCopyBuffer</c> on the compute queue (TODO alongside
-    /// the staging ring / device-local memory migration).
-    /// </remarks>
-    internal unsafe void UpdateDevice(
+    internal void UpdateDevice(
         VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
         ReadOnlySpan<int> positions, int seqLen, int layerIndex)
     {
@@ -101,49 +101,115 @@ public sealed class VulkanKvCache : IKvCache
 
         int rowBytes = _kvStride * sizeof(float);
 
-        // Map sources and destinations. All four mappings operate on the same
-        // device, and Vulkan lets a buffer be mapped at most once at a time —
-        // so we map all four here and copy row by row.
-        VulkanApi.vkMapMemory(_device.Handle, kDev.Memory, 0, (ulong)(seqLen * rowBytes), 0, out nint kSrcMapped)
-            .ThrowOnError("vkMapMemory kv.kDev");
-        VulkanApi.vkMapMemory(_device.Handle, vDev.Memory, 0, (ulong)(seqLen * rowBytes), 0, out nint vSrcMapped)
-            .ThrowOnError("vkMapMemory kv.vDev");
-        VulkanApi.vkMapMemory(_device.Handle, _keys[layerIndex].Memory, 0, (ulong)_keys[layerIndex].Size, 0, out nint kDstMapped)
-            .ThrowOnError("vkMapMemory kv.keys[layer]");
-        VulkanApi.vkMapMemory(_device.Handle, _values[layerIndex].Memory, 0, (ulong)_values[layerIndex].Size, 0, out nint vDstMapped)
-            .ThrowOnError("vkMapMemory kv.values[layer]");
+        // Single contiguous range if positions are consecutive — one copy call
+        // covers the whole seqLen. Otherwise fall back to per-row copies.
+        int maxPos = ValidateAndFindMaxPos(positions, seqLen);
+        bool contiguous = IsContiguousAscending(positions);
 
-        int maxPos = -1;
-        try
+        if (contiguous)
         {
-            byte* kSrc = (byte*)kSrcMapped;
-            byte* vSrc = (byte*)vSrcMapped;
-            byte* kDst = (byte*)kDstMapped;
-            byte* vDst = (byte*)vDstMapped;
-
+            int startPos = positions[0];
+            ulong totalBytes = (ulong)rowBytes * (ulong)seqLen;
+            _device.CopyBufferRangeSynchronous(kDev, _keys[layerIndex],
+                srcOffset: 0, dstOffset: (ulong)((long)startPos * rowBytes), size: totalBytes);
+            _device.CopyBufferRangeSynchronous(vDev, _values[layerIndex],
+                srcOffset: 0, dstOffset: (ulong)((long)startPos * rowBytes), size: totalBytes);
+        }
+        else
+        {
             for (int i = 0; i < seqLen; i++)
             {
                 int pos = positions[i];
-                if ((uint)pos >= (uint)_maxSeqLen)
-                    throw new ArgumentOutOfRangeException(nameof(positions),
-                        $"Position {pos} exceeds max cache length {_maxSeqLen}.");
-                if (pos > maxPos) maxPos = pos;
-
-                System.Buffer.MemoryCopy(kSrc + i * rowBytes, kDst + (long)pos * rowBytes, rowBytes, rowBytes);
-                System.Buffer.MemoryCopy(vSrc + i * rowBytes, vDst + (long)pos * rowBytes, rowBytes, rowBytes);
+                _device.CopyBufferRangeSynchronous(kDev, _keys[layerIndex],
+                    srcOffset: (ulong)((long)i * rowBytes),
+                    dstOffset: (ulong)((long)pos * rowBytes),
+                    size: (ulong)rowBytes);
+                _device.CopyBufferRangeSynchronous(vDev, _values[layerIndex],
+                    srcOffset: (ulong)((long)i * rowBytes),
+                    dstOffset: (ulong)((long)pos * rowBytes),
+                    size: (ulong)rowBytes);
             }
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, _values[layerIndex].Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, _keys[layerIndex].Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, vDev.Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, kDev.Memory);
         }
 
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;
+    }
+
+    /// <summary>
+    /// Appends K/V copy commands onto the supplied <paramref name="cmdBuf"/>.
+    /// The caller is responsible for the <c>TRANSFER → COMPUTE_SHADER</c>
+    /// barrier that follows (so the attention kernel reads the freshly
+    /// written cache rows), and for advancing <see cref="CurrentLength"/>
+    /// after the batch commits.
+    /// </summary>
+    internal unsafe void RecordUpdate(
+        nint cmdBuf,
+        VulkanDevice.Buffer kDev, VulkanDevice.Buffer vDev,
+        ReadOnlySpan<int> positions, int seqLen, int layerIndex)
+    {
+        if (positions.Length != seqLen)
+            throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+
+        int rowBytes = _kvStride * sizeof(float);
+        int maxPos = ValidateAndFindMaxPos(positions, seqLen);
+        bool contiguous = IsContiguousAscending(positions);
+
+        if (contiguous)
+        {
+            int startPos = positions[0];
+            var region = new VkBufferCopy
+            {
+                srcOffset = 0,
+                dstOffset = (ulong)((long)startPos * rowBytes),
+                size = (ulong)rowBytes * (ulong)seqLen,
+            };
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, kDev.Handle, _keys[layerIndex].Handle, 1, region);
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, vDev.Handle, _values[layerIndex].Handle, 1, region);
+        }
+        else
+        {
+            for (int i = 0; i < seqLen; i++)
+            {
+                int pos = positions[i];
+                var region = new VkBufferCopy
+                {
+                    srcOffset = (ulong)((long)i * rowBytes),
+                    dstOffset = (ulong)((long)pos * rowBytes),
+                    size = (ulong)rowBytes,
+                };
+                VulkanApi.vkCmdCopyBuffer(cmdBuf, kDev.Handle, _keys[layerIndex].Handle, 1, region);
+                VulkanApi.vkCmdCopyBuffer(cmdBuf, vDev.Handle, _values[layerIndex].Handle, 1, region);
+            }
+        }
+
+        int newLength = maxPos + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
+    private int ValidateAndFindMaxPos(ReadOnlySpan<int> positions, int seqLen)
+    {
+        int maxPos = -1;
+        for (int i = 0; i < seqLen; i++)
+        {
+            int pos = positions[i];
+            if ((uint)pos >= (uint)_maxSeqLen)
+                throw new ArgumentOutOfRangeException(nameof(positions),
+                    $"Position {pos} exceeds max cache length {_maxSeqLen}.");
+            if (pos > maxPos) maxPos = pos;
+        }
+        return maxPos;
+    }
+
+    private static bool IsContiguousAscending(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++)
+        {
+            if (positions[i] != positions[i - 1] + 1)
+                return false;
+        }
+        return true;
     }
 
     /// <inheritdoc/>
