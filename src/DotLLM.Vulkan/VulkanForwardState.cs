@@ -24,10 +24,52 @@ internal sealed class VulkanForwardState : IDisposable
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
-    public VulkanDevice.Buffer HiddenState { get; private set; } = null!;
-    public VulkanDevice.Buffer Residual { get; private set; } = null!;
+    //
+    // Hidden / AddScratch form a 2-slot pair. The "current hidden" sits in
+    // one slot; the "scratch that the residual-add writes into" sits in the
+    // other. After each residual add we swap the slot indices — the buffer
+    // that was just written becomes the new HiddenState, and the previous
+    // HiddenState becomes the new AddScratch. This replaces two vkCmdCopyBuffer
+    // dispatches per residual cycle (HiddenState→Residual snapshot copy and
+    // AddScratch→HiddenState writeback copy) with pure pointer relabelling —
+    // Residual is simply an alias for the current HiddenState, because the
+    // snapshot read and the norm read come from the same buffer.
+    private readonly VulkanDevice.Buffer[] _hiddenSlots = new VulkanDevice.Buffer[2];
+    private int _hiddenIdx; // index into _hiddenSlots of the current HiddenState
+
+    /// <summary>Currently active hidden-state buffer (rotates on each residual add).</summary>
+    public VulkanDevice.Buffer HiddenState => _hiddenSlots[_hiddenIdx];
+
+    /// <summary>
+    /// Residual snapshot for the current pre-norm → post-add cycle. By design
+    /// it aliases <see cref="HiddenState"/>: the snapshot is always the
+    /// hidden state as-of the start of the cycle, and rotating the hidden
+    /// slot only happens after the residual add finishes reading from here.
+    /// </summary>
+    public VulkanDevice.Buffer Residual => _hiddenSlots[_hiddenIdx];
+
+    /// <summary>Alternate hidden slot — residual-add writes here, then <see cref="RotateHiddenSlot"/> promotes it.</summary>
+    public VulkanDevice.Buffer AddScratch => _hiddenSlots[_hiddenIdx ^ 1];
+
+    /// <summary>
+    /// Flips <see cref="HiddenState"/> and <see cref="AddScratch"/>. Call after
+    /// the residual add has been dispatched and the post-add barrier is in
+    /// place — the old <see cref="AddScratch"/> now carries the new hidden
+    /// state and the old <see cref="HiddenState"/> becomes free scratch.
+    /// </summary>
+    public void RotateHiddenSlot() => _hiddenIdx ^= 1;
+
+    /// <summary>
+    /// Resets the hidden-slot rotation so the next forward starts with the
+    /// canonical slot 0 as <see cref="HiddenState"/>. Called at the start of
+    /// every forward — without this, the forward pass would alternate the
+    /// physical buffer it writes the initial embedding into, defeating any
+    /// per-buffer descriptor-set caching that depends on the buffer handle
+    /// staying stable across forwards.
+    /// </summary>
+    public void ResetHiddenSlot() => _hiddenIdx = 0;
+
     public VulkanDevice.Buffer NormOutput { get; private set; } = null!;
-    public VulkanDevice.Buffer AddScratch { get; private set; } = null!;
     public VulkanDevice.Buffer Q { get; private set; } = null!;
     public VulkanDevice.Buffer K { get; private set; } = null!;
     public VulkanDevice.Buffer V { get; private set; } = null!;
@@ -89,10 +131,10 @@ internal sealed class VulkanForwardState : IDisposable
         long kvBytes = (long)seqLen * _numKvHeads * _headDim * sizeof(float);
         long ffnBytes = (long)seqLen * _intermediateSize * sizeof(float);
 
-        HiddenState = _device.Allocate(hiddenBytes);
-        Residual = _device.Allocate(hiddenBytes);
+        _hiddenSlots[0] = _device.Allocate(hiddenBytes);
+        _hiddenSlots[1] = _device.Allocate(hiddenBytes);
+        _hiddenIdx = 0;
         NormOutput = _device.Allocate(hiddenBytes);
-        AddScratch = _device.Allocate(hiddenBytes);
 
         Q = _device.Allocate(qBytes);
         K = _device.Allocate(kvBytes);
@@ -109,16 +151,18 @@ internal sealed class VulkanForwardState : IDisposable
 
         _capacitySeqLen = seqLen;
 
-        AllocatedBytes = hiddenBytes * 4 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
+        // hiddenBytes × 3: two hidden slots (HiddenState/AddScratch rotate) + NormOutput.
+        AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
                        + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
     }
 
     private void ReleaseLayerScratch()
     {
-        HiddenState?.Dispose();
-        Residual?.Dispose();
+        _hiddenSlots[0]?.Dispose();
+        _hiddenSlots[1]?.Dispose();
+        _hiddenSlots[0] = null!;
+        _hiddenSlots[1] = null!;
         NormOutput?.Dispose();
-        AddScratch?.Dispose();
         Q?.Dispose();
         K?.Dispose();
         V?.Dispose();
