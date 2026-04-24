@@ -63,39 +63,47 @@ public sealed class MatMulF32Kernel : IDisposable
             throw;
         }
 
-        nint pool = CreateDescriptorPool(device);
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
         return new MatMulF32Kernel(device, module, pipeline, pool);
     }
 
-    private static unsafe nint CreateDescriptorPool(VulkanDevice device)
-    {
-        var poolSize = new VkDescriptorPoolSize
-        {
-            type = VkDescriptorType.StorageBuffer,
-            descriptorCount = 3,
-        };
-        VkDescriptorPoolCreateInfo ci = default;
-        ci.sType = VkStructureType.DescriptorPoolCreateInfo;
-        ci.maxSets = 1;
-        ci.poolSizeCount = 1;
-        ci.pPoolSizes = (nint)(&poolSize);
-        VulkanApi.vkCreateDescriptorPool(device.Handle, ci, 0, out nint pool)
-            .ThrowOnError("vkCreateDescriptorPool");
-        return pool;
-    }
+    /// <summary>Resets this kernel's descriptor pool; call at the start of each forward pass.</summary>
+    internal void ResetDescriptors() => KernelSupport.ResetPool(_device, _descriptorPool);
 
     /// <summary>
     /// Dispatches the matmul: <c>C[N,M] = B[N,K] @ A[M,K]^T</c>.
-    /// Synchronous — the call returns after <c>vkQueueWaitIdle</c>.
+    /// Synchronous — the call returns after <c>vkQueueWaitIdle</c>. Legacy
+    /// wrapper around <see cref="Record"/> for unit tests and standalone
+    /// use; production forward pass uses <see cref="Record"/> directly.
     /// </summary>
+    public void Launch(VulkanDevice.Buffer weightsA, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
+                       int m, int k, int n)
+    {
+        using var ctx = _device.CreateSubmitContext();
+        ctx.Begin();
+        Record(ctx.CommandBuffer, weightsA, inputB, outputC, m, k, n);
+        ctx.SubmitAndWait();
+        ResetDescriptors();
+    }
+
+    /// <summary>
+    /// Records the matmul into <paramref name="cmdBuf"/> without submitting.
+    /// The caller owns the command buffer, the submission fence, and the
+    /// surrounding pipeline barriers (none needed before a sequence of
+    /// compute dispatches against the same buffer set aside from the
+    /// standard SHADER_WRITE → SHADER_READ between kernels).
+    /// </summary>
+    /// <param name="cmdBuf">Open Vulkan command buffer to append commands to.</param>
     /// <param name="weightsA">Row-major <c>[M,K]</c> FP32 weights.</param>
     /// <param name="inputB">Row-major <c>[N,K]</c> FP32 inputs.</param>
     /// <param name="outputC">Row-major <c>[N,M]</c> FP32 outputs.</param>
     /// <param name="m">Output dimension.</param>
     /// <param name="k">Contraction dimension.</param>
     /// <param name="n">Batch size (number of input rows).</param>
-    public unsafe void Launch(VulkanDevice.Buffer weightsA, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
-                              int m, int k, int n)
+    public unsafe void Record(
+        nint cmdBuf,
+        VulkanDevice.Buffer weightsA, VulkanDevice.Buffer inputB, VulkanDevice.Buffer outputC,
+        int m, int k, int n)
     {
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
@@ -108,103 +116,26 @@ public sealed class MatMulF32Kernel : IDisposable
         if (inputB.Size < bMin) throw new ArgumentException("Input buffer too small.", nameof(inputB));
         if (outputC.Size < cMin) throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
-        // 1. Allocate descriptor set.
-        nint setLayout = _pipeline.DescriptorSetLayout;
-        var dsai = new VkDescriptorSetAllocateInfo
-        {
-            sType = VkStructureType.DescriptorSetAllocateInfo,
-            descriptorPool = _descriptorPool,
-            descriptorSetCount = 1,
-            pSetLayouts = (nint)(&setLayout),
-        };
-        VulkanApi.vkAllocateDescriptorSets(_device.Handle, dsai, out nint descriptorSet)
-            .ThrowOnError("vkAllocateDescriptorSets");
+        nint descriptorSet = KernelSupport.AllocateDescriptorSet(_device, _descriptorPool, _pipeline.DescriptorSetLayout);
+        Span<nint> buffers = stackalloc nint[3] { weightsA.Handle, inputB.Handle, outputC.Handle };
+        KernelSupport.WriteBufferBindings(_device, descriptorSet, buffers);
 
-        // 2. Bind buffers to the set.
-        Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[3];
-        bufferInfos[0] = new VkDescriptorBufferInfo { buffer = weightsA.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[1] = new VkDescriptorBufferInfo { buffer = inputB.Handle, offset = 0, range = ulong.MaxValue };
-        bufferInfos[2] = new VkDescriptorBufferInfo { buffer = outputC.Handle, offset = 0, range = ulong.MaxValue };
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        VulkanApi.vkCmdBindDescriptorSets(
+            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            0, 1, descriptorSet, 0, 0);
 
-        Span<VkWriteDescriptorSet> writes = stackalloc VkWriteDescriptorSet[3];
-        fixed (VkDescriptorBufferInfo* bufPtr = bufferInfos)
+        Span<uint> pc = stackalloc uint[3] { (uint)m, (uint)k, (uint)n };
+        fixed (uint* pcPtr = pc)
         {
-            for (int i = 0; i < 3; i++)
-            {
-                writes[i] = new VkWriteDescriptorSet
-                {
-                    sType = VkStructureType.WriteDescriptorSet,
-                    dstSet = descriptorSet,
-                    dstBinding = (uint)i,
-                    descriptorCount = 1,
-                    descriptorType = VkDescriptorType.StorageBuffer,
-                    pBufferInfo = (nint)(bufPtr + i),
-                };
-            }
-            fixed (VkWriteDescriptorSet* writesPtr = writes)
-            {
-                VulkanApi.vkUpdateDescriptorSets(_device.Handle, 3, (nint)writesPtr, 0, 0);
-            }
+            VulkanApi.vkCmdPushConstants(
+                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                0, PushConstantBytes, (nint)pcPtr);
         }
 
-        // 3. Record command buffer.
-        var cbai = new VkCommandBufferAllocateInfo
-        {
-            sType = VkStructureType.CommandBufferAllocateInfo,
-            commandPool = _device.CommandPool,
-            level = VkCommandBufferLevel.Primary,
-            commandBufferCount = 1,
-        };
-        VulkanApi.vkAllocateCommandBuffers(_device.Handle, cbai, out nint cmdBuf)
-            .ThrowOnError("vkAllocateCommandBuffers");
-
-        try
-        {
-            var begin = new VkCommandBufferBeginInfo
-            {
-                sType = VkStructureType.CommandBufferBeginInfo,
-                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
-            };
-            VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
-
-            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
-            VulkanApi.vkCmdBindDescriptorSets(
-                cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
-                0, 1, descriptorSet, 0, 0);
-
-            // Push constants: [M, K, N] as three uint32s.
-            Span<uint> pc = stackalloc uint[3] { (uint)m, (uint)k, (uint)n };
-            fixed (uint* pcPtr = pc)
-            {
-                VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
-                    0, PushConstantBytes, (nint)pcPtr);
-            }
-
-            uint groupsX = (uint)((m + WorkgroupX - 1) / WorkgroupX);
-            uint groupsY = (uint)((n + WorkgroupY - 1) / WorkgroupY);
-            VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
-
-            VulkanApi.vkEndCommandBuffer(cmdBuf).ThrowOnError("vkEndCommandBuffer");
-
-            var submit = new VkSubmitInfo
-            {
-                sType = VkStructureType.SubmitInfo,
-                commandBufferCount = 1,
-                pCommandBuffers = (nint)(&cmdBuf),
-            };
-            VulkanApi.vkQueueSubmit(_device.Queue, 1, submit, 0).ThrowOnError("vkQueueSubmit");
-            VulkanApi.vkQueueWaitIdle(_device.Queue).ThrowOnError("vkQueueWaitIdle");
-        }
-        finally
-        {
-            VulkanApi.vkFreeCommandBuffers(_device.Handle, _device.CommandPool, 1, cmdBuf);
-            // The queue wait above guarantees the descriptor set is no longer in flight; reset
-            // the pool so the next Launch() can allocate fresh. Without this the single-set
-            // descriptor pool would exhaust on the second invocation (VK_ERROR_OUT_OF_POOL_MEMORY),
-            // which the end-to-end forward pass hits within the first layer.
-            VulkanApi.vkResetDescriptorPool(_device.Handle, _descriptorPool, 0);
-        }
+        uint groupsX = (uint)((m + WorkgroupX - 1) / WorkgroupX);
+        uint groupsY = (uint)((n + WorkgroupY - 1) / WorkgroupY);
+        VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
     }
 
     /// <inheritdoc/>
