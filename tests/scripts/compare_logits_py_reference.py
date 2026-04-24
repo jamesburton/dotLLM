@@ -79,6 +79,13 @@ def main() -> int:
         choices=["bfloat16", "float16", "float32"],
         help="Model dtype (default: bfloat16 — matches HF canonical storage).",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow execution of modeling code shipped in the snapshot "
+             "(required for DeepSeek-V2/V3 and other checkpoints that "
+             "declare an auto_map for custom classes).",
+    )
     args = parser.parse_args()
 
     # Deferred imports so `--help` works without torch installed.
@@ -102,15 +109,18 @@ def main() -> int:
     torch_dtype = dtype_map[args.dtype]
 
     print(f"Loading tokenizer from {model_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path), trust_remote_code=args.trust_remote_code)
 
-    print(f"Loading model from {model_path} (dtype={args.dtype}) ...")
+    print(f"Loading model from {model_path} (dtype={args.dtype}, "
+          f"trust_remote_code={args.trust_remote_code}) ...")
     # low_cpu_mem_usage requires `accelerate`; we keep the dep surface small
     # and take the higher peak-RSS hit — 0.5 B params in bf16 is ~1 GiB and
     # fits comfortably in RAM on any dev box that can run this script.
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
         torch_dtype=torch_dtype,
+        trust_remote_code=args.trust_remote_code,
     )
     model.eval()
 
