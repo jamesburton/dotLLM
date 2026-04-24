@@ -822,8 +822,12 @@ public sealed class RealHfSafetensorsEndToEndTests
             return;
         }
 
+        // Phi-3.5 matches HF 5/5 argmax when the reference is generated with
+        // F32 + eager attention (the regeneration after 78f24b5 confirmed
+        // this — row 0 previously mismatched under BF16+SDPA only). Keeping
+        // Tight tolerances forces a regression check if our Phi path drifts.
         RunLogitsReferenceTest(root, referencePath, Architecture.Phi,
-            tolerances: DriftTolerances.PhiObserved);
+            tolerances: DriftTolerances.Tight);
     }
 
     /// <summary>
@@ -996,7 +1000,14 @@ public sealed class RealHfSafetensorsEndToEndTests
             MinArgmaxMatchRate = 0.9,
         };
 
-        /// <summary>Phi-3.5-mini observed baseline + headroom.</summary>
+        /// <summary>
+        /// Phi-3.5-mini with F32+eager reference: 5/5 argmax, max_abs_diff
+        /// ~2.55, mean ~0.30. The bf16+SDPA variant had a row-0 mismatch
+        /// — confirmed accountable to HF's SDPA kernel, not our code.
+        /// Retained for potential future bf16 reference regenerations but
+        /// the current checked-in reference is F32+eager so the active
+        /// tolerance is <see cref="Tight"/>.
+        /// </summary>
         public static DriftTolerances PhiObserved => new()
         {
             MaxAbsDiff = 4.0f,
@@ -1004,7 +1015,16 @@ public sealed class RealHfSafetensorsEndToEndTests
             MinArgmaxMatchRate = 0.7,
         };
 
-        /// <summary>TinyLlama-1.1B observed baseline + headroom.</summary>
+        /// <summary>
+        /// TinyLlama-1.1B observed baseline. F32+eager reference: 3/5 argmax,
+        /// max_abs_diff ~4.22, mean ~0.46. Critically: the 2 mismatching
+        /// rows produce FAR-APART wrong tokens (e.g. 2791 vs 310), not
+        /// near-ties — this is a real structural bug in our Llama path,
+        /// NOT SDPA/bf16 accounting. Under investigation as a P2.6
+        /// follow-up. Candidate cause: Llama uses <c>rotate_half</c>
+        /// (halves convention) for RoPE, we may be using adjacent-pairs
+        /// (Norm convention) per <c>docs/POSITION_ENCODING.md</c>.
+        /// </summary>
         public static DriftTolerances LlamaObserved => new()
         {
             MaxAbsDiff = 6.0f,
