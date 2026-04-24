@@ -14,9 +14,20 @@ namespace DotLLM.Tests.Unit.Tokenizers.Hf;
 /// example; GPT-2 proper and older Llama-family repos follow the same layout.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Tests are skipped when <c>C:/temp/dotllm-granite3-moe/</c> is absent so
 /// the suite remains green on CI without the weights.
+/// </para>
+/// <para>
+/// Marked <see cref="CollectionAttribute"/> <c>SequentialFileIO</c> to opt
+/// out of xUnit parallel execution — when running the full suite,
+/// concurrent <c>HfLegacyBpeLoader.TryLoad</c> calls against the 442 KB
+/// <c>merges.txt</c> deadlock in testhost (fine standalone, fine as a
+/// filtered sub-suite; classic test-runner I/O contention). Pinning this
+/// class to a single-thread collection fixes the hang.
+/// </para>
 /// </remarks>
+[Collection("SequentialFileIO")]
 public class HfLegacyBpeTokenizerTests
 {
     private const string GraniteMoeDir = "C:/temp/dotllm-granite3-moe";
