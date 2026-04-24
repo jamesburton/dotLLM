@@ -32,14 +32,11 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// </para>
 ///
 /// <para>
-/// <b>Known API gap (2026-04-24).</b> <see cref="CudaTransformerModel"/>
-/// currently exposes <c>LoadFromGguf</c> only — no
-/// <c>LoadFromSafetensors</c>. The CPU HF-parity suite depends on safetensors
-/// (HF snapshots ship safetensors + tokenizer.json; GGUF needs separate
-/// conversion that may perturb weights, e.g. Llama Q/K permutation). Until a
-/// safetensors path exists on the CUDA stack, the four sibling tests below
-/// skip with an explicit message pointing at the gap. See
-/// <c>src/DotLLM.Cuda/CudaTransformerModel.cs</c> + <c>CudaModelLoader.cs</c>.
+/// <b>Safetensors loader wired 2026-04-24.</b>
+/// <see cref="CudaModelLoader.LoadFromSafetensors"/> covers the same
+/// Transformer-family archs as the CPU side, so each of the four sibling
+/// tests activates on any machine with the HF checkpoint on disk and the
+/// matching reference JSON. Tests still skip when either is missing.
 /// </para>
 ///
 /// <para>
@@ -151,16 +148,14 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
 
     // ════════════════════════════════════════════════════════════════════
     // Siblings of the CPU HF-parity tests. Each requires an HF safetensors
-    // checkpoint AND a CUDA safetensors loader. Until the latter lands,
-    // they skip. The checkpoint-existence probe is kept so that when the
-    // loader lands on a machine that does have the snapshots, the tests
-    // activate without further edits.
+    // checkpoint + matching PyTorch reference JSON; skip otherwise. The
+    // CUDA safetensors loader lives in CudaModelLoader.LoadFromSafetensors.
     // ════════════════════════════════════════════════════════════════════
 
     [SkippableFact]
     public void Qwen25_0_5B_LogitsMatchPyTorchReference_Cuda()
     {
-        SkipCudaSafetensorsGate(
+        RunCudaSafetensorsGate(
             envVar: "DOTLLM_QWEN25_CHECKPOINT_PATH",
             conventional: "C:/Users/james/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987",
             referenceFile: "qwen2.5-0.5b-reference.json",
@@ -171,7 +166,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     [SkippableFact]
     public void TinyLlama_11B_LogitsMatchPyTorchReference_Cuda()
     {
-        SkipCudaSafetensorsGate(
+        RunCudaSafetensorsGate(
             envVar: "DOTLLM_TINYLLAMA_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-tinyllama",
             referenceFile: "tinyllama-1.1b-reference.json",
@@ -182,7 +177,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     [SkippableFact]
     public void Phi35Mini_LogitsMatchPyTorchReference_Cuda()
     {
-        SkipCudaSafetensorsGate(
+        RunCudaSafetensorsGate(
             envVar: "DOTLLM_PHI35_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-phi35-mini",
             referenceFile: "phi-3.5-mini-reference.json",
@@ -193,7 +188,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     [SkippableFact]
     public void DeepSeekV2Lite_LogitsMatchPyTorchReference_Cuda()
     {
-        SkipCudaSafetensorsGate(
+        RunCudaSafetensorsGate(
             envVar: "DOTLLM_DEEPSEEK_V2_LITE_CHECKPOINT_PATH",
             conventional: "C:/temp/dotllm-deepseek-v2-lite",
             referenceFile: "deepseek-v2-lite-reference.json",
@@ -384,12 +379,13 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Gate helper — skips when HF safetensors isn't present OR when CUDA
-    // can't load safetensors (current state). Once CudaTransformerModel
-    // gains a safetensors entrypoint, fold this into a real loader call.
+    // Gate helper — skips when the HF safetensors checkpoint or reference
+    // JSON is missing, otherwise loads the model onto CUDA via
+    // CudaModelLoader.LoadFromSafetensors and compares the last-row logits
+    // against the PyTorch oracle.
     // ────────────────────────────────────────────────────────────────────
 
-    private void SkipCudaSafetensorsGate(
+    private unsafe void RunCudaSafetensorsGate(
         string envVar, string conventional, string referenceFile,
         Architecture expectedArch, DriftTolerances tolerances)
     {
@@ -413,19 +409,48 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
             return;
         }
 
-        // API gap: CudaTransformerModel exposes only LoadFromGguf. Until a
-        // safetensors path exists on the CUDA stack (CudaTransformerModel.
-        // LoadFromSafetensors / CudaModelLoader.LoadFromSafetensors), this
-        // test cannot activate. The suppressed unused locals confirm the
-        // probes work; they'll drive the live test once the loader lands.
-        _ = root;
-        _ = referencePath;
-        _ = expectedArch;
-        _ = tolerances;
-        Skip.If(true,
-            $"CudaTransformerModel.LoadFromSafetensors is not implemented (tracked as P2.6 API gap). "
-            + $"Checkpoint present at {root}; reference {referenceFile} present; "
-            + "expected arch {expectedArch}. Activate once the loader lands — no further edits needed.");
+        var reference = LoadReferenceJson(referencePath);
+        string ptxDir = ResolvePtxDir();
+        _output.WriteLine($"Checkpoint: {root}");
+        _output.WriteLine($"Reference:  {referencePath}");
+        _output.WriteLine($"PTX dir:    {ptxDir}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (gpuModel, source, config) = CudaModelLoader.LoadFromSafetensors(
+            root, deviceId: 0, ptxDir);
+        loadWatch.Stop();
+        _output.WriteLine(
+            $"CUDA load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms "
+            + $"(arch={config.Architecture}, layers={config.NumLayers}, "
+            + $"hidden={config.HiddenSize}, vocab={config.VocabSize})");
+
+        try
+        {
+            Assert.Equal(expectedArch, config.Architecture);
+            Assert.Equal(reference.LogitsShape[1], config.VocabSize);
+
+            int[] tokenIds = reference.InputIds;
+            int[] positions = new int[tokenIds.Length];
+            for (int i = 0; i < positions.Length; i++) positions[i] = i;
+
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = gpuModel.Forward(tokenIds, positions, deviceId: 0);
+            fwdWatch.Stop();
+            _output.WriteLine(
+                $"CUDA forward ({fwdWatch.Elapsed.TotalSeconds:F3} s): "
+                + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+
+            Assert.Equal(2, logits.Shape.Rank);
+            Assert.Equal(1, logits.Shape[0]);
+            Assert.Equal(reference.LogitsShape[1], logits.Shape[1]);
+
+            CompareLastRowAgainstReference(logits, reference, tolerances);
+        }
+        finally
+        {
+            gpuModel.Dispose();
+            source.Dispose();
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────

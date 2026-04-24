@@ -5,6 +5,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 
 namespace DotLLM.Cuda;
 
@@ -21,7 +22,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly CudaCublasHandle _cublas;
     private readonly CudaContext _context;
     private readonly CudaKernels _kernels;
-    private readonly GgufFile _gguf;
+    private readonly GgufFile? _gguf;
     private readonly int _deviceId;
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
@@ -48,7 +49,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaTransformerModel(
         ModelConfig config, CudaWeights weights, CudaForwardState state,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context,
-        CudaKernels kernels, GgufFile gguf, int deviceId,
+        CudaKernels kernels, GgufFile? gguf, int deviceId,
         float ropeTheta, int ropeDim, int ropeType, string? vramWarning)
     {
         Config = config;
@@ -79,18 +80,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Load CPU weights (mmap references only, no heavy allocation)
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
 
-        // Initialize CUDA
-        var context = CudaContext.Create(deviceId);
-        var stream = CudaStream.Create();
-        var cublas = CudaCublasHandle.Create();
-        cublas.SetStream(stream);
-
-        // Resolve PTX directory
-        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
-        var kernels = new CudaKernels(ptxDir);
-
-        // Check VRAM before loading — warn if model likely exceeds available memory.
-        // Estimate: sum of quantized byte sizes for all GGUF tensors.
+        // VRAM estimate uses GGUF quant info — cheaper than walking cpuWeights.
         long estimatedWeightBytes = 0;
         foreach (var t in gguf.TensorsByName.Values)
         {
@@ -99,8 +89,62 @@ public sealed unsafe class CudaTransformerModel : IModel
             estimatedWeightBytes += Cpu.Kernels.Dequantize.RowByteSize(innerDim, t.QuantizationType) * outerDim;
         }
 
+        return LoadFromCpuWeights(cpuWeights, config, gguf, deviceId, ptxDir, estimatedWeightBytes);
+    }
+
+    /// <summary>
+    /// Loads a transformer model onto the GPU from an opened HuggingFace-convention
+    /// safetensors source (single-file or multi-shard). Same arch coverage as
+    /// <see cref="LoadFromGguf"/> for the Transformer family; MLA/Mamba3 not yet
+    /// ported to CUDA and will throw at forward time if attempted.
+    /// </summary>
+    /// <param name="file">Opened safetensors source; caller retains ownership.</param>
+    /// <param name="config">Model configuration parsed from <c>config.json</c>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null auto-detects.</param>
+    public static CudaTransformerModel LoadFromSafetensors(ISafetensorsTensorSource file,
+                                                              ModelConfig config,
+                                                              int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        // Safetensors path produces a TransformerWeights that owns bf16→F32 upcast
+        // allocations; do NOT call RepackWeights (R4 interleaving is a CPU-SIMD
+        // concern, not a GPU one) — CudaWeights.LoadFromGguf reads the raw tensor
+        // pointers and uploads them. The misleading method name stays for now; the
+        // underlying flow is source-agnostic.
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+
+        // VRAM estimate: skip for the safetensors path for now — TransformerWeights
+        // doesn't expose per-tensor byte sizes cheaply, and the CPU pre-load above
+        // already either succeeded in RAM or failed with an explicit error. Follow-up:
+        // add a TransformerWeights.EstimatedDeviceBytes helper.
+        return LoadFromCpuWeights(cpuWeights, config, gguf: null, deviceId, ptxDir,
+                                  estimatedWeightBytes: 0);
+    }
+
+    /// <summary>
+    /// Shared CUDA init + upload used by both the GGUF and safetensors entrypoints.
+    /// Creates the CUDA context/stream/cuBLAS, loads the PTX module, emits the VRAM
+    /// warning if the estimate exceeds free device memory, and uploads the already-
+    /// loaded <see cref="TransformerWeights"/> to the GPU.
+    /// </summary>
+    private static CudaTransformerModel LoadFromCpuWeights(
+        TransformerWeights cpuWeights, ModelConfig config, GgufFile? gguf,
+        int deviceId, string? ptxDir, long estimatedWeightBytes)
+    {
+        var context = CudaContext.Create(deviceId);
+        var stream = CudaStream.Create();
+        var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        var kernels = new CudaKernels(ptxDir);
+
         string? vramWarning = null;
-        if (CudaDriverApi.cuMemGetInfo_v2(out nuint freeBefore, out nuint totalVram) == 0
+        if (estimatedWeightBytes > 0
+            && CudaDriverApi.cuMemGetInfo_v2(out nuint freeBefore, out nuint totalVram) == 0
             && totalVram > 0 && estimatedWeightBytes > (long)freeBefore)
         {
             long modelMb = estimatedWeightBytes / (1024 * 1024);
@@ -111,10 +155,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                           $"Consider a smaller model or quantization format.";
         }
 
-        // Upload weights to GPU
         var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
 
-        // Create scratch buffers
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize);

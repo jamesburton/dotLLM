@@ -70,6 +70,49 @@ public static class ModelLoader
     {
         ArgumentNullException.ThrowIfNull(safetensorsPath);
 
+        (ISafetensorsTensorSource source, ModelConfig config) = OpenSafetensorsAndConfig(safetensorsPath);
+
+        try
+        {
+            IModel model = config.Architecture switch
+            {
+                Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
+                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
+                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
+                Architecture.Mamba3
+                    => Mamba3TransformerModel.LoadFromSafetensors(source, config),
+                _ => throw new NotSupportedException(
+                    $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, Mamba3."),
+            };
+
+            return (model, source, config);
+        }
+        catch
+        {
+            source.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Opens an HF safetensors checkpoint and parses its <c>config.json</c>
+    /// into a <see cref="ModelConfig"/>, without creating any model instance.
+    /// Used by alternative loaders (e.g. CUDA) that need the source + config
+    /// to hand to a backend-specific model constructor. Caller owns the
+    /// returned <see cref="ISafetensorsTensorSource"/> and must dispose it.
+    /// </summary>
+    /// <param name="safetensorsPath">A <c>*.safetensors</c> file, a
+    /// <c>model.safetensors.index.json</c>, or a directory containing one.</param>
+    /// <exception cref="FileNotFoundException">Path or sibling <c>config.json</c> missing.</exception>
+    /// <exception cref="InvalidDataException">config.json declares an unsupported
+    /// architecture or a multi-shard index references missing files.</exception>
+    public static (ISafetensorsTensorSource Source, ModelConfig Config) OpenSafetensorsAndConfig(
+        string safetensorsPath)
+    {
+        ArgumentNullException.ThrowIfNull(safetensorsPath);
+
         (ISafetensorsTensorSource source, string weightsDir) = OpenSafetensorsSource(safetensorsPath);
 
         try
@@ -106,20 +149,7 @@ public static class ModelLoader
                 _ => HfConfigExtractor.Extract(doc.RootElement),
             };
 
-            IModel model = config.Architecture switch
-            {
-                Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
-                    or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
-                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
-                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
-                Architecture.Mamba3
-                    => Mamba3TransformerModel.LoadFromSafetensors(source, config),
-                _ => throw new NotSupportedException(
-                    $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, Mamba3."),
-            };
-
-            return (model, source, config);
+            return (source, config);
         }
         catch
         {
