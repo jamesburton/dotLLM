@@ -86,15 +86,22 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         int workerCount = threadCount - 1;
         _activeWorkerCount = workerCount;
 
-        // Compute decode thread count using the pool's actual threadCount, not the config's EffectiveThreadCount
-        // (which may be wrong when using the simple constructor with default config).
-        // When topology is null (no NUMA detection), don't apply the memory channel heuristic —
-        // use all configured threads. The cap only makes sense with real topology data.
+        // Compute decode thread count using the pool's actual threadCount, not the config's
+        // EffectiveThreadCount (which may be wrong when using the simple constructor with default config).
+        //
+        // Decode dispatches are short and happen 30-40 times per token per layer, so the per-dispatch
+        // coordination cost dominates once worker count gets large. ThreadPoolDispatchBenchmarks on
+        // Strix Halo (32 logical) showed SpinWait dispatch collapses at 32 threads — the 30-dispatch
+        // decode burst measured 10.6 ms at 32T vs 32 µs at 8T (see .perf-runs/.../dispatch-microbench.md).
+        // When no NumaTopology is available we therefore fall back to a conservative default of
+        // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
+        // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
+        const int DefaultDecodeThreadCountCap = 8;
         _decodeThreadCount = config.DecodeThreadCount > 0
             ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
             : topology is not null
                 ? Math.Clamp(topology.MemoryChannelEstimate, 2, threadCount)
-                : threadCount;
+                : Math.Clamp(DefaultDecodeThreadCountCap, 2, threadCount);
 
         // Build core assignment map (and caller core if pinning is enabled).
         (int[] workerAssignment, int callerCore) = BuildCoreAssignment(workerCount, topology, config);
