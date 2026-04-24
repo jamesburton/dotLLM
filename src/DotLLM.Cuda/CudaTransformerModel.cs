@@ -69,10 +69,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// Collapses ~400 per-step kernel submissions into one stream packet — typically
     /// 2-3× decode speedup on Windows / WDDM where each launch costs ~22 µs.
     /// <para>
-    /// Only the standard <see cref="CudaKvCache"/> decode path is graph-capable (the
-    /// quantized KV-cache path uses host-side eviction state and stays eager). Prefill
-    /// (seqLen &gt; 1) always stays eager. The graph is invalidated when the model is
-    /// disposed or when the decode position resets backwards (Rollback).
+    /// Both the standard <see cref="CudaKvCache"/> and the mixed-precision
+    /// <see cref="CudaQuantizedKvCache"/> (with <c>WindowCapacity &gt; 0</c>) decode
+    /// paths are graph-capable. Pure-quantized configs (<c>WindowCapacity == 0</c>)
+    /// stay on the eager path. Prefill (seqLen &gt; 1) always stays eager. The graph is
+    /// invalidated when the kvCache identity changes or when <see cref="DebugMaxLayers"/>
+    /// flips between calls.
     /// </para>
     /// </summary>
     public bool UseGraphCapture { get; set; }
@@ -90,7 +92,10 @@ public sealed unsafe class CudaTransformerModel : IModel
     private nint _decodeSeqKvDevice;
     private nint _decodeGraph;       // cuGraph handle (intermediate, freed after instantiate)
     private nint _decodeGraphExec;   // cuGraphExec handle (the launchable instance)
-    private CudaKvCache? _decodeGraphKvCache; // KvCache the graph was captured against; invalidate if it changes
+    // KvCache the graph was captured against (may be CudaKvCache or CudaQuantizedKvCache);
+    // invalidate if it changes. Stored as object since both implementations are graph-capable
+    // but go through different launch sequences.
+    private object? _decodeGraphKvCache;
     private int _decodeGraphLayerCount;       // DebugMaxLayers snapshot at capture time
 
     // ── per-category profiling state (only allocated when ProfilingEnabled is set) ──
@@ -281,17 +286,20 @@ public sealed unsafe class CudaTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
-        // CUDA Graphs decode fast-path: single-token decode with the standard (non-quantized)
-        // KV-cache. Captures on first invocation, replays via cuGraphLaunch thereafter.
-        // Falls through to the eager path for prefill, multi-token decode (speculative
-        // verify), or quantized KV-cache.
+        // CUDA Graphs decode fast-path: single-token decode for both the standard
+        // FP16 KV-cache and the quantized cache (when a mixed-precision FP16 window
+        // is configured). Captures on first invocation, replays via cuGraphLaunch
+        // thereafter. Falls through to eager for prefill, multi-token decode
+        // (speculative verify), and pure-quantized configs (windowCapacity == 0).
         if (UseGraphCapture
             && tokenIds.Length == 1
-            && kvCache is CudaKvCache stdKv
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled)            // event injection between launches breaks capture
         {
-            return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
+            if (kvCache is CudaKvCache stdKv)
+                return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
+            if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0)
+                return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }
 
         _context.MakeCurrent();
@@ -637,6 +645,66 @@ public sealed unsafe class CudaTransformerModel : IModel
     }
 
     /// <summary>
+    /// CUDA Graphs decode replay path for the mixed-precision quantized KV cache.
+    /// Mirrors <see cref="ForwardDecodeGraph"/> but routes the KV-cache update and
+    /// attention-scratch preparation through <see cref="CudaQuantizedKvCache"/>'s
+    /// graph-friendly variants, which read the absolute decode position from
+    /// <see cref="_decodePosDevice"/> and predicate quantize-on-evict device-side.
+    /// </summary>
+    private ITensor ForwardDecodeGraphQuantized(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                                  int deviceId, CudaQuantizedKvCache kvCache)
+    {
+        _context.MakeCurrent();
+        int vocabSize = Config.VocabSize;
+
+        _state.EnsureCapacity(1);
+        EnsureGraphScalarBuffers();
+
+        nint s = _stream.Handle;
+        int pos = positions[0];
+        int seqKv = pos + 1;
+
+        unsafe
+        {
+            int tok = tokenIds[0];
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)(&tok), sizeof(int)).ThrowOnError();
+            int p = positions[0];
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)(&p), sizeof(int)).ThrowOnError();
+            CudaDriverApi.cuMemcpyHtoD_v2(_decodePosDevice, (nint)(&pos), sizeof(int)).ThrowOnError();
+            CudaDriverApi.cuMemcpyHtoD_v2(_decodeSeqKvDevice, (nint)(&seqKv), sizeof(int)).ThrowOnError();
+        }
+
+        int effectiveLayers = DebugMaxLayers switch
+        {
+            < 0 => 0,
+            0 => Config.NumLayers,
+            _ => Math.Min(DebugMaxLayers, Config.NumLayers)
+        };
+
+        if (_decodeGraphExec == 0
+            || !ReferenceEquals(_decodeGraphKvCache, kvCache)
+            || _decodeGraphLayerCount != effectiveLayers)
+        {
+            DisposeDecodeGraph();
+            CaptureDecodeGraphQuantized(kvCache, effectiveLayers);
+            _decodeGraphKvCache = kvCache;
+            _decodeGraphLayerCount = effectiveLayers;
+        }
+
+        CudaDriverApi.cuGraphLaunch(_decodeGraphExec, s).ThrowOnError();
+        _stream.Synchronize();
+
+        kvCache.AdvanceLengthForGraphDecode(seqKv);
+
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+            (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+
+        return result;
+    }
+
+    /// <summary>
     /// Captures the decode forward into a CUDA Graph by running the same kernel sequence
     /// as the eager path, but on a stream that has <c>cuStreamBeginCapture</c> active.
     /// All API calls that would normally enqueue work on the stream are added to the
@@ -755,6 +823,134 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             // Capture must always be ended (or aborted) — otherwise the stream is
             // left in capturing state and all subsequent ops fail.
+            CudaDriverApi.cuStreamEndCapture(s, out _);
+            throw;
+        }
+
+        CudaDriverApi.cuStreamEndCapture(s, out _decodeGraph).ThrowOnError();
+        CudaDriverApi.cuGraphInstantiateWithFlags(out _decodeGraphExec, _decodeGraph, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Quantized-KV variant of <see cref="CaptureDecodeGraph"/>. Identical kernel
+    /// sequence except the per-layer KV-cache update goes through
+    /// <see cref="CudaQuantizedKvCache.UpdateDeviceForGraph"/> (FP16 ring write +
+    /// predicated quantize-on-evict) and the attention reads from
+    /// <see cref="CudaQuantizedKvCache.PrepareAttentionScratchForGraph"/>'s scratch
+    /// buffers (predicated dequant + window scatter). Both ops are driven by the
+    /// existing device-resident <see cref="_decodePosDevice"/> counter so no new
+    /// device-side state is required.
+    /// </summary>
+    private void CaptureDecodeGraphQuantized(CudaQuantizedKvCache kvCache, int numLayers)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int intermediateSize = Config.IntermediateSize;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        int slidingWindow = Config.SlidingWindowSize ?? 0;
+        const int seqLen = 1;
+        const int h = sizeof(ushort);
+
+        nint s = _stream.Handle;
+
+        CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
+
+        try
+        {
+            _kernels.LaunchEmbeddingLookup(
+                _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
+                _state.TokenIdsDevice, _state.HiddenState,
+                seqLen, hiddenSize, s);
+
+            long hiddenBytes = (long)seqLen * hiddenSize * h;
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
+            _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
+                hiddenSize, eps, seqLen, s);
+
+            if (numLayers == 0)
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
+
+            for (int layer = 0; layer < numLayers; layer++)
+            {
+                ref readonly var lw = ref _weights.Layers[layer];
+
+                Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+                Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+                Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+
+                if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
+                if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.K, lw.KBias, lw.KOutputDim, seqLen, s);
+                if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.V, lw.VBias, lw.VOutputDim, seqLen, s);
+
+                if (lw.QNormWeight != 0)
+                    _kernels.LaunchPerHeadRmsNorm(_state.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                if (lw.KNormWeight != 0)
+                    _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+
+                int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
+                _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
+                    seqLen, numHeads, numKvHeads, headDim,
+                    _ropeDim, _ropeTheta, effectiveRopeType, s);
+
+                // KV-cache update (FP16 ring write + predicated quantize-on-evict),
+                // device-side eviction state.
+                kvCache.UpdateDeviceForGraph(_state.K, _state.V, layer, _decodePosDevice, s, _kernels);
+
+                // Dequant the quantized region + scatter the window into the FP16 attention
+                // scratch — both predicated, both reading position from _decodePosDevice.
+                var (kCachePtr, vCachePtr) =
+                    kvCache.PrepareAttentionScratchForGraph(layer, _decodePosDevice, s, _kernels);
+
+                // Attention with device-resident seq_kv / position_offset.
+                _kernels.LaunchAttentionDyn(_state.Q, kCachePtr, vCachePtr, _state.AttnOutput,
+                    seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
+                    _decodePosDevice, slidingWindow, s);
+
+                Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
+                if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
+
+                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                    hiddenSize, eps, seqLen, s);
+
+                Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+
+                if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
+                if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+
+                _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput, intermediateSize, seqLen, s);
+
+                Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
+                if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
+
+                if (layer < numLayers - 1)
+                {
+                    ref readonly var nextLw = ref _weights.Layers[layer + 1];
+                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                }
+                else
+                {
+                    _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
+                        seqLen * hiddenSize, s);
+                }
+            }
+
+            nint lastHidden = _state.HiddenState; // seqLen=1
+            _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
+                hiddenSize, eps, 1, s);
+
+            Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
+                _state.NormOutput, _state.LogitsF16,
+                _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+
+            _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+        }
+        catch
+        {
             CudaDriverApi.cuStreamEndCapture(s, out _);
             throw;
         }
