@@ -27,6 +27,25 @@ internal static class VkStructureType
     internal const int CommandPoolCreateInfo = 39;
     internal const int CommandBufferAllocateInfo = 40;
     internal const int CommandBufferBeginInfo = 42;
+    // Vulkan 1.1 core structure types (used by vkGetPhysicalDeviceProperties2).
+    internal const int PhysicalDeviceProperties2 = 1000059001;
+    internal const int PhysicalDeviceSubgroupProperties = 1000094000;
+}
+
+// VkSubgroupFeatureFlagBits — capabilities advertised by the driver for a given
+// subgroup size. ARITHMETIC is the one we care about (subgroupAdd, subgroupMax,
+// subgroupMin, etc.). Others listed for reference; matching the spec bit values.
+[Flags]
+internal enum VkSubgroupFeatureFlags : uint
+{
+    Basic        = 0x00000001,
+    Vote         = 0x00000002,
+    Arithmetic   = 0x00000004,
+    Ballot       = 0x00000008,
+    Shuffle      = 0x00000010,
+    ShuffleRelative = 0x00000020,
+    Clustered    = 0x00000040,
+    Quad         = 0x00000080,
 }
 
 // VkPhysicalDeviceType (chosen enum values)
@@ -400,4 +419,40 @@ internal struct VkSubmitInfo
     internal nint pCommandBuffers;
     internal uint signalSemaphoreCount;
     internal nint pSignalSemaphores;
+}
+
+// VkPhysicalDeviceSubgroupProperties — returned by vkGetPhysicalDeviceProperties2
+// on Vulkan 1.1+ when chained via pNext. `subgroupSize` is the hardware-fixed
+// wave/warp width (32 on NVIDIA/Intel, 64 on AMD GCN/RDNA pre-3, 32-or-64 on
+// RDNA3+). `supportedStages` tells us which shader stages may use subgroup ops,
+// and `supportedOperations` is the VkSubgroupFeatureFlags bitmask.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSize;
+    internal uint supportedStages;       // VkShaderStageFlags bitmask
+    internal uint supportedOperations;   // VkSubgroupFeatureFlags bitmask
+    internal uint quadOperationsInAllStages; // VkBool32
+}
+
+// VkPhysicalDeviceProperties2 — Vulkan 1.1 core. We only read the `sType`
+// (driver ignores) and `pNext` (chain). `properties` is a VkPhysicalDeviceProperties
+// which is large; we reserve the full upper-bound byte tail exactly as in the
+// 1.0 struct to guarantee the driver has room to write without stack issues.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceProperties2
+{
+    internal int sType;
+    internal nint pNext;
+    // Inline VkPhysicalDeviceProperties body — same layout as the 1.0 struct.
+    internal uint apiVersion;
+    internal uint driverVersion;
+    internal uint vendorID;
+    internal uint deviceID;
+    internal int deviceType;
+    internal fixed byte deviceName[256];
+    internal fixed byte pipelineCacheUUID[16];
+    internal fixed byte tail[2048];
 }

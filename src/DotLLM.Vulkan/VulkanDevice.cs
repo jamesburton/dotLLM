@@ -41,6 +41,24 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>Queue family index selected for compute.</summary>
     public uint QueueFamilyIndex { get; }
 
+    /// <summary>
+    /// Hardware subgroup width reported by the driver — e.g. 32 on NVIDIA /
+    /// Intel, 64 on AMD GCN / RDNA3.5 iGPU. Zero when the probe could not
+    /// run (Vulkan 1.0 driver, loader missing <c>vkGetPhysicalDeviceProperties2</c>).
+    /// Exposed so kernel code can size cross-subgroup scratch without guessing.
+    /// </summary>
+    public uint SubgroupSize { get; }
+
+    /// <summary>
+    /// True when the physical device advertises
+    /// <c>VK_SUBGROUP_FEATURE_ARITHMETIC_BIT</c> AND the compute stage is in
+    /// <c>supportedStages</c>. Kernels use this to pick the
+    /// <c>subgroupAdd</c> / <c>subgroupMax</c> fast path over shared-memory
+    /// tree reductions. Falls back to <c>false</c> on any device that does not
+    /// report Vulkan 1.1 core subgroup properties.
+    /// </summary>
+    public bool HasSubgroupArithmetic { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -48,7 +66,8 @@ public sealed class VulkanDevice : IDisposable
 
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
-        nint commandPool, string name, uint vendor, int type, uint queueFamily)
+        nint commandPool, string name, uint vendor, int type, uint queueFamily,
+        uint subgroupSize, bool hasSubgroupArithmetic)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -59,6 +78,8 @@ public sealed class VulkanDevice : IDisposable
         VendorId = vendor;
         DeviceType = type;
         QueueFamilyIndex = queueFamily;
+        SubgroupSize = subgroupSize;
+        HasSubgroupArithmetic = hasSubgroupArithmetic;
     }
 
     /// <summary>
@@ -118,7 +139,7 @@ public sealed class VulkanDevice : IDisposable
 
         try
         {
-            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type);
+            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type, out uint apiVersion);
             uint queueFamily = SelectComputeQueueFamily(physical);
             nint device = CreateLogicalDevice(physical, queueFamily);
 
@@ -133,8 +154,14 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkCreateCommandPool(device, cpInfo, 0, out nint pool)
                 .ThrowOnError("vkCreateCommandPool");
 
+            // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
+            // Vulkan 1.0 drivers — SubgroupSize=0, HasSubgroupArithmetic=false.
+            ProbeSubgroup(physical, apiVersion, out uint subgroupSize, out bool hasArithmetic);
+
             // Transfer ownership of instance to the device on success.
-            var result = new VulkanDevice(instance, physical, device, queue, pool, name, vendor, type, queueFamily);
+            var result = new VulkanDevice(
+                instance, physical, device, queue, pool, name, vendor, type, queueFamily,
+                subgroupSize, hasArithmetic);
             instance = 0;
             return result;
         }
@@ -168,7 +195,7 @@ public sealed class VulkanDevice : IDisposable
     }
 
     private static nint SelectPhysicalDevice(
-        nint instance, out string name, out uint vendor, out int type)
+        nint instance, out string name, out uint vendor, out int type, out uint apiVersion)
     {
         uint count = 0;
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null)
@@ -188,6 +215,7 @@ public sealed class VulkanDevice : IDisposable
         string bestName = "unknown";
         uint bestVendor = 0;
         int bestType = 0;
+        uint bestApi = 0;
 
         foreach (var dev in devices)
         {
@@ -202,13 +230,71 @@ public sealed class VulkanDevice : IDisposable
                 bestName = devName;
                 bestVendor = props.vendorID;
                 bestType = props.deviceType;
+                bestApi = props.apiVersion;
             }
         }
 
         name = bestName;
         vendor = bestVendor;
         type = bestType;
+        apiVersion = bestApi;
         return bestDev;
+    }
+
+    // Packed Vulkan API version helpers. Layout: variant(3) | major(7) | minor(10) | patch(12).
+    private static uint VkApiMajor(uint packed) => (packed >> 22) & 0x7Fu;
+    private static uint VkApiMinor(uint packed) => (packed >> 12) & 0x3FFu;
+
+    /// <summary>
+    /// Queries <c>VkPhysicalDeviceSubgroupProperties</c> via the Vulkan 1.1
+    /// core entry point <c>vkGetPhysicalDeviceProperties2</c>. Safely degrades
+    /// on Vulkan 1.0 devices (where the entry point does not exist) by
+    /// returning <c>size=0, hasArithmetic=false</c> — callers then stick to
+    /// the shared-memory path without regressing on older hardware.
+    /// </summary>
+    private static void ProbeSubgroup(nint physical, uint apiVersion, out uint subgroupSize, out bool hasArithmetic)
+    {
+        subgroupSize = 0;
+        hasArithmetic = false;
+
+        // Gate on the driver's reported API version. vkGetPhysicalDeviceProperties2
+        // is core in Vulkan 1.1 (May 2018). Prior to that the function symbol is
+        // not guaranteed to exist in the loader's dispatch table.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            VkPhysicalDeviceSubgroupProperties sub = default;
+            sub.sType = VkStructureType.PhysicalDeviceSubgroupProperties;
+
+            VkPhysicalDeviceProperties2 props2 = default;
+            props2.sType = VkStructureType.PhysicalDeviceProperties2;
+
+            unsafe
+            {
+                props2.pNext = (nint)(&sub);
+                VulkanApi.vkGetPhysicalDeviceProperties2(physical, ref props2);
+            }
+
+            subgroupSize = sub.subgroupSize;
+
+            // Require BOTH: arithmetic op support AND compute-stage visibility.
+            // The Vulkan spec (§36.2) lists individual stage bits in supportedStages;
+            // COMPUTE is 0x20. On a conformant driver both conditions are usually
+            // set together for arithmetic, but we're explicit.
+            const uint stageCompute = VkShaderStageFlags.Compute;
+            bool stageOk = (sub.supportedStages & stageCompute) != 0;
+            bool featureOk = ((VkSubgroupFeatureFlags)sub.supportedOperations & VkSubgroupFeatureFlags.Arithmetic) != 0;
+            hasArithmetic = stageOk && featureOk && subgroupSize > 0;
+        }
+        catch
+        {
+            // Loader or driver returned garbage — disable fast path. The
+            // shared-memory shaders run on every Vulkan 1.0+ device.
+            subgroupSize = 0;
+            hasArithmetic = false;
+        }
     }
 
     // Vendor IDs are PCI SIG assignments. 0x10DE=NVIDIA, 0x1002=AMD, 0x8086=Intel, 0x13B5=ARM, 0x5143=Qualcomm.
