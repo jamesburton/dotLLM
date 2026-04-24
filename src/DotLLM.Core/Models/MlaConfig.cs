@@ -153,6 +153,28 @@ public sealed record MlaConfig
     public bool UseLatentCache { get; init; }
 
     /// <summary>
+    /// When <see langword="true"/>, the forward pass uses the latent
+    /// <c>MlaLatentKvState</c> cache (same ~7× memory win as
+    /// <see cref="UseLatentCache"/>) but dispatches the attention kernel by
+    /// sequence length: <b>prefill</b> (<c>seqLen &gt; 1</c>) expands the
+    /// cached latents into per-head K_nope/V in a local scratch buffer and
+    /// runs the standard 192-dim MHA attention loop (compute-bound, cheaper
+    /// than the 576-dim absorbed form at long prefill seqKv); <b>decode</b>
+    /// (<c>seqLen == 1</c>) uses the Phase B absorbed kernel verbatim
+    /// (bandwidth-bound — 576-dim MQA-style read of the compact latent
+    /// cache). Mirrors vLLM's production MLA backend split.
+    /// </summary>
+    /// <remarks>
+    /// Mutually exclusive with <see cref="UseLatentCache"/>. The cache
+    /// format stored on disk is identical to Phase B
+    /// (<c>c_kv + k_pe</c> per token), so a decode step after a Phase C
+    /// prefill consumes the same latents a pure-Phase-B prefill would
+    /// have produced — Phase A's expanded K_nope/V is scratch only during
+    /// the prefill step and is discarded.
+    /// </remarks>
+    public bool UseHybridMlaCache { get; init; }
+
+    /// <summary>
     /// Compute the YaRN softmax-scale multiplier to fold into the attention
     /// scale: returns <c>mscale² = (yarn_get_mscale(factor, mscale_all_dim))²</c>
     /// when YaRN scaling is configured and active (<c>factor &gt; 1</c>), else
