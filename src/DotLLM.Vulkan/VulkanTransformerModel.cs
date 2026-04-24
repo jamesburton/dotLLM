@@ -62,6 +62,11 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MatMulF32Kernel _matmul;
     private readonly MatMulQ8_0Kernel _matmulQ8;
     private readonly MatMulQ8_0GemmKernel _matmulQ8Gemm;
+    // Optional: coopmat Q8_0 GEMM for prefill (seqLen>1) on devices that
+    // advertise VK_KHR_cooperative_matrix. ~3.8× over the scalar GEMM on AMD
+    // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
+    // without coopmat — the router falls back to _matmulQ8Gemm then.
+    private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -97,6 +102,7 @@ public sealed class VulkanTransformerModel : IModel
         ModelConfig config, VulkanWeights weights, TransformerWeights cpuWeights,
         VulkanForwardState state,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         VulkanDevice.SubmitContext submit,
@@ -112,6 +118,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmul = matmul;
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
+        _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -196,6 +203,17 @@ public sealed class VulkanTransformerModel : IModel
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
         var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        // Optional coopmat prefill GEMM — 3.8× over scalar on AMD RDNA3.5 at
+        // Llama-3 4096² N=64. Null on devices without KHR_cooperative_matrix;
+        // router falls back to the scalar GEMM. Tolerance: abs 5e-3 / rel 5e-3
+        // end-to-end (looser than the 1e-4 / 1e-3 of the scalar path because
+        // KHR_coopmat only offers F16 operands — see the coopmat kernel tests).
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat = null;
+        if (device.HasCooperativeMatrix)
+        {
+            try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
+            catch (InvalidOperationException) { /* Kernel threw: no usable tile shape. Stay on scalar. */ }
+        }
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -215,7 +233,8 @@ public sealed class VulkanTransformerModel : IModel
         return new VulkanTransformerModel(
             device, ownsDevice,
             config, weights, cpuWeights, state,
-            matmul, matmulQ8, matmulQ8Gemm, rmsnorm, rope, attention, swiglu, add,
+            matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            rmsnorm, rope, attention, swiglu, add,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
@@ -487,6 +506,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmul.InvalidateDescriptorCache();
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
+        _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -519,6 +539,13 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _matmulQ8.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ8GemmCoopmat is not null)
+            {
+                // Prefill path on coopmat-capable devices — ~3.8× over scalar
+                // at Llama-3 prefill shapes. See MatMulQ8_0GemmCoopmatKernel.
+                _matmulQ8GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
@@ -655,6 +682,7 @@ public sealed class VulkanTransformerModel : IModel
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();
         _matmul.Dispose();
