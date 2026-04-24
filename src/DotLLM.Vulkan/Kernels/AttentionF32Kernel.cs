@@ -32,49 +32,109 @@ public sealed class AttentionF32Kernel : IDisposable
     private const int PushConstantBytes = 7 * sizeof(uint); // seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow
 
     private readonly VulkanDevice _device;
-    private readonly VulkanModule _module;
-    private readonly ComputePipeline _pipeline;
+    private readonly VulkanModule _sharedModule;
+    private readonly ComputePipeline _sharedPipeline;
+    private readonly VulkanModule? _subgroupModule;
+    private readonly ComputePipeline? _subgroupPipeline;
     private readonly nint _descriptorPool;
+    private readonly bool _useSubgroup;
     private bool _disposed;
 
-    private AttentionF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    /// <summary>
+    /// True when this kernel dispatches the <c>attention_f32_sg.spv</c>
+    /// subgroup-arithmetic variant; false when it uses the shared-memory
+    /// reference. Exposed for tests and telemetry.
+    /// </summary>
+    public bool UsesSubgroupReduce => _useSubgroup;
+
+    private AttentionF32Kernel(
+        VulkanDevice device,
+        VulkanModule sharedModule, ComputePipeline sharedPipeline,
+        VulkanModule? subgroupModule, ComputePipeline? subgroupPipeline,
+        nint pool, bool useSubgroup)
     {
         _device = device;
-        _module = module;
-        _pipeline = pipeline;
+        _sharedModule = sharedModule;
+        _sharedPipeline = sharedPipeline;
+        _subgroupModule = subgroupModule;
+        _subgroupPipeline = subgroupPipeline;
         _descriptorPool = pool;
+        _useSubgroup = useSubgroup;
     }
 
-    /// <summary>Loads <c>attention_f32.spv</c> from the given directory and creates the pipeline.</summary>
+    /// <summary>
+    /// Loads <c>attention_f32.spv</c> (always) and <c>attention_f32_sg.spv</c>
+    /// (when the device advertises subgroup arithmetic) from the given
+    /// directory and creates the pipelines.
+    /// </summary>
+    /// <remarks>
+    /// Selects the subgroup variant at runtime when <see cref="VulkanDevice.HasSubgroupArithmetic"/>
+    /// is <c>true</c> and <c>DOTLLM_VULKAN_FORCE_SHARED_REDUCE</c> is not set
+    /// to <c>1</c>. Subgroup SPV is optional; silently falls back if missing.
+    /// </remarks>
     public static AttentionF32Kernel Create(VulkanDevice device, string spvDir)
     {
-        string path = Path.Combine(spvDir, "attention_f32.spv");
-        if (!File.Exists(path))
+        string sharedPath = Path.Combine(spvDir, "attention_f32.spv");
+        if (!File.Exists(sharedPath))
             throw new FileNotFoundException(
-                $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
+                $"Vulkan SPIR-V not found: {sharedPath}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
 
-        var module = VulkanModule.LoadFromFile(device, path);
-        ComputePipeline pipeline;
+        VulkanModule sharedModule = VulkanModule.LoadFromFile(device, sharedPath);
+        ComputePipeline sharedPipeline;
         try
         {
-            Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
-            bindings[0] = new VkDescriptorBinding(0);
-            bindings[1] = new VkDescriptorBinding(1);
-            bindings[2] = new VkDescriptorBinding(2);
-            bindings[3] = new VkDescriptorBinding(3);
-            pipeline = module.CreateComputePipeline(
-                entryPoint: "main",
-                bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+            sharedPipeline = CreatePipeline(sharedModule);
         }
         catch
         {
-            module.Dispose();
+            sharedModule.Dispose();
             throw;
         }
 
+        VulkanModule? subgroupModule = null;
+        ComputePipeline? subgroupPipeline = null;
+        bool useSubgroup = device.HasSubgroupArithmetic && !RmsNormF32Kernel.IsForceSharedReduce();
+        if (useSubgroup)
+        {
+            string subgroupPath = Path.Combine(spvDir, "attention_f32_sg.spv");
+            if (File.Exists(subgroupPath))
+            {
+                try
+                {
+                    subgroupModule = VulkanModule.LoadFromFile(device, subgroupPath);
+                    subgroupPipeline = CreatePipeline(subgroupModule);
+                }
+                catch
+                {
+                    subgroupModule?.Dispose();
+                    subgroupModule = null;
+                    subgroupPipeline = null;
+                    useSubgroup = false;
+                }
+            }
+            else
+            {
+                useSubgroup = false;
+            }
+        }
+
         nint pool = CreateDescriptorPool(device);
-        return new AttentionF32Kernel(device, module, pipeline, pool);
+        return new AttentionF32Kernel(
+            device, sharedModule, sharedPipeline,
+            subgroupModule, subgroupPipeline, pool, useSubgroup);
+    }
+
+    private static ComputePipeline CreatePipeline(VulkanModule module)
+    {
+        Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+        bindings[0] = new VkDescriptorBinding(0);
+        bindings[1] = new VkDescriptorBinding(1);
+        bindings[2] = new VkDescriptorBinding(2);
+        bindings[3] = new VkDescriptorBinding(3);
+        return module.CreateComputePipeline(
+            entryPoint: "main",
+            bindings: bindings,
+            pushConstantBytes: PushConstantBytes);
     }
 
     private static unsafe nint CreateDescriptorPool(VulkanDevice device)
@@ -138,8 +198,10 @@ public sealed class AttentionF32Kernel : IDisposable
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
+        ComputePipeline pipeline = (_useSubgroup && _subgroupPipeline != null) ? _subgroupPipeline : _sharedPipeline;
+
         // 1. Allocate descriptor set.
-        nint setLayout = _pipeline.DescriptorSetLayout;
+        nint setLayout = pipeline.DescriptorSetLayout;
         var dsai = new VkDescriptorSetAllocateInfo
         {
             sType = VkStructureType.DescriptorSetAllocateInfo,
@@ -198,9 +260,9 @@ public sealed class AttentionF32Kernel : IDisposable
             };
             VulkanApi.vkBeginCommandBuffer(cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer");
 
-            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+            VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
             VulkanApi.vkCmdBindDescriptorSets(
-                cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+                cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
                 0, 1, descriptorSet, 0, 0);
 
             Span<uint> pc = stackalloc uint[7]
@@ -216,7 +278,7 @@ public sealed class AttentionF32Kernel : IDisposable
             fixed (uint* pcPtr = pc)
             {
                 VulkanApi.vkCmdPushConstants(
-                    cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                    cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
                     0, PushConstantBytes, (nint)pcPtr);
             }
 
@@ -249,7 +311,9 @@ public sealed class AttentionF32Kernel : IDisposable
 
         if (_descriptorPool != 0)
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
-        _pipeline.Dispose();
-        _module.Dispose();
+        _subgroupPipeline?.Dispose();
+        _subgroupModule?.Dispose();
+        _sharedPipeline.Dispose();
+        _sharedModule.Dispose();
     }
 }

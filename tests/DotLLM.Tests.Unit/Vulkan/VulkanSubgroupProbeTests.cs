@@ -12,6 +12,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// capabilities. Always passes; the values are informational.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanSubgroupProbeTests
 {
     private readonly ITestOutputHelper _output;

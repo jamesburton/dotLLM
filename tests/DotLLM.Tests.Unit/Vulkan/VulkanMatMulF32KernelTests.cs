@@ -13,6 +13,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// differences. Tolerances follow the mandate: relative 1e-3 / absolute 1e-4.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanMatMulF32KernelTests
 {
     private const float AbsTol = 1e-4f;

@@ -13,6 +13,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// expected at larger N. Tolerance: rel 1e-3 / abs 1e-4 per mandate.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanRmsNormF32KernelTests
 {
     private const float AbsTol = 1e-4f;

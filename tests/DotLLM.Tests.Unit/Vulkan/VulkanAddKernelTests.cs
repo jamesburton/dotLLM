@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// catches most such cases but the env var is a belt-and-braces escape hatch.
 /// </remarks>
 [Trait("Category", "GPU")]
+[Collection("VulkanKernels")]
 public class VulkanAddKernelTests
 {
     [SkippableFact]
