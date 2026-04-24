@@ -132,6 +132,36 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuStreamSynchronize(nint stream);
 
+    // ── Graphs (capture + replay) ──────────────────────────────────────
+    //
+    // Capture path: cuStreamBeginCapture_v2 → run normal stream operations →
+    // cuStreamEndCapture → cuGraphInstantiateWithFlags → cache the cuGraphExec.
+    // Replay path: cuGraphLaunch (single packet submission, ~1 µs vs ~22 µs/launch
+    // on WDDM). Suitable for the inner decode loop where launch sequence is
+    // topology-invariant; per-step variability handled via device-resident state.
+
+    /// <summary>Thread-local capture mode — only operations on this thread's stream are captured.
+    /// Safer than relaxed/global mode when other threads might touch the stream.</summary>
+    internal const uint CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 2;
+
+    [LibraryImport(LibName)]
+    internal static partial int cuStreamBeginCapture_v2(nint stream, uint mode);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuStreamEndCapture(nint stream, out nint graph);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphInstantiateWithFlags(out nint graphExec, nint graph, ulong flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphLaunch(nint graphExec, nint stream);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphDestroy(nint graph);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphExecDestroy(nint graphExec);
+
     // ── Events (used for GPU-side profiling) ────────────────────────
 
     /// <summary>Default flags. Use for profiling: blocking-sync isn't needed when we cuEventSynchronize host-side.</summary>
