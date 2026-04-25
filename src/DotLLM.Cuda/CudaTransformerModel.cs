@@ -382,9 +382,18 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedQkv = seqLen == 1 && lw.QkvPacked != 0;
             if (fusedQkv)
             {
-                _kernels.LaunchQuantizedGemv(lw.QkvPacked, lw.QkvPackedQuantType,
-                    _state.NormOutput, _state.QkvPacked,
-                    lw.QkvPackedOutputDim, lw.QInputDim, s);
+                if (lw.QkvPackedQuantType == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+                {
+                    _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
+                        _state.NormOutput, _state.QkvPacked,
+                        lw.QkvPackedOutputDim, lw.QInputDim, s);
+                }
+                else
+                {
+                    _kernels.LaunchQuantizedGemv(lw.QkvPacked, lw.QkvPackedQuantType,
+                        _state.NormOutput, _state.QkvPacked,
+                        lw.QkvPackedOutputDim, lw.QInputDim, s);
+                }
                 qPtr = _state.QkvPacked;
                 kPtr = _state.QkvPacked + (nint)((long)lw.QOutputDim * h);
                 vPtr = _state.QkvPacked + (nint)((long)(lw.QOutputDim + lw.KOutputDim) * h);
@@ -498,9 +507,18 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedGateUp = seqLen == 1 && lw.GateUpPacked != 0;
             if (fusedGateUp)
             {
-                _kernels.LaunchQuantizedGemv(lw.GateUpPacked, lw.GateUpPackedQuantType,
-                    _state.NormOutput, _state.GateUpPacked,
-                    lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                if (lw.GateUpPackedQuantType == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+                {
+                    _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                        _state.NormOutput, _state.GateUpPacked,
+                        lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                }
+                else
+                {
+                    _kernels.LaunchQuantizedGemv(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                        _state.NormOutput, _state.GateUpPacked,
+                        lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                }
                 gatePtr = _state.GateUpPacked;
                 upPtr = _state.GateUpPacked + (nint)((long)lw.GateOutputDim * h);
             }
@@ -1024,6 +1042,11 @@ public sealed unsafe class CudaTransformerModel : IModel
                 w = _state.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+        {
+            // Decode: MMQ-style fused dequant+matmul (dp4a) — faster than the FP fmuladd kernel.
+            _kernels.LaunchQuantizedGemvMmq(quantWeight, qt, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt)) // Decode: quantized GEMV
         {

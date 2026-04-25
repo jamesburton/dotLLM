@@ -42,6 +42,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _perHeadRmsNormF32Module;
     private readonly CudaModule _rmsnormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
+    private readonly CudaModule? _quantizedGemvMmqModule;
+    private readonly nint _quantizedGemvQ4_KMmqFunc;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -142,6 +144,15 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "per_head_rmsnorm_f32.ptx"));
         _rmsnormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm_f32.ptx"));
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
+
+        // MMQ-style fused dequant+matmul GEMV (optional — PTX may not be compiled yet).
+        // Provides a faster Q4_K decode path via dp4a-packed INT8 multiply-add.
+        string mmqPath = Path.Combine(ptxDir, "quantized_gemv_mmq.ptx");
+        if (File.Exists(mmqPath))
+        {
+            _quantizedGemvMmqModule = CudaModule.LoadFromFile(mmqPath);
+            _quantizedGemvQ4_KMmqFunc = _quantizedGemvMmqModule.GetFunction("quantized_gemv_q4_k_mmq");
+        }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
         _rmsnormF32Func = _rmsnormF32Module.GetFunction("rmsnorm_f32");
@@ -887,6 +898,46 @@ public sealed unsafe class CudaKernels : IDisposable
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K;
 
+    /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
+
+    /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
+
+    /// <summary>
+    /// MMQ-style fused dequant+matmul Q4_K GEMV. Quantizes the input activation
+    /// to INT8 (per-32-element scale) and accumulates the dot product via __dp4a
+    /// (packed 4×INT8 multiply-add) instead of FP fmuladd. Lossy on the input
+    /// quantization but matches CPU output within Q4_K_M tolerance.
+    /// One CUDA block processes <c>MMQ_ROWS_PER_BLOCK</c> (4) output rows so the
+    /// input-quantization pass amortizes across rows.
+    /// </summary>
+    public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
+                                         nint x, nint y, int n, int k, nint stream)
+    {
+        if (_quantizedGemvMmqModule == null)
+            throw new InvalidOperationException(
+                "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
+
+        nint func = qt switch
+        {
+            QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
+            _ => throw new NotSupportedException($"MMQ GEMV not yet implemented for {qt}.")
+        };
+
+        nint wArg = quantWeight, xArg = x, yArg = y;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+
+        // Must mirror MMQ_ROWS_PER_BLOCK in quantized_gemv_mmq.cu.
+        const int MmqRowsPerBlock = 4;
+        uint gridDim = (uint)((n + MmqRowsPerBlock - 1) / MmqRowsPerBlock);
+
+        CudaDriverApi.cuLaunchKernel(func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>
     /// <param name="src">Device pointer to quantized weight data.</param>
     /// <param name="srcDtype">Source quantization type.</param>
@@ -1089,6 +1140,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module.Dispose();
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
+        _quantizedGemvMmqModule?.Dispose();
         _quantKvModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
