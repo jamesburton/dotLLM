@@ -22,9 +22,10 @@
 #include <stdint.h>
 
 // MMQ_MAX_CHUNKS: per-block shared-memory budget for input quantization scratch.
-// Each chunk = 32 int8 + 1 half scale + 1 half sum = 36 bytes; 256 chunks fits in 9216 B.
-// Supports k up to 8192. SmolLM-135M k=576 → 18 chunks.
-#define MMQ_MAX_CHUNKS 256
+// Each chunk = 32 int8 + 1 half scale + 1 half sum = 36 bytes; 384 chunks fits in 13.5 KiB.
+// Supports k up to 12288 — covers Qwen3-8B MlpDown (k=intermediate=12288, 384 chunks).
+// SmolLM-135M k=576 → 18 chunks; Qwen3-8B QkvProj/GateUp k=4096 → 128 chunks.
+#define MMQ_MAX_CHUNKS 384
 
 // Output rows per CUDA block. 4 rows × 2 superblocks/row (for SmolLM-135M) = 8 superblocks
 // distributed across 256 threads → 32 superblocks per warp before grouping. Larger models
@@ -564,5 +565,492 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k_mmq(
 
         if (lane == 0)
             y[row_base + warp_id] = __float2half(v);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// MMVQ-large variants — 1 row per CUDA block, 128 threads (4 warps).
+//
+// Tuned for large-k regime (k >= 1024, ≥4 super-blocks per row). Modeled on
+// llama.cpp's mul_mat_vec_q<Q4_K, 1, false> structure: each block computes
+// exactly one output row's dot product, all 128 threads cooperate on the same
+// accumulator (kept in registers, no per-row shmem), final reduction is a
+// per-warp __shfl_xor_sync sum followed by a small 4-warp fan-in via shmem.
+//
+// The 4-rows-per-block kernels above remain the right choice for small k
+// (≤3 super-blocks/row, e.g. SmolLM-135M k=576) where the input-quantization
+// amortization across rows is the dominant win and there's not enough work
+// per row to saturate 128 threads.
+//
+// Stage 1 (input quant) is structurally identical to the 4-row variant: 4
+// warps walk all num_chunks chunks via warp-stride, producing s_xq/s_dx/s_sx
+// (or s_sx2 for Q6_K) in shared memory.
+//
+// Stage 2 distributes one row's dot-product work across all 128 threads using
+// a "g-cell" decomposition: each (super-block, sub-block-or-pair, g) triple is
+// a single dp4a-pair work unit; each thread accumulates partial dp4a results
+// into a register float `acc`. The mins/origin term (which is constant per
+// (sb, sub) and would over-count if added per-cell) is added by exactly one
+// designated cell (g==0) per (sb, sub) — the rest contribute only the dot
+// product.
+//
+// Stage 3: warp-shuffle reduction within each warp, 4 partials staged into
+// __shared__ float[4], one final reduction in warp 0, write y[row] from
+// thread (0, 0).
+
+// 4 warps × 32 = 128 threads/block, mirroring llama.cpp's mul_mat_vec_q for ncols_dst=1.
+// Smaller blocks give more concurrent blocks per SM (occupancy-vs-per-block-work tradeoff
+// favors small blocks for GEMV where each row is shallow on its own).
+#define MMVQ_LARGE_THREADS 128
+#define MMVQ_LARGE_NWARPS  4
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q4_k_mmvq_large(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const int num_chunks = k / 32;
+
+    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
+    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
+    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    // ── Stage 1: quantize x to INT8 per 32-element chunk ────────────────
+    for (int c = warp_id; c < num_chunks; c += MMVQ_LARGE_NWARPS)
+    {
+        float v = __half2float(x[c * 32 + lane]);
+        float a = fabsf(v);
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_xor_sync(0xFFFFFFFF, a, offset);
+            a = fmaxf(a, other);
+        }
+
+        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
+        int qi = __float2int_rn(v * inv_scale);
+        qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+        s_xq[c * 32 + lane] = (int8_t)qi;
+
+        int s = qi;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
+
+        if (lane == 0)
+        {
+            s_dx[c] = __float2half(a / 127.0f);
+            s_sx[c] = __float2half((float)s);
+        }
+    }
+
+    __syncthreads();
+
+    // ── Stage 2: dp4a accumulation across (sb, pair) units ───────────────
+    // Each (super-block, pair) is one work unit covering 8 g-cells (16 dp4a)
+    // with constant per-pair scales sc0/m0/sc1/m1. Total units per row =
+    // superblocks_per_row * 4. For k=4096 → 64 units; k=12288 (Qwen3-8B
+    // MlpDown) → 192 units. Stride loop over 128 threads.
+    const int total_units = superblocks_per_row * 4;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 144;
+    float acc = 0.0f;
+
+    for (int unit = tid; unit < total_units; unit += MMVQ_LARGE_THREADS)
+    {
+        int sb = unit >> 2;            // unit / 4
+        int pair = unit & 3;           // 0..3
+
+        const uint8_t* block = w_row + sb * 144;
+        float d    = __half2float(*reinterpret_cast<const half*>(block));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* scales_raw = block + 4;
+        const uint8_t* qs = block + 16;
+
+        int sb_even = pair * 2;
+        int sb_odd  = pair * 2 + 1;
+        int sc0, m0, sc1, m1;
+        if (sb_even < 4)
+        {
+            sc0 = scales_raw[sb_even]     & 0x3F;
+            m0  = scales_raw[sb_even + 4] & 0x3F;
+            sc1 = scales_raw[sb_odd]      & 0x3F;
+            m1  = scales_raw[sb_odd + 4]  & 0x3F;
+        }
+        else
+        {
+            sc0 = (scales_raw[sb_even + 4] & 0x0F) | ((scales_raw[sb_even - 4] >> 6) << 4);
+            m0  = (scales_raw[sb_even + 4] >> 4)   | ((scales_raw[sb_even]     >> 6) << 4);
+            sc1 = (scales_raw[sb_odd + 4]  & 0x0F) | ((scales_raw[sb_odd - 4]  >> 6) << 4);
+            m1  = (scales_raw[sb_odd + 4]  >> 4)   | ((scales_raw[sb_odd]      >> 6) << 4);
+        }
+
+        const uint8_t* pair_qs = qs + pair * 32;
+        int chunk_even = sb * 8 + sb_even;
+        int chunk_odd  = sb * 8 + sb_odd;
+
+        const int8_t* xq_even = s_xq + chunk_even * 32;
+        const int8_t* xq_odd  = s_xq + chunk_odd  * 32;
+
+        int dot0 = 0;
+        int dot1 = 0;
+
+        #pragma unroll
+        for (int g = 0; g < 8; g++)
+        {
+            uint32_t qpacked = *reinterpret_cast<const uint32_t*>(pair_qs + g * 4);
+            int lo = (int)(qpacked & 0x0F0F0F0F);
+            int hi = (int)((qpacked >> 4) & 0x0F0F0F0F);
+
+            int xq_e_packed = *reinterpret_cast<const int*>(xq_even + g * 4);
+            int xq_o_packed = *reinterpret_cast<const int*>(xq_odd  + g * 4);
+
+            dot0 = __dp4a(lo, xq_e_packed, dot0);
+            dot1 = __dp4a(hi, xq_o_packed, dot1);
+        }
+
+        float dx_e = __half2float(s_dx[chunk_even]);
+        float dx_o = __half2float(s_dx[chunk_odd]);
+        float sx_e = __half2float(s_sx[chunk_even]);
+        float sx_o = __half2float(s_sx[chunk_odd]);
+
+        acc += dx_e * (d * (float)sc0 * (float)dot0 - dmin * (float)m0 * sx_e);
+        acc += dx_o * (d * (float)sc1 * (float)dot1 - dmin * (float)m1 * sx_o);
+    }
+
+    // ── Stage 3: warp-shfl reduction → 4-warp shmem fan-in → final sum ──
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Q5_K MMVQ-large — same 1-row-per-block structure, Q5_K weight decode.
+//
+// Cell layout per super-block: 8 sub-blocks × 8 g = 64 cells/sb.
+// Each sub-block = one 32-element chunk with its own scale and 5-bit quants.
+// For k=4096 → 16 sb × 64 = 1024 cells / 128 threads = 8 cells per thread.
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q5_k_mmvq_large(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const int num_chunks = k / 32;
+
+    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
+    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
+    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    // ── Stage 1: input quantization (identical to Q4_K MMVQ-large) ─────
+    for (int c = warp_id; c < num_chunks; c += MMVQ_LARGE_NWARPS)
+    {
+        float v = __half2float(x[c * 32 + lane]);
+        float a = fabsf(v);
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_xor_sync(0xFFFFFFFF, a, offset);
+            a = fmaxf(a, other);
+        }
+
+        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
+        int qi = __float2int_rn(v * inv_scale);
+        qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+        s_xq[c * 32 + lane] = (int8_t)qi;
+
+        int s = qi;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
+
+        if (lane == 0)
+        {
+            s_dx[c] = __float2half(a / 127.0f);
+            s_sx[c] = __float2half((float)s);
+        }
+    }
+
+    __syncthreads();
+
+    // ── Stage 2: dp4a accumulation across (sb, sub) units ──────────────
+    // Each (super-block, sub-block) is one work unit (8 g-cells, 8 dp4a, with
+    // constant per-sub scales sc/m). Total units per row = superblocks_per_row * 8.
+    // For k=4096 → 128 units exactly = 1 unit per thread; for k=12288 → 384 units = 3 each.
+    const int total_units = superblocks_per_row * 8;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 176;
+    float acc = 0.0f;
+
+    for (int unit = tid; unit < total_units; unit += MMVQ_LARGE_THREADS)
+    {
+        int sb = unit >> 3;            // unit / 8
+        int sub = unit & 7;            // 0..7
+
+        const uint8_t* block = w_row + sb * 176;
+        float d    = __half2float(*reinterpret_cast<const half*>(block));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* scales_raw = block + 4;
+        const uint8_t* qh = block + 16;
+        const uint8_t* qs = block + 48;
+
+        int sc, m;
+        if (sub < 4)
+        {
+            sc = scales_raw[sub] & 0x3F;
+            m  = scales_raw[sub + 4] & 0x3F;
+        }
+        else
+        {
+            sc = (scales_raw[sub + 4] & 0x0F) | ((scales_raw[sub - 4] >> 6) << 4);
+            m  = (scales_raw[sub + 4] >> 4)   | ((scales_raw[sub]     >> 6) << 4);
+        }
+
+        const uint8_t* sub_qs = qs + sub * 16;
+        const uint8_t* sub_qh = qh + sub * 4;
+        int chunk_idx = sb * 8 + sub;
+        const int8_t* xq = s_xq + chunk_idx * 32;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 8; g++)
+        {
+            int j_e = 2 * g;
+            int j_o = 2 * g + 1;
+            int p_e = sub_qs[j_e];
+            int p_o = sub_qs[j_o];
+            int qhb_e = sub_qh[j_e >> 2];
+            int qhb_o = sub_qh[j_o >> 2];
+
+            int blo_e = (qhb_e >> ((j_e & 3) * 2)) & 1;
+            int bhi_e = (qhb_e >> ((j_e & 3) * 2 + 1)) & 1;
+            int blo_o = (qhb_o >> ((j_o & 3) * 2)) & 1;
+            int bhi_o = (qhb_o >> ((j_o & 3) * 2 + 1)) & 1;
+
+            int lo_e = (p_e & 0x0F) | (blo_e << 4);
+            int hi_e = (p_e >> 4)   | (bhi_e << 4);
+            int lo_o = (p_o & 0x0F) | (blo_o << 4);
+            int hi_o = (p_o >> 4)   | (bhi_o << 4);
+
+            int wpack = (lo_e & 0xFF) | ((hi_e & 0xFF) << 8)
+                      | ((lo_o & 0xFF) << 16) | ((hi_o & 0xFF) << 24);
+            int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
+
+            dot = __dp4a(wpack, xpack, dot);
+        }
+
+        float dx = __half2float(s_dx[chunk_idx]);
+        float sx = __half2float(s_sx[chunk_idx]);
+        acc += dx * (d * (float)sc * (float)dot - dmin * (float)m * sx);
+    }
+
+    // ── Stage 3: warp-shfl reduction → 4-warp shmem fan-in → final sum ──
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Q6_K MMVQ-large — same 1-row-per-block structure, Q6_K weight decode.
+//
+// Q6_K has 16 sub-blocks per super-block (16 elements each, vs 32 for Q4/5_K),
+// no dmin term, and per-half-chunk x sums. The cell decomposition unrolls the
+// 4-row kernel's nested (half, q_quad, isc) loop into a flat (sb, slot, g)
+// indexing where slot ∈ [0, 16) covers the 16 sub-blocks (2 halves × 4 q_quads
+// × 2 isc) and g ∈ [0, 4) covers the 4 dp4a calls per sub-block.
+//
+// Cell layout per super-block: 16 sub-blocks × 4 g = 64 cells/sb.
+// For k=4096 → 16 sb × 64 = 1024 cells / 128 threads = 8 cells per thread.
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q6_k_mmvq_large(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const int num_chunks = k / 32;
+
+    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
+    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
+    __shared__ half    s_sx2[MMQ_MAX_CHUNKS * 2];   // [a, b] per chunk
+    __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    // ── Stage 1: input quantization with per-half-chunk sums ───────────
+    for (int c = warp_id; c < num_chunks; c += MMVQ_LARGE_NWARPS)
+    {
+        float v = __half2float(x[c * 32 + lane]);
+        float a = fabsf(v);
+
+        // Full warp max for dx (chunk-wide scale).
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_xor_sync(0xFFFFFFFF, a, offset);
+            a = fmaxf(a, other);
+        }
+
+        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
+        int qi = __float2int_rn(v * inv_scale);
+        qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+        s_xq[c * 32 + lane] = (int8_t)qi;
+
+        // Half-warp sum: stop at offset=8 so lanes 0..15 and 16..31 stay isolated.
+        int s = qi;
+        #pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1)
+            s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
+
+        if (lane == 0)
+        {
+            s_dx[c] = __float2half(a / 127.0f);
+            s_sx2[c * 2 + 0] = __float2half((float)s);
+        }
+        if (lane == 16)
+        {
+            s_sx2[c * 2 + 1] = __float2half((float)s);
+        }
+    }
+
+    __syncthreads();
+
+    // ── Stage 2: dp4a accumulation across (sb, slot) units ────────────
+    // Each (super-block, slot) is one Q6_K 16-element sub-block (4 dp4a).
+    // slot ∈ [0, 16) decodes as: half_idx = slot >> 3, q_quad = (slot >> 1) & 3,
+    // isc = slot & 1. Total units per row = superblocks_per_row * 16.
+    // For k=4096 → 256 units = 2 per thread; for k=12288 → 768 units = 6 each.
+    const int total_units = superblocks_per_row * 16;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 210;
+    float acc = 0.0f;
+
+    for (int unit = tid; unit < total_units; unit += MMVQ_LARGE_THREADS)
+    {
+        int sb = unit >> 4;            // unit / 16
+        int slot = unit & 15;          // 0..15
+
+        int half_idx = slot >> 3;      // 0..1
+        int q_quad   = (slot >> 1) & 3; // 0..3
+        int isc      = slot & 1;        // 0..1
+
+        const uint8_t* block = w_row + sb * 210;
+        const uint8_t* ql = block;
+        const uint8_t* qh = block + 128;
+        const int8_t*  scales = reinterpret_cast<const int8_t*>(block + 192);
+        float d = __half2float(*reinterpret_cast<const half*>(block + 208));
+
+        const uint8_t* ql_half = ql + half_idx * 64;
+        const uint8_t* qh_half = qh + half_idx * 32;
+        const int8_t*  sc_half = scales + half_idx * 8;
+
+        int ql_offset = (q_quad & 1) * 32;
+        int ql_shift  = (q_quad & 2) << 1;   // 0 or 4
+        int qh_shift  = q_quad << 1;         // 0,2,4,6
+        int chunk_idx = sb * 8 + half_idx * 4 + q_quad;
+        int sc = sc_half[q_quad * 2 + isc];
+
+        int l_base = isc * 16;
+        const int8_t* xq = s_xq + chunk_idx * 32 + l_base;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+        {
+            int wpack = 0;
+            #pragma unroll
+            for (int b = 0; b < 4; b++)
+            {
+                int l = l_base + g * 4 + b;
+                int q = ((ql_half[l + ql_offset] >> ql_shift) & 0x0F)
+                      | (((qh_half[l] >> qh_shift) & 3) << 4);
+                wpack |= (q & 0xFF) << (b * 8);
+            }
+            int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
+            dot = __dp4a(wpack, xpack, dot);
+        }
+
+        float dx = __half2float(s_dx[chunk_idx]);
+        float sx = __half2float(s_sx2[chunk_idx * 2 + isc]);
+
+        acc += dx * d * (float)sc * ((float)dot - 32.0f * sx);
+    }
+
+    // ── Stage 3: warp-shfl reduction → 4-warp shmem fan-in → final sum ──
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
     }
 }

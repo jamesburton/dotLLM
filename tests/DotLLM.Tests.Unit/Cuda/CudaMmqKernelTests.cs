@@ -53,9 +53,52 @@ public class CudaMmqKernelTests
             (rng, span) => SynthesiseQ6KBlock(rng, span));
     }
 
+    // ── MMVQ-large equivalence tests ─────────────────────────────────────────
+    // Validate the 1-row-per-block × 128-thread MMVQ-large kernel against the
+    // legacy FP-fmuladd path on Qwen3-8B-class shapes (k=4096):
+    //   - n=4096 covers the QkvProj fused n=q+k+v output dim for 4096-d models.
+    //   - n=11008 stresses an MlpDown intermediate shape.
+    //   - n=24576 = 2 × 12288 covers Qwen3-8B's fused gate+up MlpUp.
+    // The dispatcher routes these to mmvq_large because k=4096 >= the 1024
+    // threshold; k<1024 cases above continue to validate the MMQ-4-rows path.
+
+    [SkippableTheory]
+    [InlineData(4096, 4096)]
+    [InlineData(11008, 4096)]
+    [InlineData(24576, 4096)]
+    public void MmvqLargeQ4K_MatchesLegacy_Qwen3_8B_Shapes(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q4_K, n, k, blockBytes: 144,
+            (rng, span) => SynthesiseQ4KBlock(rng, span), requireMmvqLarge: true);
+    }
+
+    [SkippableTheory]
+    [InlineData(4096, 4096)]
+    [InlineData(11008, 4096)]
+    [InlineData(24576, 4096)]
+    public void MmvqLargeQ5K_MatchesLegacy_Qwen3_8B_Shapes(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q5_K, n, k, blockBytes: 176,
+            (rng, span) => SynthesiseQ5KBlock(rng, span), requireMmvqLarge: true);
+    }
+
+    [SkippableTheory]
+    [InlineData(4096, 4096)]
+    [InlineData(11008, 4096)]
+    [InlineData(24576, 4096)]
+    public void MmvqLargeQ6K_MatchesLegacy_Qwen3_8B_Shapes(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q6_K, n, k, blockBytes: 210,
+            (rng, span) => SynthesiseQ6KBlock(rng, span), requireMmvqLarge: true);
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunMmqEquivalence(QuantizationType qt, int n, int k, int blockBytes,
-                                           Action<Random, Span<byte>> synthesiseBlock)
+                                           Action<Random, Span<byte>> synthesiseBlock,
+                                           bool requireMmvqLarge = false)
     {
         using var ctx = CudaContext.Create(0);
         using var stream = CudaStream.Create();
@@ -63,6 +106,20 @@ public class CudaMmqKernelTests
         Skip.If(ptxDir == null, "PTX files not found");
         using var kernels = new CudaKernels(ptxDir!);
         Skip.IfNot(kernels.HasMmq(qt), $"MMQ kernel for {qt} not loaded (PTX may be stale)");
+
+        // MMVQ-large is opt-in via env var (default off due to perf regression on RTX 3060
+        // — see HasMmvqLargeQ4K remarks). Tests that exercise the new kernel toggle the
+        // enable knob in-process. Must be reset in `finally` to avoid state leak.
+        bool prevEnableQ4K = CudaKernels.EnableMmvqLargeQ4K;
+        bool prevEnableQ5K = CudaKernels.EnableMmvqLargeQ5K;
+        bool prevEnableQ6K = CudaKernels.EnableMmvqLargeQ6K;
+        if (requireMmvqLarge)
+        {
+            CudaKernels.EnableMmvqLargeQ4K = qt == QuantizationType.Q4_K;
+            CudaKernels.EnableMmvqLargeQ5K = qt == QuantizationType.Q5_K;
+            CudaKernels.EnableMmvqLargeQ6K = qt == QuantizationType.Q6_K;
+            Skip.IfNot(kernels.HasMmvqLarge(qt), $"MMVQ-large kernel for {qt} not loaded (PTX may be stale)");
+        }
 
         var rng = new Random(1234 ^ (int)qt ^ n ^ k);
         int superblocksPerRow = k / 256;
@@ -120,6 +177,10 @@ public class CudaMmqKernelTests
             if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
             if (devYLegacy != 0) CudaDriverApi.cuMemFree_v2(devYLegacy);
             if (devYMmq != 0) CudaDriverApi.cuMemFree_v2(devYMmq);
+            // Restore prior MMVQ-large enable knobs (see top of method).
+            CudaKernels.EnableMmvqLargeQ4K = prevEnableQ4K;
+            CudaKernels.EnableMmvqLargeQ5K = prevEnableQ5K;
+            CudaKernels.EnableMmvqLargeQ6K = prevEnableQ6K;
         }
 
         // Compare against the **peak magnitude** of the legacy output rather than
@@ -152,6 +213,21 @@ public class CudaMmqKernelTests
         // outputs and tighter ratios in practice (the end-to-end logits parity
         // test on SmolLM-135M Q4_K_M passes within Tight tolerance).
         Assert.True(peakRelMax < 0.03f, $"Peak-relative max diff {peakRelMax:P2} exceeds 3% (max={maxAbs}, refMax={refMax})");
+    }
+
+    private static unsafe void SynthesiseQ4KBlock(Random rng, Span<byte> block)
+    {
+        // Q4_K layout (144 bytes): half d, half dmin, uint8[12] scales, uint8[128] qs.
+        Half d = (Half)(rng.NextDouble() * 0.05 + 0.01);
+        Half dmin = (Half)((rng.NextDouble() - 0.5) * 0.04);
+
+        fixed (byte* pBlock = block)
+        {
+            *(Half*)pBlock = d;
+            *(Half*)(pBlock + 2) = dmin;
+        }
+        for (int i = 4; i < 144; i++)
+            block[i] = (byte)rng.Next(0, 256);
     }
 
     private static unsafe void SynthesiseQ5KBlock(Random rng, Span<byte> block)
