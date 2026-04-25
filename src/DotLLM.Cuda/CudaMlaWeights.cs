@@ -4,6 +4,23 @@ using DotLLM.Models.Architectures;
 
 namespace DotLLM.Cuda;
 
+#region MLA FP16
+/// <summary>
+/// Numeric precision used by an MLA layer's weights and activations. F32 is
+/// the Phase A reference (matches the CPU oracle byte-for-byte algorithmically);
+/// F16 is the production-target sibling that mirrors the rest of the CUDA
+/// backend's GQA path (FP16 weights / activations / cache, FP32 softmax /
+/// RMSNorm reduction).
+/// </summary>
+public enum MlaPrecision
+{
+    /// <summary>F32 weights + activations + cache. Matches the CPU oracle; debug / fallback only.</summary>
+    F32 = 0,
+    /// <summary>F16 weights + activations + cache, FP32 reductions. Default production path.</summary>
+    F16 = 1,
+}
+#endregion
+
 /// <summary>
 /// Per-layer GPU weight pointers for Multi-head Latent Attention (MLA, DeepSeek-V2/V3).
 /// Phase 1: every projection is uploaded as F32 row-major to GPU memory and the kernel
@@ -78,13 +95,44 @@ public readonly struct CudaMlaLayerWeights
     /// <summary>Model hidden size.</summary>
     public readonly int HiddenSize;
 
-    /// <summary>Constructs a fully-populated MLA layer weight bundle.</summary>
+    /// <summary>
+    /// Precision of the projection weights and the activations the kernel
+    /// path expects. F32 weights mean the F32 attention/helpers run; F16
+    /// weights mean the FP16 sibling kernels run. Norm weights stay F32
+    /// in both cases (the F16 RMSNorm helper takes a FP32 weight buffer).
+    /// </summary>
+    public readonly MlaPrecision Precision;
+
+    /// <summary>
+    /// Constructs a fully-populated F32 MLA layer weight bundle (back-compat
+    /// constructor — matches the original Phase A signature exactly).
+    /// </summary>
     public CudaMlaLayerWeights(
         nint qAProj, nint qALayernormWeight, nint qBProj, nint qProj,
         nint kvAProjWithMqa, nint kvALayernormWeight, nint kvBProj,
         nint oProj, nint attnNormWeight, nint ffnNormWeight, nint oBias,
         int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
         int qLoraRank, int kvLoraRank, int hiddenSize)
+        : this(qAProj, qALayernormWeight, qBProj, qProj,
+               kvAProjWithMqa, kvALayernormWeight, kvBProj,
+               oProj, attnNormWeight, ffnNormWeight, oBias,
+               numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
+               qLoraRank, kvLoraRank, hiddenSize, MlaPrecision.F32)
+    {
+    }
+
+    /// <summary>
+    /// Constructs a fully-populated MLA layer weight bundle with explicit
+    /// <paramref name="precision"/>. F32 selects the original Phase A kernels;
+    /// F16 selects the FP16 sibling kernels (default production path).
+    /// </summary>
+    public CudaMlaLayerWeights(
+        nint qAProj, nint qALayernormWeight, nint qBProj, nint qProj,
+        nint kvAProjWithMqa, nint kvALayernormWeight, nint kvBProj,
+        nint oProj, nint attnNormWeight, nint ffnNormWeight, nint oBias,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int qLoraRank, int kvLoraRank, int hiddenSize,
+        MlaPrecision precision)
     {
         QAProj = qAProj;
         QALayernormWeight = qALayernormWeight;
@@ -104,6 +152,7 @@ public readonly struct CudaMlaLayerWeights
         QLoraRank = qLoraRank;
         KvLoraRank = kvLoraRank;
         HiddenSize = hiddenSize;
+        Precision = precision;
     }
 
     /// <summary>Total Q vector elements per token: <c>numHeads * (qkNope + qkRope)</c>.</summary>
@@ -218,4 +267,96 @@ internal static unsafe class CudaMlaWeightsLoader
             CudaDriverApi.cuMemcpyHtoD_v2(devPtr, (nint)p, (nuint)bytes).ThrowOnError();
         return devPtr;
     }
+
+    #region MLA FP16 — uploader path
+    /// <summary>
+    /// Uploads a single MLA layer's projections to FP16 device buffers (norm
+    /// weights stay F32). Mirrors <see cref="LoadLayer"/> but down-casts each
+    /// projection tensor to FP16 on the host before HtoD copy. Memory is
+    /// roughly half the F32 path; throughput is materially better since
+    /// cuBLAS HGEMM and the FP16 attention kernel are bandwidth-bound at
+    /// decode batch=1.
+    /// </summary>
+    /// <param name="cpuLayer">Per-layer weight bundle from the safetensors loader.</param>
+    /// <param name="hiddenSize">Model hidden dimension.</param>
+    /// <param name="allocs">Allocation list to extend (caller owns + frees on dispose).</param>
+    /// <returns>Populated <see cref="CudaMlaLayerWeights"/> with FP16 device pointers and <c>Precision = F16</c>.</returns>
+    public static CudaMlaLayerWeights LoadLayerF16(
+        in TransformerLayerWeights cpuLayer, int hiddenSize, List<nint> allocs)
+    {
+        var mla = cpuLayer.Mla
+            ?? throw new InvalidOperationException(
+                "CudaMlaWeightsLoader.LoadLayerF16 called with non-MLA layer.");
+
+        int qTotal = mla.NumHeads * (mla.QkNopeHeadDim + mla.QkRopeHeadDim);
+        int kvAOut = mla.KvLoraRank + mla.QkRopeHeadDim;
+        int kvBOut = mla.NumHeads * (mla.QkNopeHeadDim + mla.VHeadDim);
+        int oInput = mla.NumHeads * mla.VHeadDim;
+
+        // Q path
+        nint qAProj = 0, qBProj = 0, qProj = 0, qANorm = 0;
+        if (mla.QLoraRank > 0)
+        {
+            qAProj = UploadF32AsF16(mla.QAProj, (long)mla.QLoraRank * hiddenSize, allocs);
+            qANorm = UploadF32Array(mla.QALayernormWeight!, allocs);
+            qBProj = UploadF32AsF16(mla.QBProj, (long)qTotal * mla.QLoraRank, allocs);
+        }
+        else
+        {
+            qProj = UploadF32AsF16(mla.QProj, (long)qTotal * hiddenSize, allocs);
+        }
+
+        // KV path (always LoRA-factored).
+        nint kvAProj = UploadF32AsF16(mla.KvAProjWithMqa, (long)kvAOut * hiddenSize, allocs);
+        nint kvANorm = UploadF32Array(mla.KvALayernormWeight, allocs);
+        nint kvBProj = UploadF32AsF16(mla.KvBProj, (long)kvBOut * mla.KvLoraRank, allocs);
+
+        // O projection — FP16.
+        nint oProj = UploadF32AsF16(cpuLayer.OWeight, (long)hiddenSize * oInput, allocs);
+
+        // Norm weights stay F32 (the FP16 RMSNorm kernel takes a FP32 weight buffer
+        // — saves the FP16 round-trip and keeps the multiplicative scale precise).
+        nint attnNorm = UploadF32Array(cpuLayer.AttnNormWeight, allocs);
+        nint ffnNorm = UploadF32Array(cpuLayer.FfnNormWeight, allocs);
+
+        nint oBias = cpuLayer.OBias is float[] arr ? UploadF32Array(arr, allocs) : (nint)0;
+
+        return new CudaMlaLayerWeights(
+            qAProj, qANorm, qBProj, qProj,
+            kvAProj, kvANorm, kvBProj,
+            oProj, attnNorm, ffnNorm, oBias,
+            mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
+            mla.QLoraRank, mla.KvLoraRank, hiddenSize,
+            MlaPrecision.F16);
+    }
+
+    /// <summary>
+    /// Down-casts an F32 host tensor to FP16 (via Half) and uploads it to a new
+    /// device buffer. Returns the device pointer; appends to
+    /// <paramref name="allocs"/>. Memory cost: half of the F32 equivalent.
+    /// </summary>
+    private static nint UploadF32AsF16(nint hostF32Ptr, long elementCount, List<nint> allocs)
+    {
+        if (hostF32Ptr == 0)
+            throw new InvalidOperationException("UploadF32AsF16 called with null host pointer.");
+        long bytes = elementCount * sizeof(ushort);
+        CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();
+        allocs.Add(devPtr);
+
+        // Stage in a Half[] on the heap; cast each element. For weight uploads
+        // (one-shot at model load), the GC pressure is acceptable — we don't
+        // hot-path this. Caller already keeps the F32 tensor mapped for the
+        // duration of the load, so the source is stable.
+        var staging = new Half[elementCount];
+        unsafe
+        {
+            float* src = (float*)hostF32Ptr;
+            for (long i = 0; i < elementCount; i++)
+                staging[i] = (Half)src[i];
+            fixed (Half* dst = staging)
+                CudaDriverApi.cuMemcpyHtoD_v2(devPtr, (nint)dst, (nuint)bytes).ThrowOnError();
+        }
+        return devPtr;
+    }
+    #endregion
 }

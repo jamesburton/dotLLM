@@ -737,3 +737,327 @@ public sealed unsafe class CudaMlaLatentScratch : IDisposable
 }
 
 #endregion
+
+public static unsafe partial class CudaMlaAttention
+{
+
+    #region MLA FP16
+    /// <summary>
+    /// FP16 sibling of <see cref="Forward"/>. Runs the full MLA layer in FP16
+    /// — weights, activations, and cache are all FP16 — with FP32 reductions
+    /// in RMSNorm and softmax. Matches the GQA precision pattern on this
+    /// branch; ~2× memory reduction vs F32 plus better cuBLAS HGEMM throughput.
+    /// </summary>
+    /// <param name="hiddenF16">Device pointer to F16 hidden state input <c>[seqLen, hiddenSize]</c>.</param>
+    /// <param name="outputF16">Device pointer to F16 output <c>[seqLen, hiddenSize]</c>. Receives the post-o_proj attention output (caller adds residual separately).</param>
+    /// <param name="seqLen">Number of tokens this call processes.</param>
+    /// <param name="positionOffset">Absolute position of token 0 in the full causal window.</param>
+    /// <param name="layer">Per-layer MLA weights bundle. <c>layer.Precision</c> must be <see cref="MlaPrecision.F16"/>.</param>
+    /// <param name="kvCache">Phase A expanded MLA KV cache — must be F16 (<see cref="CudaMlaKvCache.Precision"/> == F16).</param>
+    /// <param name="layerIndex">Which layer in <paramref name="kvCache"/> to write into / read from.</param>
+    /// <param name="ropeCosF32">Device pointer to F32 RoPE cos table <c>[maxSeq, qkRope/2]</c>.</param>
+    /// <param name="ropeSinF32">Device pointer to F32 RoPE sin table <c>[maxSeq, qkRope/2]</c>.</param>
+    /// <param name="rmsNormEps">RMSNorm epsilon shared by all three RMSNorm sites.</param>
+    /// <param name="softmaxScale">Combined softmax scale: <c>(1 / sqrt(qk_head_dim)) * yarn_mscale²</c>.</param>
+    /// <param name="scratch">Caller-owned FP16 scratch buffers.</param>
+    /// <param name="cublasHandle">cuBLAS handle for FP16 HGEMM.</param>
+    /// <param name="kernels">Loaded PTX kernel module.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public static void ForwardF16(
+        nint hiddenF16, nint outputF16,
+        int seqLen, int positionOffset,
+        in CudaMlaLayerWeights layer,
+        CudaMlaKvCache kvCache, int layerIndex,
+        nint ropeCosF32, nint ropeSinF32,
+        float rmsNormEps, float softmaxScale,
+        CudaMlaScratchF16 scratch, nint cublasHandle, CudaKernels kernels, nint stream)
+    {
+        if (layer.Precision != MlaPrecision.F16)
+            throw new InvalidOperationException(
+                $"ForwardF16 requires FP16 weights but layer.Precision is {layer.Precision}.");
+        if (kvCache.Precision != MlaPrecision.F16)
+            throw new InvalidOperationException(
+                $"ForwardF16 requires an FP16 KV cache but cache.Precision is {kvCache.Precision}.");
+        if (!kernels.HasMlaAttentionKernelF16 || !kernels.HasMlaHelpersF16)
+            throw new InvalidOperationException(
+                "MLA FP16 kernels not available. Rebuild PTX from native/kernels/attention_mla.cu and mla_helpers.cu.");
+
+        scratch.EnsureCapacity(seqLen, layer);
+
+        int hiddenSize = layer.HiddenSize;
+        int qkNope = layer.QkNopeHeadDim;
+        int qkRope = layer.QkRopeHeadDim;
+        int qkHead = qkNope + qkRope;
+        int vHead = layer.VHeadDim;
+        int numHeads = layer.NumHeads;
+        int qLora = layer.QLoraRank;
+        int kvLora = layer.KvLoraRank;
+        int qTotal = layer.QTotalElems;
+        int kvAOut = layer.KvAOutElems;
+        int kvBOut = layer.KvBOutElems;
+        int oInput = layer.OInputDim;
+
+        // ── Pre-attention RMSNorm (FP16 in / FP16 out, F32 weight) ──
+        kernels.LaunchMlaRmsNormF16(
+            hiddenF16, layer.AttnNormWeight, scratch.NormHidden,
+            seqLen, hiddenSize, rmsNormEps, stream);
+
+        // ── Q path (cuBLAS HGEMM) ──
+        if (qLora > 0)
+        {
+            CudaGemm.LinearF16(
+                cublasHandle, scratch.NormHidden, layer.QAProj, scratch.QLatent,
+                seqLen, hiddenSize, qLora, stream);
+            kernels.LaunchMlaRmsNormF16(
+                scratch.QLatent, layer.QALayernormWeight, scratch.QLatentNorm,
+                seqLen, qLora, rmsNormEps, stream);
+            CudaGemm.LinearF16(
+                cublasHandle, scratch.QLatentNorm, layer.QBProj, scratch.Q,
+                seqLen, qLora, qTotal, stream);
+        }
+        else
+        {
+            CudaGemm.LinearF16(
+                cublasHandle, scratch.NormHidden, layer.QProj, scratch.Q,
+                seqLen, hiddenSize, qTotal, stream);
+        }
+
+        // ── KV down-projection + split (FP16) ──
+        CudaGemm.LinearF16(
+            cublasHandle, scratch.NormHidden, layer.KvAProjWithMqa, scratch.CompressedKv,
+            seqLen, hiddenSize, kvAOut, stream);
+
+        // Extract latent half (first kvLora F16s of each row), RMSNorm.
+        ExtractLatentSliceF16(
+            scratch.CompressedKv, scratch.KvLatentNorm, seqLen, kvAOut, kvLora, stream);
+        kernels.LaunchMlaRmsNormF16(
+            scratch.KvLatentNorm, layer.KvALayernormWeight, scratch.KvLatentNormOut,
+            seqLen, kvLora, rmsNormEps, stream);
+
+        // KV-B expansion (FP16 HGEMM).
+        CudaGemm.LinearF16(
+            cublasHandle, scratch.KvLatentNormOut, layer.KvBProj, scratch.KvBExpanded,
+            seqLen, kvLora, kvBOut, stream);
+
+        // Per-head split into K_nope and V scratch buffers (F16 in / F16 out).
+        kernels.LaunchMlaSplitKvBF16(
+            scratch.KvBExpanded, scratch.KNope, scratch.V,
+            seqLen, numHeads, qkNope, vHead, stream);
+
+        // Extract K_pe (last qkRope F16s of each row), pre-RoPE.
+        ExtractKpeSliceF16(
+            scratch.CompressedKv, scratch.KPe, seqLen, kvAOut, kvLora, qkRope, stream);
+
+        // ── RoPE on Q.rope (per head) and shared K_pe (FP16 in-place) ──
+        kernels.LaunchMlaRopeQpeF16(
+            scratch.Q, ropeCosF32, ropeSinF32,
+            seqLen, numHeads, qkNope, qkRope, positionOffset, stream);
+        kernels.LaunchMlaRopeKpeF16(
+            scratch.KPe, ropeCosF32, ropeSinF32,
+            seqLen, qkRope, positionOffset, stream);
+
+        // ── Append new K_nope / V / K_pe rows into the FP16 cache. ──
+        int cachedLength = kvCache.GetCurrentLength(layerIndex);
+        long kNopeRowBytes = kvCache.KNopeRowBytes;
+        long vRowBytes = kvCache.VRowBytes;
+        long kPeRowBytes = kvCache.KPeRowBytes;
+
+        nint dstKNope = kvCache.GetKNopePtr(layerIndex) + (nint)((long)cachedLength * kNopeRowBytes);
+        nint dstV = kvCache.GetVPtr(layerIndex) + (nint)((long)cachedLength * vRowBytes);
+        nint dstKPe = kvCache.GetKPePtr(layerIndex) + (nint)((long)cachedLength * kPeRowBytes);
+
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(dstKNope, scratch.KNope,
+            (nuint)((long)seqLen * kNopeRowBytes), stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(dstV, scratch.V,
+            (nuint)((long)seqLen * vRowBytes), stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(dstKPe, scratch.KPe,
+            (nuint)((long)seqLen * kPeRowBytes), stream).ThrowOnError();
+
+        // ── Attention over [0, cachedLength + seqLen) ──
+        int seqKv = cachedLength + seqLen;
+        kernels.LaunchAttentionMlaF16(
+            scratch.Q, kvCache.GetKNopePtr(layerIndex), kvCache.GetKPePtr(layerIndex),
+            kvCache.GetVPtr(layerIndex), scratch.AttnOut,
+            seqLen, seqKv, numHeads, qkNope, qkRope, vHead,
+            positionOffset, softmaxScale, stream);
+
+        // ── O projection (FP16 HGEMM) ──
+        CudaGemm.LinearF16(
+            cublasHandle, scratch.AttnOut, layer.OProj, outputF16,
+            seqLen, oInput, hiddenSize, stream);
+    }
+
+    /// <summary>
+    /// FP16 strided D2D extract — first <paramref name="dstWidth"/> halfs of
+    /// each row of a strided source into a contiguous destination.
+    /// </summary>
+    private static void ExtractLatentSliceF16(
+        nint src, nint dst, int seqLen, int srcStride, int dstWidth, nint stream)
+    {
+        long dstRowBytes = (long)dstWidth * sizeof(ushort);
+        long srcRowBytes = (long)srcStride * sizeof(ushort);
+        for (int t = 0; t < seqLen; t++)
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(
+                dst + (nint)((long)t * dstRowBytes),
+                src + (nint)((long)t * srcRowBytes),
+                (nuint)dstRowBytes, stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// FP16 strided D2D extract — last <paramref name="kPeWidth"/> halfs of each
+    /// row of a strided source (offset by <paramref name="kvLora"/> halfs) into
+    /// a contiguous destination.
+    /// </summary>
+    private static void ExtractKpeSliceF16(
+        nint src, nint dst, int seqLen, int srcStride, int kvLora, int kPeWidth, nint stream)
+    {
+        long srcRowBytes = (long)srcStride * sizeof(ushort);
+        long dstRowBytes = (long)kPeWidth * sizeof(ushort);
+        long offsetWithinRow = (long)kvLora * sizeof(ushort);
+        for (int t = 0; t < seqLen; t++)
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(
+                dst + (nint)((long)t * dstRowBytes),
+                src + (nint)((long)t * srcRowBytes + (nint)offsetWithinRow),
+                (nuint)dstRowBytes, stream).ThrowOnError();
+        }
+    }
+    #endregion
+}
+
+#region MLA FP16
+/// <summary>
+/// Caller-owned per-call scratch buffers for <see cref="CudaMlaAttention.ForwardF16"/>.
+/// Mirrors <see cref="CudaMlaScratch"/> exactly but every buffer is FP16
+/// (sizeof(ushort) per element). Sized to the maximum <c>seqLen</c> the
+/// caller will ever pass; reused across layers and calls.
+/// </summary>
+public sealed unsafe class CudaMlaScratchF16 : IDisposable
+{
+    private nint _normHidden;       // [seqLen, hidden]
+    private nint _qLatent;          // [seqLen, qLora] (only when LoRA path)
+    private nint _qLatentNorm;
+    private nint _q;                // [seqLen, numHeads * qkHead]
+    private nint _compressedKv;     // [seqLen, kvLora + qkRope]
+    private nint _kvLatentNorm;     // [seqLen, kvLora] (extracted slice — pre-RMSNorm)
+    private nint _kvLatentNormOut;  // [seqLen, kvLora]
+    private nint _kvBExpanded;      // [seqLen, numHeads * (qkNope + vHead)]
+    private nint _kNope;            // [seqLen, numHeads * qkNope]
+    private nint _v;                // [seqLen, numHeads * vHead]
+    private nint _kPe;              // [seqLen, qkRope]
+    private nint _attnOut;          // [seqLen, numHeads * vHead]
+
+    private int _capacitySeqLen;
+    private int _hidden, _qLora, _qkHead, _qkRope, _qkNope, _vHead, _numHeads, _kvLora;
+
+    /// <summary>Total allocated bytes across all FP16 scratch buffers.</summary>
+    public long AllocatedBytes { get; private set; }
+
+    internal nint NormHidden => _normHidden;
+    internal nint QLatent => _qLatent;
+    internal nint QLatentNorm => _qLatentNorm;
+    internal nint Q => _q;
+    internal nint CompressedKv => _compressedKv;
+    internal nint KvLatentNorm => _kvLatentNorm;
+    internal nint KvLatentNormOut => _kvLatentNormOut;
+    internal nint KvBExpanded => _kvBExpanded;
+    internal nint KNope => _kNope;
+    internal nint V => _v;
+    internal nint KPe => _kPe;
+    internal nint AttnOut => _attnOut;
+
+    /// <summary>
+    /// Ensures all FP16 scratch buffers can hold <paramref name="seqLen"/> tokens
+    /// for this layer's MLA shapes. Reallocates with power-of-2 growth.
+    /// </summary>
+    public void EnsureCapacity(int seqLen, in CudaMlaLayerWeights layer)
+    {
+        if (seqLen <= _capacitySeqLen
+            && _hidden == layer.HiddenSize
+            && _qLora == layer.QLoraRank
+            && _qkNope == layer.QkNopeHeadDim
+            && _qkRope == layer.QkRopeHeadDim
+            && _vHead == layer.VHeadDim
+            && _numHeads == layer.NumHeads
+            && _kvLora == layer.KvLoraRank)
+            return;
+
+        int newCap = Math.Max(seqLen, 1);
+        if (newCap > _capacitySeqLen)
+        {
+            newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)newCap);
+        }
+
+        Free();
+
+        _hidden = layer.HiddenSize;
+        _qLora = layer.QLoraRank;
+        _qkNope = layer.QkNopeHeadDim;
+        _qkRope = layer.QkRopeHeadDim;
+        _qkHead = _qkNope + _qkRope;
+        _vHead = layer.VHeadDim;
+        _numHeads = layer.NumHeads;
+        _kvLora = layer.KvLoraRank;
+        _capacitySeqLen = newCap;
+
+        int qTotal = _numHeads * _qkHead;
+        int kvAOut = _kvLora + _qkRope;
+        int kvBOut = _numHeads * (_qkNope + _vHead);
+
+        _normHidden = Alloc((long)newCap * _hidden);
+        if (_qLora > 0)
+        {
+            _qLatent = Alloc((long)newCap * _qLora);
+            _qLatentNorm = Alloc((long)newCap * _qLora);
+        }
+        _q = Alloc((long)newCap * qTotal);
+        _compressedKv = Alloc((long)newCap * kvAOut);
+        _kvLatentNorm = Alloc((long)newCap * _kvLora);
+        _kvLatentNormOut = Alloc((long)newCap * _kvLora);
+        _kvBExpanded = Alloc((long)newCap * kvBOut);
+        _kNope = Alloc((long)newCap * _numHeads * _qkNope);
+        _v = Alloc((long)newCap * _numHeads * _vHead);
+        _kPe = Alloc((long)newCap * _qkRope);
+        _attnOut = Alloc((long)newCap * _numHeads * _vHead);
+    }
+
+    private nint Alloc(long elemCount)
+    {
+        long bytes = elemCount * sizeof(ushort);
+        CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
+        AllocatedBytes += bytes;
+        return ptr;
+    }
+
+    private void Free()
+    {
+        FreeIfNonZero(ref _normHidden);
+        FreeIfNonZero(ref _qLatent);
+        FreeIfNonZero(ref _qLatentNorm);
+        FreeIfNonZero(ref _q);
+        FreeIfNonZero(ref _compressedKv);
+        FreeIfNonZero(ref _kvLatentNorm);
+        FreeIfNonZero(ref _kvLatentNormOut);
+        FreeIfNonZero(ref _kvBExpanded);
+        FreeIfNonZero(ref _kNope);
+        FreeIfNonZero(ref _v);
+        FreeIfNonZero(ref _kPe);
+        FreeIfNonZero(ref _attnOut);
+        AllocatedBytes = 0;
+    }
+
+    private static void FreeIfNonZero(ref nint ptr)
+    {
+        if (ptr != 0) { CudaDriverApi.cuMemFree_v2(ptr); ptr = 0; }
+    }
+
+    /// <summary>Frees every FP16 device buffer.</summary>
+    public void Dispose()
+    {
+        Free();
+        _capacitySeqLen = 0;
+    }
+}
+#endregion

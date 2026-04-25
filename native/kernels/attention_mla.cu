@@ -1,9 +1,15 @@
-// Multi-head Latent Attention (MLA) Phase A naive forward kernel — FP32.
+// Multi-head Latent Attention (MLA) Phase A naive forward kernel — FP32 + FP16.
 //
 // Implements the equivalent of CPU MlaAttention.Execute's attention loop.
 // Each block computes attention for one (query_token, head) pair, scanning
 // the cached K_nope (per-head), shared K_pe (broadcast), and V (per-head)
 // over [0..seqKv) with a causal mask.
+//
+// Two entry points share the same online-softmax algorithm:
+//   attention_mla_f32 — F32 inputs/outputs (Phase A reference / debug).
+//   attention_mla_f16 — F16 inputs/outputs, FP32 softmax accumulator.
+//                       Matches the GQA `attention_f16` precision pattern
+//                       (FP32 reduction, FP16 in/out for cache + bandwidth).
 //
 // Distinctive vs the standard FP32 attention kernel:
 //   - Per-token Q is split into nope (qkNope) + rope (qkRope) sub-dims.
@@ -188,3 +194,178 @@ extern "C" __global__ void __launch_bounds__(128) attention_mla_f32(
     for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x)
         out_vec[d] = out_accum[d] * sum_inv;
 }
+
+// ── #region MLA FP16 ─────────────────────────────────────────────────────
+//
+// FP16 sibling of attention_mla_f32. Inputs (Q, K_nope, K_pe, V) and output
+// are __half; all reductions and the softmax accumulator run in FP32 for
+// numerical stability, matching the precision pattern used by the GQA
+// `attention_f16` kernel in attention.cu.
+//
+// Shared memory layout is identical to the F32 kernel (all FP32 scratch):
+//   q_nope_shared [qk_nope_head_dim] FP32
+//   q_pe_shared   [qk_rope_head_dim] FP32
+//   score_tile    [TILE_KV]          FP32
+//   out_accum     [v_head_dim]       FP32
+//   warp_scratch  [32]               FP32
+//
+// Q is widened to FP32 once on shared-memory load. K and V FP16 reads are
+// converted on the fly inside the inner dot products / V accumulation.
+
+#include <cuda_fp16.h>
+
+extern "C" __global__ void __launch_bounds__(128) attention_mla_f16(
+    const half* __restrict__ q,          // [seqLen, numHeads, qkNope + qkRope]
+    const half* __restrict__ k_nope,     // [seqKv, numHeads, qkNope]
+    const half* __restrict__ k_pe,       // [seqKv, qkRope]              (shared)
+    const half* __restrict__ v,          // [seqKv, numHeads, vHead]
+    half* __restrict__ output,           // [seqLen, numHeads, vHead]
+    const int seq_q,
+    const int seq_kv,
+    const int num_heads,
+    const int qk_nope_head_dim,
+    const int qk_rope_head_dim,
+    const int v_head_dim,
+    const int position_offset,
+    const float softmax_scale)
+{
+    int block_id = blockIdx.x;
+    if (block_id >= seq_q * num_heads) return;
+
+    int tq = block_id / num_heads;
+    int hq = block_id % num_heads;
+    int pos_q = position_offset + tq;
+
+    int qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+    int q_stride = num_heads * qk_head_dim;
+    int k_nope_stride = num_heads * qk_nope_head_dim;
+    int v_stride = num_heads * v_head_dim;
+
+    extern __shared__ float smem[];
+    float* q_nope_shared = smem;
+    float* q_pe_shared   = q_nope_shared + qk_nope_head_dim;
+    float* score_tile    = q_pe_shared + qk_rope_head_dim;
+    float* out_accum     = score_tile + TILE_KV;
+    float* warp_scratch  = out_accum + v_head_dim;
+
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    // Load Q for this (tq, hq) into shared (FP16 → FP32 widen on load).
+    const half* q_vec_nope = q + (size_t)tq * q_stride + hq * qk_head_dim;
+    const half* q_vec_pe   = q_vec_nope + qk_nope_head_dim;
+    for (int d = threadIdx.x; d < qk_nope_head_dim; d += blockDim.x)
+        q_nope_shared[d] = __half2float(q_vec_nope[d]);
+    for (int d = threadIdx.x; d < qk_rope_head_dim; d += blockDim.x)
+        q_pe_shared[d] = __half2float(q_vec_pe[d]);
+    for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x)
+        out_accum[d] = 0.0f;
+    __syncthreads();
+
+    float running_max = -FLT_MAX;
+    float running_sum = 0.0f;
+
+    for (int t_start = 0; t_start < seq_kv; t_start += TILE_KV)
+    {
+        int t_end = t_start + TILE_KV;
+        if (t_end > seq_kv) t_end = seq_kv;
+        int tile_len = t_end - t_start;
+
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+        {
+            int tkv = t_start + t;
+            if (tkv > pos_q)
+            {
+                score_tile[t] = -FLT_MAX;
+                continue;
+            }
+
+            const half* k_nope_vec = k_nope
+                + (size_t)tkv * k_nope_stride
+                + hq * qk_nope_head_dim;
+            const half* k_pe_vec = k_pe + (size_t)tkv * qk_rope_head_dim;
+
+            float dot = 0.0f;
+            for (int d = 0; d < qk_nope_head_dim; d++)
+                dot += q_nope_shared[d] * __half2float(k_nope_vec[d]);
+            for (int d = 0; d < qk_rope_head_dim; d++)
+                dot += q_pe_shared[d] * __half2float(k_pe_vec[d]);
+
+            score_tile[t] = dot * softmax_scale;
+        }
+        __syncthreads();
+
+        // ── Tile max reduction ──
+        float tile_max = -FLT_MAX;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+            tile_max = fmaxf(tile_max, score_tile[t]);
+
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        if (lane == 0) warp_scratch[warp_id] = tile_max;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_max = (lane < nw) ? warp_scratch[lane] : -FLT_MAX;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        }
+        if (threadIdx.x == 0) warp_scratch[0] = tile_max;
+        __syncthreads();
+        tile_max = warp_scratch[0];
+
+        // ── Online softmax rescale ──
+        float new_max = fmaxf(running_max, tile_max);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? expf(running_max - new_max) : 0.0f;
+        running_sum *= correction;
+        for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+        running_max = new_max;
+        __syncthreads();
+
+        // ── Attention weights for this tile ──
+        float tile_sum = 0.0f;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
+            float w = (score_tile[t] > -FLT_MAX + 1.0f)
+                      ? expf(score_tile[t] - running_max) : 0.0f;
+            score_tile[t] = w;
+            tile_sum += w;
+        }
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+        if (lane == 0) warp_scratch[warp_id] = tile_sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_sum = (lane < nw) ? warp_scratch[lane] : 0.0f;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+            if (lane == 0) warp_scratch[0] = tile_sum;
+        }
+        __syncthreads();
+        running_sum += warp_scratch[0];
+
+        // ── Accumulate weighted V (FP16 → FP32 on read) ──
+        for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x) {
+            float v_acc = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                if (score_tile[t] > 0.0f) {
+                    const half* v_vec = v
+                        + (size_t)(t_start + t) * v_stride
+                        + hq * v_head_dim;
+                    v_acc += score_tile[t] * __half2float(v_vec[d]);
+                }
+            }
+            out_accum[d] += v_acc;
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write (FP32 → FP16 narrow on store).
+    float sum_inv = (running_sum > 1e-10f) ? (1.0f / running_sum) : 0.0f;
+    half* out_vec = output + (size_t)tq * v_stride + hq * v_head_dim;
+    for (int d = threadIdx.x; d < v_head_dim; d += blockDim.x)
+        out_vec[d] = __float2half(out_accum[d] * sum_inv);
+}
+// ── #endregion MLA FP16 ──────────────────────────────────────────────────
