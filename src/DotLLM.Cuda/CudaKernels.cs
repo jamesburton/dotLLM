@@ -69,6 +69,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _embeddingF32Func;
     private readonly nint _embeddingF16Func;
     private readonly nint _embeddingQ8_0Func;
+    private readonly nint _embeddingQ4_KFunc;
+    private readonly nint _embeddingQ5_KFunc;
+    private readonly nint _embeddingQ6_KFunc;
     private readonly nint _attentionFunc;
     private readonly nint _biasAddFunc;
     private readonly nint _perHeadRmsNormFunc;
@@ -180,6 +183,11 @@ public sealed unsafe class CudaKernels : IDisposable
         _embeddingF32Func = _embeddingModule.GetFunction("embedding_lookup_f32");
         _embeddingF16Func = _embeddingModule.GetFunction("embedding_lookup_f16");
         _embeddingQ8_0Func = _embeddingModule.GetFunction("embedding_lookup_q8_0");
+        // Per-row K-quant lookups are optional — TryGetFunction so a stale PTX
+        // (without the new symbols) still loads gracefully.
+        _embeddingQ4_KFunc = _embeddingModule.TryGetFunction("embedding_lookup_q4_k");
+        _embeddingQ5_KFunc = _embeddingModule.TryGetFunction("embedding_lookup_q5_k");
+        _embeddingQ6_KFunc = _embeddingModule.TryGetFunction("embedding_lookup_q6_k");
         _attentionFunc = _attentionModule.GetFunction("attention_f16");
         _attentionDynFunc = _attentionModule.GetFunction("attention_f16_dyn");
         _biasAddFunc = _biasAddModule.GetFunction("bias_add_f16");
@@ -521,6 +529,12 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>Embedding lookup with per-format dispatch.</summary>
+    /// <remarks>
+    /// Per-row K-quant lookups (Q4_K/Q5_K/Q6_K) require <paramref name="hiddenSize"/>
+    /// to be a multiple of 256 (the K-quant super-block size). Caller
+    /// (<see cref="HasEmbeddingLookup"/>) gates this — types without an available
+    /// per-row kernel must be dequant-expanded to FP16 at load.
+    /// </remarks>
     public void LaunchEmbeddingLookup(nint embedTable, QuantizationType embedDtype,
                                        nint tokenIds, nint output,
                                        int seqLen, int hiddenSize, nint stream)
@@ -533,8 +547,14 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.F32 => _embeddingF32Func,
             QuantizationType.F16 => _embeddingF16Func,
             QuantizationType.Q8_0 => _embeddingQ8_0Func,
-            _ => throw new NotSupportedException($"Embedding type {embedDtype} not supported on GPU.")
+            QuantizationType.Q4_K => _embeddingQ4_KFunc,
+            QuantizationType.Q5_K => _embeddingQ5_KFunc,
+            QuantizationType.Q6_K => _embeddingQ6_KFunc,
+            _ => 0,
         };
+
+        if (func == 0)
+            throw new NotSupportedException($"Embedding type {embedDtype} not supported on GPU.");
 
         void** args = stackalloc void*[] {&tableArg, &idsArg, &outArg, &slArg, &hsArg};
 
@@ -542,6 +562,21 @@ public sealed unsafe class CudaKernels : IDisposable
                 (uint)seqLen, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
+
+    /// <summary>
+    /// True when a per-row embedding lookup kernel exists for <paramref name="qt"/>
+    /// at the given <paramref name="hiddenSize"/>. K-quant variants require
+    /// <c>hiddenSize % 256 == 0</c> (the super-block size); other types have no
+    /// such constraint.
+    /// </summary>
+    public bool HasEmbeddingLookup(QuantizationType qt, int hiddenSize) => qt switch
+    {
+        QuantizationType.F32 or QuantizationType.F16 or QuantizationType.Q8_0 => true,
+        QuantizationType.Q4_K => _embeddingQ4_KFunc != 0 && (hiddenSize % 256) == 0,
+        QuantizationType.Q5_K => _embeddingQ5_KFunc != 0 && (hiddenSize % 256) == 0,
+        QuantizationType.Q6_K => _embeddingQ6_KFunc != 0 && (hiddenSize % 256) == 0,
+        _ => false,
+    };
 
     /// <summary>Naive scaled dot-product attention with causal mask and GQA.</summary>
     public void LaunchAttention(nint q, nint k, nint v, nint output,

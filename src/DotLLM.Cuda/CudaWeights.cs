@@ -140,18 +140,27 @@ internal sealed class CudaWeights : IDisposable
 
         var allocs = new List<nint>();
 
-        // Token embeddings — upload in original format if the embedding kernel supports it,
-        // otherwise dequant to FP16 at load time (one-time cost).
+        // Token embeddings — upload in original format if a per-row embedding lookup
+        // kernel exists for it (saves the FP16 expansion of a vocab×hidden table).
+        // Otherwise dequant the entire table to FP16 at load time (one-time cost,
+        // costs vocab×hidden×2 bytes of VRAM — 1.16 GiB on Qwen3-8B Q4_K_M).
+        // K-quant variants need hidden % 256 == 0; HasEmbeddingLookup gates this.
         nint tokenEmbed;
         var tokenEmbedQt = cpuWeights.TokenEmbedQuantType;
-        if (tokenEmbedQt is QuantizationType.F32 or QuantizationType.F16 or QuantizationType.Q8_0)
+        // Env-var escape hatch (matches DOTLLM_DISABLE_MMQ_* convention) — forces
+        // the legacy bulk-dequant path even when a per-row kernel exists. Used
+        // for A/B perf comparison and as a fallback if a per-row kernel ever
+        // misbehaves on a new model.
+        bool disablePerRowEmbed = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_EMBED_ROWLOOKUP") == "1";
+        if (!disablePerRowEmbed && kernels.HasEmbeddingLookup(tokenEmbedQt, config.HiddenSize))
         {
             long embedBytes = Dequantize.RowByteSize(config.HiddenSize, tokenEmbedQt) * config.VocabSize;
             tokenEmbed = AllocAndUpload(cpuWeights.TokenEmbedWeight, embedBytes, allocs);
         }
         else
         {
-            // Q4_K, Q5_K, Q6_K, Q4_0 — no per-row embedding kernel; dequant entire table to FP16
+            // No per-row kernel (e.g. Q4_0, or K-quant with hidden not a multiple
+            // of 256) — dequant the entire table to FP16 once at load.
             tokenEmbed = UploadAndDequant(cpuWeights.TokenEmbedWeight, tokenEmbedQt,
                 config.VocabSize, config.HiddenSize, allocs, kernels, stream);
             tokenEmbedQt = QuantizationType.F16;
