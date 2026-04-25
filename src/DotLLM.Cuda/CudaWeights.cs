@@ -195,13 +195,43 @@ internal sealed class CudaWeights : IDisposable
             nint up = SkipFp16(lw.UpQuantType) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
             nint down = SkipFp16(lw.DownQuantType) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
 
-            // Upload raw quantized weights (single copy — for decode quantized GEMV and prefill on-the-fly dequant)
-            nint qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
-            nint kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
-            nint vQuant = UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+            // ── Upload raw quantized Q/K/V weights ──
+            // When fusion is possible (shared quant type + input dim, GEMV kernel exists),
+            // allocate ONE packed device buffer and upload Q/K/V directly into it at the
+            // appropriate row offsets. The per-tensor pointers (qQuant/kQuant/vQuant) are
+            // then slices into the packed buffer — bit-identical layout, zero data copy,
+            // and the per-tensor row-iterating consumers (Project, ProjectGpu, MMQ GEMV)
+            // work unchanged because they only read `outputDim` rows starting at the
+            // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
+            // was previously double-stored. Only the packed allocation is in `allocs`.
+            (nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut,
+             nint qQuant, nint kQuant, nint vQuant) = TryUploadPackedThree(
+                lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
+                lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                allocs);
+            if (qkvPacked == 0)
+            {
+                // Fusion not possible — fall back to per-tensor uploads (separate allocations).
+                qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
+                kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
+                vQuant = UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+            }
+
             nint oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
-            nint gateQuant = UploadQuantized(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs);
-            nint upQuant = UploadQuantized(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs);
+
+            // ── Upload raw quantized Gate/Up weights (same packing strategy as Q/K/V) ──
+            (nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut,
+             nint gateQuant, nint upQuant) = TryUploadPackedTwo(
+                lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
+                lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
+                allocs);
+            if (gateUpPacked == 0)
+            {
+                gateQuant = UploadQuantized(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs);
+                upQuant = UploadQuantized(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs);
+            }
+
             nint downQuant = UploadQuantized(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs);
 
             nint attnNorm = UploadNormWeight(lw.AttnNormWeight, allocs, kernels, stream);
@@ -217,23 +247,6 @@ internal sealed class CudaWeights : IDisposable
             nint gateBias = UploadBias(lw.GateBias, allocs, kernels, stream);
             nint upBias = UploadBias(lw.UpBias, allocs, kernels, stream);
             nint downBias = UploadBias(lw.DownBias, allocs, kernels, stream);
-
-            // ── Build fused QkvPacked / GateUpPacked weights (decode-only optimization) ──
-            // Conditions: all three Q/K/V (or both Gate/Up) share the same quant type,
-            // share the same input dim, and a custom quantized-GEMV kernel exists for
-            // that type. The packed buffer is a byte-concatenation along N (output dim);
-            // every per-row GEMV kernel iterates rows independently so this is a
-            // trivial reuse — we just call the existing kernel with a larger N.
-            (nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut) = TryPackThree(
-                qQuant, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                kQuant, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                vQuant, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                allocs, stream);
-
-            (nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut) = TryPackTwo(
-                gateQuant, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                upQuant, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                allocs, stream);
 
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
@@ -277,28 +290,44 @@ internal sealed class CudaWeights : IDisposable
     }
 
     /// <summary>
-    /// Allocates a single packed device buffer holding the byte-concatenation of three
-    /// already-uploaded quantized weight tensors along the N (output row) dimension.
-    /// Returns (0, F32, 0) when fusion is not possible — callers should fall back to
-    /// the per-tensor path. Conditions for fusion:
-    ///  - all three have the same quantization type
-    ///  - that type has a custom quantized-GEMV kernel
-    ///  - the three quantized device pointers are all non-zero (i.e., weights are
-    ///    actually quantized; F16/F32 have <c>UploadQuantized → 0</c>)
+    /// Allocates a single packed device buffer and uploads three CPU quantized weight
+    /// tensors directly into it via H2D copies at row offsets along the N (output)
+    /// dimension. Returns the packed handle plus three sub-pointers (Q/K/V) that
+    /// alias into the packed buffer — bit-identical to the layout of three separate
+    /// per-tensor uploads, but stored ONCE. Returns all-zero on failure (caller falls
+    /// back to per-tensor uploads).
+    /// <para>
+    /// Conditions for packing (must all hold):
+    ///  - all three weights are quantized (skip F16/F32 — those don't get a quant copy)
+    ///  - all three share the same quantization type
+    ///  - that type has a custom quantized-GEMV kernel (the only consumer of these pointers)
     ///  - the input dim (K) matches across all three
-    /// The packed buffer is logically <c>[(qOut+kOut+vOut), inputDim]</c> in the same
-    /// row-major-of-quantized-rows layout used by the per-row GEMV kernels.
+    /// </para>
+    /// <para>
+    /// VRAM saving vs. previous "separate + DtoD-pack" approach: eliminates the
+    /// duplicate copy that held the three tensors a second time (~Q+K+V row-bytes
+    /// per layer). Q4_K_M Qwen3-8B (k=4096, 36 layers): saves ~2.5 GB.
+    /// </para>
+    /// <para>
+    /// Why this is safe: every consumer of <c>QQuant</c>/<c>KQuant</c>/<c>VQuant</c>
+    /// (Project, ProjectGpu, MMQ GEMV) iterates exactly <c>outputDim</c> rows starting
+    /// at the given pointer. Slicing into the packed buffer is invisible to the kernel
+    /// — it sees the same row layout as a standalone per-tensor allocation.
+    /// </para>
     /// </summary>
-    private static (nint Ptr, QuantizationType Qt, int OutputDim) TryPackThree(
-        nint qQuant, QuantizationType qQt, int qOut, int qIn,
-        nint kQuant, QuantizationType kQt, int kOut, int kIn,
-        nint vQuant, QuantizationType vQt, int vOut, int vIn,
-        List<nint> allocs, nint stream)
+    /// <returns>Tuple of (packed handle, packed quant type, packed output dim,
+    /// q-slice pointer, k-slice pointer, v-slice pointer). All zero on failure.</returns>
+    private static (nint Packed, QuantizationType PackedQt, int PackedOut,
+                    nint QSlice, nint KSlice, nint VSlice) TryUploadPackedThree(
+        nint qHost, QuantizationType qQt, int qOut, int qIn,
+        nint kHost, QuantizationType kQt, int kOut, int kIn,
+        nint vHost, QuantizationType vQt, int vOut, int vIn,
+        List<nint> allocs)
     {
-        if (qQuant == 0 || kQuant == 0 || vQuant == 0) return (0, QuantizationType.F32, 0);
-        if (qQt != kQt || qQt != vQt) return (0, QuantizationType.F32, 0);
-        if (!CudaKernels.HasQuantizedGemv(qQt)) return (0, QuantizationType.F32, 0);
-        if (qIn != kIn || qIn != vIn) return (0, QuantizationType.F32, 0);
+        if (qQt is QuantizationType.F16 or QuantizationType.F32) return default;
+        if (qQt != kQt || qQt != vQt) return default;
+        if (!CudaKernels.HasQuantizedGemv(qQt)) return default;
+        if (qIn != kIn || qIn != vIn) return default;
 
         long rowBytes = Dequantize.RowByteSize(qIn, qQt);
         long qBytes = rowBytes * qOut;
@@ -306,38 +335,47 @@ internal sealed class CudaWeights : IDisposable
         long vBytes = rowBytes * vOut;
         long totalBytes = qBytes + kBytes + vBytes;
 
-        CudaDriverApi.cuMemAlloc_v2(out nint packed, (nuint)totalBytes).ThrowOnError();
+        AllocOrThrowWithContext(totalBytes, "QkvPacked", out nint packed);
         allocs.Add(packed);
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed, qQuant, (nuint)qBytes, stream).ThrowOnError();
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)qBytes, kQuant, (nuint)kBytes, stream).ThrowOnError();
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)(qBytes + kBytes), vQuant, (nuint)vBytes, stream).ThrowOnError();
-        return (packed, qQt, qOut + kOut + vOut);
+        // Upload each tensor's bytes directly into its slice — no intermediate alloc,
+        // no D2D copy. Slices are NOT in `allocs` (they alias `packed`).
+        nint qSlice = packed;
+        nint kSlice = packed + (nint)qBytes;
+        nint vSlice = packed + (nint)(qBytes + kBytes);
+        MemcpyHtoDOrThrowWithContext(qSlice, qHost, qBytes, "QkvPacked.Q");
+        MemcpyHtoDOrThrowWithContext(kSlice, kHost, kBytes, "QkvPacked.K");
+        MemcpyHtoDOrThrowWithContext(vSlice, vHost, vBytes, "QkvPacked.V");
+        return (packed, qQt, qOut + kOut + vOut, qSlice, kSlice, vSlice);
     }
 
     /// <summary>
-    /// Two-tensor variant of <see cref="TryPackThree"/>. Used to fuse Gate + Up
-    /// projections into a single decode-time GEMV.
+    /// Two-tensor variant of <see cref="TryUploadPackedThree"/>. Used to fuse
+    /// Gate + Up MLP projections into a single decode-time GEMV with one
+    /// shared quantized weight buffer.
     /// </summary>
-    private static (nint Ptr, QuantizationType Qt, int OutputDim) TryPackTwo(
-        nint aQuant, QuantizationType aQt, int aOut, int aIn,
-        nint bQuant, QuantizationType bQt, int bOut, int bIn,
-        List<nint> allocs, nint stream)
+    private static (nint Packed, QuantizationType PackedQt, int PackedOut,
+                    nint ASlice, nint BSlice) TryUploadPackedTwo(
+        nint aHost, QuantizationType aQt, int aOut, int aIn,
+        nint bHost, QuantizationType bQt, int bOut, int bIn,
+        List<nint> allocs)
     {
-        if (aQuant == 0 || bQuant == 0) return (0, QuantizationType.F32, 0);
-        if (aQt != bQt) return (0, QuantizationType.F32, 0);
-        if (!CudaKernels.HasQuantizedGemv(aQt)) return (0, QuantizationType.F32, 0);
-        if (aIn != bIn) return (0, QuantizationType.F32, 0);
+        if (aQt is QuantizationType.F16 or QuantizationType.F32) return default;
+        if (aQt != bQt) return default;
+        if (!CudaKernels.HasQuantizedGemv(aQt)) return default;
+        if (aIn != bIn) return default;
 
         long rowBytes = Dequantize.RowByteSize(aIn, aQt);
         long aBytes = rowBytes * aOut;
         long bBytes = rowBytes * bOut;
         long totalBytes = aBytes + bBytes;
 
-        CudaDriverApi.cuMemAlloc_v2(out nint packed, (nuint)totalBytes).ThrowOnError();
+        AllocOrThrowWithContext(totalBytes, "GateUpPacked", out nint packed);
         allocs.Add(packed);
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed, aQuant, (nuint)aBytes, stream).ThrowOnError();
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(packed + (nint)aBytes, bQuant, (nuint)bBytes, stream).ThrowOnError();
-        return (packed, aQt, aOut + bOut);
+        nint aSlice = packed;
+        nint bSlice = packed + (nint)aBytes;
+        MemcpyHtoDOrThrowWithContext(aSlice, aHost, aBytes, "GateUpPacked.Gate");
+        MemcpyHtoDOrThrowWithContext(bSlice, bHost, bBytes, "GateUpPacked.Up");
+        return (packed, aQt, aOut + bOut, aSlice, bSlice);
     }
 
     /// <summary>Upload quantized weight to GPU, then dequantize to FP16 on device.</summary>
@@ -426,10 +464,45 @@ internal sealed class CudaWeights : IDisposable
     /// <summary>Allocate device memory and copy host data.</summary>
     private static nint AllocAndUpload(nint hostPtr, long bytes, List<nint> allocs)
     {
-        CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();
+        AllocOrThrowWithContext(bytes, "weight upload", out nint devPtr);
         allocs.Add(devPtr);
-        CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes).ThrowOnError();
+        MemcpyHtoDOrThrowWithContext(devPtr, hostPtr, bytes, "weight upload");
         return devPtr;
+    }
+
+    /// <summary>
+    /// Allocates device memory; on failure (typically OOM), augments the exception
+    /// with VRAM context (free / total) and the requested size. Used by the packed
+    /// weight allocators where running out of VRAM is the primary suspected failure.
+    /// </summary>
+    private static void AllocOrThrowWithContext(long bytes, string label, out nint devPtr)
+    {
+        int rc = CudaDriverApi.cuMemAlloc_v2(out devPtr, (nuint)bytes);
+        if (rc == 0) return;
+        // Best-effort mem probe for diagnostics; ignore probe failure.
+        nuint free = 0, total = 0;
+        _ = CudaDriverApi.cuMemGetInfo_v2(out free, out total);
+        throw new InvalidOperationException(
+            $"CUDA OOM allocating {label} ({bytes / (1024.0 * 1024.0):F1} MiB requested). " +
+            $"Free VRAM: {free / (1024.0 * 1024.0):F1} MiB / {total / (1024.0 * 1024.0):F1} MiB total. " +
+            $"Underlying cuMemAlloc rc={rc}.");
+    }
+
+    /// <summary>
+    /// Synchronous H2D copy that augments OOM-class failures with VRAM context.
+    /// CUDA can defer page commits until first write, so an alloc may succeed and
+    /// the subsequent memcpy reports OOM.
+    /// </summary>
+    private static void MemcpyHtoDOrThrowWithContext(nint devPtr, nint hostPtr, long bytes, string label)
+    {
+        int rc = CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes);
+        if (rc == 0) return;
+        nuint free = 0, total = 0;
+        _ = CudaDriverApi.cuMemGetInfo_v2(out free, out total);
+        throw new InvalidOperationException(
+            $"CUDA H2D failure for {label} ({bytes / (1024.0 * 1024.0):F1} MiB). " +
+            $"Free VRAM: {free / (1024.0 * 1024.0):F1} MiB / {total / (1024.0 * 1024.0):F1} MiB total. " +
+            $"Underlying cuMemcpyHtoD rc={rc} (typically rc=2 → OOM via deferred page commit).");
     }
 
     public void Dispose()
