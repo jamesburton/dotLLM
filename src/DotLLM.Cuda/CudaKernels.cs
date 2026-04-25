@@ -150,6 +150,13 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _attentionMlaModule;
     private readonly nint _attentionMlaF32Func;
 
+    // #region MLA FP16 — sibling FP16 attention kernel (FP32 softmax accum).
+    // Loaded from the same attention_mla.ptx module via TryGetFunction so a
+    // stale PTX (F32-only) still loads gracefully and HasMlaAttentionKernelF16
+    // reports false.
+    private readonly nint _attentionMlaF16Func;
+    // #endregion
+
     // MLA forward-path helpers: per-head split of kv_b expansion, RoPE on
     // the rope sub-dim of Q (per head) and on the shared K_pe, and a
     // (numRows, dim) F32 RMSNorm used by q_a_layernorm / kv_a_layernorm.
@@ -158,6 +165,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _mlaRopeQpeF32Func;
     private readonly nint _mlaRopeKpeF32Func;
     private readonly nint _mlaRmsNormF32Func;
+
+    // #region MLA FP16 — sibling FP16 helper kernels (split / RoPE / RMSNorm).
+    // Loaded from the same mla_helpers.ptx module via TryGetFunction.
+    private readonly nint _mlaSplitKvBF16Func;
+    private readonly nint _mlaRopeQpeF16Func;
+    private readonly nint _mlaRopeKpeF16Func;
+    private readonly nint _mlaRmsNormF16Func;
+    // #endregion
 
     // ── MLA Phase B (latent KV cache + W_UK absorbed attention) ──────────
     // Optional — PTX may not be present on stale builds. Phase B's compact
@@ -353,6 +368,7 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _attentionMlaModule = CudaModule.LoadFromFile(attentionMlaPath);
             _attentionMlaF32Func = _attentionMlaModule.GetFunction("attention_mla_f32");
+            _attentionMlaF16Func = _attentionMlaModule.TryGetFunction("attention_mla_f16");
         }
 
         // MLA forward-path helper kernels (F32 split / RoPE / RMSNorm).
@@ -364,6 +380,11 @@ public sealed unsafe class CudaKernels : IDisposable
             _mlaRopeQpeF32Func = _mlaHelpersModule.GetFunction("mla_rope_q_pe_f32");
             _mlaRopeKpeF32Func = _mlaHelpersModule.GetFunction("mla_rope_k_pe_f32");
             _mlaRmsNormF32Func = _mlaHelpersModule.GetFunction("mla_rmsnorm_f32");
+            // FP16 siblings — TryGetFunction so a stale PTX (F32-only) still loads.
+            _mlaSplitKvBF16Func = _mlaHelpersModule.TryGetFunction("mla_split_kv_b_f16");
+            _mlaRopeQpeF16Func = _mlaHelpersModule.TryGetFunction("mla_rope_q_pe_f16");
+            _mlaRopeKpeF16Func = _mlaHelpersModule.TryGetFunction("mla_rope_k_pe_f16");
+            _mlaRmsNormF16Func = _mlaHelpersModule.TryGetFunction("mla_rmsnorm_f16");
         }
 
         // MLA Phase B: absorbed-attention kernel + Q absorption + V expansion
@@ -405,6 +426,16 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMlaHelpers =>
         _mlaSplitKvBF32Func != 0 && _mlaRopeQpeF32Func != 0
         && _mlaRopeKpeF32Func != 0 && _mlaRmsNormF32Func != 0;
+
+    #region MLA FP16
+    /// <summary>True when the MLA Phase A attention kernel (FP16 sibling) is available on this kernel module.</summary>
+    public bool HasMlaAttentionKernelF16 => _attentionMlaF16Func != 0;
+
+    /// <summary>True when all FP16 MLA forward-path helper kernels (split, RoPE, RMSNorm) are available.</summary>
+    public bool HasMlaHelpersF16 =>
+        _mlaSplitKvBF16Func != 0 && _mlaRopeQpeF16Func != 0
+        && _mlaRopeKpeF16Func != 0 && _mlaRmsNormF16Func != 0;
+    #endregion
 
     /// <summary>True when the MLA Phase B (absorbed attention + helpers) PTX is available.</summary>
     public bool HasMlaPhaseB =>
@@ -1948,6 +1979,147 @@ public sealed unsafe class CudaKernels : IDisposable
                 (uint)batchSize, 1, 1, block, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
+
+    #region MLA FP16 launchers
+    /// <summary>
+    /// FP16 sibling of <see cref="LaunchAttentionMla"/>. Same online-softmax
+    /// algorithm; FP16 inputs/outputs (Q, K_nope, K_pe, V, output) with FP32
+    /// softmax accumulator. Shared memory layout matches the F32 kernel
+    /// (all FP32 scratch).
+    /// </summary>
+    public void LaunchAttentionMlaF16(
+        nint q, nint kNope, nint kPe, nint v, nint output,
+        int seqQ, int seqKv,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int positionOffset, float softmaxScale, nint stream)
+    {
+        if (_attentionMlaF16Func == 0)
+            throw new InvalidOperationException(
+                "MLA FP16 attention kernel not available. Rebuild PTX from native/kernels/attention_mla.cu.");
+
+        nint qArg = q, kNopeArg = kNope, kPeArg = kPe, vArg = v, outArg = output;
+        int sqArg = seqQ, skvArg = seqKv;
+        int nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, ropeArg = qkRopeHeadDim, vhArg = vHeadDim;
+        int poArg = positionOffset;
+        float scaleArg = softmaxScale;
+
+        void** args = stackalloc void*[] {
+            &qArg, &kNopeArg, &kPeArg, &vArg, &outArg,
+            &sqArg, &skvArg,
+            &nhArg, &nopeArg, &ropeArg, &vhArg,
+            &poArg, &scaleArg
+        };
+
+        int numBlocks = seqQ * numHeads;
+        // Shared layout (FP32): q_nope[qkNope] + q_pe[qkRope] + score_tile[128] + out_accum[vHead] + warp_scratch[32]
+        const int TileKv = 128;
+        uint sharedBytes = (uint)((qkNopeHeadDim + qkRopeHeadDim + TileKv + vHeadDim + 32) * sizeof(float));
+        const uint MlaBlockSize = 128;
+
+        CudaDriverApi.cuLaunchKernel(_attentionMlaF16Func,
+                (uint)numBlocks, 1, 1, MlaBlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP16 sibling of <see cref="LaunchMlaSplitKvB"/>. Per-head split of the
+    /// kv_b expansion: FP16 in / FP16 out.
+    /// </summary>
+    public void LaunchMlaSplitKvBF16(
+        nint kvBExpanded, nint kNopeDst, nint vDst,
+        int seqLen, int numHeads, int qkNopeHeadDim, int vHeadDim, nint stream)
+    {
+        if (_mlaSplitKvBF16Func == 0)
+            throw new InvalidOperationException(
+                "MLA FP16 split helper not available. Rebuild PTX from native/kernels/mla_helpers.cu.");
+
+        nint srcArg = kvBExpanded, kArg = kNopeDst, vArg = vDst;
+        int slArg = seqLen, nhArg = numHeads, nopeArg = qkNopeHeadDim, vhArg = vHeadDim;
+        void** args = stackalloc void*[] {
+            &srcArg, &kArg, &vArg,
+            &slArg, &nhArg, &nopeArg, &vhArg
+        };
+        uint blocks = (uint)(seqLen * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaSplitKvBF16Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP16 sibling of <see cref="LaunchMlaRopeQpe"/>. Cos/sin tables stay F32.
+    /// </summary>
+    public void LaunchMlaRopeQpeF16(
+        nint q, nint cosTab, nint sinTab,
+        int seqLen, int numHeads, int qkNopeHeadDim, int qkRopeHeadDim,
+        int positionOffset, nint stream)
+    {
+        if (_mlaRopeQpeF16Func == 0)
+            throw new InvalidOperationException("MLA FP16 RoPE-Q-pe helper not available.");
+
+        nint qArg = q, cosArg = cosTab, sinArg = sinTab;
+        int slArg = seqLen, nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, ropeArg = qkRopeHeadDim;
+        int poArg = positionOffset;
+        void** args = stackalloc void*[] {
+            &qArg, &cosArg, &sinArg,
+            &slArg, &nhArg, &nopeArg, &ropeArg, &poArg
+        };
+        uint blocks = (uint)(seqLen * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRopeQpeF16Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP16 sibling of <see cref="LaunchMlaRopeKpe"/>. Cos/sin tables stay F32.
+    /// </summary>
+    public void LaunchMlaRopeKpeF16(
+        nint kPe, nint cosTab, nint sinTab,
+        int seqLen, int qkRopeHeadDim, int positionOffset, nint stream)
+    {
+        if (_mlaRopeKpeF16Func == 0)
+            throw new InvalidOperationException("MLA FP16 RoPE-K-pe helper not available.");
+
+        nint kArg = kPe, cosArg = cosTab, sinArg = sinTab;
+        int slArg = seqLen, ropeArg = qkRopeHeadDim, poArg = positionOffset;
+        void** args = stackalloc void*[] {
+            &kArg, &cosArg, &sinArg,
+            &slArg, &ropeArg, &poArg
+        };
+        uint blocks = (uint)seqLen;
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRopeKpeF16Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP16 sibling of <see cref="LaunchMlaRmsNormF32"/>. FP16 input, FP32 weight,
+    /// FP16 output, FP32 reduction. Used by MLA's q_a_layernorm and
+    /// kv_a_layernorm on the FP16 path.
+    /// </summary>
+    public void LaunchMlaRmsNormF16(
+        nint inputF16, nint weightF32, nint outputF16,
+        int numRows, int dim, float epsilon, nint stream)
+    {
+        if (_mlaRmsNormF16Func == 0)
+            throw new InvalidOperationException("MLA FP16 RMSNorm helper not available.");
+
+        nint inArg = inputF16, wArg = weightF32, outArg = outputF16;
+        int dimArg = dim;
+        float epsArg = epsilon;
+        void** args = stackalloc void*[] {
+            &inArg, &wArg, &outArg, &dimArg, &epsArg
+        };
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRmsNormF16Func,
+                (uint)numRows, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+    #endregion
 
     #region MLA Phase B launchers
 

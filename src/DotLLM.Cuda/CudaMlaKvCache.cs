@@ -49,15 +49,19 @@ public sealed class CudaMlaKvCache : IDisposable
     private readonly int _qkNopeHeadDim;
     private readonly int _vHeadDim;
     private readonly int _qkRopeHeadDim;
+    // #region MLA FP16 — element size for K_nope / V / K_pe (4 = F32, 2 = F16).
+    private readonly int _elementSize;
+    private readonly MlaPrecision _precision;
+    // #endregion
 
     /// <summary>Total bytes held across K_nope + V + K_pe for all layers.</summary>
     public long AllocatedBytes
     {
         get
         {
-            long perTokenK = (long)_numHeads * _qkNopeHeadDim * sizeof(float);
-            long perTokenV = (long)_numHeads * _vHeadDim * sizeof(float);
-            long perTokenKpe = (long)_qkRopeHeadDim * sizeof(float);
+            long perTokenK = (long)_numHeads * _qkNopeHeadDim * _elementSize;
+            long perTokenV = (long)_numHeads * _vHeadDim * _elementSize;
+            long perTokenKpe = (long)_qkRopeHeadDim * _elementSize;
             return _numLayers * _maxSeqLen * (perTokenK + perTokenV + perTokenKpe);
         }
     }
@@ -66,13 +70,29 @@ public sealed class CudaMlaKvCache : IDisposable
     public int NumLayers => _numLayers;
     /// <summary>Maximum sequence length the cache was allocated for.</summary>
     public int MaxSeqLen => _maxSeqLen;
+    /// <summary>Precision of stored cache elements (F32 or F16).</summary>
+    public MlaPrecision Precision => _precision;
 
     /// <summary>
-    /// Allocates per-layer device buffers for the Phase A expanded MLA cache.
+    /// Allocates per-layer F32 device buffers for the Phase A expanded MLA cache
+    /// (back-compat constructor — original Phase A signature, F32 only).
     /// </summary>
     public CudaMlaKvCache(
         int numLayers, int maxSeqLen,
         int numHeads, int qkNopeHeadDim, int vHeadDim, int qkRopeHeadDim)
+        : this(numLayers, maxSeqLen, numHeads, qkNopeHeadDim, vHeadDim, qkRopeHeadDim, MlaPrecision.F32)
+    {
+    }
+
+    /// <summary>
+    /// Allocates per-layer device buffers for the Phase A expanded MLA cache at
+    /// the requested <paramref name="precision"/>. F16 halves the memory cost
+    /// vs F32 and matches the GQA cache convention.
+    /// </summary>
+    public CudaMlaKvCache(
+        int numLayers, int maxSeqLen,
+        int numHeads, int qkNopeHeadDim, int vHeadDim, int qkRopeHeadDim,
+        MlaPrecision precision)
     {
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
@@ -87,15 +107,17 @@ public sealed class CudaMlaKvCache : IDisposable
         _qkNopeHeadDim = qkNopeHeadDim;
         _vHeadDim = vHeadDim;
         _qkRopeHeadDim = qkRopeHeadDim;
+        _precision = precision;
+        _elementSize = precision == MlaPrecision.F16 ? sizeof(ushort) : sizeof(float);
 
         _kNope = new nint[numLayers];
         _v = new nint[numLayers];
         _kPe = new nint[numLayers];
         _currentLengths = new int[numLayers];
 
-        long kBytes = (long)maxSeqLen * numHeads * qkNopeHeadDim * sizeof(float);
-        long vBytes = (long)maxSeqLen * numHeads * vHeadDim * sizeof(float);
-        long kPeBytes = (long)maxSeqLen * qkRopeHeadDim * sizeof(float);
+        long kBytes = (long)maxSeqLen * numHeads * qkNopeHeadDim * _elementSize;
+        long vBytes = (long)maxSeqLen * numHeads * vHeadDim * _elementSize;
+        long kPeBytes = (long)maxSeqLen * qkRopeHeadDim * _elementSize;
         for (int i = 0; i < numLayers; i++)
         {
             CudaDriverApi.cuMemAlloc_v2(out _kNope[i], (nuint)kBytes).ThrowOnError();
@@ -141,13 +163,13 @@ public sealed class CudaMlaKvCache : IDisposable
     public nint GetKPePtr(int layerIndex) => _kPe[layerIndex];
 
     /// <summary>Bytes per cached K_nope row (one token, all heads).</summary>
-    public long KNopeRowBytes => (long)_numHeads * _qkNopeHeadDim * sizeof(float);
+    public long KNopeRowBytes => (long)_numHeads * _qkNopeHeadDim * _elementSize;
 
     /// <summary>Bytes per cached V row (one token, all heads).</summary>
-    public long VRowBytes => (long)_numHeads * _vHeadDim * sizeof(float);
+    public long VRowBytes => (long)_numHeads * _vHeadDim * _elementSize;
 
     /// <summary>Bytes per cached K_pe row (one token, shared).</summary>
-    public long KPeRowBytes => (long)_qkRopeHeadDim * sizeof(float);
+    public long KPeRowBytes => (long)_qkRopeHeadDim * _elementSize;
 
     /// <summary>Frees all per-layer device buffers.</summary>
     public void Dispose()
