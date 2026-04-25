@@ -192,33 +192,43 @@ See [KV_CACHE.md](KV_CACHE.md) for general KV-cache design (KV-cache quantizatio
 
 Supported GGUF quantization formats for GPU inference:
 
-| Format | Embedding | Dequant→FP16 | Quantized GEMV | Notes |
-|--------|-----------|--------------|----------------|-------|
-| F32 | Yes | Yes | — | Converted to FP16 on upload |
-| F16 | Yes | — | — | Direct upload, used by cuBLAS directly |
-| Q8_0 | Yes | Yes | Yes | Best quality quantized format |
-| Q4_0 | No | Yes | No | Dequant-only (no custom GEMV kernel) |
-| Q5_0 | No | Yes | No | Dequant-only (no custom GEMV kernel) |
-| Q4_K | No | Yes | Yes | Good quality-to-size ratio |
-| Q5_K | No | Yes | No | Dequant-only (no custom GEMV kernel) |
-| Q6_K | No | Yes | Yes | High quality, larger than Q4_K |
+| Format | Embedding | Dequant→FP16 | Quantized GEMV | MMQ (dp4a) | MMVQ-large + pre-Q8_1 | Notes |
+|--------|-----------|--------------|----------------|-----------|---------------------|-------|
+| F32 | Yes | Yes | — | — | — | Converted to FP16 on upload |
+| F16 | Yes | — | — | — | — | Direct upload, used by cuBLAS directly |
+| Q8_0 | Yes | Yes | Yes | — | — | Best quality quantized format |
+| Q4_0 | No | Yes | No | — | — | Dequant-only (no custom GEMV kernel) |
+| Q5_0 | No | Yes | No | — | — | Dequant-only (no custom GEMV kernel) |
+| Q4_K | **Yes (per-row)** | Yes | Yes | Yes | Yes (k≥1024) | Good quality-to-size ratio |
+| Q5_K | **Yes (per-row)** | Yes | Yes | Yes | Yes (k≥1024) | |
+| Q6_K | **Yes (per-row)** | Yes | Yes | Yes | Yes (k≥1024) | High quality, larger than Q4_K |
 
-**Decode** uses custom quantized GEMV kernels (Q8_0, Q4_K, Q6_K) that operate directly on quantized weights — no dequantization needed. For formats without a custom GEMV kernel, the weight is dequantized on-the-fly into a scratch buffer and cuBLAS GEMV is used.
+**Decode dispatch** (per call, picked by `LaunchQuantizedGemvMmq`):
+- **k ≥ 1024 + Q4_K/Q5_K/Q6_K**: MMVQ-large + pre-Q8_1 (1 row/block × 128 threads, dp4a, input pre-quantized once per fused-GEMV-input). Hits ~33 tok/s on Qwen3-8B Q4_K_M (inside llama.cpp's reported 25-42 range).
+- **k < 1024 + Q4_K/Q5_K/Q6_K**: MMQ-4-rows (4 rows/block × 256 threads, dp4a, on-the-fly Stage 1 quant). Right for SmolLM-class.
+- **Q8_0**: legacy FP-fmuladd GEMV (no MMQ variant).
+- **Other formats (Q4_0, Q5_0)**: dequant→FP16 scratch + cuBLAS GEMV.
+
+**Embedding** uses per-row K-quant lookup kernels for Q4_K/Q5_K/Q6_K (llama.cpp `get_rows_q*_K` pattern) — keeps the embedding table quantized in VRAM and dequantizes only the looked-up rows at forward time. Saves ~1.16 GiB on Qwen3-8B vocab×hidden vs the bulk-dequant path.
 
 **Prefill** always dequantizes into a scratch buffer before calling cuBLAS HGEMM. The scratch holds one projection at a time and is reused across all projections.
 
 See [QUANTIZATION.md](QUANTIZATION.md) for block layouts.
 
-## Weight Strategy: On-the-Fly Dequantization
+## Weight Strategy: Quantized + on-demand dequant
 
-### Problem
+### Problem (historical)
 
-Storing quantized weights provides compression (e.g., Q4_K is ~4.5 bits/param), but cuBLAS GEMM for prefill requires FP16 input. A naive approach stores both the quantized copy (for decode GEMV) and a permanent FP16 copy (for cuBLAS). This **doubles** VRAM usage, negating the benefit of quantization:
+Storing quantized weights provides compression (e.g., Q4_K is ~4.5 bits/param), but cuBLAS GEMM for prefill requires FP16 input. A naive approach stores both the quantized copy (for decode GEMV) and a permanent FP16 copy (for cuBLAS). This would **double** VRAM usage, negating the benefit of quantization:
 
 | Model | Quantized only | Quantized + FP16 copy | Overhead |
 |-------|---------------|----------------------|----------|
 | Llama-3.2-1B Q8_0 | 1.1 GB | 3.3 GB | +200% |
 | Llama-3.1-8B Q4_K_M | 4.9 GB | 21 GB | +330% |
+
+### Current state — only-quantized + scratch + dedup
+
+dotLLM today stores **only the quantized copy** for formats with a custom GEMV (Q8_0/Q4_K/Q5_K/Q6_K) and uses a single per-projection FP16 scratch for prefill HGEMM. Plus: the fused QkvPacked / GateUpPacked buffers are now the *source of truth* — per-tensor `qQuant`/`kQuant`/etc. pointers slice into them rather than allocating duplicates (saves ~2.5 GiB on Qwen3-8B). Net VRAM at load on Qwen3-8B Q4_K_M: ~5.3 GiB (was OOMing on a 12 GB RTX 3060 before the dedup).
 
 ### Industry Approaches
 

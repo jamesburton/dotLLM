@@ -41,6 +41,15 @@ DeepSeek-V2/V3. Compresses KV into low-rank latent space.
 
 Requires its own attention implementation with `LatentKvCache`.
 
+**CPU**: complete. Three phases coexist behind `MlaConfig` flags:
+- `MlaAttention.Execute` — Phase A naive expanded (per-head K_nope/V cache); the numerical oracle.
+- `MlaAttention.ExecuteLatent` — Phase B absorbed-form attention over latent `[c_kv, k_pe]` cache (`MlaLatentKvState`).
+- `MlaAttention.ExecuteLatentHybrid` — Phase C vLLM-style: prefill expands + MHA, decode runs absorbed.
+- All three handle low-rank Q (`q_a_proj` + `q_a_layernorm` + `q_b_proj`), low-rank KV with `kv_a_layernorm`, RoPE on the rope-only sub-dim, causal mask, and YaRN's `mscale²` softmax-scale multiplier (`MlaConfig.ComputeYarnSoftmaxScaleMultiplier`).
+- Verified end-to-end on tiny-random DeepSeek-V2/V3 fixtures and (gated by checkpoint availability) DeepSeek-V2-Lite real weights.
+
+**CUDA**: Phase A primitives landed (`CudaMlaAttention.Forward`, `attention_mla_f32` kernel, `mla_helpers.cu`, `CudaMlaWeights`, `CudaMlaKvCache`). F32 throughout for now, validated against the CPU oracle within FP16 noise. **Not yet wired into `CudaTransformerModel.Forward`** — that wiring blocks on the CUDA MoE FFN port (DeepSeek-V2/V3 layers are MLA + MoE FFN, and the FFN GPU path doesn't exist). Phase B/C and FP16/quantized weight paths are deferred follow-ups.
+
 ## IAttentionStrategy — Kernel Selection
 
 ```

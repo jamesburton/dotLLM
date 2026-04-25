@@ -640,11 +640,25 @@ All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaun
 
 **Quantized GEMV (decode path — operate directly on quantized weights):**
 
-| Kernel | File | Function Name |
-|---|---|---|
-| Q8_0 GEMV | `quantized_gemv.cu` | `quantized_gemv_q8_0` |
-| Q4_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q4_k` |
-| Q6_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q6_k` |
+| Kernel | File | Function Name | Notes |
+|---|---|---|---|
+| Q8_0 GEMV | `quantized_gemv.cu` | `quantized_gemv_q8_0` | FP fmuladd, legacy |
+| Q4_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q4_k` | FP fmuladd, legacy |
+| Q5_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q5_k` | FP fmuladd, legacy |
+| Q6_K GEMV | `quantized_gemv.cu` | `quantized_gemv_q6_k` | FP fmuladd, legacy |
+| Q4_K MMQ | `quantized_gemv_mmq.cu` | `quantized_gemv_q4_k_mmq` | dp4a, 4 rows/block; default for k<1024 |
+| Q5_K MMQ | `quantized_gemv_mmq.cu` | `quantized_gemv_q5_k_mmq` | dp4a, 4 rows/block |
+| Q6_K MMQ | `quantized_gemv_mmq.cu` | `quantized_gemv_q6_k_mmq` | dp4a, 4 rows/block; lifts LmHead in Q4_K_M GGUFs |
+| Q{4,5,6}_K MMVQ-large | `quantized_gemv_mmq.cu` | `quantized_gemv_q*_k_mmvq_large` | dp4a, 1 row/block × 128 threads; default for k≥1024 (paired with `_preq` variants) |
+| Q{4,5,6}_K MMQ/MMVQ `_preq` | `quantized_gemv_mmq.cu` | `*_preq` suffix | Read pre-quantized x from scratch; skips Stage 1 input quant |
+| Pre-Q8_1 input quant | `quantize_x.cu` | `quantize_x_to_q8_1` | Quantizes activation x[k] once per fused-GEMV-input — feeds the `_preq` variants. Auto-engages for k≥1024 |
+
+**Embedding lookup (per-row dequant, no full-table FP16):**
+
+| Kernel | File | Function Name | Notes |
+|---|---|---|---|
+| F32 / F16 / Q8_0 | `embedding.cu` | `embedding_lookup_*` | Existing fast paths |
+| Q4_K / Q5_K / Q6_K | `embedding.cu` | `embedding_lookup_q{4,5,6}_k_f16` | Per-row dequant, llama.cpp `get_rows_q*_K` pattern. Saves ~1.16 GiB on Qwen3-8B vocab×hidden |
 
 **Conversion:**
 
@@ -691,8 +705,13 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 
 ## Future Work
 
+- **CUDA MoE FFN port**: top-k routing + per-expert grouped-GEMM on GPU. CPU has `MoeSwiGluMlp`; CUDA equivalent doesn't exist yet. **Concrete blocker for end-to-end DeepSeek-V2/V3 on CUDA** (MLA attention Phase 1 primitives landed; they need a matching MoE FFN to complete the layer forward).
+- **MLA Phase B + C** (CUDA decode efficiency): latent KV cache + W_UK absorption (`MlaAttention.ExecuteLatent`/`ExecuteLatentHybrid` CPU equivalents). Phase A naive expanded forward is already in tree (`CudaMlaAttention.Forward`).
+- **MLA FP16/quantized weight paths**: current Phase A is F32 throughout. FP16 follow-up; quantized extends `Project` patterns from the GQA path.
 - **Flash Attention**: replace naive attention kernel with tiled flash attention (shared memory, online softmax). Full Tensor Core access via `wmma` intrinsics in PTX.
-- **Fused quantized GEMM for prefill**: Marlin-style dequant-in-register or llama.cpp MMQ-style fused matmul to eliminate per-projection dequant→scratch overhead during prefill. Decode path already uses custom quantized GEMV kernels (Q8_0, Q4_K, Q6_K).
+- **Fused quantized GEMM for prefill**: Marlin-style dequant-in-register. Decode is now MMQ + MMVQ-large + pre-Q8_1 (Qwen3-8B Q4_K_M decode hits 33 tok/s eager on RTX 3060 — inside llama.cpp's reported range); prefill still uses dequant→cuBLAS HGEMM.
+- **Continuous batching scheduler** (engine-layer prerequisite for tensor-core mma kernel value — see `docs/perf/MMA_BATCHED_MMQ.md` for the design analysis).
+- **Tensor-core (mma) batched MMQ**: only valuable once batched decode is the call shape. See `docs/perf/MMA_BATCHED_MMQ.md` for thresholds.
 - **Multi-stream pipelining** (Step 32): overlap H2D transfer with compute across layers.
 - **NCCL integration** (Step 51): multi-GPU tensor parallelism. NCCL is another system library — same P/Invoke pattern, no shared library needed.
 - **Fatbin distribution**: ship pre-compiled SASS for common architectures to eliminate JIT overhead.
