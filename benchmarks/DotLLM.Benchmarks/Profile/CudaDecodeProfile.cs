@@ -40,12 +40,16 @@ internal static class CudaDecodeProfile
             return 2;
         }
 
-        // --graph        : run only the CUDA-Graphs decode path
+        // --graph        : (legacy, now redundant) force CUDA-Graphs decode path
+        // --no-graph     : force eager decode (overrides the new default-on)
         // --compare      : run BOTH eager and graph back-to-back, side-by-side report
         // --no-profiling : measure eager wall WITHOUT cuEventRecord overhead so the
         //                  comparison vs graph is true-apples-to-apples
-        // (default)      : eager only (prior behaviour)
-        bool useGraph = args.Contains("--graph");
+        // (default)      : graph capture (mirrors CudaTransformerModel default-on; flipped
+        //                  in commit "CUDA: graph capture default-ON for all k").
+        bool noGraph = args.Contains("--no-graph") ||
+                       Environment.GetEnvironmentVariable("DOTLLM_DISABLE_GRAPH_CAPTURE") == "1";
+        bool useGraph = !noGraph;
         bool compare = args.Contains("--compare");
         bool noProfiling = args.Contains("--no-profiling");
         // --kv-quant : run with the mixed-precision quantized KV cache

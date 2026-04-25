@@ -43,11 +43,14 @@ public class CudaGraphCaptureEquivalenceTest
         int kvCap = prompt.Length + decodeSteps + 8;
 
         // === Run 1: Eager ===
+        // Graph capture is now default-on, so explicitly disable it here to
+        // exercise the eager path the test name promises.
         int[] eagerTokens = new int[decodeSteps];
         float[] eagerFirstLogits = new float[config.VocabSize];
         using (var modelEager = CudaTransformerModel.LoadFromGguf(gguf, config))
         using (var kvEager = modelEager.CreateKvCache(kvCap))
         {
+            modelEager.UseGraphCapture = false;
             int[] positions = new int[prompt.Length];
             for (int i = 0; i < prompt.Length; i++) positions[i] = i;
             using (var _ = modelEager.Forward(prompt, positions, 0, kvEager)) { }
@@ -172,6 +175,8 @@ public class CudaGraphCaptureEquivalenceTest
         using (var modelEager = CudaTransformerModel.LoadFromGguf(gguf, config))
         using (var kvEager = (DotLLM.Core.Attention.IKvCache)modelEager.CreateKvCache(kvCap, kvCfg))
         {
+            // Graph capture is now default-on; explicitly disable for eager pass.
+            modelEager.UseGraphCapture = false;
             int[] positions = new int[prompt.Length];
             for (int i = 0; i < prompt.Length; i++) positions[i] = i;
             using (var _ = modelEager.Forward(prompt, positions, 0, kvEager)) { }

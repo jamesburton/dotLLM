@@ -76,8 +76,27 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// invalidated when the kvCache identity changes or when <see cref="DebugMaxLayers"/>
     /// flips between calls.
     /// </para>
+    /// <para>
+    /// <b>Default ON</b> (post re-bench on RTX 3060: graph is never slower across
+    /// SmolLM-135M / Qwen3-4B / Qwen3-8B). Override with the
+    /// <c>DOTLLM_DISABLE_GRAPH_CAPTURE=1</c> env var (matches the
+    /// <c>DOTLLM_DISABLE_*</c> kernel-feature convention) or by explicitly
+    /// assigning <c>false</c>. When the model is constructed without the
+    /// kv-write fusion kernel (<see cref="CudaKernels.HasKvWriteKernel"/>),
+    /// the default silently falls back to eager and a one-line warning is
+    /// emitted — speculative decoding (multi-token decode) and prefill
+    /// (multi-token forward) always fall through to the eager path at
+    /// runtime regardless of this flag.
+    /// </para>
     /// </summary>
     public bool UseGraphCapture { get; set; }
+
+    /// <summary>Env-var override for the default-on graph-capture path. Set
+    /// <c>DOTLLM_DISABLE_GRAPH_CAPTURE=1</c> to force eager decode regardless
+    /// of capability. Test/benchmark hook follows the same convention as
+    /// <see cref="CudaKernels.DisablePreQ8_1"/>, etc.</summary>
+    public static bool DisableGraphCapture { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_GRAPH_CAPTURE") == "1";
 
     private nint _evtStart;
     private nint _evtEnd;
@@ -141,6 +160,31 @@ public sealed unsafe class CudaTransformerModel : IModel
         _ropeDim = ropeDim;
         VramWarning = vramWarning;
         _ropeType = ropeType;
+
+        // Default-on graph capture when capable. Re-bench on RTX 3060
+        // (post pre-Q8_1 + MMVQ-large default-ON) shows graph never regresses
+        // across SmolLM-135M / Qwen3-4B / Qwen3-8B. Env-var override:
+        // DOTLLM_DISABLE_GRAPH_CAPTURE=1.
+        // The runtime path-selection in Forward() additionally gates on
+        // single-token decode, no profiling, and a graph-capable kvCache,
+        // so prefill / speculative-verify / pure-quant configs naturally
+        // fall through to eager. Here we only suppress the default-on
+        // when the underlying kv-write fusion kernel isn't loaded.
+        if (DisableGraphCapture)
+        {
+            UseGraphCapture = false;
+        }
+        else if (!kernels.HasKvWriteKernel)
+        {
+            UseGraphCapture = false;
+            Console.Error.WriteLine(
+                "[dotLLM.Cuda] Graph-capture default disabled: kv-write fusion kernel " +
+                "not available — falling back to eager decode.");
+        }
+        else
+        {
+            UseGraphCapture = true;
+        }
     }
 
     /// <summary>
