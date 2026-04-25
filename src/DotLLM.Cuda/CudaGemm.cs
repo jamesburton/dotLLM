@@ -48,4 +48,32 @@ public static class CudaGemm
     {
         LinearF16(handle, xF16, wF16, yF16, 1, k, n, stream);
     }
+
+    /// <summary>
+    /// Linear projection (F32 in, F32 out): Y_f32[m, n] = X_f32[m, k] × W_f32^T.
+    /// FP32 accumulation. Weight layout matches LinearF16: W[outputDim, inputDim]
+    /// row-major. Used by MoE forward where the per-expert kernel chain stays
+    /// in F32 for parity with the CPU oracle.
+    /// </summary>
+    public static unsafe void LinearF32(nint handle, nint xF32, nint wF32, nint yF32,
+                                          int m, int k, int n, nint stream)
+    {
+        CublasApi.cublasSetStream_v2(handle, stream).ThrowOnCublasError();
+
+        float alpha = FloatOne;
+        float beta = FloatZero;
+
+        CublasApi.cublasGemmEx(
+            handle,
+            CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+            n, m, k,
+            (nint)(&alpha),
+            wF32, CublasApi.CUDA_R_32F, k,
+            xF32, CublasApi.CUDA_R_32F, k,
+            (nint)(&beta),
+            yF32, CublasApi.CUDA_R_32F, n,
+            CublasApi.CUBLAS_COMPUTE_32F,
+            CublasApi.CUBLAS_GEMM_DEFAULT
+        ).ThrowOnCublasError();
+    }
 }
