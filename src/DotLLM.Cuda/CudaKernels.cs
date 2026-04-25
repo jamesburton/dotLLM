@@ -63,6 +63,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
+    /// <summary>
+    /// Device's maximum opt-in dynamic shared-memory bytes per block (queried once at
+    /// kernel-load via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN). The
+    /// on-the-fly MMQ kernels are opted into this cap via cuFuncSetAttribute so
+    /// arbitrarily large k (up to ~k=53000 on a 100 KB cap) launches succeed without
+    /// recompiling. 0 means we couldn't query — fall back to the default 48 KB cap.
+    /// </summary>
+    private readonly int _maxDynamicSharedBytesOptIn;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -190,6 +198,27 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ4_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large_preq");
             _quantizedGemvQ5_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large_preq");
             _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
+
+            // The on-the-fly MMQ kernels size their per-chunk Stage 1 scratch (s_xq/s_dx/s_sx[2])
+            // dynamically from `k`. For k up to ~12 KiB-shmem-worth (Qwen3-8B intermediate=12288)
+            // we fit under the 48 KB default cap, but Llama-70B-class intermediate=14336 lands at
+            // ~15.7 KB and Llama-405B-class intermediate=53248 lands at ~58 KB — past 48 KB. Opt
+            // each on-the-fly variant into the device's full optin cap (typically 100+ KB on
+            // Ampere/Ada/Hopper) so any in-budget k launches without recompiling.
+            int devForOptIn;
+            if (CudaDriverApi.cuCtxGetDevice(out devForOptIn) == 0
+                && CudaDriverApi.cuDeviceGetAttribute(out int optIn,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, devForOptIn) == 0
+                && optIn > 0)
+            {
+                _maxDynamicSharedBytesOptIn = optIn;
+                SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmvqLargeFunc, optIn);
+            }
         }
 
         // Pre-Q8_1 input quantization kernel (optional — PTX may be missing on stale builds).
@@ -276,6 +305,22 @@ public sealed unsafe class CudaKernels : IDisposable
             _fusedRopeKvWriteF16Func = _fusedRopeKvWriteModule.GetFunction("fused_rope_kv_write_f16");
             _fusedRopeKvWriteF16DynFunc = _fusedRopeKvWriteModule.GetFunction("fused_rope_kv_write_f16_dyn");
         }
+    }
+
+    /// <summary>
+    /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
+    /// Silently skipped when func == 0 (kernel not loaded — TryGetFunction returned 0).
+    /// Errors are non-fatal; the kernel will still launch as long as the launch's
+    /// requested sharedMemBytes stays within the static 48 KB default.
+    /// </summary>
+    private static void SetMaxDynamicSharedBytes(nint func, int bytes)
+    {
+        if (func == 0) return;
+        // Best effort — if the driver rejects the attribute (older driver, kernel
+        // already too large for occupancy=1), we silently fall back to the default.
+        // Launches that need more than the default will fail with a clear CUDA error.
+        CudaDriverApi.cuFuncSetAttribute(func,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes);
     }
 
     /// <summary>RMS normalization. One block per row.</summary>
@@ -1171,6 +1216,7 @@ public sealed unsafe class CudaKernels : IDisposable
                     nint wL = quantWeight, xqL = xqPtr, dxL = dxPtr, sx2L = sx2Ptr, yL = y;
                     int nL = n, kL = k;
                     void** argsL = stackalloc void*[] { &wL, &xqL, &dxL, &sx2L, &yL, &nL, &kL };
+                    // _preq variants don't use dynamic shmem — only static s_warp_partials (16 B).
                     CudaDriverApi.cuLaunchKernel(largeFunc,
                             (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
                             0, stream, (nint)argsL, 0).ThrowOnError();
@@ -1180,9 +1226,11 @@ public sealed unsafe class CudaKernels : IDisposable
                     nint wL = quantWeight, xL = x, yL = y;
                     int nL = n, kL = k;
                     void** argsL = stackalloc void*[] { &wL, &xL, &yL, &nL, &kL };
+                    uint dynShmem = (uint)ComputeMmqDynamicSharedBytes(qt, k);
+                    CheckDynamicSharedBudget(dynShmem, qt, k);
                     CudaDriverApi.cuLaunchKernel(largeFunc,
                             (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
-                            0, stream, (nint)argsL, 0).ThrowOnError();
+                            dynShmem, stream, (nint)argsL, 0).ThrowOnError();
                 }
                 return;
             }
@@ -1228,6 +1276,7 @@ public sealed unsafe class CudaKernels : IDisposable
             nint wArg = quantWeight, xqArg = xqPtr, dxArg = dxPtr, sx2Arg = sx2Ptr, yArg = y;
             int nArg = n, kArg = k;
             void** args = stackalloc void*[] { &wArg, &xqArg, &dxArg, &sx2Arg, &yArg, &nArg, &kArg };
+            // _preq variants don't use dynamic shmem — only static s_acc (4 KB).
             CudaDriverApi.cuLaunchKernel(func,
                     gridDim, 1, 1, BlockSize, 1, 1,
                     0, stream, (nint)args, 0).ThrowOnError();
@@ -1237,10 +1286,46 @@ public sealed unsafe class CudaKernels : IDisposable
             nint wArg = quantWeight, xArg = x, yArg = y;
             int nArg = n, kArg = k;
             void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+            uint dynShmem = (uint)ComputeMmqDynamicSharedBytes(qt, k);
+            CheckDynamicSharedBudget(dynShmem, qt, k);
             CudaDriverApi.cuLaunchKernel(func,
                     gridDim, 1, 1, BlockSize, 1, 1,
-                    0, stream, (nint)args, 0).ThrowOnError();
+                    dynShmem, stream, (nint)args, 0).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Pre-launch check that the requested dynamic shmem fits the device budget. Failing
+    /// fast here gives a much clearer error than CUDA's generic CUDA_ERROR_INVALID_VALUE
+    /// when sharedMemBytes exceeds the opt-in cap. Skipped if we couldn't query the cap.
+    /// </summary>
+    private void CheckDynamicSharedBudget(uint dynShmem, QuantizationType qt, int k)
+    {
+        if (_maxDynamicSharedBytesOptIn <= 0) return;
+        if (dynShmem <= (uint)_maxDynamicSharedBytesOptIn) return;
+        throw new InvalidOperationException(
+            $"MMQ GEMV {qt} k={k} requires {dynShmem} bytes of dynamic shared memory, " +
+            $"exceeding the device cap of {_maxDynamicSharedBytesOptIn} bytes. " +
+            "Either route through the dequantize-then-cuBLAS-FP16 fallback or fan the matmul " +
+            "across multiple kernel launches.");
+    }
+
+    /// <summary>
+    /// Compute the dynamic shared-memory bytes needed by an on-the-fly MMQ kernel
+    /// for the given quant type and k. Layout per chunk (32 elements):
+    /// <list type="bullet">
+    /// <item>Q4_K / Q5_K: 32 INT8 (s_xq) + 1 half (s_dx) + 1 half (s_sx) = 36 bytes/chunk</item>
+    /// <item>Q6_K: 32 INT8 (s_xq) + 1 half (s_dx) + 2 halves (s_sx2 lo, hi) = 38 bytes/chunk</item>
+    /// </list>
+    /// SmolLM-135M k=576 → 18 chunks → 648 B (Q4_K) / 684 B (Q6_K). Qwen3-8B
+    /// k=12288 → 384 chunks → 13.5 KB / 14.25 KB. Llama-405B k=53248 → 1664 chunks
+    /// → ~58 KB / ~62 KB (still under the 100 KB sm_86 optin cap).
+    /// </summary>
+    private static int ComputeMmqDynamicSharedBytes(QuantizationType qt, int k)
+    {
+        int numChunks = k >> 5;
+        int bytesPerChunk = qt == QuantizationType.Q6_K ? 38 : 36;
+        return numChunks * bytesPerChunk;
     }
 
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>

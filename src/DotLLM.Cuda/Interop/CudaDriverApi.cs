@@ -75,6 +75,19 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuModuleUnload(nint module);
 
+    /// <summary>
+    /// Set a CUfunction attribute. Currently used to opt kernels into the
+    /// device's full dynamic-shared-memory budget (default cap is 48 KB on
+    /// most archs; sm_75+ supports raising it to MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+    /// — typically 100 KB+ on Ampere/Ada/Hopper).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuFuncSetAttribute(
+        nint function, int attribute, int value);
+
+    /// <summary>CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES — opt in to >48 KB dynamic shmem.</summary>
+    internal const int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
+
     // ── Kernel launch ───────────────────────────────────────────────
 
     [LibraryImport(LibName)]
@@ -198,4 +211,10 @@ internal static partial class CudaDriverApi
     internal const int CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1;
     internal const int CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8;
     internal const int CU_DEVICE_ATTRIBUTE_WARP_SIZE = 10;
+    /// <summary>
+    /// MAX_SHARED_MEMORY_PER_BLOCK_OPTIN — the dynamic-shmem cap a kernel can
+    /// raise itself to via cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, ...).
+    /// Typically 100+ KB on sm_86 (RTX 3060), 164 KB on sm_80/89, etc.
+    /// </summary>
+    internal const int CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
 }
