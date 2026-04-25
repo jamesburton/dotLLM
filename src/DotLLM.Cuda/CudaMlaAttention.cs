@@ -35,7 +35,7 @@ namespace DotLLM.Cuda;
 /// forward.
 /// </para>
 /// </remarks>
-public static unsafe class CudaMlaAttention
+public static unsafe partial class CudaMlaAttention
 {
     /// <summary>
     /// Runs one MLA layer's forward pass on the GPU.
@@ -365,3 +365,375 @@ public sealed unsafe class CudaMlaScratch : IDisposable
         _capacitySeqLen = 0;
     }
 }
+
+#region MLA Phase B (latent KV cache + W_UK absorbed attention)
+
+/// <summary>
+/// MLA Phase B forward helpers: latent-cache + absorbed attention. The
+/// production decode efficiency path for DeepSeek-V2/V3 — stores only the
+/// shared <c>c_kv</c> + <c>k_pe</c> latents (~7-14× smaller than Phase A's
+/// expanded cache) and recovers per-head K/V on the fly via the W_UK / W_UV
+/// absorption identities derived in <see cref="DotLLM.Cpu.Kernels.MlaAttention.ExecuteLatent"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Coexists with Phase A.</b> <see cref="CudaMlaAttention.Forward"/> stays
+/// unchanged and continues to drive the expanded <see cref="CudaMlaKvCache"/>.
+/// <see cref="CudaMlaAttention.ForwardLatent"/> is a parallel path the wiring
+/// agent can pick per layer or per call. The on-disk caches are different
+/// types (<see cref="CudaMlaKvCache"/> vs <see cref="CudaMlaLatentKvCache"/>),
+/// so the two paths are not interchangeable mid-sequence.
+/// </para>
+/// <para>
+/// <b>F32 throughout.</b> Matches Phase A's correctness-first contract. FP16
+/// is the next follow-up agent.
+/// </para>
+/// </remarks>
+public static unsafe partial class CudaMlaAttention
+{
+    /// <summary>
+    /// MLA Phase B forward: latent KV cache + W_UK absorbed attention. Runs the
+    /// equivalent of <c>DotLLM.Cpu.Kernels.MlaAttention.ExecuteLatent</c> on GPU.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Math: per head <c>h</c>, per query token <c>t</c>:
+    /// </para>
+    /// <list type="number">
+    ///   <item>Project + RoPE + cache-write (identical to Phase A but writes only
+    ///     <c>c_kv</c> + <c>k_pe</c>).</item>
+    ///   <item><c>Q_absorbed[h,t] = W_UK[h]^T @ Q_nope[h,t]</c> (per (h,t),
+    ///     yields <c>kvLoraRank</c> floats).</item>
+    ///   <item>Score = <c>Q_absorbed[h,t] · c_kv[s] + Q_pe[h,t] · k_pe[s]</c>,
+    ///     causal-masked, softmaxed.</item>
+    ///   <item><c>c_v_out[h,t] = Σ_s softmax · c_kv[s]</c> (latent V output,
+    ///     <c>kvLoraRank</c> floats).</item>
+    ///   <item><c>attn_out[h,t] = W_UV[h] @ c_v_out[h,t]</c> (vHead floats).</item>
+    ///   <item><c>output = o_proj @ attn_out</c> (hidden floats).</item>
+    /// </list>
+    /// </remarks>
+    public static void ForwardLatent(
+        nint hiddenF32, nint outputF32,
+        int seqLen, int positionOffset,
+        in CudaMlaLayerWeights layer,
+        CudaMlaLatentKvCache kvCache, int layerIndex,
+        nint ropeCosF32, nint ropeSinF32,
+        float rmsNormEps, float softmaxScale,
+        CudaMlaLatentScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream)
+    {
+        if (!kernels.HasMlaPhaseB || !kernels.HasMlaHelpers)
+            throw new InvalidOperationException(
+                "MLA Phase B kernels not available. Compile native/kernels/attention_mla_latent.cu and mla_helpers.cu.");
+
+        scratch.EnsureCapacity(seqLen, layer);
+
+        int hiddenSize = layer.HiddenSize;
+        int qkNope = layer.QkNopeHeadDim;
+        int qkRope = layer.QkRopeHeadDim;
+        int qkHead = qkNope + qkRope;
+        int vHead = layer.VHeadDim;
+        int numHeads = layer.NumHeads;
+        int qLora = layer.QLoraRank;
+        int kvLora = layer.KvLoraRank;
+        int qTotal = layer.QTotalElems;
+        int kvAOut = layer.KvAOutElems;
+        int oInput = layer.OInputDim;
+
+        // ── Pre-attention RMSNorm ──
+        kernels.LaunchMlaRmsNormF32(
+            hiddenF32, layer.AttnNormWeight, scratch.NormHidden,
+            seqLen, hiddenSize, rmsNormEps, stream);
+
+        // ── Q path (LoRA-factored or monolithic) ──
+        if (qLora > 0)
+        {
+            CudaGemm.LinearF32(
+                cublasHandle, scratch.NormHidden, layer.QAProj, scratch.QLatent,
+                seqLen, hiddenSize, qLora, stream);
+            kernels.LaunchMlaRmsNormF32(
+                scratch.QLatent, layer.QALayernormWeight, scratch.QLatentNorm,
+                seqLen, qLora, rmsNormEps, stream);
+            CudaGemm.LinearF32(
+                cublasHandle, scratch.QLatentNorm, layer.QBProj, scratch.Q,
+                seqLen, qLora, qTotal, stream);
+        }
+        else
+        {
+            CudaGemm.LinearF32(
+                cublasHandle, scratch.NormHidden, layer.QProj, scratch.Q,
+                seqLen, hiddenSize, qTotal, stream);
+        }
+
+        // ── KV down-projection + split ──
+        // compressed = kv_a @ normHidden  → [seqLen, kvLora + qkRope]
+        CudaGemm.LinearF32(
+            cublasHandle, scratch.NormHidden, layer.KvAProjWithMqa, scratch.CompressedKv,
+            seqLen, hiddenSize, kvAOut, stream);
+
+        // Extract latent slice → RMSNorm.
+        ExtractLatentSliceLatent(
+            scratch.CompressedKv, scratch.KvLatentNorm, seqLen, kvAOut, kvLora, stream);
+        kernels.LaunchMlaRmsNormF32(
+            scratch.KvLatentNorm, layer.KvALayernormWeight, scratch.KvLatentNormOut,
+            seqLen, kvLora, rmsNormEps, stream);
+
+        // Extract k_pe slice (last qkRope of compressed row, pre-RoPE).
+        ExtractKpeSliceLatent(
+            scratch.CompressedKv, scratch.KPe, seqLen, kvAOut, kvLora, qkRope, stream);
+
+        // ── RoPE on Q.rope (per head) and shared K_pe ──
+        kernels.LaunchMlaRopeQpe(
+            scratch.Q, ropeCosF32, ropeSinF32,
+            seqLen, numHeads, qkNope, qkRope, positionOffset, stream);
+        kernels.LaunchMlaRopeKpe(
+            scratch.KPe, ropeCosF32, ropeSinF32,
+            seqLen, qkRope, positionOffset, stream);
+
+        // ── Cache write: append latentNorm + k_pe at offset cachedLength ──
+        int cachedLength = kvCache.GetCurrentLength(layerIndex);
+        long cKvRowBytes = kvCache.CKvRowBytes;
+        long kPeRowBytes = kvCache.KPeRowBytes;
+        nint dstCKv = kvCache.GetCKvPtr(layerIndex) + (nint)((long)cachedLength * cKvRowBytes);
+        nint dstKPe = kvCache.GetKPePtr(layerIndex) + (nint)((long)cachedLength * kPeRowBytes);
+
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(dstCKv, scratch.KvLatentNormOut,
+            (nuint)((long)seqLen * cKvRowBytes), stream).ThrowOnError();
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(dstKPe, scratch.KPe,
+            (nuint)((long)seqLen * kPeRowBytes), stream).ThrowOnError();
+
+        // ── Q absorption: Q_absorbed = W_UK^T @ Q_nope ──
+        kernels.LaunchMlaQAbsorbUk(
+            scratch.Q, layer.KvBProj, scratch.QAbsorbed,
+            seqLen, numHeads, qkNope, qkRope, vHead, kvLora, stream);
+
+        // ── Absorbed attention over the latent cache ──
+        // Note: the kernel expects q_pe as a separate buffer, but Phase A's
+        // packed Q layout has q_pe interleaved at offset qkNope inside each
+        // head. We pass a base pointer + the kernel walks by num_heads *
+        // qkRope stride per token; the per-(t,h) offset is done internally.
+        // Same trick: pass scratch.Q + qkNope so the kernel reads from the
+        // right starting offset. The kernel uses q_pe_stride = num_heads *
+        // qkRope, but our q layout uses stride num_heads * (qkNope + qkRope).
+        // → we must materialise q_pe contiguously OR change the kernel.
+        //
+        // Materialise q_pe contiguously into scratch.QPe so the kernel
+        // contract holds without surgical kernel changes.
+        ExtractQPeSliceLatent(
+            scratch.Q, scratch.QPe, seqLen, numHeads, qkNope, qkRope, stream);
+
+        int seqKv = cachedLength + seqLen;
+        kernels.LaunchAttentionMlaLatent(
+            scratch.QAbsorbed, scratch.QPe,
+            kvCache.GetCKvPtr(layerIndex), kvCache.GetKPePtr(layerIndex),
+            scratch.CVOut,
+            seqLen, seqKv,
+            numHeads, kvLora, qkRope,
+            positionOffset, softmaxScale, stream);
+
+        // ── V expansion: attn_out = W_UV @ c_v_out (per head, per token) ──
+        kernels.LaunchMlaVExpandUv(
+            scratch.CVOut, layer.KvBProj, scratch.AttnOut,
+            seqLen, numHeads, qkNope, vHead, kvLora, stream);
+
+        // ── O projection ──
+        CudaGemm.LinearF32(
+            cublasHandle, scratch.AttnOut, layer.OProj, outputF32,
+            seqLen, oInput, hiddenSize, stream);
+    }
+
+    /// <summary>Strided D2D extract of the first dstWidth floats per row (Phase B copy of ExtractLatentSlice).</summary>
+    private static void ExtractLatentSliceLatent(
+        nint src, nint dst, int seqLen, int srcStride, int dstWidth, nint stream)
+    {
+        long dstRowBytes = (long)dstWidth * sizeof(float);
+        long srcRowBytes = (long)srcStride * sizeof(float);
+        for (int t = 0; t < seqLen; t++)
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(
+                dst + (nint)((long)t * dstRowBytes),
+                src + (nint)((long)t * srcRowBytes),
+                (nuint)dstRowBytes, stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>Strided D2D extract of the last kPeWidth floats per row (Phase B copy of ExtractKpeSlice).</summary>
+    private static void ExtractKpeSliceLatent(
+        nint src, nint dst, int seqLen, int srcStride, int kvLora, int kPeWidth, nint stream)
+    {
+        long srcRowBytes = (long)srcStride * sizeof(float);
+        long dstRowBytes = (long)kPeWidth * sizeof(float);
+        long offsetWithinRow = (long)kvLora * sizeof(float);
+        for (int t = 0; t < seqLen; t++)
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(
+                dst + (nint)((long)t * dstRowBytes),
+                src + (nint)((long)t * srcRowBytes + (nint)offsetWithinRow),
+                (nuint)dstRowBytes, stream).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Materialises the per-head q_pe slices contiguously so the absorbed
+    /// attention kernel can use a [seqLen, numHeads, qkRope] stride. Source
+    /// layout interleaves q_nope and q_pe per head, so each (t, h) row needs
+    /// its own short DtoD copy. seqLen * numHeads launches per call — small
+    /// enough for decode (numHeads is 16 on V2-Lite, 128 on V2-full); a fused
+    /// kernel is a follow-up.
+    /// </summary>
+    private static void ExtractQPeSliceLatent(
+        nint qSrc, nint qPeDst,
+        int seqLen, int numHeads, int qkNope, int qkRope, nint stream)
+    {
+        int qkHead = qkNope + qkRope;
+        long qStrideBytes = (long)numHeads * qkHead * sizeof(float);
+        long qPeStrideBytes = (long)numHeads * qkRope * sizeof(float);
+        long perHeadBytes = (long)qkRope * sizeof(float);
+        long qkNopeBytes = (long)qkNope * sizeof(float);
+        long qkHeadBytes = (long)qkHead * sizeof(float);
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int h = 0; h < numHeads; h++)
+            {
+                nint srcPtr = qSrc + (nint)((long)t * qStrideBytes + (long)h * qkHeadBytes + qkNopeBytes);
+                nint dstPtr = qPeDst + (nint)((long)t * qPeStrideBytes + (long)h * perHeadBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(dstPtr, srcPtr, (nuint)perHeadBytes, stream)
+                             .ThrowOnError();
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Caller-owned scratch for <see cref="CudaMlaAttention.ForwardLatent"/>.
+/// Sized once for the maximum <c>seqLen</c> the caller will pass (with
+/// power-of-2 growth), reused across layers and across forward calls.
+/// Distinct from <see cref="CudaMlaScratch"/> because Phase B's intermediate
+/// shapes differ — no kvBExpanded / kNope / v (Phase A's per-head expansion
+/// is gone), but adds qAbsorbed / cVOut / qPe (the absorbed-path scratch).
+/// </summary>
+public sealed unsafe class CudaMlaLatentScratch : IDisposable
+{
+    private nint _normHidden;       // [seqLen, hidden]
+    private nint _qLatent;          // [seqLen, qLora]
+    private nint _qLatentNorm;
+    private nint _q;                // [seqLen, numHeads * qkHead]
+    private nint _qPe;              // [seqLen, numHeads * qkRope] — contiguous q_pe slice
+    private nint _qAbsorbed;        // [seqLen, numHeads * kvLora]
+    private nint _compressedKv;     // [seqLen, kvLora + qkRope]
+    private nint _kvLatentNorm;     // [seqLen, kvLora] (extracted slice, pre-RMSNorm)
+    private nint _kvLatentNormOut;  // [seqLen, kvLora]
+    private nint _kPe;              // [seqLen, qkRope]
+    private nint _cVOut;            // [seqLen, numHeads * kvLora] — latent attention output
+    private nint _attnOut;          // [seqLen, numHeads * vHead]
+
+    private int _capacitySeqLen;
+    private int _hidden, _qLora, _qkHead, _qkRope, _qkNope, _vHead, _numHeads, _kvLora;
+
+    /// <summary>Total allocated bytes across all scratch buffers.</summary>
+    public long AllocatedBytes { get; private set; }
+
+    internal nint NormHidden => _normHidden;
+    internal nint QLatent => _qLatent;
+    internal nint QLatentNorm => _qLatentNorm;
+    internal nint Q => _q;
+    internal nint QPe => _qPe;
+    internal nint QAbsorbed => _qAbsorbed;
+    internal nint CompressedKv => _compressedKv;
+    internal nint KvLatentNorm => _kvLatentNorm;
+    internal nint KvLatentNormOut => _kvLatentNormOut;
+    internal nint KPe => _kPe;
+    internal nint CVOut => _cVOut;
+    internal nint AttnOut => _attnOut;
+
+    /// <summary>
+    /// Ensures all scratch buffers can hold <paramref name="seqLen"/> tokens
+    /// for this layer's MLA shapes. Reallocates with power-of-2 growth on demand.
+    /// </summary>
+    public void EnsureCapacity(int seqLen, in CudaMlaLayerWeights layer)
+    {
+        if (seqLen <= _capacitySeqLen
+            && _hidden == layer.HiddenSize
+            && _qLora == layer.QLoraRank
+            && _qkNope == layer.QkNopeHeadDim
+            && _qkRope == layer.QkRopeHeadDim
+            && _vHead == layer.VHeadDim
+            && _numHeads == layer.NumHeads
+            && _kvLora == layer.KvLoraRank)
+            return;
+
+        int newCap = Math.Max(seqLen, 1);
+        if (newCap > _capacitySeqLen)
+            newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)newCap);
+
+        Free();
+
+        _hidden = layer.HiddenSize;
+        _qLora = layer.QLoraRank;
+        _qkNope = layer.QkNopeHeadDim;
+        _qkRope = layer.QkRopeHeadDim;
+        _qkHead = _qkNope + _qkRope;
+        _vHead = layer.VHeadDim;
+        _numHeads = layer.NumHeads;
+        _kvLora = layer.KvLoraRank;
+        _capacitySeqLen = newCap;
+
+        int qTotal = _numHeads * _qkHead;
+        int kvAOut = _kvLora + _qkRope;
+
+        _normHidden = Alloc((long)newCap * _hidden);
+        if (_qLora > 0)
+        {
+            _qLatent = Alloc((long)newCap * _qLora);
+            _qLatentNorm = Alloc((long)newCap * _qLora);
+        }
+        _q = Alloc((long)newCap * qTotal);
+        _qPe = Alloc((long)newCap * _numHeads * _qkRope);
+        _qAbsorbed = Alloc((long)newCap * _numHeads * _kvLora);
+        _compressedKv = Alloc((long)newCap * kvAOut);
+        _kvLatentNorm = Alloc((long)newCap * _kvLora);
+        _kvLatentNormOut = Alloc((long)newCap * _kvLora);
+        _kPe = Alloc((long)newCap * _qkRope);
+        _cVOut = Alloc((long)newCap * _numHeads * _kvLora);
+        _attnOut = Alloc((long)newCap * _numHeads * _vHead);
+    }
+
+    private nint Alloc(long elemCount)
+    {
+        long bytes = elemCount * sizeof(float);
+        CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
+        AllocatedBytes += bytes;
+        return ptr;
+    }
+
+    private void Free()
+    {
+        FreeIfNonZero(ref _normHidden);
+        FreeIfNonZero(ref _qLatent);
+        FreeIfNonZero(ref _qLatentNorm);
+        FreeIfNonZero(ref _q);
+        FreeIfNonZero(ref _qPe);
+        FreeIfNonZero(ref _qAbsorbed);
+        FreeIfNonZero(ref _compressedKv);
+        FreeIfNonZero(ref _kvLatentNorm);
+        FreeIfNonZero(ref _kvLatentNormOut);
+        FreeIfNonZero(ref _kPe);
+        FreeIfNonZero(ref _cVOut);
+        FreeIfNonZero(ref _attnOut);
+        AllocatedBytes = 0;
+    }
+
+    private static void FreeIfNonZero(ref nint ptr)
+    {
+        if (ptr != 0) { CudaDriverApi.cuMemFree_v2(ptr); ptr = 0; }
+    }
+
+    /// <summary>Frees every device buffer.</summary>
+    public void Dispose()
+    {
+        Free();
+        _capacitySeqLen = 0;
+    }
+}
+
+#endregion
