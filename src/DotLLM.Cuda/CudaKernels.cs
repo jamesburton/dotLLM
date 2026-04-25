@@ -150,6 +150,15 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _attentionMlaModule;
     private readonly nint _attentionMlaF32Func;
 
+    // MLA forward-path helpers: per-head split of kv_b expansion, RoPE on
+    // the rope sub-dim of Q (per head) and on the shared K_pe, and a
+    // (numRows, dim) F32 RMSNorm used by q_a_layernorm / kv_a_layernorm.
+    private readonly CudaModule? _mlaHelpersModule;
+    private readonly nint _mlaSplitKvBF32Func;
+    private readonly nint _mlaRopeQpeF32Func;
+    private readonly nint _mlaRopeKpeF32Func;
+    private readonly nint _mlaRmsNormF32Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -320,10 +329,26 @@ public sealed unsafe class CudaKernels : IDisposable
             _attentionMlaModule = CudaModule.LoadFromFile(attentionMlaPath);
             _attentionMlaF32Func = _attentionMlaModule.GetFunction("attention_mla_f32");
         }
+
+        // MLA forward-path helper kernels (F32 split / RoPE / RMSNorm).
+        string mlaHelpersPath = Path.Combine(ptxDir, "mla_helpers.ptx");
+        if (File.Exists(mlaHelpersPath))
+        {
+            _mlaHelpersModule = CudaModule.LoadFromFile(mlaHelpersPath);
+            _mlaSplitKvBF32Func = _mlaHelpersModule.GetFunction("mla_split_kv_b_f32");
+            _mlaRopeQpeF32Func = _mlaHelpersModule.GetFunction("mla_rope_q_pe_f32");
+            _mlaRopeKpeF32Func = _mlaHelpersModule.GetFunction("mla_rope_k_pe_f32");
+            _mlaRmsNormF32Func = _mlaHelpersModule.GetFunction("mla_rmsnorm_f32");
+        }
     }
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
+
+    /// <summary>True when all MLA forward-path helper kernels (split, RoPE, RMSNorm) are available.</summary>
+    public bool HasMlaHelpers =>
+        _mlaSplitKvBF32Func != 0 && _mlaRopeQpeF32Func != 0
+        && _mlaRopeKpeF32Func != 0 && _mlaRmsNormF32Func != 0;
 
     /// <summary>
     /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
@@ -1580,6 +1605,107 @@ public sealed unsafe class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Per-head split of the kv_b expansion for MLA Phase A. Reads packed
+    /// <c>[seqLen, numHeads * (qkNope + vHead)]</c> F32 and writes per-head
+    /// K_nope <c>[seqLen, numHeads * qkNope]</c> + per-head V
+    /// <c>[seqLen, numHeads * vHead]</c>. One CUDA block per (token, head).
+    /// </summary>
+    public void LaunchMlaSplitKvB(
+        nint kvBExpanded, nint kNopeDst, nint vDst,
+        int seqLen, int numHeads, int qkNopeHeadDim, int vHeadDim, nint stream)
+    {
+        if (_mlaSplitKvBF32Func == 0)
+            throw new InvalidOperationException(
+                "MLA helper kernels not available. Compile native/kernels/mla_helpers.cu to PTX.");
+
+        nint srcArg = kvBExpanded, kArg = kNopeDst, vArg = vDst;
+        int slArg = seqLen, nhArg = numHeads, nopeArg = qkNopeHeadDim, vhArg = vHeadDim;
+        void** args = stackalloc void*[] {
+            &srcArg, &kArg, &vArg,
+            &slArg, &nhArg, &nopeArg, &vhArg
+        };
+        uint blocks = (uint)(seqLen * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaSplitKvBF32Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place RoPE on the rope sub-dim of Q (per head). Norm-pair convention.
+    /// One CUDA block per (token, head).
+    /// </summary>
+    public void LaunchMlaRopeQpe(
+        nint q, nint cosTab, nint sinTab,
+        int seqLen, int numHeads, int qkNopeHeadDim, int qkRopeHeadDim,
+        int positionOffset, nint stream)
+    {
+        if (_mlaRopeQpeF32Func == 0)
+            throw new InvalidOperationException("MLA helper kernels not available.");
+
+        nint qArg = q, cosArg = cosTab, sinArg = sinTab;
+        int slArg = seqLen, nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, ropeArg = qkRopeHeadDim;
+        int poArg = positionOffset;
+        void** args = stackalloc void*[] {
+            &qArg, &cosArg, &sinArg,
+            &slArg, &nhArg, &nopeArg, &ropeArg, &poArg
+        };
+        uint blocks = (uint)(seqLen * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRopeQpeF32Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place RoPE on the MQA-shared K_pe (one rope vector per token, no head dim).
+    /// One CUDA block per token.
+    /// </summary>
+    public void LaunchMlaRopeKpe(
+        nint kPe, nint cosTab, nint sinTab,
+        int seqLen, int qkRopeHeadDim, int positionOffset, nint stream)
+    {
+        if (_mlaRopeKpeF32Func == 0)
+            throw new InvalidOperationException("MLA helper kernels not available.");
+
+        nint kArg = kPe, cosArg = cosTab, sinArg = sinTab;
+        int slArg = seqLen, ropeArg = qkRopeHeadDim, poArg = positionOffset;
+        void** args = stackalloc void*[] {
+            &kArg, &cosArg, &sinArg,
+            &slArg, &ropeArg, &poArg
+        };
+        uint blocks = (uint)seqLen;
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRopeKpeF32Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// F32 RMSNorm with explicit (numRows, dim) layout. One CUDA block per row.
+    /// Used by MLA's q_a_layernorm and kv_a_layernorm.
+    /// </summary>
+    public void LaunchMlaRmsNormF32(
+        nint input, nint weight, nint output,
+        int numRows, int dim, float epsilon, nint stream)
+    {
+        if (_mlaRmsNormF32Func == 0)
+            throw new InvalidOperationException("MLA helper kernels not available.");
+
+        nint inArg = input, wArg = weight, outArg = output;
+        int dimArg = dim;
+        float epsArg = epsilon;
+        void** args = stackalloc void*[] {
+            &inArg, &wArg, &outArg, &dimArg, &epsArg
+        };
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaRmsNormF32Func,
+                (uint)numRows, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -1611,5 +1737,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
+        _mlaHelpersModule?.Dispose();
     }
 }
