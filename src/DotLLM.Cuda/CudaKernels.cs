@@ -44,6 +44,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _quantizedGemvF32InModule;
     private readonly CudaModule? _quantizedGemvMmqModule;
     private readonly nint _quantizedGemvQ4_KMmqFunc;
+    private readonly nint _quantizedGemvQ5_KMmqFunc;
+    private readonly nint _quantizedGemvQ6_KMmqFunc;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -152,6 +154,8 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _quantizedGemvMmqModule = CudaModule.LoadFromFile(mmqPath);
             _quantizedGemvQ4_KMmqFunc = _quantizedGemvMmqModule.GetFunction("quantized_gemv_q4_k_mmq");
+            _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
+            _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -908,16 +912,38 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
 
+    /// <summary>True when the MMQ-style Q5_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableMmqQ5K;
+
+    /// <summary>True when the MMQ-style Q6_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
+
     /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
 
+    /// <summary>Test/benchmark hook to force the legacy Q5_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ5K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q5K") == "1";
+
+    /// <summary>Test/benchmark hook to force the legacy Q6_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ6K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q6K") == "1";
+
+    /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
+    public bool HasMmq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => HasMmqQ4K,
+        QuantizationType.Q5_K => HasMmqQ5K,
+        QuantizationType.Q6_K => HasMmqQ6K,
+        _ => false,
+    };
+
     /// <summary>
-    /// MMQ-style fused dequant+matmul Q4_K GEMV. Quantizes the input activation
-    /// to INT8 (per-32-element scale) and accumulates the dot product via __dp4a
+    /// MMQ-style fused dequant+matmul GEMV. Quantizes the input activation to
+    /// INT8 (per-32-element scale) and accumulates the dot product via __dp4a
     /// (packed 4×INT8 multiply-add) instead of FP fmuladd. Lossy on the input
-    /// quantization but matches CPU output within Q4_K_M tolerance.
+    /// quantization but matches CPU output within K-quant tolerance.
     /// One CUDA block processes <c>MMQ_ROWS_PER_BLOCK</c> (4) output rows so the
     /// input-quantization pass amortizes across rows.
+    /// Supports Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
     /// </summary>
     public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
                                          nint x, nint y, int n, int k, nint stream)
@@ -929,8 +955,13 @@ public sealed unsafe class CudaKernels : IDisposable
         nint func = qt switch
         {
             QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
-            _ => throw new NotSupportedException($"MMQ GEMV not yet implemented for {qt}.")
+            QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
+            QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
+            _ => 0,
         };
+
+        if (func == 0)
+            throw new NotSupportedException($"MMQ GEMV not available for {qt}.");
 
         nint wArg = quantWeight, xArg = x, yArg = y;
         int nArg = n, kArg = k;

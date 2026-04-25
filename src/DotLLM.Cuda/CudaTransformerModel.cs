@@ -382,7 +382,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedQkv = seqLen == 1 && lw.QkvPacked != 0;
             if (fusedQkv)
             {
-                if (lw.QkvPackedQuantType == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+                if (_kernels.HasMmq(lw.QkvPackedQuantType))
                 {
                     _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
                         _state.NormOutput, _state.QkvPacked,
@@ -507,7 +507,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedGateUp = seqLen == 1 && lw.GateUpPacked != 0;
             if (fusedGateUp)
             {
-                if (lw.GateUpPackedQuantType == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+                if (_kernels.HasMmq(lw.GateUpPackedQuantType))
                 {
                     _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
                         _state.NormOutput, _state.GateUpPacked,
@@ -1043,9 +1043,11 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
         }
-        else if (quantWeight != 0 && qt == QuantizationType.Q4_K && _kernels.HasMmqQ4K)
+        else if (quantWeight != 0 && _kernels.HasMmq(qt))
         {
             // Decode: MMQ-style fused dequant+matmul (dp4a) — faster than the FP fmuladd kernel.
+            // Routes Q4_K, Q5_K, Q6_K through the dp4a path; the rest fall through to the
+            // legacy FP-fmuladd kernel below.
             _kernels.LaunchQuantizedGemvMmq(quantWeight, qt, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt)) // Decode: quantized GEMV
