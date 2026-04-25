@@ -242,6 +242,11 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>Fused residual-add + RMS normalization. Avoids FP16 truncation at residual junction.</summary>
+    /// <remarks>
+    /// Allocates dynamic shared memory: <c>(hiddenSize + 32) * sizeof(float)</c> per block.
+    /// hiddenSize rounded up to even is the FP32 sum cache; the trailing 32 floats are warp-reduce scratch (also stores rms_inv).
+    /// For hidden=576 (SmolLM-135M), this is 2432 bytes — well within the SM86 default 48 KB budget.
+    /// </remarks>
     public void LaunchFusedAddRmsNorm(nint residual, nint x, nint weight, nint output,
                                         int hiddenSize, float eps, int rows, nint stream)
     {
@@ -250,9 +255,11 @@ public sealed unsafe class CudaKernels : IDisposable
         float epsArg = eps;
 
         void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg};
+        // Shared memory: n floats (sum cache, padded to even) + 32 floats (warp scratch)
+        uint sharedBytes = (uint)((((hiddenSize + 1) & ~1) + 32) * sizeof(float));
         CudaDriverApi.cuLaunchKernel(_fusedAddRmsNormFunc,
                 (uint)rows, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Full FP32 RMS normalization: FP32 input, FP32 weight, FP32 output.</summary>
