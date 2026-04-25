@@ -159,6 +159,21 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _mlaRopeKpeF32Func;
     private readonly nint _mlaRmsNormF32Func;
 
+    // ── MoE (Mixture-of-Experts) helper kernels (F32) ──
+    // Routing softmax + top-k selection, output zero-init, weighted/unweighted
+    // axpy accumulators, sigmoid-gate dot product, and per-expert token gather.
+    // All optional — TryGetFunction so a stale PTX without the new symbols still
+    // loads gracefully (HasMoeKernels reports false and the dispatcher skips MoE).
+    private readonly CudaModule? _moeFfnModule;
+    private readonly nint _moeSoftmaxTopkF32Func;
+    private readonly nint _moeRenormTopkF32Func;
+    private readonly nint _moeZeroF32Func;
+    private readonly nint _moeAxpyScaledRowF32Func;
+    private readonly nint _moeAxpyUnweightedF32Func;
+    private readonly nint _moeAxpyScaledPerTokenF32Func;
+    private readonly nint _moeSigmoidLogitF32Func;
+    private readonly nint _moeGatherTokenRowsF32Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -340,6 +355,24 @@ public sealed unsafe class CudaKernels : IDisposable
             _mlaRopeKpeF32Func = _mlaHelpersModule.GetFunction("mla_rope_k_pe_f32");
             _mlaRmsNormF32Func = _mlaHelpersModule.GetFunction("mla_rmsnorm_f32");
         }
+
+        // MoE (Mixture-of-Experts) forward-path helper kernels (F32). Optional —
+        // only required when the model has MoE layers (Mixtral / Qwen-MoE /
+        // DeepSeek-V2/V3). TryGetFunction so a stale PTX without the new
+        // symbols still loads.
+        string moeFfnPath = Path.Combine(ptxDir, "moe_ffn.ptx");
+        if (File.Exists(moeFfnPath))
+        {
+            _moeFfnModule = CudaModule.LoadFromFile(moeFfnPath);
+            _moeSoftmaxTopkF32Func = _moeFfnModule.TryGetFunction("moe_softmax_topk_f32");
+            _moeRenormTopkF32Func = _moeFfnModule.TryGetFunction("moe_renorm_topk_f32");
+            _moeZeroF32Func = _moeFfnModule.TryGetFunction("moe_zero_f32");
+            _moeAxpyScaledRowF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_row_f32");
+            _moeAxpyUnweightedF32Func = _moeFfnModule.TryGetFunction("moe_axpy_unweighted_f32");
+            _moeAxpyScaledPerTokenF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_per_token_f32");
+            _moeSigmoidLogitF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_logit_f32");
+            _moeGatherTokenRowsF32Func = _moeFfnModule.TryGetFunction("moe_gather_token_rows_f32");
+        }
     }
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
@@ -349,6 +382,17 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMlaHelpers =>
         _mlaSplitKvBF32Func != 0 && _mlaRopeQpeF32Func != 0
         && _mlaRopeKpeF32Func != 0 && _mlaRmsNormF32Func != 0;
+
+    /// <summary>
+    /// True when all MoE FFN helper kernels (softmax-topk, renorm, zero, axpy
+    /// variants, sigmoid logit, token gather) are available. Required by
+    /// <see cref="CudaMoeFfn.Forward"/>.
+    /// </summary>
+    public bool HasMoeKernels =>
+        _moeSoftmaxTopkF32Func != 0 && _moeRenormTopkF32Func != 0
+        && _moeZeroF32Func != 0 && _moeAxpyScaledRowF32Func != 0
+        && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
+        && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
 
     /// <summary>
     /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
@@ -1706,6 +1750,177 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    // ── MoE launchers ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Per-token softmax + top-k selection for MoE routing. Reads
+    /// <c>logits[seqLen, numExperts]</c>; writes <c>topkIdx[seqLen, topK]</c>
+    /// (int32) and <c>topkWeight[seqLen, topK]</c> (F32, raw softmax probabilities
+    /// — caller invokes <see cref="LaunchMoeRenormTopk"/> separately when
+    /// <c>norm_topk_prob</c> is true).
+    /// </summary>
+    public void LaunchMoeSoftmaxTopk(
+        nint logits, nint topkIdx, nint topkWeight,
+        int seqLen, int numExperts, int topK, nint stream)
+    {
+        if (_moeSoftmaxTopkF32Func == 0)
+            throw new InvalidOperationException(
+                "MoE kernels not available. Compile native/kernels/moe_ffn.cu to PTX.");
+        if (topK > 64)
+            throw new ArgumentOutOfRangeException(nameof(topK),
+                "topK > 64 is not supported by the GPU MoE kernel (kernel-side fixed-size scratch).");
+
+        nint logitsArg = logits, idxArg = topkIdx, wArg = topkWeight;
+        int slArg = seqLen, neArg = numExperts, kArg = topK;
+        void** args = stackalloc void*[] {
+            &logitsArg, &idxArg, &wArg,
+            &slArg, &neArg, &kArg
+        };
+        // Shared memory: numExperts floats (softmax probs) + 4 floats (warp scratch).
+        uint sharedBytes = (uint)((numExperts + 4) * sizeof(float));
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_moeSoftmaxTopkF32Func,
+                (uint)seqLen, 1, 1, block, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-token in-place renormalisation of top-k weights to sum to 1.0
+    /// (Mixtral / Qwen3-MoE convention; skip for Qwen1.5-MoE).
+    /// </summary>
+    public void LaunchMoeRenormTopk(nint topkWeight, int seqLen, int topK, nint stream)
+    {
+        if (_moeRenormTopkF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint wArg = topkWeight;
+        int slArg = seqLen, kArg = topK;
+        void** args = stackalloc void*[] { &wArg, &slArg, &kArg };
+        const uint block = 32;
+        CudaDriverApi.cuLaunchKernel(_moeRenormTopkF32Func,
+                (uint)seqLen, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Zero a flat F32 device buffer of <paramref name="n"/> elements.</summary>
+    public void LaunchMoeZeroF32(nint buf, int n, nint stream)
+    {
+        if (_moeZeroF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint bArg = buf;
+        int nArg = n;
+        void** args = stackalloc void*[] { &bArg, &nArg };
+        const uint block = 256;
+        uint grid = (uint)Math.Min(MaxDequantGridSize, (n + (int)block - 1) / (int)block);
+        if (grid == 0) grid = 1;
+        CudaDriverApi.cuLaunchKernel(_moeZeroF32Func,
+                grid, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-expert weighted accumulator. For each batch row b at output token
+    /// <c>tokenIndices[b]</c>: <c>output[t,:] += topkWeight[t, slotIndex] * down[b,:]</c>.
+    /// Single block per batch row.
+    /// </summary>
+    public void LaunchMoeAxpyScaledRowF32(
+        nint output, nint down, nint topkWeight, nint tokenIndices,
+        int batchSize, int hidden, int topK, int slotIndex, nint stream)
+    {
+        if (_moeAxpyScaledRowF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint outArg = output, downArg = down, wArg = topkWeight, tiArg = tokenIndices;
+        int bArg = batchSize, hArg = hidden, kArg = topK, sArg = slotIndex;
+        void** args = stackalloc void*[] {
+            &outArg, &downArg, &wArg, &tiArg,
+            &bArg, &hArg, &kArg, &sArg
+        };
+        const uint block = 256;
+        CudaDriverApi.cuLaunchKernel(_moeAxpyScaledRowF32Func,
+                (uint)batchSize, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Unweighted accumulator: <c>output[t,:] += down[t,:]</c> for all tokens.
+    /// Used by the shared-expert path (no per-token gating, e.g. DeepSeek).
+    /// </summary>
+    public void LaunchMoeAxpyUnweightedF32(
+        nint output, nint down, int seqLen, int hidden, nint stream)
+    {
+        if (_moeAxpyUnweightedF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint outArg = output, downArg = down;
+        int slArg = seqLen, hArg = hidden;
+        void** args = stackalloc void*[] { &outArg, &downArg, &slArg, &hArg };
+        const uint block = 256;
+        CudaDriverApi.cuLaunchKernel(_moeAxpyUnweightedF32Func,
+                (uint)seqLen, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-token sigmoid-gated accumulator: <c>output[t,:] += scale[t] * down[t,:]</c>.
+    /// Used by Qwen1.5-MoE shared_expert_gate path.
+    /// </summary>
+    public void LaunchMoeAxpyScaledPerTokenF32(
+        nint output, nint down, nint scale, int seqLen, int hidden, nint stream)
+    {
+        if (_moeAxpyScaledPerTokenF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint outArg = output, downArg = down, scArg = scale;
+        int slArg = seqLen, hArg = hidden;
+        void** args = stackalloc void*[] {
+            &outArg, &downArg, &scArg, &slArg, &hArg
+        };
+        const uint block = 256;
+        CudaDriverApi.cuLaunchKernel(_moeAxpyScaledPerTokenF32Func,
+                (uint)seqLen, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-token sigmoid-gated dot product:
+    /// <c>scaleOut[t] = sigmoid(Σ hidden[t,k] * g[k])</c>. One block per token.
+    /// </summary>
+    public void LaunchMoeSigmoidLogitF32(
+        nint hidden, nint g, nint scaleOut, int seqLen, int hiddenSize, nint stream)
+    {
+        if (_moeSigmoidLogitF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint hArg = hidden, gArg = g, sArg = scaleOut;
+        int slArg = seqLen, hsArg = hiddenSize;
+        void** args = stackalloc void*[] {
+            &hArg, &gArg, &sArg, &slArg, &hsArg
+        };
+        const uint block = 128;
+        // Shared memory: 4 floats for warp-reduce scratch.
+        uint sharedBytes = 4 * sizeof(float);
+        CudaDriverApi.cuLaunchKernel(_moeSigmoidLogitF32Func,
+                (uint)seqLen, 1, 1, block, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gathers <paramref name="batchSize"/> rows from <c>src[seqLen, hidden]</c>
+    /// into <c>dst[batchSize, hidden]</c> indexed by
+    /// <c>tokenIndices[b]</c>. Used to assemble per-expert input batches.
+    /// </summary>
+    public void LaunchMoeGatherTokenRowsF32(
+        nint src, nint dst, nint tokenIndices, int batchSize, int hidden, nint stream)
+    {
+        if (_moeGatherTokenRowsF32Func == 0)
+            throw new InvalidOperationException("MoE kernels not available.");
+        nint srcArg = src, dstArg = dst, tiArg = tokenIndices;
+        int bArg = batchSize, hArg = hidden;
+        void** args = stackalloc void*[] {
+            &srcArg, &dstArg, &tiArg, &bArg, &hArg
+        };
+        const uint block = 256;
+        CudaDriverApi.cuLaunchKernel(_moeGatherTokenRowsF32Func,
+                (uint)batchSize, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -1738,5 +1953,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
         _mlaHelpersModule?.Dispose();
+        _moeFfnModule?.Dispose();
     }
 }
