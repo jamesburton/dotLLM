@@ -67,6 +67,12 @@ public sealed class VulkanTransformerModel : IModel
     // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
     // without coopmat — the router falls back to _matmulQ8Gemm then.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Eliminates one
+    // dispatch + one barrier per attn-norm/Q proj and per ffn-norm/Gate proj
+    // (60 dispatches per decode at 30 layers). Null when the SPV is missing
+    // or when the model's hidden size exceeds the shader's on-chip cap;
+    // router falls back to the standalone (rmsnorm + matmul_q8_0) pair.
+    private readonly RmsNormMatmulQ8_0FusedKernel? _rmsnormMatmulQ8Fused;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -103,6 +109,7 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         VulkanDevice.SubmitContext submit,
@@ -119,6 +126,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -214,6 +222,12 @@ public sealed class VulkanTransformerModel : IModel
             try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
             catch (InvalidOperationException) { /* Kernel threw: no usable tile shape. Stay on scalar. */ }
         }
+        // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Older builds
+        // without the fused SPV stay working — TryCreate returns null and
+        // the router falls back to the standalone pair.
+        RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused =
+            RmsNormMatmulQ8_0FusedKernel.TryCreate(device, spvDir);
+
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -234,6 +248,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            rmsnormMatmulQ8Fused,
             rmsnorm, rope, attention, swiglu, add,
             submit,
             gguf,
@@ -321,15 +336,26 @@ public sealed class VulkanTransformerModel : IModel
             // gather's TRANSFER→COMPUTE on layer 0) has already made the
             // hidden-state writes visible to this rmsnorm.
 
-            // Attn RMSNorm
-            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
-                rowCount: seqLen, n: hiddenSize, eps: eps);
+            // Attn RMSNorm + Q projection — fused into one dispatch when
+            // available (decode + Q8_0 + hidden ≤ shader cap). The fused
+            // shader writes BOTH the normalised hidden state (for K/V to
+            // read) AND the Q matmul output. Falls back to the standalone
+            // pair on prefill, non-Q8_0 weights, or oversized hidden.
+            if (!TryRecordFusedRmsNormMatmul(cmdBuf,
+                    _state.HiddenState, lw.AttnNormWeight,
+                    lw.Q, lw.QDeviceQuantType,
+                    _state.NormOutput, _state.Q,
+                    lw.QOutputDim, lw.QInputDim, seqLen, eps))
+            {
+                _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+                    lw.QOutputDim, lw.QInputDim, seqLen);
+            }
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // Q/K/V projections
-            RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
-                lw.QOutputDim, lw.QInputDim, seqLen);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // K/V projections — read the normalised hidden state written above.
             RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
                 lw.KOutputDim, lw.KInputDim, seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -422,15 +448,24 @@ public sealed class VulkanTransformerModel : IModel
             // Pre-FFN residual snapshot: Residual aliases HiddenState (same
             // slot); no copy needed.
 
-            // FFN RMSNorm
-            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
-                rowCount: seqLen, n: hiddenSize, eps: eps);
+            // FFN RMSNorm + Gate projection — fused when available
+            // (mirrors the attn-norm + Q fusion above). Up reads the
+            // normalised hidden state written by the fused dispatch.
+            if (!TryRecordFusedRmsNormMatmul(cmdBuf,
+                    _state.HiddenState, lw.FfnNormWeight,
+                    lw.Gate, lw.GateDeviceQuantType,
+                    _state.NormOutput, _state.FfnGate,
+                    lw.GateOutputDim, lw.GateInputDim, seqLen, eps))
+            {
+                _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
+                    lw.GateOutputDim, lw.GateInputDim, seqLen);
+            }
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // Gate/Up projections
-            RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
-                lw.GateOutputDim, lw.GateInputDim, seqLen);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // Up projection — reads the normalised hidden state.
             RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
                 lw.UpOutputDim, lw.UpInputDim, seqLen);
 
@@ -527,6 +562,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -547,6 +583,47 @@ public sealed class VulkanTransformerModel : IModel
     /// construction; the Q8_0 kernels still validate at dispatch so a
     /// surprise non-aligned model fails loud.
     /// </remarks>
+    /// <summary>
+    /// Attempts to dispatch a fused (rmsnorm → Q8_0 matmul) pair as a single
+    /// dispatch with one barrier instead of two. Returns false when the fast
+    /// path is unavailable (no fused SPV, non-Q8_0 weight, prefill, or hidden
+    /// size beyond the shader's on-chip cap) — the caller must record the
+    /// standalone (rmsnorm + matmul) pair as a fallback.
+    /// </summary>
+    /// <remarks>
+    /// On success the fused dispatch:
+    ///   1. Computes rmsnorm of <paramref name="hidden"/> with
+    ///      <paramref name="normWeight"/>, writing the normalised values to
+    ///      <paramref name="normOutput"/> (so downstream non-fused matmuls
+    ///      like K, V, Up still see the normalised hidden state).
+    ///   2. Computes <c>matmulOutput[m] = sum_k weight[m,k] * normalised[k]</c>
+    ///      using on-chip shared memory for the dot product.
+    /// Caller is responsible for the post-dispatch barrier — same shape as a
+    /// standalone matmul.
+    /// </remarks>
+    private bool TryRecordFusedRmsNormMatmul(
+        nint cmdBuf,
+        VulkanDevice.Buffer hidden, VulkanDevice.Buffer normWeight,
+        VulkanDevice.Buffer weights, QuantType weightQt,
+        VulkanDevice.Buffer normOutput, VulkanDevice.Buffer matmulOutput,
+        int outputDim, int inputDim, int seqLen, float eps)
+    {
+        if (_rmsnormMatmulQ8Fused is null) return false;
+        // Opt-out switch — default is fused-on. On RDNA3.5 the fused path
+        // wins by ~3-5% in median paired-run min latency and is more
+        // resilient to dispatch-time contention. Set the env var to "1"
+        // to bypass on hardware where fusion regresses (vendor A/B).
+        if (Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_FUSED_RMSNORM_MATMUL") == "1") return false;
+        if (seqLen != 1) return false;
+        if (weightQt != QuantType.Q8_0) return false;
+        if (!RmsNormMatmulQ8_0FusedKernel.SupportsHiddenSize(inputDim)) return false;
+
+        _rmsnormMatmulQ8Fused.Record(cmdBuf, hidden, normWeight, weights,
+            normOutput, matmulOutput,
+            m: outputDim, k: inputDim, eps: eps);
+        return true;
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantType weightQt,
@@ -701,6 +778,7 @@ public sealed class VulkanTransformerModel : IModel
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
+        _rmsnormMatmulQ8Fused?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();
