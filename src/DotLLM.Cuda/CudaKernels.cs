@@ -51,6 +51,18 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
+    // Pre-Q8_1 variants. Read INT8/dx/sx2 from device-resident scratch (populated
+    // once per fused projection group via _quantizeXToQ8_1Func) instead of
+    // re-quantizing the input inside every CUDA block. Eliminates the redundant
+    // Stage 1 work that scales with output dim n (n× for MMVQ-large, n/4× for MMQ-4-rows).
+    private readonly CudaModule? _quantizeXModule;
+    private readonly nint _quantizeXToQ8_1Func;
+    private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
+    private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
+    private readonly nint _quantizedGemvQ6_KMmqPreqFunc;
+    private readonly nint _quantizedGemvQ4_KMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvQ5_KMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -170,6 +182,22 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
             _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
+            // Pre-quantized GEMV variants (consume scratch from quantize_x.ptx kernel).
+            // TryGetFunction so a stale PTX without the new symbols still loads.
+            _quantizedGemvQ4_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_preq");
+            _quantizedGemvQ5_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq_preq");
+            _quantizedGemvQ6_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq_preq");
+            _quantizedGemvQ4_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large_preq");
+            _quantizedGemvQ5_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large_preq");
+            _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
+        }
+
+        // Pre-Q8_1 input quantization kernel (optional — PTX may be missing on stale builds).
+        string quantizeXPath = Path.Combine(ptxDir, "quantize_x.ptx");
+        if (File.Exists(quantizeXPath))
+        {
+            _quantizeXModule = CudaModule.LoadFromFile(quantizeXPath);
+            _quantizeXToQ8_1Func = _quantizeXModule.GetFunction("quantize_x_to_q8_1");
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -965,25 +993,24 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
 
     /// <summary>True when the MMVQ-large Q4_K GEMV kernel (1 row × 128 threads) is loaded
-    /// AND the MMVQ-large dispatch is enabled (default: disabled — see remarks).</summary>
-    /// <remarks>
-    /// The MMVQ-large kernels are functionally correct (covered by
-    /// CudaMmqKernelTests.MmvqLargeQ4K_MatchesLegacy_Qwen3_8B_Shapes) but do not currently
-    /// achieve the perf target from <c>docs/perf/MLPUP_GEMV_GAP.md</c> on RTX 3060 with
-    /// dotLLM's on-the-fly Stage 1 input quantization. The 1-row-per-block × 128-thread
-    /// structure runs Stage 1 once per output row (24576x for Qwen3-8B's MlpUp) instead of
-    /// once per 4-row tile (6144x). Without llama.cpp's pre-Q8_1-quantize-x kernel pattern,
-    /// that 4× redundant Stage 1 work outweighs the dp4a-side win. The kernel is shipped
-    /// behind an opt-in env var so the structural work stays in tree for follow-up
-    /// (Stage 1 amortization via a separate quantize-x launch — see brief §H4).
-    /// </remarks>
-    public bool HasMmvqLargeQ4K => _quantizedGemvQ4_KMmvqLargeFunc != 0 && EnableMmvqLargeQ4K;
+    /// AND not disabled. Default ON — pre-Q8_1 input quantization (<see cref="HasPreQ8_1"/>)
+    /// removes the redundant Stage 1 cost that previously made this kernel regress
+    /// (<c>docs/perf/MLPUP_GEMV_GAP.md</c> §H4). Per-quant-type override:
+    /// <c>DOTLLM_DISABLE_MMVQ_LARGE_Q4K=1</c>.</summary>
+    public bool HasMmvqLargeQ4K => _quantizedGemvQ4_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ4K;
 
-    /// <summary>True when the MMVQ-large Q5_K GEMV kernel is loaded and routing is enabled.</summary>
-    public bool HasMmvqLargeQ5K => _quantizedGemvQ5_KMmvqLargeFunc != 0 && EnableMmvqLargeQ5K;
+    /// <summary>True when the MMVQ-large Q5_K GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeQ5K => _quantizedGemvQ5_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ5K;
 
-    /// <summary>True when the MMVQ-large Q6_K GEMV kernel is loaded and routing is enabled.</summary>
-    public bool HasMmvqLargeQ6K => _quantizedGemvQ6_KMmvqLargeFunc != 0 && EnableMmvqLargeQ6K;
+    /// <summary>True when the MMVQ-large Q6_K GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeQ6K => _quantizedGemvQ6_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ6K;
+
+    /// <summary>True when the pre-Q8_1 input-quantization kernel is loaded and not disabled.
+    /// When this is on (default) and a scratch buffer is provided to the MMQ GEMV launcher,
+    /// Stage 1 runs once via <see cref="LaunchQuantizeXToQ8_1"/> and the GEMV uses the
+    /// <c>_preq</c> kernel variants — eliminating the per-block redundant input quant.
+    /// Override: <c>DOTLLM_DISABLE_PREQ8_1=1</c>.</summary>
+    public bool HasPreQ8_1 => _quantizeXToQ8_1Func != 0 && !DisablePreQ8_1;
 
     /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
@@ -994,24 +1021,23 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Test/benchmark hook to force the legacy Q6_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ6K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q6K") == "1";
 
-    /// <summary>Opt-in routing to the MMVQ-large Q4_K kernel (default: off — see <see cref="HasMmvqLargeQ4K"/> remarks).</summary>
-    /// <remarks>
-    /// To force the MMQ-4-rows path even when the MMVQ-large kernel is enabled (A/B comparison),
-    /// set <c>DOTLLM_DISABLE_MMVQ_LARGE_Q4K=1</c> — that takes precedence over the enable knob.
-    /// </remarks>
-    public static bool EnableMmvqLargeQ4K { get; set; } =
-        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q4K") == "1"
-        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q4K") != "1";
+    /// <summary>Disable MMVQ-large routing (forces MMQ-4-rows for k ≥ <see cref="MmvqLargeKThreshold"/>).</summary>
+    public static bool DisableMmvqLargeQ4K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q4K") == "1";
 
-    /// <summary>Opt-in routing to the MMVQ-large Q5_K kernel (default: off).</summary>
-    public static bool EnableMmvqLargeQ5K { get; set; } =
-        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q5K") == "1"
-        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q5K") != "1";
+    /// <summary>Disable MMVQ-large routing for Q5_K.</summary>
+    public static bool DisableMmvqLargeQ5K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q5K") == "1";
 
-    /// <summary>Opt-in routing to the MMVQ-large Q6_K kernel (default: off).</summary>
-    public static bool EnableMmvqLargeQ6K { get; set; } =
-        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q6K") == "1"
-        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q6K") != "1";
+    /// <summary>Disable MMVQ-large routing for Q6_K.</summary>
+    public static bool DisableMmvqLargeQ6K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q6K") == "1";
+
+    /// <summary>Disable pre-Q8_1 input quantization (falls back to on-the-fly Stage 1 in every GEMV).</summary>
+    /// <remarks>Useful for A/B comparison or when the model's max k makes the pre-quant scratch
+    /// buffer awkward to size. Default off — pre-Q8_1 is the recommended path.</remarks>
+    public static bool DisablePreQ8_1 { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PREQ8_1") == "1";
 
     /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
     public bool HasMmq(QuantizationType qt) => qt switch
@@ -1041,6 +1067,41 @@ public sealed unsafe class CudaKernels : IDisposable
     public const int MmvqLargeKThreshold = 1024;
 
     /// <summary>
+    /// Pre-Q8_1 input quantization. Quantizes <paramref name="x"/>[k] to INT8 with one FP16 scale
+    /// per 32-element chunk and per-half-chunk FP16 sums. Output layout (single contiguous buffer):
+    /// <code>int8_t xq[k] | half dx[k/32] | half sx2[k/16]</code>
+    /// Use <see cref="CudaForwardState.PreQ8_1ScratchBytes"/> to size the scratch.
+    /// Consumed by the <c>_preq</c> MMQ kernel variants (see the MMQ GEMV launcher overload
+    /// taking a <c>preqScratch</c> pointer).
+    /// </summary>
+    public void LaunchQuantizeXToQ8_1(nint x, nint scratch, int k, nint stream)
+    {
+        if (_quantizeXToQ8_1Func == 0)
+            throw new InvalidOperationException(
+                "Pre-Q8_1 quantization kernel not available. Compile native/kernels/quantize_x.cu to PTX.");
+        if ((k & 31) != 0)
+            throw new ArgumentException($"k must be a multiple of 32 (got {k}).", nameof(k));
+
+        int numChunks = k >> 5;
+        // xq starts at offset 0; dx at offset k; sx2 at offset k + 2*numChunks.
+        nint xqPtr  = scratch;
+        nint dxPtr  = scratch + k;
+        nint sx2Ptr = scratch + k + (nint)(numChunks * 2);
+
+        nint xArg = x, xqArg = xqPtr, dxArg = dxPtr, sx2Arg = sx2Ptr;
+        int kArg = k;
+        void** args = stackalloc void*[] { &xArg, &xqArg, &dxArg, &sx2Arg, &kArg };
+
+        // Must mirror QX_THREADS_X / QX_WARPS_PER_BLOCK in quantize_x.cu (32 × 8 = 256).
+        const uint QxThreadsX = 32;
+        const uint QxWarpsPerBlock = 8;
+        uint gridDim = (uint)((numChunks + (int)QxWarpsPerBlock - 1) / (int)QxWarpsPerBlock);
+        CudaDriverApi.cuLaunchKernel(_quantizeXToQ8_1Func,
+                gridDim, 1, 1, QxThreadsX, QxWarpsPerBlock, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
     /// MMQ-style fused dequant+matmul GEMV. Quantizes the input activation to
     /// INT8 (per-32-element scale) and accumulates the dot product via __dp4a
     /// (packed 4×INT8 multiply-add) instead of FP fmuladd. Lossy on the input
@@ -1054,62 +1115,132 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
     /// </list>
     /// Supports Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
+    /// On-the-fly Stage 1 input quantization. Use the overload taking a <c>preqScratch</c>
+    /// pointer for the pre-Q8_1 path (eliminates per-block redundant Stage 1).
     /// </summary>
     public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
                                          nint x, nint y, int n, int k, nint stream)
+        => LaunchQuantizedGemvMmq(quantWeight, qt, x, y, n, k, preqScratch: 0, stream);
+
+    /// <summary>
+    /// MMQ-style fused dequant+matmul GEMV with optional pre-Q8_1 scratch. When
+    /// <paramref name="preqScratch"/> is non-zero, <see cref="HasPreQ8_1"/> is true, and the
+    /// <c>_preq</c> variant is loaded for the chosen quant type, the GEMV reads INT8/dx/sx2
+    /// from the device-resident scratch (populated upstream by <see cref="LaunchQuantizeXToQ8_1"/>)
+    /// and skips Stage 1 entirely. Otherwise falls back to the on-the-fly Stage 1 kernel.
+    /// </summary>
+    public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
+                                         nint x, nint y, int n, int k, nint preqScratch, nint stream)
     {
         if (_quantizedGemvMmqModule == null)
             throw new InvalidOperationException(
                 "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
+
+        bool usePreq = preqScratch != 0 && HasPreQ8_1;
 
         // Prefer MMVQ-large for k ≥ threshold when the variant is loaded and not disabled.
         // The DOTLLM_DISABLE_MMVQ_LARGE_<QT> env vars (separate from DOTLLM_DISABLE_MMQ_<QT>)
         // force the MMQ-4-rows path for A/B comparison without bypassing dp4a entirely.
         if (k >= MmvqLargeKThreshold && HasMmvqLarge(qt))
         {
-            nint largeFunc = qt switch
-            {
-                QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
-                QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
-                QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
-                _ => 0,
-            };
+            nint largeFunc = usePreq
+                ? qt switch
+                {
+                    QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargePreqFunc,
+                    QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargePreqFunc,
+                    QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargePreqFunc,
+                    _ => 0,
+                }
+                : qt switch
+                {
+                    QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
+                    QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
+                    QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
+                    _ => 0,
+                };
             if (largeFunc != 0)
             {
-                nint wL = quantWeight, xL = x, yL = y;
-                int nL = n, kL = k;
-                void** argsL = stackalloc void*[] { &wL, &xL, &yL, &nL, &kL };
                 // Must mirror MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu.
                 const uint MmvqLargeThreads = 128;
-                CudaDriverApi.cuLaunchKernel(largeFunc,
-                        (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
-                        0, stream, (nint)argsL, 0).ThrowOnError();
+                if (usePreq)
+                {
+                    int numChunks = k >> 5;
+                    nint xqPtr  = preqScratch;
+                    nint dxPtr  = preqScratch + k;
+                    nint sx2Ptr = preqScratch + k + (nint)(numChunks * 2);
+                    nint wL = quantWeight, xqL = xqPtr, dxL = dxPtr, sx2L = sx2Ptr, yL = y;
+                    int nL = n, kL = k;
+                    void** argsL = stackalloc void*[] { &wL, &xqL, &dxL, &sx2L, &yL, &nL, &kL };
+                    CudaDriverApi.cuLaunchKernel(largeFunc,
+                            (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
+                            0, stream, (nint)argsL, 0).ThrowOnError();
+                }
+                else
+                {
+                    nint wL = quantWeight, xL = x, yL = y;
+                    int nL = n, kL = k;
+                    void** argsL = stackalloc void*[] { &wL, &xL, &yL, &nL, &kL };
+                    CudaDriverApi.cuLaunchKernel(largeFunc,
+                            (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
+                            0, stream, (nint)argsL, 0).ThrowOnError();
+                }
                 return;
             }
         }
 
-        nint func = qt switch
-        {
-            QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
-            QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
-            QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
-            _ => 0,
-        };
+        nint func = usePreq
+            ? qt switch
+            {
+                QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc,
+                QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc,
+                QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc,
+                _ => 0,
+            }
+            : qt switch
+            {
+                QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
+                QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
+                QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
+                _ => 0,
+            };
 
         if (func == 0)
+        {
+            // Fallback: requested preq variant missing (stale PTX) — try the on-the-fly path.
+            if (usePreq)
+            {
+                LaunchQuantizedGemvMmq(quantWeight, qt, x, y, n, k, 0, stream);
+                return;
+            }
             throw new NotSupportedException($"MMQ GEMV not available for {qt}.");
-
-        nint wArg = quantWeight, xArg = x, yArg = y;
-        int nArg = n, kArg = k;
-        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+        }
 
         // Must mirror MMQ_ROWS_PER_BLOCK in quantized_gemv_mmq.cu.
         const int MmqRowsPerBlock = 4;
         uint gridDim = (uint)((n + MmqRowsPerBlock - 1) / MmqRowsPerBlock);
 
-        CudaDriverApi.cuLaunchKernel(func,
-                gridDim, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+        if (usePreq)
+        {
+            int numChunks = k >> 5;
+            nint xqPtr  = preqScratch;
+            nint dxPtr  = preqScratch + k;
+            nint sx2Ptr = preqScratch + k + (nint)(numChunks * 2);
+            nint wArg = quantWeight, xqArg = xqPtr, dxArg = dxPtr, sx2Arg = sx2Ptr, yArg = y;
+            int nArg = n, kArg = k;
+            void** args = stackalloc void*[] { &wArg, &xqArg, &dxArg, &sx2Arg, &yArg, &nArg, &kArg };
+            CudaDriverApi.cuLaunchKernel(func,
+                    gridDim, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
+        else
+        {
+            nint wArg = quantWeight, xArg = x, yArg = y;
+            int nArg = n, kArg = k;
+            void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+            CudaDriverApi.cuLaunchKernel(func,
+                    gridDim, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
     }
 
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>

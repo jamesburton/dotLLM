@@ -54,6 +54,15 @@ internal sealed class CudaForwardState : IDisposable
     // Reused across all cuBLAS calls — safe because all ops are on the same stream.
     public nint DequantScratch;
 
+    // Pre-Q8_1 input quantization scratch (single buffer per forward state, sized
+    // for the largest GEMV input vector across all call sites in the model).
+    // Layout: int8_t xq[K] | half dx[K/32] | half sx2[K/16]. Consumed by the MMQ
+    // `_preq` GEMV kernel variants which skip Stage 1. Populated once per fused
+    // projection group via LaunchQuantizeXToQ8_1, then reused across all rows
+    // (eliminates the redundant Stage 1 work the on-the-fly kernels run per block).
+    public nint PreQ8_1Scratch;
+    public int  PreQ8_1ScratchK;        // capacity in elements (must be a multiple of 32)
+
     // Small device buffers for H2D copy of token IDs and positions
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
@@ -85,6 +94,14 @@ internal sealed class CudaForwardState : IDisposable
         long gateUpPackedFp16Bytes = (long)(2 * intermediateSize) * sizeof(ushort);
         QkvPacked = AllocDevice(qkvPackedFp16Bytes);
         GateUpPacked = AllocDevice(gateUpPackedFp16Bytes);
+
+        // Pre-Q8_1 scratch: sized for the largest GEMV input vector.
+        // Inputs are: hidden (Q/K/V/Gate/Up/LmHead read NormOutput), intermediate (Down reads SiluOutput),
+        // num_q*head_dim (O reads AttnOutput). Take the max and round up to a 32-element multiple.
+        int preQ8K = Math.Max(hiddenSize, Math.Max(intermediateSize, numHeads * headDim));
+        preQ8K = ((preQ8K + 31) / 32) * 32;
+        PreQ8_1ScratchK = preQ8K;
+        PreQ8_1Scratch = AllocDevice(PreQ8_1ScratchBytes(preQ8K));
 
         // Initial allocation for decode (seqLen=1)
         EnsureCapacity(1);
@@ -167,6 +184,20 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref DequantScratch);
         FreeIfNonZero(ref QkvPacked);
         FreeIfNonZero(ref GateUpPacked);
+        FreeIfNonZero(ref PreQ8_1Scratch);
+        PreQ8_1ScratchK = 0;
         _currentSeqLen = 0;
+    }
+
+    /// <summary>
+    /// Total bytes required for the pre-Q8_1 scratch buffer holding a vector of <paramref name="k"/> elements.
+    /// Layout: int8_t xq[k] | half dx[k/32] | half sx2[k/16].
+    /// </summary>
+    /// <remarks>k must be a multiple of 32 (pre-quant kernel chunks 32 elements at a time).</remarks>
+    public static long PreQ8_1ScratchBytes(int k)
+    {
+        // xq: k bytes, dx: (k/32) halves = k/16 bytes, sx2: (k/16) halves = k/8 bytes.
+        // Total: k + k/16 + k/8 = k * (1 + 0.0625 + 0.125) = k * 1.1875.
+        return (long)k + ((long)k / 16) + ((long)k / 8);
     }
 }

@@ -384,9 +384,10 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 if (_kernels.HasMmq(lw.QkvPackedQuantType))
                 {
+                    nint scratch = MaybePreQuantize(_state.NormOutput, lw.QInputDim, s);
                     _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
                         _state.NormOutput, _state.QkvPacked,
-                        lw.QkvPackedOutputDim, lw.QInputDim, s);
+                        lw.QkvPackedOutputDim, lw.QInputDim, scratch, s);
                 }
                 else
                 {
@@ -509,9 +510,10 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 if (_kernels.HasMmq(lw.GateUpPackedQuantType))
                 {
+                    nint scratch = MaybePreQuantize(_state.NormOutput, lw.GateInputDim, s);
                     _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
                         _state.NormOutput, _state.GateUpPacked,
-                        lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                        lw.GateUpPackedOutputDim, lw.GateInputDim, scratch, s);
                 }
                 else
                 {
@@ -1022,6 +1024,33 @@ public sealed unsafe class CudaTransformerModel : IModel
     }
 
     /// <summary>
+    /// Pre-quantizes the input vector to INT8 (Q8_1) into <see cref="CudaForwardState.PreQ8_1Scratch"/>
+    /// when the pre-Q8_1 kernel is available, the scratch is large enough, inputDim is a
+    /// 32-element multiple, AND inputDim ≥ <see cref="CudaKernels.MmvqLargeKThreshold"/>. Returns
+    /// the scratch pointer for the GEMV launcher to consume, or 0 when the on-the-fly Stage 1
+    /// path should be used.
+    /// <para>
+    /// The k threshold is the same one that gates MMVQ-large dispatch: below 1024 elements the
+    /// MMQ-4-rows path's in-kernel Stage 1 already amortizes across 4 rows, so the extra
+    /// pre-quant launch overhead (~22 µs on WDDM eager) outweighs the saving and SmolLM-class
+    /// models regress slightly. At k≥1024 MMVQ-large runs Stage 1 once per output row (n× across
+    /// the GEMV) — pre-quantization eliminates that and unlocks the structural win on
+    /// Qwen3-class models.
+    /// </para>
+    /// </summary>
+    private nint MaybePreQuantize(nint input, int inputDim, nint stream)
+    {
+        if (!_kernels.HasPreQ8_1) return 0;
+        if (_state.PreQ8_1Scratch == 0) return 0;
+        if (inputDim > _state.PreQ8_1ScratchK) return 0;
+        if ((inputDim & 31) != 0) return 0;
+        if (inputDim < CudaKernels.MmvqLargeKThreshold) return 0;
+
+        _kernels.LaunchQuantizeXToQ8_1(input, _state.PreQ8_1Scratch, inputDim, stream);
+        return _state.PreQ8_1Scratch;
+    }
+
+    /// <summary>
     /// Dispatches projection as cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV (decode).
     /// For quantized weights with no persistent FP16 copy (<paramref name="fp16Weight"/> == 0),
     /// dequantizes on-the-fly into <see cref="CudaForwardState.DequantScratch"/> before calling cuBLAS.
@@ -1047,8 +1076,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             // Decode: MMQ-style fused dequant+matmul (dp4a) — faster than the FP fmuladd kernel.
             // Routes Q4_K, Q5_K, Q6_K through the dp4a path; the rest fall through to the
-            // legacy FP-fmuladd kernel below.
-            _kernels.LaunchQuantizedGemvMmq(quantWeight, qt, input, output, outputDim, inputDim, s);
+            // legacy FP-fmuladd kernel below. Use the pre-Q8_1 scratch when available and
+            // when inputDim fits — eliminates per-block redundant Stage 1 work
+            // (especially material for the MMVQ-large variant).
+            nint scratch = MaybePreQuantize(input, inputDim, s);
+            _kernels.LaunchQuantizedGemvMmq(quantWeight, qt, input, output, outputDim, inputDim, scratch, s);
         }
         else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt)) // Decode: quantized GEMV
         {
