@@ -1,0 +1,95 @@
+#version 450
+// MLA RoPE — rotates the decoupled-rope sub-dim of Q (the q_pe tail of each
+// head) and the MQA-shared K_pe (one rope-K per token, broadcast across
+// heads). Mirrors the post-projection RoPE step in
+// DotLLM.Cpu.Kernels.MlaAttention.Execute (DeepSeek-V2/V3 convention,
+// Norm/interleaved pairing).
+//
+// Layout differences from rope_f32.comp:
+//   - Q is [seqLen, numHeads, qkNope + qkRope] — only the qkRope tail of
+//     each head is rotated; the qkNope prefix is untouched.
+//   - K_pe is [seqLen, qkRope] — a single rope-K per token, no head dim.
+//     Stored in its own buffer (not interleaved with K_nope).
+//
+// Pair convention: Norm/interleaved — (2i, 2i+1) within the q_pe slice.
+// DeepSeek-V2/V3 use this; the parameter is fixed (no NeoX path) for
+// simplicity.
+//
+// Frequency: identical to rope_f32.comp — freq[i] = 1 / theta^(2i/qkRope),
+// no YaRN frequency rescaling at this kernel level (host-side scale
+// folded into the attention kernel's softmax-scale push constant).
+//
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = ceil(max(totalQpairs, totalKpePairs) / 256)
+//     where totalQpairs    = seqLen * numHeads * (qkRope / 2)
+//           totalKpePairs  = seqLen * (qkRope / 2)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufQ   { float q[]; };       // [seqLen, numHeads * (qkNope + qkRope)]
+layout(set = 0, binding = 1, std430)          buffer BufKPe { float kPe[]; };     // [seqLen, qkRope]
+layout(set = 0, binding = 2, std430) readonly buffer BufPos { int positions[]; }; // [seqLen]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqLen;
+    uint  numHeads;
+    uint  qkNopeHeadDim;
+    uint  qkRopeHeadDim;
+    float theta;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint halfRope = pc.qkRopeHeadDim >> 1u;
+    if (halfRope == 0u) return;
+
+    uint qkHeadDim    = pc.qkNopeHeadDim + pc.qkRopeHeadDim;
+    uint totalQPairs  = pc.seqLen * pc.numHeads * halfRope;
+    uint totalKPePairs = pc.seqLen * halfRope;
+
+    // --- Q_pe pair (within the qkRope tail of each head) ---
+    if (idx < totalQPairs) {
+        uint pair = idx % halfRope;
+        uint rem  = idx / halfRope;
+        uint head = rem % pc.numHeads;
+        uint t    = rem / pc.numHeads;
+
+        float expn  = float(2u * pair) / float(pc.qkRopeHeadDim);
+        float freq  = 1.0 / pow(pc.theta, expn);
+        float angle = float(positions[t]) * freq;
+        float c     = cos(angle);
+        float s     = sin(angle);
+
+        uint headBase = t * pc.numHeads * qkHeadDim + head * qkHeadDim + pc.qkNopeHeadDim;
+        uint i0 = headBase + 2u * pair;
+        uint i1 = headBase + 2u * pair + 1u;
+
+        float v0 = q[i0];
+        float v1 = q[i1];
+        q[i0] = v0 * c - v1 * s;
+        q[i1] = v0 * s + v1 * c;
+    }
+
+    // --- K_pe pair (shared across heads — one rotation per token) ---
+    if (idx < totalKPePairs) {
+        uint pair = idx % halfRope;
+        uint t    = idx / halfRope;
+
+        float expn  = float(2u * pair) / float(pc.qkRopeHeadDim);
+        float freq  = 1.0 / pow(pc.theta, expn);
+        float angle = float(positions[t]) * freq;
+        float c     = cos(angle);
+        float s     = sin(angle);
+
+        uint baseIdx = t * pc.qkRopeHeadDim;
+        uint i0 = baseIdx + 2u * pair;
+        uint i1 = baseIdx + 2u * pair + 1u;
+
+        float v0 = kPe[i0];
+        float v1 = kPe[i1];
+        kPe[i0] = v0 * c - v1 * s;
+        kPe[i1] = v0 * s + v1 * c;
+    }
+}
