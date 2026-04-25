@@ -1,0 +1,209 @@
+#version 450
+// Multi-head Latent Attention (MLA) — DeepSeek-V2/V3 attention kernel.
+//
+// Mirrors DotLLM.Cpu.Kernels.MlaAttention.Execute for the post-projection
+// attention loop. The kernel takes already-projected Q (with concatenated
+// q_nope + q_pe per head), per-head K_nope, per-head V, and the MQA-shared
+// K_pe (one per token, broadcast across heads). RoPE is assumed already
+// applied to q_pe and k_pe by the caller.
+//
+//   Q[t, h] = concat(Q_nope[t, h], Q_pe[t, h])   total dim = qk_head_dim
+//   K[s, h] = concat(K_nope[s, h], K_pe[s])      K_pe shared across heads
+//   V[s, h] (width v_head_dim — may differ from qk_head_dim)
+//   score[t, s] = (Q_nope[t,h] · K_nope[s,h] + Q_pe[t,h] · K_pe[s]) * scale
+//   out[t, h]  = sum_s softmax(score[t,:])[s] · V[s, h]
+//
+// One workgroup per (tq, hq) pair — same layout as attention_f32.comp.
+// Online softmax (flash-attention style) keeps memory O(v_head_dim).
+//
+// Differences from attention_f32.comp:
+//   - No GQA (MLA is head-parallel; numHeads = numKvHeads). The hkv lookup
+//     drops out — every head reads its own K_nope / V slice and the shared
+//     K_pe slice.
+//   - Score has two contributions (Q_nope·K_nope + Q_pe·K_pe). K_pe is
+//     loaded once per KV row from a separate buffer, broadcast across heads.
+//   - Output uses v_head_dim, NOT qk_head_dim.
+//
+// Dispatch:
+//   local_size_x  = 256
+//   groupCount.x  = seq_q * num_heads
+// Shared memory: qNope + qPe + outAccum + scoreTile + reduceScratch.
+
+#define TILE_KV         256
+#define MAX_QK_HEAD_DIM 256          // qk_nope + qk_rope, e.g. V2-Lite 128+64
+#define MAX_V_HEAD_DIM  256
+#define WG_SIZE         256
+#define NEG_INF         (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ      { float q[];      }; // [seqQ,  numHeads * (qkNope + qkRope)]
+layout(set = 0, binding = 1, std430) readonly  buffer BufKNope  { float kNope[];  }; // [seqKv, numHeads * qkNope]
+layout(set = 0, binding = 2, std430) readonly  buffer BufV      { float v[];      }; // [seqKv, numHeads * vHead]
+layout(set = 0, binding = 3, std430) readonly  buffer BufKPe    { float kPe[];    }; // [seqKv, qkRope]   (shared across heads)
+layout(set = 0, binding = 4, std430) writeonly buffer BufOut    { float outp[];   }; // [seqQ,  numHeads * vHead]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqQ;
+    uint  seqKv;
+    uint  numHeads;
+    uint  qkNopeHeadDim;
+    uint  qkRopeHeadDim;
+    uint  vHeadDim;
+    uint  positionOffset;
+    float scale;             // already includes attnScaleMultiplier (e.g. YaRN mscale²)
+} pc;
+
+shared float qNopeShared[MAX_QK_HEAD_DIM];
+shared float qPeShared[MAX_QK_HEAD_DIM];   // sized to MAX (rope ≤ qk total) — wastes <1KB
+shared float outAccum[MAX_V_HEAD_DIM];
+shared float scoreTile[TILE_KV];
+shared float reduceScratch[WG_SIZE];
+
+float workgroupMax(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    reduceScratch[tid] = val;
+    barrier();
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduceScratch[tid] = max(reduceScratch[tid], reduceScratch[tid + stride]);
+        }
+        barrier();
+    }
+    float m = reduceScratch[0];
+    barrier();
+    return m;
+}
+
+float workgroupSum(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    reduceScratch[tid] = val;
+    barrier();
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduceScratch[tid] += reduceScratch[tid + stride];
+        }
+        barrier();
+    }
+    float s = reduceScratch[0];
+    barrier();
+    return s;
+}
+
+void main() {
+    uint blockId = gl_WorkGroupID.x;
+    uint total = pc.seqQ * pc.numHeads;
+    if (blockId >= total) return;
+
+    uint tq = blockId / pc.numHeads;
+    uint hq = blockId - tq * pc.numHeads;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = WG_SIZE;
+
+    uint qkHeadDim   = pc.qkNopeHeadDim + pc.qkRopeHeadDim;
+    uint qStride     = pc.numHeads * qkHeadDim;
+    uint kNopeStride = pc.numHeads * pc.qkNopeHeadDim;
+    uint vStride     = pc.numHeads * pc.vHeadDim;
+
+    uint posQ = pc.positionOffset + tq;
+
+    // 1. Load Q (split into nope and pe shared scratches) and zero out accumulator.
+    uint qBase = tq * qStride + hq * qkHeadDim;
+    for (uint d = tid; d < pc.qkNopeHeadDim; d += threads) {
+        qNopeShared[d] = q[qBase + d];
+    }
+    for (uint d = tid; d < pc.qkRopeHeadDim; d += threads) {
+        qPeShared[d] = q[qBase + pc.qkNopeHeadDim + d];
+    }
+    for (uint d = tid; d < pc.vHeadDim; d += threads) {
+        outAccum[d] = 0.0;
+    }
+    barrier();
+
+    float runningMax = NEG_INF;
+    float runningSum = 0.0;
+
+    for (uint tStart = 0u; tStart < pc.seqKv; tStart += uint(TILE_KV)) {
+        uint tEnd = tStart + uint(TILE_KV);
+        if (tEnd > pc.seqKv) tEnd = pc.seqKv;
+        uint tileLen = tEnd - tStart;
+
+        // 2. Compute raw scores: Q_nope · K_nope[h] + Q_pe · K_pe (shared).
+        for (uint t = tid; t < tileLen; t += threads) {
+            uint tkv = tStart + t;
+            if (tkv > posQ) {
+                scoreTile[t] = NEG_INF;
+                continue;
+            }
+            uint kNopeBase = tkv * kNopeStride + hq * pc.qkNopeHeadDim;
+            uint kPeBase   = tkv * pc.qkRopeHeadDim;
+            float s = 0.0;
+            for (uint d = 0u; d < pc.qkNopeHeadDim; d++) {
+                s += qNopeShared[d] * kNope[kNopeBase + d];
+            }
+            for (uint d = 0u; d < pc.qkRopeHeadDim; d++) {
+                s += qPeShared[d] * kPe[kPeBase + d];
+            }
+            scoreTile[t] = s * pc.scale;
+        }
+        barrier();
+
+        // 3. Tile-max reduction.
+        float localMax = NEG_INF;
+        for (uint t = tid; t < tileLen; t += threads) {
+            localMax = max(localMax, scoreTile[t]);
+        }
+        float tileMax = workgroupMax(localMax);
+
+        // 4. Online-softmax rescale of running state.
+        float newMax = max(runningMax, tileMax);
+        float correction;
+        if (runningMax > NEG_INF * 0.5) {
+            correction = exp(runningMax - newMax);
+        } else {
+            correction = 0.0;
+        }
+        runningSum *= correction;
+        for (uint d = tid; d < pc.vHeadDim; d += threads) {
+            outAccum[d] *= correction;
+        }
+        runningMax = newMax;
+        barrier();
+
+        // 5. Convert raw scores to exp(score - newMax); accumulate tile sum.
+        float localSum = 0.0;
+        for (uint t = tid; t < tileLen; t += threads) {
+            float s = scoreTile[t];
+            float w = (s > NEG_INF * 0.5) ? exp(s - runningMax) : 0.0;
+            scoreTile[t] = w;
+            localSum += w;
+        }
+        float tileSum = workgroupSum(localSum);
+        runningSum += tileSum;
+        barrier();
+
+        // 6. Accumulate weighted V over the tile. Each thread owns a subset of
+        //    v_head_dim output lanes and loops across tile's KV rows.
+        for (uint d = tid; d < pc.vHeadDim; d += threads) {
+            float vAcc = 0.0;
+            for (uint t = 0u; t < tileLen; t++) {
+                float w = scoreTile[t];
+                if (w > 0.0) {
+                    uint vBase = (tStart + t) * vStride + hq * pc.vHeadDim;
+                    vAcc += w * v[vBase + d];
+                }
+            }
+            outAccum[d] += vAcc;
+        }
+        barrier();
+    }
+
+    // 7. Normalise and write out — output uses v_head_dim per head.
+    float invSum = (runningSum > 1e-10) ? (1.0 / runningSum) : 0.0;
+    uint outStride = pc.numHeads * pc.vHeadDim;
+    uint outBase = tq * outStride + hq * pc.vHeadDim;
+    for (uint d = tid; d < pc.vHeadDim; d += threads) {
+        outp[outBase + d] = outAccum[d] * invSum;
+    }
+}
