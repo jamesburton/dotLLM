@@ -95,6 +95,162 @@ public class CudaMmqKernelTests
             (rng, span) => SynthesiseQ6KBlock(rng, span), requireMmvqLarge: true);
     }
 
+    // ── Pre-Q8_1 equivalence tests ──────────────────────────────────────────
+    // Verify that pre-quantizing the input via quantize_x_to_q8_1 + the `_preq`
+    // GEMV variants matches the on-the-fly kernel within the same K-quant noise
+    // budget. The pre-quant kernel produces bit-identical scratch to the in-kernel
+    // Stage 1 (same rounding, clamp, and per-half-chunk sum reduction) so the
+    // GEMV outputs should agree to within FP16 add-order noise.
+
+    [SkippableTheory]
+    [InlineData(64, 1024)]    // small-k path (MMQ-4-rows preq)
+    [InlineData(4096, 4096)]  // large-k path (MMVQ-large preq)
+    [InlineData(24576, 4096)] // Qwen3-8B fused gate+up shape
+    public void PreqQ4K_MatchesOnTheFly(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunPreqEquivalence(QuantizationType.Q4_K, n, k, blockBytes: 144,
+            (rng, span) => SynthesiseQ4KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 1024)]
+    [InlineData(4096, 4096)]
+    [InlineData(24576, 4096)]
+    public void PreqQ5K_MatchesOnTheFly(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunPreqEquivalence(QuantizationType.Q5_K, n, k, blockBytes: 176,
+            (rng, span) => SynthesiseQ5KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(64, 1024)]
+    [InlineData(4096, 4096)]
+    [InlineData(24576, 4096)]
+    public void PreqQ6K_MatchesOnTheFly(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunPreqEquivalence(QuantizationType.Q6_K, n, k, blockBytes: 210,
+            (rng, span) => SynthesiseQ6KBlock(rng, span));
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunPreqEquivalence(QuantizationType qt, int n, int k, int blockBytes,
+                                            Action<Random, Span<byte>> synthesiseBlock)
+    {
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasMmq(qt), $"MMQ kernel for {qt} not loaded (PTX may be stale)");
+        Skip.IfNot(kernels.HasPreQ8_1, "Pre-Q8_1 quantize_x kernel not loaded (PTX may be stale)");
+
+        // Force MMVQ-large ON for the large-k cases so we exercise both `_preq` variants.
+        bool prevDisableQ4K = CudaKernels.DisableMmvqLargeQ4K;
+        bool prevDisableQ5K = CudaKernels.DisableMmvqLargeQ5K;
+        bool prevDisableQ6K = CudaKernels.DisableMmvqLargeQ6K;
+        bool prevDisablePreq = CudaKernels.DisablePreQ8_1;
+        CudaKernels.DisableMmvqLargeQ4K = false;
+        CudaKernels.DisableMmvqLargeQ5K = false;
+        CudaKernels.DisableMmvqLargeQ6K = false;
+        CudaKernels.DisablePreQ8_1 = false;
+
+        var rng = new Random(5678 ^ (int)qt ^ n ^ k);
+        int superblocksPerRow = k / 256;
+        int rowBytes = superblocksPerRow * blockBytes;
+        long weightBytes = (long)n * rowBytes;
+
+        byte[] hostWeight = new byte[weightBytes];
+        var weightSpan = hostWeight.AsSpan();
+        for (int row = 0; row < n; row++)
+        for (int sb = 0; sb < superblocksPerRow; sb++)
+            synthesiseBlock(rng, weightSpan.Slice(row * rowBytes + sb * blockBytes, blockBytes));
+
+        Half[] hostX = new Half[k];
+        for (int i = 0; i < k; i++)
+        {
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = 1.0 - rng.NextDouble();
+            double g = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            hostX[i] = (Half)(g * 0.4);
+        }
+
+        long xBytes = (long)k * sizeof(ushort);
+        long yBytes = (long)n * sizeof(ushort);
+        long scratchBytes = CudaForwardState.PreQ8_1ScratchBytes(k);
+
+        nint devW = 0, devX = 0, devYOnTheFly = 0, devYPreq = 0, devScratch = 0;
+        Half[] yOnTheFly = new Half[n];
+        Half[] yPreq = new Half[n];
+
+        try
+        {
+            CudaDriverApi.cuMemAlloc_v2(out devW, (nuint)weightBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devX, (nuint)xBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devYOnTheFly, (nuint)yBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devYPreq, (nuint)yBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devScratch, (nuint)scratchBytes).ThrowOnError();
+
+            fixed (byte* pW = hostWeight)
+                CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)pW, (nuint)weightBytes).ThrowOnError();
+            fixed (Half* pX = hostX)
+                CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)pX, (nuint)xBytes).ThrowOnError();
+
+            // Path A: on-the-fly Stage 1 (no scratch passed → original kernel variant).
+            kernels.LaunchQuantizedGemvMmq(devW, qt, devX, devYOnTheFly, n, k, preqScratch: 0, stream.Handle);
+            // Path B: pre-Q8_1 + `_preq` kernel variant.
+            kernels.LaunchQuantizeXToQ8_1(devX, devScratch, k, stream.Handle);
+            kernels.LaunchQuantizedGemvMmq(devW, qt, devX, devYPreq, n, k, devScratch, stream.Handle);
+            stream.Synchronize();
+
+            fixed (Half* pY = yOnTheFly)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)pY, devYOnTheFly, (nuint)yBytes).ThrowOnError();
+            fixed (Half* pY = yPreq)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)pY, devYPreq, (nuint)yBytes).ThrowOnError();
+        }
+        finally
+        {
+            if (devW != 0) CudaDriverApi.cuMemFree_v2(devW);
+            if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
+            if (devYOnTheFly != 0) CudaDriverApi.cuMemFree_v2(devYOnTheFly);
+            if (devYPreq != 0) CudaDriverApi.cuMemFree_v2(devYPreq);
+            if (devScratch != 0) CudaDriverApi.cuMemFree_v2(devScratch);
+            CudaKernels.DisableMmvqLargeQ4K = prevDisableQ4K;
+            CudaKernels.DisableMmvqLargeQ5K = prevDisableQ5K;
+            CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
+            CudaKernels.DisablePreQ8_1 = prevDisablePreq;
+        }
+
+        // Pre-quant produces bit-identical INT8/dx/sx2 to the in-kernel Stage 1
+        // (same rounding, clamp, half-warp sum). The only divergence is the
+        // chunk-sum recombination for Q4_K/Q5_K (sx2[lo]+sx2[hi] vs full-warp sum):
+        // an FP16 add-order difference of < 1 ULP per chunk. End-to-end we expect
+        // peak-relative drift well under 1%.
+        float maxAbs = 0f, refMax = 0f;
+        double sumAbs = 0.0;
+        for (int i = 0; i < n; i++)
+        {
+            float a = (float)yOnTheFly[i];
+            float b = (float)yPreq[i];
+            float diff = MathF.Abs(a - b);
+            sumAbs += diff;
+            if (diff > maxAbs) maxAbs = diff;
+            if (MathF.Abs(a) > refMax) refMax = MathF.Abs(a);
+        }
+        float meanAbs = (float)(sumAbs / n);
+        float peakRelMax = refMax > 0 ? maxAbs / refMax : 0f;
+        float peakRelMean = refMax > 0 ? meanAbs / refMax : 0f;
+
+        _out.WriteLine($"PREQ {qt} n={n} k={k}: ref|max|={refMax:F3}  |preq-onTheFly| max={maxAbs:F4} mean={meanAbs:F4} peak-rel max={peakRelMax:P3} mean={peakRelMean:P3}");
+
+        // 1% peak-relative tolerance — much tighter than the 3% cross-kernel test
+        // because Stage 1 itself is bit-identical; only post-Stage-1 FP16 add-order
+        // and the lazy sx_lo+sx_hi recombination differ.
+        Assert.True(peakRelMax < 0.01f, $"Peak-relative max diff {peakRelMax:P3} exceeds 1% (max={maxAbs}, refMax={refMax})");
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunMmqEquivalence(QuantizationType qt, int n, int k, int blockBytes,
                                            Action<Random, Span<byte>> synthesiseBlock,
@@ -107,17 +263,18 @@ public class CudaMmqKernelTests
         using var kernels = new CudaKernels(ptxDir!);
         Skip.IfNot(kernels.HasMmq(qt), $"MMQ kernel for {qt} not loaded (PTX may be stale)");
 
-        // MMVQ-large is opt-in via env var (default off due to perf regression on RTX 3060
-        // — see HasMmvqLargeQ4K remarks). Tests that exercise the new kernel toggle the
-        // enable knob in-process. Must be reset in `finally` to avoid state leak.
-        bool prevEnableQ4K = CudaKernels.EnableMmvqLargeQ4K;
-        bool prevEnableQ5K = CudaKernels.EnableMmvqLargeQ5K;
-        bool prevEnableQ6K = CudaKernels.EnableMmvqLargeQ6K;
+        // MMVQ-large is now ON by default (pre-Q8_1 lands the win that was missing before).
+        // Per-quant-type Disable knobs let us force the MMQ-4-rows path for A/B comparison.
+        // We snapshot + restore the disable knobs to avoid leaking test state across cases.
+        bool prevDisableQ4K = CudaKernels.DisableMmvqLargeQ4K;
+        bool prevDisableQ5K = CudaKernels.DisableMmvqLargeQ5K;
+        bool prevDisableQ6K = CudaKernels.DisableMmvqLargeQ6K;
         if (requireMmvqLarge)
         {
-            CudaKernels.EnableMmvqLargeQ4K = qt == QuantizationType.Q4_K;
-            CudaKernels.EnableMmvqLargeQ5K = qt == QuantizationType.Q5_K;
-            CudaKernels.EnableMmvqLargeQ6K = qt == QuantizationType.Q6_K;
+            // Make sure no prior test left the kernel disabled.
+            CudaKernels.DisableMmvqLargeQ4K = false;
+            CudaKernels.DisableMmvqLargeQ5K = false;
+            CudaKernels.DisableMmvqLargeQ6K = false;
             Skip.IfNot(kernels.HasMmvqLarge(qt), $"MMVQ-large kernel for {qt} not loaded (PTX may be stale)");
         }
 
@@ -177,10 +334,10 @@ public class CudaMmqKernelTests
             if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
             if (devYLegacy != 0) CudaDriverApi.cuMemFree_v2(devYLegacy);
             if (devYMmq != 0) CudaDriverApi.cuMemFree_v2(devYMmq);
-            // Restore prior MMVQ-large enable knobs (see top of method).
-            CudaKernels.EnableMmvqLargeQ4K = prevEnableQ4K;
-            CudaKernels.EnableMmvqLargeQ5K = prevEnableQ5K;
-            CudaKernels.EnableMmvqLargeQ6K = prevEnableQ6K;
+            // Restore prior MMVQ-large disable knobs (see top of method).
+            CudaKernels.DisableMmvqLargeQ4K = prevDisableQ4K;
+            CudaKernels.DisableMmvqLargeQ5K = prevDisableQ5K;
+            CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
         }
 
         // Compare against the **peak magnitude** of the legacy output rather than
