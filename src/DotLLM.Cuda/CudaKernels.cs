@@ -46,6 +46,11 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmqFunc;
     private readonly nint _quantizedGemvQ5_KMmqFunc;
     private readonly nint _quantizedGemvQ6_KMmqFunc;
+    // MMVQ-large variants — 1 row per CUDA block, 128 threads (4 warps).
+    // Tuned for k≥1024 (≥4 super-blocks/row); fall back to MMQ-4-rows for smaller k.
+    private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
+    private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
+    private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -159,6 +164,12 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ4_KMmqFunc = _quantizedGemvMmqModule.GetFunction("quantized_gemv_q4_k_mmq");
             _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
             _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
+            // MMVQ-large variants (k≥1024). TryGetFunction so a stale PTX without the
+            // new kernels still loads — HasMmvqLarge* will report false and the dispatcher
+            // will fall back to the MMQ-4-rows path.
+            _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
+            _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
+            _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -953,6 +964,27 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>True when the MMQ-style Q6_K GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
 
+    /// <summary>True when the MMVQ-large Q4_K GEMV kernel (1 row × 128 threads) is loaded
+    /// AND the MMVQ-large dispatch is enabled (default: disabled — see remarks).</summary>
+    /// <remarks>
+    /// The MMVQ-large kernels are functionally correct (covered by
+    /// CudaMmqKernelTests.MmvqLargeQ4K_MatchesLegacy_Qwen3_8B_Shapes) but do not currently
+    /// achieve the perf target from <c>docs/perf/MLPUP_GEMV_GAP.md</c> on RTX 3060 with
+    /// dotLLM's on-the-fly Stage 1 input quantization. The 1-row-per-block × 128-thread
+    /// structure runs Stage 1 once per output row (24576x for Qwen3-8B's MlpUp) instead of
+    /// once per 4-row tile (6144x). Without llama.cpp's pre-Q8_1-quantize-x kernel pattern,
+    /// that 4× redundant Stage 1 work outweighs the dp4a-side win. The kernel is shipped
+    /// behind an opt-in env var so the structural work stays in tree for follow-up
+    /// (Stage 1 amortization via a separate quantize-x launch — see brief §H4).
+    /// </remarks>
+    public bool HasMmvqLargeQ4K => _quantizedGemvQ4_KMmvqLargeFunc != 0 && EnableMmvqLargeQ4K;
+
+    /// <summary>True when the MMVQ-large Q5_K GEMV kernel is loaded and routing is enabled.</summary>
+    public bool HasMmvqLargeQ5K => _quantizedGemvQ5_KMmvqLargeFunc != 0 && EnableMmvqLargeQ5K;
+
+    /// <summary>True when the MMVQ-large Q6_K GEMV kernel is loaded and routing is enabled.</summary>
+    public bool HasMmvqLargeQ6K => _quantizedGemvQ6_KMmvqLargeFunc != 0 && EnableMmvqLargeQ6K;
+
     /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
 
@@ -961,6 +993,25 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>Test/benchmark hook to force the legacy Q6_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ6K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q6K") == "1";
+
+    /// <summary>Opt-in routing to the MMVQ-large Q4_K kernel (default: off — see <see cref="HasMmvqLargeQ4K"/> remarks).</summary>
+    /// <remarks>
+    /// To force the MMQ-4-rows path even when the MMVQ-large kernel is enabled (A/B comparison),
+    /// set <c>DOTLLM_DISABLE_MMVQ_LARGE_Q4K=1</c> — that takes precedence over the enable knob.
+    /// </remarks>
+    public static bool EnableMmvqLargeQ4K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q4K") == "1"
+        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q4K") != "1";
+
+    /// <summary>Opt-in routing to the MMVQ-large Q5_K kernel (default: off).</summary>
+    public static bool EnableMmvqLargeQ5K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q5K") == "1"
+        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q5K") != "1";
+
+    /// <summary>Opt-in routing to the MMVQ-large Q6_K kernel (default: off).</summary>
+    public static bool EnableMmvqLargeQ6K { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_MMVQ_LARGE_Q6K") == "1"
+        && Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q6K") != "1";
 
     /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
     public bool HasMmq(QuantizationType qt) => qt switch
@@ -971,13 +1022,37 @@ public sealed unsafe class CudaKernels : IDisposable
         _ => false,
     };
 
+    /// <summary>True when the MMVQ-large variant is available for the given quantization type.</summary>
+    public bool HasMmvqLarge(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => HasMmvqLargeQ4K,
+        QuantizationType.Q5_K => HasMmvqLargeQ5K,
+        QuantizationType.Q6_K => HasMmvqLargeQ6K,
+        _ => false,
+    };
+
+    /// <summary>k threshold (inclusive) below which the MMQ-4-rows kernel is preferred over MMVQ-large.</summary>
+    /// <remarks>
+    /// At k&lt;1024 (≤3 super-blocks per row) the input-quantization amortization across 4 rows
+    /// outweighs the per-row warp parallelism of the MMVQ-large kernel. At k≥1024 the per-row
+    /// work saturates 128 threads and the row-coherent register accumulator wins.
+    /// SmolLM-135M (k=576) stays on MMQ-4-rows; Qwen3-8B (k=4096) gets MMVQ-large.
+    /// </remarks>
+    public const int MmvqLargeKThreshold = 1024;
+
     /// <summary>
     /// MMQ-style fused dequant+matmul GEMV. Quantizes the input activation to
     /// INT8 (per-32-element scale) and accumulates the dot product via __dp4a
     /// (packed 4×INT8 multiply-add) instead of FP fmuladd. Lossy on the input
     /// quantization but matches CPU output within K-quant tolerance.
-    /// One CUDA block processes <c>MMQ_ROWS_PER_BLOCK</c> (4) output rows so the
-    /// input-quantization pass amortizes across rows.
+    /// Routes between two kernel variants based on k:
+    /// <list type="bullet">
+    /// <item>k ≥ <see cref="MmvqLargeKThreshold"/> (1024): MMVQ-large kernel — 1 row per CUDA block,
+    /// 128 threads (4 warps), no cross-row shmem accumulator. Modeled on llama.cpp's
+    /// <c>mul_mat_vec_q&lt;Q4_K, 1&gt;</c>. Optimal for Qwen3-8B-class shapes (k=4096).</item>
+    /// <item>k &lt; 1024: MMQ-4-rows kernel — 4 rows per block, 256 threads, cross-row reduction.
+    /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
+    /// </list>
     /// Supports Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
     /// </summary>
     public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
@@ -986,6 +1061,32 @@ public sealed unsafe class CudaKernels : IDisposable
         if (_quantizedGemvMmqModule == null)
             throw new InvalidOperationException(
                 "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
+
+        // Prefer MMVQ-large for k ≥ threshold when the variant is loaded and not disabled.
+        // The DOTLLM_DISABLE_MMVQ_LARGE_<QT> env vars (separate from DOTLLM_DISABLE_MMQ_<QT>)
+        // force the MMQ-4-rows path for A/B comparison without bypassing dp4a entirely.
+        if (k >= MmvqLargeKThreshold && HasMmvqLarge(qt))
+        {
+            nint largeFunc = qt switch
+            {
+                QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
+                QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
+                QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
+                _ => 0,
+            };
+            if (largeFunc != 0)
+            {
+                nint wL = quantWeight, xL = x, yL = y;
+                int nL = n, kL = k;
+                void** argsL = stackalloc void*[] { &wL, &xL, &yL, &nL, &kL };
+                // Must mirror MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu.
+                const uint MmvqLargeThreads = 128;
+                CudaDriverApi.cuLaunchKernel(largeFunc,
+                        (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
+                        0, stream, (nint)argsL, 0).ThrowOnError();
+                return;
+            }
+        }
 
         nint func = qt switch
         {

@@ -31,7 +31,9 @@
   <PropertyGroup>
     <CudaKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'kernels'))</CudaKernelDir>
     <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'ptx'))</PtxOutputDir>
-    <CudaArch>compute_61</CudaArch>
+    <!-- compute_75 = Turing, the CUDA 13 floor (CUDA 13 dropped Pascal/Volta sm_61/7.0).
+         PTX is forward-compatible so this runs on Turing/Ampere/Ada/Hopper/Blackwell. -->
+    <CudaArch>compute_75</CudaArch>
   </PropertyGroup>
 
   <!-- All .cu kernel files, default to precise math -->
