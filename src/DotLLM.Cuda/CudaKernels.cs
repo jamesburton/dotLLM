@@ -159,6 +159,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _mlaRopeKpeF32Func;
     private readonly nint _mlaRmsNormF32Func;
 
+    // ── MLA Phase B (latent KV cache + W_UK absorbed attention) ──────────
+    // Optional — PTX may not be present on stale builds. Phase B's compact
+    // cache is 8-16× smaller than Phase A's expanded form (V2-Lite: 7.22×).
+    // The attention kernel reads c_kv directly and outputs into the latent
+    // dim; the W_UV expansion happens in a follow-on helper.
+    private readonly CudaModule? _attentionMlaLatentModule;
+    private readonly nint _attentionMlaLatentF32Func;
+    private readonly nint _mlaQAbsorbUkF32Func;
+    private readonly nint _mlaVExpandUvF32Func;
+
     // ── MoE (Mixture-of-Experts) helper kernels (F32) ──
     // Routing softmax + top-k selection, output zero-init, weighted/unweighted
     // axpy accumulators, sigmoid-gate dot product, and per-expert token gather.
@@ -356,6 +366,19 @@ public sealed unsafe class CudaKernels : IDisposable
             _mlaRmsNormF32Func = _mlaHelpersModule.GetFunction("mla_rmsnorm_f32");
         }
 
+        // MLA Phase B: absorbed-attention kernel + Q absorption + V expansion
+        // helpers. Optional — PTX file may not be present on stale builds, in
+        // which case HasMlaPhaseB returns false and callers can fall back to
+        // Phase A.
+        string attentionMlaLatentPath = Path.Combine(ptxDir, "attention_mla_latent.ptx");
+        if (File.Exists(attentionMlaLatentPath))
+        {
+            _attentionMlaLatentModule = CudaModule.LoadFromFile(attentionMlaLatentPath);
+            _attentionMlaLatentF32Func = _attentionMlaLatentModule.GetFunction("attention_mla_latent_f32");
+            _mlaQAbsorbUkF32Func = _attentionMlaLatentModule.GetFunction("mla_q_absorb_uk_f32");
+            _mlaVExpandUvF32Func = _attentionMlaLatentModule.GetFunction("mla_v_expand_uv_f32");
+        }
+
         // MoE (Mixture-of-Experts) forward-path helper kernels (F32). Optional —
         // only required when the model has MoE layers (Mixtral / Qwen-MoE /
         // DeepSeek-V2/V3). TryGetFunction so a stale PTX without the new
@@ -382,6 +405,11 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMlaHelpers =>
         _mlaSplitKvBF32Func != 0 && _mlaRopeQpeF32Func != 0
         && _mlaRopeKpeF32Func != 0 && _mlaRmsNormF32Func != 0;
+
+    /// <summary>True when the MLA Phase B (absorbed attention + helpers) PTX is available.</summary>
+    public bool HasMlaPhaseB =>
+        _attentionMlaLatentF32Func != 0
+        && _mlaQAbsorbUkF32Func != 0 && _mlaVExpandUvF32Func != 0;
 
     /// <summary>
     /// True when all MoE FFN helper kernels (softmax-topk, renorm, zero, axpy
@@ -1921,6 +1949,128 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    #region MLA Phase B launchers
+
+    /// <summary>
+    /// MLA Phase B absorbed attention — F32. One CUDA block per (query_token, head).
+    /// Reads the compact latent KV cache (<paramref name="cKv"/>, <paramref name="kPe"/>)
+    /// and writes the per-head latent V output (<paramref name="cVOut"/>) of shape
+    /// <c>[seqQ, numHeads, kvLoraRank]</c>. Caller is responsible for the W_UK
+    /// absorption that produces <paramref name="qAbsorbed"/> and the W_UV
+    /// expansion that turns <paramref name="cVOut"/> into the post-attention
+    /// per-head output (use <see cref="LaunchMlaQAbsorbUk"/> /
+    /// <see cref="LaunchMlaVExpandUv"/> respectively, or cuBLAS GEMM).
+    /// </summary>
+    /// <param name="qAbsorbed">F32 [seqQ, numHeads, kvLoraRank].</param>
+    /// <param name="qPe">F32 [seqQ, numHeads, qkRopeHeadDim] (RoPE-applied Q rope sub-dim).</param>
+    /// <param name="cKv">F32 [seqKv, kvLoraRank] (shared latent cache).</param>
+    /// <param name="kPe">F32 [seqKv, qkRopeHeadDim] (shared rope-K cache, RoPE-applied).</param>
+    /// <param name="cVOut">F32 [seqQ, numHeads, kvLoraRank] (latent attention output).</param>
+    /// <param name="seqQ">Number of query tokens this call produces output for.</param>
+    /// <param name="seqKv">Total cached length the queries attend over (= cachedLength + seqQ in autoregression).</param>
+    /// <param name="numHeads">Number of attention heads.</param>
+    /// <param name="kvLoraRank">Latent KV rank (the compressed dim).</param>
+    /// <param name="qkRopeHeadDim">Per-token rope-K dim (must be even).</param>
+    /// <param name="positionOffset">Absolute position of query token 0 (causal mask base).</param>
+    /// <param name="softmaxScale">Combined softmax scale: <c>(1 / sqrt(qk_head_dim)) * yarn_mscale²</c>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchAttentionMlaLatent(
+        nint qAbsorbed, nint qPe, nint cKv, nint kPe, nint cVOut,
+        int seqQ, int seqKv,
+        int numHeads, int kvLoraRank, int qkRopeHeadDim,
+        int positionOffset, float softmaxScale, nint stream)
+    {
+        if (_attentionMlaLatentF32Func == 0)
+            throw new InvalidOperationException(
+                "MLA Phase B kernel not available. Compile native/kernels/attention_mla_latent.cu to PTX.");
+
+        nint qaArg = qAbsorbed, qpeArg = qPe, ckvArg = cKv, kpeArg = kPe, outArg = cVOut;
+        int sqArg = seqQ, skvArg = seqKv;
+        int nhArg = numHeads, klArg = kvLoraRank, ropeArg = qkRopeHeadDim;
+        int poArg = positionOffset;
+        float scaleArg = softmaxScale;
+
+        void** args = stackalloc void*[] {
+            &qaArg, &qpeArg, &ckvArg, &kpeArg, &outArg,
+            &sqArg, &skvArg,
+            &nhArg, &klArg, &ropeArg,
+            &poArg, &scaleArg
+        };
+
+        int numBlocks = seqQ * numHeads;
+        // Shared memory layout: q_abs[kvLora] + q_pe[qkRope] + score_tile[128]
+        //                       + out_accum[kvLora] + warp_scratch[32]
+        const int TileKv = 128;
+        uint sharedBytes = (uint)((kvLoraRank + qkRopeHeadDim + TileKv + kvLoraRank + 32) * sizeof(float));
+        // Block size 128 (matches __launch_bounds__ in attention_mla_latent.cu).
+        const uint MlaBlockSize = 128;
+
+        CudaDriverApi.cuLaunchKernel(_attentionMlaLatentF32Func,
+                (uint)numBlocks, 1, 1, MlaBlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Q absorption: <c>Q_absorbed[h, t] = W_UK[h]^T @ Q_nope[h, t]</c> per
+    /// (token, head). One block per (t, h); each block emits the kvLoraRank-wide
+    /// absorbed Q vector. Reads <c>kv_b_proj</c> directly (W_UK lives at the
+    /// per-head row offset <c>h * (qkNope + vHead)</c>; W_UV is offset by
+    /// <c>+ qkNope</c> in the same packed layout). No separate W_UK upload.
+    /// </summary>
+    public void LaunchMlaQAbsorbUk(
+        nint q, nint kvBProj, nint qAbsorbed,
+        int seqQ, int numHeads,
+        int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim, int kvLoraRank,
+        nint stream)
+    {
+        if (_mlaQAbsorbUkF32Func == 0)
+            throw new InvalidOperationException("MLA Phase B helpers not available.");
+
+        nint qArg = q, wArg = kvBProj, outArg = qAbsorbed;
+        int sqArg = seqQ, nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, ropeArg = qkRopeHeadDim, vhArg = vHeadDim, klArg = kvLoraRank;
+        void** args = stackalloc void*[] {
+            &qArg, &wArg, &outArg,
+            &sqArg, &nhArg, &nopeArg, &ropeArg, &vhArg, &klArg
+        };
+        uint blocks = (uint)(seqQ * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaQAbsorbUkF32Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// V expansion: <c>out[h, t] = W_UV[h] @ c_v_out[h, t]</c> per (token, head).
+    /// One block per (t, h); each block emits the vHeadDim-wide expanded output.
+    /// Reads <c>kv_b_proj</c> directly (W_UV lives at row offset
+    /// <c>h * (qkNope + vHead) + qkNope</c>).
+    /// </summary>
+    public void LaunchMlaVExpandUv(
+        nint cVOut, nint kvBProj, nint attnOut,
+        int seqQ, int numHeads,
+        int qkNopeHeadDim, int vHeadDim, int kvLoraRank,
+        nint stream)
+    {
+        if (_mlaVExpandUvF32Func == 0)
+            throw new InvalidOperationException("MLA Phase B helpers not available.");
+
+        nint inArg = cVOut, wArg = kvBProj, outArg = attnOut;
+        int sqArg = seqQ, nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, vhArg = vHeadDim, klArg = kvLoraRank;
+        void** args = stackalloc void*[] {
+            &inArg, &wArg, &outArg,
+            &sqArg, &nhArg, &nopeArg, &vhArg, &klArg
+        };
+        uint blocks = (uint)(seqQ * numHeads);
+        const uint block = 128;
+        CudaDriverApi.cuLaunchKernel(_mlaVExpandUvF32Func,
+                blocks, 1, 1, block, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    #endregion
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -1954,5 +2104,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _attentionMlaModule?.Dispose();
         _mlaHelpersModule?.Dispose();
         _moeFfnModule?.Dispose();
+        _attentionMlaLatentModule?.Dispose();
     }
 }
