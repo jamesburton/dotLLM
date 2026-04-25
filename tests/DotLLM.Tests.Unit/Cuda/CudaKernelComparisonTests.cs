@@ -137,6 +137,178 @@ public class CudaKernelComparisonTests : IDisposable
         }
     }
 
+    // ─────────────────── RmsNorm FP16 ───────────────────
+
+    [SkippableFact]
+    public unsafe void RmsNormF16_MatchesCpuReference()
+    {
+        SkipIfUnavailable();
+
+        int n = HiddenSize; // 576 — even
+        var rng = new Random(43);
+        float[] input  = RandomF32(rng, n);
+        float[] weight = RandomF32(rng, n, scale: 1.0f);
+
+        float[] cpuResult = new float[n];
+        RmsNorm.Execute(input, weight, RmsEps, cpuResult);
+
+        float[] gpuResult = RunGpuRmsNormF16(input, weight, n, rows: 1);
+
+        // FP16 round-trip introduces ~5e-4 error; same scale as other FP16 tests.
+        CompareResults("RmsNormF16", cpuResult, gpuResult, tolerance: 0.005f);
+    }
+
+    [SkippableFact]
+    public unsafe void RmsNormF16_OddHidden_MatchesCpuReference()
+    {
+        SkipIfUnavailable();
+
+        int n = 577; // odd — exercises tail-element path
+        var rng = new Random(44);
+        float[] input  = RandomF32(rng, n);
+        float[] weight = RandomF32(rng, n, scale: 1.0f);
+
+        float[] cpuResult = new float[n];
+        RmsNorm.Execute(input, weight, RmsEps, cpuResult);
+
+        float[] gpuResult = RunGpuRmsNormF16(input, weight, n, rows: 1);
+
+        CompareResults("RmsNormF16(odd)", cpuResult, gpuResult, tolerance: 0.005f);
+    }
+
+    [SkippableFact]
+    public unsafe void FusedAddRmsNormF16_MatchesCpuReference()
+    {
+        SkipIfUnavailable();
+
+        int n = HiddenSize; // 576
+        var rng = new Random(45);
+        float[] residual = RandomF32(rng, n);
+        float[] x        = RandomF32(rng, n);
+        float[] weight   = RandomF32(rng, n, scale: 1.0f);
+
+        // CPU reference: sum then RmsNorm
+        float[] sum = new float[n];
+        for (int i = 0; i < n; i++) sum[i] = residual[i] + x[i];
+        float[] cpuOut = new float[n];
+        RmsNorm.Execute(sum, weight, RmsEps, cpuOut);
+
+        // GPU
+        float[] gpuOut = new float[n];
+        float[] gpuResidualOut = new float[n];
+        RunGpuFusedAddRmsNormF16(residual, x, weight, n, gpuOut, gpuResidualOut);
+
+        CompareResults("FusedAddRmsNormF16-output", cpuOut, gpuOut, tolerance: 0.005f);
+        // Residual should be the FP16-quantized sum.
+        CompareResults("FusedAddRmsNormF16-residual", sum, gpuResidualOut, tolerance: 0.005f);
+    }
+
+    [SkippableFact]
+    public unsafe void FusedAddRmsNormF16_AliasOutputAndX_MatchesCpuReference()
+    {
+        // In-product call path uses output=x (same buffer) — verify aliasing safety.
+        SkipIfUnavailable();
+
+        int n = HiddenSize;
+        var rng = new Random(46);
+        float[] residual = RandomF32(rng, n);
+        float[] x        = RandomF32(rng, n);
+        float[] weight   = RandomF32(rng, n, scale: 1.0f);
+
+        float[] sum = new float[n];
+        for (int i = 0; i < n; i++) sum[i] = residual[i] + x[i];
+        float[] cpuOut = new float[n];
+        RmsNorm.Execute(sum, weight, RmsEps, cpuOut);
+
+        float[] gpuOut = new float[n];
+        float[] gpuResidualOut = new float[n];
+        RunGpuFusedAddRmsNormF16(residual, x, weight, n, gpuOut, gpuResidualOut, aliasOutputWithX: true);
+
+        CompareResults("FusedAddRmsNormF16-aliased-output", cpuOut, gpuOut, tolerance: 0.005f);
+    }
+
+    private unsafe float[] RunGpuRmsNormF16(float[] input, float[] weight, int n, int rows)
+    {
+        nint s = _stream!.Handle;
+        // Convert to FP16
+        Half[] inputF16  = new Half[input.Length];
+        Half[] weightF16 = new Half[weight.Length];
+        for (int i = 0; i < input.Length;  i++) inputF16[i]  = (Half)input[i];
+        for (int i = 0; i < weight.Length; i++) weightF16[i] = (Half)weight[i];
+
+        long inputBytes  = (long)input.Length * sizeof(ushort);
+        long weightBytes = (long)weight.Length * sizeof(ushort);
+        long outputBytes = inputBytes;
+
+        CudaDriverApi.cuMemAlloc_v2(out nint devInput, (nuint)inputBytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devWeight, (nuint)weightBytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devOutput, (nuint)outputBytes).ThrowOnError();
+
+        try
+        {
+            fixed (Half* pIn = inputF16) CudaDriverApi.cuMemcpyHtoD_v2(devInput, (nint)pIn, (nuint)inputBytes).ThrowOnError();
+            fixed (Half* pW = weightF16) CudaDriverApi.cuMemcpyHtoD_v2(devWeight, (nint)pW, (nuint)weightBytes).ThrowOnError();
+
+            _kernels!.LaunchRmsNorm(devInput, devWeight, devOutput, n, RmsEps, rows, s);
+            _stream!.Synchronize();
+
+            Half[] resultF16 = new Half[input.Length];
+            fixed (Half* pOut = resultF16) CudaDriverApi.cuMemcpyDtoH_v2((nint)pOut, devOutput, (nuint)outputBytes).ThrowOnError();
+            float[] result = new float[input.Length];
+            for (int i = 0; i < result.Length; i++) result[i] = (float)resultF16[i];
+            return result;
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devInput);
+            CudaDriverApi.cuMemFree_v2(devWeight);
+            CudaDriverApi.cuMemFree_v2(devOutput);
+        }
+    }
+
+    private unsafe void RunGpuFusedAddRmsNormF16(float[] residual, float[] x, float[] weight, int n,
+                                                 float[] outResult, float[] outResidual,
+                                                 bool aliasOutputWithX = false)
+    {
+        nint s = _stream!.Handle;
+        Half[] resF16 = new Half[n];
+        Half[] xF16   = new Half[n];
+        Half[] wF16   = new Half[n];
+        for (int i = 0; i < n; i++) { resF16[i] = (Half)residual[i]; xF16[i] = (Half)x[i]; wF16[i] = (Half)weight[i]; }
+
+        long bytes = (long)n * sizeof(ushort);
+        CudaDriverApi.cuMemAlloc_v2(out nint devRes, (nuint)bytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devX,   (nuint)bytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW,   (nuint)bytes).ThrowOnError();
+        nint devOut = 0;
+        try
+        {
+            if (!aliasOutputWithX)
+                CudaDriverApi.cuMemAlloc_v2(out devOut, (nuint)bytes).ThrowOnError();
+
+            fixed (Half* p = resF16) CudaDriverApi.cuMemcpyHtoD_v2(devRes, (nint)p, (nuint)bytes).ThrowOnError();
+            fixed (Half* p = xF16)   CudaDriverApi.cuMemcpyHtoD_v2(devX,   (nint)p, (nuint)bytes).ThrowOnError();
+            fixed (Half* p = wF16)   CudaDriverApi.cuMemcpyHtoD_v2(devW,   (nint)p, (nuint)bytes).ThrowOnError();
+
+            nint outPtr = aliasOutputWithX ? devX : devOut;
+            _kernels!.LaunchFusedAddRmsNorm(devRes, devX, devW, outPtr, n, RmsEps, rows: 1, s);
+            _stream!.Synchronize();
+
+            Half[] outF16 = new Half[n];
+            Half[] resOutF16 = new Half[n];
+            fixed (Half* p = outF16)    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, outPtr, (nuint)bytes).ThrowOnError();
+            fixed (Half* p = resOutF16) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devRes,  (nuint)bytes).ThrowOnError();
+            for (int i = 0; i < n; i++) { outResult[i] = (float)outF16[i]; outResidual[i] = (float)resOutF16[i]; }
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devRes);
+            CudaDriverApi.cuMemFree_v2(devX);
+            CudaDriverApi.cuMemFree_v2(devW);
+            if (devOut != 0) CudaDriverApi.cuMemFree_v2(devOut);
+        }
+    }
+
     // ─────────────────── RoPE ───────────────────
 
     [SkippableFact]
