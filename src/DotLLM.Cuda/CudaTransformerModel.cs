@@ -6,6 +6,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 
 namespace DotLLM.Cuda;
 
@@ -22,7 +23,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly CudaCublasHandle _cublas;
     private readonly CudaContext _context;
     private readonly CudaKernels _kernels;
-    private readonly GgufFile _gguf;
+    private readonly GgufFile? _gguf;
     private readonly int _deviceId;
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
@@ -85,7 +86,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaTransformerModel(
         ModelConfig config, CudaWeights weights, CudaForwardState state,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context,
-        CudaKernels kernels, GgufFile gguf, int deviceId,
+        CudaKernels kernels, GgufFile? gguf, int deviceId,
         float ropeTheta, int ropeDim, int ropeType, string? vramWarning)
     {
         Config = config;
@@ -163,6 +164,51 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         return new CudaTransformerModel(config, weights, state, stream, cublas, context,
             kernels, gguf, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
+    }
+
+    /// <summary>
+    /// Loads a transformer model onto the GPU from an opened HuggingFace-convention
+    /// safetensors file. Mirrors <see cref="LoadFromGguf"/> for the safetensors path
+    /// — used by the CUDA HF-parity / MLA forward parity tests.
+    /// </summary>
+    /// <param name="file">Opened safetensors source; caller retains ownership.</param>
+    /// <param name="config">Model configuration parsed from <c>config.json</c>.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null auto-detects.</param>
+    public static CudaTransformerModel LoadFromSafetensors(SafetensorsFile file,
+                                                              ModelConfig config,
+                                                              int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        // Safetensors path produces a TransformerWeights that owns bf16→F32 upcast
+        // allocations; do NOT call RepackWeights (R4 interleaving is a CPU-SIMD
+        // concern, not a GPU one) — CudaWeights.LoadFromGguf reads the raw tensor
+        // pointers and uploads them.
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+
+        var context = CudaContext.Create(deviceId);
+        var stream = CudaStream.Create();
+        var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        var kernels = new CudaKernels(ptxDir);
+
+        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
+
+        var state = new CudaForwardState(
+            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+            config.HeadDim, config.IntermediateSize, config.VocabSize);
+
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        int ropeType = (int)(config.RoPEConfig?.Type ?? RoPEType.Norm);
+
+        return new CudaTransformerModel(config, weights, state, stream, cublas, context,
+            kernels, gguf: null, deviceId, ropeTheta, ropeDim, ropeType, vramWarning: null);
     }
 
     /// <inheritdoc/>
@@ -363,11 +409,13 @@ public sealed unsafe class CudaTransformerModel : IModel
                 MarkProfile(ProfileCategory.Attention);
                 MarkProfile(ProfileCategory.OProj);
 
-                // Residual + FfnNorm. MLA's FfnNormWeight comes from CudaMlaLayerWeights
-                // (uploaded by CudaMlaWeightsLoader.LoadLayerF16). Same kernel as the GQA
-                // path; only the norm-weight pointer differs.
+                // Residual + FfnNorm. The MLA loader uploads its FfnNormWeight as F32
+                // (the FP16 RMSNorm helper inside CudaMlaAttention.ForwardF16 takes an
+                // F32 weight). LaunchFusedAddRmsNorm expects F16 — use the F16 sibling
+                // already uploaded into _weights.Layers[layer].FfnNormWeight, which
+                // shares the same source data via UploadNormWeight's F32→F16 cast.
                 _kernels.LaunchFusedAddRmsNorm(
-                    _state.Residual, _state.NormOutput, mlaLayer.FfnNormWeight, _state.NormOutput,
+                    _state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
                     hiddenSize, eps, seqLen, s);
                 MarkProfile(ProfileCategory.Norm);
 

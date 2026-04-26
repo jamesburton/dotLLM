@@ -303,22 +303,31 @@ internal static class TransformerWeightsSafetensorsLoader
         // Post-attention RMSNorm (shared with Llama convention).
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
 
-        // Dense FFN (Llama SwiGLU convention). DeepSeek-V2/V3 interleaves
-        // dense MLP (first_k_dense_replace layers) with MoE (rest) — only
-        // the dense path is wired in this foundation PR. The MoE FFN branch
-        // and its layer-level routing land with the MoE foundation PR.
-        var (gatePtr, gateQt, gateM, gateK) = ResolveLinear(
-            file, $"{prefix}.mlp.gate_proj.weight", owned);
-        var (upPtr, upQt, upM, upK) = ResolveLinear(
-            file, $"{prefix}.mlp.up_proj.weight", owned);
-        var (downPtr, downQt, downM, downK) = ResolveLinear(
-            file, $"{prefix}.mlp.down_proj.weight", owned);
-        ValidateProjectionShape(gateM, gateK, config.IntermediateSize, hiddenSize,
-            $"{prefix}.mlp.gate_proj.weight");
-        ValidateProjectionShape(upM, upK, config.IntermediateSize, hiddenSize,
-            $"{prefix}.mlp.up_proj.weight");
-        ValidateProjectionShape(downM, downK, hiddenSize, config.IntermediateSize,
-            $"{prefix}.mlp.down_proj.weight");
+        // FFN: DeepSeek-V2/V3 interleaves dense MLP (first_k_dense_replace
+        // layers — typically layer 0 only) with MoE (rest). When the layer is
+        // MoE, swap the dense Gate/Up/Down loader for the DeepSeek MoE path
+        // (plural `shared_experts.{k}.*` naming, no sigmoid gate).
+        bool isMoeLayer = config.Moe is not null && config.Moe.IsMoeLayer(layerIdx);
+        MoeLayerWeights? moe = isMoeLayer ? LoadDeepSeekMoeLayer(layerIdx, file, config, owned) : null;
+
+        nint gatePtr = 0, upPtr = 0, downPtr = 0;
+        QuantizationType gateQt = QuantizationType.F32, upQt = QuantizationType.F32, downQt = QuantizationType.F32;
+        int gateM = 0, gateK = 0, upM = 0, upK = 0, downM = 0, downK = 0;
+        if (!isMoeLayer)
+        {
+            (gatePtr, gateQt, gateM, gateK) = ResolveLinear(
+                file, $"{prefix}.mlp.gate_proj.weight", owned);
+            (upPtr, upQt, upM, upK) = ResolveLinear(
+                file, $"{prefix}.mlp.up_proj.weight", owned);
+            (downPtr, downQt, downM, downK) = ResolveLinear(
+                file, $"{prefix}.mlp.down_proj.weight", owned);
+            ValidateProjectionShape(gateM, gateK, config.IntermediateSize, hiddenSize,
+                $"{prefix}.mlp.gate_proj.weight");
+            ValidateProjectionShape(upM, upK, config.IntermediateSize, hiddenSize,
+                $"{prefix}.mlp.up_proj.weight");
+            ValidateProjectionShape(downM, downK, hiddenSize, config.IntermediateSize,
+                $"{prefix}.mlp.down_proj.weight");
+        }
 
         return new TransformerLayerWeights(
             attnNorm,
@@ -333,7 +342,26 @@ internal static class TransformerWeightsSafetensorsLoader
             qBias: null, kBias: null, vBias: null, oBias: oBias,
             gateBias: null, upBias: null, downBias: null,
             qNormWeight: null, kNormWeight: null,
-            mla: mla);
+            mla: mla,
+            moe: moe);
+    }
+
+    /// <summary>
+    /// Loads a DeepSeek-V2/V3 MoE layer: <c>mlp.gate.weight</c> +
+    /// <c>mlp.experts.{j}.{gate,up,down}_proj.weight</c> + optional plural
+    /// shared experts <c>mlp.shared_experts.{k}.*</c>. Mirrors LoadQwenMoeLayer
+    /// but reuses the DeepSeek detection path (n_shared_experts plural, no
+    /// sigmoid gate).
+    /// </summary>
+    private static MoeLayerWeights LoadDeepSeekMoeLayer(
+        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+    {
+        // Delegate to the Qwen-convention loader — DeepSeek and Qwen-MoE both
+        // use the `mlp.gate` + `mlp.experts.{j}.{gate,up,down}_proj` naming
+        // for routed experts. Shared-expert detection inside LoadQwenMoeLayer
+        // is convention-aware (plural vs singular), so it handles DeepSeek's
+        // shared_experts.{k}.* layout too.
+        return LoadQwenMoeLayer(layerIdx, file, config, owned);
     }
 
     /// <summary>
