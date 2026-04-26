@@ -78,6 +78,11 @@ public sealed class VulkanTransformerModel : IModel
     private readonly AttentionF32Kernel _attention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
+    // Per-feature bias add. Replaces the host-mapped fallback that used to
+    // split the forward into multiple submits whenever Phi-3 / Qwen3 /
+    // DeepSeek-V2 layers carried biases — now the whole forward stays in
+    // one submit regardless of bias presence.
+    private readonly BiasAddF32Kernel _biasAdd;
 
     // Persistent command buffer + fence used by Forward. One SubmitContext
     // per model — reset+begin at the start of each forward, submit+wait at
@@ -112,6 +117,7 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
+        BiasAddF32Kernel biasAdd,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow)
@@ -132,6 +138,7 @@ public sealed class VulkanTransformerModel : IModel
         _attention = attention;
         _swiglu = swiglu;
         _add = add;
+        _biasAdd = biasAdd;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
@@ -233,6 +240,7 @@ public sealed class VulkanTransformerModel : IModel
         var attention = AttentionF32Kernel.Create(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
+        var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
 
         var submit = device.CreateSubmitContext();
 
@@ -250,6 +258,7 @@ public sealed class VulkanTransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             rmsnormMatmulQ8Fused,
             rmsnorm, rope, attention, swiglu, add,
+            biasAdd,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
@@ -362,22 +371,15 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
                 lw.VOutputDim, lw.VInputDim, seqLen);
 
-            // Optional QKV biases — host path. Submit, wait, write, re-begin.
-            if (cpuLw.QBias is not null || cpuLw.KBias is not null || cpuLw.VBias is not null)
-            {
-                KernelSupport.ComputeToHostBarrier(cmdBuf);
-                _submit.SubmitAndWait();
-                if (cpuLw.QBias is { } qb) AddBiasRows(_state.Q, qb, lw.QOutputDim, seqLen);
-                if (cpuLw.KBias is { } kb) AddBiasRows(_state.K, kb, lw.KOutputDim, seqLen);
-                if (cpuLw.VBias is { } vb) AddBiasRows(_state.V, vb, lw.VOutputDim, seqLen);
-                _submit.Begin();
-                cmdBuf = _submit.CommandBuffer;
-                KernelSupport.HostToComputeBarrier(cmdBuf);
-            }
-            else
-            {
+            // Optional QKV biases — kernel path keeps the whole forward in
+            // one submit. Each bias add writes a different output buffer
+            // (Q / K / V are independent), so no inter-bias barrier needed.
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.QBias is not null) _biasAdd.Record(cmdBuf, _state.Q, lw.QBias, seqLen, lw.QOutputDim);
+            if (lw.KBias is not null) _biasAdd.Record(cmdBuf, _state.K, lw.KBias, seqLen, lw.KOutputDim);
+            if (lw.VBias is not null) _biasAdd.Record(cmdBuf, _state.V, lw.VBias, seqLen, lw.VOutputDim);
+            if (lw.QBias is not null || lw.KBias is not null || lw.VBias is not null)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            }
 
             // RoPE on Q and K
             _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
@@ -420,17 +422,10 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
 
-            if (cpuLw.OBias is { } ob)
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.OBias is not null)
             {
-                KernelSupport.ComputeToHostBarrier(cmdBuf);
-                _submit.SubmitAndWait();
-                AddBiasRows(_state.NormOutput, ob, lw.OOutputDim, seqLen);
-                _submit.Begin();
-                cmdBuf = _submit.CommandBuffer;
-                KernelSupport.HostToComputeBarrier(cmdBuf);
-            }
-            else
-            {
+                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
 
@@ -469,20 +464,11 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
                 lw.UpOutputDim, lw.UpInputDim, seqLen);
 
-            if (cpuLw.GateBias is not null || cpuLw.UpBias is not null)
-            {
-                KernelSupport.ComputeToHostBarrier(cmdBuf);
-                _submit.SubmitAndWait();
-                if (cpuLw.GateBias is { } gb) AddBiasRows(_state.FfnGate, gb, lw.GateOutputDim, seqLen);
-                if (cpuLw.UpBias is { } ub) AddBiasRows(_state.FfnUp, ub, lw.UpOutputDim, seqLen);
-                _submit.Begin();
-                cmdBuf = _submit.CommandBuffer;
-                KernelSupport.HostToComputeBarrier(cmdBuf);
-            }
-            else
-            {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.GateBias is not null) _biasAdd.Record(cmdBuf, _state.FfnGate, lw.GateBias, seqLen, lw.GateOutputDim);
+            if (lw.UpBias is not null) _biasAdd.Record(cmdBuf, _state.FfnUp, lw.UpBias, seqLen, lw.UpOutputDim);
+            if (lw.GateBias is not null || lw.UpBias is not null)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            }
 
             // SwiGLU
             _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
@@ -492,17 +478,10 @@ public sealed class VulkanTransformerModel : IModel
             RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
 
-            if (cpuLw.DownBias is { } db)
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.DownBias is not null)
             {
-                KernelSupport.ComputeToHostBarrier(cmdBuf);
-                _submit.SubmitAndWait();
-                AddBiasRows(_state.NormOutput, db, lw.DownOutputDim, seqLen);
-                _submit.Begin();
-                cmdBuf = _submit.CommandBuffer;
-                KernelSupport.HostToComputeBarrier(cmdBuf);
-            }
-            else
-            {
+                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
 
@@ -568,6 +547,7 @@ public sealed class VulkanTransformerModel : IModel
         _attention.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
+        _biasAdd.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -674,38 +654,6 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
-    /// Adds a per-feature bias vector to every row of a
-    /// <c>[seqLen, outputDim]</c> FP32 output buffer. Implemented in-place on
-    /// the host via mapped memory — biases are tiny (hidden_size scale), and
-    /// adding a dedicated "bias_add" compute kernel is out of scope for the
-    /// correctness wave.
-    /// </summary>
-    private unsafe void AddBiasRows(VulkanDevice.Buffer output, float[] bias, int outputDim, int seqLen)
-    {
-        long biasBytes = (long)outputDim * sizeof(float);
-        long outBytes = biasBytes * seqLen;
-
-        VulkanApi.vkMapMemory(_device.Handle, output.Memory, 0, (ulong)outBytes, 0, out nint outMapped)
-            .ThrowOnError("vkMapMemory AddBiasRows.output");
-        try
-        {
-            float* o = (float*)outMapped;
-            fixed (float* b = bias)
-            {
-                for (int t = 0; t < seqLen; t++)
-                {
-                    for (int i = 0; i < outputDim; i++)
-                        o[t * outputDim + i] += b[i];
-                }
-            }
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, output.Memory);
-        }
-    }
-
-    /// <summary>
     /// Validates every token id is in range <c>[0, vocabSize)</c>. Separated
     /// from <see cref="RecordEmbeddingGather"/> so the check happens before
     /// we begin recording the command buffer — a bad id throws cleanly
@@ -773,6 +721,7 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
         _attention.Dispose();
