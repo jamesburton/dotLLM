@@ -1,0 +1,60 @@
+#version 450
+// MoE indexed expert matmul — per-row weight selection from a bank of
+// expert weight matrices. The bank packs all numExperts expert matrices
+// of shape [M, K] into one [numExperts, M, K] row-major buffer. For each
+// output row n, the kernel reads expert index idx = indices[n] and uses
+// bank[idx, :, :] as the weight for that row's matmul.
+//
+//   y[n, m] = sum_k bank[indices[n], m, k] * x[n, k]
+//
+// In MoE forward terms:
+//   - x is the per-(token, slot) expanded input  : [seqLen * topK, K]
+//   - indices is the topk indices buffer         : [seqLen * topK] (int)
+//   - y is the per-(token, slot) expanded output : [seqLen * topK, M]
+// where each (token, slot) row consumes the expert it was routed to.
+//
+// Reused for all three expert projections in a SwiGLU MLP:
+//   - gate (W1): [intermediateSize, hiddenSize]
+//   - up   (W3): [intermediateSize, hiddenSize]
+//   - down (W2): [hiddenSize,       intermediateSize]
+//
+// Dispatch: 2D grid, one thread per output cell (n, m). Workgroup (16, 16).
+// groupCount = (ceil(M/16), ceil(N/16)).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { float bank[]; };  // [numExperts * M * K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };     // [N * K]
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int indices[]; }; // [N]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };     // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;          // output dim   (per-expert weight row count)
+    uint K;          // input  dim   (per-expert weight col count, contraction)
+    uint N;          // total rows   (seqLen * topK)
+    uint numExperts; // bank's first axis size — bounds-check only
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    // Per-row expert selection. A negative or out-of-range index would be
+    // a routing bug; clamp to 0 to avoid a UB read but the math will be
+    // wrong if it ever fires.
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint bankRowSize = pc.M * pc.K;
+    uint expertBase = expertIdx * bankRowSize;
+    uint weightRowBase = expertBase + m * pc.K;
+    uint xRowBase = n * pc.K;
+
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        acc += bank[weightRowBase + k] * x[xRowBase + k];
+    }
+
+    y[n * pc.M + m] = acc;
+}
