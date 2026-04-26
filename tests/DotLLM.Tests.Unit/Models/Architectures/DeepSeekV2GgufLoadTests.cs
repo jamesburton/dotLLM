@@ -1,5 +1,6 @@
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
+using DotLLM.Cuda;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Unit.Models.Gguf;
@@ -136,6 +137,83 @@ public sealed class DeepSeekV2GgufLoadTests
         Assert.False(config.Moe.IsMoeLayer(0));
         Assert.True(config.Moe.IsMoeLayer(1));
         Assert.True(config.Moe.IsMoeLayer(26));
+    }
+
+    /// <summary>
+    /// Narrow real-checkpoint smoke against the cached
+    /// <c>DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf</c>. Trims the model to
+    /// <see cref="ModelConfig.NumLayers"/>=1 (only layer 0, which is dense FFN
+    /// per <c>leading_dense_block_count=1</c>) so the GGUF MoE tensor loader
+    /// (still F32-host-dequant for now → would blow ~57 GB host RAM at full
+    /// V2-Lite scale) is bypassed entirely. Exercises the new quantized MLA
+    /// path on real Q4_K_M weights — proves the GGUF→CudaTransformerModel→
+    /// CudaMlaAttention.ForwardF16(Quantized) chain works end-to-end on real
+    /// data without crashing or producing NaN logits. The full multi-layer
+    /// run gates on task #10 (quantized MoE + on-device dequant for the 3D
+    /// expert tensors).
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "GPU")]
+    public void RealGguf_QuantizedMla_Layer0Smoke()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        // Trim to layer 0 (dense FFN, no MoE) so the F32-host MoE dequant
+        // is skipped entirely. Also clear Moe so the dispatcher doesn't
+        // expect MoE entries on a 1-layer model.
+        var config = fullConfig with { NumLayers = 1, Moe = null };
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        Assert.Equal(MlaPrecision.Quantized, ModelLayer0MlaPrecision(model));
+
+        // Tiny prefill — first 4 tokens of any prompt. We don't have the
+        // tokenizer wired up here so we use raw token IDs from the BOS region.
+        int[] tokenIds = [100000, 261, 1559, 11];   // arbitrary valid V2-Lite ids
+        int[] positions = [0, 1, 2, 3];
+
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null);
+        Assert.Equal(fullConfig.VocabSize, logits.Shape[1]);
+
+        unsafe
+        {
+            int finite = 0;
+            int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+            var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+            foreach (float v in span)
+                if (float.IsFinite(v)) finite++;
+            Assert.True(finite == total,
+                $"Expected all {total} logits finite; got {finite} finite. " +
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+        }
+    }
+
+    /// <summary>
+    /// Helper: peek at layer 0's MLA precision via the model's internal weights.
+    /// Confirms the GGUF loader routed through LoadLayerQuant rather than
+    /// falling back to the F16-cast path.
+    /// </summary>
+    private static MlaPrecision ModelLayer0MlaPrecision(CudaTransformerModel model)
+    {
+        // Reach in via reflection to the private _weights field. This test
+        // file uses InternalsVisibleTo, but the field is private — short of
+        // adding an internal accessor we use reflection. Acceptable for this
+        // single one-off test (kept narrow on purpose).
+        var weightsField = typeof(CudaTransformerModel).GetField("_weights",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var weights = weightsField!.GetValue(model);
+        var mlaLayersProp = weights!.GetType().GetProperty("MlaLayers");
+        var mlaLayers = (Array)mlaLayersProp!.GetValue(weights)!;
+        var layer0 = mlaLayers.GetValue(0)!;
+        var precisionField = layer0.GetType().GetField("Precision");
+        return (MlaPrecision)precisionField!.GetValue(layer0)!;
     }
 
     [Fact]
