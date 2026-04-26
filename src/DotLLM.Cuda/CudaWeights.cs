@@ -90,6 +90,28 @@ internal readonly struct CudaLayerWeights
 internal sealed class CudaWeights : IDisposable
 {
     public CudaLayerWeights[] Layers { get; }
+
+    /// <summary>
+    /// Per-layer MLA weights for DeepSeek-V2/V3. Non-null iff
+    /// <c>config.MlaConfig is not null</c>; entries are populated for layers
+    /// whose CPU side carries an <c>Mla</c> bundle (today: every layer in pure
+    /// MLA models). When non-null, the GQA Q/K/V/O slots in the matching
+    /// <see cref="Layers"/> entry are zeroed and the forward dispatcher routes
+    /// through <see cref="CudaMlaAttention.ForwardF16"/>.
+    /// </summary>
+    public CudaMlaLayerWeights[]? MlaLayers { get; }
+
+    /// <summary>
+    /// Per-layer MoE weights for Mixtral / Qwen-MoE / DeepSeek MoE. Non-null
+    /// iff <c>config.Moe is not null</c>; entries are non-null for routed-MoE
+    /// layers and null for dense layers (Qwen3-MoE alternates per
+    /// <see cref="MoeConfig.IsMoeLayer"/>). When the entry is non-null the
+    /// dense FFN slots in the matching <see cref="Layers"/> entry are zeroed
+    /// and the forward dispatcher routes through
+    /// <see cref="CudaMoeFfn.Forward"/>.
+    /// </summary>
+    public CudaMoeLayerWeights?[]? MoeLayers { get; }
+
     public nint TokenEmbedDevice { get; }
     public QuantizationType TokenEmbedQuantType { get; }
     public nint OutputNormWeight { get; }
@@ -104,7 +126,9 @@ internal sealed class CudaWeights : IDisposable
     private CudaWeights(CudaLayerWeights[] layers, nint tokenEmbed, QuantizationType tokenEmbedQt,
                           nint outputNorm, nint outputWeight, int outputOutDim, int outputInDim,
                           nint outputWeightQuant, QuantizationType outputQt,
-                          List<nint> allocs)
+                          List<nint> allocs,
+                          CudaMlaLayerWeights[]? mlaLayers,
+                          CudaMoeLayerWeights?[]? moeLayers)
     {
         Layers = layers;
         TokenEmbedDevice = tokenEmbed;
@@ -116,6 +140,8 @@ internal sealed class CudaWeights : IDisposable
         OutputWeightQuant = outputWeightQuant;
         OutputQuantType = outputQt;
         _allAllocations = allocs;
+        MlaLayers = mlaLayers;
+        MoeLayers = moeLayers;
     }
 
     /// <summary>
@@ -192,70 +218,106 @@ internal sealed class CudaWeights : IDisposable
         // All other types (Q5_0, Q4_0, Q5_K, F16, F32) keep a persistent FP16 copy.
         // In hybrid mode, only upload the first layerCount layers.
         var layers = new CudaLayerWeights[layerCount];
+
+        // MLA / MoE side-tables. Non-null iff the model declares the matching config.
+        // Per-layer entries are populated for layers whose CPU side carries an Mla / Moe
+        // bundle (Qwen3-MoE-style alternating layouts leave non-MoE layers null).
+        bool hasMla = config.MlaConfig is not null;
+        bool hasMoe = config.Moe is not null;
+        var mlaLayers = hasMla ? new CudaMlaLayerWeights[layerCount] : null;
+        var moeLayers = hasMoe ? new CudaMoeLayerWeights?[layerCount] : null;
+
         for (int i = 0; i < layerCount; i++)
         {
             ref readonly var lw = ref cpuWeights.Layers[i];
 
-            nint q = SkipFp16(lw.QQuantType) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
-            nint k = SkipFp16(lw.KQuantType) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
-            nint v = SkipFp16(lw.VQuantType) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
-            nint o = SkipFp16(lw.OQuantType) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
-            nint gate = SkipFp16(lw.GateQuantType) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
-            nint up = SkipFp16(lw.UpQuantType) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
-            nint down = SkipFp16(lw.DownQuantType) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
+            // MLA layers do NOT carry GQA Q/K/V tensors — those slots are zero on
+            // the CPU side. Skip the GQA upload path entirely; CudaMlaWeightsLoader
+            // owns the q_a/q_b/kv_a/kv_b/o uploads. Norms still come from the
+            // shared CPU layer (AttnNorm/FfnNorm); MLA's internal AttnNorm pointer
+            // duplicates these tiny buffers for kernel-call convenience.
+            bool isMlaLayer = lw.Mla is not null;
+            // MoE layers do NOT carry dense gate/up/down tensors — those slots are
+            // zero on the CPU side. The MoE loader uploads per-expert projections
+            // into separate device allocations.
+            bool isMoeLayer = lw.Moe is not null;
 
-            // ── Upload raw quantized Q/K/V weights ──
-            // When fusion is possible (shared quant type + input dim, GEMV kernel exists),
-            // allocate ONE packed device buffer and upload Q/K/V directly into it at the
-            // appropriate row offsets. The per-tensor pointers (qQuant/kQuant/vQuant) are
-            // then slices into the packed buffer — bit-identical layout, zero data copy,
-            // and the per-tensor row-iterating consumers (Project, ProjectGpu, MMQ GEMV)
-            // work unchanged because they only read `outputDim` rows starting at the
-            // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
-            // was previously double-stored. Only the packed allocation is in `allocs`.
-            (nint qkvPacked, QuantizationType qkvPackedQt, int qkvPackedOut,
-             nint qQuant, nint kQuant, nint vQuant) = TryUploadPackedThree(
-                lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                allocs);
-            if (qkvPacked == 0)
+            nint q = 0, k = 0, v = 0, o = 0;
+            nint qQuant = 0, kQuant = 0, vQuant = 0, oQuant = 0;
+            nint qkvPacked = 0; QuantizationType qkvPackedQt = QuantizationType.F16; int qkvPackedOut = 0;
+            nint qBias = 0, kBias = 0, vBias = 0, oBias = 0;
+            nint qNorm = 0, kNorm = 0;
+            if (!isMlaLayer)
             {
-                // Fusion not possible — fall back to per-tensor uploads (separate allocations).
-                qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
-                kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
-                vQuant = UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+                q = SkipFp16(lw.QQuantType) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
+                k = SkipFp16(lw.KQuantType) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
+                v = SkipFp16(lw.VQuantType) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
+                o = SkipFp16(lw.OQuantType) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
+
+                // ── Upload raw quantized Q/K/V weights ──
+                // When fusion is possible (shared quant type + input dim, GEMV kernel exists),
+                // allocate ONE packed device buffer and upload Q/K/V directly into it at the
+                // appropriate row offsets. The per-tensor pointers (qQuant/kQuant/vQuant) are
+                // then slices into the packed buffer — bit-identical layout, zero data copy,
+                // and the per-tensor row-iterating consumers (Project, ProjectGpu, MMQ GEMV)
+                // work unchanged because they only read `outputDim` rows starting at the
+                // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
+                // was previously double-stored. Only the packed allocation is in `allocs`.
+                (qkvPacked, qkvPackedQt, qkvPackedOut,
+                 qQuant, kQuant, vQuant) = TryUploadPackedThree(
+                    lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
+                    lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                    lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                    allocs);
+                if (qkvPacked == 0)
+                {
+                    // Fusion not possible — fall back to per-tensor uploads (separate allocations).
+                    qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
+                    kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
+                    vQuant = UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+                }
+
+                oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
+
+                qBias = UploadBias(lw.QBias, allocs, kernels, stream);
+                kBias = UploadBias(lw.KBias, allocs, kernels, stream);
+                vBias = UploadBias(lw.VBias, allocs, kernels, stream);
+                oBias = UploadBias(lw.OBias, allocs, kernels, stream);
+                qNorm = lw.QNormWeight is not null ? UploadNormWeight(lw.QNormWeight, allocs, kernels, stream) : 0;
+                kNorm = lw.KNormWeight is not null ? UploadNormWeight(lw.KNormWeight, allocs, kernels, stream) : 0;
             }
 
-            nint oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
-
-            // ── Upload raw quantized Gate/Up weights (same packing strategy as Q/K/V) ──
-            (nint gateUpPacked, QuantizationType gateUpPackedQt, int gateUpPackedOut,
-             nint gateQuant, nint upQuant) = TryUploadPackedTwo(
-                lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                allocs);
-            if (gateUpPacked == 0)
+            nint gate = 0, up = 0, down = 0;
+            nint gateQuant = 0, upQuant = 0, downQuant = 0;
+            nint gateUpPacked = 0; QuantizationType gateUpPackedQt = QuantizationType.F16; int gateUpPackedOut = 0;
+            nint gateBias = 0, upBias = 0, downBias = 0;
+            if (!isMoeLayer)
             {
-                gateQuant = UploadQuantized(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs);
-                upQuant = UploadQuantized(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs);
-            }
+                gate = SkipFp16(lw.GateQuantType) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
+                up = SkipFp16(lw.UpQuantType) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
+                down = SkipFp16(lw.DownQuantType) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
 
-            nint downQuant = UploadQuantized(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs);
+                // ── Upload raw quantized Gate/Up weights (same packing strategy as Q/K/V) ──
+                (gateUpPacked, gateUpPackedQt, gateUpPackedOut,
+                 gateQuant, upQuant) = TryUploadPackedTwo(
+                    lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
+                    lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
+                    allocs);
+                if (gateUpPacked == 0)
+                {
+                    gateQuant = UploadQuantized(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs);
+                    upQuant = UploadQuantized(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs);
+                }
+
+                downQuant = UploadQuantized(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs);
+
+                gateBias = UploadBias(lw.GateBias, allocs, kernels, stream);
+                upBias = UploadBias(lw.UpBias, allocs, kernels, stream);
+                downBias = UploadBias(lw.DownBias, allocs, kernels, stream);
+            }
 
             nint attnNorm = UploadNormWeight(lw.AttnNormWeight, allocs, kernels, stream);
             nint ffnNorm = UploadNormWeight(lw.FfnNormWeight, allocs, kernels, stream);
-
-            nint qNorm = lw.QNormWeight is not null ? UploadNormWeight(lw.QNormWeight, allocs, kernels, stream) : 0;
-            nint kNorm = lw.KNormWeight is not null ? UploadNormWeight(lw.KNormWeight, allocs, kernels, stream) : 0;
-
-            nint qBias = UploadBias(lw.QBias, allocs, kernels, stream);
-            nint kBias = UploadBias(lw.KBias, allocs, kernels, stream);
-            nint vBias = UploadBias(lw.VBias, allocs, kernels, stream);
-            nint oBias = UploadBias(lw.OBias, allocs, kernels, stream);
-            nint gateBias = UploadBias(lw.GateBias, allocs, kernels, stream);
-            nint upBias = UploadBias(lw.UpBias, allocs, kernels, stream);
-            nint downBias = UploadBias(lw.DownBias, allocs, kernels, stream);
 
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
@@ -270,6 +332,11 @@ internal sealed class CudaWeights : IDisposable
                 downQuant, lw.DownQuantType,
                 qkvPacked, qkvPackedQt, qkvPackedOut,
                 gateUpPacked, gateUpPackedQt, gateUpPackedOut);
+
+            if (isMlaLayer)
+                mlaLayers![i] = CudaMlaWeightsLoader.LoadLayerF16(lw, config.HiddenSize, allocs);
+            if (isMoeLayer)
+                moeLayers![i] = CudaMoeWeightsLoader.LoadLayer(lw, allocs);
         }
 
         // Sync to ensure all uploads are complete
@@ -284,7 +351,8 @@ internal sealed class CudaWeights : IDisposable
 
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
-            outputWeightQuant, cpuWeights.OutputQuantType, allocs);
+            outputWeightQuant, cpuWeights.OutputQuantType, allocs,
+            mlaLayers, moeLayers);
     }
 
     /// <summary>Upload raw quantized weight bytes to GPU (no dequant). For decode quantized GEMV.</summary>
