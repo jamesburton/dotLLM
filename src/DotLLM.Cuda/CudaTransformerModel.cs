@@ -558,11 +558,13 @@ public sealed unsafe class CudaTransformerModel : IModel
                 MarkProfile(ProfileCategory.Attention);
                 MarkProfile(ProfileCategory.OProj);
 
-                // Residual + FfnNorm. MLA's FfnNormWeight comes from CudaMlaLayerWeights
-                // (uploaded by CudaMlaWeightsLoader.LoadLayerF16). Same kernel as the GQA
-                // path; only the norm-weight pointer differs.
+                // Residual + FfnNorm. The MLA loader uploads its FfnNormWeight as F32
+                // (the FP16 RMSNorm helper inside CudaMlaAttention.ForwardF16 takes an
+                // F32 weight). LaunchFusedAddRmsNorm expects F16 — use the F16 sibling
+                // already uploaded into _weights.Layers[layer].FfnNormWeight, which
+                // shares the same source data via UploadNormWeight's F32→F16 cast.
                 _kernels.LaunchFusedAddRmsNorm(
-                    _state.Residual, _state.NormOutput, mlaLayer.FfnNormWeight, _state.NormOutput,
+                    _state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
                     hiddenSize, eps, seqLen, s);
                 MarkProfile(ProfileCategory.Norm);
 
