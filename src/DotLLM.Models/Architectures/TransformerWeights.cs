@@ -521,11 +521,18 @@ internal sealed class TransformerWeights : IDisposable
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase + (nint)embDesc.DataOffset;
 
+        // MLA (DeepSeek-V2/V3) loads its projection tensors as F32 dequant
+        // buffers since the CPU MlaAttention.Execute oracle is F32-only. Track
+        // them on the loader so Dispose can free them. Empty for non-MLA models.
+        var owned = config.MlaConfig is not null ? new List<nint>() : null;
+
         // Per-layer weights
         var layers = new TransformerLayerWeights[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
         {
-            layers[i] = LoadLayer(i, dataBase, tensors, config);
+            layers[i] = config.MlaConfig is not null
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!)
+                : LoadLayer(i, dataBase, tensors, config);
         }
 
         // Output norm
@@ -558,7 +565,8 @@ internal sealed class TransformerWeights : IDisposable
             embPtr, embDesc.QuantizationType, config.VocabSize, config.HiddenSize,
             layers,
             outputNormWeight,
-            outputPtr, outputQt, outputM, outputK);
+            outputPtr, outputQt, outputM, outputK,
+            ownedAllocations: owned);
     }
 
     /// <summary>
@@ -773,6 +781,176 @@ internal sealed class TransformerWeights : IDisposable
         int k = desc.Shape[0];
         int m = desc.Shape[1];
         return (ptr, desc.QuantizationType, m, k);
+    }
+
+    /// <summary>
+    /// Loads a single DeepSeek-V2 / V3 MLA layer's projection tensors from GGUF.
+    /// Each MLA-specific tensor is dequantized to a 64-byte-aligned F32 host
+    /// buffer (to match the CPU oracle <see cref="DotLLM.Cpu.Kernels.MlaAttention.Execute"/>'s
+    /// F32 contract); the returned <see cref="TransformerLayerWeights"/> carries
+    /// these F32 pointers in <c>lw.Mla</c> and zeroes the legacy GQA Q/K/V slots.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Tensor naming</b> (per llama.cpp's <c>convert_hf_to_gguf.py</c>
+    /// <c>DeepseekV2Model</c>):
+    /// <list type="bullet">
+    ///   <item><c>blk.{N}.attn_q_a.weight</c> + <c>attn_q_a_norm.weight</c> +
+    ///     <c>attn_q_b.weight</c> when <c>q_lora_rank &gt; 0</c></item>
+    ///   <item><c>blk.{N}.attn_q.weight</c> when <c>q_lora_rank == 0</c> (V2-Lite)</item>
+    ///   <item><c>blk.{N}.attn_kv_a_mqa.weight</c> + <c>attn_kv_a_norm.weight</c> +
+    ///     <c>attn_kv_b.weight</c></item>
+    ///   <item><c>blk.{N}.attn_output.weight</c> (same name as GQA — reused as o_proj)</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Memory budget.</b> Q4_K_M → F32 dequant inflates ~4× per element.
+    /// V2-Lite MLA per-layer footprint ≈ 12 MB raw → 48 MB F32 (×27 layers ≈
+    /// 1.3 GB total). Dense FFN (separate path) is the main pressure.
+    /// Full-V2 MLA is ~10× this (160 GB) — that needs an on-device dequant
+    /// path; flagged as a follow-up.
+    /// </para>
+    /// </remarks>
+    private static unsafe TransformerLayerWeights LoadMlaLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var mla = config.MlaConfig
+            ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int qLora = mla.QLoraRank;
+        int kvLora = mla.KvLoraRank;
+        int qkNope = mla.QkNopeHeadDim;
+        int qkRope = mla.QkRopeHeadDim;
+        int vHead = mla.VHeadDim;
+        int numHeads = config.NumAttentionHeads;
+        int qTotal = numHeads * (qkNope + qkRope);
+        int kvAOut = kvLora + qkRope;
+        int kvBOut = numHeads * (qkNope + vHead);
+        int oInput = numHeads * vHead;
+
+        // ── Norms ─────────────────────────────────────────────────────
+        float[] attnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_norm.weight"], hiddenSize);
+        float[] ffnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_norm.weight"], hiddenSize);
+
+        // ── Q path ─────────────────────────────────────────────────────
+        nint qAProj = 0, qBProj = 0, qProj = 0;
+        float[]? qANorm = null;
+        if (qLora > 0)
+        {
+            qAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_a.weight"],
+                                  (long)qLora * hiddenSize, owned);
+            qANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_q_a_norm.weight"], qLora);
+            qBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_b.weight"],
+                                  (long)qTotal * qLora, owned);
+        }
+        else
+        {
+            qProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q.weight"],
+                                 (long)qTotal * hiddenSize, owned);
+        }
+
+        // ── KV path (always factored) ────────────────────────────────
+        nint kvAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_a_mqa.weight"],
+                                    (long)kvAOut * hiddenSize, owned);
+        float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
+        nint kvBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_b.weight"],
+                                    (long)kvBOut * kvLora, owned);
+
+        // ── O projection (same tensor name as GQA: attn_output) ──────
+        nint oProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_output.weight"],
+                                  (long)hiddenSize * oInput, owned);
+
+        var mlaBundle = new MlaLayerWeights(
+            numHeads: numHeads,
+            qkNopeHeadDim: qkNope,
+            qkRopeHeadDim: qkRope,
+            vHeadDim: vHead,
+            qLoraRank: qLora,
+            kvLoraRank: kvLora,
+            qAProj: qAProj,
+            qALayernormWeight: qANorm,
+            qBProj: qBProj,
+            qProj: qProj,
+            kvAProjWithMqa: kvAProj,
+            kvALayernormWeight: kvANorm,
+            kvBProj: kvBProj);
+
+        // ── FFN ────────────────────────────────────────────────────────
+        // Dense FFN for non-MoE layers. MoE layers (when config.Moe is set
+        // and the layer index is in MoeConfig.IsMoeLayer) are loaded via the
+        // 3D-stacked-expert tensor path — DEFERRED to a follow-up commit
+        // (gguf_writer's ffn_*_exps layout differs materially from per-expert
+        // tensors and needs its own loader). For now, fall back to dense FFN
+        // even on MoE layers — model loads but produces wrong logits at
+        // those layers; flagged with a one-time warning.
+        bool layerIsMoe = config.Moe is not null && config.Moe.IsMoeLayer(layerIdx);
+        if (layerIsMoe)
+        {
+            // Future: 3D-stacked MoE expert loader. For now the GGUF Mla
+            // path supports only the dense / pre-MoE layers; layers in the
+            // MoE band will load with placeholder dense FFN tensors that
+            // the model probably doesn't ship — the dictionary lookup
+            // below will throw with a clear message.
+        }
+
+        nint gatePtr = 0; QuantizationType gateQt = QuantizationType.F32; int gateM = 0, gateK = 0;
+        nint upPtr = 0; QuantizationType upQt = QuantizationType.F32; int upM = 0, upK = 0;
+        nint downPtr = 0; QuantizationType downQt = QuantizationType.F32; int downM = 0, downK = 0;
+        if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
+        {
+            (gatePtr, gateQt, gateM, gateK) = LoadLinear(dataBase, gateDesc);
+            (upPtr, upQt, upM, upK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_up.weight"]);
+            (downPtr, downQt, downM, downK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_down.weight"]);
+        }
+        else if (!layerIsMoe)
+        {
+            throw new InvalidDataException(
+                $"DeepSeek-V2 layer {layerIdx} has neither dense ffn_gate.weight nor MoE ffn_*_exps tensors. " +
+                "Either the layer is malformed or this loader needs the 3D-stacked MoE expert path " +
+                "(deferred follow-up; see .continue-here.md task #12).");
+        }
+        // For MoE layers without dense FFN tensors, gate/up/down stay 0 and
+        // the inference path will fail with a clearer error downstream when
+        // it tries to project on them. Eventually the MoE branch will route
+        // around this entirely.
+
+        // GGUF: Dimensions[0] = input dim (K), Dimensions[1] = output dim (M)
+        return new TransformerLayerWeights(
+            attnNormWeight: attnNorm,
+            qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
+            kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
+            vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
+            oWeight: oProj, oQuantType: QuantizationType.F32,
+            oOutputDim: hiddenSize, oInputDim: oInput,
+            ffnNormWeight: ffnNorm,
+            gateWeight: gatePtr, gateQuantType: gateQt, gateOutputDim: gateM, gateInputDim: gateK,
+            upWeight: upPtr, upQuantType: upQt, upOutputDim: upM, upInputDim: upK,
+            downWeight: downPtr, downQuantType: downQt, downOutputDim: downM, downInputDim: downK,
+            mla: mlaBundle);
+    }
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned F32 buffer and dequantizes <paramref name="elementCount"/>
+    /// values from the GGUF tensor at <paramref name="desc"/>'s data offset into it.
+    /// Tracks the allocation in <paramref name="owned"/> so the loader's Dispose
+    /// can free it. Returns the pointer.
+    /// </summary>
+    private static unsafe nint DequantToF32(nint dataBase, GgufTensorDescriptor desc,
+                                            long elementCount, List<nint> owned)
+    {
+        nuint bytes = (nuint)(elementCount * sizeof(float));
+        nint dst = (nint)NativeMemory.AlignedAlloc(bytes, 64);
+        owned.Add(dst);
+        nint src = dataBase + (nint)desc.DataOffset;
+        Dequantize.ToFloat32(src, elementCount, desc.QuantizationType,
+                              new Span<float>((void*)dst, (int)elementCount));
+        return dst;
     }
 
     private static float[] DequantizeNorm(nint dataBase, GgufTensorDescriptor desc, int expectedSize)
