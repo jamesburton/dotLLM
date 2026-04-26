@@ -25,7 +25,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private const int Q8_0GroupSize = 32;
     private const int Q8_1GroupSize = 32;
 
-    private readonly GgufFile _gguf; // keep alive
+    private readonly GgufFile? _gguf; // keep alive (null when constructed from prebuilt weights)
     private readonly NemotronHLayerWeights[] _layers;
     private readonly float[] _outputNormWeight;
 
@@ -66,7 +66,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
 
     private NemotronHTransformerModel(
         ModelConfig config,
-        GgufFile gguf,
+        GgufFile? gguf,
         NemotronHLayerWeights[] layers,
         float[] outputNormWeight,
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
@@ -214,6 +214,80 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             config, gguf, layers, outputNormWeight,
             embPtr, embDesc.QuantizationType,
             outputPtr, outputQt, outputM, outputK,
+            kvSlotForLayer, attentionLayerCount,
+            ropeCos, ropeSin, ropeDim);
+    }
+
+    /// <summary>
+    /// Builds a NemotronH model from caller-owned, pre-dequantised weight pointers — used by the
+    /// Vulkan parity tests that construct synthetic weight banks in unmanaged memory directly,
+    /// bypassing the GGUF/safetensors loaders. Caller retains ownership of every <see cref="nint"/>
+    /// pointer (token embed, output, plus every projection inside <paramref name="layers"/>).
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="LoadFromGguf"/> there is no <see cref="GgufFile"/> to keep alive — the
+    /// model holds <c>null</c> for the gguf reference. Disposing this model frees only the forward
+    /// scratch and the SSM cache; weight memory belongs to the caller.
+    /// </remarks>
+    internal static NemotronHTransformerModel BuildFromPrebuiltWeights(
+        ModelConfig config,
+        NemotronHLayerWeights[] layers,
+        float[] outputNormWeight,
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType,
+        nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim)
+    {
+        if (config.Architecture != Architecture.NemotronH)
+            throw new ArgumentException(
+                $"NemotronHTransformerModel requires Architecture.NemotronH, got {config.Architecture}.",
+                nameof(config));
+        if (config.HybridLayout is null)
+            throw new ArgumentException("NemotronH config must have HybridLayout populated.", nameof(config));
+        if (config.SsmConfig is null)
+            throw new ArgumentException("NemotronH config must have SsmConfig populated.", nameof(config));
+        if (layers.Length != config.NumLayers)
+            throw new ArgumentException(
+                $"layers length {layers.Length} != config.NumLayers {config.NumLayers}.", nameof(layers));
+
+        var layout = config.HybridLayout!;
+
+        // Compute per-layer KV slot map (sparse over attention layers).
+        var kvSlotForLayer = new int[config.NumLayers];
+        int attentionLayerCount = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            kvSlotForLayer[i] = layout.LayerKind[i] == HybridLayerKind.Attention
+                ? attentionLayerCount++
+                : -1;
+        }
+
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? 0;
+        // Allow ropeDim==0 when there are no attention layers.
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        int halfRope = ropeDim / 2;
+        float[] ropeCos, ropeSin;
+        if (attentionLayerCount > 0)
+        {
+            if (ropeDim <= 0 || (ropeDim & 1) != 0)
+                throw new ArgumentException(
+                    $"NemotronH attention layers require an even rope_dim > 0 (got {ropeDim}).", nameof(config));
+            if (ropeDim > config.HeadDim)
+                throw new ArgumentException(
+                    $"rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
+
+            ropeCos = new float[config.MaxSequenceLength * halfRope];
+            ropeSin = new float[config.MaxSequenceLength * halfRope];
+            RoPE.PrecomputeFrequencyTable(config.MaxSequenceLength, ropeDim, ropeTheta, ropeCos, ropeSin);
+        }
+        else
+        {
+            ropeCos = Array.Empty<float>();
+            ropeSin = Array.Empty<float>();
+        }
+
+        return new NemotronHTransformerModel(
+            config, gguf: null, layers, outputNormWeight,
+            tokenEmbedWeight, tokenEmbedQuantType,
+            outputWeight, outputQuantType, outputOutputDim, outputInputDim,
             kvSlotForLayer, attentionLayerCount,
             ropeCos, ropeSin, ropeDim);
     }
