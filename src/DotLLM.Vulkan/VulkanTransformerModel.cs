@@ -298,6 +298,7 @@ public sealed class VulkanTransformerModel : IModel
         // conservative trigger.
         bool hasMoe = false;
         int moeNumExperts = 0, moeTopK = 0, moeIntermediate = 0;
+        int moeSharedIntermediate = 0, moeNumSharedExperts = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
             ref readonly var lwTmp = ref cpuWeights.Layers[i];
@@ -307,6 +308,11 @@ public sealed class VulkanTransformerModel : IModel
                 moeNumExperts = Math.Max(moeNumExperts, lwTmp.Moe.NumExperts);
                 moeTopK = Math.Max(moeTopK, lwTmp.Moe.NumExpertsPerTok);
                 moeIntermediate = Math.Max(moeIntermediate, lwTmp.Moe.IntermediateSize);
+                if (lwTmp.Moe.HasSharedExpert)
+                {
+                    moeSharedIntermediate = Math.Max(moeSharedIntermediate, lwTmp.Moe.SharedIntermediateSize);
+                    moeNumSharedExperts = Math.Max(moeNumSharedExperts, lwTmp.Moe.NumSharedExperts);
+                }
             }
         }
 
@@ -338,7 +344,9 @@ public sealed class VulkanTransformerModel : IModel
             mlaKvLoraRank: mlaKvLora,
             moeNumExperts: moeNumExperts,
             moeTopK: moeTopK,
-            moeIntermediateSize: moeIntermediate);
+            moeIntermediateSize: moeIntermediate,
+            moeSharedIntermediateSize: moeSharedIntermediate,
+            moeNumSharedExperts: moeNumSharedExperts);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -1005,6 +1013,121 @@ public sealed class VulkanTransformerModel : IModel
             _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput,
             seqLen: seqLen, topK: topK, hiddenSize: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 9. Shared-expert branch (DeepSeek-V2/V3 ungated). Each shared expert
+        //    runs a dense SwiGLU MLP on the per-token hidden state and the
+        //    outputs are summed into the routed result. Skipped when the
+        //    layer has no shared experts (Mixtral / Qwen3-MoE without shared).
+        if (moeW.NumSharedExperts > 0)
+        {
+            RecordMoeSharedExperts(cmdBuf, moeW, lw.FfnNormWeight, seqLen, hidden, eps);
+        }
+    }
+
+    /// <summary>
+    /// Records the shared-expert branch of a DeepSeek-V2/V3-style MoE layer:
+    /// for each shared expert run a dense SwiGLU MLP over the per-token
+    /// normalised hidden state, sum the outputs, and add the sum into the
+    /// routed-MoE result already in <c>_state.NormOutput</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The routed-MoE scatter has overwritten <c>NormOutput</c> with the
+    /// routed sum already, so we re-derive the normalised hidden state from
+    /// <c>HiddenState</c> via a fresh rmsnorm into
+    /// <see cref="VulkanForwardState.MoeSharedInput"/> — a dedicated buffer
+    /// that pins the shared-expert input across every iteration. That keeps
+    /// the SumA / SumB pair available as pure ping-pong accumulator slots.
+    /// </para>
+    /// <para>
+    /// Accumulation: shared expert 0's down-projection writes directly into
+    /// SumA. For each subsequent expert we matmul into MoeSharedDown and add
+    /// (running-sum, MoeSharedDown) into the alternating ping-pong side.
+    /// After all shared experts the running sum is folded into NormOutput via
+    /// the unused ping-pong slot and a device-to-device copy lands the result
+    /// back in <c>NormOutput</c> so the caller's residual-add contract is
+    /// preserved.
+    /// </para>
+    /// </remarks>
+    private unsafe void RecordMoeSharedExperts(
+        nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW,
+        VulkanDevice.Buffer ffnNormWeight, int seqLen, int hidden, float eps)
+    {
+        int numShared = moeW.NumSharedExperts;
+        int sharedI = moeW.SharedIntermediateSize;
+        int hiddenElems = seqLen * hidden;
+        int sharedInterElems = seqLen * sharedI;
+
+        // Re-derive the normalised hidden state. NormOutput is occupied by
+        // the routed-MoE result; HiddenState still holds the pre-FFN residual.
+        var sharedInput = _state.MoeSharedInput!;
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, ffnNormWeight, sharedInput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // SumA / SumB ping-pong; activeSum tracks the slot currently holding
+        // the running shared-expert sum. Expert 0 writes directly into SumA;
+        // subsequent experts compute their down-output into MoeSharedDown and
+        // we add (activeSum + MoeSharedDown) → the OTHER side, alternating.
+        VulkanDevice.Buffer activeSum = _state.MoeSharedSumA!;
+
+        for (int s = 0; s < numShared; s++)
+        {
+            // gate / up matmuls share sharedInput; SwiGLU then fuses them.
+            _matmul.Record(cmdBuf, moeW.SharedW1![s], sharedInput, _state.MoeSharedGate!,
+                m: sharedI, k: hidden, n: seqLen);
+            _matmul.Record(cmdBuf, moeW.SharedW3![s], sharedInput, _state.MoeSharedUp!,
+                m: sharedI, k: hidden, n: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            _swiglu.Record(cmdBuf, _state.MoeSharedGate!, _state.MoeSharedUp!, _state.MoeSharedSilu!,
+                n: sharedInterElems);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            if (s == 0)
+            {
+                // First expert seeds the running sum directly into SumA.
+                _matmul.Record(cmdBuf, moeW.SharedW2![s], _state.MoeSharedSilu!, _state.MoeSharedSumA!,
+                    m: hidden, k: sharedI, n: seqLen);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                activeSum = _state.MoeSharedSumA!;
+            }
+            else
+            {
+                // Per-expert down output → MoeSharedDown, then ping-pong add
+                // into the slot opposite activeSum.
+                _matmul.Record(cmdBuf, moeW.SharedW2![s], _state.MoeSharedSilu!, _state.MoeSharedDown!,
+                    m: hidden, k: sharedI, n: seqLen);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+                var sumDst = activeSum.Handle == _state.MoeSharedSumA!.Handle
+                    ? _state.MoeSharedSumB!
+                    : _state.MoeSharedSumA!;
+                _add.Record(cmdBuf, activeSum, _state.MoeSharedDown!, sumDst, hiddenElems);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                activeSum = sumDst;
+            }
+        }
+
+        // Fold the running shared sum into NormOutput. We need a destination
+        // buffer different from both NormOutput (read) and activeSum (read);
+        // pick the OTHER ping-pong slot, then copy it back into NormOutput so
+        // the caller's residual-add reads the merged result.
+        VulkanDevice.Buffer foldDst = activeSum.Handle == _state.MoeSharedSumA!.Handle
+            ? _state.MoeSharedSumB!
+            : _state.MoeSharedSumA!;
+        _add.Record(cmdBuf, _state.NormOutput, activeSum, foldDst, hiddenElems);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        var foldRegion = new VkBufferCopy
+        {
+            srcOffset = 0,
+            dstOffset = 0,
+            size = (ulong)hiddenElems * sizeof(float),
+        };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, foldDst.Handle, _state.NormOutput.Handle, 1, foldRegion);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
     }
 
     private void RecordMatmul(

@@ -28,16 +28,27 @@ internal sealed class VulkanWeights : IDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Three banks per layer:
+    /// Three banks per layer for the routed top-k experts:
     /// <list type="bullet">
     ///   <item><c>W1Bank</c> (<i>gate_proj</i>): <c>[numExperts, intermediate, hidden]</c></item>
     ///   <item><c>W2Bank</c> (<i>down_proj</i>): <c>[numExperts, hidden, intermediate]</c></item>
     ///   <item><c>W3Bank</c> (<i>up_proj</i>):   <c>[numExperts, intermediate, hidden]</c></item>
     /// </list>
-    /// Plus the router gate <c>[numExperts, hidden]</c>. Shared experts
-    /// (DeepSeek-V2/V3) are NOT supported in this pass — the loader still
-    /// resolves them on the CPU side, but the Vulkan upload guard rejects
-    /// any layer with <c>HasSharedExpert</c>.
+    /// Plus the router gate <c>[numExperts, hidden]</c>.
+    /// </para>
+    /// <para>
+    /// Shared experts (DeepSeek-V2/V3 ungated branch) are stored as <i>separate
+    /// per-expert buffers</i>, not packed into a single bank. The per-shared-
+    /// expert matmuls go through the standard <c>matmul_f32</c> kernel which
+    /// reads its weight buffer from offset 0 — packing all shared experts into
+    /// one bank would require either a per-expert sub-buffer (the kernel API
+    /// takes a whole <c>VulkanDevice.Buffer</c>, not a sub-range) or a new
+    /// weight-offset push constant on the matmul kernel. Shared experts are
+    /// few (typically 1..2) and small, so per-expert buffers keep the wiring
+    /// simple while costing one extra buffer per shared expert per layer.
+    /// Qwen1.5-MoE's per-token sigmoid gate is intentionally NOT wired here —
+    /// the upload guard rejects layers carrying a <c>SharedExpertGate</c>
+    /// until a dedicated sigmoid + scalar-multiply kernel pair lands.
     /// </para>
     /// </remarks>
     internal readonly struct MoeLayerBuffers
@@ -47,16 +58,28 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer W2Bank;     // [numExperts, hidden, intermediate]
         public readonly VulkanDevice.Buffer W3Bank;     // [numExperts, intermediate, hidden]
 
+        // Shared-expert weights (DeepSeek-V2/V3 ungated convention). Each
+        // array has one entry per shared expert; null when no shared experts
+        // are present on this layer. Stored as separate buffers (NOT packed)
+        // because the matmul kernel reads its weight buffer from offset 0.
+        public readonly VulkanDevice.Buffer[]? SharedW1;     // [sharedIntermediate, hidden]
+        public readonly VulkanDevice.Buffer[]? SharedW2;     // [hidden, sharedIntermediate]
+        public readonly VulkanDevice.Buffer[]? SharedW3;     // [sharedIntermediate, hidden]
+
         public readonly int NumExperts;
         public readonly int NumExpertsPerTok;
         public readonly int HiddenSize;
         public readonly int IntermediateSize;
         public readonly bool NormTopKProb;
+        public readonly int SharedIntermediateSize;
+        public readonly int NumSharedExperts;
 
         public MoeLayerBuffers(
             VulkanDevice.Buffer gate, VulkanDevice.Buffer w1, VulkanDevice.Buffer w2, VulkanDevice.Buffer w3,
             int numExperts, int numExpertsPerTok,
-            int hiddenSize, int intermediateSize, bool normTopKProb)
+            int hiddenSize, int intermediateSize, bool normTopKProb,
+            VulkanDevice.Buffer[]? sharedW1, VulkanDevice.Buffer[]? sharedW2, VulkanDevice.Buffer[]? sharedW3,
+            int sharedIntermediateSize, int numSharedExperts)
         {
             Gate = gate;
             W1Bank = w1;
@@ -67,6 +90,11 @@ internal sealed class VulkanWeights : IDisposable
             HiddenSize = hiddenSize;
             IntermediateSize = intermediateSize;
             NormTopKProb = normTopKProb;
+            SharedW1 = sharedW1;
+            SharedW2 = sharedW2;
+            SharedW3 = sharedW3;
+            SharedIntermediateSize = sharedIntermediateSize;
+            NumSharedExperts = numSharedExperts;
         }
 
         public void Dispose()
@@ -75,6 +103,12 @@ internal sealed class VulkanWeights : IDisposable
             W1Bank.Dispose();
             W2Bank.Dispose();
             W3Bank.Dispose();
+            if (SharedW1 is not null)
+                for (int i = 0; i < SharedW1.Length; i++) SharedW1[i].Dispose();
+            if (SharedW2 is not null)
+                for (int i = 0; i < SharedW2.Length; i++) SharedW2[i].Dispose();
+            if (SharedW3 is not null)
+                for (int i = 0; i < SharedW3.Length; i++) SharedW3[i].Dispose();
         }
     }
 
@@ -415,9 +449,14 @@ internal sealed class VulkanWeights : IDisposable
             MoeLayerBuffers? moe = null;
             if (lw.Moe is not null)
             {
-                if (lw.Moe.HasSharedExpert)
+                // Qwen1.5-MoE's per-token sigmoid gate (mlp.shared_expert_gate.weight)
+                // needs a sigmoid kernel + per-row scalar multiply that we don't
+                // have on the Vulkan side yet. DeepSeek-V2/V3 ships shared experts
+                // WITHOUT the gate so we accept that path here; gated shared
+                // experts are still rejected until the kernels land.
+                if (lw.Moe.SharedExpertGate is not null)
                     throw new NotSupportedException(
-                        "MoE shared experts (DeepSeek-V2/V3 / Qwen1.5-MoE shared expert branch) are not supported on the Vulkan backend yet.");
+                        "MoE shared expert sigmoid gate (Qwen1.5-MoE convention) is not supported on the Vulkan backend yet; only ungated shared experts (DeepSeek-V2/V3) are supported.");
                 moe = UploadMoeLayer(device, lw.Moe, out long moeBytes);
                 totalBytes += moeBytes;
             }
@@ -691,17 +730,28 @@ internal sealed class VulkanWeights : IDisposable
         int hidden = moe.HiddenSize;
         int interm = moe.IntermediateSize;
         int numE = moe.NumExperts;
+        int numShared = moe.NumSharedExperts;
+        int sharedI = moe.SharedIntermediateSize;
+        bool hasShared = moe.HasSharedExpert;
 
         // Router gate: contiguous F32 [numExperts, hidden].
         long gateBytes = (long)numE * hidden * sizeof(float);
         long perExpertW1Bytes = (long)interm * hidden * sizeof(float);
         long perExpertW2Bytes = (long)hidden * interm * sizeof(float);
         long perExpertW3Bytes = perExpertW1Bytes;
+        long perSharedW1Bytes = hasShared ? (long)sharedI * hidden * sizeof(float) : 0;
+        long perSharedW2Bytes = hasShared ? (long)hidden * sharedI * sizeof(float) : 0;
+        long perSharedW3Bytes = perSharedW1Bytes;
 
         // Stage sized to the largest single per-expert matrix OR the gate row,
         // whichever is bigger. The bank-pack copies one expert at a time so
-        // we never need to stage the full bank at once.
+        // we never need to stage the full bank at once. Shared-expert
+        // matrices are sized off sharedIntermediate which may be larger than
+        // the routed intermediate (DeepSeek-V2-Lite: shared==3*moe_intermediate),
+        // so include them in the staging bound.
         long stageBytes = Math.Max(gateBytes, Math.Max(perExpertW1Bytes, perExpertW2Bytes));
+        if (hasShared)
+            stageBytes = Math.Max(stageBytes, Math.Max(perSharedW1Bytes, perSharedW2Bytes));
         using var stage = device.Allocate(stageBytes);
 
         // ── Router gate ──────────────────────────────────────────────
@@ -735,9 +785,40 @@ internal sealed class VulkanWeights : IDisposable
         }
         uploadedBytes += w1BankBytes + w2BankBytes + w3BankBytes;
 
+        // ── Shared-expert per-expert buffers (option (c) — see struct
+        //    docs). Each shared expert gets its own three F32 device
+        //    buffers; the forward pass dispatches each shared-expert
+        //    matmul against the buffer at offset 0 via the existing
+        //    matmul_f32 kernel, no kernel changes required. Shared
+        //    experts are few (1..2 typically) so the extra buffer
+        //    descriptors aren't a concern. ─────────────────────────────
+        VulkanDevice.Buffer[]? sharedW1 = null, sharedW2 = null, sharedW3 = null;
+        if (hasShared)
+        {
+            sharedW1 = new VulkanDevice.Buffer[numShared];
+            sharedW2 = new VulkanDevice.Buffer[numShared];
+            sharedW3 = new VulkanDevice.Buffer[numShared];
+            for (int s = 0; s < numShared; s++)
+            {
+                sharedW1[s] = device.AllocateDeviceLocal(perSharedW1Bytes);
+                sharedW2[s] = device.AllocateDeviceLocal(perSharedW2Bytes);
+                sharedW3[s] = device.AllocateDeviceLocal(perSharedW3Bytes);
+                // UploadExpertBankSlot at dstOffset=0 is just a per-buffer
+                // upload — the bank semantics fall away when the bank
+                // happens to hold one expert's worth of data.
+                UploadExpertBankSlot(device, stage, moe.SharedGateProj[s], perSharedW1Bytes, sharedW1[s], 0);
+                UploadExpertBankSlot(device, stage, moe.SharedDownProj[s], perSharedW2Bytes, sharedW2[s], 0);
+                UploadExpertBankSlot(device, stage, moe.SharedUpProj[s], perSharedW3Bytes, sharedW3[s], 0);
+            }
+            uploadedBytes += (long)numShared * (perSharedW1Bytes + perSharedW2Bytes + perSharedW3Bytes);
+        }
+
         return new MoeLayerBuffers(gate, w1Bank, w2Bank, w3Bank,
             moe.NumExperts, moe.NumExpertsPerTok,
-            moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb);
+            moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
+            sharedW1, sharedW2, sharedW3,
+            sharedIntermediateSize: hasShared ? sharedI : 0,
+            numSharedExperts: hasShared ? numShared : 0);
     }
 
     /// <summary>
