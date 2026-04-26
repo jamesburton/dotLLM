@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
 namespace DotLLM.Cuda;
@@ -772,15 +773,9 @@ public static unsafe partial class CudaMlaAttention
         float rmsNormEps, float softmaxScale,
         CudaMlaScratchF16 scratch, nint cublasHandle, CudaKernels kernels, nint stream)
     {
-        if (layer.Precision == MlaPrecision.Quantized)
-            throw new NotImplementedException(
-                "MLA quantized forward path (raw GGUF quant bytes + on-device dequant) is not " +
-                "yet wired into ForwardF16. Loader-side scaffolding (CudaMlaWeightsLoader.LoadLayerQuant) " +
-                "is in place; the per-projection dequant-to-F16-scratch + HGEMM branch is the next " +
-                "step (sub-task #9-iii in docs/perf/DEEPSEEK_QUANTIZED_GPU_PATH.md).");
-        if (layer.Precision != MlaPrecision.F16)
+        if (layer.Precision != MlaPrecision.F16 && layer.Precision != MlaPrecision.Quantized)
             throw new InvalidOperationException(
-                $"ForwardF16 requires FP16 weights but layer.Precision is {layer.Precision}.");
+                $"ForwardF16 requires FP16 or Quantized weights; got Precision={layer.Precision}.");
         if (kvCache.Precision != MlaPrecision.F16)
             throw new InvalidOperationException(
                 $"ForwardF16 requires an FP16 KV cache but cache.Precision is {kvCache.Precision}.");
@@ -808,30 +803,48 @@ public static unsafe partial class CudaMlaAttention
             hiddenF16, layer.AttnNormWeight, scratch.NormHidden,
             seqLen, hiddenSize, rmsNormEps, stream);
 
-        // ── Q path (cuBLAS HGEMM) ──
+        bool isQuant = layer.Precision == MlaPrecision.Quantized;
+
+        // ── Q path (cuBLAS HGEMM, optionally preceded by on-device dequant) ──
         if (qLora > 0)
         {
-            CudaGemm.LinearF16(
-                cublasHandle, scratch.NormHidden, layer.QAProj, scratch.QLatent,
-                seqLen, hiddenSize, qLora, stream);
+            ProjectF16OrQuant(
+                layer.Precision, cublasHandle, kernels, stream,
+                scratch.NormHidden, seqLen, K: hiddenSize, M: qLora,
+                weightF16: layer.QAProj,
+                weightQuant: layer.QAProjQuant, weightQt: layer.QAProjQuantType,
+                dequantScratch: scratch.DequantScratch,
+                outputF16: scratch.QLatent);
             kernels.LaunchMlaRmsNormF16(
                 scratch.QLatent, layer.QALayernormWeight, scratch.QLatentNorm,
                 seqLen, qLora, rmsNormEps, stream);
-            CudaGemm.LinearF16(
-                cublasHandle, scratch.QLatentNorm, layer.QBProj, scratch.Q,
-                seqLen, qLora, qTotal, stream);
+            ProjectF16OrQuant(
+                layer.Precision, cublasHandle, kernels, stream,
+                scratch.QLatentNorm, seqLen, K: qLora, M: qTotal,
+                weightF16: layer.QBProj,
+                weightQuant: layer.QBProjQuant, weightQt: layer.QBProjQuantType,
+                dequantScratch: scratch.DequantScratch,
+                outputF16: scratch.Q);
         }
         else
         {
-            CudaGemm.LinearF16(
-                cublasHandle, scratch.NormHidden, layer.QProj, scratch.Q,
-                seqLen, hiddenSize, qTotal, stream);
+            ProjectF16OrQuant(
+                layer.Precision, cublasHandle, kernels, stream,
+                scratch.NormHidden, seqLen, K: hiddenSize, M: qTotal,
+                weightF16: layer.QProj,
+                weightQuant: layer.QProjQuant, weightQt: layer.QProjQuantType,
+                dequantScratch: scratch.DequantScratch,
+                outputF16: scratch.Q);
         }
 
         // ── KV down-projection + split (FP16) ──
-        CudaGemm.LinearF16(
-            cublasHandle, scratch.NormHidden, layer.KvAProjWithMqa, scratch.CompressedKv,
-            seqLen, hiddenSize, kvAOut, stream);
+        ProjectF16OrQuant(
+            layer.Precision, cublasHandle, kernels, stream,
+            scratch.NormHidden, seqLen, K: hiddenSize, M: kvAOut,
+            weightF16: layer.KvAProjWithMqa,
+            weightQuant: layer.KvAProjWithMqaQuant, weightQt: layer.KvAProjWithMqaQuantType,
+            dequantScratch: scratch.DequantScratch,
+            outputF16: scratch.CompressedKv);
 
         // Extract latent half (first kvLora F16s of each row), RMSNorm.
         ExtractLatentSliceF16(
@@ -840,10 +853,14 @@ public static unsafe partial class CudaMlaAttention
             scratch.KvLatentNorm, layer.KvALayernormWeight, scratch.KvLatentNormOut,
             seqLen, kvLora, rmsNormEps, stream);
 
-        // KV-B expansion (FP16 HGEMM).
-        CudaGemm.LinearF16(
-            cublasHandle, scratch.KvLatentNormOut, layer.KvBProj, scratch.KvBExpanded,
-            seqLen, kvLora, kvBOut, stream);
+        // KV-B expansion (FP16 HGEMM, optionally preceded by on-device dequant).
+        ProjectF16OrQuant(
+            layer.Precision, cublasHandle, kernels, stream,
+            scratch.KvLatentNormOut, seqLen, K: kvLora, M: kvBOut,
+            weightF16: layer.KvBProj,
+            weightQuant: layer.KvBProjQuant, weightQt: layer.KvBProjQuantType,
+            dequantScratch: scratch.DequantScratch,
+            outputF16: scratch.KvBExpanded);
 
         // Per-head split into K_nope and V scratch buffers (F16 in / F16 out).
         kernels.LaunchMlaSplitKvBF16(
@@ -887,10 +904,47 @@ public static unsafe partial class CudaMlaAttention
             seqLen, seqKv, numHeads, qkNope, qkRope, vHead,
             positionOffset, softmaxScale, stream);
 
-        // ── O projection (FP16 HGEMM) ──
-        CudaGemm.LinearF16(
-            cublasHandle, scratch.AttnOut, layer.OProj, outputF16,
-            seqLen, oInput, hiddenSize, stream);
+        // ── O projection (FP16 HGEMM, optionally preceded by on-device dequant) ──
+        ProjectF16OrQuant(
+            layer.Precision, cublasHandle, kernels, stream,
+            scratch.AttnOut, seqLen, K: oInput, M: hiddenSize,
+            weightF16: layer.OProj,
+            weightQuant: layer.OProjQuant, weightQt: layer.OProjQuantType,
+            dequantScratch: scratch.DequantScratch,
+            outputF16: outputF16);
+    }
+
+    /// <summary>
+    /// Projection helper that branches on <paramref name="precision"/>: F16 weights
+    /// route through cuBLAS HGEMM directly; quantized weights are dequantized into
+    /// <paramref name="dequantScratch"/> via <see cref="CudaKernels.LaunchDequantToF16"/>
+    /// first, then HGEMM. Sized assumptions: weight is <c>[M, K]</c> row-major (K innermost),
+    /// scratch must hold at least <c>M*K</c> halfs.
+    /// </summary>
+    /// <remarks>
+    /// Cost on the quantized path: one extra dequant kernel launch per projection
+    /// (5 per layer × 27 layers = 135 launches/forward at V2-Lite scale). At 22 µs
+    /// WDDM overhead that's ~3 ms/forward — small relative to the cuBLAS HGEMMs
+    /// (each ~50 µs at MLA's projection sizes). Decode-batch=1 quantized GEMV is
+    /// the optimization that follows once correctness is verified.
+    /// </remarks>
+    private static void ProjectF16OrQuant(
+        MlaPrecision precision, nint cublasHandle, CudaKernels kernels, nint stream,
+        nint inputF16, int seqLen, int K, int M,
+        nint weightF16, nint weightQuant, QuantizationType weightQt,
+        nint dequantScratch, nint outputF16)
+    {
+        if (precision == MlaPrecision.Quantized)
+        {
+            kernels.LaunchDequantToF16(weightQuant, weightQt, dequantScratch, M * K, stream);
+            CudaGemm.LinearF16(cublasHandle, inputF16, dequantScratch, outputF16,
+                seqLen, K, M, stream);
+        }
+        else
+        {
+            CudaGemm.LinearF16(cublasHandle, inputF16, weightF16, outputF16,
+                seqLen, K, M, stream);
+        }
     }
 
     /// <summary>
@@ -954,6 +1008,8 @@ public sealed unsafe class CudaMlaScratchF16 : IDisposable
     private nint _v;                // [seqLen, numHeads * vHead]
     private nint _kPe;              // [seqLen, qkRope]
     private nint _attnOut;          // [seqLen, numHeads * vHead]
+    private nint _dequantScratch;   // [max(M*K) across MLA projections] FP16 — reused for the quantized path
+    private long _dequantScratchElems;
 
     private int _capacitySeqLen;
     private int _hidden, _qLora, _qkHead, _qkRope, _qkNope, _vHead, _numHeads, _kvLora;
@@ -973,6 +1029,7 @@ public sealed unsafe class CudaMlaScratchF16 : IDisposable
     internal nint V => _v;
     internal nint KPe => _kPe;
     internal nint AttnOut => _attnOut;
+    internal nint DequantScratch => _dequantScratch;
 
     /// <summary>
     /// Ensures all FP16 scratch buffers can hold <paramref name="seqLen"/> tokens
@@ -1027,6 +1084,24 @@ public sealed unsafe class CudaMlaScratchF16 : IDisposable
         _v = Alloc((long)newCap * _numHeads * _vHead);
         _kPe = Alloc((long)newCap * _qkRope);
         _attnOut = Alloc((long)newCap * _numHeads * _vHead);
+
+        // Dequant scratch — quantized path only. Sized to the largest of the
+        // 5 MLA projections so a single buffer covers any of them per call.
+        if (layer.Precision == MlaPrecision.Quantized)
+        {
+            long qLargest = _qLora > 0
+                ? Math.Max((long)_qLora * _hidden, (long)qTotal * _qLora)
+                : (long)qTotal * _hidden;
+            long maxElems = Math.Max(
+                Math.Max(qLargest, (long)kvAOut * _hidden),
+                Math.Max((long)kvBOut * _kvLora, (long)_hidden * _numHeads * _vHead));
+            if (maxElems > _dequantScratchElems)
+            {
+                FreeIfNonZero(ref _dequantScratch);
+                _dequantScratch = Alloc(maxElems);
+                _dequantScratchElems = maxElems;
+            }
+        }
     }
 
     private nint Alloc(long elemCount)
@@ -1059,10 +1134,12 @@ public sealed unsafe class CudaMlaScratchF16 : IDisposable
         if (ptr != 0) { CudaDriverApi.cuMemFree_v2(ptr); ptr = 0; }
     }
 
-    /// <summary>Frees every FP16 device buffer.</summary>
+    /// <summary>Frees every FP16 device buffer (including the optional dequant scratch).</summary>
     public void Dispose()
     {
         Free();
+        FreeIfNonZero(ref _dequantScratch);
+        _dequantScratchElems = 0;
         _capacitySeqLen = 0;
     }
 }
