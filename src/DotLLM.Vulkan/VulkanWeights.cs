@@ -21,6 +21,64 @@ namespace DotLLM.Vulkan;
 internal sealed class VulkanWeights : IDisposable
 {
     /// <summary>
+    /// Per-layer device-resident MoE (Mixtral / Qwen-MoE) weight bundle.
+    /// Per-expert weights are <i>packed</i> into one contiguous F32 device
+    /// bank per projection so the indexed-matmul kernel can address any
+    /// expert via a single descriptor binding plus a per-row index lookup.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three banks per layer:
+    /// <list type="bullet">
+    ///   <item><c>W1Bank</c> (<i>gate_proj</i>): <c>[numExperts, intermediate, hidden]</c></item>
+    ///   <item><c>W2Bank</c> (<i>down_proj</i>): <c>[numExperts, hidden, intermediate]</c></item>
+    ///   <item><c>W3Bank</c> (<i>up_proj</i>):   <c>[numExperts, intermediate, hidden]</c></item>
+    /// </list>
+    /// Plus the router gate <c>[numExperts, hidden]</c>. Shared experts
+    /// (DeepSeek-V2/V3) are NOT supported in this pass — the loader still
+    /// resolves them on the CPU side, but the Vulkan upload guard rejects
+    /// any layer with <c>HasSharedExpert</c>.
+    /// </para>
+    /// </remarks>
+    internal readonly struct MoeLayerBuffers
+    {
+        public readonly VulkanDevice.Buffer Gate;       // [numExperts, hidden]
+        public readonly VulkanDevice.Buffer W1Bank;     // [numExperts, intermediate, hidden]
+        public readonly VulkanDevice.Buffer W2Bank;     // [numExperts, hidden, intermediate]
+        public readonly VulkanDevice.Buffer W3Bank;     // [numExperts, intermediate, hidden]
+
+        public readonly int NumExperts;
+        public readonly int NumExpertsPerTok;
+        public readonly int HiddenSize;
+        public readonly int IntermediateSize;
+        public readonly bool NormTopKProb;
+
+        public MoeLayerBuffers(
+            VulkanDevice.Buffer gate, VulkanDevice.Buffer w1, VulkanDevice.Buffer w2, VulkanDevice.Buffer w3,
+            int numExperts, int numExpertsPerTok,
+            int hiddenSize, int intermediateSize, bool normTopKProb)
+        {
+            Gate = gate;
+            W1Bank = w1;
+            W2Bank = w2;
+            W3Bank = w3;
+            NumExperts = numExperts;
+            NumExpertsPerTok = numExpertsPerTok;
+            HiddenSize = hiddenSize;
+            IntermediateSize = intermediateSize;
+            NormTopKProb = normTopKProb;
+        }
+
+        public void Dispose()
+        {
+            Gate.Dispose();
+            W1Bank.Dispose();
+            W2Bank.Dispose();
+            W3Bank.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Per-layer device-resident MLA (DeepSeek-V2/V3) weight bundle. All
     /// projection buffers are F32 row-major, mirroring
     /// <see cref="MlaLayerWeights"/>. The CPU loader stores
@@ -126,6 +184,13 @@ internal sealed class VulkanWeights : IDisposable
         /// </summary>
         public readonly MlaLayerBuffers? Mla;
 
+        /// <summary>
+        /// Non-null when the layer uses a MoE FFN (Mixtral, Qwen-MoE).
+        /// Forward routes the FFN through <c>RecordMoeLayer</c> and the
+        /// dense Gate/Up/Down slots above are unused (zero buffers).
+        /// </summary>
+        public readonly MoeLayerBuffers? Moe;
+
         public readonly VulkanDevice.Buffer FfnNormWeight;
 
         public readonly VulkanDevice.Buffer Gate;
@@ -152,7 +217,8 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer up, QuantizationType upQt, int upM, int upK,
             VulkanDevice.Buffer down, QuantizationType downQt, int downM, int downK,
             VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias,
-            MlaLayerBuffers? mla = null)
+            MlaLayerBuffers? mla = null,
+            MoeLayerBuffers? moe = null)
         {
             AttnNormWeight = attnNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
@@ -166,6 +232,7 @@ internal sealed class VulkanWeights : IDisposable
             Down = down; DownDeviceQuantType = downQt; DownOutputDim = downM; DownInputDim = downK;
             GateBias = gateBias; UpBias = upBias; DownBias = downBias;
             Mla = mla;
+            Moe = moe;
         }
 
         public void Dispose()
@@ -177,6 +244,7 @@ internal sealed class VulkanWeights : IDisposable
             Gate.Dispose(); Up.Dispose(); Down.Dispose();
             GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
             Mla?.Dispose();
+            Moe?.Dispose();
         }
     }
 
@@ -314,16 +382,45 @@ internal sealed class VulkanWeights : IDisposable
             var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
             totalBytes += (long)lw.FfnNormWeight.Length * sizeof(float);
 
-            var gate = UploadMatrix(device, staging, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                dequantToFp32, out var gateDeviceQt, out long gateBytes);
-            var up = UploadMatrix(device, staging, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                dequantToFp32, out var upDeviceQt, out long upBytes);
-            var down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim,
-                dequantToFp32, out var downDeviceQt, out long downBytes);
+            // MoE layers replace the dense Gate/Up/Down with per-expert
+            // banks (lw.Moe). Stub the dense slots with 64-byte buffers so
+            // the LayerBuffers contract still holds — the forward pass
+            // never dispatches a matmul against them on MoE layers.
+            VulkanDevice.Buffer gate, up, down;
+            QuantizationType gateDeviceQt, upDeviceQt, downDeviceQt;
+            long gateBytes, upBytes, downBytes;
+            VulkanDevice.Buffer? gateBias, upBias, downBias;
+            if (lw.Moe is not null)
+            {
+                gate = device.AllocateDeviceLocal(64);
+                up = device.AllocateDeviceLocal(64);
+                down = device.AllocateDeviceLocal(64);
+                gateDeviceQt = upDeviceQt = downDeviceQt = QuantizationType.F32;
+                gateBytes = upBytes = downBytes = 0;
+                gateBias = upBias = downBias = null;
+            }
+            else
+            {
+                gate = UploadMatrix(device, staging, lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
+                    dequantToFp32, out gateDeviceQt, out gateBytes);
+                up = UploadMatrix(device, staging, lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
+                    dequantToFp32, out upDeviceQt, out upBytes);
+                down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim,
+                    dequantToFp32, out downDeviceQt, out downBytes);
+                gateBias = UploadOptionalVec(device, staging, lw.GateBias);
+                upBias = UploadOptionalVec(device, staging, lw.UpBias);
+                downBias = UploadOptionalVec(device, staging, lw.DownBias);
+            }
 
-            var gateBias = UploadOptionalVec(device, staging, lw.GateBias);
-            var upBias = UploadOptionalVec(device, staging, lw.UpBias);
-            var downBias = UploadOptionalVec(device, staging, lw.DownBias);
+            MoeLayerBuffers? moe = null;
+            if (lw.Moe is not null)
+            {
+                if (lw.Moe.HasSharedExpert)
+                    throw new NotSupportedException(
+                        "MoE shared experts (DeepSeek-V2/V3 / Qwen1.5-MoE shared expert branch) are not supported on the Vulkan backend yet.");
+                moe = UploadMoeLayer(device, lw.Moe, out long moeBytes);
+                totalBytes += moeBytes;
+            }
 
             layerBuffers[i] = new LayerBuffers(
                 attnNorm,
@@ -337,7 +434,7 @@ internal sealed class VulkanWeights : IDisposable
                 up, upDeviceQt, lw.UpOutputDim, lw.UpInputDim,
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
                 gateBias, upBias, downBias,
-                mla);
+                mla, moe);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes
                 + gateBytes + upBytes + downBytes;
@@ -575,6 +672,95 @@ internal sealed class VulkanWeights : IDisposable
             kvALatent, kvAKPe, kvALayernorm, kvBProj,
             mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
             mla.QLoraRank, mla.KvLoraRank, hiddenSize);
+    }
+
+    /// <summary>
+    /// Uploads the MoE-specific weights for one layer. The router gate
+    /// goes into its own buffer; per-expert <c>W1</c>/<c>W2</c>/<c>W3</c>
+    /// are <i>packed</i> into one contiguous F32 device bank per
+    /// projection so the indexed matmul kernel can address any expert via
+    /// a single descriptor binding plus a per-row index lookup. Each
+    /// expert is uploaded individually through a per-call staging buffer
+    /// (sized to the largest expert matrix) — the main staging buffer
+    /// passed by the caller isn't large enough for whole expert banks.
+    /// </summary>
+    private static unsafe MoeLayerBuffers UploadMoeLayer(
+        VulkanDevice device, MoeLayerWeights moe, out long uploadedBytes)
+    {
+        uploadedBytes = 0;
+        int hidden = moe.HiddenSize;
+        int interm = moe.IntermediateSize;
+        int numE = moe.NumExperts;
+
+        // Router gate: contiguous F32 [numExperts, hidden].
+        long gateBytes = (long)numE * hidden * sizeof(float);
+        long perExpertW1Bytes = (long)interm * hidden * sizeof(float);
+        long perExpertW2Bytes = (long)hidden * interm * sizeof(float);
+        long perExpertW3Bytes = perExpertW1Bytes;
+
+        // Stage sized to the largest single per-expert matrix OR the gate row,
+        // whichever is bigger. The bank-pack copies one expert at a time so
+        // we never need to stage the full bank at once.
+        long stageBytes = Math.Max(gateBytes, Math.Max(perExpertW1Bytes, perExpertW2Bytes));
+        using var stage = device.Allocate(stageBytes);
+
+        // ── Router gate ──────────────────────────────────────────────
+        var gate = device.AllocateDeviceLocal(gateBytes);
+        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateBytes, 0, out nint gateMapped)
+            .ThrowOnError("vkMapMemory UploadMoeLayer gate");
+        try
+        {
+            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, stage.Memory);
+        }
+        device.CopyBufferSynchronous(stage, gate, (ulong)gateBytes);
+        uploadedBytes += gateBytes;
+
+        // ── Bank packing (per-expert) ────────────────────────────────
+        long w1BankBytes = perExpertW1Bytes * numE;
+        long w2BankBytes = perExpertW2Bytes * numE;
+        long w3BankBytes = perExpertW3Bytes * numE;
+        var w1Bank = device.AllocateDeviceLocal(w1BankBytes);
+        var w2Bank = device.AllocateDeviceLocal(w2BankBytes);
+        var w3Bank = device.AllocateDeviceLocal(w3BankBytes);
+
+        for (int e = 0; e < numE; e++)
+        {
+            UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
+            UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
+            UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
+        }
+        uploadedBytes += w1BankBytes + w2BankBytes + w3BankBytes;
+
+        return new MoeLayerBuffers(gate, w1Bank, w2Bank, w3Bank,
+            moe.NumExperts, moe.NumExpertsPerTok,
+            moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb);
+    }
+
+    /// <summary>
+    /// Uploads one per-expert F32 matrix from an unmanaged source pointer
+    /// into a slot of a packed bank buffer at <paramref name="dstOffset"/>.
+    /// </summary>
+    private static unsafe void UploadExpertBankSlot(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
+    {
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory UploadExpertBankSlot");
+        try
+        {
+            int elems = checked((int)(bytes / sizeof(float)));
+            new ReadOnlySpan<float>((void*)srcPtr, elems)
+                .CopyTo(new Span<float>((void*)mapped, elems));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
     }
 
     /// <summary>

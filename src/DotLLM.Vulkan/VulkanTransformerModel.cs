@@ -99,6 +99,10 @@ public sealed class VulkanTransformerModel : IModel
     private readonly int _mlaVHeadDim;
     private readonly int _mlaNumHeads;
     private readonly float _mlaRopeTheta;
+    // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
+    private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
+    private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
+    private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
 
     // Persistent command buffer + fence used by Forward. One SubmitContext
     // per model — reset+begin at the start of each forward, submit+wait at
@@ -149,6 +153,8 @@ public sealed class VulkanTransformerModel : IModel
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
+        MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
+        MoeWeightedScatterF32Kernel? moeWeightedScatter,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow,
@@ -175,6 +181,9 @@ public sealed class VulkanTransformerModel : IModel
         _mlaAttention = mlaAttention;
         _mlaRope = mlaRope;
         _mlaKvSplit = mlaKvSplit;
+        _moeTopkSoftmax = moeTopkSoftmax;
+        _moeIndexedMatmul = moeIndexedMatmul;
+        _moeWeightedScatter = moeWeightedScatter;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
@@ -280,6 +289,25 @@ public sealed class VulkanTransformerModel : IModel
         // quant types are still dequantised to FP32 at upload.
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
 
+        // MoE detection: any layer with non-null Moe in CPU weights. We
+        // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
+        // mark "MoE everywhere" while DeepSeek-V2 first_k_dense_replace
+        // makes only the tail layers MoE — any-layer check is the
+        // conservative trigger.
+        bool hasMoe = false;
+        int moeNumExperts = 0, moeTopK = 0, moeIntermediate = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            ref readonly var lwTmp = ref cpuWeights.Layers[i];
+            if (lwTmp.Moe is not null)
+            {
+                hasMoe = true;
+                moeNumExperts = Math.Max(moeNumExperts, lwTmp.Moe.NumExperts);
+                moeTopK = Math.Max(moeTopK, lwTmp.Moe.NumExpertsPerTok);
+                moeIntermediate = Math.Max(moeIntermediate, lwTmp.Moe.IntermediateSize);
+            }
+        }
+
         bool hasMla = config.MlaConfig is not null;
         int mlaNumHeads = hasMla ? config.NumAttentionHeads : 0;
         int mlaQkNope = hasMla ? config.MlaConfig!.QkNopeHeadDim : 0;
@@ -305,7 +333,10 @@ public sealed class VulkanTransformerModel : IModel
             mlaQkRopeHeadDim: mlaQkRope,
             mlaVHeadDim: mlaVHead,
             mlaQLoraRank: mlaQLora,
-            mlaKvLoraRank: mlaKvLora);
+            mlaKvLoraRank: mlaKvLora,
+            moeNumExperts: moeNumExperts,
+            moeTopK: moeTopK,
+            moeIntermediateSize: moeIntermediate);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -344,6 +375,16 @@ public sealed class VulkanTransformerModel : IModel
             mlaKvSplit = MlaKvSplitF32Kernel.Create(device, spvDir);
         }
 
+        MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
+        MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
+        MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
+        if (hasMoe)
+        {
+            moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
+            moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
+            moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
+        }
+
         var submit = device.CreateSubmitContext();
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -362,6 +403,7 @@ public sealed class VulkanTransformerModel : IModel
             rmsnorm, rope, attention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
+            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
@@ -371,8 +413,6 @@ public sealed class VulkanTransformerModel : IModel
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
     {
-        if (config.Moe is not null)
-            throw new NotSupportedException("MoE is not supported on the Vulkan backend yet.");
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
         // MLA: latent / hybrid cache modes are CPU-only for now; the Vulkan
@@ -567,6 +607,17 @@ public sealed class VulkanTransformerModel : IModel
             // Pre-FFN residual snapshot: Residual aliases HiddenState (same
             // slot); no copy needed.
 
+            if (lw.Moe is { } moeW)
+            {
+                // MoE FFN replaces the dense Gate/Up/Down with a sparse
+                // top-k expert dispatch. Writes the post-MoE result into
+                // _state.NormOutput so the shared residual-add below
+                // works unchanged.
+                RecordMoeLayer(cmdBuf, moeW, lw, seqLen, eps);
+            }
+            else
+            {
+
             // FFN RMSNorm + Gate projection — fused when available
             // (mirrors the attn-norm + Q fusion above). Up reads the
             // normalised hidden state written by the fused dispatch.
@@ -608,6 +659,7 @@ public sealed class VulkanTransformerModel : IModel
                 _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
+            }  // end of dense-FFN branch (else of MoE)
 
             // Residual add #2: AddScratch = Residual + NormOutput; then rotate
             // the slot so the new hidden state lives in the buffer we just
@@ -675,6 +727,9 @@ public sealed class VulkanTransformerModel : IModel
         _mlaAttention?.InvalidateDescriptorCache();
         _mlaRope?.InvalidateDescriptorCache();
         _mlaKvSplit?.InvalidateDescriptorCache();
+        _moeTopkSoftmax?.InvalidateDescriptorCache();
+        _moeIndexedMatmul?.InvalidateDescriptorCache();
+        _moeWeightedScatter?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -858,6 +913,109 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Records the MoE (Mixtral / Qwen-MoE) FFN block for one layer:
+    /// rmsnorm → router gate matmul → top-k softmax → broadcast hidden
+    /// to per-(token, slot) → indexed gate / up matmuls (W1, W3) →
+    /// SwiGLU → indexed down matmul (W2) → weighted scatter back to
+    /// per-token output. Writes the post-MoE result into <c>_state.NormOutput</c>
+    /// so the shared residual-add downstream sees the same contract as
+    /// the dense FFN path.
+    /// </summary>
+    /// <remarks>
+    /// All projection weights are F32 (the loader upcasts F16/BF16 at
+    /// load) so every matmul lands on the F32 plain kernel. Per-expert
+    /// banks are addressed via <c>moe_indexed_matmul_f32</c> with the
+    /// per-row expert index sourced from <c>moe_topk_softmax_f32</c>'s
+    /// indices buffer — no host sync between the router and the expert
+    /// matmuls.
+    /// </remarks>
+    private unsafe void RecordMoeLayer(
+        nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW,
+        in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
+    {
+        int hidden = moeW.HiddenSize;
+        int interm = moeW.IntermediateSize;
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int expandedRows = seqLen * topK;
+
+        // 1. Pre-FFN RMSNorm: HiddenState → NormOutput.
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 2. Router gate matmul: Gate @ NormOutput → MoeRouterLogits.
+        _matmul.Record(cmdBuf, moeW.Gate, _state.NormOutput, _state.MoeRouterLogits!,
+            m: numE, k: hidden, n: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
+        _moeTopkSoftmax!.Record(cmdBuf,
+            _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        // The expanded-input broadcast below runs in TRANSFER (vkCmdCopyBuffer)
+        // and reads NormOutput; the topk indices/weights are read by COMPUTE
+        // matmul / scatter dispatches downstream. A compute→compute barrier
+        // on indices/weights and a compute→transfer barrier on NormOutput
+        // are both needed — the broader compute→all barrier covers it.
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 4. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
+        //    Each token's row gets replicated topK times so each (t, slot)
+        //    shares the same input but consumes a different expert. Issuing
+        //    seqLen * topK vkCmdCopyBuffer regions is fine for the small-N
+        //    workloads we care about; a fused broadcast shader is a
+        //    perf-wave follow-up.
+        long rowBytes = (long)hidden * sizeof(float);
+        for (int t = 0; t < seqLen; t++)
+        {
+            long srcOff = (long)t * rowBytes;
+            for (int slot = 0; slot < topK; slot++)
+            {
+                long dstOff = ((long)t * topK + slot) * rowBytes;
+                var region = new VkBufferCopy
+                {
+                    srcOffset = (ulong)srcOff,
+                    dstOffset = (ulong)dstOff,
+                    size = (ulong)rowBytes,
+                };
+                VulkanApi.vkCmdCopyBuffer(cmdBuf,
+                    _state.NormOutput.Handle, _state.MoeExpandedInput!.Handle, 1, region);
+            }
+        }
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        // 5. Indexed expert matmuls: gate (W1) and up (W3) project the
+        //    expanded input through the experts selected by topk indices.
+        _moeIndexedMatmul!.Record(cmdBuf,
+            moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+            m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        _moeIndexedMatmul!.Record(cmdBuf,
+            moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+            m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 6. SwiGLU pointwise: silu(gate) * up.
+        _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+            n: expandedRows * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 7. Indexed down matmul (W2): silu_intermediate → MoeDownRows.
+        _moeIndexedMatmul!.Record(cmdBuf,
+            moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+            m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // 8. Weighted scatter: combine each token's topK expert outputs into
+        //    NormOutput, scaled by the routing weights.
+        _moeWeightedScatter!.Record(cmdBuf,
+            _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput,
+            seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantType weightQt,
@@ -975,6 +1133,9 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _moeWeightedScatter?.Dispose();
+        _moeIndexedMatmul?.Dispose();
+        _moeTopkSoftmax?.Dispose();
         _mlaKvSplit?.Dispose();
         _mlaRope?.Dispose();
         _mlaAttention?.Dispose();
