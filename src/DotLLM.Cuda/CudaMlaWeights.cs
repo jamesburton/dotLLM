@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
@@ -10,7 +11,10 @@ namespace DotLLM.Cuda;
 /// the Phase A reference (matches the CPU oracle byte-for-byte algorithmically);
 /// F16 is the production-target sibling that mirrors the rest of the CUDA
 /// backend's GQA path (FP16 weights / activations / cache, FP32 softmax /
-/// RMSNorm reduction).
+/// RMSNorm reduction). <c>Quantized</c> keeps raw GGUF Q4_K/Q8_0 bytes on
+/// device and dequantizes per call into reused F16 scratch — the only viable
+/// path for full DeepSeek-V2-Lite (the F32 / F16 fully-resident variants
+/// don't fit a 12 GB GPU).
 /// </summary>
 public enum MlaPrecision
 {
@@ -18,6 +22,11 @@ public enum MlaPrecision
     F32 = 0,
     /// <summary>F16 weights + activations + cache, FP32 reductions. Default production path.</summary>
     F16 = 1,
+    /// <summary>
+    /// Raw GGUF quantized weights on device; dequantize per call into reused
+    /// F16 scratch. Activations + cache + reductions same as <see cref="F16"/>.
+    /// </summary>
+    Quantized = 2,
 }
 #endregion
 
@@ -104,6 +113,40 @@ public readonly struct CudaMlaLayerWeights
     public readonly MlaPrecision Precision;
 
     /// <summary>
+    /// When <see cref="Precision"/> is <see cref="MlaPrecision.Quantized"/>:
+    /// raw on-device GGUF quant bytes per projection + their quant type. The
+    /// forward path dequantizes per call into reused F16 scratch (or, for
+    /// decode batch=1, dispatches a quantized-GEMV kernel directly when the
+    /// quant type has one). When <see cref="Precision"/> is F16 / F32, these
+    /// are zero / F32 and the corresponding F16 / F32 fields above are the
+    /// only views.
+    /// </summary>
+    /// <summary>Raw on-device GGUF quant bytes for q_a_proj. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint QAProjQuant;
+    /// <summary>Quant type for <see cref="QAProjQuant"/>.</summary>
+    public readonly QuantizationType QAProjQuantType;
+    /// <summary>Raw on-device GGUF quant bytes for q_b_proj. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint QBProjQuant;
+    /// <summary>Quant type for <see cref="QBProjQuant"/>.</summary>
+    public readonly QuantizationType QBProjQuantType;
+    /// <summary>Raw on-device GGUF quant bytes for monolithic q_proj. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint QProjQuant;
+    /// <summary>Quant type for <see cref="QProjQuant"/>.</summary>
+    public readonly QuantizationType QProjQuantType;
+    /// <summary>Raw on-device GGUF quant bytes for kv_a_proj_with_mqa. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint KvAProjWithMqaQuant;
+    /// <summary>Quant type for <see cref="KvAProjWithMqaQuant"/>.</summary>
+    public readonly QuantizationType KvAProjWithMqaQuantType;
+    /// <summary>Raw on-device GGUF quant bytes for kv_b_proj. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint KvBProjQuant;
+    /// <summary>Quant type for <see cref="KvBProjQuant"/>.</summary>
+    public readonly QuantizationType KvBProjQuantType;
+    /// <summary>Raw on-device GGUF quant bytes for o_proj. 0 unless <see cref="Precision"/>==<see cref="MlaPrecision.Quantized"/>.</summary>
+    public readonly nint OProjQuant;
+    /// <summary>Quant type for <see cref="OProjQuant"/>.</summary>
+    public readonly QuantizationType OProjQuantType;
+
+    /// <summary>
     /// Constructs a fully-populated F32 MLA layer weight bundle (back-compat
     /// constructor — matches the original Phase A signature exactly).
     /// </summary>
@@ -133,6 +176,40 @@ public readonly struct CudaMlaLayerWeights
         int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
         int qLoraRank, int kvLoraRank, int hiddenSize,
         MlaPrecision precision)
+        : this(qAProj, qALayernormWeight, qBProj, qProj,
+               kvAProjWithMqa, kvALayernormWeight, kvBProj,
+               oProj, attnNormWeight, ffnNormWeight, oBias,
+               numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
+               qLoraRank, kvLoraRank, hiddenSize, precision,
+               qAProjQuant: 0, qAProjQuantType: QuantizationType.F32,
+               qBProjQuant: 0, qBProjQuantType: QuantizationType.F32,
+               qProjQuant: 0, qProjQuantType: QuantizationType.F32,
+               kvAProjWithMqaQuant: 0, kvAProjWithMqaQuantType: QuantizationType.F32,
+               kvBProjQuant: 0, kvBProjQuantType: QuantizationType.F32,
+               oProjQuant: 0, oProjQuantType: QuantizationType.F32)
+    {
+    }
+
+    /// <summary>
+    /// Full ctor — used by the quantized loader path. Norm weights + bias stay
+    /// F32 device buffers (the FP16 RMSNorm helper takes a FP32 weight). The
+    /// non-quant projection pointers should be 0 when <paramref name="precision"/>
+    /// is <see cref="MlaPrecision.Quantized"/> — the forward path reads from
+    /// <c>*Quant</c> + <c>*QuantType</c> instead.
+    /// </summary>
+    public CudaMlaLayerWeights(
+        nint qAProj, nint qALayernormWeight, nint qBProj, nint qProj,
+        nint kvAProjWithMqa, nint kvALayernormWeight, nint kvBProj,
+        nint oProj, nint attnNormWeight, nint ffnNormWeight, nint oBias,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int qLoraRank, int kvLoraRank, int hiddenSize,
+        MlaPrecision precision,
+        nint qAProjQuant, QuantizationType qAProjQuantType,
+        nint qBProjQuant, QuantizationType qBProjQuantType,
+        nint qProjQuant, QuantizationType qProjQuantType,
+        nint kvAProjWithMqaQuant, QuantizationType kvAProjWithMqaQuantType,
+        nint kvBProjQuant, QuantizationType kvBProjQuantType,
+        nint oProjQuant, QuantizationType oProjQuantType)
     {
         QAProj = qAProj;
         QALayernormWeight = qALayernormWeight;
@@ -153,6 +230,12 @@ public readonly struct CudaMlaLayerWeights
         KvLoraRank = kvLoraRank;
         HiddenSize = hiddenSize;
         Precision = precision;
+        QAProjQuant = qAProjQuant; QAProjQuantType = qAProjQuantType;
+        QBProjQuant = qBProjQuant; QBProjQuantType = qBProjQuantType;
+        QProjQuant = qProjQuant; QProjQuantType = qProjQuantType;
+        KvAProjWithMqaQuant = kvAProjWithMqaQuant; KvAProjWithMqaQuantType = kvAProjWithMqaQuantType;
+        KvBProjQuant = kvBProjQuant; KvBProjQuantType = kvBProjQuantType;
+        OProjQuant = oProjQuant; OProjQuantType = oProjQuantType;
     }
 
     /// <summary>Total Q vector elements per token: <c>numHeads * (qkNope + qkRope)</c>.</summary>
@@ -328,6 +411,122 @@ internal static unsafe class CudaMlaWeightsLoader
             mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
             mla.QLoraRank, mla.KvLoraRank, hiddenSize,
             MlaPrecision.F16);
+    }
+
+    /// <summary>
+    /// Loads a single MLA layer's projections to GPU as raw GGUF quantized
+    /// bytes (zero-copy upload from the CPU mmap). Used when the source layer
+    /// has populated raw quant views (<see cref="MlaLayerWeights.HasRawQuantView"/>)
+    /// — i.e. GGUF-loaded DeepSeek-V2 weights. Norm weights stay F32 (same
+    /// as the FP16 path). The forward path (CudaMlaAttention.ForwardF16
+    /// quantized branch) dequantizes per call into reused F16 scratch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Memory budget</b> at DeepSeek-V2-Lite scale (Q4_K_M):
+    /// q_proj=2 MB, kv_a=0.4 MB, kv_b=0.6 MB, o_proj=2 MB per layer ⇒
+    /// ~5 MB raw + 64 KB norm weights ⇒ ~140 MB total across 27 layers.
+    /// Compared to ~1.4 GB for F16 fully-resident or ~2.8 GB F32, this is
+    /// the only path that fits a 12 GB consumer GPU after the MoE expert
+    /// block (separate path, see <see cref="CudaMoeWeightsLoader"/> +
+    /// task #10) lands too.
+    /// </para>
+    /// </remarks>
+    /// <param name="cpuLayer">Per-layer weight bundle (must have raw quant views populated by GGUF loader).</param>
+    /// <param name="hiddenSize">Model hidden dimension.</param>
+    /// <param name="oQuantType">O-projection quant type (lives in TransformerLayerWeights.OQuantType, not on Mla).</param>
+    /// <param name="allocs">Allocation list (caller owns + frees on dispose).</param>
+    public static CudaMlaLayerWeights LoadLayerQuant(
+        in TransformerLayerWeights cpuLayer, int hiddenSize,
+        QuantizationType oQuantType, List<nint> allocs)
+    {
+        var mla = cpuLayer.Mla
+            ?? throw new InvalidOperationException(
+                "CudaMlaWeightsLoader.LoadLayerQuant called with non-MLA layer.");
+        if (!mla.HasRawQuantView)
+            throw new InvalidOperationException(
+                "CudaMlaWeightsLoader.LoadLayerQuant requires the source MlaLayerWeights to carry " +
+                "raw GGUF quant views (the GGUF loader populates these alongside the F32 dequants).");
+
+        int qTotal = mla.NumHeads * (mla.QkNopeHeadDim + mla.QkRopeHeadDim);
+        int kvAOut = mla.KvLoraRank + mla.QkRopeHeadDim;
+        int kvBOut = mla.NumHeads * (mla.QkNopeHeadDim + mla.VHeadDim);
+        int oInput = mla.NumHeads * mla.VHeadDim;
+
+        // Q path — upload raw GGUF quant bytes for whichever Q variant the model uses.
+        nint qAQuant = 0, qBQuant = 0, qQuant = 0, qANorm = 0;
+        QuantizationType qAQt = QuantizationType.F32, qBQt = QuantizationType.F32, qQt = QuantizationType.F32;
+        if (mla.QLoraRank > 0)
+        {
+            qAQuant = UploadQuantBytes(mla.QAProjRaw, mla.QLoraRank, hiddenSize, mla.QAProjRawQt, allocs);
+            qAQt = mla.QAProjRawQt;
+            qANorm = UploadF32Array(mla.QALayernormWeight!, allocs);
+            qBQuant = UploadQuantBytes(mla.QBProjRaw, qTotal, mla.QLoraRank, mla.QBProjRawQt, allocs);
+            qBQt = mla.QBProjRawQt;
+        }
+        else
+        {
+            qQuant = UploadQuantBytes(mla.QProjRaw, qTotal, hiddenSize, mla.QProjRawQt, allocs);
+            qQt = mla.QProjRawQt;
+        }
+
+        // KV path
+        nint kvAQuant = UploadQuantBytes(mla.KvAProjWithMqaRaw, kvAOut, hiddenSize, mla.KvAProjWithMqaRawQt, allocs);
+        QuantizationType kvAQt = mla.KvAProjWithMqaRawQt;
+        nint kvANorm = UploadF32Array(mla.KvALayernormWeight, allocs);
+        nint kvBQuant = UploadQuantBytes(mla.KvBProjRaw, kvBOut, mla.KvLoraRank, mla.KvBProjRawQt, allocs);
+        QuantizationType kvBQt = mla.KvBProjRawQt;
+
+        // O projection — raw quant from cpuLayer.OWeight + cpuLayer.OQuantType.
+        // Output dim is hidden, input dim is numHeads * vHeadDim.
+        nint oQuant = UploadQuantBytes(cpuLayer.OWeight, hiddenSize, oInput, oQuantType, allocs);
+
+        // Norms + bias stay F32 (same as the F16 path).
+        nint attnNorm = UploadF32Array(cpuLayer.AttnNormWeight, allocs);
+        nint ffnNorm = UploadF32Array(cpuLayer.FfnNormWeight, allocs);
+        nint oBias = cpuLayer.OBias is float[] biasArr ? UploadF32Array(biasArr, allocs) : (nint)0;
+
+        // The F16 / F32 projection slots are zero — the forward path reads
+        // *Quant + *QuantType when Precision == Quantized.
+        return new CudaMlaLayerWeights(
+            qAProj: 0, qALayernormWeight: qANorm,
+            qBProj: 0, qProj: 0,
+            kvAProjWithMqa: 0, kvALayernormWeight: kvANorm,
+            kvBProj: 0,
+            oProj: 0, attnNormWeight: attnNorm, ffnNormWeight: ffnNorm, oBias: oBias,
+            numHeads: mla.NumHeads,
+            qkNopeHeadDim: mla.QkNopeHeadDim,
+            qkRopeHeadDim: mla.QkRopeHeadDim,
+            vHeadDim: mla.VHeadDim,
+            qLoraRank: mla.QLoraRank,
+            kvLoraRank: mla.KvLoraRank,
+            hiddenSize: hiddenSize,
+            precision: MlaPrecision.Quantized,
+            qAProjQuant: qAQuant, qAProjQuantType: qAQt,
+            qBProjQuant: qBQuant, qBProjQuantType: qBQt,
+            qProjQuant: qQuant, qProjQuantType: qQt,
+            kvAProjWithMqaQuant: kvAQuant, kvAProjWithMqaQuantType: kvAQt,
+            kvBProjQuant: kvBQuant, kvBProjQuantType: kvBQt,
+            oProjQuant: oQuant, oProjQuantType: oQuantType);
+    }
+
+    /// <summary>
+    /// Uploads raw GGUF quantized bytes to GPU (zero-copy from CPU mmap into
+    /// a fresh device buffer). Byte size is computed from the GGUF
+    /// row-byte-stride convention (<see cref="DotLLM.Cpu.Kernels.Dequantize.RowByteSize"/>).
+    /// </summary>
+    private static unsafe nint UploadQuantBytes(nint hostPtr, int outputDim, int inputDim,
+                                                 QuantizationType qt, List<nint> allocs)
+    {
+        if (hostPtr == 0)
+            throw new InvalidOperationException(
+                $"UploadQuantBytes called with null host pointer (qt={qt}, dims={outputDim}x{inputDim}).");
+        long rowBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(inputDim, qt);
+        long bytes = rowBytes * outputDim;
+        CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)bytes).ThrowOnError();
+        allocs.Add(devPtr);
+        CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPtr, (nuint)bytes).ThrowOnError();
+        return devPtr;
     }
 
     /// <summary>
