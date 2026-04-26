@@ -109,6 +109,12 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeIndexedMatmulTiledF32Kernel? _moeIndexedMatmulTiled;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
     private readonly MoeBroadcastF32Kernel? _moeBroadcast;
+    // Optional Qwen1.5-MoE per-token sigmoid gate fold for the shared-expert
+    // branch. Null when no MoE layer exists OR when no MoE layer carries a
+    // SharedExpertGate weight (DeepSeek-V2/V3, Mixtral). Allocated alongside
+    // the other MoE kernels so the gated path is wired wherever it might
+    // fire across the per-layer mix.
+    private readonly MoeSigmoidGatedAddF32Kernel? _moeSigmoidGatedAdd;
 
     // Persistent command buffer + fence used by Forward. One SubmitContext
     // per model — reset+begin at the start of each forward, submit+wait at
@@ -162,6 +168,7 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled,
         MoeWeightedScatterF32Kernel? moeWeightedScatter, MoeBroadcastF32Kernel? moeBroadcast,
+        MoeSigmoidGatedAddF32Kernel? moeSigmoidGatedAdd,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow,
@@ -193,6 +200,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulTiled = moeIndexedMatmulTiled;
         _moeWeightedScatter = moeWeightedScatter;
         _moeBroadcast = moeBroadcast;
+        _moeSigmoidGatedAdd = moeSigmoidGatedAdd;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
@@ -397,6 +405,7 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled = null;
         MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
         MoeBroadcastF32Kernel? moeBroadcast = null;
+        MoeSigmoidGatedAddF32Kernel? moeSigmoidGatedAdd = null;
         if (hasMoe)
         {
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
@@ -404,6 +413,7 @@ public sealed class VulkanTransformerModel : IModel
             moeIndexedMatmulTiled = MoeIndexedMatmulTiledF32Kernel.Create(device, spvDir);
             moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
             moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
+            moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
         }
 
         var submit = device.CreateSubmitContext();
@@ -425,6 +435,7 @@ public sealed class VulkanTransformerModel : IModel
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulTiled, moeWeightedScatter, moeBroadcast,
+            moeSigmoidGatedAdd,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
@@ -753,6 +764,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulTiled?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
+        _moeSigmoidGatedAdd?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -1119,25 +1131,49 @@ public sealed class VulkanTransformerModel : IModel
             }
         }
 
-        // Fold the running shared sum into NormOutput. We need a destination
-        // buffer different from both NormOutput (read) and activeSum (read);
-        // pick the OTHER ping-pong slot, then copy it back into NormOutput so
-        // the caller's residual-add reads the merged result.
-        VulkanDevice.Buffer foldDst = activeSum.Handle == _state.MoeSharedSumA!.Handle
-            ? _state.MoeSharedSumB!
-            : _state.MoeSharedSumA!;
-        _add.Record(cmdBuf, _state.NormOutput, activeSum, foldDst, hiddenElems);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
-        var foldRegion = new VkBufferCopy
+        // Fold the running shared sum into NormOutput. Two paths:
+        //  - DeepSeek-V2/V3 (no gate): plain add via a ping-pong destination,
+        //    then a vkCmdCopyBuffer back into NormOutput (the existing add
+        //    kernel cannot self-write).
+        //  - Qwen1.5-MoE (sigmoid gate): compute per-token gate logits via a
+        //    1×hidden matmul against SharedExpertGate, then apply sigmoid +
+        //    weighted-add into NormOutput in place via the fused kernel.
+        //    No ping-pong / copy needed — the gated kernel writes NormOutput
+        //    directly, with sigmoid(logit_t) folded into the per-token scale.
+        if (moeW.SharedExpertGate is not null)
         {
-            srcOffset = 0,
-            dstOffset = 0,
-            size = (ulong)hiddenElems * sizeof(float),
-        };
-        VulkanApi.vkCmdCopyBuffer(cmdBuf, foldDst.Handle, _state.NormOutput.Handle, 1, foldRegion);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+            // gateLogits[t] = SharedExpertGate[1, hidden] @ MoeSharedInput[t, :].
+            // The post-FFN-RMSNorm hidden state is the right input here — it
+            // mirrors MoeSwiGluMlp.ExecuteCoreGrouped which receives the
+            // already-RMSNormed hidden as `hidden` and computes the gate
+            // logit against that same buffer.
+            _matmul.Record(cmdBuf, moeW.SharedExpertGate, sharedInput, _state.MoeSharedGateLogits!,
+                m: 1, k: hidden, n: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            _moeSigmoidGatedAdd!.Record(cmdBuf,
+                output: _state.NormOutput, b: activeSum, gateLogits: _state.MoeSharedGateLogits!,
+                seqLen: seqLen, hiddenSize: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        else
+        {
+            VulkanDevice.Buffer foldDst = activeSum.Handle == _state.MoeSharedSumA!.Handle
+                ? _state.MoeSharedSumB!
+                : _state.MoeSharedSumA!;
+            _add.Record(cmdBuf, _state.NormOutput, activeSum, foldDst, hiddenElems);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            var foldRegion = new VkBufferCopy
+            {
+                srcOffset = 0,
+                dstOffset = 0,
+                size = (ulong)hiddenElems * sizeof(float),
+            };
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, foldDst.Handle, _state.NormOutput.Handle, 1, foldRegion);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
     }
 
     /// <summary>
@@ -1300,6 +1336,7 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _moeSigmoidGatedAdd?.Dispose();
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
         _moeIndexedMatmulTiled?.Dispose();

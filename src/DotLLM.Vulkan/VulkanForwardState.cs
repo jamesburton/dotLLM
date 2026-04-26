@@ -118,6 +118,7 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeSharedDown { get; private set; }     // [seqLen, hidden] — per-expert down output
     public VulkanDevice.Buffer? MoeSharedSumA { get; private set; }     // [seqLen, hidden] — running shared sum, ping side A
     public VulkanDevice.Buffer? MoeSharedSumB { get; private set; }     // [seqLen, hidden] — running shared sum, ping side B
+    public VulkanDevice.Buffer? MoeSharedGateLogits { get; private set; } // [seqLen] — pre-sigmoid gate logits (Qwen1.5-MoE)
 
     // ── MLA scratch (DeepSeek-V2/V3) ──────────────────────────────────
     // Allocated only when the model carries an MLA layer (mla* dims > 0
@@ -278,7 +279,14 @@ internal sealed class VulkanForwardState : IDisposable
             MoeSharedSumA = _device.AllocateDeviceLocal(sharedHiddenBytes);
             MoeSharedSumB = _device.AllocateDeviceLocal(sharedHiddenBytes);
 
-            total += sharedInterBytes * 3 + sharedHiddenBytes * 4;
+            // Per-token gate logits — only used by the Qwen1.5-MoE sigmoid
+            // gate path. Allocated unconditionally when shared experts exist
+            // so the same state object covers both DeepSeek (unused) and
+            // Qwen1.5-MoE (used) layers; the size is tiny (seqLen × 4B).
+            long gateLogitBytes = (long)seqLen * sizeof(float);
+            MoeSharedGateLogits = _device.AllocateDeviceLocal(gateLogitBytes);
+
+            total += sharedInterBytes * 3 + sharedHiddenBytes * 4 + gateLogitBytes;
         }
 
         return total;
@@ -359,6 +367,7 @@ internal sealed class VulkanForwardState : IDisposable
         MoeSharedDown?.Dispose(); MoeSharedDown = null;
         MoeSharedSumA?.Dispose(); MoeSharedSumA = null;
         MoeSharedSumB?.Dispose(); MoeSharedSumB = null;
+        MoeSharedGateLogits?.Dispose(); MoeSharedGateLogits = null;
     }
 
     public void Dispose()
