@@ -45,6 +45,14 @@ public class VulkanMatMulQ8_0KernelTests
     [InlineData(576, 576)]                // SmolLM q/k/v projection shape
     [InlineData(1536, 576)]               // SmolLM gate/up projection
     [InlineData(576, 1536)]               // SmolLM down projection
+    // Regression for issue #1 — latent stride bug at K=32 with M>1. Row stride
+    // = blocksPerRow*34 = 34 bytes, but rowUints*4 = 36 (rounded up). Earlier
+    // shader read at the rowUints stride and silently returned garbage for
+    // rows beyond the first. Repeats for any K where blocksPerRow*34 % 4 != 0
+    // (i.e., blocksPerRow odd: K = 32, 96, 160, 224, ...).
+    [InlineData(8, 32)]                   // K=32, M>1 — historical bug
+    [InlineData(4, 96)]                   // K=96, blocksPerRow=3 (odd) — same family
+    [InlineData(2, 160)]                  // K=160, blocksPerRow=5 (odd) — same family
     public void Launch_MatchesCpuReference(int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

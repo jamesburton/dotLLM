@@ -79,8 +79,15 @@ void main() {
     uint threads = gl_WorkGroupSize.x;
 
     // Absolute byte offset of the start of this row in the raw weight blob.
-    // rowUints * 4 gives the per-row byte stride.
-    uint rowByteStride = pc.rowUints * 4u;
+    // Compute the stride from blocksPerRow directly rather than rowUints*4 —
+    // rowUints is rounded up to the next uint multiple for buffer-bounds
+    // safety, so it overstates the per-row stride when blocksPerRow*34 is
+    // not itself a multiple of 4 (e.g. K=32 yields rowBytes=34, rowUints=9,
+    // rowUints*4=36 ≠ 34). Mirrors the convention used by matmul_q8_0_gemm
+    // and rmsnorm_matmul_q8_0. Fixes issue #1: latent stride bug at K=32
+    // with M>1 — earlier rev silently returned garbage past the first row
+    // for any K where blocksPerRow*34 % 4 != 0 (blocksPerRow odd).
+    uint rowByteStride = pc.blocksPerRow * 34u;
     uint rowByteBase = m * rowByteStride;
 
     float acc = 0.0;
