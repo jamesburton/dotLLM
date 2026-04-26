@@ -1,0 +1,149 @@
+#version 450
+// MoE router top-k softmax — for each token, full softmax over `numExperts`
+// router logits, then pick the top-k entries (stable on ties, lower index
+// wins — matches PyTorch torch.topk forward-order CPU behaviour). Optional
+// renormalisation of the top-k probabilities to sum to 1.0 (Mixtral /
+// Qwen3-MoE convention; Qwen1.5-MoE uses raw softmax probs).
+//
+// Mirrors the routing path in DotLLM.Cpu.Kernels.MoeSwiGluMlp:
+//   probs = softmax(logits)
+//   for slot = 0..k-1:
+//     pick argmax over remaining experts (lower index wins on tie)
+//     mark claimed
+//   if normTopKProb: weights /= sum(weights)
+//
+// Dispatch:
+//   local_size_x = 64                  (numExperts up to 256 fits in 4 strides)
+//   groupCount.x = seqLen
+//
+// Buffer layout:
+//   logits  : [seqLen, numExperts]  F32 row-major
+//   indices : [seqLen, k]           int32 row-major
+//   weights : [seqLen, k]           F32 row-major
+
+#define MAX_EXPERTS    256u
+#define WG_SIZE        64u
+#define MAX_K          16u
+#define NEG_INF        (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufLogits  { float logits[];  };
+layout(set = 0, binding = 1, std430) writeonly buffer BufIdx     { int   indices[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufWeights { float weights[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint numExperts;
+    uint k;
+    uint normTopKProb;   // 0 = no, 1 = yes
+} pc;
+
+shared float probs[MAX_EXPERTS];
+shared float reduceScratch[WG_SIZE];
+shared int   sharedIdx[MAX_K];
+shared float sharedWeight[MAX_K];
+
+float workgroupMax(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    reduceScratch[tid] = val;
+    barrier();
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduceScratch[tid] = max(reduceScratch[tid], reduceScratch[tid + stride]);
+        }
+        barrier();
+    }
+    float m = reduceScratch[0];
+    barrier();
+    return m;
+}
+
+float workgroupSum(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    reduceScratch[tid] = val;
+    barrier();
+    for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduceScratch[tid] += reduceScratch[tid + stride];
+        }
+        barrier();
+    }
+    float s = reduceScratch[0];
+    barrier();
+    return s;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint logitBase = t * pc.numExperts;
+
+    // 1. Load logits into shared memory.
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        probs[e] = logits[logitBase + e];
+    }
+    barrier();
+
+    // 2. Find max for numerical stability.
+    float localMax = NEG_INF;
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        localMax = max(localMax, probs[e]);
+    }
+    float maxVal = workgroupMax(localMax);
+
+    // 3. exp(x - max) and accumulate sum.
+    float localSum = 0.0;
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        float p = exp(probs[e] - maxVal);
+        probs[e] = p;
+        localSum += p;
+    }
+    float sumVal = workgroupSum(localSum);
+
+    // 4. Normalise to probabilities.
+    float invSum = (sumVal > 1e-30) ? (1.0 / sumVal) : 0.0;
+    for (uint e = tid; e < pc.numExperts; e += WG_SIZE) {
+        probs[e] = probs[e] * invSum;
+    }
+    barrier();
+
+    // 5. Top-k selection — thread 0 only (small k, small numExperts; the
+    //    sequential argmax preserves lower-index-wins-on-tie which the
+    //    parallel reduction would not). Marks each picked expert with
+    //    NEG_INF so subsequent slots skip it.
+    if (tid == 0u) {
+        for (uint slot = 0u; slot < pc.k; slot++) {
+            int bestIdx = -1;
+            float bestVal = NEG_INF;
+            for (uint e = 0u; e < pc.numExperts; e++) {
+                float v = probs[e];
+                // Strict > ensures lower index wins on ties.
+                if (v > bestVal) {
+                    bestVal = v;
+                    bestIdx = int(e);
+                }
+            }
+            sharedIdx[slot] = bestIdx;
+            sharedWeight[slot] = bestVal;
+            probs[uint(bestIdx)] = NEG_INF;  // mark claimed
+        }
+
+        // 6. Optional renormalisation of top-k weights to sum to 1.0.
+        if (pc.normTopKProb != 0u) {
+            float sw = 0.0;
+            for (uint slot = 0u; slot < pc.k; slot++) sw += sharedWeight[slot];
+            float invSw = (sw > 1e-30) ? (1.0 / sw) : 0.0;
+            for (uint slot = 0u; slot < pc.k; slot++) sharedWeight[slot] *= invSw;
+        }
+    }
+    barrier();
+
+    // 7. Write outputs — first k threads each write one slot.
+    if (tid < pc.k) {
+        indices[t * pc.k + tid] = sharedIdx[tid];
+        weights[t * pc.k + tid] = sharedWeight[tid];
+    }
+}
