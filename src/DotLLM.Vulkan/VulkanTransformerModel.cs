@@ -6,6 +6,7 @@ using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -83,6 +84,21 @@ public sealed class VulkanTransformerModel : IModel
     // DeepSeek-V2 layers carried biases — now the whole forward stays in
     // one submit regardless of bias presence.
     private readonly BiasAddF32Kernel _biasAdd;
+    // MLA (DeepSeek-V2/V3) — null when the model carries no MLA layer.
+    // The post-projection attention loop (per-head SDPA with Q_nope/Q_pe
+    // split + MQA-shared K_pe), the decoupled-rope rotation on Q_pe + K_pe,
+    // and the per-head split of kv_b_proj's fused output into K_nope/V.
+    private readonly AttentionMlaF32Kernel? _mlaAttention;
+    private readonly RopeMlaF32Kernel? _mlaRope;
+    private readonly MlaKvSplitF32Kernel? _mlaKvSplit;
+    // MLA softmax scale = (YaRN mscale²) / sqrt(qk_head_dim). Folded once at
+    // construction since the kernel takes scale as a push constant.
+    private readonly float _mlaScale;
+    private readonly int _mlaQkNopeHeadDim;
+    private readonly int _mlaQkRopeHeadDim;
+    private readonly int _mlaVHeadDim;
+    private readonly int _mlaNumHeads;
+    private readonly float _mlaRopeTheta;
 
     // Persistent command buffer + fence used by Forward. One SubmitContext
     // per model — reset+begin at the start of each forward, submit+wait at
@@ -108,6 +124,20 @@ public sealed class VulkanTransformerModel : IModel
     public VulkanKvCache CreateKvCache(int maxSeqLen)
         => new(_device, Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
+    /// <summary>
+    /// Creates a per-layer MLA (DeepSeek-V2/V3) KV-cache sized for this
+    /// model. Throws when the model is not an MLA model (no <c>MlaConfig</c>
+    /// at construction).
+    /// </summary>
+    public MlaVulkanKvCache CreateMlaKvCache(int maxSeqLen)
+    {
+        if (Config.MlaConfig is null)
+            throw new InvalidOperationException(
+                "CreateMlaKvCache requires a model with MlaConfig set; this model has none.");
+        return new MlaVulkanKvCache(_device, Config.NumLayers, maxSeqLen,
+            _mlaNumHeads, _mlaQkNopeHeadDim, _mlaVHeadDim, _mlaQkRopeHeadDim);
+    }
+
     private VulkanTransformerModel(
         VulkanDevice device, bool ownsDevice,
         ModelConfig config, VulkanWeights weights, TransformerWeights cpuWeights,
@@ -118,9 +148,12 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         BiasAddF32Kernel biasAdd,
+        AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
-        float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow)
+        float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow,
+        int mlaNumHeads, int mlaQkNopeHeadDim, int mlaQkRopeHeadDim, int mlaVHeadDim,
+        float mlaScale, float mlaRopeTheta)
     {
         _device = device;
         _ownsDevice = ownsDevice;
@@ -139,12 +172,21 @@ public sealed class VulkanTransformerModel : IModel
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
+        _mlaAttention = mlaAttention;
+        _mlaRope = mlaRope;
+        _mlaKvSplit = mlaKvSplit;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
         _ropeVariant = ropeVariant;
         _slidingWindow = slidingWindow;
+        _mlaNumHeads = mlaNumHeads;
+        _mlaQkNopeHeadDim = mlaQkNopeHeadDim;
+        _mlaQkRopeHeadDim = mlaQkRopeHeadDim;
+        _mlaVHeadDim = mlaVHeadDim;
+        _mlaScale = mlaScale;
+        _mlaRopeTheta = mlaRopeTheta;
     }
 
     /// <summary>
@@ -201,6 +243,34 @@ public sealed class VulkanTransformerModel : IModel
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
+    /// <summary>
+    /// Loads a model from a HuggingFace-convention safetensors source onto a
+    /// new Vulkan device. Mirrors <see cref="TransformerModel.LoadFromSafetensors(ISafetensorsTensorSource, ModelConfig)"/>
+    /// but produces a Vulkan-backed model. Used by tests and tooling that
+    /// build synthetic fixtures (no GGUF roundtrip).
+    /// </summary>
+    public static VulkanTransformerModel LoadFromSafetensors(
+        ISafetensorsTensorSource file, ModelConfig config, string? spvDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        RejectUnsupportedArchitecture(config);
+
+        var device = VulkanDevice.Create();
+        try
+        {
+            spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
+            var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+            return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf: null);
+        }
+        catch
+        {
+            device.Dispose();
+            throw;
+        }
+    }
+
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
@@ -210,10 +280,32 @@ public sealed class VulkanTransformerModel : IModel
         // quant types are still dequantised to FP32 at upload.
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
 
+        bool hasMla = config.MlaConfig is not null;
+        int mlaNumHeads = hasMla ? config.NumAttentionHeads : 0;
+        int mlaQkNope = hasMla ? config.MlaConfig!.QkNopeHeadDim : 0;
+        int mlaQkRope = hasMla ? config.MlaConfig!.QkRopeHeadDim : 0;
+        int mlaVHead = hasMla ? config.MlaConfig!.VHeadDim : 0;
+        int mlaQLora = hasMla ? config.MlaConfig!.QLoraRank : 0;
+        int mlaKvLora = hasMla ? config.MlaConfig!.KvLoraRank : 0;
+        float mlaScale = 0f, mlaRopeTheta = 0f;
+        if (hasMla)
+        {
+            int qkHeadDim = mlaQkNope + mlaQkRope;
+            float yarnMul = config.MlaConfig!.ComputeYarnSoftmaxScaleMultiplier();
+            mlaScale = yarnMul / MathF.Sqrt(qkHeadDim);
+            mlaRopeTheta = config.MlaConfig!.RopeTheta;
+        }
+
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize,
-            initialSeqLen: 1);
+            initialSeqLen: 1,
+            mlaNumHeads: mlaNumHeads,
+            mlaQkNopeHeadDim: mlaQkNope,
+            mlaQkRopeHeadDim: mlaQkRope,
+            mlaVHeadDim: mlaVHead,
+            mlaQLoraRank: mlaQLora,
+            mlaKvLoraRank: mlaKvLora);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -242,6 +334,16 @@ public sealed class VulkanTransformerModel : IModel
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
 
+        AttentionMlaF32Kernel? mlaAttention = null;
+        RopeMlaF32Kernel? mlaRope = null;
+        MlaKvSplitF32Kernel? mlaKvSplit = null;
+        if (hasMla)
+        {
+            mlaAttention = AttentionMlaF32Kernel.Create(device, spvDir);
+            mlaRope = RopeMlaF32Kernel.Create(device, spvDir);
+            mlaKvSplit = MlaKvSplitF32Kernel.Create(device, spvDir);
+        }
+
         var submit = device.CreateSubmitContext();
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -259,19 +361,27 @@ public sealed class VulkanTransformerModel : IModel
             rmsnormMatmulQ8Fused,
             rmsnorm, rope, attention, swiglu, add,
             biasAdd,
+            mlaAttention, mlaRope, mlaKvSplit,
             submit,
             gguf,
-            ropeTheta, ropeDim, ropeVariant, slidingWindow);
+            ropeTheta, ropeDim, ropeVariant, slidingWindow,
+            mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
+            mlaScale, mlaRopeTheta);
     }
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
     {
-        if (config.MlaConfig is not null)
-            throw new NotSupportedException("MLA (DeepSeek-V2/V3) is not supported on the Vulkan backend yet.");
         if (config.Moe is not null)
             throw new NotSupportedException("MoE is not supported on the Vulkan backend yet.");
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
             throw new NotSupportedException("Hybrid SSM / Mamba architectures are not supported on the Vulkan backend yet.");
+        // MLA: latent / hybrid cache modes are CPU-only for now; the Vulkan
+        // path runs the Phase A expanded cache (MlaVulkanKvCache) which
+        // matches the CPU expanded path. Reject the latent flags so callers
+        // don't silently get a different attention math.
+        if (config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true })
+            throw new NotSupportedException(
+                "MLA latent / hybrid KV-cache modes are not supported on the Vulkan backend yet; use the default expanded cache.");
     }
 
     /// <inheritdoc/>
@@ -344,6 +454,19 @@ public sealed class VulkanTransformerModel : IModel
             // the previous layer's final residual add (or the embedding
             // gather's TRANSFER→COMPUTE on layer 0) has already made the
             // hidden-state writes visible to this rmsnorm.
+
+            if (lw.Mla is { } mlaW)
+            {
+                // MLA (DeepSeek-V2/V3) attention block — projection ladder +
+                // decoupled RoPE + per-head SDPA. Writes the post-o_proj
+                // result into _state.NormOutput (mirrors the GQA path's
+                // contract so the shared residual-add code below works
+                // unchanged).
+                RecordMlaLayer(cmdBuf, layer, mlaW, lw, seqLen, eps,
+                    positions, kvCache);
+            }
+            else
+            {
 
             // Attn RMSNorm + Q projection — fused into one dispatch when
             // available (decode + Q8_0 + hidden ≤ shader cap). The fused
@@ -428,6 +551,7 @@ public sealed class VulkanTransformerModel : IModel
                 _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
+            }  // end of GQA branch (else of MLA)
 
             // Residual add #1: AddScratch = Residual + NormOutput. The add
             // reads from HiddenState (which aliases Residual — same slot)
@@ -548,6 +672,9 @@ public sealed class VulkanTransformerModel : IModel
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
+        _mlaAttention?.InvalidateDescriptorCache();
+        _mlaRope?.InvalidateDescriptorCache();
+        _mlaKvSplit?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -602,6 +729,133 @@ public sealed class VulkanTransformerModel : IModel
             normOutput, matmulOutput,
             m: outputDim, k: inputDim, eps: eps);
         return true;
+    }
+
+    /// <summary>
+    /// Records the MLA (DeepSeek-V2/V3) attention block for one layer:
+    /// rmsnorm → Q path (LoRA-factored or monolithic) → KV path (latent
+    /// rmsnorm + kv_b expansion + per-head split) → decoupled-rope on
+    /// Q_pe + shared K_pe → optional KV-cache write → per-head SDPA →
+    /// o_proj. Writes the post-o_proj result into <c>_state.NormOutput</c>
+    /// so the shared residual-add downstream sees the same contract as the
+    /// GQA path.
+    /// </summary>
+    /// <remarks>
+    /// All MLA projections are F32 (no Q8_0 path on MLA today; the loader
+    /// upcasts F16/BF16 at load). The matmul router still uses
+    /// <see cref="RecordMatmul"/> and lands on <c>matmul_f32</c> uniformly.
+    /// </remarks>
+    private void RecordMlaLayer(
+        nint cmdBuf, int layer, VulkanWeights.MlaLayerBuffers mlaW,
+        in VulkanWeights.LayerBuffers lw, int seqLen, float eps,
+        ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        int qkHeadDim = mlaW.QkHeadDim;
+        int hidden = mlaW.HiddenSize;
+
+        // Pre-attention RMSNorm: HiddenState → NormOutput.
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── Q path ────────────────────────────────────────────────────
+        // LoRA: NormOutput → MlaQLatent → (rmsnorm with QALayernormWeight)
+        //       → MlaQLatentNorm → MlaQ.
+        // Monolithic: NormOutput → MlaQ.
+        if (mlaW.QLoraRank > 0)
+        {
+            _matmul.Record(cmdBuf, mlaW.QAProj!, _state.NormOutput, _state.MlaQLatent!,
+                m: mlaW.QLoraRank, k: hidden, n: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _rmsnorm.Record(cmdBuf, _state.MlaQLatent!, mlaW.QALayernormWeight!, _state.MlaQLatentNorm!,
+                rowCount: seqLen, n: mlaW.QLoraRank, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _matmul.Record(cmdBuf, mlaW.QBProj!, _state.MlaQLatentNorm!, _state.MlaQ!,
+                m: mlaW.QTotal, k: mlaW.QLoraRank, n: seqLen);
+        }
+        else
+        {
+            _matmul.Record(cmdBuf, mlaW.QProj!, _state.NormOutput, _state.MlaQ!,
+                m: mlaW.QTotal, k: hidden, n: seqLen);
+        }
+
+        // ── KV path (latent + rope-K split) ──────────────────────────
+        // Two parallel matmuls off the same NormOutput: first kvLoraRank
+        // rows of kv_a_proj_with_mqa → MlaKvLatent (independent), last
+        // qkRopeHeadDim rows → MlaKPe (independent — also independent from
+        // the Q matmul above). All three writes complete before the
+        // single barrier below.
+        _matmul.Record(cmdBuf, mlaW.KvALatentProj, _state.NormOutput, _state.MlaKvLatent!,
+            m: mlaW.KvLoraRank, k: hidden, n: seqLen);
+        _matmul.Record(cmdBuf, mlaW.KvAKPeProj, _state.NormOutput, _state.MlaKPe!,
+            m: mlaW.QkRopeHeadDim, k: hidden, n: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // RMSNorm the latent slice (rope-K is left untouched).
+        _rmsnorm.Record(cmdBuf, _state.MlaKvLatent!, mlaW.KvALayernormWeight, _state.MlaKvLatentNorm!,
+            rowCount: seqLen, n: mlaW.KvLoraRank, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // kv_b expansion: latent_norm → MlaKvBExpanded
+        // Then split per-head into MlaKNope and MlaV.
+        _matmul.Record(cmdBuf, mlaW.KvBProj, _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
+            m: mlaW.KvBOutputDim, k: mlaW.KvLoraRank, n: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _mlaKvSplit!.Record(cmdBuf, _state.MlaKvBExpanded!, _state.MlaKNope!, _state.MlaV!,
+            seqLen: seqLen, numHeads: mlaW.NumHeads,
+            qkNopeHeadDim: mlaW.QkNopeHeadDim, vHeadDim: mlaW.VHeadDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── Decoupled RoPE on Q_pe (per head) and shared K_pe ────────
+        _mlaRope!.Record(cmdBuf, _state.MlaQ!, _state.MlaKPe!, _state.PositionsBuffer,
+            seqLen: seqLen, numHeads: mlaW.NumHeads,
+            qkNopeHeadDim: mlaW.QkNopeHeadDim, qkRopeHeadDim: mlaW.QkRopeHeadDim,
+            theta: _mlaRopeTheta);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── KV-cache update + attention ──────────────────────────────
+        VulkanDevice.Buffer kNopeSrc, vSrc, kPeSrc;
+        int seqKv;
+        int positionOffset;
+        if (kvCache is MlaVulkanKvCache mlaCache)
+        {
+            // Cache the new K_nope / V / K_pe rows; attention then reads
+            // the full cached window.
+            mlaCache.RecordUpdate(cmdBuf, _state.MlaKNope!, _state.MlaV!, _state.MlaKPe!,
+                positions, seqLen, layer);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            kNopeSrc = mlaCache.GetKNopeBuffer(layer);
+            vSrc = mlaCache.GetVBuffer(layer);
+            kPeSrc = mlaCache.GetKPeBuffer(layer);
+            seqKv = mlaCache.CurrentLength;
+            positionOffset = positions[0];
+        }
+        else
+        {
+            kNopeSrc = _state.MlaKNope!;
+            vSrc = _state.MlaV!;
+            kPeSrc = _state.MlaKPe!;
+            seqKv = seqLen;
+            positionOffset = 0;
+        }
+
+        _mlaAttention!.Record(cmdBuf, _state.MlaQ!, kNopeSrc, vSrc, kPeSrc, _state.MlaAttnOutput!,
+            seqQ: seqLen, seqKv: seqKv, numHeads: mlaW.NumHeads,
+            qkNopeHeadDim: mlaW.QkNopeHeadDim, qkRopeHeadDim: mlaW.QkRopeHeadDim,
+            vHeadDim: mlaW.VHeadDim,
+            positionOffset: positionOffset, scale: _mlaScale);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── o_proj → NormOutput (mirrors GQA contract for residual add) ─
+        RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.MlaAttnOutput!, _state.NormOutput,
+            lw.OOutputDim, lw.OInputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        if (lw.OBias is not null)
+        {
+            _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
     }
 
     private void RecordMatmul(
@@ -721,6 +975,9 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _mlaKvSplit?.Dispose();
+        _mlaRope?.Dispose();
+        _mlaAttention?.Dispose();
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();

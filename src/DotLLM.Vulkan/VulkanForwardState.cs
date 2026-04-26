@@ -21,6 +21,13 @@ internal sealed class VulkanForwardState : IDisposable
     private readonly int _headDim;
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
+    // MLA dims — zero unless the model carries an MLA layer.
+    private readonly int _mlaQLoraRank;
+    private readonly int _mlaKvLoraRank;
+    private readonly int _mlaQkNopeHeadDim;
+    private readonly int _mlaQkRopeHeadDim;
+    private readonly int _mlaVHeadDim;
+    private readonly int _mlaNumHeads;
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
@@ -78,6 +85,20 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer FfnUp { get; private set; } = null!;
     public VulkanDevice.Buffer SiluOutput { get; private set; } = null!;
 
+    // ── MLA scratch (DeepSeek-V2/V3) ──────────────────────────────────
+    // Allocated only when the model carries an MLA layer (mla* dims > 0
+    // at construction). Names match MlaAttention.Execute one-for-one.
+    public VulkanDevice.Buffer? MlaQLatent { get; private set; }       // [seqLen, qLoraRank]
+    public VulkanDevice.Buffer? MlaQLatentNorm { get; private set; }   // [seqLen, qLoraRank]
+    public VulkanDevice.Buffer? MlaQ { get; private set; }             // [seqLen, numHeads * (qkNope + qkRope)]
+    public VulkanDevice.Buffer? MlaKvLatent { get; private set; }      // [seqLen, kvLoraRank]
+    public VulkanDevice.Buffer? MlaKvLatentNorm { get; private set; }  // [seqLen, kvLoraRank]
+    public VulkanDevice.Buffer? MlaKvBExpanded { get; private set; }   // [seqLen, numHeads * (qkNope + vHead)]
+    public VulkanDevice.Buffer? MlaKNope { get; private set; }         // [seqLen, numHeads * qkNope]
+    public VulkanDevice.Buffer? MlaV { get; private set; }             // [seqLen, numHeads * vHead]
+    public VulkanDevice.Buffer? MlaKPe { get; private set; }           // [seqLen, qkRope]
+    public VulkanDevice.Buffer? MlaAttnOutput { get; private set; }    // [seqLen, numHeads * vHead]
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 
@@ -91,7 +112,9 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanForwardState(
         VulkanDevice device,
         int hiddenSize, int numHeads, int numKvHeads, int headDim,
-        int intermediateSize, int vocabSize, int initialSeqLen)
+        int intermediateSize, int vocabSize, int initialSeqLen,
+        int mlaNumHeads = 0, int mlaQkNopeHeadDim = 0, int mlaQkRopeHeadDim = 0,
+        int mlaVHeadDim = 0, int mlaQLoraRank = 0, int mlaKvLoraRank = 0)
     {
         _device = device;
         _hiddenSize = hiddenSize;
@@ -100,6 +123,12 @@ internal sealed class VulkanForwardState : IDisposable
         _headDim = headDim;
         _intermediateSize = intermediateSize;
         _vocabSize = vocabSize;
+        _mlaNumHeads = mlaNumHeads;
+        _mlaQkNopeHeadDim = mlaQkNopeHeadDim;
+        _mlaQkRopeHeadDim = mlaQkRopeHeadDim;
+        _mlaVHeadDim = mlaVHeadDim;
+        _mlaQLoraRank = mlaQLoraRank;
+        _mlaKvLoraRank = mlaKvLoraRank;
 
         // LM-head logits are always one token (last). Positions buffer sized for some reasonable
         // default; grows with EnsureCapacity.
@@ -157,6 +186,8 @@ internal sealed class VulkanForwardState : IDisposable
         FfnUp = _device.Allocate(ffnBytes);
         SiluOutput = _device.AllocateDeviceLocal(ffnBytes);
 
+        long mlaBytes = AllocateMlaScratch(seqLen);
+
         // Resize positions buffer — host writes positions per forward.
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
@@ -165,7 +196,41 @@ internal sealed class VulkanForwardState : IDisposable
 
         // hiddenBytes × 3: two hidden slots (HiddenState/AddScratch rotate) + NormOutput.
         AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
+                       + mlaBytes
                        + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
+    }
+
+    private long AllocateMlaScratch(int seqLen)
+    {
+        if (_mlaNumHeads == 0) return 0;
+
+        int qkHeadDim = _mlaQkNopeHeadDim + _mlaQkRopeHeadDim;
+        long qLatentBytes = _mlaQLoraRank > 0 ? (long)seqLen * _mlaQLoraRank * sizeof(float) : 0;
+        long qBytes = (long)seqLen * _mlaNumHeads * qkHeadDim * sizeof(float);
+        long kvLatentBytes = (long)seqLen * _mlaKvLoraRank * sizeof(float);
+        long kvBExpandedBytes = (long)seqLen * _mlaNumHeads * (_mlaQkNopeHeadDim + _mlaVHeadDim) * sizeof(float);
+        long kNopeBytes = (long)seqLen * _mlaNumHeads * _mlaQkNopeHeadDim * sizeof(float);
+        long vBytes = (long)seqLen * _mlaNumHeads * _mlaVHeadDim * sizeof(float);
+        long kPeBytes = (long)seqLen * _mlaQkRopeHeadDim * sizeof(float);
+        long attnOutBytes = (long)seqLen * _mlaNumHeads * _mlaVHeadDim * sizeof(float);
+
+        // Latent / latent-norm only when the Q path is LoRA-factored.
+        if (_mlaQLoraRank > 0)
+        {
+            MlaQLatent = _device.AllocateDeviceLocal(qLatentBytes);
+            MlaQLatentNorm = _device.AllocateDeviceLocal(qLatentBytes);
+        }
+        MlaQ = _device.AllocateDeviceLocal(qBytes);
+        MlaKvLatent = _device.AllocateDeviceLocal(kvLatentBytes);
+        MlaKvLatentNorm = _device.AllocateDeviceLocal(kvLatentBytes);
+        MlaKvBExpanded = _device.AllocateDeviceLocal(kvBExpandedBytes);
+        MlaKNope = _device.AllocateDeviceLocal(kNopeBytes);
+        MlaV = _device.AllocateDeviceLocal(vBytes);
+        MlaKPe = _device.AllocateDeviceLocal(kPeBytes);
+        MlaAttnOutput = _device.AllocateDeviceLocal(attnOutBytes);
+
+        return qLatentBytes * 2 + qBytes + kvLatentBytes * 2 + kvBExpandedBytes
+             + kNopeBytes + vBytes + kPeBytes + attnOutBytes;
     }
 
     private void ReleaseLayerScratch()
@@ -182,6 +247,17 @@ internal sealed class VulkanForwardState : IDisposable
         FfnGate?.Dispose();
         FfnUp?.Dispose();
         SiluOutput?.Dispose();
+
+        MlaQLatent?.Dispose(); MlaQLatent = null;
+        MlaQLatentNorm?.Dispose(); MlaQLatentNorm = null;
+        MlaQ?.Dispose(); MlaQ = null;
+        MlaKvLatent?.Dispose(); MlaKvLatent = null;
+        MlaKvLatentNorm?.Dispose(); MlaKvLatentNorm = null;
+        MlaKvBExpanded?.Dispose(); MlaKvBExpanded = null;
+        MlaKNope?.Dispose(); MlaKNope = null;
+        MlaV?.Dispose(); MlaV = null;
+        MlaKPe?.Dispose(); MlaKPe = null;
+        MlaAttnOutput?.Dispose(); MlaAttnOutput = null;
     }
 
     public void Dispose()

@@ -20,10 +20,90 @@ namespace DotLLM.Vulkan;
 /// </summary>
 internal sealed class VulkanWeights : IDisposable
 {
+    /// <summary>
+    /// Per-layer device-resident MLA (DeepSeek-V2/V3) weight bundle. All
+    /// projection buffers are F32 row-major, mirroring
+    /// <see cref="MlaLayerWeights"/>. The CPU loader stores
+    /// <c>kv_a_proj_with_mqa</c> as a fused <c>[kvLoraRank + qkRopeHeadDim,
+    /// hidden]</c> matrix; the Vulkan upload splits it row-wise into two
+    /// device buffers so the latent path can RMSNorm just the kvLoraRank
+    /// portion (the existing rmsnorm kernel doesn't support a stride),
+    /// while the rope-K portion goes straight to the RoPE kernel.
+    /// </summary>
+    internal readonly struct MlaLayerBuffers
+    {
+        // Q path — exactly one of (QAProj+QBProj) / (QProj) is non-null.
+        public readonly VulkanDevice.Buffer? QAProj;
+        public readonly VulkanDevice.Buffer? QALayernormWeight;
+        public readonly VulkanDevice.Buffer? QBProj;
+        public readonly VulkanDevice.Buffer? QProj;
+
+        // KV path — KvAProjWithMqa split row-wise on upload:
+        //   KvALatentProj = first kvLoraRank rows  (→ kv latent bottleneck)
+        //   KvAKPeProj    = last qkRopeHeadDim rows (→ MQA-shared rope-K)
+        public readonly VulkanDevice.Buffer KvALatentProj;
+        public readonly VulkanDevice.Buffer KvAKPeProj;
+        public readonly VulkanDevice.Buffer KvALayernormWeight;
+        public readonly VulkanDevice.Buffer KvBProj;
+
+        // Hyperparameters carried for forward-path convenience.
+        public readonly int NumHeads;
+        public readonly int QkNopeHeadDim;
+        public readonly int QkRopeHeadDim;
+        public readonly int VHeadDim;
+        public readonly int QLoraRank;
+        public readonly int KvLoraRank;
+        public readonly int HiddenSize;
+
+        public MlaLayerBuffers(
+            VulkanDevice.Buffer? qAProj, VulkanDevice.Buffer? qALayernorm, VulkanDevice.Buffer? qBProj,
+            VulkanDevice.Buffer? qProj,
+            VulkanDevice.Buffer kvALatentProj, VulkanDevice.Buffer kvAKPeProj,
+            VulkanDevice.Buffer kvALayernorm, VulkanDevice.Buffer kvBProj,
+            int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+            int qLoraRank, int kvLoraRank, int hiddenSize)
+        {
+            QAProj = qAProj;
+            QALayernormWeight = qALayernorm;
+            QBProj = qBProj;
+            QProj = qProj;
+            KvALatentProj = kvALatentProj;
+            KvAKPeProj = kvAKPeProj;
+            KvALayernormWeight = kvALayernorm;
+            KvBProj = kvBProj;
+            NumHeads = numHeads;
+            QkNopeHeadDim = qkNopeHeadDim;
+            QkRopeHeadDim = qkRopeHeadDim;
+            VHeadDim = vHeadDim;
+            QLoraRank = qLoraRank;
+            KvLoraRank = kvLoraRank;
+            HiddenSize = hiddenSize;
+        }
+
+        public int QkHeadDim => QkNopeHeadDim + QkRopeHeadDim;
+        public int QTotal => NumHeads * QkHeadDim;
+        public int KvBOutputDim => NumHeads * (QkNopeHeadDim + VHeadDim);
+
+        public void Dispose()
+        {
+            QAProj?.Dispose();
+            QALayernormWeight?.Dispose();
+            QBProj?.Dispose();
+            QProj?.Dispose();
+            KvALatentProj.Dispose();
+            KvAKPeProj.Dispose();
+            KvALayernormWeight.Dispose();
+            KvBProj.Dispose();
+        }
+    }
+
     internal readonly struct LayerBuffers
     {
         public readonly VulkanDevice.Buffer AttnNormWeight;
 
+        // Q/K/V/QBias/KBias/VBias are unused (default) on MLA layers — see
+        // <see cref="Mla"/>. The dense FFN block (FfnNorm/Gate/Up/Down) is
+        // shared with the standard transformer path.
         public readonly VulkanDevice.Buffer Q;
         public readonly VulkanDevice.Buffer K;
         public readonly VulkanDevice.Buffer V;
@@ -38,6 +118,13 @@ internal sealed class VulkanWeights : IDisposable
         public readonly int OOutputDim, OInputDim;
 
         public readonly VulkanDevice.Buffer? QBias, KBias, VBias, OBias;
+
+        /// <summary>
+        /// Non-null when the layer uses MLA attention (DeepSeek-V2/V3).
+        /// Forward routes through <c>RecordMlaLayer</c> and the Q/K/V slots
+        /// above are unused (zero buffers).
+        /// </summary>
+        public readonly MlaLayerBuffers? Mla;
 
         public readonly VulkanDevice.Buffer FfnNormWeight;
 
@@ -64,7 +151,8 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer gate, QuantizationType gateQt, int gateM, int gateK,
             VulkanDevice.Buffer up, QuantizationType upQt, int upM, int upK,
             VulkanDevice.Buffer down, QuantizationType downQt, int downM, int downK,
-            VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias)
+            VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias,
+            MlaLayerBuffers? mla = null)
         {
             AttnNormWeight = attnNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
@@ -77,6 +165,7 @@ internal sealed class VulkanWeights : IDisposable
             Up = up; UpDeviceQuantType = upQt; UpOutputDim = upM; UpInputDim = upK;
             Down = down; DownDeviceQuantType = downQt; DownOutputDim = downM; DownInputDim = downK;
             GateBias = gateBias; UpBias = upBias; DownBias = downBias;
+            Mla = mla;
         }
 
         public void Dispose()
@@ -87,6 +176,7 @@ internal sealed class VulkanWeights : IDisposable
             FfnNormWeight.Dispose();
             Gate.Dispose(); Up.Dispose(); Down.Dispose();
             GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
+            Mla?.Dispose();
         }
     }
 
@@ -181,19 +271,45 @@ internal sealed class VulkanWeights : IDisposable
             var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
 
-            var q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                dequantToFp32, out var qDeviceQt, out long qBytes);
-            var k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                dequantToFp32, out var kDeviceQt, out long kBytes);
-            var v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                dequantToFp32, out var vDeviceQt, out long vBytes);
+            // MLA layers carry their projections in lw.Mla; the standard
+            // Q/K/V slots are zeroed by the loader. Replace each with a
+            // 64-byte stub so the LayerBuffers contract still holds — the
+            // forward pass never dispatches a matmul against them.
+            VulkanDevice.Buffer q, k, v;
+            QuantizationType qDeviceQt, kDeviceQt, vDeviceQt;
+            long qBytes, kBytes, vBytes;
+            VulkanDevice.Buffer? qBias, kBias, vBias;
+            if (lw.Mla is not null)
+            {
+                q = device.AllocateDeviceLocal(64);
+                k = device.AllocateDeviceLocal(64);
+                v = device.AllocateDeviceLocal(64);
+                qDeviceQt = kDeviceQt = vDeviceQt = QuantizationType.F32;
+                qBytes = kBytes = vBytes = 0;
+                qBias = kBias = vBias = null;
+            }
+            else
+            {
+                q = UploadMatrix(device, staging, lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
+                    dequantToFp32, out qDeviceQt, out qBytes);
+                k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                    dequantToFp32, out kDeviceQt, out kBytes);
+                v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                    dequantToFp32, out vDeviceQt, out vBytes);
+                qBias = UploadOptionalVec(device, staging, lw.QBias);
+                kBias = UploadOptionalVec(device, staging, lw.KBias);
+                vBias = UploadOptionalVec(device, staging, lw.VBias);
+            }
             var o = UploadMatrix(device, staging, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim,
                 dequantToFp32, out var oDeviceQt, out long oBytes);
-
-            var qBias = UploadOptionalVec(device, staging, lw.QBias);
-            var kBias = UploadOptionalVec(device, staging, lw.KBias);
-            var vBias = UploadOptionalVec(device, staging, lw.VBias);
             var oBias = UploadOptionalVec(device, staging, lw.OBias);
+
+            MlaLayerBuffers? mla = null;
+            if (lw.Mla is not null)
+            {
+                mla = UploadMlaLayer(device, staging, lw.Mla, weights.HiddenSize, out long mlaBytes);
+                totalBytes += mlaBytes;
+            }
 
             var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
             totalBytes += (long)lw.FfnNormWeight.Length * sizeof(float);
@@ -220,7 +336,8 @@ internal sealed class VulkanWeights : IDisposable
                 gate, gateDeviceQt, lw.GateOutputDim, lw.GateInputDim,
                 up, upDeviceQt, lw.UpOutputDim, lw.UpInputDim,
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
-                gateBias, upBias, downBias);
+                gateBias, upBias, downBias,
+                mla);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes
                 + gateBytes + upBytes + downBytes;
@@ -264,6 +381,26 @@ internal sealed class VulkanWeights : IDisposable
             max = Math.Max(max, UploadBytes(lw.GateOutputDim, lw.GateInputDim, lw.GateQuantType, dequantToFp32));
             max = Math.Max(max, UploadBytes(lw.UpOutputDim, lw.UpInputDim, lw.UpQuantType, dequantToFp32));
             max = Math.Max(max, UploadBytes(lw.DownOutputDim, lw.DownInputDim, lw.DownQuantType, dequantToFp32));
+
+            // MLA projections are F32 row-major (loader upcasts F16/BF16 at load).
+            if (lw.Mla is not null)
+            {
+                int hidden = weights.HiddenSize;
+                int qTotal = lw.Mla.NumHeads * (lw.Mla.QkNopeHeadDim + lw.Mla.QkRopeHeadDim);
+                int kvBOut = lw.Mla.NumHeads * (lw.Mla.QkNopeHeadDim + lw.Mla.VHeadDim);
+                if (lw.Mla.QLoraRank > 0)
+                {
+                    max = Math.Max(max, (long)lw.Mla.QLoraRank * hidden * sizeof(float));
+                    max = Math.Max(max, (long)qTotal * lw.Mla.QLoraRank * sizeof(float));
+                }
+                else
+                {
+                    max = Math.Max(max, (long)qTotal * hidden * sizeof(float));
+                }
+                max = Math.Max(max, (long)lw.Mla.KvLoraRank * hidden * sizeof(float));
+                max = Math.Max(max, (long)lw.Mla.QkRopeHeadDim * hidden * sizeof(float));
+                max = Math.Max(max, (long)kvBOut * lw.Mla.KvLoraRank * sizeof(float));
+            }
         }
         return max;
     }
@@ -380,6 +517,93 @@ internal sealed class VulkanWeights : IDisposable
     {
         if (vec is null) return null;
         return UploadNormVec(device, staging, vec);
+    }
+
+    /// <summary>
+    /// Uploads the MLA-specific projection weights for one layer. The CPU
+    /// loader hands us F32 row-major pointers; we upload them as device-local
+    /// FP32 buffers (no Q8_0 path on MLA — the kernels are F32 only). The
+    /// fused <c>kv_a_proj_with_mqa</c> tensor of shape
+    /// <c>[kvLoraRank + qkRopeHeadDim, hidden]</c> is split row-wise into a
+    /// dense latent projection (rows <c>[0, kvLoraRank)</c>) and a dense
+    /// rope-K projection (rows <c>[kvLoraRank, kvLoraRank+qkRopeHeadDim)</c>)
+    /// so the forward path can RMSNorm just the latent slice without a
+    /// stride-aware kernel.
+    /// </summary>
+    private static unsafe MlaLayerBuffers UploadMlaLayer(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        MlaLayerWeights mla, int hiddenSize, out long uploadedBytes)
+    {
+        uploadedBytes = 0;
+        int qTotal = mla.NumHeads * (mla.QkNopeHeadDim + mla.QkRopeHeadDim);
+        int kvBOut = mla.NumHeads * (mla.QkNopeHeadDim + mla.VHeadDim);
+
+        VulkanDevice.Buffer? qAProj = null, qBProj = null, qProj = null, qALayernorm = null;
+        if (mla.QLoraRank > 0)
+        {
+            qAProj = UploadFp32Matrix(device, staging, mla.QAProj, mla.QLoraRank, hiddenSize, out long qABytes);
+            qBProj = UploadFp32Matrix(device, staging, mla.QBProj, qTotal, mla.QLoraRank, out long qBBytes);
+            qALayernorm = UploadNormVec(device, staging, mla.QALayernormWeight!);
+            uploadedBytes += qABytes + qBBytes + (long)mla.QLoraRank * sizeof(float);
+        }
+        else
+        {
+            qProj = UploadFp32Matrix(device, staging, mla.QProj, qTotal, hiddenSize, out long qPBytes);
+            uploadedBytes += qPBytes;
+        }
+
+        // Split kv_a_proj_with_mqa row-wise. Rows are contiguous in row-major
+        // [output_dim, input_dim] storage, so the latent block sits at byte
+        // offset 0 and the rope-K block at kvLoraRank * hidden * 4.
+        long latentRowsBytes = (long)mla.KvLoraRank * hiddenSize * sizeof(float);
+        var kvALatent = UploadFp32Matrix(device, staging,
+            mla.KvAProjWithMqa, mla.KvLoraRank, hiddenSize, out long latentBytes);
+        nint kPePtr = mla.KvAProjWithMqa + (nint)latentRowsBytes;
+        var kvAKPe = UploadFp32Matrix(device, staging,
+            kPePtr, mla.QkRopeHeadDim, hiddenSize, out long kPeBytes);
+        uploadedBytes += latentBytes + kPeBytes;
+
+        var kvALayernorm = UploadNormVec(device, staging, mla.KvALayernormWeight);
+        uploadedBytes += (long)mla.KvLoraRank * sizeof(float);
+
+        var kvBProj = UploadFp32Matrix(device, staging,
+            mla.KvBProj, kvBOut, mla.KvLoraRank, out long kvBBytes);
+        uploadedBytes += kvBBytes;
+
+        return new MlaLayerBuffers(
+            qAProj, qALayernorm, qBProj, qProj,
+            kvALatent, kvAKPe, kvALayernorm, kvBProj,
+            mla.NumHeads, mla.QkNopeHeadDim, mla.QkRopeHeadDim, mla.VHeadDim,
+            mla.QLoraRank, mla.KvLoraRank, hiddenSize);
+    }
+
+    /// <summary>
+    /// Uploads a contiguous F32 row-major matrix from an unmanaged pointer to
+    /// a device-local buffer via the supplied staging buffer. Used by the MLA
+    /// path where every projection is F32 (no quant path on MLA today).
+    /// </summary>
+    private static unsafe VulkanDevice.Buffer UploadFp32Matrix(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, int outputDim, int inputDim, out long uploadedBytes)
+    {
+        long elems = (long)outputDim * inputDim;
+        long bytes = elems * sizeof(float);
+        var buf = device.AllocateDeviceLocal(bytes);
+
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory VulkanWeights.UploadFp32Matrix staging");
+        try
+        {
+            new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
+                .CopyTo(new Span<float>((void*)mapped, checked((int)elems)));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        uploadedBytes = bytes;
+        return buf;
     }
 
     public void Dispose()
