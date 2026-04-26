@@ -438,7 +438,20 @@ public sealed unsafe class CudaTransformerModel : IModel
             && !isMla && !isMoe)
         {
             if (kvCache is CudaKvCache stdKv)
+            {
+                // Guard against silent corruption: if speculative-verify rolled the
+                // cache back, the captured cuGraphExec was instantiated against a
+                // device-side write-pos counter that is now stale relative to the
+                // actual cache state. Today speculative decoding is restricted to
+                // greedy (non-graph), so this branch only fires if a future change
+                // wires both on simultaneously without invalidating the graph.
+                if (stdKv.WasRolledBack)
+                    throw new InvalidOperationException(
+                        "CudaKvCache.Rollback was called on this cache; the captured " +
+                        "cuGraphExec is no longer valid. Either disable UseGraphCapture " +
+                        "before the rollback or invalidate the graph and recapture.");
                 return ForwardDecodeGraph(tokenIds, positions, deviceId, stdKv);
+            }
             if (kvCache is CudaQuantizedKvCache qKv && qKv.WindowCapacity > 0)
                 return ForwardDecodeGraphQuantized(tokenIds, positions, deviceId, qKv);
         }

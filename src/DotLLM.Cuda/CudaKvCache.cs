@@ -240,7 +240,19 @@ public sealed class CudaKvCache : IKvCache
         if ((uint)length > (uint)_currentLength)
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
+        WasRolledBack = true;
     }
+
+    /// <summary>
+    /// Set on the first <see cref="Rollback"/> call against this cache.
+    /// <see cref="CudaTransformerModel"/>'s graph-replay fast path consults
+    /// this flag to guard against the silent-corruption case where a captured
+    /// <c>cuGraphExec</c> would replay with a stale device-side write-pos.
+    /// Speculative decoding is the only Rollback caller today and is currently
+    /// restricted to greedy (non-graph) — this flag exists so a future
+    /// speculative+graph combination fails fast at the graph-launch site.
+    /// </summary>
+    public bool WasRolledBack { get; private set; }
 
     /// <inheritdoc/>
     public void Dispose()

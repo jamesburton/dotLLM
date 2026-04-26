@@ -23,14 +23,16 @@ public class CudaGraphCaptureEquivalenceTest
 
     public CudaGraphCaptureEquivalenceTest(ITestOutputHelper output) => _out = output;
 
-    [SkippableFact]
-    public unsafe void EagerVsGraphDecode_Q4KM_Match()
+    [SkippableTheory]
+    [InlineData("SmolLM-135M.Q4_K_M.gguf")]
+    [InlineData("SmolLM-135M.Q8_0.gguf")]
+    public unsafe void EagerVsGraphDecode_Match(string modelFile)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
 
         string modelPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q4_K_M.gguf");
+            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", modelFile);
         Skip.If(!File.Exists(modelPath), $"{modelPath} not found");
 
         var gguf = GgufFile.Open(modelPath);
