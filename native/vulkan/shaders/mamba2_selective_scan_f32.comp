@@ -1,0 +1,117 @@
+#version 450
+// Mamba2 selective state-space scan — Nemotron-H SSM recurrent kernel.
+//
+// Mirrors DotLLM.Cpu.Kernels.Mamba2SelectiveScan.Execute. Mamba-2 keeps A
+// scalar per head (one float, not a [head_dim, d_state] matrix), so the
+// recurrence collapses to a per-(h, i, k) state update broadcast by a
+// per-(t, h) decay factor dA.
+//
+// Per token t:
+//   dt_sp = softplus(dt[t, h])
+//   dA    = exp(dt_sp * a[h])             // A is stored negative -> dA in (0, 1]
+//   g     = h / (n_head / n_group)
+//   for i in [0, head_dim):
+//     x_dt = x[t, h*head_dim + i] * dt_sp
+//     sum  = 0
+//     for k in [0, d_state):
+//       state[h, i, k] = state[h, i, k] * dA + b[t, g*d_state + k] * x_dt
+//       sum += state[h, i, k] * c[t, g*d_state + k]
+//     y[t, h*head_dim + i] = sum
+//
+// Dispatch:
+//   local_size_x = 64
+//   groupCount.x = n_head           (one workgroup per head — heads are independent)
+// Each thread tid owns the rows i = tid + n*64 for n covering [0, head_dim).
+// For Nemotron-H head_dim=80 each thread loops 1-2 iterations. Sequential
+// over t inside the shader: parallelising across t requires a chunked
+// prefix-scan (out of scope for the foundation port).
+//
+// Shared memory carries the per-(t, h) broadcast of dt_sp and dA written by
+// thread 0 and read by every thread before the per-i recurrence.
+//
+// State persistence across calls: state is the only buffer that is both
+// read AND written. Callers re-issue the kernel with the same state buffer
+// and the recurrence simply continues — running scan(seqLen=4) twice on the
+// same state is bit-equivalent to scan(seqLen=8).
+
+#define WG_SIZE 64
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufState { float st[];  }; // [n_head, head_dim, d_state] (RW)
+layout(set = 0, binding = 1, std430) readonly buffer BufX     { float x[];   }; // [seqLen, n_head*head_dim]
+layout(set = 0, binding = 2, std430) readonly buffer BufDt    { float dt[];  }; // [seqLen, n_head]
+layout(set = 0, binding = 3, std430) readonly buffer BufA     { float a[];   }; // [n_head]
+layout(set = 0, binding = 4, std430) readonly buffer BufB     { float bcoef[]; }; // [seqLen, n_group, d_state]
+layout(set = 0, binding = 5, std430) readonly buffer BufC     { float ccoef[]; }; // [seqLen, n_group, d_state]
+layout(set = 0, binding = 6, std430) writeonly buffer BufY    { float y[];   }; // [seqLen, n_head*head_dim]
+
+layout(push_constant) uniform PushConstants {
+    uint nHead;
+    uint headDim;
+    uint dState;
+    uint nGroup;
+    uint seqLen;
+} pc;
+
+shared float dtSpShared;
+shared float dAShared;
+
+float softplusF(float v) {
+    // Match the CPU reference's numerically-stable fast path.
+    if (v > 20.0)  return v;
+    if (v < -20.0) return exp(v);
+    return log(1.0 + exp(v));
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.nHead) return;
+
+    uint tid       = gl_LocalInvocationID.x;
+    uint dInner    = pc.nHead * pc.headDim;
+    uint headsPerG = pc.nHead / pc.nGroup;       // caller asserts nHead % nGroup == 0
+    uint g         = h / headsPerG;
+
+    uint stateHeadBase = h * pc.headDim * pc.dState;
+    uint xHeadOffset   = h * pc.headDim;
+    float aH           = a[h];
+
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        // 1. Per-(t, h) broadcast: thread 0 produces dt_sp, dA into shared mem.
+        if (tid == 0u) {
+            float dtSp = softplusF(dt[t * pc.nHead + h]);
+            dtSpShared = dtSp;
+            dAShared   = exp(dtSp * aH);
+        }
+        barrier();
+
+        float dtSp = dtSpShared;
+        float dA   = dAShared;
+
+        uint xRowBase = t * dInner + xHeadOffset;
+        uint bRowBase = t * pc.nGroup * pc.dState + g * pc.dState;
+        uint cRowBase = bRowBase;          // C shares group layout with B
+        uint yRowBase = xRowBase;          // y has same [T, dInner] layout as x
+
+        // 2. Each thread strides over i = tid, tid + WG_SIZE, ... (covers head_dim).
+        //    For Nemotron-H head_dim ∈ {64, 80, 128} this is 1-2 iterations.
+        for (uint i = tid; i < pc.headDim; i += WG_SIZE) {
+            float xDt = x[xRowBase + i] * dtSp;
+            uint stateRowBase = stateHeadBase + i * pc.dState;
+
+            float sumf = 0.0;
+            for (uint k = 0u; k < pc.dState; k++) {
+                float s = st[stateRowBase + k] * dA + bcoef[bRowBase + k] * xDt;
+                st[stateRowBase + k] = s;
+                sumf += s * ccoef[cRowBase + k];
+            }
+            y[yRowBase + i] = sumf;
+        }
+
+        // 3. Barrier before thread 0 overwrites the shared dt_sp / dA next t.
+        //    (No data hazard on state / y across iterations — each thread
+        //    keeps the same i set and writes its own y lane.)
+        barrier();
+    }
+}
