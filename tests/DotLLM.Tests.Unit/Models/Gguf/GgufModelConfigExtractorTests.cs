@@ -178,7 +178,7 @@ public class GgufModelConfigExtractorTests
             // MLA-specific
             d.AddUInt32("deepseek2.attention.q_lora_rank", 0);        // V2-Lite is monolithic
             d.AddUInt32("deepseek2.attention.kv_lora_rank", 512);
-            d.AddUInt32("deepseek2.attention.key_length", 128);       // qk_nope
+            d.AddUInt32("deepseek2.attention.key_length", 192);       // total qk_head (qk_nope + qk_rope)
             d.AddUInt32("deepseek2.attention.value_length", 128);     // v_head
             // MoE-specific
             d.AddUInt32("deepseek2.expert_count", 64);
@@ -240,7 +240,7 @@ public class GgufModelConfigExtractorTests
             d.AddUInt32("deepseek2.rope.dimension_count", 64);
             d.AddUInt32("deepseek2.attention.q_lora_rank", 1536);      // V2-full LoRA-Q
             d.AddUInt32("deepseek2.attention.kv_lora_rank", 512);
-            d.AddUInt32("deepseek2.attention.key_length", 128);
+            d.AddUInt32("deepseek2.attention.key_length", 192);        // total qk_head
             d.AddUInt32("deepseek2.attention.value_length", 128);
             d.AddUInt32("deepseek2.expert_count", 160);
             d.AddUInt32("deepseek2.expert_used_count", 6);
@@ -270,7 +270,7 @@ public class GgufModelConfigExtractorTests
             d.AddUInt32("deepseek3.rope.dimension_count", 64);
             d.AddUInt32("deepseek3.attention.q_lora_rank", 1536);
             d.AddUInt32("deepseek3.attention.kv_lora_rank", 512);
-            d.AddUInt32("deepseek3.attention.key_length", 128);
+            d.AddUInt32("deepseek3.attention.key_length", 192);   // total qk_head
             d.AddUInt32("deepseek3.attention.value_length", 128);
             d.AddUInt32("deepseek3.expert_count", 256);
             d.AddUInt32("deepseek3.expert_used_count", 8);

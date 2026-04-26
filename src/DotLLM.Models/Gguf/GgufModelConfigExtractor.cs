@@ -122,19 +122,25 @@ public static class GgufModelConfigExtractor
     /// <list type="bullet">
     ///   <item><c>{arch}.attention.q_lora_rank</c> — Q LoRA bottleneck (0 = monolithic, V2-Lite default)</item>
     ///   <item><c>{arch}.attention.kv_lora_rank</c> — KV LoRA bottleneck (typically 512)</item>
-    ///   <item><c>{arch}.attention.key_length</c> — qk_nope_head_dim (NOT including rope half)</item>
+    ///   <item><c>{arch}.attention.key_length</c> — TOTAL per-head qk dim (qk_nope + qk_rope; 192 on V2-Lite)</item>
     ///   <item><c>{arch}.attention.value_length</c> — v_head_dim (may differ from qk_nope_head_dim)</item>
-    ///   <item><c>{arch}.rope.dimension_count</c> — qk_rope_head_dim (must be even)</item>
+    ///   <item><c>{arch}.rope.dimension_count</c> — qk_rope_head_dim (must be even; 64 on V2-Lite)</item>
     /// </list>
+    /// <para>
+    /// <b>qk_nope_head_dim is derived</b> as <c>key_length - rope.dimension_count</c>.
+    /// Confirmed against the bartowski DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
+    /// (key_length=192, rope.dimension_count=64 ⇒ qk_nope=128).
+    /// </para>
     /// </summary>
     private static MlaConfig ExtractMlaConfig(GgufMetadata metadata, string arch, RoPEConfig? ropeConfig)
     {
         // q_lora_rank may be absent or zero on V2-Lite (monolithic-Q variant).
         int qLoraRank = (int)metadata.GetUInt32OrDefault($"{arch}.attention.q_lora_rank", 0);
         int kvLoraRank = (int)metadata.GetUInt32($"{arch}.attention.kv_lora_rank");
-        int qkNope = (int)metadata.GetUInt32($"{arch}.attention.key_length");
+        int qkTotal = (int)metadata.GetUInt32($"{arch}.attention.key_length");
         int vHead = (int)metadata.GetUInt32($"{arch}.attention.value_length");
         int qkRope = (int)metadata.GetUInt32($"{arch}.rope.dimension_count");
+        int qkNope = qkTotal - qkRope;
 
         if (kvLoraRank <= 0)
             throw new InvalidDataException(
@@ -142,6 +148,10 @@ public static class GgufModelConfigExtractor
         if (qkRope <= 0 || (qkRope & 1) != 0)
             throw new InvalidDataException(
                 $"DeepSeek-V2 MLA requires '{arch}.rope.dimension_count' (qk_rope) to be a positive even number; got {qkRope}.");
+        if (qkNope <= 0)
+            throw new InvalidDataException(
+                $"DeepSeek-V2 MLA requires '{arch}.attention.key_length' > '{arch}.rope.dimension_count' " +
+                $"(qk_nope = key_length - rope.dimension_count); got {qkTotal} and {qkRope}.");
 
         float ropeTheta = ropeConfig?.Theta ?? 10000.0f;
 

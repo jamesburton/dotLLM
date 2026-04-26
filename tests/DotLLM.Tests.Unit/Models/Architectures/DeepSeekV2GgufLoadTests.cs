@@ -77,6 +77,67 @@ public sealed class DeepSeekV2GgufLoadTests
         }
     }
 
+    /// <summary>
+    /// Real-checkpoint config-extraction smoke test against a cached
+    /// <c>DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf</c> (~10.4 GB,
+    /// 16B-class with MLA + 64 routed + 2 shared experts). Skipped when
+    /// the file isn't downloaded. This validates that the metadata
+    /// extractor handles the real key naming + type encoding without
+    /// blowing the host RAM (only metadata is read; tensor data isn't
+    /// touched). Full TransformerWeights load + forward exercises tasks
+    /// #9 / #10 (on-device dequant) — gated on the F32 dequant pressure
+    /// being addressed.
+    /// </summary>
+    [SkippableFact]
+    public void RealGguf_ConfigExtractor_ParsesDeepSeekV2Lite()
+    {
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        Assert.Equal(Architecture.DeepSeekV2, config.Architecture);
+        Assert.Equal(AttentionType.MLA, config.AttentionType);
+
+        // V2-Lite expected hyperparameters (per HF config.json on
+        // deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct):
+        //   hidden_size = 2048, num_hidden_layers = 27,
+        //   num_attention_heads = 16, num_key_value_heads = 16,
+        //   intermediate_size = 10944, vocab_size ≈ 102400,
+        //   first_k_dense_replace = 1, n_routed_experts = 64,
+        //   num_experts_per_tok = 6, n_shared_experts = 2,
+        //   moe_intermediate_size = 1408,
+        //   q_lora_rank = 0 (monolithic Q on V2-Lite),
+        //   kv_lora_rank = 512, qk_nope_head_dim = 128,
+        //   qk_rope_head_dim = 64, v_head_dim = 128.
+        Assert.Equal(2048, config.HiddenSize);
+        Assert.Equal(27, config.NumLayers);
+        Assert.Equal(16, config.NumAttentionHeads);
+
+        Assert.NotNull(config.MlaConfig);
+        Assert.Equal(0, config.MlaConfig.QLoraRank);   // V2-Lite is monolithic-Q
+        Assert.Equal(512, config.MlaConfig.KvLoraRank);
+        Assert.Equal(128, config.MlaConfig.QkNopeHeadDim);
+        Assert.Equal(64, config.MlaConfig.QkRopeHeadDim);
+        Assert.Equal(128, config.MlaConfig.VHeadDim);
+        Assert.Equal(192, config.HeadDim);             // patched to qk_nope + qk_rope
+
+        Assert.NotNull(config.Moe);
+        Assert.Equal(64, config.Moe.NumExperts);
+        Assert.Equal(6, config.Moe.NumExpertsPerTok);
+        Assert.Equal(2, config.Moe.NumSharedExperts);
+        Assert.Equal(1408, config.Moe.MoeIntermediateSize);
+        Assert.Equal(1408 * 2, config.Moe.SharedExpertIntermediateSize);
+        // leading_dense_block_count = 1 → layer 0 dense, 1..26 MoE
+        Assert.False(config.Moe.IsMoeLayer(0));
+        Assert.True(config.Moe.IsMoeLayer(1));
+        Assert.True(config.Moe.IsMoeLayer(26));
+    }
+
     [Fact]
     public void LoadFromGguf_DeepSeekV2_LoraQ_Loads()
     {
@@ -134,7 +195,10 @@ public sealed class DeepSeekV2GgufLoadTests
         // MLA
         b.AddUInt32("deepseek2.attention.q_lora_rank", (uint)qLoraRank);
         b.AddUInt32("deepseek2.attention.kv_lora_rank", (uint)KvLoraRank);
-        b.AddUInt32("deepseek2.attention.key_length", (uint)QkNope);
+        // attention.key_length = TOTAL per-head qk dim (qk_nope + qk_rope), per
+        // llama.cpp's gguf_writer convention for MLA models. The extractor
+        // derives qk_nope = key_length - rope.dimension_count.
+        b.AddUInt32("deepseek2.attention.key_length", (uint)(QkNope + QkRope));
         b.AddUInt32("deepseek2.attention.value_length", (uint)VHead);
 
         // MoE
