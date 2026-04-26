@@ -103,6 +103,7 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
+    private readonly MoeBroadcastF32Kernel? _moeBroadcast;
 
     // Persistent command buffer + fence used by Forward. One SubmitContext
     // per model — reset+begin at the start of each forward, submit+wait at
@@ -154,7 +155,7 @@ public sealed class VulkanTransformerModel : IModel
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
-        MoeWeightedScatterF32Kernel? moeWeightedScatter,
+        MoeWeightedScatterF32Kernel? moeWeightedScatter, MoeBroadcastF32Kernel? moeBroadcast,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow,
@@ -184,6 +185,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax = moeTopkSoftmax;
         _moeIndexedMatmul = moeIndexedMatmul;
         _moeWeightedScatter = moeWeightedScatter;
+        _moeBroadcast = moeBroadcast;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
@@ -378,11 +380,13 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
         MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
+        MoeBroadcastF32Kernel? moeBroadcast = null;
         if (hasMoe)
         {
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
             moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
+            moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
         }
 
         var submit = device.CreateSubmitContext();
@@ -403,7 +407,7 @@ public sealed class VulkanTransformerModel : IModel
             rmsnorm, rope, attention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
-            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter,
+            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter, moeBroadcast,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
@@ -730,6 +734,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
+        _moeBroadcast?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -954,38 +959,24 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax!.Record(cmdBuf,
             _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
-        // The expanded-input broadcast below runs in TRANSFER (vkCmdCopyBuffer)
-        // and reads NormOutput; the topk indices/weights are read by COMPUTE
-        // matmul / scatter dispatches downstream. A compute→compute barrier
-        // on indices/weights and a compute→transfer barrier on NormOutput
-        // are both needed — the broader compute→all barrier covers it.
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        // Broadcast (compute) reads NormOutput, writes MoeExpandedInput; the
+        // indexed matmul downstream reads MoeExpandedInput plus topk
+        // indices/weights. A single compute→compute barrier covers both
+        // RMSNorm-output → broadcast-read on NormOutput and topk-write →
+        // matmul-read on the indices/weights.
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 4. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
         //    Each token's row gets replicated topK times so each (t, slot)
-        //    shares the same input but consumes a different expert. Issuing
-        //    seqLen * topK vkCmdCopyBuffer regions is fine for the small-N
-        //    workloads we care about; a fused broadcast shader is a
-        //    perf-wave follow-up.
-        long rowBytes = (long)hidden * sizeof(float);
-        for (int t = 0; t < seqLen; t++)
-        {
-            long srcOff = (long)t * rowBytes;
-            for (int slot = 0; slot < topK; slot++)
-            {
-                long dstOff = ((long)t * topK + slot) * rowBytes;
-                var region = new VkBufferCopy
-                {
-                    srcOffset = (ulong)srcOff,
-                    dstOffset = (ulong)dstOff,
-                    size = (ulong)rowBytes,
-                };
-                VulkanApi.vkCmdCopyBuffer(cmdBuf,
-                    _state.NormOutput.Handle, _state.MoeExpandedInput!.Handle, 1, region);
-            }
-        }
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        //    shares the same input but consumes a different expert. One
+        //    compute dispatch replaces the seqLen × topK loop of
+        //    vkCmdCopyBuffer regions the previous implementation issued —
+        //    same math, no transfer↔compute stage transition, dispatch
+        //    count drops from O(seqLen·topK) to 1 per MoE layer.
+        _moeBroadcast!.Record(cmdBuf,
+            _state.NormOutput, _state.MoeExpandedInput!,
+            seqLen: seqLen, topK: topK, hidden: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 5. Indexed expert matmuls: gate (W1) and up (W3) project the
         //    expanded input through the experts selected by topk indices.
@@ -1133,6 +1124,7 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();

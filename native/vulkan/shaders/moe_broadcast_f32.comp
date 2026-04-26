@@ -1,0 +1,39 @@
+#version 450
+// MoE broadcast — expands the per-token NormOutput into the per-(token, slot)
+// expanded input consumed by the indexed expert matmul. Replaces a
+// seqLen × topK loop of vkCmdCopyBuffer regions with a single 2D dispatch:
+//
+//   out[n, h] = in[n / topK, h]
+//
+// where the output shape is [seqLen * topK, hiddenSize] (n indexes the
+// concatenated rows) and the input is [seqLen, hiddenSize]. Each token's
+// row gets replicated topK times so each (token, slot) shares the same
+// pre-FFN-norm input but consumes a different expert downstream.
+//
+// Dispatch: 2D grid, one thread per output cell (n, h). Workgroup (16, 16).
+// groupCount = (ceil(hiddenSize/16), ceil(seqLen*topK/16)).
+//
+// Buffer layout:
+//   in   : [seqLen, hiddenSize]          F32 row-major
+//   out  : [seqLen * topK, hiddenSize]   F32 row-major   (fully overwritten)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIn  { float inBuf[];  }; // [seqLen * hiddenSize]
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float outBuf[]; }; // [seqLen * topK * hiddenSize]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint topK;
+    uint hidden;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;            // 0..hidden
+    uint n = gl_GlobalInvocationID.y;            // 0..seqLen*topK
+    uint expandedRows = pc.seqLen * pc.topK;
+    if (h >= pc.hidden || n >= expandedRows) return;
+
+    uint t = n / pc.topK;                         // source token row
+    outBuf[n * pc.hidden + h] = inBuf[t * pc.hidden + h];
+}
