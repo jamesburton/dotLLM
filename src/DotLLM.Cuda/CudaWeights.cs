@@ -343,7 +343,14 @@ internal sealed class CudaWeights : IDisposable
                     : CudaMlaWeightsLoader.LoadLayerF16(lw, config.HiddenSize, allocs);
             }
             if (isMoeLayer)
-                moeLayers![i] = CudaMoeWeightsLoader.LoadLayer(lw, allocs);
+            {
+                // GGUF source with raw quant view → upload Q4_K bytes per expert
+                // (~26 GB at full V2-Lite Q4_K_M scale; the next perf milestone
+                // is grouped-GEMM compaction). Safetensors source → F32 path.
+                moeLayers![i] = lw.Moe!.HasRawQuantView
+                    ? CudaMoeWeightsLoader.LoadLayerQuant(lw, allocs)
+                    : CudaMoeWeightsLoader.LoadLayer(lw, allocs);
+            }
         }
 
         // Sync to ensure all uploads are complete

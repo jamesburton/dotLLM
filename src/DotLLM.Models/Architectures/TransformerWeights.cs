@@ -97,65 +97,52 @@ internal sealed class MoeLayerWeights
     /// <summary>True iff a shared-expert branch is present on this layer.</summary>
     public bool HasSharedExpert => SharedIntermediateSize > 0 && NumSharedExperts > 0;
 
-    // ── Vulkan-only quant overlay ──────────────────────────────────────────────
-    // Production loaders today upcast every MoE projection to F32, so these fields are
-    // unused on production paths; tests populate them to exercise the Vulkan quantised
-    // GEMV/GEMM path for the non-indexed MoE matmuls (router gate + shared-expert
-    // gate/up/down + optional Qwen1.5-MoE shared-expert sigmoid gate). The CPU forward
-    // continues to consume the corresponding F32 arrays (Gate, SharedGateProj, etc.); the
-    // F32 arrays must hold values equivalent to dequantising the raw quant bytes so the
-    // Vulkan vs CPU comparison is fair. The per-routed-expert W1/W2/W3 banks deliberately
-    // have NO quant overlay here — the Vulkan moe_indexed_matmul_f32 kernel is F32-only
-    // in tree, so a quantised indexed variant is future work. Same two-mode storage
-    // policy as the standard transformer: when the source is Q8_0 (contraction axis a
-    // multiple of 32) or Q4_K / Q5_K / Q6_K (a multiple of 256), raw blocks live on
-    // device and dispatch via the matching matmul kernel; otherwise the Vulkan upload
-    // dequantises to F32.
-    //
-    // The overlay slots use the historical "Q8" naming because Q8_0 was the first quant
-    // type wired through. They actually carry raw bytes for whichever format the
-    // companion `*QuantTypeOverlay` field declares — Q8_0, Q4_K, Q5_K, or Q6_K (Phase 1
-    // of the K-quant work, now complete for the Vulkan matmul kernels — coopmat variants
-    // and the remaining K-quant formats (Q2_K, Q3_K) remain follow-up tickets).
+    /// <summary>
+    /// Raw GGUF mmap base pointer of the fused-experts <c>ffn_gate_exps</c>
+    /// tensor, populated alongside the F32 dequants <see cref="W1"/> when the
+    /// source is a GGUF-quantized DeepSeek-V2/V3 checkpoint. The CUDA loader
+    /// consumes these (zero-copy upload to GPU per-expert slice, on-device
+    /// dequant) instead of the F32 host inflation. Zero when the source is
+    /// non-GGUF (e.g. safetensors) — in which case only <see cref="W1"/> is
+    /// populated. Per-expert byte offset into the raw view is
+    /// <c>e * (M * RowByteSize(K, qt))</c> where M = <see cref="GateExpsMDim"/>
+    /// and K = <see cref="GateExpsKDim"/>.
+    /// </summary>
+    public readonly nint GateExpsRaw;
+    /// <summary>Quant type of <see cref="GateExpsRaw"/>; <c>F32</c> when raw view absent.</summary>
+    public readonly QuantizationType GateExpsRawQt;
+    /// <summary>Output dim (M) of the per-expert <c>ffn_gate_exps</c> slice (= moe_intermediate_size).</summary>
+    public readonly int GateExpsMDim;
+    /// <summary>Input dim (K) of the per-expert <c>ffn_gate_exps</c> slice (= hidden_size).</summary>
+    public readonly int GateExpsKDim;
 
-    /// <summary>Optional raw-quant bytes for the router gate ([numExperts, hiddenSize]).
-    /// Zero when the gate stays F32 on device. When non-zero, <see cref="Gate"/> still
-    /// holds an F32 array for the CPU oracle (must match the dequant of the raw bytes).
-    /// The format is declared by <see cref="GateQuantTypeOverlay"/>.</summary>
-    public nint GateQ8Ptr;
-    /// <summary>Storage type of the router-gate raw-byte overlay (<see cref="GateQ8Ptr"/>).
-    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
-    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
-    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
-    public QuantizationType GateQuantTypeOverlay;
+    /// <summary>Raw GGUF mmap base pointer of <c>ffn_up_exps</c>. See <see cref="GateExpsRaw"/>.</summary>
+    public readonly nint UpExpsRaw;
+    public readonly QuantizationType UpExpsRawQt;
+    public readonly int UpExpsMDim;
+    public readonly int UpExpsKDim;
 
-    /// <summary>Optional raw-quant byte pointers for the per-shared-expert gate_proj
-    /// ([sharedIntermediateSize, hiddenSize]). Null or empty when no overlay; otherwise
-    /// length must equal <see cref="NumSharedExperts"/>. Format declared by
-    /// <see cref="SharedExpertProjQuantTypeOverlay"/>.</summary>
-    public nint[]? SharedGateProjQ8Ptrs;
-    /// <summary>Optional raw-quant byte pointers for the per-shared-expert up_proj.</summary>
-    public nint[]? SharedUpProjQ8Ptrs;
-    /// <summary>Optional raw-quant byte pointers for the per-shared-expert down_proj
-    /// ([hiddenSize, sharedIntermediateSize]).</summary>
-    public nint[]? SharedDownProjQ8Ptrs;
-    /// <summary>Storage type of the shared-expert projection overlay arrays. All three
-    /// arrays share one quant type (uniform across the shared-expert branch).
-    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
-    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
-    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
-    public QuantizationType SharedExpertProjQuantTypeOverlay;
+    /// <summary>Raw GGUF mmap base pointer of <c>ffn_down_exps</c>. See <see cref="GateExpsRaw"/>.</summary>
+    /// <remarks>For down_exps the M/K dims are swapped: M = hidden_size, K = moe_intermediate_size.</remarks>
+    public readonly nint DownExpsRaw;
+    public readonly QuantizationType DownExpsRawQt;
+    public readonly int DownExpsMDim;
+    public readonly int DownExpsKDim;
 
-    /// <summary>Optional raw-quant bytes for the Qwen1.5-MoE shared-expert sigmoid gate
-    /// ([1, hiddenSize] — the Vulkan side stores it as a one-row matrix). Null when no
-    /// overlay is present (matches <see cref="SharedExpertGate"/> being F32-only).
-    /// Format declared by <see cref="SharedExpertGateQuantTypeOverlay"/>.</summary>
-    public nint SharedExpertGateQ8Ptr;
-    /// <summary>Storage type of the shared-expert gate overlay (<see cref="SharedExpertGateQ8Ptr"/>).
-    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
-    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
-    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
-    public QuantizationType SharedExpertGateQuantTypeOverlay;
+    /// <summary>Raw GGUF mmap pointers for shared experts (parallel to <see cref="SharedGateProj"/>). 0 when raw view absent.</summary>
+    public readonly nint[] SharedGateRaw;
+    public readonly QuantizationType SharedGateRawQt;
+    public readonly nint[] SharedUpRaw;
+    public readonly QuantizationType SharedUpRawQt;
+    public readonly nint[] SharedDownRaw;
+    public readonly QuantizationType SharedDownRawQt;
+
+    /// <summary>
+    /// True when the routed-expert raw quant views are populated — the CUDA
+    /// loader can take the on-device dequant fast path. False on safetensors
+    /// loads where only the F32 dequants are populated.
+    /// </summary>
+    public bool HasRawQuantView => GateExpsRaw != 0 && UpExpsRaw != 0 && DownExpsRaw != 0;
 
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
@@ -176,7 +163,7 @@ internal sealed class MoeLayerWeights
     /// Full ctor covering Qwen-MoE and DeepSeek extensions: per-shared-expert
     /// pointer arrays, <c>norm_topk_prob</c> flag, optional sigmoid gate.
     /// Length of the three shared arrays must agree; a zero-length array set
-    /// disables the shared-expert branch.
+    /// disables the shared-expert branch. Raw quant views default to absent.
     /// </summary>
     public MoeLayerWeights(
         float[] gate,
@@ -185,6 +172,41 @@ internal sealed class MoeLayerWeights
         bool normTopKProb,
         nint[] sharedGateProj, nint[] sharedUpProj, nint[] sharedDownProj,
         int sharedIntermediateSize, float[]? sharedExpertGate)
+        : this(gate, w1, w2, w3, numExperts, numExpertsPerTok, hiddenSize, intermediateSize,
+               normTopKProb,
+               sharedGateProj, sharedUpProj, sharedDownProj,
+               sharedIntermediateSize, sharedExpertGate,
+               gateExpsRaw: 0, gateExpsRawQt: QuantizationType.F32,
+               gateExpsMDim: 0, gateExpsKDim: 0,
+               upExpsRaw: 0, upExpsRawQt: QuantizationType.F32,
+               upExpsMDim: 0, upExpsKDim: 0,
+               downExpsRaw: 0, downExpsRawQt: QuantizationType.F32,
+               downExpsMDim: 0, downExpsKDim: 0,
+               sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
+               sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
+               sharedDownRaw: Array.Empty<nint>(), sharedDownRawQt: QuantizationType.F32)
+    {
+    }
+
+    /// <summary>
+    /// Full ctor including raw GGUF mmap views for the routed-expert and
+    /// shared-expert tensors. Used by the GGUF MoE loader so the CUDA backend
+    /// can upload raw quantized bytes per expert (avoiding the ~57 GB host
+    /// F32 inflation at V2-Lite scale).
+    /// </summary>
+    public MoeLayerWeights(
+        float[] gate,
+        nint[] w1, nint[] w2, nint[] w3,
+        int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize,
+        bool normTopKProb,
+        nint[] sharedGateProj, nint[] sharedUpProj, nint[] sharedDownProj,
+        int sharedIntermediateSize, float[]? sharedExpertGate,
+        nint gateExpsRaw, QuantizationType gateExpsRawQt, int gateExpsMDim, int gateExpsKDim,
+        nint upExpsRaw, QuantizationType upExpsRawQt, int upExpsMDim, int upExpsKDim,
+        nint downExpsRaw, QuantizationType downExpsRawQt, int downExpsMDim, int downExpsKDim,
+        nint[] sharedGateRaw, QuantizationType sharedGateRawQt,
+        nint[] sharedUpRaw, QuantizationType sharedUpRawQt,
+        nint[] sharedDownRaw, QuantizationType sharedDownRawQt)
     {
         if (sharedGateProj.Length != sharedUpProj.Length || sharedGateProj.Length != sharedDownProj.Length)
             throw new ArgumentException(
@@ -204,16 +226,15 @@ internal sealed class MoeLayerWeights
         NumSharedExperts = sharedGateProj.Length;
         SharedExpertGate = sharedExpertGate;
 
-        // Q8_0 overlays default to F32 / null — production loaders never set them; tests
-        // populate them post-construction to exercise the Vulkan Q8_0 matmul path.
-        GateQ8Ptr = 0;
-        GateQuantTypeOverlay = QuantizationType.F32;
-        SharedGateProjQ8Ptrs = null;
-        SharedUpProjQ8Ptrs = null;
-        SharedDownProjQ8Ptrs = null;
-        SharedExpertProjQuantTypeOverlay = QuantizationType.F32;
-        SharedExpertGateQ8Ptr = 0;
-        SharedExpertGateQuantTypeOverlay = QuantizationType.F32;
+        GateExpsRaw = gateExpsRaw; GateExpsRawQt = gateExpsRawQt;
+        GateExpsMDim = gateExpsMDim; GateExpsKDim = gateExpsKDim;
+        UpExpsRaw = upExpsRaw; UpExpsRawQt = upExpsRawQt;
+        UpExpsMDim = upExpsMDim; UpExpsKDim = upExpsKDim;
+        DownExpsRaw = downExpsRaw; DownExpsRawQt = downExpsRawQt;
+        DownExpsMDim = downExpsMDim; DownExpsKDim = downExpsKDim;
+        SharedGateRaw = sharedGateRaw; SharedGateRawQt = sharedGateRawQt;
+        SharedUpRaw = sharedUpRaw; SharedUpRawQt = sharedUpRawQt;
+        SharedDownRaw = sharedDownRaw; SharedDownRawQt = sharedDownRawQt;
     }
 }
 
@@ -1062,32 +1083,59 @@ internal sealed class TransformerWeights : IDisposable
             routerDesc.QuantizationType,
             router);
 
-        // Per-expert routed projections — slice the 3D tensor by expert index.
+        // Per-expert routed projections. Populate BOTH the F32 dequant (for
+        // the CPU MoeSwiGluMlp oracle path) AND the raw GGUF mmap pointer +
+        // quant type (for the CUDA loader's on-device dequant path). The F32
+        // dequant footprint at full V2-Lite scale is ~57 GB (untenable) — the
+        // GPU loader takes the raw view and avoids the host inflation; the
+        // CPU oracle just isn't run on full V2-Lite for this reason.
+        var gateDesc = tensors[$"{prefix}.ffn_gate_exps.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up_exps.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
+
         var w1 = SliceExpertsToF32(
-            dataBase, tensors[$"{prefix}.ffn_gate_exps.weight"],
+            dataBase, gateDesc,
             numExperts, M: moeIntermediate, K: hiddenSize, owned);
         var w3 = SliceExpertsToF32(
-            dataBase, tensors[$"{prefix}.ffn_up_exps.weight"],
+            dataBase, upDesc,
             numExperts, M: moeIntermediate, K: hiddenSize, owned);
         var w2 = SliceExpertsToF32(
-            dataBase, tensors[$"{prefix}.ffn_down_exps.weight"],
+            dataBase, downDesc,
             numExperts, M: hiddenSize, K: moeIntermediate, owned);
+
+        nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
+        nint upRaw = dataBase + (nint)upDesc.DataOffset;
+        nint downRaw = dataBase + (nint)downDesc.DataOffset;
 
         // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
         nint[] sharedGate = Array.Empty<nint>();
         nint[] sharedUp = Array.Empty<nint>();
         nint[] sharedDown = Array.Empty<nint>();
+        nint[] sharedGateRaw = Array.Empty<nint>();
+        nint[] sharedUpRaw = Array.Empty<nint>();
+        nint[] sharedDownRaw = Array.Empty<nint>();
+        QuantizationType sharedGateRawQt = QuantizationType.F32;
+        QuantizationType sharedUpRawQt = QuantizationType.F32;
+        QuantizationType sharedDownRawQt = QuantizationType.F32;
         int sharedIntermediate = 0;
         if (moe.SharedExpertIntermediateSize is int sharedI && sharedI > 0
             && tensors.ContainsKey($"{prefix}.ffn_gate_shexp.weight"))
         {
             sharedIntermediate = sharedI;
-            sharedGate = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_gate_shexp.weight"],
-                                        (long)sharedI * hiddenSize, owned)];
-            sharedUp = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_up_shexp.weight"],
-                                        (long)sharedI * hiddenSize, owned)];
-            sharedDown = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_down_shexp.weight"],
-                                        (long)hiddenSize * sharedI, owned)];
+            var sharedGateDesc = tensors[$"{prefix}.ffn_gate_shexp.weight"];
+            var sharedUpDesc = tensors[$"{prefix}.ffn_up_shexp.weight"];
+            var sharedDownDesc = tensors[$"{prefix}.ffn_down_shexp.weight"];
+
+            sharedGate = [DequantToF32(dataBase, sharedGateDesc, (long)sharedI * hiddenSize, owned)];
+            sharedUp = [DequantToF32(dataBase, sharedUpDesc, (long)sharedI * hiddenSize, owned)];
+            sharedDown = [DequantToF32(dataBase, sharedDownDesc, (long)hiddenSize * sharedI, owned)];
+
+            sharedGateRaw = [dataBase + (nint)sharedGateDesc.DataOffset];
+            sharedGateRawQt = sharedGateDesc.QuantizationType;
+            sharedUpRaw = [dataBase + (nint)sharedUpDesc.DataOffset];
+            sharedUpRawQt = sharedUpDesc.QuantizationType;
+            sharedDownRaw = [dataBase + (nint)sharedDownDesc.DataOffset];
+            sharedDownRawQt = sharedDownDesc.QuantizationType;
         }
 
         // DeepSeek convention: no per-token sigmoid gate on the shared branch.
@@ -1106,7 +1154,16 @@ internal sealed class TransformerWeights : IDisposable
             sharedUpProj: sharedUp,
             sharedDownProj: sharedDown,
             sharedIntermediateSize: sharedIntermediate,
-            sharedExpertGate: null);
+            sharedExpertGate: null,
+            gateExpsRaw: gateRaw, gateExpsRawQt: gateDesc.QuantizationType,
+            gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
+            upExpsRaw: upRaw, upExpsRawQt: upDesc.QuantizationType,
+            upExpsMDim: moeIntermediate, upExpsKDim: hiddenSize,
+            downExpsRaw: downRaw, downExpsRawQt: downDesc.QuantizationType,
+            downExpsMDim: hiddenSize, downExpsKDim: moeIntermediate,
+            sharedGateRaw: sharedGateRaw, sharedGateRawQt: sharedGateRawQt,
+            sharedUpRaw: sharedUpRaw, sharedUpRawQt: sharedUpRawQt,
+            sharedDownRaw: sharedDownRaw, sharedDownRawQt: sharedDownRawQt);
     }
 
     /// <summary>
