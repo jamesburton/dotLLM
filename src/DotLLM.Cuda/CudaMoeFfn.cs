@@ -65,6 +65,16 @@ public static unsafe class CudaMoeFfn
             throw new InvalidOperationException(
                 "MoE kernels not available. Compile native/kernels/moe_ffn.cu to PTX.");
 
+        if (weights.Precision == MoePrecision.Quantized)
+            throw new NotImplementedException(
+                "MoE quantized forward path (per-expert raw GGUF quant bytes + on-device dequant) " +
+                "is not yet wired into CudaMoeFfn.Forward. Loader-side scaffolding " +
+                "(CudaMoeWeightsLoader.LoadLayerQuant) is in place; the per-expert dequant-to-F16-scratch " +
+                "+ HGEMM (or quantized GEMV) branch is the next step. See " +
+                "docs/perf/DEEPSEEK_QUANTIZED_GPU_PATH.md (#10-ii). For now this path fails fast " +
+                "to avoid silently feeding raw Q4_K bytes through cuBLAS LinearF32 (would produce " +
+                "garbage logits).");
+
         if (seqLen <= 0) return;
 
         int hidden = weights.HiddenSize;
