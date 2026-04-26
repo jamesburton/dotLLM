@@ -131,21 +131,33 @@ internal sealed class VulkanForwardState : IDisposable
         long kvBytes = (long)seqLen * _numKvHeads * _headDim * sizeof(float);
         long ffnBytes = (long)seqLen * _intermediateSize * sizeof(float);
 
-        _hiddenSlots[0] = _device.Allocate(hiddenBytes);
-        _hiddenSlots[1] = _device.Allocate(hiddenBytes);
+        // Buffers never read or written from the host go device-local — the
+        // driver can pick its tiled / swizzled native layout instead of the
+        // host-coherent linear layout that Allocate() returns. On UMA (Strix
+        // Halo iGPU) this lets the compute path use the GPU's preferred
+        // memory access pattern; on dGPU it keeps the bytes off the
+        // PCIe-host-coherent path.
+        //
+        // Bias-add receiver buffers (Q, K, V, NormOutput, FfnGate, FfnUp)
+        // stay host-visible because AddBiasRows host-maps them when a bias
+        // tensor is present. SmolLM-135M has no biases so the host-map
+        // never fires, but Phi-3 / Qwen3 / DeepSeek-V2 do — moving them
+        // requires a bias_add_f32 compute kernel (issue #7).
+        _hiddenSlots[0] = _device.AllocateDeviceLocal(hiddenBytes);
+        _hiddenSlots[1] = _device.AllocateDeviceLocal(hiddenBytes);
         _hiddenIdx = 0;
         NormOutput = _device.Allocate(hiddenBytes);
 
         Q = _device.Allocate(qBytes);
         K = _device.Allocate(kvBytes);
         V = _device.Allocate(kvBytes);
-        AttnOutput = _device.Allocate(qBytes);
+        AttnOutput = _device.AllocateDeviceLocal(qBytes);
 
         FfnGate = _device.Allocate(ffnBytes);
         FfnUp = _device.Allocate(ffnBytes);
-        SiluOutput = _device.Allocate(ffnBytes);
+        SiluOutput = _device.AllocateDeviceLocal(ffnBytes);
 
-        // Resize positions buffer.
+        // Resize positions buffer — host writes positions per forward.
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
