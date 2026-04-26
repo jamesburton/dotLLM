@@ -77,6 +77,202 @@ public sealed class DeepSeekV2GgufLoadTests
         }
     }
 
+    /// <summary>
+    /// Real-checkpoint config-extraction smoke test against a cached
+    /// <c>DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf</c> (~10.4 GB,
+    /// 16B-class with MLA + 64 routed + 2 shared experts). Skipped when
+    /// the file isn't downloaded. This validates that the metadata
+    /// extractor handles the real key naming + type encoding without
+    /// blowing the host RAM (only metadata is read; tensor data isn't
+    /// touched). Full TransformerWeights load + forward exercises tasks
+    /// #9 / #10 (on-device dequant) — gated on the F32 dequant pressure
+    /// being addressed.
+    /// </summary>
+    [SkippableFact]
+    public void RealGguf_ConfigExtractor_ParsesDeepSeekV2Lite()
+    {
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        Assert.Equal(Architecture.DeepSeekV2, config.Architecture);
+        Assert.Equal(AttentionType.MLA, config.AttentionType);
+
+        // V2-Lite expected hyperparameters (per HF config.json on
+        // deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct):
+        //   hidden_size = 2048, num_hidden_layers = 27,
+        //   num_attention_heads = 16, num_key_value_heads = 16,
+        //   intermediate_size = 10944, vocab_size ≈ 102400,
+        //   first_k_dense_replace = 1, n_routed_experts = 64,
+        //   num_experts_per_tok = 6, n_shared_experts = 2,
+        //   moe_intermediate_size = 1408,
+        //   q_lora_rank = 0 (monolithic Q on V2-Lite),
+        //   kv_lora_rank = 512, qk_nope_head_dim = 128,
+        //   qk_rope_head_dim = 64, v_head_dim = 128.
+        Assert.Equal(2048, config.HiddenSize);
+        Assert.Equal(27, config.NumLayers);
+        Assert.Equal(16, config.NumAttentionHeads);
+
+        Assert.NotNull(config.MlaConfig);
+        Assert.Equal(0, config.MlaConfig.QLoraRank);   // V2-Lite is monolithic-Q
+        Assert.Equal(512, config.MlaConfig.KvLoraRank);
+        Assert.Equal(128, config.MlaConfig.QkNopeHeadDim);
+        Assert.Equal(64, config.MlaConfig.QkRopeHeadDim);
+        Assert.Equal(128, config.MlaConfig.VHeadDim);
+        Assert.Equal(192, config.HeadDim);             // patched to qk_nope + qk_rope
+
+        Assert.NotNull(config.Moe);
+        Assert.Equal(64, config.Moe.NumExperts);
+        Assert.Equal(6, config.Moe.NumExpertsPerTok);
+        Assert.Equal(2, config.Moe.NumSharedExperts);
+        Assert.Equal(1408, config.Moe.MoeIntermediateSize);
+        Assert.Equal(1408 * 2, config.Moe.SharedExpertIntermediateSize);
+        // leading_dense_block_count = 1 → layer 0 dense, 1..26 MoE
+        Assert.False(config.Moe.IsMoeLayer(0));
+        Assert.True(config.Moe.IsMoeLayer(1));
+        Assert.True(config.Moe.IsMoeLayer(26));
+    }
+
+    /// <summary>
+    /// Narrow real-checkpoint smoke against the cached
+    /// <c>DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf</c>. Trims the model to
+    /// <see cref="ModelConfig.NumLayers"/>=1 (only layer 0, which is dense FFN
+    /// per <c>leading_dense_block_count=1</c>) so the GGUF MoE tensor loader
+    /// (still F32-host-dequant for now → would blow ~57 GB host RAM at full
+    /// V2-Lite scale) is bypassed entirely. Exercises the new quantized MLA
+    /// path on real Q4_K_M weights — proves the GGUF→CudaTransformerModel→
+    /// CudaMlaAttention.ForwardF16(Quantized) chain works end-to-end on real
+    /// data without crashing or producing NaN logits. The full multi-layer
+    /// run gates on task #10 (quantized MoE + on-device dequant for the 3D
+    /// expert tensors).
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "GPU")]
+    public void RealGguf_QuantizedMla_Layer0Smoke()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        // Trim to layer 0 (dense FFN, no MoE) so the F32-host MoE dequant
+        // is skipped entirely. Also clear Moe so the dispatcher doesn't
+        // expect MoE entries on a 1-layer model.
+        var config = fullConfig with { NumLayers = 1, Moe = null };
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        Assert.Equal(MlaPrecision.Quantized, ModelLayer0MlaPrecision(model));
+
+        // Tiny prefill — first 4 tokens of any prompt. We don't have the
+        // tokenizer wired up here so we use raw token IDs from the BOS region.
+        int[] tokenIds = [100000, 261, 1559, 11];   // arbitrary valid V2-Lite ids
+        int[] positions = [0, 1, 2, 3];
+
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null);
+        Assert.Equal(fullConfig.VocabSize, logits.Shape[1]);
+
+        unsafe
+        {
+            int finite = 0;
+            int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+            var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+            foreach (float v in span)
+                if (float.IsFinite(v)) finite++;
+            Assert.True(finite == total,
+                $"Expected all {total} logits finite; got {finite} finite. " +
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+        }
+    }
+
+    /// <summary>
+    /// Multi-layer real-checkpoint smoke that ALSO exercises the new
+    /// quantized-MoE forward path. Trims to 2 layers (dense layer 0 + MoE
+    /// layer 1) — a minimal slice that validates the quant MoE path
+    /// end-to-end on real Q4_K_M data without loading the full ~9 GB GPU
+    /// budget of all 26 MoE layers.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "GPU")]
+    public void RealGguf_QuantizedMlaMoe_TwoLayerSmoke()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        // Layer 0 dense (per leading_dense_block_count=1), layer 1 MoE.
+        var config = fullConfig with { NumLayers = 2 };
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        Assert.Equal(MlaPrecision.Quantized, ModelLayer0MlaPrecision(model));
+        Assert.Equal(MoePrecision.Quantized, ModelLayer1MoePrecision(model));
+
+        int[] tokenIds = [100000, 261, 1559, 11];
+        int[] positions = [0, 1, 2, 3];
+
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null);
+
+        unsafe
+        {
+            int finite = 0;
+            int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+            var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+            foreach (float v in span)
+                if (float.IsFinite(v)) finite++;
+            Assert.True(finite == total,
+                $"Expected all {total} logits finite; got {finite} finite. " +
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+        }
+    }
+
+    /// <summary>Reflection peek at layer 1's MoE precision (mirrors the MLA helper).</summary>
+    private static MoePrecision ModelLayer1MoePrecision(CudaTransformerModel model)
+    {
+        var weightsField = typeof(CudaTransformerModel).GetField("_weights",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var weights = weightsField!.GetValue(model);
+        var moeLayersProp = weights!.GetType().GetProperty("MoeLayers");
+        var moeLayers = (Array)moeLayersProp!.GetValue(weights)!;
+        var layer1 = moeLayers.GetValue(1)!;
+        var precisionProp = layer1.GetType().GetProperty("Precision");
+        return (MoePrecision)precisionProp!.GetValue(layer1)!;
+    }
+
+    /// <summary>
+    /// Helper: peek at layer 0's MLA precision via the model's internal weights.
+    /// Confirms the GGUF loader routed through LoadLayerQuant rather than
+    /// falling back to the F16-cast path.
+    /// </summary>
+    private static MlaPrecision ModelLayer0MlaPrecision(CudaTransformerModel model)
+    {
+        // Reach in via reflection to the private _weights field. This test
+        // file uses InternalsVisibleTo, but the field is private — short of
+        // adding an internal accessor we use reflection. Acceptable for this
+        // single one-off test (kept narrow on purpose).
+        var weightsField = typeof(CudaTransformerModel).GetField("_weights",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var weights = weightsField!.GetValue(model);
+        var mlaLayersProp = weights!.GetType().GetProperty("MlaLayers");
+        var mlaLayers = (Array)mlaLayersProp!.GetValue(weights)!;
+        var layer0 = mlaLayers.GetValue(0)!;
+        var precisionField = layer0.GetType().GetField("Precision");
+        return (MlaPrecision)precisionField!.GetValue(layer0)!;
+    }
+
     [Fact]
     public void LoadFromGguf_DeepSeekV2_LoraQ_Loads()
     {

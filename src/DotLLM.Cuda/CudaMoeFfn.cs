@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
 namespace DotLLM.Cuda;
@@ -64,16 +65,6 @@ public static unsafe class CudaMoeFfn
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
                 "MoE kernels not available. Compile native/kernels/moe_ffn.cu to PTX.");
-
-        if (weights.Precision == MoePrecision.Quantized)
-            throw new NotImplementedException(
-                "MoE quantized forward path (per-expert raw GGUF quant bytes + on-device dequant) " +
-                "is not yet wired into CudaMoeFfn.Forward. Loader-side scaffolding " +
-                "(CudaMoeWeightsLoader.LoadLayerQuant) is in place; the per-expert dequant-to-F16-scratch " +
-                "+ HGEMM (or quantized GEMV) branch is the next step. See " +
-                "docs/perf/DEEPSEEK_QUANTIZED_GPU_PATH.md (#10-ii). For now this path fails fast " +
-                "to avoid silently feeding raw Q4_K bytes through cuBLAS LinearF32 (would produce " +
-                "garbage logits).");
 
         if (seqLen <= 0) return;
 
@@ -207,12 +198,20 @@ public static unsafe class CudaMoeFfn
             // 3. GEMMs gate / up.
             //    LinearF32 contract: Y[m, n] = X[m, k] × W[n, k]^T.
             //    gate[batch, I] = gathered[batch, hidden] × W1[I, hidden]^T
-            CudaGemm.LinearF32(
-                cublasHandle, scratch.GatheredInput, weights.GateProj[e],
-                scratch.GateBatch, batch, hidden, I, stream);
-            CudaGemm.LinearF32(
-                cublasHandle, scratch.GatheredInput, weights.UpProj[e],
-                scratch.UpBatch, batch, hidden, I, stream);
+            //    Quantized path: dequant the per-expert weight raw bytes →
+            //    F16 scratch → F32 scratch → LinearF32. F32 path: direct.
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                scratch.GatheredInput, batch, K: hidden, M: I,
+                weightF32: weights.GateProj[e],
+                weightQuant: weights.GateProj[e], weightQt: weights.GateProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                outputF32: scratch.GateBatch);
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                scratch.GatheredInput, batch, K: hidden, M: I,
+                weightF32: weights.UpProj[e],
+                weightQuant: weights.UpProj[e], weightQt: weights.UpProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                outputF32: scratch.UpBatch);
 
             // 4. SwiGLU element-wise.
             kernels.LaunchSwiGLUF32(
@@ -221,9 +220,12 @@ public static unsafe class CudaMoeFfn
 
             // 5. GEMM down.
             //    down[batch, hidden] = silu[batch, I] × W2[hidden, I]^T
-            CudaGemm.LinearF32(
-                cublasHandle, scratch.SiluBatch, weights.DownProj[e],
-                scratch.DownBatch, batch, I, hidden, stream);
+            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                scratch.SiluBatch, batch, K: I, M: hidden,
+                weightF32: weights.DownProj[e],
+                weightQuant: weights.DownProj[e], weightQt: weights.DownProjQuantType,
+                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                outputF32: scratch.DownBatch);
 
             // 6. Per-slot axpy (group by slot to amortise weight lookups).
             //    The fast common case is K=2..8; we walk slots 0..K-1 and
@@ -310,18 +312,27 @@ public static unsafe class CudaMoeFfn
 
             for (int s = 0; s < weights.NumSharedExperts; s++)
             {
-                CudaGemm.LinearF32(
-                    cublasHandle, hiddenF32, weights.SharedGateProj[s],
-                    scratch.SharedGateBatch, seqLen, hidden, sI, stream);
-                CudaGemm.LinearF32(
-                    cublasHandle, hiddenF32, weights.SharedUpProj[s],
-                    scratch.SharedUpBatch, seqLen, hidden, sI, stream);
+                ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                    hiddenF32, seqLen, K: hidden, M: sI,
+                    weightF32: weights.SharedGateProj[s],
+                    weightQuant: weights.SharedGateProj[s], weightQt: weights.SharedGateProjQuantType,
+                    dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                    outputF32: scratch.SharedGateBatch);
+                ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                    hiddenF32, seqLen, K: hidden, M: sI,
+                    weightF32: weights.SharedUpProj[s],
+                    weightQuant: weights.SharedUpProj[s], weightQt: weights.SharedUpProjQuantType,
+                    dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                    outputF32: scratch.SharedUpBatch);
                 kernels.LaunchSwiGLUF32(
                     scratch.SharedGateBatch, scratch.SharedUpBatch, scratch.SharedSiluBatch,
                     sI, seqLen, stream);
-                CudaGemm.LinearF32(
-                    cublasHandle, scratch.SharedSiluBatch, weights.SharedDownProj[s],
-                    scratch.SharedDownBatch, seqLen, sI, hidden, stream);
+                ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                    scratch.SharedSiluBatch, seqLen, K: sI, M: hidden,
+                    weightF32: weights.SharedDownProj[s],
+                    weightQuant: weights.SharedDownProj[s], weightQt: weights.SharedDownProjQuantType,
+                    dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                    outputF32: scratch.SharedDownBatch);
 
                 if (hasGate)
                 {
@@ -335,6 +346,43 @@ public static unsafe class CudaMoeFfn
                         outputF32, scratch.SharedDownBatch, seqLen, hidden, stream);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Projection helper that branches on <paramref name="precision"/>: F32 weights
+    /// route through cuBLAS LinearF32 directly; quantized weights are dequantized
+    /// into <paramref name="dequantF16"/> via <see cref="CudaKernels.LaunchDequantToF16"/>,
+    /// converted to F32 in <paramref name="dequantF32"/> via
+    /// <see cref="CudaKernels.LaunchConvertF16ToF32"/>, then LinearF32.
+    /// Sized assumptions: weight is <c>[M, K]</c> row-major (K innermost),
+    /// scratches must each hold at least <c>M*K</c> elements.
+    /// </summary>
+    /// <remarks>
+    /// Cost on the quantized path: 2 extra kernel launches per projection
+    /// (dequant + convert). At V2-Lite Q4_K_M scale: 6 routed projections
+    /// per active expert × 6 active experts × 26 MoE layers + 3 shared
+    /// projections × 1 fused × 26 = 999 extra launches per decode token,
+    /// plus the cuBLAS GEMMs themselves. WDDM dispatch overhead dominates
+    /// here; grouped-GEMM is the next perf milestone.
+    /// </remarks>
+    private static void ProjectF32OrQuant(
+        MoePrecision precision, nint cublasHandle, CudaKernels kernels, nint stream,
+        nint inputF32, int batch, int K, int M,
+        nint weightF32, nint weightQuant, QuantizationType weightQt,
+        nint dequantF16, nint dequantF32, nint outputF32)
+    {
+        if (precision == MoePrecision.Quantized)
+        {
+            kernels.LaunchDequantToF16(weightQuant, weightQt, dequantF16, M * K, stream);
+            kernels.LaunchConvertF16ToF32(dequantF16, dequantF32, M * K, stream);
+            CudaGemm.LinearF32(cublasHandle, inputF32, dequantF32, outputF32,
+                batch, K, M, stream);
+        }
+        else
+        {
+            CudaGemm.LinearF32(cublasHandle, inputF32, weightF32, outputF32,
+                batch, K, M, stream);
         }
     }
 }
@@ -363,6 +411,15 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     private nint _sharedDownBatch;   // [seqLen, hidden]     F32
     private nint _sharedScale;       // [seqLen]             F32
 
+    // Quantized-path dequant scratches: F16 for the LaunchDequantToF16 output,
+    // F32 for the cuBLAS-LinearF32-consumed weight after F16→F32 conversion.
+    // Sized to the largest single projection (max(I*hidden, hidden*sI) elements).
+    // Reused across all per-expert and per-shared-expert calls in a forward.
+    private nint _dequantF16;         // F16 scratch (sizeof(ushort) per elem)
+    private nint _dequantF32;         // F32 scratch (sizeof(float) per elem)
+    private long _dequantElems;
+    private bool _capQuantized;
+
     private int _capSeqLen, _capE, _capK, _capHidden, _capI, _capSI;
     private bool _capHasShared;
 
@@ -384,6 +441,8 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     internal nint SharedSiluBatch => _sharedSiluBatch;
     internal nint SharedDownBatch => _sharedDownBatch;
     internal nint SharedScale => _sharedScale;
+    internal nint DequantF16 => _dequantF16;
+    internal nint DequantF32 => _dequantF32;
 
     /// <summary>Ensures all scratch buffers fit the requested workload.</summary>
     public void EnsureCapacity(int seqLen, CudaMoeLayerWeights weights)
@@ -432,6 +491,31 @@ public sealed unsafe class CudaMoeScratch : IDisposable
             _sharedDownBatch = AllocF32((long)newCap * _capHidden);
             _sharedScale = AllocF32(newCap);
         }
+
+        // Dequant scratch — quantized path only. Sized to the largest single
+        // projection across routed (I × hidden) and shared (sI × hidden).
+        // Two buffers: F16 dequant target + F32 conversion target. Both
+        // reused across all per-expert calls in a forward.
+        bool isQuant = weights.Precision == MoePrecision.Quantized;
+        _capQuantized = isQuant;
+        if (isQuant)
+        {
+            long routedMax = (long)_capI * _capHidden;
+            long sharedMax = hasShared ? (long)_capSI * _capHidden : 0;
+            long maxElems = Math.Max(routedMax, sharedMax);
+            if (maxElems > _dequantElems)
+            {
+                FreeIf(ref _dequantF16);
+                FreeIf(ref _dequantF32);
+                long f16Bytes = maxElems * sizeof(ushort);
+                long f32Bytes = maxElems * sizeof(float);
+                CudaDriverApi.cuMemAlloc_v2(out _dequantF16, (nuint)f16Bytes).ThrowOnError();
+                AllocatedBytes += f16Bytes;
+                CudaDriverApi.cuMemAlloc_v2(out _dequantF32, (nuint)f32Bytes).ThrowOnError();
+                AllocatedBytes += f32Bytes;
+                _dequantElems = maxElems;
+            }
+        }
     }
 
     private nint AllocF32(long elems)
@@ -460,6 +544,8 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         FreeIf(ref _sharedGateBatch); FreeIf(ref _sharedUpBatch);
         FreeIf(ref _sharedSiluBatch); FreeIf(ref _sharedDownBatch);
         FreeIf(ref _sharedScale);
+        FreeIf(ref _dequantF16); FreeIf(ref _dequantF32);
+        _dequantElems = 0;
         AllocatedBytes = 0;
     }
 
