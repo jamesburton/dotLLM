@@ -1,0 +1,65 @@
+#version 450
+// MLA kv_b split — after kv_b_proj produces a fused per-head
+// [qkNope + vHead] block per token, this shader splits it into two
+// densely-packed output buffers:
+//
+//   kvBExpanded[seqLen, numHeads * (qkNope + vHead)]
+//     →  kNope[seqLen, numHeads * qkNope]    (first qkNope per head)
+//     +  v    [seqLen, numHeads * vHead]     (last  vHead per head)
+//
+// Mirrors the per-head copy loop in
+// DotLLM.Cpu.Kernels.MlaAttention.Execute lines 246-256:
+//   for h in 0..numHeads:
+//     kNope[t, h, :] = expanded[t, h * (qkNope + vHead) : ... + qkNope]
+//     v    [t, h, :] = expanded[t, h * (qkNope + vHead) + qkNope : ... + vHead]
+//
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = seqLen
+// One workgroup per token; threads stride over the per-token element
+// count (numHeads * (qkNope + vHead)) and dispatch each element to
+// kNope or v based on its position within the head's block.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufExp   { float kvBExpanded[]; }; // [seqLen, numHeads * (qkNope + vHead)]
+layout(set = 0, binding = 1, std430) writeonly buffer BufKNope { float kNope[];       }; // [seqLen, numHeads * qkNope]
+layout(set = 0, binding = 2, std430) writeonly buffer BufV     { float vOut[];        }; // [seqLen, numHeads * vHead]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint numHeads;
+    uint qkNopeHeadDim;
+    uint vHeadDim;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint perHead = pc.qkNopeHeadDim + pc.vHeadDim;
+    uint expRowSize = pc.numHeads * perHead;
+    uint expRowBase = t * expRowSize;
+    uint kNopeRowBase = t * pc.numHeads * pc.qkNopeHeadDim;
+    uint vRowBase = t * pc.numHeads * pc.vHeadDim;
+
+    for (uint i = tid; i < expRowSize; i += threads) {
+        uint head = i / perHead;
+        uint idxInHead = i - head * perHead;
+        float val = kvBExpanded[expRowBase + i];
+
+        if (idxInHead < pc.qkNopeHeadDim) {
+            // K_nope slot for this head
+            uint dst = kNopeRowBase + head * pc.qkNopeHeadDim + idxInHead;
+            kNope[dst] = val;
+        } else {
+            // V slot for this head
+            uint vIdx = idxInHead - pc.qkNopeHeadDim;
+            uint dst = vRowBase + head * pc.vHeadDim + vIdx;
+            vOut[dst] = val;
+        }
+    }
+}
