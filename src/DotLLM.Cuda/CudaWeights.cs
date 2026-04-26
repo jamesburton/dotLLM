@@ -334,7 +334,14 @@ internal sealed class CudaWeights : IDisposable
                 gateUpPacked, gateUpPackedQt, gateUpPackedOut);
 
             if (isMlaLayer)
-                mlaLayers![i] = CudaMlaWeightsLoader.LoadLayerF16(lw, config.HiddenSize, allocs);
+            {
+                // GGUF source: raw quant view present → upload Q4_K bytes directly
+                // (~140 MB for V2-Lite, vs ~1.4 GB F16). Safetensors source: no
+                // raw view → fall back to F32→F16 cast as before.
+                mlaLayers![i] = lw.Mla!.HasRawQuantView
+                    ? CudaMlaWeightsLoader.LoadLayerQuant(lw, config.HiddenSize, lw.OQuantType, allocs)
+                    : CudaMlaWeightsLoader.LoadLayerF16(lw, config.HiddenSize, allocs);
+            }
             if (isMoeLayer)
                 moeLayers![i] = CudaMoeWeightsLoader.LoadLayer(lw, allocs);
         }

@@ -772,6 +772,12 @@ public static unsafe partial class CudaMlaAttention
         float rmsNormEps, float softmaxScale,
         CudaMlaScratchF16 scratch, nint cublasHandle, CudaKernels kernels, nint stream)
     {
+        if (layer.Precision == MlaPrecision.Quantized)
+            throw new NotImplementedException(
+                "MLA quantized forward path (raw GGUF quant bytes + on-device dequant) is not " +
+                "yet wired into ForwardF16. Loader-side scaffolding (CudaMlaWeightsLoader.LoadLayerQuant) " +
+                "is in place; the per-projection dequant-to-F16-scratch + HGEMM branch is the next " +
+                "step (sub-task #9-iii in docs/perf/DEEPSEEK_QUANTIZED_GPU_PATH.md).");
         if (layer.Precision != MlaPrecision.F16)
             throw new InvalidOperationException(
                 $"ForwardF16 requires FP16 weights but layer.Precision is {layer.Precision}.");

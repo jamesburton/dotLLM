@@ -368,21 +368,39 @@ internal readonly struct TransformerLayerWeights
 /// </remarks>
 internal sealed class MlaLayerWeights
 {
-    /// <summary>Q down-projection [qLoraRank, hidden]. Zero when <see cref="QLoraRank"/>==0.</summary>
+    /// <summary>Q down-projection (F32) [qLoraRank, hidden]. Zero when <see cref="QLoraRank"/>==0.</summary>
     public readonly nint QAProj;
     /// <summary>Q LoRA RMSNorm weight [qLoraRank]. Null when <see cref="QLoraRank"/>==0.</summary>
     public readonly float[]? QALayernormWeight;
-    /// <summary>Q up-projection [numHeads * qkHeadDim, qLoraRank]. Zero when <see cref="QLoraRank"/>==0.</summary>
+    /// <summary>Q up-projection (F32) [numHeads * qkHeadDim, qLoraRank]. Zero when <see cref="QLoraRank"/>==0.</summary>
     public readonly nint QBProj;
-    /// <summary>Monolithic Q projection [numHeads * qkHeadDim, hidden]. Zero when <see cref="QLoraRank"/>&gt;0.</summary>
+    /// <summary>Monolithic Q projection (F32) [numHeads * qkHeadDim, hidden]. Zero when <see cref="QLoraRank"/>&gt;0.</summary>
     public readonly nint QProj;
 
-    /// <summary>KV down-projection with shared-rope-K [kvLoraRank + qkRopeHeadDim, hidden].</summary>
+    /// <summary>KV down-projection with shared-rope-K (F32) [kvLoraRank + qkRopeHeadDim, hidden].</summary>
     public readonly nint KvAProjWithMqa;
     /// <summary>KV LoRA RMSNorm weight [kvLoraRank].</summary>
     public readonly float[] KvALayernormWeight;
-    /// <summary>KV up-projection [numHeads * (qkNopeHeadDim + vHeadDim), kvLoraRank].</summary>
+    /// <summary>KV up-projection (F32) [numHeads * (qkNopeHeadDim + vHeadDim), kvLoraRank].</summary>
     public readonly nint KvBProj;
+
+    /// <summary>
+    /// Raw GGUF mmap views of the projection weights — populated alongside
+    /// the F32 dequants when the source is GGUF-quantized. The GPU loader
+    /// consumes these directly (zero-copy upload to GPU, on-device dequant)
+    /// to avoid the F32 host inflation. Zero / F32 means the F32 dequant
+    /// pointer above is the only view (e.g. safetensors source).
+    /// </summary>
+    public readonly nint QAProjRaw;
+    public readonly QuantizationType QAProjRawQt;
+    public readonly nint QBProjRaw;
+    public readonly QuantizationType QBProjRawQt;
+    public readonly nint QProjRaw;
+    public readonly QuantizationType QProjRawQt;
+    public readonly nint KvAProjWithMqaRaw;
+    public readonly QuantizationType KvAProjWithMqaRawQt;
+    public readonly nint KvBProjRaw;
+    public readonly QuantizationType KvBProjRawQt;
 
     // Hyperparameters (mirrors MlaConfig, carried on the layer for forward-path convenience).
     public readonly int NumHeads;
@@ -391,12 +409,38 @@ internal sealed class MlaLayerWeights
     public readonly int VHeadDim;
     public readonly int QLoraRank;
     public readonly int KvLoraRank;
+    public readonly int HiddenSize;
 
+    /// <summary>Back-compat ctor — F32 dequants only, no raw quant view (safetensors path).</summary>
     public MlaLayerWeights(
         nint qAProj, float[]? qALayernormWeight, nint qBProj, nint qProj,
         nint kvAProjWithMqa, float[] kvALayernormWeight, nint kvBProj,
         int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
-        int qLoraRank, int kvLoraRank)
+        int qLoraRank, int kvLoraRank,
+        int hiddenSize = 0)
+        : this(qAProj, qALayernormWeight, qBProj, qProj,
+               kvAProjWithMqa, kvALayernormWeight, kvBProj,
+               numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
+               qLoraRank, kvLoraRank, hiddenSize,
+               qAProjRaw: 0, qAProjRawQt: QuantizationType.F32,
+               qBProjRaw: 0, qBProjRawQt: QuantizationType.F32,
+               qProjRaw: 0, qProjRawQt: QuantizationType.F32,
+               kvAProjWithMqaRaw: 0, kvAProjWithMqaRawQt: QuantizationType.F32,
+               kvBProjRaw: 0, kvBProjRawQt: QuantizationType.F32)
+    {
+    }
+
+    /// <summary>Full ctor with both F32 dequant views and raw GGUF quant views.</summary>
+    public MlaLayerWeights(
+        nint qAProj, float[]? qALayernormWeight, nint qBProj, nint qProj,
+        nint kvAProjWithMqa, float[] kvALayernormWeight, nint kvBProj,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int qLoraRank, int kvLoraRank, int hiddenSize,
+        nint qAProjRaw, QuantizationType qAProjRawQt,
+        nint qBProjRaw, QuantizationType qBProjRawQt,
+        nint qProjRaw, QuantizationType qProjRawQt,
+        nint kvAProjWithMqaRaw, QuantizationType kvAProjWithMqaRawQt,
+        nint kvBProjRaw, QuantizationType kvBProjRawQt)
     {
         QAProj = qAProj;
         QALayernormWeight = qALayernormWeight;
@@ -411,7 +455,18 @@ internal sealed class MlaLayerWeights
         VHeadDim = vHeadDim;
         QLoraRank = qLoraRank;
         KvLoraRank = kvLoraRank;
+        HiddenSize = hiddenSize;
+        QAProjRaw = qAProjRaw; QAProjRawQt = qAProjRawQt;
+        QBProjRaw = qBProjRaw; QBProjRawQt = qBProjRawQt;
+        QProjRaw = qProjRaw; QProjRawQt = qProjRawQt;
+        KvAProjWithMqaRaw = kvAProjWithMqaRaw; KvAProjWithMqaRawQt = kvAProjWithMqaRawQt;
+        KvBProjRaw = kvBProjRaw; KvBProjRawQt = kvBProjRawQt;
     }
+
+    /// <summary>True when at least one raw quant view is non-trivial — the GPU
+    /// loader can take the on-device dequant fast path. False on safetensors
+    /// loads where everything is F32 and only the F32 dequants are populated.</summary>
+    public bool HasRawQuantView => QAProjRaw != 0 || QBProjRaw != 0 || QProjRaw != 0;
 }
 
 /// <summary>
@@ -839,47 +894,76 @@ internal sealed class TransformerWeights : IDisposable
         float[] ffnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_norm.weight"], hiddenSize);
 
         // ── Q path ─────────────────────────────────────────────────────
+        // Populate BOTH the F32 dequant (for the CPU MlaAttention oracle)
+        // and the raw GGUF mmap pointer + quant type (for the GPU loader's
+        // on-device dequant path). MLA total host F32 footprint at V2-Lite
+        // scale is ~1.4 GB across 27 layers — acceptable; the MoE 3D-stacked
+        // experts are where the host-RAM blowup lives, and that path is
+        // refactored separately in task #10.
         nint qAProj = 0, qBProj = 0, qProj = 0;
+        nint qAProjRaw = 0, qBProjRaw = 0, qProjRaw = 0;
+        QuantizationType qAProjRawQt = QuantizationType.F32, qBProjRawQt = QuantizationType.F32, qProjRawQt = QuantizationType.F32;
         float[]? qANorm = null;
         if (qLora > 0)
         {
-            qAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_a.weight"],
-                                  (long)qLora * hiddenSize, owned);
+            var qaDesc = tensors[$"{prefix}.attn_q_a.weight"];
+            qAProjRaw = dataBase + (nint)qaDesc.DataOffset;
+            qAProjRawQt = qaDesc.QuantizationType;
+            qAProj = DequantToF32(dataBase, qaDesc, (long)qLora * hiddenSize, owned);
             qANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_q_a_norm.weight"], qLora);
-            qBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_b.weight"],
-                                  (long)qTotal * qLora, owned);
+
+            var qbDesc = tensors[$"{prefix}.attn_q_b.weight"];
+            qBProjRaw = dataBase + (nint)qbDesc.DataOffset;
+            qBProjRawQt = qbDesc.QuantizationType;
+            qBProj = DequantToF32(dataBase, qbDesc, (long)qTotal * qLora, owned);
         }
         else
         {
-            qProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q.weight"],
-                                 (long)qTotal * hiddenSize, owned);
+            var qDesc = tensors[$"{prefix}.attn_q.weight"];
+            qProjRaw = dataBase + (nint)qDesc.DataOffset;
+            qProjRawQt = qDesc.QuantizationType;
+            qProj = DequantToF32(dataBase, qDesc, (long)qTotal * hiddenSize, owned);
         }
 
         // ── KV path (always factored) ────────────────────────────────
-        nint kvAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_a_mqa.weight"],
-                                    (long)kvAOut * hiddenSize, owned);
+        var kvaDesc = tensors[$"{prefix}.attn_kv_a_mqa.weight"];
+        nint kvAProjRaw = dataBase + (nint)kvaDesc.DataOffset;
+        QuantizationType kvAProjRawQt = kvaDesc.QuantizationType;
+        nint kvAProj = DequantToF32(dataBase, kvaDesc, (long)kvAOut * hiddenSize, owned);
         float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
-        nint kvBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_b.weight"],
-                                    (long)kvBOut * kvLora, owned);
+
+        var kvbDesc = tensors[$"{prefix}.attn_kv_b.weight"];
+        nint kvBProjRaw = dataBase + (nint)kvbDesc.DataOffset;
+        QuantizationType kvBProjRawQt = kvbDesc.QuantizationType;
+        nint kvBProj = DequantToF32(dataBase, kvbDesc, (long)kvBOut * kvLora, owned);
 
         // ── O projection (same tensor name as GQA: attn_output) ──────
-        nint oProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_output.weight"],
-                                  (long)hiddenSize * oInput, owned);
+        // O lives in TransformerLayerWeights.OWeight + OQuantType (the existing
+        // GQA slot) — the raw quant view comes for free via that field;
+        // the F32 dequant here is for the CPU MLA path's o_proj GEMM.
+        var oDesc = tensors[$"{prefix}.attn_output.weight"];
+        nint oProj = DequantToF32(dataBase, oDesc, (long)hiddenSize * oInput, owned);
 
         var mlaBundle = new MlaLayerWeights(
-            numHeads: numHeads,
-            qkNopeHeadDim: qkNope,
-            qkRopeHeadDim: qkRope,
-            vHeadDim: vHead,
-            qLoraRank: qLora,
-            kvLoraRank: kvLora,
             qAProj: qAProj,
             qALayernormWeight: qANorm,
             qBProj: qBProj,
             qProj: qProj,
             kvAProjWithMqa: kvAProj,
             kvALayernormWeight: kvANorm,
-            kvBProj: kvBProj);
+            kvBProj: kvBProj,
+            numHeads: numHeads,
+            qkNopeHeadDim: qkNope,
+            qkRopeHeadDim: qkRope,
+            vHeadDim: vHead,
+            qLoraRank: qLora,
+            kvLoraRank: kvLora,
+            hiddenSize: hiddenSize,
+            qAProjRaw: qAProjRaw, qAProjRawQt: qAProjRawQt,
+            qBProjRaw: qBProjRaw, qBProjRawQt: qBProjRawQt,
+            qProjRaw: qProjRaw, qProjRawQt: qProjRawQt,
+            kvAProjWithMqaRaw: kvAProjRaw, kvAProjWithMqaRawQt: kvAProjRawQt,
+            kvBProjRaw: kvBProjRaw, kvBProjRawQt: kvBProjRawQt);
 
         // ── FFN ────────────────────────────────────────────────────────
         // DeepSeek-V2/V3 layouts:
