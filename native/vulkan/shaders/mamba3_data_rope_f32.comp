@@ -1,0 +1,182 @@
+#version 450
+// Mamba-3 data-dependent RoPE — canonical (state-spaces/mamba) entry point.
+//
+// Mirrors DotLLM.Cpu.Kernels.Mamba3DataRoPE.ExecuteCanonical. Per token t the
+// kernel:
+//   1. Computes tanhPi[k] = tanh(anglesRaw[t, k]) * π    (shared across heads)
+//   2. For each head h, lane k:
+//        cum[h, k] += dt[t, h] * tanhPi[k]               (positive cumsum)
+//        cum[h, k]  = cum[h, k] - 2π * floor(cum[h, k] / 2π)   // wrap mod 2π
+//        cosTab[h, k] = cos(cum[h, k]); sinTab[h, k] = sin(cum[h, k])
+//   3. Rotates b and c at this token, ALL rank slices, this head's slice in
+//      [dState] using the per-(h, k) cos/sin table.
+//
+// Modes:
+//   0 = Pairwise — first 2*numRopeAngles channels rotated as adjacent pairs
+//                   (v[2k], v[2k+1]); tail [2*numRopeAngles, dState) passes
+//                   through unchanged.
+//   1 = Halved   — first numRopeAngles lanes of each half rotated as pairs
+//                   (v[k], v[k + dState/2]); tail of each half passes through.
+//
+// Dispatch:
+//   local_size_x = WG_SIZE                (typically 64)
+//   groupCount.x = nHead                  (one workgroup per head; heads independent)
+// Each thread tid owns the lane index k = tid + n*WG_SIZE for n covering
+// [0, numRopeAngles). For typical Mamba-3 numRopeAngles ∈ {32, 64} this is
+// a single iteration per thread. Sequential over t inside the shader: the
+// recurrence cum[h, k] += ... is per-head per-lane and cannot be parallelised
+// across t without a chunked prefix-scan (out of scope for the foundation port).
+//
+// Cum_angle state-thread:
+//   hasCumPrev  (push constant) — when 1, seed cum[h, k] from cumPrev buffer;
+//                                 when 0, seed to 0 (ignore cumPrev contents).
+//   writeCumOut (push constant) — when 1, write final cum[h, k] to cumOut after
+//                                 the last token; when 0, skip the write.
+//   The caller must pass real (non-null) buffer handles for both bindings even
+//   when the flag is 0 — Vulkan descriptor-set bindings need a valid handle.
+//
+// Shared memory: per-token broadcast of cos/sin tables [numRopeAngles] each.
+// Thread k writes sharedCos[k] / sharedSin[k] under the 'k < numRopeAngles'
+// guard, then a barrier() makes them visible to every thread before the
+// rotation loop reads them across all rank slices.
+
+#define WG_SIZE 64
+#define MAX_RA 256u   // upper bound on numRopeAngles (sized for shared mem)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufB { float bArr[]; }; // [seqLen, nRank, nHead, dState] RW
+layout(set = 0, binding = 1, std430) buffer BufC { float cArr[]; }; // [seqLen, nRank, nHead, dState] RW
+layout(set = 0, binding = 2, std430) readonly buffer BufAng { float anglesRaw[]; }; // [seqLen, numRopeAngles]
+layout(set = 0, binding = 3, std430) readonly buffer BufDt  { float dt[]; };         // [seqLen, nHead]
+layout(set = 0, binding = 4, std430) readonly buffer BufCumPrev { float cumPrev[]; };// [nHead, numRopeAngles]
+layout(set = 0, binding = 5, std430) writeonly buffer BufCumOut { float cumOut[]; }; // [nHead, numRopeAngles]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint nRank;
+    uint nHead;
+    uint dState;
+    uint numRopeAngles;
+    uint mode;          // 0 = Pairwise, 1 = Halved
+    uint hasCumPrev;
+    uint writeCumOut;
+} pc;
+
+// Per-workgroup (per-head) running cumulative angle, kept in shared memory
+// so multiple threads per workgroup can see each other's lanes. Sized to a
+// fixed upper bound; the kernel guards every read/write by 'k < numRopeAngles'.
+shared float sharedCum[MAX_RA];
+shared float sharedCos[MAX_RA];
+shared float sharedSin[MAX_RA];
+
+const float TWO_PI = 6.28318530717958647693;
+const float INV_TWO_PI = 0.15915494309189535;
+const float PI_F = 3.14159265358979323846;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.nHead) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint nra = pc.numRopeAngles;
+    uint dState = pc.dState;
+    uint halfDState = dState >> 1;
+    uint rotaryDim = 2u * nra;
+
+    // 1. Seed cum[h, :] either from cumPrev or zero.
+    //    Threads stride over k = tid, tid + WG_SIZE, ... so numRopeAngles > WG_SIZE
+    //    still works (each thread iterates multiple k indices).
+    //    The hasCumPrev branch guards the read so callers passing a small
+    //    placeholder buffer with the flag clear don't trigger UB.
+    if (pc.hasCumPrev != 0u) {
+        for (uint k = tid; k < nra; k += WG_SIZE) {
+            sharedCum[k] = cumPrev[h * nra + k];
+        }
+    } else {
+        for (uint k = tid; k < nra; k += WG_SIZE) {
+            sharedCum[k] = 0.0;
+        }
+    }
+    barrier();
+
+    // 2. Per-token loop. Sequential over t — the recurrence cum += dt*tanhPi
+    //    is per-(h, k) and depends on the previous t's cum[h, k].
+    uint bcHeadStride  = dState;
+    uint bcRankStride  = pc.nHead * dState;
+    uint bcTokenStride = pc.nRank * bcRankStride;
+
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        // Load the per-(t, h) dt scalar once per thread (cheap broadcast read).
+        float dtHere = dt[t * pc.nHead + h];
+
+        // 2a. Each thread k: read anglesRaw[t, k], compute tanhPi*dt, advance
+        //     cum, wrap mod 2π, compute cos/sin, publish to shared mem.
+        for (uint k = tid; k < nra; k += WG_SIZE) {
+            float raw = anglesRaw[t * nra + k];
+            float tanhPi = tanh(raw) * PI_F;
+            float v = sharedCum[k] + dtHere * tanhPi;
+            // Wrap mod 2π — keeps cum bounded so cos/sin stay accurate over
+            // long sequences. floor(v / 2π) handles negative v correctly:
+            // for v=-3π, floor = -2, v - 2π*(-2) = -3π + 4π = π.
+            float floored = floor(v * INV_TWO_PI);
+            v = v - TWO_PI * floored;
+            sharedCum[k] = v;
+            sharedCos[k] = cos(v);
+            sharedSin[k] = sin(v);
+        }
+
+        // Barrier: every thread needs the full sharedCos/sharedSin table to
+        // rotate its lane-pair across all rank slices.
+        barrier();
+
+        // 2b. Apply rotation to b and c at this token, ALL rank slices, head h.
+        //     Strategy 1: thread k owns its lane-pair and rotates it for every r.
+        //     Tail lanes (k >= numRopeAngles) do nothing — pass-through.
+        if (tid < nra) {
+            float co = sharedCos[tid];
+            float si = sharedSin[tid];
+
+            uint tokenBase = t * bcTokenStride;
+
+            for (uint r = 0u; r < pc.nRank; r++) {
+                uint bcBase = tokenBase + r * bcRankStride + h * bcHeadStride;
+
+                if (pc.mode == 0u) {
+                    // Pairwise: rotate (v[2k], v[2k+1]).
+                    uint i0 = bcBase + 2u * tid;
+                    uint i1 = i0 + 1u;
+                    float be = bArr[i0]; float bo = bArr[i1];
+                    float ce = cArr[i0]; float co2 = cArr[i1];
+                    bArr[i0] = co * be - si * bo;
+                    bArr[i1] = si * be + co * bo;
+                    cArr[i0] = co * ce - si * co2;
+                    cArr[i1] = si * ce + co * co2;
+                } else {
+                    // Halved: rotate (v[k], v[k + halfDState]). Only the first
+                    // numRopeAngles lanes of each half — guarded by tid < nra.
+                    uint i0 = bcBase + tid;
+                    uint i1 = bcBase + halfDState + tid;
+                    float be = bArr[i0]; float bo = bArr[i1];
+                    float ce = cArr[i0]; float co2 = cArr[i1];
+                    bArr[i0] = co * be - si * bo;
+                    bArr[i1] = si * be + co * bo;
+                    cArr[i0] = co * ce - si * co2;
+                    cArr[i1] = si * ce + co * co2;
+                }
+            }
+        }
+
+        // Barrier before the next iteration's sharedCum/sharedCos updates.
+        // (No data hazard on b/c across t — each t writes a disjoint slab of
+        // bArr / cArr indexed by tokenBase.)
+        barrier();
+    }
+
+    // 3. Optional: write final cum back to caller's cumOut buffer.
+    if (pc.writeCumOut != 0u) {
+        for (uint k = tid; k < nra; k += WG_SIZE) {
+            cumOut[h * nra + k] = sharedCum[k];
+        }
+    }
+}
