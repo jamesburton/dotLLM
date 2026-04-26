@@ -1,6 +1,22 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda.Interop;
 
 namespace DotLLM.Cuda;
+
+/// <summary>
+/// Numeric precision used by an MoE layer's expert weights. F32 is the
+/// existing CPU-oracle-matching path. <c>Quantized</c> keeps raw GGUF Q4_K /
+/// Q8_0 bytes on device per expert and dequantizes per call into reused F16
+/// scratch — the only viable path for full DeepSeek-V2-Lite (the F32
+/// fully-resident expert block doesn't fit a 12 GB GPU).
+/// </summary>
+public enum MoePrecision
+{
+    /// <summary>F32 expert weights resident on GPU; cuBLAS LinearF32 directly.</summary>
+    F32 = 0,
+    /// <summary>Raw GGUF quant bytes per expert; dequant per call.</summary>
+    Quantized = 1,
+}
 
 /// <summary>
 /// Per-layer GPU weight pointers for a Mixture-of-Experts SwiGLU FFN
@@ -98,7 +114,23 @@ public sealed class CudaMoeLayerWeights
     /// <summary>Total expert vector elements per token: <c>numExpertsPerTok</c>.</summary>
     public int TopK => NumExpertsPerTok;
 
-    /// <summary>Constructs a fully-populated MoE layer weight bundle.</summary>
+    /// <summary>Precision of the per-expert projections. F32 = direct cuBLAS GEMM; Quantized = dequant-per-call into F16 scratch.</summary>
+    public MoePrecision Precision { get; }
+
+    /// <summary>Quant type for <see cref="GateProj"/> when <see cref="Precision"/>==<see cref="MoePrecision.Quantized"/> (raw GGUF bytes per expert).</summary>
+    public QuantizationType GateProjQuantType { get; }
+    /// <summary>Quant type for <see cref="UpProj"/> on the quantized path.</summary>
+    public QuantizationType UpProjQuantType { get; }
+    /// <summary>Quant type for <see cref="DownProj"/> on the quantized path.</summary>
+    public QuantizationType DownProjQuantType { get; }
+    /// <summary>Quant type for <see cref="SharedGateProj"/> on the quantized path.</summary>
+    public QuantizationType SharedGateProjQuantType { get; }
+    /// <summary>Quant type for <see cref="SharedUpProj"/> on the quantized path.</summary>
+    public QuantizationType SharedUpProjQuantType { get; }
+    /// <summary>Quant type for <see cref="SharedDownProj"/> on the quantized path.</summary>
+    public QuantizationType SharedDownProjQuantType { get; }
+
+    /// <summary>Constructs a fully-populated F32 MoE layer weight bundle (back-compat ctor).</summary>
     public CudaMoeLayerWeights(
         int numExperts, int numExpertsPerTok, int hiddenSize, int moeIntermediateSize,
         bool normTopKProb,
@@ -107,6 +139,37 @@ public sealed class CudaMoeLayerWeights
         int numSharedExperts, int sharedIntermediateSize,
         nint[]? sharedGateProj, nint[]? sharedUpProj, nint[]? sharedDownProj,
         nint sharedExpertGate)
+        : this(numExperts, numExpertsPerTok, hiddenSize, moeIntermediateSize,
+               normTopKProb, router,
+               gateProj, upProj, downProj,
+               numSharedExperts, sharedIntermediateSize,
+               sharedGateProj, sharedUpProj, sharedDownProj, sharedExpertGate,
+               precision: MoePrecision.F32,
+               gateProjQuantType: QuantizationType.F32,
+               upProjQuantType: QuantizationType.F32,
+               downProjQuantType: QuantizationType.F32,
+               sharedGateProjQuantType: QuantizationType.F32,
+               sharedUpProjQuantType: QuantizationType.F32,
+               sharedDownProjQuantType: QuantizationType.F32)
+    {
+    }
+
+    /// <summary>Full ctor with explicit precision + per-projection quant types.</summary>
+    public CudaMoeLayerWeights(
+        int numExperts, int numExpertsPerTok, int hiddenSize, int moeIntermediateSize,
+        bool normTopKProb,
+        nint router,
+        nint[] gateProj, nint[] upProj, nint[] downProj,
+        int numSharedExperts, int sharedIntermediateSize,
+        nint[]? sharedGateProj, nint[]? sharedUpProj, nint[]? sharedDownProj,
+        nint sharedExpertGate,
+        MoePrecision precision,
+        QuantizationType gateProjQuantType,
+        QuantizationType upProjQuantType,
+        QuantizationType downProjQuantType,
+        QuantizationType sharedGateProjQuantType,
+        QuantizationType sharedUpProjQuantType,
+        QuantizationType sharedDownProjQuantType)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -138,5 +201,12 @@ public sealed class CudaMoeLayerWeights
         SharedUpProj = sharedUpProj ?? Array.Empty<nint>();
         SharedDownProj = sharedDownProj ?? Array.Empty<nint>();
         SharedExpertGate = sharedExpertGate;
+        Precision = precision;
+        GateProjQuantType = gateProjQuantType;
+        UpProjQuantType = upProjQuantType;
+        DownProjQuantType = downProjQuantType;
+        SharedGateProjQuantType = sharedGateProjQuantType;
+        SharedUpProjQuantType = sharedUpProjQuantType;
+        SharedDownProjQuantType = sharedDownProjQuantType;
     }
 }
