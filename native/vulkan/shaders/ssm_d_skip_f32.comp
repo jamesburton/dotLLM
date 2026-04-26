@@ -1,0 +1,44 @@
+#version 450
+// Mamba-2 / Mamba-3 post-scan per-head scalar skip add (the "D" term).
+//
+//   y[t, h*headDim + i] += x[t, h*headDim + i] * D[h]
+//
+// D is a per-head scalar broadcast across head_dim. This is step #9 of
+// the SSM body in NemotronH / Mamba-2: after the selective scan produces
+// y, we add a learned skip-connection scaled by the per-head D vector.
+//
+// Buffer layout (row-major F32):
+//
+//   y : [seqLen, nHead*headDim]   — read+write, in-place
+//   x : [seqLen, nHead*headDim]   — read
+//   d : [nHead]                   — read (per-head scalar)
+//
+// where dInner = nHead * headDim.
+//
+// Dispatch: 2D grid, one thread per (t, h*headDim+i) output cell.
+// Workgroup (16, 16). groupCount = (ceil(nHead*headDim / 16), ceil(seqLen / 16)).
+// Each thread computes h = (col / headDim), reads D[h], and does the FMA.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufY { float y[]; }; // [seqLen, nHead*headDim]
+layout(set = 0, binding = 1, std430) readonly buffer BufX { float x[]; }; // [seqLen, nHead*headDim]
+layout(set = 0, binding = 2, std430) readonly buffer BufD { float d[]; }; // [nHead]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint nHead;
+    uint headDim;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x; // 0..nHead*headDim
+    uint t   = gl_GlobalInvocationID.y; // 0..seqLen
+
+    uint dInner = pc.nHead * pc.headDim;
+    if (col >= dInner || t >= pc.seqLen) return;
+
+    uint h = col / pc.headDim;
+    uint idx = t * dInner + col;
+    y[idx] += x[idx] * d[h];
+}
