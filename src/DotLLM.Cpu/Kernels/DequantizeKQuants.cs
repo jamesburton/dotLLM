@@ -223,7 +223,7 @@ public static unsafe partial class Dequantize
     /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
     /// </summary>
     [SkipLocalsInit]
-    public static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
+    internal static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
     {
         if (elementCount % KQuantGroupSize != 0)
             throw new ArgumentException(
