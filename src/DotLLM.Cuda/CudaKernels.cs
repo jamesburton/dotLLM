@@ -210,6 +210,9 @@ public sealed unsafe class CudaKernels : IDisposable
     // reports false and CudaMoeFfn falls back to the per-expert path.
     private readonly CudaModule? _moeGroupedGemvModule;
     private readonly nint _moeGroupedGemvQ4_KFunc;
+    private readonly nint _moeGroupedGemvQ5_KFunc;
+    private readonly nint _moeGroupedGemvQ6_KFunc;
+    private readonly nint _moeGroupedGemvQ8_0Func;
 
 
     /// <summary>
@@ -435,13 +438,18 @@ public sealed unsafe class CudaKernels : IDisposable
         }
 
         // MoE grouped-GEMV (Phase B). One kernel walks K_active raw-quant per-expert
-        // pointers in a single launch. Optional — Q4_K only at v1; Q5_K/Q6_K/Q8_0 are
-        // future stretch additions. HasMoeGroupedGemv* gates the call.
+        // pointers in a single launch. Q4_K + Q5_K + Q6_K + Q8_0 supported; per-quant
+        // HasMoeGroupedGemv* gates the call so a stale PTX without one entry still
+        // routes the others through the fast path and falls back per-expert for the
+        // missing one.
         string moeGroupedGemvPath = Path.Combine(ptxDir, "moe_grouped_gemv.ptx");
         if (File.Exists(moeGroupedGemvPath))
         {
             _moeGroupedGemvModule = CudaModule.LoadFromFile(moeGroupedGemvPath);
             _moeGroupedGemvQ4_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q4_k_f16");
+            _moeGroupedGemvQ5_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q5_k_f16");
+            _moeGroupedGemvQ6_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q6_k_f16");
+            _moeGroupedGemvQ8_0Func = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q8_0_f16");
         }
     }
 
@@ -485,6 +493,18 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMoeGroupedGemvQ4K =>
         _moeGroupedGemvQ4_KFunc != 0 && !DisableMoeGroupedGemv;
 
+    /// <summary>True when the Phase-B Q5_K grouped-GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMoeGroupedGemvQ5K =>
+        _moeGroupedGemvQ5_KFunc != 0 && !DisableMoeGroupedGemv;
+
+    /// <summary>True when the Phase-B Q6_K grouped-GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMoeGroupedGemvQ6K =>
+        _moeGroupedGemvQ6_KFunc != 0 && !DisableMoeGroupedGemv;
+
+    /// <summary>True when the Phase-B Q8_0 grouped-GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMoeGroupedGemvQ8_0 =>
+        _moeGroupedGemvQ8_0Func != 0 && !DisableMoeGroupedGemv;
+
     /// <summary>Disable the Phase-B grouped-GEMV path. Forces the per-expert
     /// <see cref="LaunchQuantizedGemv"/> fallback in <see cref="CudaMoeFfn"/>.</summary>
     public static bool DisableMoeGroupedGemv { get; set; } =
@@ -494,6 +514,9 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMoeGroupedGemv(QuantizationType qt) => qt switch
     {
         QuantizationType.Q4_K => HasMoeGroupedGemvQ4K,
+        QuantizationType.Q5_K => HasMoeGroupedGemvQ5K,
+        QuantizationType.Q6_K => HasMoeGroupedGemvQ6K,
+        QuantizationType.Q8_0 => HasMoeGroupedGemvQ8_0,
         _ => false,
     };
 
@@ -1232,7 +1255,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <param name="x">Device pointer to the shared FP16 input row, length K.</param>
     /// <param name="qt">Quantization type. Currently must be <c>Q4_K</c>.</param>
     /// <param name="M">Per-expert output rows.</param>
-    /// <param name="K">Input dim. Must satisfy <c>K % 256 == 0</c> for Q4_K.</param>
+    /// <param name="K">Input dim. Must satisfy <c>K % 256 == 0</c> for K-quants and
+    /// <c>K % 32 == 0</c> for Q8_0. The shared dispatch keeps the 256 alignment so
+    /// callers can use the same gate regardless of quant type.</param>
     /// <param name="kActive">Number of active experts.</param>
     /// <param name="stream">CUDA stream.</param>
     public void LaunchMoeGroupedGemv(nint weightPtrsDevice, nint outputPtrsDevice,
@@ -1241,11 +1266,14 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         if (kActive <= 0 || M <= 0 || K <= 0) return;
         if ((K & 255) != 0)
-            throw new ArgumentException($"K must be a multiple of 256 for Q4_K (got {K}).", nameof(K));
+            throw new ArgumentException($"K must be a multiple of 256 (got {K}).", nameof(K));
 
         nint func = qt switch
         {
             QuantizationType.Q4_K => _moeGroupedGemvQ4_KFunc,
+            QuantizationType.Q5_K => _moeGroupedGemvQ5_KFunc,
+            QuantizationType.Q6_K => _moeGroupedGemvQ6_KFunc,
+            QuantizationType.Q8_0 => _moeGroupedGemvQ8_0Func,
             _ => 0,
         };
         if (func == 0)

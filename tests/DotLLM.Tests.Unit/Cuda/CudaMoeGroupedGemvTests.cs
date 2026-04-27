@@ -51,6 +51,42 @@ public class CudaMoeGroupedGemvTests
             (rng, span) => SynthesiseQ4KBlock(rng, span));
     }
 
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]
+    [InlineData(4, 1408, 2048)]
+    [InlineData(2, 256, 512)]
+    public void GroupedQ5K_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGroupedEquivalence(QuantizationType.Q5_K, kActive, M, K, blockBytes: 176,
+            (rng, span) => SynthesiseQ5KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]
+    [InlineData(4, 1408, 2048)]
+    [InlineData(2, 256, 512)]
+    public void GroupedQ6K_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGroupedEquivalence(QuantizationType.Q6_K, kActive, M, K, blockBytes: 210,
+            (rng, span) => SynthesiseQ6KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]
+    [InlineData(4, 1408, 2048)]
+    [InlineData(2, 256, 512)]
+    public void GroupedQ8_0_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        // Q8_0 blocks are 34 bytes / 32 elements. Use the 256-element "super-unit"
+        // parameterization so the same RunGroupedEquivalence works: 8 q8_0 blocks
+        // per super-unit ⇒ blockBytes = 8 × 34 = 272.
+        RunGroupedEquivalence(QuantizationType.Q8_0, kActive, M, K, blockBytes: 272,
+            (rng, span) => SynthesiseQ8_0SuperUnit(rng, span));
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunGroupedEquivalence(QuantizationType qt,
         int kActive, int M, int K, int blockBytes,
@@ -211,6 +247,53 @@ public class CudaMoeGroupedGemvTests
         }
         for (int i = 4; i < 144; i++)
             block[i] = (byte)rng.Next(0, 256);
+    }
+
+    private static unsafe void SynthesiseQ5KBlock(Random rng, Span<byte> block)
+    {
+        // Q5_K layout (176 bytes): half d, half dmin, uint8[12] scales, uint8[32] qh, uint8[128] qs.
+        Half d = (Half)(rng.NextDouble() * 0.03 + 0.005);
+        Half dmin = (Half)((rng.NextDouble() - 0.5) * 0.02);
+
+        fixed (byte* pBlock = block)
+        {
+            *(Half*)pBlock = d;
+            *(Half*)(pBlock + 2) = dmin;
+        }
+        for (int i = 4; i < 176; i++)
+            block[i] = (byte)rng.Next(0, 256);
+    }
+
+    private static unsafe void SynthesiseQ6KBlock(Random rng, Span<byte> block)
+    {
+        // Q6_K layout (210 bytes): uint8[128] ql, uint8[64] qh, int8[16] scales, half d at offset 208.
+        Half d = (Half)(rng.NextDouble() * 0.02 + 0.005);
+
+        // Random ql, qh, scales — scales are int8 in [-128, 127].
+        for (int i = 0; i < 128; i++)
+            block[i] = (byte)rng.Next(0, 256);
+        for (int i = 128; i < 192; i++)
+            block[i] = (byte)rng.Next(0, 256);
+        for (int i = 192; i < 208; i++)
+            block[i] = (byte)rng.Next(0, 256);  // any byte → reinterpreted as int8
+
+        fixed (byte* pBlock = block)
+            *(Half*)(pBlock + 208) = d;
+    }
+
+    private static unsafe void SynthesiseQ8_0SuperUnit(Random rng, Span<byte> superUnit)
+    {
+        // 8 consecutive q8_0 blocks (34 bytes / 32 elements each = 272 bytes total).
+        // Each block: half d, int8[32] qs.
+        for (int b = 0; b < 8; b++)
+        {
+            int off = b * 34;
+            Half d = (Half)(rng.NextDouble() * 0.02 + 0.005);
+            fixed (byte* pBlock = superUnit)
+                *(Half*)(pBlock + off) = d;
+            for (int j = 0; j < 32; j++)
+                superUnit[off + 2 + j] = (byte)rng.Next(0, 256);
+        }
     }
 
     private static string? FindPtxDir()
