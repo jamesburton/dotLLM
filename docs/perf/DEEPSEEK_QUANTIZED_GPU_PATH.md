@@ -1,8 +1,25 @@
 # Quantized DeepSeek-V2 GPU Weight Paths (Tasks #9 + #10)
 
-Design note for the next session. Maps the work needed to take real
+Design note. Maps the work needed to take real
 `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` from "metadata loads" to
 "prefill + decode runs end-to-end on the RTX 3060".
+
+## Status (2026-04-27)
+
+- **#9-i, #9-ii, #9-iii (quantized MLA)** — COMPLETE.
+- **#10-i, #10-ii, #10-iii (quantized MoE)** — COMPLETE.
+- **#11 (real-checkpoint smoke)** — COMPLETE (1/2/4/8-layer V2-Lite Q4_K_M).
+- **Phase A (direct quantized GEMV in CudaMoeFfn)** — COMPLETE in commit
+  `4a09dbe`. Replaces the dequant→F16→F32→LinearF32 chain with
+  `LaunchConvertF32ToF16` + `LaunchQuantizedGemv` + `LaunchConvertF16ToF32`
+  for K-aligned projections (gate_proj + up_proj at hidden=2048).
+  down_proj at K=intermediate=1408 stays on the dequant fallback (K not
+  256-aligned). This is a perf-only improvement; doesn't move the GPU
+  memory cap.
+- **8-layer ceiling on RTX 3060 12 GB** — empirical, see Round 10.
+  16+ layers GPU-OOM. The path to fitting more layers is **NOT this
+  document's design**; it's separate (expert offloading or grouped-GEMM
+  cross-expert batching).
 
 ## Constraint summary
 
@@ -140,6 +157,54 @@ For DeepSeek-V2-Lite Q4_K_M:
   kernel that walks the bucketed assignments). Stretch goal — sequential first.
 
 **Cost: ~4h.** Touches `CudaMoeWeights.cs` + `CudaMoeFfn.cs`.
+
+### Phase B: cross-expert grouped-GEMM kernel — NOT YET STARTED
+
+The literal "grouped GEMM" — single CUDA kernel that walks K_active
+experts in one launch instead of issuing one cuBLAS call per active
+expert per projection. Combined with raw-quant-on-the-fly weight reads
+(avoiding the per-expert resident GPU buffers), this is the path to:
+
+1. **Reducing dispatch overhead** further: today (post-Phase A) we
+   issue 3 launches per active expert per projection (F32→F16, GEMV,
+   F16→F32). Grouped kernel handles all K active experts in 1 launch
+   per projection. For K=6, V2-Lite, 26 MoE layers: ~40% of remaining
+   dispatch overhead.
+2. **(Stretch) Reducing GPU resident memory**: if the kernel streams
+   raw quant blocks from a single contiguous per-tensor buffer (keeping
+   one ffn_*_exps tensor on GPU rather than 64 per-expert allocations),
+   bookkeeping shrinks ~10-15%. Doesn't unblock 16+ layers on its own.
+
+Sketch:
+
+```c
+extern "C" __global__ void moe_grouped_gemv_q4_k_f16(
+    const half* __restrict__ x,                  // [K] F16 input row, shared
+    const uint8_t* const* __restrict__ weights,  // K_active per-expert weight ptrs
+    half* const* __restrict__ outputs,           // K_active per-expert output ptrs
+    int M, int K, int K_active)
+{
+    // Each block: one (expert, output_row) pair.
+    int blocks_per_expert = M / 1;  // one block per output row
+    int expert_idx = blockIdx.x / blocks_per_expert;
+    int row_idx = blockIdx.x % blocks_per_expert;
+
+    if (expert_idx >= K_active) return;
+
+    // Standard Q4_K dot product over K elements...
+    // Output one F16 to outputs[expert_idx][row_idx].
+}
+```
+
+**Implementation cost:** ~1-2 days focused work — new CUDA kernel +
+PTX module + per-quant-type variants (Q4_K, Q5_K, Q6_K, Q8_0) + tests.
+Output goes through `LaunchMoeGroupedGemv` helper that mirrors
+`LaunchQuantizedGemv` but accepts arrays of pointers.
+
+The Phase A speedup was already meaningful — Phase B's incremental win
+shrinks now that the dequant scratch overhead is eliminated. Phase B's
+real value is opening the door to memory-streaming variants that fit
+larger models, not the dispatch reduction itself.
 
 ### #11. Smoke test on cached real DeepSeek-V2-Lite GGUF
 
