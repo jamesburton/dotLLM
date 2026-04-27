@@ -97,6 +97,66 @@ internal sealed class MoeLayerWeights
     /// <summary>True iff a shared-expert branch is present on this layer.</summary>
     public bool HasSharedExpert => SharedIntermediateSize > 0 && NumSharedExperts > 0;
 
+    // ── Vulkan-only quant overlay ──────────────────────────────────────────────
+    // Production loaders today upcast every MoE projection to F32, so these fields are
+    // unused on production paths; tests populate them to exercise the Vulkan quantised
+    // GEMV/GEMM path for the non-indexed MoE matmuls (router gate + shared-expert
+    // gate/up/down + optional Qwen1.5-MoE shared-expert sigmoid gate). The CPU forward
+    // continues to consume the corresponding F32 arrays (Gate, SharedGateProj, etc.); the
+    // F32 arrays must hold values equivalent to dequantising the raw quant bytes so the
+    // Vulkan vs CPU comparison is fair. The per-routed-expert W1/W2/W3 banks deliberately
+    // have NO quant overlay here — the Vulkan moe_indexed_matmul_f32 kernel is F32-only
+    // in tree, so a quantised indexed variant is future work. Same two-mode storage
+    // policy as the standard transformer: when the source is Q8_0 (contraction axis a
+    // multiple of 32) or Q4_K / Q5_K / Q6_K (a multiple of 256), raw blocks live on
+    // device and dispatch via the matching matmul kernel; otherwise the Vulkan upload
+    // dequantises to F32.
+    //
+    // The overlay slots use the historical "Q8" naming because Q8_0 was the first quant
+    // type wired through. They actually carry raw bytes for whichever format the
+    // companion `*QuantTypeOverlay` field declares — Q8_0, Q4_K, Q5_K, or Q6_K (Phase 1
+    // of the K-quant work, now complete for the Vulkan matmul kernels — coopmat variants
+    // and the remaining K-quant formats (Q2_K, Q3_K) remain follow-up tickets).
+
+    /// <summary>Optional raw-quant bytes for the router gate ([numExperts, hiddenSize]).
+    /// Zero when the gate stays F32 on device. When non-zero, <see cref="Gate"/> still
+    /// holds an F32 array for the CPU oracle (must match the dequant of the raw bytes).
+    /// The format is declared by <see cref="GateQuantTypeOverlay"/>.</summary>
+    public nint GateQ8Ptr;
+    /// <summary>Storage type of the router-gate raw-byte overlay (<see cref="GateQ8Ptr"/>).
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
+    public QuantizationType GateQuantTypeOverlay;
+
+    /// <summary>Optional raw-quant byte pointers for the per-shared-expert gate_proj
+    /// ([sharedIntermediateSize, hiddenSize]). Null or empty when no overlay; otherwise
+    /// length must equal <see cref="NumSharedExperts"/>. Format declared by
+    /// <see cref="SharedExpertProjQuantTypeOverlay"/>.</summary>
+    public nint[]? SharedGateProjQ8Ptrs;
+    /// <summary>Optional raw-quant byte pointers for the per-shared-expert up_proj.</summary>
+    public nint[]? SharedUpProjQ8Ptrs;
+    /// <summary>Optional raw-quant byte pointers for the per-shared-expert down_proj
+    /// ([hiddenSize, sharedIntermediateSize]).</summary>
+    public nint[]? SharedDownProjQ8Ptrs;
+    /// <summary>Storage type of the shared-expert projection overlay arrays. All three
+    /// arrays share one quant type (uniform across the shared-expert branch).
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
+    public QuantizationType SharedExpertProjQuantTypeOverlay;
+
+    /// <summary>Optional raw-quant bytes for the Qwen1.5-MoE shared-expert sigmoid gate
+    /// ([1, hiddenSize] — the Vulkan side stores it as a one-row matrix). Null when no
+    /// overlay is present (matches <see cref="SharedExpertGate"/> being F32-only).
+    /// Format declared by <see cref="SharedExpertGateQuantTypeOverlay"/>.</summary>
+    public nint SharedExpertGateQ8Ptr;
+    /// <summary>Storage type of the shared-expert gate overlay (<see cref="SharedExpertGateQ8Ptr"/>).
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
+    public QuantizationType SharedExpertGateQuantTypeOverlay;
+
     /// <summary>
     /// Raw GGUF mmap base pointer of the fused-experts <c>ffn_gate_exps</c>
     /// tensor, populated alongside the F32 dequants <see cref="W1"/> when the
@@ -225,6 +285,17 @@ internal sealed class MoeLayerWeights
         SharedIntermediateSize = sharedIntermediateSize;
         NumSharedExperts = sharedGateProj.Length;
         SharedExpertGate = sharedExpertGate;
+
+        // Q8_0 / K-quant overlays default to F32 / null — production loaders never set them; tests
+        // populate them post-construction to exercise the Vulkan quant matmul path.
+        GateQ8Ptr = 0;
+        GateQuantTypeOverlay = QuantizationType.F32;
+        SharedGateProjQ8Ptrs = null;
+        SharedUpProjQ8Ptrs = null;
+        SharedDownProjQ8Ptrs = null;
+        SharedExpertProjQuantTypeOverlay = QuantizationType.F32;
+        SharedExpertGateQ8Ptr = 0;
+        SharedExpertGateQuantTypeOverlay = QuantizationType.F32;
 
         GateExpsRaw = gateExpsRaw; GateExpsRawQt = gateExpsRawQt;
         GateExpsMDim = gateExpsMDim; GateExpsKDim = gateExpsKDim;
