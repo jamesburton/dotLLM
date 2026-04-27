@@ -1,0 +1,200 @@
+#version 450
+// Q6_K matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_q6k[m, k] * x[k]      with W_q6k dequantized on the fly.
+//
+// Sibling of matmul_q4_k_gemv_f32.comp / matmul_q5_k_gemv_f32.comp — same
+// dispatch model (one workgroup per output row, 128 threads, shared-memory
+// tree reduce). Q6_K is structurally simpler than Q4_K / Q5_K: scale-only
+// reconstruction (no dmin), 16 signed int8 scales (no 6-bit packed scale
+// table), and signed quants (range -32..31 after subtracting 32). The byte
+// extraction, however, is more involved than Q4_K/Q5_K because a Q6_K
+// super-block is laid out in two 128-element halves, each with 4 groups of
+// 32 elements that share a 32-byte qh slab.
+//
+// Weight layout (matches llama.cpp / DotLLM.Cpu.Kernels.DequantizeKQuants.
+// DequantizeQ6_KScalar byte-for-byte):
+//   Each 256 contiguous elements of a row form one Q6_K super-block of 210
+//   bytes:
+//       bytes [0..127]   = ql[128]  — low 4 bits, two per byte
+//       bytes [128..191] = qh[64]   — high 2 bits per element, four per byte
+//       bytes [192..207] = scales[16] (int8, signed)
+//       bytes [208,209]  = fp16 d  (global delta)
+//   Row stride = (K / 256) * 210 bytes.
+//
+// Reconstruction. Each super-block is processed in two 128-element halves
+// (half = 0, 1). Each half consumes:
+//     ql[half*64 .. half*64 + 64)
+//     qh[half*32 .. half*32 + 32)
+//     scales[half*8 .. half*8 + 8)
+// Within a half, the 128 elements are produced in 4 *groups* of 32. For
+// l in [0, 32):
+//     half=0, group=0: out[l]      = scales[0+isc] * (ql[l]      &0xF | ((qh[l]>>0)&3)<<4) - 32
+//     half=0, group=1: out[l + 32] = scales[0+isc+2]*(ql[l+32]   &0xF | ((qh[l]>>2)&3)<<4) - 32
+//     half=0, group=2: out[l + 64] = scales[0+isc+4]*(ql[l]    >> 4   | ((qh[l]>>4)&3)<<4) - 32
+//     half=0, group=3: out[l + 96] = scales[0+isc+6]*(ql[l+32] >> 4   | ((qh[l]>>6)&3)<<4) - 32
+//   where isc = l / 16, ie groups [0..16) and [16..32) have different scales.
+// Half 1 is identical with a +64 ql offset, +32 qh offset, +8 scales offset
+// and outputs at +128.
+//
+// Putting it together, given the *output element index* i_global in [0, 256):
+//   half       = i_global / 128
+//   local      = i_global - half*128            // 0..127
+//   group      = local / 32                     // 0..3
+//   l          = local - group*32               // 0..31
+//   isc        = l / 16                          // 0 or 1
+//   ql_idx     = half*64 + (group & 1) * 32 + l
+//   qh_idx     = half*32 + l
+//   shift      = group * 2                       // 0,2,4,6
+//   sc_idx     = half*8 + isc + 2*group          // 0..15
+//   nibble     = (group < 2) ? (ql[ql_idx] & 0xF) : (ql[ql_idx] >> 4)
+//   high2      = (qh[qh_idx] >> shift) & 3
+//   q6_signed  = (nibble | (high2 << 4)) - 32    // -32..31
+//   w          = d * scales[sc_idx] * q6_signed
+//
+// scales[16] is signed int8. The byte buffer is read as uint and we explicitly
+// sign-extend with `int(byte) - ((byte >> 7) << 8) * 2` (equivalent: shift the
+// 8-bit value into the sign-bit position then arithmetic-shift back).
+//
+// x[] is FP32. Output y[] is FP32. This is the N=1 decode-path.
+//
+// Dispatch:
+//   One workgroup per output row (gl_WorkGroupID.x = m).
+//   local_size_x = 128 — threads stride across super-blocks and accumulate
+//   partial sums, then the workgroup reduces in shared memory.
+//
+// Storage-buffer access:
+//   `weight` is bound as `uint[]` because GLSL storage buffers cannot hold
+//   int8 / float16 scalars without optional extensions. Per-byte access goes
+//   through `readByte` with explicit shifts. fp16 d via `unpackHalf2x16`.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // Q6_K blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;                    // number of output rows
+    uint K;                    // columns (must be a multiple of 256)
+    uint blocksPerRow;         // = K / 256 (super-blocks)
+    uint rowUints;             // per-row uint stride bound (rounded up)
+} pc;
+
+const uint Q6K_BLOCK_BYTES = 210u;
+const uint Q6K_GROUP_SIZE  = 256u;
+
+// Read one byte from the weight blob at absolute byte offset `absByteOff`.
+// Returns it as a uint in [0, 255].
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Read a signed int8 byte and sign-extend to int.
+int readSByte(uint absByteOff) {
+    uint b = readByte(absByteOff);
+    // Branchless sign-extension: bit 7 → 0xFFFFFF00 mask.
+    return int(b) - int((b & 0x80u) << 1);
+}
+
+// Read fp16 at `absByteOff` (2 bytes), handling straddled uint words.
+// Note: the per-row stride is `blocksPerRow * 210`, which is NOT a multiple
+// of 4 in general (210 % 4 == 2), so straddle handling is essential here —
+// unlike Q4_K / Q5_K where the row stride happened to be 4-byte aligned.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        // Straddles: low byte in this word, high byte in next.
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // Row stride bytes — 210 per super-block.
+    uint rowByteStride = pc.blocksPerRow * Q6K_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    // One thread handles a strided slice of super-blocks. Per super-block we
+    // iterate the 8 (half, group) chunks of 32 elements each, mirroring the
+    // K-chunk structure of the Q4_K / Q5_K kernels (8 chunks per block).
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q6K_BLOCK_BYTES;
+        uint qlBase     = blockByteBase;          //   0
+        uint qhBase     = blockByteBase + 128u;   // 128
+        uint scalesBase = blockByteBase + 192u;   // 192
+        float d         = readHalf(blockByteBase + 208u);
+
+        uint xBase = b * Q6K_GROUP_SIZE;
+
+        // 8 chunks per super-block: 2 halves × 4 groups.
+        for (uint chunk = 0u; chunk < 8u; chunk++) {
+            uint hf    = chunk >> 2u;            // 0..1 — super-block half
+            uint group = chunk & 3u;             // 0..3
+
+            uint qlOff   = hf * 64u;
+            uint qhOff   = hf * 32u;
+            uint scOff   = hf * 8u;
+            uint shift   = group * 2u;
+            bool useHigh = (group >= 2u);          // group 2,3 take ql high nibble
+            uint qlLane  = (group & 1u) * 32u;     // group 0,2 → +0; group 1,3 → +32
+
+            uint outBase = xBase + chunk * 32u;
+
+            // Two half-chunks of 16 share a scale (isc=0 for first 16, isc=1 for next).
+            float subSum = 0.0;
+            // First 16 elements (isc=0):
+            int sc0 = readSByte(scalesBase + scOff + 0u + 2u * group);
+            float scF0 = d * float(sc0);
+            for (uint i = 0u; i < 16u; i++) {
+                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
+                uint qhByte = readByte(qhBase + qhOff + i);
+                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
+                uint high2  = (qhByte >> shift) & 3u;
+                int q6 = int(nibble | (high2 << 4u)) - 32;
+                float xi = x[outBase + i];
+                subSum += xi * (scF0 * float(q6));
+            }
+            // Next 16 elements (isc=1):
+            int sc1 = readSByte(scalesBase + scOff + 1u + 2u * group);
+            float scF1 = d * float(sc1);
+            for (uint i = 16u; i < 32u; i++) {
+                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
+                uint qhByte = readByte(qhBase + qhOff + i);
+                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
+                uint high2  = (qhByte >> shift) & 3u;
+                int q6 = int(nibble | (high2 << 4u)) - 32;
+                float xi = x[outBase + i];
+                subSum += xi * (scF1 * float(q6));
+            }
+            acc += subSum;
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
