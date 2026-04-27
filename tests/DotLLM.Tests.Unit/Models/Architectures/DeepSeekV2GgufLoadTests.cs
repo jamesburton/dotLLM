@@ -288,6 +288,80 @@ public sealed class DeepSeekV2GgufLoadTests
         }
     }
 
+    /// <summary>
+    /// Full 27-layer V2-Lite at Q3_K_M (smaller quant than Q4_K_M ⇒ ~6.5 GB
+    /// vs ~10.4 GB on disk; per-MoE-layer GPU footprint scales similarly).
+    /// At Q3_K_M the full model fits the RTX 3060's 12 GB cap (Q4_K_M
+    /// OOMs at 16+ layers — see RealGguf_QuantizedMlaMoe_NLayerSmoke).
+    /// Asserts: 27-layer load + prefill on 4 tokens + 3 decode steps,
+    /// every step's logits finite. Skips when the GGUF isn't cached.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "GPU")]
+    public void RealGguf_Q3KM_FullModel_27LayerSmoke()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q3_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Q3_K_M GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(27, config.NumLayers);  // full V2-Lite
+        Assert.Equal(AttentionType.MLA, config.AttentionType);
+        Assert.NotNull(config.MlaConfig);
+        Assert.NotNull(config.Moe);
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+
+        // Prefill on 4 tokens. MLA dispatch uses the model's internal
+        // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
+        int[] tokenIds = [100000, 261, 1559, 11];
+        int[] positions = [0, 1, 2, 3];
+        int curTok;
+        using (ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null))
+        {
+            AssertAllFinite(logits, "prefill");
+            curTok = ArgmaxLogits(logits);
+        }
+
+        // 3 decode steps — exercises KV cache write/read on every MoE layer.
+        // Cache state persists in the model between calls.
+        for (int i = 0; i < 3; i++)
+        {
+            int pos = positions.Length + i;
+            using var step = model.Forward(new[] { curTok }, new[] { pos },
+                deviceId: 0, kvCache: null);
+            AssertAllFinite(step, $"decode step {i}");
+            curTok = ArgmaxLogits(step);
+        }
+    }
+
+    private static unsafe void AssertAllFinite(ITensor logits, string label)
+    {
+        int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+        int finite = 0;
+        foreach (float v in span)
+            if (float.IsFinite(v)) finite++;
+        Assert.True(finite == total,
+            $"{label}: expected all {total} logits finite; got {finite} finite. " +
+            $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3")))}]");
+    }
+
+    private static unsafe int ArgmaxLogits(ITensor logits)
+    {
+        int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+        int idx = 0;
+        float best = span[0];
+        for (int i = 1; i < total; i++)
+            if (span[i] > best) { best = span[i]; idx = i; }
+        return idx;
+    }
+
     /// <summary>Reflection peek at layer 1's MoE precision (mirrors the MLA helper).</summary>
     private static MoePrecision ModelLayer1MoePrecision(CudaTransformerModel model)
     {
