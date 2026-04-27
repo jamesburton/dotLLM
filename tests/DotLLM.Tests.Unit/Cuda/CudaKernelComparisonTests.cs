@@ -1281,6 +1281,72 @@ public class CudaKernelComparisonTests : IDisposable
         return result;
     }
 
+    // ─────────────────── Q2_K dequant parity (GPU vs CPU) ───────────────────
+
+    [SkippableFact]
+    public void DequantQ2K_GpuMatchesCpu()
+    {
+        Skip.IfNot(_available, "No CUDA GPU available or PTX missing");
+
+        const int superBlocks = 16;  // 16 × 256 = 4096 elements
+        const int elementCount = superBlocks * 256;
+        const int blockBytes = 84;
+        long totalBytes = (long)superBlocks * blockBytes;
+
+        var rng = new Random(0xC0FFEE);
+        byte[] hostBytes = new byte[totalBytes];
+        rng.NextBytes(hostBytes);
+
+        // Make d / dmin reasonable halves at offset 80 / 82 of each super-block
+        unsafe {
+            fixed (byte* p = hostBytes) {
+                for (int sb = 0; sb < superBlocks; sb++) {
+                    byte* block = p + sb * blockBytes;
+                    *(Half*)(block + 80) = (Half)((rng.NextDouble() - 0.5) * 0.04);
+                    *(Half*)(block + 82) = (Half)((rng.NextDouble() - 0.5) * 0.02);
+                }
+            }
+        }
+
+        // CPU reference
+        float[] cpuRef = new float[elementCount];
+        unsafe {
+            fixed (byte* p = hostBytes) {
+                DotLLM.Cpu.Kernels.Dequantize.ToFloat32((nint)p, elementCount, Core.Configuration.QuantizationType.Q2_K, cpuRef);
+            }
+        }
+
+        // GPU path
+        Half[] gpuOut = new Half[elementCount];
+        nint devSrc = 0, devDst = 0;
+        try {
+            CudaDriverApi.cuMemAlloc_v2(out devSrc, (nuint)totalBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devDst, (nuint)((long)elementCount * sizeof(ushort))).ThrowOnError();
+            unsafe {
+                fixed (byte* p = hostBytes)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devSrc, (nint)p, (nuint)totalBytes).ThrowOnError();
+            }
+            _kernels!.LaunchDequantToF16(devSrc, Core.Configuration.QuantizationType.Q2_K, devDst, elementCount, _stream!.Handle);
+            _stream.Synchronize();
+            unsafe {
+                fixed (Half* p = gpuOut)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devDst, (nuint)((long)elementCount * sizeof(ushort))).ThrowOnError();
+            }
+        }
+        finally {
+            if (devSrc != 0) CudaDriverApi.cuMemFree_v2(devSrc);
+            if (devDst != 0) CudaDriverApi.cuMemFree_v2(devDst);
+        }
+
+        float maxAbs = 0f;
+        for (int i = 0; i < elementCount; i++) {
+            float diff = MathF.Abs(cpuRef[i] - (float)gpuOut[i]);
+            if (diff > maxAbs) maxAbs = diff;
+        }
+        _output.WriteLine($"Q2_K dequant max-abs-diff (GPU vs CPU): {maxAbs:F6}");
+        Assert.True(maxAbs < 1e-3f, $"Q2_K GPU dequant diverges from CPU (max-abs-diff={maxAbs}).");
+    }
+
     // ─────────────────── Helpers ───────────────────
 
     private void SkipIfUnavailable()

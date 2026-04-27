@@ -174,6 +174,43 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q5_1_f16(
     }
 }
 
+// ── Q2_K: 84 bytes per 256 values ──────────────────────────────────
+// struct block_q2_K { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; };
+//   - scales[i]: low nibble = sub-block i scale, high nibble = sub-block i dmin coef
+//   - qs[i]: 2-bit elements packed 4 per byte (low-to-high)
+//
+// 256 threads/block, one element per thread, FP16 store.
+
+#define Q2_K_SUPER_BLOCK_SIZE 256
+#define Q2_K_BLOCK_BYTES 84
+
+extern "C" __global__ void __launch_bounds__(256) dequant_q2_k_f16(
+    const uint8_t* __restrict__ src,
+    half* __restrict__ dst,
+    const int total_superblocks)
+{
+    int t = threadIdx.x; // 0..255
+
+    for (int sb_idx = blockIdx.x; sb_idx < total_superblocks; sb_idx += gridDim.x)
+    {
+        const uint8_t* block = src + (size_t)sb_idx * Q2_K_BLOCK_BYTES;
+        const uint8_t* scales = block;        // 16 bytes
+        const uint8_t* qs = block + 16;       // 64 bytes
+        float d = __half2float(*reinterpret_cast<const half*>(block + 80));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
+
+        int sub = t >> 4;            // t / 16
+        int byte_idx = t >> 2;       // t / 4
+        int bit_off = (t & 0x3) << 1; // (t % 4) * 2
+        int q2 = (qs[byte_idx] >> bit_off) & 0x3;
+        int scale = scales[sub] & 0xF;
+        int dm_coef = (scales[sub] >> 4) & 0xF;
+
+        float result = d * (float)scale * (float)q2 - dmin * (float)dm_coef;
+        dst[(size_t)sb_idx * Q2_K_SUPER_BLOCK_SIZE + t] = __float2half(result);
+    }
+}
+
 // ── Q3_K: 110 bytes per 256 values (super-block with 16 sub-blocks of 16) ──
 // struct block_q3_K { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; half d; };
 //   hmask: 1 high bit per element (32 × 8 = 256 bits)
