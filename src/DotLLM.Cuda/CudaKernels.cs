@@ -1293,18 +1293,19 @@ public sealed unsafe class CudaKernels : IDisposable
     };
 
     /// <summary>
-    /// Phase-B MoE grouped quantized GEMV (Q4_K only at v1). Computes K_active
-    /// independent <c>y_e[m] = W_e[m,k] @ x[k]</c> projections in a single launch
-    /// where <c>x</c> (FP16, length K) is shared across all experts and each
+    /// Phase-B MoE grouped quantized GEMV. Computes K_active independent
+    /// <c>y_e[m] = W_e[m,k] @ x[k]</c> projections in a single launch where
+    /// <c>x</c> (FP16, length K) is shared across all experts and each
     /// <c>W_e</c> / <c>y_e</c> pair is selected from the K_active per-expert
-    /// pointer arrays.
+    /// pointer arrays. Supports Q2_K, Q4_K, Q5_K, Q6_K, and Q8_0 — gate the
+    /// call with <see cref="HasMoeGroupedGemv"/>.
     /// </summary>
     /// <param name="weightPtrsDevice">Device pointer to <c>K_active</c> contiguous
     /// <c>nint</c>-sized weight pointers (one per active expert, raw quant bytes).</param>
     /// <param name="outputPtrsDevice">Device pointer to <c>K_active</c> contiguous
     /// <c>nint</c>-sized output pointers (one per active expert, FP16 [M] each).</param>
     /// <param name="x">Device pointer to the shared FP16 input row, length K.</param>
-    /// <param name="qt">Quantization type. Currently must be <c>Q4_K</c>.</param>
+    /// <param name="qt">Quantization type. Must be one of Q2_K, Q4_K, Q5_K, Q6_K, Q8_0.</param>
     /// <param name="M">Per-expert output rows.</param>
     /// <param name="K">Input dim. Must satisfy <c>K % 256 == 0</c> for K-quants and
     /// <c>K % 32 == 0</c> for Q8_0. The shared dispatch keeps the 256 alignment so
