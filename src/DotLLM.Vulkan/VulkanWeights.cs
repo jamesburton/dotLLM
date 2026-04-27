@@ -248,6 +248,24 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q6_K super-blocks
+    /// (210 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q6_K super-block size (256). Phase 1 of the K-quant work on Vulkan
+    /// (sibling tickets land Q4_K / Q5_K with the same dispatch shape).</summary>
+    private static bool KeepQ6KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q6_K && (inputDim % 256) == 0;
+
+    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q6_K /
+    /// F32 depending on the source and the alignment constraints.</summary>
+    private static QuantizationType DeviceQuantTypeFor(
+        QuantizationType srcQt, int inputDim, bool dequantToFp32)
+    {
+        if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
+        if (KeepQ6KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q6_K;
+        return QuantizationType.F32;
+    }
+
+
     private static long ComputeMaxUploadBytes(
         TransformerWeights weights, int numLayers, bool dequantToFp32)
     {
@@ -273,14 +291,18 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ6KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q6_K) * outputDim;
         return elems * sizeof(float);
     }
 
     /// <summary>
     /// Uploads a single weight matrix. When <paramref name="dequantToFp32"/> is false and
-    /// <paramref name="qt"/> is Q8_0 the raw Q8_0 block bytes are copied to device memory
-    /// and the returned <paramref name="deviceQuantType"/> is <see cref="QuantizationType.Q8_0"/>.
-    /// Otherwise the source is dequantised to FP32 before upload and
+    /// <paramref name="qt"/> is a supported on-device quant format (Q8_0 / Q6_K with an
+    /// aligned contraction axis), the raw block bytes are copied to device memory and the
+    /// returned <paramref name="deviceQuantType"/> reflects that format so the dispatcher
+    /// in <see cref="VulkanTransformerModel"/> can route through the matching matmul
+    /// kernel. Otherwise the source is dequantised to FP32 before upload and
     /// <paramref name="deviceQuantType"/> is <see cref="QuantizationType.F32"/>.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadMatrix(
@@ -292,15 +314,18 @@ internal sealed class VulkanWeights : IDisposable
     {
         long elems = (long)outputDim * inputDim;
 
-        if (KeepQ8OnDevice(qt, dequantToFp32))
+        // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
+        // the matmul_q8_0 / matmul_q6_k kernels can read it directly. Mirrors the CPU
+        // path's mmap-backed layout.
+        QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
+        if (keepQt != QuantizationType.F32)
         {
-            // Raw Q8_0 blob upload — mirrors the CPU path's mmap-backed layout.
-            long rowBytes = Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0);
+            long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
             var buf = device.AllocateDeviceLocal(bytes);
             VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (Q8_0)");
+                .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
             try
             {
                 new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -312,7 +337,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
 
-            deviceQuantType = QuantizationType.Q8_0;
+            deviceQuantType = keepQt;
             uploadedBytes = bytes;
             return buf;
         }
