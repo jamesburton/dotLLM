@@ -1,0 +1,168 @@
+#version 450
+// Q4_K matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_q4k[m, k] * x[k]      with W_q4k dequantized on the fly.
+//
+// Weight layout mirrors llama.cpp / DotLLM.Cpu.Kernels.Dequantize.DequantizeQ4_KScalar:
+//   Each 256 contiguous elements of a row form one Q4_K super-block of 144 bytes:
+//       bytes [0,1]   = fp16 delta scale d
+//       bytes [2,3]   = fp16 delta min  dmin
+//       bytes [4..15] = scales[12] — 8 × 6-bit scales + 8 × 6-bit mins, packed
+//                       per llama.cpp's get_scale_min_k4()
+//       bytes [16..143] = qs[128] — 128 bytes, two 4-bit values per byte
+//                                   (low nibble = element 2i, high nibble = 2i+1
+//                                   within a sub-block pair)
+//   Row stride = (K / 256) * 144 bytes.
+//
+// Reconstruction (matches DequantizeKQuants.UnpackQ4Q5Scales + the scalar dequant
+// loop): the super-block has 8 sub-blocks of 32 elements each. For sub-block j
+// in [0,8):
+//   pair_idx    = j / 2          // which 32-byte slab of qs[]
+//   nibble_half = j % 2          // 0 = low nibbles, 1 = high nibbles
+//   for i in [0, 32):
+//     byte = qs[pair_idx*32 + i]
+//     n    = (byte & 0xF) when nibble_half==0 else (byte >> 4)
+//     w    = d * scale[j] * n - dmin * min[j]
+//   sub-block j writes to elements [j*32 .. j*32 + 32) in row order.
+//
+// x[] is FP32. Output y[] is FP32. This is the N=1 decode-path (mirrors
+// matmul_q8_0.comp).
+//
+// Dispatch:
+//   One workgroup per output row (gl_WorkGroupID.x = m).
+//   local_size_x = 128 — threads stride across super-blocks and accumulate
+//   partial sums, then the workgroup reduces in shared memory.
+//
+// Storage-buffer access:
+//   `weight` is bound as `uint[]` because GLSL storage buffers cannot hold
+//   int8 / float16 scalars without optional extensions. Per-byte access goes
+//   through `readByte` with explicit shifts. fp16 d / dmin via
+//   `unpackHalf2x16`.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // Q4_K blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;                    // number of output rows
+    uint K;                    // columns (must be a multiple of 256)
+    uint blocksPerRow;         // = K / 256 (super-blocks)
+    uint rowUints;             // per-row uint stride bound (rounded up)
+} pc;
+
+const uint Q4K_BLOCK_BYTES = 144u;
+const uint Q4K_GROUP_SIZE  = 256u;
+
+// Read one byte from the weight blob at absolute byte offset `absByteOff`.
+// Returns it as a uint in [0, 255].
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Read fp16 at `absByteOff` (2 bytes), handling straddled uint words.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        // Straddles: low byte in this word, high byte in next.
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Unpack the j-th (0..7) (scale, min) pair from the 12-byte scales[] region
+// at absolute byte offset `scalesByteBase`. Mirrors
+// DotLLM.Cpu.Kernels.Dequantize.UnpackQ4Q5Scales / llama.cpp's
+// get_scale_min_k4: sub-blocks 0..3 take the low 6 bits of bytes [j] / [j+4];
+// sub-blocks 4..7 take the low 4 bits of byte [j+4] (j in 4..7) ored with the
+// top 2 bits of byte [j-4] (scales) / [j] (mins) shifted to position [4,5].
+//
+// Returns scale in .x, min in .y, both as uint (each in [0, 63]).
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        // j in [4, 7]
+        uint jm4 = j - 4u;          // 0..3 — top-bits-source byte index
+        uint jp4 = j + 4u;           // 8..11 — low-nibble-source byte index
+        uint scLow  = readByte(scalesByteBase + jp4) & 0xFu;          // bits [0..3]
+        uint scHigh = (readByte(scalesByteBase + jm4) >> 6u) & 0x3u;  // bits [4..5]
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + jp4) >> 4u) & 0xFu;  // bits [0..3]
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;    // bits [4..5]
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // Row-stride bytes. Compute from blocksPerRow directly — same convention as
+    // matmul_q8_0.comp: rowUints*4 may overstate the stride since 144 is divisible by 4
+    // here (no straddle issue) but we use blocksPerRow*144 for symmetry / clarity.
+    uint rowByteStride = pc.blocksPerRow * Q4K_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    // One thread handles a strided slice of super-blocks.
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase);
+        float dmin = readHalf(blockByteBase + 2u);
+        uint scalesBase = blockByteBase + 4u;
+        uint qsBase     = blockByteBase + 16u;
+
+        uint xBase = b * Q4K_GROUP_SIZE;
+
+        // 8 sub-blocks of 32 elements. Each sub-block has its own (scale, min).
+        // Two sub-blocks share the same 32-byte qs slab (low / high nibble half).
+        for (uint j = 0u; j < 8u; j++) {
+            uvec2 sm = unpackScaleMin(scalesBase, j);
+            float sc = d * float(sm.x);
+            float mn = dmin * float(sm.y);
+
+            uint pairIdx    = j >> 1u;       // 0..3
+            uint nibbleHalf = j & 1u;        // 0 or 1
+            uint qsByteBase = qsBase + pairIdx * 32u;
+            uint outBase    = xBase + j * 32u;
+
+            float subSum = 0.0;
+            for (uint i = 0u; i < 32u; i++) {
+                uint byteVal = readByte(qsByteBase + i);
+                uint nibble  = (nibbleHalf == 0u) ? (byteVal & 0xFu) : (byteVal >> 4u);
+                // w_i = sc * nibble - mn (constant w.r.t. i over the sub-block)
+                float xi = x[outBase + i];
+                subSum += xi * (sc * float(nibble) - mn);
+            }
+            acc += subSum;
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
