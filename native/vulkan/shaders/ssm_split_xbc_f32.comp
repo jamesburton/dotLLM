@@ -1,0 +1,59 @@
+#version 450
+// SSM split xBC — extracts the [x | B | C] row-major projection output
+// produced by the SSM conv1d+SiLU stage into three separately bound
+// destination buffers, in one fused dispatch. Replaces a per-token loop
+// of THREE vkCmdCopyBuffer regions per token (one each for x, B, C) in
+// VulkanNemotronHTransformerModel.RecordSsmLayer step 7.
+//
+// Source layout — XBC[seqLen, convDim] row-major, where convDim = dInner
+// + 2*bcDim and each token row is laid out as [x (dInner) | B (bcDim) | C
+// (bcDim)]. The three destinations are SsmX[seqLen, dInner], SsmB[seqLen,
+// bcDim], SsmC[seqLen, bcDim] — bit-equal to the per-token-copy path.
+//
+// Dispatch: 2D grid, one thread per output cell (col, t). Workgroup
+// (16, 16). The col axis covers the WIDEST destination row
+// (max(dInner, bcDim)); each thread early-returns if its (col, branch)
+// pair is out of range for that branch's row width. Branch 0 = x (col <
+// dInner), branch 1 = B (col < bcDim), branch 2 = C (col < bcDim) — the
+// three branches share the same dispatch via the gl_GlobalInvocationID.z
+// axis.
+//
+// Buffer layout:
+//   xbc  : [seqLen * convDim]                     F32 row-major
+//   x    : [seqLen * dInner]                      F32 row-major  (overwritten)
+//   b    : [seqLen * bcDim]                       F32 row-major  (overwritten)
+//   c    : [seqLen * bcDim]                       F32 row-major  (overwritten)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufXbc { float xbcBuf[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufX   { float xBuf[];   };
+layout(set = 0, binding = 2, std430) writeonly buffer BufB   { float bBuf[];   };
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float cBuf[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint dInner;
+    uint bcDim;
+    uint convDim;   // = dInner + 2*bcDim
+} pc;
+
+void main() {
+    uint col    = gl_GlobalInvocationID.x;        // 0..max(dInner, bcDim)
+    uint t      = gl_GlobalInvocationID.y;        // 0..seqLen
+    uint branch = gl_GlobalInvocationID.z;        // 0=x, 1=B, 2=C
+    if (t >= pc.seqLen) return;
+
+    uint srcRowBase = t * pc.convDim;
+
+    if (branch == 0u) {
+        if (col >= pc.dInner) return;
+        xBuf[t * pc.dInner + col] = xbcBuf[srcRowBase + col];
+    } else if (branch == 1u) {
+        if (col >= pc.bcDim) return;
+        bBuf[t * pc.bcDim + col] = xbcBuf[srcRowBase + pc.dInner + col];
+    } else {
+        if (col >= pc.bcDim) return;
+        cBuf[t * pc.bcDim + col] = xbcBuf[srcRowBase + pc.dInner + pc.bcDim + col];
+    }
+}
