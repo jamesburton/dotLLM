@@ -108,14 +108,15 @@ internal sealed class MoeLayerWeights
     // have NO quant overlay here — the Vulkan moe_indexed_matmul_f32 kernel is F32-only
     // in tree, so a quantised indexed variant is future work. Same two-mode storage
     // policy as the standard transformer: when the source is Q8_0 (contraction axis a
-    // multiple of 32) or Q4_K (a multiple of 256), raw blocks live on device and
-    // dispatch via the matching matmul kernel; otherwise the Vulkan upload dequantises
-    // to F32.
+    // multiple of 32) or Q4_K / Q5_K / Q6_K (a multiple of 256), raw blocks live on
+    // device and dispatch via the matching matmul kernel; otherwise the Vulkan upload
+    // dequantises to F32.
     //
     // The overlay slots use the historical "Q8" naming because Q8_0 was the first quant
     // type wired through. They actually carry raw bytes for whichever format the
-    // companion `*QuantTypeOverlay` field declares — currently Q8_0 or Q4_K (Phase 1 of
-    // the K-quant work). Q5_K / Q6_K are follow-up tickets.
+    // companion `*QuantTypeOverlay` field declares — Q8_0, Q4_K, Q5_K, or Q6_K (Phase 1
+    // of the K-quant work, now complete for the Vulkan matmul kernels — coopmat variants
+    // and the remaining K-quant formats (Q2_K, Q3_K) remain follow-up tickets).
 
     /// <summary>Optional raw-quant bytes for the router gate ([numExperts, hiddenSize]).
     /// Zero when the gate stays F32 on device. When non-zero, <see cref="Gate"/> still
@@ -123,7 +124,8 @@ internal sealed class MoeLayerWeights
     /// The format is declared by <see cref="GateQuantTypeOverlay"/>.</summary>
     public nint GateQ8Ptr;
     /// <summary>Storage type of the router-gate raw-byte overlay (<see cref="GateQ8Ptr"/>).
-    /// Currently <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
     /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
     public QuantizationType GateQuantTypeOverlay;
 
@@ -139,7 +141,8 @@ internal sealed class MoeLayerWeights
     public nint[]? SharedDownProjQ8Ptrs;
     /// <summary>Storage type of the shared-expert projection overlay arrays. All three
     /// arrays share one quant type (uniform across the shared-expert branch).
-    /// Currently <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
     /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
     public QuantizationType SharedExpertProjQuantTypeOverlay;
 
@@ -149,7 +152,8 @@ internal sealed class MoeLayerWeights
     /// Format declared by <see cref="SharedExpertGateQuantTypeOverlay"/>.</summary>
     public nint SharedExpertGateQ8Ptr;
     /// <summary>Storage type of the shared-expert gate overlay (<see cref="SharedExpertGateQ8Ptr"/>).
-    /// Currently <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// One of <see cref="QuantizationType.Q8_0"/>, <see cref="QuantizationType.Q4_K"/>,
+    /// <see cref="QuantizationType.Q5_K"/>, or <see cref="QuantizationType.Q6_K"/>;
     /// <see cref="QuantizationType.F32"/> when no overlay is present.</summary>
     public QuantizationType SharedExpertGateQuantTypeOverlay;
 

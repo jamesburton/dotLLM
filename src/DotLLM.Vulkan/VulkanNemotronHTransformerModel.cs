@@ -62,6 +62,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // Q5_K_M matmul kernels — Phase 1 sibling of Q4_K. Always created.
     private readonly MatMulQ5KGemvF32Kernel _matmulQ5K;
     private readonly MatMulQ5KGemmF32Kernel _matmulQ5KGemm;
+    // Q6_K_M matmul kernels — Phase 1 sibling of Q4_K / Q5_K, completing the
+    // K-quant matmul kernel coverage. Always created.
+    private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
+    private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -108,6 +112,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
+        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
@@ -137,6 +142,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ4KGemm = matmulQ4KGemm;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
+        _matmulQ6K = matmulQ6K;
+        _matmulQ6KGemm = matmulQ6KGemm;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -257,6 +264,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q5_K_M GEMV + GEMM — Phase 1 sibling of Q4_K. Always created.
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
         var matmulQ5KGemm = MatMulQ5KGemmF32Kernel.Create(device, spvDir);
+        // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
+        var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -280,6 +290,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
+            matmulQ6K, matmulQ6KGemm,
             rmsnorm, rope, attention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
@@ -628,6 +639,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ4KGemm.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
+        _matmulQ6K.InvalidateDescriptorCache();
+        _matmulQ6KGemm.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -709,6 +722,21 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantizationType.Q6_K)
+        {
+            // Q6_K_M decode-path GEMV (seqLen==1) or prefill-path tiled GEMM. Same
+            // alignment as Q4_K / Q5_K (inputDim % 256 == 0, enforced by upload path).
+            if (seqLen == 1)
+            {
+                _matmulQ6K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ6KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else
         {
             _matmul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
@@ -780,6 +808,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ6KGemm.Dispose();
+        _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();

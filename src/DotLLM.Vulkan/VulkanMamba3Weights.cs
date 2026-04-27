@@ -229,10 +229,10 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
         // LM head [vocab, hidden]. Whether tied or not, the weight loader gives us a
         // populated handle; we always upload a separate device buffer so the model doesn't
-        // need to know about tying. Honours the quant overlay (Q8_0 / Q4_K / Q5_K —
-        // Phase 1 of the K-quant work) when present and the contraction axis (hidden) is
-        // aligned to the format's group size; otherwise falls back to the F32 source
-        // upload.
+        // need to know about tying. Honours the quant overlay (Q8_0 / Q4_K / Q5_K /
+        // Q6_K — Phase 1 of the K-quant work) when present and the contraction axis
+        // (hidden) is aligned to the format's group size; otherwise falls back to the
+        // F32 source upload.
         bool lmKeepQuant = KeepQuantOnDevice(weights.LmHeadQuantTypeOverlay, hidden) && weights.LmHeadQ8Ptr != 0;
         VulkanDevice.Buffer lmHead;
         QuantizationType lmHeadDeviceQt;
@@ -268,8 +268,9 @@ internal sealed class VulkanMamba3Weights : IDisposable
             var norm = UploadTensor(device, staging, lw.Norm, hidden, out long normBytes);
 
             // in_proj: contraction axis = hiddenSize. Honours the quant overlay (Q8_0 /
-            // Q4_K / Q5_K — Phase 1 of K-quant work) when set AND hidden is aligned to
-            // the format's group size; otherwise falls back to F32 source upload.
+            // Q4_K / Q5_K / Q6_K — Phase 1 of K-quant work) when set AND hidden is
+            // aligned to the format's group size; otherwise falls back to F32 source
+            // upload.
             VulkanDevice.Buffer inProj;
             QuantizationType inProjDeviceQt;
             long inProjBytes;
@@ -371,7 +372,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
     /// <summary>True iff a Q4_K overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction dim being a multiple of the Q4_K super-block size
-    /// (256). Phase 1 of K-quant work; Q6_K follow-up ticket.</summary>
+    /// (256). Phase 1 of K-quant work.</summary>
     private static bool KeepQ4KOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q4_K && (contractionDim % 256) == 0;
 
@@ -381,12 +382,21 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ5KOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q5_K && (contractionDim % 256) == 0;
 
+    /// <summary>True iff a Q6_K overlay can be kept on device as raw Q6_K super-blocks
+    /// — gated on the contraction dim being a multiple of the Q6_K super-block size
+    /// (256). Phase 1 sibling of <see cref="KeepQ4KOnDevice"/> completing the K-quant
+    /// matmul kernel coverage (Q4_K / Q5_K / Q6_K).</summary>
+    private static bool KeepQ6KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
+
     /// <summary>True iff the overlay declares a supported quantised format (Q8_0 /
-    /// Q4_K / Q5_K) AND the contraction axis is aligned to that format's group size.</summary>
+    /// Q4_K / Q5_K / Q6_K) AND the contraction axis is aligned to that format's group
+    /// size.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
         => KeepQ8OnDevice(qt, contractionDim)
         || KeepQ4KOnDevice(qt, contractionDim)
-        || KeepQ5KOnDevice(qt, contractionDim);
+        || KeepQ5KOnDevice(qt, contractionDim)
+        || KeepQ6KOnDevice(qt, contractionDim);
 
     /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
     /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.

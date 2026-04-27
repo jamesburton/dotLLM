@@ -102,6 +102,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
     // Q5_K_M matmul kernels — Phase 1 sibling of Q4_K. Always created.
     private readonly MatMulQ5KGemvF32Kernel _matmulQ5K;
     private readonly MatMulQ5KGemmF32Kernel _matmulQ5KGemm;
+    // Q6_K_M matmul kernels — Phase 1 sibling of Q4_K / Q5_K, completing the
+    // K-quant matmul kernel coverage. Always created.
+    private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
+    private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly Mamba3DataRopeF32Kernel _dataRope;
     private readonly Mamba3CanonicalSsdSisoF32Kernel _sisoScan;
@@ -133,6 +137,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
+        MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
         RmsNormF32Kernel rmsnorm,
         Mamba3DataRopeF32Kernel dataRope, Mamba3CanonicalSsdSisoF32Kernel sisoScan,
         Mamba3CanonicalSsdMimoF32Kernel? mimoScan,
@@ -156,6 +161,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulQ4KGemm = matmulQ4KGemm;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
+        _matmulQ6K = matmulQ6K;
+        _matmulQ6KGemm = matmulQ6KGemm;
         _rmsnorm = rmsnorm;
         _dataRope = dataRope;
         _sisoScan = sisoScan;
@@ -256,6 +263,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         // Q5_K_M GEMV + GEMM — Phase 1 sibling of Q4_K. Always created.
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
         var matmulQ5KGemm = MatMulQ5KGemmF32Kernel.Create(device, spvDir);
+        // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
+        var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var dataRope = Mamba3DataRopeF32Kernel.Create(device, spvDir);
         var sisoScan = Mamba3CanonicalSsdSisoF32Kernel.Create(device, spvDir);
@@ -273,6 +283,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
+            matmulQ6K, matmulQ6KGemm,
             rmsnorm, dataRope, sisoScan, mimoScan, boundary, add,
             submit);
     }
@@ -847,6 +858,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulQ4KGemm.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
+        _matmulQ6K.InvalidateDescriptorCache();
+        _matmulQ6KGemm.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _dataRope.InvalidateDescriptorCache();
         _sisoScan.InvalidateDescriptorCache();
@@ -858,19 +871,20 @@ public sealed class VulkanMamba3TransformerModel : IModel
     /// <summary>
     /// Dispatches a matmul for one Mamba-3 projection: chooses
     /// <see cref="MatMulQ8_0Kernel"/> / <see cref="MatMulQ4KGemvF32Kernel"/> /
-    /// <see cref="MatMulQ5KGemvF32Kernel"/> (decode-path GEMV) when
-    /// <paramref name="seqLen"/>==1, the batched <see cref="MatMulQ8_0GemmKernel"/> /
-    /// <see cref="MatMulQ4KGemmF32Kernel"/> / <see cref="MatMulQ5KGemmF32Kernel"/> (or
+    /// <see cref="MatMulQ5KGemvF32Kernel"/> / <see cref="MatMulQ6KGemvF32Kernel"/>
+    /// (decode-path GEMV) when <paramref name="seqLen"/>==1, the batched
+    /// <see cref="MatMulQ8_0GemmKernel"/> / <see cref="MatMulQ4KGemmF32Kernel"/> /
+    /// <see cref="MatMulQ5KGemmF32Kernel"/> / <see cref="MatMulQ6KGemmF32Kernel"/> (or
     /// the Q8_0 coopmat variant when available) when <paramref name="seqLen"/>&gt;1,
     /// and <see cref="MatMulF32Kernel"/> for every F32 weight. Same routing as
     /// <see cref="VulkanNemotronHTransformerModel"/> / <see cref="VulkanTransformerModel"/>.
     /// </summary>
     /// <remarks>
     /// Q8_0 kernels require <paramref name="inputDim"/> to be a multiple of 32; Q4_K /
-    /// Q5_K kernels require it to be a multiple of 256. The upload path
+    /// Q5_K / Q6_K kernels require it to be a multiple of 256. The upload path
     /// (<see cref="VulkanMamba3Weights"/>) only marks a projection as Q8_0 / Q4_K /
-    /// Q5_K when the matching alignment constraint holds; otherwise the source is
-    /// uploaded as F32 and lands here as F32, sidestepping the kernel alignment
+    /// Q5_K / Q6_K when the matching alignment constraint holds; otherwise the source
+    /// is uploaded as F32 and lands here as F32, sidestepping the kernel alignment
     /// requirement entirely.
     /// </remarks>
     private void RecordMatmul(
@@ -925,6 +939,21 @@ public sealed class VulkanMamba3TransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantizationType.Q6_K)
+        {
+            // Q6_K_M decode-path GEMV (seqLen==1) or prefill-path tiled GEMM. Same
+            // alignment as Q4_K / Q5_K (inputDim % 256 == 0, enforced by upload path).
+            if (seqLen == 1)
+            {
+                _matmulQ6K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ6KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else
         {
             _matmul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
@@ -945,6 +974,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _sisoScan.Dispose();
         _dataRope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ6KGemm.Dispose();
+        _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();

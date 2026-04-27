@@ -527,8 +527,7 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>Returns true when the matrix will be kept on device as Q4_K super-blocks
     /// (144 bytes per 256 elements). Gated on the contraction axis being a multiple of
-    /// the Q4_K super-block size (256). Phase 1 of the K-quant work — Q6_K is the
-    /// remaining follow-up ticket and still dequantises to F32 at upload.</summary>
+    /// the Q4_K super-block size (256). Phase 1 of the K-quant work.</summary>
     private static bool KeepQ4KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q4_K && (inputDim % 256) == 0;
 
@@ -538,14 +537,22 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ5KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q5_K && (inputDim % 256) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q6_K super-blocks
+    /// (210 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q6_K super-block size (256). Phase 1 sibling of <see cref="KeepQ4KOnDevice"/>
+    /// completing the K-quant matmul kernel coverage (Q4_K / Q5_K / Q6_K).</summary>
+    private static bool KeepQ6KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q6_K && (inputDim % 256) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
-    /// Q5_K / F32 depending on the source and the alignment constraints.</summary>
+    /// Q5_K / Q6_K / F32 depending on the source and the alignment constraints.</summary>
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_K;
+        if (KeepQ6KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q6_K;
         return QuantizationType.F32;
     }
 
@@ -598,6 +605,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         if (KeepQ5KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_K) * outputDim;
+        if (KeepQ6KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q6_K) * outputDim;
         return elems * sizeof(float);
     }
 
@@ -620,8 +629,8 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
 
         // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
-        // the matmul_q8_0 / matmul_q4_k / matmul_q5_k kernels can read it directly.
-        // Mirrors the CPU path's mmap-backed layout.
+        // the matmul_q8_0 / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
+        // directly. Mirrors the CPU path's mmap-backed layout.
         QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
         if (keepQt != QuantizationType.F32)
         {
@@ -968,7 +977,7 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction-axis dim being a multiple of the Q4_K super-block size
-    /// (256). Phase 1 of the K-quant work; Q6_K follow-up ticket.</summary>
+    /// (256). Phase 1 of the K-quant work.</summary>
     private static bool MoeOverlayKeepsQ4K(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q4_K && (contractionDim % 256) == 0;
 
@@ -978,18 +987,26 @@ internal sealed class VulkanWeights : IDisposable
     private static bool MoeOverlayKeepsQ5K(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q5_K && (contractionDim % 256) == 0;
 
+    /// <summary>True iff a Q6_K MoE overlay can be kept on device as raw Q6_K super-blocks
+    /// — gated on the contraction-axis dim being a multiple of the Q6_K super-block size
+    /// (256). Phase 1 sibling of <see cref="MoeOverlayKeepsQ4K"/> completing the K-quant
+    /// MoE coverage.</summary>
+    private static bool MoeOverlayKeepsQ6K(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
+
     /// <summary>True iff the MoE overlay is one of the supported quantised formats
-    /// (Q8_0 / Q4_K / Q5_K) AND the contraction axis is aligned to that format's group
-    /// size — i.e. raw blocks can be kept on device verbatim and dispatched through the
-    /// matching matmul kernel.</summary>
+    /// (Q8_0 / Q4_K / Q5_K / Q6_K) AND the contraction axis is aligned to that format's
+    /// group size — i.e. raw blocks can be kept on device verbatim and dispatched through
+    /// the matching matmul kernel.</summary>
     private static bool MoeOverlayKeepsQuantized(QuantizationType qt, int contractionDim)
         => MoeOverlayKeepsQ8(qt, contractionDim)
         || MoeOverlayKeepsQ4K(qt, contractionDim)
-        || MoeOverlayKeepsQ5K(qt, contractionDim);
+        || MoeOverlayKeepsQ5K(qt, contractionDim)
+        || MoeOverlayKeepsQ6K(qt, contractionDim);
 
     /// <summary>Returns the on-device byte size for an MoE projection in its chosen
-    /// storage form — raw Q8_0 / Q4_K / Q5_K row-stride bytes when the overlay says so,
-    /// otherwise F32.</summary>
+    /// storage form — raw Q8_0 / Q4_K / Q5_K / Q6_K row-stride bytes when the overlay
+    /// says so, otherwise F32.</summary>
     private static long MoeOverlayUploadBytes(
         QuantizationType qt, int outputDim, int contractionDim)
     {
@@ -999,6 +1016,8 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q4_K) * outputDim;
         if (MoeOverlayKeepsQ5K(qt, contractionDim))
             return Dequantize.RowByteSize(contractionDim, QuantizationType.Q5_K) * outputDim;
+        if (MoeOverlayKeepsQ6K(qt, contractionDim))
+            return Dequantize.RowByteSize(contractionDim, QuantizationType.Q6_K) * outputDim;
         return (long)outputDim * contractionDim * sizeof(float);
     }
 
