@@ -43,6 +43,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _rmsnormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
     private readonly CudaModule? _quantizedGemvMmqModule;
+    private readonly nint _quantizedGemvQ2_KMmqFunc;
     private readonly nint _quantizedGemvQ4_KMmqFunc;
     private readonly nint _quantizedGemvQ5_KMmqFunc;
     private readonly nint _quantizedGemvQ6_KMmqFunc;
@@ -254,6 +255,7 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _quantizedGemvMmqModule = CudaModule.LoadFromFile(mmqPath);
             _quantizedGemvQ4_KMmqFunc = _quantizedGemvMmqModule.GetFunction("quantized_gemv_q4_k_mmq");
+            _quantizedGemvQ2_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq");
             _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
             _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
             // MMVQ-large variants (k≥1024). TryGetFunction so a stale PTX without the
@@ -285,6 +287,7 @@ public sealed unsafe class CudaKernels : IDisposable
             {
                 _maxDynamicSharedBytesOptIn = optIn;
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
@@ -1322,6 +1325,9 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>True when the MMQ-style Q2_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ2K => _quantizedGemvQ2_KMmqFunc != 0 && !DisableMmqQ2K;
+
     /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
 
@@ -1350,6 +1356,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <c>_preq</c> kernel variants — eliminating the per-block redundant input quant.
     /// Override: <c>DOTLLM_DISABLE_PREQ8_1=1</c>.</summary>
     public bool HasPreQ8_1 => _quantizeXToQ8_1Func != 0 && !DisablePreQ8_1;
+
+    /// <summary>Test/benchmark hook to force the legacy Q2_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ2K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q2K") == "1";
 
     /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
     public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
@@ -1381,6 +1390,7 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
     public bool HasMmq(QuantizationType qt) => qt switch
     {
+        QuantizationType.Q2_K => HasMmqQ2K,
         QuantizationType.Q4_K => HasMmqQ4K,
         QuantizationType.Q5_K => HasMmqQ5K,
         QuantizationType.Q6_K => HasMmqQ6K,
@@ -1540,6 +1550,7 @@ public sealed unsafe class CudaKernels : IDisposable
             }
             : qt switch
             {
+                QuantizationType.Q2_K => _quantizedGemvQ2_KMmqFunc,
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
@@ -1609,16 +1620,18 @@ public sealed unsafe class CudaKernels : IDisposable
     /// for the given quant type and k. Layout per chunk (32 elements):
     /// <list type="bullet">
     /// <item>Q4_K / Q5_K: 32 INT8 (s_xq) + 1 half (s_dx) + 1 half (s_sx) = 36 bytes/chunk</item>
-    /// <item>Q6_K: 32 INT8 (s_xq) + 1 half (s_dx) + 2 halves (s_sx2 lo, hi) = 38 bytes/chunk</item>
+    /// <item>Q2_K / Q6_K: 32 INT8 (s_xq) + 1 half (s_dx) + 2 halves (s_sx2 lo, hi) = 38 bytes/chunk</item>
     /// </list>
-    /// SmolLM-135M k=576 → 18 chunks → 648 B (Q4_K) / 684 B (Q6_K). Qwen3-8B
+    /// Q2_K and Q6_K both use 16-element sub-blocks so the chunk-32 covers two
+    /// sub-blocks and the dmin/min term needs per-half-chunk xsum precomputation.
+    /// SmolLM-135M k=576 → 18 chunks → 648 B (Q4_K) / 684 B (Q2_K, Q6_K). Qwen3-8B
     /// k=12288 → 384 chunks → 13.5 KB / 14.25 KB. Llama-405B k=53248 → 1664 chunks
     /// → ~58 KB / ~62 KB (still under the 100 KB sm_86 optin cap).
     /// </summary>
     private static int ComputeMmqDynamicSharedBytes(QuantizationType qt, int k)
     {
         int numChunks = k >> 5;
-        int bytesPerChunk = qt == QuantizationType.Q6_K ? 38 : 36;
+        int bytesPerChunk = (qt == QuantizationType.Q6_K || qt == QuantizationType.Q2_K) ? 38 : 36;
         return numChunks * bytesPerChunk;
     }
 

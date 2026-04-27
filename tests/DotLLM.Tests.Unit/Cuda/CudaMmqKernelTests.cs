@@ -35,6 +35,18 @@ public class CudaMmqKernelTests
     [InlineData(4, 256)]    // 1 superblock × few rows (smaller than MMQ_ROWS_PER_BLOCK)
     [InlineData(8, 512)]    // 2 superblocks × MMQ_ROWS_PER_BLOCK × 2 blocks
     [InlineData(64, 1024)]  // 4 superblocks × many rows
+    [InlineData(2048, 2048)] // Llama-70B-class shape stress test
+    public void MmqQ2K_MatchesLegacyWithinTolerance(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q2_K, n, k, blockBytes: 84,
+            (rng, span) => SynthesiseQ2KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 256)]    // 1 superblock × few rows (smaller than MMQ_ROWS_PER_BLOCK)
+    [InlineData(8, 512)]    // 2 superblocks × MMQ_ROWS_PER_BLOCK × 2 blocks
+    [InlineData(64, 1024)]  // 4 superblocks × many rows
     public void MmqQ5K_MatchesLegacyWithinTolerance(int n, int k)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
@@ -385,6 +397,24 @@ public class CudaMmqKernelTests
         // outputs and tighter ratios in practice (the end-to-end logits parity
         // test on SmolLM-135M Q4_K_M passes within Tight tolerance).
         Assert.True(peakRelMax < 0.03f, $"Peak-relative max diff {peakRelMax:P2} exceeds 3% (max={maxAbs}, refMax={refMax})");
+    }
+
+    private static unsafe void SynthesiseQ2KBlock(Random rng, Span<byte> block)
+    {
+        // Q2_K layout (84 bytes): uint8[16] scales, uint8[64] qs, half d (offset 80), half dmin (offset 82).
+        // scales: low nibble = 4-bit sub-block scale, high nibble = 4-bit dmin coef.
+        // Smaller d/dmin magnitude than Q4_K because q∈[0,3] × sc∈[0,15] means each
+        // element's per-d contribution is up to 45 (vs Q4_K's 15×15=225).
+        for (int i = 0; i < 80; i++)
+            block[i] = (byte)rng.Next(0, 256);
+
+        Half d = (Half)(rng.NextDouble() * 0.05 + 0.01);
+        Half dmin = (Half)((rng.NextDouble() - 0.5) * 0.02);
+        fixed (byte* pBlock = block)
+        {
+            *(Half*)(pBlock + 80) = d;
+            *(Half*)(pBlock + 82) = dmin;
+        }
     }
 
     private static unsafe void SynthesiseQ4KBlock(Random rng, Span<byte> block)
