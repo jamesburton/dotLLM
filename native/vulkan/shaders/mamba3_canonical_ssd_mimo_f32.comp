@@ -1,0 +1,153 @@
+#version 450
+// Mamba-3 canonical SSD scan (MIMO variant) — rank-expanded recurrent
+// attention-style kernel. Mirrors DotLLM.Cpu.Kernels.Mamba3CanonicalSsd.ExecuteMimo.
+//
+// MIMO adds a rank axis R to B/C (qRoped/kRoped). The state update sums K
+// over rank (canonical's K-sum trick); per-rank y is read out, gated through
+// silu(z * mimoZ[h, r, p]), then contracted via mimoO[h, r, p].
+//
+// Per token t, per head h:
+//   decay = exp(adt[t, h])
+//   scl   = scale[t, h]
+//   skip  = d[h] + gamma[t, h] * qkPreDotSum[t, h]
+//   for p in [0, headDim):
+//     // h update: kSum_n = Σ_r kRoped[t, r, h, n]
+//     for n in [0, dState):
+//       kSum = 0
+//       for r in [0, nRank): kSum += kRoped[t, r, h, n]
+//       state[h, p, n] = decay * state[h, p, n] + V[t, h, p] * (kSum * scl)
+//     // per-rank readout + contraction
+//     y_final = 0
+//     for r in [0, nRank):
+//       yScanR = Σ_n qRoped[t, r, h, n] * state[h, p, n]
+//       yR     = yScanR + (skip / R) * V[t, h, p]
+//       if hasZ:
+//         zGated = z[t, h, p] * mimoZ[h, r, p]
+//         yR    *= silu(zGated)
+//       y_final += yR * mimoO[h, r, p]
+//     y[t, h, p] = y_final
+//
+// Dispatch:
+//   local_size_x = 256
+//   groupCount.x = nHead
+// Each thread strides p over headDim. Sequential over t. Rank iterated inside
+// per-thread loops (small R, typically 2-8).
+
+#define WG_SIZE 256
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding =  0, std430)          buffer BufState     { float st[];     }; // [nHead, headDim, dState] (RW)
+layout(set = 0, binding =  1, std430) readonly buffer BufV         { float v[];      }; // [seqLen, nHead, headDim]
+layout(set = 0, binding =  2, std430) readonly buffer BufQRoped    { float qR[];     }; // [seqLen, nRank, nHead, dState]
+layout(set = 0, binding =  3, std430) readonly buffer BufKRoped    { float kR[];     }; // [seqLen, nRank, nHead, dState]
+layout(set = 0, binding =  4, std430) readonly buffer BufQkPreDot  { float qkp[];    }; // [seqLen, nHead]
+layout(set = 0, binding =  5, std430) readonly buffer BufScale     { float scl[];    }; // [seqLen, nHead]
+layout(set = 0, binding =  6, std430) readonly buffer BufGamma     { float gm[];     }; // [seqLen, nHead]
+layout(set = 0, binding =  7, std430) readonly buffer BufAdt       { float adt[];    }; // [seqLen, nHead]
+layout(set = 0, binding =  8, std430) readonly buffer BufD         { float d[];      }; // [nHead]
+layout(set = 0, binding =  9, std430) readonly buffer BufZ         { float z[];      }; // [seqLen, nHead, headDim] (only if hasZ)
+layout(set = 0, binding = 10, std430) readonly buffer BufMimoZ     { float mz[];     }; // [nHead, nRank, headDim]
+layout(set = 0, binding = 11, std430) readonly buffer BufMimoO     { float mo[];     }; // [nHead, nRank, headDim]
+layout(set = 0, binding = 12, std430) writeonly buffer BufY        { float y[];      }; // [seqLen, nHead, headDim]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint nRank;
+    uint nHead;
+    uint headDim;
+    uint dState;
+    uint hasZ;
+} pc;
+
+shared float decayShared;
+shared float sclShared;
+shared float skipShared;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.nHead) return;
+
+    uint tid           = gl_LocalInvocationID.x;
+    uint stateHeadBase = h * pc.headDim * pc.dState;
+    float dh           = d[h];
+
+    float invRank = 1.0 / float(pc.nRank);
+
+    // Strides into qRoped / kRoped: [T, R, H, N] row-major.
+    uint bcHeadStride = pc.dState;
+    uint bcRankStride = pc.nHead * pc.dState;
+    uint bcTokStride  = pc.nRank * bcRankStride;
+
+    // Strides into mimoZ / mimoO: [H, R, P] row-major.
+    uint mimoHeadStride = pc.nRank * pc.headDim;
+    uint mimoRankStride = pc.headDim;
+    uint mimoHeadBase   = h * mimoHeadStride;
+
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        // 1. Per-(t, h) broadcast.
+        if (tid == 0u) {
+            uint hdrIdx = t * pc.nHead + h;
+            decayShared = exp(adt[hdrIdx]);
+            sclShared   = scl[hdrIdx];
+            float gm_   = gm[hdrIdx];
+            float qkp_  = qkp[hdrIdx];
+            skipShared  = dh + gm_ * qkp_;
+        }
+        barrier();
+
+        float decay  = decayShared;
+        float scaleT = sclShared;
+        float skipT  = skipShared;
+
+        uint vRowBase  = t * pc.nHead * pc.headDim + h * pc.headDim;
+        uint yRowBase  = vRowBase;
+        uint zRowBase  = vRowBase;
+        uint bcTokBase = t * bcTokStride;
+
+        // 2. Each thread strides over p in [0, headDim). The state update and
+        //    per-rank readout/contraction are independent across p, so we
+        //    fold them into one outer loop per thread.
+        for (uint p = tid; p < pc.headDim; p += WG_SIZE) {
+            float vp = v[vRowBase + p];
+            uint stateRowBase = stateHeadBase + p * pc.dState;
+
+            // 2a. State update: state[h, p, n] = decay * state[h, p, n] + vp * (Σ_r K_r[n]) * scl
+            for (uint n = 0u; n < pc.dState; n++) {
+                float kSum = 0.0;
+                for (uint r = 0u; r < pc.nRank; r++) {
+                    uint kIdx = bcTokBase + r * bcRankStride + h * bcHeadStride + n;
+                    kSum += kR[kIdx];
+                }
+                float s = decay * st[stateRowBase + n] + vp * (kSum * scaleT);
+                st[stateRowBase + n] = s;
+            }
+
+            // 2b. Per-rank readout + contraction.
+            float yFinal = 0.0;
+            for (uint r = 0u; r < pc.nRank; r++) {
+                uint qBase = bcTokBase + r * bcRankStride + h * bcHeadStride;
+                float yScanR = 0.0;
+                for (uint n = 0u; n < pc.dState; n++) {
+                    yScanR += qR[qBase + n] * st[stateRowBase + n];
+                }
+                float yR = yScanR + skipT * invRank * vp;
+
+                if (pc.hasZ != 0u) {
+                    uint mimoZIdx = mimoHeadBase + r * mimoRankStride + p;
+                    float zGated = z[zRowBase + p] * mz[mimoZIdx];
+                    float siluZ = zGated / (1.0 + exp(-zGated));
+                    yR *= siluZ;
+                }
+
+                uint mimoOIdx = mimoHeadBase + r * mimoRankStride + p;
+                yFinal += yR * mo[mimoOIdx];
+            }
+
+            y[yRowBase + p] = yFinal;
+        }
+
+        // 3. Barrier before thread 0 overwrites the shared values for next t.
+        barrier();
+    }
+}
