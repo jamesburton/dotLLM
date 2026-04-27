@@ -4,8 +4,8 @@ using DotLLM.Models.Architectures;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// Per-forward scratch buffers for the Mamba-3 SISO Vulkan path. Sized for the maximum
-/// <c>seqLen</c> seen so far; grows monotonically with <see cref="EnsureCapacity"/>.
+/// Per-forward scratch buffers for the Mamba-3 Vulkan path (SISO and MIMO). Sized for the
+/// maximum <c>seqLen</c> seen so far; grows monotonically with <see cref="EnsureCapacity"/>.
 /// Mirrors <see cref="VulkanNemotronHForwardState"/> in slot management but with the
 /// Mamba-3-specific scratch shapes (Proj, X, Z, Dt, Adt, Trap, Gamma, Scale, AnglesRaw,
 /// B, C, QkPreDot, YScan).
@@ -23,6 +23,12 @@ namespace DotLLM.Vulkan;
 /// The remaining scratch (HiddenState pair, NormOutput, BlockOut, Logits) is device-local —
 /// touched only by GPU kernels.
 /// </para>
+/// <para>
+/// <b>Rank-aware B / C.</b> The B and C buffers are sized at
+/// <c>seqLen · max(1, mimoRank) · n_head · d_state</c> so that a single allocation covers
+/// the canonical SISO <c>[T, H, N]</c> and MIMO <c>[T, R, H, N]</c> layouts. The MIMO
+/// scan kernel reads them with stride <c>R·H·N</c> per token; SISO collapses R=1 trivially.
+/// </para>
 /// </remarks>
 internal sealed class VulkanMamba3ForwardScratch : IDisposable
 {
@@ -31,7 +37,9 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
     private readonly int _dInProj;
     private readonly int _dInner;
     private readonly int _nHead;
-    private readonly int _bcWidth;          // n_head * d_state (SISO; r==1)
+    // n_head * effectiveRank * d_state — effectiveRank == max(1, mimoRank) so SISO
+    // (r==1) and MIMO share the same allocation footprint per token.
+    private readonly int _bcWidth;
     private readonly int _numRopeAngles;
     private readonly int _vocabSize;
 
@@ -61,8 +69,8 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
     public VulkanDevice.Buffer Gamma { get; private set; } = null!;            // [seqLen, n_head]
     public VulkanDevice.Buffer Scale { get; private set; } = null!;            // [seqLen, n_head]
     public VulkanDevice.Buffer AnglesRaw { get; private set; } = null!;        // [seqLen, num_rope_angles]
-    public VulkanDevice.Buffer B { get; private set; } = null!;                // [seqLen, n_head, d_state]
-    public VulkanDevice.Buffer C { get; private set; } = null!;                // [seqLen, n_head, d_state]
+    public VulkanDevice.Buffer B { get; private set; } = null!;                // [seqLen, R, n_head, d_state] (R=1 for SISO)
+    public VulkanDevice.Buffer C { get; private set; } = null!;                // [seqLen, R, n_head, d_state] (R=1 for SISO)
     public VulkanDevice.Buffer QkPreDot { get; private set; } = null!;         // [seqLen, n_head]
     public VulkanDevice.Buffer YScan { get; private set; } = null!;            // [seqLen, n_head, head_dim]
 
@@ -86,7 +94,10 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
         _dInProj = m3.InputProjectionDim;
         _dInner = m3.DInner;
         _nHead = m3.NumHeads;
-        _bcWidth = _nHead * m3.StateSize;     // SISO: r==1
+        // Rank-aware B/C width — SISO collapses R to 1; MIMO uses the canonical [T, R, H, N]
+        // layout the MIMO scan kernel expects.
+        int effectiveRank = m3.IsMimo ? m3.MimoRank : 1;
+        _bcWidth = _nHead * effectiveRank * m3.StateSize;
         _numRopeAngles = m3.NumRopeAngles;
         _vocabSize = config.VocabSize;
 

@@ -6,9 +6,9 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// Per-layer weight buffers on a Vulkan device for the Mamba-3 SISO model. Mirrors
-/// <see cref="VulkanNemotronHWeights"/>'s upload/lifetime pattern but with a single
-/// per-layer projection bundle (the Mamba-3 mixer tensors) rather than the three
+/// Per-layer weight buffers on a Vulkan device for the Mamba-3 model (SISO and MIMO).
+/// Mirrors <see cref="VulkanNemotronHWeights"/>'s upload/lifetime pattern but with a
+/// single per-layer projection bundle (the Mamba-3 mixer tensors) rather than the three
 /// hybrid sub-bundles of NemotronH.
 /// </summary>
 /// <remarks>
@@ -20,11 +20,14 @@ namespace DotLLM.Vulkan;
 /// Mamba-3 ingest is a follow-up.
 /// </para>
 /// <para>
-/// <b>SISO only.</b> <see cref="Upload(VulkanDevice, ModelConfig, Mamba3Weights)"/> rejects
-/// MIMO checkpoints (<see cref="Mamba3Config.IsMimo"/> is <c>true</c>) at the upload boundary
-/// so callers fail fast — the Mamba-3 SISO orchestrator does not consume <c>mimo_x</c> /
-/// <c>mimo_z</c> / <c>mimo_o</c> and the MIMO scan kernel is wired in by a follow-up
-/// commit (see <see cref="DotLLM.Vulkan.Kernels.Mamba3CanonicalSsdMimoF32Kernel"/>).
+/// <b>SISO and MIMO.</b> Both checkpoint flavours land here. SISO uploads the canonical
+/// 9 per-layer mixer tensors; MIMO additionally uploads the per-rank gate / output
+/// contraction weights (<c>mimo_z</c>, <c>mimo_o</c>) and lays <c>B_bias</c>/<c>C_bias</c>
+/// out as the rank-expanded <c>[num_heads, mimo_rank, state_size]</c> form the canonical
+/// MIMO scan expects. The canonical kernel folds <c>mimo_x</c> (V's per-rank expansion)
+/// into the rank-summed K·V state update inside <c>ExecuteMimo</c>, so the Vulkan side
+/// does not consume <c>mimo_x</c> directly — it lives on the CPU loader for compatibility
+/// with canonical checkpoints but is not uploaded.
 /// </para>
 /// </remarks>
 internal sealed class VulkanMamba3Weights : IDisposable
@@ -52,12 +55,21 @@ internal sealed class VulkanMamba3Weights : IDisposable
         public required VulkanDevice.Buffer D { get; init; }
         public required VulkanDevice.Buffer DtBias { get; init; }
 
+        // MIMO-only per-rank weights (null on a SISO layer). The MIMO scan kernel needs
+        // both bound when nRank > 1 — the canonical kernel folds mimo_x into the rank-
+        // summed state update, so it is intentionally NOT mirrored on the device.
+        public VulkanDevice.Buffer? MimoZ { get; init; }
+        public VulkanDevice.Buffer? MimoO { get; init; }
+
         public required int InProjOutputDim { get; init; }
         public required int InProjInputDim { get; init; }
         public required int OutProjOutputDim { get; init; }
         public required int OutProjInputDim { get; init; }
 
         // Host-side mirrors of the tiny tensors consumed by the per-token CPU prep.
+        // BBiasHost / CBiasHost are sized to nHead * effectiveRank * dState — for SISO
+        // that is nHead * dState; for MIMO it is nHead * mimoRank * dState laid out
+        // [H, R, N] row-major (matches Mamba3Block.ForwardMimo's bias indexing).
         public required float[] BNormHost { get; init; }
         public required float[] CNormHost { get; init; }
         public required float[] BBiasHost { get; init; }
@@ -75,6 +87,8 @@ internal sealed class VulkanMamba3Weights : IDisposable
             CBias.Dispose();
             D.Dispose();
             DtBias.Dispose();
+            MimoZ?.Dispose();
+            MimoO?.Dispose();
         }
     }
 
@@ -112,14 +126,13 @@ internal sealed class VulkanMamba3Weights : IDisposable
     }
 
     /// <summary>
-    /// Uploads a Mamba-3 SISO model's weights to the Vulkan device. Every tensor handle
-    /// in <paramref name="weights"/> must be populated and F32 — <see cref="Mamba3WeightLoader"/>
-    /// already enforces F32 at load time, so this is a straight memcpy upload.
+    /// Uploads a Mamba-3 model's weights (SISO or MIMO) to the Vulkan device. Every tensor
+    /// handle in <paramref name="weights"/> must be populated and F32 —
+    /// <see cref="Mamba3WeightLoader"/> already enforces F32 at load time, so this is a
+    /// straight memcpy upload.
     /// </summary>
-    /// <exception cref="NotSupportedException">
-    /// The supplied <paramref name="config"/> describes a MIMO checkpoint
-    /// (<c>nRank &gt; 1</c>). MIMO scan wires in via a follow-up commit; the current path
-    /// is SISO only.
+    /// <exception cref="ArgumentException">
+    /// The supplied <paramref name="config"/> requests a non-positive MIMO rank.
     /// </exception>
     public static VulkanMamba3Weights Upload(
         VulkanDevice device, ModelConfig config, Mamba3Weights weights)
@@ -133,9 +146,11 @@ internal sealed class VulkanMamba3Weights : IDisposable
                 "ModelConfig.Mamba3Config must be populated for VulkanMamba3Weights.",
                 nameof(config));
 
-        if (m3.IsMimo)
-            throw new NotSupportedException(
-                "MIMO scan wires in via follow-up commit; current path is SISO only.");
+        bool isMimo = m3.IsMimo;
+        int mimoRank = isMimo ? m3.MimoRank : 1;
+        if (mimoRank < 1)
+            throw new ArgumentException(
+                $"Mamba3Config.MimoRank must be >= 1 (got {mimoRank}).", nameof(config));
 
         if (weights.Report.HasMissingRequired)
             throw new InvalidDataException(
@@ -147,11 +162,19 @@ internal sealed class VulkanMamba3Weights : IDisposable
         int dInner = m3.DInner;
         int dState = m3.StateSize;
         int nHead = m3.NumHeads;
+        int headDim = m3.HeadDim;
         int dInProj = m3.InputProjectionDim;
+
+        // Per-layer rank-aware bias element count. SISO: H * 1 * N == H * N. MIMO:
+        // H * R * N (canonical [H, R, N] layout, validated by the loader).
+        int bcBiasElems = nHead * mimoRank * dState;
+        // mimo_z / mimo_o per-layer element count when MIMO is on.
+        int mimoElems = nHead * mimoRank * headDim;
 
         // Largest single matrix we will upload, in its F32 form. Used to size the
         // staging buffer once and reuse it across every device-local copy.
-        long maxBytes = ComputeMaxStagingBytes(numLayers, hidden, vocab, dInner, dState, nHead, dInProj);
+        long maxBytes = ComputeMaxStagingBytes(
+            numLayers, hidden, vocab, dInner, dState, nHead, dInProj, bcBiasElems, mimoElems);
         using var staging = device.Allocate(maxBytes);
 
         long totalBytes = 0;
@@ -180,14 +203,29 @@ internal sealed class VulkanMamba3Weights : IDisposable
             var outProj = UploadTensor(device, staging, lw.OutProj, (long)hidden * dInner, out long outProjBytes);
             var bNorm = UploadTensor(device, staging, lw.BNorm, dState, out long bNormBytes);
             var cNorm = UploadTensor(device, staging, lw.CNorm, dState, out long cNormBytes);
-            // Bias shape on disk is [n_head, 1, d_state] — element count nHead * dState.
-            var bBias = UploadTensor(device, staging, lw.BBias, (long)nHead * dState, out long bBiasBytes);
-            var cBias = UploadTensor(device, staging, lw.CBias, (long)nHead * dState, out long cBiasBytes);
+            // Bias shape on disk: SISO [n_head, 1, d_state] (element count H·N), MIMO
+            // [n_head, mimo_rank, d_state] (element count H·R·N). Element count is the
+            // only thing the upload path cares about — the rank-expanded slot ordering
+            // is preserved verbatim by the row-major copy.
+            var bBias = UploadTensor(device, staging, lw.BBias, bcBiasElems, out long bBiasBytes);
+            var cBias = UploadTensor(device, staging, lw.CBias, bcBiasElems, out long cBiasBytes);
             var d = UploadTensor(device, staging, lw.D, nHead, out long dBytes);
             var dtBias = UploadTensor(device, staging, lw.DtBias, nHead, out long dtBytes);
 
             totalBytes += normBytes + inProjBytes + outProjBytes + bNormBytes + cNormBytes
                         + bBiasBytes + cBiasBytes + dBytes + dtBytes;
+
+            VulkanDevice.Buffer? mimoZ = null;
+            VulkanDevice.Buffer? mimoO = null;
+            if (isMimo)
+            {
+                mimoZ = UploadTensor(device, staging, lw.MimoZ, mimoElems, out long mzBytes);
+                mimoO = UploadTensor(device, staging, lw.MimoO, mimoElems, out long moBytes);
+                totalBytes += mzBytes + moBytes;
+                // mimo_x is intentionally not uploaded — the canonical MIMO scan folds
+                // its V-rank expansion into the rank-summed K·V state update inside
+                // ExecuteMimo (mirrored by Mamba3CanonicalSsdMimoF32Kernel).
+            }
 
             var lb = new LayerBuffers
             {
@@ -197,11 +235,12 @@ internal sealed class VulkanMamba3Weights : IDisposable
                 BNorm = bNorm, CNorm = cNorm,
                 BBias = bBias, CBias = cBias,
                 D = d, DtBias = dtBias,
+                MimoZ = mimoZ, MimoO = mimoO,
                 // Host-side mirrors of the small tensors the per-token CPU prep reads.
                 BNormHost = SnapshotHost(lw.BNorm, dState),
                 CNormHost = SnapshotHost(lw.CNorm, dState),
-                BBiasHost = SnapshotHost(lw.BBias, nHead * dState),
-                CBiasHost = SnapshotHost(lw.CBias, nHead * dState),
+                BBiasHost = SnapshotHost(lw.BBias, bcBiasElems),
+                CBiasHost = SnapshotHost(lw.CBias, bcBiasElems),
                 DtBiasHost = SnapshotHost(lw.DtBias, nHead),
             };
             layers[i] = lb;
@@ -215,16 +254,18 @@ internal sealed class VulkanMamba3Weights : IDisposable
     }
 
     private static long ComputeMaxStagingBytes(
-        int numLayers, int hidden, int vocab, int dInner, int dState, int nHead, int dInProj)
+        int numLayers, int hidden, int vocab, int dInner, int dState, int nHead, int dInProj,
+        int bcBiasElems, int mimoElems)
     {
         long max = 0;
         max = Math.Max(max, (long)vocab * hidden * sizeof(float));            // token embed / lm_head
         max = Math.Max(max, (long)dInProj * hidden * sizeof(float));          // in_proj
         max = Math.Max(max, (long)hidden * dInner * sizeof(float));           // out_proj
-        max = Math.Max(max, (long)nHead * dState * sizeof(float));            // bias
+        max = Math.Max(max, (long)bcBiasElems * sizeof(float));               // B_bias / C_bias (rank-aware)
         max = Math.Max(max, (long)hidden * sizeof(float));                    // norms
         max = Math.Max(max, (long)dState * sizeof(float));                    // bc_norm
         max = Math.Max(max, (long)nHead * sizeof(float));                     // d, dt_bias
+        max = Math.Max(max, (long)mimoElems * sizeof(float));                 // mimo_z / mimo_o
         return Math.Max(max, 64);
     }
 
