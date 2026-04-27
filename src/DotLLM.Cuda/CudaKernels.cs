@@ -1463,7 +1463,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <item>k &lt; 1024: MMQ-4-rows kernel — 4 rows per block, 256 threads, cross-row reduction.
     /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
     /// </list>
-    /// Supports Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
+    /// Supports Q2_K, Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
+    /// Q2_K has no MMVQ-large or pre-Q8_1 variant yet, so it always uses the
+    /// on-the-fly MMQ path regardless of k or preqScratch.
     /// On-the-fly Stage 1 input quantization. Use the overload taking a <c>preqScratch</c>
     /// pointer for the pre-Q8_1 path (eliminates per-block redundant Stage 1).
     /// </summary>
@@ -1540,6 +1542,9 @@ public sealed unsafe class CudaKernels : IDisposable
             }
         }
 
+        // NOTE: Q2_K not in the usePreq switch — its _preq variant ships in
+        // Phase 1 Task 5. Until then Q2_K silently falls back to the on-the-fly
+        // path (which is correct, just slightly more work per call).
         nint func = usePreq
             ? qt switch
             {

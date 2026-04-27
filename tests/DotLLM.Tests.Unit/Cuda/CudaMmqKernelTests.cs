@@ -35,7 +35,7 @@ public class CudaMmqKernelTests
     [InlineData(4, 256)]    // 1 superblock × few rows (smaller than MMQ_ROWS_PER_BLOCK)
     [InlineData(8, 512)]    // 2 superblocks × MMQ_ROWS_PER_BLOCK × 2 blocks
     [InlineData(64, 1024)]  // 4 superblocks × many rows
-    [InlineData(2048, 2048)] // Llama-70B-class shape stress test
+    [InlineData(2048, 2048)] // Multi-superblock × multi-row stress (8 sb/row × 512 rows)
     public void MmqQ2K_MatchesLegacyWithinTolerance(int n, int k)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
