@@ -130,6 +130,21 @@ public class CudaMmqKernelTests
     // GEMV outputs should agree to within FP16 add-order noise.
 
     [SkippableTheory]
+    [InlineData(4, 256)]
+    [InlineData(8, 512)]
+    [InlineData(64, 1024)]
+    [InlineData(2048, 2048)]
+    public void PreqQ2K_MatchesOnTheFly(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        // Q2_K has no MMVQ-large variant yet — _preq always routes through the
+        // MMQ-4-rows path. Shapes mirror MmqQ2K_MatchesLegacyWithinTolerance so
+        // we cover the same coverage envelope as the on-the-fly tests.
+        RunPreqEquivalence(QuantizationType.Q2_K, n, k, blockBytes: 84,
+            (rng, span) => SynthesiseQ2KBlock(rng, span));
+    }
+
+    [SkippableTheory]
     [InlineData(64, 1024)]    // small-k path (MMQ-4-rows preq)
     [InlineData(4096, 4096)]  // large-k path (MMVQ-large preq)
     [InlineData(24576, 4096)] // Qwen3-8B fused gate+up shape

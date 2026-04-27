@@ -58,6 +58,7 @@ public sealed unsafe class CudaKernels : IDisposable
     // Stage 1 work that scales with output dim n (n× for MMVQ-large, n/4× for MMQ-4-rows).
     private readonly CudaModule? _quantizeXModule;
     private readonly nint _quantizeXToQ8_1Func;
+    private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ6_KMmqPreqFunc;
@@ -266,6 +267,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
             // Pre-quantized GEMV variants (consume scratch from quantize_x.ptx kernel).
             // TryGetFunction so a stale PTX without the new symbols still loads.
+            _quantizedGemvQ2_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq_preq");
             _quantizedGemvQ4_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_preq");
             _quantizedGemvQ5_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq_preq");
             _quantizedGemvQ6_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq_preq");
@@ -1464,8 +1466,7 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
     /// </list>
     /// Supports Q2_K, Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
-    /// Q2_K has no MMVQ-large or pre-Q8_1 variant yet, so it always uses the
-    /// on-the-fly MMQ path regardless of k or preqScratch.
+    /// Q2_K has no MMVQ-large variant yet (only on-the-fly + pre-Q8_1 paths).
     /// On-the-fly Stage 1 input quantization. Use the overload taking a <c>preqScratch</c>
     /// pointer for the pre-Q8_1 path (eliminates per-block redundant Stage 1).
     /// </summary>
@@ -1542,12 +1543,10 @@ public sealed unsafe class CudaKernels : IDisposable
             }
         }
 
-        // NOTE: Q2_K not in the usePreq switch — its _preq variant ships in
-        // Phase 1 Task 5. Until then Q2_K silently falls back to the on-the-fly
-        // path (which is correct, just slightly more work per call).
         nint func = usePreq
             ? qt switch
             {
+                QuantizationType.Q2_K => _quantizedGemvQ2_KMmqPreqFunc,
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc,
