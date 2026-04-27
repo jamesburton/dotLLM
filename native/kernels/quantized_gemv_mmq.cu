@@ -1290,6 +1290,121 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 // sums identically to Q6_K's existing in-kernel Stage 1.
 // ============================================================================
 
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    if (row_base >= n) return;
+    const int rows_in_block = (n - row_base) < MMQ_ROWS_PER_BLOCK
+                                  ? (n - row_base)
+                                  : MMQ_ROWS_PER_BLOCK;
+
+    const int superblocks_per_row = k / 256;
+
+    __shared__ float s_acc[MMQ_ROWS_PER_BLOCK * 256];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MMQ_ROWS_PER_BLOCK; r++)
+        s_acc[r * 256 + tid] = 0.0f;
+
+    __syncthreads();
+
+    // Stage 2: dp4a accumulation. Same shape as quantized_gemv_q2_k_mmq's Stage 2,
+    // except the per-chunk INT8 packs / dx / per-half-chunk sums come from device
+    // scratch populated upstream by quantize_x_to_q8_1 (matching Q6_K's layout).
+    const int total_units = rows_in_block * superblocks_per_row;
+
+    for (int unit = tid; unit < total_units; unit += blockDim.x)
+    {
+        int r = unit / superblocks_per_row;
+        int sb = unit % superblocks_per_row;
+        int row = row_base + r;
+
+        const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 84;
+        const uint8_t* block = w_row + sb * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        float d    = __half2float(*reinterpret_cast<const half*>(block + 80));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
+
+        float row_acc = 0.0f;
+
+        // 8 chunks per super-block, each chunk covers 2 sub-blocks (isc=0,1).
+        #pragma unroll
+        for (int q_quad = 0; q_quad < 8; q_quad++)
+        {
+            int chunk_idx = sb * 8 + q_quad;
+            const uint8_t* chunk_qs = qs + q_quad * 8;   // 8 bytes = 2 sub-blocks of 4 bytes
+
+            #pragma unroll
+            for (int isc = 0; isc < 2; isc++)
+            {
+                int sub = q_quad * 2 + isc;              // sub-block index 0..15
+                int sc  = scales[sub] & 0x0F;            // 4-bit scale
+                int dm  = (scales[sub] >> 4) & 0x0F;     // 4-bit dmin coef
+
+                const uint8_t* sub_qs = chunk_qs + isc * 4;   // 4 bytes for this sub-block
+                int l_base = isc * 16;
+                const int8_t* xq = xq_in + chunk_idx * 32 + l_base;
+
+                int dot = 0;
+                // 16 elements / 4 per dp4a = 4 dp4a calls. Each byte qs[g] holds 4
+                // consecutive 2-bit values at bit offsets 0,2,4,6.
+                #pragma unroll
+                for (int g = 0; g < 4; g++)
+                {
+                    uint32_t qbyte = sub_qs[g];
+                    int q0 = (int)((qbyte >> 0) & 0x3);
+                    int q1 = (int)((qbyte >> 2) & 0x3);
+                    int q2v = (int)((qbyte >> 4) & 0x3);
+                    int q3 = (int)((qbyte >> 6) & 0x3);
+                    int wpack = (q0 & 0xFF)
+                              | ((q1 & 0xFF) << 8)
+                              | ((q2v & 0xFF) << 16)
+                              | ((q3 & 0xFF) << 24);
+                    int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
+                    dot = __dp4a(wpack, xpack, dot);
+                }
+
+                float dx = __half2float(dx_in[chunk_idx]);
+                float sx = __half2float(sx2_in[chunk_idx * 2 + isc]);
+
+                // Per-element identity:
+                //   Σ (d*sc*q - dmin*dm) * x  ≈  dx * (d*sc * Σ q*xq  -  dmin*dm * Σ xq)
+                row_acc += dx * (d * (float)sc * (float)dot - dmin * (float)dm * sx);
+            }
+        }
+
+        s_acc[r * 256 + tid] += row_acc;
+    }
+    __syncthreads();
+
+    // Stage 3: per-row reduction (same shape as Q4_K/Q5_K/Q6_K _preq).
+    if (warp_id < rows_in_block)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            v += s_acc[warp_id * 256 + i * 32 + lane];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+
+        if (lane == 0)
+            y[row_base + warp_id] = __float2half(v);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq_preq(
     const uint8_t* __restrict__ weight,
     const int8_t*  __restrict__ xq_in,
