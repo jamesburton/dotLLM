@@ -215,6 +215,7 @@ public sealed unsafe class CudaKernels : IDisposable
     // projection. Optional — PTX may be missing on stale builds; HasMoeGroupedGemv
     // reports false and CudaMoeFfn falls back to the per-expert path.
     private readonly CudaModule? _moeGroupedGemvModule;
+    private readonly nint _moeGroupedGemvQ2_KFunc;
     private readonly nint _moeGroupedGemvQ4_KFunc;
     private readonly nint _moeGroupedGemvQ5_KFunc;
     private readonly nint _moeGroupedGemvQ6_KFunc;
@@ -461,6 +462,7 @@ public sealed unsafe class CudaKernels : IDisposable
         if (File.Exists(moeGroupedGemvPath))
         {
             _moeGroupedGemvModule = CudaModule.LoadFromFile(moeGroupedGemvPath);
+            _moeGroupedGemvQ2_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q2_k_f16");
             _moeGroupedGemvQ4_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q4_k_f16");
             _moeGroupedGemvQ5_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q5_k_f16");
             _moeGroupedGemvQ6_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q6_k_f16");
@@ -502,6 +504,12 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
 
+    /// <summary>True when the Phase-B Q2_K grouped-GEMV kernel is loaded (PTX present).</summary>
+    /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
+    /// fallback for A/B comparison.</remarks>
+    public bool HasMoeGroupedGemvQ2K =>
+        _moeGroupedGemvQ2_KFunc != 0 && !DisableMoeGroupedGemv;
+
     /// <summary>True when the Phase-B Q4_K grouped-GEMV kernel is loaded (PTX present).</summary>
     /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
     /// fallback for A/B comparison.</remarks>
@@ -528,6 +536,7 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>True when a grouped-GEMV kernel is available for the given quant type.</summary>
     public bool HasMoeGroupedGemv(QuantizationType qt) => qt switch
     {
+        QuantizationType.Q2_K => HasMoeGroupedGemvQ2K,
         QuantizationType.Q4_K => HasMoeGroupedGemvQ4K,
         QuantizationType.Q5_K => HasMoeGroupedGemvQ5K,
         QuantizationType.Q6_K => HasMoeGroupedGemvQ6K,
@@ -1312,6 +1321,7 @@ public sealed unsafe class CudaKernels : IDisposable
 
         nint func = qt switch
         {
+            QuantizationType.Q2_K => _moeGroupedGemvQ2_KFunc,
             QuantizationType.Q4_K => _moeGroupedGemvQ4_KFunc,
             QuantizationType.Q5_K => _moeGroupedGemvQ5_KFunc,
             QuantizationType.Q6_K => _moeGroupedGemvQ6_KFunc,
