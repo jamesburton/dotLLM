@@ -103,6 +103,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _convertF16ToF32Func;
     private readonly nint _convertF32ToF16Func;
     private readonly nint _quantizedGemvQ8_0Func;
+    private readonly nint _quantizedGemvQ2_KFunc;
     private readonly nint _quantizedGemvQ4_KFunc;
     private readonly nint _quantizedGemvQ5_0Func;
     private readonly nint _quantizedGemvQ5_KFunc;
@@ -334,6 +335,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _convertF16ToF32Func = _convertModule.GetFunction("convert_f16_to_f32");
         _convertF32ToF16Func = _convertModule.GetFunction("convert_f32_to_f16");
         _quantizedGemvQ8_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q8_0");
+        // Q2_K is optional — older PTX builds may not have it.
+        _quantizedGemvQ2_KFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_q2_k");
         _quantizedGemvQ4_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q4_k");
         _quantizedGemvQ5_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q5_0");
         _quantizedGemvQ5_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q5_k");
@@ -1222,6 +1225,7 @@ public sealed unsafe class CudaKernels : IDisposable
         nint func = qt switch
         {
             QuantizationType.Q8_0 => _quantizedGemvQ8_0Func,
+            QuantizationType.Q2_K => _quantizedGemvQ2_KFunc,
             QuantizationType.Q4_K => _quantizedGemvQ4_KFunc,
             QuantizationType.Q5_0 => _quantizedGemvQ5_0Func,
             QuantizationType.Q5_K => _quantizedGemvQ5_KFunc,
@@ -1242,7 +1246,8 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Whether a quantization type has a custom quantized GEMV kernel.</summary>
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
-            or QuantizationType.Q5_K or QuantizationType.Q6_K;
+            or QuantizationType.Q5_K or QuantizationType.Q6_K
+            or QuantizationType.Q2_K;
 
     /// <summary>
     /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
@@ -1264,7 +1269,8 @@ public sealed unsafe class CudaKernels : IDisposable
             or QuantizationType.Q5_0 or QuantizationType.Q5_1
             or QuantizationType.Q8_0 => 32,
         QuantizationType.Q3_K or QuantizationType.Q4_K
-            or QuantizationType.Q5_K or QuantizationType.Q6_K => 256,
+            or QuantizationType.Q5_K or QuantizationType.Q6_K
+            or QuantizationType.Q2_K => 256,
         _ => int.MaxValue,  // unsupported types — gate always fails
     };
 

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
 using Xunit;
@@ -46,6 +47,7 @@ public class CudaQuantizedGemvAlignmentTests
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q5_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q6_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q3_K));
+        Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q2_K));
     }
 
     /// <summary>
@@ -187,6 +189,111 @@ public class CudaQuantizedGemvAlignmentTests
             }
             y[row] = acc;
         }
+    }
+
+    [SkippableTheory]
+    [InlineData(QuantizationType.Q2_K, 2048, 2048, 84)]
+    [InlineData(QuantizationType.Q2_K, 2048, 1024, 84)]
+    [InlineData(QuantizationType.Q2_K, 256, 256, 84)]
+    public void GemvKQuantMatchesScalarReference(
+        QuantizationType qt, int M, int K, int blockBytes)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGemvVsScalarKQuant(qt, M, K, blockBytes);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunGemvVsScalarKQuant(QuantizationType qt, int M, int K, int blockBytes)
+    {
+        // Test infrastructure for K-quants (block_size=256). Mirrors RunGemvVsScalar
+        // structurally but iterates over superblocks (K/256) per row, dequants the
+        // whole row to F32 via Dequantize.ToFloat32 as the scalar oracle.
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(CudaKernels.HasQuantizedGemv(qt), $"No GEMV kernel for {qt}");
+        Assert.Equal(0, K % 256);
+
+        int sbPerRow = K / 256;
+        long rowBytes = (long)sbPerRow * blockBytes;
+        long weightBytes = (long)M * rowBytes;
+        var rng = new Random(0xBEEF ^ (int)qt ^ M ^ K);
+
+        byte[] hostW = new byte[weightBytes];
+        rng.NextBytes(hostW);
+        // Per-super-block: write d/dmin halves at known offset (Q2_K: +80/+82)
+        unsafe {
+            fixed (byte* p = hostW) {
+                for (int row = 0; row < M; row++) {
+                    for (int sb = 0; sb < sbPerRow; sb++) {
+                        byte* blk = p + row * rowBytes + sb * blockBytes;
+                        if (qt == QuantizationType.Q2_K) {
+                            *(Half*)(blk + 80) = (Half)((rng.NextDouble() - 0.5) * 0.04);
+                            *(Half*)(blk + 82) = (Half)((rng.NextDouble() - 0.5) * 0.02);
+                        }
+                    }
+                }
+            }
+        }
+
+        Half[] hostX = new Half[K];
+        for (int i = 0; i < K; i++) {
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = 1.0 - rng.NextDouble();
+            double g = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            hostX[i] = (Half)(g * 0.4);
+        }
+
+        // Scalar reference: dequant whole row → F32 dot.
+        float[] yRef = new float[M];
+        float[] xF32 = new float[K];
+        for (int i = 0; i < K; i++) xF32[i] = (float)hostX[i];
+        unsafe {
+            fixed (byte* p = hostW) {
+                float[] rowDequant = new float[K];
+                for (int row = 0; row < M; row++) {
+                    DotLLM.Cpu.Kernels.Dequantize.ToFloat32((nint)(p + row * rowBytes), K, qt, rowDequant);
+                    float acc = 0;
+                    for (int i = 0; i < K; i++) acc += rowDequant[i] * xF32[i];
+                    yRef[row] = acc;
+                }
+            }
+        }
+
+        // GPU GEMV
+        long xBytes = (long)K * sizeof(ushort);
+        long yBytes = (long)M * sizeof(ushort);
+        nint devW = 0, devX = 0, devY = 0;
+        Half[] yGpu = new Half[M];
+        try {
+            CudaDriverApi.cuMemAlloc_v2(out devW, (nuint)weightBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devX, (nuint)xBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devY, (nuint)yBytes).ThrowOnError();
+            unsafe {
+                fixed (byte* pW = hostW) CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)pW, (nuint)weightBytes).ThrowOnError();
+                fixed (Half* pX = hostX) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)pX, (nuint)xBytes).ThrowOnError();
+            }
+            kernels.LaunchQuantizedGemv(devW, qt, devX, devY, M, K, stream.Handle);
+            stream.Synchronize();
+            unsafe { fixed (Half* p = yGpu) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devY, (nuint)yBytes).ThrowOnError(); }
+        }
+        finally {
+            if (devW != 0) CudaDriverApi.cuMemFree_v2(devW);
+            if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
+            if (devY != 0) CudaDriverApi.cuMemFree_v2(devY);
+        }
+
+        float maxAbs = 0f, refMax = 0f;
+        for (int i = 0; i < M; i++) {
+            float diff = MathF.Abs((float)yGpu[i] - yRef[i]);
+            if (diff > maxAbs) maxAbs = diff;
+            if (MathF.Abs(yRef[i]) > refMax) refMax = MathF.Abs(yRef[i]);
+        }
+        _out.WriteLine($"{qt} M={M} K={K}: ref|max|={refMax:F3} max-abs-diff={maxAbs:F5}");
+        Assert.True(maxAbs < 0.05f,
+            $"K-quant GEMV diverges from scalar reference (max-abs-diff={maxAbs}, refMax={refMax}).");
     }
 
     private static string? FindPtxDir()

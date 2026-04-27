@@ -62,6 +62,79 @@ extern "C" __global__ void __launch_bounds__(256) quantized_gemv_q8_0(
         y[row] = __float2half(acc);
 }
 
+// ── Q2_K: 84 bytes per 256 values ──────────────────────────────────
+// struct block_q2_K { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; };
+//   scales: 16 × (4-bit scale | 4-bit dmin coef), one byte per sub-block of 16 elements
+//   qs:     2 bits per element (256 elements × 2 bits = 64 bytes)
+//   d:      FP16 super-block delta
+//   dmin:   FP16 super-block min delta
+// Per-element value: d × sc[sub] × q2 − dmin × dm[sub]
+// Identity: Σ_i (d·sc[sub_i]·q2[i] − dmin·dm[sub_i]) · x[i]
+//         = Σ_sub d·sc[sub] · Σ_j q2·x  −  dmin·dm[sub] · Σ_j x
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 84;
+
+    float acc = 0.0f;
+
+    for (int sb = threadIdx.x; sb < superblocks_per_row; sb += blockDim.x)
+    {
+        const uint8_t* block = w_row + sb * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        float d = __half2float(*reinterpret_cast<const half*>(block + 80));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 82));
+
+        // 16 sub-blocks of 16 elements
+        for (int sub = 0; sub < 16; sub++) {
+            int sc = scales[sub] & 0xF;
+            int dm = (scales[sub] >> 4) & 0xF;
+
+            float sub_acc = 0.0f;
+            float xsum_sub = 0.0f;
+            #pragma unroll 16
+            for (int j = 0; j < 16; j++) {
+                int t = sub * 16 + j;
+                int byte_idx = t >> 2;
+                int bit_off = (t & 0x3) << 1;
+                int q2 = (qs[byte_idx] >> bit_off) & 0x3;
+                float xv = __half2float(x[sb * 256 + t]);
+                sub_acc += (float)q2 * xv;
+                xsum_sub += xv;
+            }
+            acc += d * (float)sc * sub_acc - dmin * (float)dm * xsum_sub;
+        }
+    }
+
+    // Warp reduction
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+    if (threadIdx.x == 0) y[row] = __float2half(acc);
+}
+
 // ── Q4_K: 144 bytes per 256 values ──────────────────────────────────
 
 extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k(
