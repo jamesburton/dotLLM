@@ -227,6 +227,16 @@ public static class HfConfigExtractor
             RopeScalingOriginalMaxPositionEmbeddings = scalingOriginalMax,
             RopeScalingBetaFast = betaFast,
             RopeScalingBetaSlow = betaSlow,
+            // DeepSeek-V2 / V3 are designed around the latent KV cache.
+            // Phase C (hybrid: latent persistence + Phase A-equivalent
+            // prefill expand + absorbed decode) is the production-shipping
+            // path; Phase A's eager full-expansion cache scales as
+            // O(numLayers * maxSeqLen * numHeads * (qkNope + v) * 4 bytes)
+            // which for DeepSeek-V2-Lite at max_position_embeddings=163840
+            // is ~68 GB and OOMs on most hosts. Phase C scales as
+            // O(numLayers * maxSeqLen * (kvLoraRank + qkRope) * 4 bytes)
+            // ≈ 9 GB for the same model — within budget.
+            UseHybridMlaCache = true,
         };
     }
 
