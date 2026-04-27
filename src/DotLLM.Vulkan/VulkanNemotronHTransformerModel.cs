@@ -67,6 +67,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly SsmDSkipF32Kernel _ssmDSkip;
     private readonly GroupRmsNormF32Kernel _groupRmsNorm;
     private readonly ReluSquaredInplaceF32Kernel _reluSquared;
+    private readonly SsmSplitXbcF32Kernel _ssmSplitXbc;
 
     private readonly VulkanDevice.SubmitContext _submit;
     private readonly bool _ownsDevice;
@@ -103,6 +104,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
+        SsmSplitXbcF32Kernel ssmSplitXbc,
         VulkanDevice.SubmitContext submit,
         int ropeDim, float ropeTheta)
     {
@@ -134,6 +136,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ssmDSkip = ssmDSkip;
         _groupRmsNorm = groupRmsNorm;
         _reluSquared = reluSquared;
+        _ssmSplitXbc = ssmSplitXbc;
 
         _submit = submit;
         _ropeDim = ropeDim;
@@ -247,6 +250,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var ssmDSkip = SsmDSkipF32Kernel.Create(device, spvDir);
         var groupRmsNorm = GroupRmsNormF32Kernel.Create(device, spvDir);
         var reluSquared = ReluSquaredInplaceF32Kernel.Create(device, spvDir);
+        var ssmSplitXbc = SsmSplitXbcF32Kernel.Create(device, spvDir);
 
         var submit = device.CreateSubmitContext();
 
@@ -257,6 +261,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             rmsnorm, rope, attention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
+            ssmSplitXbc,
             submit,
             ropeDim, ropeTheta);
     }
@@ -453,34 +458,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         _biasAdd.Record(cmdBuf, _state.DtBuf, ssmW.DtBias, seqLen, nHead);
-        // The mamba2Scan call below is the consumer of DtBuf; the unrelated transfer copies
-        // into SsmX/B/C below run in parallel — barrier the bias-add against the scan.
+        // The mamba2Scan call below is the consumer of DtBuf; the split kernel below
+        // doesn't touch DtBuf, so it can run concurrently. The compute→compute barrier
+        // after the split kernel covers both the bias_add → scan and split → scan deps.
 
         // 7. Split XBC[t, :] into SsmX[t, 0..dInner], SsmB[t, 0..bcDim], SsmC[t, 0..bcDim].
-        //    Per-token transfer copies — XBC's row is laid out as [x | B | C].
-        KernelSupport.ComputeToTransferBarrier(cmdBuf);
-        long xbcRowBytes = (long)convDim * sizeof(float);
-        long ssmXRowBytes = (long)dInner * sizeof(float);
-        long bcRowBytes = (long)bcDim * sizeof(float);
-        for (int t = 0; t < seqLen; t++)
-        {
-            ulong srcRowBase = (ulong)((long)t * xbcRowBytes);
-            // x slice
-            RecordCopyBufferRange(cmdBuf, _state.XBC, _state.SsmX,
-                srcOffset: srcRowBase, dstOffset: (ulong)((long)t * ssmXRowBytes),
-                size: (ulong)ssmXRowBytes);
-            // B slice
-            RecordCopyBufferRange(cmdBuf, _state.XBC, _state.SsmB,
-                srcOffset: srcRowBase + (ulong)((long)dInner * sizeof(float)),
-                dstOffset: (ulong)((long)t * bcRowBytes),
-                size: (ulong)bcRowBytes);
-            // C slice
-            RecordCopyBufferRange(cmdBuf, _state.XBC, _state.SsmC,
-                srcOffset: srcRowBase + (ulong)(((long)dInner + bcDim) * sizeof(float)),
-                dstOffset: (ulong)((long)t * bcRowBytes),
-                size: (ulong)bcRowBytes);
-        }
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        //    XBC's row is laid out as [x | B | C]. One fused compute dispatch
+        //    replaces the previous per-token loop of 3 vkCmdCopyBuffer regions
+        //    (one each for x, B, C) — same math, no transfer↔compute stage
+        //    transition, dispatch count drops from O(3·seqLen) to 1 per SSM
+        //    layer. Bit-equal to the per-token-copy path (pure F32 strided
+        //    load/store, no FP arithmetic).
+        _ssmSplitXbc.Record(cmdBuf, _state.XBC, _state.SsmX, _state.SsmB, _state.SsmC,
+            seqLen: seqLen, dInner: dInner, bcDim: bcDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 8. Mamba2 selective scan: state, SsmX, DtBuf, A, SsmB, SsmC -> SsmY.
         _mamba2Scan.Record(cmdBuf, ssmStateBuf, _state.SsmX, _state.DtBuf, ssmW.A,
@@ -495,6 +486,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // 10. Extract z = Zxbcdt[t, 0..dInner] into SsmZ, then SwiGLU(SsmZ, SsmY) → SsmY.
         //     Per-token copy of dInner-wide slice from row offset 0.
+        long ssmXRowBytes = (long)dInner * sizeof(float);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
         for (int t = 0; t < seqLen; t++)
         {
@@ -623,6 +615,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ssmDSkip.InvalidateDescriptorCache();
         _groupRmsNorm.InvalidateDescriptorCache();
         _reluSquared.InvalidateDescriptorCache();
+        _ssmSplitXbc.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -721,6 +714,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _weights.Dispose();
         _ssmCache.Dispose();
 
+        _ssmSplitXbc.Dispose();
         _reluSquared.Dispose();
         _groupRmsNorm.Dispose();
         _ssmDSkip.Dispose();
