@@ -297,6 +297,26 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Test-only factory that loads a model from already-built CPU
+    /// <see cref="TransformerWeights"/>. Used by parity tests that need to inject
+    /// Q8_0 overlays onto <see cref="MoeLayerWeights"/> before the Vulkan upload —
+    /// the safetensors loader currently upcasts every MoE projection to F32, so
+    /// production code paths can't carry a Q8_0 MoE projection through to Vulkan
+    /// without this hook.
+    /// </summary>
+    internal static VulkanTransformerModel BuildFromPrebuiltWeights(
+        VulkanDevice device, ModelConfig config, TransformerWeights cpuWeights, string spvDir)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(cpuWeights);
+        ArgumentNullException.ThrowIfNull(spvDir);
+
+        RejectUnsupportedArchitecture(config);
+        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null);
+    }
+
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
@@ -958,12 +978,15 @@ public sealed class VulkanTransformerModel : IModel
     /// the dense FFN path.
     /// </summary>
     /// <remarks>
-    /// All projection weights are F32 (the loader upcasts F16/BF16 at
-    /// load) so every matmul lands on the F32 plain kernel. Per-expert
-    /// banks are addressed via <c>moe_indexed_matmul_f32</c> with the
-    /// per-row expert index sourced from <c>moe_topk_softmax_f32</c>'s
-    /// indices buffer — no host sync between the router and the expert
-    /// matmuls.
+    /// <para>
+    /// The per-routed-expert <c>W1</c>/<c>W2</c>/<c>W3</c> banks are always F32 — the
+    /// indexed-matmul kernel (<c>moe_indexed_matmul_f32</c>) is F32-only in tree, no Q8_0
+    /// indexed variant exists yet. The router gate and the shared-expert
+    /// <c>W1</c>/<c>W2</c>/<c>W3</c> + sigmoid gate are dispatched through the standard
+    /// <see cref="RecordMatmul"/> router so they pick the Q8_0 GEMV/GEMM kernels when the
+    /// upload kept the source as raw Q8_0 blocks (and fall back to <c>matmul_f32</c>
+    /// otherwise — the production loader path today).
+    /// </para>
     /// </remarks>
     private unsafe void RecordMoeLayer(
         nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW,
@@ -981,8 +1004,11 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 2. Router gate matmul: Gate @ NormOutput → MoeRouterLogits.
-        _matmul.Record(cmdBuf, moeW.Gate, _state.NormOutput, _state.MoeRouterLogits!,
-            m: numE, k: hidden, n: seqLen);
+        //    Q8_0 dispatch via RecordMatmul (matmul_q8_0 GEMV at seqLen==1 / GEMM at >1)
+        //    when the upload kept the gate as Q8_0; otherwise the standard F32 kernel.
+        RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType,
+            _state.NormOutput, _state.MoeRouterLogits!,
+            outputDim: numE, inputDim: hidden, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
@@ -1095,11 +1121,16 @@ public sealed class VulkanTransformerModel : IModel
 
         for (int s = 0; s < numShared; s++)
         {
-            // gate / up matmuls share sharedInput; SwiGLU then fuses them.
-            _matmul.Record(cmdBuf, moeW.SharedW1![s], sharedInput, _state.MoeSharedGate!,
-                m: sharedI, k: hidden, n: seqLen);
-            _matmul.Record(cmdBuf, moeW.SharedW3![s], sharedInput, _state.MoeSharedUp!,
-                m: sharedI, k: hidden, n: seqLen);
+            // gate / up matmuls share sharedInput; SwiGLU then fuses them. Each
+            // dispatch goes through RecordMatmul so Q8_0 shared-expert weights pick
+            // the matmul_q8_0[_gemm[_coopmat]] kernels when the upload kept them
+            // Q8_0; F32 dispatches stay on matmul_f32 (production path).
+            RecordMatmul(cmdBuf, moeW.SharedW1![s], moeW.SharedW1DeviceQuantType,
+                sharedInput, _state.MoeSharedGate!,
+                outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
+            RecordMatmul(cmdBuf, moeW.SharedW3![s], moeW.SharedW3DeviceQuantType,
+                sharedInput, _state.MoeSharedUp!,
+                outputDim: sharedI, inputDim: hidden, seqLen: seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             _swiglu.Record(cmdBuf, _state.MoeSharedGate!, _state.MoeSharedUp!, _state.MoeSharedSilu!,
@@ -1109,8 +1140,9 @@ public sealed class VulkanTransformerModel : IModel
             if (s == 0)
             {
                 // First expert seeds the running sum directly into SumA.
-                _matmul.Record(cmdBuf, moeW.SharedW2![s], _state.MoeSharedSilu!, _state.MoeSharedSumA!,
-                    m: hidden, k: sharedI, n: seqLen);
+                RecordMatmul(cmdBuf, moeW.SharedW2![s], moeW.SharedW2DeviceQuantType,
+                    _state.MoeSharedSilu!, _state.MoeSharedSumA!,
+                    outputDim: hidden, inputDim: sharedI, seqLen: seqLen);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 activeSum = _state.MoeSharedSumA!;
             }
@@ -1118,8 +1150,9 @@ public sealed class VulkanTransformerModel : IModel
             {
                 // Per-expert down output → MoeSharedDown, then ping-pong add
                 // into the slot opposite activeSum.
-                _matmul.Record(cmdBuf, moeW.SharedW2![s], _state.MoeSharedSilu!, _state.MoeSharedDown!,
-                    m: hidden, k: sharedI, n: seqLen);
+                RecordMatmul(cmdBuf, moeW.SharedW2![s], moeW.SharedW2DeviceQuantType,
+                    _state.MoeSharedSilu!, _state.MoeSharedDown!,
+                    outputDim: hidden, inputDim: sharedI, seqLen: seqLen);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
                 var sumDst = activeSum.Handle == _state.MoeSharedSumA!.Handle
@@ -1146,9 +1179,11 @@ public sealed class VulkanTransformerModel : IModel
             // The post-FFN-RMSNorm hidden state is the right input here — it
             // mirrors MoeSwiGluMlp.ExecuteCoreGrouped which receives the
             // already-RMSNormed hidden as `hidden` and computes the gate
-            // logit against that same buffer.
-            _matmul.Record(cmdBuf, moeW.SharedExpertGate, sharedInput, _state.MoeSharedGateLogits!,
-                m: 1, k: hidden, n: seqLen);
+            // logit against that same buffer. RecordMatmul picks Q8_0 vs F32
+            // based on the upload-time storage choice.
+            RecordMatmul(cmdBuf, moeW.SharedExpertGate, moeW.SharedExpertGateDeviceQuantType,
+                sharedInput, _state.MoeSharedGateLogits!,
+                outputDim: 1, inputDim: hidden, seqLen: seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             _moeSigmoidGatedAdd!.Record(cmdBuf,

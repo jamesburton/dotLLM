@@ -60,13 +60,16 @@ public sealed unsafe class TransformerModel : IModel
     internal int DebugMaxLayers { get; set; }
 
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
-                       object mmapAnchor, int ropeDim, RoPEType ropeType,
+                       object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
     {
         Config = config;
         _weights = weights;
         _state = state;
-        _mmapAnchor = mmapAnchor;
+        // mmapAnchor is non-null on production load paths (mmap-backed weights need to be
+        // pinned for the model's lifetime); test paths that build from prebuilt weights
+        // may pass null when the source memory is owned by the caller.
+        _mmapAnchor = mmapAnchor!;
         _ropeDim = ropeDim;
         _ropeType = ropeType;
         _slidingWindowSize = config.SlidingWindowSize;
@@ -153,6 +156,28 @@ public sealed unsafe class TransformerModel : IModel
         ArgumentNullException.ThrowIfNull(config);
 
         var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
+    }
+
+    /// <summary>
+    /// Test-only factory that wires a model around already-built CPU
+    /// <see cref="TransformerWeights"/>. Used by parity tests that mutate
+    /// <see cref="MoeLayerWeights"/> (e.g. attaching a Q8_0 overlay) between the
+    /// safetensors load and model construction — there is no production loader
+    /// today that emits a Q8_0-overlay-bearing <c>MoeLayerWeights</c>, so the
+    /// tests need to skip the loader's F32 upcast for those projections.
+    /// </summary>
+    internal static TransformerModel BuildFromPrebuiltWeights(
+        TransformerWeights weights, ModelConfig config, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(weights);
+        ArgumentNullException.ThrowIfNull(config);
+        return BuildFromPrebuiltWeightsInternal(weights, config, threading ?? ThreadingConfig.SingleThreaded, anchorSource: null);
+    }
+
+    private static TransformerModel BuildFromPrebuiltWeightsInternal(
+        TransformerWeights weights, ModelConfig config, ThreadingConfig threading, ISafetensorsTensorSource? anchorSource)
+    {
         weights.RepackWeights();
 
         // For MLA (DeepSeek-V2/V3) RoPE applies only to the decoupled
@@ -223,7 +248,7 @@ public sealed unsafe class TransformerModel : IModel
             }
         }
 
-        return new TransformerModel(config, weights, state, file, ropeDim, ropeType, pool, ownsPool: pool is not null);
+        return new TransformerModel(config, weights, state, anchorSource, ropeDim, ropeType, pool, ownsPool: pool is not null);
     }
 
     /// <inheritdoc/>
