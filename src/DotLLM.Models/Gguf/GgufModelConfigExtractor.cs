@@ -182,6 +182,13 @@ public static class GgufModelConfigExtractor
             RopeScalingMscale = ropeScalingMscale,
             RopeScalingMscaleAllDim = ropeScalingMscaleAllDim,
             RopeScalingOriginalMaxPositionEmbeddings = ropeScalingOrigCtx,
+            // Phase C latent cache by default — matches HfConfigExtractor's
+            // default at 4b54a72. DeepSeek-V2/V3 are designed around the
+            // latent KV cache; Phase A's expanded cache scales as O(numLayers
+            // × maxSeqLen × numHeads × (qkNope + v) × 4 bytes) which for
+            // V2-Lite at max_position_embeddings=163840 is ~68 GB and OOMs.
+            // Phase C ≈ 9 GB for the same model.
+            UseHybridMlaCache = true,
         };
     }
 
