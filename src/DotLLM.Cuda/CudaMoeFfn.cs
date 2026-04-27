@@ -165,9 +165,47 @@ public static unsafe class CudaMoeFfn
         // We'd ideally fuse axpy across all batch rows by walking each per
         // (token, slot) pair, but slots vary across the bucket. So we group
         // batches by slot — issuing one axpy launch per (expert, slot) pair.
+
+        // ── Phase B fast path: grouped quantized GEMV across K_active experts ──
+        // For decode (seqLen=1) every active expert has batch=1 and reads the same
+        // single hidden row. We can collapse all K_active gate / up projections into
+        // ONE kernel launch each (instead of per-expert) by passing the K_active
+        // weight pointers as device-resident arrays.
         //
-        // This is correct but suboptimal for high-fan-out experts; the
-        // grouped-GEMM optimisation is an explicit follow-up.
+        // Eligibility: Quantized precision + seqLen=1 + hidden % 256 == 0 + a
+        // grouped-GEMV kernel exists for the gate/up dtype (Q4_K only at v1).
+        //
+        // When eligible we precompute gate/up F32 outputs for all active experts
+        // into _gateBatch / _upBatch (each laid out as [K_active, I]). The per-
+        // expert loop below then skips the gate/up ProjectF32OrQuant calls and
+        // just slices into the already-populated buffers.
+        bool useGrouped = weights.Precision == MoePrecision.Quantized
+            && seqLen == 1
+            && (hidden % 256) == 0
+            && kernels.HasMoeGroupedGemv(weights.GateProjQuantType)
+            && kernels.HasMoeGroupedGemv(weights.UpProjQuantType)
+            && weights.GateProjQuantType == weights.UpProjQuantType
+            && activeExperts > 0;
+
+        // Map global expert id e → local index in the [0, K_active) compacted array.
+        // For inactive experts the map entry stays -1. Stack-allocated since E is
+        // bounded by numExperts (≤ 256 for any model we ship today).
+        Span<int> expertLocalIdx = stackalloc int[E];
+        for (int i = 0; i < E; i++) expertLocalIdx[i] = -1;
+        int kActive = 0;
+        for (int e = 0; e < E; e++)
+        {
+            if (counts[e] == 0) continue;
+            expertLocalIdx[e] = kActive++;
+        }
+
+        if (useGrouped && kActive > 0)
+        {
+            DispatchGroupedGateUp(
+                hiddenF32, weights, scratch, kernels, stream,
+                expertLocalIdx: expertLocalIdx, kActive: kActive,
+                hidden: hidden, I: I);
+        }
 
         for (int e = 0; e < E; e++)
         {
@@ -175,53 +213,85 @@ public static unsafe class CudaMoeFfn
             if (batch == 0) continue;
             int start = offsets[e];
 
-            // 1. Upload bucketTokens slice (only this expert's section).
-            // Sync HtoD: source is pageable managed memory, and the next
-            // loop iteration may overwrite or invalidate the bucketTokens
-            // pointer through array bounds reuse. cuMemcpyHtoD_v2 returns
-            // only after the copy is staged, so it's safe to keep the
-            // source pointer scoped to the `fixed` block.
-            fixed (int* tp = bucketTokens)
+            // For the Phase-B grouped path, expert e's gate/up F32 outputs
+            // already live at offset [e_local * I, (e_local+1) * I) in
+            // _gateBatch / _upBatch. The remaining work (swiglu / down / axpy)
+            // is identical to the per-expert path; we just rebase the swiglu
+            // input pointers and skip the per-expert gate/up projection calls.
+            int eLocal = useGrouped ? expertLocalIdx[e] : 0;
+            long gateOff = useGrouped ? (long)eLocal * I * sizeof(float) : 0;
+            long upOff = useGrouped ? (long)eLocal * I * sizeof(float) : 0;
+
+            if (!useGrouped)
             {
-                CudaDriverApi.cuMemcpyHtoD_v2(
+                // 1. Upload bucketTokens slice (only this expert's section).
+                // Sync HtoD: source is pageable managed memory, and the next
+                // loop iteration may overwrite or invalidate the bucketTokens
+                // pointer through array bounds reuse. cuMemcpyHtoD_v2 returns
+                // only after the copy is staged, so it's safe to keep the
+                // source pointer scoped to the `fixed` block.
+                fixed (int* tp = bucketTokens)
+                {
+                    CudaDriverApi.cuMemcpyHtoD_v2(
+                        scratch.TokenIndices + (nint)((long)start * sizeof(int)),
+                        (nint)(tp + start),
+                        (nuint)((long)batch * sizeof(int))).ThrowOnError();
+                }
+
+                // 2. Gather hidden rows.
+                kernels.LaunchMoeGatherTokenRowsF32(
+                    hiddenF32, scratch.GatheredInput,
                     scratch.TokenIndices + (nint)((long)start * sizeof(int)),
-                    (nint)(tp + start),
-                    (nuint)((long)batch * sizeof(int))).ThrowOnError();
+                    batch, hidden, stream);
+
+                // 3. GEMMs gate / up.
+                //    LinearF32 contract: Y[m, n] = X[m, k] × W[n, k]^T.
+                //    gate[batch, I] = gathered[batch, hidden] × W1[I, hidden]^T
+                //    Quantized path: dequant the per-expert weight raw bytes →
+                //    F16 scratch → F32 scratch → LinearF32. F32 path: direct.
+                ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                    scratch.GatheredInput, batch, K: hidden, M: I,
+                    weightF32: weights.GateProj[e],
+                    weightQuant: weights.GateProj[e], weightQt: weights.GateProjQuantType,
+                    dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                    gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
+                    outputF32: scratch.GateBatch);
+                ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
+                    scratch.GatheredInput, batch, K: hidden, M: I,
+                    weightF32: weights.UpProj[e],
+                    weightQuant: weights.UpProj[e], weightQt: weights.UpProjQuantType,
+                    dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
+                    gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
+                    outputF32: scratch.UpBatch);
+            }
+            else
+            {
+                // Grouped path: still need TokenIndices populated for the axpy.
+                // For seqLen=1, every entry of bucketTokens is 0 (the only token).
+                // We upload once via SingleTokenScratch so the axpy launcher (which
+                // reads tokenIdx[0]) sees a valid slot.
+                fixed (int* tp = bucketTokens)
+                {
+                    CudaDriverApi.cuMemcpyHtoD_v2(
+                        scratch.TokenIndices + (nint)((long)start * sizeof(int)),
+                        (nint)(tp + start),
+                        (nuint)((long)batch * sizeof(int))).ThrowOnError();
+                }
             }
 
-            // 2. Gather hidden rows.
-            kernels.LaunchMoeGatherTokenRowsF32(
-                hiddenF32, scratch.GatheredInput,
-                scratch.TokenIndices + (nint)((long)start * sizeof(int)),
-                batch, hidden, stream);
-
-            // 3. GEMMs gate / up.
-            //    LinearF32 contract: Y[m, n] = X[m, k] × W[n, k]^T.
-            //    gate[batch, I] = gathered[batch, hidden] × W1[I, hidden]^T
-            //    Quantized path: dequant the per-expert weight raw bytes →
-            //    F16 scratch → F32 scratch → LinearF32. F32 path: direct.
-            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
-                scratch.GatheredInput, batch, K: hidden, M: I,
-                weightF32: weights.GateProj[e],
-                weightQuant: weights.GateProj[e], weightQt: weights.GateProjQuantType,
-                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
-                gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                outputF32: scratch.GateBatch);
-            ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
-                scratch.GatheredInput, batch, K: hidden, M: I,
-                weightF32: weights.UpProj[e],
-                weightQuant: weights.UpProj[e], weightQt: weights.UpProjQuantType,
-                dequantF16: scratch.DequantF16, dequantF32: scratch.DequantF32,
-                gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
-                outputF32: scratch.UpBatch);
-
             // 4. SwiGLU element-wise.
+            //    Sources rebase into the K_active-laid-out gate/up buffers when
+            //    grouped is active; otherwise they read the per-expert buffer at offset 0.
             kernels.LaunchSwiGLUF32(
-                scratch.GateBatch, scratch.UpBatch, scratch.SiluBatch,
+                scratch.GateBatch + (nint)gateOff,
+                scratch.UpBatch + (nint)upOff,
+                scratch.SiluBatch,
                 I, batch, stream);
 
             // 5. GEMM down.
             //    down[batch, hidden] = silu[batch, I] × W2[hidden, I]^T
+            //    K=intermediate may not be 256-aligned (V2-Lite intermediate=1408)
+            //    so down keeps using the dequant fallback. No grouped variant yet.
             ProjectF32OrQuant(weights.Precision, cublasHandle, kernels, stream,
                 scratch.SiluBatch, batch, K: I, M: hidden,
                 weightF32: weights.DownProj[e],
@@ -413,6 +483,84 @@ public static unsafe class CudaMoeFfn
                 batch, K, M, stream);
         }
     }
+
+    /// <summary>
+    /// Phase B: dispatch grouped quantized GEMV for the gate and up projections
+    /// across all <paramref name="kActive"/> active experts in just two kernel
+    /// launches (instead of <c>2 × kActive</c> per-expert launches). Caller
+    /// guarantees decode batch=1 (single shared input row), <c>hidden % 256 == 0</c>,
+    /// and <see cref="CudaKernels.HasMoeGroupedGemv(QuantizationType)"/> is true
+    /// for both projection dtypes. After this returns, expert <c>e</c>'s gate
+    /// and up F32 outputs occupy <c>scratch.GateBatch[e_local * I .. (e_local+1) * I)</c>
+    /// and <c>scratch.UpBatch[e_local * I .. (e_local+1) * I)</c> where
+    /// <c>e_local = expertLocalIdx[e]</c>.
+    /// </summary>
+    private static void DispatchGroupedGateUp(
+        nint hiddenF32, CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, CudaKernels kernels, nint stream,
+        Span<int> expertLocalIdx, int kActive, int hidden, int I)
+    {
+        int E = weights.NumExperts;
+
+        // Build host-side ptr arrays (4 × kActive nints, all packed into one
+        // contiguous block matching the device-side layout).
+        //   slice 0: gate weights[0..kActive)
+        //   slice 1: gate outputs[0..kActive)
+        //   slice 2: up weights  [0..kActive)
+        //   slice 3: up outputs  [0..kActive)
+        long* hostPtrs = stackalloc long[4 * kActive];
+
+        // Walk experts in increasing global id (matches the per-expert loop
+        // ordering), skipping inactive ones. eLocal = position in the compacted
+        // [0, kActive) array. Per-expert F16 output offsets land at e_local * I
+        // halfs into the staging buffers.
+        int eLocal = 0;
+        long iBytesF16 = (long)I * sizeof(ushort);
+        for (int e = 0; e < E; e++)
+        {
+            if (expertLocalIdx[e] < 0) continue;
+            hostPtrs[0 * kActive + eLocal] = (long)weights.GateProj[e];
+            hostPtrs[1 * kActive + eLocal] = (long)(scratch.GroupedGateF16 + (nint)((long)eLocal * iBytesF16));
+            hostPtrs[2 * kActive + eLocal] = (long)weights.UpProj[e];
+            hostPtrs[3 * kActive + eLocal] = (long)(scratch.GroupedUpF16 + (nint)((long)eLocal * iBytesF16));
+            eLocal++;
+        }
+
+        // One synchronous HtoD copy of all 4 ptr arrays at once. Source is
+        // stack-local — must complete before this method returns. Sync HtoD
+        // (cuMemcpyHtoD_v2) on pageable memory is immediate.
+        long ptrBytes = 4L * kActive * sizeof(long);
+        CudaDriverApi.cuMemcpyHtoD_v2(
+            scratch.GroupedPtrArrays, (nint)hostPtrs, (nuint)ptrBytes).ThrowOnError();
+
+        // Convert the shared input hidden vector F32→F16 once.
+        kernels.LaunchConvertF32ToF16(hiddenF32, scratch.GemvInputF16, hidden, stream);
+
+        // Slice out the device-side ptr arrays.
+        long perArrayBytes = (long)kActive * sizeof(long);
+        nint gateWeightsDev = scratch.GroupedPtrArrays;
+        nint gateOutputsDev = scratch.GroupedPtrArrays + (nint)perArrayBytes;
+        nint upWeightsDev   = scratch.GroupedPtrArrays + (nint)(2 * perArrayBytes);
+        nint upOutputsDev   = scratch.GroupedPtrArrays + (nint)(3 * perArrayBytes);
+
+        // Launch grouped gate + grouped up GEMVs. Each kernel walks (M output
+        // rows) × (kActive experts) blocks.
+        kernels.LaunchMoeGroupedGemv(
+            gateWeightsDev, gateOutputsDev,
+            scratch.GemvInputF16, weights.GateProjQuantType,
+            M: I, K: hidden, kActive: kActive, stream);
+        kernels.LaunchMoeGroupedGemv(
+            upWeightsDev, upOutputsDev,
+            scratch.GemvInputF16, weights.UpProjQuantType,
+            M: I, K: hidden, kActive: kActive, stream);
+
+        // Convert F16 outputs (kActive × I halfs each) → F32 in one launch each
+        // into the existing gate/up F32 batch buffers, which the per-expert loop
+        // below treats as a [kActive, I] layout and slices via e_local * I offsets.
+        long elemsAll = (long)kActive * I;
+        kernels.LaunchConvertF16ToF32(scratch.GroupedGateF16, scratch.GateBatch, (int)elemsAll, stream);
+        kernels.LaunchConvertF16ToF32(scratch.GroupedUpF16,   scratch.UpBatch,   (int)elemsAll, stream);
+    }
 }
 
 /// <summary>
@@ -458,6 +606,19 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     private long _gemvKMax;
     private long _gemvMMax;
 
+    // Phase-B grouped-GEMV scratch (decode batch=1, all K_active experts in
+    // one launch). Two F16 staging buffers — one per projection (gate, up) —
+    // each holding K_active_max × I_max halfs. After the grouped kernel, the
+    // F16 outputs are converted to F32 in one launch into the existing
+    // _gateBatch / _upBatch buffers (which are already sized [K_active_max, I]).
+    // Plus a small device-resident pointer-array buffer (4 × K_active_max
+    // nints — gate-weights, gate-outputs, up-weights, up-outputs).
+    private nint _groupedGateF16;     // [K_active_max, I_max] halfs
+    private nint _groupedUpF16;       // [K_active_max, I_max] halfs
+    private nint _groupedPtrArrays;   // 4 × K_active_max nints (8 bytes each)
+    private long _groupedActiveMax;   // K_active_max actually allocated for
+    private long _groupedIMax;        // I_max actually allocated for
+
     private int _capSeqLen, _capE, _capK, _capHidden, _capI, _capSI;
     private bool _capHasShared;
 
@@ -483,6 +644,11 @@ public sealed unsafe class CudaMoeScratch : IDisposable
     internal nint DequantF32 => _dequantF32;
     internal nint GemvInputF16 => _gemvInputF16;
     internal nint GemvOutputF16 => _gemvOutputF16;
+    internal nint GroupedGateF16 => _groupedGateF16;
+    internal nint GroupedUpF16 => _groupedUpF16;
+    internal nint GroupedPtrArrays => _groupedPtrArrays;
+    internal long GroupedActiveMax => _groupedActiveMax;
+    internal long GroupedIMax => _groupedIMax;
 
     /// <summary>Ensures all scratch buffers fit the requested workload.</summary>
     public void EnsureCapacity(int seqLen, CudaMoeLayerWeights weights)
@@ -582,6 +748,29 @@ public sealed unsafe class CudaMoeScratch : IDisposable
                 AllocatedBytes += bytes;
                 _gemvMMax = mMax;
             }
+
+            // Phase-B grouped-GEMV scratch. K_active_max = numExpertsPerTok (decode
+            // sees up to K active experts per token; we route per-token into K_active
+            // slots). I_max = MoE intermediate (the per-projection output dim).
+            long activeMax = _capK;
+            long iMaxGrouped = _capI;
+            long needGroupedF16 = activeMax * iMaxGrouped * sizeof(ushort);
+            if (activeMax > _groupedActiveMax || iMaxGrouped > _groupedIMax)
+            {
+                FreeIf(ref _groupedGateF16);
+                FreeIf(ref _groupedUpF16);
+                FreeIf(ref _groupedPtrArrays);
+                CudaDriverApi.cuMemAlloc_v2(out _groupedGateF16, (nuint)needGroupedF16).ThrowOnError();
+                AllocatedBytes += needGroupedF16;
+                CudaDriverApi.cuMemAlloc_v2(out _groupedUpF16, (nuint)needGroupedF16).ThrowOnError();
+                AllocatedBytes += needGroupedF16;
+                // 4 ptr arrays × K_active_max × sizeof(nint).
+                long ptrBytes = 4L * activeMax * sizeof(long);
+                CudaDriverApi.cuMemAlloc_v2(out _groupedPtrArrays, (nuint)ptrBytes).ThrowOnError();
+                AllocatedBytes += ptrBytes;
+                _groupedActiveMax = activeMax;
+                _groupedIMax = iMaxGrouped;
+            }
         }
     }
 
@@ -613,8 +802,11 @@ public sealed unsafe class CudaMoeScratch : IDisposable
         FreeIf(ref _sharedScale);
         FreeIf(ref _dequantF16); FreeIf(ref _dequantF32);
         FreeIf(ref _gemvInputF16); FreeIf(ref _gemvOutputF16);
+        FreeIf(ref _groupedGateF16); FreeIf(ref _groupedUpF16);
+        FreeIf(ref _groupedPtrArrays);
         _dequantElems = 0;
         _gemvKMax = 0; _gemvMMax = 0;
+        _groupedActiveMax = 0; _groupedIMax = 0;
         AllocatedBytes = 0;
     }
 

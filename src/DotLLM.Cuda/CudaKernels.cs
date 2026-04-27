@@ -199,6 +199,15 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeSigmoidLogitF32Func;
     private readonly nint _moeGatherTokenRowsF32Func;
 
+    // ── MoE grouped-GEMV kernels (Phase B — single launch across K_active experts) ──
+    // One kernel computes (K_active × M) F16 outputs by walking K_active raw-quant
+    // weight pointers + K_active output pointers, sharing a single F16 input row.
+    // Reduces dispatch overhead from K_active per-projection launches to 1 per
+    // projection. Optional — PTX may be missing on stale builds; HasMoeGroupedGemv
+    // reports false and CudaMoeFfn falls back to the per-expert path.
+    private readonly CudaModule? _moeGroupedGemvModule;
+    private readonly nint _moeGroupedGemvQ4_KFunc;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -417,6 +426,16 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeSigmoidLogitF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_logit_f32");
             _moeGatherTokenRowsF32Func = _moeFfnModule.TryGetFunction("moe_gather_token_rows_f32");
         }
+
+        // MoE grouped-GEMV (Phase B). One kernel walks K_active raw-quant per-expert
+        // pointers in a single launch. Optional — Q4_K only at v1; Q5_K/Q6_K/Q8_0 are
+        // future stretch additions. HasMoeGroupedGemv* gates the call.
+        string moeGroupedGemvPath = Path.Combine(ptxDir, "moe_grouped_gemv.ptx");
+        if (File.Exists(moeGroupedGemvPath))
+        {
+            _moeGroupedGemvModule = CudaModule.LoadFromFile(moeGroupedGemvPath);
+            _moeGroupedGemvQ4_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q4_k_f16");
+        }
     }
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
@@ -452,6 +471,24 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeZeroF32Func != 0 && _moeAxpyScaledRowF32Func != 0
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>True when the Phase-B Q4_K grouped-GEMV kernel is loaded (PTX present).</summary>
+    /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
+    /// fallback for A/B comparison.</remarks>
+    public bool HasMoeGroupedGemvQ4K =>
+        _moeGroupedGemvQ4_KFunc != 0 && !DisableMoeGroupedGemv;
+
+    /// <summary>Disable the Phase-B grouped-GEMV path. Forces the per-expert
+    /// <see cref="LaunchQuantizedGemv"/> fallback in <see cref="CudaMoeFfn"/>.</summary>
+    public static bool DisableMoeGroupedGemv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MOE_GROUPED_GEMV") == "1";
+
+    /// <summary>True when a grouped-GEMV kernel is available for the given quant type.</summary>
+    public bool HasMoeGroupedGemv(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => HasMoeGroupedGemvQ4K,
+        _ => false,
+    };
 
     /// <summary>
     /// Opt a kernel into >48 KB dynamic shared memory (up to the device's optin cap).
@@ -1173,6 +1210,50 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K;
+
+    /// <summary>
+    /// Phase-B MoE grouped quantized GEMV (Q4_K only at v1). Computes K_active
+    /// independent <c>y_e[m] = W_e[m,k] @ x[k]</c> projections in a single launch
+    /// where <c>x</c> (FP16, length K) is shared across all experts and each
+    /// <c>W_e</c> / <c>y_e</c> pair is selected from the K_active per-expert
+    /// pointer arrays.
+    /// </summary>
+    /// <param name="weightPtrsDevice">Device pointer to <c>K_active</c> contiguous
+    /// <c>nint</c>-sized weight pointers (one per active expert, raw quant bytes).</param>
+    /// <param name="outputPtrsDevice">Device pointer to <c>K_active</c> contiguous
+    /// <c>nint</c>-sized output pointers (one per active expert, FP16 [M] each).</param>
+    /// <param name="x">Device pointer to the shared FP16 input row, length K.</param>
+    /// <param name="qt">Quantization type. Currently must be <c>Q4_K</c>.</param>
+    /// <param name="M">Per-expert output rows.</param>
+    /// <param name="K">Input dim. Must satisfy <c>K % 256 == 0</c> for Q4_K.</param>
+    /// <param name="kActive">Number of active experts.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchMoeGroupedGemv(nint weightPtrsDevice, nint outputPtrsDevice,
+                                       nint x, QuantizationType qt,
+                                       int M, int K, int kActive, nint stream)
+    {
+        if (kActive <= 0 || M <= 0 || K <= 0) return;
+        if ((K & 255) != 0)
+            throw new ArgumentException($"K must be a multiple of 256 for Q4_K (got {K}).", nameof(K));
+
+        nint func = qt switch
+        {
+            QuantizationType.Q4_K => _moeGroupedGemvQ4_KFunc,
+            _ => 0,
+        };
+        if (func == 0)
+            throw new NotSupportedException(
+                $"MoE grouped GEMV not available for {qt}. Compile native/kernels/moe_grouped_gemv.cu to PTX.");
+
+        nint xArg = x, wArg = weightPtrsDevice, yArg = outputPtrsDevice;
+        int mArg = M, kArg = K, kActiveArg = kActive;
+        void** args = stackalloc void*[] { &xArg, &wArg, &yArg, &mArg, &kArg, &kActiveArg };
+
+        // Grid: (M output rows, K_active experts, 1). Block: 256 threads.
+        CudaDriverApi.cuLaunchKernel(func,
+                (uint)M, (uint)kActive, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
     public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
@@ -2276,6 +2357,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _attentionMlaModule?.Dispose();
         _mlaHelpersModule?.Dispose();
         _moeFfnModule?.Dispose();
+        _moeGroupedGemvModule?.Dispose();
         _attentionMlaLatentModule?.Dispose();
     }
 }
