@@ -99,6 +99,152 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
     }
 
     [SkippableFact]
+    public void Forward_Streaming_SplitChunk_MatchesMonolithic_Siso()
+    {
+        // Streaming-chunk parity: split a T=8 forward into 2×T=4 forwards on the
+        // same persistent state and assert the last-token logits match a single
+        // monolithic T=8 forward within abs 5e-3 / rel 1e-3. Exercises the
+        // chunk-boundary k_state / v_state buffers added by this commit; without
+        // them the second chunk would miss the canonical shifted_γ[T_prev-1]
+        // term that a one-shot forward folds in at the chunk edge.
+        AssertSplitMatchesMonolithicSiso(numLayers: 1, totalLen: 8, splitAt: 4, seed: 41);
+    }
+
+    [SkippableFact]
+    public void Forward_Streaming_SplitChunk_MultiLayer_MatchesMonolithic_Siso()
+    {
+        // Same parity bar as the single-layer split test, but with two layers so
+        // the boundary buffers are exercised independently per layer (each layer
+        // owns its own k_state / v_state).
+        AssertSplitMatchesMonolithicSiso(numLayers: 2, totalLen: 8, splitAt: 4, seed: 43);
+    }
+
+    [SkippableFact]
+    public void Forward_Streaming_SplitChunk_MatchesMonolithic_Mimo()
+    {
+        // MIMO streaming parity. mimo_rank=2 → k_state holds [R, H, N] and the
+        // boundary kernel sums across the rank axis (matches CPU oracle's
+        // ExecuteMimoStreaming rank-sum form). Single-layer to keep the F32 drift
+        // budget lean.
+        AssertSplitMatchesMonolithicMimo(numLayers: 1, totalLen: 8, splitAt: 4, seed: 47);
+    }
+
+    [SkippableFact]
+    public void Forward_Streaming_SplitChunk_MultiLayer_MatchesMonolithic_Mimo()
+    {
+        // MIMO streaming parity, multi-layer. mimo_rank=2 across 2 layers.
+        AssertSplitMatchesMonolithicMimo(numLayers: 2, totalLen: 8, splitAt: 4, seed: 53);
+    }
+
+    private void AssertSplitMatchesMonolithicSiso(int numLayers, int totalLen, int splitAt, int seed)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        if (splitAt <= 0 || splitAt >= totalLen)
+            throw new ArgumentException("splitAt must lie strictly inside (0, totalLen).", nameof(splitAt));
+
+        string path = Path.Combine(_scratch, $"m3-stream-L{numLayers}-T{totalLen}-s{seed}.safetensors");
+        WriteFixture(path, numLayers, seed);
+        ModelConfig config = BuildConfig(numLayers);
+
+        int[] tokenIds = new int[totalLen];
+        int[] positions = new int[totalLen];
+        for (int i = 0; i < totalLen; i++) { tokenIds[i] = i % VocabSize; positions[i] = i; }
+
+        // ── Vulkan monolithic: single Forward over the full T=8 sequence ──
+        float[] vkMonoLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            vkMonoLogits = CopyLogits(logits);
+        }
+
+        // ── Vulkan split: two Forwards (T=splitAt then T=totalLen-splitAt) on the
+        //    same model instance (which owns the persistent state internally —
+        //    k_state / v_state thread across calls).
+        float[] vkSplitLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            int firstLen = splitAt;
+            int secondLen = totalLen - splitAt;
+            int[] firstIds = tokenIds.AsSpan(0, firstLen).ToArray();
+            int[] firstPos = positions.AsSpan(0, firstLen).ToArray();
+            int[] secondIds = tokenIds.AsSpan(firstLen, secondLen).ToArray();
+            int[] secondPos = positions.AsSpan(firstLen, secondLen).ToArray();
+
+            using (ITensor _ = model.Forward(firstIds, firstPos, deviceId: -1)) { }
+            using ITensor secondLogits = model.Forward(secondIds, secondPos, deviceId: -1);
+            vkSplitLogits = CopyLogits(secondLogits);
+        }
+
+        AssertLogitsClose(vkMonoLogits, vkSplitLogits,
+            $"SISO streaming split parity (numLayers={numLayers}, totalLen={totalLen}, splitAt={splitAt})");
+    }
+
+    private void AssertSplitMatchesMonolithicMimo(int numLayers, int totalLen, int splitAt, int seed)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        if (splitAt <= 0 || splitAt >= totalLen)
+            throw new ArgumentException("splitAt must lie strictly inside (0, totalLen).", nameof(splitAt));
+
+        string path = Path.Combine(_scratch, $"m3-mimo-stream-L{numLayers}-T{totalLen}-s{seed}.safetensors");
+        WriteMimoFixture(path, numLayers, seed);
+        ModelConfig config = BuildMimoConfig(numLayers);
+
+        int[] tokenIds = new int[totalLen];
+        int[] positions = new int[totalLen];
+        for (int i = 0; i < totalLen; i++) { tokenIds[i] = i % VocabSize; positions[i] = i; }
+
+        // Vulkan monolithic: single Forward over T=totalLen.
+        float[] vkMonoLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            vkMonoLogits = CopyLogits(logits);
+        }
+
+        // Vulkan split.
+        float[] vkSplitLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            int firstLen = splitAt;
+            int secondLen = totalLen - splitAt;
+            int[] firstIds = tokenIds.AsSpan(0, firstLen).ToArray();
+            int[] firstPos = positions.AsSpan(0, firstLen).ToArray();
+            int[] secondIds = tokenIds.AsSpan(firstLen, secondLen).ToArray();
+            int[] secondPos = positions.AsSpan(firstLen, secondLen).ToArray();
+
+            using (ITensor _ = model.Forward(firstIds, firstPos, deviceId: -1)) { }
+            using ITensor secondLogits = model.Forward(secondIds, secondPos, deviceId: -1);
+            vkSplitLogits = CopyLogits(secondLogits);
+        }
+
+        AssertLogitsClose(vkMonoLogits, vkSplitLogits,
+            $"MIMO streaming split parity (numLayers={numLayers}, totalLen={totalLen}, splitAt={splitAt})");
+    }
+
+    private static void AssertLogitsClose(float[] reference, float[] actual, string label)
+    {
+        // reference is the monolithic T=totalLen forward result — Vulkan returns the
+        // last token's logits as [1, vocab]. actual is the second chunk's last-token
+        // logits, also [1, vocab]. Both arrays are length VocabSize.
+        Assert.Equal(VocabSize, reference.Length);
+        Assert.Equal(VocabSize, actual.Length);
+        for (int c = 0; c < VocabSize; c++)
+        {
+            float r = reference[c];
+            float a = actual[c];
+            float diff = MathF.Abs(r - a);
+            float bar = AbsTol + RelTol * MathF.Abs(r);
+            Assert.True(diff <= bar,
+                $"{label}: col={c}: monolithic={r:F6} vs split={a:F6} (|diff|={diff:E3} > {bar:E3})");
+        }
+    }
+
+    [SkippableFact]
     public void Forward_Decode_WithStateContinuation_MatchesCpuReference()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

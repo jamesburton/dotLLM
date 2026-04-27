@@ -46,15 +46,27 @@ namespace DotLLM.Vulkan;
 /// in_proj / out_proj matmuls.
 /// </para>
 /// <para>
-/// <b>State threading.</b> Two persistent buffers per layer cross call boundaries:
-/// <c>ssm_state</c> ([H, P, N], threaded into the SISO scan kernel) and <c>cum_angle</c>
-/// ([H, S], threaded into the data-RoPE kernel via <c>hasCumPrev=writeCumOut=true</c>).
-/// Both are owned by <see cref="VulkanMamba3State"/> and zero-initialised at construction;
-/// the orchestrator never resets them between layers (each layer has its own state row).
-/// The CPU oracle's <c>k_state</c> / <c>v_state</c> chunk-boundary buffers are NOT mirrored
-/// — the Vulkan SISO path treats each Forward as one chunk and relies on the canonical
-/// <c>shifted_γ[T-1] = 0</c> boundary inside the SSD scan. Cross-chunk parity is a follow-up
-/// if streaming-decode parity becomes a regression bar.
+/// <b>State threading.</b> Four persistent buffers per layer cross call boundaries:
+/// <c>ssm_state</c> ([H, P, N], threaded into the SISO/MIMO scan kernel), <c>cum_angle</c>
+/// ([H, S], threaded into the data-RoPE kernel via <c>hasCumPrev=writeCumOut=true</c>),
+/// and the streaming-chunk boundary buffers <c>k_state</c> ([H, N] for SISO, [R, H, N] for
+/// MIMO) and <c>v_state</c> ([H, P]). All four are owned by <see cref="VulkanMamba3State"/>
+/// and zero-initialised at construction; the orchestrator never resets them between layers
+/// (each layer has its own state row).
+/// </para>
+/// <para>
+/// The <c>k_state</c> / <c>v_state</c> pair is consumed by
+/// <see cref="Mamba3ChunkBoundaryF32Kernel"/> at the START of each chunk (after the data-
+/// RoPE, before the SSD scan), applying the canonical
+/// <c>ssm_state += v_state · (Σ_r k_state[r]) · DT[0] · (1-trap[0])</c> adjustment that
+/// closes the <c>shifted_γ[T_prev-1]</c> lookahead gap a one-shot forward would have folded
+/// in at the previous chunk's last token. The orchestrator skips the dispatch entirely on
+/// the first chunk of a sequence (<see cref="VulkanMamba3State.HasBoundary"/> still
+/// <c>false</c>) — bit-equal to a zero-buffered dispatch and matches the CPU oracle's
+/// <c>if (kState.IsEmpty) skip</c> short-circuit. At the END of each chunk the orchestrator
+/// copies the last token's post-RoPE (pre-scale) B slice to <c>k_state</c> (rank-aware) and
+/// last token's V (= <c>x</c>) to <c>v_state</c> via <c>vkCmdCopyBuffer</c> regions, then
+/// flips <see cref="VulkanMamba3State.MarkBoundaryPrimed"/> for the next call.
 /// </para>
 /// </remarks>
 public sealed class VulkanMamba3TransformerModel : IModel
@@ -74,6 +86,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
     // MIMO scan kernel — only created when Mamba3Config.IsMimo is true. Lazy creation
     // keeps the SPV file dependency optional for SISO-only deployments.
     private readonly Mamba3CanonicalSsdMimoF32Kernel? _mimoScan;
+    // Streaming-chunk boundary state-adjustment kernel. Used to close the canonical
+    // shifted_γ[T_prev-1] lookahead gap when a Forward call resumes a previously
+    // primed VulkanMamba3State.
+    private readonly Mamba3ChunkBoundaryF32Kernel _boundary;
     private readonly AddKernel _add;
 
     private readonly VulkanDevice.SubmitContext _submit;
@@ -93,6 +109,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm,
         Mamba3DataRopeF32Kernel dataRope, Mamba3CanonicalSsdSisoF32Kernel sisoScan,
         Mamba3CanonicalSsdMimoF32Kernel? mimoScan,
+        Mamba3ChunkBoundaryF32Kernel boundary,
         AddKernel add,
         VulkanDevice.SubmitContext submit)
     {
@@ -109,6 +126,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _dataRope = dataRope;
         _sisoScan = sisoScan;
         _mimoScan = mimoScan;
+        _boundary = boundary;
         _add = add;
         _submit = submit;
     }
@@ -193,6 +211,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         Mamba3CanonicalSsdMimoF32Kernel? mimoScan = null;
         if (config.Mamba3Config!.IsMimo)
             mimoScan = Mamba3CanonicalSsdMimoF32Kernel.Create(device, spvDir);
+        var boundary = Mamba3ChunkBoundaryF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
 
         var submit = device.CreateSubmitContext();
@@ -200,7 +219,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         return new VulkanMamba3TransformerModel(
             device, ownsDevice,
             config, weights, state, recurrent,
-            matmul, rmsnorm, dataRope, sisoScan, mimoScan, add,
+            matmul, rmsnorm, dataRope, sisoScan, mimoScan, boundary, add,
             submit);
     }
 
@@ -267,6 +286,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         float[] bHost = new float[seqLen * mimoRank * nHead * dState];
         float[] cHost = new float[seqLen * mimoRank * nHead * dState];
         float[] qkPreDotHost = new float[seqLen * nHead];
+        // Per-head boundary coefficient: coef[h] = dt[0, h] · (1 - trap[0, h]).
+        // Shared across layers within a single Forward — every layer recomputes
+        // dtHost/trapHost from its own in_proj output, so we recompute coef per
+        // layer too. Holding the array outside the layer loop avoids re-allocation.
+        float[] coefHost = new float[nHead];
 
         // 2. LAYERS — one Mamba3 SISO block per layer.
         for (int layer = 0; layer < numLayers; layer++)
@@ -313,6 +337,19 @@ public sealed class VulkanMamba3TransformerModel : IModel
             _device.Upload(cHost.AsSpan(0, bcElems), _state.C);
             _device.Upload(qkPreDotHost.AsSpan(0, seqLen * nHead), _state.QkPreDot);
 
+            // Streaming-chunk boundary coefficient: coef[h] = dt[0, h] · (1 - trap[0, h]).
+            // Only uploaded + the boundary kernel only dispatched when the recurrent state
+            // is already primed by a prior Forward (HasBoundary == true). On the first
+            // chunk of a sequence we skip both — matches the CPU oracle's empty-span
+            // short-circuit in Mamba3Block.ApplyChunkBoundaryAdjustment.
+            bool runBoundary = _recurrent.HasBoundary;
+            if (runBoundary)
+            {
+                for (int h = 0; h < nHead; h++)
+                    coefHost[h] = dtHost[h] * (1f - trapHost[h]);
+                _device.Upload(coefHost.AsSpan(0, nHead), _state.BoundaryCoef);
+            }
+
             // ── 2c. DATA-ROPE + SSD SCAN + OUT_PROJ + RESIDUAL (single submit) ───
             _submit.Begin();
             cmdBuf = _submit.CommandBuffer;
@@ -320,6 +357,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
 
             VulkanDevice.Buffer cumAngle = _recurrent.GetCumAngleBuffer(layer);
             VulkanDevice.Buffer ssmState = _recurrent.GetSsmStateBuffer(layer);
+            VulkanDevice.Buffer kState = _recurrent.GetKStateBuffer(layer);
+            VulkanDevice.Buffer vState = _recurrent.GetVStateBuffer(layer);
 
             // data-RoPE: B and C are mutated in place (post-RoPE). cum_angle is read at
             // entry (hasCumPrev=true, even on first call — buffer is zero-initialised) and
@@ -336,15 +375,39 @@ public sealed class VulkanMamba3TransformerModel : IModel
                 hasCumPrev: true, writeCumOut: true);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // Streaming-chunk boundary state adjustment. Applied BEFORE the SSD scan
+            // when the recurrent state was primed by a previous Forward — closes the
+            // canonical shifted_γ[T_prev-1] lookahead gap that a one-shot forward would
+            // have folded in at the previous chunk's last token. Reads the previous
+            // chunk's k_state / v_state (written at the end of the previous Forward)
+            // and updates ssm_state in place. SISO passes nRank=1 (kState is [H, N]);
+            // MIMO passes the model's mimo_rank (kState is [R, H, N]). On the first
+            // chunk of a sequence runBoundary == false → dispatch is skipped entirely
+            // (matches CPU oracle's IsEmpty short-circuit; bit-equal to the existing
+            // SISO/MIMO single-chunk path that landed at e40ada4 / 7142f31).
+            if (runBoundary)
+            {
+                _boundary.Record(cmdBuf,
+                    state: ssmState,
+                    vState: vState,
+                    kState: kState,
+                    coef: _state.BoundaryCoef,
+                    nHead: nHead, headDim: headDim, dState: dState,
+                    nRank: _recurrent.KStateRank);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
             if (isMimo)
             {
                 // SSD MIMO scan. qRoped = post-RoPE C, kRoped = post-RoPE B (matches the
                 // CPU oracle's argument order to ExecuteMimo). qkPreDotHost is the
                 // canonical Σ_r form, prepared host-side. mimo_z / mimo_o are uploaded
-                // per-layer and bound here. Equivalent to CPU's ExecuteMimoStreaming with
-                // empty kState/vState — the Vulkan path threads ssm_state and cum_angle
-                // across calls but does not maintain k_state / v_state chunk-boundary
-                // buffers (matches the SISO Vulkan path; one-shot semantics).
+                // per-layer and bound here. The streaming-chunk boundary adjustment that
+                // CPU's ExecuteMimoStreaming applies inline before the scan is dispatched
+                // separately above (Mamba3ChunkBoundaryF32Kernel) — by the time we reach
+                // this scan, ssm_state already carries the boundary correction (or no-op
+                // if HasBoundary was false), so the scan body is bit-equal to ExecuteMimo
+                // with the canonical shifted_γ[T-1]=0 boundary inside.
                 Mamba3CanonicalSsdMimoF32Kernel mimo = _mimoScan
                     ?? throw new InvalidOperationException(
                         "MIMO scan kernel not initialised — Mamba3Config.IsMimo must be set when constructing the model.");
@@ -389,6 +452,39 @@ public sealed class VulkanMamba3TransformerModel : IModel
             }
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // ── 2d. PERSIST CHUNK-BOUNDARY BUFFERS ───────────────────────────────
+            // Copy this chunk's last-token post-RoPE B → k_state, last-token V (= x)
+            // → v_state. Both are on-device vkCmdCopyBuffer regions — kState's source
+            // is the [T, R, H, N] post-RoPE B buffer (rank slot collapses to 1 for
+            // SISO; one contiguous copy of R·H·N floats per layer covers both modes).
+            // The next Forward call's boundary kernel will read these via the
+            // GetKStateBuffer / GetVStateBuffer accessors. Issued before out_proj so
+            // the kState/vState writes overlap with the residual GEMM in flight (the
+            // copy targets are disjoint from out_proj's I/O).
+            //
+            // Compute → transfer barrier: data-RoPE wrote into _state.B as a compute
+            // shader; we now read it as a transfer command. Single barrier covers both
+            // the B and X reads (X was last touched by the scan, also compute-stage).
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+            int kStateElems = _recurrent.KStateRank * nHead * dState;
+            int vStateElems = nHead * headDim;
+            // Last-token slice offsets in the post-RoPE B / X scratch.
+            // _state.B layout: [seqLen, R, nHead, dState] row-major.
+            // _state.X layout: [seqLen, nHead, headDim] row-major.
+            ulong lastBOffset = (ulong)((long)(seqLen - 1) * kStateElems * sizeof(float));
+            ulong lastXOffset = (ulong)((long)(seqLen - 1) * vStateElems * sizeof(float));
+            ulong kStateBytes = (ulong)((long)kStateElems * sizeof(float));
+            ulong vStateBytes = (ulong)((long)vStateElems * sizeof(float));
+            RecordCopyBufferRange(cmdBuf, _state.B, kState,
+                srcOffset: lastBOffset, dstOffset: 0, size: kStateBytes);
+            RecordCopyBufferRange(cmdBuf, _state.X, vState,
+                srcOffset: lastXOffset, dstOffset: 0, size: vStateBytes);
+            // No transfer→compute barrier needed inside this submit — kState/vState
+            // are not read again until the NEXT Forward's boundary dispatch, and the
+            // SubmitAndWait below + the next call's HostToComputeBarrier serialise
+            // those across submits.
+
             // out_proj: YScan @ OutProj^T → BlockOut.
             _matmul.Record(cmdBuf, lw.OutProj, _state.YScan, _state.BlockOut,
                 m: lw.OutProjOutputDim, k: lw.OutProjInputDim, n: seqLen);
@@ -402,6 +498,12 @@ public sealed class VulkanMamba3TransformerModel : IModel
             _submit.SubmitAndWait();
             _state.RotateHiddenSlot();
         }
+
+        // After every layer has run, mark the recurrent state as primed so the NEXT
+        // Forward call dispatches the boundary kernel. Idempotent — flipping the flag
+        // a second time is a no-op. Stays sticky until VulkanMamba3State.Reset is
+        // called by the caller.
+        _recurrent.MarkBoundaryPrimed();
 
         // 3. FINAL RMSNORM + LM HEAD on last token only.
         _submit.Begin();
@@ -685,6 +787,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _dataRope.InvalidateDescriptorCache();
         _sisoScan.InvalidateDescriptorCache();
         _mimoScan?.InvalidateDescriptorCache();
+        _boundary.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
     }
 
@@ -697,6 +800,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _recurrent.Dispose();
 
         _add.Dispose();
+        _boundary.Dispose();
         _mimoScan?.Dispose();
         _sisoScan.Dispose();
         _dataRope.Dispose();

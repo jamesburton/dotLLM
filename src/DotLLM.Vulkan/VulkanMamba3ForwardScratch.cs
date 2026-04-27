@@ -74,6 +74,12 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
     public VulkanDevice.Buffer QkPreDot { get; private set; } = null!;         // [seqLen, n_head]
     public VulkanDevice.Buffer YScan { get; private set; } = null!;            // [seqLen, n_head, head_dim]
 
+    // Host-visible per-head coefficient buffer for the streaming-chunk boundary
+    // adjustment: coef[h] = dt[0, h] · (1 - trap[0, h]). Sized to nHead — does
+    // NOT scale with seqLen, so it lives outside the AllocateForCapacity grow path
+    // and is allocated once in the constructor + freed in Dispose.
+    public VulkanDevice.Buffer BoundaryCoef { get; private set; } = null!;     // [n_head]
+
     // ── Final logits (1-row, last token only) ──
     public VulkanDevice.Buffer Logits { get; private set; }
     public VulkanDevice.Buffer LastTokenHidden { get; private set; } = null!;  // [hidden]
@@ -102,6 +108,9 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
         _vocabSize = config.VocabSize;
 
         Logits = device.Allocate((long)_vocabSize * sizeof(float));
+        // Per-head boundary-adjustment coefficient buffer — fixed-size (no seqLen
+        // dependence), so allocated once here and reused across every Forward.
+        BoundaryCoef = device.Allocate((long)_nHead * sizeof(float));
         AllocateForCapacity(Math.Max(1, initialSeqLen));
     }
 
@@ -155,7 +164,8 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
                        + headBytes * 5             // Dt, Adt, Gamma, Scale, QkPreDot
                        + angBytes
                        + bcBytes * 2               // B, C
-                       + (long)_vocabSize * sizeof(float);
+                       + (long)_vocabSize * sizeof(float)
+                       + (long)_nHead * sizeof(float);   // BoundaryCoef (per-head, no seqLen scale)
     }
 
     private void ReleaseLayerScratch()
@@ -187,5 +197,6 @@ internal sealed class VulkanMamba3ForwardScratch : IDisposable
         _disposed = true;
         ReleaseLayerScratch();
         Logits?.Dispose();
+        BoundaryCoef?.Dispose();
     }
 }
