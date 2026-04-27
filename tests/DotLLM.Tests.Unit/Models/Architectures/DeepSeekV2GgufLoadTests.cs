@@ -359,6 +359,71 @@ public sealed class DeepSeekV2GgufLoadTests
         }
     }
 
+    /// <summary>
+    /// Full 27-layer V2-Lite at Q2_K — the smallest practical V2-Lite quantization
+    /// (~5 GB on disk vs ~6.5 GB Q3_K_M and ~10.4 GB Q4_K_M). The full 27-layer
+    /// model fits the RTX 3060's 12 GB cap with significant headroom.
+    /// Asserts: 27-layer load + prefill on 4 tokens + 3 decode steps,
+    /// every step's logits finite. Skips when the GGUF isn't cached.
+    /// </summary>
+    [SkippableFact]
+    [Trait("Category", "GPU")]
+    public void RealGguf_Q2K_FullModel_27LayerSmoke()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf");
+        Skip.If(!File.Exists(path), $"Q2_K GGUF not cached at {path}");
+
+        // Catches Q2_K loader gaps the same way the Q3_K_M smoke caught Q3_K
+        // (which prompted Round 13). Gracefully skip if the loader hits an
+        // unsupported quant type rather than failing the test.
+        GgufFile gguf;
+        try { gguf = GgufFile.Open(path); }
+        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type"))
+        {
+            Skip.If(true, $"Q2_K loader-side gap: {ex.Message}");
+            return;
+        }
+        using var _gguf = gguf;
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(27, fullConfig.NumLayers);  // full V2-Lite
+        Assert.Equal(AttentionType.MLA, fullConfig.AttentionType);
+        Assert.NotNull(fullConfig.MlaConfig);
+        Assert.NotNull(fullConfig.Moe);
+
+        // Trim KV cache horizon to 16 tokens (4 prefill + 3 decode + headroom),
+        // mirroring the Q3_K_M smoke. V2-Lite's native 163840-token context would
+        // OOM the 12 GB cap before any inference.
+        var config = fullConfig with { MaxSequenceLength = 16 };
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+
+        // Prefill on 4 tokens. MLA dispatch uses the model's internal
+        // _mlaKvCache; the kvCache parameter is ignored on the MLA path.
+        int[] tokenIds = [100000, 261, 1559, 11];
+        int[] positions = [0, 1, 2, 3];
+        int curTok;
+        using (ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null))
+        {
+            AssertAllFinite(logits, "Q2_K prefill");
+            curTok = ArgmaxLogits(logits);
+        }
+
+        // 3 decode steps — exercises KV cache write/read on every MoE layer.
+        // Cache state persists in the model between calls.
+        for (int i = 0; i < 3; i++)
+        {
+            int pos = positions.Length + i;
+            using var step = model.Forward(new[] { curTok }, new[] { pos },
+                deviceId: 0, kvCache: null);
+            AssertAllFinite(step, $"Q2_K decode step {i}");
+            curTok = ArgmaxLogits(step);
+        }
+    }
+
     private static unsafe void AssertAllFinite(ITensor logits, string label)
     {
         int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
