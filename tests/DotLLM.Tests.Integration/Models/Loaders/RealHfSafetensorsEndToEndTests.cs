@@ -742,7 +742,8 @@ public sealed class RealHfSafetensorsEndToEndTests
         {
             Assert.Equal(Architecture.Qwen, config.Architecture);
             Assert.Equal(reference.LogitsShape[1], config.VocabSize);
-            Assert.Equal(reference.InputIds.Length, reference.LogitsShape[0]);
+            Assert.Equal(reference.InputIds.Length,
+                reference.LogitsShape[0] + reference.LogitsOffset);
 
             int[] tokenIds = reference.InputIds;
             int[] positions = new int[tokenIds.Length];
@@ -756,7 +757,7 @@ public sealed class RealHfSafetensorsEndToEndTests
                 $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
 
             Assert.Equal(2, logits.Shape.Rank);
-            Assert.Equal(reference.LogitsShape[0], logits.Shape[0]);
+            Assert.Equal(reference.InputIds.Length, logits.Shape[0]);
             Assert.Equal(reference.LogitsShape[1], logits.Shape[1]);
 
             CompareLogitsAgainstReference(logits, reference);
@@ -1002,7 +1003,12 @@ public sealed class RealHfSafetensorsEndToEndTests
         {
             Assert.Equal(expectedArch, config.Architecture);
             Assert.Equal(reference.LogitsShape[1], config.VocabSize);
-            Assert.Equal(reference.InputIds.Length, reference.LogitsShape[0]);
+            // Reference logits cover positions [LogitsOffset, LogitsOffset+LogitsShape[0])
+            // of the full input_ids; for short-prompt references LogitsOffset=0
+            // and LogitsShape[0]==InputIds.Length. The full forward pass runs over
+            // every input id regardless.
+            Assert.Equal(reference.InputIds.Length,
+                reference.LogitsShape[0] + reference.LogitsOffset);
 
             int[] tokenIds = reference.InputIds;
             int[] positions = new int[tokenIds.Length];
@@ -1016,7 +1022,7 @@ public sealed class RealHfSafetensorsEndToEndTests
                 $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
 
             Assert.Equal(2, logits.Shape.Rank);
-            Assert.Equal(reference.LogitsShape[0], logits.Shape[0]);
+            Assert.Equal(reference.InputIds.Length, logits.Shape[0]);
             Assert.Equal(reference.LogitsShape[1], logits.Shape[1]);
 
             CompareLogitsAgainstReference(logits, reference, tolerances);
@@ -1129,19 +1135,22 @@ public sealed class RealHfSafetensorsEndToEndTests
         ITensor ours, ReferenceLogits reference, DriftTolerances? tolerances = null)
     {
         DriftTolerances tol = tolerances ?? DriftTolerances.Tight;
-        int seqLen = reference.LogitsShape[0];
+        int refSeqLen = reference.LogitsShape[0];
         int vocab = reference.LogitsShape[1];
-        int total = seqLen * vocab;
-        var oursSpan = new ReadOnlySpan<float>((void*)ours.DataPointer, total);
+        int offset = reference.LogitsOffset;
+        int oursTotal = (int)(ours.Shape[0] * ours.Shape[1]);
+        var oursSpan = new ReadOnlySpan<float>((void*)ours.DataPointer, oursTotal);
 
         double sumAbsDiff = 0;
         float maxAbsDiff = 0;
         int maxAbsDiffIdx = -1;
         int argmaxMatches = 0;
+        int total = refSeqLen * vocab;
 
-        for (int row = 0; row < seqLen; row++)
+        for (int row = 0; row < refSeqLen; row++)
         {
-            ReadOnlySpan<float> oursRow = oursSpan.Slice(row * vocab, vocab);
+            int oursRowIdx = offset + row;
+            ReadOnlySpan<float> oursRow = oursSpan.Slice(oursRowIdx * vocab, vocab);
             float[] refRow = reference.Logits[row];
             Assert.Equal(vocab, refRow.Length);
 
@@ -1173,12 +1182,13 @@ public sealed class RealHfSafetensorsEndToEndTests
         }
 
         double meanAbsDiff = sumAbsDiff / total;
-        double argmaxMatchRate = (double)argmaxMatches / seqLen;
+        double argmaxMatchRate = (double)argmaxMatches / refSeqLen;
 
         _output.WriteLine(
             $"Drift: max_abs_diff={maxAbsDiff:F4} (at flat idx {maxAbsDiffIdx}) "
             + $"mean_abs_diff={meanAbsDiff:F6} "
-            + $"argmax_match_rate={argmaxMatchRate:F3} ({argmaxMatches}/{seqLen})");
+            + $"argmax_match_rate={argmaxMatchRate:F3} ({argmaxMatches}/{refSeqLen}) "
+            + $"[ref offset={offset}]");
 
         Assert.True(
             maxAbsDiff < tol.MaxAbsDiff,
@@ -1238,6 +1248,13 @@ public sealed class RealHfSafetensorsEndToEndTests
         int seqLen = shapeEl[0].GetInt32();
         int vocab = shapeEl[1].GetInt32();
 
+        // logits_offset is optional (default 0 for backward compat with
+        // existing references). When > 0, the reference logits cover only
+        // positions [logits_offset, logits_offset + seqLen) of the full
+        // input_ids — used for long-context references where the full
+        // [seq_len, vocab] tensor would be GBs of JSON.
+        int logitsOffset = root.TryGetProperty("logits_offset", out var lo) ? lo.GetInt32() : 0;
+
         var logitsEl = root.GetProperty("logits");
         Assert.Equal(seqLen, logitsEl.GetArrayLength());
         var logits = new float[seqLen][];
@@ -1260,6 +1277,7 @@ public sealed class RealHfSafetensorsEndToEndTests
             pythonVersion,
             inputIds,
             [seqLen, vocab],
+            logitsOffset,
             logits);
     }
 
@@ -1271,6 +1289,7 @@ public sealed class RealHfSafetensorsEndToEndTests
         string PythonVersion,
         int[] InputIds,
         int[] LogitsShape,
+        int LogitsOffset,
         float[][] Logits);
 
     // ────────────────────────────────────────────────────────────────────

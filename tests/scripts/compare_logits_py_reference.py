@@ -71,8 +71,28 @@ def main() -> int:
         description="Generate a PyTorch reference logits JSON for dotLLM drift testing."
     )
     parser.add_argument("--model-path", required=True, help="Path to HF snapshot directory.")
-    parser.add_argument("--prompt", required=True, help="Prompt string to forward.")
+    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt", help="Prompt string to forward.")
+    prompt_group.add_argument(
+        "--prompt-file",
+        help="Path to a UTF-8 file containing the prompt. Useful for long "
+             "contexts where shell quoting is impractical (e.g. the >4K-token "
+             "long-context YaRN test).",
+    )
     parser.add_argument("--output-path", required=True, help="Destination JSON path.")
+    parser.add_argument(
+        "--last-n-rows",
+        type=int,
+        default=None,
+        help="If set, only the last N rows of logits are written to the JSON "
+             "fixture, with a 'logits_offset' field recording where they sit "
+             "in the full sequence. Required for long-context references "
+             "where the full [seq_len, vocab_size] tensor would balloon to "
+             "GBs (e.g. a 4500-token DeepSeek-V2-Lite reference at 102400 "
+             "vocab is ~4 GB; --last-n-rows 8 gives ~8 MB). The full "
+             "input_ids are still emitted so the C# test can run the full "
+             "prompt forward and compare only the last-N output rows.",
+    )
     parser.add_argument(
         "--dtype",
         default="bfloat16",
@@ -137,13 +157,30 @@ def main() -> int:
     )
     model.eval()
 
-    print(f"Encoding prompt: {args.prompt!r}")
+    if args.prompt is not None:
+        prompt_text = args.prompt
+        print(f"Encoding prompt: {prompt_text!r}")
+    else:
+        prompt_path = Path(args.prompt_file)
+        if not prompt_path.exists():
+            print(f"ERROR: prompt-file does not exist: {prompt_path}", file=sys.stderr)
+            return 2
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        print(f"Loaded prompt from {prompt_path} ({len(prompt_text)} chars)")
+
     # add_special_tokens=False to match dotLLM's raw-prompt tokenisation
     # path — the existing Qwen25_0_5B_GeneratesText_FromTokenizedPrompt
     # test feeds the raw `tok.Encode(prompt)` ids into Forward without BOS.
-    encoded = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
+    encoded = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
     input_ids = encoded["input_ids"]
-    print(f"Input ids ({input_ids.shape[-1]}): {input_ids[0].tolist()}")
+    seq_len_full = int(input_ids.shape[-1])
+    if args.prompt is not None:
+        print(f"Input ids ({seq_len_full}): {input_ids[0].tolist()}")
+    else:
+        # Avoid printing thousands of token ids; show first/last summary.
+        head = input_ids[0, :8].tolist()
+        tail = input_ids[0, -8:].tolist()
+        print(f"Input ids ({seq_len_full}): head={head} ... tail={tail}")
 
     print("Running forward pass ...")
     with torch.no_grad():
@@ -163,11 +200,26 @@ def main() -> int:
         f"std={logits_f32.std().item():.4f}"
     )
 
+    # Optionally subset to last-N rows for long-context references where the
+    # full tensor would be GBs of JSON. logits_offset records where the
+    # subset starts so the C# test can compare model.Forward()'s output at
+    # positions [offset, offset+N) against these N rows.
+    logits_offset = 0
+    if args.last_n_rows is not None and args.last_n_rows > 0 and args.last_n_rows < seq_len:
+        n = args.last_n_rows
+        logits_offset = int(seq_len - n)
+        logits_f32 = logits_f32[-n:]
+        print(
+            f"Subsetting to last {n} rows: logits_offset={logits_offset}, "
+            f"new logits shape: {list(logits_f32.shape)}"
+        )
+
     payload = {
         "model_path": str(model_path).replace("\\", "/"),
-        "prompt": args.prompt,
+        "prompt": (args.prompt if args.prompt is not None else f"<file:{Path(args.prompt_file).name}>"),
         "input_ids": input_ids[0].tolist(),
-        "logits_shape": [int(seq_len), int(vocab_size)],
+        "logits_shape": [int(logits_f32.shape[0]), int(vocab_size)],
+        "logits_offset": logits_offset,
         "logits": logits_f32.tolist(),
         "dtype": args.dtype,
         "attn_impl": args.attn_impl or "auto",
