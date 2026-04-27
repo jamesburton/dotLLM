@@ -1242,6 +1242,30 @@ public sealed unsafe class CudaKernels : IDisposable
             or QuantizationType.Q5_K or QuantizationType.Q6_K;
 
     /// <summary>
+    /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
+    /// kernel for the given quant type. Block-32 quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
+    /// require <c>K % 32 == 0</c>; K-quants (Q3_K/Q4_K/Q5_K/Q6_K) require
+    /// <c>K % 256 == 0</c>. Caller-side gates use this to decide between the
+    /// direct-GEMV fast path and the dequant-then-GEMM fallback.
+    /// </summary>
+    /// <remarks>
+    /// V2-Lite's <c>ffn_down_exps</c> is stored at K=intermediate=1408 with quant
+    /// type Q8_0 (Q4_K_M mix) or Q5_0 (Q3_K_M mix). 1408 is a multiple of 32 but
+    /// not 256; the previous unconditional <c>K % 256</c> gate locked these
+    /// projections out of the GEMV fast path. The block-32 kernels handle K=1408
+    /// natively (<c>blocks_per_row = K/32 = 44</c>).
+    /// </remarks>
+    public static int MinKAlignmentFor(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_0 or QuantizationType.Q4_1
+            or QuantizationType.Q5_0 or QuantizationType.Q5_1
+            or QuantizationType.Q8_0 => 32,
+        QuantizationType.Q3_K or QuantizationType.Q4_K
+            or QuantizationType.Q5_K or QuantizationType.Q6_K => 256,
+        _ => int.MaxValue,  // unsupported types — gate always fails
+    };
+
+    /// <summary>
     /// Phase-B MoE grouped quantized GEMV (Q4_K only at v1). Computes K_active
     /// independent <c>y_e[m] = W_e[m,k] @ x[k]</c> projections in a single launch
     /// where <c>x</c> (FP16, length K) is shared across all experts and each
