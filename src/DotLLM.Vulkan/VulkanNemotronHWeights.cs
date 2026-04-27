@@ -14,16 +14,23 @@ namespace DotLLM.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>F32-only constraint (first cut, issue #5):</b> every projection weight is dequantised
-/// to F32 at upload, regardless of the source quant type. The Vulkan path consumes them via
-/// <see cref="DotLLM.Vulkan.Kernels.MatMulF32Kernel"/>. The Q8_0 fast path used by
-/// <see cref="VulkanWeights"/> is intentionally not wired here yet — quant support is a
-/// follow-up so this commit can focus on getting the SSM + hybrid-dispatch wiring correct.
+/// <b>Two-mode storage.</b> Q8_0 source projections are kept on device as raw 34-byte
+/// blocks when the contraction dim is a multiple of 32 (the Q8_0 group size) — the
+/// forward pass dispatches them through the existing
+/// <see cref="DotLLM.Vulkan.Kernels.MatMulQ8_0Kernel"/> /
+/// <see cref="DotLLM.Vulkan.Kernels.MatMulQ8_0GemmKernel"/>, mirroring the
+/// <see cref="VulkanWeights"/> path. F16 and Q4_K/Q5_K/Q6_K/Q5_0 are still dequantised
+/// to F32 at upload (no kernel in tree); F32 sources are uploaded verbatim. Norm weights
+/// and the small per-head SSM vectors (<c>ssm_a</c>, <c>ssm_d</c>, <c>ssm_dt.bias</c>,
+/// <c>ssm_norm.weight</c>, <c>ssm_conv1d.weight</c>, <c>ssm_conv1d.bias</c>) are always
+/// uploaded as F32 device buffers — they are already dequantised to <c>float[]</c> on
+/// the CPU side at GGUF load time.
 /// </para>
 /// <para>
-/// Norm weights and small per-head vectors (ssm_a, ssm_d, ssm_dt.bias, ssm_norm.weight,
-/// ssm_conv1d.weight, ssm_conv1d.bias) are uploaded as F32 device buffers — they are
-/// already dequantised to <c>float[]</c> on the CPU side at GGUF load time.
+/// <b>Token embedding.</b> Dequantised to F32 at upload regardless of source quant type
+/// — the embedding gather uses <c>vkCmdCopyBuffer</c> with row-major byte offsets, which
+/// only works with a contiguous F32 layout. This matches the
+/// <see cref="VulkanWeights"/> convention.
 /// </para>
 /// </remarks>
 internal sealed class VulkanNemotronHWeights : IDisposable
@@ -40,24 +47,29 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         public readonly VulkanDevice.Buffer NormWeight;     // [d_inner] (group-norm weight, n_group * group_dim)
         public readonly VulkanDevice.Buffer OutWeight;      // [hidden, d_inner]
 
+        public readonly QuantizationType InDeviceQuantType;
+        public readonly QuantizationType OutDeviceQuantType;
+
         public readonly int InInputDim;
         public readonly int InOutputDim;
         public readonly int OutInputDim;
         public readonly int OutOutputDim;
 
         public SsmLayerBuffers(
-            VulkanDevice.Buffer inWeight, int inInputDim, int inOutputDim,
+            VulkanDevice.Buffer inWeight, QuantizationType inDeviceQt, int inInputDim, int inOutputDim,
             VulkanDevice.Buffer conv1dWeight, VulkanDevice.Buffer conv1dBias,
             VulkanDevice.Buffer a, VulkanDevice.Buffer d, VulkanDevice.Buffer dtBias,
             VulkanDevice.Buffer normWeight,
-            VulkanDevice.Buffer outWeight, int outInputDim, int outOutputDim)
+            VulkanDevice.Buffer outWeight, QuantizationType outDeviceQt, int outInputDim, int outOutputDim)
         {
-            InWeight = inWeight; InInputDim = inInputDim; InOutputDim = inOutputDim;
+            InWeight = inWeight; InDeviceQuantType = inDeviceQt;
+            InInputDim = inInputDim; InOutputDim = inOutputDim;
             Conv1dWeight = conv1dWeight;
             Conv1dBias = conv1dBias;
             A = a; D = d; DtBias = dtBias;
             NormWeight = normWeight;
-            OutWeight = outWeight; OutInputDim = outInputDim; OutOutputDim = outOutputDim;
+            OutWeight = outWeight; OutDeviceQuantType = outDeviceQt;
+            OutInputDim = outInputDim; OutOutputDim = outOutputDim;
         }
 
         public void Dispose()
@@ -78,6 +90,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         public readonly VulkanDevice.Buffer K;
         public readonly VulkanDevice.Buffer V;
         public readonly VulkanDevice.Buffer O;
+        public readonly QuantizationType QDeviceQuantType;
+        public readonly QuantizationType KDeviceQuantType;
+        public readonly QuantizationType VDeviceQuantType;
+        public readonly QuantizationType ODeviceQuantType;
         public readonly int QOutputDim, QInputDim;
         public readonly int KOutputDim, KInputDim;
         public readonly int VOutputDim, VInputDim;
@@ -85,16 +101,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         public readonly int NumKvHeads;
 
         public AttentionLayerBuffers(
-            VulkanDevice.Buffer q, int qM, int qK,
-            VulkanDevice.Buffer k, int kM, int kK,
-            VulkanDevice.Buffer v, int vM, int vK,
-            VulkanDevice.Buffer o, int oM, int oK,
+            VulkanDevice.Buffer q, QuantizationType qQt, int qM, int qK,
+            VulkanDevice.Buffer k, QuantizationType kQt, int kM, int kK,
+            VulkanDevice.Buffer v, QuantizationType vQt, int vM, int vK,
+            VulkanDevice.Buffer o, QuantizationType oQt, int oM, int oK,
             int numKvHeads)
         {
-            Q = q; QOutputDim = qM; QInputDim = qK;
-            K = k; KOutputDim = kM; KInputDim = kK;
-            V = v; VOutputDim = vM; VInputDim = vK;
-            O = o; OOutputDim = oM; OInputDim = oK;
+            Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
+            K = k; KDeviceQuantType = kQt; KOutputDim = kM; KInputDim = kK;
+            V = v; VDeviceQuantType = vQt; VOutputDim = vM; VInputDim = vK;
+            O = o; ODeviceQuantType = oQt; OOutputDim = oM; OInputDim = oK;
             NumKvHeads = numKvHeads;
         }
 
@@ -109,15 +125,17 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         public readonly VulkanDevice.Buffer Up;
         public readonly VulkanDevice.Buffer Down;
+        public readonly QuantizationType UpDeviceQuantType;
+        public readonly QuantizationType DownDeviceQuantType;
         public readonly int UpOutputDim, UpInputDim;
         public readonly int DownOutputDim, DownInputDim;
 
         public FfnLayerBuffers(
-            VulkanDevice.Buffer up, int upM, int upK,
-            VulkanDevice.Buffer down, int downM, int downK)
+            VulkanDevice.Buffer up, QuantizationType upQt, int upM, int upK,
+            VulkanDevice.Buffer down, QuantizationType downQt, int downM, int downK)
         {
-            Up = up; UpOutputDim = upM; UpInputDim = upK;
-            Down = down; DownOutputDim = downM; DownInputDim = downK;
+            Up = up; UpDeviceQuantType = upQt; UpOutputDim = upM; UpInputDim = upK;
+            Down = down; DownDeviceQuantType = downQt; DownOutputDim = downM; DownInputDim = downK;
         }
 
         public void Dispose()
@@ -162,6 +180,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
     public VulkanDevice.Buffer OutputNormWeight { get; }
     public VulkanDevice.Buffer OutputWeight { get; }
+    public QuantizationType OutputDeviceQuantType { get; }
     public int OutputOutputDim { get; }
     public int OutputInputDim { get; }
 
@@ -171,7 +190,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         LayerBuffers[] layers,
         VulkanDevice.Buffer tokenEmbedding, int vocabSize, int hiddenSize,
         VulkanDevice.Buffer outputNormWeight,
-        VulkanDevice.Buffer outputWeight, int outputOutputDim, int outputInputDim,
+        VulkanDevice.Buffer outputWeight, QuantizationType outputDeviceQt,
+        int outputOutputDim, int outputInputDim,
         long allocatedBytes)
     {
         _layers = layers;
@@ -180,14 +200,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         HiddenSize = hiddenSize;
         OutputNormWeight = outputNormWeight;
         OutputWeight = outputWeight;
+        OutputDeviceQuantType = outputDeviceQt;
         OutputOutputDim = outputOutputDim;
         OutputInputDim = outputInputDim;
         AllocatedBytes = allocatedBytes;
     }
 
     /// <summary>
-    /// Uploads a NemotronH model's weights to the Vulkan device. All projection weights are
-    /// dequantised to F32 in this first cut — see class remarks.
+    /// Uploads a NemotronH model's weights to the Vulkan device. Q8_0 projection sources
+    /// are kept on device as raw Q8_0 blocks when the contraction dim is a multiple of 32;
+    /// every other source dtype is dequantised to F32 on upload (see class remarks).
     /// </summary>
     public static VulkanNemotronHWeights Upload(
         VulkanDevice device,
@@ -207,15 +229,17 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         long totalBytes = 0;
 
         // Size the staging buffer to the largest single matrix we will upload (in its
-        // F32 form, since every matrix is dequantised).
+        // on-device byte form — Q8_0 blocks for kept-Q8_0, F32 elsewhere).
         long stagingBytes = ComputeMaxStagingBytes(config, cpuLayers, outputNormWeight,
-            outputOutputDim, outputInputDim);
+            outputOutputDim, outputInputDim, outputQuantType);
         using var staging = device.Allocate(stagingBytes);
 
-        // Token embedding [vocab, hidden] — dequantised on upload.
+        // Token embedding [vocab, hidden] — always dequantised on upload (the embedding
+        // gather uses byte-offset vkCmdCopyBuffer and needs a contiguous F32 layout).
         var tokenEmbed = UploadProjectionMatrix(device, staging,
             tokenEmbedWeight, tokenEmbedQuantType, config.VocabSize, config.HiddenSize,
-            out long tokenEmbedBytes);
+            forceF32: true,
+            out _, out long tokenEmbedBytes);
         totalBytes += tokenEmbedBytes;
 
         var layers = new LayerBuffers[config.NumLayers];
@@ -262,22 +286,38 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
         var outputW = UploadProjectionMatrix(device, staging,
             outputWeight, outputQuantType, outputOutputDim, outputInputDim,
-            out long outputBytes);
+            forceF32: false,
+            out var outputDeviceQt, out long outputBytes);
         totalBytes += outputBytes;
 
         return new VulkanNemotronHWeights(layers,
             tokenEmbed, config.VocabSize, config.HiddenSize,
-            outputNorm, outputW, outputOutputDim, outputInputDim,
+            outputNorm, outputW, outputDeviceQt, outputOutputDim, outputInputDim,
             totalBytes);
+    }
+
+    /// <summary>True iff a Q8_0 source projection can be kept on device as raw Q8_0
+    /// blocks — gated on the input dim being a multiple of the Q8_0 group size (32).</summary>
+    private static bool KeepQ8OnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.Q8_0 && (inputDim % 32) == 0;
+
+    /// <summary>Returns the on-device byte size for one projection matrix in its
+    /// chosen storage form — Q8_0 row-stride bytes when kept Q8_0, otherwise F32.</summary>
+    private static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
+    {
+        if (KeepQ8OnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        return (long)outputDim * inputDim * sizeof(float);
     }
 
     private static long ComputeMaxStagingBytes(
         ModelConfig config, NemotronHLayerWeights[] cpuLayers, float[] outputNormWeight,
-        int outputOutputDim, int outputInputDim)
+        int outputOutputDim, int outputInputDim, QuantizationType outputQt)
     {
         long max = 0;
+        // Token embedding is always dequantised → F32 staging size.
         max = Math.Max(max, (long)config.VocabSize * config.HiddenSize * sizeof(float));
-        max = Math.Max(max, (long)outputOutputDim * outputInputDim * sizeof(float));
+        max = Math.Max(max, ProjectionUploadBytes(outputOutputDim, outputInputDim, outputQt));
         max = Math.Max(max, (long)outputNormWeight.Length * sizeof(float));
 
         for (int i = 0; i < cpuLayers.Length; i++)
@@ -287,8 +327,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
             if (lw.Ssm is { } s)
             {
-                max = Math.Max(max, (long)s.InOutputDim * s.InInputDim * sizeof(float));
-                max = Math.Max(max, (long)s.OutOutputDim * s.OutInputDim * sizeof(float));
+                max = Math.Max(max, ProjectionUploadBytes(s.InOutputDim, s.InInputDim, s.InQuantType));
+                max = Math.Max(max, ProjectionUploadBytes(s.OutOutputDim, s.OutInputDim, s.OutQuantType));
                 max = Math.Max(max, (long)s.Conv1dWeight.Length * sizeof(float));
                 max = Math.Max(max, (long)s.Conv1dBias.Length * sizeof(float));
                 max = Math.Max(max, (long)s.A.Length * sizeof(float));
@@ -298,15 +338,15 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             }
             if (lw.Attention is { } a)
             {
-                max = Math.Max(max, (long)a.QOutputDim * a.QInputDim * sizeof(float));
-                max = Math.Max(max, (long)a.KOutputDim * a.KInputDim * sizeof(float));
-                max = Math.Max(max, (long)a.VOutputDim * a.VInputDim * sizeof(float));
-                max = Math.Max(max, (long)a.OOutputDim * a.OInputDim * sizeof(float));
+                max = Math.Max(max, ProjectionUploadBytes(a.QOutputDim, a.QInputDim, a.QQuantType));
+                max = Math.Max(max, ProjectionUploadBytes(a.KOutputDim, a.KInputDim, a.KQuantType));
+                max = Math.Max(max, ProjectionUploadBytes(a.VOutputDim, a.VInputDim, a.VQuantType));
+                max = Math.Max(max, ProjectionUploadBytes(a.OOutputDim, a.OInputDim, a.OQuantType));
             }
             if (lw.Ffn is { } f)
             {
-                max = Math.Max(max, (long)f.UpOutputDim * f.UpInputDim * sizeof(float));
-                max = Math.Max(max, (long)f.DownOutputDim * f.DownInputDim * sizeof(float));
+                max = Math.Max(max, ProjectionUploadBytes(f.UpOutputDim, f.UpInputDim, f.UpQuantType));
+                max = Math.Max(max, ProjectionUploadBytes(f.DownOutputDim, f.DownInputDim, f.DownQuantType));
             }
         }
         return Math.Max(max, 64);
@@ -319,7 +359,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         uploadedBytes = 0;
         var inBuf = UploadProjectionMatrix(device, staging,
             ssmW.InWeight, ssmW.InQuantType, ssmW.InOutputDim, ssmW.InInputDim,
-            out long inBytes);
+            forceF32: false,
+            out var inDeviceQt, out long inBytes);
         uploadedBytes += inBytes;
 
         var conv1dWeight = UploadFloatArray(device, staging, ssmW.Conv1dWeight);
@@ -337,15 +378,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
 
         var outBuf = UploadProjectionMatrix(device, staging,
             ssmW.OutWeight, ssmW.OutQuantType, ssmW.OutOutputDim, ssmW.OutInputDim,
-            out long outBytes);
+            forceF32: false,
+            out var outDeviceQt, out long outBytes);
         uploadedBytes += outBytes;
 
         return new SsmLayerBuffers(
-            inBuf, ssmW.InInputDim, ssmW.InOutputDim,
+            inBuf, inDeviceQt, ssmW.InInputDim, ssmW.InOutputDim,
             conv1dWeight, conv1dBias,
             a, d, dtBias,
             norm,
-            outBuf, ssmW.OutInputDim, ssmW.OutOutputDim);
+            outBuf, outDeviceQt, ssmW.OutInputDim, ssmW.OutOutputDim);
     }
 
     private static AttentionLayerBuffers UploadAttentionLayer(
@@ -354,20 +396,24 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         uploadedBytes = 0;
         var q = UploadProjectionMatrix(device, staging,
-            attnW.QWeight, attnW.QQuantType, attnW.QOutputDim, attnW.QInputDim, out long qBytes);
+            attnW.QWeight, attnW.QQuantType, attnW.QOutputDim, attnW.QInputDim,
+            forceF32: false, out var qQt, out long qBytes);
         var k = UploadProjectionMatrix(device, staging,
-            attnW.KWeight, attnW.KQuantType, attnW.KOutputDim, attnW.KInputDim, out long kBytes);
+            attnW.KWeight, attnW.KQuantType, attnW.KOutputDim, attnW.KInputDim,
+            forceF32: false, out var kQt, out long kBytes);
         var v = UploadProjectionMatrix(device, staging,
-            attnW.VWeight, attnW.VQuantType, attnW.VOutputDim, attnW.VInputDim, out long vBytes);
+            attnW.VWeight, attnW.VQuantType, attnW.VOutputDim, attnW.VInputDim,
+            forceF32: false, out var vQt, out long vBytes);
         var o = UploadProjectionMatrix(device, staging,
-            attnW.OWeight, attnW.OQuantType, attnW.OOutputDim, attnW.OInputDim, out long oBytes);
+            attnW.OWeight, attnW.OQuantType, attnW.OOutputDim, attnW.OInputDim,
+            forceF32: false, out var oQt, out long oBytes);
         uploadedBytes += qBytes + kBytes + vBytes + oBytes;
 
         return new AttentionLayerBuffers(
-            q, attnW.QOutputDim, attnW.QInputDim,
-            k, attnW.KOutputDim, attnW.KInputDim,
-            v, attnW.VOutputDim, attnW.VInputDim,
-            o, attnW.OOutputDim, attnW.OInputDim,
+            q, qQt, attnW.QOutputDim, attnW.QInputDim,
+            k, kQt, attnW.KOutputDim, attnW.KInputDim,
+            v, vQt, attnW.VOutputDim, attnW.VInputDim,
+            o, oQt, attnW.OOutputDim, attnW.OInputDim,
             attnW.NumKvHeads);
     }
 
@@ -376,33 +422,72 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         NemotronHFfnWeights ffnW, out long uploadedBytes)
     {
         var up = UploadProjectionMatrix(device, staging,
-            ffnW.UpWeight, ffnW.UpQuantType, ffnW.UpOutputDim, ffnW.UpInputDim, out long upBytes);
+            ffnW.UpWeight, ffnW.UpQuantType, ffnW.UpOutputDim, ffnW.UpInputDim,
+            forceF32: false, out var upQt, out long upBytes);
         var down = UploadProjectionMatrix(device, staging,
-            ffnW.DownWeight, ffnW.DownQuantType, ffnW.DownOutputDim, ffnW.DownInputDim, out long downBytes);
+            ffnW.DownWeight, ffnW.DownQuantType, ffnW.DownOutputDim, ffnW.DownInputDim,
+            forceF32: false, out var downQt, out long downBytes);
         uploadedBytes = upBytes + downBytes;
         return new FfnLayerBuffers(
-            up, ffnW.UpOutputDim, ffnW.UpInputDim,
-            down, ffnW.DownOutputDim, ffnW.DownInputDim);
+            up, upQt, ffnW.UpOutputDim, ffnW.UpInputDim,
+            down, downQt, ffnW.DownOutputDim, ffnW.DownInputDim);
     }
 
     /// <summary>
-    /// Uploads one projection matrix from an unmanaged source pointer, dequantising to F32
-    /// when the source quant type is not already F32.
+    /// Uploads one projection matrix from an unmanaged source pointer. When the source
+    /// is Q8_0 and <paramref name="forceF32"/> is false and the contraction dim is a
+    /// multiple of 32, the raw Q8_0 block bytes are copied verbatim and
+    /// <paramref name="deviceQuantType"/> is <see cref="QuantizationType.Q8_0"/>; the
+    /// caller must dispatch the matmul through a Q8_0 kernel. Otherwise the source is
+    /// dequantised to F32 before upload and <paramref name="deviceQuantType"/> is
+    /// <see cref="QuantizationType.F32"/>.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadProjectionMatrix(
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
+        bool forceF32,
+        out QuantizationType deviceQuantType,
         out long uploadedBytes)
     {
         long elems = (long)outputDim * inputDim;
-        long bytes = elems * sizeof(float);
-        var buf = device.AllocateDeviceLocal(bytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+        if (!forceF32 && KeepQ8OnDevice(qt, inputDim))
+        {
+            // Raw Q8_0 blob upload — same on-device byte layout as VulkanWeights so the
+            // existing matmul_q8_0 / matmul_q8_0_gemm kernels read it directly.
+            long rowBytes = Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0);
+            long bytes = rowBytes * outputDim;
+
+            var buf = device.AllocateDeviceLocal(bytes);
+            VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+                .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging (Q8_0)");
+            try
+            {
+                new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
+                    .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
+            }
+            finally
+            {
+                VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+            }
+            device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+
+            deviceQuantType = QuantizationType.Q8_0;
+            uploadedBytes = bytes;
+            return buf;
+        }
+
+        // F32 dequantised upload — covers F32 source, F16 source, every K-quant /
+        // Q5_0 (no Vulkan kernel for those yet), and the forceF32-token-embedding
+        // path that always lands here.
+        long fpBytes = elems * sizeof(float);
+        var fpBuf = device.AllocateDeviceLocal(fpBytes);
+
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)fpBytes, 0, out nint fpMapped)
             .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging");
         try
         {
-            float* dst = (float*)mapped;
+            float* dst = (float*)fpMapped;
             if (qt == QuantizationType.F32)
             {
                 new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
@@ -430,9 +515,11 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
         }
 
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
-        uploadedBytes = bytes;
-        return buf;
+        device.CopyBufferSynchronous(staging, fpBuf, (ulong)fpBytes);
+
+        deviceQuantType = QuantizationType.F32;
+        uploadedBytes = fpBytes;
+        return fpBuf;
     }
 
     private static unsafe VulkanDevice.Buffer UploadFloatArray(

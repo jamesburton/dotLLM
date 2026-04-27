@@ -18,9 +18,13 @@ namespace DotLLM.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// All projection weights are dequantised to F32 at upload in this first cut — see
-/// <see cref="VulkanNemotronHWeights"/> for rationale and the quant-support follow-up note.
-/// The 6 SSM kernels (silu_inplace, conv1d_causal, mamba2_selective_scan, ssm_d_skip,
+/// Projection weights honour their source quant type at upload: Q8_0 sources are kept on
+/// device as raw Q8_0 blocks when the contraction dim is a multiple of 32 and dispatched
+/// through <see cref="MatMulQ8_0Kernel"/> (decode) or <see cref="MatMulQ8_0GemmKernel"/> /
+/// <see cref="MatMulQ8_0GemmCoopmatKernel"/> (prefill) — same routing as
+/// <see cref="VulkanTransformerModel"/>. Every other dtype (F32, F16, K-quants) is
+/// dequantised to F32 at upload and dispatched through <see cref="MatMulF32Kernel"/>. The 6
+/// SSM kernels (silu_inplace, conv1d_causal, mamba2_selective_scan, ssm_d_skip,
 /// group_rmsnorm, relu_squared_inplace) all have parity tests in
 /// <c>tests/DotLLM.Tests.Unit/Vulkan/</c>; this model only orchestrates them.
 /// </para>
@@ -46,6 +50,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     // Kernels.
     private readonly MatMulF32Kernel _matmul;
+    private readonly MatMulQ8_0Kernel _matmulQ8;
+    private readonly MatMulQ8_0GemmKernel _matmulQ8Gemm;
+    // Coopmat-accelerated Q8_0 prefill kernel — created opportunistically; null on devices
+    // without VK_KHR_cooperative_matrix support, in which case the scalar Q8_0 GEMM is used.
+    private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -87,7 +96,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         VulkanSsmStateCache ssmCache,
         int[] ssmLayerOrdinal,
         int[] kvSlotForLayer, int attentionLayerCount,
-        MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
+        MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
@@ -108,6 +119,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _attentionLayerCount = attentionLayerCount;
 
         _matmul = matmul;
+        _matmulQ8 = matmulQ8;
+        _matmulQ8Gemm = matmulQ8Gemm;
+        _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -208,6 +222,19 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         // Create kernels.
         var matmul = MatMulF32Kernel.Create(device, spvDir);
+        // Q8_0 matmul kernels are always created — projections that aren't kept on device as
+        // Q8_0 (i.e. uploaded as F32) simply never dispatch through them, but the dispatch
+        // router needs them bound on every device because mixed-quant configs (some Q8_0
+        // SSM in_proj, F16 attention Q, …) are common in real GGUFs.
+        var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
+        var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        // Optional coopmat prefill GEMM — null on devices without KHR_cooperative_matrix.
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat = null;
+        if (device.HasCooperativeMatrix)
+        {
+            try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
+            catch (InvalidOperationException) { /* Kernel threw: no usable tile shape. Stay on scalar. */ }
+        }
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -227,7 +254,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             device, ownsDevice: false,
             config, weights, state, ssmCache,
             ssmLayerOrdinal, kvSlotForLayer, attentionLayerCount,
-            matmul, rmsnorm, rope, attention, swiglu, add, biasAdd,
+            matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            rmsnorm, rope, attention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             submit,
             ropeDim, ropeTheta);
@@ -318,8 +346,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             rowCount: 1, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        _matmul.Record(cmdBuf, _weights.OutputWeight, _state.NormOutput, _state.Logits,
-            m: _weights.OutputOutputDim, k: _weights.OutputInputDim, n: 1);
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, _state.Logits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
@@ -363,8 +392,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var ssmStateBuf = _ssmCache.GetSsmStateBuffer(ssmOrdinal);
 
         // 1. ssm_in matmul: NormOutput[seqLen, hidden] @ InWeight^T → Zxbcdt[seqLen, inProjDim]
-        _matmul.Record(cmdBuf, ssmW.InWeight, _state.NormOutput, _state.Zxbcdt,
-            m: ssmW.InOutputDim, k: ssmW.InInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, ssmW.InWeight, ssmW.InDeviceQuantType, _state.NormOutput, _state.Zxbcdt,
+            outputDim: ssmW.InOutputDim, inputDim: ssmW.InInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 2. ConvInput = concat(conv_state[(d_conv-1)*conv_dim], xBC rows from Zxbcdt)
@@ -493,8 +522,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 12. ssm_out matmul: SsmY @ OutWeight^T → NormOutput.
-        _matmul.Record(cmdBuf, ssmW.OutWeight, _state.SsmY, _state.NormOutput,
-            m: ssmW.OutOutputDim, k: ssmW.OutInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, ssmW.OutWeight, ssmW.OutDeviceQuantType, _state.SsmY, _state.NormOutput,
+            outputDim: ssmW.OutOutputDim, inputDim: ssmW.OutInputDim, seqLen: seqLen);
     }
 
     /// <summary>
@@ -509,12 +538,12 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int kvStride = numKvHeads * headDim;
 
         // Q/K/V projections — read NormOutput, write Q/K/V.
-        _matmul.Record(cmdBuf, attnW.Q, _state.NormOutput, _state.Q,
-            m: attnW.QOutputDim, k: attnW.QInputDim, n: seqLen);
-        _matmul.Record(cmdBuf, attnW.K, _state.NormOutput, _state.K,
-            m: attnW.KOutputDim, k: attnW.KInputDim, n: seqLen);
-        _matmul.Record(cmdBuf, attnW.V, _state.NormOutput, _state.V,
-            m: attnW.VOutputDim, k: attnW.VInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, attnW.Q, attnW.QDeviceQuantType, _state.NormOutput, _state.Q,
+            outputDim: attnW.QOutputDim, inputDim: attnW.QInputDim, seqLen: seqLen);
+        RecordMatmul(cmdBuf, attnW.K, attnW.KDeviceQuantType, _state.NormOutput, _state.K,
+            outputDim: attnW.KOutputDim, inputDim: attnW.KInputDim, seqLen: seqLen);
+        RecordMatmul(cmdBuf, attnW.V, attnW.VDeviceQuantType, _state.NormOutput, _state.V,
+            outputDim: attnW.VOutputDim, inputDim: attnW.VInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Partial RoPE on Q/K (only the first _ropeDim dims of each head).
@@ -552,8 +581,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Output projection → NormOutput (mirrors the GQA contract for the residual add).
-        _matmul.Record(cmdBuf, attnW.O, _state.AttnOutput, _state.NormOutput,
-            m: attnW.OOutputDim, k: attnW.OInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, attnW.O, attnW.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
+            outputDim: attnW.OOutputDim, inputDim: attnW.OInputDim, seqLen: seqLen);
     }
 
     /// <summary>
@@ -565,20 +594,23 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     {
         int intermediateSize = ffnW.UpOutputDim;
 
-        _matmul.Record(cmdBuf, ffnW.Up, _state.NormOutput, _state.FfnIntermediate,
-            m: ffnW.UpOutputDim, k: ffnW.UpInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, ffnW.Up, ffnW.UpDeviceQuantType, _state.NormOutput, _state.FfnIntermediate,
+            outputDim: ffnW.UpOutputDim, inputDim: ffnW.UpInputDim, seqLen: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         _reluSquared.Record(cmdBuf, _state.FfnIntermediate, n: seqLen * intermediateSize);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        _matmul.Record(cmdBuf, ffnW.Down, _state.FfnIntermediate, _state.NormOutput,
-            m: ffnW.DownOutputDim, k: ffnW.DownInputDim, n: seqLen);
+        RecordMatmul(cmdBuf, ffnW.Down, ffnW.DownDeviceQuantType, _state.FfnIntermediate, _state.NormOutput,
+            outputDim: ffnW.DownOutputDim, inputDim: ffnW.DownInputDim, seqLen: seqLen);
     }
 
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
+        _matmulQ8.InvalidateDescriptorCache();
+        _matmulQ8Gemm.InvalidateDescriptorCache();
+        _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -591,6 +623,50 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _ssmDSkip.InvalidateDescriptorCache();
         _groupRmsNorm.InvalidateDescriptorCache();
         _reluSquared.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// Dispatches a matmul for a single linear projection: chooses
+    /// <see cref="MatMulQ8_0Kernel"/> (decode-path GEMV) when the device-side weight is
+    /// Q8_0 and <paramref name="seqLen"/>==1, the batched <see cref="MatMulQ8_0GemmKernel"/>
+    /// (or its coopmat variant when available) when Q8_0 and <paramref name="seqLen"/>&gt;1,
+    /// and <see cref="MatMulF32Kernel"/> for every non-Q8_0 weight.
+    /// </summary>
+    /// <remarks>
+    /// All Q8_0 kernels require <paramref name="inputDim"/> to be a multiple of 32 (the
+    /// Q8_0 group size). The upload path (<see cref="VulkanNemotronHWeights"/>) only keeps
+    /// Q8_0 sources on device when that constraint holds — otherwise the source is
+    /// dequantised to F32 at upload and lands here as F32, sidestepping the kernel
+    /// alignment requirement entirely.
+    /// </remarks>
+    private void RecordMatmul(
+        nint cmdBuf,
+        VulkanDevice.Buffer weights, QuantizationType weightQt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (weightQt == QuantizationType.Q8_0)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ8.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ8GemmCoopmat is not null)
+            {
+                _matmulQ8GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+            else
+            {
+                _matmulQ8Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else
+        {
+            _matmul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
+        }
     }
 
     private static void RecordCopyBufferRange(
@@ -657,6 +733,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ8GemmCoopmat?.Dispose();
+        _matmulQ8Gemm.Dispose();
+        _matmulQ8.Dispose();
         _matmul.Dispose();
 
         if (_ownsDevice)
