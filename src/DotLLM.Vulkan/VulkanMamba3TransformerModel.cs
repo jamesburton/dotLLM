@@ -12,18 +12,19 @@ using DotLLM.Vulkan.Kernels;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// End-to-end Vulkan forward pass for the Mamba-3 SISO architecture. Mirrors the CPU
-/// oracle <see cref="Mamba3Block"/>.<see cref="Mamba3Block.Forward(Mamba3ForwardScratch, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, Span{float}, Span{float}, int, int, int, int, int, int, int, int, float, float)"/>
-/// step-for-step:
+/// End-to-end Vulkan forward pass for the Mamba-3 architecture (SISO and MIMO). Mirrors
+/// the CPU oracle <see cref="Mamba3Block"/> step-for-step:
 /// <c>embed → N × (norm + in_proj + per-token prep + data-RoPE + SSD scan + out_proj +
 /// residual) → norm_f → lm_head</c>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>SISO only.</b> The class throws <see cref="NotSupportedException"/> at upload time
-/// for MIMO checkpoints; MIMO scan support wires in via a follow-up commit (the kernel
-/// at <see cref="Mamba3CanonicalSsdMimoF32Kernel"/> is in tree but the orchestrator wiring
-/// is out of scope for this commit).
+/// <b>SISO and MIMO.</b> The orchestrator branches on <see cref="Mamba3Config.IsMimo"/> per
+/// layer: SISO routes through <see cref="Mamba3CanonicalSsdSisoF32Kernel"/> with pairwise-
+/// rotated B/C, MIMO routes through <see cref="Mamba3CanonicalSsdMimoF32Kernel"/> with
+/// rank-expanded B/C and halved-rotation RoPE plus the per-rank <c>mimo_z</c>/<c>mimo_o</c>
+/// expansion / contraction weights. State plumbing (ssm_state, cum_angle) is identical
+/// between the two paths — the rank axis lives entirely inside the per-token scratch.
 /// </para>
 /// <para>
 /// <b>F32-only.</b> Every weight, every activation, every scratch is F32. Quantised ingest
@@ -70,6 +71,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly Mamba3DataRopeF32Kernel _dataRope;
     private readonly Mamba3CanonicalSsdSisoF32Kernel _sisoScan;
+    // MIMO scan kernel — only created when Mamba3Config.IsMimo is true. Lazy creation
+    // keeps the SPV file dependency optional for SISO-only deployments.
+    private readonly Mamba3CanonicalSsdMimoF32Kernel? _mimoScan;
     private readonly AddKernel _add;
 
     private readonly VulkanDevice.SubmitContext _submit;
@@ -88,6 +92,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         VulkanMamba3State recurrent,
         MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm,
         Mamba3DataRopeF32Kernel dataRope, Mamba3CanonicalSsdSisoF32Kernel sisoScan,
+        Mamba3CanonicalSsdMimoF32Kernel? mimoScan,
         AddKernel add,
         VulkanDevice.SubmitContext submit)
     {
@@ -103,18 +108,20 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _rmsnorm = rmsnorm;
         _dataRope = dataRope;
         _sisoScan = sisoScan;
+        _mimoScan = mimoScan;
         _add = add;
         _submit = submit;
     }
 
     /// <summary>
-    /// Loads a Mamba-3 SISO model from an opened safetensors file onto the Vulkan device.
-    /// The <paramref name="file"/> must remain alive for the lifetime of the returned model.
+    /// Loads a Mamba-3 model (SISO or MIMO) from an opened safetensors file onto the
+    /// Vulkan device. The <paramref name="file"/> must remain alive for the lifetime of
+    /// the returned model.
     /// </summary>
-    /// <param name="file">An opened safetensors file with Mamba-3 SISO tensors.</param>
-    /// <param name="config">Model config; <see cref="ModelConfig.Mamba3Config"/> must be populated and <c>IsMimo=false</c>.</param>
+    /// <param name="file">An opened safetensors file with Mamba-3 SISO/MIMO tensors.</param>
+    /// <param name="config">Model config; <see cref="ModelConfig.Mamba3Config"/> must be populated.</param>
     /// <param name="spvDir">Directory containing the compiled SPIR-V kernel blobs.</param>
-    /// <returns>A ready-to-forward Vulkan Mamba-3 SISO model.</returns>
+    /// <returns>A ready-to-forward Vulkan Mamba-3 model.</returns>
     public static VulkanMamba3TransformerModel LoadFromSafetensors(
         ISafetensorsTensorSource file, ModelConfig config, string spvDir)
     {
@@ -148,9 +155,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
     }
 
     /// <summary>
-    /// Builds a Vulkan Mamba-3 SISO model from a caller-owned device + already-loaded
-    /// <see cref="Mamba3Weights"/>. The caller retains ownership of <paramref name="device"/>;
-    /// the returned model does NOT dispose it.
+    /// Builds a Vulkan Mamba-3 model (SISO or MIMO) from a caller-owned device +
+    /// already-loaded <see cref="Mamba3Weights"/>. The caller retains ownership of
+    /// <paramref name="device"/>; the returned model does NOT dispose it.
     /// </summary>
     public static VulkanMamba3TransformerModel BuildOnDevice(
         VulkanDevice device, ModelConfig config, Mamba3Weights weights, string spvDir)
@@ -183,6 +190,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var dataRope = Mamba3DataRopeF32Kernel.Create(device, spvDir);
         var sisoScan = Mamba3CanonicalSsdSisoF32Kernel.Create(device, spvDir);
+        Mamba3CanonicalSsdMimoF32Kernel? mimoScan = null;
+        if (config.Mamba3Config!.IsMimo)
+            mimoScan = Mamba3CanonicalSsdMimoF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
 
         var submit = device.CreateSubmitContext();
@@ -190,7 +200,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         return new VulkanMamba3TransformerModel(
             device, ownsDevice,
             config, weights, state, recurrent,
-            matmul, rmsnorm, dataRope, sisoScan, add,
+            matmul, rmsnorm, dataRope, sisoScan, mimoScan, add,
             submit);
     }
 
@@ -218,6 +228,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         int numBcHeads = _m3.NumGroups;
         int numRopeAngles = _m3.NumRopeAngles;
         int dInProj = _m3.InputProjectionDim;
+        bool isMimo = _m3.IsMimo;
+        int mimoRank = isMimo ? _m3.MimoRank : 1;
         float aFloor = _m3.AFloor;
         float eps = Config.NormEpsilon;
 
@@ -239,7 +251,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
 
         // Host-side scratch arrays for the per-token preprocessing — sized to seqLen and
         // reused across layers. Pooled here rather than in VulkanMamba3ForwardScratch
-        // because they never cross the device boundary.
+        // because they never cross the device boundary. Rank-aware sizing for B/C: SISO
+        // collapses to T·H·N, MIMO uses the canonical T·R·H·N layout the MIMO scan kernel
+        // expects (qkPreDotHost is shared — it stores the already-rank-summed Σ_r dot in
+        // MIMO mode, matching the kernel's qkPreDotSum binding).
         float[] projHost = new float[seqLen * dInProj];
         float[] xHost = new float[seqLen * dInner];
         float[] zHost = new float[seqLen * dInner];
@@ -249,8 +264,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         float[] gammaHost = new float[seqLen * nHead];
         float[] scaleHost = new float[seqLen * nHead];
         float[] anglesRawHost = new float[seqLen * numRopeAngles];
-        float[] bHost = new float[seqLen * nHead * dState];
-        float[] cHost = new float[seqLen * nHead * dState];
+        float[] bHost = new float[seqLen * mimoRank * nHead * dState];
+        float[] cHost = new float[seqLen * mimoRank * nHead * dState];
         float[] qkPreDotHost = new float[seqLen * nHead];
 
         // 2. LAYERS — one Mamba3 SISO block per layer.
@@ -275,16 +290,18 @@ public sealed class VulkanMamba3TransformerModel : IModel
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             _submit.SubmitAndWait();
 
-            // ── 2b. HOST PREP (mirrors Mamba3Block.Forward, steps 2–4) ───────────
+            // ── 2b. HOST PREP (mirrors Mamba3Block.Forward / ForwardMimo steps 2–4) ──
             _device.Download(_state.Proj, projHost.AsSpan(0, seqLen * dInProj));
             ComputeHostTables(
                 projHost, lw, seqLen, dInProj, dInner, nHead, dState, headDim,
-                numBcHeads, numRopeAngles, aFloor, eps,
+                numBcHeads, numRopeAngles, mimoRank, aFloor, eps,
                 xHost, zHost, dtHost, adtHost, trapHost, gammaHost,
                 anglesRawHost, bHost, cHost, qkPreDotHost, scaleHost);
 
             // Upload prepared tables. Each is a host-visible buffer, so this is a
-            // map+memcpy.
+            // map+memcpy. B / C are sized for [seqLen, R, H, N] in MIMO and [seqLen, H, N]
+            // in SISO — same backing scratch, the rank slot collapses to 1 when SISO.
+            int bcElems = seqLen * mimoRank * nHead * dState;
             _device.Upload(xHost.AsSpan(0, seqLen * dInner), _state.X);
             _device.Upload(zHost.AsSpan(0, seqLen * dInner), _state.Z);
             _device.Upload(dtHost.AsSpan(0, seqLen * nHead), _state.Dt);
@@ -292,8 +309,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
             _device.Upload(gammaHost.AsSpan(0, seqLen * nHead), _state.Gamma);
             _device.Upload(scaleHost.AsSpan(0, seqLen * nHead), _state.Scale);
             _device.Upload(anglesRawHost.AsSpan(0, seqLen * numRopeAngles), _state.AnglesRaw);
-            _device.Upload(bHost.AsSpan(0, seqLen * nHead * dState), _state.B);
-            _device.Upload(cHost.AsSpan(0, seqLen * nHead * dState), _state.C);
+            _device.Upload(bHost.AsSpan(0, bcElems), _state.B);
+            _device.Upload(cHost.AsSpan(0, bcElems), _state.C);
             _device.Upload(qkPreDotHost.AsSpan(0, seqLen * nHead), _state.QkPreDot);
 
             // ── 2c. DATA-ROPE + SSD SCAN + OUT_PROJ + RESIDUAL (single submit) ───
@@ -307,32 +324,69 @@ public sealed class VulkanMamba3TransformerModel : IModel
             // data-RoPE: B and C are mutated in place (post-RoPE). cum_angle is read at
             // entry (hasCumPrev=true, even on first call — buffer is zero-initialised) and
             // written back at exit (writeCumOut=true) so subsequent decode chunks resume.
+            // SISO uses pairwise rotation; MIMO uses halved-split rotation per the
+            // canonical mamba3_mimo_fwd reference.
             _dataRope.Record(cmdBuf,
                 b: _state.B, c: _state.C,
                 anglesRaw: _state.AnglesRaw, dt: _state.Dt,
                 cumPrev: cumAngle, cumOut: cumAngle,
-                seqLen: seqLen, nRank: 1, nHead: nHead, dState: dState,
+                seqLen: seqLen, nRank: mimoRank, nHead: nHead, dState: dState,
                 numRopeAngles: numRopeAngles,
-                mode: Mamba3RopeMode.Pairwise,
+                mode: isMimo ? Mamba3RopeMode.Halved : Mamba3RopeMode.Pairwise,
                 hasCumPrev: true, writeCumOut: true);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // SSD SISO scan. qRoped = post-RoPE C, kRoped = post-RoPE B (matches the CPU
-            // oracle's argument order to ExecuteSiso).
-            _sisoScan.Record(cmdBuf,
-                state: ssmState,
-                v: _state.X,
-                qRoped: _state.C,
-                kRoped: _state.B,
-                qkPreDot: _state.QkPreDot,
-                scale: _state.Scale,
-                gamma: _state.Gamma,
-                adt: _state.Adt,
-                d: lw.D,
-                z: _state.Z,
-                y: _state.YScan,
-                seqLen: seqLen, nHead: nHead, headDim: headDim, dState: dState,
-                hasZ: true);
+            if (isMimo)
+            {
+                // SSD MIMO scan. qRoped = post-RoPE C, kRoped = post-RoPE B (matches the
+                // CPU oracle's argument order to ExecuteMimo). qkPreDotHost is the
+                // canonical Σ_r form, prepared host-side. mimo_z / mimo_o are uploaded
+                // per-layer and bound here. Equivalent to CPU's ExecuteMimoStreaming with
+                // empty kState/vState — the Vulkan path threads ssm_state and cum_angle
+                // across calls but does not maintain k_state / v_state chunk-boundary
+                // buffers (matches the SISO Vulkan path; one-shot semantics).
+                Mamba3CanonicalSsdMimoF32Kernel mimo = _mimoScan
+                    ?? throw new InvalidOperationException(
+                        "MIMO scan kernel not initialised — Mamba3Config.IsMimo must be set when constructing the model.");
+                if (lw.MimoZ is null || lw.MimoO is null)
+                    throw new InvalidOperationException(
+                        "MIMO layer is missing mimo_z/mimo_o device buffers — check VulkanMamba3Weights.Upload.");
+                mimo.Record(cmdBuf,
+                    state: ssmState,
+                    v: _state.X,
+                    qRoped: _state.C,
+                    kRoped: _state.B,
+                    qkPreDotSum: _state.QkPreDot,
+                    scale: _state.Scale,
+                    gamma: _state.Gamma,
+                    adt: _state.Adt,
+                    d: lw.D,
+                    z: _state.Z,
+                    mimoZ: lw.MimoZ,
+                    mimoO: lw.MimoO,
+                    y: _state.YScan,
+                    seqLen: seqLen, nRank: mimoRank, nHead: nHead, headDim: headDim,
+                    dState: dState, hasZ: true);
+            }
+            else
+            {
+                // SSD SISO scan. qRoped = post-RoPE C, kRoped = post-RoPE B (matches the
+                // CPU oracle's argument order to ExecuteSiso).
+                _sisoScan.Record(cmdBuf,
+                    state: ssmState,
+                    v: _state.X,
+                    qRoped: _state.C,
+                    kRoped: _state.B,
+                    qkPreDot: _state.QkPreDot,
+                    scale: _state.Scale,
+                    gamma: _state.Gamma,
+                    adt: _state.Adt,
+                    d: lw.D,
+                    z: _state.Z,
+                    y: _state.YScan,
+                    seqLen: seqLen, nHead: nHead, headDim: headDim, dState: dState,
+                    hasZ: true);
+            }
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // out_proj: YScan @ OutProj^T → BlockOut.
@@ -390,14 +444,32 @@ public sealed class VulkanMamba3TransformerModel : IModel
     /// <summary>
     /// Runs the per-token preprocessing block on the host: split projection, compute
     /// DT/ADT/trap/gamma, RMSNorm B/C, broadcast G→H, add bias, qk_pre_dot, scale.
-    /// Mirrors steps 2–4 of <see cref="Mamba3Block"/>.Forward step-for-step.
+    /// Mirrors steps 2–4 of <see cref="Mamba3Block"/>.Forward (SISO,
+    /// <paramref name="mimoRank"/>=1) or <see cref="Mamba3Block"/>.ForwardMimo
+    /// (MIMO, <paramref name="mimoRank"/>>=2) step-for-step.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Layout differences SISO ↔ MIMO.</b>
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><c>B_raw</c>/<c>C_raw</c> per-token slot is <c>[R, G, N]</c> row-major
+    ///   (R=1 collapses to <c>[G, N]</c> for SISO).</item>
+    ///   <item><c>B_bias</c>/<c>C_bias</c> are <c>[H, R, N]</c> row-major in MIMO;
+    ///   for SISO the loader keeps the HF <c>[H, 1, N]</c> shape with R=1.</item>
+    ///   <item>Output <c>b</c>/<c>c</c> are written as <c>[T, R, H, N]</c> for MIMO,
+    ///   <c>[T, H, N]</c> for SISO. Dispatchers downstream slice <c>seqLen · R · H · N</c>
+    ///   elements from the rank-aware scratch.</item>
+    ///   <item><c>qkPreDot</c> stores the rank-summed <c>Σ_r Σ_n (C_biased · B_biased)</c>
+    ///   for MIMO; SISO has no rank to sum so it simplifies to the SISO dot.</item>
+    /// </list>
+    /// </remarks>
     [SkipLocalsInit]
     private static void ComputeHostTables(
         ReadOnlySpan<float> proj,
         VulkanMamba3Weights.LayerBuffers lw,
         int seqLen, int dInProj, int dInner, int nHead, int dState, int headDim,
-        int numBcHeads, int numRopeAngles,
+        int numBcHeads, int numRopeAngles, int mimoRank,
         float aFloor, float eps,
         Span<float> x, Span<float> z, Span<float> dt, Span<float> adt,
         Span<float> trap, Span<float> gamma,
@@ -407,23 +479,15 @@ public sealed class VulkanMamba3TransformerModel : IModel
         // Norm weights and biases live on the device — but we need them host-side for the
         // per-token RMSNorm+bias step. Map and read them once per layer; the buffers are
         // device-local so we can't map directly, but they're tiny (d_state and
-        // n_head*d_state) — download via the staging path. Download uses Map on the buffer
-        // memory which is only legal for host-visible buffers; the weights are device-local.
-        // Workaround: keep an inline copy. The caller already has the original CPU
-        // Mamba3Weights handle, but VulkanMamba3Weights does not retain it. Add a small
-        // host-side cache below — populated once per Forward (and crucially once per
-        // ComputeHostTables call) by downloading via a host-visible staging copy.
-        //
-        // Implementation note: we sidestep this by maintaining BNorm / CNorm / BBias /
-        // CBias as *also* available on a host-readable mirror inside VulkanMamba3Weights.
-        // For this first cut we keep them host-resident at upload time.
+        // n_head*max(R,1)*d_state) — keep them on a host-readable mirror inside
+        // VulkanMamba3Weights and read them straight here.
         ReadOnlySpan<float> bNormW = lw.BNormHost;
         ReadOnlySpan<float> cNormW = lw.CNormHost;
         ReadOnlySpan<float> bBias = lw.BBiasHost;
         ReadOnlySpan<float> cBias = lw.CBiasHost;
         ReadOnlySpan<float> dtBias = lw.DtBiasHost;
 
-        const int R = 1; // SISO
+        int R = mimoRank;
         int bcPerToken = dState * numBcHeads * R;
         int ofsZ = 0;
         int ofsX = dInner;
@@ -433,6 +497,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         int ofsDdA = ofsDdDt + nHead;
         int ofsTrap = ofsDdA + nHead;
         int ofsAngles = ofsTrap + nHead;
+
+        int headsPerGroup = nHead / numBcHeads;
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -463,42 +529,72 @@ public sealed class VulkanMamba3TransformerModel : IModel
             proj.Slice(src + ofsAngles, numRopeAngles)
                 .CopyTo(anglesRaw.Slice(t * numRopeAngles, numRopeAngles));
 
-            // B/C per-(G,N) slice RMSNorm + broadcast G→H + bias add.
-            for (int g = 0; g < numBcHeads; g++)
+            // B/C per-(R, G, N) slice RMSNorm + broadcast G→H + per-(H, R, N) bias add.
+            // For SISO (R=1) this collapses to the original [H, 1, N] layout. For MIMO
+            // the destination layout is [T, R, H, N] row-major (matches the canonical
+            // SSD MIMO scan kernel binding).
+            for (int r = 0; r < R; r++)
             {
-                int bSrcBase = src + ofsB + g * dState;
-                int cSrcBase = src + ofsC + g * dState;
-                RmsNormFactor(proj.Slice(bSrcBase, dState), eps, out float bInvRms);
-                RmsNormFactor(proj.Slice(cSrcBase, dState), eps, out float cInvRms);
-
-                int headsPerGroup = nHead / numBcHeads;
-                for (int hInGroup = 0; hInGroup < headsPerGroup; hInGroup++)
+                for (int g = 0; g < numBcHeads; g++)
                 {
-                    int h = g * headsPerGroup + hInGroup;
-                    int biasBase = (h * numBcHeads + g) * dState;
-                    int dstBase = (t * nHead + h) * dState;
+                    int bSrcBase = src + ofsB + (r * numBcHeads + g) * dState;
+                    int cSrcBase = src + ofsC + (r * numBcHeads + g) * dState;
+                    RmsNormFactor(proj.Slice(bSrcBase, dState), eps, out float bInvRms);
+                    RmsNormFactor(proj.Slice(cSrcBase, dState), eps, out float cInvRms);
 
-                    for (int n = 0; n < dState; n++)
+                    for (int hInGroup = 0; hInGroup < headsPerGroup; hInGroup++)
                     {
-                        float bv = proj[bSrcBase + n] * bInvRms * bNormW[n] + bBias[biasBase + n];
-                        float cv = proj[cSrcBase + n] * cInvRms * cNormW[n] + cBias[biasBase + n];
-                        b[dstBase + n] = bv;
-                        c[dstBase + n] = cv;
+                        int h = g * headsPerGroup + hInGroup;
+                        // Bias indexing: SISO uses [H, 1, N] (R=1, so equivalent to
+                        // [H, G=1, N] via g==0), MIMO uses [H, R, N]. Both collapse to a
+                        // simple flat [h * R + r] * dState base.
+                        int biasBase = (h * R + r) * dState;
+                        int dstBase = ((t * R + r) * nHead + h) * dState;
+
+                        for (int n = 0; n < dState; n++)
+                        {
+                            float bv = proj[bSrcBase + n] * bInvRms * bNormW[n] + bBias[biasBase + n];
+                            float cv = proj[cSrcBase + n] * cInvRms * cNormW[n] + cBias[biasBase + n];
+                            b[dstBase + n] = bv;
+                            c[dstBase + n] = cv;
+                        }
                     }
                 }
             }
         }
 
-        // qk_pre_dot[t, h] = Σ_n (C_biased · B_biased) — per-(t, h) dot product over the
-        // dState axis. Same as CPU oracle step 3.
-        for (int t = 0; t < seqLen; t++)
+        // qk_pre_dot[t, h] = Σ_r Σ_n (C_biased · B_biased) — rank-summed in MIMO,
+        // single-rank in SISO. Same as CPU oracle step 3.
+        if (R == 1)
         {
-            int baseT = t * nHead * dState;
-            for (int h = 0; h < nHead; h++)
+            for (int t = 0; t < seqLen; t++)
             {
-                ReadOnlySpan<float> bh = b.Slice(baseT + h * dState, dState);
-                ReadOnlySpan<float> ch = c.Slice(baseT + h * dState, dState);
-                qkPreDot[t * nHead + h] = TensorPrimitives.Dot(ch, bh);
+                int baseT = t * nHead * dState;
+                for (int h = 0; h < nHead; h++)
+                {
+                    ReadOnlySpan<float> bh = b.Slice(baseT + h * dState, dState);
+                    ReadOnlySpan<float> ch = c.Slice(baseT + h * dState, dState);
+                    qkPreDot[t * nHead + h] = TensorPrimitives.Dot(ch, bh);
+                }
+            }
+        }
+        else
+        {
+            // MIMO: layout [T, R, H, N] — sum across the rank axis.
+            for (int t = 0; t < seqLen; t++)
+            {
+                for (int h = 0; h < nHead; h++)
+                {
+                    float sum = 0f;
+                    for (int r = 0; r < R; r++)
+                    {
+                        int baseIdx = ((t * R + r) * nHead + h) * dState;
+                        ReadOnlySpan<float> bh = b.Slice(baseIdx, dState);
+                        ReadOnlySpan<float> ch = c.Slice(baseIdx, dState);
+                        sum += TensorPrimitives.Dot(ch, bh);
+                    }
+                    qkPreDot[t * nHead + h] = sum;
+                }
             }
         }
 
@@ -588,6 +684,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _rmsnorm.InvalidateDescriptorCache();
         _dataRope.InvalidateDescriptorCache();
         _sisoScan.InvalidateDescriptorCache();
+        _mimoScan?.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
     }
 
@@ -600,6 +697,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _recurrent.Dispose();
 
         _add.Dispose();
+        _mimoScan?.Dispose();
         _sisoScan.Dispose();
         _dataRope.Dispose();
         _rmsnorm.Dispose();

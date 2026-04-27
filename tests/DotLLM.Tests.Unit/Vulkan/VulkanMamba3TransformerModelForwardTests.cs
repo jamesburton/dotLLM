@@ -50,6 +50,14 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
     private const int NumRopeAngles = 2;
     private const int DInProj = 2 * DInner + 2 * BcDim + 3 * NumHeads + NumRopeAngles; // 62
 
+    // MIMO fixture dimensions — same model dims as SISO but with a rank > 1 B/C
+    // expansion. Shares DInner / HeadDim / NumHeads / StateSize with SISO so the
+    // recurrent state and out-projection paths exercise identical code with only
+    // the rank axis changed.
+    private const int MimoRank = 2;
+    private const int MimoBcDim = StateSize * NumBcHeads * MimoRank;
+    private const int MimoDInProj = 2 * DInner + 2 * MimoBcDim + 3 * NumHeads + NumRopeAngles;
+
     private const float AbsTol = 5e-3f;
     private const float RelTol = 1e-3f;
 
@@ -76,6 +84,18 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
     public void Forward_Prefill_MultiLayer_MatchesCpuReference()
     {
         AssertVulkanMatchesCpu(numLayers: 2, seqLen: 4, seed: 17);
+    }
+
+    [SkippableFact]
+    public void Forward_Mimo_Prefill_SingleLayer_MatchesCpuReference()
+    {
+        AssertVulkanMatchesCpuMimo(numLayers: 1, seqLen: 4, seed: 23);
+    }
+
+    [SkippableFact]
+    public void Forward_Mimo_Prefill_MultiLayer_MatchesCpuReference()
+    {
+        AssertVulkanMatchesCpuMimo(numLayers: 2, seqLen: 4, seed: 29);
     }
 
     [SkippableFact]
@@ -177,6 +197,50 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
         }
     }
 
+    private void AssertVulkanMatchesCpuMimo(int numLayers, int seqLen, int seed)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        string path = Path.Combine(_scratch, $"m3-mimo-L{numLayers}-T{seqLen}-s{seed}.safetensors");
+        WriteMimoFixture(path, numLayers, seed);
+        ModelConfig config = BuildMimoConfig(numLayers);
+
+        int[] tokenIds = new int[seqLen];
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) { tokenIds[i] = i % VocabSize; positions[i] = i; }
+
+        // ── CPU oracle ────────────────────────────────────────────────
+        float[] cpuLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = Mamba3TransformerModel.LoadFromSafetensors(sf, config);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            cpuLogits = CopyLogits(logits);
+        }
+
+        // ── Vulkan under test ─────────────────────────────────────────
+        float[] vkLogits;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            Assert.Equal(1, logits.Shape[0]);
+            Assert.Equal(VocabSize, logits.Shape[1]);
+            vkLogits = CopyLogits(logits);
+        }
+
+        int lastRow = seqLen - 1;
+        for (int c = 0; c < VocabSize; c++)
+        {
+            float cpu = cpuLogits[lastRow * VocabSize + c];
+            float vk = vkLogits[c];
+            float diff = MathF.Abs(cpu - vk);
+            float bar = AbsTol + RelTol * MathF.Abs(cpu);
+            Assert.True(diff <= bar,
+                $"MIMO numLayers={numLayers}, seqLen={seqLen}, col={c}: cpu={cpu:F6} vs vulkan={vk:F6} (|diff|={diff:E3} > {bar:E3})");
+        }
+    }
+
     private static unsafe float[] CopyLogits(ITensor logits)
     {
         int total = checked(logits.Shape[0] * logits.Shape[1]);
@@ -232,6 +296,97 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
             Mamba3Config = m3,
             ChatTemplate = null,
         };
+    }
+
+    private static ModelConfig BuildMimoConfig(int numLayers)
+    {
+        var m3 = new Mamba3Config
+        {
+            StateSize = StateSize,
+            NumHeads = NumHeads,
+            HeadDim = HeadDim,
+            Expand = Expand,
+            NumGroups = NumBcHeads,
+            ChunkSize = 4,
+            IsMimo = true,
+            MimoRank = MimoRank,
+            AFloor = 1e-4f,
+            DtInitFloor = 1e-4f,
+            DtMin = 1e-3f,
+            DtMax = 0.1f,
+            UseL2Warp = false,
+            RopeFraction = 0.5f,
+            IsOutProjNorm = false,
+            RescalePrenormResidual = true,
+            ResidualInFp32 = true,
+        };
+        return new ModelConfig
+        {
+            Architecture = Architecture.Mamba3,
+            VocabSize = VocabSize,
+            HiddenSize = HiddenSize,
+            IntermediateSize = 0,
+            NumLayers = numLayers,
+            NumAttentionHeads = NumHeads,
+            NumKvHeads = NumHeads,
+            HeadDim = HeadDim,
+            MaxSequenceLength = 32,
+            AttentionType = AttentionType.GQA,
+            PositionEncodingType = PositionEncodingType.None,
+            RoPEConfig = null,
+            ActivationFunction = ActivationFunction.SiLU,
+            NormType = NormType.RMSNorm,
+            NormEpsilon = 1e-5f,
+            TiedEmbeddings = false,
+            SlidingWindowSize = null,
+            MlaConfig = null,
+            HybridLayout = null,
+            SsmConfig = null,
+            Mamba3Config = m3,
+            ChatTemplate = null,
+        };
+    }
+
+    private static void WriteMimoFixture(string path, int numLayers, int seed)
+    {
+        // MIMO fixture: same shape pattern as the SISO fixture but with B/C biases
+        // reshaped to the canonical [H, R, N] layout and the three MIMO-only per-rank
+        // weights (mimo_x, mimo_z, mimo_o) populated. Centred small-amplitude cosines
+        // on top of the canonical mimo_x = mimo_o = 1/R, mimo_z = 1 inits keep the
+        // forward pass numerically tractable on tiny dims.
+        var b = new SafetensorsFixtureBuilder();
+
+        AddRand(b, Mamba3TensorMapping.TokenEmbedding, [VocabSize, HiddenSize], 0.05f, seed + 0);
+        AddRand(b, Mamba3TensorMapping.FinalNorm, [HiddenSize], 0.5f, seed + 1, center: 1.0f, jitter: 0.1f);
+        AddRand(b, Mamba3TensorMapping.LmHead, [VocabSize, HiddenSize], 0.05f, seed + 2);
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            int s = seed + 10 * (i + 1);
+            AddRand(b, Mamba3TensorMapping.LayerNorm(i), [HiddenSize],
+                    amplitude: 0.5f, seed: s + 0, center: 1.0f, jitter: 0.1f);
+            AddRand(b, Mamba3TensorMapping.InProj(i), [MimoDInProj, HiddenSize], 0.02f, s + 1);
+            AddRand(b, Mamba3TensorMapping.OutProj(i), [HiddenSize, DInner], 0.05f, s + 2);
+            AddRand(b, Mamba3TensorMapping.BNorm(i), [StateSize],
+                    amplitude: 0.5f, seed: s + 3, center: 1.0f, jitter: 0.1f);
+            AddRand(b, Mamba3TensorMapping.CNorm(i), [StateSize],
+                    amplitude: 0.5f, seed: s + 4, center: 1.0f, jitter: 0.1f);
+            // Canonical MIMO bias layout is [H, R, N].
+            AddRand(b, Mamba3TensorMapping.BBias(i), [NumHeads, MimoRank, StateSize], 0.02f, s + 5);
+            AddRand(b, Mamba3TensorMapping.CBias(i), [NumHeads, MimoRank, StateSize], 0.02f, s + 6);
+            AddRand(b, Mamba3TensorMapping.D(i), [NumHeads], 0.1f, s + 7);
+            AddRand(b, Mamba3TensorMapping.DtBias(i), [NumHeads], 0.02f, s + 8);
+            // Per-rank MIMO weights — small-amplitude cosines centred on the canonical
+            // identity inits (mimo_x = mimo_o = 1/R, mimo_z = 1).
+            AddRand(b, Mamba3TensorMapping.MimoX(i), [NumHeads, MimoRank, HeadDim],
+                    amplitude: 0.05f, seed: s + 9, center: 1.0f / MimoRank, jitter: 0.05f);
+            AddRand(b, Mamba3TensorMapping.MimoZ(i), [NumHeads, MimoRank, HeadDim],
+                    amplitude: 0.05f, seed: s + 10, center: 1.0f, jitter: 0.05f);
+            AddRand(b, Mamba3TensorMapping.MimoO(i), [NumHeads, MimoRank, HeadDim],
+                    amplitude: 0.05f, seed: s + 11, center: 1.0f / MimoRank, jitter: 0.05f);
+        }
+
+        b.WriteTo(path);
     }
 
     private static void WriteFixture(string path, int numLayers, int seed)
