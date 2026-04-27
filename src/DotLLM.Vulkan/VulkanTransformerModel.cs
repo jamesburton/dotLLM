@@ -68,6 +68,11 @@ public sealed class VulkanTransformerModel : IModel
     // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
     // without coopmat — the router falls back to _matmulQ8Gemm then.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Q4_K_M matmul kernels — Phase 1 of K-quant work. Always created; the
+    // dispatcher in RecordMatmul branches on the device-side QuantizationType
+    // per call. Coopmat Q4_K is a follow-up ticket.
+    private readonly MatMulQ4KGemvF32Kernel _matmulQ4K;
+    private readonly MatMulQ4KGemmF32Kernel _matmulQ4KGemm;
     // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Eliminates one
     // dispatch + one barrier per attn-norm/Q proj and per ffn-norm/Gate proj
     // (60 dispatches per decode at 30 layers). Null when the SPV is missing
@@ -160,6 +165,7 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
@@ -185,6 +191,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        _matmulQ4K = matmulQ4K;
+        _matmulQ4KGemm = matmulQ4KGemm;
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
         _rmsnorm = rmsnorm;
         _rope = rope;
@@ -386,6 +394,10 @@ public sealed class VulkanTransformerModel : IModel
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
         var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created; the
+        // RecordMatmul dispatcher routes per device-side QuantizationType.
+        var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
         // Optional coopmat prefill GEMM — 3.8× over scalar on AMD RDNA3.5 at
         // Llama-3 4096² N=64. Null on devices without KHR_cooperative_matrix;
         // router falls back to the scalar GEMM. Tolerance: abs 5e-3 / rel 5e-3
@@ -450,6 +462,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            matmulQ4K, matmulQ4KGemm,
             rmsnormMatmulQ8Fused,
             rmsnorm, rope, attention, swiglu, add,
             biasAdd,
@@ -769,6 +782,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ4K.InvalidateDescriptorCache();
+        _matmulQ4KGemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
@@ -1280,6 +1295,21 @@ public sealed class VulkanTransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantType.Q4_K)
+        {
+            // Q4_K_M decode-path GEMV (seqLen==1) or prefill-path tiled GEMM.
+            // No coopmat variant in Phase 1 — follow-up ticket.
+            if (seqLen == 1)
+            {
+                _matmulQ4K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ4KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else
         {
             _matmul.Record(cmdBuf, weights, input, output,
@@ -1387,6 +1417,8 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
+        _matmulQ4KGemm.Dispose();
+        _matmulQ4K.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();

@@ -25,19 +25,24 @@ namespace DotLLM.Models.Architectures;
 /// double-free on <see cref="Dispose"/>.
 /// </para>
 /// <para>
-/// <b>Vulkan-only Q8_0 overlay.</b> The matmul-target projections (<see cref="LmHead"/>
+/// <b>Vulkan-only quant overlay.</b> The matmul-target projections (<see cref="LmHead"/>
 /// plus the per-layer <see cref="Mamba3LayerWeights.InProj"/> and
-/// <see cref="Mamba3LayerWeights.OutProj"/>) carry optional Q8_0 raw-byte overlay
+/// <see cref="Mamba3LayerWeights.OutProj"/>) carry optional raw-quant byte overlay
 /// pointers that are zero on production load paths and only populated by tests / a
-/// future quant-aware loader. When set, the Vulkan upload keeps the raw Q8_0 blocks
-/// on device (gated on the contraction axis being a multiple of 32) and dispatches
-/// the matmuls through the existing <c>matmul_q8_0</c> kernels — same two-mode
-/// storage policy as the standard transformer at <c>VulkanWeights</c>. The CPU
-/// forward continues to consume the F32 handle (<see cref="LmHead"/>, etc.); when
-/// overlay is set the F32 source must already carry values equivalent to dequantising
-/// the Q8_0 raw bytes so the CPU-vs-Vulkan comparison is fair. Small per-layer
-/// tensors (norms, biases, D, dt_bias, MIMO per-rank weights) are NOT overlaid —
-/// they stay F32 in every mode (matches what production GGUFs ship for SSMs).
+/// future quant-aware loader. When set, the Vulkan upload keeps the raw quant blocks
+/// on device (gated on the contraction axis being a multiple of the format's group
+/// size — 32 for Q8_0, 256 for Q4_K) and dispatches the matmuls through the matching
+/// kernel — same two-mode storage policy as the standard transformer at
+/// <c>VulkanWeights</c>. The CPU forward continues to consume the F32 handle
+/// (<see cref="LmHead"/>, etc.); when an overlay is set the F32 source must already
+/// carry values equivalent to dequantising the raw quant bytes so the CPU-vs-Vulkan
+/// comparison is fair. Small per-layer tensors (norms, biases, D, dt_bias, MIMO
+/// per-rank weights) are NOT overlaid — they stay F32 in every mode (matches what
+/// production GGUFs ship for SSMs). The overlay slots use the historical "Q8" naming
+/// because Q8_0 was the first quant type wired through; they actually carry raw bytes
+/// for whichever format the companion <c>*QuantTypeOverlay</c> field declares —
+/// currently Q8_0 or Q4_K (Phase 1 of the K-quant work). Q5_K / Q6_K are follow-up
+/// tickets.
 /// </para>
 /// </remarks>
 public sealed class Mamba3Weights : IDisposable
@@ -64,15 +69,17 @@ public sealed class Mamba3Weights : IDisposable
     /// </remarks>
     public required Mamba3TensorHandle LmHead { get; set; }
 
-    /// <summary>Optional Q8_0 raw bytes for the LM head (<c>[vocab, hidden]</c>).
-    /// Zero when <see cref="LmHead"/> stays F32 on device. When non-zero the
-    /// Vulkan upload keeps the raw Q8_0 blocks; the CPU oracle continues reading
+    /// <summary>Optional raw-quant bytes for the LM head (<c>[vocab, hidden]</c>).
+    /// Zero when <see cref="LmHead"/> stays F32 on device. When non-zero the Vulkan
+    /// upload keeps the raw quant blocks (Q8_0 or Q4_K, declared via
+    /// <see cref="LmHeadQuantTypeOverlay"/>); the CPU oracle continues reading
     /// <see cref="LmHead"/>'s F32 data, which must hold values equivalent to
-    /// dequantising the Q8_0 bytes for parity. Production loaders never set this.</summary>
+    /// dequantising the raw bytes for parity. Production loaders never set this.</summary>
     public nint LmHeadQ8Ptr { get; set; }
 
-    /// <summary>Storage type of the <see cref="LmHeadQ8Ptr"/> overlay
-    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    /// <summary>Storage type of the <see cref="LmHeadQ8Ptr"/> overlay. Currently
+    /// <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is set.</summary>
     public QuantizationType LmHeadQuantTypeOverlay { get; set; } = QuantizationType.F32;
 
     /// <summary>Per-layer weights, ordered by physical layer index.</summary>
@@ -174,38 +181,48 @@ public readonly record struct Mamba3LayerWeights(
     Mamba3TensorHandle MimoO = default);
 
 /// <summary>
-/// Optional per-layer Q8_0 overlay for the matmul-target projections of one Mamba-3
+/// Optional per-layer quant overlay for the matmul-target projections of one Mamba-3
 /// layer. Holds raw-byte pointers that the Vulkan upload may keep on device verbatim
-/// when the corresponding <see cref="QuantizationType"/> is <see cref="QuantizationType.Q8_0"/>
-/// and the contraction axis is a multiple of 32. Production load paths leave this
-/// at the default (F32 / null pointers); tests populate it to drive the Q8_0 matmul
-/// kernels.
+/// when the corresponding <see cref="QuantizationType"/> is one of the supported
+/// formats (Q8_0 — group size 32 — or Q4_K — group size 256, Phase 1 of the K-quant
+/// work) and the contraction axis is a multiple of that group size. Production load
+/// paths leave this at the default (F32 / null pointers); tests populate it to drive
+/// the Vulkan quantised matmul kernels.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The CPU forward pass continues to read the F32 handles on
 /// <see cref="Mamba3LayerWeights"/>; when <see cref="InProjQuantTypeOverlay"/> /
-/// <see cref="OutProjQuantTypeOverlay"/> is <see cref="QuantizationType.Q8_0"/> the
-/// F32 source must already carry values equivalent to dequantising the Q8_0 raw
-/// bytes so the CPU-vs-Vulkan comparison is fair.
+/// <see cref="OutProjQuantTypeOverlay"/> is set to a quantised format the F32 source
+/// must already carry values equivalent to dequantising the raw quant bytes so the
+/// CPU-vs-Vulkan comparison is fair.
+/// </para>
+/// <para>
+/// The slot names use "Q8" for historical reasons (Q8_0 was the first quant type
+/// wired through); the slots actually carry raw bytes for whichever format the
+/// companion <c>*QuantTypeOverlay</c> field declares.
 /// </para>
 /// </remarks>
 public sealed class Mamba3LayerQuantOverlay
 {
-    /// <summary>Optional Q8_0 raw bytes for <c>in_proj</c>
-    /// (<c>[d_in_proj, hidden_size]</c>).</summary>
+    /// <summary>Optional raw-quant bytes for <c>in_proj</c>
+    /// (<c>[d_in_proj, hidden_size]</c>). Format declared by
+    /// <see cref="InProjQuantTypeOverlay"/>.</summary>
     public nint InProjQ8Ptr;
 
-    /// <summary>Storage type of <see cref="InProjQ8Ptr"/>
-    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    /// <summary>Storage type of <see cref="InProjQ8Ptr"/>. Currently
+    /// <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is set.</summary>
     public QuantizationType InProjQuantTypeOverlay = QuantizationType.F32;
 
-    /// <summary>Optional Q8_0 raw bytes for <c>out_proj</c>
-    /// (<c>[hidden_size, d_inner]</c>).</summary>
+    /// <summary>Optional raw-quant bytes for <c>out_proj</c>
+    /// (<c>[hidden_size, d_inner]</c>). Format declared by
+    /// <see cref="OutProjQuantTypeOverlay"/>.</summary>
     public nint OutProjQ8Ptr;
 
-    /// <summary>Storage type of <see cref="OutProjQ8Ptr"/>
-    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    /// <summary>Storage type of <see cref="OutProjQ8Ptr"/>. Currently
+    /// <see cref="QuantizationType.Q8_0"/> or <see cref="QuantizationType.Q4_K"/>;
+    /// <see cref="QuantizationType.F32"/> when no overlay is set.</summary>
     public QuantizationType OutProjQuantTypeOverlay = QuantizationType.F32;
 }
 

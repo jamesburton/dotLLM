@@ -229,18 +229,19 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
         // LM head [vocab, hidden]. Whether tied or not, the weight loader gives us a
         // populated handle; we always upload a separate device buffer so the model doesn't
-        // need to know about tying. Honours the Q8_0 overlay when present and
-        // hidden % 32 == 0; otherwise falls back to the F32 source upload.
-        bool lmKeepQ8 = KeepQ8OnDevice(weights.LmHeadQuantTypeOverlay, hidden) && weights.LmHeadQ8Ptr != 0;
+        // need to know about tying. Honours the quant overlay (Q8_0 or Q4_K — Phase 1 of
+        // the K-quant work) when present and the contraction axis (hidden) is aligned to
+        // the format's group size; otherwise falls back to the F32 source upload.
+        bool lmKeepQuant = KeepQuantOnDevice(weights.LmHeadQuantTypeOverlay, hidden) && weights.LmHeadQ8Ptr != 0;
         VulkanDevice.Buffer lmHead;
         QuantizationType lmHeadDeviceQt;
         long lmBytes;
-        if (lmKeepQ8)
+        if (lmKeepQuant)
         {
-            lmBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q8_0) * vocab;
+            lmBytes = Dequantize.RowByteSize(hidden, weights.LmHeadQuantTypeOverlay) * vocab;
             lmHead = device.AllocateDeviceLocal(lmBytes);
             UploadRawBytes(device, staging, weights.LmHeadQ8Ptr, lmBytes, lmHead);
-            lmHeadDeviceQt = QuantizationType.Q8_0;
+            lmHeadDeviceQt = weights.LmHeadQuantTypeOverlay;
         }
         else
         {
@@ -265,20 +266,21 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
             var norm = UploadTensor(device, staging, lw.Norm, hidden, out long normBytes);
 
-            // in_proj: contraction axis = hiddenSize. Honours Q8_0 overlay when set AND
-            // hidden % 32 == 0; otherwise falls back to F32 source upload.
+            // in_proj: contraction axis = hiddenSize. Honours the quant overlay (Q8_0 or
+            // Q4_K — Phase 1 of K-quant work) when set AND hidden is aligned to the
+            // format's group size; otherwise falls back to F32 source upload.
             VulkanDevice.Buffer inProj;
             QuantizationType inProjDeviceQt;
             long inProjBytes;
-            bool inProjKeepQ8 = layerOv is not null
-                && KeepQ8OnDevice(layerOv.InProjQuantTypeOverlay, hidden)
+            bool inProjKeepQuant = layerOv is not null
+                && KeepQuantOnDevice(layerOv.InProjQuantTypeOverlay, hidden)
                 && layerOv.InProjQ8Ptr != 0;
-            if (inProjKeepQ8)
+            if (inProjKeepQuant)
             {
-                inProjBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q8_0) * dInProj;
+                inProjBytes = Dequantize.RowByteSize(hidden, layerOv!.InProjQuantTypeOverlay) * dInProj;
                 inProj = device.AllocateDeviceLocal(inProjBytes);
-                UploadRawBytes(device, staging, layerOv!.InProjQ8Ptr, inProjBytes, inProj);
-                inProjDeviceQt = QuantizationType.Q8_0;
+                UploadRawBytes(device, staging, layerOv.InProjQ8Ptr, inProjBytes, inProj);
+                inProjDeviceQt = layerOv.InProjQuantTypeOverlay;
             }
             else
             {
@@ -286,20 +288,20 @@ internal sealed class VulkanMamba3Weights : IDisposable
                 inProjDeviceQt = QuantizationType.F32;
             }
 
-            // out_proj: contraction axis = dInner. Honours Q8_0 overlay when set AND
-            // dInner % 32 == 0.
+            // out_proj: contraction axis = dInner. Honours the quant overlay when set
+            // AND dInner is aligned to the format's group size.
             VulkanDevice.Buffer outProj;
             QuantizationType outProjDeviceQt;
             long outProjBytes;
-            bool outProjKeepQ8 = layerOv is not null
-                && KeepQ8OnDevice(layerOv.OutProjQuantTypeOverlay, dInner)
+            bool outProjKeepQuant = layerOv is not null
+                && KeepQuantOnDevice(layerOv.OutProjQuantTypeOverlay, dInner)
                 && layerOv.OutProjQ8Ptr != 0;
-            if (outProjKeepQ8)
+            if (outProjKeepQuant)
             {
-                outProjBytes = Dequantize.RowByteSize(dInner, QuantizationType.Q8_0) * hidden;
+                outProjBytes = Dequantize.RowByteSize(dInner, layerOv!.OutProjQuantTypeOverlay) * hidden;
                 outProj = device.AllocateDeviceLocal(outProjBytes);
-                UploadRawBytes(device, staging, layerOv!.OutProjQ8Ptr, outProjBytes, outProj);
-                outProjDeviceQt = QuantizationType.Q8_0;
+                UploadRawBytes(device, staging, layerOv.OutProjQ8Ptr, outProjBytes, outProj);
+                outProjDeviceQt = layerOv.OutProjQuantTypeOverlay;
             }
             else
             {
@@ -365,6 +367,17 @@ internal sealed class VulkanMamba3Weights : IDisposable
     /// constraint fails the upload silently falls back to the F32 source instead.</summary>
     private static bool KeepQ8OnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
+
+    /// <summary>True iff a Q4_K overlay can be kept on device as raw Q4_K super-blocks
+    /// — gated on the contraction dim being a multiple of the Q4_K super-block size
+    /// (256). Phase 1 of K-quant work; Q5_K / Q6_K follow-up tickets.</summary>
+    private static bool KeepQ4KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q4_K && (contractionDim % 256) == 0;
+
+    /// <summary>True iff the overlay declares a supported quantised format (Q8_0 or
+    /// Q4_K) AND the contraction axis is aligned to that format's group size.</summary>
+    private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
+        => KeepQ8OnDevice(qt, contractionDim) || KeepQ4KOnDevice(qt, contractionDim);
 
     /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
     /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.

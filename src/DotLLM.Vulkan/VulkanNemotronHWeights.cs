@@ -301,12 +301,27 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.Q8_0 && (inputDim % 32) == 0;
 
+    /// <summary>True iff a Q4_K source projection can be kept on device as raw Q4_K
+    /// super-blocks — gated on the input dim being a multiple of the Q4_K super-block
+    /// size (256). Phase 1 of K-quant work; Q5_K / Q6_K follow-up tickets.</summary>
+    private static bool KeepQ4KOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.Q4_K && (inputDim % 256) == 0;
+
+    /// <summary>True iff the source projection is a quantised format with a Vulkan
+    /// kernel (Q8_0 or Q4_K) AND the contraction axis is aligned to that format's
+    /// group size — i.e. the raw blocks can stay on device verbatim.</summary>
+    private static bool KeepQuantOnDevice(QuantizationType qt, int inputDim)
+        => KeepQ8OnDevice(qt, inputDim) || KeepQ4KOnDevice(qt, inputDim);
+
     /// <summary>Returns the on-device byte size for one projection matrix in its
-    /// chosen storage form — Q8_0 row-stride bytes when kept Q8_0, otherwise F32.</summary>
+    /// chosen storage form — Q8_0 / Q4_K row-stride bytes when kept quantised,
+    /// otherwise F32.</summary>
     private static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
     {
         if (KeepQ8OnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ4KOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         return (long)outputDim * inputDim * sizeof(float);
     }
 
@@ -451,16 +466,19 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         long elems = (long)outputDim * inputDim;
 
-        if (!forceF32 && KeepQ8OnDevice(qt, inputDim))
+        if (!forceF32 && KeepQuantOnDevice(qt, inputDim))
         {
-            // Raw Q8_0 blob upload — same on-device byte layout as VulkanWeights so the
-            // existing matmul_q8_0 / matmul_q8_0_gemm kernels read it directly.
-            long rowBytes = Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0);
+            // Raw quant-block upload — same on-device byte layout as VulkanWeights so
+            // the matching matmul kernel (Q8_0 or Q4_K) reads it directly.
+            QuantizationType keepQt = KeepQ8OnDevice(qt, inputDim)
+                ? QuantizationType.Q8_0
+                : QuantizationType.Q4_K;
+            long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
             var buf = device.AllocateDeviceLocal(bytes);
             VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging (Q8_0)");
+                .ThrowOnError("vkMapMemory VulkanNemotronHWeights.UploadProjectionMatrix staging (raw quant)");
             try
             {
                 new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -472,7 +490,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             }
             device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
 
-            deviceQuantType = QuantizationType.Q8_0;
+            deviceQuantType = keepQt;
             uploadedBytes = bytes;
             return buf;
         }
