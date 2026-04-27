@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 
 namespace DotLLM.Models.Architectures;
 
@@ -23,16 +24,31 @@ namespace DotLLM.Models.Architectures;
 /// <see cref="Mamba3TensorHandle.OwnsMemory"/> is <c>false</c> to avoid a
 /// double-free on <see cref="Dispose"/>.
 /// </para>
+/// <para>
+/// <b>Vulkan-only Q8_0 overlay.</b> The matmul-target projections (<see cref="LmHead"/>
+/// plus the per-layer <see cref="Mamba3LayerWeights.InProj"/> and
+/// <see cref="Mamba3LayerWeights.OutProj"/>) carry optional Q8_0 raw-byte overlay
+/// pointers that are zero on production load paths and only populated by tests / a
+/// future quant-aware loader. When set, the Vulkan upload keeps the raw Q8_0 blocks
+/// on device (gated on the contraction axis being a multiple of 32) and dispatches
+/// the matmuls through the existing <c>matmul_q8_0</c> kernels — same two-mode
+/// storage policy as the standard transformer at <c>VulkanWeights</c>. The CPU
+/// forward continues to consume the F32 handle (<see cref="LmHead"/>, etc.); when
+/// overlay is set the F32 source must already carry values equivalent to dequantising
+/// the Q8_0 raw bytes so the CPU-vs-Vulkan comparison is fair. Small per-layer
+/// tensors (norms, biases, D, dt_bias, MIMO per-rank weights) are NOT overlaid —
+/// they stay F32 in every mode (matches what production GGUFs ship for SSMs).
+/// </para>
 /// </remarks>
 public sealed class Mamba3Weights : IDisposable
 {
     private bool _disposed;
 
     /// <summary>Token-embedding matrix, shape <c>[vocab_size, hidden_size]</c>.</summary>
-    public required Mamba3TensorHandle TokenEmbedding { get; init; }
+    public required Mamba3TensorHandle TokenEmbedding { get; set; }
 
     /// <summary>Final pre-LM-head RMSNorm gain, shape <c>[hidden_size]</c>.</summary>
-    public required Mamba3TensorHandle FinalNorm { get; init; }
+    public required Mamba3TensorHandle FinalNorm { get; set; }
 
     /// <summary>
     /// LM head matrix, shape <c>[vocab_size, hidden_size]</c>. When the
@@ -40,10 +56,38 @@ public sealed class Mamba3Weights : IDisposable
     /// shape are aliased to <see cref="TokenEmbedding"/> with
     /// <see cref="Mamba3TensorHandle.OwnsMemory"/> set to <c>false</c>.
     /// </summary>
-    public required Mamba3TensorHandle LmHead { get; init; }
+    /// <remarks>
+    /// Settable so tests / a future quant-aware loader can rewire the F32 source pointer
+    /// to a buffer holding dequantised-from-Q8_0 values when attaching the
+    /// <see cref="LmHeadQ8Ptr"/> overlay; production load paths set this once at
+    /// construction and never touch it again.
+    /// </remarks>
+    public required Mamba3TensorHandle LmHead { get; set; }
+
+    /// <summary>Optional Q8_0 raw bytes for the LM head (<c>[vocab, hidden]</c>).
+    /// Zero when <see cref="LmHead"/> stays F32 on device. When non-zero the
+    /// Vulkan upload keeps the raw Q8_0 blocks; the CPU oracle continues reading
+    /// <see cref="LmHead"/>'s F32 data, which must hold values equivalent to
+    /// dequantising the Q8_0 bytes for parity. Production loaders never set this.</summary>
+    public nint LmHeadQ8Ptr { get; set; }
+
+    /// <summary>Storage type of the <see cref="LmHeadQ8Ptr"/> overlay
+    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    public QuantizationType LmHeadQuantTypeOverlay { get; set; } = QuantizationType.F32;
 
     /// <summary>Per-layer weights, ordered by physical layer index.</summary>
     public required Mamba3LayerWeights[] Layers { get; init; }
+
+    /// <summary>
+    /// Optional per-layer Q8_0 overlays for the matmul-target projections
+    /// <c>in_proj</c> and <c>out_proj</c>. Null on production load paths; tests
+    /// allocate one entry per layer and populate the relevant raw-byte pointers
+    /// to drive the Vulkan Q8_0 matmul path. Length must equal
+    /// <see cref="Layers"/>.Length when non-null. The <see cref="Mamba3LayerWeights"/>
+    /// record struct itself stays F32-only / immutable — this side-array is the
+    /// mutable opt-in slot.
+    /// </summary>
+    public Mamba3LayerQuantOverlay[]? LayerOverlays { get; set; }
 
     /// <summary>
     /// Structured diagnostics produced at load time: one entry per tensor
@@ -128,6 +172,42 @@ public readonly record struct Mamba3LayerWeights(
     Mamba3TensorHandle MimoX = default,
     Mamba3TensorHandle MimoZ = default,
     Mamba3TensorHandle MimoO = default);
+
+/// <summary>
+/// Optional per-layer Q8_0 overlay for the matmul-target projections of one Mamba-3
+/// layer. Holds raw-byte pointers that the Vulkan upload may keep on device verbatim
+/// when the corresponding <see cref="QuantizationType"/> is <see cref="QuantizationType.Q8_0"/>
+/// and the contraction axis is a multiple of 32. Production load paths leave this
+/// at the default (F32 / null pointers); tests populate it to drive the Q8_0 matmul
+/// kernels.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The CPU forward pass continues to read the F32 handles on
+/// <see cref="Mamba3LayerWeights"/>; when <see cref="InProjQuantTypeOverlay"/> /
+/// <see cref="OutProjQuantTypeOverlay"/> is <see cref="QuantizationType.Q8_0"/> the
+/// F32 source must already carry values equivalent to dequantising the Q8_0 raw
+/// bytes so the CPU-vs-Vulkan comparison is fair.
+/// </para>
+/// </remarks>
+public sealed class Mamba3LayerQuantOverlay
+{
+    /// <summary>Optional Q8_0 raw bytes for <c>in_proj</c>
+    /// (<c>[d_in_proj, hidden_size]</c>).</summary>
+    public nint InProjQ8Ptr;
+
+    /// <summary>Storage type of <see cref="InProjQ8Ptr"/>
+    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    public QuantizationType InProjQuantTypeOverlay = QuantizationType.F32;
+
+    /// <summary>Optional Q8_0 raw bytes for <c>out_proj</c>
+    /// (<c>[hidden_size, d_inner]</c>).</summary>
+    public nint OutProjQ8Ptr;
+
+    /// <summary>Storage type of <see cref="OutProjQ8Ptr"/>
+    /// (<see cref="QuantizationType.F32"/> when no overlay is set).</summary>
+    public QuantizationType OutProjQuantTypeOverlay = QuantizationType.F32;
+}
 
 /// <summary>
 /// Opaque pointer + shape metadata for a single Mamba-3 weight tensor.

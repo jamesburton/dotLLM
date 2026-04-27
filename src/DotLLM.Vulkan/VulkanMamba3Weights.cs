@@ -1,4 +1,6 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
 using DotLLM.Vulkan.Interop;
@@ -13,11 +15,29 @@ namespace DotLLM.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>F32-only constraint (first cut, issue #5):</b> every weight is consumed as F32 by
-/// the Vulkan kernels. The CPU-side <see cref="Mamba3WeightLoader"/> already requires F32
-/// source tensors (see <c>Mamba3WeightLoader.ResolveRequired</c>), so the upload path here
-/// is a straight host-to-device copy — no dequantisation, no Q8_0 fast path. Quantised
-/// Mamba-3 ingest is a follow-up.
+/// <b>Two-mode storage.</b> The matmul-target projections (<c>in_proj</c>, <c>out_proj</c>,
+/// <c>lm_head</c>) honour the optional Q8_0 overlay on <see cref="Mamba3Weights"/> /
+/// <see cref="Mamba3LayerQuantOverlay"/>: when the overlay is set and the contraction axis
+/// is a multiple of 32 (the Q8_0 group size) the raw Q8_0 blocks are uploaded verbatim and
+/// the forward pass dispatches them through the existing
+/// <see cref="DotLLM.Vulkan.Kernels.MatMulQ8_0Kernel"/> /
+/// <see cref="DotLLM.Vulkan.Kernels.MatMulQ8_0GemmKernel"/> kernels, mirroring the standard
+/// transformer at <see cref="VulkanWeights"/>. Otherwise — and on every production load
+/// path today, since <see cref="Mamba3WeightLoader"/> emits only F32 handles — the F32
+/// source is uploaded verbatim and the forward pass uses <c>matmul_f32</c>.
+/// </para>
+/// <para>
+/// <b>Token embedding.</b> Always uploaded as F32 regardless of any overlay — the
+/// embedding gather uses <c>vkCmdCopyBuffer</c> with row-major byte offsets, which only
+/// works with a contiguous F32 layout. Same convention as <see cref="VulkanWeights"/> and
+/// <see cref="VulkanNemotronHWeights"/>.
+/// </para>
+/// <para>
+/// <b>Small per-layer tensors.</b> Norms (<c>Norm</c>, <c>BNorm</c>, <c>CNorm</c>,
+/// <c>FinalNorm</c>), biases (<c>BBias</c>, <c>CBias</c>, <c>DtBias</c>), per-head decay
+/// (<c>D</c>), and the MIMO per-rank weights (<c>mimo_z</c>, <c>mimo_o</c>) are always
+/// F32. They are never quantised in production GGUFs (and the overlay schema does not
+/// expose Q8_0 slots for them).
 /// </para>
 /// <para>
 /// <b>SISO and MIMO.</b> Both checkpoint flavours land here. SISO uploads the canonical
@@ -66,6 +86,14 @@ internal sealed class VulkanMamba3Weights : IDisposable
         public required int OutProjOutputDim { get; init; }
         public required int OutProjInputDim { get; init; }
 
+        // Device-side storage type per matmul-target projection. <see cref="QuantizationType.Q8_0"/>
+        // when the source carried a Q8_0 overlay AND the contraction axis is a multiple of 32;
+        // <see cref="QuantizationType.F32"/> otherwise. The forward pass branches on this to
+        // choose the matmul kernel (<c>matmul_q8_0[_gemm]</c> vs <c>matmul_f32</c>) — same
+        // routing as <see cref="VulkanNemotronHTransformerModel"/>.
+        public QuantizationType InProjDeviceQuantType { get; init; }
+        public QuantizationType OutProjDeviceQuantType { get; init; }
+
         // Host-side mirrors of the tiny tensors consumed by the per-token CPU prep.
         // BBiasHost / CBiasHost are sized to nHead * effectiveRank * dState — for SISO
         // that is nHead * dState; for MIMO it is nHead * mimoRank * dState laid out
@@ -105,13 +133,19 @@ internal sealed class VulkanMamba3Weights : IDisposable
     public int LmHeadOutputDim { get; }
     public int LmHeadInputDim { get; }
 
+    /// <summary>Device-side storage type for <see cref="LmHead"/>. <see cref="QuantizationType.Q8_0"/>
+    /// when the source carried a Q8_0 overlay AND <c>hidden_size % 32 == 0</c>;
+    /// <see cref="QuantizationType.F32"/> otherwise.</summary>
+    public QuantizationType LmHeadDeviceQuantType { get; }
+
     public long AllocatedBytes { get; }
 
     private VulkanMamba3Weights(
         LayerBuffers[] layers,
         VulkanDevice.Buffer tokenEmbedding, int vocabSize, int hiddenSize,
         VulkanDevice.Buffer finalNorm,
-        VulkanDevice.Buffer lmHead, int lmHeadOutputDim, int lmHeadInputDim,
+        VulkanDevice.Buffer lmHead, QuantizationType lmHeadDeviceQt,
+        int lmHeadOutputDim, int lmHeadInputDim,
         long allocatedBytes)
     {
         _layers = layers;
@@ -120,16 +154,20 @@ internal sealed class VulkanMamba3Weights : IDisposable
         HiddenSize = hiddenSize;
         FinalNormWeight = finalNorm;
         LmHead = lmHead;
+        LmHeadDeviceQuantType = lmHeadDeviceQt;
         LmHeadOutputDim = lmHeadOutputDim;
         LmHeadInputDim = lmHeadInputDim;
         AllocatedBytes = allocatedBytes;
     }
 
     /// <summary>
-    /// Uploads a Mamba-3 model's weights (SISO or MIMO) to the Vulkan device. Every tensor
-    /// handle in <paramref name="weights"/> must be populated and F32 —
-    /// <see cref="Mamba3WeightLoader"/> already enforces F32 at load time, so this is a
-    /// straight memcpy upload.
+    /// Uploads a Mamba-3 model's weights (SISO or MIMO) to the Vulkan device. Every F32
+    /// tensor handle in <paramref name="weights"/> must be populated —
+    /// <see cref="Mamba3WeightLoader"/> already enforces F32 at load time. The optional
+    /// Q8_0 overlay (<see cref="Mamba3Weights.LmHeadQ8Ptr"/> et al.) is honoured for the
+    /// matmul-target projections when the contraction axis is a multiple of 32; the F32
+    /// handle is still required (the CPU oracle reads it) but is not uploaded when the
+    /// overlay is consumed.
     /// </summary>
     /// <exception cref="ArgumentException">
     /// The supplied <paramref name="config"/> requests a non-positive MIMO rank.
@@ -179,7 +217,9 @@ internal sealed class VulkanMamba3Weights : IDisposable
 
         long totalBytes = 0;
 
-        // Token embedding [vocab, hidden].
+        // Token embedding [vocab, hidden]. Always F32 — the embedding gather uses
+        // byte-offset vkCmdCopyBuffer which needs a contiguous F32 layout. Same convention
+        // as VulkanWeights / VulkanNemotronHWeights.
         var tokenEmbed = UploadTensor(device, staging, weights.TokenEmbedding, (long)vocab * hidden, out long tokenBytes);
         totalBytes += tokenBytes;
 
@@ -188,19 +228,84 @@ internal sealed class VulkanMamba3Weights : IDisposable
         totalBytes += fnBytes;
 
         // LM head [vocab, hidden]. Whether tied or not, the weight loader gives us a
-        // populated handle; we always upload a separate device buffer so the model
-        // doesn't need to know about tying.
-        var lmHead = UploadTensor(device, staging, weights.LmHead, (long)vocab * hidden, out long lmBytes);
+        // populated handle; we always upload a separate device buffer so the model doesn't
+        // need to know about tying. Honours the Q8_0 overlay when present and
+        // hidden % 32 == 0; otherwise falls back to the F32 source upload.
+        bool lmKeepQ8 = KeepQ8OnDevice(weights.LmHeadQuantTypeOverlay, hidden) && weights.LmHeadQ8Ptr != 0;
+        VulkanDevice.Buffer lmHead;
+        QuantizationType lmHeadDeviceQt;
+        long lmBytes;
+        if (lmKeepQ8)
+        {
+            lmBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q8_0) * vocab;
+            lmHead = device.AllocateDeviceLocal(lmBytes);
+            UploadRawBytes(device, staging, weights.LmHeadQ8Ptr, lmBytes, lmHead);
+            lmHeadDeviceQt = QuantizationType.Q8_0;
+        }
+        else
+        {
+            lmHead = UploadTensor(device, staging, weights.LmHead, (long)vocab * hidden, out lmBytes);
+            lmHeadDeviceQt = QuantizationType.F32;
+        }
         totalBytes += lmBytes;
+
+        // Per-layer overlays — null on production load paths (production loaders never set
+        // them); tests populate one entry per layer to drive the Q8_0 matmul kernels.
+        Mamba3LayerQuantOverlay[]? overlays = weights.LayerOverlays;
+        if (overlays is not null && overlays.Length != numLayers)
+            throw new ArgumentException(
+                $"Mamba3Weights.LayerOverlays length {overlays.Length} != NumLayers {numLayers}.",
+                nameof(weights));
 
         var layers = new LayerBuffers[numLayers];
         for (int i = 0; i < numLayers; i++)
         {
             ref readonly var lw = ref weights.Layers[i];
+            Mamba3LayerQuantOverlay? layerOv = overlays?[i];
 
             var norm = UploadTensor(device, staging, lw.Norm, hidden, out long normBytes);
-            var inProj = UploadTensor(device, staging, lw.InProj, (long)dInProj * hidden, out long inProjBytes);
-            var outProj = UploadTensor(device, staging, lw.OutProj, (long)hidden * dInner, out long outProjBytes);
+
+            // in_proj: contraction axis = hiddenSize. Honours Q8_0 overlay when set AND
+            // hidden % 32 == 0; otherwise falls back to F32 source upload.
+            VulkanDevice.Buffer inProj;
+            QuantizationType inProjDeviceQt;
+            long inProjBytes;
+            bool inProjKeepQ8 = layerOv is not null
+                && KeepQ8OnDevice(layerOv.InProjQuantTypeOverlay, hidden)
+                && layerOv.InProjQ8Ptr != 0;
+            if (inProjKeepQ8)
+            {
+                inProjBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q8_0) * dInProj;
+                inProj = device.AllocateDeviceLocal(inProjBytes);
+                UploadRawBytes(device, staging, layerOv!.InProjQ8Ptr, inProjBytes, inProj);
+                inProjDeviceQt = QuantizationType.Q8_0;
+            }
+            else
+            {
+                inProj = UploadTensor(device, staging, lw.InProj, (long)dInProj * hidden, out inProjBytes);
+                inProjDeviceQt = QuantizationType.F32;
+            }
+
+            // out_proj: contraction axis = dInner. Honours Q8_0 overlay when set AND
+            // dInner % 32 == 0.
+            VulkanDevice.Buffer outProj;
+            QuantizationType outProjDeviceQt;
+            long outProjBytes;
+            bool outProjKeepQ8 = layerOv is not null
+                && KeepQ8OnDevice(layerOv.OutProjQuantTypeOverlay, dInner)
+                && layerOv.OutProjQ8Ptr != 0;
+            if (outProjKeepQ8)
+            {
+                outProjBytes = Dequantize.RowByteSize(dInner, QuantizationType.Q8_0) * hidden;
+                outProj = device.AllocateDeviceLocal(outProjBytes);
+                UploadRawBytes(device, staging, layerOv!.OutProjQ8Ptr, outProjBytes, outProj);
+                outProjDeviceQt = QuantizationType.Q8_0;
+            }
+            else
+            {
+                outProj = UploadTensor(device, staging, lw.OutProj, (long)hidden * dInner, out outProjBytes);
+                outProjDeviceQt = QuantizationType.F32;
+            }
             var bNorm = UploadTensor(device, staging, lw.BNorm, dState, out long bNormBytes);
             var cNorm = UploadTensor(device, staging, lw.CNorm, dState, out long cNormBytes);
             // Bias shape on disk: SISO [n_head, 1, d_state] (element count H·N), MIMO
@@ -231,7 +336,9 @@ internal sealed class VulkanMamba3Weights : IDisposable
             {
                 Norm = norm,
                 InProj = inProj, InProjOutputDim = dInProj, InProjInputDim = hidden,
+                InProjDeviceQuantType = inProjDeviceQt,
                 OutProj = outProj, OutProjOutputDim = hidden, OutProjInputDim = dInner,
+                OutProjDeviceQuantType = outProjDeviceQt,
                 BNorm = bNorm, CNorm = cNorm,
                 BBias = bBias, CBias = cBias,
                 D = d, DtBias = dtBias,
@@ -249,8 +356,36 @@ internal sealed class VulkanMamba3Weights : IDisposable
         return new VulkanMamba3Weights(layers,
             tokenEmbed, vocab, hidden,
             finalNorm,
-            lmHead, lmHeadOutputDim: vocab, lmHeadInputDim: hidden,
+            lmHead, lmHeadDeviceQt, lmHeadOutputDim: vocab, lmHeadInputDim: hidden,
             totalBytes);
+    }
+
+    /// <summary>True iff a Q8_0 overlay can be kept on device as raw Q8_0 blocks — gated
+    /// on the contraction dim being a multiple of the Q8_0 group size (32). When the
+    /// constraint fails the upload silently falls back to the F32 source instead.</summary>
+    private static bool KeepQ8OnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
+
+    /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
+    /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.
+    /// Same on-device byte layout as <see cref="VulkanWeights"/> so the existing
+    /// <c>matmul_q8_0</c> / <c>matmul_q8_0_gemm</c> kernels can read it directly.</summary>
+    private static unsafe void UploadRawBytes(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long bytes, VulkanDevice.Buffer dst)
+    {
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory VulkanMamba3Weights raw");
+        try
+        {
+            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
+                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferSynchronous(staging, dst, (ulong)bytes);
     }
 
     private static long ComputeMaxStagingBytes(

@@ -8,6 +8,7 @@ using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
+using QuantizationType = DotLLM.Core.Configuration.QuantizationType;
 
 namespace DotLLM.Vulkan;
 
@@ -27,9 +28,15 @@ namespace DotLLM.Vulkan;
 /// between the two paths — the rank axis lives entirely inside the per-token scratch.
 /// </para>
 /// <para>
-/// <b>F32-only.</b> Every weight, every activation, every scratch is F32. Quantised ingest
-/// is a follow-up — the CPU loader currently rejects non-F32 source dtypes too, so the
-/// Vulkan side has no asymmetry to honour.
+/// <b>Activations stay F32; weights honour the Q8_0 overlay.</b> Every activation and scratch
+/// buffer is F32. The matmul-target projections (<c>in_proj</c>, <c>out_proj</c>, <c>lm_head</c>)
+/// honour the optional Q8_0 overlay on <see cref="Mamba3Weights"/> at upload time: when set,
+/// the raw Q8_0 blocks are kept on device and dispatched through
+/// <see cref="MatMulQ8_0Kernel"/> (decode GEMV) /
+/// <see cref="MatMulQ8_0GemmKernel"/> / <see cref="MatMulQ8_0GemmCoopmatKernel"/> (prefill GEMM)
+/// — same routing as <see cref="VulkanTransformerModel"/> /
+/// <see cref="VulkanNemotronHTransformerModel"/>. Production load paths never set the overlay
+/// (<see cref="Mamba3WeightLoader"/> is F32-only), so existing F32 forwards remain bit-equal.
 /// </para>
 /// <para>
 /// <b>Per-token preprocessing on the host.</b> The Mamba-3 SISO block needs softplus,
@@ -80,6 +87,14 @@ public sealed class VulkanMamba3TransformerModel : IModel
 
     // Kernels.
     private readonly MatMulF32Kernel _matmul;
+    // Q8_0 matmul kernels — always created so mixed-quant configs (some Q8_0 in_proj +
+    // F32 out_proj, etc.) can dispatch correctly. RecordMatmul branches on the device-side
+    // QuantizationType per call.
+    private readonly MatMulQ8_0Kernel _matmulQ8;
+    private readonly MatMulQ8_0GemmKernel _matmulQ8Gemm;
+    // Optional coopmat-accelerated Q8_0 prefill GEMM — null on devices without
+    // VK_KHR_cooperative_matrix support, in which case the scalar Q8_0 GEMM is used.
+    private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly Mamba3DataRopeF32Kernel _dataRope;
     private readonly Mamba3CanonicalSsdSisoF32Kernel _sisoScan;
@@ -106,7 +121,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
         VulkanMamba3Weights weights,
         VulkanMamba3ForwardScratch state,
         VulkanMamba3State recurrent,
-        MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm,
+        MatMulF32Kernel matmul,
+        MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        RmsNormF32Kernel rmsnorm,
         Mamba3DataRopeF32Kernel dataRope, Mamba3CanonicalSsdSisoF32Kernel sisoScan,
         Mamba3CanonicalSsdMimoF32Kernel? mimoScan,
         Mamba3ChunkBoundaryF32Kernel boundary,
@@ -122,6 +140,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _m3 = config.Mamba3Config!;
 
         _matmul = matmul;
+        _matmulQ8 = matmulQ8;
+        _matmulQ8Gemm = matmulQ8Gemm;
+        _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
         _rmsnorm = rmsnorm;
         _dataRope = dataRope;
         _sisoScan = sisoScan;
@@ -205,6 +226,17 @@ public sealed class VulkanMamba3TransformerModel : IModel
         var recurrent = new VulkanMamba3State(device, config);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
+        // Q8_0 kernels are always created — production loaders never attach a Q8_0 overlay
+        // so they remain unused on the F32 path, but mixed-quant test configs need them
+        // bound on every device. Same policy as VulkanNemotronHTransformerModel.
+        var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
+        var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat = null;
+        if (device.HasCooperativeMatrix)
+        {
+            try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
+            catch (InvalidOperationException) { /* Kernel threw: no usable tile shape. Stay on scalar. */ }
+        }
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var dataRope = Mamba3DataRopeF32Kernel.Create(device, spvDir);
         var sisoScan = Mamba3CanonicalSsdSisoF32Kernel.Create(device, spvDir);
@@ -219,7 +251,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
         return new VulkanMamba3TransformerModel(
             device, ownsDevice,
             config, weights, state, recurrent,
-            matmul, rmsnorm, dataRope, sisoScan, mimoScan, boundary, add,
+            matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            rmsnorm, dataRope, sisoScan, mimoScan, boundary, add,
             submit);
     }
 
@@ -305,8 +338,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
                 rowCount: seqLen, n: hiddenSize, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            _matmul.Record(cmdBuf, lw.InProj, _state.NormOutput, _state.Proj,
-                m: lw.InProjOutputDim, k: lw.InProjInputDim, n: seqLen);
+            RecordMatmul(cmdBuf, lw.InProj, lw.InProjDeviceQuantType,
+                _state.NormOutput, _state.Proj,
+                outputDim: lw.InProjOutputDim, inputDim: lw.InProjInputDim, seqLen: seqLen);
 
             // The matmul writes Proj (which is host-visible). We need a compute → host
             // barrier so the host map below sees the kernel's writes, then SubmitAndWait
@@ -486,8 +520,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
             // those across submits.
 
             // out_proj: YScan @ OutProj^T → BlockOut.
-            _matmul.Record(cmdBuf, lw.OutProj, _state.YScan, _state.BlockOut,
-                m: lw.OutProjOutputDim, k: lw.OutProjInputDim, n: seqLen);
+            RecordMatmul(cmdBuf, lw.OutProj, lw.OutProjDeviceQuantType,
+                _state.YScan, _state.BlockOut,
+                outputDim: lw.OutProjOutputDim, inputDim: lw.OutProjInputDim, seqLen: seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Residual add: NewHidden = OldHidden (Residual) + BlockOut, written into
@@ -519,8 +554,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
             rowCount: 1, n: hiddenSize, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        _matmul.Record(cmdBuf, _weights.LmHead, _state.LastTokenHidden, _state.Logits,
-            m: _weights.LmHeadOutputDim, k: _weights.LmHeadInputDim, n: 1);
+        RecordMatmul(cmdBuf, _weights.LmHead, _weights.LmHeadDeviceQuantType,
+            _state.LastTokenHidden, _state.Logits,
+            outputDim: _weights.LmHeadOutputDim, inputDim: _weights.LmHeadInputDim, seqLen: 1);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
@@ -783,12 +819,59 @@ public sealed class VulkanMamba3TransformerModel : IModel
     private void InvalidateKernelCaches()
     {
         _matmul.InvalidateDescriptorCache();
+        _matmulQ8.InvalidateDescriptorCache();
+        _matmulQ8Gemm.InvalidateDescriptorCache();
+        _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _dataRope.InvalidateDescriptorCache();
         _sisoScan.InvalidateDescriptorCache();
         _mimoScan?.InvalidateDescriptorCache();
         _boundary.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
+    }
+
+    /// <summary>
+    /// Dispatches a matmul for one Mamba-3 projection: chooses
+    /// <see cref="MatMulQ8_0Kernel"/> (decode-path GEMV) when the device-side weight is
+    /// Q8_0 and <paramref name="seqLen"/>==1, the batched <see cref="MatMulQ8_0GemmKernel"/>
+    /// (or its coopmat variant when available) when Q8_0 and <paramref name="seqLen"/>&gt;1,
+    /// and <see cref="MatMulF32Kernel"/> for every non-Q8_0 weight. Same routing as
+    /// <see cref="VulkanNemotronHTransformerModel"/>.
+    /// </summary>
+    /// <remarks>
+    /// All Q8_0 kernels require <paramref name="inputDim"/> to be a multiple of 32. The
+    /// upload path (<see cref="VulkanMamba3Weights"/>) only marks a projection as Q8_0
+    /// when that constraint holds; otherwise the source is uploaded as F32 and lands here
+    /// as F32, sidestepping the kernel alignment requirement entirely.
+    /// </remarks>
+    private void RecordMatmul(
+        nint cmdBuf,
+        VulkanDevice.Buffer weights, QuantizationType weightQt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (weightQt == QuantizationType.Q8_0)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ8.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else if (_matmulQ8GemmCoopmat is not null)
+            {
+                _matmulQ8GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+            else
+            {
+                _matmulQ8Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else
+        {
+            _matmul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
+        }
     }
 
     /// <inheritdoc/>
@@ -805,6 +888,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _sisoScan.Dispose();
         _dataRope.Dispose();
         _rmsnorm.Dispose();
+        _matmulQ8GemmCoopmat?.Dispose();
+        _matmulQ8Gemm.Dispose();
+        _matmulQ8.Dispose();
         _matmul.Dispose();
 
         if (_ownsDevice)
