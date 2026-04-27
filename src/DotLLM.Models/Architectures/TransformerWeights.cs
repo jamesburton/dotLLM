@@ -588,7 +588,17 @@ internal sealed class TransformerWeights : IDisposable
     /// Loads all weight references from an opened GGUF file.
     /// Norm weights are dequantized to <c>float[]</c>. Linear projections stay as mmap pointers.
     /// </summary>
-    public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config)
+    /// <param name="gguf">Opened GGUF file.</param>
+    /// <param name="config">Model configuration.</param>
+    /// <param name="skipF32MoeDequant">When true, skip the per-expert F32 host
+    /// dequant of the MoE 3D-stacked tensors (still populates raw GGUF mmap
+    /// views so the GPU loader can take its zero-copy path). Used by GPU-only
+    /// callers — the F32 dequants are dead weight when the CPU MoE oracle
+    /// isn't called, and they blow ~2.2 GB host RAM per V2-Lite Q4_K_M layer.
+    /// CPU-only callers leave this false to keep <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp.Execute"/>
+    /// callable.</param>
+    public static TransformerWeights LoadFromGguf(GgufFile gguf, ModelConfig config,
+                                                    bool skipF32MoeDequant = false)
     {
         nint dataBase = gguf.DataBasePointer;
         var tensors = gguf.TensorsByName;
@@ -607,7 +617,7 @@ internal sealed class TransformerWeights : IDisposable
         for (int i = 0; i < config.NumLayers; i++)
         {
             layers[i] = config.MlaConfig is not null
-                ? LoadMlaLayer(i, dataBase, tensors, config, owned!)
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant)
                 : LoadLayer(i, dataBase, tensors, config);
         }
 
@@ -892,7 +902,8 @@ internal sealed class TransformerWeights : IDisposable
         nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
-        List<nint> owned)
+        List<nint> owned,
+        bool skipF32MoeDequant = false)
     {
         var mla = config.MlaConfig
             ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
@@ -1001,7 +1012,7 @@ internal sealed class TransformerWeights : IDisposable
 
         if (layerIsMoe)
         {
-            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned);
+            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned, skipF32MoeDequant);
         }
         else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
@@ -1064,7 +1075,8 @@ internal sealed class TransformerWeights : IDisposable
         nint dataBase,
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
-        List<nint> owned)
+        List<nint> owned,
+        bool skipF32Dequant = false)
     {
         var moe = config.Moe
             ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
@@ -1093,15 +1105,31 @@ internal sealed class TransformerWeights : IDisposable
         var upDesc = tensors[$"{prefix}.ffn_up_exps.weight"];
         var downDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
 
-        var w1 = SliceExpertsToF32(
-            dataBase, gateDesc,
-            numExperts, M: moeIntermediate, K: hiddenSize, owned);
-        var w3 = SliceExpertsToF32(
-            dataBase, upDesc,
-            numExperts, M: moeIntermediate, K: hiddenSize, owned);
-        var w2 = SliceExpertsToF32(
-            dataBase, downDesc,
-            numExperts, M: hiddenSize, K: moeIntermediate, owned);
+        nint[] w1, w3, w2;
+        if (skipF32Dequant)
+        {
+            // GPU-only callers skip the F32 host dequant of the per-expert
+            // 3D tensors — saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE
+            // layer. Zero-filled arrays of size numExperts (to satisfy the
+            // MoeLayerWeights ctor's length validation); the GPU loader uses
+            // the raw views (gateRaw/upRaw/downRaw below). The CPU
+            // MoeSwiGluMlp oracle is not callable on this layer in this mode.
+            w1 = new nint[numExperts];
+            w3 = new nint[numExperts];
+            w2 = new nint[numExperts];
+        }
+        else
+        {
+            w1 = SliceExpertsToF32(
+                dataBase, gateDesc,
+                numExperts, M: moeIntermediate, K: hiddenSize, owned);
+            w3 = SliceExpertsToF32(
+                dataBase, upDesc,
+                numExperts, M: moeIntermediate, K: hiddenSize, owned);
+            w2 = SliceExpertsToF32(
+                dataBase, downDesc,
+                numExperts, M: hiddenSize, K: moeIntermediate, owned);
+        }
 
         nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
         nint upRaw = dataBase + (nint)upDesc.DataOffset;
@@ -1126,9 +1154,22 @@ internal sealed class TransformerWeights : IDisposable
             var sharedUpDesc = tensors[$"{prefix}.ffn_up_shexp.weight"];
             var sharedDownDesc = tensors[$"{prefix}.ffn_down_shexp.weight"];
 
-            sharedGate = [DequantToF32(dataBase, sharedGateDesc, (long)sharedI * hiddenSize, owned)];
-            sharedUp = [DequantToF32(dataBase, sharedUpDesc, (long)sharedI * hiddenSize, owned)];
-            sharedDown = [DequantToF32(dataBase, sharedDownDesc, (long)hiddenSize * sharedI, owned)];
+            // Single fused shared MLP — small enough that skipping the F32
+            // dequant only saves ~10 MB host RAM per layer (vs ~2.2 GB for
+            // routed experts). Skip when caller asks for it anyway, for
+            // consistency.
+            if (skipF32Dequant)
+            {
+                sharedGate = [(nint)0];
+                sharedUp = [(nint)0];
+                sharedDown = [(nint)0];
+            }
+            else
+            {
+                sharedGate = [DequantToF32(dataBase, sharedGateDesc, (long)sharedI * hiddenSize, owned)];
+                sharedUp = [DequantToF32(dataBase, sharedUpDesc, (long)sharedI * hiddenSize, owned)];
+                sharedDown = [DequantToF32(dataBase, sharedDownDesc, (long)hiddenSize * sharedI, owned)];
+            }
 
             sharedGateRaw = [dataBase + (nint)sharedGateDesc.DataOffset];
             sharedGateRawQt = sharedGateDesc.QuantizationType;

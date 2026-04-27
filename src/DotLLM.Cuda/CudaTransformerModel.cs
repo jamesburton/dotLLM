@@ -217,7 +217,11 @@ public sealed unsafe class CudaTransformerModel : IModel
                                                        int deviceId = 0, string? ptxDir = null)
     {
         // Load CPU weights (mmap references only, no heavy allocation)
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
+        // GPU-only path: skip the F32 host dequant of the per-expert MoE 3D
+        // tensors. Saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE layer
+        // (the GPU loader takes the raw view; the CPU MoeSwiGluMlp oracle
+        // is never called on a CudaTransformerModel anyway).
+        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant: true);
 
         // VRAM estimate uses GGUF quant info — cheaper than walking cpuWeights.
         long estimatedWeightBytes = 0;

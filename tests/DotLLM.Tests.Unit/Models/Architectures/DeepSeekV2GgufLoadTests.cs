@@ -240,6 +240,54 @@ public sealed class DeepSeekV2GgufLoadTests
         }
     }
 
+    /// <summary>
+    /// Real-checkpoint multi-layer smoke at the empirically-determined ceiling
+    /// for an RTX 3060 12 GB. Above 8 layers the per-MoE-layer footprint
+    /// (~1 GB raw quant bytes for 64 experts × 3 projections + scratch +
+    /// embed/LM head + KV cache) exceeds the 12 GB cap. Tests {4, 8} as a
+    /// sanity ramp; both should pass on the cached real GGUF. Higher layer
+    /// counts fail with CUDA "out of memory" — the gap is closed by
+    /// grouped-GEMM compaction (next perf milestone, not correctness).
+    /// </summary>
+    [SkippableTheory]
+    [Trait("Category", "GPU")]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void RealGguf_QuantizedMlaMoe_NLayerSmoke(int numLayers)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        string path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
+        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
+
+        using var gguf = GgufFile.Open(path);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Skip.If(numLayers > fullConfig.NumLayers,
+            $"Model has {fullConfig.NumLayers} layers; can't request {numLayers}.");
+        var config = fullConfig with { NumLayers = numLayers };
+
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
+        {
+            int[] tokenIds = [100000, 261, 1559, 11];
+            int[] positions = [0, 1, 2, 3];
+
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: 0, kvCache: null);
+
+            unsafe
+            {
+                int finite = 0;
+                int total = logits.Shape.Rank == 1 ? logits.Shape[0] : logits.Shape[1];
+                var span = new ReadOnlySpan<float>((void*)logits.DataPointer, total);
+                foreach (float v in span)
+                    if (float.IsFinite(v)) finite++;
+                Assert.True(finite == total,
+                    $"NumLayers={numLayers}: expected all {total} logits finite; got {finite}.");
+            }
+        }
+    }
+
     /// <summary>Reflection peek at layer 1's MoE precision (mirrors the MLA helper).</summary>
     private static MoePrecision ModelLayer1MoePrecision(CudaTransformerModel model)
     {
