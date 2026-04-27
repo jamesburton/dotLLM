@@ -335,8 +335,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _convertF16ToF32Func = _convertModule.GetFunction("convert_f16_to_f32");
         _convertF32ToF16Func = _convertModule.GetFunction("convert_f32_to_f16");
         _quantizedGemvQ8_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q8_0");
-        // Q2_K is optional — older PTX builds may not have it.
-        _quantizedGemvQ2_KFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_q2_k");
+        _quantizedGemvQ2_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q2_k");
         _quantizedGemvQ4_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q4_k");
         _quantizedGemvQ5_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q5_0");
         _quantizedGemvQ5_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q5_k");
@@ -1252,7 +1251,7 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>
     /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
     /// kernel for the given quant type. Block-32 quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
-    /// require <c>K % 32 == 0</c>; K-quants (Q3_K/Q4_K/Q5_K/Q6_K) require
+    /// require <c>K % 32 == 0</c>; K-quants (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) require
     /// <c>K % 256 == 0</c>. Caller-side gates use this to decide between the
     /// direct-GEMV fast path and the dequant-then-GEMM fallback.
     /// </summary>
