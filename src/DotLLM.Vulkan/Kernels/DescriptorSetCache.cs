@@ -37,8 +37,8 @@ internal sealed class DescriptorSetCache
     /// <summary>Fixed cache slot count. Must be &gt;= the expected number of distinct buffer tuples per forward.</summary>
     internal const int Capacity = 256;
 
-    /// <summary>Hard upper bound on buffers per descriptor set — matches the widest kernel (mamba3 canonical SSD SISO scan, 11 bindings: state, v, qRoped, kRoped, qkPreDot, scale, gamma, adt, d, z, y).</summary>
-    private const int MaxBuffersPerSet = 11;
+    /// <summary>Hard upper bound on buffers per descriptor set — matches the widest kernel (mamba3 canonical SSD MIMO scan, 13 bindings: state, v, qRoped, kRoped, qkPreDotSum, scale, gamma, adt, d, z, mimoZ, mimoO, y).</summary>
+    private const int MaxBuffersPerSet = 13;
 
     private readonly VulkanDevice _device;
     private readonly nint _pool;
