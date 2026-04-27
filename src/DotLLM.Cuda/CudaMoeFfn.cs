@@ -441,10 +441,13 @@ public static unsafe class CudaMoeFfn
     /// </list>
     /// </summary>
     /// <remarks>
-    /// V2-Lite Q4_K_M numbers: gate_proj/up_proj have K=hidden=2048 (256-aligned),
-    /// take the GEMV fast path. down_proj has K=intermediate=1408 (NOT aligned),
-    /// stays on the dequant fallback. ~2× of MoE projections benefit; the third
-    /// awaits a Q4_K kernel that handles K%256!=0 or grouped-GEMM compaction.
+    /// V2-Lite Q4_K_M numbers: gate_proj/up_proj have K=hidden=2048 stored as Q4_K
+    /// (256-aligned ✓), take the GEMV fast path. down_proj has K=intermediate=1408
+    /// stored as Q8_0 (block_size=32, 32-aligned ✓) — also takes the GEMV fast
+    /// path now that the gate uses per-quant-type minimum K alignment via
+    /// <see cref="CudaKernels.MinKAlignmentFor(QuantizationType)"/>. All three
+    /// MoE projections benefit; only the (rare) prefill batch&gt;1 case falls
+    /// through to the dequant-then-GEMM fallback.
     /// </remarks>
     private static void ProjectF32OrQuant(
         MoePrecision precision, nint cublasHandle, CudaKernels kernels, nint stream,
@@ -455,12 +458,14 @@ public static unsafe class CudaMoeFfn
     {
         if (precision == MoePrecision.Quantized)
         {
-            // Fast path: direct quantized GEMV when batch=1, K is 256-aligned,
-            // and a kernel exists for this quant type. Avoids materialising
-            // the full M*K dequant scratch on every projection — typically
-            // an order of magnitude smaller memory footprint per launch.
+            // Fast path: direct quantized GEMV when batch=1, K satisfies the
+            // per-quant-type alignment (block-32 quants need K%32==0; K-quants
+            // need K%256==0), and a kernel exists for this quant type. Avoids
+            // materialising the full M*K dequant scratch on every projection —
+            // typically an order of magnitude smaller memory footprint per launch.
+            int minKAlign = CudaKernels.MinKAlignmentFor(weightQt);
             bool gemvEligible = batch == 1
-                && (K % 256) == 0
+                && (K % minKAlign) == 0
                 && CudaKernels.HasQuantizedGemv(weightQt);
             if (gemvEligible)
             {
