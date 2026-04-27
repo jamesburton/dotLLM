@@ -14,6 +14,14 @@ public enum QuantizationType
     /// <summary>4-bit quantization, group size 32, no min.</summary>
     Q4_0 = 2,
 
+    /// <summary>
+    /// Brain float (truncated FP32, 1 sign / 8 exponent / 7 mantissa bits) — same exponent
+    /// range as F32, narrower mantissa than F16. Common in HuggingFace-trained transformer
+    /// checkpoints. GGUF reserves enum value 30 for BF16 (added in llama.cpp ggml-quants);
+    /// dotLLM uses the same value so on-disk GGUF BF16 tensors round-trip cleanly.
+    /// </summary>
+    BF16 = 30,
+
     /// <summary>4-bit quantization, group size 32, with min.</summary>
     Q4_1 = 3,
 

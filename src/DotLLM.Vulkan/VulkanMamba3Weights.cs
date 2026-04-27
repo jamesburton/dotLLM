@@ -389,14 +389,29 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ6KOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
 
-    /// <summary>True iff the overlay declares a supported quantised format (Q8_0 /
-    /// Q4_K / Q5_K / Q6_K) AND the contraction axis is aligned to that format's group
-    /// size.</summary>
+    /// <summary>True iff an F16 overlay can be kept on device as raw 2-byte F16 elements
+    /// — gated on the contraction dim being a multiple of 2. Phase 8 of the native
+    /// matmul work — unblocks BF16 / F16 SafeTensors loads that previously had to expand
+    /// to F32 at upload.</summary>
+    private static bool KeepF16OnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.F16 && (contractionDim & 1) == 0;
+
+    /// <summary>True iff a BF16 overlay can be kept on device as raw 2-byte BF16 elements
+    /// — gated on the contraction dim being a multiple of 2. Phase 8 sibling of
+    /// <see cref="KeepF16OnDevice"/>.</summary>
+    private static bool KeepBf16OnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.BF16 && (contractionDim & 1) == 0;
+
+    /// <summary>True iff the overlay declares a supported on-device dtype (Q8_0 /
+    /// Q4_K / Q5_K / Q6_K / F16 / BF16) AND the contraction axis is aligned to that
+    /// format's group size.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
         => KeepQ8OnDevice(qt, contractionDim)
         || KeepQ4KOnDevice(qt, contractionDim)
         || KeepQ5KOnDevice(qt, contractionDim)
-        || KeepQ6KOnDevice(qt, contractionDim);
+        || KeepQ6KOnDevice(qt, contractionDim)
+        || KeepF16OnDevice(qt, contractionDim)
+        || KeepBf16OnDevice(qt, contractionDim);
 
     /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
     /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.

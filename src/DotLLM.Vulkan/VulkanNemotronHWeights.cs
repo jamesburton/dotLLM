@@ -322,14 +322,28 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepQ6KOnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.Q6_K && (inputDim % 256) == 0;
 
-    /// <summary>True iff the source projection is a quantised format with a Vulkan
-    /// kernel (Q8_0 / Q4_K / Q5_K / Q6_K) AND the contraction axis is aligned to that
-    /// format's group size — i.e. the raw blocks can stay on device verbatim.</summary>
+    /// <summary>True iff an F16 source projection can be kept on device as raw 2-byte
+    /// F16 elements — gated on the contraction dim being a multiple of 2. Phase 8 of
+    /// the native matmul work.</summary>
+    private static bool KeepF16OnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.F16 && (inputDim & 1) == 0;
+
+    /// <summary>True iff a BF16 source projection can be kept on device as raw 2-byte
+    /// BF16 elements — gated on the contraction dim being a multiple of 2. Phase 8
+    /// sibling of <see cref="KeepF16OnDevice"/>.</summary>
+    private static bool KeepBf16OnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.BF16 && (inputDim & 1) == 0;
+
+    /// <summary>True iff the source projection is a supported on-device dtype (Q8_0 /
+    /// Q4_K / Q5_K / Q6_K / F16 / BF16) AND the contraction axis is aligned to that
+    /// format's group size — i.e. the raw bytes can stay on device verbatim.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int inputDim)
         => KeepQ8OnDevice(qt, inputDim)
         || KeepQ4KOnDevice(qt, inputDim)
         || KeepQ5KOnDevice(qt, inputDim)
-        || KeepQ6KOnDevice(qt, inputDim);
+        || KeepQ6KOnDevice(qt, inputDim)
+        || KeepF16OnDevice(qt, inputDim)
+        || KeepBf16OnDevice(qt, inputDim);
 
     /// <summary>Returns the storage quant type the projection will land at on device
     /// for the given source/contraction-axis pair. F32 means it'll be dequantised at
@@ -340,12 +354,14 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         if (KeepQ4KOnDevice(qt, inputDim)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(qt, inputDim)) return QuantizationType.Q5_K;
         if (KeepQ6KOnDevice(qt, inputDim)) return QuantizationType.Q6_K;
+        if (KeepF16OnDevice(qt, inputDim)) return QuantizationType.F16;
+        if (KeepBf16OnDevice(qt, inputDim)) return QuantizationType.BF16;
         return QuantizationType.F32;
     }
 
     /// <summary>Returns the on-device byte size for one projection matrix in its
-    /// chosen storage form — Q8_0 / Q4_K / Q5_K / Q6_K row-stride bytes when kept
-    /// quantised, otherwise F32.</summary>
+    /// chosen storage form — Q-format / F16 / BF16 row-stride bytes when kept native,
+    /// otherwise F32.</summary>
     private static long ProjectionUploadBytes(int outputDim, int inputDim, QuantizationType qt)
     {
         if (KeepQ8OnDevice(qt, inputDim))
@@ -356,6 +372,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_K) * outputDim;
         if (KeepQ6KOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q6_K) * outputDim;
+        if (KeepF16OnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
+        if (KeepBf16OnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.BF16) * outputDim;
         return (long)outputDim * inputDim * sizeof(float);
     }
 

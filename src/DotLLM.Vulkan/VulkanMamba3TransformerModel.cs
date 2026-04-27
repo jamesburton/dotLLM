@@ -106,6 +106,15 @@ public sealed class VulkanMamba3TransformerModel : IModel
     // K-quant matmul kernel coverage. Always created.
     private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
     private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
+    // F16 / BF16 native matmul kernels — Phase 8. Always created; the dispatcher
+    // routes per device-side QuantizationType. F16 GEMM coopmat path is null on
+    // devices without VK_KHR_cooperative_matrix; BF16 has no coopmat path
+    // (KHR_coopmat exposes F16 / Sint8 operands, not BF16).
+    private readonly MatMulF16GemvF32Kernel _matmulF16;
+    private readonly MatMulF16GemmF32Kernel _matmulF16Gemm;
+    private readonly MatMulF16GemmCoopmatKernel? _matmulF16GemmCoopmat;
+    private readonly MatMulBf16GemvF32Kernel _matmulBf16;
+    private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly Mamba3DataRopeF32Kernel _dataRope;
     private readonly Mamba3CanonicalSsdSisoF32Kernel _sisoScan;
@@ -138,6 +147,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
+        MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
+        MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
+        MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm,
         Mamba3DataRopeF32Kernel dataRope, Mamba3CanonicalSsdSisoF32Kernel sisoScan,
         Mamba3CanonicalSsdMimoF32Kernel? mimoScan,
@@ -163,6 +175,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
         _matmulQ6KGemm = matmulQ6KGemm;
+        _matmulF16 = matmulF16;
+        _matmulF16Gemm = matmulF16Gemm;
+        _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
+        _matmulBf16 = matmulBf16;
+        _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnorm = rmsnorm;
         _dataRope = dataRope;
         _sisoScan = sisoScan;
@@ -266,6 +283,18 @@ public sealed class VulkanMamba3TransformerModel : IModel
         // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
         var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
         var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
+        // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat is
+        // opportunistic (null on devices without VK_KHR_cooperative_matrix).
+        var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
+        var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
+        MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
+        if (device.HasCooperativeMatrix)
+        {
+            try { matmulF16GemmCoopmat = MatMulF16GemmCoopmatKernel.Create(device, spvDir); }
+            catch (InvalidOperationException) { /* No usable F16 tile shape; stay on scalar. */ }
+        }
+        var matmulBf16 = MatMulBf16GemvF32Kernel.Create(device, spvDir);
+        var matmulBf16Gemm = MatMulBf16GemmF32Kernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var dataRope = Mamba3DataRopeF32Kernel.Create(device, spvDir);
         var sisoScan = Mamba3CanonicalSsdSisoF32Kernel.Create(device, spvDir);
@@ -284,6 +313,8 @@ public sealed class VulkanMamba3TransformerModel : IModel
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
+            matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
+            matmulBf16, matmulBf16Gemm,
             rmsnorm, dataRope, sisoScan, mimoScan, boundary, add,
             submit);
     }
@@ -860,6 +891,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
         _matmulQ6KGemm.InvalidateDescriptorCache();
+        _matmulF16.InvalidateDescriptorCache();
+        _matmulF16Gemm.InvalidateDescriptorCache();
+        _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulBf16.InvalidateDescriptorCache();
+        _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _dataRope.InvalidateDescriptorCache();
         _sisoScan.InvalidateDescriptorCache();
@@ -954,6 +990,41 @@ public sealed class VulkanMamba3TransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantizationType.F16)
+        {
+            // Phase 8: native F16 weights — 2 bytes/element on device, GEMV at decode,
+            // coopmat or scalar tiled GEMM at prefill.
+            if (seqLen == 1)
+            {
+                _matmulF16.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else if (_matmulF16GemmCoopmat is not null)
+            {
+                _matmulF16GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+            else
+            {
+                _matmulF16Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.BF16)
+        {
+            // Phase 8: native BF16 weights — 2 bytes/element on device. No coopmat
+            // path for BF16 on this hardware.
+            if (seqLen == 1)
+            {
+                _matmulBf16.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulBf16Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else
         {
             _matmul.Record(cmdBuf, weights, input, output, outputDim, inputDim, seqLen);
@@ -974,6 +1045,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _sisoScan.Dispose();
         _dataRope.Dispose();
         _rmsnorm.Dispose();
+        _matmulBf16Gemm.Dispose();
+        _matmulBf16.Dispose();
+        _matmulF16GemmCoopmat?.Dispose();
+        _matmulF16Gemm.Dispose();
+        _matmulF16.Dispose();
         _matmulQ6KGemm.Dispose();
         _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
