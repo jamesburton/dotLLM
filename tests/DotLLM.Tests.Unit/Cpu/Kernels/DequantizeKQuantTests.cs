@@ -202,6 +202,77 @@ public sealed unsafe class DequantizeKQuantTests
         }
     }
 
+    // ──────────────────── Q3_K dequant ────────────────────
+
+    private const int Q3_K_BlockBytes = 110;
+
+    [Fact]
+    public void Q3_K_SingleBlock_HandCalculated()
+    {
+        // Block layout: hmask[32] + qs[64] + scales[12] + d[2] = 110 bytes.
+        nuint totalBytes = Q3_K_BlockBytes;
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            NativeMemory.Clear((void*)ptr, totalBytes);
+            byte* block = (byte*)ptr;
+
+            // d = 1.0
+            Unsafe.WriteUnaligned(block + 32 + 64 + 12, (Half)1.0f);
+
+            // scales12 (offset 32+64=96):
+            //   sub 0 → low nibble in scales12[0] (low 4 bits) + high 2 bits in scales12[8] bits 0-1
+            //   We want unsigned scale = 33 (= 32 + 1 → signed scale = +1).
+            //   33 = 0b100001 → low nibble 0b0001 (=1), high 2 bits 0b10 (=2).
+            block[96 + 0] = 0x01;        // scales12[0] = low nibble
+            block[96 + 8] = 0x02;        // scales12[8] bit 0-1 = high 2 bits of scale[0]
+
+            // qs[0] (offset 32): set element 0's 2 low bits to 0b11 (= 3)
+            block[32 + 0] = 0x03;
+
+            // hmask[0] (offset 0): set element 0's high bit to 1
+            block[0] = 0x01;
+
+            // Element 0: signed_3bit = ((1<<2) | 3) - 4 = 7 - 4 = 3
+            // Signed scale = 33 - 32 = 1
+            // d × scale × signed_3bit = 1.0 × 1 × 3 = 3.0
+            float[] dest = new float[KQuantGroupSize];
+            Dequantize.ToFloat32(ptr, KQuantGroupSize, QuantizationType.Q3_K, dest);
+
+            Assert.Equal(3.0f, dest[0], 0.01f);
+
+            // Element 1 (no qs/hmask bits set, scale[0] = 1):
+            //   signed_3bit = (0 << 2 | 0) - 4 = -4
+            //   value = 1.0 × 1 × -4 = -4
+            Assert.Equal(-4.0f, dest[1], 0.01f);
+
+            // Sub-block 1 (elements 16..31) has scale[1] = 0 - 32 = -32 → all values = 1 × -32 × -4 = 128
+            // (since qs/hmask are all zero, signed_3bit = -4 for every element).
+            Assert.Equal(128.0f, dest[16], 0.01f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q3_K_RowByteSize_Matches()
+    {
+        // 256 elements = 1 super-block = 110 bytes.
+        Assert.Equal(110L, Dequantize.RowByteSize(256, QuantizationType.Q3_K));
+        // 1024 elements = 4 super-blocks = 440 bytes.
+        Assert.Equal(440L, Dequantize.RowByteSize(1024, QuantizationType.Q3_K));
+    }
+
+    [Fact]
+    public void Q3_K_NonAlignedCount_Throws()
+    {
+        float[] dest = new float[100];
+        Assert.Throws<ArgumentException>(() =>
+            Dequantize.ToFloat32(nint.Zero, 100, QuantizationType.Q3_K, dest));
+    }
+
     // ──────────────────── Q4_K dequant ────────────────────
 
     [Fact]

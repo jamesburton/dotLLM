@@ -321,11 +321,18 @@ public sealed class DeepSeekV2GgufLoadTests
             return;
         }
         using var _gguf = gguf;
-        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        Assert.Equal(27, config.NumLayers);  // full V2-Lite
-        Assert.Equal(AttentionType.MLA, config.AttentionType);
-        Assert.NotNull(config.MlaConfig);
-        Assert.NotNull(config.Moe);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        Assert.Equal(27, fullConfig.NumLayers);  // full V2-Lite
+        Assert.Equal(AttentionType.MLA, fullConfig.AttentionType);
+        Assert.NotNull(fullConfig.MlaConfig);
+        Assert.NotNull(fullConfig.Moe);
+
+        // V2-Lite's native max context is 163840 tokens. At 27 layers × 16 heads
+        // × (192 qk + 128 v) + (64 rope) F16 each, the MLA KV cache for full
+        // context would be ~37 GB — OOMs the 12 GB cap before any inference.
+        // Trim to 16-token horizon for the smoke (4 prefill + 3 decode +
+        // headroom). Real production sizes to actual prompt+decode budget.
+        var config = fullConfig with { MaxSequenceLength = 16 };
 
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config);
 

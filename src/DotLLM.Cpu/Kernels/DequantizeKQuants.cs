@@ -11,6 +11,9 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class Dequantize
 {
+    /// <summary>Q3_K block size in bytes: 32(hmask) + 64(qs) + 12(scales) + 2(d) = 110.</summary>
+    internal const int Q3_K_BlockBytes = 110;
+
     /// <summary>Q4_K block size in bytes: 2(d) + 2(dmin) + 12(scales) + 128(qs) = 144.</summary>
     internal const int Q4_K_BlockBytes = 144;
 
@@ -205,6 +208,89 @@ public static unsafe partial class Dequantize
 
                 blockBase += Q6_K_BlockBytes;
             }
+        }
+    }
+
+    // ──────────────────── Q3_K ────────────────────
+
+    /// <summary>
+    /// Dispatches Q3_K dequantization. Block layout (per ggml-quants.h):
+    /// <c>hmask[32]</c> (1 high bit per element) + <c>qs[64]</c> (2 low bits
+    /// per element) + <c>scales[12]</c> (16 packed 6-bit signed-after-bias
+    /// scales) + <c>d[2]</c> (FP16 super-block delta). 110 bytes per 256
+    /// elements. Per-element value:
+    /// <c>d × (signedScale[sub]) × ((hbit&lt;&lt;2 | qbits) - 4)</c> where sub
+    /// = element_idx / 16.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DequantizeQ3_K(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"Q3_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
+                nameof(elementCount));
+        DequantizeQ3_KScalar(src, elementCount, dest);
+    }
+
+    /// <summary>
+    /// Scalar Q3_K dequantization. Reference port of llama.cpp's
+    /// <c>dequantize_row_q3_K</c>. AVX2 acceleration is a future optimization;
+    /// at V2-Lite scale Q3_K is only used for token_embd.weight + output.weight
+    /// (not the per-call hot-path), so the scalar path is acceptable for now.
+    /// </summary>
+    internal static void DequantizeQ3_KScalar(nint src, long elementCount, Span<float> dest)
+    {
+        long numBlocks = elementCount / KQuantGroupSize;
+        byte* blockBase = (byte*)src;
+        long destOffset = 0;
+        Span<byte> scales = stackalloc byte[16];
+
+        for (long b = 0; b < numBlocks; b++)
+        {
+            byte* hmask = blockBase;                 // [32 bytes]
+            byte* qs = blockBase + 32;               // [64 bytes]
+            byte* scales12 = blockBase + 32 + 64;    // [12 bytes]
+            ushort dHalf = *(ushort*)(blockBase + 32 + 64 + 12);
+            float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
+
+            // Unpack 12 bytes → 16 unsigned 6-bit scales (then biased by -32).
+            // Layout: low 4 bits in scales12[0..7] (sub 0..7) and scales12[4..11]
+            // high nibbles (sub 8..15); high 2 bits packed into scales12[8..11]
+            // (2 bits per scale, 4 scales per byte). See llama.cpp ggml-common.h
+            // dequantize_row_q3_K for the reference unpacking.
+            // bytes 8-11 each hold high 2 bits for 4 sub-blocks.
+            //   byte 8: subs 0..3
+            //   byte 9: subs 4..7
+            //   byte 10: subs 8..11
+            //   byte 11: subs 12..15
+            for (int sub = 0; sub < 16; sub++)
+            {
+                int lowSrcByte = sub < 8 ? sub : sub - 4;  // sub 8..15 use bytes 4..11 high nibble
+                int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
+                int hiByte = 8 + (sub / 4);
+                int hiShift = (sub % 4) * 2;
+                int hiBits = (scales12[hiByte] >> hiShift) & 0x03;
+                scales[sub] = (byte)(lowNibble | (hiBits << 4));
+            }
+
+            // 16 sub-blocks × 16 elements = 256 elements per super-block.
+            for (int sub = 0; sub < 16; sub++)
+            {
+                int signedScale = scales[sub] - 32;  // [-32, 31]
+                float scaleD = d * signedScale;
+                int eBase = sub * 16;
+                for (int l = 0; l < 16; l++)
+                {
+                    int e = eBase + l;
+                    int qBits = (qs[e / 4] >> ((e % 4) * 2)) & 0x03;
+                    int hBit = (hmask[e / 8] >> (e % 8)) & 0x01;
+                    int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
+                    dest[(int)(destOffset + e)] = scaleD * signed3;
+                }
+            }
+
+            blockBase += Q3_K_BlockBytes;
+            destOffset += KQuantGroupSize;
         }
     }
 
