@@ -42,6 +42,17 @@ public class CudaMoeGroupedGemvTests
     [SkippableTheory]
     [InlineData(4, 256, 256)]   // tiny synthetic — exercises kernel correctness fast
     [InlineData(4, 1408, 2048)] // V2-Lite shape
+    [InlineData(2, 256, 512)]
+    public void GroupedQ2K_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGroupedEquivalence(QuantizationType.Q2_K, kActive, M, K, blockBytes: 84,
+            (rng, span) => SynthesiseQ2KBlock(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]   // tiny synthetic — exercises kernel correctness fast
+    [InlineData(4, 1408, 2048)] // V2-Lite shape
     [InlineData(6, 1408, 2048)] // V2-Lite full top-k=6
     [InlineData(2, 256, 512)]
     public void GroupedQ4K_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
@@ -98,6 +109,7 @@ public class CudaMoeGroupedGemvTests
         Skip.If(ptxDir == null, "PTX files not found");
         using var kernels = new CudaKernels(ptxDir!);
         Skip.IfNot(kernels.HasMoeGroupedGemv(qt), $"Grouped MoE GEMV for {qt} not loaded (PTX may be stale)");
+        Skip.IfNot(CudaKernels.HasQuantizedGemv(qt), $"Per-call quantized GEMV oracle not available for {qt}");
 
         var rng = new Random(31415 ^ (int)qt ^ kActive ^ M ^ K);
         int superblocksPerRow = K / 256;
@@ -232,6 +244,19 @@ public class CudaMoeGroupedGemvTests
         Assert.True(maxAbs < 1e-3f,
             $"Grouped GEMV diverges from per-call (max-abs-diff={maxAbs}, refMax={refMax}). " +
             "Both paths share the same Q4_K body — any divergence is a bug.");
+    }
+
+    private static unsafe void SynthesiseQ2KBlock(Random rng, Span<byte> block)
+    {
+        // Q2_K layout (84 bytes): scales[16] + qs[64] + d (half) + dmin (half).
+        Half d = (Half)((rng.NextDouble() - 0.5) * 0.04);
+        Half dmin = (Half)((rng.NextDouble() - 0.5) * 0.02);
+        fixed (byte* pBlk = block)
+        {
+            *(Half*)(pBlk + 80) = d;
+            *(Half*)(pBlk + 82) = dmin;
+        }
+        for (int i = 0; i < 80; i++) block[i] = (byte)rng.Next(0, 256);
     }
 
     private static unsafe void SynthesiseQ4KBlock(Random rng, Span<byte> block)
