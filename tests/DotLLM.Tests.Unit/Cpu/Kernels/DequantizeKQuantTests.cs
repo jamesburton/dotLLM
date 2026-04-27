@@ -273,6 +273,77 @@ public sealed unsafe class DequantizeKQuantTests
             Dequantize.ToFloat32(nint.Zero, 100, QuantizationType.Q3_K, dest));
     }
 
+    // ──────────────────── Q2_K dequant ────────────────────
+
+    private const int Q2_K_BlockBytes = 84;
+
+    [Fact]
+    public void Q2_K_SingleBlock_HandCalculated()
+    {
+        // Block layout: scales[16] + qs[64] + d[2] + dmin[2] = 84 bytes.
+        nuint totalBytes = Q2_K_BlockBytes;
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            NativeMemory.Clear((void*)ptr, totalBytes);
+            byte* block = (byte*)ptr;
+
+            // d = 1.0, dmin = 0.5
+            Unsafe.WriteUnaligned(block + 80, (Half)1.0f);
+            Unsafe.WriteUnaligned(block + 82, (Half)0.5f);
+
+            // scales[0]: low nibble = scale (we want scale = 3), high nibble = dmin coef (we want 2).
+            // Packed as: (dmin_coef << 4) | scale = (2 << 4) | 3 = 0x23
+            block[0] = 0x23;
+
+            // qs[0] (offset 16): set element 0's 2 low bits to 0b10 (= 2).
+            // qs encoding: 4 elements per byte, low-to-high.
+            //   byte 0, bits 0-1 → element 0
+            //   byte 0, bits 2-3 → element 1
+            //   byte 0, bits 4-5 → element 2
+            //   byte 0, bits 6-7 → element 3
+            block[16 + 0] = 0x02;  // element 0 = 2, elements 1-3 = 0
+
+            // Element 0: q2 = 2, scale = 3, dmin_coef = 2
+            //   value = d * scale * q2 - dmin * dmin_coef
+            //         = 1.0 * 3 * 2 - 0.5 * 2
+            //         = 6 - 1 = 5
+            float[] dest = new float[KQuantGroupSize];
+            Dequantize.ToFloat32(ptr, KQuantGroupSize, QuantizationType.Q2_K, dest);
+
+            Assert.Equal(5.0f, dest[0], 0.01f);
+
+            // Element 1: q2 = 0, scale = 3, dmin_coef = 2
+            //   value = 1.0 * 3 * 0 - 0.5 * 2 = -1
+            Assert.Equal(-1.0f, dest[1], 0.01f);
+
+            // Sub-block 1 (elements 16..31): scale = 0, dmin_coef = 0 (all-zero scales[1..15])
+            //   value = 1.0 * 0 * 0 - 0.5 * 0 = 0
+            Assert.Equal(0.0f, dest[16], 0.01f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void Q2_K_RowByteSize_Matches()
+    {
+        // 256 elements = 1 super-block = 84 bytes.
+        Assert.Equal(84L, Dequantize.RowByteSize(256, QuantizationType.Q2_K));
+        // 1024 elements = 4 super-blocks = 336 bytes.
+        Assert.Equal(336L, Dequantize.RowByteSize(1024, QuantizationType.Q2_K));
+    }
+
+    [Fact]
+    public void Q2_K_NonAlignedCount_Throws()
+    {
+        float[] dest = new float[100];
+        Assert.Throws<ArgumentException>(() =>
+            Dequantize.ToFloat32(nint.Zero, 100, QuantizationType.Q2_K, dest));
+    }
+
     // ──────────────────── Q4_K dequant ────────────────────
 
     [Fact]

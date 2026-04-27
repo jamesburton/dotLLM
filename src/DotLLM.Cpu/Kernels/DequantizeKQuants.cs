@@ -11,6 +11,9 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class Dequantize
 {
+    /// <summary>Q2_K block size in bytes: 16(scales) + 64(qs) + 2(d) + 2(dmin) = 84.</summary>
+    internal const int Q2_K_BlockBytes = 84;
+
     /// <summary>Q3_K block size in bytes: 32(hmask) + 64(qs) + 12(scales) + 2(d) = 110.</summary>
     internal const int Q3_K_BlockBytes = 110;
 
@@ -209,6 +212,54 @@ public static unsafe partial class Dequantize
                 blockBase += Q6_K_BlockBytes;
             }
         }
+    }
+
+    // ──────────────────── Q2_K ────────────────────
+
+    /// <summary>
+    /// Dequantizes Q2_K-quantized data to float32. Block layout:
+    /// scales[16] (4-bit scale + 4-bit dmin coef per sub-block, packed) +
+    /// qs[64] (2-bit elements, 4 per byte) + d (half) + dmin (half) = 84 bytes per 256 elements.
+    /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
+    /// </summary>
+    public static unsafe void DequantizeQ2_K(nint src, Span<float> dest, long elementCount)
+    {
+        if (elementCount % KQuantGroupSize != 0)
+            throw new ArgumentException(
+                $"Q2_K requires elementCount to be a multiple of {KQuantGroupSize}.", nameof(elementCount));
+
+        long superBlocks = elementCount / KQuantGroupSize;
+        byte* basePtr = (byte*)src;
+
+        for (long sb = 0; sb < superBlocks; sb++)
+        {
+            byte* block = basePtr + sb * Q2_K_BlockBytes;
+            byte* scales = block;          // 16 bytes
+            byte* qs = block + 16;         // 64 bytes
+            float d = (float)Unsafe.ReadUnaligned<Half>(block + 80);
+            float dmin = (float)Unsafe.ReadUnaligned<Half>(block + 82);
+
+            int outOffset = (int)(sb * KQuantGroupSize);
+            for (int t = 0; t < KQuantGroupSize; t++)
+            {
+                int sub = t >> 4;          // t / 16
+                int byteIdx = t >> 2;      // t / 4
+                int bitOff = (t & 0x3) << 1; // (t % 4) * 2
+                int q2 = (qs[byteIdx] >> bitOff) & 0x3;
+                int scale = scales[sub] & 0xF;
+                int dmCoef = (scales[sub] >> 4) & 0xF;
+                dest[outOffset + t] = d * scale * q2 - dmin * dmCoef;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Internal dispatch wrapper for Q2_K matching the dispatch pattern used by Q3_K..Q6_K.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
+    {
+        DequantizeQ2_K(src, dest.Slice(0, (int)elementCount), elementCount);
     }
 
     // ──────────────────── Q3_K ────────────────────
