@@ -1,0 +1,165 @@
+#version 450
+// F16 native batched matrix multiplication via VK_KHR_cooperative_matrix.
+//
+//   C[N, M] = B[N, K] @ W_f16[M, K]^T
+//
+// Functional parity with matmul_f16_gemm_f32.comp (the scalar tiled GEMM) —
+// same weight byte layout, same I/O semantics:
+//   W_f16  row-major [M, K] in IEEE-754 binary16, 2 bytes / element.
+//   B      row-major [N, K] FP32 input.
+//   C      row-major [N, M] FP32 output; C[t, m] = dot(W[m, :], B[t, :]).
+//
+// Coopmat strategy (mirrors matmul_q8_0_gemm_coopmat.comp):
+//
+//   Output tile per workgroup : TM × TN = 16 × 16 cells of C.
+//   Workgroup                 : one subgroup (64 threads on AMD RDNA3.5,
+//                               32 on NVIDIA). All coopmat ops at subgroup scope.
+//   K chunk per iter          : BK = 32.
+//   Inner coopmat K           : TK = 16, two coopMatMulAdd per chunk, each
+//                               contracting a 16×16×16 F16×F16→F32 tile into
+//                               the master F32 accumulator.
+//
+// Precision note: KHR_coopmat exposes F16 operands; B (FP32) is cast to F16
+// at staging and W is loaded native F16 (no precision loss vs the storage
+// representation). Drift versus the scalar GEMM is the standard F16-vs-F32
+// staging delta — within the kernel-parity envelope of abs 5e-3 / rel 1e-3
+// at the M / K shapes the tests cover. The scalar F16 GEMM remains the
+// parity reference; this kernel is the perf path on hosts that advertise
+// VK_KHR_cooperative_matrix.
+//
+// Edge handling: tiles whose output straddles the (M, N) boundary take a
+// bounds-guarded scatter path via shared-mem staging; fully-in-bounds
+// tiles take the direct coopMatStore fast path.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // F16 blob (2 F16 / uint)
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };       // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };       // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output dim
+    uint K;            // contraction dim (must be a multiple of 32)
+    uint N;            // batch size
+    uint pairsPerRow;  // K / 2 (uints per row)
+    uint rowUints;     // per-row uint stride
+} pc;
+
+const uint TM    = 16u;
+const uint TN    = 16u;
+const uint TK    = 16u;
+const uint BK    = 32u;
+const uint WG_SIZE = 64u;
+
+// Shared weight tile [TM rows × BK cols] as F16 — loaded native from W.
+shared float16_t sharedA[TM * BK];
+// Shared input tile [TN rows × BK cols] as F16 — cast from FP32 B at staging.
+shared float16_t sharedB[TN * BK];
+// Staging for partial-tile stores.
+shared float storeStage[TM * TN];
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * TM;
+    uint tBase = gl_WorkGroupID.y * TN;
+
+    uint tid = gl_LocalInvocationID.x;  // 0..63
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    uint chunks = pc.K / BK;
+    for (uint chunk = 0u; chunk < chunks; chunk++) {
+        uint kBase = chunk * BK;
+
+        // ── 1. Stage sharedB[TN, BK] as F16 from FP32 B. TN*BK=512, WG=64, 8 per thread. ──
+        for (uint i = 0u; i < 8u; i++) {
+            uint idx = tid * 8u + i;
+            uint row = idx / BK;             // 0..15
+            uint col = idx - row * BK;       // 0..31
+            uint tGlobal = tBase + row;
+            float v = 0.0;
+            if (tGlobal < pc.N) {
+                v = b[tGlobal * pc.K + kBase + col];
+            }
+            sharedB[row * BK + col] = float16_t(v);
+        }
+
+        // ── 2. Load sharedA[TM, BK] from F16 W via unpackHalf2x16. ──
+        // 64 threads, 4 per row, 8 cols per thread. We read 4 uints (= 8 F16)
+        // per thread per row; lane-of-row = 0..3, each lane handles one 8-elt span.
+        // Layout: lane 0 reads pairs [0..3] => cols 0..7; lane 1 pairs [4..7] => cols 8..15; etc.
+        //
+        // Each row has K/2 pairs total. The chunk's pairs start at pair index
+        // chunk * (BK/2) = chunk * 16 within the row.
+        uint mLocal = tid / 4u;              // 0..15
+        uint laneOfRow = tid - mLocal * 4u;  // 0..3
+        uint mGlobal = mBase + mLocal;
+
+        bool rowValid = mGlobal < pc.M;
+        uint rowUintBase = 0u;
+        if (rowValid) rowUintBase = mGlobal * pc.rowUints;
+
+        // Each lane handles 4 consecutive uints (= 8 F16 elements = 8 cols).
+        uint pairBase = chunk * (BK / 2u) + laneOfRow * 4u;   // pair index within row
+        uint col0 = laneOfRow * 8u;
+
+        for (uint q = 0u; q < 4u; q++) {
+            float wLo = 0.0;
+            float wHi = 0.0;
+            if (rowValid) {
+                uint packed = weight[rowUintBase + pairBase + q];
+                vec2 wp = unpackHalf2x16(packed);
+                wLo = wp.x;
+                wHi = wp.y;
+            }
+            uint col = col0 + q * 2u;
+            sharedA[mLocal * BK + col]      = float16_t(wLo);
+            sharedA[mLocal * BK + col + 1u] = float16_t(wHi);
+        }
+
+        // Shared-mem fences before subgroup-wide coopmat load.
+        barrier();
+        memoryBarrierShared();
+
+        // ── 3. Two coopMatMulAdd over BK split into K-slices [0,16) and [16,32). ──
+        for (uint kSlice = 0u; kSlice < BK; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bTile;
+
+            coopMatLoad(aTile, sharedA, kSlice, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bTile, sharedB, kSlice, BK, gl_CooperativeMatrixLayoutColumnMajor);
+
+            sums = coopMatMulAdd(aTile, bTile, sums);
+        }
+
+        barrier();
+    }
+
+    // ── 4. Store output. ──
+    bool tileAllIn = (mBase + TM) <= pc.M && (tBase + TN) <= pc.N;
+
+    if (tileAllIn) {
+        coopMatStore(sums, c, tBase * pc.M + mBase, pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+        coopMatStore(sums, storeStage, 0, TM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        for (uint i = 0u; i < 4u; i++) {
+            uint idx = tid + i * WG_SIZE;
+            if (idx >= TM * TN) break;
+            uint t = idx / TM;
+            uint m = idx - t * TM;
+            uint mGlobal = mBase + m;
+            uint tGlobal = tBase + t;
+            if (mGlobal < pc.M && tGlobal < pc.N) {
+                c[tGlobal * pc.M + mGlobal] = storeStage[t * TM + m];
+            }
+        }
+    }
+}
