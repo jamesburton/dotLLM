@@ -344,6 +344,47 @@ public sealed unsafe class DequantizeKQuantTests
             Dequantize.ToFloat32(nint.Zero, 100, QuantizationType.Q2_K, dest));
     }
 
+    [Fact]
+    public void Q2_K_TwoSuperBlocks_StrideCorrect()
+    {
+        // Two super-blocks of 256 elements each = 168 bytes total.
+        // SB0: d=1.0, dmin=0.0, scales[0]=0x03 (scale=3, dmin_coef=0), qs[0]=0x01 (element 0 q2=1)
+        // SB1: d=2.0, dmin=0.0, scales[0]=0x05 (scale=5, dmin_coef=0), qs[0]=0x03 (element 0 q2=3)
+        // Expect: dest[0]   = 1.0 * 3 * 1 - 0 = 3.0       (SB0, element 0)
+        //         dest[256] = 2.0 * 5 * 3 - 0 = 30.0      (SB1, element 0)
+        // Catches super-block stride bugs (e.g. sb*80 instead of sb*84).
+        nuint totalBytes = 2 * Q2_K_BlockBytes;  // 168
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            NativeMemory.Clear((void*)ptr, totalBytes);
+            byte* sb0 = (byte*)ptr;
+            byte* sb1 = (byte*)ptr + Q2_K_BlockBytes;
+
+            // SB0
+            Unsafe.WriteUnaligned(sb0 + 80, (Half)1.0f);
+            Unsafe.WriteUnaligned(sb0 + 82, (Half)0.0f);
+            sb0[0] = 0x03;
+            sb0[16] = 0x01;
+
+            // SB1
+            Unsafe.WriteUnaligned(sb1 + 80, (Half)2.0f);
+            Unsafe.WriteUnaligned(sb1 + 82, (Half)0.0f);
+            sb1[0] = 0x05;
+            sb1[16] = 0x03;
+
+            float[] dest = new float[2 * KQuantGroupSize];
+            Dequantize.ToFloat32(ptr, 2 * KQuantGroupSize, QuantizationType.Q2_K, dest);
+
+            Assert.Equal(3.0f,  dest[0],   0.01f);
+            Assert.Equal(30.0f, dest[256], 0.01f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
     // ──────────────────── Q4_K dequant ────────────────────
 
     [Fact]

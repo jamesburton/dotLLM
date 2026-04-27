@@ -222,7 +222,8 @@ public static unsafe partial class Dequantize
     /// qs[64] (2-bit elements, 4 per byte) + d (half) + dmin (half) = 84 bytes per 256 elements.
     /// Per-element decode: <c>value = d × scale × q2 − dmin × dmin_coef</c>.
     /// </summary>
-    public static unsafe void DequantizeQ2_K(nint src, Span<float> dest, long elementCount)
+    [SkipLocalsInit]
+    public static unsafe void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
     {
         if (elementCount % KQuantGroupSize != 0)
             throw new ArgumentException(
@@ -251,15 +252,6 @@ public static unsafe partial class Dequantize
                 dest[outOffset + t] = d * scale * q2 - dmin * dmCoef;
             }
         }
-    }
-
-    /// <summary>
-    /// Internal dispatch wrapper for Q2_K matching the dispatch pattern used by Q3_K..Q6_K.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void DequantizeQ2_K(nint src, long elementCount, Span<float> dest)
-    {
-        DequantizeQ2_K(src, dest.Slice(0, (int)elementCount), elementCount);
     }
 
     // ──────────────────── Q3_K ────────────────────
