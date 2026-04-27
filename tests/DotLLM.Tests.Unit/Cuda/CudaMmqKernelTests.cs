@@ -122,6 +122,17 @@ public class CudaMmqKernelTests
             (rng, span) => SynthesiseQ6KBlock(rng, span), requireMmvqLarge: true);
     }
 
+    [SkippableTheory]
+    [InlineData(2048, 2048)]
+    [InlineData(4096, 4096)]
+    [InlineData(11264, 2048)]
+    public void MmvqLargeQ2K_MatchesLegacy(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q2_K, n, k, blockBytes: 84,
+            (rng, span) => SynthesiseQ2KBlock(rng, span), requireMmvqLarge: true);
+    }
+
     // ── Pre-Q8_1 equivalence tests ──────────────────────────────────────────
     // Verify that pre-quantizing the input via quantize_x_to_q8_1 + the `_preq`
     // GEMV variants matches the on-the-fly kernel within the same K-quant noise
@@ -130,16 +141,16 @@ public class CudaMmqKernelTests
     // GEMV outputs should agree to within FP16 add-order noise.
 
     [SkippableTheory]
-    [InlineData(4, 256)]
+    [InlineData(4, 256)]      // small-k path (MMQ-4-rows preq)
     [InlineData(8, 512)]
-    [InlineData(64, 1024)]
-    [InlineData(2048, 2048)]
+    [InlineData(64, 1024)]    // boundary: k=1024 routes to MMVQ-large preq
+    [InlineData(2048, 2048)]  // large-k path (MMVQ-large preq)
+    [InlineData(4096, 4096)]  // Qwen3-8B-class large-k stress
     public void PreqQ2K_MatchesOnTheFly(int n, int k)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
-        // Q2_K has no MMVQ-large variant yet — _preq always routes through the
-        // MMQ-4-rows path. Shapes mirror MmqQ2K_MatchesLegacyWithinTolerance so
-        // we cover the same coverage envelope as the on-the-fly tests.
+        // Q2_K now has full MMQ + MMVQ-large coverage in both on-the-fly and pre-Q8_1 modes.
+        // Small-k routes to the 4-rows _preq variant; k≥1024 routes to MMVQ-large _preq.
         RunPreqEquivalence(QuantizationType.Q2_K, n, k, blockBytes: 84,
             (rng, span) => SynthesiseQ2KBlock(rng, span));
     }
@@ -190,10 +201,12 @@ public class CudaMmqKernelTests
         Skip.IfNot(kernels.HasPreQ8_1, "Pre-Q8_1 quantize_x kernel not loaded (PTX may be stale)");
 
         // Force MMVQ-large ON for the large-k cases so we exercise both `_preq` variants.
+        bool prevDisableQ2K = CudaKernels.DisableMmvqLargeQ2K;
         bool prevDisableQ4K = CudaKernels.DisableMmvqLargeQ4K;
         bool prevDisableQ5K = CudaKernels.DisableMmvqLargeQ5K;
         bool prevDisableQ6K = CudaKernels.DisableMmvqLargeQ6K;
         bool prevDisablePreq = CudaKernels.DisablePreQ8_1;
+        CudaKernels.DisableMmvqLargeQ2K = false;
         CudaKernels.DisableMmvqLargeQ4K = false;
         CudaKernels.DisableMmvqLargeQ5K = false;
         CudaKernels.DisableMmvqLargeQ6K = false;
@@ -259,6 +272,7 @@ public class CudaMmqKernelTests
             if (devYOnTheFly != 0) CudaDriverApi.cuMemFree_v2(devYOnTheFly);
             if (devYPreq != 0) CudaDriverApi.cuMemFree_v2(devYPreq);
             if (devScratch != 0) CudaDriverApi.cuMemFree_v2(devScratch);
+            CudaKernels.DisableMmvqLargeQ2K = prevDisableQ2K;
             CudaKernels.DisableMmvqLargeQ4K = prevDisableQ4K;
             CudaKernels.DisableMmvqLargeQ5K = prevDisableQ5K;
             CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
@@ -308,12 +322,14 @@ public class CudaMmqKernelTests
         // MMVQ-large is now ON by default (pre-Q8_1 lands the win that was missing before).
         // Per-quant-type Disable knobs let us force the MMQ-4-rows path for A/B comparison.
         // We snapshot + restore the disable knobs to avoid leaking test state across cases.
+        bool prevDisableQ2K = CudaKernels.DisableMmvqLargeQ2K;
         bool prevDisableQ4K = CudaKernels.DisableMmvqLargeQ4K;
         bool prevDisableQ5K = CudaKernels.DisableMmvqLargeQ5K;
         bool prevDisableQ6K = CudaKernels.DisableMmvqLargeQ6K;
         if (requireMmvqLarge)
         {
             // Make sure no prior test left the kernel disabled.
+            CudaKernels.DisableMmvqLargeQ2K = false;
             CudaKernels.DisableMmvqLargeQ4K = false;
             CudaKernels.DisableMmvqLargeQ5K = false;
             CudaKernels.DisableMmvqLargeQ6K = false;
@@ -377,6 +393,7 @@ public class CudaMmqKernelTests
             if (devYLegacy != 0) CudaDriverApi.cuMemFree_v2(devYLegacy);
             if (devYMmq != 0) CudaDriverApi.cuMemFree_v2(devYMmq);
             // Restore prior MMVQ-large disable knobs (see top of method).
+            CudaKernels.DisableMmvqLargeQ2K = prevDisableQ2K;
             CudaKernels.DisableMmvqLargeQ4K = prevDisableQ4K;
             CudaKernels.DisableMmvqLargeQ5K = prevDisableQ5K;
             CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
