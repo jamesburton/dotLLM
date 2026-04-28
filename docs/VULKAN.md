@@ -124,20 +124,20 @@ each lands a testable end-to-end slice:
 
 | Phase | Kernel | CUDA file | Notes |
 |---|---|---|---|
-| 1 | `add`           | `add.cu`            | ✅ Done (this PR) |
-| 2 | `rmsnorm_f32`   | `rmsnorm_f32.cu`    | Warp reduction → subgroup shuffle (`GL_KHR_shader_subgroup`) |
-| 2 | `rope_f32`      | `rope_f32.cu`       | sin/cos lookup; no reduction |
-| 2 | `swiglu_f32`    | `swiglu_f32.cu`     | Pointwise, trivial |
-| 3 | `embedding_*`   | `embedding.cu`      | Gather; three dtypes (F32/F16/Q8_0) |
-| 3 | `bias_add_f32`  | `bias_add_f32.cu`   | Pointwise |
-| 3 | `softmax`       | `softmax.cu`        | Two-pass (max, exp-sum), subgroup reduction |
-| 4 | `attention_f32` | `attention_f32.cu`  | Per-head QK<sup>T</sup>, softmax, AV |
-| 5 | `dequant_q8_0`  | `dequant.cu`        | Per-block 32-element dequant |
-| 5 | `dequant_q4_k`  | `dequant.cu`        | K-quant (superblock) |
-| 6 | `quantized_gemv_q8_0` | `quantized_gemv.cu` | Decode-path GEMV on quantized weights |
-| 6 | `quantized_gemv_q4_k` | `quantized_gemv.cu` | K-quant GEMV |
-| 7 | FP16 pipeline   | `*_f16.cu`          | `VK_KHR_16bit_storage` + `VK_KHR_shader_float16_int8` |
-| 8 | Cooperative matrix | (new) | `VK_NV_cooperative_matrix2` for Tensor-Core-equivalent GEMM |
+| 1 | `add`           | `add.cu`            | ✅ Done |
+| 2 | `rmsnorm_f32`   | `rmsnorm_f32.cu`    | ✅ Done; warp reduction → subgroup shuffle (`GL_KHR_shader_subgroup`); fused rmsnorm+matmul_q8_0 sub-tile variant landed |
+| 2 | `rope_f32`      | `rope_f32.cu`       | ✅ Done; sin/cos lookup; no reduction |
+| 2 | `swiglu_f32`    | `swiglu_f32.cu`     | ✅ Done; pointwise |
+| 3 | `embedding_*`   | `embedding.cu`      | ✅ Done; gather, F32 + Q8_0 in tree |
+| 3 | `bias_add_f32`  | `bias_add_f32.cu`   | ✅ Done |
+| 3 | `softmax`       | `softmax.cu`        | ✅ Done; two-pass (max, exp-sum), subgroup reduction |
+| 4 | `attention_f32` | `attention_f32.cu`  | ✅ Done; standard + MLA (`AttentionMlaF32Kernel`) variants |
+| 5 | `dequant_q8_0`  | `dequant.cu`        | ✅ Done (CPU-side); Vulkan reads source bytes inline |
+| 5 | `dequant_q4_k` / `q5_k` / `q6_k`  | `dequant.cu`        | ✅ Done (CPU-side); Vulkan kernels read source bytes inline (Phase 1 K-quant work) |
+| 6 | `matmul_q8_0_*` | `quantized_gemv.cu` | ✅ Done; GEMV (`MatMulQ8_0Kernel`) + GEMM (`MatMulQ8_0GemmKernel`) + coopmat (`MatMulQ8_0GemmCoopmatKernel`) |
+| 6 | `matmul_q4_k_*` / `q5_k_*` / `q6_k_*` | `quantized_gemv.cu` | ✅ Done (Phase 1, commits `afb2272`/`b1ee6bc` Q4_K, `15099b9`/`83e0732` Q5_K, `29a1459`/`39b7646` Q6_K); GEMV + GEMM each |
+| 7 | F16 / BF16 pipeline | `*_f16.cu` | ✅ Done (Phase 8 brought forward, commits `c9c08c5`/`6787492`); F16 GEMV + GEMM + coopmat (F16xF16→F32, gfx1151), BF16 GEMV + GEMM (`uintBitsToFloat(bits<<16)`); F32 activations + native F16/BF16 weights on device |
+| 8 | Cooperative matrix | (new) | ✅ Partial (F16 + Q8_0 GEMM coopmat tiles via `GL_KHR_cooperative_matrix`; gfx1151 verified). K-quant coopmat variants tracked as Phase 1 follow-up. MoE indexed-matmul coopmat needs Strategy C redesign (separate issue) — see prior architectural finding |
 
 Milestone 7 (FP16) is a significant enabler: most Vulkan drivers expose
 `shaderFloat16` only through those two extensions. `VK_KHR_16bit_storage`

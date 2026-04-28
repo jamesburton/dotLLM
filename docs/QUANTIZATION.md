@@ -97,3 +97,21 @@ GGUF files can have different types per tensor. Dispatch to correct kernel based
 - Vec_dot dominant for decode (GEMV). Dequant+BLAS may win for prefill (GEMM).
 - GPU: custom CUDA kernels dequantize in shared memory, use tensor cores. Ref: llama.cpp `ggml-cuda/mmq.cu`.
 - Block alignment awkward for SIMD — handle tail elements carefully.
+
+## Vulkan Backend Coverage
+
+The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with an opt-in F16 cooperative-matrix tile when the device enumerates F16xF16→F32) for the following source dtypes / quant formats. Source bytes stay on device — dequantisation happens in the shader inner loop, so memory cost is the GGUF source size (not 2-4× expanded F32):
+
+| Format | GEMV | GEMM | Coopmat | Reference |
+|---|---|---|---|---|
+| F32 | ✓ | ✓ | — | baseline |
+| F16 | ✓ | ✓ | ✓ (F16xF16→F32, M=N=K=16 tile) | `c9c08c5` |
+| BF16 | ✓ | ✓ | — (BF16 tiles not enumerated on RDNA3.5; use shift-left-16 reinterpret) | `c9c08c5` |
+| Q8_0 | ✓ | ✓ | ✓ (`MatMulQ8_0GemmCoopmatKernel`) | pre-existing |
+| Q4_K_M | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
+| Q5_K_M | ✓ | ✓ | — | `15099b9` + `83e0732` |
+| Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
+
+Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ-family Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K are present in the CUDA backend (lighter-weight reference kernels) and are tracked as a Vulkan follow-up.
+
+See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
