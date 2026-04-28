@@ -8,6 +8,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -165,6 +166,52 @@ public sealed class VulkanTransformerModel : IModel
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
         var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
+    }
+
+    /// <summary>
+    /// Loads a model from a HuggingFace-convention safetensors file onto a
+    /// new Vulkan device. Mirrors <see cref="LoadFromGguf(GgufFile, ModelConfig, string?)"/>
+    /// but reads weights via <see cref="TransformerWeightsSafetensorsLoader"/>.
+    /// </summary>
+    public static VulkanTransformerModel LoadFromSafetensors(
+        SafetensorsFile file, ModelConfig config, string? spvDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        RejectUnsupportedArchitecture(config);
+
+        var device = VulkanDevice.Create();
+        try
+        {
+            spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
+            var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+            return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf: null);
+        }
+        catch
+        {
+            device.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Loads a model from a safetensors file onto an existing
+    /// <see cref="VulkanDevice"/>. The device is NOT disposed when the model
+    /// is disposed.
+    /// </summary>
+    public static VulkanTransformerModel LoadFromSafetensors(
+        VulkanDevice device, SafetensorsFile file, ModelConfig config, string? spvDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        RejectUnsupportedArchitecture(config);
+
+        spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null);
     }
 
     private static VulkanTransformerModel BuildModel(

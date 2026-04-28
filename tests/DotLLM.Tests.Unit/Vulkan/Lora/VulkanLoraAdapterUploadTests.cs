@@ -137,9 +137,12 @@ public sealed class VulkanLoraAdapterUploadTests
     }
 
     /// <summary>
-    /// Stages a device-local buffer into host memory by copying through a
-    /// host-visible staging buffer + <c>vkCmdCopyBuffer</c>. Used by the
-    /// upload round-trip test to verify the bytes that landed on device.
+    /// Downloads an adapter device buffer back to host memory. On the
+    /// scaffold path adapter buffers are host-visible host-coherent (see
+    /// <see cref="VulkanLoraAdapter"/>), so a direct
+    /// <see cref="VulkanDevice.Download"/> is sufficient. When a future
+    /// perf pass migrates adapter weights to device-local memory this
+    /// helper must stage via a host-visible buffer.
     /// </summary>
     private static unsafe void DownloadDeviceLocal(VulkanDevice device, VulkanDevice.Buffer src, Span<byte> dest)
     {
@@ -147,11 +150,7 @@ public sealed class VulkanLoraAdapterUploadTests
         if (bytes > src.Size)
             throw new ArgumentException("Destination larger than source buffer.", nameof(dest));
 
-        using var staging = device.Allocate(bytes);
-        device.CopyBufferSynchronous(src, staging, (ulong)bytes);
-
-        // staging is host-visible host-coherent — map and copy out.
         var floatDst = MemoryMarshal.Cast<byte, float>(dest);
-        device.Download(staging, floatDst);
+        device.Download(src, floatDst);
     }
 }
