@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Lora;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -93,6 +95,90 @@ public static unsafe class LoraDelta
         finally
         {
             ArrayPool<float>.Shared.Return(tmpBuf);
+        }
+    }
+
+    /// <summary>
+    /// Quantised-weight overload (Phase 4d.1). Dequantises B and A from
+    /// <paramref name="bDType"/> / <paramref name="aDType"/> into a small F32
+    /// scratch and reuses the standard F32 path. Both buffers are typically
+    /// the same dtype (PEFT writes lora_A and lora_B together) but we permit
+    /// independent dtypes for completeness.
+    /// </summary>
+    /// <remarks>
+    /// We dequantise the entire (small) B and A factors once per call rather
+    /// than inlining dequant into the inner GEMM loop. For r=16 typical
+    /// shapes the factors are kilobytes — staying in L1 — and this avoids
+    /// duplicating the GEMM kernel for each dtype combination.
+    /// </remarks>
+    [SkipLocalsInit]
+    public static void Apply(float* x, void* bWeight, void* aWeight, float* y,
+                             int seqLen, int inputDim, int outputDim, int rank, float scale,
+                             LoraWeightDType bDType, LoraWeightDType aDType)
+    {
+        if (seqLen <= 0 || rank <= 0) return;
+
+        // Fast path: both F32 — go straight to the existing kernel without
+        // copies. Common when callers haven't migrated to the dtype-aware path.
+        if (bDType == LoraWeightDType.F32 && aDType == LoraWeightDType.F32)
+        {
+            Apply(x, (float*)bWeight, (float*)aWeight, y, seqLen, inputDim, outputDim, rank, scale);
+            return;
+        }
+
+        long bElems = (long)rank * inputDim;
+        long aElems = (long)outputDim * rank;
+        float[] bBuf = ArrayPool<float>.Shared.Rent((int)bElems);
+        float[] aBuf = ArrayPool<float>.Shared.Rent((int)aElems);
+        try
+        {
+            DequantToF32(bWeight, bDType, bBuf, (int)bElems);
+            DequantToF32(aWeight, aDType, aBuf, (int)aElems);
+
+            fixed (float* bF32 = bBuf)
+            fixed (float* aF32 = aBuf)
+            {
+                Apply(x, bF32, aF32, y, seqLen, inputDim, outputDim, rank, scale);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(aBuf);
+            ArrayPool<float>.Shared.Return(bBuf);
+        }
+    }
+
+    private static void DequantToF32(void* src, LoraWeightDType dtype, float[] dst, int count)
+    {
+        switch (dtype)
+        {
+            case LoraWeightDType.F32:
+                {
+                    var srcSpan = new ReadOnlySpan<float>(src, count);
+                    srcSpan.CopyTo(dst.AsSpan(0, count));
+                    break;
+                }
+            case LoraWeightDType.F16:
+                {
+                    var srcSpan = new ReadOnlySpan<Half>(src, count);
+                    TensorPrimitives.ConvertToSingle(srcSpan, dst.AsSpan(0, count));
+                    break;
+                }
+            case LoraWeightDType.BF16:
+                {
+                    byte* p = (byte*)src;
+                    for (int i = 0; i < count; i++)
+                    {
+                        ushort raw = BinaryPrimitives.ReadUInt16LittleEndian(
+                            new ReadOnlySpan<byte>(p + i * 2, 2));
+                        uint asF32 = (uint)raw << 16;
+                        dst[i] = BitConverter.UInt32BitsToSingle(asF32);
+                    }
+                    break;
+                }
+            default:
+                throw new NotSupportedException(
+                    $"LoRA weight dtype {dtype} is not supported by LoraDelta.Apply.");
         }
     }
 

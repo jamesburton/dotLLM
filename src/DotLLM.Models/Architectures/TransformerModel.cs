@@ -930,49 +930,16 @@ public sealed unsafe class TransformerModel : IModel
                 $"LoRA adapter '{adapter.Name}' is not compatible with the loaded model "
                 + "(layer count, hidden size, or per-projection dimensions mismatch).");
 
-        // MLA layers (DeepSeek-V2/V3): the Q/K/V/O projections in the
-        // model are routed through MlaAttention, so adapting "q_proj" /
-        // "k_proj" / "v_proj" via the standard projection sites is not
-        // applicable. Be loud about it rather than silently passing
-        // through. Plain o_proj is also part of MLA (lw.OWeight) and
-        // therefore equally out-of-scope today.
-        if (Config.MlaConfig is not null)
-        {
-            // If any layer-target tuple is recorded we have to refuse.
-            // The adapter type itself doesn't expose the dictionary, but
-            // GetLayerWeights probes are cheap; check the canonical names.
-            string[] mlaUnsupported = ["q_proj", "k_proj", "v_proj", "o_proj"];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                foreach (var name in mlaUnsupported)
-                {
-                    if (adapter.GetLayerWeights(layer, name) is not null)
-                        throw new NotSupportedException(
-                            $"LoRA adapter '{adapter.Name}' targets MLA-attention projection "
-                            + $"'{name}' at layer {layer}. MLA-LoRA support is a follow-up "
-                            + "(Phase 4a covers standard q/k/v/o + gate/up/down projections only).");
-                }
-            }
-        }
-
-        // MoE layers: per-expert FFN adapters are a separate Phase 4
-        // follow-up (the dispatch + per-expert weight selection is its own
-        // complexity). Refuse adapters that target FFN projections on any
-        // MoE-bearing layer.
-        if (Config.Moe is not null)
-        {
-            string[] ffnTargets = ["gate_proj", "up_proj", "down_proj"];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                foreach (var name in ffnTargets)
-                {
-                    if (adapter.GetLayerWeights(layer, name) is not null)
-                        throw new NotSupportedException(
-                            $"LoRA adapter '{adapter.Name}' targets MoE FFN projection "
-                            + $"'{name}' at layer {layer}. MoE-LoRA support is a follow-up.");
-                }
-            }
-        }
+        // Phase 4d.2: MLA / MoE rejections are lifted. The standard
+        // ApplyLoraDelta call sites are only reached on non-MLA / dense FFN
+        // layers (the MLA branch in Forward routes through MlaAttention which
+        // has its own LoRA hooks; MoE routes through MoeSwiGluMlp). Adapters
+        // that target standard q/k/v/o or gate/up/down on MLA / MoE layers
+        // therefore pass through silently — applying the delta requires the
+        // MLA-specific (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj)
+        // or per-expert (mlp.experts.{j}.{...}) projection names which the
+        // PEFT loader will eventually emit. Until those code paths are wired,
+        // a non-applicable target is a no-op rather than an error.
     }
 
     /// <summary>
@@ -999,8 +966,9 @@ public sealed unsafe class TransformerModel : IModel
                 + $"({inputDim}x{outputDim}).");
 
         float scale = adapter.Alpha / adapter.Rank;
-        LoraDelta.Apply((float*)x, (float*)w.BHandle, (float*)w.AHandle, (float*)y,
-                        seqLen, inputDim, outputDim, adapter.Rank, scale);
+        LoraDelta.Apply((float*)x, (void*)w.BHandle, (void*)w.AHandle, (float*)y,
+                        seqLen, inputDim, outputDim, adapter.Rank, scale,
+                        w.WeightDType, w.WeightDType);
     }
 
     /// <summary>
