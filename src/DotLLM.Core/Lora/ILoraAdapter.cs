@@ -68,16 +68,31 @@ public interface ILoraAdapter : IDisposable
 }
 
 /// <summary>
-/// Per-projection LoRA factor pair. <see cref="AHandle"/> is the up-projection
-/// <c>A: [Rank, OutputDim]</c> and <see cref="BHandle"/> is the down-projection
-/// <c>B: [InputDim, Rank]</c>, both row-major F32 in 64-byte-aligned native
-/// memory owned by the parent <see cref="ILoraAdapter"/>.
+/// Per-projection LoRA factor pair. Both buffers are row-major F32 in
+/// 64-byte-aligned native memory owned by the parent <see cref="ILoraAdapter"/>.
+/// Layout matches dotLLM's standard "weight as [output, input]" convention so
+/// the existing CPU MatMul kernels consume them directly without transposes.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Mapping to / from PEFT (<c>peft.tuners.lora.LoraLayer</c>): PEFT's
+/// <c>lora_A.weight</c> has shape <c>[r, in_features]</c> — that is dotLLM's
+/// <see cref="BHandle"/> buffer (the down-projection). PEFT's
+/// <c>lora_B.weight</c> has shape <c>[out_features, r]</c> — that is dotLLM's
+/// <see cref="AHandle"/> buffer (the up-projection). The PEFT loader swaps
+/// roles when copying so the runtime kernel sees a uniform layout.
+/// </para>
+/// <para>
+/// Math: <c>y += scale × (x · B) · A</c> where
+/// <c>tmp[t, r] = sum_i x[t, i] · B[r, i]</c> and
+/// <c>delta[t, o] = sum_r A[o, r] · tmp[t, r]</c>.
+/// </para>
+/// </remarks>
 /// <param name="AHandle">
-/// Up-projection pointer — F32 row-major <c>[Rank, OutputDim]</c>.
+/// Up-projection pointer — F32 row-major <c>[OutputDim, Rank]</c>.
 /// </param>
 /// <param name="BHandle">
-/// Down-projection pointer — F32 row-major <c>[InputDim, Rank]</c>.
+/// Down-projection pointer — F32 row-major <c>[Rank, InputDim]</c>.
 /// </param>
 /// <param name="InputDim">Input dimension of the projection (d_in).</param>
 /// <param name="OutputDim">Output dimension of the projection (d_out).</param>
