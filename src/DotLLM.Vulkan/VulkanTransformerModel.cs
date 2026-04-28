@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
@@ -156,6 +157,15 @@ public sealed class VulkanTransformerModel : IModel
     private readonly int _slidingWindow;
     private readonly bool _ownsDevice;
 
+    // LoRA (Phase 4b) — device-side cache of uploaded adapters keyed by
+    // ILoraAdapter reference identity. Lazy: zero VRAM when no LoRA Forward
+    // is ever invoked. _currentLora is set/cleared in the try/finally
+    // surrounding the inner Forward and is checked at every projection
+    // site in RecordMatmulWithLora to decide whether to dispatch the
+    // LoRA delta on top of the base projection.
+    private readonly VulkanLoraAdapterCache _loraCache;
+    private VulkanLoraAdapter? _currentLora;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -256,6 +266,7 @@ public sealed class VulkanTransformerModel : IModel
         _mlaVHeadDim = mlaVHeadDim;
         _mlaScale = mlaScale;
         _mlaRopeTheta = mlaRopeTheta;
+        _loraCache = new VulkanLoraAdapterCache(device);
     }
 
     /// <summary>
@@ -551,6 +562,106 @@ public sealed class VulkanTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
+    /// <summary>
+    /// LoRA-aware forward. When <paramref name="adapter"/> is non-null, each
+    /// adapted projection (q/k/v/o + gate/up/down on the standard transformer
+    /// path) adds <c>scale × (x · B) · A</c> on top of the base projection.
+    /// When null, this is byte-equivalent to the 4-arg overload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors the CPU <c>TransformerModel.Forward</c> 5-arg overload: a
+    /// per-call <see cref="_currentLora"/> field is set/cleared via
+    /// try/finally around the inner forward; <see cref="MaybeApplyLoraDelta"/>
+    /// at every standard projection site in the inner forward checks the
+    /// field and applies the LoRA delta as an extra dispatch chain.
+    /// </para>
+    /// <para>
+    /// MLA-attention (DeepSeek-V2/V3) and MoE-FFN adapter targets are
+    /// rejected at validation time — they are deferred follow-ups.
+    /// </para>
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache);
+
+        ValidateAdapterForModel(adapter);
+
+        // Resolve / lazy-upload device-side LoRA buffers. Subsequent forwards
+        // with the same adapter hit the cache and pay zero upload cost.
+        var vkLora = _loraCache.GetOrAdd(adapter);
+
+        // Size LoRA scratch for this adapter's largest output dim. seqLen is
+        // honoured via _state._capacitySeqLen (set in EnsureCapacity below
+        // when the inner Forward runs); EnsureLoraScratch is called from
+        // here AFTER EnsureCapacity has run by routing through the inner
+        // Forward — but the inner Forward needs the scratch to exist
+        // already. So we EnsureCapacity ourselves first, then EnsureLora.
+        int seqLen = tokenIds.Length;
+        if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
+        bool resized = _state.EnsureCapacity(seqLen);
+        bool loraResized = _state.EnsureLoraScratch(vkLora.Rank, vkLora.MaxOutputDim);
+        if (resized || loraResized)
+            InvalidateKernelCaches();
+
+        _currentLora = vkLora;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentLora = null;
+        }
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="adapter"/> is compatible with this
+    /// model and that its targeted projections do not collide with
+    /// out-of-scope MLA / MoE structures. Mirrors the CPU
+    /// <c>TransformerModel.ValidateAdapterForModel</c>.
+    /// </summary>
+    private void ValidateAdapterForModel(ILoraAdapter adapter)
+    {
+        if (!adapter.IsCompatible(Config))
+            throw new InvalidOperationException(
+                $"LoRA adapter '{adapter.Name}' is not compatible with the loaded model "
+                + "(layer count, hidden size, or per-projection dimensions mismatch).");
+
+        if (Config.MlaConfig is not null)
+        {
+            string[] mlaUnsupported = ["q_proj", "k_proj", "v_proj", "o_proj"];
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                foreach (var name in mlaUnsupported)
+                {
+                    if (adapter.GetLayerWeights(layer, name) is not null)
+                        throw new NotSupportedException(
+                            $"LoRA adapter '{adapter.Name}' targets MLA-attention projection "
+                            + $"'{name}' at layer {layer}. MLA-LoRA support is a follow-up "
+                            + "(Phase 4b covers standard q/k/v/o + gate/up/down projections only).");
+                }
+            }
+        }
+
+        if (Config.Moe is not null)
+        {
+            string[] ffnTargets = ["gate_proj", "up_proj", "down_proj"];
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                foreach (var name in ffnTargets)
+                {
+                    if (adapter.GetLayerWeights(layer, name) is not null)
+                        throw new NotSupportedException(
+                            $"LoRA adapter '{adapter.Name}' targets MoE FFN projection "
+                            + $"'{name}' at layer {layer}. MoE-LoRA support is a follow-up.");
+                }
+            }
+        }
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
     {
@@ -667,6 +778,22 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.QBias is not null || lw.KBias is not null || lw.VBias is not null)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // LoRA delta (q/k/v) — applied AFTER bias and BEFORE QK-norm /
+            // RoPE so the delta contributes to the same downstream pipeline
+            // as the base projection. The fused rmsnorm+matmul path above
+            // still writes F32 normOut (its shader's contract), so the LoRA
+            // matmul's input is materialised in either branch — no need to
+            // bypass the fused path.
+            if (_currentLora is not null)
+            {
+                MaybeApplyLoraDelta(cmdBuf, layer, "q_proj", _state.NormOutput, _state.Q,
+                    seqLen, lw.QInputDim, lw.QOutputDim);
+                MaybeApplyLoraDelta(cmdBuf, layer, "k_proj", _state.NormOutput, _state.K,
+                    seqLen, lw.KInputDim, lw.KOutputDim);
+                MaybeApplyLoraDelta(cmdBuf, layer, "v_proj", _state.NormOutput, _state.V,
+                    seqLen, lw.VInputDim, lw.VOutputDim);
+            }
+
             // RoPE on Q and K
             _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
@@ -713,6 +840,13 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
+            // LoRA delta (o_proj): y += scale * (attnOut · B) · A.
+            if (_currentLora is not null)
+            {
+                MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.AttnOutput, _state.NormOutput,
+                    seqLen, lw.OInputDim, lw.OOutputDim);
             }
             }  // end of GQA branch (else of MLA)
 
@@ -768,6 +902,15 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.GateBias is not null || lw.UpBias is not null)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // LoRA delta (gate/up): y += scale * (normOut · B) · A.
+            if (_currentLora is not null)
+            {
+                MaybeApplyLoraDelta(cmdBuf, layer, "gate_proj", _state.NormOutput, _state.FfnGate,
+                    seqLen, lw.GateInputDim, lw.GateOutputDim);
+                MaybeApplyLoraDelta(cmdBuf, layer, "up_proj", _state.NormOutput, _state.FfnUp,
+                    seqLen, lw.UpInputDim, lw.UpOutputDim);
+            }
+
             // SwiGLU
             _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -781,6 +924,15 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
+            // LoRA delta (down_proj): y += scale * (siluOut · B) · A.
+            // Input is post-SwiGLU (siluOut), not normOut. The base GEMM
+            // already wrote into normOut, so we accumulate delta in place.
+            if (_currentLora is not null)
+            {
+                MaybeApplyLoraDelta(cmdBuf, layer, "down_proj", _state.SiluOutput, _state.NormOutput,
+                    seqLen, lw.DownInputDim, lw.DownOutputDim);
             }
             }  // end of dense-FFN branch (else of MoE)
 
@@ -1336,6 +1488,69 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Dispatches the LoRA delta for <paramref name="projName"/> at
+    /// <paramref name="layer"/> when an adapter is active and targets that
+    /// site. No-op when there is no active adapter or no entry. Composes
+    /// existing kernels (Option A — no new shaders this commit):
+    /// <list type="number">
+    ///   <item><c>tmp[seqLen, rank] = matmul_f32(B_scaled, x)</c> via <see cref="MatMulF32Kernel"/>.</item>
+    ///   <item><c>delta[seqLen, outputDim] = matmul_f32(A, tmp)</c> via <see cref="MatMulF32Kernel"/>.</item>
+    ///   <item><c>deltaSum[seqLen, outputDim] = AddKernel(y, delta)</c> via <see cref="AddKernel"/>.</item>
+    ///   <item><c>vkCmdCopyBuffer(deltaSum -> y)</c> to land the LoRA-augmented output back in <c>y</c>.</item>
+    /// </list>
+    /// The <c>scale = alpha / rank</c> factor is folded into <c>B</c> at
+    /// upload time (see <see cref="VulkanLoraAdapter.Upload"/>), so the
+    /// existing matmul + add kernels stay scale-agnostic.
+    /// </summary>
+    private void MaybeApplyLoraDelta(
+        nint cmdBuf, int layer, string projName,
+        VulkanDevice.Buffer x, VulkanDevice.Buffer y,
+        int seqLen, int inputDim, int outputDim)
+    {
+        var lora = _currentLora;
+        if (lora is null) return;
+        var lb = lora.Get(layer, projName);
+        if (lb is not { } w) return;
+
+        if (w.InputDim != inputDim || w.OutputDim != outputDim)
+            throw new InvalidOperationException(
+                $"LoRA adapter '{lora.Source.Name}' layer={layer} proj='{projName}' shape "
+                + $"({w.InputDim}x{w.OutputDim}) does not match base projection ({inputDim}x{outputDim}).");
+
+        var tmp = _state.LoraTmp ?? throw new InvalidOperationException(
+            "LoraTmp scratch is null — EnsureLoraScratch was not called before a LoRA-active Forward.");
+        var delta = _state.LoraDelta ?? throw new InvalidOperationException("LoraDelta scratch is null.");
+        var deltaSum = _state.LoraDeltaSum ?? throw new InvalidOperationException("LoraDeltaSum scratch is null.");
+
+        // Stage 1: tmp[N=seqLen, M=rank] = MatMul(B[M=rank, K=inputDim], x[N=seqLen, K=inputDim]).
+        // MatMulF32Kernel contracts as C[N,M] = B_in[N,K] @ A_in[M,K]^T —
+        // so weightsA=B (the LoRA down-proj), inputB=x, outputC=tmp.
+        _matmul.Record(cmdBuf, w.B, x, tmp, m: w.Rank, k: inputDim, n: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Stage 2: delta[N=seqLen, M=outputDim] = MatMul(A[M=outputDim, K=rank], tmp[N=seqLen, K=rank]).
+        _matmul.Record(cmdBuf, w.A, tmp, delta, m: outputDim, k: w.Rank, n: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Stage 3: deltaSum = y + delta. AddKernel reads a, b and writes c —
+        // a, b are read-only and c is write-only so we can't alias y == c.
+        _add.Record(cmdBuf, y, delta, deltaSum, seqLen * outputDim);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+        // Stage 4: copy deltaSum back into y. The next dispatch downstream
+        // (RoPE for q/k, attention for o, SwiGLU for gate/up, residual add
+        // for down) reads y — so we issue a transfer→compute barrier after.
+        var region = new VkBufferCopy
+        {
+            srcOffset = 0,
+            dstOffset = 0,
+            size = (ulong)((long)seqLen * outputDim * sizeof(float)),
+        };
+        VulkanApi.vkCmdCopyBuffer(cmdBuf, deltaSum.Handle, y.Handle, 1, region);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantType weightQt,
@@ -1540,6 +1755,11 @@ public sealed class VulkanTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Drop the device-side LoRA cache before tearing down the device —
+        // each VulkanLoraAdapter owns VkBuffers that must be freed before
+        // the device is disposed.
+        _loraCache.Dispose();
+
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();
