@@ -140,6 +140,23 @@ internal sealed class VulkanForwardState : IDisposable
     // ── Host → device transfer scratch (tokens + positions) ──────────
     public VulkanDevice.Buffer PositionsBuffer { get; private set; }
 
+    // ── LoRA delta scratch (Phase 4b) ─────────────────────────────────
+    // Allocated lazily on first LoRA-aware forward via EnsureLoraScratch
+    // (otherwise null — forward pass with no adapter pays no extra VRAM).
+    // Sized for [seqLen, max(rank)] / [seqLen, max(outputDim)] so we can
+    // dispatch the two-stage LoRA delta as:
+    //   LoraTmp[seqLen, rank] = matmul_f32(B_scaled, x)
+    //   LoraDelta[seqLen, outputDim] = matmul_f32(A, LoraTmp)
+    //   LoraDeltaSum[seqLen, outputDim] = AddKernel(y, LoraDelta)
+    //   vkCmdCopyBuffer(LoraDeltaSum -> y)
+    // The third buffer is needed because AddKernel writes to a separate
+    // output (read-only A, write-only C); we copy the sum back into y.
+    private int _loraCapacityRank;
+    private int _loraCapacityOutputDim;
+    public VulkanDevice.Buffer? LoraTmp { get; private set; }       // [seqLen, rank]
+    public VulkanDevice.Buffer? LoraDelta { get; private set; }     // [seqLen, outputDim]
+    public VulkanDevice.Buffer? LoraDeltaSum { get; private set; }  // [seqLen, outputDim]
+
     private bool _disposed;
 
     public long AllocatedBytes { get; private set; }
@@ -192,6 +209,53 @@ internal sealed class VulkanForwardState : IDisposable
 
         ReleaseLayerScratch();
         AllocateForCapacity(seqLen);
+        return true;
+    }
+
+    /// <summary>
+    /// Ensures the LoRA scratch buffers are sized for at least
+    /// <paramref name="rank"/> × <paramref name="outputDim"/> at the current
+    /// <see cref="EnsureCapacity"/>-honoured seqLen capacity. Allocated
+    /// lazily (so non-LoRA forwards never pay this VRAM cost) and grows
+    /// monotonically — multiple adapters with different ranks share one
+    /// scratch sized to the largest seen so far.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> when scratch was re-allocated (so cached descriptor sets
+    /// pointing at the old <see cref="LoraTmp"/> / <see cref="LoraDelta"/> /
+    /// <see cref="LoraDeltaSum"/> handles are now stale); <c>false</c> when
+    /// existing capacity was sufficient.
+    /// </returns>
+    public bool EnsureLoraScratch(int rank, int outputDim)
+    {
+        if (rank <= 0) throw new ArgumentOutOfRangeException(nameof(rank));
+        if (outputDim <= 0) throw new ArgumentOutOfRangeException(nameof(outputDim));
+
+        bool needRealloc =
+            LoraTmp is null || LoraDelta is null || LoraDeltaSum is null
+            || rank > _loraCapacityRank
+            || outputDim > _loraCapacityOutputDim;
+        if (!needRealloc) return false;
+
+        // Grow to the max ever requested (monotonic — small adapters
+        // benefit from a previous larger allocation; large adapters force
+        // a one-shot resize).
+        int newRank = Math.Max(_loraCapacityRank, rank);
+        int newOutputDim = Math.Max(_loraCapacityOutputDim, outputDim);
+
+        LoraTmp?.Dispose();
+        LoraDelta?.Dispose();
+        LoraDeltaSum?.Dispose();
+
+        long tmpBytes = (long)_capacitySeqLen * newRank * sizeof(float);
+        long deltaBytes = (long)_capacitySeqLen * newOutputDim * sizeof(float);
+
+        // Device-local: written by matmul_f32 / add kernels, never host-mapped.
+        LoraTmp = _device.AllocateDeviceLocal(tmpBytes);
+        LoraDelta = _device.AllocateDeviceLocal(deltaBytes);
+        LoraDeltaSum = _device.AllocateDeviceLocal(deltaBytes);
+        _loraCapacityRank = newRank;
+        _loraCapacityOutputDim = newOutputDim;
         return true;
     }
 
@@ -368,6 +432,16 @@ internal sealed class VulkanForwardState : IDisposable
         MoeSharedSumA?.Dispose(); MoeSharedSumA = null;
         MoeSharedSumB?.Dispose(); MoeSharedSumB = null;
         MoeSharedGateLogits?.Dispose(); MoeSharedGateLogits = null;
+
+        // LoRA scratch (Phase 4b) — sized in seqLen × rank / outputDim, so
+        // it grows alongside the main scratch on EnsureCapacity. Reset the
+        // capacity counters so the next EnsureLoraScratch call re-allocates
+        // at the new seqLen.
+        LoraTmp?.Dispose(); LoraTmp = null;
+        LoraDelta?.Dispose(); LoraDelta = null;
+        LoraDeltaSum?.Dispose(); LoraDeltaSum = null;
+        _loraCapacityRank = 0;
+        _loraCapacityOutputDim = 0;
     }
 
     public void Dispose()
