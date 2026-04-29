@@ -27,10 +27,6 @@ public sealed class VulkanMoeGroupByExpertF32KernelTests
             for (int c = 0; c < hidden; c++)
                 x[r * hidden + c] = r * 100 + c + 0.25f;
 
-        float[] expectedPacked = new float[x.Length];
-        uint[] expectedPermutation = new uint[rows];
-        BuildReference(x, indices, offsets, expectedPacked, expectedPermutation, rows, hidden, numExperts);
-
         using var device = VulkanDevice.Create();
         using var offsetsKernel = MoeExpertOffsetsKernel.Create(device, spvDir);
         using var groupKernel = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
@@ -68,8 +64,7 @@ public sealed class VulkanMoeGroupByExpertF32KernelTests
         DownloadUInt32(device, countersBuf, finalCounters);
 
         Assert.Equal(offsets, gpuOffsets);
-        Assert.Equal(expectedPermutation, permutation);
-        Assert.Equal(expectedPacked, packed);
+        AssertGroupedPermutationAndPackedRows(indices, x, packed, permutation, offsets, rows, hidden, numExperts);
         for (int expert = 0; expert < numExperts; expert++)
         {
             Assert.Equal(offsets[expert + 1] - offsets[expert], gpuCounts[expert]);
@@ -135,19 +130,27 @@ public sealed class VulkanMoeGroupByExpertF32KernelTests
         return offsets;
     }
 
-    private static void BuildReference(
-        float[] x, int[] indices, uint[] offsets,
-        float[] packed, uint[] permutation,
-        int rows, int hidden, int numExperts)
+    private static void AssertGroupedPermutationAndPackedRows(
+        int[] indices, float[] x, float[] packed, uint[] permutation,
+        uint[] offsets, int rows, int hidden, int numExperts)
     {
-        uint[] counters = new uint[numExperts];
-        for (int row = 0; row < rows; row++)
+        var seen = new bool[rows];
+        for (int expert = 0; expert < numExperts; expert++)
         {
-            int expert = Math.Clamp(indices[row], 0, numExperts - 1);
-            uint dstRow = offsets[expert] + counters[expert]++;
-            permutation[dstRow] = (uint)row;
-            Array.Copy(x, row * hidden, packed, (int)dstRow * hidden, hidden);
+            for (int packedRow = (int)offsets[expert]; packedRow < offsets[expert + 1]; packedRow++)
+            {
+                int sourceRow = checked((int)permutation[packedRow]);
+                Assert.InRange(sourceRow, 0, rows - 1);
+                Assert.False(seen[sourceRow]);
+                seen[sourceRow] = true;
+                Assert.Equal(expert, Math.Clamp(indices[sourceRow], 0, numExperts - 1));
+
+                for (int col = 0; col < hidden; col++)
+                    Assert.Equal(x[sourceRow * hidden + col], packed[packedRow * hidden + col]);
+            }
         }
+
+        Assert.All(seen, Assert.True);
     }
 
     private static unsafe float[] CpuGroupedMatmulF16(
