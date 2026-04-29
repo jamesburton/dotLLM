@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda;
@@ -43,11 +44,28 @@ public class CudaQuantizedGemvAlignmentTests
         Assert.Equal(32, CudaKernels.MinKAlignmentFor(QuantizationType.Q4_0));
         Assert.Equal(32, CudaKernels.MinKAlignmentFor(QuantizationType.Q4_1));
         Assert.Equal(32, CudaKernels.MinKAlignmentFor(QuantizationType.Q5_1));
+        Assert.Equal(32, CudaKernels.MinKAlignmentFor(QuantizationType.IQ4_NL));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q4_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q5_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q6_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q3_K));
         Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.Q2_K));
+        Assert.Equal(256, CudaKernels.MinKAlignmentFor(QuantizationType.IQ4_XS));
+    }
+
+    [Theory]
+    [InlineData(QuantizationType.IQ4_NL)]
+    [InlineData(QuantizationType.IQ4_XS)]
+    public void HasLoadedQuantizedGemv_DoesNotTreatStaticIQ4SupportAsRuntimeCapability(QuantizationType qt)
+    {
+        Assert.True(CudaKernels.HasQuantizedGemv(qt));
+
+        // Simulates stale PTX: the type is supported by metadata, but no runtime
+        // GEMV function pointer was resolved. This avoids checking in stale PTX.
+        var kernels = (CudaKernels)RuntimeHelpers.GetUninitializedObject(typeof(CudaKernels));
+
+        Assert.False(kernels.HasQuantizedGemvKernel(qt));
+        Assert.False(kernels.HasLoadedQuantizedGemv(qt));
     }
 
     /// <summary>
@@ -77,7 +95,7 @@ public class CudaQuantizedGemvAlignmentTests
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir == null, "PTX files not found");
         using var kernels = new CudaKernels(ptxDir!);
-        Skip.IfNot(CudaKernels.HasQuantizedGemv(qt), $"No GEMV kernel for {qt}");
+        Skip.IfNot(kernels.HasQuantizedGemvKernel(qt), $"No GEMV kernel loaded for {qt}");
         Assert.Equal(0, K % CudaKernels.MinKAlignmentFor(qt));
 
         int blocksPerRow = K / 32;
@@ -213,7 +231,7 @@ public class CudaQuantizedGemvAlignmentTests
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir == null, "PTX files not found");
         using var kernels = new CudaKernels(ptxDir!);
-        Skip.IfNot(CudaKernels.HasQuantizedGemv(qt), $"No GEMV kernel for {qt}");
+        Skip.IfNot(kernels.HasQuantizedGemvKernel(qt), $"No GEMV kernel loaded for {qt}");
         Assert.Equal(0, K % 256);
 
         int sbPerRow = K / 256;
@@ -294,6 +312,112 @@ public class CudaQuantizedGemvAlignmentTests
         _out.WriteLine($"{qt} M={M} K={K}: ref|max|={refMax:F3} max-abs-diff={maxAbs:F5}");
         Assert.True(maxAbs < 0.05f,
             $"K-quant GEMV diverges from scalar reference (max-abs-diff={maxAbs}, refMax={refMax}).");
+    }
+
+    [SkippableTheory]
+    [InlineData(QuantizationType.IQ4_NL, 512, 1408, 18)]
+    [InlineData(QuantizationType.IQ4_NL, 256, 32, 18)]
+    [InlineData(QuantizationType.IQ4_XS, 512, 1024, 136)]
+    [InlineData(QuantizationType.IQ4_XS, 256, 256, 136)]
+    [InlineData(QuantizationType.IQ4_XS, 128256, 4096, 136)]
+    public void GemvIQ4MatchesScalarReference(
+        QuantizationType qt, int M, int K, int blockBytes)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGemvVsDequantScalar(qt, M, K, blockBytes);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunGemvVsDequantScalar(QuantizationType qt, int M, int K, int blockBytes)
+    {
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasQuantizedGemvKernel(qt), $"No GEMV kernel loaded for {qt}");
+        Assert.Equal(0, K % CudaKernels.MinKAlignmentFor(qt));
+
+        int blockSize = qt == QuantizationType.IQ4_NL ? 32 : 256;
+        int blocksPerRow = K / blockSize;
+        long rowBytes = (long)blocksPerRow * blockBytes;
+        long weightBytes = (long)M * rowBytes;
+        var rng = new Random(0x1A4D ^ (int)qt ^ M ^ K);
+
+        byte[] hostW = new byte[weightBytes];
+        rng.NextBytes(hostW);
+        fixed (byte* p = hostW)
+        {
+            for (int row = 0; row < M; row++)
+            for (int b = 0; b < blocksPerRow; b++)
+            {
+                byte* blk = p + row * rowBytes + b * blockBytes;
+                *(Half*)blk = qt == QuantizationType.IQ4_NL
+                    ? (Half)((rng.NextDouble() - 0.5) * 0.04)
+                    : (Half)((rng.NextDouble() - 0.5) * 0.002);
+            }
+        }
+
+        Half[] hostX = new Half[K];
+        for (int i = 0; i < K; i++)
+        {
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = 1.0 - rng.NextDouble();
+            double g = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            hostX[i] = (Half)(g * 0.4);
+        }
+
+        float[] yRef = new float[M];
+        float[] xF32 = new float[K];
+        for (int i = 0; i < K; i++) xF32[i] = (float)hostX[i];
+        fixed (byte* p = hostW)
+        {
+            float[] rowDequant = new float[K];
+            for (int row = 0; row < M; row++)
+            {
+                Dequantize.ToFloat32((nint)(p + row * rowBytes), K, qt, rowDequant);
+                float acc = 0;
+                for (int i = 0; i < K; i++) acc += rowDequant[i] * xF32[i];
+                yRef[row] = acc;
+            }
+        }
+
+        long xBytes = (long)K * sizeof(ushort);
+        long yBytes = (long)M * sizeof(ushort);
+        nint devW = 0, devX = 0, devY = 0;
+        Half[] yGpu = new Half[M];
+        try
+        {
+            CudaDriverApi.cuMemAlloc_v2(out devW, (nuint)weightBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devX, (nuint)xBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devY, (nuint)yBytes).ThrowOnError();
+            fixed (byte* pW = hostW)
+                CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)pW, (nuint)weightBytes).ThrowOnError();
+            fixed (Half* pX = hostX)
+                CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)pX, (nuint)xBytes).ThrowOnError();
+            kernels.LaunchQuantizedGemv(devW, qt, devX, devY, M, K, stream.Handle);
+            stream.Synchronize();
+            fixed (Half* p = yGpu)
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devY, (nuint)yBytes).ThrowOnError();
+        }
+        finally
+        {
+            if (devW != 0) CudaDriverApi.cuMemFree_v2(devW);
+            if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
+            if (devY != 0) CudaDriverApi.cuMemFree_v2(devY);
+        }
+
+        float maxAbs = 0f, refMax = 0f;
+        for (int i = 0; i < M; i++)
+        {
+            float diff = MathF.Abs((float)yGpu[i] - yRef[i]);
+            if (diff > maxAbs) maxAbs = diff;
+            if (MathF.Abs(yRef[i]) > refMax) refMax = MathF.Abs(yRef[i]);
+        }
+
+        _out.WriteLine($"{qt} M={M} K={K}: ref|max|={refMax:F3} max-abs-diff={maxAbs:F5}");
+        Assert.True(maxAbs < 0.1f,
+            $"IQ GEMV diverges from scalar reference (max-abs-diff={maxAbs}, refMax={refMax}).");
     }
 
     private static string? FindPtxDir()

@@ -1,4 +1,6 @@
 using System.Runtime.CompilerServices;
+using System.Buffers;
+using System.Numerics.Tensors;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -24,10 +26,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly CudaContext _context;
     private readonly CudaKernels _kernels;
     private readonly GgufFile? _gguf;
+    private readonly TransformerWeights? _cpuWeights;
     private readonly int _deviceId;
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly int _ropeType;
+    private readonly bool _useHighPrecisionForward;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -98,6 +102,10 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static bool DisableGraphCapture { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_GRAPH_CAPTURE") == "1";
 
+    /// <summary>Disable the F32 activation correctness path for IQ4-family models.</summary>
+    public static bool EnableHighPrecisionIQuants { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ENABLE_HIGH_PRECISION_IQUANTS") == "1";
+
     private nint _evtStart;
     private nint _evtEnd;
 
@@ -163,7 +171,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaTransformerModel(
         ModelConfig config, CudaWeights weights, CudaForwardState state,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context,
-        CudaKernels kernels, GgufFile? gguf, int deviceId,
+        CudaKernels kernels, GgufFile? gguf, TransformerWeights? cpuWeights, int deviceId,
         float ropeTheta, int ropeDim, int ropeType, string? vramWarning)
     {
         Config = config;
@@ -179,6 +187,16 @@ public sealed unsafe class CudaTransformerModel : IModel
         _ropeDim = ropeDim;
         VramWarning = vramWarning;
         _ropeType = ropeType;
+        _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
+        if (_useHighPrecisionForward)
+        {
+            _cpuWeights = cpuWeights;
+        }
+        else
+        {
+            _cpuWeights = null;
+            cpuWeights?.Dispose();
+        }
 
         // Default-on graph capture when capable. Re-bench on RTX 3060
         // (post pre-Q8_1 + MMVQ-large default-ON) shows graph never regresses
@@ -310,7 +328,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         int ropeType = (int)(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
         return new CudaTransformerModel(config, weights, state, stream, cublas, context,
-            kernels, gguf, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
+            kernels, gguf, cpuWeights, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
     }
 
     /// <inheritdoc/>
@@ -427,6 +445,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     {
         bool isMla = _weights.MlaLayers is not null;
         bool isMoe = _weights.MoeLayers is not null;
+
+        if (_useHighPrecisionForward && kvCache is null && !isMla && !isMoe)
+        {
+            return ForwardHighPrecision(tokenIds, positions, deviceId);
+        }
 
         // CUDA Graphs decode fast-path: single-token decode for both the standard
         // FP16 KV-cache and the quantized cache (when a mixed-precision FP16 window
@@ -598,7 +621,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedQkv = seqLen == 1 && lw.QkvPacked != 0;
             if (fusedQkv)
             {
-                if (_kernels.HasMmq(lw.QkvPackedQuantType))
+                if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
                 {
                     nint scratch = MaybePreQuantize(_state.NormOutput, lw.QInputDim, s);
                     _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
@@ -750,7 +773,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             bool fusedGateUp = seqLen == 1 && lw.GateUpPacked != 0;
             if (fusedGateUp)
             {
-                if (_kernels.HasMmq(lw.GateUpPackedQuantType))
+                if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
                 {
                     nint scratch = MaybePreQuantize(_state.NormOutput, lw.GateInputDim, s);
                     _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
@@ -1054,30 +1077,56 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 ref readonly var lw = ref _weights.Layers[layer];
 
-                Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
-                Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
-                Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+                nint qPtr, kPtr, vPtr;
+                if (lw.QkvPacked != 0)
+                {
+                    if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
+                    {
+                        nint scratch = MaybePreQuantize(_state.NormOutput, lw.QInputDim, s);
+                        _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
+                            _state.NormOutput, _state.QkvPacked,
+                            lw.QkvPackedOutputDim, lw.QInputDim, scratch, s);
+                    }
+                    else
+                    {
+                        _kernels.LaunchQuantizedGemv(lw.QkvPacked, lw.QkvPackedQuantType,
+                            _state.NormOutput, _state.QkvPacked,
+                            lw.QkvPackedOutputDim, lw.QInputDim, s);
+                    }
+                    qPtr = _state.QkvPacked;
+                    kPtr = _state.QkvPacked + (nint)((long)lw.QOutputDim * h);
+                    vPtr = _state.QkvPacked + (nint)((long)(lw.QOutputDim + lw.KOutputDim) * h);
+                }
+                else
+                {
+                    Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+                    Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+                    Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+                    qPtr = _state.Q;
+                    kPtr = _state.K;
+                    vPtr = _state.V;
+                }
 
-                if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
-                if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.K, lw.KBias, lw.KOutputDim, seqLen, s);
-                if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.V, lw.VBias, lw.VOutputDim, seqLen, s);
+                if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(qPtr, lw.QBias, lw.QOutputDim, seqLen, s);
+                if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(kPtr, lw.KBias, lw.KOutputDim, seqLen, s);
+                if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
 
                 if (lw.QNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(_state.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
                 if (lw.KNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
-                _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
+                _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
                     _ropeDim, _ropeTheta, effectiveRopeType, s);
 
                 // KV-cache update via device-resident position; replaces the eager
                 // path's cuMemcpyDtoDAsync (which would bake the dst address).
-                kvCache.UpdateDeviceSingleDevicePos(_state.K, _state.V, layer, _decodePosDevice, s, _kernels);
+                kvCache.UpdateDeviceSingleDevicePos(kPtr, vPtr, layer, _decodePosDevice, s, _kernels);
 
                 // Attention with device-resident seq_kv / position_offset.
-                _kernels.LaunchAttentionDyn(_state.Q, kvCache.GetKeysPtr(layer),
+                _kernels.LaunchAttentionDyn(qPtr, kvCache.GetKeysPtr(layer),
                     kvCache.GetValuesPtr(layer), _state.AttnOutput,
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
                     _decodePosDevice, slidingWindow, s);
@@ -1088,13 +1137,37 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
                     hiddenSize, eps, seqLen, s);
 
-                Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-                Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+                nint gatePtr, upPtr;
+                if (lw.GateUpPacked != 0)
+                {
+                    if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
+                    {
+                        nint scratch = MaybePreQuantize(_state.NormOutput, lw.GateInputDim, s);
+                        _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                            _state.NormOutput, _state.GateUpPacked,
+                            lw.GateUpPackedOutputDim, lw.GateInputDim, scratch, s);
+                    }
+                    else
+                    {
+                        _kernels.LaunchQuantizedGemv(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                            _state.NormOutput, _state.GateUpPacked,
+                            lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                    }
+                    gatePtr = _state.GateUpPacked;
+                    upPtr = _state.GateUpPacked + (nint)((long)lw.GateOutputDim * h);
+                }
+                else
+                {
+                    Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                    Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+                    gatePtr = _state.FfnGate;
+                    upPtr = _state.FfnUp;
+                }
 
-                if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
-                if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+                if (lw.GateBias != 0) _kernels.LaunchBiasAdd(gatePtr, lw.GateBias, lw.GateOutputDim, seqLen, s);
+                if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-                _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput, intermediateSize, seqLen, s);
+                _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
 
                 Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
                 if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
@@ -1180,27 +1253,53 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 ref readonly var lw = ref _weights.Layers[layer];
 
-                Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
-                Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
-                Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+                nint qPtr, kPtr, vPtr;
+                if (lw.QkvPacked != 0)
+                {
+                    if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
+                    {
+                        nint scratch = MaybePreQuantize(_state.NormOutput, lw.QInputDim, s);
+                        _kernels.LaunchQuantizedGemvMmq(lw.QkvPacked, lw.QkvPackedQuantType,
+                            _state.NormOutput, _state.QkvPacked,
+                            lw.QkvPackedOutputDim, lw.QInputDim, scratch, s);
+                    }
+                    else
+                    {
+                        _kernels.LaunchQuantizedGemv(lw.QkvPacked, lw.QkvPackedQuantType,
+                            _state.NormOutput, _state.QkvPacked,
+                            lw.QkvPackedOutputDim, lw.QInputDim, s);
+                    }
+                    qPtr = _state.QkvPacked;
+                    kPtr = _state.QkvPacked + (nint)((long)lw.QOutputDim * h);
+                    vPtr = _state.QkvPacked + (nint)((long)(lw.QOutputDim + lw.KOutputDim) * h);
+                }
+                else
+                {
+                    Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+                    Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+                    Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+                    qPtr = _state.Q;
+                    kPtr = _state.K;
+                    vPtr = _state.V;
+                }
 
-                if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
-                if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.K, lw.KBias, lw.KOutputDim, seqLen, s);
-                if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.V, lw.VBias, lw.VOutputDim, seqLen, s);
+                if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(qPtr, lw.QBias, lw.QOutputDim, seqLen, s);
+                if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(kPtr, lw.KBias, lw.KOutputDim, seqLen, s);
+                if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
 
                 if (lw.QNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(_state.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+                    _kernels.LaunchPerHeadRmsNorm(qPtr, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
                 if (lw.KNormWeight != 0)
-                    _kernels.LaunchPerHeadRmsNorm(_state.K, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+                    _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
-                _kernels.LaunchRoPE(_state.Q, _state.K, _state.PositionsDevice,
+                _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
                     seqLen, numHeads, numKvHeads, headDim,
                     _ropeDim, _ropeTheta, effectiveRopeType, s);
 
                 // KV-cache update (FP16 ring write + predicated quantize-on-evict),
                 // device-side eviction state.
-                kvCache.UpdateDeviceForGraph(_state.K, _state.V, layer, _decodePosDevice, s, _kernels);
+                kvCache.UpdateDeviceForGraph(kPtr, vPtr, layer, _decodePosDevice, s, _kernels);
 
                 // Dequant the quantized region + scatter the window into the FP16 attention
                 // scratch — both predicated, both reading position from _decodePosDevice.
@@ -1208,7 +1307,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     kvCache.PrepareAttentionScratchForGraph(layer, _decodePosDevice, s, _kernels);
 
                 // Attention with device-resident seq_kv / position_offset.
-                _kernels.LaunchAttentionDyn(_state.Q, kCachePtr, vCachePtr, _state.AttnOutput,
+                _kernels.LaunchAttentionDyn(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
                     _decodePosDevice, slidingWindow, s);
 
@@ -1218,13 +1317,37 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
                     hiddenSize, eps, seqLen, s);
 
-                Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-                Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+                nint gatePtr, upPtr;
+                if (lw.GateUpPacked != 0)
+                {
+                    if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
+                    {
+                        nint scratch = MaybePreQuantize(_state.NormOutput, lw.GateInputDim, s);
+                        _kernels.LaunchQuantizedGemvMmq(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                            _state.NormOutput, _state.GateUpPacked,
+                            lw.GateUpPackedOutputDim, lw.GateInputDim, scratch, s);
+                    }
+                    else
+                    {
+                        _kernels.LaunchQuantizedGemv(lw.GateUpPacked, lw.GateUpPackedQuantType,
+                            _state.NormOutput, _state.GateUpPacked,
+                            lw.GateUpPackedOutputDim, lw.GateInputDim, s);
+                    }
+                    gatePtr = _state.GateUpPacked;
+                    upPtr = _state.GateUpPacked + (nint)((long)lw.GateOutputDim * h);
+                }
+                else
+                {
+                    Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                    Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+                    gatePtr = _state.FfnGate;
+                    upPtr = _state.FfnUp;
+                }
 
-                if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
-                if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+                if (lw.GateBias != 0) _kernels.LaunchBiasAdd(gatePtr, lw.GateBias, lw.GateOutputDim, seqLen, s);
+                if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-                _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput, intermediateSize, seqLen, s);
+                _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
 
                 Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
                 if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
@@ -1305,6 +1428,251 @@ public sealed unsafe class CudaTransformerModel : IModel
         return _state.PreQ8_1Scratch;
     }
 
+    private static bool ShouldUseHighPrecisionForward(CudaWeights weights)
+    {
+        if (!EnableHighPrecisionIQuants) return false;
+        if (weights.OutputQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS)
+            return true;
+
+        foreach (ref readonly var lw in weights.Layers.AsSpan())
+        {
+            if (lw.QQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.KQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.VQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.OQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.GateQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.UpQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                || lw.DownQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS)
+                return true;
+        }
+
+        return false;
+    }
+
+    private ITensor ForwardHighPrecision(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        _context.MakeCurrent();
+        int seqLen = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int intermediateSize = Config.IntermediateSize;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        int slidingWindow = Config.SlidingWindowSize ?? 0;
+        nint s = _stream.Handle;
+
+        _state.EnsureCapacity(seqLen);
+
+        fixed (int* tokenPtr = tokenIds)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+        fixed (int* posPtr = positions)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+
+        _kernels.LaunchEmbeddingLookupF32(
+            _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
+            _state.TokenIdsDevice, _state.HiddenStateF32,
+            seqLen, hiddenSize, s);
+
+        long hiddenBytesF32 = (long)seqLen * hiddenSize * sizeof(float);
+        CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.ResidualF32, _state.HiddenStateF32,
+            (nuint)hiddenBytesF32, s).ThrowOnError();
+
+        int numLayers = DebugMaxLayers switch
+        {
+            < 0 => 0,
+            0 => Config.NumLayers,
+            _ => Math.Min(DebugMaxLayers, Config.NumLayers)
+        };
+
+        if (numLayers > 0)
+            RmsNormF32WithWeight(_state.ResidualF32, _weights.Layers[0].AttnNormWeight,
+                _cpuWeights?.Layers[0].AttnNormWeight,
+                _state.NormOutputF32, hiddenSize, eps, seqLen, s);
+
+        for (int layer = 0; layer < numLayers; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+
+            ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
+                lw.QOutputDim, lw.QInputDim, seqLen);
+            ProjectF32(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
+                lw.KOutputDim, lw.KInputDim, seqLen);
+            ProjectF32(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
+                lw.VOutputDim, lw.VInputDim, seqLen);
+
+            if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAddF32(_state.QF32, lw.QBias, lw.QOutputDim, seqLen, s);
+            if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAddF32(_state.KF32, lw.KBias, lw.KOutputDim, seqLen, s);
+            if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAddF32(_state.VF32, lw.VBias, lw.VOutputDim, seqLen, s);
+
+            if (lw.QNormWeight != 0)
+                _kernels.LaunchPerHeadRmsNormF32(_state.QF32, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
+            if (lw.KNormWeight != 0)
+                _kernels.LaunchPerHeadRmsNormF32(_state.KF32, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
+
+            int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
+            _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, effectiveRopeType, s);
+
+            _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
+                seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+
+            ProjectF32(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
+                lw.OOutputDim, lw.OInputDim, seqLen);
+            if (lw.OBias != 0) _kernels.LaunchBiasAddF32(_state.NormOutputF32, lw.OBias, lw.OOutputDim, seqLen, s);
+
+            _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
+                seqLen * hiddenSize, s);
+
+            RmsNormF32WithWeight(_state.ResidualF32, lw.FfnNormWeight,
+                _cpuWeights?.Layers[layer].FfnNormWeight, _state.NormOutputF32,
+                hiddenSize, eps, seqLen, s);
+
+            ProjectF32(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
+                lw.GateOutputDim, lw.GateInputDim, seqLen);
+            ProjectF32(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
+                lw.UpOutputDim, lw.UpInputDim, seqLen);
+            if (lw.GateBias != 0) _kernels.LaunchBiasAddF32(_state.FfnGateF32, lw.GateBias, lw.GateOutputDim, seqLen, s);
+            if (lw.UpBias != 0) _kernels.LaunchBiasAddF32(_state.FfnUpF32, lw.UpBias, lw.UpOutputDim, seqLen, s);
+
+            _kernels.LaunchSwiGLUF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+                intermediateSize, seqLen, s);
+
+            ProjectF32(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _state.NormOutputF32,
+                lw.DownOutputDim, lw.DownInputDim, seqLen);
+            if (lw.DownBias != 0) _kernels.LaunchBiasAddF32(_state.NormOutputF32, lw.DownBias, lw.DownOutputDim, seqLen, s);
+
+            _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.ResidualF32,
+                seqLen * hiddenSize, s);
+
+            if (layer < numLayers - 1)
+            {
+                ref readonly var nextLw = ref _weights.Layers[layer + 1];
+                RmsNormF32WithWeight(_state.ResidualF32, nextLw.AttnNormWeight,
+                    _cpuWeights?.Layers[layer + 1].AttnNormWeight, _state.NormOutputF32,
+                    hiddenSize, eps, seqLen, s);
+            }
+        }
+
+        nint lastHidden = _state.ResidualF32 + (nint)((seqLen - 1) * hiddenSize * sizeof(float));
+        RmsNormF32WithWeight(lastHidden, _weights.OutputNormWeight, _cpuWeights?.OutputNormWeight, _state.NormOutputF32,
+            hiddenSize, eps, 1, s);
+
+        _stream.Synchronize();
+
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+
+        if (_cpuWeights is not null)
+        {
+            float[] normHost = ArrayPool<float>.Shared.Rent(hiddenSize);
+            try
+            {
+                fixed (float* pNorm = normHost)
+                {
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)pNorm, _state.NormOutputF32,
+                        (nuint)(hiddenSize * sizeof(float))).ThrowOnError();
+                    ProjectCpuLmHead(_cpuWeights.OutputWeight, _cpuWeights.OutputQuantType,
+                        pNorm, (float*)result.DataPointer, _cpuWeights.OutputOutputDim,
+                        _cpuWeights.OutputInputDim);
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(normHost);
+            }
+        }
+        else
+        {
+            // Keep the large LM head on the existing quantized/FP16 projection path:
+            // expanding vocab x hidden to F32 would require several GiB of scratch.
+            _kernels.LaunchConvertF32ToF16(_state.NormOutputF32, _state.NormOutput, hiddenSize, s);
+            Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
+                _state.NormOutput, _state.LogitsF16,
+                _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+            _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+            _stream.Synchronize();
+            CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+                (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        }
+        return result;
+    }
+
+    private static void ProjectCpuLmHead(nint weights, QuantizationType qt, float* input, float* output,
+                                          int outputDim, int inputDim)
+    {
+        long rowBytes = DotLLM.Cpu.Kernels.Dequantize.RowByteSize(inputDim, qt);
+        float[] rowBuf = ArrayPool<float>.Shared.Rent(inputDim);
+        try
+        {
+            var row = rowBuf.AsSpan(0, inputDim);
+            var x = new ReadOnlySpan<float>(input, inputDim);
+            for (int i = 0; i < outputDim; i++)
+            {
+                DotLLM.Cpu.Kernels.Dequantize.ToFloat32(weights + i * (nint)rowBytes,
+                    inputDim, qt, row);
+                output[i] = TensorPrimitives.Dot(row, x);
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rowBuf);
+        }
+    }
+
+    private void RmsNormF32WithWeight(nint inputF32, nint weightF16, float[]? hostWeightF32, nint outputF32,
+                                      int hiddenSize, float eps, int rows, nint stream)
+    {
+        if (hostWeightF32 is not null)
+        {
+            fixed (float* pWeight = hostWeightF32)
+            {
+                CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.DequantScratchF32, (nint)pWeight,
+                    (nuint)(hiddenSize * sizeof(float)), stream).ThrowOnError();
+            }
+        }
+        else
+        {
+            _kernels.LaunchConvertF16ToF32(weightF16, _state.DequantScratchF32, hiddenSize, stream);
+        }
+        _kernels.LaunchRmsNormF32(inputF32, _state.DequantScratchF32, outputF32,
+            hiddenSize, eps, rows, stream);
+    }
+
+    private void ProjectF32(nint quantWeight, QuantizationType qt, nint fp16Weight,
+                             nint inputF32, nint outputF32, int outputDim, int inputDim, int seqLen)
+    {
+        nint s = _stream.Handle;
+        nint weightF32 = _state.DequantScratchF32;
+
+        if (quantWeight != 0)
+        {
+            if (qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS or QuantizationType.Q5_K)
+            {
+                _kernels.LaunchDequantToF32(quantWeight, qt, weightF32,
+                    outputDim * inputDim, s);
+            }
+            else
+            {
+                _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
+                    outputDim * inputDim, s);
+                _kernels.LaunchConvertF16ToF32(_state.DequantScratch, weightF32,
+                    outputDim * inputDim, s);
+            }
+        }
+        else
+        {
+            _kernels.LaunchConvertF16ToF32(fp16Weight, weightF32,
+                outputDim * inputDim, s);
+        }
+
+        CudaGemm.LinearF32(_cublas.Handle, inputF32, weightF32, outputF32,
+            seqLen, inputDim, outputDim, s);
+    }
+
     /// <summary>
     /// Dispatches projection as cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV (decode).
     /// For quantized weights with no persistent FP16 copy (<paramref name="fp16Weight"/> == 0),
@@ -1327,7 +1695,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
         }
-        else if (quantWeight != 0 && _kernels.HasMmq(qt))
+        else if (quantWeight != 0 && _kernels.HasMmq(qt) && !CudaKernels.ForceDirectGemv)
         {
             // Decode: MMQ-style fused dequant+matmul (dp4a) — faster than the FP fmuladd kernel.
             // Routes Q4_K, Q5_K, Q6_K through the dp4a path; the rest fall through to the
@@ -1337,7 +1705,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             nint scratch = MaybePreQuantize(input, inputDim, s);
             _kernels.LaunchQuantizedGemvMmq(quantWeight, qt, input, output, outputDim, inputDim, scratch, s);
         }
-        else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt)) // Decode: quantized GEMV
+        else if (quantWeight != 0 && _kernels.HasQuantizedGemvKernel(qt)) // Decode: quantized GEMV
         {
             _kernels.LaunchQuantizedGemv(quantWeight, qt, input, output, outputDim, inputDim, s);
         }
@@ -1399,6 +1767,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         _moeScratch?.Dispose();
         _state.Dispose();
         _weights.Dispose();
+        _cpuWeights?.Dispose();
         _kernels.Dispose();
         _cublas.Dispose();
         _stream.Dispose();

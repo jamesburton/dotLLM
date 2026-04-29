@@ -47,5 +47,11 @@ public enum QuantizationType
     Q5_K = 13,
 
     /// <summary>6-bit K-quant, super-block of 256.</summary>
-    Q6_K = 14
+    Q6_K = 14,
+
+    /// <summary>4-bit non-linear importance quantization, block size 32.</summary>
+    IQ4_NL = 20,
+
+    /// <summary>4-bit extra-small non-linear importance quantization, super-block of 256.</summary>
+    IQ4_XS = 23
 }

@@ -49,11 +49,13 @@ public static unsafe partial class Dequantize
         QuantizationType.Q8_0 => elementCount / Q8_0GroupSize * Q8_0BlockBytes,
         QuantizationType.Q5_0 => elementCount / Q5_0GroupSize * Q5_0BlockBytes,
         QuantizationType.Q5_1 => elementCount / Q5_0GroupSize * Q5_1BlockBytes,
+        QuantizationType.IQ4_NL => elementCount / IQ4_NL_GroupSize * IQ4_NL_BlockBytes,
         QuantizationType.Q2_K => elementCount / KQuantGroupSize * Q2_K_BlockBytes,
         QuantizationType.Q3_K => elementCount / KQuantGroupSize * Q3_K_BlockBytes,
         QuantizationType.Q4_K => elementCount / KQuantGroupSize * Q4_K_BlockBytes,
         QuantizationType.Q5_K => elementCount / KQuantGroupSize * Q5_K_BlockBytes,
         QuantizationType.Q6_K => elementCount / KQuantGroupSize * Q6_K_BlockBytes,
+        QuantizationType.IQ4_XS => elementCount / KQuantGroupSize * IQ4_XS_BlockBytes,
         _ => throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
             $"Unknown quantization type: {quantType}")
     };
@@ -96,6 +98,9 @@ public static unsafe partial class Dequantize
             case QuantizationType.Q5_1:
                 DequantizeQ5_1Scalar(src, elementCount, dest);
                 break;
+            case QuantizationType.IQ4_NL:
+                DequantizeIQ4_NL(src, elementCount, dest);
+                break;
             case QuantizationType.Q2_K:
                 DequantizeQ2_K(src, elementCount, dest);
                 break;
@@ -110,6 +115,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.Q6_K:
                 DequantizeQ6_K(src, elementCount, dest);
+                break;
+            case QuantizationType.IQ4_XS:
+                DequantizeIQ4_XS(src, elementCount, dest);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(quantType), quantType,

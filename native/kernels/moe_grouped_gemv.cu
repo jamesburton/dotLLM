@@ -20,6 +20,11 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+__device__ __constant__ int8_t kvalues_iq4nl_grouped[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // ── Q2_K: 84 bytes per 256 values ───────────────────────────────────
 // struct block_q2_K { uint8_t scales[16]; uint8_t qs[64]; half d; half dmin; };
 //   scales: 16 × (4-bit scale | 4-bit dmin coef), one byte per sub-block of 16 elements
@@ -371,6 +376,131 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_grouped_gemv_q6_k_f16(
 // Note: K must be a multiple of 32 (the Q8_0 block size). Q5_K/Q6_K above
 // require K%256==0, but Q8_0 has finer granularity — same K%256==0 gate at
 // the dispatch layer keeps the API uniform.
+
+extern "C" __global__ void __launch_bounds__(256) moe_grouped_gemv_iq4_nl_f16(
+    const half*       __restrict__ x,
+    const uint8_t* const* __restrict__ weights,
+    half*       const* __restrict__ outputs,
+    const int M,
+    const int K,
+    const int K_active)
+{
+    int expert_idx = blockIdx.y;
+    int row = blockIdx.x;
+    if (expert_idx >= K_active || row >= M) return;
+
+    const uint8_t* weight = weights[expert_idx];
+    half*          y      = outputs[expert_idx];
+
+    const int blocks_per_row = K / 32;
+    const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+    float acc = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x)
+    {
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+
+        #pragma unroll 16
+        for (int j = 0; j < 16; j++)
+        {
+            uint8_t packed = qs[j];
+            acc += d * (float)kvalues_iq4nl_grouped[packed & 0x0F] * __half2float(x[b * 32 + j]);
+            acc += d * (float)kvalues_iq4nl_grouped[packed >> 4] * __half2float(x[b * 32 + j + 16]);
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = __float2half(acc);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) moe_grouped_gemv_iq4_xs_f16(
+    const half*       __restrict__ x,
+    const uint8_t* const* __restrict__ weights,
+    half*       const* __restrict__ outputs,
+    const int M,
+    const int K,
+    const int K_active)
+{
+    int expert_idx = blockIdx.y;
+    int row = blockIdx.x;
+    if (expert_idx >= K_active || row >= M) return;
+
+    const uint8_t* weight = weights[expert_idx];
+    half*          y      = outputs[expert_idx];
+
+    const int superblocks_per_row = K / 256;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+    float acc = 0.0f;
+
+    for (int sb = threadIdx.x; sb < superblocks_per_row; sb += blockDim.x)
+    {
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+        int base_x = sb * 256;
+
+        for (int ib = 0; ib < 8; ib++)
+        {
+            int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+            int high = (scales_h >> (2 * ib)) & 0x03;
+            int ls = low | (high << 4);
+            float dl = d * (float)(ls - 32);
+            const uint8_t* sub_qs = qs + ib * 16;
+            int x_off = base_x + ib * 32;
+
+            #pragma unroll 16
+            for (int j = 0; j < 16; j++)
+            {
+                uint8_t packed = sub_qs[j];
+                acc += dl * (float)kvalues_iq4nl_grouped[packed & 0x0F] * __half2float(x[x_off + j]);
+                acc += dl * (float)kvalues_iq4nl_grouped[packed >> 4] * __half2float(x[x_off + j + 16]);
+            }
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = __float2half(acc);
+}
 
 extern "C" __global__ void __launch_bounds__(256) moe_grouped_gemv_q8_0_f16(
     const half*       __restrict__ x,

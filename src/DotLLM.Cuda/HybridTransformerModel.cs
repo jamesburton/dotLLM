@@ -670,7 +670,7 @@ public sealed unsafe class HybridTransformerModel : IModel
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
         }
-        else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt))
+        else if (quantWeight != 0 && _kernels.HasQuantizedGemvKernel(qt))
         {
             _kernels.LaunchQuantizedGemv(quantWeight, qt, input, output, outputDim, inputDim, s);
         }
