@@ -1,3 +1,4 @@
+using DotLLM.Core.Lora;
 using DotLLM.Cpu.Kernels;
 using Xunit;
 
@@ -172,6 +173,38 @@ public sealed class MlaAttentionTests
         Assert.True(anyDifferent, "attnScaleMultiplier had no effect on output");
     }
 
+    [Fact]
+    public unsafe void Execute_LoraQAProj_MatchesEquivalentMergedWeight()
+    {
+        const int seqLen = 4;
+        const int hiddenSize = 12;
+        const int numHeads = 3;
+        const int qkNope = 4;
+        const int qkRope = 2;
+        const int vHead = 4;
+        const int qLora = 8;
+        const int kvLora = 6;
+        const float eps = 1e-6f;
+        const int maxSeq = 8;
+
+        var fixture = BuildFixture(seqLen, hiddenSize, numHeads, qkNope, qkRope, vHead,
+                                   qLora, kvLora, eps, maxSeq, seed: 314);
+        float[] b = Enumerable.Range(0, hiddenSize).Select(i => (i + 1) * 0.003f).ToArray();
+        float[] a = Enumerable.Range(0, qLora).Select(i => (i - 3) * 0.002f).ToArray();
+
+        using var adapter = BuildRankOneAdapter("q_a_proj", inputDim: hiddenSize, outputDim: qLora, b, a);
+
+        float[] actual = new float[seqLen * hiddenSize];
+        RunKernelWithAdapter(fixture, actual, adapter);
+
+        var merged = new Fixture(fixture) { QAProj = (float[])fixture.QAProj.Clone() };
+        AddOuterProduct(merged.QAProj, rows: qLora, cols: hiddenSize, a, b);
+        float[] expected = new float[seqLen * hiddenSize];
+        RunKernel(merged, expected);
+
+        AssertSpansClose(expected, actual, Tolerance);
+    }
+
     // ───────────────────────── helpers ─────────────────────────
 
     private sealed class Fixture
@@ -293,6 +326,62 @@ public sealed class MlaAttentionTests
             kvBProj: f.KvBProj,
             oProj: f.OProj,
             attnScaleMultiplier: attnScaleMultiplier);
+    }
+
+    private static void RunKernelWithAdapter(Fixture f, Span<float> output, ILoraAdapter adapter)
+    {
+        MlaAttention.Execute(
+            hidden: f.Hidden,
+            output: output,
+            seqLen: f.SeqLen,
+            positionOffset: 0,
+            hiddenSize: f.HiddenSize,
+            numHeads: f.NumHeads,
+            qkNopeHeadDim: f.QkNope,
+            qkRopeHeadDim: f.QkRope,
+            vHeadDim: f.VHead,
+            qLoraRank: f.QLora,
+            kvLoraRank: f.KvLora,
+            rmsNormEps: f.Eps,
+            ropeCosTable: f.CosTable,
+            ropeSinTable: f.SinTable,
+            qAProj: f.QAProj,
+            qALayernormWeight: f.QANorm,
+            qBProj: f.QBProj,
+            qProj: f.QProj,
+            kvAProjWithMqa: f.KvAProj,
+            kvALayernormWeight: f.KvANorm,
+            kvBProj: f.KvBProj,
+            oProj: f.OProj,
+            loraAdapter: adapter,
+            loraLayer: 0);
+    }
+
+    private static unsafe LoraAdapter BuildRankOneAdapter(
+        string projection,
+        int inputDim,
+        int outputDim,
+        float[] b,
+        float[] a)
+    {
+        var adapter = new LoraAdapter("mla-test", rank: 1, alpha: 1f, targetModules: [projection]);
+        nint bHandle = LoraAdapter.AllocAligned(inputDim);
+        nint aHandle = LoraAdapter.AllocAligned(outputDim);
+        b.CopyTo(new Span<float>((void*)bHandle, inputDim));
+        a.CopyTo(new Span<float>((void*)aHandle, outputDim));
+        adapter.AddLayerWeights(0, projection, new LoraLayerWeights(
+            AHandle: aHandle,
+            BHandle: bHandle,
+            InputDim: inputDim,
+            OutputDim: outputDim));
+        return adapter;
+    }
+
+    private static void AddOuterProduct(float[] matrix, int rows, int cols, float[] a, float[] b)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                matrix[r * cols + c] += a[r] * b[c];
     }
 
     /// <summary>

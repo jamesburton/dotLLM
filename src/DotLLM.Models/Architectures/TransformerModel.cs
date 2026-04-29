@@ -548,7 +548,9 @@ public sealed unsafe class TransformerModel : IModel
                         cachedKNope: _mlaKvState!.GetKNopePointer(layer),
                         cachedV: _mlaKvState.GetVPointer(layer),
                         cachedKPe: _mlaKvState.GetKPePointer(layer),
-                        cachedLength: _mlaKvState.GetCurrentLength(layer));
+                        cachedLength: _mlaKvState.GetCurrentLength(layer),
+                        loraAdapter: _currentAdapter,
+                        loraLayer: layer);
                     _mlaKvState.Advance(layer, seqLen);
                 }
 
@@ -760,7 +762,9 @@ public sealed unsafe class TransformerModel : IModel
                         sharedUpProj: moe.SharedUpProj,
                         sharedDownProj: moe.SharedDownProj,
                         sharedIntermediateSize: moe.SharedIntermediateSize,
-                        sharedExpertGate: sharedGateSpan);
+                        sharedExpertGate: sharedGateSpan,
+                        loraAdapter: _currentAdapter,
+                        loraLayer: layer);
                 }
                 else
                 {
@@ -775,7 +779,9 @@ public sealed unsafe class TransformerModel : IModel
                         numExpertsPerTok: moe.NumExpertsPerTok,
                         hiddenSize: hiddenSize,
                         intermediateSize: moe.IntermediateSize,
-                        seqLen: seqLen);
+                        seqLen: seqLen,
+                        loraAdapter: _currentAdapter,
+                        loraLayer: layer);
                 }
 
                 // Residual add (per token) → hidden. Same as dense path.

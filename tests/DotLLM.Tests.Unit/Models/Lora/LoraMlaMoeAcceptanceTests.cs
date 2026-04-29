@@ -79,6 +79,40 @@ public sealed class LoraMlaMoeAcceptanceTests
         Assert.True(adapter.IsCompatible(cfg));
     }
 
+    [Fact]
+    public void IsCompatible_AcceptsMlaSpecificProjectionNames()
+    {
+        var cfg = BuildMlaConfig();
+        using var adapter = new LoraAdapter(
+            "mla-specific", rank: 4, alpha: 8f,
+            targetModules: ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]);
+
+        Add(adapter, 0, "q_a_proj", cfg.HiddenSize, cfg.MlaConfig!.QLoraRank);
+        Add(adapter, 0, "q_b_proj", cfg.MlaConfig.QLoraRank,
+            cfg.NumAttentionHeads * (cfg.MlaConfig.QkNopeHeadDim + cfg.MlaConfig.QkRopeHeadDim));
+        Add(adapter, 0, "kv_a_proj_with_mqa", cfg.HiddenSize,
+            cfg.MlaConfig.KvLoraRank + cfg.MlaConfig.QkRopeHeadDim);
+        Add(adapter, 0, "kv_b_proj", cfg.MlaConfig.KvLoraRank,
+            cfg.NumAttentionHeads * (cfg.MlaConfig.QkNopeHeadDim + cfg.MlaConfig.VHeadDim));
+
+        Assert.True(adapter.IsCompatible(cfg));
+    }
+
+    [Fact]
+    public void IsCompatible_AcceptsPerExpertMoeProjectionNames()
+    {
+        var cfg = BuildMoeConfig();
+        using var adapter = new LoraAdapter(
+            "moe-specific", rank: 4, alpha: 8f,
+            targetModules: ["mlp.experts.1.gate_proj", "mlp.experts.1.up_proj", "mlp.experts.1.down_proj"]);
+
+        Add(adapter, 0, "mlp.experts.1.gate_proj", cfg.HiddenSize, cfg.Moe!.MoeIntermediateSize);
+        Add(adapter, 0, "mlp.experts.1.up_proj", cfg.HiddenSize, cfg.Moe.MoeIntermediateSize);
+        Add(adapter, 0, "mlp.experts.1.down_proj", cfg.Moe.MoeIntermediateSize, cfg.HiddenSize);
+
+        Assert.True(adapter.IsCompatible(cfg));
+    }
+
     /// <summary>
     /// Smoke test: the LoraAdapter dispose path must not leak when validation
     /// is bypassed for MLA / MoE base models.
@@ -112,5 +146,16 @@ public sealed class LoraMlaMoeAcceptanceTests
             AHandle: oA, BHandle: oB, InputDim: qOut, OutputDim: cfg.HiddenSize));
 
         return adapter;
+    }
+
+    private static void Add(LoraAdapter adapter, int layer, string projection, int inputDim, int outputDim)
+    {
+        nint b = LoraAdapter.AllocAligned((long)adapter.Rank * inputDim);
+        nint a = LoraAdapter.AllocAligned((long)outputDim * adapter.Rank);
+        adapter.AddLayerWeights(layer, projection, new LoraLayerWeights(
+            AHandle: a,
+            BHandle: b,
+            InputDim: inputDim,
+            OutputDim: outputDim));
     }
 }

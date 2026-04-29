@@ -99,21 +99,17 @@ public sealed class VulkanLoraAdapterUploadTests
     }
 
     [SkippableFact]
-    public unsafe void Upload_StripsNonStandardProjections()
+    public unsafe void Upload_IncludesMlaAndPerExpertProjections_ButStripsUnknownNames()
     {
-        // Adapters declaring out-of-scope target names (e.g. q_a_proj for
-        // MLA) should be silently skipped at upload — the validation that
-        // such adapters can't be used with the standard transformer path
-        // is handled by VulkanTransformerModel.ValidateAdapterForModel,
-        // not the upload layer.
+        // MLA-specific and per-expert MoE projection names are runtime
+        // supported and must upload. Truly unknown target names should still
+        // be silently skipped at upload.
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
 
         const int rank = 4, inputDim = 8, outputDim = 12;
-        using var adapter = new LoraAdapter("test", rank, alpha: 8f, ["q_proj", "q_a_proj"]);
-        // ILoraAdapter.IsCompatible would reject q_a_proj, but at the upload
-        // boundary we just need the upload path to drop the unknown name
-        // without an exception (caller validation guarantees no stray
-        // pointer reads).
+        using var adapter = new LoraAdapter("test", rank, alpha: 8f,
+            ["q_proj", "q_a_proj", "mlp.experts.0.gate_proj", "not_a_projection"]);
+
         nint b1 = LoraAdapter.AllocAligned((long)rank * inputDim);
         nint a1 = LoraAdapter.AllocAligned((long)outputDim * rank);
         new Span<float>((void*)b1, rank * inputDim).Clear();
@@ -121,7 +117,7 @@ public sealed class VulkanLoraAdapterUploadTests
         adapter.AddLayerWeights(0, "q_proj",
             new LoraLayerWeights(AHandle: a1, BHandle: b1, InputDim: inputDim, OutputDim: outputDim));
 
-        // Non-standard name — must be ignored by upload.
+        // MLA-specific name — must upload.
         nint b2 = LoraAdapter.AllocAligned((long)rank * inputDim);
         nint a2 = LoraAdapter.AllocAligned((long)outputDim * rank);
         new Span<float>((void*)b2, rank * inputDim).Clear();
@@ -129,11 +125,29 @@ public sealed class VulkanLoraAdapterUploadTests
         adapter.AddLayerWeights(0, "q_a_proj",
             new LoraLayerWeights(AHandle: a2, BHandle: b2, InputDim: inputDim, OutputDim: outputDim));
 
+        // Per-expert MoE name — must upload.
+        nint b3 = LoraAdapter.AllocAligned((long)rank * inputDim);
+        nint a3 = LoraAdapter.AllocAligned((long)outputDim * rank);
+        new Span<float>((void*)b3, rank * inputDim).Clear();
+        new Span<float>((void*)a3, outputDim * rank).Clear();
+        adapter.AddLayerWeights(0, "mlp.experts.0.gate_proj",
+            new LoraLayerWeights(AHandle: a3, BHandle: b3, InputDim: inputDim, OutputDim: outputDim));
+
+        // Unknown name — must be ignored by upload.
+        nint b4 = LoraAdapter.AllocAligned((long)rank * inputDim);
+        nint a4 = LoraAdapter.AllocAligned((long)outputDim * rank);
+        new Span<float>((void*)b4, rank * inputDim).Clear();
+        new Span<float>((void*)a4, outputDim * rank).Clear();
+        adapter.AddLayerWeights(0, "not_a_projection",
+            new LoraLayerWeights(AHandle: a4, BHandle: b4, InputDim: inputDim, OutputDim: outputDim));
+
         using var device = VulkanDevice.Create();
         using var vkLora = VulkanLoraAdapter.Upload(device, adapter);
 
         Assert.NotNull(vkLora.Get(0, "q_proj"));
-        Assert.Null(vkLora.Get(0, "q_a_proj"));
+        Assert.NotNull(vkLora.Get(0, "q_a_proj"));
+        Assert.NotNull(vkLora.Get(0, "mlp.experts.0.gate_proj"));
+        Assert.Null(vkLora.Get(0, "not_a_projection"));
     }
 
     /// <summary>

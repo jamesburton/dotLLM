@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Lora;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -62,6 +63,8 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
     /// <param name="intermediateSize">Per-expert MLP intermediate dimension (I).</param>
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
+    /// <param name="loraAdapter">Optional active LoRA adapter for per-expert projection deltas.</param>
+    /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     [SkipLocalsInit]
     public static void Execute(
         ReadOnlySpan<float> hidden,
@@ -74,7 +77,9 @@ public static unsafe class MoeSwiGluMlp
         int numExpertsPerTok,
         int hiddenSize,
         int intermediateSize,
-        int seqLen)
+        int seqLen,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         // Default overload keeps the Mixtral contract: always renormalise top-k,
         // no shared expert. Qwen-MoE / DeepSeek callers go through
@@ -86,7 +91,8 @@ public static unsafe class MoeSwiGluMlp
             sharedGateProj: ReadOnlySpan<nint>.Empty,
             sharedUpProj: ReadOnlySpan<nint>.Empty,
             sharedDownProj: ReadOnlySpan<nint>.Empty,
-            sharedIntermediateSize: 0, sharedExpertGate: default);
+            sharedIntermediateSize: 0, sharedExpertGate: default,
+            loraAdapter, loraLayer);
     }
 
     /// <summary>
@@ -126,6 +132,8 @@ public static unsafe class MoeSwiGluMlp
     /// Optional F32 [hiddenSize] sigmoid-gate weight. Length 0 → no sigmoid
     /// scaling (DeepSeek; Qwen-MoE variants without <c>shared_expert_gate</c>).
     /// </param>
+    /// <param name="loraAdapter">Optional active LoRA adapter for routed per-expert projection deltas.</param>
+    /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     [SkipLocalsInit]
     public static void ExecuteWithSharedExpert(
         ReadOnlySpan<float> hidden,
@@ -144,14 +152,17 @@ public static unsafe class MoeSwiGluMlp
         ReadOnlySpan<nint> sharedUpProj,
         ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
-        ReadOnlySpan<float> sharedExpertGate)
+        ReadOnlySpan<float> sharedExpertGate,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         ExecuteCoreGrouped(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
             numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
             normTopKProb,
             sharedGateProj, sharedUpProj, sharedDownProj,
-            sharedIntermediateSize, sharedExpertGate);
+            sharedIntermediateSize, sharedExpertGate,
+            loraAdapter, loraLayer);
     }
 
     /// <summary>
@@ -179,7 +190,9 @@ public static unsafe class MoeSwiGluMlp
         ReadOnlySpan<nint> sharedUpProj,
         ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
-        ReadOnlySpan<float> sharedExpertGate)
+        ReadOnlySpan<float> sharedExpertGate,
+        ILoraAdapter? loraAdapter,
+        int loraLayer)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -395,6 +408,10 @@ public static unsafe class MoeSwiGluMlp
                     //   gate[batch,I] = batchIn[batch,H] × w1[I,H]^T
                     MatMul.GemmF32(w1, batchInPtr, gateBatchPtr, intermediateSize, hiddenSize, batch);
                     MatMul.GemmF32(w3, batchInPtr, upBatchPtr, intermediateSize, hiddenSize, batch);
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "gate_proj"),
+                        batchInPtr, gateBatchPtr, batch, hiddenSize, intermediateSize);
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
+                        batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
 
                     // Per-row SwiGLU (fuse identical to scalar path).
                     var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
@@ -411,6 +428,8 @@ public static unsafe class MoeSwiGluMlp
 
                     //   down[batch,H] = silu[batch,I] × w2[H,I]^T
                     MatMul.GemmF32(w2, siluBatchPtr, downBatchPtr, hiddenSize, intermediateSize, batch);
+                    ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "down_proj"),
+                        siluBatchPtr, downBatchPtr, batch, intermediateSize, hiddenSize);
 
                     // Scatter each row of down to scatterDown[(t*k + slot)*H].
                     for (int b = 0; b < batch; b++)
@@ -580,6 +599,34 @@ public static unsafe class MoeSwiGluMlp
             if (sharedScaleBuf is not null) ArrayPool<float>.Shared.Return(sharedScaleBuf);
             ArrayPool<float>.Shared.Return(accBuf);
         }
+    }
+
+    private static string ExpertProjectionName(int expert, string projection)
+        => $"mlp.experts.{expert}.{projection}";
+
+    private static void ApplyLoraDelta(
+        ILoraAdapter? adapter,
+        int layer,
+        string projection,
+        float* input,
+        float* output,
+        int seqLen,
+        int inputDim,
+        int outputDim)
+    {
+        if (adapter is null || layer < 0) return;
+        var lora = adapter.GetLayerWeights(layer, projection);
+        if (lora is not { } w) return;
+        if (w.InputDim != inputDim || w.OutputDim != outputDim)
+            throw new InvalidOperationException(
+                $"LoRA adapter '{adapter.Name}' layer={layer} proj='{projection}' shape "
+                + $"({w.InputDim}x{w.OutputDim}) does not match MoE projection "
+                + $"({inputDim}x{outputDim}).");
+
+        float scale = adapter.Alpha / adapter.Rank;
+        LoraDelta.Apply(input, (void*)w.BHandle, (void*)w.AHandle, output,
+            seqLen, inputDim, outputDim, adapter.Rank, scale,
+            w.WeightDType, w.WeightDType);
     }
 
     /// <summary>
