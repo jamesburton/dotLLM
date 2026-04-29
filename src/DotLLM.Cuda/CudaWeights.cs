@@ -203,19 +203,19 @@ internal sealed class CudaWeights : IDisposable
             outputNorm = UploadNormWeight(cpuWeights.OutputNormWeight, allocs, kernels, stream);
 
             // LM head — too large for the per-projection dequant scratch (vocabSize × hiddenSize).
-            // Create a persistent FP16 copy unless it has a custom quantized GEMV kernel
-            // (Q8_0/Q4_K/Q6_K can use quantized GEMV directly → no FP16 copy needed).
-            bool lmHeadHasGemv = CudaKernels.HasQuantizedGemv(cpuWeights.OutputQuantType);
+            // Create a persistent FP16 copy unless the runtime has a loaded
+            // quantized GEMV implementation for this type.
+            bool lmHeadHasGemv = kernels.HasLoadedQuantizedGemv(cpuWeights.OutputQuantType);
             outputWeight = (!IsQuantized(cpuWeights.OutputQuantType) || !lmHeadHasGemv)
                 ? UploadAndDequant(cpuWeights.OutputWeight, cpuWeights.OutputQuantType,
                     cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim, allocs, kernels, stream)
                 : 0;
         }
 
-        // Per-layer weights — skip persistent FP16 copies only for types with custom
-        // quantized GEMV kernels (Q8_0, Q4_K, Q6_K). These can dequant on-the-fly into
+        // Per-layer weights — skip persistent FP16 copies only for types with loaded
+        // quantized GEMV kernels. These can dequant on-the-fly into
         // a scratch buffer for prefill GEMM, and use the GEMV kernel directly for decode.
-        // All other types (Q5_0, Q4_0, Q5_K, F16, F32) keep a persistent FP16 copy.
+        // All other types keep a persistent FP16 copy.
         // In hybrid mode, only upload the first layerCount layers.
         var layers = new CudaLayerWeights[layerCount];
 
@@ -249,10 +249,10 @@ internal sealed class CudaWeights : IDisposable
             nint qNorm = 0, kNorm = 0;
             if (!isMlaLayer)
             {
-                q = SkipFp16(lw.QQuantType) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
-                k = SkipFp16(lw.KQuantType) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
-                v = SkipFp16(lw.VQuantType) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
-                o = SkipFp16(lw.OQuantType) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
+                q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
+                k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
+                v = SkipFp16(lw.VQuantType, kernels) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
+                o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
 
                 // ── Upload raw quantized Q/K/V weights ──
                 // When fusion is possible (shared quant type + input dim, GEMV kernel exists),
@@ -263,12 +263,15 @@ internal sealed class CudaWeights : IDisposable
                 // work unchanged because they only read `outputDim` rows starting at the
                 // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
                 // was previously double-stored. Only the packed allocation is in `allocs`.
-                (qkvPacked, qkvPackedQt, qkvPackedOut,
-                 qQuant, kQuant, vQuant) = TryUploadPackedThree(
-                    lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
-                    lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
-                    lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                    allocs);
+                if (!CudaKernels.DisablePackedQkv)
+                {
+                    (qkvPacked, qkvPackedQt, qkvPackedOut,
+                     qQuant, kQuant, vQuant) = TryUploadPackedThree(
+                        lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim,
+                        lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
+                        lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                        allocs, kernels);
+                }
                 if (qkvPacked == 0)
                 {
                     // Fusion not possible — fall back to per-tensor uploads (separate allocations).
@@ -293,16 +296,19 @@ internal sealed class CudaWeights : IDisposable
             nint gateBias = 0, upBias = 0, downBias = 0;
             if (!isMoeLayer)
             {
-                gate = SkipFp16(lw.GateQuantType) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
-                up = SkipFp16(lw.UpQuantType) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
-                down = SkipFp16(lw.DownQuantType) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
+                gate = SkipFp16(lw.GateQuantType, kernels) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
+                up = SkipFp16(lw.UpQuantType, kernels) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
+                down = SkipFp16(lw.DownQuantType, kernels) ? 0 : UploadAndDequant(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim, allocs, kernels, stream);
 
                 // ── Upload raw quantized Gate/Up weights (same packing strategy as Q/K/V) ──
-                (gateUpPacked, gateUpPackedQt, gateUpPackedOut,
-                 gateQuant, upQuant) = TryUploadPackedTwo(
-                    lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
-                    lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
-                    allocs);
+                if (!CudaKernels.DisablePackedGateUp)
+                {
+                    (gateUpPacked, gateUpPackedQt, gateUpPackedOut,
+                     gateQuant, upQuant) = TryUploadPackedTwo(
+                        lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim,
+                        lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim,
+                        allocs, kernels);
+                }
                 if (gateUpPacked == 0)
                 {
                     gateQuant = UploadQuantized(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs);
@@ -391,7 +397,7 @@ internal sealed class CudaWeights : IDisposable
     /// Conditions for packing (must all hold):
     ///  - all three weights are quantized (skip F16/F32 — those don't get a quant copy)
     ///  - all three share the same quantization type
-    ///  - that type has a custom quantized-GEMV kernel (the only consumer of these pointers)
+    ///  - that type has a loaded quantized-GEMV kernel (the only consumer of these pointers)
     ///  - the input dim (K) matches across all three
     /// </para>
     /// <para>
@@ -413,11 +419,11 @@ internal sealed class CudaWeights : IDisposable
         nint qHost, QuantizationType qQt, int qOut, int qIn,
         nint kHost, QuantizationType kQt, int kOut, int kIn,
         nint vHost, QuantizationType vQt, int vOut, int vIn,
-        List<nint> allocs)
+        List<nint> allocs, CudaKernels kernels)
     {
         if (qQt is QuantizationType.F16 or QuantizationType.F32) return default;
         if (qQt != kQt || qQt != vQt) return default;
-        if (!CudaKernels.HasQuantizedGemv(qQt)) return default;
+        if (!kernels.HasLoadedQuantizedGemv(qQt)) return default;
         if (qIn != kIn || qIn != vIn) return default;
 
         long rowBytes = Dequantize.RowByteSize(qIn, qQt);
@@ -448,11 +454,11 @@ internal sealed class CudaWeights : IDisposable
                     nint ASlice, nint BSlice) TryUploadPackedTwo(
         nint aHost, QuantizationType aQt, int aOut, int aIn,
         nint bHost, QuantizationType bQt, int bOut, int bIn,
-        List<nint> allocs)
+        List<nint> allocs, CudaKernels kernels)
     {
         if (aQt is QuantizationType.F16 or QuantizationType.F32) return default;
         if (aQt != bQt) return default;
-        if (!CudaKernels.HasQuantizedGemv(aQt)) return default;
+        if (!kernels.HasLoadedQuantizedGemv(aQt)) return default;
         if (aIn != bIn) return default;
 
         long rowBytes = Dequantize.RowByteSize(aIn, aQt);
@@ -544,13 +550,13 @@ internal sealed class CudaWeights : IDisposable
 
     /// <summary>
     /// Whether to skip the persistent FP16 copy for this quant type.
-    /// Only skip when we have BOTH a custom quantized GEMV kernel (for decode)
+    /// Only skip when we have BOTH a loaded custom quantized GEMV kernel (for decode)
     /// AND a dequant-to-F16 kernel (for on-the-fly prefill GEMM via scratch buffer).
-    /// Types without a custom GEMV (Q5_0, Q4_0, Q5_K) keep persistent FP16
+    /// Types without a loaded custom GEMV keep persistent FP16
     /// because the scratch buffer approach requires cuBLAS fallback.
     /// </summary>
-    private static bool SkipFp16(QuantizationType qt) =>
-        CudaKernels.HasQuantizedGemv(qt); // Q8_0, Q4_K, Q6_K only
+    private static bool SkipFp16(QuantizationType qt, CudaKernels kernels) =>
+        kernels.HasLoadedQuantizedGemv(qt);
 
     /// <summary>Allocate device memory and copy host data.</summary>
     private static nint AllocAndUpload(nint hostPtr, long bytes, List<nint> allocs)

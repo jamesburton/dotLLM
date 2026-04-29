@@ -30,6 +30,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _perHeadRmsNormModule;
     private readonly CudaModule _convertModule;
     private readonly CudaModule _dequantModule;
+    private readonly CudaModule? _dequantIQuantsModule;
     private readonly CudaModule _quantizedGemvModule;
     private readonly CudaModule _fusedAddRmsNormModule;
     private readonly CudaModule _rmsnormF32InModule;
@@ -47,12 +48,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmqFunc;
     private readonly nint _quantizedGemvQ5_KMmqFunc;
     private readonly nint _quantizedGemvQ6_KMmqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmqFunc;
     // MMVQ-large variants — 1 row per CUDA block, 128 threads (4 warps).
     // Tuned for k≥1024 (≥4 super-blocks/row); fall back to MMQ-4-rows for smaller k.
     private readonly nint _quantizedGemvQ2_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmvqLargeFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmvqLargeFunc;
     // Pre-Q8_1 variants. Read INT8/dx/sx2 from device-resident scratch (populated
     // once per fused projection group via _quantizeXToQ8_1Func) instead of
     // re-quantizing the input inside every CUDA block. Eliminates the redundant
@@ -63,10 +68,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ6_KMmqPreqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmqPreqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmqPreqFunc;
     private readonly nint _quantizedGemvQ2_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
     /// <summary>
     /// Device's maximum opt-in dynamic shared-memory bytes per block (queried once at
     /// kernel-load via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN). The
@@ -112,6 +121,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ5_0Func;
     private readonly nint _quantizedGemvQ5_KFunc;
     private readonly nint _quantizedGemvQ6_KFunc;
+    private readonly nint _quantizedGemvIQ4_NLFunc;
+    private readonly nint _quantizedGemvIQ4_XSFunc;
     private readonly nint _dequantQ8_0Func;
     private readonly nint _dequantQ4_0Func;
     private readonly nint _dequantQ4_1Func;
@@ -121,7 +132,12 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantQ3_KFunc;
     private readonly nint _dequantQ4_KFunc;
     private readonly nint _dequantQ5_KFunc;
+    private readonly nint _dequantQ5_KF32Func;
     private readonly nint _dequantQ6_KFunc;
+    private readonly nint _dequantIQ4_NLFunc;
+    private readonly nint _dequantIQ4_XSFunc;
+    private readonly nint _dequantIQ4_NLF32Func;
+    private readonly nint _dequantIQ4_XSF32Func;
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -220,6 +236,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeGroupedGemvQ5_KFunc;
     private readonly nint _moeGroupedGemvQ6_KFunc;
     private readonly nint _moeGroupedGemvQ8_0Func;
+    private readonly nint _moeGroupedGemvIQ4_NLFunc;
+    private readonly nint _moeGroupedGemvIQ4_XSFunc;
 
 
     /// <summary>
@@ -262,6 +280,8 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ2_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq");
             _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
             _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
+            _quantizedGemvIQ4_NLMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmq");
+            _quantizedGemvIQ4_XSMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmq");
             // MMVQ-large variants (k≥1024). TryGetFunction so a stale PTX without the
             // new kernels still loads — HasMmvqLarge* will report false and the dispatcher
             // will fall back to the MMQ-4-rows path.
@@ -269,16 +289,22 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
             _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
+            _quantizedGemvIQ4_NLMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large");
+            _quantizedGemvIQ4_XSMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large");
             // Pre-quantized GEMV variants (consume scratch from quantize_x.ptx kernel).
             // TryGetFunction so a stale PTX without the new symbols still loads.
             _quantizedGemvQ2_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq_preq");
             _quantizedGemvQ4_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_preq");
             _quantizedGemvQ5_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq_preq");
             _quantizedGemvQ6_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq_preq");
+            _quantizedGemvIQ4_NLMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmq_preq");
+            _quantizedGemvIQ4_XSMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmq_preq");
             _quantizedGemvQ2_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmvq_large_preq");
             _quantizedGemvQ4_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large_preq");
             _quantizedGemvQ5_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large_preq");
             _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
+            _quantizedGemvIQ4_NLMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large_preq");
+            _quantizedGemvIQ4_XSMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large_preq");
 
             // The on-the-fly MMQ kernels size their per-chunk Stage 1 scratch (s_xq/s_dx/s_sx[2])
             // dynamically from `k`. For k up to ~12 KiB-shmem-worth (Qwen3-8B intermediate=12288)
@@ -297,10 +323,14 @@ public sealed unsafe class CudaKernels : IDisposable
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmvqLargeFunc, optIn);
             }
         }
 
@@ -351,6 +381,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvQ5_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q5_0");
         _quantizedGemvQ5_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q5_k");
         _quantizedGemvQ6_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q6_k");
+        _quantizedGemvIQ4_NLFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_iq4_nl");
+        _quantizedGemvIQ4_XSFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_iq4_xs");
         _dequantQ8_0Func = _dequantModule.GetFunction("dequant_q8_0_f16");
         _dequantQ4_0Func = _dequantModule.GetFunction("dequant_q4_0_f16");
         _dequantQ4_1Func = _dequantModule.TryGetFunction("dequant_q4_1_f16");
@@ -362,7 +394,18 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantQ3_KFunc = _dequantModule.TryGetFunction("dequant_q3_k_f16");
         _dequantQ4_KFunc = _dequantModule.GetFunction("dequant_q4_k_f16");
         _dequantQ5_KFunc = _dequantModule.GetFunction("dequant_q5_k_f16");
+        _dequantQ5_KF32Func = _dequantModule.TryGetFunction("dequant_q5_k_f32");
         _dequantQ6_KFunc = _dequantModule.GetFunction("dequant_q6_k_f16");
+
+        string dequantIQuantsPath = Path.Combine(ptxDir, "dequant_iquants.ptx");
+        if (File.Exists(dequantIQuantsPath))
+        {
+            _dequantIQuantsModule = CudaModule.LoadFromFile(dequantIQuantsPath);
+            _dequantIQ4_NLFunc = _dequantIQuantsModule.TryGetFunction("dequant_iq4_nl_f16");
+            _dequantIQ4_XSFunc = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f16");
+            _dequantIQ4_NLF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_nl_f32");
+            _dequantIQ4_XSF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f32");
+        }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
         string quantKvPath = Path.Combine(ptxDir, "quant_kv.ptx");
@@ -467,6 +510,8 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeGroupedGemvQ5_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q5_k_f16");
             _moeGroupedGemvQ6_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q6_k_f16");
             _moeGroupedGemvQ8_0Func = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q8_0_f16");
+            _moeGroupedGemvIQ4_NLFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_nl_f16");
+            _moeGroupedGemvIQ4_XSFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_xs_f16");
         }
     }
 
@@ -528,10 +573,36 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMoeGroupedGemvQ8_0 =>
         _moeGroupedGemvQ8_0Func != 0 && !DisableMoeGroupedGemv;
 
+    /// <summary>True when the MoE grouped IQ4_NL GEMV kernel is loaded and enabled.</summary>
+    public bool HasMoeGroupedGemvIQ4_NL =>
+        _moeGroupedGemvIQ4_NLFunc != 0 && !DisableMoeGroupedGemv;
+
+    /// <summary>True when the MoE grouped IQ4_XS GEMV kernel is loaded and enabled.</summary>
+    public bool HasMoeGroupedGemvIQ4_XS =>
+        _moeGroupedGemvIQ4_XSFunc != 0 && !DisableMoeGroupedGemv;
+
     /// <summary>Disable the Phase-B grouped-GEMV path. Forces the per-expert
     /// <see cref="LaunchQuantizedGemv"/> fallback in <see cref="CudaMoeFfn"/>.</summary>
     public static bool DisableMoeGroupedGemv { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MOE_GROUPED_GEMV") == "1";
+
+    /// <summary>Force direct GEMV path, disabling MMQ and MMVQ-Large variants.
+    /// Useful for diagnostics to isolate dequant vs advanced GEMV kernels.
+    /// Set environment variable DOTLLM_FORCE_DIRECT_GEMV=1 to enable.</summary>
+    public static bool ForceDirectGemv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_FORCE_DIRECT_GEMV") == "1";
+
+    /// <summary>Force dequant-then-cuBLAS fallback instead of quantized GEMV.</summary>
+    public static bool DisableQuantizedGemv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_QUANTIZED_GEMV") == "1";
+
+    /// <summary>Disable decode-time packed QKV upload/dispatch for diagnostics.</summary>
+    public static bool DisablePackedQkv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PACKED_QKV") == "1";
+
+    /// <summary>Disable decode-time packed Gate/Up upload/dispatch for diagnostics.</summary>
+    public static bool DisablePackedGateUp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PACKED_GATEUP") == "1";
 
     /// <summary>True when a grouped-GEMV kernel is available for the given quant type.</summary>
     public bool HasMoeGroupedGemv(QuantizationType qt) => qt switch
@@ -541,6 +612,8 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q5_K => HasMoeGroupedGemvQ5K,
         QuantizationType.Q6_K => HasMoeGroupedGemvQ6K,
         QuantizationType.Q8_0 => HasMoeGroupedGemvQ8_0,
+        QuantizationType.IQ4_NL => HasMoeGroupedGemvIQ4_NL,
+        QuantizationType.IQ4_XS => HasMoeGroupedGemvIQ4_XS,
         _ => false,
     };
 
@@ -1248,6 +1321,8 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.Q5_0 => _quantizedGemvQ5_0Func,
             QuantizationType.Q5_K => _quantizedGemvQ5_KFunc,
             QuantizationType.Q6_K => _quantizedGemvQ6_KFunc,
+            QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLFunc,
+            QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSFunc,
             _ => 0
         };
 
@@ -1265,7 +1340,33 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K;
+            or QuantizationType.Q2_K
+            or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS;
+
+    /// <summary>
+    /// True when the legacy per-row quantized GEMV kernel function is loaded for
+    /// the given type. Unlike <see cref="HasQuantizedGemv"/>, this is runtime PTX
+    /// capability, not static type-support metadata.
+    /// </summary>
+    public bool HasQuantizedGemvKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q8_0 => !DisableQuantizedGemv && _quantizedGemvQ8_0Func != 0,
+        QuantizationType.Q2_K => !DisableQuantizedGemv && _quantizedGemvQ2_KFunc != 0,
+        QuantizationType.Q4_K => !DisableQuantizedGemv && _quantizedGemvQ4_KFunc != 0,
+        QuantizationType.Q5_0 => !DisableQuantizedGemv && _quantizedGemvQ5_0Func != 0,
+        QuantizationType.Q5_K => !DisableQuantizedGemv && _quantizedGemvQ5_KFunc != 0,
+        QuantizationType.Q6_K => !DisableQuantizedGemv && _quantizedGemvQ6_KFunc != 0,
+        QuantizationType.IQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLFunc != 0,
+        QuantizationType.IQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSFunc != 0,
+        _ => false,
+    };
+
+    /// <summary>
+    /// True when any loaded decode-time quantized GEMV implementation can execute
+    /// this type (MMQ/MMVQ-large or the legacy per-row kernel).
+    /// </summary>
+    public bool HasLoadedQuantizedGemv(QuantizationType qt) =>
+        HasMmq(qt) || HasQuantizedGemvKernel(qt);
 
     /// <summary>
     /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
@@ -1285,10 +1386,10 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         QuantizationType.Q4_0 or QuantizationType.Q4_1
             or QuantizationType.Q5_0 or QuantizationType.Q5_1
-            or QuantizationType.Q8_0 => 32,
+            or QuantizationType.Q8_0 or QuantizationType.IQ4_NL => 32,
         QuantizationType.Q3_K or QuantizationType.Q4_K
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K => 256,
+            or QuantizationType.Q2_K or QuantizationType.IQ4_XS => 256,
         _ => int.MaxValue,  // unsupported types — gate always fails
     };
 
@@ -1327,6 +1428,8 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.Q5_K => _moeGroupedGemvQ5_KFunc,
             QuantizationType.Q6_K => _moeGroupedGemvQ6_KFunc,
             QuantizationType.Q8_0 => _moeGroupedGemvQ8_0Func,
+            QuantizationType.IQ4_NL => _moeGroupedGemvIQ4_NLFunc,
+            QuantizationType.IQ4_XS => _moeGroupedGemvIQ4_XSFunc,
             _ => 0,
         };
         if (func == 0)
@@ -1344,16 +1447,22 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>True when the MMQ-style Q2_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ2K => _quantizedGemvQ2_KMmqFunc != 0 && !DisableMmqQ2K;
+    public bool HasMmqQ2K => _quantizedGemvQ2_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ2K;
 
     /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
+    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableQuantizedGemv && !DisableMmqQ4K;
 
     /// <summary>True when the MMQ-style Q5_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableMmqQ5K;
+    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ5K;
 
     /// <summary>True when the MMQ-style Q6_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
+    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ6K;
+
+    /// <summary>True when the MMQ-style IQ4_NL GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqIQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLMmqFunc != 0;
+
+    /// <summary>True when the MMQ-style IQ4_XS GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqIQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSMmqFunc != 0;
 
     /// <summary>True when the MMVQ-large Q2_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ2K => _quantizedGemvQ2_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ2K;
@@ -1370,6 +1479,12 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>True when the MMVQ-large Q6_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ6K => _quantizedGemvQ6_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ6K;
+
+    /// <summary>True when the MMVQ-large IQ4_NL GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeIQ4_NL => _quantizedGemvIQ4_NLMmvqLargeFunc != 0 && !DisableMmvqLargeIQ4_NL;
+
+    /// <summary>True when the MMVQ-large IQ4_XS GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeIQ4_XS => _quantizedGemvIQ4_XSMmvqLargeFunc != 0 && !DisableMmvqLargeIQ4_XS;
 
     /// <summary>True when the pre-Q8_1 input-quantization kernel is loaded and not disabled.
     /// When this is on (default) and a scratch buffer is provided to the MMQ GEMV launcher,
@@ -1406,6 +1521,14 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool DisableMmvqLargeQ6K { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q6K") == "1";
 
+    /// <summary>Disable MMVQ-large routing for IQ4_NL.</summary>
+    public static bool DisableMmvqLargeIQ4_NL { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_IQ4_NL") == "1";
+
+    /// <summary>Disable MMVQ-large routing for IQ4_XS.</summary>
+    public static bool DisableMmvqLargeIQ4_XS { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_IQ4_XS") == "1";
+
     /// <summary>Disable pre-Q8_1 input quantization (falls back to on-the-fly Stage 1 in every GEMV).</summary>
     /// <remarks>Useful for A/B comparison or when the model's max k makes the pre-quant scratch
     /// buffer awkward to size. Default off — pre-Q8_1 is the recommended path.</remarks>
@@ -1419,6 +1542,8 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q4_K => HasMmqQ4K,
         QuantizationType.Q5_K => HasMmqQ5K,
         QuantizationType.Q6_K => HasMmqQ6K,
+        QuantizationType.IQ4_NL => HasMmqIQ4_NL,
+        QuantizationType.IQ4_XS => HasMmqIQ4_XS,
         _ => false,
     };
 
@@ -1429,6 +1554,32 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q4_K => HasMmvqLargeQ4K,
         QuantizationType.Q5_K => HasMmvqLargeQ5K,
         QuantizationType.Q6_K => HasMmvqLargeQ6K,
+        QuantizationType.IQ4_NL => HasMmvqLargeIQ4_NL,
+        QuantizationType.IQ4_XS => HasMmvqLargeIQ4_XS,
+        _ => false,
+    };
+
+    /// <summary>True when the 4-rows pre-Q8_1 MMQ variant is loaded for the given quantization type.</summary>
+    public bool HasMmqPreq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q2_K => _quantizedGemvQ2_KMmqPreqFunc != 0,
+        QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc != 0,
+        QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc != 0,
+        QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc != 0,
+        QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqPreqFunc != 0,
+        QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqPreqFunc != 0,
+        _ => false,
+    };
+
+    /// <summary>True when the MMVQ-large pre-Q8_1 variant is loaded for the given quantization type.</summary>
+    public bool HasMmvqLargePreq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargePreqFunc != 0,
+        QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargePreqFunc != 0,
+        QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargePreqFunc != 0,
         _ => false,
     };
 
@@ -1489,8 +1640,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <item>k &lt; 1024: MMQ-4-rows kernel — 4 rows per block, 256 threads, cross-row reduction.
     /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
     /// </list>
-    /// Supports Q2_K, Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>. All four
-    /// quant types have full MMQ + MMVQ-large coverage in both on-the-fly and pre-Q8_1 modes.
+    /// Supports Q2_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS — gate the call with
+    /// <see cref="HasMmq"/>. These quant types have MMQ + MMVQ-large coverage in both
+    /// on-the-fly and pre-Q8_1 modes when the corresponding PTX symbols are present.
     /// On-the-fly Stage 1 input quantization. Use the overload taking a <c>preqScratch</c>
     /// pointer for the pre-Q8_1 path (eliminates per-block redundant Stage 1).
     /// </summary>
@@ -1519,28 +1671,35 @@ public sealed unsafe class CudaKernels : IDisposable
         // force the MMQ-4-rows path for A/B comparison without bypassing dp4a entirely.
         if (k >= MmvqLargeKThreshold && HasMmvqLarge(qt))
         {
-            nint largeFunc = usePreq
+            nint largePreqFunc = usePreq
                 ? qt switch
                 {
                     QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargePreqFunc,
                     QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargePreqFunc,
                     QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargePreqFunc,
                     QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargePreqFunc,
+                    QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargePreqFunc,
+                    QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargePreqFunc,
                     _ => 0,
                 }
-                : qt switch
-                {
-                    QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargeFunc,
-                    QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
-                    QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
-                    QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
-                    _ => 0,
-                };
+                : 0;
+            nint largeOnTheFlyFunc = qt switch
+            {
+                QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargeFunc,
+                QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
+                QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
+                QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargeFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargeFunc,
+                _ => 0,
+            };
+            bool useLargePreq = largePreqFunc != 0;
+            nint largeFunc = useLargePreq ? largePreqFunc : largeOnTheFlyFunc;
             if (largeFunc != 0)
             {
                 // Must mirror MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu.
                 const uint MmvqLargeThreads = 128;
-                if (usePreq)
+                if (useLargePreq)
                 {
                     int numChunks = k >> 5;
                     nint xqPtr  = preqScratch;
@@ -1576,6 +1735,8 @@ public sealed unsafe class CudaKernels : IDisposable
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqPreqFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqPreqFunc,
                 _ => 0,
             }
             : qt switch
@@ -1584,6 +1745,8 @@ public sealed unsafe class CudaKernels : IDisposable
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqFunc,
                 _ => 0,
             };
 
@@ -1663,6 +1826,68 @@ public sealed unsafe class CudaKernels : IDisposable
         int numChunks = k >> 5;
         int bytesPerChunk = (qt == QuantizationType.Q6_K || qt == QuantizationType.Q2_K) ? 38 : 36;
         return numChunks * bytesPerChunk;
+    }
+
+    /// <summary>Dequantize a weight matrix to FP32 on the GPU.</summary>
+    public void LaunchDequantToF32(nint src, QuantizationType srcDtype,
+                                     nint dst, int totalElements, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+
+        switch (srcDtype)
+        {
+            case QuantizationType.F32:
+                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)(totalElements * sizeof(float))).ThrowOnError();
+                return;
+
+            case QuantizationType.F16:
+                LaunchConvertF16ToF32(src, dst, totalElements, stream);
+                return;
+
+            case QuantizationType.IQ4_NL:
+            {
+                if (_dequantIQ4_NLF32Func == 0)
+                    break;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_XS:
+            {
+                if (_dequantIQ4_XSF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_XSF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.Q5_K:
+            {
+                if (_dequantQ5_KF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantQ5_KF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+        }
+
+        throw new NotSupportedException($"GPU FP32 dequantization not supported directly for {srcDtype}.");
     }
 
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>
@@ -1767,6 +1992,38 @@ public sealed unsafe class CudaKernels : IDisposable
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
                 uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantQ2_KFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_NL:
+            {
+                if (_dequantIQ4_NLFunc == 0)
+                    throw new InvalidOperationException(
+                        "IQ4_NL dequant kernel not present in dequant_iquants.ptx - rebuild PTX from " +
+                        "native/kernels/dequant_iquants.cu.");
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min(totalBlocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_XS:
+            {
+                if (_dequantIQ4_XSFunc == 0)
+                    throw new InvalidOperationException(
+                        "IQ4_XS dequant kernel not present in dequant_iquants.ptx - rebuild PTX from " +
+                        "native/kernels/dequant_iquants.cu.");
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_XSFunc,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -2510,6 +2767,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormModule.Dispose();
         _convertModule.Dispose();
         _dequantModule.Dispose();
+        _dequantIQuantsModule?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();

@@ -34,6 +34,7 @@
     <!-- compute_75 = Turing, the CUDA 13 floor (CUDA 13 dropped Pascal/Volta sm_61/7.0).
          PTX is forward-compatible so this runs on Turing/Ampere/Ada/Hopper/Blackwell. -->
     <CudaArch>compute_75</CudaArch>
+    <CudaAllowUnsupportedCompiler Condition="'$(DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER)' == '1'">-allow-unsupported-compiler</CudaAllowUnsupportedCompiler>
   </PropertyGroup>
 
   <!-- All .cu kernel files, default to precise math -->
@@ -79,7 +80,7 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 

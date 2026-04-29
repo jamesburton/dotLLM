@@ -34,6 +34,19 @@ internal sealed class CudaForwardState : IDisposable
     public nint FfnUp;          // [seqLen, intermediateSize]
     public nint SiluOutput;     // [seqLen, intermediateSize]
 
+    // Optional high-precision activation buffers. Used by correctness paths
+    // where cumulative FP16 activation truncation dominates real-model parity.
+    public nint HiddenStateF32;  // [seqLen, hiddenSize]
+    public nint ResidualF32;     // [seqLen, hiddenSize]
+    public nint NormOutputF32;   // [seqLen, hiddenSize]
+    public nint QF32;            // [seqLen, numHeads * headDim]
+    public nint KF32;            // [seqLen, numKvHeads * headDim]
+    public nint VF32;            // [seqLen, numKvHeads * headDim]
+    public nint AttnOutputF32;   // [seqLen, numHeads * headDim]
+    public nint FfnGateF32;      // [seqLen, intermediateSize]
+    public nint FfnUpF32;        // [seqLen, intermediateSize]
+    public nint SiluOutputF32;   // [seqLen, intermediateSize]
+
     // Fused-projection scratches — written by a single packed quantized GEMV
     // when the layer has CudaLayerWeights.QkvPacked / GateUpPacked set.
     // Decode-only: only safe when seqLen==1 because consumers downstream
@@ -53,6 +66,7 @@ internal sealed class CudaForwardState : IDisposable
     // for cuBLAS GEMM. Sized for the largest projection (max of Gate/Up/Down/Q/O).
     // Reused across all cuBLAS calls — safe because all ops are on the same stream.
     public nint DequantScratch;
+    public nint DequantScratchF32;
 
     // Pre-Q8_1 input quantization scratch (single buffer per forward state, sized
     // for the largest GEMV input vector across all call sites in the model).
@@ -88,6 +102,7 @@ internal sealed class CudaForwardState : IDisposable
             (long)Math.Max(numHeads * headDim, numKvHeads * headDim) * hiddenSize,
             (long)intermediateSize * hiddenSize);
         DequantScratch = AllocDevice(maxProjectionElements * sizeof(ushort));
+        DequantScratchF32 = AllocDevice(maxProjectionElements * sizeof(float));
 
         // Fused decode scratches (seqLen=1 only). Sized once — tiny.
         long qkvPackedFp16Bytes = (long)(numHeads * headDim + 2 * numKvHeads * headDim) * sizeof(ushort);
@@ -133,6 +148,16 @@ internal sealed class CudaForwardState : IDisposable
         FfnGate = AllocDevice((long)newCapacity * _intermediateSize * half);
         FfnUp = AllocDevice((long)newCapacity * _intermediateSize * half);
         SiluOutput = AllocDevice((long)newCapacity * _intermediateSize * half);
+        HiddenStateF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        ResidualF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        NormOutputF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
+        QF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
+        KF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+        VF32 = AllocDevice((long)newCapacity * _numKvHeads * _headDim * sizeof(float));
+        AttnOutputF32 = AllocDevice((long)newCapacity * _numHeads * _headDim * sizeof(float));
+        FfnGateF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
+        FfnUpF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
+        SiluOutputF32 = AllocDevice((long)newCapacity * _intermediateSize * sizeof(float));
         // General scratch: must fit largest projection output or LM head logits
         long maxPerLayer = (long)newCapacity * Math.Max(Math.Max(_numHeads * _headDim, _intermediateSize), _hiddenSize);
         long maxLmHead = _vocabSize;
@@ -171,6 +196,16 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref FfnGate);
         FreeIfNonZero(ref FfnUp);
         FreeIfNonZero(ref SiluOutput);
+        FreeIfNonZero(ref HiddenStateF32);
+        FreeIfNonZero(ref ResidualF32);
+        FreeIfNonZero(ref NormOutputF32);
+        FreeIfNonZero(ref QF32);
+        FreeIfNonZero(ref KF32);
+        FreeIfNonZero(ref VF32);
+        FreeIfNonZero(ref AttnOutputF32);
+        FreeIfNonZero(ref FfnGateF32);
+        FreeIfNonZero(ref FfnUpF32);
+        FreeIfNonZero(ref SiluOutputF32);
         FreeIfNonZero(ref GemmOutputF16);
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
@@ -182,6 +217,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref LogitsF16);
         FreeIfNonZero(ref LogitsF32);
         FreeIfNonZero(ref DequantScratch);
+        FreeIfNonZero(ref DequantScratchF32);
         FreeIfNonZero(ref QkvPacked);
         FreeIfNonZero(ref GateUpPacked);
         FreeIfNonZero(ref PreQ8_1Scratch);

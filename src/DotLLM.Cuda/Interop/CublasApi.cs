@@ -76,6 +76,9 @@ internal static partial class CublasApi
     /// <summary>CUBLAS_COMPUTE_32F — FP32 compute.</summary>
     internal const int CUBLAS_COMPUTE_32F = 68;
 
+    /// <summary>CUBLAS_COMPUTE_32F_PEDANTIC - FP32 compute without TF32 shortcuts.</summary>
+    internal const int CUBLAS_COMPUTE_32F_PEDANTIC = 69;
+
     /// <summary>CUBLAS_GEMM_DEFAULT — default algorithm selection.</summary>
     internal const int CUBLAS_GEMM_DEFAULT = -1;
 }

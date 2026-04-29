@@ -7,6 +7,11 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+__device__ __constant__ int8_t kvalues_iq4nl_gemv[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // ── Q8_0: 34 bytes per 32 values ────────────────────────────────────
 // scale (half) applied once per block: acc += float(scale) * sum(qs[j] * x[j])
 
@@ -309,6 +314,119 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k(
 // ── Q5_0: 22 bytes per 32 values ────────────────────────────────────
 // struct block_q5_0 { half d; uint32_t qh; uint8_t qs[16]; };
 
+extern "C" __global__ void __launch_bounds__(256) quantized_gemv_iq4_nl(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / 32;
+    const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+    float acc = 0.0f;
+
+    for (int b = threadIdx.x; b < blocks_per_row; b += blockDim.x)
+    {
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+
+        #pragma unroll 16
+        for (int j = 0; j < 16; j++)
+        {
+            uint8_t packed = qs[j];
+            acc += d * (float)kvalues_iq4nl_gemv[packed & 0x0F] * __half2float(x[b * 32 + j]);
+            acc += d * (float)kvalues_iq4nl_gemv[packed >> 4] * __half2float(x[b * 32 + j + 16]);
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = __float2half(acc);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_iq4_xs(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+    float acc = 0.0f;
+
+    for (int sb = threadIdx.x; sb < superblocks_per_row; sb += blockDim.x)
+    {
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+        int base_x = sb * 256;
+
+        for (int ib = 0; ib < 8; ib++)
+        {
+            int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+            int high = (scales_h >> (2 * ib)) & 0x03;
+            int ls = low | (high << 4);
+            float dl = d * (float)(ls - 32);
+            const uint8_t* sub_qs = qs + ib * 16;
+            int x_off = base_x + ib * 32;
+
+            #pragma unroll 16
+            for (int j = 0; j < 16; j++)
+            {
+                uint8_t packed = sub_qs[j];
+                acc += dl * (float)kvalues_iq4nl_gemv[packed & 0x0F] * __half2float(x[x_off + j]);
+                acc += dl * (float)kvalues_iq4nl_gemv[packed >> 4] * __half2float(x[x_off + j + 16]);
+            }
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float warp_sums[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = __float2half(acc);
+}
+
 extern "C" __global__ void __launch_bounds__(256) quantized_gemv_q5_0(
     const uint8_t* __restrict__ weight,
     const half* __restrict__ x,
@@ -417,22 +535,19 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k(
             float scale = d * (float)sc;
             float min_val = dmin * (float)m;
 
-            const uint8_t* sub_qs = qs + sub * 16;
-            const uint8_t* sub_qh = qh + sub * 4;
             int x_off = base_x + sub * 32;
+            const int pair_idx = sub >> 1;
+            const int nibble_half = sub & 1;
 
-            // Element ordering matches dequant: interleaved lo/hi within sub-block
-            // sub_out[2j] = lo(qs[j]), sub_out[2j+1] = hi(qs[j])
-            for (int j = 0; j < 16; j++)
+            // Q5_K layout stores 4 pairs of 64 elements. Each sub-block has
+            // 32 elements at qs[pair_idx * 32 + pos], taking lo/hi nibbles
+            // from consecutive sub-blocks and bit `sub` from qh[pos].
+            for (int pos = 0; pos < 32; pos++)
             {
-                uint8_t packed = sub_qs[j];
-                int bit_lo = (sub_qh[j / 4] >> ((j % 4) * 2)) & 1;
-                int bit_hi = (sub_qh[j / 4] >> ((j % 4) * 2 + 1)) & 1;
-                int lo = (packed & 0x0F) | (bit_lo << 4);
-                int hi = (packed >> 4) | (bit_hi << 4);
-
-                acc += (scale * (float)lo - min_val) * __half2float(x[x_off + 2 * j]);
-                acc += (scale * (float)hi - min_val) * __half2float(x[x_off + 2 * j + 1]);
+                uint8_t packed = qs[pair_idx * 32 + pos];
+                int bit = (qh[pos] >> sub) & 1;
+                int q = (((packed >> (4 * nibble_half)) & 0x0F) | (bit << 4));
+                acc += (scale * (float)q - min_val) * __half2float(x[x_off + pos]);
             }
         }
     }

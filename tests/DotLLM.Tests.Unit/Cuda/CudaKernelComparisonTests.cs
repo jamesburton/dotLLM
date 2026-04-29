@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
@@ -1345,6 +1346,103 @@ public class CudaKernelComparisonTests : IDisposable
         }
         _output.WriteLine($"Q2_K dequant max-abs-diff (GPU vs CPU): {maxAbs:F6}");
         Assert.True(maxAbs < 1e-3f, $"Q2_K GPU dequant diverges from CPU (max-abs-diff={maxAbs}).");
+    }
+
+    [SkippableFact]
+    public void DequantIQ4NL_GpuMatchesCpu()
+    {
+        Skip.IfNot(_available, "No CUDA GPU available or PTX missing");
+
+        const int blocks = 32;
+        const int elementCount = blocks * 32;
+        const int blockBytes = 18;
+        long totalBytes = (long)blocks * blockBytes;
+
+        var rng = new Random(0x1A4);
+        byte[] hostBytes = new byte[totalBytes];
+        rng.NextBytes(hostBytes);
+
+        unsafe {
+            fixed (byte* p = hostBytes) {
+                for (int b = 0; b < blocks; b++) {
+                    byte* block = p + b * blockBytes;
+                    *(Half*)block = (Half)((rng.NextDouble() * 2 - 1) * 0.02);
+                }
+            }
+        }
+
+        RunGpuDequantVsCpu(hostBytes, QuantizationType.IQ4_NL, elementCount, totalBytes, 0.01f);
+    }
+
+    [SkippableFact]
+    public void DequantIQ4XS_GpuMatchesCpu()
+    {
+        Skip.IfNot(_available, "No CUDA GPU available or PTX missing");
+
+        const int superBlocks = 16;
+        const int elementCount = superBlocks * 256;
+        const int blockBytes = 136;
+        long totalBytes = (long)superBlocks * blockBytes;
+
+        var rng = new Random(0x1A45);
+        byte[] hostBytes = new byte[totalBytes];
+        rng.NextBytes(hostBytes);
+
+        unsafe {
+            fixed (byte* p = hostBytes) {
+                for (int sb = 0; sb < superBlocks; sb++) {
+                    byte* block = p + sb * blockBytes;
+                    *(Half*)block = (Half)((rng.NextDouble() * 2 - 1) * 0.001);
+                }
+            }
+        }
+
+        RunGpuDequantVsCpu(hostBytes, QuantizationType.IQ4_XS, elementCount, totalBytes, 0.01f);
+    }
+
+    private void RunGpuDequantVsCpu(
+        byte[] hostBytes,
+        QuantizationType quantType,
+        int elementCount,
+        long totalBytes,
+        float tolerance)
+    {
+        float[] cpuRef = new float[elementCount];
+        unsafe {
+            fixed (byte* p = hostBytes) {
+                Dequantize.ToFloat32((nint)p, elementCount, quantType, cpuRef);
+            }
+        }
+
+        Half[] gpuOut = new Half[elementCount];
+        nint devSrc = 0, devDst = 0;
+        try {
+            CudaDriverApi.cuMemAlloc_v2(out devSrc, (nuint)totalBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out devDst, (nuint)((long)elementCount * sizeof(ushort))).ThrowOnError();
+            unsafe {
+                fixed (byte* p = hostBytes)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devSrc, (nint)p, (nuint)totalBytes).ThrowOnError();
+            }
+            _kernels!.LaunchDequantToF16(devSrc, quantType, devDst, elementCount, _stream!.Handle);
+            _stream.Synchronize();
+            unsafe {
+                fixed (Half* p = gpuOut)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devDst, (nuint)((long)elementCount * sizeof(ushort))).ThrowOnError();
+            }
+        }
+        finally {
+            if (devSrc != 0) CudaDriverApi.cuMemFree_v2(devSrc);
+            if (devDst != 0) CudaDriverApi.cuMemFree_v2(devDst);
+        }
+
+        float maxAbs = 0f;
+        for (int i = 0; i < elementCount; i++) {
+            float diff = MathF.Abs(cpuRef[i] - (float)gpuOut[i]);
+            if (diff > maxAbs) maxAbs = diff;
+        }
+        _output.WriteLine($"{quantType} dequant max-abs-diff (GPU vs CPU): {maxAbs:F6}");
+        Assert.True(maxAbs < tolerance,
+            $"{quantType} GPU dequant diverges from CPU (max-abs-diff={maxAbs}, tolerance={tolerance}).");
     }
 
     // ─────────────────── Helpers ───────────────────

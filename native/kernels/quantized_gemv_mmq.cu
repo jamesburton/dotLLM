@@ -21,6 +21,11 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
+__device__ __constant__ int8_t kvalues_iq4nl_mmq[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+};
+
 // Per-chunk Stage 1 scratch lives in dynamic shared memory, sized at launch from `k`.
 // Layout (one extern __shared__ block, host passes `sharedMemBytes` to cuLaunchKernel):
 //   int8_t  s_xq [num_chunks * 32]                   // INT8-quantized x bytes
@@ -43,6 +48,149 @@
 // distributed across 256 threads → 32 superblocks per warp before grouping. Larger models
 // with k≥1024 (≥4 superblocks/row) become work-saturated regardless.
 #define MMQ_ROWS_PER_BLOCK 4
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_iq4_nl_mmq(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    if (row_base >= n) return;
+    const int rows_in_block = (n - row_base) < MMQ_ROWS_PER_BLOCK
+                                  ? (n - row_base)
+                                  : MMQ_ROWS_PER_BLOCK;
+
+    const int blocks_per_row = k / 32;
+    __shared__ float s_acc[MMQ_ROWS_PER_BLOCK * 256];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MMQ_ROWS_PER_BLOCK; r++)
+        s_acc[r * 256 + tid] = 0.0f;
+    __syncthreads();
+
+    const int total_units = rows_in_block * blocks_per_row;
+    for (int unit = tid; unit < total_units; unit += blockDim.x)
+    {
+        int r = unit / blocks_per_row;
+        int b = unit % blocks_per_row;
+        int row = row_base + r;
+
+        const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+
+        float row_acc = 0.0f;
+        #pragma unroll 16
+        for (int j = 0; j < 16; j++)
+        {
+            uint8_t packed = qs[j];
+            row_acc += d * (float)kvalues_iq4nl_mmq[packed & 0x0F] * __half2float(x[b * 32 + j]);
+            row_acc += d * (float)kvalues_iq4nl_mmq[packed >> 4] * __half2float(x[b * 32 + j + 16]);
+        }
+
+        s_acc[r * 256 + tid] += row_acc;
+    }
+    __syncthreads();
+
+    if (warp_id < rows_in_block)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            v += s_acc[warp_id * 256 + i * 32 + lane];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+
+        if (lane == 0)
+            y[row_base + warp_id] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_iq4_xs_mmq(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    if (row_base >= n) return;
+    const int rows_in_block = (n - row_base) < MMQ_ROWS_PER_BLOCK
+                                  ? (n - row_base)
+                                  : MMQ_ROWS_PER_BLOCK;
+
+    const int superblocks_per_row = k / 256;
+    __shared__ float s_acc[MMQ_ROWS_PER_BLOCK * 256];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MMQ_ROWS_PER_BLOCK; r++)
+        s_acc[r * 256 + tid] = 0.0f;
+    __syncthreads();
+
+    const int total_units = rows_in_block * superblocks_per_row;
+    for (int unit = tid; unit < total_units; unit += blockDim.x)
+    {
+        int r = unit / superblocks_per_row;
+        int sb = unit % superblocks_per_row;
+        int row = row_base + r;
+
+        const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+        int base_x = sb * 256;
+
+        float row_acc = 0.0f;
+        for (int ib = 0; ib < 8; ib++)
+        {
+            int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+            int high = (scales_h >> (2 * ib)) & 0x03;
+            int ls = low | (high << 4);
+            float dl = d * (float)(ls - 32);
+            const uint8_t* sub_qs = qs + ib * 16;
+            int x_off = base_x + ib * 32;
+
+            #pragma unroll 16
+            for (int j = 0; j < 16; j++)
+            {
+                uint8_t packed = sub_qs[j];
+                row_acc += dl * (float)kvalues_iq4nl_mmq[packed & 0x0F] * __half2float(x[x_off + j]);
+                row_acc += dl * (float)kvalues_iq4nl_mmq[packed >> 4] * __half2float(x[x_off + j + 16]);
+            }
+        }
+
+        s_acc[r * 256 + tid] += row_acc;
+    }
+    __syncthreads();
+
+    if (warp_id < rows_in_block)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            v += s_acc[warp_id * 256 + i * 32 + lane];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+
+        if (lane == 0)
+            y[row_base + warp_id] = __float2half(v);
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq(
     const uint8_t* __restrict__ weight,
@@ -522,36 +670,28 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq(
                 m  = (scales_raw[sub + 4] >> 4)   | ((scales_raw[sub]     >> 6) << 4);
             }
 
-            const uint8_t* sub_qs = qs + sub * 16;
-            const uint8_t* sub_qh = qh + sub * 4;
             int chunk_idx = sb * 8 + sub;
             const int8_t* xq = s_xq + chunk_idx * 32;
+            const int pair_idx = sub >> 1;
+            const int nibble_half = sub & 1;
 
             int dot = 0;
             #pragma unroll
             for (int g = 0; g < 8; g++)
             {
-                // Cover j=2g (even) and j=2g+1 (odd); pack [lo_e, hi_e, lo_o, hi_o].
-                int j_e = 2 * g;
-                int j_o = 2 * g + 1;
-                int p_e = sub_qs[j_e];
-                int p_o = sub_qs[j_o];
-                int qhb_e = sub_qh[j_e >> 2];   // = sub_qh[g >> 1]
-                int qhb_o = sub_qh[j_o >> 2];   // = sub_qh[g >> 1]
+                // Pack four Q5_K weights in input memory order for this 32-value sub-block.
+                int pos0 = 4 * g;
+                int p0 = qs[pair_idx * 32 + pos0 + 0];
+                int p1 = qs[pair_idx * 32 + pos0 + 1];
+                int p2 = qs[pair_idx * 32 + pos0 + 2];
+                int p3 = qs[pair_idx * 32 + pos0 + 3];
+                int q0 = ((p0 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 0] >> sub) & 1) << 4);
+                int q1 = ((p1 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 1] >> sub) & 1) << 4);
+                int q2 = ((p2 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 2] >> sub) & 1) << 4);
+                int q3 = ((p3 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 3] >> sub) & 1) << 4);
 
-                int blo_e = (qhb_e >> ((j_e & 3) * 2)) & 1;
-                int bhi_e = (qhb_e >> ((j_e & 3) * 2 + 1)) & 1;
-                int blo_o = (qhb_o >> ((j_o & 3) * 2)) & 1;
-                int bhi_o = (qhb_o >> ((j_o & 3) * 2 + 1)) & 1;
-
-                int lo_e = (p_e & 0x0F) | (blo_e << 4);
-                int hi_e = (p_e >> 4)   | (bhi_e << 4);
-                int lo_o = (p_o & 0x0F) | (blo_o << 4);
-                int hi_o = (p_o >> 4)   | (bhi_o << 4);
-
-                // Pack 4 INT8 weight values; values ∈ [0, 31] fit in signed INT8.
-                int wpack = (lo_e & 0xFF) | ((hi_e & 0xFF) << 8)
-                          | ((lo_o & 0xFF) << 16) | ((hi_o & 0xFF) << 24);
+                int wpack = (q0 & 0xFF) | ((q1 & 0xFF) << 8)
+                          | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
                 int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
 
                 dot = __dp4a(wpack, xpack, dot);
@@ -809,6 +949,135 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k_mmq(
 // favors small blocks for GEMV where each row is shallow on its own).
 #define MMVQ_LARGE_THREADS 128
 #define MMVQ_LARGE_NWARPS  4
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_iq4_nl_mmvq_large(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / 32;
+
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += MMVQ_LARGE_THREADS)
+    {
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        const uint8_t* qs = block + 2;
+
+        float block_acc = 0.0f;
+        #pragma unroll 16
+        for (int j = 0; j < 16; j++)
+        {
+            uint8_t packed = qs[j];
+            block_acc += d * (float)kvalues_iq4nl_mmq[packed & 0x0F] * __half2float(x[b * 32 + j]);
+            block_acc += d * (float)kvalues_iq4nl_mmq[packed >> 4] * __half2float(x[b * 32 + j + 16]);
+        }
+        acc += block_acc;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_iq4_xs_mmvq_large(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+    float acc = 0.0f;
+
+    const int total_units = superblocks_per_row * 8;
+    for (int unit = tid; unit < total_units; unit += MMVQ_LARGE_THREADS)
+    {
+        int sb = unit >> 3;
+        int ib = unit & 7;
+
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+
+        int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+        int high = (scales_h >> (2 * ib)) & 0x03;
+        int ls = low | (high << 4);
+        float dl = d * (float)(ls - 32);
+        const uint8_t* sub_qs = qs + ib * 16;
+        int x_off = sb * 256 + ib * 32;
+
+        float sub_acc = 0.0f;
+        #pragma unroll 16
+        for (int j = 0; j < 16; j++)
+        {
+            uint8_t packed = sub_qs[j];
+            sub_acc += dl * (float)kvalues_iq4nl_mmq[packed & 0x0F] * __half2float(x[x_off + j]);
+            sub_acc += dl * (float)kvalues_iq4nl_mmq[packed >> 4] * __half2float(x[x_off + j + 16]);
+        }
+        acc += sub_acc;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q4_k_mmvq_large(
     const uint8_t* __restrict__ weight,
@@ -1209,34 +1478,27 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             m  = (scales_raw[sub + 4] >> 4)   | ((scales_raw[sub]     >> 6) << 4);
         }
 
-        const uint8_t* sub_qs = qs + sub * 16;
-        const uint8_t* sub_qh = qh + sub * 4;
         int chunk_idx = sb * 8 + sub;
         const int8_t* xq = s_xq + chunk_idx * 32;
+        const int pair_idx = sub >> 1;
+        const int nibble_half = sub & 1;
 
         int dot = 0;
         #pragma unroll
         for (int g = 0; g < 8; g++)
         {
-            int j_e = 2 * g;
-            int j_o = 2 * g + 1;
-            int p_e = sub_qs[j_e];
-            int p_o = sub_qs[j_o];
-            int qhb_e = sub_qh[j_e >> 2];
-            int qhb_o = sub_qh[j_o >> 2];
+            int pos0 = 4 * g;
+            int p0 = qs[pair_idx * 32 + pos0 + 0];
+            int p1 = qs[pair_idx * 32 + pos0 + 1];
+            int p2 = qs[pair_idx * 32 + pos0 + 2];
+            int p3 = qs[pair_idx * 32 + pos0 + 3];
+            int q0 = ((p0 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 0] >> sub) & 1) << 4);
+            int q1 = ((p1 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 1] >> sub) & 1) << 4);
+            int q2 = ((p2 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 2] >> sub) & 1) << 4);
+            int q3 = ((p3 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 3] >> sub) & 1) << 4);
 
-            int blo_e = (qhb_e >> ((j_e & 3) * 2)) & 1;
-            int bhi_e = (qhb_e >> ((j_e & 3) * 2 + 1)) & 1;
-            int blo_o = (qhb_o >> ((j_o & 3) * 2)) & 1;
-            int bhi_o = (qhb_o >> ((j_o & 3) * 2 + 1)) & 1;
-
-            int lo_e = (p_e & 0x0F) | (blo_e << 4);
-            int hi_e = (p_e >> 4)   | (bhi_e << 4);
-            int lo_o = (p_o & 0x0F) | (blo_o << 4);
-            int hi_o = (p_o >> 4)   | (bhi_o << 4);
-
-            int wpack = (lo_e & 0xFF) | ((hi_e & 0xFF) << 8)
-                      | ((lo_o & 0xFF) << 16) | ((hi_o & 0xFF) << 24);
+            int wpack = (q0 & 0xFF) | ((q1 & 0xFF) << 8)
+                      | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
             int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
 
             dot = __dp4a(wpack, xpack, dot);
@@ -1443,6 +1705,182 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 // works for all three quant types and the pre-quant kernel writes per-half
 // sums identically to Q6_K's existing in-kernel Stage 1.
 // ============================================================================
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_iq4_nl_mmq_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    (void)sx2_in;
+
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    if (row_base >= n) return;
+    const int rows_in_block = (n - row_base) < MMQ_ROWS_PER_BLOCK
+                                  ? (n - row_base)
+                                  : MMQ_ROWS_PER_BLOCK;
+
+    const int blocks_per_row = k / 32;
+    __shared__ float s_acc[MMQ_ROWS_PER_BLOCK * 256];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MMQ_ROWS_PER_BLOCK; r++)
+        s_acc[r * 256 + tid] = 0.0f;
+    __syncthreads();
+
+    const int total_units = rows_in_block * blocks_per_row;
+    for (int unit = tid; unit < total_units; unit += blockDim.x)
+    {
+        int r = unit / blocks_per_row;
+        int b = unit % blocks_per_row;
+        int row = row_base + r;
+
+        const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        float dx = __half2float(dx_in[b]);
+        const uint8_t* qs = block + 2;
+        const int8_t* xq = xq_in + b * 32;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+        {
+            int wpack_lo = 0;
+            int wpack_hi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                uint8_t packed = qs[g * 4 + j];
+                wpack_lo |= ((int)kvalues_iq4nl_mmq[packed & 0x0F] & 0xFF) << (j * 8);
+                wpack_hi |= ((int)kvalues_iq4nl_mmq[packed >> 4] & 0xFF) << (j * 8);
+            }
+
+            int xpack_lo = *reinterpret_cast<const int*>(xq + g * 4);
+            int xpack_hi = *reinterpret_cast<const int*>(xq + 16 + g * 4);
+            dot = __dp4a(wpack_lo, xpack_lo, dot);
+            dot = __dp4a(wpack_hi, xpack_hi, dot);
+        }
+
+        s_acc[r * 256 + tid] += d * dx * (float)dot;
+    }
+    __syncthreads();
+
+    if (warp_id < rows_in_block)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            v += s_acc[warp_id * 256 + i * 32 + lane];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+
+        if (lane == 0)
+            y[row_base + warp_id] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_iq4_xs_mmq_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    (void)sx2_in;
+
+    const int row_base = blockIdx.x * MMQ_ROWS_PER_BLOCK;
+    if (row_base >= n) return;
+    const int rows_in_block = (n - row_base) < MMQ_ROWS_PER_BLOCK
+                                  ? (n - row_base)
+                                  : MMQ_ROWS_PER_BLOCK;
+
+    const int superblocks_per_row = k / 256;
+    __shared__ float s_acc[MMQ_ROWS_PER_BLOCK * 256];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MMQ_ROWS_PER_BLOCK; r++)
+        s_acc[r * 256 + tid] = 0.0f;
+    __syncthreads();
+
+    const int total_units = rows_in_block * superblocks_per_row * 8;
+    for (int unit = tid; unit < total_units; unit += blockDim.x)
+    {
+        int row_unit = unit / (superblocks_per_row * 8);
+        int rem = unit - row_unit * superblocks_per_row * 8;
+        int sb = rem >> 3;
+        int ib = rem & 7;
+        int row = row_base + row_unit;
+
+        const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+
+        int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+        int high = (scales_h >> (2 * ib)) & 0x03;
+        int ls = low | (high << 4);
+        float dl = d * (float)(ls - 32);
+
+        int chunk_idx = sb * 8 + ib;
+        float dx = __half2float(dx_in[chunk_idx]);
+        const uint8_t* sub_qs = qs + ib * 16;
+        const int8_t* xq = xq_in + chunk_idx * 32;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+        {
+            int wpack_lo = 0;
+            int wpack_hi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                uint8_t packed = sub_qs[g * 4 + j];
+                wpack_lo |= ((int)kvalues_iq4nl_mmq[packed & 0x0F] & 0xFF) << (j * 8);
+                wpack_hi |= ((int)kvalues_iq4nl_mmq[packed >> 4] & 0xFF) << (j * 8);
+            }
+
+            int xpack_lo = *reinterpret_cast<const int*>(xq + g * 4);
+            int xpack_hi = *reinterpret_cast<const int*>(xq + 16 + g * 4);
+            dot = __dp4a(wpack_lo, xpack_lo, dot);
+            dot = __dp4a(wpack_hi, xpack_hi, dot);
+        }
+
+        s_acc[row_unit * 256 + tid] += dl * dx * (float)dot;
+    }
+    __syncthreads();
+
+    if (warp_id < rows_in_block)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            v += s_acc[warp_id * 256 + i * 32 + lane];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+
+        if (lane == 0)
+            y[row_base + warp_id] = __float2half(v);
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q2_k_mmq_preq(
     const uint8_t* __restrict__ weight,
@@ -1740,34 +2178,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq_pre
                 m  = (scales_raw[sub + 4] >> 4)   | ((scales_raw[sub]     >> 6) << 4);
             }
 
-            const uint8_t* sub_qs = qs + sub * 16;
-            const uint8_t* sub_qh = qh + sub * 4;
             int chunk_idx = sb * 8 + sub;
             const int8_t* xq = xq_in + chunk_idx * 32;
+            const int pair_idx = sub >> 1;
+            const int nibble_half = sub & 1;
 
             int dot = 0;
             #pragma unroll
             for (int g = 0; g < 8; g++)
             {
-                int j_e = 2 * g;
-                int j_o = 2 * g + 1;
-                int p_e = sub_qs[j_e];
-                int p_o = sub_qs[j_o];
-                int qhb_e = sub_qh[j_e >> 2];
-                int qhb_o = sub_qh[j_o >> 2];
+                int pos0 = 4 * g;
+                int p0 = qs[pair_idx * 32 + pos0 + 0];
+                int p1 = qs[pair_idx * 32 + pos0 + 1];
+                int p2 = qs[pair_idx * 32 + pos0 + 2];
+                int p3 = qs[pair_idx * 32 + pos0 + 3];
+                int q0 = ((p0 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 0] >> sub) & 1) << 4);
+                int q1 = ((p1 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 1] >> sub) & 1) << 4);
+                int q2 = ((p2 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 2] >> sub) & 1) << 4);
+                int q3 = ((p3 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 3] >> sub) & 1) << 4);
 
-                int blo_e = (qhb_e >> ((j_e & 3) * 2)) & 1;
-                int bhi_e = (qhb_e >> ((j_e & 3) * 2 + 1)) & 1;
-                int blo_o = (qhb_o >> ((j_o & 3) * 2)) & 1;
-                int bhi_o = (qhb_o >> ((j_o & 3) * 2 + 1)) & 1;
-
-                int lo_e = (p_e & 0x0F) | (blo_e << 4);
-                int hi_e = (p_e >> 4)   | (bhi_e << 4);
-                int lo_o = (p_o & 0x0F) | (blo_o << 4);
-                int hi_o = (p_o >> 4)   | (bhi_o << 4);
-
-                int wpack = (lo_e & 0xFF) | ((hi_e & 0xFF) << 8)
-                          | ((lo_o & 0xFF) << 16) | ((hi_o & 0xFF) << 24);
+                int wpack = (q0 & 0xFF) | ((q1 & 0xFF) << 8)
+                          | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
                 int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
 
                 dot = __dp4a(wpack, xpack, dot);
@@ -2005,6 +2436,170 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
     }
 }
 
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_iq4_nl_mmvq_large_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    (void)sx2_in;
+
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / 32;
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const uint8_t* w_row = weight + (size_t)row * blocks_per_row * 18;
+    float acc = 0.0f;
+
+    for (int b = tid; b < blocks_per_row; b += MMVQ_LARGE_THREADS)
+    {
+        const uint8_t* block = w_row + b * 18;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        float dx = __half2float(dx_in[b]);
+        const uint8_t* qs = block + 2;
+        const int8_t* xq = xq_in + b * 32;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+        {
+            int wpack_lo = 0;
+            int wpack_hi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                uint8_t packed = qs[g * 4 + j];
+                wpack_lo |= ((int)kvalues_iq4nl_mmq[packed & 0x0F] & 0xFF) << (j * 8);
+                wpack_hi |= ((int)kvalues_iq4nl_mmq[packed >> 4] & 0xFF) << (j * 8);
+            }
+
+            int xpack_lo = *reinterpret_cast<const int*>(xq + g * 4);
+            int xpack_hi = *reinterpret_cast<const int*>(xq + 16 + g * 4);
+            dot = __dp4a(wpack_lo, xpack_lo, dot);
+            dot = __dp4a(wpack_hi, xpack_hi, dot);
+        }
+
+        acc += d * dx * (float)dot;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_iq4_xs_mmvq_large_preq(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq_in,
+    const half*    __restrict__ dx_in,
+    const half*    __restrict__ sx2_in,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    (void)sx2_in;
+
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const int total_units = superblocks_per_row * 8;
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 136;
+    float acc = 0.0f;
+
+    for (int unit = tid; unit < total_units; unit += MMVQ_LARGE_THREADS)
+    {
+        int sb = unit >> 3;
+        int ib = unit & 7;
+
+        const uint8_t* block = w_row + sb * 136;
+        float d = __half2float(*reinterpret_cast<const half*>(block));
+        uint16_t scales_h = (uint16_t)block[2] | ((uint16_t)block[3] << 8);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+
+        int low = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+        int high = (scales_h >> (2 * ib)) & 0x03;
+        int ls = low | (high << 4);
+        float dl = d * (float)(ls - 32);
+
+        int chunk_idx = sb * 8 + ib;
+        float dx = __half2float(dx_in[chunk_idx]);
+        const uint8_t* sub_qs = qs + ib * 16;
+        const int8_t* xq = xq_in + chunk_idx * 32;
+
+        int dot = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++)
+        {
+            int wpack_lo = 0;
+            int wpack_hi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                uint8_t packed = sub_qs[g * 4 + j];
+                wpack_lo |= ((int)kvalues_iq4nl_mmq[packed & 0x0F] & 0xFF) << (j * 8);
+                wpack_hi |= ((int)kvalues_iq4nl_mmq[packed >> 4] & 0xFF) << (j * 8);
+            }
+
+            int xpack_lo = *reinterpret_cast<const int*>(xq + g * 4);
+            int xpack_hi = *reinterpret_cast<const int*>(xq + 16 + g * 4);
+            dot = __dp4a(wpack_lo, xpack_lo, dot);
+            dot = __dp4a(wpack_hi, xpack_hi, dot);
+        }
+
+        acc += dl * dx * (float)dot;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0)
+        s_warp_partials[warp_id] = acc;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float v = (lane < MMVQ_LARGE_NWARPS) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 2; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0)
+            y[row] = __float2half(v);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q4_k_mmvq_large_preq(
     const uint8_t* __restrict__ weight,
     const int8_t*  __restrict__ xq_in,
@@ -2159,34 +2754,27 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
             m  = (scales_raw[sub + 4] >> 4)   | ((scales_raw[sub]     >> 6) << 4);
         }
 
-        const uint8_t* sub_qs = qs + sub * 16;
-        const uint8_t* sub_qh = qh + sub * 4;
         int chunk_idx = sb * 8 + sub;
         const int8_t* xq = xq_in + chunk_idx * 32;
+        const int pair_idx = sub >> 1;
+        const int nibble_half = sub & 1;
 
         int dot = 0;
         #pragma unroll
         for (int g = 0; g < 8; g++)
         {
-            int j_e = 2 * g;
-            int j_o = 2 * g + 1;
-            int p_e = sub_qs[j_e];
-            int p_o = sub_qs[j_o];
-            int qhb_e = sub_qh[j_e >> 2];
-            int qhb_o = sub_qh[j_o >> 2];
+            int pos0 = 4 * g;
+            int p0 = qs[pair_idx * 32 + pos0 + 0];
+            int p1 = qs[pair_idx * 32 + pos0 + 1];
+            int p2 = qs[pair_idx * 32 + pos0 + 2];
+            int p3 = qs[pair_idx * 32 + pos0 + 3];
+            int q0 = ((p0 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 0] >> sub) & 1) << 4);
+            int q1 = ((p1 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 1] >> sub) & 1) << 4);
+            int q2 = ((p2 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 2] >> sub) & 1) << 4);
+            int q3 = ((p3 >> (4 * nibble_half)) & 0x0F) | (((qh[pos0 + 3] >> sub) & 1) << 4);
 
-            int blo_e = (qhb_e >> ((j_e & 3) * 2)) & 1;
-            int bhi_e = (qhb_e >> ((j_e & 3) * 2 + 1)) & 1;
-            int blo_o = (qhb_o >> ((j_o & 3) * 2)) & 1;
-            int bhi_o = (qhb_o >> ((j_o & 3) * 2 + 1)) & 1;
-
-            int lo_e = (p_e & 0x0F) | (blo_e << 4);
-            int hi_e = (p_e >> 4)   | (bhi_e << 4);
-            int lo_o = (p_o & 0x0F) | (blo_o << 4);
-            int hi_o = (p_o >> 4)   | (bhi_o << 4);
-
-            int wpack = (lo_e & 0xFF) | ((hi_e & 0xFF) << 8)
-                      | ((lo_o & 0xFF) << 16) | ((hi_o & 0xFF) << 24);
+            int wpack = (q0 & 0xFF) | ((q1 & 0xFF) << 8)
+                      | ((q2 & 0xFF) << 16) | ((q3 & 0xFF) << 24);
             int xpack = *reinterpret_cast<const int*>(xq + 4 * g);
 
             dot = __dp4a(wpack, xpack, dot);

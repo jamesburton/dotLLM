@@ -98,6 +98,28 @@ public class CudaMoeGroupedGemvTests
             (rng, span) => SynthesiseQ8_0SuperUnit(rng, span));
     }
 
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]
+    [InlineData(4, 1408, 2048)]
+    [InlineData(2, 256, 512)]
+    public void GroupedIQ4_NL_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGroupedEquivalence(QuantizationType.IQ4_NL, kActive, M, K, blockBytes: 144,
+            (rng, span) => SynthesiseIQ4_NLSuperUnit(rng, span));
+    }
+
+    [SkippableTheory]
+    [InlineData(4, 256, 256)]
+    [InlineData(4, 1408, 2048)]
+    [InlineData(2, 256, 512)]
+    public void GroupedIQ4_XS_MatchesPerCallWithinFp16Tolerance(int kActive, int M, int K)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunGroupedEquivalence(QuantizationType.IQ4_XS, kActive, M, K, blockBytes: 136,
+            (rng, span) => SynthesiseIQ4_XSBlock(rng, span));
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunGroupedEquivalence(QuantizationType qt,
         int kActive, int M, int K, int blockBytes,
@@ -318,6 +340,30 @@ public class CudaMoeGroupedGemvTests
             for (int j = 0; j < 32; j++)
                 superUnit[off + 2 + j] = (byte)rng.Next(0, 256);
         }
+    }
+
+    private static unsafe void SynthesiseIQ4_NLSuperUnit(Random rng, Span<byte> superUnit)
+    {
+        // 8 consecutive IQ4_NL blocks (18 bytes / 32 elements each = 144 bytes total).
+        for (int b = 0; b < 8; b++)
+        {
+            int off = b * 18;
+            Half d = (Half)((rng.NextDouble() - 0.5) * 0.04);
+            fixed (byte* pBlock = superUnit)
+                *(Half*)(pBlock + off) = d;
+            for (int j = 0; j < 16; j++)
+                superUnit[off + 2 + j] = (byte)rng.Next(0, 256);
+        }
+    }
+
+    private static unsafe void SynthesiseIQ4_XSBlock(Random rng, Span<byte> block)
+    {
+        // IQ4_XS layout (136 bytes): half d, uint16 scales_h, uint8[4] scales_l, uint8[128] qs.
+        Half d = (Half)((rng.NextDouble() - 0.5) * 0.002);
+        fixed (byte* pBlock = block)
+            *(Half*)pBlock = d;
+        for (int i = 2; i < 136; i++)
+            block[i] = (byte)rng.Next(0, 256);
     }
 
     private static string? FindPtxDir()
