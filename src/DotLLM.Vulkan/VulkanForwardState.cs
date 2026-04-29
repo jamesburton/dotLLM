@@ -104,6 +104,13 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeUpInter { get; private set; }        // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeSiluInter { get; private set; }      // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeDownRows { get; private set; }       // [seqLen * topK, hidden]
+    public VulkanDevice.Buffer? MoeExpertCounts { get; private set; }   // [numExperts] uint32
+    public VulkanDevice.Buffer? MoeExpertOffsets { get; private set; }  // [numExperts + 1] uint32
+    public VulkanDevice.Buffer? MoeExpertCounters { get; private set; } // [numExperts] uint32
+    public VulkanDevice.Buffer? MoePermutation { get; private set; }    // [seqLen * topK] uint32
+    public VulkanDevice.Buffer? MoeGroupedHidden { get; private set; }  // [seqLen * topK, hidden]
+    public VulkanDevice.Buffer? MoeGroupedGateInter { get; private set; } // [seqLen * topK, intermediate]
+    public VulkanDevice.Buffer? MoeGroupedUpInter { get; private set; } // [seqLen * topK, intermediate]
 
     // ── MoE shared-expert scratch (DeepSeek-V2/V3) ────────────────────
     // Allocated only when the model carries an MoE layer with shared
@@ -317,6 +324,9 @@ internal sealed class VulkanForwardState : IDisposable
         long expandedBytes = (long)seqLen * _moeTopK * _hiddenSize * sizeof(float);
         long interBytes = (long)seqLen * _moeTopK * _moeIntermediateSize * sizeof(float);
         long downBytes = expandedBytes;
+        long expertCountsBytes = (long)_moeNumExperts * sizeof(uint);
+        long expertOffsetsBytes = (long)(_moeNumExperts + 1) * sizeof(uint);
+        long routedRowsBytes = (long)seqLen * _moeTopK * sizeof(uint);
 
         MoeRouterLogits = _device.AllocateDeviceLocal(routerBytes);
         MoeTopkIndices = _device.AllocateDeviceLocal(topkIdxBytes);
@@ -326,9 +336,18 @@ internal sealed class VulkanForwardState : IDisposable
         MoeUpInter = _device.AllocateDeviceLocal(interBytes);
         MoeSiluInter = _device.AllocateDeviceLocal(interBytes);
         MoeDownRows = _device.AllocateDeviceLocal(downBytes);
+        MoeExpertCounts = _device.AllocateDeviceLocal(expertCountsBytes);
+        MoeExpertOffsets = _device.AllocateDeviceLocal(expertOffsetsBytes);
+        MoeExpertCounters = _device.AllocateDeviceLocal(expertCountsBytes);
+        MoePermutation = _device.AllocateDeviceLocal(routedRowsBytes);
+        MoeGroupedHidden = _device.AllocateDeviceLocal(expandedBytes);
+        MoeGroupedGateInter = _device.AllocateDeviceLocal(interBytes);
+        MoeGroupedUpInter = _device.AllocateDeviceLocal(interBytes);
 
         long total = routerBytes + topkIdxBytes + topkWtBytes + expandedBytes
-                   + interBytes * 3 + downBytes;
+                   + interBytes * 3 + downBytes
+                   + expertCountsBytes * 2 + expertOffsetsBytes + routedRowsBytes
+                   + expandedBytes + interBytes * 2;
 
         if (_moeNumSharedExperts > 0)
         {
@@ -423,6 +442,13 @@ internal sealed class VulkanForwardState : IDisposable
         MoeUpInter?.Dispose(); MoeUpInter = null;
         MoeSiluInter?.Dispose(); MoeSiluInter = null;
         MoeDownRows?.Dispose(); MoeDownRows = null;
+        MoeExpertCounts?.Dispose(); MoeExpertCounts = null;
+        MoeExpertOffsets?.Dispose(); MoeExpertOffsets = null;
+        MoeExpertCounters?.Dispose(); MoeExpertCounters = null;
+        MoePermutation?.Dispose(); MoePermutation = null;
+        MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;
+        MoeGroupedGateInter?.Dispose(); MoeGroupedGateInter = null;
+        MoeGroupedUpInter?.Dispose(); MoeGroupedUpInter = null;
 
         MoeSharedInput?.Dispose(); MoeSharedInput = null;
         MoeSharedGate?.Dispose(); MoeSharedGate = null;

@@ -1,0 +1,51 @@
+#version 450
+// Groups routed MoE rows by expert for a future dense/coopmat per-expert path.
+//
+// Input:
+//   x       [rows, hidden]
+//   indices [rows] expert id for each row
+//   offsets [numExperts + 1] exclusive prefix sum of per-expert row counts
+//   counters[numExperts] zero-initialized scratch counters
+//
+// Output:
+//   packed      [rows, hidden], grouped by expert according to offsets
+//   permutation [rows], where permutation[packedRow] = original row
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX       { float x[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufIdx     { int indices[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; };
+layout(set = 0, binding = 3, std430) coherent  buffer BufCount   { uint counters[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer BufPacked  { float packed[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer BufPerm    { uint permutation[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint hidden;
+    uint numExperts;
+} pc;
+
+shared uint dstRow;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    int rawExpert = indices[row];
+    uint expert = uint(clamp(rawExpert, 0, int(pc.numExperts) - 1));
+
+    if (tid == 0u) {
+        uint slot = atomicAdd(counters[expert], 1u);
+        dstRow = offsets[expert] + slot;
+        permutation[dstRow] = row;
+    }
+    barrier();
+
+    uint srcBase = row * pc.hidden;
+    uint dstBase = dstRow * pc.hidden;
+    for (uint col = tid; col < pc.hidden; col += gl_WorkGroupSize.x) {
+        packed[dstBase + col] = x[srcBase + col];
+    }
+}

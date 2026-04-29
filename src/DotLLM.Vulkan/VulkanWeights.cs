@@ -9,22 +9,19 @@ namespace DotLLM.Vulkan;
 /// <summary>
 /// Per-layer weight buffers on a Vulkan device. Mirrors
 /// <c>DotLLM.Cuda.CudaWeights</c> but with a two-mode storage model:
-/// Q8_0 matrices are kept on device as raw 34-byte blocks when
-/// <c>dequantToFp32=false</c> (default) so the <c>matmul_q8_0</c> /
-/// <c>matmul_q8_0_gemm</c> kernels can read them directly — 4× less VRAM
-/// and 4× less per-forward bandwidth vs the dequantised F32 path.
-/// F16 and other quant types are still dequantised to FP32 at upload time
-/// (those kernels don't exist yet); passing <c>dequantToFp32=true</c> forces
-/// the legacy all-F32 path as a fallback. Bias and norm weights are always
-/// FP32 device buffers (tiny, kernels consume FP32).
+/// Q8_0, Q4_K, Q5_K, Q6_K, F16, and BF16 matrices are kept on device in
+/// their source byte layout when <c>dequantToFp32=false</c> (default) and the
+/// relevant Vulkan kernel supports the contraction shape. Unsupported shapes
+/// fall back to dequantised F32 upload. Bias and norm weights are always FP32
+/// device buffers (tiny, kernels consume FP32).
 /// </summary>
 internal sealed class VulkanWeights : IDisposable
 {
     /// <summary>
     /// Per-layer device-resident MoE (Mixtral / Qwen-MoE) weight bundle.
-    /// Per-expert weights are <i>packed</i> into one contiguous F32 device
-    /// bank per projection so the indexed-matmul kernel can address any
-    /// expert via a single descriptor binding plus a per-row index lookup.
+    /// Per-expert weights are <i>packed</i> into one contiguous device bank
+    /// per projection so either the indexed-matmul path or the grouped F16
+    /// coopmat path can address any expert via a single descriptor binding.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -46,9 +43,8 @@ internal sealed class VulkanWeights : IDisposable
     /// weight-offset push constant on the matmul kernel. Shared experts are
     /// few (typically 1..2) and small, so per-expert buffers keep the wiring
     /// simple while costing one extra buffer per shared expert per layer.
-    /// Qwen1.5-MoE's per-token sigmoid gate is intentionally NOT wired here —
-    /// the upload guard rejects layers carrying a <c>SharedExpertGate</c>
-    /// until a dedicated sigmoid + scalar-multiply kernel pair lands.
+    /// Qwen1.5-MoE's per-token sigmoid gate is uploaded as a one-row matrix
+    /// and consumed by the fused sigmoid-gated add kernel when present.
     /// </para>
     /// </remarks>
     internal readonly struct MoeLayerBuffers
@@ -57,6 +53,9 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer W1Bank;     // [numExperts, intermediate, hidden]
         public readonly VulkanDevice.Buffer W2Bank;     // [numExperts, hidden, intermediate]
         public readonly VulkanDevice.Buffer W3Bank;     // [numExperts, intermediate, hidden]
+        public readonly QuantizationType W1DeviceQuantType;
+        public readonly QuantizationType W2DeviceQuantType;
+        public readonly QuantizationType W3DeviceQuantType;
 
         // Device-side storage type for the router gate. Q8_0 when the source carried a
         // Q8_0 overlay (and hidden % 32 == 0); F32 otherwise — same two-mode policy as
@@ -99,6 +98,7 @@ internal sealed class VulkanWeights : IDisposable
         public MoeLayerBuffers(
             VulkanDevice.Buffer gate, QuantizationType gateDeviceQt,
             VulkanDevice.Buffer w1, VulkanDevice.Buffer w2, VulkanDevice.Buffer w3,
+            QuantizationType w1DeviceQt, QuantizationType w2DeviceQt, QuantizationType w3DeviceQt,
             int numExperts, int numExpertsPerTok,
             int hiddenSize, int intermediateSize, bool normTopKProb,
             VulkanDevice.Buffer[]? sharedW1, VulkanDevice.Buffer[]? sharedW2, VulkanDevice.Buffer[]? sharedW3,
@@ -111,6 +111,9 @@ internal sealed class VulkanWeights : IDisposable
             W1Bank = w1;
             W2Bank = w2;
             W3Bank = w3;
+            W1DeviceQuantType = w1DeviceQt;
+            W2DeviceQuantType = w2DeviceQt;
+            W3DeviceQuantType = w3DeviceQt;
             NumExperts = numExperts;
             NumExpertsPerTok = numExpertsPerTok;
             HiddenSize = hiddenSize;
@@ -831,17 +834,25 @@ internal sealed class VulkanWeights : IDisposable
         int sharedI = moe.SharedIntermediateSize;
         bool hasShared = moe.HasSharedExpert;
 
-        // Two-mode byte sizes for the quant-overlayable projections (gate, per-shared-
-        // expert gate/up/down, shared-expert sigmoid gate). The per-routed-expert banks
-        // are always F32 since the Vulkan indexed-matmul kernel is F32-only.
+        // Two-mode byte sizes for the quant-overlayable projections (gate, routed
+        // expert banks, per-shared-expert gate/up/down, shared-expert sigmoid gate).
         // `*KeepQuant` is true when the overlay declares a supported quant format (Q8_0
         // or Q4_K) AND the contraction axis is aligned to that format's group size.
         bool gateKeepQuant = MoeOverlayKeepsQuantized(moe.GateQuantTypeOverlay, hidden);
         long gateBytes = MoeOverlayUploadBytes(moe.GateQuantTypeOverlay, numE, hidden);
 
-        long perExpertW1Bytes = (long)interm * hidden * sizeof(float);
-        long perExpertW2Bytes = (long)hidden * interm * sizeof(float);
-        long perExpertW3Bytes = perExpertW1Bytes;
+        QuantizationType routedW1Qt = MoeRoutedRawDeviceQuantType(device, moe.GateExpsRaw, moe.GateExpsRawQt, moe.GateExpsMDim, moe.GateExpsKDim, interm, hidden);
+        QuantizationType routedW2Qt = MoeRoutedRawDeviceQuantType(device, moe.DownExpsRaw, moe.DownExpsRawQt, moe.DownExpsMDim, moe.DownExpsKDim, hidden, interm);
+        QuantizationType routedW3Qt = MoeRoutedRawDeviceQuantType(device, moe.UpExpsRaw, moe.UpExpsRawQt, moe.UpExpsMDim, moe.UpExpsKDim, interm, hidden);
+        long perExpertW1Bytes = routedW1Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW1Qt, interm, hidden)
+            : (long)interm * hidden * sizeof(float);
+        long perExpertW2Bytes = routedW2Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW2Qt, hidden, interm)
+            : (long)hidden * interm * sizeof(float);
+        long perExpertW3Bytes = routedW3Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW3Qt, interm, hidden)
+            : (long)interm * hidden * sizeof(float);
 
         bool sharedW1KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, hidden);
         bool sharedW2KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, sharedI);
@@ -904,9 +915,20 @@ internal sealed class VulkanWeights : IDisposable
 
         for (int e = 0; e < numE; e++)
         {
-            UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
-            UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
-            UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
+            if (routedW1Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.GateExpsRaw + (nint)((long)e * perExpertW1Bytes), perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
+
+            if (routedW2Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.DownExpsRaw + (nint)((long)e * perExpertW2Bytes), perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
+
+            if (routedW3Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.UpExpsRaw + (nint)((long)e * perExpertW3Bytes), perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
         }
         uploadedBytes += w1BankBytes + w2BankBytes + w3BankBytes;
 
@@ -982,6 +1004,9 @@ internal sealed class VulkanWeights : IDisposable
         }
 
         return new MoeLayerBuffers(gate, gateDeviceQt, w1Bank, w2Bank, w3Bank,
+            routedW1Qt,
+            routedW2Qt,
+            routedW3Qt,
             moe.NumExperts, moe.NumExpertsPerTok,
             moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
             sharedW1, sharedW2, sharedW3,
@@ -996,6 +1021,39 @@ internal sealed class VulkanWeights : IDisposable
     /// gated on the contraction-axis dim being a multiple of the Q8_0 group size (32).</summary>
     private static bool MoeOverlayKeepsQ8(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
+
+    private static bool MoeRoutedRawKeepsQ8(
+        nint raw, QuantizationType qt,
+        int rawM, int rawK,
+        int expectedM, int expectedK)
+        => raw != 0
+        && qt == QuantizationType.Q8_0
+        && rawM == expectedM
+        && rawK == expectedK
+        && (expectedK % 32) == 0;
+
+    private static QuantizationType MoeRoutedRawDeviceQuantType(
+        VulkanDevice device,
+        nint raw, QuantizationType qt,
+        int rawM, int rawK,
+        int expectedM, int expectedK)
+    {
+        if (MoeRoutedRawKeepsQ8(raw, qt, rawM, rawK, expectedM, expectedK))
+            return QuantizationType.Q8_0;
+
+        // Strategy C path: keep routed F16 expert banks raw only when the
+        // coopmat grouped matmul can consume them. Otherwise upload F32 so
+        // the existing indexed path remains the fallback.
+        if (raw != 0
+            && qt == QuantizationType.F16
+            && device.HasCooperativeMatrix
+            && rawM == expectedM
+            && rawK == expectedK
+            && (expectedK % 32) == 0)
+            return QuantizationType.F16;
+
+        return QuantizationType.F32;
+    }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction-axis dim being a multiple of the Q4_K super-block size
@@ -1079,6 +1137,24 @@ internal sealed class VulkanWeights : IDisposable
             VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
         }
         device.CopyBufferSynchronous(staging, dst, (ulong)bytes);
+    }
+
+    private static unsafe void UploadRawBankSlot(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
+    {
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory UploadRawBankSlot");
+        try
+        {
+            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
+                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
     }
 
     /// <summary>

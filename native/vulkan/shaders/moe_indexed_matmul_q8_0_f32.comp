@@ -1,0 +1,71 @@
+#version 450
+// MoE indexed expert matmul over a packed Q8_0 expert bank.
+//
+//   y[n, m] = sum_k dequant_q8(bank[indices[n], m, k]) * x[n, k]
+//
+// Weight layout is [numExperts, M, K] row-major, with each row stored as
+// Q8_0 blocks: fp16 scale + 32 int8 values (34 bytes per block).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint bank[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX    { float x[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufIdx  { int indices[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY    { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint numExperts;
+    uint blocksPerRow;
+} pc;
+
+int readQsByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    int b = int((u >> shift) & 0xFFu);
+    return (b ^ 0x80) - 0x80;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint n = gl_GlobalInvocationID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride = pc.blocksPerRow * 34u;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase = expertIdx * matrixByteStride + m * rowByteStride;
+    uint xRowBase = n * pc.K;
+
+    float acc = 0.0;
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float d = readHalf(blockByteBase);
+        uint xBase = xRowBase + b * 32u;
+        float blockSum = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            blockSum += float(readQsByte(blockByteBase + 2u + j)) * x[xBase + j];
+        }
+        acc += d * blockSum;
+    }
+
+    y[n * pc.M + m] = acc;
+}

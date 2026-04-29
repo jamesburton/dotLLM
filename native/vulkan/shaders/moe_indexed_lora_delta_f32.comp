@@ -1,0 +1,44 @@
+#version 450
+// Indexed per-expert LoRA delta for routed MoE rows.
+//
+// For each expanded MoE row n, apply the adapter only if indices[n] matches
+// pc.expert:
+//   y[n,m] += sum_r A[m,r] * sum_k B[r,k] * x[n,k]
+//
+// B is pre-scaled by alpha/rank at upload time, matching VulkanLoraAdapter.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX       { float x[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufIndices { int indices[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufB       { float bWeight[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufA       { float aWeight[]; };
+layout(set = 0, binding = 4, std430)          buffer BufY       { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint outputDim;
+    uint inputDim;
+    uint rank;
+    uint rows;
+    uint expert;
+} pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (m >= pc.outputDim || row >= pc.rows) return;
+    if (indices[row] != int(pc.expert)) return;
+
+    float acc = 0.0;
+    for (uint r = 0u; r < pc.rank; r++) {
+        float tmp = 0.0;
+        uint bBase = r * pc.inputDim;
+        uint xBase = row * pc.inputDim;
+        for (uint k = 0u; k < pc.inputDim; k++) {
+            tmp += bWeight[bBase + k] * x[xBase + k];
+        }
+        acc += aWeight[m * pc.rank + r] * tmp;
+    }
+
+    y[row * pc.outputDim + m] += acc;
+}

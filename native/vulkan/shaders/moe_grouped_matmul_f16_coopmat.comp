@@ -1,0 +1,131 @@
+#version 450
+// Grouped F16 MoE expert matmul via VK_KHR_cooperative_matrix.
+//
+//   Y[packedRow, m] = X[packedRow, :] @ W_f16[expert, m, :]^T
+//
+// Rows are grouped by expert using offsets[expert]..offsets[expert+1]. The
+// dispatch grid is (M tiles, pessimistic row tiles, experts); row tiles whose
+// local row exceeds the expert's count are skipped. This is the dense expert
+// projection primitive needed by the Strategy C grouped MoE path.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint weight[]; }; // [E,M,K] F16, 2 elems/uint
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };      // [rows,K] F32
+layout(set = 0, binding = 2, std430) readonly  buffer BufOffsets { uint offsets[]; }; // [E+1]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY       { float y[]; };      // [rows,M] F32
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint rows;
+    uint numExperts;
+    uint pairsPerRow;
+    uint rowUints;
+} pc;
+
+const uint TM = 16u;
+const uint TN = 16u;
+const uint TK = 16u;
+const uint BK = 32u;
+const uint WG_SIZE = 64u;
+
+shared float16_t sharedA[TM * BK];
+shared float16_t sharedB[TN * BK];
+shared float storeStage[TM * TN];
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * TM;
+    uint localRowBase = gl_WorkGroupID.y * TN;
+    uint expert = gl_WorkGroupID.z;
+    if (expert >= pc.numExperts) return;
+
+    uint expertStart = offsets[expert];
+    uint expertEnd = offsets[expert + 1u];
+    uint expertRows = expertEnd - expertStart;
+    if (localRowBase >= expertRows) return;
+
+    uint packedRowBase = expertStart + localRowBase;
+    uint tid = gl_LocalInvocationID.x;
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    uint chunks = pc.K / BK;
+    uint expertWeightBase = expert * pc.M * pc.rowUints;
+
+    for (uint chunk = 0u; chunk < chunks; chunk++) {
+        uint kBase = chunk * BK;
+
+        for (uint i = 0u; i < 8u; i++) {
+            uint idx = tid * 8u + i;
+            uint row = idx / BK;
+            uint col = idx - row * BK;
+            uint localRow = localRowBase + row;
+            float v = 0.0;
+            if (localRow < expertRows) {
+                uint packedRow = expertStart + localRow;
+                v = x[packedRow * pc.K + kBase + col];
+            }
+            sharedB[row * BK + col] = float16_t(v);
+        }
+
+        uint mLocal = tid / 4u;
+        uint laneOfRow = tid - mLocal * 4u;
+        uint mGlobal = mBase + mLocal;
+        bool rowValid = mGlobal < pc.M;
+        uint rowUintBase = expertWeightBase + mGlobal * pc.rowUints;
+        uint pairBase = chunk * (BK / 2u) + laneOfRow * 4u;
+        uint col0 = laneOfRow * 8u;
+
+        for (uint q = 0u; q < 4u; q++) {
+            float wLo = 0.0;
+            float wHi = 0.0;
+            if (rowValid) {
+                uint packed = weight[rowUintBase + pairBase + q];
+                vec2 wp = unpackHalf2x16(packed);
+                wLo = wp.x;
+                wHi = wp.y;
+            }
+            uint col = col0 + q * 2u;
+            sharedA[mLocal * BK + col] = float16_t(wLo);
+            sharedA[mLocal * BK + col + 1u] = float16_t(wHi);
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        for (uint kSlice = 0u; kSlice < BK; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bTile;
+
+            coopMatLoad(aTile, sharedA, kSlice, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bTile, sharedB, kSlice, BK, gl_CooperativeMatrixLayoutColumnMajor);
+            sums = coopMatMulAdd(aTile, bTile, sums);
+        }
+
+        barrier();
+    }
+
+    coopMatStore(sums, storeStage, 0, TM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+
+    for (uint i = 0u; i < 4u; i++) {
+        uint idx = tid + i * WG_SIZE;
+        if (idx >= TM * TN) break;
+        uint localRowInTile = idx / TM;
+        uint m = idx - localRowInTile * TM;
+        uint localRow = localRowBase + localRowInTile;
+        uint mGlobal = mBase + m;
+        if (localRow < expertRows && mGlobal < pc.M) {
+            uint packedRow = expertStart + localRow;
+            y[packedRow * pc.M + mGlobal] = storeStage[localRowInTile * TM + m];
+        }
+    }
+}
