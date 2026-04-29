@@ -17,7 +17,12 @@ public enum Architecture
     /// <summary>Alibaba Qwen family.</summary>
     Qwen,
 
-    /// <summary>DeepSeek family (pre-V2; legacy placeholder).</summary>
+    /// <summary>
+    /// DeepSeek family (pre-V2; legacy GGUF metadata placeholder).
+    /// Prefer <see cref="DeepSeekV2"/> or <see cref="DeepSeekV3"/> for supported
+    /// MLA-based checkpoints.
+    /// </summary>
+    [System.Obsolete("Architecture.DeepSeek is a legacy pre-V2 placeholder kept for GGUF metadata compatibility. Use DeepSeekV2 or DeepSeekV3.")]
     DeepSeek,
 
     /// <summary>

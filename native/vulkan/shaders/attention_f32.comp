@@ -41,6 +41,7 @@ layout(push_constant) uniform PushConstants {
     uint headDim;
     uint positionOffset;
     uint slidingWindow;   // 0 = disabled
+    uint useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
 } pc;
 
 shared float qShared[MAX_HEAD_DIM];
@@ -84,6 +85,30 @@ float workgroupSum(float val) {
     return s;
 }
 
+uint previousPowerOfTwo(uint value) {
+    uint power = 1u;
+    while ((power << 1u) <= value) {
+        power <<= 1u;
+    }
+    return power;
+}
+
+float alibiSlopePowerOfTwo(uint head, uint numHeads) {
+    float start = exp2(-exp2(-(log2(float(numHeads)) - 3.0)));
+    return pow(start, float(head + 1u));
+}
+
+float alibiSlope(uint head, uint numHeads) {
+    uint power = previousPowerOfTwo(numHeads);
+    if (power == numHeads || head < power) {
+        return alibiSlopePowerOfTwo(head, power);
+    }
+
+    uint expanded = power << 1u;
+    uint extraHead = (head - power) << 1u;
+    return alibiSlopePowerOfTwo(extraHead, expanded);
+}
+
 void main() {
     uint blockId = gl_WorkGroupID.x;
     uint total = pc.seqQ * pc.numHeads;
@@ -102,6 +127,7 @@ void main() {
 
     uint posQ = pc.positionOffset + tq;
     float scale = inversesqrt(float(pc.headDim));
+    float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
 
     uint qBase = tq * qStride + hq * pc.headDim;
 
@@ -137,7 +163,7 @@ void main() {
             for (uint d = 0u; d < pc.headDim; d++) {
                 s += qShared[d] * k[kBase + d];
             }
-            scoreTile[t] = s * scale;
+            scoreTile[t] = s * scale - slope * float(posQ - tkv);
         }
         barrier();
 
