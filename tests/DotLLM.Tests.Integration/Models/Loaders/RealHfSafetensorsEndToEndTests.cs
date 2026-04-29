@@ -248,6 +248,55 @@ public sealed class RealHfSafetensorsEndToEndTests
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Phase 5 gated real-weight coverage for previously tiny-random-only archs
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Mistral7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
+        => RunGatedSafetensorsSmoke(
+            envVar: "DOTLLM_MISTRAL_7B_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-mistral-7b",
+            label: "Mistral-7B",
+            expectedArch: Architecture.Mistral,
+            assertConfig: config =>
+            {
+                Assert.Equal(Architecture.Mistral, config.Architecture);
+                Assert.True(config.HiddenSize >= 4096);
+                Assert.True(config.NumLayers >= 32);
+            });
+
+    [Fact]
+    public void Mixtral8x7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
+        => RunGatedSafetensorsSmoke(
+            envVar: "DOTLLM_MIXTRAL_8X7B_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-mixtral-8x7b",
+            label: "Mixtral-8x7B",
+            expectedArch: Architecture.Mixtral,
+            assertConfig: config =>
+            {
+                Assert.Equal(Architecture.Mixtral, config.Architecture);
+                Assert.NotNull(config.Moe);
+                Assert.True(config.Moe!.NumExperts >= 8);
+                Assert.True(config.Moe.NumExpertsPerTok >= 2);
+            });
+
+    [Fact]
+    public void Qwen15MoeA27B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent()
+        => RunGatedSafetensorsSmoke(
+            envVar: "DOTLLM_QWEN15_MOE_A27B_CHECKPOINT_PATH",
+            conventional: "C:/temp/dotllm-qwen15-moe-a27b",
+            label: "Qwen1.5-MoE-A2.7B",
+            expectedArch: Architecture.QwenMoe,
+            assertConfig: config =>
+            {
+                Assert.Equal(Architecture.QwenMoe, config.Architecture);
+                Assert.NotNull(config.Moe);
+                Assert.True(config.Moe!.NumExperts >= 60);
+                Assert.False(config.Moe.NormTopKProb);
+                Assert.NotNull(config.Moe.SharedExpertIntermediateSize);
+            });
+
+    // ────────────────────────────────────────────────────────────────────
     // TinyLlama-1.1B-Chat-v1.0 (small real Llama, cheap validation)
     // ────────────────────────────────────────────────────────────────────
 
@@ -1295,6 +1344,62 @@ public sealed class RealHfSafetensorsEndToEndTests
     // ────────────────────────────────────────────────────────────────────
     // Helpers
     // ────────────────────────────────────────────────────────────────────
+
+    private void RunGatedSafetensorsSmoke(
+        string envVar,
+        string conventional,
+        string label,
+        Architecture expectedArch,
+        Action<ModelConfig> assertConfig)
+    {
+        string? root = ResolveCheckpointRoot(envVar, conventional);
+        if (root is null)
+        {
+            _output.WriteLine(
+                $"[SKIP] {label} checkpoint not found. Set {envVar} or place the snapshot at {conventional}/");
+            return;
+        }
+
+        _output.WriteLine($"Root: {root}");
+
+        var loadWatch = Stopwatch.StartNew();
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(root);
+        loadWatch.Stop();
+
+        try
+        {
+            _output.WriteLine(
+                $"Load ({loadWatch.Elapsed.TotalMilliseconds:F1} ms): arch={config.Architecture} "
+                + $"vocab={config.VocabSize} hidden={config.HiddenSize} layers={config.NumLayers} "
+                + $"heads={config.NumAttentionHeads} kv_heads={config.NumKvHeads}");
+            if (config.Moe is not null)
+            {
+                _output.WriteLine(
+                    $"MoE: experts={config.Moe.NumExperts} top_k={config.Moe.NumExpertsPerTok} "
+                    + $"intermediate={config.Moe.MoeIntermediateSize} "
+                    + $"shared_intermediate={config.Moe.SharedExpertIntermediateSize} "
+                    + $"norm_topk_prob={config.Moe.NormTopKProb}");
+            }
+
+            Assert.Equal(expectedArch, config.Architecture);
+            assertConfig(config);
+
+            int[] tokenIds = [0, 1, 2];
+            int[] positions = [0, 1, 2];
+            var fwdWatch = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            fwdWatch.Stop();
+
+            _output.WriteLine(
+                $"Forward ({fwdWatch.Elapsed.TotalSeconds:F2} s): shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+            AssertFiniteLogits(logits, config.VocabSize);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
 
     private static string? ResolveCheckpointRoot(string envVar, string conventional)
     {

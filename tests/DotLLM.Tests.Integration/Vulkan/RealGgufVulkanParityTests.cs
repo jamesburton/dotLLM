@@ -95,6 +95,33 @@ public sealed class RealGgufVulkanParityTests
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // Mistral-7B Q4_K_M real-weight coverage. This TheBloke GGUF was exported
+    // with llama.cpp's `general.architecture=llama` metadata even though the
+    // checkpoint is Mistral-family, so the assertion below intentionally uses
+    // Architecture.Llama. The separate SafeTensors gate covers native
+    // Architecture.Mistral config extraction when a HF checkpoint is present.
+    // ────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Mistral7B_Q4_K_M_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF",
+            conventional: "C:/Users/james/.dotllm/models/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Mistral-7B Q4_K_M GGUF not found. Set "
+                + "DOTLLM_MISTRAL_7B_Q4_K_M_GGUF or download "
+                + "TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf "
+                + "to ~/.dotllm/models/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/.");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Mistral-7B-Q4_K_M",
+            prompt: "The capital of France is");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // DeepSeek-V2-Lite Q4_K_M (MLA + MoE, ~10.4 GB GGUF)
     //
     // The SafeTensors variant cannot run on memory-constrained hosts because
