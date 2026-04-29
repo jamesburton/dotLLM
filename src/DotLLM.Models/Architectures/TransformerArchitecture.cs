@@ -30,7 +30,9 @@ public sealed class TransformerArchitecture : IModelArchitecture
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
     {
+#pragma warning disable CS0618 // Legacy DeepSeek must remain detectable for compatibility diagnostics.
         if (config.Architecture is Architecture.DeepSeek)
+#pragma warning restore CS0618
             throw new NotSupportedException(
                 "Pre-V2 DeepSeek (legacy 'deepseek' arch string in GGUF) is not supported — " +
                 "the kernel set targets DeepSeek-V2 / V3 (MLA + MoE). Re-export from a V2/V3 checkpoint.");

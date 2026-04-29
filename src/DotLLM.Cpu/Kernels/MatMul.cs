@@ -1365,9 +1365,9 @@ public static unsafe partial class MatMul
         c[2 * cStride + 0] = acc02; c[2 * cStride + 1] = acc12; c[2 * cStride + 2] = acc22; c[2 * cStride + 3] = acc32;
     }
 
-    // TODO: Experiment with 2×3 tile (2 rows × 3 tokens): 6 acc + 6 token + 1 ones + 3 temps = 16 YMM.
-    // This would process rows in pairs instead of individually, reducing token reloads by 2×
-    // while staying within AVX2's 16 YMM register budget. Needs benchmarking.
+    // Tile note: a 2x3 AVX2 variant fits the 16-YMM register budget on paper
+    // (6 acc + 6 token + 1 ones + 3 temps), but remains an optimization idea
+    // rather than a correctness gap. Keep the proven 1x4 path until benchmarked.
 
     /// <summary>
     /// AVX2 outer-product microkernel for Q8_0 R4 layout.
@@ -1608,9 +1608,10 @@ public static unsafe partial class MatMul
         absXHi = Avx2.Sign(vxHi, vxHi);
     }
 
-    // TODO: Check disasm on AVX-512 hardware — Vector512.Create(vec256, vec256) may emit
-    // unnecessary vinsertf64x4 instead of using ZMM directly. Consider manual Avx512F
-    // intrinsics if overhead is measurable.
+    // AVX-512 note: Vector512.Create(vec256, vec256) may lower through
+    // vinsertf64x4 on some JIT/hardware combinations. The current path is
+    // correct; revisit with manual Avx512F intrinsics only if disassembly and
+    // benchmarks show measurable overhead.
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Avx512DualBlockFma(

@@ -47,7 +47,7 @@ public sealed class AttentionF32Kernel : IDisposable
     public const int MaxHeadDim = 256;
 
     private const int WorkgroupSize = 256;
-    private const int PushConstantBytes = 7 * sizeof(uint); // seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow
+    private const int PushConstantBytes = 8 * sizeof(uint); // seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, useAlibi
 
     /// <summary>
     /// Env-var opt-in: use the coopmat attention pipeline. When set to
@@ -267,14 +267,15 @@ public sealed class AttentionF32Kernel : IDisposable
     /// <param name="headDim">Per-head dimension; must be &lt;= <see cref="MaxHeadDim"/>.</param>
     /// <param name="positionOffset">Offset added to q positions for causal masking (decode: cached-tokens count).</param>
     /// <param name="slidingWindow">Sliding-window size in tokens; <c>0</c> disables.</param>
+    /// <param name="useAlibi">When true, applies built-in standard ALiBi slopes per query head.</param>
     public void Launch(
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset = 0, int slidingWindow = 0)
+        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
-        Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow);
+        Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow, useAlibi);
         ctx.SubmitAndWait();
     }
 
@@ -283,7 +284,7 @@ public sealed class AttentionF32Kernel : IDisposable
         nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset = 0, int slidingWindow = 0)
+        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -323,7 +324,7 @@ public sealed class AttentionF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        Span<uint> pc = stackalloc uint[7]
+        Span<uint> pc = stackalloc uint[8]
         {
             (uint)seqQ,
             (uint)seqKv,
@@ -332,6 +333,7 @@ public sealed class AttentionF32Kernel : IDisposable
             (uint)headDim,
             (uint)positionOffset,
             (uint)slidingWindow,
+            useAlibi ? 1u : 0u,
         };
         fixed (uint* pcPtr = pc)
         {

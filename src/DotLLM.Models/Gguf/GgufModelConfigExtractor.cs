@@ -331,8 +331,10 @@ public static class GgufModelConfigExtractor
             "mistral" or "mistral3" => Architecture.Mistral,
             "phi" or "phi2" or "phi3" => Architecture.Phi,
             "qwen" or "qwen2" or "qwen3" => Architecture.Qwen,
+#pragma warning disable CS0618 // Preserve legacy GGUF metadata mapping for compatibility diagnostics.
             // Pre-V2 DeepSeek (legacy placeholder — never actually loaded by us).
             "deepseek" => Architecture.DeepSeek,
+#pragma warning restore CS0618
             // V2 / V2-Lite — MLA + MoE per <c>convert_hf_to_gguf.py</c>'s
             // <c>DeepseekV2Model</c>. Distinct from V3 only in routing details.
             "deepseek2" => Architecture.DeepSeekV2,

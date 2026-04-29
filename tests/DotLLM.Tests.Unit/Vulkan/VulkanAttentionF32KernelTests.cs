@@ -1,4 +1,5 @@
 using DotLLM.Cpu.Kernels;
+using DotLLM.Core.PositionEncoding;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -66,9 +67,16 @@ public class VulkanAttentionF32KernelTests
         RunOne(seqQ: 1, seqKv: 400, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 399);
     }
 
+    [SkippableFact]
+    public void Launch_Alibi_MatchesCpuReference()
+    {
+        RunOne(seqQ: 4, seqKv: 8, numHeads: 6, numKvHeads: 2, headDim: 64, positionOffset: 0, useAlibi: true);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
-    private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset)
+    private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
+        bool useAlibi = false)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -78,8 +86,17 @@ public class VulkanAttentionF32KernelTests
         float[] vh = RandomFloats(rng, seqKv * numKvHeads * headDim);
         float[] expected = new float[seqQ * numHeads * headDim];
 
-        Attention.ExecuteScalar(qh, kh, vh, expected,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+        if (useAlibi)
+        {
+            Attention.ExecuteScalar(qh, kh, vh, expected,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                AlibiPositionEncoding.CreateSlopes(numHeads));
+        }
+        else
+        {
+            Attention.ExecuteScalar(qh, kh, vh, expected,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+        }
 
         // GPU path.
         using var device = VulkanDevice.Create();
@@ -95,7 +112,7 @@ public class VulkanAttentionF32KernelTests
         device.Upload(vh.AsSpan(), bufV);
 
         kernel.Launch(bufQ, bufK, bufV, bufOut,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, useAlibi: useAlibi);
 
         float[] actual = new float[expected.Length];
         device.Download(bufOut, actual);
