@@ -129,7 +129,9 @@ public sealed class TextGenerator
                 new EosStopCondition(_tokenizer.EosTokenId),
                 new MaxTokensStopCondition(maxTokens)
             };
-            // TODO: Trim matched suffix only, not entire token (see PR #24 review)
+            // StopStringCondition excludes the triggering token. Partial-token
+            // suffix trimming would require text-level stop metadata alongside
+            // token-level finish semantics.
             foreach (string seq in options.StopSequences)
                 stopConditions.Add(new StopStringCondition(seq));
         }
@@ -1030,6 +1032,7 @@ public sealed class TextGenerator
     {
         KvCache.SimpleKvCache simple => simple.AllocatedBytes,
         KvCache.QuantizedKvCache quantized => quantized.AllocatedBytes,
+        KvCache.PagedKvCache paged => paged.AllocatedBytes,
         _ => 0 // GPU caches — AllocatedBytes is on the concrete type, accessed by CLI directly
     };
 }
