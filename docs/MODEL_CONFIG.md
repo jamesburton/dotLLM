@@ -6,7 +6,7 @@ Comprehensive record describing any transformer variant. Populated from GGUF met
 
 ```
 ModelConfig:
-  Architecture          Llama | Mistral | Phi | Qwen | DeepSeek
+  Architecture          Llama | Mistral | Phi | Qwen | DeepSeekV2 | DeepSeekV3 | NemotronH | Mamba3 | Mixtral | QwenMoe | GraniteMoe
   VocabSize             int
   HiddenSize            int
   IntermediateSize      int       (FFN intermediate dim)

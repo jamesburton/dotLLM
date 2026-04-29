@@ -137,7 +137,7 @@ each lands a testable end-to-end slice:
 | 6 | `matmul_q8_0_*` | `quantized_gemv.cu` | ✅ Done; GEMV (`MatMulQ8_0Kernel`) + GEMM (`MatMulQ8_0GemmKernel`) + coopmat (`MatMulQ8_0GemmCoopmatKernel`) |
 | 6 | `matmul_q4_k_*` / `q5_k_*` / `q6_k_*` | `quantized_gemv.cu` | ✅ Done (Phase 1, commits `afb2272`/`b1ee6bc` Q4_K, `15099b9`/`83e0732` Q5_K, `29a1459`/`39b7646` Q6_K); GEMV + GEMM each |
 | 7 | F16 / BF16 pipeline | `*_f16.cu` | ✅ Done (Phase 8 brought forward, commits `c9c08c5`/`6787492`); F16 GEMV + GEMM + coopmat (F16xF16→F32, gfx1151), BF16 GEMV + GEMM (`uintBitsToFloat(bits<<16)`); F32 activations + native F16/BF16 weights on device |
-| 8 | Cooperative matrix | (new) | ✅ Partial (F16 + Q8_0 GEMM coopmat tiles via `GL_KHR_cooperative_matrix`; gfx1151 verified). K-quant coopmat variants tracked as Phase 1 follow-up. MoE indexed-matmul coopmat needs Strategy C redesign (separate issue) — see prior architectural finding |
+| 8 | Cooperative matrix | (new) | ✅ Partial (F16 + Q8_0 GEMM coopmat tiles via `GL_KHR_cooperative_matrix`; gfx1151 verified). MoE Strategy C now has a gated F16 grouped path: expert-count/offset, group-by-expert, grouped F16 coopmat matmul, ungroup scatter, and end-to-end synthetic forward parity. K-quant coopmat variants and non-F16 grouped MoE remain follow-ups |
 
 Milestone 7 (FP16) is a significant enabler: most Vulkan drivers expose
 `shaderFloat16` only through those two extensions. `VK_KHR_16bit_storage`
