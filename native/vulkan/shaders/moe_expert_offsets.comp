@@ -1,0 +1,60 @@
+#version 450
+// Builds expert counts and exclusive offsets for grouped MoE routing.
+//
+// Input:
+//   indices [rows] expert id for each routed row
+//
+// Output:
+//   counts        [numExperts]     number of rows routed to each expert
+//   offsets       [numExperts + 1] exclusive prefix sum of counts
+//   groupCounters [numExperts]     zeroed counters ready for moe_expand_group_by_expert_f32
+//
+// This intentionally uses one workgroup and a strided loop over rows. The
+// expert count is small for supported MoE models, and keeping the prefix sum
+// inside one dispatch avoids a CPU readback/synchronization point before the
+// future grouped dense/coopmat MoE path.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufIdx      { int indices[]; };
+layout(set = 0, binding = 1, std430) coherent buffer BufCounts   { uint counts[]; };
+layout(set = 0, binding = 2, std430) coherent buffer BufOffsets  { uint offsets[]; };
+layout(set = 0, binding = 3, std430) coherent buffer BufCounters { uint groupCounters[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint numExperts;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint e = tid; e < pc.numExperts; e += gl_WorkGroupSize.x) {
+        counts[e] = 0u;
+        groupCounters[e] = 0u;
+    }
+    if (tid == 0u) {
+        offsets[pc.numExperts] = 0u;
+    }
+
+    barrier();
+    memoryBarrierBuffer();
+
+    for (uint row = tid; row < pc.rows; row += gl_WorkGroupSize.x) {
+        int rawExpert = indices[row];
+        uint expert = uint(clamp(rawExpert, 0, int(pc.numExperts) - 1));
+        atomicAdd(counts[expert], 1u);
+    }
+
+    barrier();
+    memoryBarrierBuffer();
+
+    if (tid == 0u) {
+        uint running = 0u;
+        offsets[0] = 0u;
+        for (uint e = 0u; e < pc.numExperts; e++) {
+            running += counts[e];
+            offsets[e + 1u] = running;
+        }
+    }
+}

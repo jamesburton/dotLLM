@@ -1,0 +1,23 @@
+#version 450
+// Inverse of moe_expand_group_by_expert_f32:
+//   output[permutation[packedRow], col] = packed[packedRow, col]
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufPacked { float packed[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufPerm   { uint permutation[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufOutput { float outRows[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint hidden;
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint packedRow = gl_GlobalInvocationID.y;
+    if (col >= pc.hidden || packedRow >= pc.rows) return;
+
+    uint originalRow = permutation[packedRow];
+    outRows[originalRow * pc.hidden + col] = packed[packedRow * pc.hidden + col];
+}

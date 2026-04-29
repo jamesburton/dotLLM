@@ -27,13 +27,12 @@ namespace DotLLM.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Q8_0 weights stay on device as 34-byte blocks and are consumed directly
-/// by the Q8_0 matmul kernels — 4× less VRAM and 4× less bytes-per-forward
-/// on the weight read vs the legacy dequantise-at-load path. Other quant
-/// types (F16, K-quants) still dequantise to FP32 at load. All non-matmul
-/// kernels remain F32; only the weight storage changes. The model assumes
-/// a pure-Transformer Llama-family architecture — MLA, MoE, and SSM layers
-/// are rejected at load time.
+/// Supported quantized weights stay on device in their source byte layout
+/// and are consumed directly by the matching matmul kernels. This covers
+/// Q8_0, Q4_K, Q5_K, Q6_K, F16, and BF16 where shape constraints permit;
+/// unsupported shapes fall back to F32 upload. All non-matmul kernels remain
+/// F32. Transformer-family MLA and MoE layers are handled by dedicated Vulkan
+/// branches; SSM / Mamba models use their separate Vulkan model type.
 /// </para>
 /// <para>
 /// Forward pass is fence-pipelined: a single persistent command buffer
@@ -129,11 +128,17 @@ public sealed class VulkanTransformerModel : IModel
     // MoE (Mixtral / Qwen-MoE) — null when the model carries no MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
+    private readonly MoeIndexedMatmulQ8_0F32Kernel? _moeIndexedMatmulQ8;
     // Tiled (shared-memory) variant of the indexed matmul. Wins on prefill at
     // large N (seqLen * topK ≥ 32) by amortising the x-row load across a
     // TILE_M-wide output tile; the scalar variant remains for decode (small N)
     // where the GEMV-style scalar dispatch wins.
     private readonly MoeIndexedMatmulTiledF32Kernel? _moeIndexedMatmulTiled;
+    private readonly MoeIndexedLoraDeltaF32Kernel? _moeIndexedLoraDelta;
+    private readonly MoeExpertOffsetsKernel? _moeExpertOffsets;
+    private readonly MoeExpandGroupByExpertF32Kernel? _moeExpandGroupByExpert;
+    private readonly MoeGroupedMatmulF16CoopmatKernel? _moeGroupedMatmulF16Coopmat;
+    private readonly MoeUngroupScatterF32Kernel? _moeUngroupScatter;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
     private readonly MoeBroadcastF32Kernel? _moeBroadcast;
     // Optional Qwen1.5-MoE per-token sigmoid gate fold for the shared-expert
@@ -208,7 +213,13 @@ public sealed class VulkanTransformerModel : IModel
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
+        MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8,
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled,
+        MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta,
+        MoeExpertOffsetsKernel? moeExpertOffsets,
+        MoeExpandGroupByExpertF32Kernel? moeExpandGroupByExpert,
+        MoeGroupedMatmulF16CoopmatKernel? moeGroupedMatmulF16Coopmat,
+        MoeUngroupScatterF32Kernel? moeUngroupScatter,
         MoeWeightedScatterF32Kernel? moeWeightedScatter, MoeBroadcastF32Kernel? moeBroadcast,
         MoeSigmoidGatedAddF32Kernel? moeSigmoidGatedAdd,
         VulkanDevice.SubmitContext submit,
@@ -250,7 +261,13 @@ public sealed class VulkanTransformerModel : IModel
         _mlaKvSplit = mlaKvSplit;
         _moeTopkSoftmax = moeTopkSoftmax;
         _moeIndexedMatmul = moeIndexedMatmul;
+        _moeIndexedMatmulQ8 = moeIndexedMatmulQ8;
         _moeIndexedMatmulTiled = moeIndexedMatmulTiled;
+        _moeIndexedLoraDelta = moeIndexedLoraDelta;
+        _moeExpertOffsets = moeExpertOffsets;
+        _moeExpandGroupByExpert = moeExpandGroupByExpert;
+        _moeGroupedMatmulF16Coopmat = moeGroupedMatmulF16Coopmat;
+        _moeUngroupScatter = moeUngroupScatter;
         _moeWeightedScatter = moeWeightedScatter;
         _moeBroadcast = moeBroadcast;
         _moeSigmoidGatedAdd = moeSigmoidGatedAdd;
@@ -499,7 +516,13 @@ public sealed class VulkanTransformerModel : IModel
 
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
+        MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8 = null;
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled = null;
+        MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta = null;
+        MoeExpertOffsetsKernel? moeExpertOffsets = null;
+        MoeExpandGroupByExpertF32Kernel? moeExpandGroupByExpert = null;
+        MoeGroupedMatmulF16CoopmatKernel? moeGroupedMatmulF16Coopmat = null;
+        MoeUngroupScatterF32Kernel? moeUngroupScatter = null;
         MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
         MoeBroadcastF32Kernel? moeBroadcast = null;
         MoeSigmoidGatedAddF32Kernel? moeSigmoidGatedAdd = null;
@@ -507,7 +530,17 @@ public sealed class VulkanTransformerModel : IModel
         {
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
+            moeIndexedMatmulQ8 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir);
             moeIndexedMatmulTiled = MoeIndexedMatmulTiledF32Kernel.Create(device, spvDir);
+            moeIndexedLoraDelta = MoeIndexedLoraDeltaF32Kernel.Create(device, spvDir);
+            moeExpertOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
+            moeExpandGroupByExpert = MoeExpandGroupByExpertF32Kernel.Create(device, spvDir);
+            if (device.HasCooperativeMatrix)
+            {
+                try { moeGroupedMatmulF16Coopmat = MoeGroupedMatmulF16CoopmatKernel.Create(device, spvDir); }
+                catch (InvalidOperationException) { /* Stay on indexed MoE when no usable coopmat tile is exposed. */ }
+            }
+            moeUngroupScatter = MoeUngroupScatterF32Kernel.Create(device, spvDir);
             moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
             moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
             moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
@@ -536,7 +569,9 @@ public sealed class VulkanTransformerModel : IModel
             rmsnorm, rope, attention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
-            moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulTiled, moeWeightedScatter, moeBroadcast,
+            moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8, moeIndexedMatmulTiled, moeIndexedLoraDelta,
+            moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
+            moeWeightedScatter, moeBroadcast,
             moeSigmoidGatedAdd,
             submit,
             gguf,
@@ -619,9 +654,8 @@ public sealed class VulkanTransformerModel : IModel
 
     /// <summary>
     /// Validates that <paramref name="adapter"/> is compatible with this
-    /// model and that its targeted projections do not collide with
-    /// out-of-scope MLA / MoE structures. Mirrors the CPU
-    /// <c>TransformerModel.ValidateAdapterForModel</c>.
+    /// model. Projection support is governed by <see cref="ILoraAdapter.IsCompatible"/>;
+    /// unsupported runtime sites are no-ops rather than validation failures.
     /// </summary>
     private void ValidateAdapterForModel(ILoraAdapter adapter)
     {
@@ -629,37 +663,6 @@ public sealed class VulkanTransformerModel : IModel
             throw new InvalidOperationException(
                 $"LoRA adapter '{adapter.Name}' is not compatible with the loaded model "
                 + "(layer count, hidden size, or per-projection dimensions mismatch).");
-
-        if (Config.MlaConfig is not null)
-        {
-            string[] mlaUnsupported = ["q_proj", "k_proj", "v_proj", "o_proj"];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                foreach (var name in mlaUnsupported)
-                {
-                    if (adapter.GetLayerWeights(layer, name) is not null)
-                        throw new NotSupportedException(
-                            $"LoRA adapter '{adapter.Name}' targets MLA-attention projection "
-                            + $"'{name}' at layer {layer}. MLA-LoRA support is a follow-up "
-                            + "(Phase 4b covers standard q/k/v/o + gate/up/down projections only).");
-                }
-            }
-        }
-
-        if (Config.Moe is not null)
-        {
-            string[] ffnTargets = ["gate_proj", "up_proj", "down_proj"];
-            for (int layer = 0; layer < Config.NumLayers; layer++)
-            {
-                foreach (var name in ffnTargets)
-                {
-                    if (adapter.GetLayerWeights(layer, name) is not null)
-                        throw new NotSupportedException(
-                            $"LoRA adapter '{adapter.Name}' targets MoE FFN projection "
-                            + $"'{name}' at layer {layer}. MoE-LoRA support is a follow-up.");
-                }
-            }
-        }
     }
 
     /// <inheritdoc/>
@@ -870,7 +873,7 @@ public sealed class VulkanTransformerModel : IModel
                 // top-k expert dispatch. Writes the post-MoE result into
                 // _state.NormOutput so the shared residual-add below
                 // works unchanged.
-                RecordMoeLayer(cmdBuf, moeW, lw, seqLen, eps);
+                RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
             }
             else
             {
@@ -1015,9 +1018,15 @@ public sealed class VulkanTransformerModel : IModel
         _mlaKvSplit?.InvalidateDescriptorCache();
         _moeTopkSoftmax?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulTiled?.InvalidateDescriptorCache();
+        _moeExpertOffsets?.InvalidateDescriptorCache();
+        _moeExpandGroupByExpert?.InvalidateDescriptorCache();
+        _moeGroupedMatmulF16Coopmat?.InvalidateDescriptorCache();
+        _moeUngroupScatter?.InvalidateDescriptorCache();
         _moeWeightedScatter?.InvalidateDescriptorCache();
         _moeBroadcast?.InvalidateDescriptorCache();
+        _moeIndexedLoraDelta?.InvalidateDescriptorCache();
         _moeSigmoidGatedAdd?.InvalidateDescriptorCache();
     }
 
@@ -1111,16 +1120,24 @@ public sealed class VulkanTransformerModel : IModel
             _matmul.Record(cmdBuf, mlaW.QAProj!, _state.NormOutput, _state.MlaQLatent!,
                 m: mlaW.QLoraRank, k: hidden, n: seqLen);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_a_proj", _state.NormOutput, _state.MlaQLatent!,
+                seqLen, hidden, mlaW.QLoraRank);
             _rmsnorm.Record(cmdBuf, _state.MlaQLatent!, mlaW.QALayernormWeight!, _state.MlaQLatentNorm!,
                 rowCount: seqLen, n: mlaW.QLoraRank, eps: eps);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             _matmul.Record(cmdBuf, mlaW.QBProj!, _state.MlaQLatentNorm!, _state.MlaQ!,
                 m: mlaW.QTotal, k: mlaW.QLoraRank, n: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_b_proj", _state.MlaQLatentNorm!, _state.MlaQ!,
+                seqLen, mlaW.QLoraRank, mlaW.QTotal);
         }
         else
         {
             _matmul.Record(cmdBuf, mlaW.QProj!, _state.NormOutput, _state.MlaQ!,
                 m: mlaW.QTotal, k: hidden, n: seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MaybeApplyLoraDelta(cmdBuf, layer, "q_proj", _state.NormOutput, _state.MlaQ!,
+                seqLen, hidden, mlaW.QTotal);
         }
 
         // ── KV path (latent + rope-K split) ──────────────────────────
@@ -1145,6 +1162,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmul.Record(cmdBuf, mlaW.KvBProj, _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
             m: mlaW.KvBOutputDim, k: mlaW.KvLoraRank, n: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        MaybeApplyLoraDelta(cmdBuf, layer, "kv_b_proj", _state.MlaKvLatentNorm!, _state.MlaKvBExpanded!,
+            seqLen, mlaW.KvLoraRank, mlaW.KvBOutputDim);
 
         _mlaKvSplit!.Record(cmdBuf, _state.MlaKvBExpanded!, _state.MlaKNope!, _state.MlaV!,
             seqLen: seqLen, numHeads: mlaW.NumHeads,
@@ -1200,6 +1219,8 @@ public sealed class VulkanTransformerModel : IModel
             _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
+        MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.MlaAttnOutput!, _state.NormOutput,
+            seqLen, lw.OInputDim, lw.OOutputDim);
     }
 
     /// <summary>
@@ -1223,7 +1244,7 @@ public sealed class VulkanTransformerModel : IModel
     /// </para>
     /// </remarks>
     private unsafe void RecordMoeLayer(
-        nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW,
+        nint cmdBuf, int layer, VulkanWeights.MoeLayerBuffers moeW,
         in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
     {
         int hidden = moeW.HiddenSize;
@@ -1268,26 +1289,49 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 5. Indexed expert matmuls: gate (W1) and up (W3) project the
-        //    expanded input through the experts selected by topk indices.
-        RecordMoeIndexedMatmul(cmdBuf,
-            moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        RecordMoeIndexedMatmul(cmdBuf,
-            moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        if (CanUseGroupedF16Moe(moeW, hidden, interm))
+        {
+            RecordMoeGroupedF16Layer(cmdBuf, moeW, expandedRows, hidden, interm, numE);
+        }
+        else
+        {
+            // 5. Indexed expert matmuls: gate (W1) and up (W3) project the
+            //    expanded input through the experts selected by topk indices.
+            RecordMoeIndexedMatmul(cmdBuf,
+                moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+                moeW.W1DeviceQuantType,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            RecordMoeIndexedMatmul(cmdBuf,
+                moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+                moeW.W3DeviceQuantType,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MaybeApplyMoeIndexedLoraDeltas(cmdBuf, layer, "gate_proj",
+                _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+                rows: expandedRows, inputDim: hidden, outputDim: interm, numExperts: numE);
+            MaybeApplyMoeIndexedLoraDeltas(cmdBuf, layer, "up_proj",
+                _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+                rows: expandedRows, inputDim: hidden, outputDim: interm, numExperts: numE);
+            if (_currentLora is not null)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 6. SwiGLU pointwise: silu(gate) * up.
-        _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
-            n: expandedRows * interm);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // 6. SwiGLU pointwise: silu(gate) * up.
+            _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+                n: expandedRows * interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 7. Indexed down matmul (W2): silu_intermediate → MoeDownRows.
-        RecordMoeIndexedMatmul(cmdBuf,
-            moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
-            m: hidden, k: interm, n: expandedRows, numExperts: numE);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            // 7. Indexed down matmul (W2): silu_intermediate → MoeDownRows.
+            RecordMoeIndexedMatmul(cmdBuf,
+                moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+                moeW.W2DeviceQuantType,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            MaybeApplyMoeIndexedLoraDeltas(cmdBuf, layer, "down_proj",
+                _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+                rows: expandedRows, inputDim: interm, outputDim: hidden, numExperts: numE);
+            if (_currentLora is not null)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
 
         // 8. Weighted scatter: combine each token's topK expert outputs into
         //    NormOutput, scaled by the routing weights.
@@ -1304,6 +1348,80 @@ public sealed class VulkanTransformerModel : IModel
         {
             RecordMoeSharedExperts(cmdBuf, moeW, lw.FfnNormWeight, seqLen, hidden, eps);
         }
+    }
+
+    private bool CanUseGroupedF16Moe(
+        in VulkanWeights.MoeLayerBuffers moeW, int hidden, int interm)
+        => _currentLora is null
+        && _moeExpertOffsets is not null
+        && _moeExpandGroupByExpert is not null
+        && _moeGroupedMatmulF16Coopmat is not null
+        && _moeUngroupScatter is not null
+        && moeW.W1DeviceQuantType == QuantType.F16
+        && moeW.W2DeviceQuantType == QuantType.F16
+        && moeW.W3DeviceQuantType == QuantType.F16
+        && (hidden % MoeGroupedMatmulF16CoopmatKernel.KChunk) == 0
+        && (interm % MoeGroupedMatmulF16CoopmatKernel.KChunk) == 0;
+
+    private void RecordMoeGroupedF16Layer(
+        nint cmdBuf, VulkanWeights.MoeLayerBuffers moeW,
+        int expandedRows, int hidden, int interm, int numExperts)
+    {
+        _moeExpertOffsets!.Record(cmdBuf,
+            _state.MoeTopkIndices!, _state.MoeExpertCounts!,
+            _state.MoeExpertOffsets!, _state.MoeExpertCounters!,
+            rows: expandedRows, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeExpandGroupByExpert!.Record(cmdBuf,
+            _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeExpertOffsets!,
+            _state.MoeExpertCounters!, _state.MoeGroupedHidden!, _state.MoePermutation!,
+            rows: expandedRows, hidden: hidden, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeGroupedMatmulF16Coopmat!.Record(cmdBuf,
+            moeW.W1Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedGateInter!,
+            m: interm, k: hidden, rows: expandedRows, numExperts: numExperts);
+        _moeGroupedMatmulF16Coopmat.Record(cmdBuf,
+            moeW.W3Bank, _state.MoeGroupedHidden!, _state.MoeExpertOffsets!, _state.MoeGroupedUpInter!,
+            m: interm, k: hidden, rows: expandedRows, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeUngroupScatter!.Record(cmdBuf,
+            _state.MoeGroupedGateInter!, _state.MoePermutation!, _state.MoeGateInter!,
+            rows: expandedRows, hidden: interm);
+        _moeUngroupScatter.Record(cmdBuf,
+            _state.MoeGroupedUpInter!, _state.MoePermutation!, _state.MoeUpInter!,
+            rows: expandedRows, hidden: interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _swiglu.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+            n: expandedRows * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Re-run the count/prefix kernel to reset group counters before grouping the
+        // post-SwiGLU rows for W2. Offsets/counts are deterministic for the same indices.
+        _moeExpertOffsets.Record(cmdBuf,
+            _state.MoeTopkIndices!, _state.MoeExpertCounts!,
+            _state.MoeExpertOffsets!, _state.MoeExpertCounters!,
+            rows: expandedRows, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeExpandGroupByExpert.Record(cmdBuf,
+            _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeExpertOffsets!,
+            _state.MoeExpertCounters!, _state.MoeGroupedGateInter!, _state.MoePermutation!,
+            rows: expandedRows, hidden: interm, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeGroupedMatmulF16Coopmat.Record(cmdBuf,
+            moeW.W2Bank, _state.MoeGroupedGateInter!, _state.MoeExpertOffsets!, _state.MoeGroupedHidden!,
+            m: hidden, k: interm, rows: expandedRows, numExperts: numExperts);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        _moeUngroupScatter.Record(cmdBuf,
+            _state.MoeGroupedHidden!, _state.MoePermutation!, _state.MoeDownRows!,
+            rows: expandedRows, hidden: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
     }
 
     /// <summary>
@@ -1468,8 +1586,22 @@ public sealed class VulkanTransformerModel : IModel
         nint cmdBuf,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
+        QuantizationType weightQt,
         int m, int k, int n, int numExperts)
     {
+        if (weightQt == QuantizationType.Q8_0)
+        {
+            if (_moeIndexedMatmulQ8 is null)
+                throw new InvalidOperationException("Q8_0 MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ8.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt != QuantizationType.F32)
+            throw new NotSupportedException($"MoE indexed matmul does not support {weightQt} banks.");
+
         bool useTiled = _moeIndexedMatmulTiled is not null
             && n >= TiledMinRows
             && (m % MoeIndexedMatmulTiledF32Kernel.TileM) == 0;
@@ -1485,6 +1617,39 @@ public sealed class VulkanTransformerModel : IModel
             _moeIndexedMatmul!.Record(cmdBuf,
                 bank, x, indices, y,
                 m: m, k: k, n: n, numExperts: numExperts);
+        }
+    }
+
+    private void MaybeApplyMoeIndexedLoraDeltas(
+        nint cmdBuf,
+        int layer,
+        string projection,
+        VulkanDevice.Buffer x,
+        VulkanDevice.Buffer indices,
+        VulkanDevice.Buffer y,
+        int rows,
+        int inputDim,
+        int outputDim,
+        int numExperts)
+    {
+        var lora = _currentLora;
+        if (lora is null || _moeIndexedLoraDelta is null) return;
+
+        for (int expert = 0; expert < numExperts; expert++)
+        {
+            string projName = $"mlp.experts.{expert}.{projection}";
+            var lb = lora.Get(layer, projName);
+            if (lb is not { } w) continue;
+
+            if (w.InputDim != inputDim || w.OutputDim != outputDim)
+                throw new InvalidOperationException(
+                    $"LoRA adapter '{lora.Source.Name}' layer={layer} proj='{projName}' shape "
+                    + $"({w.InputDim}x{w.OutputDim}) does not match MoE projection ({inputDim}x{outputDim}).");
+
+            _moeIndexedLoraDelta.Record(cmdBuf,
+                x, indices, w.B, w.A, y,
+                rows: rows, inputDim: inputDim, outputDim: outputDim,
+                rank: w.Rank, expert: expert);
         }
     }
 
@@ -1767,7 +1932,13 @@ public sealed class VulkanTransformerModel : IModel
         _moeSigmoidGatedAdd?.Dispose();
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
+        _moeUngroupScatter?.Dispose();
+        _moeGroupedMatmulF16Coopmat?.Dispose();
+        _moeExpandGroupByExpert?.Dispose();
+        _moeExpertOffsets?.Dispose();
+        _moeIndexedLoraDelta?.Dispose();
         _moeIndexedMatmulTiled?.Dispose();
+        _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
         _mlaKvSplit?.Dispose();
