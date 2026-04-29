@@ -225,7 +225,9 @@ internal sealed class VulkanLoraAdapter : IDisposable
 
     private static bool IsStandardTransformerProj(string proj) =>
         proj is "q_proj" or "k_proj" or "v_proj" or "o_proj"
-             or "gate_proj" or "up_proj" or "down_proj";
+             or "gate_proj" or "up_proj" or "down_proj"
+             or "q_a_proj" or "q_b_proj" or "kv_a_proj_with_mqa" or "kv_b_proj"
+             || proj.StartsWith("mlp.experts.", StringComparison.Ordinal);
 
     /// <summary>
     /// Looks up the device buffers for <paramref name="layerIndex"/> /
