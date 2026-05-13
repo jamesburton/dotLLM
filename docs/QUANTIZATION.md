@@ -111,8 +111,37 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | Q4_K_M | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
 | Q5_K_M | ✓ | ✓ | — | `15099b9` + `83e0732` |
 | Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
+| IQ4_NL | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ4_XS | ✓ | ✓ | — | IQ-family Phase 2 |
 
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ-family Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K are present in the CUDA backend (lighter-weight reference kernels) and are tracked as a Vulkan follow-up.
+Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ3_x / IQ2_x / IQ1_S Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints); IQ4_NL and IQ4_XS followed because they are the most-used IQ-family quants in production (Llama-3.1 / Qwen2.5 IQ4_XS). Q2_K + Q3_K + IQ3 / IQ2 / IQ1 are present in the CUDA backend (lighter-weight reference kernels) and are tracked as Vulkan follow-ups.
+
+### IQ4_NL / IQ4_XS layout (Vulkan)
+
+Both IQ4 formats share the 16-entry signed-int8 codebook `kvalues_iq4nl = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}`. The 4-bit `qs` nibble is an *index* into the codebook, not a signed int — so the Vulkan dequant path does a constant-array lookup rather than a linear subtract. The codebook is duplicated as a `const float[16]` inside each shader (≈ 64 bytes per shader, well under push-constant / register pressure thresholds).
+
+**IQ4_NL** (32-element block, 18 bytes/block):
+```
+bytes [0,1]   = fp16 d
+bytes [2..17] = qs[16]   // low nibble = element j, high nibble = element j + 16
+value         = d * float(kvalues_iq4nl[nibble])
+```
+
+**IQ4_XS** (256-element super-block, 136 bytes/super-block):
+```
+bytes [0,1]    = fp16 d
+bytes [2,3]    = scales_h (uint16 LE)             // top 2 bits of each 6-bit ls
+bytes [4..7]   = scales_l[4]                       // low 4 bits of each 6-bit ls
+bytes [8..135] = qs[128]                           // 8 sub-blocks of 16 bytes / 32 nibbles
+per sub-block ib:
+    low6  = (scales_l[ib/2] >> (4*(ib&1))) & 0xF
+    high2 = (scales_h >> (2*ib))           & 0x3
+    ls    = low6 | (high2 << 4)            // 6-bit unsigned in [0..63]
+    dl    = d * float(ls - 32)             // signed effective scale, range ≈ [-32, 31]
+    value = dl * float(kvalues_iq4nl[nibble])
+```
+
+Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `inputDim % 256 == 0`. The upload path's `KeepIq4NlOnDevice` / `KeepIq4XsOnDevice` predicates gate on these.
 
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
