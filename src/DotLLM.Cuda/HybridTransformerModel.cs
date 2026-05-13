@@ -165,7 +165,11 @@ public sealed unsafe class HybridTransformerModel : IModel
         if (ropeDim == 0) ropeDim = config.HeadDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
         RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
-        int gpuRopeType = (int)cpuRopeType;
+        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+        // kernel's encoding (Norm=0, NeoX=1). The CPU half of this hybrid
+        // model still consumes the enum directly via cpuRopeType; only the
+        // GPU dispatch needs the kernel-side integer encoding.
+        int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
 
         var cpuState = new TransformerForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,

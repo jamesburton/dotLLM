@@ -357,7 +357,11 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
         int ropeDim = config.RoPEConfig?.DimensionCount ?? headDim;
         if (ropeDim == 0) ropeDim = headDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int ropeType = (int)(config.RoPEConfig?.Type ?? RoPEType.Norm);
+        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+        // kernel's encoding (Norm=0, NeoX=1). Llama is Norm so the cast and
+        // the helper produce the same value here, but routing through the
+        // helper keeps this test correct if a NeoX checkpoint is ever swapped in.
+        int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
         float[] hiddenF32 = new float[seqLen * hidden];
         Half[] hiddenF16 = new Half[hiddenF32.Length];
@@ -625,7 +629,10 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
         int ropeDim = config.RoPEConfig?.DimensionCount ?? headDim;
         if (ropeDim == 0) ropeDim = headDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int ropeType = (int)(config.RoPEConfig?.Type ?? RoPEType.Norm);
+        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+        // kernel's encoding (Norm=0, NeoX=1). See the F16 sibling test for
+        // the full rationale.
+        int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
         float[] hiddenCpu = new float[seqLen * hidden];
         LoadEmbeddingRows(weights.TokenEmbedWeight, weights.TokenEmbedQuantType, promptTokens, hidden, hiddenCpu);

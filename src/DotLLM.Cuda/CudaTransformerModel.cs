@@ -286,6 +286,32 @@ public sealed unsafe class CudaTransformerModel : IModel
     }
 
     /// <summary>
+    /// Test-only factory that wires a CUDA model around an already-built CPU
+    /// <see cref="TransformerWeights"/>. Mirrors
+    /// <see cref="TransformerModel.BuildFromPrebuiltWeights(TransformerWeights, ModelConfig, ThreadingConfig?)"/>
+    /// so synthetic fixtures can pin CPU-vs-CUDA parity without a GGUF / safetensors
+    /// file. Caller retains ownership of every host pointer carried by
+    /// <paramref name="cpuWeights"/>; <see cref="Dispose"/> only releases the device
+    /// allocations created by the loader.
+    /// </summary>
+    /// <param name="cpuWeights">Already-built weight bundle (host F32 pointers OK).</param>
+    /// <param name="config">Matching model configuration.</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null auto-detects.</param>
+    internal static CudaTransformerModel BuildFromPrebuiltWeights(
+        TransformerWeights cpuWeights, ModelConfig config,
+        int deviceId = 0, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(cpuWeights);
+        ArgumentNullException.ThrowIfNull(config);
+        // Skip the VRAM-estimate path — synthetic fixtures are tiny and we
+        // don't have a GGUF tensor manifest to walk; passing 0 disables the
+        // warning emission inside LoadFromCpuWeights.
+        return LoadFromCpuWeights(cpuWeights, config, gguf: null, deviceId, ptxDir,
+                                  estimatedWeightBytes: 0);
+    }
+
+    /// <summary>
     /// Shared CUDA init + upload used by both the GGUF and safetensors entrypoints.
     /// Creates the CUDA context/stream/cuBLAS, loads the PTX module, emits the VRAM
     /// warning if the estimate exceeds free device memory, and uploads the already-
@@ -325,7 +351,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
         float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        int ropeType = (int)(config.RoPEConfig?.Type ?? RoPEType.Norm);
+        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+        // kernel's encoding (Norm=0, NeoX=1). Direct cast was a long-standing
+        // bug — passing NeoX=2 fell into the kernel's "anything but 1 → GPT-J
+        // interleaved" branch, silently mis-rotating every Qwen/Phi forward.
+        int ropeType = CudaKernels.ToCudaRopeType(config.RoPEConfig?.Type ?? RoPEType.Norm);
 
         return new CudaTransformerModel(config, weights, state, stream, cublas, context,
             kernels, gguf, cpuWeights, deviceId, ropeTheta, ropeDim, ropeType, vramWarning);
