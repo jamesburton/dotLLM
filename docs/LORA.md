@@ -81,3 +81,114 @@ This is less efficient than uniform batching but the LoRA matmuls are small (low
 - **No weight merging**: Adapters are never merged into base weights (`W' = W + αBA`). This enables instant switching and concurrent adapters. Trade-off: small per-layer overhead vs. large flexibility gain.
 - **Adapter caching**: Loaded adapters kept in memory (GPU or CPU). Small footprint (10-100MB typical for 7B model adapter).
 - **Hot loading**: Adapters can be loaded/unloaded at runtime without restarting the server.
+
+## Performance — Macro-Bench (Phase 4d.3)
+
+End-to-end forward-pass throughput with and without an active adapter,
+measured via `benchmarks/DotLLM.Benchmarks/Lora/LoraMacroBenchmarks.cs`.
+Sister bench to the kernel-level `LoraDeltaOverheadBenchmark` that reported
++9% prefill / +4% decode at TinyLlama `q_proj` shapes — this one closes the
+loop at the system level.
+
+### Methodology
+
+- **Adapter**: deterministic synthetic, rank=16, alpha=32, covering every
+  `(layer, projection)` site the standard `TransformerModel` dispatch looks
+  up (q/k/v/o + gate/up/down per layer). Generated in-memory via
+  `SyntheticLoraAdapter` so no real adapter checkpoint is shipped with the
+  repo.
+- **Scenarios**: `Prefill512` runs a ~512-token prompt + 1-token decode
+  (prefill-dominated); `Decode128` runs a 32-token prompt + 128 decode
+  steps (decode-dominated, batch=1).
+- **Iterations**: BDN `SimpleJob(warmupCount: 1, iterationCount: 3)` —
+  5 raw measurements per case (1 warmup + 1 pilot + 3 measured); the
+  reported numbers are the **median** across all 5 to absorb the
+  cold-cache warmup outlier without overfitting to a single best.
+- **Sampling**: greedy (`Temperature = 0`) so the same prompt produces
+  identical decoded tokens on every iteration, removing sampler variance.
+
+### Results — 2026-05-13, Strix Halo (Ryzen AI Max+ 395)
+
+| Component | Value |
+|---|---|
+| CPU | AMD Ryzen AI Max+ 395 (Strix Halo, 16C/32T, AVX-512F+CD+BW+DQ+VL+VBMI) |
+| GPU | Radeon 8060S iGPU (not exercised — CPU backend only) |
+| OS | Windows 11 Pro 10.0.26200.7019 |
+| .NET | SDK 10.0.103 / Runtime 10.0.3 |
+| BenchmarkDotNet | 0.14.0, InProcessEmitToolchain |
+| Base model | `Llama-3.2-1B-Instruct.Q8_0.gguf` (16 layers, hidden=2048, 32 q-heads, 8 kv-heads, ffn=8192) — TinyLlama-1.1B GGUF not present in `~/.dotllm/test-cache/`, so the closest available stand-in was used. Adapter covers 16 layers × 7 projections = 112 sites. |
+| Date | 2026-05-13 |
+
+#### Prefill (512-token prompt, prefill-dominated)
+
+| Variant | Median Prefill tok/s | Δ vs NoLora |
+|---|---:|---:|
+| NoLora | 115.02 | — |
+| LoraF32 | 74.06 | **−35.6%** |
+| LoraF16 | 74.64 | **−35.1%** |
+| LoraBF16 | 73.57 | **−36.0%** |
+
+#### Decode (32-token prompt, 128-step decode, batch=1)
+
+| Variant | Median Decode tok/s | Δ vs NoLora |
+|---|---:|---:|
+| NoLora | 10.74 | — |
+| LoraF32 | 11.17 | +4.0% (within noise) |
+| LoraF16 | 10.57 | −1.6% (within noise) |
+| LoraBF16 | 9.15 | **−14.8%** |
+
+### Conclusion
+
+The +9% kernel-level prefill regression is system-visible **and amplifies
+sharply at the prefill scale** — observed real-checkpoint prefill drops
+~36% with LoRA active across all three dtypes, vs the ~9% predicted by the
+kernel bench at TinyLlama `q_proj` shapes. The disparity comes from
+applying LoRA on top of a **quantised (Q8_0) base**: the base GEMM is now
+memory-bandwidth-bound and very fast per FLOP, so the F32 LoRA delta —
+which adds an unquantised `(seq × hidden × rank) + (seq × rank × out)`
+matmul pair per projection — becomes a much larger relative share of the
+forward-pass cost than the kernel bench (F32 base, F32 delta) predicted.
+
+Decode is essentially noise-bounded: the per-step LoRA cost is small
+enough relative to the per-step base forward (which is `seqLen=1` and
+dominated by per-token KV-cache writes + attention) that the F32 / F16
+variants land within ±5% of NoLora. The BF16 path lags by ~15%, traceable
+to the scalar `ReadUInt16LittleEndian` per-element dequant loop in
+`LoraDelta.DequantToF32` — F16 uses `TensorPrimitives.ConvertToSingle`
+(SIMD) instead.
+
+### Next Optimisation Opportunities
+
+1. **Quantise the LoRA delta to match the base**. Today the base is Q8_0
+   but `LoraDelta.Apply` dequantises to F32 and runs two F32 GEMMs. A
+   Q8_0-LoRA path (or even an F16-LoRA path that fuses dequant into the
+   GEMM inner loop) would put the delta on a roughly equal FLOP/byte
+   ratio to the base — closing the bulk of the prefill regression.
+2. **SIMD-vectorise the BF16 dequant**. The current scalar loop reads
+   2 bytes and shifts left 16 to construct an F32; the equivalent F16
+   path is ~8× faster via `TensorPrimitives.ConvertToSingle`. Either
+   write a vectorised BF16→F32 routine or persist BF16 adapters as F16
+   internally on load (small, one-time cost; halves CPU dequant work).
+3. **Reuse adapter scratch across projections in a layer**. The current
+   path rents `tmp[seq, rank]` and `delta[out]` per `Apply` call. Hoisting
+   to a per-layer scratch pool would save 7 rent/return pairs per layer
+   per forward — a small win individually but ~22 × 7 = 154 fewer pool
+   round-trips per TinyLlama-class forward.
+4. **Macro-bench the Vulkan path on Strix Halo's iGPU**. The 8060S
+   integrated GPU is bandwidth-rich (UMA, 256 GB/s class) and may amortise
+   the LoRA delta proportionally better than CPU — worth confirming
+   before any kernel-side work lands.
+
+### Reproducing
+
+```pwsh
+# Use a specific model checkpoint:
+$env:DOTLLM_BENCH_MODEL_PATH = "C:\path\to\model.gguf"
+
+dotnet run -c Release --project benchmarks/DotLLM.Benchmarks `
+    -- --filter '*LoraMacroBenchmarks*' --invocationCount 1 --unrollFactor 1
+```
+
+Metrics are written to `%TEMP%/dotllm-bdn-metrics/Lora_*.json`; the BDN
+summary table surfaces the median values via the custom `Prefill tok/s`
+and `Decode tok/s` columns.
