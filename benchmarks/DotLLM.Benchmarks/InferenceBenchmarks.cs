@@ -111,7 +111,17 @@ public class InferenceBenchmarks
         }
         else
         {
-            _model = TransformerModel.LoadFromGguf(_gguf, config, ThreadingConfig.Auto);
+            // Architecture-aware dispatch — TransformerModel handles dense (Llama/Mistral/Phi/Qwen)
+            // and DeepSeek-V2/V3, but hybrid SSM+attention models like Qwen3MoeHybrid have
+            // their own concrete IModel type.
+            if (config.Architecture == Architecture.Qwen3MoeHybrid)
+            {
+                _model = Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config, ThreadingConfig.Auto);
+            }
+            else
+            {
+                _model = TransformerModel.LoadFromGguf(_gguf, config, ThreadingConfig.Auto);
+            }
             Console.WriteLine($"Device: CPU ({ThreadingConfig.Auto.EffectiveThreadCount} threads)");
         }
 

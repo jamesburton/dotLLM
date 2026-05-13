@@ -20,9 +20,12 @@ this exercise it does:
   cleanest measurement in the baseline and is the **headline gap to
   fix** in correctness-clean data.
 - **Qwen3.6-35B-A3B (Gated DeltaNet + MoE, Phase 10)**: dotLLM CPU
-  output is gibberish today — both the correctness claim from
-  roadmap Step 63 and the supposed perf number are unreliable.
-  Correctness regression must be fixed before this can be measured.
+  output now matches llama.cpp end-to-end on the canonical prompt
+  (post-`fdb39b4`, Q/K head-broadcast convention fix across all
+  backends). Indicative decode is ~0.25× llama.cpp under
+  memory-contended conditions; the GDN scan + per-expert MoE matmul
+  are scalar-loop reference impls and are the obvious next SIMD
+  targets. See §3.1.
 
 ## 1. Environment
 
@@ -98,8 +101,8 @@ header. Numbers in this table are reproducible via the commands in
 | Llama-3.2-1B-Instruct (medium prompt) | Q8_0 | llama.cpp |  98 |  9 | 15.3 | – | 1.21 | – | Single run, contention-impaired — **ratio not meaningful** |
 | Llama-3.2-3B-Instruct     | Q8_0    | dotLLM    |   5 | 29 | 7.78 | 30% | 3.93 | 7% | dotLLM clean (CV 7%) |
 | Llama-3.2-3B-Instruct     | Q8_0    | llama.cpp |   5 | 29 | 7.46 | 93% | 2.18 | 81% | Contention-dominated — **ratio not meaningful** |
-| **Qwen3.6-35B-A3B-UD**    | Q6_K_XL | dotLLM    |   5 | 29 |   0.3–0.6 | – |   0.2–0.6 | – | **Output is gibberish — see §3.1** |
-| **Qwen3.6-35B-A3B-UD**    | Q6_K_XL | llama.cpp |   5 | 29 | **7.25** | – | **3.93** | – | Output coherent: `"Paris, a city renowned"` |
+| **Qwen3.6-35B-A3B-UD**    | Q6_K_XL | dotLLM    |   5 | 19 |   0.3–0.8 | – |   0.6–1.0 | – | Post-`fdb39b4` — output matches llama.cpp. Memory-contended runs; see §3.1 |
+| **Qwen3.6-35B-A3B-UD**    | Q6_K_XL | llama.cpp |   5 | 19 | **2.86** | – | **3.92** | – | `--no-warmup`, same `-t 8`; output: `"Paris, a city renowned for its iconic landmarks..."` |
 
 Bold values indicate the faster engine on that row **for rows where
 both engines are within a comparable noise envelope**. Rows marked
@@ -147,35 +150,56 @@ llama.cpp").
 | Llama-3.2-1B / CPU      | 0.62×   | **0.69×** | Clean enough on dotLLM side; llama.cpp CV 75% — directional only |
 | Llama-3.2-1B (medium prompt) / CPU | (1.73×) | — | llama.cpp single run, contention — not load-bearing |
 | Llama-3.2-3B / CPU      | —       | — | Both runs contention-impaired — not load-bearing |
-| Qwen3.6-A3B / CPU       | (0.04×) | (0.05×) | dotLLM **output is incorrect** — see §3.1; perf number is not a baseline |
+| Qwen3.6-A3B / CPU       | 0.28×   | **0.25×** | Correctness restored; memory-contended floor — see §3.1 |
 | SmolLM-135M / CUDA      | 1.02×   | **0.43×** | Clean |
 | **Llama-3.2-1B / CUDA** | 0.85×   | **0.60×** | **Clean** — dotLLM 51 tok/s vs llama.cpp 85 tok/s |
 
-### 3.1 Qwen3.6-A3B CPU is broken before it is slow
+### 3.1 Qwen3.6-A3B CPU — correctness restored, perf measurable
 
-The dotLLM CPU forward pass on `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`
-produces gibberish output at greedy temperature:
+**Status (post-`fdb39b4`, 2026-05-13)**: dotLLM CPU output now matches
+llama.cpp end-to-end on the canonical prompts. Root cause was a TILED-
+vs-INTERLEAVED Q/K head-broadcast bug in the GDN scan kernel (all three
+backends), masked in CI by every existing GDN test fixture using
+`NKHead=1` (where both mappings degenerate to `kh=0`). See commit
+`fdb39b4` and `.planning/notes/qwen35moe-gdeltanet-architecture.md`
+("Critical Implementation Notes") for the full diagnosis.
 
 ```
 Prompt:  "The capital of France is"
-dotLLM:  " ore��dee 000oes 0 1own  20af000120 Io777"
-llama.cpp: " Paris, a city renowned"
+dotLLM:  " Paris, a city renowned for its iconic landmarks such as the Eiffel Tower, the Louvre Museum"
+llama.cpp: same continuation
 ```
 
-Roadmap step 63 claims **"CPU bit-exact verified — top-1 token 'Ta'
-matches llama.cpp reference"**. The committed code (`bcace4b`, and
-specifically `src/DotLLM.Models/Architectures/Qwen3MoeHybridTransformerModel.cs`
-is **not** in the working-tree dirty list) does not reproduce that
-claim today. The roadmap claim was either first-token only (and the
-multi-token drift has always been there) or there has been a
-regression. Either way the 20× perf gap is meaningless: that number
-is the cost of a broken inference path, and 1× the cost of fixing the
-correctness problem may eliminate most or all of the apparent perf
-gap.
+Indicative perf snapshot (Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf, 5-token
+prompt + 20-token decode, 8 threads, warm OS page cache; system under
+heavy memory pressure with a separate `llama-server` instance holding
+~50 GiB of the same model concurrently — these numbers are a floor,
+not the steady-state achievable on a quiescent system):
 
-**Recommendation**: do not pick Qwen3MoeHybrid CPU perf as the "next
-optimisation" target until correctness is restored. Re-measure after
-the fix and put the resulting number into this table.
+| Engine    | Run | Prefill tok/s | Decode tok/s | Note |
+|-----------|----:|--------------:|-------------:|------|
+| dotLLM    |  1  |     0.3       |     0.6      | First post-load run; mmap not yet hot |
+| dotLLM    |  2  |     0.8       |     0.7      | |
+| dotLLM    |  3  |     0.8       |   **1.0**    | Best |
+| dotLLM    |  4  |     0.5       |     0.6      | Concurrent llama-server load spike |
+| llama.cpp |  1  |   **2.86**    |   **3.92**   | `--no-warmup`, warm cache |
+| llama.cpp |  2  |     0.48      |     0.45     | System under load |
+
+Indicative warm ratios (best-of-N for both engines, single hardware
+configuration, contended system): dotLLM/llama.cpp ≈ **0.28× prefill,
+0.25× decode** — a ~4× gap. This is a real signal but not yet a
+publication-quality baseline: BDN-driven measurements on a quiescent
+system are pending (the existing `InferenceBenchmarks` dispatches via
+`TransformerModel.LoadFromGguf` which does not yet handle
+`Architecture.Qwen3MoeHybrid` — needs the `Qwen3MoeHybridTransformerModel.LoadFromGguf`
+dispatcher to be wired in; tracked as a follow-up).
+
+**Recommendation**: the GDN scan kernel and per-expert MoE matmul are
+both scalar-loop reference implementations in CPU. Both are obvious
+SIMD/AVX2 targets and likely close the gap meaningfully; see Step 63's
+"Optimize" subsection for the specific candidates (vectorise GDN inner
+loops, fuse alpha/beta proj with softplus/sigmoid). Re-measure after
+those land and update this table.
 
 ### 3.2 Biggest gap (correctness-clean)
 
