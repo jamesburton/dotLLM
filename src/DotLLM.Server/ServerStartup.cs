@@ -7,6 +7,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 
@@ -246,6 +247,13 @@ public static class ServerStartup
 
         // Keep only warning+ logging to avoid noisy request logs
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+
+        // OpenTelemetry — opt-in via the standard OTEL_EXPORTER_OTLP_ENDPOINT env var.
+        // No listener means EngineTelemetry stays zero-overhead.
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT")))
+        {
+            builder.Services.AddDotLLMOpenTelemetry(state.Options.ModelId);
+        }
 
         var app = builder.Build();
         app.UseDeveloperExceptionPage();
