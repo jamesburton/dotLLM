@@ -121,10 +121,34 @@ public static class HfConfigExtractor
         // shared-expert PoC only — multi-shared is a follow-up).
         MoeConfig? moe = ExtractMoeConfig(root, intermediateSize, numLayers, architecture);
 
+        // Dense-path YaRN scaling. MLA handles its own rope_scaling extraction
+        // above (carried inside MlaConfig); for non-MLA architectures we surface
+        // YaRN into RoPEConfig so TransformerModel can rebuild the cos/sin
+        // tables via PrecomputeFrequencyTableYarn. The base SmolLM3-3B ships
+        // rope_scaling=null — for the long-context 128k SKUs the same checkpoint
+        // family ships {"rope_type":"yarn","factor":...,"original_max_position_embeddings":...}.
+        (RoPEScalingType ropeScalingType, float ropeScalingFactor,
+         int ropeScalingOrigMax, float ropeScalingBetaFast, float ropeScalingBetaSlow,
+         float ropeScalingAttnFactor) = ExtractDenseRopeScaling(root);
+
+        // SmolLM3 NoPE mask: per-layer 0/1 array where the layer skips RoPE
+        // when the value is 0 (HF naming is counterintuitive — see
+        // modeling_smollm3.py: self.use_rope = config.no_rope_layers[layer_idx]
+        // then `if self.use_rope: apply_rotary_pos_emb(...)`). Convert to a
+        // list of layer INDICES where RoPE is skipped so the forward pass can
+        // gate via ModelConfig.IsNoRopeLayer.
+        IReadOnlyList<int>? noRopeLayers = ExtractNoRopeLayers(root);
+
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
             DimensionCount: headDim,
-            Type: ropeType);
+            Type: ropeType,
+            ScalingType: ropeScalingType,
+            ScalingFactor: ropeScalingFactor,
+            OrigMaxSeqLen: ropeScalingOrigMax,
+            AttnFactor: ropeScalingAttnFactor,
+            BetaFast: ropeScalingBetaFast,
+            BetaSlow: ropeScalingBetaSlow);
 
         return new ModelConfig
         {
@@ -148,7 +172,99 @@ public static class HfConfigExtractor
             MlaConfig = mla,
             Moe = moe,
             ChatTemplate = null,
+            NoRopeLayers = noRopeLayers,
         };
+    }
+
+    /// <summary>
+    /// Pulls the optional <c>rope_scaling</c> block for non-MLA architectures
+    /// (SmolLM3, Llama 3.1+, ...). Returns defaults
+    /// (<see cref="RoPEScalingType.None"/>, factor=1) when the block is
+    /// absent or declares <c>rope_type=default</c>. Recognises HF's modern
+    /// keys (<c>rope_type</c>, <c>type</c>) alongside the legacy
+    /// <c>linear</c> / <c>dynamic</c> family.
+    /// </summary>
+    private static (RoPEScalingType Type, float Factor, int OrigMax, float BetaFast, float BetaSlow, float AttnFactor)
+        ExtractDenseRopeScaling(JsonElement root)
+    {
+        if (!root.TryGetProperty("rope_scaling", out var rs) || rs.ValueKind != JsonValueKind.Object)
+            return (RoPEScalingType.None, 1.0f, 0, 32.0f, 1.0f, 1.0f);
+
+        // HF rope_scaling sometimes uses `rope_type`, sometimes `type`.
+        string? typeName = null;
+        if (rs.TryGetProperty("rope_type", out var rt) && rt.ValueKind == JsonValueKind.String)
+            typeName = rt.GetString();
+        else if (rs.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String)
+            typeName = t.GetString();
+
+        RoPEScalingType scalingType = typeName?.ToLowerInvariant() switch
+        {
+            "linear" => RoPEScalingType.Linear,
+            "yarn" => RoPEScalingType.YaRN,
+            "ntk" => RoPEScalingType.NTK,
+            "dynamic" or "dynamic_ntk" => RoPEScalingType.DynamicNTK,
+            "su" or "longrope" => RoPEScalingType.Su,
+            _ => RoPEScalingType.None,
+        };
+
+        float factor = 1.0f;
+        if (rs.TryGetProperty("factor", out var f) && f.ValueKind == JsonValueKind.Number
+            && f.TryGetSingle(out float fv))
+            factor = fv;
+
+        int origMax = 0;
+        if (rs.TryGetProperty("original_max_position_embeddings", out var om)
+            && om.ValueKind == JsonValueKind.Number
+            && om.TryGetInt32(out int omv))
+            origMax = omv;
+
+        float betaFast = 32.0f;
+        if (rs.TryGetProperty("beta_fast", out var bf) && bf.ValueKind == JsonValueKind.Number
+            && bf.TryGetSingle(out float bfv))
+            betaFast = bfv;
+
+        float betaSlow = 1.0f;
+        if (rs.TryGetProperty("beta_slow", out var bs) && bs.ValueKind == JsonValueKind.Number
+            && bs.TryGetSingle(out float bsv))
+            betaSlow = bsv;
+
+        // attention_factor (HF) — softmax scale multiplier folded into cos/sin.
+        // Defaults to 1.0 (SmolLM3 doesn't ship it).
+        float attnFactor = 1.0f;
+        if (rs.TryGetProperty("attention_factor", out var af) && af.ValueKind == JsonValueKind.Number
+            && af.TryGetSingle(out float afv))
+            attnFactor = afv;
+
+        return (scalingType, factor, origMax, betaFast, betaSlow, attnFactor);
+    }
+
+    /// <summary>
+    /// Parses SmolLM3's <c>no_rope_layers</c> per-layer mask. HF encodes
+    /// <c>1 = apply RoPE</c>, <c>0 = skip RoPE</c> — we invert and return
+    /// the indices that SKIP RoPE so downstream code reads naturally
+    /// (<c>IsNoRopeLayer(i)</c> matches the field name). Returns null when
+    /// the key is absent or every layer applies RoPE.
+    /// </summary>
+    private static IReadOnlyList<int>? ExtractNoRopeLayers(JsonElement root)
+    {
+        if (!root.TryGetProperty("no_rope_layers", out var prop) || prop.ValueKind != JsonValueKind.Array)
+            return null;
+        int len = prop.GetArrayLength();
+        if (len == 0) return null;
+
+        List<int>? skipped = null;
+        int i = 0;
+        foreach (var el in prop.EnumerateArray())
+        {
+            // 1 = apply RoPE; 0 = skip RoPE (NoPE).
+            if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out int v) && v == 0)
+            {
+                skipped ??= new List<int>();
+                skipped.Add(i);
+            }
+            i++;
+        }
+        return skipped;
     }
 
     /// <summary>
@@ -434,6 +550,10 @@ public static class HfConfigExtractor
             // layout requires its own loader path.
             (var a, _) when a is not null && a.Contains("granitemoe") => Architecture.GraniteMoe,
             (_, "granitemoe" or "granite_moe") => Architecture.GraniteMoe,
+            // SmolLM3 — `SmolLM3ForCausalLM` / `model_type=smollm3`. Llama-shaped
+            // tensors but carries `no_rope_layers` mask + (optional) YaRN scaling.
+            (var a, _) when a is not null && a.Contains("smollm3") => Architecture.SmolLM3,
+            (_, "smollm3") => Architecture.SmolLM3,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,
