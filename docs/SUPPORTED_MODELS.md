@@ -40,8 +40,9 @@ for system context.
 | Qwen-MoE (1.5 / 2 / 3) | `Architecture.QwenMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX | GQA, optional `sliding_window` | yes: `mlp.gate` + per-expert `experts.{j}.{gate,up,down}_proj`; optional shared-expert branch (Qwen1.5-MoE) with sigmoid gate; layer-level sparsity (Qwen3-MoE) via `decoder_sparse_step` + `mlp_only_layers` | Llama set plus `num_experts` or `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`, optional `shared_expert_intermediate_size`, optional `norm_topk_prob`, optional `decoder_sparse_step`, optional `mlp_only_layers` | `verified: tiny-random` — `yujiepan/qwen3-moe-tiny-random` (20 MB, `TinyQwenMoeSafetensorsLoadTests`) and synthetic unit fixtures in `TransformerSafetensorsLoadTests` covering shared-expert + sigmoid-gate paths; `verified: real weights (gated)` — `Qwen15MoeA27B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent` when `DOTLLM_QWEN15_MOE_A27B_CHECKPOINT_PATH` or `C:/temp/dotllm-qwen15-moe-a27b` is present | `LoadQwenMoeLayer` resolves both singular `shared_expert.*` (Qwen1.5-MoE-A2.7B) and plural `shared_experts.{k}.*` (DeepSeek, reused). |
 | IBM Granite-3.x MoE | `Architecture.GraniteMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm | GQA | yes: fused per-layer `block_sparse_moe.{router.layer, input_linear, output_linear}` | Llama set plus `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`. `architectures[0] = GraniteMoeForCausalLM` or `model_type = granitemoe`. | `verified: real weights` (CPU + Vulkan) — `ibm-granite/granite-3.0-3b-a800m-instruct` (6.3 GB, CPU `Granite3Moe_LoadsAndForwardsEndToEnd`; Vulkan `Granite3Moe_VulkanForward_MatchesCpuReference_OnEightDecodeSteps` 3m 56s) | Fused per-expert layout: `input_linear [E, 2*I, H]` packs w1 (rows `[0..I)`) + w3 (rows `[I..2*I)`), `output_linear [E, H, I]` packs w2. Each expert is upcast into its own F32 slab via `AllocPartAsF32`. No shared expert; typical top-k is unusually high (8 of 40). |
 | Alibaba Qwen3MoeHybrid | `Architecture.Qwen3MoeHybrid` | GGUF BPE (via `GgufBpeTokenizerFactory`) | RoPE NeoX (full-attn only) + MultiRope (`ggml_rope_multi`) | Hybrid: Gated DeltaNet (GDN) linear-attention recurrence on 38 of 40 layers + full GQA every 4th layer (`qwen35moe.full_attention_interval`); per-layer GDN state cache `[NVHead, DState, DState]` | yes: 256 routed experts top-8 + a sigmoid-gated shared expert on every layer; expert tensors stored as fused-per-projection (`ffn_{gate,up,down}_exps`) with per-expert byte stride | GGUF `general.architecture = qwen35moe` with `qwen35moe.full_attention_interval`, GDN config (`d_inner`, `n_v_head`, `n_k_head`, `d_state`, `d_conv`), MoE config (`n_routed_experts`, `n_shared_experts`, `n_experts_per_tok`, `expert_feed_forward_length`, `norm_topk_prob`) | **CPU bit-exact vs llama.cpp** — `Qwen3MoeHybridTransformerModelTests` (5/5 synthetic F32: GDN-only / mixed / shared-expert / GDN+full-attn / determinism); real Qwen3.6-35B-A3B-UD-Q6_K_XL GGUF top-1 token ("Ta") matches the `gguf-py` Python reference. **CUDA**: implementation landed (CudaQwen3MoeHybridTransformerModel, CudaGdnStateCache, on-device MoE dispatcher via CudaMoeFfn, F32 KV cache for full-attn layers) — real-GGUF GPU parity test pending hardware (29.6 GiB exceeds local 12 GiB). **Vulkan**: implementation landed (VulkanQwen3MoeHybridTransformerModel + 7 GDN compute shaders, multi-token scan, opt-in resident routed banks via `DOTLLM_VK_MOE_RESIDENT=1`) — real-GGUF parity test pending Strix Halo + glslc. | **GGUF-only** — no HF safetensors path. CPU `Qwen3MoeHybridTransformerModel` consumes the GGUF raw quant view directly (Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16), eliminating the previous ~30 GiB per-forward dequant scratch (commit landed as Step 26). Each layer carries either a `GdnTokenMixingWeights` or a `Qwen3FullAttnWeights` plus a shared `Qwen3MoeLayerWeights`. Refer to `docs/ROADMAP.md` Phase 10 and `.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full architecture map. |
+| HuggingFace SmolLM3 | `Architecture.SmolLM3` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX (rotate_half) with optional dense-path YaRN (long-context SKUs) | GQA-4; per-layer `NoPE` gating via `ModelConfig.NoRopeLayers` | no | Llama set plus `no_rope_layers` mask (HF: 1=apply RoPE, 0=skip; surfaced as a SKIP-index list), optional `rope_scaling`. `architectures[0] = SmolLM3ForCausalLM` or `model_type = smollm3`. | `verified: tiny-random (synthetic)` — `SmolLM3SafetensorsLoadTests` synthesises a 4-layer Llama-shaped fixture and exercises three correctness invariants: AllNoPe-bit-identical-across-positions, NoNoPe-positions-affect-logits, and YaRN-at-position-beyond-origMax-diverges-from-baseline. Real-weight HuggingFaceTB/SmolLM3-3B test is gated (`~/.dotllm/test-cache/HuggingFaceTB/SmolLM3-3B/`) and returns early in CI. | Llama-shaped attention + SwiGLU FFN — the new code is the per-layer RoPE skip, the `RoPE.PrecomputeFrequencyTableYarn` wiring for the dense path (`TransformerModel.BuildFromPrebuiltWeightsInternal`), and the SmolLM3-style tool-call parsers (`XmlToolCallParser` + `PythonicToolCallParser`). |
 
-**Row count: 13 / 13 `Architecture` enum variants covered.**
+**Row count: 14 / 14 `Architecture` enum variants covered.**
 
 ## Per-architecture notes
 
@@ -174,6 +175,41 @@ resident-routed-bank mode (`DOTLLM_VK_MOE_RESIDENT=1`).
 GGUF-only — there is no HF safetensors path because the architecture
 ships as `qwen35moe` only. See `docs/ROADMAP.md` Phase 10 and
 `.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full map.
+
+### SmolLM3 (`Architecture.SmolLM3`)
+Llama-shaped GQA-4 dense transformer with two SmolLM3-specific extensions:
+
+1. **NoPE layers.** The HF config supplies a per-layer 0/1 mask
+   (`no_rope_layers`) where `0` marks layers that skip RoPE entirely
+   (the 3B SKU runs NoPE on layers `3, 7, 11, ..., 35`).
+   `HfConfigExtractor` inverts the mask into the layer indices that
+   SKIP RoPE and stores them on `ModelConfig.NoRopeLayers`;
+   `TransformerModel.Forward` gates the per-layer `RoPE.Execute` call
+   via `Config.IsNoRopeLayer(layer)`. The rest of the GQA pipeline
+   (Q/K/V projections, attention, O-projection) is unchanged. When
+   `NoRopeLayers` is null or empty the gate compiles to a fast-path
+   bool check — non-SmolLM3 models pay no cost.
+2. **Dense-path YaRN.** Long-context SKUs ship `rope_scaling.rope_type
+   = yarn` with `factor > 1` and `original_max_position_embeddings`,
+   lifting the effective context to 128k.
+   `HfConfigExtractor.ExtractDenseRopeScaling` surfaces these onto
+   `RoPEConfig` (`ScalingType=YaRN`, `ScalingFactor`, `OrigMaxSeqLen`,
+   `BetaFast`, `BetaSlow`, `AttnFactor`), and
+   `TransformerModel.BuildFromPrebuiltWeightsInternal` calls
+   `RoPE.PrecomputeFrequencyTableYarn` (the same kernel DeepSeek-V2
+   uses) to rebuild the cos/sin tables. The base 3B checkpoint ships
+   `rope_scaling=null` and routes through the plain precompute path —
+   bit-identical to non-YaRN behaviour.
+
+Tool calling: `XmlToolCallParser` (Hermes-compatible
+`<tool_call>{...}</tool_call>` wrapper, thin alias of
+`HermesToolCallParser`) is the default for `Architecture.SmolLM3`;
+`PythonicToolCallParser` is selected when the chat template references
+`python_tools` but not `xml_tools`. The Pythonic parser converts
+`function_name(arg=value, ...)` expressions to JSON arguments,
+recursing through `str`/`num`/`bool`/`None`/`list`/`dict` literals and
+round-tripping the final object through `System.Text.Json` for
+well-formedness.
 
 ## Legend
 
