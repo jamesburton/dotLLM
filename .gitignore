@@ -435,3 +435,14 @@ _*.txt
 .mamba3-python-venv/
 .venv-pyref/
 .gpu-lock/
+
+# Scratch / tensor-dump files used during qwen3.6 / qwen35moe parity work.
+# Small parity-comparison stdouts (dotllm_parity_out.txt / llama_parity_out.txt)
+# are tracked as references — the larger multi-stream dumps and the binary
+# TensorDump directories are excluded.
+dotllm_multi_out.txt
+llama_eval_callback_out.txt
+llama_raw_out.txt
+moe_debug.txt
+parity_dotllm/
+parity_dotllm_multi/
