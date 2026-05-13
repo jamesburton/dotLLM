@@ -28,6 +28,13 @@ public static class QuantizationTypeExtensions
         QuantizationType.Q6_K => elementCount / 256 * 210,
         QuantizationType.IQ4_NL => elementCount / 32 * 18,
         QuantizationType.IQ4_XS => elementCount / 256 * 136,
+        // IQ2_XXS:  d(2) + qs[QK_K/8](uint16) = 2 + 64 = 66 bytes / 256 elements (2.0625 bpw).
+        QuantizationType.IQ2_XXS => elementCount / 256 * 66,
+        // IQ2_XS:   d(2) + qs[QK_K/8](uint16) + scales[QK_K/32] = 2 + 64 + 8 = 74 bytes / 256 (2.3125 bpw).
+        QuantizationType.IQ2_XS => elementCount / 256 * 74,
+        // IQ2_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + scales[QK_K/32] = 2 + 64 + 8 + 8 = 82 bytes / 256.
+        // Also the on-disk type for MOSTLY_IQ2_M file-type recipe (~2.5625 bpw).
+        QuantizationType.IQ2_S => elementCount / 256 * 82,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

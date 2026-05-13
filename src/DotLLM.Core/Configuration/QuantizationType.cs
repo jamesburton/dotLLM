@@ -53,5 +53,33 @@ public enum QuantizationType
     IQ4_NL = 20,
 
     /// <summary>4-bit extra-small non-linear importance quantization, super-block of 256.</summary>
-    IQ4_XS = 23
+    IQ4_XS = 23,
+
+    /// <summary>
+    /// 2-bit importance quantization, "extra extra small" (2.0625 bpw). Super-block
+    /// of 256 elements stored in 66 bytes: <c>d(Half@0)</c> + <c>qs[32](uint16)@2</c>.
+    /// Each pair of <c>uint16</c> values encodes 32 dequantized elements via four
+    /// 256-entry codebook lookups + four sign patterns + a 4-bit shared scale.
+    /// </summary>
+    IQ2_XXS = 16,
+
+    /// <summary>
+    /// 2-bit importance quantization, "small" (2.3125 bpw). Super-block of 256
+    /// elements stored in 74 bytes. Distinct from <see cref="IQ2_S"/>: this format
+    /// uses 9-bit codebook indices packed into <c>uint16 qs[32]</c> with 7-bit sign
+    /// codes, and 4-bit scales in <c>scales[8]</c>. dotLLM ships dequant + CPU
+    /// fallback only — no dedicated CUDA GEMV today.
+    /// </summary>
+    IQ2_XS = 17,
+
+    /// <summary>
+    /// 2-bit importance quantization, "standard" (2.5625 bpw). Super-block of 256
+    /// elements stored in 82 bytes. This is the on-disk format used by both the
+    /// <c>MOSTLY_IQ2_S</c> and <c>MOSTLY_IQ2_M</c> file-type recipes — the
+    /// "IQ2_M" 11-12 GB GGUFs (e.g. Qwen3.6-A3B-IQ2_M) store their 2-bit tensors as
+    /// IQ2_S blocks and use higher-precision K-quant tensors for attention. Block
+    /// layout: <c>d(Half)+qs[64]+qh[8]+scales[8]</c>; signs are stored in the upper
+    /// half of <c>qs</c> (bytes 32-63), inline grid indices in the lower half.
+    /// </summary>
+    IQ2_S = 22
 }

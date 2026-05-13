@@ -1461,22 +1461,29 @@ public sealed unsafe class CudaTransformerModel : IModel
     private static bool ShouldUseHighPrecisionForward(CudaWeights weights)
     {
         if (!EnableHighPrecisionIQuants) return false;
-        if (weights.OutputQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS)
+        if (IsIQuant(weights.OutputQuantType))
             return true;
 
         foreach (ref readonly var lw in weights.Layers.AsSpan())
         {
-            if (lw.QQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.KQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.VQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.OQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.GateQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.UpQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
-                || lw.DownQuantType is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS)
+            if (IsIQuant(lw.QQuantType)
+                || IsIQuant(lw.KQuantType)
+                || IsIQuant(lw.VQuantType)
+                || IsIQuant(lw.OQuantType)
+                || IsIQuant(lw.GateQuantType)
+                || IsIQuant(lw.UpQuantType)
+                || IsIQuant(lw.DownQuantType))
                 return true;
         }
 
         return false;
+
+        // IQ-family detector covers IQ4_NL / IQ4_XS plus the 2-bit IQ2_* family
+        // (IQ2_XXS / IQ2_XS / IQ2_S — IQ2_S also stores IQ2_M file-type tensors).
+        // Higher precision-loss formats benefit from the dequant→F32→dot fallback.
+        static bool IsIQuant(QuantizationType qt) =>
+            qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
     }
 
     private ITensor ForwardHighPrecision(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
@@ -1680,7 +1687,8 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         if (quantWeight != 0)
         {
-            if (qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS or QuantizationType.Q5_K)
+            if (qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS or QuantizationType.Q5_K
+                    or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S)
             {
                 _kernels.LaunchDequantToF32(quantWeight, qt, weightF32,
                     outputDim * inputDim, s);

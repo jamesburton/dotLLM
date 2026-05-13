@@ -75,6 +75,14 @@ public sealed class QuantizedGemvParityTests : IDisposable
         // I-quants: IQ4_NL is block-32; IQ4_XS is super-block-256.
         [QuantizationType.IQ4_NL, 64, 256, 2e-3f, 5e-3f],
         [QuantizationType.IQ4_XS, 64, 256, 2e-3f, 5e-3f],
+
+        // 2-bit IQ-family (super-block 256). Codebook entries are unsigned bytes
+        // {0x08, 0x19, 0x2b} so the dequantised magnitude per element is small —
+        // the dot accumulator stays bounded for K=256 even with d in [-0.02, 0.02].
+        // IQ2_S is the on-disk type for IQ2_M file recipes too.
+        [QuantizationType.IQ2_XXS, 64, 256, 2e-3f, 5e-3f],
+        [QuantizationType.IQ2_XS,  64, 256, 2e-3f, 5e-3f],
+        [QuantizationType.IQ2_S,   64, 256, 2e-3f, 5e-3f],
     ];
 
     [SkippableTheory]
@@ -264,6 +272,52 @@ public sealed class QuantizedGemvParityTests : IDisposable
                             {
                                 byte* blk = pW + row * rowBytes + sb * superBlockBytes;
                                 *(Half*)blk = (Half)((rng.NextDouble() - 0.5) * 0.002);
+                            }
+                        break;
+                    }
+
+                case QuantizationType.IQ2_XXS:
+                    {
+                        // Super-block-256, 66 bytes/block. d half @ +0.
+                        // Grid magnitudes (8/25/43) * scale (~0.5..3.875 * d) * sign
+                        // gives per-element |val| up to ~43 * 4 * |d|. For K=256 the
+                        // dot accumulator stays bounded with d ~ 0.0005.
+                        const int superBlockBytes = 66;
+                        int sbPerRow = k / 256;
+                        for (int row = 0; row < m; row++)
+                            for (int sb = 0; sb < sbPerRow; sb++)
+                            {
+                                byte* blk = pW + row * rowBytes + sb * superBlockBytes;
+                                *(Half*)blk = (Half)((rng.NextDouble() - 0.5) * 0.001);
+                            }
+                        break;
+                    }
+
+                case QuantizationType.IQ2_XS:
+                    {
+                        // Super-block-256, 74 bytes/block. d half @ +0.
+                        const int superBlockBytes = 74;
+                        int sbPerRow = k / 256;
+                        for (int row = 0; row < m; row++)
+                            for (int sb = 0; sb < sbPerRow; sb++)
+                            {
+                                byte* blk = pW + row * rowBytes + sb * superBlockBytes;
+                                *(Half*)blk = (Half)((rng.NextDouble() - 0.5) * 0.001);
+                            }
+                        break;
+                    }
+
+                case QuantizationType.IQ2_S:
+                    {
+                        // Super-block-256, 82 bytes/block. d half @ +0.
+                        // Also the on-disk type for MOSTLY_IQ2_M file recipes.
+                        const int superBlockBytes = 82;
+                        int sbPerRow = k / 256;
+                        for (int row = 0; row < m; row++)
+                            for (int sb = 0; sb < sbPerRow; sb++)
+                            {
+                                byte* blk = pW + row * rowBytes + sb * superBlockBytes;
+                                *(Half*)blk = (Half)((rng.NextDouble() - 0.5) * 0.001);
                             }
                         break;
                     }

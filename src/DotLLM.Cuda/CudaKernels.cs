@@ -138,6 +138,21 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantIQ4_XSFunc;
     private readonly nint _dequantIQ4_NLF32Func;
     private readonly nint _dequantIQ4_XSF32Func;
+
+    // IQ2 family (iq2.ptx). Each format ships a F16 dequant, a F32 dequant, and a
+    // legacy per-row quantized GEMV. IQ2_S doubles as the on-disk format for the
+    // MOSTLY_IQ2_M file-type recipe. MMQ / MMVQ-large / MoE-grouped variants are
+    // deferred — prefill falls back to dequant+cuBLAS for IQ2 weights.
+    private readonly CudaModule? _iq2Module;
+    private readonly nint _dequantIQ2_XXSFunc;
+    private readonly nint _dequantIQ2_XSFunc;
+    private readonly nint _dequantIQ2_SFunc;
+    private readonly nint _dequantIQ2_XXSF32Func;
+    private readonly nint _dequantIQ2_XSF32Func;
+    private readonly nint _dequantIQ2_SF32Func;
+    private readonly nint _quantizedGemvIQ2_XXSFunc;
+    private readonly nint _quantizedGemvIQ2_XSFunc;
+    private readonly nint _quantizedGemvIQ2_SFunc;
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -441,6 +456,24 @@ public sealed unsafe class CudaKernels : IDisposable
             _dequantIQ4_XSFunc = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f16");
             _dequantIQ4_NLF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_nl_f32");
             _dequantIQ4_XSF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f32");
+        }
+
+        // IQ2 module bundles the 2-bit dequant + GEMV kernels (iq2_xxs / iq2_xs / iq2_s).
+        // Optional: older PTX builds may pre-date this kernel, so the file is allowed to be
+        // absent. Each function pointer is independently nullable so partial loads still work.
+        string iq2Path = Path.Combine(ptxDir, "iq2.ptx");
+        if (File.Exists(iq2Path))
+        {
+            _iq2Module = CudaModule.LoadFromFile(iq2Path);
+            _dequantIQ2_XXSFunc = _iq2Module.TryGetFunction("dequant_iq2_xxs_f16");
+            _dequantIQ2_XSFunc = _iq2Module.TryGetFunction("dequant_iq2_xs_f16");
+            _dequantIQ2_SFunc = _iq2Module.TryGetFunction("dequant_iq2_s_f16");
+            _dequantIQ2_XXSF32Func = _iq2Module.TryGetFunction("dequant_iq2_xxs_f32");
+            _dequantIQ2_XSF32Func = _iq2Module.TryGetFunction("dequant_iq2_xs_f32");
+            _dequantIQ2_SF32Func = _iq2Module.TryGetFunction("dequant_iq2_s_f32");
+            _quantizedGemvIQ2_XXSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xxs");
+            _quantizedGemvIQ2_XSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xs");
+            _quantizedGemvIQ2_SFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_s");
         }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
@@ -1696,6 +1729,9 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.Q6_K => _quantizedGemvQ6_KFunc,
             QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLFunc,
             QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSFunc,
+            QuantizationType.IQ2_XXS => _quantizedGemvIQ2_XXSFunc,
+            QuantizationType.IQ2_XS => _quantizedGemvIQ2_XSFunc,
+            QuantizationType.IQ2_S => _quantizedGemvIQ2_SFunc,
             _ => 0
         };
 
@@ -1714,7 +1750,8 @@ public sealed unsafe class CudaKernels : IDisposable
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K
             or QuantizationType.Q2_K
-            or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS;
+            or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+            or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
 
     /// <summary>
     /// True when the legacy per-row quantized GEMV kernel function is loaded for
@@ -1731,6 +1768,9 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q6_K => !DisableQuantizedGemv && _quantizedGemvQ6_KFunc != 0,
         QuantizationType.IQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLFunc != 0,
         QuantizationType.IQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSFunc != 0,
+        QuantizationType.IQ2_XXS => !DisableQuantizedGemv && _quantizedGemvIQ2_XXSFunc != 0,
+        QuantizationType.IQ2_XS => !DisableQuantizedGemv && _quantizedGemvIQ2_XSFunc != 0,
+        QuantizationType.IQ2_S => !DisableQuantizedGemv && _quantizedGemvIQ2_SFunc != 0,
         _ => false,
     };
 
@@ -1762,7 +1802,9 @@ public sealed unsafe class CudaKernels : IDisposable
             or QuantizationType.Q8_0 or QuantizationType.IQ4_NL => 32,
         QuantizationType.Q3_K or QuantizationType.Q4_K
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K or QuantizationType.IQ4_XS => 256,
+            or QuantizationType.Q2_K or QuantizationType.IQ4_XS
+            or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS
+            or QuantizationType.IQ2_S => 256,
         _ => int.MaxValue,  // unsupported types — gate always fails
     };
 
@@ -2245,6 +2287,33 @@ public sealed unsafe class CudaKernels : IDisposable
                 return;
             }
 
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            {
+                // All three IQ2 dequant F32 kernels share the same launch shape (one
+                // thread per element within a 256-element super-block). Resolve the
+                // function by quant type and fall through to break (-> NotSupported)
+                // when the PTX hasn't shipped the symbol.
+                nint func = srcDtype switch
+                {
+                    QuantizationType.IQ2_XXS => _dequantIQ2_XXSF32Func,
+                    QuantizationType.IQ2_XS => _dequantIQ2_XSF32Func,
+                    QuantizationType.IQ2_S => _dequantIQ2_SF32Func,
+                    _ => 0
+                };
+                if (func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
             case QuantizationType.Q5_K:
             {
                 if (_dequantQ5_KF32Func == 0)
@@ -2411,6 +2480,34 @@ public sealed unsafe class CudaKernels : IDisposable
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
                 uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantIQ4_XSFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            {
+                // All three IQ2 dequant F16 kernels follow IQ4_XS's super-block shape
+                // (one thread per element within a 256-element block). IQ2_S doubles
+                // as the on-disk format for IQ2_M file-type GGUFs (e.g. Qwen3.6-A3B-IQ2_M).
+                nint func = srcDtype switch
+                {
+                    QuantizationType.IQ2_XXS => _dequantIQ2_XXSFunc,
+                    QuantizationType.IQ2_XS => _dequantIQ2_XSFunc,
+                    QuantizationType.IQ2_S => _dequantIQ2_SFunc,
+                    _ => 0
+                };
+                if (func == 0)
+                    throw new InvalidOperationException(
+                        $"{srcDtype} dequant kernel not present in iq2.ptx — rebuild PTX from " +
+                        "native/kernels/iq2.cu.");
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(func,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -3155,6 +3252,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _convertModule.Dispose();
         _dequantModule.Dispose();
         _dequantIQuantsModule?.Dispose();
+        _iq2Module?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();
