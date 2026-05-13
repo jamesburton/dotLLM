@@ -131,6 +131,30 @@ public sealed class RealGgufVulkanParityTests
     // Production-relevance: most DeepSeek-V2 deployments ship K-quants.
     // ────────────────────────────────────────────────────────────────────
 
+    // ────────────────────────────────────────────────────────────────────
+    // Llama-3.1-8B IQ4_XS (dense Llama, exercises IQ4_XS path — most-used
+    // IQ-family quant in production deployments).
+    // ────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Llama31_8B_IQ4_XS_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Llama-3.1-8B IQ4_XS GGUF not found. Set "
+                + "DOTLLM_LLAMA31_8B_IQ4_XS_GGUF or download to "
+                + "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ4_XS.gguf "
+                + "(~4.5 GB) from huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF.");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.1-8B-IQ4_XS",
+            prompt: "The capital of France is");
+    }
+
     [SkippableFact]
     public void DeepSeekV2Lite_Q4_K_M_VulkanForward_MatchesCpuReference()
     {

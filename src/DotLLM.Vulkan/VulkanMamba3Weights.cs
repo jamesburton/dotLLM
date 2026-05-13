@@ -389,6 +389,16 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ6KOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
 
+    /// <summary>True iff an IQ4_NL overlay can be kept on device as raw 18-byte blocks
+    /// — gated on the contraction dim being a multiple of 32.</summary>
+    private static bool KeepIq4NlOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ4_NL && (contractionDim % 32) == 0;
+
+    /// <summary>True iff an IQ4_XS overlay can be kept on device as raw 136-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq4XsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ4_XS && (contractionDim % 256) == 0;
+
     /// <summary>True iff an F16 overlay can be kept on device as raw 2-byte F16 elements
     /// — gated on the contraction dim being a multiple of 2. Phase 8 of the native
     /// matmul work — unblocks BF16 / F16 SafeTensors loads that previously had to expand
@@ -410,6 +420,8 @@ internal sealed class VulkanMamba3Weights : IDisposable
         || KeepQ4KOnDevice(qt, contractionDim)
         || KeepQ5KOnDevice(qt, contractionDim)
         || KeepQ6KOnDevice(qt, contractionDim)
+        || KeepIq4NlOnDevice(qt, contractionDim)
+        || KeepIq4XsOnDevice(qt, contractionDim)
         || KeepF16OnDevice(qt, contractionDim)
         || KeepBf16OnDevice(qt, contractionDim);
 
