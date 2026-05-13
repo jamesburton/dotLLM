@@ -25,7 +25,8 @@ public sealed class TransformerArchitecture : IModelArchitecture
     /// <inheritdoc/>
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
         [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen,
-         Architecture.NemotronH, Architecture.DeepSeekV2, Architecture.DeepSeekV3];
+         Architecture.NemotronH, Architecture.Qwen3MoeHybrid,
+         Architecture.DeepSeekV2, Architecture.DeepSeekV3];
 
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
@@ -39,6 +40,9 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
         if (config.Architecture is Architecture.NemotronH)
             return NemotronHTransformerModel.LoadFromGguf(_gguf, config);
+
+        if (config.Architecture is Architecture.Qwen3MoeHybrid)
+            return Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config);
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
                                     or Architecture.Phi or Architecture.Qwen

@@ -92,6 +92,15 @@ public record ModelConfig
     /// </summary>
     public MoeConfig? Moe { get; init; }
 
+    /// <summary>
+    /// Gated DeltaNet (GDN) SSM configuration. Non-null iff
+    /// <see cref="Architecture"/> is
+    /// <see cref="DotLLM.Core.Configuration.Architecture.Qwen3MoeHybrid"/>.
+    /// Carries GDN-specific parameters (state size, head counts, attention
+    /// interval) that do not map onto the Mamba-2 <see cref="SsmConfig"/>.
+    /// </summary>
+    public GatedDeltaNetConfig? GdnConfig { get; init; }
+
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
 }

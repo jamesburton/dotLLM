@@ -43,7 +43,12 @@ public static class GgufModelConfigExtractor
         }
         else
         {
-            intermediateSize = (int)metadata.GetUInt32($"{arch}.feed_forward_length");
+            // Pure-MoE GGUFs (Qwen-MoE, Mixtral) omit feed_forward_length and store the
+            // per-expert width in expert_feed_forward_length instead.
+            uint ffLen = metadata.GetUInt32OrDefault($"{arch}.feed_forward_length", 0);
+            if (ffLen == 0)
+                ffLen = metadata.GetUInt32OrDefault($"{arch}.expert_feed_forward_length", 0);
+            intermediateSize = (int)ffLen;
             numKvHeads = (int)metadata.GetUInt32OrDefault($"{arch}.attention.head_count_kv", (uint)numAttentionHeads);
         }
 
@@ -70,14 +75,24 @@ public static class GgufModelConfigExtractor
             chatTemplate = null;
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
-        MambaSsmConfig? ssmConfig = TryExtractSsmConfig(metadata, arch);
+
+        // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
+        // different semantics — skip Mamba-2 SSM config extraction for them.
+        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid
+            ? null
+            : TryExtractSsmConfig(metadata, arch);
 
         // DeepSeek-V2/V3: extract MLA + MoE config and patch HeadDim to the full
         // qk_head_dim (key_length stores qk_nope only; total = qk_nope + qk_rope).
         MlaConfig? mlaConfig = null;
         MoeConfig? moeConfig = null;
+        GatedDeltaNetConfig? gdnConfig = null;
         AttentionType attentionType = AttentionType.GQA;
-        if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
+        if (architecture is Architecture.QwenMoe or Architecture.Mixtral)
+        {
+            moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+        }
+        else if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
         {
             mlaConfig = ExtractMlaConfig(metadata, arch, ropeConfig);
             moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numLayers);
@@ -87,6 +102,15 @@ public static class GgufModelConfigExtractor
             // GQA-shaped pieces of the model (cache stride etc.) see the full
             // value.
             headDim = mlaConfig.QkNopeHeadDim + mlaConfig.QkRopeHeadDim;
+        }
+        else if (architecture is Architecture.Qwen3MoeHybrid)
+        {
+            gdnConfig = TryExtractGdnConfig(metadata, arch);
+            moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+            // Build per-layer layout from full_attention_interval (not stored as
+            // per-layer arrays like Nemotron-H, so TryExtractHybridLayout returned null).
+            if (gdnConfig is { } gdn)
+                hybridLayout = BuildQwen3MoeHybridLayout(numLayers, gdn.FullAttnInterval, numKvHeads);
         }
 
         return new ModelConfig
@@ -112,6 +136,7 @@ public static class GgufModelConfigExtractor
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
             Moe = moeConfig,
+            GdnConfig = gdnConfig,
             ChatTemplate = chatTemplate,
         };
     }
@@ -250,6 +275,70 @@ public static class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// Extracts a <see cref="MoeConfig"/> for Qwen-MoE and Mixtral GGUF checkpoints.
+    /// </summary>
+    /// <remarks>
+    /// Per llama.cpp's GGUF convention: <c>{arch}.expert_count</c> = total routed experts,
+    /// <c>{arch}.expert_used_count</c> = top-k, <c>{arch}.expert_feed_forward_length</c> = per-expert
+    /// intermediate width, <c>{arch}.expert_shared_count</c> = shared experts (Qwen1.5-MoE),
+    /// <c>{arch}.decoder_sparse_step</c> = Qwen3-MoE alternating-layer stride (default 1 = all MoE).
+    /// </remarks>
+    private static MoeConfig? TryExtractQwenMoeConfig(GgufMetadata metadata, string arch, int numLayers)
+    {
+        uint expertCount = metadata.GetUInt32OrDefault($"{arch}.expert_count", 0);
+        if (expertCount == 0) return null;
+
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32($"{arch}.expert_feed_forward_length");
+        int expertShared = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_count", 0);
+
+        // qwen35moe convention: shared-expert count is implicit (1) and only the intermediate
+        // width is stored as `expert_shared_feed_forward_length`. Detect this case so we still
+        // mark the layer as having a shared branch + sigmoid gate (ffn_gate_inp_shexp.weight).
+        int sharedFfl = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_feed_forward_length", 0);
+        bool sharedFromFfl = expertShared == 0 && sharedFfl > 0;
+        bool hasSharedExpertGate = false;
+        if (sharedFromFfl)
+        {
+            expertShared = 1;
+            hasSharedExpertGate = true; // qwen35moe always pairs the shared branch with a sigmoid gate.
+        }
+
+        // decoder_sparse_step: Qwen3-MoE alternates dense/MoE every N layers (typically 2).
+        // Qwen3.6 / Mixtral have all layers as MoE so this key is absent and defaults to 1.
+        int decoderSparseStep = (int)metadata.GetUInt32OrDefault($"{arch}.decoder_sparse_step", 1);
+
+        int[]? mlpOnlyLayers = null;
+        if (decoderSparseStep > 1)
+        {
+            // Layers 0, step, 2*step, … are dense; the rest are MoE.
+            var denseLayers = new List<int>();
+            for (int i = 0; i < numLayers; i += decoderSparseStep)
+                denseLayers.Add(i);
+            mlpOnlyLayers = denseLayers.ToArray();
+        }
+
+        // qwen35moe: per-expert width (sharedFfl), NOT multiplied by count (count is implicit 1).
+        // DeepSeek path: count × moeIntermediate (legacy convention, kept for the historic V2/V3 path).
+        int? sharedIntermediate = sharedFromFfl
+            ? sharedFfl
+            : (expertShared > 0 ? moeIntermediate * expertShared : null);
+
+        return new MoeConfig
+        {
+            NumExperts = (int)expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = true,   // Qwen-MoE and Mixtral always renormalize top-k weights
+            SharedExpertIntermediateSize = sharedIntermediate,
+            NumSharedExperts = expertShared,
+            HasSharedExpertGate = hasSharedExpertGate,
+            DecoderSparseStep = decoderSparseStep,
+            MlpOnlyLayers = mlpOnlyLayers,
+        };
+    }
+
     private static HybridLayerLayout? TryExtractHybridLayout(GgufMetadata metadata, string arch, int numLayers)
     {
         string kvKey = $"{arch}.attention.head_count_kv";
@@ -316,6 +405,73 @@ public static class GgufModelConfigExtractor
         return new MambaSsmConfig(dConv, dInner, dState, nGroup, nHead);
     }
 
+    /// <summary>
+    /// Extracts a <see cref="GatedDeltaNetConfig"/> from Qwen3MoeHybrid GGUF metadata.
+    /// Returns null if the defining key (<c>{arch}.ssm.inner_size</c>) is absent.
+    /// </summary>
+    /// <remarks>
+    /// Key mapping (confirmed from llama.cpp <c>src/llama.cpp</c> qwen35moe case):
+    /// <list type="bullet">
+    ///   <item><c>{arch}.full_attention_interval</c> → <see cref="GatedDeltaNetConfig.FullAttnInterval"/></item>
+    ///   <item><c>{arch}.ssm.inner_size</c>          → <see cref="GatedDeltaNetConfig.DInner"/></item>
+    ///   <item><c>{arch}.ssm.state_size</c>           → <see cref="GatedDeltaNetConfig.DState"/> (= head_k_dim = head_v_dim)</item>
+    ///   <item><c>{arch}.ssm.time_step_rank</c>       → <see cref="GatedDeltaNetConfig.NVHead"/> (num_v_heads)</item>
+    ///   <item><c>{arch}.ssm.group_count</c>          → <see cref="GatedDeltaNetConfig.NKHead"/> (num_k_heads)</item>
+    ///   <item><c>{arch}.ssm.conv_kernel</c>          → <see cref="GatedDeltaNetConfig.DConv"/></item>
+    /// </list>
+    /// </remarks>
+    private static GatedDeltaNetConfig? TryExtractGdnConfig(GgufMetadata metadata, string arch)
+    {
+        string innerKey = $"{arch}.ssm.inner_size";
+        if (!metadata.ContainsKey(innerKey)) return null;
+
+        int fullAttnInterval = (int)metadata.GetUInt32OrDefault($"{arch}.full_attention_interval", 4);
+        int dInner = (int)metadata.GetUInt32(innerKey);
+        int dState = (int)metadata.GetUInt32($"{arch}.ssm.state_size");
+        int nVHead = (int)metadata.GetUInt32($"{arch}.ssm.time_step_rank");
+        int nKHead = (int)metadata.GetUInt32OrDefault($"{arch}.ssm.group_count", 1);
+        int dConv = (int)metadata.GetUInt32($"{arch}.ssm.conv_kernel");
+
+        if (nVHead <= 0)
+            throw new InvalidDataException(
+                $"GDN config requires '{arch}.ssm.time_step_rank' (num_v_heads) > 0; got {nVHead}.");
+        if (nVHead % nKHead != 0)
+            throw new InvalidDataException(
+                $"GDN time_step_rank (nVHead={nVHead}) must be divisible by group_count (nKHead={nKHead}).");
+
+        return new GatedDeltaNetConfig(fullAttnInterval, nVHead, nKHead, dState, dInner, dConv);
+    }
+
+    /// <summary>
+    /// Constructs a <see cref="HybridLayerLayout"/> for Qwen3MoeHybrid models using
+    /// the <paramref name="fullAttnInterval"/> formula rather than per-layer GGUF arrays.
+    /// Layer <c>i</c> (0-based) is full attention when <c>(i+1) % fullAttnInterval == 0</c>;
+    /// all other layers are <see cref="HybridLayerKind.GatedDeltaNet"/>.
+    /// All layers carry a MoE FFN tracked separately via <see cref="ModelConfig.Moe"/>,
+    /// so <c>FeedForwardLength</c> is zeroed throughout.
+    /// </summary>
+    private static HybridLayerLayout BuildQwen3MoeHybridLayout(
+        int numLayers, int fullAttnInterval, int numKvHeads)
+    {
+        var kinds = new HybridLayerKind[numLayers];
+        var headCountKv = new int[numLayers];
+        var feedForwardLength = new int[numLayers]; // all zero — MoE tracked via ModelConfig.Moe
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            bool isFullAttn = (i + 1) % fullAttnInterval == 0;
+            kinds[i] = isFullAttn ? HybridLayerKind.Attention : HybridLayerKind.GatedDeltaNet;
+            headCountKv[i] = isFullAttn ? numKvHeads : 0;
+        }
+
+        return new HybridLayerLayout
+        {
+            LayerKind = kinds,
+            HeadCountKv = headCountKv,
+            FeedForwardLength = feedForwardLength,
+        };
+    }
+
     private static int MaxNonZero(int[] values, int fallback)
     {
         int max = 0;
@@ -331,6 +487,11 @@ public static class GgufModelConfigExtractor
             "mistral" or "mistral3" => Architecture.Mistral,
             "phi" or "phi2" or "phi3" => Architecture.Phi,
             "qwen" or "qwen2" or "qwen3" => Architecture.Qwen,
+            // Qwen dense MoE variants: Qwen1.5-MoE, Qwen2-MoE, Qwen3-MoE.
+            "qwen2moe" or "qwen3moe" or "qwenmoe" => Architecture.QwenMoe,
+            // Qwen3.6-35B-A3B: Gated DeltaNet hybrid — NOT a plain Qwen-MoE transformer.
+            "qwen35moe" => Architecture.Qwen3MoeHybrid,
+            "mixtral" => Architecture.Mixtral,
 #pragma warning disable CS0618 // Preserve legacy GGUF metadata mapping for compatibility diagnostics.
             // Pre-V2 DeepSeek (legacy placeholder — never actually loaded by us).
             "deepseek" => Architecture.DeepSeek,
@@ -377,9 +538,11 @@ public static class GgufModelConfigExtractor
         // Determine RoPE element-pairing convention. Must match the GGUF Q/K weight layout:
         // - Llama/Mistral: converter permutes Q/K weights → interleaved (Norm)
         // - Qwen/Phi: weights kept in HuggingFace order → non-interleaved (NeoX)
+        // Qwen family (dense + MoE + GDN hybrid) and Phi keep HF weight order → NeoX pairing.
         RoPEType ropeType = architecture switch
         {
-            Architecture.Qwen or Architecture.Phi => RoPEType.NeoX,
+            Architecture.Qwen or Architecture.QwenMoe
+                or Architecture.Qwen3MoeHybrid or Architecture.Phi => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

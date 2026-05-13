@@ -101,5 +101,20 @@ public enum Architecture
     /// No shared expert; top-k is unusually large (8 of 40 for the 3B-A800M
     /// SKU). See <see cref="DotLLM.Core.Models.MoeConfig"/>.
     /// </summary>
-    GraniteMoe
+    GraniteMoe,
+
+    /// <summary>
+    /// Alibaba Qwen3.6 — Gated DeltaNet (GDN) SSM + sparse MoE hybrid.
+    /// GGUF architecture string: <c>qwen35moe</c>.
+    /// Layers alternate between Gated DeltaNet recurrence (3 of every 4) and full
+    /// GQA attention (every 4th layer, controlled by
+    /// <c>qwen35moe.full_attention_interval</c>). Both layer types share a sparse
+    /// MoE FFN sublayer. The GDN carries a full <c>[n_head, d_k, d_v]</c> matrix
+    /// state updated via the delta rule. See
+    /// <see cref="DotLLM.Core.Models.GatedDeltaNetConfig"/> for GDN-specific parameters.
+    /// References: <see href="https://arxiv.org/abs/2412.06464">Gated Delta Networks
+    /// (NVlabs, ICLR 2025)</see>; <see href="https://arxiv.org/abs/2505.09388">Qwen3
+    /// Technical Report</see>.
+    /// </summary>
+    Qwen3MoeHybrid
 }
