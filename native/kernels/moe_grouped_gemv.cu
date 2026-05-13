@@ -232,6 +232,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_grouped_gemv_q5_k_f16(
         const uint8_t* qs = block + 48;   // 128 bytes
         int base_x = sb * 256;
 
+        // 8 sub-blocks of 32 elements each. Q5_K layout: qs is 4 pairs of 32
+        // bytes; pair index = sub>>1 selects the 32-byte chunk, low nibbles go
+        // to the even sub-block, high nibbles to the odd sub-block. qh is
+        // indexed by element position (0..31) and bit `sub` of that byte
+        // supplies the fifth (high) bit. This matches `quantized_gemv_q5_k`
+        // and `dequant_q5_k_*` byte-for-byte so the two paths agree.
         for (int sub = 0; sub < 8; sub++)
         {
             int sc, m;
@@ -249,20 +255,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_grouped_gemv_q5_k_f16(
             float scale = d * (float)sc;
             float min_val = dmin * (float)m;
 
-            const uint8_t* sub_qs = qs + sub * 16;
-            const uint8_t* sub_qh = qh + sub * 4;
             int x_off = base_x + sub * 32;
+            const int pair_idx = sub >> 1;
+            const int nibble_half = sub & 1;
 
-            for (int j = 0; j < 16; j++)
+            for (int pos = 0; pos < 32; pos++)
             {
-                uint8_t packed = sub_qs[j];
-                int bit_lo = (sub_qh[j / 4] >> ((j % 4) * 2)) & 1;
-                int bit_hi = (sub_qh[j / 4] >> ((j % 4) * 2 + 1)) & 1;
-                int lo = (packed & 0x0F) | (bit_lo << 4);
-                int hi = (packed >> 4) | (bit_hi << 4);
-
-                acc += (scale * (float)lo - min_val) * __half2float(x[x_off + 2 * j]);
-                acc += (scale * (float)hi - min_val) * __half2float(x[x_off + 2 * j + 1]);
+                uint8_t packed = qs[pair_idx * 32 + pos];
+                int bit = (qh[pos] >> sub) & 1;
+                int q = (((packed >> (4 * nibble_half)) & 0x0F) | (bit << 4));
+                acc += (scale * (float)q - min_val) * __half2float(x[x_off + pos]);
             }
         }
     }

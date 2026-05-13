@@ -54,6 +54,15 @@ if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 REM Kernels safe under --use_fast_math (elementwise; no expf/rsqrtf/sin/cos/pow):
 set "FAST_MATH=add add_f32 swiglu swiglu_f32 convert bias_add bias_add_f32 embedding embedding_f32out dequant quant_kv"
 
+REM Kernels requiring --fmad=false for bit-perfect parity with the CPU scalar
+REM reference. .NET RyuJIT does NOT emit FMA from `a*b+c` patterns without an
+REM explicit MathF.FusedMultiplyAdd call, so leaving nvcc's --fmad=true default
+REM produces ~1 ULP precision drift per accumulation versus the CPU's separate
+REM mul+add. The Qwen3MoeHybrid recurrence (GDN) compounds those tiny errors
+REM over time steps, so the two kernels backing it must be compiled with FMA
+REM fusion disabled. Costs minor perf; matches the CPU bit-for-bit.
+set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32"
+
 echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
 
@@ -64,7 +73,11 @@ for %%F in ("%KERNEL_DIR%\*.cu") do (
     for %%M in (%FAST_MATH%) do (
         if /I "%%~nF"=="%%M" set "FAST_FLAG=--use_fast_math"
     )
-    "%NVCC%" -ptx -arch=%ARCH% !FAST_FLAG! -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
+    set "FMAD_FLAG="
+    for %%M in (%NO_FMA%) do (
+        if /I "%%~nF"=="%%M" set "FMAD_FLAG=-fmad=false"
+    )
+    "%NVCC%" -ptx -arch=%ARCH% !FAST_FLAG! !FMAD_FLAG! -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
     if errorlevel 1 (
         echo FAILED: %%~nxF
         set FAIL=1
@@ -72,7 +85,11 @@ for %%F in ("%KERNEL_DIR%\*.cu") do (
         if defined FAST_FLAG (
             echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)
         ) else (
-            echo   %%~nxF -^> !BASE!.ptx ^(precise^)
+            if defined FMAD_FLAG (
+                echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)
+            ) else (
+                echo   %%~nxF -^> !BASE!.ptx ^(precise^)
+            )
         )
     )
 )

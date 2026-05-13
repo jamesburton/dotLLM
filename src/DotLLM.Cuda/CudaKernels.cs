@@ -239,6 +239,39 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeGroupedGemvIQ4_NLFunc;
     private readonly nint _moeGroupedGemvIQ4_XSFunc;
 
+    // ── Qwen3MoeHybrid recurrence-path kernels (F32) ─────────────────────────
+    // Optional kernels backing the Gated DeltaNet (GDN) recurrence and the post-
+    // attention sigmoid-gate used by Qwen3MoeHybrid models. Each is a numerically
+    // equivalent FP32 port of the CPU reference in DotLLM.Cpu.Kernels
+    // (Conv1dCausal, GatedDeltaNetScan) / Qwen3MoeHybridTransformerModel forward
+    // body. All call expf/logf — compiled with -fmad=false (see build_ptx.bat
+    // NO_FMA list and DotLLM.Cuda.csproj FmadFlag metadata) to disable FMA
+    // fusion. Numerical accuracy against the CPU oracle is within ≤1 ULP per
+    // element on Ampere+; not strictly bit-equal across all inputs (CUDA's
+    // precise expf is not guaranteed bit-identical to MathF.Exp), but matches
+    // the CPU oracle's existing host fallback to within negligible tolerance.
+    //   • conv1d_causal_f32        — depthwise causal 1-D convolution
+    //   • gdn_scan_step_f32        — per-token GDN recurrence step (host loops over seqLen)
+    //   • l2_normalize_heads_f32   — in-place per-head L2 normalisation (pre-scan)
+    //   • gdn_decay_f32            — fused softplus + exp for the per-token decay g
+    //   • sigmoid_f32              — in-place elementwise sigmoid
+    //   • silu_f32                 — in-place elementwise SiLU
+    //   • sigmoid_mul_f32          — out[i] *= sigmoid(b[i])
+    // PTX may be absent on stale builds; the Has* properties report false and
+    // callers fall back to the host-side path or surface an error.
+    private readonly CudaModule? _conv1dCausalF32Module;
+    private readonly nint _conv1dCausalF32Func;
+    private readonly CudaModule? _gdnScanF32Module;
+    private readonly nint _gdnScanStepF32Func;
+    private readonly CudaModule? _l2NormHeadsF32Module;
+    private readonly nint _l2NormHeadsF32Func;
+    private readonly nint _gdnDecayF32Func;
+    private readonly CudaModule? _elementwiseF32Module;
+    private readonly nint _sigmoidF32Func;
+    private readonly nint _siluF32Func;
+    private readonly nint _sigmoidMulF32Func;
+    private readonly nint _dequantQ6_KF32Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -396,6 +429,9 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantQ5_KFunc = _dequantModule.GetFunction("dequant_q5_k_f16");
         _dequantQ5_KF32Func = _dequantModule.TryGetFunction("dequant_q5_k_f32");
         _dequantQ6_KFunc = _dequantModule.GetFunction("dequant_q6_k_f16");
+        // F32 sibling for Q6_K — optional, falls back to a NotSupportedException
+        // in LaunchDequantToF32 if absent on a stale PTX.
+        _dequantQ6_KF32Func = _dequantModule.TryGetFunction("dequant_q6_k_f32");
 
         string dequantIQuantsPath = Path.Combine(ptxDir, "dequant_iquants.ptx");
         if (File.Exists(dequantIQuantsPath))
@@ -513,6 +549,41 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeGroupedGemvIQ4_NLFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_nl_f16");
             _moeGroupedGemvIQ4_XSFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_xs_f16");
         }
+
+        // Qwen3MoeHybrid recurrence-path kernels (optional — present only when
+        // the GDN/conv1d CUDA path has been built). Each .cu file compiles to
+        // a separate .ptx; build_ptx.bat auto-globs native/kernels/*.cu so no
+        // script change is required.
+        string conv1dCausalF32Path = Path.Combine(ptxDir, "conv1d_causal.ptx");
+        if (File.Exists(conv1dCausalF32Path))
+        {
+            _conv1dCausalF32Module = CudaModule.LoadFromFile(conv1dCausalF32Path);
+            _conv1dCausalF32Func = _conv1dCausalF32Module.TryGetFunction("conv1d_causal_f32");
+        }
+
+        string gdnScanF32Path = Path.Combine(ptxDir, "gated_delta_net_scan.ptx");
+        if (File.Exists(gdnScanF32Path))
+        {
+            _gdnScanF32Module = CudaModule.LoadFromFile(gdnScanF32Path);
+            _gdnScanStepF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32");
+            // The L2-norm and decay helpers live in the same .cu translation unit,
+            // so they are in the same .ptx module — query each function pointer here.
+            _l2NormHeadsF32Module = _gdnScanF32Module;
+            _l2NormHeadsF32Func = _gdnScanF32Module.TryGetFunction("l2_normalize_heads_f32");
+            _gdnDecayF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_f32");
+        }
+
+        // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
+        // attention gating and the Qwen3MoeHybrid GDN body. Optional — TryGetFunction
+        // so a stale PTX still loads gracefully and HasElementwiseF32 reports false.
+        string elementwiseF32Path = Path.Combine(ptxDir, "elementwise_f32.ptx");
+        if (File.Exists(elementwiseF32Path))
+        {
+            _elementwiseF32Module = CudaModule.LoadFromFile(elementwiseF32Path);
+            _sigmoidF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_f32");
+            _siluF32Func = _elementwiseF32Module.TryGetFunction("silu_f32");
+            _sigmoidMulF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_mul_f32");
+        }
     }
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
@@ -548,6 +619,29 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeZeroF32Func != 0 && _moeAxpyScaledRowF32Func != 0
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>
+    /// True when all Qwen3MoeHybrid recurrence-path FP32 kernels (causal conv1d,
+    /// per-token GDN scan step, per-head L2 normalize) are available. Required
+    /// by the CUDA Qwen3MoeHybrid forward path.
+    /// </summary>
+    public bool HasGdnKernels =>
+        _conv1dCausalF32Func != 0 && _gdnScanStepF32Func != 0 && _l2NormHeadsF32Func != 0;
+
+    /// <summary>
+    /// True when the fused GDN decay kernel (softplus + exp) is available on the
+    /// loaded gated_delta_net_scan.ptx module. When false, callers must use the
+    /// host-side fallback that D2Hs / H2Ds alpha.
+    /// </summary>
+    public bool HasGdnDecayF32 => _gdnDecayF32Func != 0;
+
+    /// <summary>
+    /// True when all three FP32 pointwise activations (sigmoid, silu, sigmoid_mul)
+    /// are loaded from elementwise_f32.ptx. When false, the Qwen3MoeHybrid forward
+    /// path must keep its host-side fallbacks.
+    /// </summary>
+    public bool HasElementwiseF32 =>
+        _sigmoidF32Func != 0 && _siluF32Func != 0 && _sigmoidMulF32Func != 0;
 
     /// <summary>True when the Phase-B Q2_K grouped-GEMV kernel is loaded (PTX present).</summary>
     /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
@@ -760,6 +854,32 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Translates the public C# <see cref="DotLLM.Core.Configuration.RoPEType"/>
+    /// enum to the integer encoding the CUDA RoPE kernels expect.
+    /// </summary>
+    /// <remarks>
+    /// The C# enum is a public API surface (used by <c>RoPEConfig</c>) and
+    /// historically encodes <c>Norm = 0</c>, <c>NeoX = 2</c>. The CUDA kernels
+    /// in <c>native/kernels/rope_f32.cu</c>, <c>rope.cu</c>, and
+    /// <c>fused_rope_kv_write.cu</c> encode the pair pattern as <c>0 = GPT-J /
+    /// Norm interleaved</c>, <c>1 = NeoX / rotate-half</c>. Casting the C#
+    /// enum value straight to <see cref="int"/> would feed <c>NeoX == 2</c>
+    /// into the kernel which falls into the "anything but 1 → interleaved"
+    /// branch — silently running Qwen / Phi (NeoX) models with the GPT-J
+    /// rotation pattern. This translator is the single chokepoint that maps
+    /// between the two conventions. The Vulkan and CPU paths consume the
+    /// <see cref="DotLLM.Core.Configuration.RoPEType"/> enum directly so this
+    /// helper is CUDA-only.
+    /// </remarks>
+    /// <param name="type">The element-pairing convention from <see cref="DotLLM.Core.PositionEncoding.RoPEConfig"/>.</param>
+    /// <returns><c>0</c> for <see cref="DotLLM.Core.Configuration.RoPEType.Norm"/>, <c>1</c> for <see cref="DotLLM.Core.Configuration.RoPEType.NeoX"/>.</returns>
+    public static int ToCudaRopeType(DotLLM.Core.Configuration.RoPEType type) => type switch
+    {
+        DotLLM.Core.Configuration.RoPEType.NeoX => 1,
+        _ => 0,
+    };
+
     /// <summary>FP32 RoPE: in-place rotation on FP32 Q and K.</summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
@@ -848,6 +968,259 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_perHeadRmsNormF32Func,
                 (uint)(seqLen * numHeads), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Depthwise causal 1-D convolution (FP32). Bit-perfect port of the CPU
+    /// <c>Conv1dCausal.ExecuteScalar</c> reference.
+    /// </summary>
+    /// <param name="input">
+    /// Device pointer to <c>[d_conv-1+seqLen, channels]</c> FP32 input, row-major.
+    /// Caller must prepend the cached <c>conv_state</c> (d_conv-1 rows) before
+    /// the new activations.
+    /// </param>
+    /// <param name="weight">
+    /// Device pointer to <c>[d_conv, channels]</c> FP32 weight in GGUF
+    /// channel-major layout: element (k, c) at <c>c * d_conv + k</c>.
+    /// </param>
+    /// <param name="bias">
+    /// Device pointer to per-channel FP32 bias (<c>channels</c> elements). Pass
+    /// a zero-filled buffer when the model has no bias — the add is unconditional.
+    /// </param>
+    /// <param name="output">
+    /// Device pointer to <c>[seqLen, channels]</c> FP32 output, row-major.
+    /// </param>
+    /// <param name="dConv">Convolution kernel width (4 for Qwen3MoeHybrid).</param>
+    /// <param name="channels">Number of channels (depthwise width).</param>
+    /// <param name="seqLen">Number of output time steps.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchConv1dCausalF32(nint input, nint weight, nint bias, nint output,
+                                        int dConv, int channels, int seqLen, nint stream)
+    {
+        nint inArg = input, wArg = weight, bArg = bias, outArg = output;
+        int dcArg = dConv, chArg = channels, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&inArg, &wArg, &bArg, &outArg,
+                        &dcArg, &chArg, &slArg};
+
+        int total = seqLen * channels;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_conv1dCausalF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gated DeltaNet (GDN) recurrence — one token step. Bit-perfect port of the
+    /// CPU <c>GatedDeltaNetScan.Execute</c> per-token inner body. The host loops
+    /// over <c>seqLen</c> and calls this once per token, advancing the
+    /// <paramref name="qT"/>/<paramref name="kT"/>/<paramref name="vT"/>/<paramref name="gT"/>/<paramref name="betaT"/>/<paramref name="outputT"/>
+    /// pointers by one token-stride per call. The recurrence on <paramref name="state"/>
+    /// flows automatically through the in-place update.
+    /// </summary>
+    /// <param name="state">
+    /// Device pointer to <c>[nVHead, dState, dState]</c> FP32 state matrix
+    /// (row-major: <c>S[vh, row, col]</c>, row = key dim, col = value dim).
+    /// Updated in place.
+    /// </param>
+    /// <param name="qT">Device pointer to this token's Q vectors, <c>[nKHead, dState]</c>. Caller must have L2-normalised per head.</param>
+    /// <param name="kT">Device pointer to this token's K vectors, <c>[nKHead, dState]</c>. Caller must have L2-normalised per head.</param>
+    /// <param name="vT">Device pointer to this token's V vectors, <c>[nVHead, dState]</c>.</param>
+    /// <param name="gT">Device pointer to this token's per-head decay scalars, <c>[nVHead]</c>.</param>
+    /// <param name="betaT">Device pointer to this token's per-head write-gate scalars, <c>[nVHead]</c>.</param>
+    /// <param name="outputT">Device pointer to this token's output, <c>[nVHead, dState]</c>. Overwritten.</param>
+    /// <param name="nVHead">Number of value heads.</param>
+    /// <param name="nKHead">Number of key heads (must divide <paramref name="nVHead"/> evenly).</param>
+    /// <param name="dState">
+    /// Per-head state dimension. The kernel launches with <c>blockDim.x == dState</c>
+    /// and is compiled with <c>__launch_bounds__(128)</c>, so the upper bound is
+    /// 128 — the universal Qwen3MoeHybrid configuration. Larger <c>dState</c> would
+    /// fail launch validation; this method throws on out-of-range values rather than
+    /// silently failing inside <c>cuLaunchKernel</c>.
+    /// </param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="dState"/> is outside (0, 128].
+    /// </exception>
+    public void LaunchGdnScanStepF32(nint state, nint qT, nint kT, nint vT,
+                                       nint gT, nint betaT, nint outputT,
+                                       int nVHead, int nKHead, int dState, nint stream)
+    {
+        if (dState <= 0 || dState > 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; gdn_scan_step_f32 is compiled with __launch_bounds__(128).");
+
+        nint sArg = state, qArg = qT, kArg = kT, vArg = vT;
+        nint gArg = gT, bArg = betaT, oArg = outputT;
+        int nvArg = nVHead, nkArg = nKHead, dsArg = dState;
+
+        void** args = stackalloc void*[] {&sArg, &qArg, &kArg, &vArg,
+                        &gArg, &bArg, &oArg,
+                        &nvArg, &nkArg, &dsArg};
+
+        // Shared memory: k_shared[dState] + q_shared[dState]
+        uint sharedBytes = (uint)(2 * dState * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_gdnScanStepF32Func,
+                (uint)nVHead, 1, 1, (uint)dState, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place per-head L2 normalisation (FP32). Bit-perfect port of the CPU
+    /// <c>GatedDeltaNetScan.L2NormalizeHeads</c> reference — the sum-of-squares
+    /// is computed serially in thread 0 of each block to preserve the CPU's
+    /// 0..dState-1 float-add order exactly.
+    /// </summary>
+    /// <param name="x">
+    /// Device pointer to a flat FP32 buffer of <c>totalHeads × dState</c> elements.
+    /// Each <c>dState</c>-element slice is normalised independently to unit norm.
+    /// </param>
+    /// <param name="totalHeads">Number of head vectors to normalise (e.g. <c>seqLen × nKHead</c>).</param>
+    /// <param name="dState">Dimension of each head vector.</param>
+    /// <param name="eps">Epsilon added to the L2 norm for numerical stability (default 1e-6 in the CPU code).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchL2NormalizeHeadsF32(nint x, int totalHeads, int dState, float eps, nint stream)
+    {
+        if (dState <= 0 || dState > 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; l2_normalize_heads_f32 is compiled with __launch_bounds__(128).");
+
+        nint xArg = x;
+        int thArg = totalHeads, dsArg = dState;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&xArg, &thArg, &dsArg, &epsArg};
+
+        // One block per head; dState threads per block. The kernel's serial-sum
+        // phase runs in thread 0 only, but the broadcast multiply uses all
+        // threads via a grid-stride loop, so blockDim can equal dState exactly.
+        CudaDriverApi.cuLaunchKernel(_l2NormHeadsF32Func,
+                (uint)totalHeads, 1, 1, (uint)dState, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-token GDN decay: in place transforms <paramref name="alphaBuf"/> via
+    /// <c>g[t, vh] = exp(softplus(alpha[t, vh] + dt_bias[vh]) * A[vh])</c>, with
+    /// <c>softplus(x) = log(1 + exp(x))</c> (no <c>x &gt; 20</c> short-circuit —
+    /// matches the Qwen3MoeHybrid CPU oracle exactly, see
+    /// <c>Qwen3MoeHybridTransformerModel.ForwardGdnBody</c>).
+    /// </summary>
+    /// <remarks>
+    /// Compiled with <c>-fmad=false</c>; CUDA's precise expf/logf are within
+    /// ≤1 ULP of <see cref="MathF.Exp(float)"/> / <see cref="MathF.Log(float)"/>
+    /// on Ampere+, so the result matches the CPU host fallback to within
+    /// negligible tolerance — not strictly bit-equal across every input, but
+    /// numerically equivalent for any well-conditioned alpha.
+    /// </remarks>
+    /// <param name="alphaBuf">Device pointer to <c>[seqLen, nVHead]</c> FP32, in/out.</param>
+    /// <param name="dtBias">Device pointer to per-head FP32 bias, <c>[nVHead]</c>.</param>
+    /// <param name="a">Device pointer to per-head FP32 decay coefficient, <c>[nVHead]</c>.</param>
+    /// <param name="seqLen">Number of tokens (rows of <paramref name="alphaBuf"/>).</param>
+    /// <param name="nVHead">Number of value heads (columns of <paramref name="alphaBuf"/>).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnDecayF32(nint alphaBuf, nint dtBias, nint a,
+                                    int seqLen, int nVHead, nint stream)
+    {
+        nint alphaArg = alphaBuf, dtArg = dtBias, aArg = a;
+        int slArg = seqLen, nvArg = nVHead;
+
+        void** args = stackalloc void*[] {&alphaArg, &dtArg, &aArg, &slArg, &nvArg};
+
+        int total = seqLen * nVHead;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_gdnDecayF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place elementwise sigmoid: <c>buf[i] = 1 / (1 + exp(-buf[i]))</c>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSigmoidHostFallback</c>.
+    /// </summary>
+    /// <param name="buf">Device pointer to FP32 buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSigmoidF32(nint buf, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; sigmoid_f32 takes an int count to match CUDA driver param size.");
+
+        nint bufArg = buf;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&bufArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_sigmoidF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place elementwise SiLU: <c>buf[i] = buf[i] * sigmoid(buf[i])</c>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSiluHostFallback</c>.
+    /// </summary>
+    /// <param name="buf">Device pointer to FP32 buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSiluF32(nint buf, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; silu_f32 takes an int count to match CUDA driver param size.");
+
+        nint bufArg = buf;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&bufArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_siluF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Elementwise <c>a[i] *= sigmoid(b[i])</c>, in place on <paramref name="a"/>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSigmoidMulHostFallback</c>.
+    /// </summary>
+    /// <param name="a">Device pointer to FP32 in/out buffer of length <paramref name="n"/>.</param>
+    /// <param name="b">Device pointer to FP32 gate buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSigmoidMulF32(nint a, nint b, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; sigmoid_mul_f32 takes an int count to match CUDA driver param size.");
+
+        nint aArg = a, bArg = b;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&aArg, &bArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_sigmoidMulF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -1885,6 +2258,20 @@ public sealed unsafe class CudaKernels : IDisposable
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
             }
+
+            case QuantizationType.Q6_K:
+            {
+                if (_dequantQ6_KF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantQ6_KF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
         }
 
         throw new NotSupportedException($"GPU FP32 dequantization not supported directly for {srcDtype}.");
@@ -2789,5 +3176,11 @@ public sealed unsafe class CudaKernels : IDisposable
         _moeFfnModule?.Dispose();
         _moeGroupedGemvModule?.Dispose();
         _attentionMlaLatentModule?.Dispose();
+        // GDN/conv1d modules: _l2NormHeadsF32Module aliases _gdnScanF32Module
+        // (same .ptx file), so dispose only the scan module — disposing both
+        // would double-free the underlying CUmodule handle.
+        _conv1dCausalF32Module?.Dispose();
+        _gdnScanF32Module?.Dispose();
+        _elementwiseF32Module?.Dispose();
     }
 }

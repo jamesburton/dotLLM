@@ -1,9 +1,38 @@
 // Tiled attention with FP32 Q/K/V/output and online softmax.
+//
+// Softmax uses Schraudolph's IEEE-754 bit-trick approximation of expf, matching the
+// CPU oracle's DotLLM.Cpu.Kernels.FastMath.ExpSumAndStore. The CPU side has used the
+// fast-exp path since the kernel's inception; switching CUDA to precise expf made the
+// two backends disagree by ~1% (5e-3 abs on attention output) on synthetic-fixture
+// parity. The bit-trick keeps both backends bit-near-equivalent without a CPU-side
+// accuracy regression. Constants C0/C1 must stay in sync with FastMath.cs.
+//
+//   exp(x) ≈ bitcast_int_to_float((int)(x * C0 + C1)),   x ≤ 0 only (no overflow guard)
+//
+// C0 = 2^23 / ln(2), C1 = (127 - 0.0579) * 2^23. Applied only to softmax `expf` calls
+// where the argument is always ≤ 0 by construction (max-subtracted scores).
 
 #include <float.h>
 #include <math.h>
 
 #define TILE_KV 256
+
+// Schraudolph fast-exp constants (mirror FastMath.cs).
+#define FASTEXP_C0 12102203.0f
+#define FASTEXP_C1 1064866805.0f
+#define FASTEXP_MIN_CLAMP -87.3f
+
+__device__ __forceinline__ float fast_exp_neg(float x)
+{
+    // Caller contract: x ≤ 0 (max-subtracted softmax scores). Clamp the lower bound
+    // to keep the integer cast inside the IEEE-754 normal range. Use float-to-int
+    // truncation (toward zero) to match the C# scalar `(int)x` and the SIMD
+    // ConvertToVector*Int32WithTruncation paths in FastMath.cs — round-to-nearest
+    // would introduce a sub-ULP bias.
+    x = fmaxf(x, FASTEXP_MIN_CLAMP);
+    int bits = __float2int_rz(fmaf(x, FASTEXP_C0, FASTEXP_C1));
+    return __int_as_float(bits);
+}
 
 extern "C" __global__ void __launch_bounds__(256) attention_f32(
     const float* __restrict__ q, const float* __restrict__ k,
@@ -88,7 +117,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
         // Online softmax rescale
         float new_max = fmaxf(running_max, tile_max);
         float correction = (running_max > -FLT_MAX + 1.0f)
-                           ? expf(running_max - new_max) : 0.0f;
+                           ? fast_exp_neg(running_max - new_max) : 0.0f;
         running_sum *= correction;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
             out_accum[d] *= correction;
@@ -99,7 +128,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
         float tile_sum = 0.0f;
         for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
             float w = (score_tile[t] > -FLT_MAX + 1.0f)
-                      ? expf(score_tile[t] - running_max) : 0.0f;
+                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
             score_tile[t] = w;
             tile_sum += w;
         }

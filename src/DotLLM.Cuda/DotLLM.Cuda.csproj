@@ -41,10 +41,22 @@
   <ItemGroup>
     <CudaKernel Include="$(CudaKernelDir)\*.cu">
       <FastMathFlag></FastMathFlag>
+      <FmadFlag></FmadFlag>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->
     <CudaKernel Update="$(CudaKernelDir)\add.cu;$(CudaKernelDir)\add_f32.cu;$(CudaKernelDir)\swiglu.cu;$(CudaKernelDir)\swiglu_f32.cu;$(CudaKernelDir)\convert.cu;$(CudaKernelDir)\bias_add.cu;$(CudaKernelDir)\bias_add_f32.cu;$(CudaKernelDir)\embedding.cu;$(CudaKernelDir)\embedding_f32out.cu;$(CudaKernelDir)\dequant.cu;$(CudaKernelDir)\quant_kv.cu">
       <FastMathFlag>--use_fast_math</FastMathFlag>
+    </CudaKernel>
+    <!-- Kernels requiring fmad=false for bit-perfect / numerical parity with the CPU
+         scalar reference. .NET RyuJIT does not emit FMA from `a*b+c` patterns without
+         an explicit MathF.FusedMultiplyAdd call, so leaving nvcc's default (fmad=true)
+         produces ~1 ULP drift per accumulation versus the CPU's separate mul+add. The
+         Qwen3MoeHybrid recurrence (GDN) compounds those tiny errors over time steps,
+         so the kernels backing it must be compiled with FMA fusion disabled.
+         elementwise_f32.cu hosts sigmoid/silu/sigmoid_mul (host fallbacks the agent
+         is replacing) and is here for the same reason. -->
+    <CudaKernel Update="$(CudaKernelDir)\conv1d_causal.cu;$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\elementwise_f32.cu">
+      <FmadFlag>-fmad=false</FmadFlag>
     </CudaKernel>
   </ItemGroup>
 
@@ -80,7 +92,7 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 
