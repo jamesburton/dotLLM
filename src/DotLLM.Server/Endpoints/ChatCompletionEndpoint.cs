@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
 using DotLLM.Server.Models;
+using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Server.Endpoints;
@@ -188,6 +189,10 @@ public static class ChatCompletionEndpoint
             },
         };
 
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
+
         httpContext.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
     }
@@ -273,6 +278,10 @@ public static class ChatCompletionEndpoint
             : new ChatDeltaDto();
 
         int promptTokens = timings?.PrefillTokenCount ?? 0;
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(promptTokens + completionTokens);
 
         var finalChunk = new ChatCompletionChunk
         {

@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
 using DotLLM.Server.Models;
+using DotLLM.Server.RateLimiting;
 
 namespace DotLLM.Server.Endpoints;
 
@@ -131,6 +132,10 @@ public static class CompletionEndpoint
             },
         };
 
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
+
         httpContext.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.CompletionResponse, ct);
     }
@@ -146,10 +151,16 @@ public static class CompletionEndpoint
         httpContext.Response.Headers.CacheControl = "no-cache";
         httpContext.Response.Headers.Connection = "keep-alive";
 
+        int completionTokens = 0;
+        int promptTokens = 0;
+
         await state.ExecuteAsync(async () =>
         {
             await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct, adapter))
             {
+                if (token.Text.Length > 0) completionTokens++;
+                if (token.Timings.HasValue) promptTokens = token.Timings.Value.PrefillTokenCount;
+
                 var tokenLogprobs = token.Logprobs.HasValue
                     ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
                     : null;
@@ -172,6 +183,10 @@ public static class CompletionEndpoint
                 await httpContext.Response.Body.FlushAsync(ct);
             }
         }, ct);
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(promptTokens + completionTokens);
 
         await httpContext.Response.WriteAsync("data: [DONE]\n\n", ct);
         await httpContext.Response.Body.FlushAsync(ct);

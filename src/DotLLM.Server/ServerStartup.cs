@@ -7,6 +7,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Server.RateLimiting;
 using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
@@ -245,6 +246,18 @@ public static class ServerStartup
         builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
             p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
 
+        // Rate limiting — only wired when enabled in config. The manager and
+        // resolver are singletons; the middleware is registered later in the
+        // pipeline (below). When disabled this is a pure no-op.
+        var rateLimitConfig = state.Options.RateLimit;
+        if (rateLimitConfig is { Enabled: true })
+        {
+            var manager = new RateLimitManager(rateLimitConfig);
+            state.RateLimitManager = manager;
+            builder.Services.AddSingleton(manager);
+            builder.Services.AddSingleton<IApiKeyResolver, HeaderApiKeyResolver>();
+        }
+
         // Keep only warning+ logging to avoid noisy request logs
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
@@ -258,6 +271,13 @@ public static class ServerStartup
         var app = builder.Build();
         app.UseDeveloperExceptionPage();
         app.UseCors();
+
+        if (state.RateLimitManager is { } rlm)
+        {
+            var resolver = app.Services.GetRequiredService<IApiKeyResolver>();
+            app.UseDotLLMRateLimiting(rlm, resolver);
+        }
+
         app.MapDotLLMEndpoints(serveUi);
 
         return app;

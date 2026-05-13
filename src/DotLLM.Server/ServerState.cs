@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Models.Gguf;
+using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 
@@ -84,6 +85,13 @@ public sealed class ServerState : IDisposable
     public ILoraAdapterRegistry? LoraRegistry { get; set; }
 
     /// <summary>
+    /// Per-API-key rate limiter manager. <c>null</c> when rate limiting is
+    /// disabled or not configured (see <see cref="ServerOptions.RateLimit"/>).
+    /// Owned by <see cref="ServerState"/> and disposed at server shutdown.
+    /// </summary>
+    public RateLimitManager? RateLimitManager { get; set; }
+
+    /// <summary>
     /// Executes a request with sequential access control.
     /// Only one request is processed at a time (Step 35 adds batching).
     /// </summary>
@@ -125,6 +133,7 @@ public sealed class ServerState : IDisposable
     /// <inheritdoc/>
     public void Dispose()
     {
+        RateLimitManager?.Dispose();
         PrefixCache?.Dispose();
         PagedFactory?.Dispose();
         DraftModel?.Dispose();
