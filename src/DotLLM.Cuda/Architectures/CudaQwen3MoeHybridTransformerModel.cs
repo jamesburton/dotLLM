@@ -98,14 +98,52 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     // disposed in Dispose(). Sized once for (numExperts, topK, intermediate, hidden).
     private readonly CudaMoeScratch _moeScratch;
 
-    // Per-attention-layer F32 KV cache. Sized lazily on first kvCache-enabled Forward
+    // Per-attention-layer F16 KV cache. Sized lazily on first kvCache-enabled Forward
     // call from kvCache.MaxLength. Slot index per absolute layer comes from
-    // _kvSlotForLayer; non-attention layers map to -1. Each entry is a device F32
+    // _kvSlotForLayer; non-attention layers map to -1. Each entry is a device F16
     // buffer [maxSeqLen, kvElems].
-    private nint[]? _f32KCache;
-    private nint[]? _f32VCache;
-    private int _f32CacheMaxSeqLen;        // current allocated capacity
-    private int _f32CacheCurrentLength;    // mirrors IKvCache.CurrentLength for the model-internal cache
+    //
+    // History: was F32 prior to #44 — halved to F16 to free roughly half the
+    // sidecar bytes (~650 MB at 8K context on qwen35moe; 16 KV heads × 256 headDim
+    // × 4 → 2 bytes × 2 sides × 10 attention layers × maxSeqLen). The freshly-
+    // projected K/V come out of RoPE as F32 and are converted to F16 via the
+    // small _f16KvWriteStaging buffer before each row-copy into the cache. On the
+    // read side the live cache prefix is dequanted F16→F32 into the per-call
+    // _f32KvReadStaging{K,V} scratch and consumed by LaunchAttentionF32 — keeping
+    // Q and the attention accumulator in F32 was necessary to stay inside the
+    // synthetic-fixture AbsTol(1e-4)+RelTol(1e-3) bars (a full-F16 attention path
+    // — Q→F16, attn out F16→F32 — was tried and breached Q5_K and F16 parity by
+    // ~0.5–1× on the hidden=32 / headDim=8 fixture).
+    private nint[]? _f16KCache;
+    private nint[]? _f16VCache;
+    private int _f16CacheMaxSeqLen;        // current allocated capacity
+    private int _f16CacheCurrentLength;    // mirrors IKvCache.CurrentLength for the model-internal cache
+
+    // Per-step staging for the cache-enabled full-attention path.
+    //
+    // _f16KvWriteStaging: F32→F16 conversion target for the freshly-projected
+    //   K or V rows before each row-copy into the F16 cache. Sized lazily to
+    //   max(seqLen × kvElems) ever seen — at 8K context × 16 KV × 256 = 8 MB.
+    //
+    // _f32KvReadStagingK / _f32KvReadStagingV: per-attention-layer F32 scratch
+    //   that the F16 cache prefix gets dequanted into before LaunchAttentionF32.
+    //   ONE pair shared across all attention layers (each layer's call overwrites
+    //   the previous content; attention reads it before the next layer's dequant
+    //   begins). Sized lazily to max(currentLength × kvElems) ever seen — at 8K
+    //   context × 16 KV × 256 × 4 bytes = 32 MB per side, 64 MB total. Still a
+    //   large net win vs the 1.3 GB F32-cache the change replaces.
+    //
+    // History: rolled forward to "F32 attention with F16-stored KV that's
+    // dequanted on read" (Option A in the plan-issue) after Option B (all-F16
+    // internal attention) breached the synthetic Q5_K and F16 parity bars by
+    // ~0.5-1× — too much drift introduced by the Q-cast on a 16-element headDim.
+    // Restricting the F16 precision loss to the cache storage only keeps Q and
+    // accumulator in F32 where the synthetic bars need them.
+    private nint _f16KvWriteStaging;
+    private long _f16KvWriteStagingElems;
+    private nint _f32KvReadStagingK;
+    private nint _f32KvReadStagingV;
+    private long _f32KvReadStagingElems;
 
     private bool _disposed;
 
@@ -649,7 +687,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <param name="layerIdx">Zero-based absolute layer index.</param>
     /// <param name="hostInput">Input hidden state <c>[seqLen, hiddenSize]</c> F32 row-major.</param>
     /// <param name="positions">Per-token absolute positions (length seqLen).</param>
-    /// <param name="kvCache">Optional KV cache. Pass <c>null</c> for the no-cache prefill fast path — recommended for parity testing to dodge the F32 KV cache sidecar.</param>
+    /// <param name="kvCache">Optional KV cache. Pass <c>null</c> for the no-cache prefill fast path — recommended for parity testing to dodge the F16 KV cache sidecar.</param>
     /// <param name="hostOutput">Output hidden state <c>[seqLen, hiddenSize]</c> F32 row-major. Filled on return.</param>
     internal void RunIsolatedLayerFromHostInput(int layerIdx,
         ReadOnlySpan<float> hostInput, ReadOnlySpan<int> positions, IKvCache? kvCache,
@@ -1935,22 +1973,41 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // ── 6. Attention (GQA with causal mask). Two paths:
         //   - kvCache == null: F32 kernel walks the freshly-projected K and V as the
         //     entire context (prefill chunk, no cache).
-        //   - kvCache != null: write the new K/V rows into the model-private F32 KV
-        //     cache at their absolute positions, then run attention over the full
-        //     cached context [0, currentLength). positionOffset = positions[0] sets the
-        //     causal mask anchor so position p only attends to keys at index ≤ p.
+        //   - kvCache != null: stage the new K/V rows F32→F16 into the model-private
+        //     F16 KV cache at their absolute positions, then dequant the live cache
+        //     prefix F16→F32 into a per-layer-reused F32 scratch and run the F32
+        //     attention kernel over the dequanted context [0, currentLength).
+        //     positionOffset = positions[0] sets the causal mask anchor so position
+        //     p only attends to keys at index ≤ p. The F32→F16→F32 round-trip
+        //     restricts precision loss to cache storage only — Q and attention
+        //     accumulator stay F32, which keeps synthetic-fixture parity inside the
+        //     existing AbsTol(1e-4)+RelTol(1e-3) bars (a full-F16 attention path was
+        //     tried and breached Q5_K + F16 parity by ~0.5–1× on a hidden=32 fixture).
+        //     KV cache halving still cuts ~650 MB at 8K context on qwen35moe; the
+        //     per-call F32 dequant scratch is shared across all attention layers
+        //     (each layer's launch consumes the scratch before the next layer's
+        //     dequant overwrites it) so the net savings is ~600 MB.
         if (kvCache is not null)
         {
-            EnsureF32KvCache(kvCache.MaxLength, numKvHeads, headDim);
+            EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
             int slot = _kvSlotForLayer[layer];
             if (slot < 0)
                 throw new InvalidOperationException(
                     $"Layer {layer} is not a full-attention layer but ForwardFullAttnBody was invoked.");
-            WriteF32KvRows(slot, k, v, positions, numKvHeads, headDim);
+            WriteF16KvRows(slot, k, v, positions, numKvHeads, headDim);
 
             int positionOffset = positions[0];
-            int seqKv = _f32CacheCurrentLength;
-            _kernels.LaunchAttentionF32(q, _f32KCache![slot], _f32VCache![slot], attnOut,
+            int seqKv = _f16CacheCurrentLength;
+            int kvLiveElems = seqKv * kvElems;
+
+            // Dequant the [0, seqKv) prefix of K and V F16→F32 into the shared F32
+            // read-side scratch. Only the live prefix is touched — the rest of the
+            // cache (positions ≥ seqKv) is irrelevant for this forward.
+            EnsureF32KvReadStaging(seqKv, kvElems);
+            _kernels.LaunchConvertF16ToF32(_f16KCache![slot], _f32KvReadStagingK, kvLiveElems, streamH);
+            _kernels.LaunchConvertF16ToF32(_f16VCache![slot], _f32KvReadStagingV, kvLiveElems, streamH);
+
+            _kernels.LaunchAttentionF32(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
                 seqLen, seqKv, numHeads, numKvHeads, headDim,
                 positionOffset: positionOffset, slidingWindow: 0, streamH);
         }
@@ -1997,56 +2054,101 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    //  Per-attention-layer F32 KV cache (model-private)
+    //  Per-attention-layer F16 KV cache (model-private)
     // ──────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Lazily allocates the per-attention-layer F32 K and V buffers. Called only from
+    /// Lazily allocates the per-attention-layer F16 K and V buffers. Called only from
     /// the full-attn path when the caller passes a non-null <see cref="IKvCache"/>.
-    /// Each buffer is sized to <c>maxSeqLen × (numKvHeads × headDim) × sizeof(float)</c>
-    /// — at qwen35moe (16 KV heads × 256 = 4096 floats per token × 2 cache halves × 10
-    /// attention layers × maxSeqLen) the total scales linearly with maxSeqLen. At the
-    /// model's full 262144 context this is ~80 GiB — the caller is expected to size
-    /// the cache to something reasonable for their hardware.
+    /// Each buffer is sized to <c>maxSeqLen × (numKvHeads × headDim) × sizeof(ushort)</c>
+    /// — at qwen35moe (16 KV heads × 256 = 4096 halves per token × 2 cache halves × 10
+    /// attention layers × maxSeqLen) the total scales linearly with maxSeqLen. At 8K
+    /// context this is ~640 MiB total (half of the previous F32 sidecar). The model's
+    /// full 262144 context would still be ~40 GiB — the caller is expected to size the
+    /// cache to something reasonable for their hardware.
     /// </summary>
     /// <remarks>
-    /// We don't reuse the standard <see cref="CudaKvCache"/> because it stores FP16
-    /// keys/values; the F32 attention path (<see cref="CudaKernels.LaunchAttentionF32"/>)
-    /// expects F32 packed [seqKv, kvStride]. Bridging via per-row F32→F16→F32 converts
-    /// would dominate the attention cost; an F32 sidecar is cleaner.
+    /// History: was F32 prior to #44 (one cuMemcpy per write, F32 attention reads
+    /// direct). Halved to F16 by staging F32→F16 on the write and switching the
+    /// attention launch to the dense-path's FP16 kernel (LaunchAttention). The
+    /// existing <see cref="CudaKvCache"/> is shaped for the dense Llama path where
+    /// K/V come out of GEMM already F16; here we have F32 RoPE output so a thin
+    /// owned cache is simpler than threading dtypes through the dense cache.
     /// </remarks>
-    private void EnsureF32KvCache(int maxSeqLen, int numKvHeads, int headDim)
+    private void EnsureF16KvCache(int maxSeqLen, int numKvHeads, int headDim)
     {
-        if (_f32KCache is not null && maxSeqLen <= _f32CacheMaxSeqLen) return;
+        if (_f16KCache is not null && maxSeqLen <= _f16CacheMaxSeqLen) return;
 
         // Free any existing buffers (resize).
-        if (_f32KCache is not null)
+        if (_f16KCache is not null)
         {
-            for (int i = 0; i < _f32KCache.Length; i++)
+            for (int i = 0; i < _f16KCache.Length; i++)
             {
-                if (_f32KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f32KCache[i]);
-                if (_f32VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f32VCache[i]);
+                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
+                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
             }
         }
 
-        _f32KCache = new nint[_attentionLayerCount];
-        _f32VCache = new nint[_attentionLayerCount];
-        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(float);
+        _f16KCache = new nint[_attentionLayerCount];
+        _f16VCache = new nint[_attentionLayerCount];
+        long bytesPerLayer = (long)maxSeqLen * numKvHeads * headDim * sizeof(ushort);
         for (int i = 0; i < _attentionLayerCount; i++)
         {
-            _f32KCache[i] = AllocDevice(bytesPerLayer);
-            _f32VCache[i] = AllocDevice(bytesPerLayer);
+            _f16KCache[i] = AllocDevice(bytesPerLayer);
+            _f16VCache[i] = AllocDevice(bytesPerLayer);
         }
-        _f32CacheMaxSeqLen = maxSeqLen;
-        _f32CacheCurrentLength = 0;
+        _f16CacheMaxSeqLen = maxSeqLen;
+        _f16CacheCurrentLength = 0;
+    }
+
+    /// <summary>
+    /// Lazily grows the per-step F16 KV write-side staging scratch (used for the
+    /// F32→F16 convert of freshly-projected K or V rows before each row-copy into
+    /// the F16 cache) to cover <c>seqLen × kvElems</c> halves. Power-of-two growth.
+    /// </summary>
+    private void EnsureF16KvWriteStaging(int seqLen, int kvElems)
+    {
+        long needed = (long)seqLen * kvElems;
+        if (needed <= _f16KvWriteStagingElems) return;
+
+        long grown = _f16KvWriteStagingElems == 0 ? 256L : _f16KvWriteStagingElems;
+        while (grown < needed) grown *= 2;
+
+        FreeIfNonZero(ref _f16KvWriteStaging);
+        _f16KvWriteStaging = AllocDevice(grown * sizeof(ushort));
+        _f16KvWriteStagingElems = grown;
+    }
+
+    /// <summary>
+    /// Lazily grows the F32 KV read-side staging buffers (K and V) used to dequant
+    /// the live F16 cache prefix back to F32 before <see cref="CudaKernels.LaunchAttentionF32"/>.
+    /// Shared across all attention layers — each layer overwrites the previous
+    /// layer's content before its own attention launch, so a single pair suffices.
+    /// Power-of-two growth.
+    /// </summary>
+    private void EnsureF32KvReadStaging(int seqKv, int kvElems)
+    {
+        long needed = (long)seqKv * kvElems;
+        if (needed <= _f32KvReadStagingElems) return;
+
+        long grown = _f32KvReadStagingElems == 0 ? 256L : _f32KvReadStagingElems;
+        while (grown < needed) grown *= 2;
+
+        FreeIfNonZero(ref _f32KvReadStagingK);
+        FreeIfNonZero(ref _f32KvReadStagingV);
+        _f32KvReadStagingK = AllocDevice(grown * sizeof(float));
+        _f32KvReadStagingV = AllocDevice(grown * sizeof(float));
+        _f32KvReadStagingElems = grown;
     }
 
     /// <summary>
     /// Writes the freshly-projected K and V rows for one attention layer into the
-    /// per-layer F32 KV cache at their absolute positions. Updates the cache's
-    /// current-length counter to <c>max(positions) + 1</c> on a per-call basis (the
-    /// same length is shared across all attention layers — they always advance in
-    /// lockstep because every layer runs once per forward).
+    /// per-layer F16 KV cache at their absolute positions. K and V arrive F32 from
+    /// the RoPE kernel; this routine converts them F32→F16 into the
+    /// <see cref="_f16KvWriteStaging"/> per call, then row-copies into the cache.
+    /// Updates the cache's current-length counter to <c>max(positions) + 1</c> on a
+    /// per-call basis (the same length is shared across all attention layers — they
+    /// always advance in lockstep because every layer runs once per forward).
     /// </summary>
     /// <remarks>
     /// Contiguous-positions fast path issues a single bulk <c>cuMemcpyDtoDAsync</c>
@@ -2054,52 +2156,74 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// non-contiguous fallback (e.g. partial-cache reuse after rollback) issues one
     /// DtoD per row.
     /// </remarks>
-    private void WriteF32KvRows(int layerSlot, nint kSrc, nint vSrc,
+    private void WriteF16KvRows(int layerSlot, nint kSrcF32, nint vSrcF32,
                                  ReadOnlySpan<int> positions, int numKvHeads, int headDim)
     {
         nint streamH = _stream.Handle;
         int seqLen = positions.Length;
-        long rowBytes = (long)numKvHeads * headDim * sizeof(float);
+        int kvElems = numKvHeads * headDim;
+        long rowBytes = (long)kvElems * sizeof(ushort);
+        int totalElems = seqLen * kvElems;
 
         bool contiguous = seqLen > 0;
         int maxPos = positions[0];
         for (int i = 0; i < seqLen; i++)
         {
             int p = positions[i];
-            if ((uint)p >= (uint)_f32CacheMaxSeqLen)
+            if ((uint)p >= (uint)_f16CacheMaxSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(positions),
-                    $"Position {p} at index {i} exceeds F32 KV cache capacity {_f32CacheMaxSeqLen}.");
+                    $"Position {p} at index {i} exceeds F16 KV cache capacity {_f16CacheMaxSeqLen}.");
             if (p > maxPos) maxPos = p;
             if (i > 0 && positions[i] != positions[i - 1] + 1) contiguous = false;
         }
 
-        nint kBase = _f32KCache![layerSlot];
-        nint vBase = _f32VCache![layerSlot];
+        // Stage K/V F32→F16 into the shared staging buffer. We do K then V back-to-back
+        // and copy each into the cache before reusing the staging for the next side, so
+        // a single seqLen × kvElems buffer suffices.
+        EnsureF16KvWriteStaging(seqLen, kvElems);
+        nint stagingF16 = _f16KvWriteStaging;
+        nint kBase = _f16KCache![layerSlot];
+        nint vBase = _f16VCache![layerSlot];
 
+        // ── K ──
+        _kernels.LaunchConvertF32ToF16(kSrcF32, stagingF16, totalElems, streamH);
         if (contiguous && seqLen > 1)
         {
             long bulkBytes = (long)seqLen * rowBytes;
             nint kDst = kBase + (nint)((long)positions[0] * rowBytes);
-            nint vDst = vBase + (nint)((long)positions[0] * rowBytes);
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kSrc, (nuint)bulkBytes, streamH).ThrowOnError();
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vSrc, (nuint)bulkBytes, streamH).ThrowOnError();
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, stagingF16, (nuint)bulkBytes, streamH).ThrowOnError();
         }
         else
         {
             for (int i = 0; i < seqLen; i++)
             {
                 nint kDst = kBase + (nint)((long)positions[i] * rowBytes);
-                nint vDst = vBase + (nint)((long)positions[i] * rowBytes);
-                nint kS = kSrc + (nint)((long)i * rowBytes);
-                nint vS = vSrc + (nint)((long)i * rowBytes);
+                nint kS = stagingF16 + (nint)((long)i * rowBytes);
                 CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, kS, (nuint)rowBytes, streamH).ThrowOnError();
+            }
+        }
+
+        // ── V ──
+        _kernels.LaunchConvertF32ToF16(vSrcF32, stagingF16, totalElems, streamH);
+        if (contiguous && seqLen > 1)
+        {
+            long bulkBytes = (long)seqLen * rowBytes;
+            nint vDst = vBase + (nint)((long)positions[0] * rowBytes);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, stagingF16, (nuint)bulkBytes, streamH).ThrowOnError();
+        }
+        else
+        {
+            for (int i = 0; i < seqLen; i++)
+            {
+                nint vDst = vBase + (nint)((long)positions[i] * rowBytes);
+                nint vS = stagingF16 + (nint)((long)i * rowBytes);
                 CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, vS, (nuint)rowBytes, streamH).ThrowOnError();
             }
         }
 
         int newLength = maxPos + 1;
-        if (newLength > _f32CacheCurrentLength)
-            _f32CacheCurrentLength = newLength;
+        if (newLength > _f16CacheCurrentLength)
+            _f16CacheCurrentLength = newLength;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2661,17 +2785,20 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         FreeIfNonZero(ref _sharedDownBuf);
         FreeIfNonZero(ref _sharedScaleBuf);
 
-        // Per-attention-layer F32 KV cache.
-        if (_f32KCache is not null)
+        // Per-attention-layer F16 KV cache + per-step staging scratches.
+        if (_f16KCache is not null)
         {
-            for (int i = 0; i < _f32KCache.Length; i++)
+            for (int i = 0; i < _f16KCache.Length; i++)
             {
-                if (_f32KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f32KCache[i]);
-                if (_f32VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f32VCache[i]);
+                if (_f16KCache[i] != 0) CudaDriverApi.cuMemFree_v2(_f16KCache[i]);
+                if (_f16VCache![i] != 0) CudaDriverApi.cuMemFree_v2(_f16VCache[i]);
             }
-            _f32KCache = null;
-            _f32VCache = null;
+            _f16KCache = null;
+            _f16VCache = null;
         }
+        FreeIfNonZero(ref _f16KvWriteStaging);
+        FreeIfNonZero(ref _f32KvReadStagingK);
+        FreeIfNonZero(ref _f32KvReadStagingV);
 
         _moeScratch.Dispose();
         _state.Dispose();

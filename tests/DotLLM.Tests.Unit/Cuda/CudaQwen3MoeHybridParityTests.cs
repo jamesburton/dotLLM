@@ -18,7 +18,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// <summary>
 /// CPU-vs-CUDA last-token-logits parity tests for
 /// <see cref="CudaQwen3MoeHybridTransformerModel"/>. These tests are the first end-to-end
-/// coverage of the new CUDA forward path (CudaMoeFfn integration, F32 KV cache sidecar,
+/// coverage of the new CUDA forward path (CudaMoeFfn integration, F16 KV cache sidecar,
 /// fused-op kernels) and they pin the CUDA model's last-token logits to the
 /// <see cref="Qwen3MoeHybridTransformerModel"/> oracle on a synthetic fixture small enough
 /// to fit in &lt;100 MB on any CUDA card (hidden=32, 4 experts, 2 layers).
@@ -129,7 +129,7 @@ public sealed unsafe class CudaQwen3MoeHybridParityTests
     /// Prefill parity on the default mixed-layer model (layer 0 GDN, layer 1 full-attn).
     /// Adds the Q+Gate fused projection, QK-norm, partial-rotary RoPE, GQA SDPA, and
     /// post-attention sigmoid-gate elementwise mul on top of the GDN-only test. The KV
-    /// cache is non-null but used as the prefill anchor — exercises the F32 KV cache
+    /// cache is non-null but used as the prefill anchor — exercises the F16 KV cache
     /// write path without the decode read path.
     /// </summary>
     [SkippableFact]
@@ -155,10 +155,10 @@ public sealed unsafe class CudaQwen3MoeHybridParityTests
     /// <summary>
     /// Diagnostic variant of Test 2: same mixed-layer model and tokens but with
     /// <c>kvCache: null</c> on both backends. The CUDA full-attn body takes the
-    /// no-cache fast path (line ~982 of CudaQwen3MoeHybridTransformerModel.cs, walks
-    /// the freshly-projected K/V directly), bypassing the F32 KV cache write/read
-    /// path entirely. Use this to disambiguate whether the failure in Test 2 lives
-    /// in the F32 KV cache sidecar or in the full-attn body itself.
+    /// no-cache fast path (walks the freshly-projected K/V directly via the F32
+    /// attention kernel), bypassing the F16 KV cache write/read path entirely. Use
+    /// this to disambiguate whether the failure in Test 2 lives in the F16 KV cache
+    /// sidecar or in the full-attn body itself.
     /// </summary>
     [SkippableFact]
     public void CudaForward_Mixed_GdnAndFullAttn_PrefillNoKvCache_LastTokenLogitsMatch()
@@ -225,10 +225,10 @@ public sealed unsafe class CudaQwen3MoeHybridParityTests
     // ─── Test 4: KV cache decode parity ─────────────────────────────────────────
 
     /// <summary>
-    /// Exercises the new model-private F32 KV cache: run a 3-token prefill, then a
+    /// Exercises the new model-private F16 KV cache: run a 3-token prefill, then a
     /// 1-token decode step, on BOTH CPU and CUDA — the per-step decode logits must match
-    /// across backends. Diverging here points at the F32 KV cache write/read path the
-    /// perf agent shipped.
+    /// across backends. Diverging here points at the F16 KV cache write/read path
+    /// (F32→F16 staging on write, dense-path F16 attention kernel on read).
     /// </summary>
     /// <remarks>
     /// We compare the decode-step row across backends, not "prefill-N+1 vs prefill-N

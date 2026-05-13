@@ -161,8 +161,9 @@ dequant scratch, parallelising the per-expert work across
 `ComputeThreadPool`. Full-attention layers use a Q+Gate fused projection,
 QK-norm, partial-rotary NeoX MultiRope, GQA SDPA, and a
 sigmoid-gate-on-output before the O projection. CUDA implementation lives
-in `CudaQwen3MoeHybridTransformerModel` with a model-private F32 KV cache
-for the 10 full-attn layers and an on-device MoE dispatcher via
+in `CudaQwen3MoeHybridTransformerModel` with a model-private F16 KV cache
+(F32→F16 staging on write, F16→F32 dequant on read into a shared per-call
+scratch) for the 10 full-attn layers and an on-device MoE dispatcher via
 `CudaMoeFfn`. Vulkan implementation lives in
 `VulkanQwen3MoeHybridTransformerModel` with seven GDN-specific compute
 shaders (`gdn_scan_step_f32`, `gdn_scan_multi_token_f32`,
