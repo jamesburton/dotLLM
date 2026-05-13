@@ -151,45 +151,96 @@ Clears all cached KV-cache sessions. Called automatically by the Chat UI when th
 
 ## Rate Limiting
 
-Per-API-key controls using `System.Threading.RateLimiting`:
+Per-API-key admission controls built on `System.Threading.RateLimiting`. Off by default — when no `RateLimit` configuration is present (or `Enabled: false`) the middleware short-circuits and adds zero overhead. When configured, the middleware sits between CORS and endpoint mapping and inspects every request to `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`.
+
+Code lives in `src/DotLLM.Server/RateLimiting/`:
+
+| File | Role |
+|------|------|
+| `RateLimitConfig` | Configuration record: `Enabled`, `DefaultPolicy`, `ApiKeys`, `EstimatedCompletionTokensFallback`. Loaded from `ServerOptions.RateLimit`. |
+| `RateLimitPolicy` | Per-key cap: `RequestsPerMinute`, `TokensPerMinute`, `MaxConcurrent`, `Priority`, `QueueTimeout`. |
+| `IApiKeyResolver` / `HeaderApiKeyResolver` | Identity surface. Default reads `X-API-Key`, falls back to `Authorization: Bearer <key>`, then `"anonymous"`. **This is NOT authentication** — host apps wiring real auth should replace the resolver. |
+| `PriorityConcurrencyGate` | Per-key concurrency limiter ordered by `RequestPriority` (highest wins, FIFO within a priority class). |
+| `RateLimitManager` | Owns the three limiters per resolved key. `TryAcquireAsync(key, estimatedTokens, ct)` returns a bundled `RateLimitLease` on admission or a `LimiterKind` + `RetryAfter` on rejection. |
+| `RateLimitMiddleware` | Plugs into the ASP.NET pipeline; stashes the lease on `HttpContext.Items` so endpoints can call `ReportActualTokens` after generation. |
+
+### Three independent limiters
+
+A request is admitted only when **all three** policies admit. The first one that rejects wins — subsequent limiters are not touched:
+
+1. **Requests/min** — `System.Threading.RateLimiting.TokenBucketRateLimiter`, replenishing at `RequestsPerMinute / 60` permits per second. `0` or negative disables.
+2. **Tokens/min** — same shape. Reservation is `prompt_tokens_estimate + max_tokens` (or `EstimatedCompletionTokensFallback` when `max_tokens` is unspecified). `0` or negative disables.
+3. **Max concurrent in-flight** — custom `PriorityConcurrencyGate`. Excess waiters park in a priority queue (negated `RequestPriority` + monotonic sequence number for FIFO tiebreak) and are released in priority order as slots free. Waiters that exceed `QueueTimeout` get a 429.
+
+The `Retry-After` header is sourced from `MetadataName.RetryAfter` on the BCL limiter where available, falling back to `60s` for requests/tokens and `QueueTimeout` for concurrency.
 
 ### Configuration
+
+The configuration record lives at `ServerOptions.RateLimit` and serializes from the standard ASP.NET options pipeline (or any path the host wires up):
+
 ```json
 {
-  "RateLimiting": {
+  "RateLimit": {
+    "Enabled": true,
+    "EstimatedCompletionTokensFallback": 256,
     "DefaultPolicy": {
       "RequestsPerMinute": 60,
       "TokensPerMinute": 100000,
-      "ConcurrentRequests": 5
+      "MaxConcurrent": 5,
+      "Priority": "Normal",
+      "QueueTimeout": "00:00:05"
     },
     "ApiKeys": {
       "key-premium": {
-        "Priority": "High",
         "RequestsPerMinute": 600,
         "TokensPerMinute": 1000000,
-        "ConcurrentRequests": 50
+        "MaxConcurrent": 50,
+        "Priority": "High"
+      },
+      "key-background-batch": {
+        "RequestsPerMinute": 10,
+        "TokensPerMinute": 50000,
+        "MaxConcurrent": 1,
+        "Priority": "Low"
       }
     }
   }
 }
 ```
 
-### Token Counting
-Rate limiting by tokens requires counting both prompt tokens (known at request time) and completion tokens (known only after generation). Strategy:
-- Deduct estimated completion tokens (using `max_tokens`) from the token budget at request admission.
-- After completion, adjust the actual count. Refund unused tokens.
+### Priority levels
 
-### Response on Limit
-HTTP 429 Too Many Requests with `Retry-After` header.
+`RequestPriority` is `Low | Normal | High | Critical`. Priority affects **admission queueing under concurrency contest**, not the requests/min or tokens/min token buckets (those are per-key and don't queue across requests). When the concurrency cap is saturated, queued waiters are released in priority order — a `High`-tier request that arrives *after* a queued `Low`-tier request jumps ahead.
 
-## Request Priority
+> Cross-request preemption of in-flight sequences is a scheduler concern — it lives in Step 59 (Advanced scheduling) and is out of scope for this step. The middleware never interrupts a generation in progress.
 
-API keys have priority levels: `Low`, `Normal`, `High`, `Critical`. Priority flows from API key config → request → scheduler.
+### Token-budget true-up
 
-Higher-priority requests:
-- Bypass lower-priority requests in the scheduler queue
-- Can trigger preemption of lower-priority active sequences
-- Are never rate-limited by token budgets allocated to lower tiers
+The tokens-per-minute limiter charges `prompt_estimate + max_tokens` upfront so callers cannot bypass the cap by omitting `max_tokens`. After generation the endpoint calls `RateLimitMiddleware.GetLease(httpContext)?.ReportActualTokens(promptTokens + completionTokens)`. The difference between reservation and actuals is recorded for accounting; the BCL `TokenBucketRateLimiter` does not currently expose a public refund API, so refunds are best-effort and tracked internally for diagnostics. The reservation is the cap; charges above it are ignored.
+
+### Response on rejection
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+X-RateLimit-Limiter: Tokens
+Content-Type: application/json
+
+{"error":"Rate limit exceeded (tokens-per-minute). Retry in 12s."}
+```
+
+| Header | Meaning |
+|--------|---------|
+| `Retry-After` | Seconds until the limiter can admit. Driven by the BCL limiter metadata where available. |
+| `X-RateLimit-Limiter` | Which of the three limiters rejected (`Requests`, `Tokens`, `Concurrency`). Useful for client backoff decisions. |
+
+### Authentication note
+
+`HeaderApiKeyResolver` exists only so rate-limit buckets can be partitioned per caller. dotLLM still has no built-in authentication — see § Security. Host applications wiring real auth (OAuth, JWT, mTLS) should register their own `IApiKeyResolver` implementation that returns the authenticated principal's stable ID. The rate-limit machinery is transport-independent and will bucket on whatever opaque string you return.
+
+### Unmetered endpoints
+
+`/health`, `/ready`, `/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/v1/lora`, `/v1/cache/clear`, `/props`, `/config`, and the chat UI are deliberately unmetered — they're either probes, control-plane operations, or static asset serving.
 
 ## Warm-up
 
