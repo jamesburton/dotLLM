@@ -238,10 +238,20 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             try
             {
                 AdmitAndPrefill(seq);
-                _active.Add(seq);
                 admittedThisStep++;
                 prefillTokensThisStep += seq.PromptLength;
                 didWork = true;
+
+                // If the first sampled token already triggered a stop condition, AdmitAndPrefill
+                // sets state to Completed — finish out the response and skip the decoding queue.
+                if (seq.State == SequenceState.Completed)
+                {
+                    CompleteSequence(seq);
+                }
+                else
+                {
+                    _active.Add(seq);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -269,6 +279,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 didWork = true;
                 if (finished)
                 {
+                    seq.State = SequenceState.Completed;
                     CompleteSequence(seq);
                     _active.RemoveAt(i);
                 }
