@@ -39,8 +39,9 @@ for system context.
 | Mistral Mixtral | `Architecture.Mixtral` | HF tokenizer.json | RoPE Norm | GQA | yes: `block_sparse_moe.gate` + per-expert `experts.{j}.w{1,2,3}` | Llama set plus `num_local_experts`, `num_experts_per_tok`. `architectures[0] = MixtralForCausalLM` or `model_type = mixtral`. | `verified: tiny-random` — `yujiepan/mixtral-tiny-random` (520 KB, `TinyMixtralSafetensorsLoadTests`); `verified: real weights (gated)` — `Mixtral8x7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent` when `DOTLLM_MIXTRAL_8X7B_CHECKPOINT_PATH` or `C:/temp/dotllm-mixtral-8x7b` is present. **Vulkan**: kernel-level + synthetic-fixture parity for the Mixtral MoE convention via `VulkanTransformerModelMoe*ForwardTests` (Q8_0 router/shared variants too). | Mixtral-convention MoE loader (`LoadMixtralMoeLayer`); no shared experts by design. |
 | Qwen-MoE (1.5 / 2 / 3) | `Architecture.QwenMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX | GQA, optional `sliding_window` | yes: `mlp.gate` + per-expert `experts.{j}.{gate,up,down}_proj`; optional shared-expert branch (Qwen1.5-MoE) with sigmoid gate; layer-level sparsity (Qwen3-MoE) via `decoder_sparse_step` + `mlp_only_layers` | Llama set plus `num_experts` or `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`, optional `shared_expert_intermediate_size`, optional `norm_topk_prob`, optional `decoder_sparse_step`, optional `mlp_only_layers` | `verified: tiny-random` — `yujiepan/qwen3-moe-tiny-random` (20 MB, `TinyQwenMoeSafetensorsLoadTests`) and synthetic unit fixtures in `TransformerSafetensorsLoadTests` covering shared-expert + sigmoid-gate paths; `verified: real weights (gated)` — `Qwen15MoeA27B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent` when `DOTLLM_QWEN15_MOE_A27B_CHECKPOINT_PATH` or `C:/temp/dotllm-qwen15-moe-a27b` is present | `LoadQwenMoeLayer` resolves both singular `shared_expert.*` (Qwen1.5-MoE-A2.7B) and plural `shared_experts.{k}.*` (DeepSeek, reused). |
 | IBM Granite-3.x MoE | `Architecture.GraniteMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm | GQA | yes: fused per-layer `block_sparse_moe.{router.layer, input_linear, output_linear}` | Llama set plus `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`. `architectures[0] = GraniteMoeForCausalLM` or `model_type = granitemoe`. | `verified: real weights` (CPU + Vulkan) — `ibm-granite/granite-3.0-3b-a800m-instruct` (6.3 GB, CPU `Granite3Moe_LoadsAndForwardsEndToEnd`; Vulkan `Granite3Moe_VulkanForward_MatchesCpuReference_OnEightDecodeSteps` 3m 56s) | Fused per-expert layout: `input_linear [E, 2*I, H]` packs w1 (rows `[0..I)`) + w3 (rows `[I..2*I)`), `output_linear [E, H, I]` packs w2. Each expert is upcast into its own F32 slab via `AllocPartAsF32`. No shared expert; typical top-k is unusually high (8 of 40). |
+| Alibaba Qwen3MoeHybrid | `Architecture.Qwen3MoeHybrid` | GGUF BPE (via `GgufBpeTokenizerFactory`) | RoPE NeoX (full-attn only) + MultiRope (`ggml_rope_multi`) | Hybrid: Gated DeltaNet (GDN) linear-attention recurrence on 38 of 40 layers + full GQA every 4th layer (`qwen35moe.full_attention_interval`); per-layer GDN state cache `[NVHead, DState, DState]` | yes: 256 routed experts top-8 + a sigmoid-gated shared expert on every layer; expert tensors stored as fused-per-projection (`ffn_{gate,up,down}_exps`) with per-expert byte stride | GGUF `general.architecture = qwen35moe` with `qwen35moe.full_attention_interval`, GDN config (`d_inner`, `n_v_head`, `n_k_head`, `d_state`, `d_conv`), MoE config (`n_routed_experts`, `n_shared_experts`, `n_experts_per_tok`, `expert_feed_forward_length`, `norm_topk_prob`) | **CPU bit-exact vs llama.cpp** — `Qwen3MoeHybridTransformerModelTests` (5/5 synthetic F32: GDN-only / mixed / shared-expert / GDN+full-attn / determinism); real Qwen3.6-35B-A3B-UD-Q6_K_XL GGUF top-1 token ("Ta") matches the `gguf-py` Python reference. **CUDA**: implementation landed (CudaQwen3MoeHybridTransformerModel, CudaGdnStateCache, on-device MoE dispatcher via CudaMoeFfn, F32 KV cache for full-attn layers) — real-GGUF GPU parity test pending hardware (29.6 GiB exceeds local 12 GiB). **Vulkan**: implementation landed (VulkanQwen3MoeHybridTransformerModel + 7 GDN compute shaders, multi-token scan, opt-in resident routed banks via `DOTLLM_VK_MOE_RESIDENT=1`) — real-GGUF parity test pending Strix Halo + glslc. | **GGUF-only** — no HF safetensors path. CPU `Qwen3MoeHybridTransformerModel` consumes the GGUF raw quant view directly (Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16), eliminating the previous ~30 GiB per-forward dequant scratch (commit landed as Step 26). Each layer carries either a `GdnTokenMixingWeights` or a `Qwen3FullAttnWeights` plus a shared `Qwen3MoeLayerWeights`. Refer to `docs/ROADMAP.md` Phase 10 and `.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full architecture map. |
 
-**Row count: 12 / 12 `Architecture` enum variants covered.**
+**Row count: 13 / 13 `Architecture` enum variants covered.**
 
 ## Per-architecture notes
 
@@ -143,6 +144,35 @@ tensors (`router.layer`, `input_linear`, `output_linear`). The loader
 (`[E, 2*I, H]` — w1 top half, w3 bottom half) and `output_linear`
 (`[E, H, I]` — w2), allocating per-expert F32 buffers via `AllocPartAsF32`.
 Unusually high top-k (8 of 40 on the 3B-A800M SKU). No shared expert.
+
+### Qwen3MoeHybrid (`Architecture.Qwen3MoeHybrid`)
+GGUF `qwen35moe` — Alibaba's Gated DeltaNet (GDN) linear-attention + sparse
+MoE hybrid (Qwen3.6-35B-A3B). Each of the 40 layers carries:
+- a token-mixing path: GDN (3 of every 4) or full GQA attention (every 4th
+  layer, set by `qwen35moe.full_attention_interval`),
+- a shared sparse MoE FFN with 256 routed experts (top-8) plus a
+  sigmoid-gated shared expert.
+
+GDN recurrence carries a full `[NVHead, DState, DState]` matrix state
+updated via the delta rule (`GdnStateCache`); the CPU forward path
+short-circuits all 256 routed experts through the GGUF raw quant view
+(Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16) without a per-forward
+dequant scratch, parallelising the per-expert work across
+`ComputeThreadPool`. Full-attention layers use a Q+Gate fused projection,
+QK-norm, partial-rotary NeoX MultiRope, GQA SDPA, and a
+sigmoid-gate-on-output before the O projection. CUDA implementation lives
+in `CudaQwen3MoeHybridTransformerModel` with a model-private F32 KV cache
+for the 10 full-attn layers and an on-device MoE dispatcher via
+`CudaMoeFfn`. Vulkan implementation lives in
+`VulkanQwen3MoeHybridTransformerModel` with seven GDN-specific compute
+shaders (`gdn_scan_step_f32`, `gdn_scan_multi_token_f32`,
+`gdn_l2_normalize_heads_f32`, `gdn_post_scan_gate_f32`, `gdn_decay_f32`,
+`sigmoid_inplace_f32`, `sigmoid_gate_mul_f32`) and an opt-in
+resident-routed-bank mode (`DOTLLM_VK_MOE_RESIDENT=1`).
+
+GGUF-only — there is no HF safetensors path because the architecture
+ships as `qwen35moe` only. See `docs/ROADMAP.md` Phase 10 and
+`.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full map.
 
 ## Legend
 
