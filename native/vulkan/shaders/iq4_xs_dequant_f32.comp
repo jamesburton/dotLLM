@@ -1,0 +1,74 @@
+#version 450
+// IQ4_XS dequantization to FP32.
+//
+// Reads a tightly-packed IQ4_XS blob (one 136-byte super-block per 256
+// elements) and produces a contiguous FP32 buffer. Layout matches llama.cpp's
+// block_iq4_xs and DotLLM.Cpu.Kernels.Dequantize.DequantizeIQ4_XS.
+//
+// Dispatch:
+//   One workgroup per IQ4_XS super-block. local_size_x = 256 — one thread
+//   per element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalSuperblocks;
+    uint srcUints;
+} pc;
+
+const uint IQ4_XS_BLOCK_BYTES = 136u;
+const uint IQ4_XS_GROUP_SIZE  = 256u;
+
+const float KVALUES_IQ4NL[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0
+);
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint sb = gl_WorkGroupID.x;
+    if (sb >= pc.totalSuperblocks) return;
+
+    uint t = gl_LocalInvocationID.x;       // 0..255
+    uint blockBase = sb * IQ4_XS_BLOCK_BYTES;
+
+    float d = readHalf(blockBase);
+    uint scalesH = readByte(blockBase + 2u) | (readByte(blockBase + 3u) << 8u);
+
+    uint ib = t >> 5u;                       // sub-block index 0..7
+    uint elem = t & 31u;                     // element within sub-block 0..31
+    uint qIndex = elem & 15u;                // qs byte index in sub-block
+
+    uint scalesLByte = readByte(blockBase + 4u + (ib >> 1u));
+    uint low  = (scalesLByte >> (4u * (ib & 1u))) & 0xFu;
+    uint high = (scalesH >> (2u * ib)) & 0x3u;
+    int  ls   = int(low | (high << 4u)) - 32;
+    float dl  = d * float(ls);
+
+    uint qsByte = readByte(blockBase + 8u + ib * 16u + qIndex);
+    uint nibble = (elem < 16u) ? (qsByte & 0xFu) : (qsByte >> 4u);
+
+    dst[sb * IQ4_XS_GROUP_SIZE + t] = dl * KVALUES_IQ4NL[nibble];
+}
