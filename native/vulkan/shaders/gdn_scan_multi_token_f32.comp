@@ -1,0 +1,147 @@
+#version 450
+// Multi-token Gated DeltaNet (GDN) scan for Qwen3MoeHybrid.
+//
+// Variant of gdn_scan_step_f32.comp that walks the seqLen dimension INSIDE the
+// shader. The per-token shader requires the host to D2D-copy each token's
+// q/k/v/g/beta row into compact staging buffers and dispatch seqLen times;
+// this shader binds the full whole-sequence buffers and runs one workgroup
+// per value head that internally processes every token in order, mutating the
+// state matrix between tokens.
+//
+// Bit-parity vs. the per-token shader and the CPU reference
+// (DotLLM.Cpu.Kernels.GatedDeltaNetScan.Execute):
+//   - State mutation order across tokens is preserved: the t-loop runs
+//     row-sequentially with a barrier at the end of each token, so token t+1
+//     reads the state mutated by token t.
+//   - Within each token the four phases (decay → retrieve → delta → read) and
+//     their reduction orders are identical to gdn_scan_step_f32.comp.
+//   - Same scale (1/sqrt(d_state)) applied ONCE after the read reduction.
+//
+// Per-token mathematics — for each value head vh:
+//   kh        = vh / v_heads_per_k_head     (NVHead must be a multiple of NKHead)
+//   S         = state[vh, :, :]             // [d_state, d_state], row=key, col=value
+//   q[t,kh,:] = qBuf[t * n_k_head * d_state + kh * d_state + ...]
+//   k[t,kh,:] = kBuf[same]                  (already L2-normed)
+//   v[t,vh,:] = vBuf[t * n_v_head * d_state + vh * d_state + ...]
+//   g[t,vh]   = gBuf[t * n_v_head + vh]     (= exp(softplus(alpha+dt)·A))
+//   beta[t,vh]= betaBuf[t * n_v_head + vh]  (= sigmoid(beta_proj))
+//
+//   for t in [0, seq_len):
+//     1. Decay   :  S[row, col] *= g[t, vh]
+//     2. Retrieve:  tmp[col] = Σ_row S[row, col] * k[t, kh, row]
+//     3. Delta   :  tmp[col] = beta[t, vh] * (v[t, vh, col] - tmp[col])
+//                   S[row, col] += k[t, kh, row] * tmp[col]
+//     4. Read    :  out[t, vh, col] = (Σ_row S[row, col] * q[t, kh, row]) / √d_state
+//
+// Dispatch:
+//   groupCount    = (n_v_head, 1, 1)         — one workgroup per value head
+//   local_size_x  = 128                      — one thread per state column
+//                                            (d_state for qwen35moe is 128)
+//
+// CRITICAL barrier hazard: every thread MUST reach every barrier() inside
+// the t-loop on every iteration. The only safe early exit is the workgroup-
+// uniform `vh >= n_v_head` short-circuit at function entry. Per-thread
+// `active = tid < d_state` threads still execute every loop iteration —
+// they only skip the load/store statements between barriers, not the
+// barriers themselves.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState  { float st[];     }; // [n_v_head, d_state, d_state] (RW)
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ      { float q_buf[];  }; // [seq_len, n_k_head, d_state]
+layout(set = 0, binding = 2, std430) readonly  buffer BufK      { float k_buf[];  }; // [seq_len, n_k_head, d_state]
+layout(set = 0, binding = 3, std430) readonly  buffer BufV      { float v_buf[];  }; // [seq_len, n_v_head, d_state]
+layout(set = 0, binding = 4, std430) readonly  buffer BufG      { float g_buf[];  }; // [seq_len, n_v_head]
+layout(set = 0, binding = 5, std430) readonly  buffer BufBeta   { float beta_buf[]; }; // [seq_len, n_v_head]
+layout(set = 0, binding = 6, std430) writeonly buffer BufOut    { float out_buf[]; }; // [seq_len, n_v_head, d_state]
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int d_state;
+    int v_heads_per_k_head;   // pre-computed: n_v_head / n_k_head
+    int seq_len;
+} pc;
+
+shared float k_shared[128];
+shared float q_shared[128];
+shared float tmp[128];
+
+void main() {
+    uint vh  = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (int(vh) >= pc.n_v_head) return;       // workgroup-uniform: safe
+
+    uint dState = uint(pc.d_state);
+    bool active = tid < dState;
+    uint kh           = vh / uint(pc.v_heads_per_k_head);
+    uint stateBase    = vh * dState * dState;       // S[vh, 0, 0]
+    uint qkPerToken   = uint(pc.n_k_head) * dState;
+    uint vPerToken    = uint(pc.n_v_head) * dState;
+    uint kvScale      = uint(pc.n_v_head);          // for g/beta indexing
+
+    float invSqrtD = 1.0 / sqrt(float(pc.d_state));
+
+    for (int t = 0; t < pc.seq_len; t++) {
+        uint qkBase = uint(t) * qkPerToken + kh * dState;     // qBuf / kBuf base for (t, kh)
+        uint vBase  = uint(t) * vPerToken + vh * dState;      // vBuf / outBuf base for (t, vh)
+        uint gbIdx  = uint(t) * kvScale + vh;                 // gBuf / betaBuf index
+
+        float gVh    = g_buf[gbIdx];
+        float betaVh = beta_buf[gbIdx];
+
+        // ── Stage 0: cooperative load of k_kh and q_kh for this token ──────
+        if (active) {
+            k_shared[tid] = k_buf[qkBase + tid];
+            q_shared[tid] = q_buf[qkBase + tid];
+        }
+        barrier();
+
+        // ── Phase 1: Decay  S[row, tid] *= g_vh ────────────────────────────
+        if (active) {
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = stateBase + row * dState + tid;
+                st[idx] = st[idx] * gVh;
+            }
+        }
+        barrier();
+
+        // ── Phase 2: Retrieve  tmp[tid] = Σ_row S[row, tid] * k_kh[row] ────
+        float retr = 0.0;
+        if (active) {
+            for (uint row = 0u; row < dState; row++) {
+                retr += st[stateBase + row * dState + tid] * k_shared[row];
+            }
+            tmp[tid] = retr;
+        }
+        barrier();
+
+        // ── Phase 3: Delta rule ────────────────────────────────────────────
+        float delta = 0.0;
+        if (active) {
+            float vVh = v_buf[vBase + tid];
+            delta = betaVh * (vVh - tmp[tid]);
+            tmp[tid] = delta;
+        }
+        barrier();
+
+        if (active) {
+            for (uint row = 0u; row < dState; row++) {
+                uint idx = stateBase + row * dState + tid;
+                st[idx] = st[idx] + k_shared[row] * delta;
+            }
+        }
+        barrier();
+
+        // ── Phase 4: Read  out[t, vh, tid] = (Σ_row S[row, tid] * q_kh[row]) / √d ──
+        if (active) {
+            float acc = 0.0;
+            for (uint row = 0u; row < dState; row++) {
+                acc += st[stateBase + row * dState + tid] * q_shared[row];
+            }
+            out_buf[vBase + tid] = acc * invSqrtD;
+        }
+        barrier();
+    }
+}

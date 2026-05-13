@@ -1,0 +1,79 @@
+#version 450
+// In-place per-head L2 normalisation used by Qwen3MoeHybrid GDN token mixing
+// (step 4 of ForwardGdnBody): the Q and K tensors must be unit-norm per head
+// before the GDN delta-rule scan so the associative-memory writes stay
+// well-conditioned.
+//
+// Mirrors DotLLM.Cpu.Kernels.GatedDeltaNetScan.L2NormalizeHeads bit-for-bit:
+//
+//   for each head h in [0, totalHeads):
+//     base   = h * dState
+//     sumSq  = sum_i (x[base+i]^2)
+//     invN   = 1 / (sqrt(sumSq) + eps)         // NB: not 1/sqrt(sumSq + eps)
+//     for i  in [0, dState):
+//         x[base+i] *= invN
+//
+// IMPORTANT: the epsilon is added OUTSIDE the sqrt — i.e. invN =
+// 1/(sqrt(sumSq)+eps), not invN = inversesqrt(sumSq+eps). This differs from
+// the RMSNorm convention (rmsnorm_f32.comp) and matches the CPU reference
+// exactly. inversesqrt() would be both faster and numerically nicer, but
+// would diverge from the C# port in the last fp32 ulps.
+//
+// Dispatch:
+//   groupCount   = (totalHeads, 1, 1)        — one workgroup per head
+//   local_size_x = 128                       — one thread per dState element
+//
+// dState == 128 for qwen35moe; if the caller ever needs dState != 128 the
+// shader still works because threads stride over [0, dState) below. The
+// shared-memory tree reduction expects local_size_x to be a power of two.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufX { float x[]; };  // [totalHeads * dState] (RW)
+
+layout(push_constant) uniform PushConstants {
+    int   totalHeads;
+    int   dState;
+    float eps;
+} pc;
+
+shared float partials[128];
+
+void main() {
+    uint h       = gl_WorkGroupID.x;
+    uint tid     = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    if (int(h) >= pc.totalHeads) return;
+
+    uint base = h * uint(pc.dState);
+
+    // 1. Per-thread partial sum of squares. Threads stride over [0, dState).
+    float sumSq = 0.0;
+    for (uint i = tid; i < uint(pc.dState); i += threads) {
+        float v = x[base + i];
+        sumSq += v * v;
+    }
+
+    // 2. Workgroup tree reduction in shared memory — no subgroup intrinsics
+    //    for driver portability (same rationale as rmsnorm_f32.comp).
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    // 3. Thread 0 computes invNorm = 1 / (sqrt(sumSq) + eps) — eps OUTSIDE
+    //    the sqrt, see header comment — and broadcasts via the shared slot.
+    if (tid == 0u) {
+        partials[0] = 1.0 / (sqrt(partials[0]) + pc.eps);
+    }
+    barrier();
+    float invNorm = partials[0];
+
+    // 4. Scale and write back in place.
+    for (uint i = tid; i < uint(pc.dState); i += threads) {
+        x[base + i] = x[base + i] * invNorm;
+    }
+}

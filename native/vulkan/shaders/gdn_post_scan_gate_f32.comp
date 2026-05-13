@@ -1,0 +1,113 @@
+#version 450
+// Per-head RMSNorm × silu(z) gating fused into one dispatch — step 6 of
+// Qwen3MoeHybrid GDN token mixing (ForwardGdnBody, lines 727-748 in
+// Qwen3MoeHybridTransformerModel.cs).
+//
+// Mirrors the CPU code bit-for-bit:
+//
+//   for each (t, vh) in [0, seq_len) × [0, n_v_head):
+//     base   = (t * n_v_head + vh) * d_state
+//     // 1. RMSNorm in place against the shared ssm_norm_weight [d_state]:
+//     sumSq  = Σ_i (gdnOut[base+i]^2)
+//     rms    = sqrt(sumSq / d_state + eps)
+//     scale  = 1 / rms
+//     gdnOut[base+i] = gdnOut[base+i] * scale * ssm_norm_weight[i]
+//     // 2. Multiply by silu(z):
+//     for i in [0, d_state):
+//       z_i = z[base+i]
+//       gdnOut[base+i] *= z_i * (1 / (1 + exp(-z_i)))
+//
+// The RMSNorm here uses the same convention as DotLLM.Cpu.Kernels.RmsNorm
+// (sqrt of mean PLUS eps, eps INSIDE the sqrt) — that's the standard
+// transformer RMSNorm convention and is intentionally different from the
+// L2 norm in gdn_l2_normalize_heads_f32.comp where eps is outside the sqrt.
+//
+// ssm_norm_weight is per-d_state and broadcast across BOTH the head and
+// token dimensions (only d_state elements total — confirmed from the C#
+// reference where RmsNorm.Execute is called with `gdnW.SsmNormWeight` for
+// every (t, vh)).
+//
+// silu(z) = z * sigmoid(z) = z * (1 / (1 + exp(-z))). Computed inline
+// rather than via a separate silu pass so we avoid an extra global-memory
+// round-trip on the dState elements.
+//
+// Dispatch:
+//   groupCount    = (n_v_head, seq_len, 1)    — one workgroup per (vh, t)
+//   local_size_x  = 128                       — one thread per d_state element
+//
+// Shared memory:
+//   partials[128] : workgroup tree reduction for sum-of-squares (same
+//                   pattern as rmsnorm_f32.comp / group_rmsnorm_f32.comp).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufOut    { float gdnOut[]; };          // [seq_len, n_v_head, d_state] (RW)
+layout(set = 0, binding = 1, std430) readonly buffer BufZ      { float z[];      };          // [seq_len, n_v_head, d_state]
+layout(set = 0, binding = 2, std430) readonly buffer BufWeight { float ssmNormWeight[]; };   // [d_state]
+
+layout(push_constant) uniform PushConstants {
+    int   seq_len;
+    int   n_v_head;
+    int   d_state;
+    float eps;
+} pc;
+
+shared float partials[128];
+
+void main() {
+    uint vh  = gl_WorkGroupID.x;
+    uint t   = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    if (int(vh) >= pc.n_v_head) return;
+    if (int(t)  >= pc.seq_len)  return;
+
+    uint dState = uint(pc.d_state);
+
+    // Flat base into gdnOut / z for the (t, vh) head slice.
+    //   index = (t * n_v_head + vh) * d_state
+    uint base = (t * uint(pc.n_v_head) + vh) * dState;
+
+    // ── 1. Per-thread partial sum of squares over the head slice ───────────
+    //    Strided in case dState < threads or dState > threads (foundation
+    //    port uses d_state == threads == 128, but stay generic).
+    float sumSq = 0.0;
+    for (uint i = tid; i < dState; i += threads) {
+        float v = gdnOut[base + i];
+        sumSq += v * v;
+    }
+
+    // ── 2. Workgroup tree reduction in shared memory ───────────────────────
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    // ── 3. Thread 0 computes invRms = 1 / sqrt(mean + eps), broadcasts ─────
+    if (tid == 0u) {
+        float meanSq = partials[0] / float(pc.d_state);
+        partials[0] = 1.0 / sqrt(meanSq + pc.eps);
+    }
+    barrier();
+    float invRms = partials[0];
+
+    // ── 4. RMSNorm scale × silu(z) fold, write back in place ───────────────
+    //    Matches the two-step CPU sequence (RmsNorm in place, then *=
+    //    silu(z)) collapsed into one read/write per element. Multiplication
+    //    is associative under fp32 only modulo ulp rounding — the per-thread
+    //    accumulation order here is unchanged from the CPU because each
+    //    element is independent (no reduction across i).
+    for (uint i = tid; i < dState; i += threads) {
+        float x  = gdnOut[base + i];
+        float w  = ssmNormWeight[i];
+        float zi = z[base + i];
+        float silu = zi * (1.0 / (1.0 + exp(-zi)));
+        // Order chosen to match the C# pair-of-statements exactly:
+        //   RmsNorm: gdnOut[i] = x * invRms * w
+        //   gate   : gdnOut[i] *= zi * sigmoid(zi)
+        gdnOut[base + i] = (x * invRms * w) * silu;
+    }
+}

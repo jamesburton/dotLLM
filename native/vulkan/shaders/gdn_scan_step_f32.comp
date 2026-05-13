@@ -1,0 +1,171 @@
+#version 450
+// Gated DeltaNet (GDN) single-token scan step for Qwen3MoeHybrid.
+//
+// Mirrors DotLLM.Cpu.Kernels.GatedDeltaNetScan.Execute bit-for-bit for ONE
+// token: the host dispatches this shader once per (token, layer) pair inside
+// a seqLen loop, advancing the per-token slice pointers of q/k/v/g/beta and
+// output between dispatches. The state buffer is read-modify-write across
+// dispatches and carries the recurrence forward.
+//
+// Per token, per value head vh in [0, n_v_head):
+//   kh        = vh / v_heads_per_k_head     (NVHead must be a multiple of NKHead)
+//   S         = state[vh, :, :]             // [d_state, d_state], row=key, col=value
+//   q_kh      = q_t[kh, :]                  // [d_state]
+//   k_kh      = k_t[kh, :]                  // [d_state]      (already L2-normed)
+//   v_vh      = v_t[vh, :]                  // [d_state]
+//   g_vh      = g_t[vh]                     scalar decay  (= exp(softplus(...)·A))
+//   beta_vh   = beta_t[vh]                  scalar write-gate (= sigmoid(beta_proj))
+//
+//   1. Decay   :  S[row, col] *= g_vh
+//   2. Retrieve:  tmp[col] = Σ_row S[row, col] * k_kh[row]            (S.T @ k)
+//   3. Delta   :  tmp[col] = beta_vh * (v_vh[col] - tmp[col])
+//                 S[row, col] += k_kh[row] * tmp[col]                  (rank-1 update)
+//   4. Read    :  out_t[vh, col] = (Σ_row S[row, col] * q_kh[row]) * 1/sqrt(d_state)
+//
+// Bit-perfect parity notes (vs the C# port):
+//
+//   - Reductions in phases 2 and 4 fold rows in order row = 0..d_state-1.
+//     This matches the C# row-outer loop (`for row { for col { tmp[col]+=
+//     S[row*d+col]*k[row] } }`). Each thread tid owns column `tid` of the
+//     state, so the per-thread accumulator sums S[0,tid]*k[0], S[1,tid]*k[1],
+//     ... in the same order as the C# inner col-loop. Same fp32 rounding.
+//
+//   - The 1/sqrt(d_state) scale is applied ONCE after the sum-of-products
+//     in phase 4 — matches the C# pattern of accumulating first then
+//     multiplying by `1f / MathF.Sqrt(dState)`.
+//
+//   - g_vh and beta_vh are broadcast scalars; multiplication by a constant
+//     scalar across threads is commutative — no ordering hazard.
+//
+// Dispatch:
+//   groupCount    = (n_v_head, 1, 1)         — one workgroup per value head
+//   local_size_x  = 128                      — one thread per state column
+//                                            (d_state for qwen35moe is 128)
+//
+// Shared memory:
+//   - k_shared[128] / q_shared[128] : broadcast k_kh / q_kh into a single
+//     cooperative load so each row-iteration reads the operand once per
+//     workgroup rather than once per (thread, row) pair.
+//   - tmp[128]                      : the per-column scratch for phases 2/3.
+//
+// Working-set: 3 * 128 * 4B = 1.5 KiB shared per workgroup — well under
+// any modern device limit (Strix Halo: 64 KiB).
+//
+// The state matrix lives in global memory throughout. Each thread tid does
+// d_state strided global loads of S[*, tid] per phase. Tiling S into shared
+// memory would help bandwidth but is left to a future optimisation — the
+// foundation port matches CPU semantics first.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)           buffer BufState  { float st[];     }; // [n_v_head, d_state, d_state] (RW)
+layout(set = 0, binding = 1, std430) readonly  buffer BufQ      { float q_t[];    }; // [n_k_head, d_state]
+layout(set = 0, binding = 2, std430) readonly  buffer BufK      { float k_t[];    }; // [n_k_head, d_state]
+layout(set = 0, binding = 3, std430) readonly  buffer BufV      { float v_t[];    }; // [n_v_head, d_state]
+layout(set = 0, binding = 4, std430) readonly  buffer BufG      { float g_t[];    }; // [n_v_head]
+layout(set = 0, binding = 5, std430) readonly  buffer BufBeta   { float beta_t[]; }; // [n_v_head]
+layout(set = 0, binding = 6, std430) writeonly buffer BufOut    { float out_t[];  }; // [n_v_head, d_state]
+
+layout(push_constant) uniform PushConstants {
+    int n_v_head;
+    int n_k_head;
+    int d_state;
+    int v_heads_per_k_head;   // pre-computed: n_v_head / n_k_head
+} pc;
+
+shared float k_shared[128];
+shared float q_shared[128];
+shared float tmp[128];
+
+void main() {
+    uint vh  = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    // NOTE: do NOT early-return individual threads based on per-thread
+    // predicates here — every thread MUST reach every `barrier()` below.
+    // The whole-workgroup short-circuit on (vh < n_v_head) is uniform
+    // across the workgroup (vh is constant per group), so this return is
+    // a uniform control-flow exit and safe with respect to barriers.
+    if (int(vh) >= pc.n_v_head) return;
+
+    uint dState = uint(pc.d_state);
+    bool active = tid < dState;          // threads with tid >= dState idle but stay alive
+
+    uint kh           = vh / uint(pc.v_heads_per_k_head);
+    uint stateBase    = vh * dState * dState;       // S[vh, 0, 0]
+    uint qkHeadBase   = kh * dState;
+    uint vHeadBase    = vh * dState;
+
+    float gVh    = g_t[vh];
+    float betaVh = beta_t[vh];
+
+    // ── Stage 0: cooperative load of k_kh and q_kh into shared memory ───────
+    // One thread per d_state element. Each row-iteration of the reductions
+    // below will broadcast-read these instead of hitting global memory
+    // 128 times per workgroup per phase. Inactive threads skip the store.
+    if (active) {
+        k_shared[tid] = k_t[qkHeadBase + tid];
+        q_shared[tid] = q_t[qkHeadBase + tid];
+    }
+    barrier();
+
+    // ── Phase 1: Decay  S[row, tid] *= g_vh ────────────────────────────────
+    // Thread `tid` owns column `tid` of S throughout. Loop the row dimension
+    // and apply the scalar decay. Order independent (scalar multiply).
+    if (active) {
+        for (uint row = 0u; row < dState; row++) {
+            uint idx = stateBase + row * dState + tid;
+            st[idx] = st[idx] * gVh;
+        }
+    }
+    barrier();
+
+    // ── Phase 2: Retrieve  tmp[tid] = Σ_row S[row, tid] * k_kh[row] ─────────
+    // Row-outer reduction matching the C# inner col-loop accumulation order.
+    float retr = 0.0;
+    if (active) {
+        for (uint row = 0u; row < dState; row++) {
+            retr += st[stateBase + row * dState + tid] * k_shared[row];
+        }
+        tmp[tid] = retr;
+    }
+    barrier();
+
+    // ── Phase 3: Delta rule ────────────────────────────────────────────────
+    //   tmp[col]      = beta_vh * (v_vh[col] - tmp[col])
+    //   S[row, col]  += k_kh[row] * tmp[col]
+    //
+    // Each thread first overwrites its own tmp slot, then performs the
+    // rank-1 update on its column. The first store is to `tmp[tid]` only —
+    // no inter-thread hazard until the next barrier.
+    float delta = 0.0;
+    if (active) {
+        float vVh = v_t[vHeadBase + tid];
+        delta = betaVh * (vVh - tmp[tid]);
+        tmp[tid] = delta;
+    }
+    barrier();
+
+    // Apply rank-1 update to the column `tid` we own. We read k_shared[row]
+    // (cooperative shared load above) and `delta` (already in register).
+    if (active) {
+        for (uint row = 0u; row < dState; row++) {
+            uint idx = stateBase + row * dState + tid;
+            st[idx] = st[idx] + k_shared[row] * delta;
+        }
+    }
+    barrier();
+
+    // ── Phase 4: Read  out[vh, tid] = (Σ_row S[row, tid] * q_kh[row]) / √d ──
+    // Same row-outer accumulation order as phase 2 — bit-equivalent to the
+    // C# implementation. Scale is applied ONCE after the sum, again matching
+    // the C# `float scale = 1f / MathF.Sqrt(dState)` pattern.
+    if (active) {
+        float acc = 0.0;
+        for (uint row = 0u; row < dState; row++) {
+            acc += st[stateBase + row * dState + tid] * q_shared[row];
+        }
+        float invSqrtD = 1.0 / sqrt(float(pc.d_state));
+        out_t[vHeadBase + tid] = acc * invSqrtD;
+    }
+}
