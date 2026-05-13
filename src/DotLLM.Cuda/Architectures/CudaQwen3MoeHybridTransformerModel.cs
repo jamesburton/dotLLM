@@ -1061,11 +1061,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
     private static DeviceGdn UploadGdnLayer(GdnTokenMixingWeights gdn, ref long maxTileFloats)
     {
-        nint qkvDevice = UploadF32Ptr(gdn.QkvWeight, (long)gdn.QkvInputDim * gdn.QkvOutputDim);
-        nint gateDevice = UploadF32Ptr(gdn.GateWeight, (long)gdn.GateInputDim * gdn.GateOutputDim);
-        nint alphaDevice = UploadF32Ptr(gdn.AlphaWeight, (long)gdn.AlphaInputDim * gdn.AlphaOutputDim);
-        nint betaDevice = UploadF32Ptr(gdn.BetaWeight, (long)gdn.BetaInputDim * gdn.BetaOutputDim);
-        nint outDevice = UploadF32Ptr(gdn.OutWeight, (long)gdn.OutInputDim * gdn.OutOutputDim);
+        // Quantised-projection upload: each projection's raw bytes already lay out in the
+        // declared quant format ([M*K] elements packed via Dequantize.RowByteSize). The
+        // Gemm() dispatcher reads QkvQt / GateQt / ... and routes through the matching
+        // CUDA branch (decode-direct quantised GEMV, prefill F16-dequant + cuBLAS HGEMM,
+        // or cuBLAS LinearF32 for the F32 fast path).
+        nint qkvDevice = UploadProjectionPtr(gdn.QkvWeight, gdn.QkvOutputDim, gdn.QkvInputDim, gdn.QkvQuantType);
+        nint gateDevice = UploadProjectionPtr(gdn.GateWeight, gdn.GateOutputDim, gdn.GateInputDim, gdn.GateQuantType);
+        nint alphaDevice = UploadProjectionPtr(gdn.AlphaWeight, gdn.AlphaOutputDim, gdn.AlphaInputDim, gdn.AlphaQuantType);
+        nint betaDevice = UploadProjectionPtr(gdn.BetaWeight, gdn.BetaOutputDim, gdn.BetaInputDim, gdn.BetaQuantType);
+        nint outDevice = UploadProjectionPtr(gdn.OutWeight, gdn.OutOutputDim, gdn.OutInputDim, gdn.OutQuantType);
 
         nint conv1dWeightDevice = UploadF32Array(gdn.Conv1dWeight);
         nint conv1dBiasDevice = UploadF32Array(gdn.Conv1dBias);
@@ -1106,10 +1111,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
     private static DeviceFullAttn UploadFullAttnLayer(Qwen3FullAttnWeights attn, ref long maxTileFloats)
     {
-        nint qDevice = UploadF32Ptr(attn.QWeight, (long)attn.QInputDim * attn.QOutputDim);
-        nint kDevice = UploadF32Ptr(attn.KWeight, (long)attn.KInputDim * attn.KOutputDim);
-        nint vDevice = UploadF32Ptr(attn.VWeight, (long)attn.VInputDim * attn.VOutputDim);
-        nint oDevice = UploadF32Ptr(attn.OWeight, (long)attn.OInputDim * attn.OOutputDim);
+        // Quant-aware upload: see UploadGdnLayer for rationale; the QQt/KQt/VQt/OQt fields
+        // drive Gemm() dispatch in the per-layer body.
+        nint qDevice = UploadProjectionPtr(attn.QWeight, attn.QOutputDim, attn.QInputDim, attn.QQuantType);
+        nint kDevice = UploadProjectionPtr(attn.KWeight, attn.KOutputDim, attn.KInputDim, attn.KQuantType);
+        nint vDevice = UploadProjectionPtr(attn.VWeight, attn.VOutputDim, attn.VInputDim, attn.VQuantType);
+        nint oDevice = UploadProjectionPtr(attn.OWeight, attn.OOutputDim, attn.OInputDim, attn.OQuantType);
 
         nint qNormDevice = UploadF32Array(attn.QNormWeight);
         nint kNormDevice = UploadF32Array(attn.KNormWeight);
@@ -1233,6 +1240,26 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         long bytes = elemCount * sizeof(float);
         nint device = AllocDevice(bytes);
         CopyHtoD(device, hostF32Ptr, bytes);
+        return device;
+    }
+
+    /// <summary>
+    /// Allocates a device buffer sized for an <c>[m, k]</c> row-major weight matrix in the
+    /// declared quantisation format and copies the raw bytes from host. The byte count is
+    /// <c>RowByteSize(k, qt) * m</c> — so K-quants (block size 256) and Q8_0 (block size 32)
+    /// use their packed block byte layout, F16 uses 2 bytes/elem, F32 uses 4. The Gemm()
+    /// dispatcher (see file header) then routes each call by the matching DeviceGdn /
+    /// DeviceFullAttn QuantType field to the correct CUDA branch.
+    /// </summary>
+    /// <param name="hostPtr">Host base pointer of the row-major weight matrix, <c>RowByteSize(k, qt) * m</c> bytes.</param>
+    /// <param name="m">Output dim (rows).</param>
+    /// <param name="k">Input/contraction dim (columns per row of un-quantised view).</param>
+    /// <param name="qt">Quantisation format of the row bytes.</param>
+    private static nint UploadProjectionPtr(nint hostPtr, int m, int k, QuantizationType qt)
+    {
+        long bytes = Dequantize.RowByteSize(k, qt) * m;
+        nint device = AllocDevice(bytes);
+        CopyHtoD(device, hostPtr, bytes);
         return device;
     }
 
