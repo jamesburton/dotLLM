@@ -46,7 +46,7 @@ dotLLM is a ground-up LLM inference engine for .NET — not a wrapper around lla
 - **Pluggable backends** — `IBackend` interface with separate packages per backend (CPU, CUDA, Vulkan, ROCm/HIP foundation)
 - **Diagnostic hooks** — zero-cost `IInferenceHook` points for activation capture, logit lens, SAE integration
 - **LoRA adapters** — runtime loading, no weight merging, CPU/Vulkan application paths, and concurrent multi-adapter serving
-- **(Planned) OpenTelemetry observability** — `System.Diagnostics.Metrics` + `Activity` for throughput, latency, and per-request tracing — Phase 7 / Phase 9, see [Roadmap](#roadmap)
+- **OpenTelemetry observability** — `System.Diagnostics.Metrics` + `Activity` for throughput, latency, and per-request tracing, OTLP exporter wired on the server side
 
 ## Architecture Overview
 
@@ -745,7 +745,7 @@ Both modes transparently reuse the embedded chat UI assets if `serveUi: true`. T
 | **6 — Improved Serving** | Warm-up, NativeAOT, paged KV-cache, speculative decoding | Done (4/4) |
 | **7 — Diagnostics & Interpretability** | Logprobs, hook system, logit lens, SAE integration, LoRA adapters | In Progress (1/5) |
 | **8 — Model Expansion** | MLA attention, ALiBi, SmolLM3, Gemma 4, Mixture of Experts, Mamba-3 | In Progress (2/6) |
-| **9 — Production Serving** | Continuous batching, prefix sharing, advanced scheduling, rate limiting, metrics & tracing | Planned (0/5) |
+| **9 — Production Serving** | Continuous batching, prefix sharing, advanced scheduling, rate limiting, metrics & tracing | In Progress (1/5) |
 | **10 — Qwen3MoeHybrid (Gated DeltaNet + MoE)** | `qwen35moe` architecture: alternating GDN linear-attention / full GQA + shared sparse MoE FFN. CPU bit-exact vs llama.cpp; CUDA forward path (MoE GPU dispatcher live, F32 KV cache for full-attn layers); Vulkan compute shaders (multi-token GDN scan, on-device decay/sigmoid). Real-GGUF GPU parity tests pending. | In Progress (5/5 impl, parity pending) |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for detailed steps, dependencies, and milestones.
