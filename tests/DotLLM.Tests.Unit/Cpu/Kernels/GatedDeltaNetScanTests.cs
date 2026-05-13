@@ -225,6 +225,81 @@ public sealed class GatedDeltaNetScanTests
     }
 
     /// <summary>
+    /// Regression test for the head-broadcast mapping (issue: Qwen3.6-A3B garbage output).
+    /// Verifies that for NVHead &gt; NKHead with NVHead/NKHead &gt; 1, the kernel uses
+    /// <b>TILED</b> mapping (<c>kh = vh % nKHead</c>) — matching llama.cpp's ggml
+    /// <c>gated_delta_net</c> op (<c>iq1 = iv1 % neq1</c> in ggml-cpu/ops.cpp).
+    /// The previous interleaved mapping (<c>kh = vh / vHeadsPerKHead</c>) only happened
+    /// to match for NKHead=1 (where both formulas give 0), which is why the original
+    /// unit-test set didn't catch the production-scale bug.
+    ///
+    /// Setup: NVHead=4, NKHead=2 (so vHeadsPerKHead=2). With TILED mapping:
+    ///   vh=0 -&gt; kh=0, vh=1 -&gt; kh=1, vh=2 -&gt; kh=0, vh=3 -&gt; kh=1.
+    /// With INTERLEAVED (bug): vh=0,1 -&gt; kh=0, vh=2,3 -&gt; kh=1 — gives different output.
+    /// We pick q/k values where dot(q_kh0, k_kh0) != dot(q_kh1, k_kh1), so the two
+    /// mappings produce numerically distinct results.
+    /// </summary>
+    [Fact]
+    public void HeadBroadcast_IsTiledNotInterleaved_QwenMoeStyle()
+    {
+        const int nVHead = 4, nKHead = 2, dState = 2, seqLen = 1;
+
+        float[] state = new float[nVHead * dState * dState];  // zeros
+
+        // q/k per K-head (2 K-heads, dState=2 each).
+        // Pick values so qk_0 = q[kh0]·k[kh0] and qk_1 = q[kh1]·k[kh1] are different.
+        float[] q = [
+            /* kh=0 */ 1.0f, 0.0f,
+            /* kh=1 */ 0.0f, 1.0f,
+        ];
+        float[] k = [
+            /* kh=0 */ 0.5f, 0.0f,    // qk_0 = 1.0*0.5 + 0.0*0.0 = 0.5
+            /* kh=1 */ 0.0f, 0.3f,    // qk_1 = 0.0*0.0 + 1.0*0.3 = 0.3
+        ];
+
+        // v per V-head (4 V-heads). Distinct values per head.
+        float[] v = [
+            /* vh=0 */ 1.0f, 2.0f,
+            /* vh=1 */ 3.0f, 4.0f,
+            /* vh=2 */ 5.0f, 6.0f,
+            /* vh=3 */ 7.0f, 8.0f,
+        ];
+
+        // beta = 1 everywhere so out = beta * v * (q·k) / sqrt(d) = v * qk / sqrt(2).
+        float[] beta = [1.0f, 1.0f, 1.0f, 1.0f];
+        float[] g    = [1.0f, 1.0f, 1.0f, 1.0f];  // no decay (zero state anyway)
+
+        float[] output = new float[seqLen * nVHead * dState];
+
+        GatedDeltaNetScan.Execute(state, q, k, v, g, beta, output, nVHead, nKHead, dState, seqLen);
+
+        // TILED expected mapping: vh%nKHead
+        //   vh=0 -> kh=0 (qk=0.5)  -> out = v[0] * 0.5 / √2 = [0.5,1.0] / √2
+        //   vh=1 -> kh=1 (qk=0.3)  -> out = v[1] * 0.3 / √2 = [0.9,1.2] / √2
+        //   vh=2 -> kh=0 (qk=0.5)  -> out = v[2] * 0.5 / √2 = [2.5,3.0] / √2
+        //   vh=3 -> kh=1 (qk=0.3)  -> out = v[3] * 0.3 / √2 = [2.1,2.4] / √2
+        float invSqrtD = 1.0f / MathF.Sqrt(dState);
+
+        // vh=0
+        Assert.Equal(1.0f * 0.5f * invSqrtD, output[0], Tol);
+        Assert.Equal(2.0f * 0.5f * invSqrtD, output[1], Tol);
+
+        // vh=1 — this is the key assertion. INTERLEAVED would give vh=1 -> kh=0 (qk=0.5)
+        // and produce v[1] * 0.5 / √2 = [1.5, 2.0]/√2. TILED gives kh=1 (qk=0.3):
+        Assert.Equal(3.0f * 0.3f * invSqrtD, output[2], Tol);
+        Assert.Equal(4.0f * 0.3f * invSqrtD, output[3], Tol);
+
+        // vh=2 — INTERLEAVED would give kh=1 (qk=0.3), TILED gives kh=0 (qk=0.5):
+        Assert.Equal(5.0f * 0.5f * invSqrtD, output[4], Tol);
+        Assert.Equal(6.0f * 0.5f * invSqrtD, output[5], Tol);
+
+        // vh=3 — INTERLEAVED would give kh=1 (qk=0.3), TILED also gives kh=1 (qk=0.3):
+        // happens to match in this slot, but vh=1 and vh=2 above are the discriminators.
+        Assert.Equal(7.0f * 0.3f * invSqrtD, output[6], Tol);
+        Assert.Equal(8.0f * 0.3f * invSqrtD, output[7], Tol);
+    }
+
+    /// <summary>
     /// Degenerate input: seqLen=0 must return immediately without touching output.
     /// </summary>
     [Fact]

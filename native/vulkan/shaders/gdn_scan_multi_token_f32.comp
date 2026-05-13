@@ -18,7 +18,7 @@
 //   - Same scale (1/sqrt(d_state)) applied ONCE after the read reduction.
 //
 // Per-token mathematics — for each value head vh:
-//   kh        = vh / v_heads_per_k_head     (NVHead must be a multiple of NKHead)
+//   kh        = vh % n_k_head               // TILED broadcast (matches llama.cpp ggml_gated_delta_net)
 //   S         = state[vh, :, :]             // [d_state, d_state], row=key, col=value
 //   q[t,kh,:] = qBuf[t * n_k_head * d_state + kh * d_state + ...]
 //   k[t,kh,:] = kBuf[same]                  (already L2-normed)
@@ -75,7 +75,10 @@ void main() {
 
     uint dState = uint(pc.d_state);
     bool active = tid < dState;
-    uint kh           = vh / uint(pc.v_heads_per_k_head);
+    // TILED head broadcast (matches llama.cpp ggml_gated_delta_net): kh = vh % n_k_head.
+    // For NVHead=32, NKHead=16 maps vh 0..15 → kh 0..15, vh 16..31 → kh 0..15.
+    // Previous interleaved mapping (vh / v_heads_per_k_head) produced garbage logits.
+    uint kh           = vh % uint(pc.n_k_head);
     uint stateBase    = vh * dState * dState;       // S[vh, 0, 0]
     uint qkPerToken   = uint(pc.n_k_head) * dState;
     uint vPerToken    = uint(pc.n_v_head) * dState;

@@ -64,8 +64,10 @@ extern "C" __global__ void __launch_bounds__(128) gdn_scan_step_f32(
     if (vh >= n_v_head) return;
 
     int col = threadIdx.x;                          // this thread owns this value-dim
-    int v_heads_per_k_head = n_v_head / n_k_head;
-    int kh = vh / v_heads_per_k_head;
+    // TILED head broadcast (matches llama.cpp ggml_gated_delta_net: iq1 = iv1 % neq1).
+    // For NVHead=32, NKHead=16 this maps vh 0..15 → kh 0..15, vh 16..31 → kh 0..15.
+    // Previous (incorrect) interleaved mapping vh / (n_v_head/n_k_head) produced garbage.
+    int kh = vh % n_k_head;
 
     float* S = state + (size_t)vh * d_state * d_state;
     const float* k_head = k_t + (size_t)kh * d_state;

@@ -169,8 +169,47 @@ A new `GdnStateCache` class is needed (different from `SsmStateCache` which hold
 
 ---
 
+## Critical Implementation Notes (Verified Against llama.cpp)
+
+### Q/K Head Broadcast Convention — TILED, NOT INTERLEAVED
+
+When `NVHead != NKHead` (here 32 vs 16), each value-head `vh` must select its
+key-head via **modulo** not division:
+
+```
+kh = vh % NKHead             ← CORRECT (TILED, matches llama.cpp)
+kh = vh / (NVHead / NKHead)  ← WRONG (INTERLEAVED, produces garbage logits)
+```
+
+llama.cpp reference: `ggml_compute_forward_gated_delta_net_one_chunk` in
+`ggml/src/ggml-cpu/ops.cpp` uses `iq1 = iv1 % neq1`, `ik1 = iv1 % nek1`. The
+`ggml_gated_delta_net` op header (`ggml/include/ggml.h`) explicitly notes
+"Q, K broadcast type: tiled vs interleaved" as a known configuration knob;
+ggml currently does TILED.
+
+For Qwen3.6-A3B (NVHead=32, NKHead=16) this maps:
+- vh 0..15 → kh 0..15
+- vh 16..31 → kh 0..15 (tile repeats)
+
+Bug history: dotLLM originally implemented the interleaved variant (`kh = vh /
+vHeadsPerKHead`) in all backends (CPU, CUDA, Vulkan). With degenerate test
+shapes (NKHead=1) both formulas give kh=0 so the unit tests passed. The bug
+silently produced garbage on the production Qwen3.6-35B-A3B GGUF. Diagnosed
+2026-05-13 via element-wise comparison against `llama-eval-callback` per-tensor
+dumps; first divergence at `attn_output-0` (GDN scan output) with per-vh
+cosine=1.0 but per-vh scale mismatch — the classic signature of a per-head
+indexing bug.
+
+Regression test: `GatedDeltaNetScanTests.HeadBroadcast_IsTiledNotInterleaved_QwenMoeStyle`
+uses NVHead=4, NKHead=2 with distinct q·k values per kh, so the two mappings
+produce numerically different outputs (vh=1 with TILED gets kh=1's qk, with
+INTERLEAVED would get kh=0's qk).
+
+---
+
 ## References
 
 - **Gated Delta Networks: Improving Mamba2 with Delta Rule** — NVlabs, ICLR 2025. arXiv:2412.06464
 - **Qwen3 Technical Report** — Alibaba, 2025. arXiv:2505.09388
 - **llama.cpp source** — `src/llama.cpp`, search `qwen35moe` for hparams and tensor loading
+- **ggml GDN op** — `ggml/src/ggml-cpu/ops.cpp::ggml_compute_forward_gated_delta_net_one_chunk` (CPU reference) and `ggml/src/ggml-cuda/gated_delta_net.cu` (CUDA reference)

@@ -14,7 +14,7 @@ namespace DotLLM.Cpu.Kernels;
 /// For each value head <c>vh</c> in <c>[0, NVHead)</c>, one decode step executes:
 /// </para>
 /// <code>
-/// kh = vh / (NVHead / NKHead)         // K head that broadcast-serves this V head
+/// kh = vh % NKHead                     // K head: TILED broadcast (matches llama.cpp ggml_gated_delta_net)
 /// S  ×= g                              // element-wise decay of [DState × DState] matrix
 /// r   = S.T @ k[kh]                   // retrieve: what was previously associated with key k
 /// d   = β × (v[vh] − r)               // prediction error, scaled by write gate
@@ -81,7 +81,13 @@ public static class GatedDeltaNetScan
         if (nVHead % nKHead != 0)
             throw new ArgumentException($"nVHead ({nVHead}) must be divisible by nKHead ({nKHead}).");
 
-        int vHeadsPerKHead = nVHead / nKHead;
+        // Per-vh → kh mapping is TILED (modulo), matching llama.cpp's ggml gated_delta_net op
+        // (ggml-cpu/ops.cpp ggml_compute_forward_gated_delta_net_one_chunk: iq1 = iv1 % neq1,
+        //  ik1 = iv1 % nek1). For Qwen3.6-A3B (NVHead=32, NKHead=16) this maps vh 0..15 to
+        // kh 0..15 and vh 16..31 back to kh 0..15 (tiled), NOT vh/2 → kh (interleaved).
+        // Using the wrong mapping silently produces garbage logits — verified against
+        // llama-eval-callback per-tensor parity (attn_output diverges immediately when
+        // wrong, matches when tiled).
         int statePerHead = dState * dState;
         int qkPerToken = nKHead * dState;
         int vPerToken = nVHead * dState;
@@ -116,7 +122,7 @@ public static class GatedDeltaNetScan
 
                 for (int vh = 0; vh < nVHead; vh++)
                 {
-                    int kh = vh / vHeadsPerKHead;
+                    int kh = vh % nKHead;
 
                     ReadOnlySpan<float> qHead = q.Slice(qkOff + kh * dState, dState);
                     ReadOnlySpan<float> kHead = k.Slice(qkOff + kh * dState, dState);

@@ -165,6 +165,16 @@ All development follows an issue-driven workflow.
 6. **Read the relevant docs first.** Before starting, read docs listed in the Documentation Index for the module being implemented.
 7. **Keep README in sync.** When a PR completes a roadmap step, update `docs/ROADMAP.md` (add `:white_check_mark:` to the step) and `README.md` (bump the step count in the Roadmap table, e.g., "4/9" → "5/9"; when a phase completes change status to "Done"; add a News entry for significant milestones).
 
+## Cross-Backend Critical Bugs
+
+**If a critical correctness bug is identified in one backend (CPU/CUDA/Vulkan/HIP) and the same logic is duplicated in other backends, ALL affected backends MUST be fixed in the same change before the diagnostic information is lost — even if the active task only targets one backend.** This takes priority over narrowing of focus or "out of scope" demarcations:
+
+- Critical-bug fixes propagate across backends. Inconsistent backends silently degrade quality and burn debugging time on the next backend the bug surfaces in.
+- When fixing, search for the routine across `src/DotLLM.Cpu/`, `src/DotLLM.Cuda/`, `src/DotLLM.Vulkan/`, `src/DotLLM.Hip/`, `native/kernels/`, and `native/vulkan/shaders/` before declaring done.
+- Add a regression test that **discriminates** between the broken and fixed forms — tests using degenerate shapes (e.g. NKHead=1 where `vh/N` and `vh%N` coincide) cannot catch broadcast-style bugs and have already let one bug ship.
+- If a parallel agent is working on a backend listed in a task's "do not touch" surface, document the cross-backend fix you applied so they can pick it up; do NOT defer the fix.
+- Reference llama.cpp's CPU implementation (`ggml/src/ggml-cpu/ops.cpp`) as the authoritative source for any GGUF-format model op semantics — including head-broadcast conventions, sign conventions, and accumulator placement.
+
 ## What Claude Should Know
 
 - **Author**: Konrad — expert .NET dev, "Pro .NET Memory Management" (2nd ed.), MVP, 20+ yrs perf. AI/agents at Nethermind. Do NOT over-explain .NET basics.
