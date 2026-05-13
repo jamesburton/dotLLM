@@ -1,0 +1,113 @@
+#version 450
+// IQ4_NL matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_iq4nl[m, k] * x[k]      with W_iq4nl dequantized on the fly.
+//
+// Weight layout mirrors llama.cpp's block_iq4_nl / DotLLM.Cpu.Kernels.Dequantize
+// .DequantizeIQ4_NL: each 32 contiguous elements of a row form one IQ4_NL block
+// of 18 bytes:
+//     bytes [0,1]   = fp16 d   (per-block scale)
+//     bytes [2..17] = qs[16]   — 32 x 4-bit codebook indices, two per byte;
+//                                low nibble produces elements [0..15], high
+//                                nibble produces elements [16..31] within the
+//                                block.
+//   Row stride = (K / 32) * 18 bytes.
+//
+// Reconstruction. The 4-bit value q is NOT a signed int — it's an index into a
+// 16-entry non-linear signed int8 lookup `kvalues_iq4nl[16]`. Per-element:
+//     value = d * float(kvalues_iq4nl[q])
+//
+// The lookup is the same as ggml's kvalues_iq4nl (also shared with IQ4_XS):
+//     {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+//
+// x[] is FP32. Output y[] is FP32. N=1 decode path (mirrors matmul_q4_k_gemv_f32).
+//
+// Dispatch:
+//   One workgroup per output row (gl_WorkGroupID.x = m).
+//   local_size_x = 128 — threads stride across blocks and accumulate
+//   partial sums, then the workgroup reduces in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };  // IQ4_NL blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };       // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // number of output rows
+    uint K;             // columns (must be a multiple of 32)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride bound (rounded up)
+} pc;
+
+const uint IQ4_NL_BLOCK_BYTES = 18u;
+const uint IQ4_NL_GROUP_SIZE  = 32u;
+
+// IQ4_NL / IQ4_XS shared signed-int8 codebook. Encoded as float for direct use.
+const float KVALUES_IQ4NL[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0
+);
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * IQ4_NL_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * IQ4_NL_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qsBase = blockByteBase + 2u;
+
+        uint xBase = b * IQ4_NL_GROUP_SIZE;
+
+        float subSum = 0.0;
+        for (uint j = 0u; j < 16u; j++) {
+            uint byteVal = readByte(qsBase + j);
+            uint nLo = byteVal & 0xFu;
+            uint nHi = byteVal >> 4u;
+            float xLo = x[xBase + j];
+            float xHi = x[xBase + j + 16u];
+            subSum += xLo * KVALUES_IQ4NL[nLo] + xHi * KVALUES_IQ4NL[nHi];
+        }
+        acc += d * subSum;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
