@@ -103,4 +103,28 @@ public record ModelConfig
 
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
+
+    /// <summary>
+    /// Layer indices that skip RoPE entirely (NoPE — "no positional encoding").
+    /// Null or empty means every layer applies RoPE per the standard
+    /// <see cref="RoPEConfig"/>. SmolLM3 ships a sparse pattern
+    /// (every 4th layer — indices 3, 7, 11, ... on the 3B SKU). The forward
+    /// pass tests <see cref="IsNoRopeLayer(int)"/> per layer and conditionally
+    /// skips the RoPE rotation while leaving the rest of the GQA pipeline
+    /// (projections, attention, output) intact. Non-RoPE architectures
+    /// (Mamba-3, MLA decoupled-rope, ...) ignore this field.
+    /// </summary>
+    public IReadOnlyList<int>? NoRopeLayers { get; init; }
+
+    /// <summary>
+    /// Returns true when <paramref name="layerIdx"/> should skip the per-layer
+    /// RoPE rotation (NoPE behaviour). Defaults to false when
+    /// <see cref="NoRopeLayers"/> is null or empty — every layer applies RoPE.
+    /// </summary>
+    public bool IsNoRopeLayer(int layerIdx)
+    {
+        if (NoRopeLayers is null || NoRopeLayers.Count == 0)
+            return false;
+        return NoRopeLayers.Contains(layerIdx);
+    }
 }
