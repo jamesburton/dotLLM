@@ -44,7 +44,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly bool _ownsThreadPool;
 
     // ── Shared ──
-    private readonly GgufFile _gguf;
+    private readonly GgufFile? _gguf;
     private readonly int _numGpuLayers;
     private readonly int _deviceId;
     private readonly float _ropeTheta;
@@ -74,7 +74,7 @@ public sealed unsafe class HybridTransformerModel : IModel
         ModelConfig config, CudaWeights gpuWeights, CudaForwardState gpuState,
         CudaStream stream, CudaCublasHandle cublas, CudaContext context,
         CudaKernels kernels, TransformerWeights cpuWeights, TransformerForwardState cpuState,
-        ComputeThreadPool? threadPool, bool ownsPool, GgufFile gguf,
+        ComputeThreadPool? threadPool, bool ownsPool, GgufFile? gguf,
         int numGpuLayers, int deviceId, float ropeTheta, int ropeDim,
         int gpuRopeType, RoPEType cpuRopeType, int? slidingWindowSize,
         string? vramWarning)
@@ -199,6 +199,116 @@ public sealed unsafe class HybridTransformerModel : IModel
             cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf,
             numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
             config.SlidingWindowSize, vramWarning);
+    }
+
+    /// <summary>
+    /// Test-only factory that wires a hybrid CPU/GPU model around an already-built
+    /// <see cref="TransformerWeights"/> bundle — used by synthetic parity fixtures
+    /// that do not have a GGUF file. Mirrors
+    /// <see cref="CudaTransformerModel.BuildFromPrebuiltWeights(TransformerWeights, ModelConfig, int, string?)"/>
+    /// and the production <see cref="LoadFromGguf"/> path on every plumbing step
+    /// (RepackWeights, CudaWeights.LoadFromGguf, RoPE-type translation via
+    /// <see cref="CudaKernels.ToCudaRopeType"/>, CPU/GPU scratch buffers); the
+    /// only differences are: no GGUF anchor (the model carries <c>null</c> for
+    /// the gguf reference) and no VRAM-availability warning emission.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Ownership: caller retains the underlying host F32 weight allocations. The
+    /// model's <see cref="Dispose"/> still calls <c>_cpuWeights.Dispose()</c> —
+    /// for synthetic fixtures that pass an empty <c>ownedAllocations</c> list to
+    /// <see cref="TransformerWeights.CreateFromSafetensors"/> this is benign
+    /// (double-Dispose only nulls the already-nulled <c>RepackedLayers</c>),
+    /// mirroring the contract of
+    /// <see cref="CudaTransformerModel.BuildFromPrebuiltWeights(TransformerWeights, ModelConfig, int, string?)"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="cpuWeights">Already-built weight bundle (host F32 pointers OK).</param>
+    /// <param name="config">Matching model configuration.</param>
+    /// <param name="numGpuLayers">Number of layers to run on GPU (must be &gt; 0 and &lt; <c>config.NumLayers</c>).</param>
+    /// <param name="deviceId">GPU device ordinal (0-based).</param>
+    /// <param name="threading">CPU threading configuration for CPU-side layers. Null → <see cref="ThreadingConfig.SingleThreaded"/>.</param>
+    /// <param name="ptxDir">Directory containing compiled PTX files. Null auto-detects.</param>
+    internal static HybridTransformerModel BuildFromPrebuiltWeights(
+        TransformerWeights cpuWeights, ModelConfig config, int numGpuLayers,
+        int deviceId = 0, ThreadingConfig? threading = null, string? ptxDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(cpuWeights);
+        ArgumentNullException.ThrowIfNull(config);
+        if (numGpuLayers <= 0 || numGpuLayers >= config.NumLayers)
+            throw new ArgumentOutOfRangeException(nameof(numGpuLayers),
+                $"numGpuLayers must be between 1 and {config.NumLayers - 1} for hybrid mode. " +
+                $"Use TransformerModel for pure CPU or CudaTransformerModel for pure GPU.");
+
+        ThreadingConfig effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
+
+        // 1. Repack CPU weights — idempotent for F32/F16 (TryRepack returns
+        //    default for non-block-structured types), so safe even if the same
+        //    TransformerWeights instance has already been threaded through
+        //    TransformerModel.BuildFromPrebuiltWeights earlier in the test.
+        cpuWeights.RepackWeights();
+
+        // 2. Initialize CUDA — mirror LoadFromGguf in every step except the
+        //    PTX dir defaulting (caller-supplied for parity tests so the test
+        //    can locate native/ptx/ from its output directory).
+        var context = CudaContext.Create(deviceId);
+        var stream = CudaStream.Create();
+        var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+
+        ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
+        var kernels = new CudaKernels(ptxDir);
+
+        // 3. Upload only GPU layers to VRAM
+        var gpuWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle, numGpuLayers);
+
+        // 4. Skip the VRAM-pressure warning — synthetic fixtures are tiny and
+        //    the cuMemGetInfo probe would just clutter the test output.
+
+        // 5. GPU scratch buffers
+        var gpuState = new CudaForwardState(
+            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+            config.HeadDim, config.IntermediateSize, config.VocabSize);
+
+        // 6. CPU scratch buffers (with RoPE tables)
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        RoPEType cpuRopeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+        // Translate the public RoPEType enum (Norm=0, NeoX=2) to the CUDA
+        // kernel's encoding (Norm=0, NeoX=1). Same translation site as
+        // LoadFromGguf — fixed in #36; the parity test built on top of this
+        // factory pins that fix for the hybrid split.
+        int gpuRopeType = CudaKernels.ToCudaRopeType(cpuRopeType);
+
+        var cpuState = new TransformerForwardState(
+            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
+            config.HeadDim, config.IntermediateSize, config.VocabSize,
+            config.MaxSequenceLength, ropeDim, ropeTheta);
+
+        // 7. ComputeThreadPool for CPU layers — mirror the LoadFromGguf branch
+        ComputeThreadPool? pool = null;
+        if (effectiveThreading.IsParallel)
+        {
+            int effectiveThreads = effectiveThreading.EffectiveThreadCount;
+            if (effectiveThreading.EnableNumaPinning || effectiveThreading.EnablePCorePinning)
+            {
+                var topology = NumaTopology.Detect();
+                if (effectiveThreading.EnablePCorePinning && topology.IsHybrid)
+                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                pool = new ComputeThreadPool(effectiveThreads, topology, effectiveThreading);
+            }
+            else
+            {
+                pool = new ComputeThreadPool(effectiveThreads, topology: null, effectiveThreading);
+            }
+        }
+
+        return new HybridTransformerModel(
+            config, gpuWeights, gpuState, stream, cublas, context, kernels,
+            cpuWeights, cpuState, pool, ownsPool: pool is not null, gguf: null,
+            numGpuLayers, deviceId, ropeTheta, ropeDim, gpuRopeType, cpuRopeType,
+            config.SlidingWindowSize, vramWarning: null);
     }
 
     /// <summary>Creates a <see cref="HybridKvCache"/> for this model.</summary>
