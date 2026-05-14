@@ -611,6 +611,16 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepIq2SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.IQ2_S && (inputDim % 256) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as IQ3_XXS super-blocks
+    /// (98 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq3XxsOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ3_XXS && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ3_S super-blocks
+    /// (110 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq3SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ3_S && (inputDim % 256) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
     /// Q5_K / Q6_K / IQ2_XXS / IQ2_XS / IQ2_S / F16 / BF16 / F32 depending on the source
     /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / IQ1_S / F16 / BF16 / F32 depending on the source
@@ -632,6 +642,8 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepIq2XxsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_XXS;
         if (KeepIq2XsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_XS;
         if (KeepIq2SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_S;
+        if (KeepIq3XxsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_XXS;
+        if (KeepIq3SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_S;
         if (KeepIq1SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ1_S;
         if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
         if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
@@ -703,6 +715,10 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_XS) * outputDim;
         if (KeepIq2SOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_S) * outputDim;
+        if (KeepIq3XxsOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_XXS) * outputDim;
+        if (KeepIq3SOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_S) * outputDim;
         if (KeepIq1SOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ1_S) * outputDim;
         if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
