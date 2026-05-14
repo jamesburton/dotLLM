@@ -206,6 +206,12 @@ public sealed class VulkanTransformerModel : IModel
     private readonly VulkanLoraAdapterCache _loraCache;
     private VulkanLoraAdapter? _currentLora;
 
+    // Fused LoRA delta-GEMV (single dispatch in place of the four-step
+    // matmul(B) → matmul(A) → add → vkCmdCopyBuffer chain). Null when the
+    // .spv is missing (older builds); router falls back to the un-fused
+    // path. Used only when the adapter's rank ≤ LoraDeltaGemvFusedF32Kernel.MaxRank.
+    private readonly LoraDeltaGemvFusedF32Kernel? _loraDeltaGemvFused;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -266,6 +272,7 @@ public sealed class VulkanTransformerModel : IModel
         MoeUngroupScatterF32Kernel? moeUngroupScatter,
         MoeWeightedScatterF32Kernel? moeWeightedScatter, MoeBroadcastF32Kernel? moeBroadcast,
         MoeSigmoidGatedAddF32Kernel? moeSigmoidGatedAdd,
+        LoraDeltaGemvFusedF32Kernel? loraDeltaGemvFused,
         VulkanDevice.SubmitContext submit,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow,
@@ -332,6 +339,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeWeightedScatter = moeWeightedScatter;
         _moeBroadcast = moeBroadcast;
         _moeSigmoidGatedAdd = moeSigmoidGatedAdd;
+        _loraDeltaGemvFused = loraDeltaGemvFused;
         _submit = submit;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
@@ -634,6 +642,13 @@ public sealed class VulkanTransformerModel : IModel
             moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
         }
 
+        // Optional fused LoRA delta-GEMV — TryCreate so older builds without
+        // the .spv blob fall back to the un-fused 4-dispatch path. Always
+        // attempted (no MoE/MLA gating) because LoRA can target any standard
+        // q/k/v/o + gate/up/down projection on the dense path.
+        LoraDeltaGemvFusedF32Kernel? loraDeltaGemvFused =
+            LoraDeltaGemvFusedF32Kernel.TryCreate(device, spvDir);
+
         var submit = device.CreateSubmitContext();
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -670,6 +685,7 @@ public sealed class VulkanTransformerModel : IModel
             moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
             moeWeightedScatter, moeBroadcast,
             moeSigmoidGatedAdd,
+            loraDeltaGemvFused,
             submit,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
@@ -1141,6 +1157,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast?.InvalidateDescriptorCache();
         _moeIndexedLoraDelta?.InvalidateDescriptorCache();
         _moeSigmoidGatedAdd?.InvalidateDescriptorCache();
+        _loraDeltaGemvFused?.InvalidateDescriptorCache();
     }
 
     /// <summary>
@@ -1769,18 +1786,33 @@ public sealed class VulkanTransformerModel : IModel
     /// <summary>
     /// Dispatches the LoRA delta for <paramref name="projName"/> at
     /// <paramref name="layer"/> when an adapter is active and targets that
-    /// site. No-op when there is no active adapter or no entry. Composes
-    /// existing kernels (Option A — no new shaders this commit):
+    /// site. No-op when there is no active adapter or no entry.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Fast path (rank ≤ <see cref="LoraDeltaGemvFusedF32Kernel.MaxRank"/>
+    /// and the fused .spv blob is present): a single dispatch of
+    /// <see cref="LoraDeltaGemvFusedF32Kernel"/> performs
+    /// <c>y[t, m] += sum_r A[m, r] · dot(B[r, :], x[t, :])</c> in place.
+    /// One workgroup per token row keeps the rank-sized inner reduction in
+    /// shared memory and reuses it across the full output dim.
+    /// </para>
+    /// <para>
+    /// Fallback path (rank &gt; 32 or older builds without the fused .spv):
+    /// the original 4-dispatch chain
     /// <list type="number">
     ///   <item><c>tmp[seqLen, rank] = matmul_f32(B_scaled, x)</c> via <see cref="MatMulF32Kernel"/>.</item>
     ///   <item><c>delta[seqLen, outputDim] = matmul_f32(A, tmp)</c> via <see cref="MatMulF32Kernel"/>.</item>
     ///   <item><c>deltaSum[seqLen, outputDim] = AddKernel(y, delta)</c> via <see cref="AddKernel"/>.</item>
-    ///   <item><c>vkCmdCopyBuffer(deltaSum -> y)</c> to land the LoRA-augmented output back in <c>y</c>.</item>
+    ///   <item><c>vkCmdCopyBuffer(deltaSum -> y)</c>.</item>
     /// </list>
+    /// </para>
+    /// <para>
     /// The <c>scale = alpha / rank</c> factor is folded into <c>B</c> at
-    /// upload time (see <see cref="VulkanLoraAdapter.Upload"/>), so the
-    /// existing matmul + add kernels stay scale-agnostic.
-    /// </summary>
+    /// upload time (see <see cref="VulkanLoraAdapter.Upload"/>), so neither
+    /// path needs a separate scale parameter.
+    /// </para>
+    /// </remarks>
     private void MaybeApplyLoraDelta(
         nint cmdBuf, int layer, string projName,
         VulkanDevice.Buffer x, VulkanDevice.Buffer y,
@@ -1798,27 +1830,30 @@ public sealed class VulkanTransformerModel : IModel
 
         var tmp = _state.LoraTmp ?? throw new InvalidOperationException(
             "LoraTmp scratch is null — EnsureLoraScratch was not called before a LoRA-active Forward.");
+
+        // Fused fast path: two dispatches (B-reduce + A-accumulate-in-place)
+        // in place of the original four. Gated by SPV availability + rank cap.
+        if (_loraDeltaGemvFused is not null && w.Rank <= LoraDeltaGemvFusedF32Kernel.MaxRank
+            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_FUSED_LORA_DELTA") != "1")
+        {
+            _loraDeltaGemvFused.Record(cmdBuf, x, w.B, w.A, y, tmp,
+                seqLen: seqLen, inputDim: inputDim, outputDim: outputDim, rank: w.Rank);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            return;
+        }
+
         var delta = _state.LoraDelta ?? throw new InvalidOperationException("LoraDelta scratch is null.");
         var deltaSum = _state.LoraDeltaSum ?? throw new InvalidOperationException("LoraDeltaSum scratch is null.");
 
-        // Stage 1: tmp[N=seqLen, M=rank] = MatMul(B[M=rank, K=inputDim], x[N=seqLen, K=inputDim]).
-        // MatMulF32Kernel contracts as C[N,M] = B_in[N,K] @ A_in[M,K]^T —
-        // so weightsA=B (the LoRA down-proj), inputB=x, outputC=tmp.
         _matmul.Record(cmdBuf, w.B, x, tmp, m: w.Rank, k: inputDim, n: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // Stage 2: delta[N=seqLen, M=outputDim] = MatMul(A[M=outputDim, K=rank], tmp[N=seqLen, K=rank]).
         _matmul.Record(cmdBuf, w.A, tmp, delta, m: outputDim, k: w.Rank, n: seqLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // Stage 3: deltaSum = y + delta. AddKernel reads a, b and writes c —
-        // a, b are read-only and c is write-only so we can't alias y == c.
         _add.Record(cmdBuf, y, delta, deltaSum, seqLen * outputDim);
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
-        // Stage 4: copy deltaSum back into y. The next dispatch downstream
-        // (RoPE for q/k, attention for o, SwiGLU for gate/up, residual add
-        // for down) reads y — so we issue a transfer→compute barrier after.
         var region = new VkBufferCopy
         {
             srcOffset = 0,
@@ -2132,6 +2167,7 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _loraDeltaGemvFused?.Dispose();
         _moeSigmoidGatedAdd?.Dispose();
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
