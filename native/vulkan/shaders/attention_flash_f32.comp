@@ -191,7 +191,7 @@ void main() {
                 uint posQ = pc.positionOffset + qStartRow + r;
                 bool masked =
                     tkv > posQ ||
-                    (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) > pc.slidingWindow);
+                    (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
                 if (masked) {
                     s = NEG_INF;
                 } else {
