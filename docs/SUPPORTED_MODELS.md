@@ -230,6 +230,16 @@ the on-disk IQ2 bytes directly with shader-side codebook lookup. The
 sibling `MOSTLY_IQ2_M` file-type lands on the same `IQ2_S` block layout
 the kernels accept.
 
+**Vulkan IQ3 family support** (this branch) adds IQ3_XXS (3.0625 bpw,
+98 B / 256 elements) and IQ3_S (3.4375 bpw, 110 B / 256 elements) on
+the same SSBO-codebook pattern as IQ2 — the 1 KB `Iq3XxsGrid` and 2 KB
+`Iq3SGrid` tables are uploaded once per model and shared across the 6
+IQ3 matmul/dequant kernels via `Iq3Codebooks`. CPU dequant + Vulkan
+dequant + GEMV + GEMM are bit-perfect against the ggml-quants.c
+reference (16 parity tests). Upload-path predicates land in
+`VulkanWeights`; per-host matmul dispatch is the follow-up step (see
+`.continue-here-iq3-dispatch.md`).
+
 ## Legend
 
 | Tag | Meaning |
