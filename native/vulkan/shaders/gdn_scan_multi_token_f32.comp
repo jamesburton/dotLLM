@@ -74,7 +74,7 @@ void main() {
     if (int(vh) >= pc.n_v_head) return;       // workgroup-uniform: safe
 
     uint dState = uint(pc.d_state);
-    bool active = tid < dState;
+    bool laneActive = tid < dState;
     // TILED head broadcast (matches llama.cpp ggml_gated_delta_net): kh = vh % n_k_head.
     // For NVHead=32, NKHead=16 maps vh 0..15 → kh 0..15, vh 16..31 → kh 0..15.
     // Previous interleaved mapping (vh / v_heads_per_k_head) produced garbage logits.
@@ -95,14 +95,14 @@ void main() {
         float betaVh = beta_buf[gbIdx];
 
         // ── Stage 0: cooperative load of k_kh and q_kh for this token ──────
-        if (active) {
+        if (laneActive) {
             k_shared[tid] = k_buf[qkBase + tid];
             q_shared[tid] = q_buf[qkBase + tid];
         }
         barrier();
 
         // ── Phase 1: Decay  S[row, tid] *= g_vh ────────────────────────────
-        if (active) {
+        if (laneActive) {
             for (uint row = 0u; row < dState; row++) {
                 uint idx = stateBase + row * dState + tid;
                 st[idx] = st[idx] * gVh;
@@ -112,7 +112,7 @@ void main() {
 
         // ── Phase 2: Retrieve  tmp[tid] = Σ_row S[row, tid] * k_kh[row] ────
         float retr = 0.0;
-        if (active) {
+        if (laneActive) {
             for (uint row = 0u; row < dState; row++) {
                 retr += st[stateBase + row * dState + tid] * k_shared[row];
             }
@@ -122,14 +122,14 @@ void main() {
 
         // ── Phase 3: Delta rule ────────────────────────────────────────────
         float delta = 0.0;
-        if (active) {
+        if (laneActive) {
             float vVh = v_buf[vBase + tid];
             delta = betaVh * (vVh - tmp[tid]);
             tmp[tid] = delta;
         }
         barrier();
 
-        if (active) {
+        if (laneActive) {
             for (uint row = 0u; row < dState; row++) {
                 uint idx = stateBase + row * dState + tid;
                 st[idx] = st[idx] + k_shared[row] * delta;
@@ -138,7 +138,7 @@ void main() {
         barrier();
 
         // ── Phase 4: Read  out[t, vh, tid] = (Σ_row S[row, tid] * q_kh[row]) / √d ──
-        if (active) {
+        if (laneActive) {
             float acc = 0.0;
             for (uint row = 0u; row < dState; row++) {
                 acc += st[stateBase + row * dState + tid] * q_shared[row];

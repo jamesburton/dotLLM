@@ -109,6 +109,10 @@ public class InferenceBenchmarks
                 int.TryParse(envDevice.Split(':')[1], out gpuId);
             kvFactory = LoadGpuModel(_gguf, config, gpuId);
         }
+        else if (envDevice.StartsWith("vulkan", StringComparison.OrdinalIgnoreCase))
+        {
+            kvFactory = LoadVulkanModel(_gguf, config);
+        }
         else
         {
             // Architecture-aware dispatch — TransformerModel handles dense (Llama/Mistral/Phi/Qwen)
@@ -151,6 +155,29 @@ public class InferenceBenchmarks
             throw new InvalidOperationException(
                 $"DOTLLM_BENCH_DEVICE=gpu but CUDA libraries not found. " +
                 $"Install CUDA Toolkit or use --device cpu. ({ex.Message})", ex);
+        }
+    }
+
+    /// <summary>
+    /// Loads the model on a Vulkan device. Same NoInlining isolation as <see cref="LoadGpuModel"/>
+    /// so the JIT only resolves <c>DotLLM.Vulkan</c> on the Vulkan path. Returns a kv-factory
+    /// that produces <see cref="DotLLM.Vulkan.VulkanKvCache"/> instances sized per request.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private Func<ModelConfig, int, IKvCache> LoadVulkanModel(GgufFile gguf, ModelConfig config)
+    {
+        try
+        {
+            var vkModel = Vulkan.VulkanTransformerModel.LoadFromGguf(gguf, config);
+            _model = vkModel;
+            Console.WriteLine("Device: Vulkan");
+            return (cfg, size) => vkModel.CreateKvCache(size);
+        }
+        catch (DllNotFoundException ex)
+        {
+            throw new InvalidOperationException(
+                $"DOTLLM_BENCH_DEVICE=vulkan but Vulkan loader not found. " +
+                $"Install the Vulkan runtime / SDK or use --device cpu. ({ex.Message})", ex);
         }
     }
 
