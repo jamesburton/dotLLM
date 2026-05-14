@@ -5,6 +5,7 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Engine.Scheduler;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Server.RateLimiting;
@@ -208,6 +209,22 @@ public static class ServerStartup
         WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
 
+        // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
+        // decoding is off — the scheduler doesn't support draft models in this iteration, and
+        // GPU/hybrid models keep their existing single-request path until the IModel.ForwardBatch
+        // override lands in those backends.
+        ContinuousBatchSchedulerService? scheduler = null;
+        if (pagedFactory is not null && kvFactory is not null && draftModel is null)
+        {
+            scheduler = new ContinuousBatchSchedulerService(
+                model,
+                tokenizer,
+                kvFactory,
+                options: null,
+                pagedPool: pagedFactory.Pool);
+            Console.WriteLine("[dotllm] Continuous-batch scheduler active");
+        }
+
         return new ServerState
         {
             Options = options,
@@ -223,6 +240,7 @@ public static class ServerStartup
             Tokenizer = tokenizer,
             ChatTemplate = chatTemplate,
             Generator = generator,
+            Scheduler = scheduler,
             LoadedModelPath = resolvedPath,
             CurrentGguf = gguf,
             DraftModel = draftModel,
@@ -284,6 +302,21 @@ public static class ServerStartup
         }
 
         app.MapDotLLMEndpoints(serveUi);
+
+        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
+        // the host shuts down. Stopped earlier in SwapModelAsync when the model is swapped.
+        if (state.Scheduler is { } scheduler)
+        {
+            var loopCts = new CancellationTokenSource();
+            state.SchedulerLoopCts = loopCts;
+            state.SchedulerLoopTask = Task.Run(() => scheduler.RunLoopAsync(loopCts.Token));
+
+            var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+            lifetime.ApplicationStopping.Register(() =>
+            {
+                try { loopCts.Cancel(); } catch { /* already disposed */ }
+            });
+        }
 
         return app;
     }

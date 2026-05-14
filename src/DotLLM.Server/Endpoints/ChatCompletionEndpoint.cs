@@ -145,10 +145,26 @@ public static class ChatCompletionEndpoint
     {
         InferenceResponse? result = null;
 
-        await state.ExecuteAsync(async () =>
+        // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
+        // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
+        // dispatch per scheduler iteration.
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
         {
-            result = generator.Generate(prompt, options, adapter: adapter);
-        }, ct);
+            int[] promptIds = state.Tokenizer!.Encode(prompt);
+            var inferenceRequest = new InferenceRequest
+            {
+                TokenIds = promptIds,
+                Options = options,
+            };
+            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+        }
+        else
+        {
+            await state.ExecuteAsync(async () =>
+            {
+                result = generator.Generate(prompt, options, adapter: adapter);
+            }, ct);
+        }
 
         // Detect tool calls
         string text = result!.Text;
