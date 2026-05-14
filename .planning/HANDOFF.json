@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "timestamp": "2026-05-14T01:01:49.402Z",
+  "timestamp": "2026-05-14T07:19:58.732Z",
   "context": "research",
   "phase": null,
   "phase_name": null,
@@ -11,7 +11,7 @@
   "status": "paused_clean",
   "branch": "feature/qwen3.6",
   "remote_sync": "up_to_date",
-  "head_commit": "21b3c30",
+  "head_commit": "433df26",
   "session_focus": "Diagnose + fix Qwen3.6-A3B CPU gibberish output (originally framed as Phase 10 MoE perf regression in commit 71eaae4 — task framing was wrong, root cause was older)",
   "completed_tasks": [
     {
