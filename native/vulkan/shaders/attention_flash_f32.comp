@@ -1,0 +1,267 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Flash-Attention-v2 style tiled attention over GQA. Each workgroup processes
+// one (query-head, query-tile of BR rows) pair. The KV stream is consumed in
+// BC-sized chunks. Compared to attention_f32.comp (one workgroup per (token,
+// head)) the per-(KV row, head) read count drops by BR×: each KV row is read
+// by exactly one workgroup, but its dot-product contribution feeds BR Q-rows
+// instead of just one.
+//
+// Strix Halo / RDNA3.5 sizing rationale:
+//   - 64-wide wavefronts, 64 KB LDS / WG cap.
+//   - WG_SIZE = BC = 64 → BC tile fits in one wavefront on RDNA3.5; reductions
+//     fall through to subgroupMax / subgroupAdd in a single step. On
+//     subgroup widths < BC (NVIDIA 32-wide, Intel 8/16-wide) the per-row
+//     reduction falls back to a one-time cross-subgroup combine through
+//     shared memory (partialMax[0..gl_NumSubgroups)).
+//   - BR = 16 query rows × MAX_HEAD_DIM = 128 → qTile 8 KB, outAccum 8 KB,
+//     scoreMatrix BR*BC = 4 KB — well under the 64 KB LDS budget.
+//
+// Decode (seq_q = 1) keeps the legacy AttentionF32Kernel naive per-row tile —
+// the FA path is wired only when seqQ > 1.
+//
+// Dispatch:
+//   local_size_x  = WG_SIZE (= BC)
+//   workgroups.x  = ceil(seq_q / BR) * num_heads
+//
+// Causal mask: masked when (positionOffset + qRow) < (tStart + c).
+// Sliding window: when slidingWindow > 0, masks columns earlier than
+// positionOffset + qRow - slidingWindow + 1.
+// Attention soft-cap (Gemma 2 / Qwen3 style): when softCap > 0, raw scores
+// pass through softCap * tanh(s / softCap) before softmax.
+
+#define BR              16
+#define BC              64
+#define WG_SIZE         BC
+#define MAX_HEAD_DIM    128
+#define NEG_INF         (-3.4e38)
+#define MAX_SUBGROUPS   16  // WG_SIZE / smallest realistic subgroupSize (= 4)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufQ   { float q[]; };    // [seq_q,  num_heads    * head_dim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufK   { float k[]; };    // [seq_kv, num_kv_heads * head_dim]
+layout(set = 0, binding = 2, std430) readonly  buffer BufV   { float v[]; };    // [seq_kv, num_kv_heads * head_dim]
+layout(set = 0, binding = 3, std430) writeonly buffer BufOut { float outp[]; }; // [seq_q,  num_heads    * head_dim]
+
+layout(push_constant) uniform PushConstants {
+    uint  seqQ;
+    uint  seqKv;
+    uint  numHeads;
+    uint  numKvHeads;
+    uint  headDim;
+    uint  positionOffset;
+    uint  slidingWindow;   // 0 = disabled
+    uint  useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
+    float softCap;         // 0.0 = disabled, >0 = tanh-capped scores
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} pc;
+
+shared float qTile[BR * MAX_HEAD_DIM];
+shared float scoreMatrix[BR * BC];
+shared float outAccum[BR * MAX_HEAD_DIM];
+shared float runningMax[BR];
+shared float runningSum[BR];
+// Per-subgroup partials for cross-subgroup reductions when subgroupSize < WG_SIZE.
+shared float partialMax[MAX_SUBGROUPS];
+shared float partialSum[MAX_SUBGROUPS];
+// Single broadcast slot so a published row-max / row-sum reaches every thread.
+shared float rowMaxBroadcast;
+shared float rowSumBroadcast;
+
+uint previousPowerOfTwo(uint value) {
+    uint power = 1u;
+    while ((power << 1u) <= value) {
+        power <<= 1u;
+    }
+    return power;
+}
+
+float alibiSlopePowerOfTwo(uint head, uint numHeads) {
+    float start = exp2(-exp2(-(log2(float(numHeads)) - 3.0)));
+    return pow(start, float(head + 1u));
+}
+
+float alibiSlope(uint head, uint numHeads) {
+    uint power = previousPowerOfTwo(numHeads);
+    if (power == numHeads || head < power) {
+        return alibiSlopePowerOfTwo(head, power);
+    }
+    uint expanded = power << 1u;
+    uint extraHead = (head - power) << 1u;
+    return alibiSlopePowerOfTwo(extraHead, expanded);
+}
+
+// Workgroup-wide max using subgroup arithmetic + a cross-subgroup combine
+// through shared memory. Result is broadcast through rowMaxBroadcast so every
+// thread observes the same workgroup-wide value.
+float wgRowMax(float val) {
+    float sgMax = subgroupMax(val);
+    if (subgroupElect()) partialMax[gl_SubgroupID] = sgMax;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                ? partialMax[gl_SubgroupInvocationID]
+                : NEG_INF;
+        float reduced = subgroupMax(x);
+        if (subgroupElect()) rowMaxBroadcast = reduced;
+    }
+    barrier();
+    float m = rowMaxBroadcast;
+    barrier();
+    return m;
+}
+
+float wgRowSum(float val) {
+    float sgSum = subgroupAdd(val);
+    if (subgroupElect()) partialSum[gl_SubgroupID] = sgSum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                ? partialSum[gl_SubgroupInvocationID]
+                : 0.0;
+        float reduced = subgroupAdd(x);
+        if (subgroupElect()) rowSumBroadcast = reduced;
+    }
+    barrier();
+    float s = rowSumBroadcast;
+    barrier();
+    return s;
+}
+
+void main() {
+    uint blockId = gl_WorkGroupID.x;
+    uint qTilesPerHead = (pc.seqQ + uint(BR) - 1u) / uint(BR);
+    uint totalBlocks = qTilesPerHead * pc.numHeads;
+    if (blockId >= totalBlocks) return;
+
+    uint qTileIdx = blockId / pc.numHeads;
+    uint hq       = blockId - qTileIdx * pc.numHeads;
+    uint qStartRow = qTileIdx * uint(BR);
+
+    uint groupSize = pc.numHeads / pc.numKvHeads;
+    uint hkv = hq / groupSize;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint qStride  = pc.numHeads   * pc.headDim;
+    uint kvStride = pc.numKvHeads * pc.headDim;
+
+    float scale = inversesqrt(float(pc.headDim));
+    float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
+
+    uint rowsInTile = min(uint(BR), pc.seqQ - qStartRow);
+
+    // 1. Load Q-tile and zero output accumulator + running state.
+    uint qLoadTotal = rowsInTile * pc.headDim;
+    for (uint idx = tid; idx < qLoadTotal; idx += uint(WG_SIZE)) {
+        uint r = idx / pc.headDim;
+        uint d = idx - r * pc.headDim;
+        qTile[r * pc.headDim + d] = q[(qStartRow + r) * qStride + hq * pc.headDim + d];
+    }
+    uint outZeroTotal = uint(BR) * pc.headDim;
+    for (uint idx = tid; idx < outZeroTotal; idx += uint(WG_SIZE)) {
+        outAccum[idx] = 0.0;
+    }
+    if (tid < uint(BR)) {
+        runningMax[tid] = NEG_INF;
+        runningSum[tid] = 0.0;
+    }
+    barrier();
+
+    // 2. Walk KV in BC-sized tiles. Thread tid owns column tid of the
+    //    active BC tile and computes BR dot products against the resident
+    //    Q-rows. Each KV row is therefore read once per Q-tile — BR× the
+    //    amortisation vs the per-token shader.
+    for (uint tStart = 0u; tStart < pc.seqKv; tStart += uint(BC)) {
+        uint tileLen = min(uint(BC), pc.seqKv - tStart);
+        uint c = tid;
+        bool cValid = (c < tileLen);
+        uint tkv = tStart + c;
+        uint kBase = tkv * kvStride + hkv * pc.headDim;
+
+        for (uint r = 0u; r < rowsInTile; r++) {
+            float s;
+            if (!cValid) {
+                s = NEG_INF;
+            } else {
+                uint posQ = pc.positionOffset + qStartRow + r;
+                bool masked =
+                    tkv > posQ ||
+                    (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) > pc.slidingWindow);
+                if (masked) {
+                    s = NEG_INF;
+                } else {
+                    float dot = 0.0;
+                    for (uint d = 0u; d < pc.headDim; d++) {
+                        dot += qTile[r * pc.headDim + d] * k[kBase + d];
+                    }
+                    s = dot * scale - slope * float(posQ - tkv);
+                    if (pc.softCap > 0.0) {
+                        s = pc.softCap * tanh(s / pc.softCap);
+                    }
+                }
+            }
+            scoreMatrix[r * uint(BC) + c] = s;
+        }
+        barrier();
+
+        // 2b. Per-row max + online-softmax rescale + exponentiate.
+        for (uint r = 0u; r < rowsInTile; r++) {
+            float val = scoreMatrix[r * uint(BC) + tid];
+            float tileMax = wgRowMax(val);
+            float oldMax  = runningMax[r];
+            float newMax  = max(oldMax, tileMax);
+            float correction = (oldMax > NEG_INF * 0.5) ? exp(oldMax - newMax) : 0.0;
+
+            if (tid == 0u) {
+                runningSum[r] = runningSum[r] * correction;
+                runningMax[r] = newMax;
+            }
+            for (uint d = tid; d < pc.headDim; d += uint(WG_SIZE)) {
+                outAccum[r * pc.headDim + d] *= correction;
+            }
+
+            float w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
+            scoreMatrix[r * uint(BC) + tid] = w;
+            barrier();
+
+            float tileSum = wgRowSum(w);
+            if (tid == 0u) {
+                runningSum[r] = runningSum[r] + tileSum;
+            }
+            barrier();
+        }
+
+        // 2c. Accumulate weighted V into outAccum[r, :]. Parallelize across
+        //     head_dim; each thread reads its share of V columns. Each V
+        //     row is read once per Q-tile.
+        for (uint r = 0u; r < rowsInTile; r++) {
+            for (uint d = tid; d < pc.headDim; d += uint(WG_SIZE)) {
+                float acc = 0.0;
+                for (uint c2 = 0u; c2 < tileLen; c2++) {
+                    float w = scoreMatrix[r * uint(BC) + c2];
+                    if (w > 0.0) {
+                        uint vOff = (tStart + c2) * kvStride + hkv * pc.headDim + d;
+                        acc += w * v[vOff];
+                    }
+                }
+                outAccum[r * pc.headDim + d] += acc;
+            }
+        }
+        barrier();
+    }
+
+    // 3. Normalize and write.
+    for (uint r = 0u; r < rowsInTile; r++) {
+        float sum = runningSum[r];
+        float inv = (sum > 1e-10) ? (1.0 / sum) : 0.0;
+        uint outBase = (qStartRow + r) * qStride + hq * pc.headDim;
+        for (uint d = tid; d < pc.headDim; d += uint(WG_SIZE)) {
+            outp[outBase + d] = outAccum[r * pc.headDim + d] * inv;
+        }
+    }
+}
