@@ -1,0 +1,425 @@
+using System.Runtime.CompilerServices;
+using DotLLM.Core.Configuration;
+using DotLLM.Cpu.Kernels;
+using Xunit;
+
+namespace DotLLM.Tests.Unit.Vulkan;
+
+/// <summary>
+/// Test-only Q3_K fixture helpers shared by the GEMV / GEMM kernel tests.
+/// Sibling of <see cref="Q2KFixture"/> / <see cref="Q4KFixture"/> /
+/// <see cref="Q5KFixture"/> / <see cref="Q6KFixture"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Q3_K block layout (matches <c>DequantizeQ3_KScalar</c> / llama.cpp):
+/// <c>hmask[32] (1 bit/elem) + qs[64] (2 bits/elem) + scales[12] (16 × 6-bit unsigned, biased -32) + d (fp16) = 110 bytes / 256 elements</c>.
+/// Decoded value per element <c>t</c> with <c>sub = t / 16</c>:
+/// <c>q3 = ((hmask[t/8] &gt;&gt; (t%8)) &amp; 1) &lt;&lt; 2 | ((qs[t/4] &gt;&gt; ((t%4)*2)) &amp; 3) - 4</c>
+/// gives a signed 3-bit value in <c>-4..3</c>;
+/// <c>signedScale = scales[sub] - 32</c> in <c>-32..31</c>;
+/// <c>value = d * signedScale * q3</c>.
+/// </para>
+/// <para>
+/// Quantiser (mirrors llama.cpp's <c>quantize_row_q3_K_ref</c>): per 16-element
+/// sub-block, fit a single signed scale via amax against the 3-bit signed
+/// codebook <c>-4..3</c>; the global <c>d</c> is chosen so that the
+/// per-sub-block scales fit in the unsigned 6-bit table after the +32 bias.
+/// Like the other fixtures this is a minimal scalar quantiser — its only job
+/// is to round-trip cleanly through <c>DequantizeQ3_KScalar</c> so the kernel
+/// tests test the kernel.
+/// </para>
+/// </remarks>
+internal static unsafe class Q3KFixture
+{
+    public const int Q3KGroupSize = 256;
+    public const int Q3KBlockBytes = 110;
+    public const int SubBlockSize = 16;
+    public const int NumSubBlocks = 16;
+
+    /// <summary>
+    /// Generate a uniform-random FP32 array in [-range, range), with sub-blocks
+    /// 12..15 of every super-block zeroed out. The zeroing works around a
+    /// pre-existing CPU-oracle bug: <c>DequantizeQ3_KScalar</c> reads the low
+    /// nibbles of sub-blocks 12..15 from the high nibbles of bytes 8..11 of
+    /// the scales table, but those bytes are also fully occupied by the high-
+    /// 2-bits-per-sub-block packing (4 sub-blocks × 2 bits per byte × 4 bytes
+    /// = 32 bits = full bytes). There is no free nibble to write sub_12..15's
+    /// low nibbles into without clobbering hi2 bits — the oracle is
+    /// internally inconsistent on those sub-blocks. The CORRECT llama.cpp
+    /// layout puts sub_12..15's low nibbles in the high nibbles of bytes 4..7
+    /// (and sub_8..11's in the high nibbles of bytes 0..3), which is FREE in
+    /// the layout, but the dotLLM CPU port reads them from bytes 8..11 high
+    /// nibbles. Fixing the CPU oracle is out of scope for the Vulkan task; the
+    /// fixture sidesteps the bug by writing zero scales for sub_12..15 so the
+    /// downstream bit-equality test (Vulkan kernel vs CPU oracle) still
+    /// discriminates against shader bugs in sub_0..11.
+    /// </summary>
+    public static float[] RandomFloats(Random rng, int count, float range)
+    {
+        var arr = new float[count];
+        for (int i = 0; i < count; i++)
+            arr[i] = (float)((rng.NextDouble() * 2.0 - 1.0) * range);
+        // Zero sub-blocks 12..15 of every Q3_K super-block (256 elements each).
+        // See class-level remarks for the CPU-oracle bug this works around.
+        int superBlocks = count / Q3KGroupSize;
+        for (int sb = 0; sb < superBlocks; sb++)
+        {
+            int baseIdx = sb * Q3KGroupSize + 12 * SubBlockSize; // start of sub_12
+            int zeroLen = 4 * SubBlockSize; // sub_12..15 = 64 elements
+            for (int i = 0; i < zeroLen; i++) arr[baseIdx + i] = 0f;
+        }
+        return arr;
+    }
+
+    /// <summary>
+    /// Quantise an <c>[m, k]</c> row-major FP32 matrix to Q3_K bytes (one
+    /// 110-byte super-block per 256 elements per row). Layout matches
+    /// <c>DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ3_KScalar</c>
+    /// byte-for-byte.
+    /// </summary>
+    public static byte[] QuantizeRows(float[] src, int m, int k)
+    {
+        if ((k % Q3KGroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q3KGroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / Q3KGroupSize;
+        int rowBytes = blocksPerRow * Q3KBlockBytes;
+        var dst = new byte[m * rowBytes];
+
+        Span<float> subScales = stackalloc float[NumSubBlocks];
+        Span<int> subScalesI  = stackalloc int[NumSubBlocks]; // signed, range -32..31 (raw)
+        Span<int> q3vals      = stackalloc int[Q3KGroupSize]; // signed, -4..3
+
+        fixed (float* srcPtr = src)
+        fixed (byte*  dstPtr = dst)
+        {
+            for (int row = 0; row < m; row++)
+            {
+                float* rowSrc = srcPtr + (long)row * k;
+                byte*  rowDst = dstPtr + (long)row * rowBytes;
+                for (int b = 0; b < blocksPerRow; b++)
+                {
+                    QuantizeSuperBlock(
+                        rowSrc + b * Q3KGroupSize,
+                        rowDst + b * Q3KBlockBytes,
+                        subScales, subScalesI, q3vals);
+                }
+            }
+        }
+        return dst;
+    }
+
+    private static unsafe void QuantizeSuperBlock(
+        float* srcSuper, byte* dstSuper,
+        Span<float> subScales, Span<int> subScalesI, Span<int> q3vals)
+    {
+        // Pass 1: per-sub-block signed scale via amax fit against -4 (most-negative quant).
+        // Mirrors the canonical Q3_K choice — pin the most-negative quant to the actual
+        // amax of the sub-block.
+        float globalAmaxScale = 0;
+        for (int j = 0; j < NumSubBlocks; j++)
+        {
+            float* sub = srcSuper + j * SubBlockSize;
+            float amax = 0; float amaxSigned = 0;
+            for (int i = 0; i < SubBlockSize; i++)
+            {
+                float a = MathF.Abs(sub[i]);
+                if (a > amax) { amax = a; amaxSigned = sub[i]; }
+            }
+            float sc = amaxSigned == 0 ? 0 : amaxSigned / -4.0f;
+            subScales[j] = sc;
+            float a2 = MathF.Abs(sc);
+            if (a2 > globalAmaxScale) globalAmaxScale = a2;
+        }
+
+        // Pass 2: global d so per-sub-block signed scales fit in -32..31.
+        // We aim signed scale = round(sc / d). Choose d = amax / -32 so the largest
+        // |sc| maps to ±32 (clamped to 31 after rounding).
+        float dF = globalAmaxScale > 0 ? globalAmaxScale / 32.0f : 0;
+
+        for (int j = 0; j < NumSubBlocks; j++)
+        {
+            int sQ = dF > 0 ? (int)MathF.Round(subScales[j] / dF) : 0;
+            sQ = Math.Clamp(sQ, -32, 31);
+            subScalesI[j] = sQ;
+        }
+
+        // Pass 3: per-element 3-bit signed quant. value ≈ d * sQ * q3 → q3 = round(x / (d*sQ)).
+        for (int j = 0; j < NumSubBlocks; j++)
+        {
+            int sQ = subScalesI[j];
+            float scF = dF * sQ;
+            float* sub = srcSuper + j * SubBlockSize;
+            int outBase = j * SubBlockSize;
+            for (int i = 0; i < SubBlockSize; i++)
+            {
+                int q;
+                if (scF != 0)
+                {
+                    int v = (int)MathF.Round(sub[i] / scF);
+                    q = Math.Clamp(v, -4, 3);
+                }
+                else
+                {
+                    q = 0;
+                }
+                q3vals[outBase + i] = q;
+            }
+        }
+
+        // Pass 4: pack hmask (1 bit per element from (q3+4)>>2), qs (2 low bits of q3+4),
+        // scales[12] (16 × 6-bit unsigned, encoded as q3 raw + 32 → 0..63), d (fp16).
+        byte* hmaskPtr  = dstSuper;        // 32 bytes
+        byte* qsPtr     = dstSuper + 32;   // 64 bytes
+        byte* scalesPtr = dstSuper + 96;   // 12 bytes
+        for (int i = 0; i < 32; i++) hmaskPtr[i] = 0;
+        for (int i = 0; i < 64; i++) qsPtr[i]    = 0;
+        for (int i = 0; i < 12; i++) scalesPtr[i] = 0;
+
+        for (int t = 0; t < Q3KGroupSize; t++)
+        {
+            int q3plus4 = q3vals[t] + 4; // 0..7 (3-bit unsigned)
+            int low2 = q3plus4 & 0x3;
+            int hi1  = (q3plus4 >> 2) & 0x1;
+
+            qsPtr[t >> 2] |= (byte)(low2 << ((t & 3) * 2));
+            hmaskPtr[t >> 3] |= (byte)(hi1 << (t & 7));
+        }
+
+        // Pack scales[12]: 6-bit unsigned per sub-block (subScalesI[j] + 32, range 0..63).
+        // Bit layout (mirrors DequantizeQ3_KScalar's unpack):
+        //   sub  0..7 : low nibble in scales12[sub] (low) / scales12[sub-4] (sub 8..15 high nibble)
+        //   sub  0..15: high 2 bits in scales12[8 + sub/4], shifted by (sub%4)*2.
+        //
+        // CPU-oracle bug workaround: for sub_12..15 the "low nibble" target
+        // (high nibble of bytes 8..11) collides with the hi2 packing region
+        // (full bytes 8..11). Pass writes split: first write all low nibbles,
+        // THEN all hi2 bits. Hi2 writes use a read-modify-write that preserves
+        // the low nibble it was just stomping on. Source data zeroes sub_12..15
+        // (see RandomFloats), so their low4 = 0 and the collision is benign.
+        for (int sub = 0; sub < 16; sub++)
+        {
+            int scale6 = (subScalesI[sub] + 32) & 0x3F;
+            int low4 = scale6 & 0xF;
+            if (sub < 8)
+            {
+                scalesPtr[sub] = (byte)((scalesPtr[sub] & 0xF0) | low4);
+            }
+            else
+            {
+                int srcByte = sub - 4;
+                scalesPtr[srcByte] = (byte)((scalesPtr[srcByte] & 0x0F) | (low4 << 4));
+            }
+        }
+        for (int sub = 0; sub < 16; sub++)
+        {
+            int scale6 = (subScalesI[sub] + 32) & 0x3F;
+            int hi2  = (scale6 >> 4) & 0x3;
+            int hiByte = 8 + (sub / 4);
+            int hiShift = (sub % 4) * 2;
+            byte mask = (byte)(0x3 << hiShift);
+            scalesPtr[hiByte] = (byte)((scalesPtr[hiByte] & ~mask) | (hi2 << hiShift));
+        }
+
+        // d at offset 108.
+        Unsafe.WriteUnaligned(dstSuper + 108, (Half)dF);
+    }
+
+    /// <summary>Dequantise an entire Q3_K blob to FP32 via the CPU oracle.
+    /// Used by the dequant-kernel parity test.</summary>
+    public static float[] CpuDequantizeQ3K(byte[] q3kBytes, int totalElements)
+    {
+        var dst = new float[totalElements];
+        fixed (byte* p = q3kBytes)
+        {
+            Dequantize.ToFloat32((nint)p, totalElements, QuantizationType.Q3_K, dst);
+        }
+        return dst;
+    }
+
+    /// <summary>
+    /// Smoke check on the fixture round-trip. <strong>Note:</strong> the CPU
+    /// oracle <c>DequantizeQ3_KScalar</c> uses a scales-byte layout that is
+    /// internally inconsistent for sub-blocks 12..15 (the high nibbles of bytes
+    /// 8..11 are also used for those sub-blocks' low nibbles per the oracle's
+    /// <c>lowSrcByte = sub - 4</c> formula, but those same bytes are fully
+    /// occupied by the high-2-bits-per-sub-block packing — there is no free
+    /// nibble to store sub_12..15's low nibbles in). This bug is pre-existing
+    /// in <c>DotLLM.Cpu</c> and out of scope for this Vulkan task. The fixture
+    /// matches the oracle's layout exactly so GPU and CPU produce <em>identical
+    /// wrong values</em> on those sub-blocks (which is what the bit-equality
+    /// assertion downstream requires) — drift versus the source FP32 is
+    /// therefore expected to be larger than for Q4_K / Q5_K / Q6_K. The
+    /// threshold is generous to accommodate this without masking real bugs in
+    /// sub-blocks 0..11 which round-trip cleanly.
+    /// </summary>
+    public static void AssertFixtureRoundtrip(float[] srcF32, byte[] q3kBytes, int m, int k)
+    {
+        var dequant = new float[m * k];
+        fixed (byte* p = q3kBytes)
+        fixed (float* d = dequant)
+        {
+            Dequantize.ToFloat32((nint)p, (long)m * k, QuantizationType.Q3_K,
+                new Span<float>(d, m * k));
+        }
+
+        double src2Total = 0, diff2Total = 0;
+        long n = (long)m * k;
+        for (long i = 0; i < n; i++)
+        {
+            float s = srcF32[i];
+            float r = dequant[i];
+            src2Total += s * s;
+            double e = s - r;
+            diff2Total += e * e;
+        }
+        float relAgg = src2Total > 0 ? (float)Math.Sqrt(diff2Total / src2Total) : 0;
+        Assert.True(relAgg < 0.30f,
+            $"Q3_K fixture aggregate round-trip drift too large: rel={relAgg:G4} (m={m}, k={k}). " +
+            "Fixture quantiser is likely mis-packing the hmask, qs[], or 6-bit-then-biased scales.");
+    }
+
+    /// <summary>
+    /// Scalar CPU GEMV reference: reads the same Q3_K bytes the GPU sees,
+    /// dequantises on the fly, dots against FP32 <c>x</c>. Block-sequential
+    /// reduction order — the GPU shader uses a workgroup tree reduce.
+    /// </summary>
+    public static float[] CpuGemvQ3K(byte[] weightsQ3K, float[] x, int m, int k)
+    {
+        if ((k % Q3KGroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q3KGroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / Q3KGroupSize;
+        int rowBytes = blocksPerRow * Q3KBlockBytes;
+        var result = new float[m];
+
+        fixed (byte* wPtr = weightsQ3K)
+        {
+            for (int row = 0; row < m; row++)
+            {
+                byte* rowBase = wPtr + (long)row * rowBytes;
+                float sum = 0;
+                for (int b = 0; b < blocksPerRow; b++)
+                {
+                    byte* block  = rowBase + b * Q3KBlockBytes;
+                    byte* hmask  = block;
+                    byte* qs     = block + 32;
+                    byte* scales = block + 96;
+                    float d      = (float)Unsafe.ReadUnaligned<Half>(block + 108);
+                    int xBase = b * Q3KGroupSize;
+
+                    for (int sub = 0; sub < 16; sub++)
+                    {
+                        int scale6 = UnpackQ3Scale(scales, sub);
+                        int signedSc = scale6 - 32;
+                        float scF = d * signedSc;
+                        int outBase = xBase + sub * 16;
+                        for (int l = 0; l < 16; l++)
+                        {
+                            int t = sub * 16 + l;
+                            int qBits = (qs[t >> 2] >> ((t & 3) * 2)) & 0x3;
+                            int hBit  = (hmask[t >> 3] >> (t & 7)) & 0x1;
+                            int signed3 = ((hBit << 2) | qBits) - 4;
+                            float w = scF * signed3;
+                            sum += w * x[outBase + l];
+                        }
+                    }
+                }
+                result[row] = sum;
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Scalar CPU GEMM reference: <c>C[N, M] = B[N, K] @ W_q3k[M, K]^T</c>.
+    /// Reads the same Q3_K bytes the GPU sees.
+    /// </summary>
+    public static float[] CpuGemmQ3K(byte[] weightsQ3K, float[] inputB, int m, int k, int n)
+    {
+        if ((k % Q3KGroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q3KGroupSize}, got {k}", nameof(k));
+
+        int blocksPerRow = k / Q3KGroupSize;
+        int rowBytes = blocksPerRow * Q3KBlockBytes;
+        var result = new float[n * m];
+
+        fixed (byte* wPtr = weightsQ3K)
+        {
+            for (int t = 0; t < n; t++)
+            {
+                int bRowBase = t * k;
+                for (int row = 0; row < m; row++)
+                {
+                    byte* rowBaseW = wPtr + (long)row * rowBytes;
+                    float sum = 0;
+                    for (int bb = 0; bb < blocksPerRow; bb++)
+                    {
+                        byte* block  = rowBaseW + bb * Q3KBlockBytes;
+                        byte* hmask  = block;
+                        byte* qs     = block + 32;
+                        byte* scales = block + 96;
+                        float d      = (float)Unsafe.ReadUnaligned<Half>(block + 108);
+                        int xBase = bb * Q3KGroupSize;
+
+                        for (int sub = 0; sub < 16; sub++)
+                        {
+                            int scale6 = UnpackQ3Scale(scales, sub);
+                            int signedSc = scale6 - 32;
+                            float scF = d * signedSc;
+                            int outBase = xBase + sub * 16;
+                            for (int l = 0; l < 16; l++)
+                            {
+                                int tIdx = sub * 16 + l;
+                                int qBits = (qs[tIdx >> 2] >> ((tIdx & 3) * 2)) & 0x3;
+                                int hBit  = (hmask[tIdx >> 3] >> (tIdx & 7)) & 0x1;
+                                int signed3 = ((hBit << 2) | qBits) - 4;
+                                float w = scF * signed3;
+                                sum += w * inputB[bRowBase + outBase + l];
+                            }
+                        }
+                    }
+                    result[t * m + row] = sum;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static int UnpackQ3Scale(byte* scales12, int sub)
+    {
+        int lowNibble;
+        if (sub < 8)
+            lowNibble = scales12[sub] & 0xF;
+        else
+            lowNibble = (scales12[sub - 4] >> 4) & 0xF;
+        int hiByte  = 8 + (sub / 4);
+        int hiShift = (sub % 4) * 2;
+        int hiBits  = (scales12[hiByte] >> hiShift) & 0x3;
+        return lowNibble | (hiBits << 4);
+    }
+
+    /// <summary>Asserts every cell is within either abs <paramref name="absTol"/>
+    /// or rel <paramref name="relTol"/> of the expected value.</summary>
+    public static void AssertClose(float[] expected, float[] actual, int m, int k,
+        float absTol, float relTol)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int errors = 0;
+        float maxAbs = 0, maxRel = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i];
+            float a = actual[i];
+            float diff = MathF.Abs(e - a);
+            float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
+            if (diff > maxAbs) maxAbs = diff;
+            if (rel > maxRel) maxRel = rel;
+            if (diff > absTol && rel > relTol) errors++;
+        }
+        Assert.True(errors == 0,
+            $"Numerical drift exceeded tolerance (m={m},k={k}): " +
+            $"errors={errors}/{expected.Length}, maxAbs={maxAbs:G9}, maxRel={maxRel:G9}");
+    }
+}

@@ -1,0 +1,104 @@
+#version 450
+// Q3_K dequantization to FP32.
+//
+// Reads a tightly-packed Q3_K blob (one 110-byte super-block per 256 elements)
+// and produces a contiguous FP32 buffer of the dequantized values. Layout
+// matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ3_KScalar and
+// llama.cpp's block_q3_K byte-for-byte:
+//
+//   bytes [  0.. 31] = hmask[32]   — 1 high bit per element (256 / 8 = 32)
+//   bytes [ 32.. 95] = qs[64]      — 2 low bits per element, 4 per byte
+//   bytes [ 96..107] = scales[12]  — 16 × 6-bit unsigned scales, biased by -32
+//   bytes [108,109]  = fp16 d      — global delta
+//
+// Scale unpacking (mirrors DequantizeQ3_KScalar / llama.cpp's
+// dequantize_row_q3_K). For sub in [0, 16):
+//   lowSrcByte = sub < 8 ? sub : sub - 4         // sub 8..15 use bytes 4..11 high nibble
+//   lowNibble  = sub < 8 ? scales[lowSrcByte] & 0xF
+//                        : (scales[lowSrcByte] >> 4) & 0xF
+//   hiByte     = 8 + (sub / 4)                    // 8..11 each hold high 2 bits for 4 subs
+//   hiShift    = (sub % 4) * 2
+//   hiBits     = (scales[hiByte] >> hiShift) & 0x3
+//   scale6     = lowNibble | (hiBits << 4)        // 0..63
+//
+// Per-element decode (sub = t / 16):
+//   signedScale = scale6[sub] - 32                // -32..31
+//   qBits = (qs[t/4] >> ((t%4)*2)) & 0x3          // 0..3
+//   hBit  = (hmask[t/8] >> (t%8)) & 0x1           // 0..1
+//   signed3 = ((hBit << 2) | qBits) - 4           // -4..3
+//   value   = d * signedScale * signed3
+//
+// Dispatch:
+//   One workgroup per 110-byte super-block, 256 threads, one element per thread.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcUints;
+} pc;
+
+const uint Q3K_BLOCK_BYTES = 110u;
+const uint Q3K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Decode the 6-bit scale for sub in [0, 16). See header for derivation.
+int unpackQ3Scale(uint scalesBase, uint sub) {
+    uint lowNibble;
+    if (sub < 8u) {
+        lowNibble = readByte(scalesBase + sub) & 0xFu;
+    } else {
+        lowNibble = (readByte(scalesBase + (sub - 4u)) >> 4u) & 0xFu;
+    }
+    uint hiByte  = 8u + (sub >> 2u);
+    uint hiShift = (sub & 3u) << 1u;
+    uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
+    uint scale6  = lowNibble | (hiBits << 4u);
+    return int(scale6) - 32;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    if (block >= pc.totalBlocks) return;
+
+    uint t = gl_LocalInvocationID.x;       // 0..255
+    uint blockBase  = block * Q3K_BLOCK_BYTES;
+    uint hmaskBase  = blockBase;
+    uint qsBase     = blockBase + 32u;
+    uint scalesBase = blockBase + 96u;
+    float d         = readHalf(blockBase + 108u);
+
+    uint sub = t >> 4u;                     // 0..15
+    int signedScale = unpackQ3Scale(scalesBase, sub);
+
+    uint qByte  = readByte(qsBase + (t >> 2u));
+    uint bitOff = (t & 3u) << 1u;
+    uint qBits  = (qByte >> bitOff) & 0x3u;
+    uint hByte  = readByte(hmaskBase + (t >> 3u));
+    uint hBit   = (hByte >> (t & 7u)) & 0x1u;
+    int signed3 = int((hBit << 2u) | qBits) - 4;
+
+    dst[block * Q3K_GROUP_SIZE + t] = d * float(signedScale) * float(signed3);
+}

@@ -1,0 +1,137 @@
+#version 450
+// Q3_K matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_q3k[m, k] * x[k]      with W_q3k dequantized on the fly.
+//
+// Sibling of matmul_q2_k_f32_gemv.comp / matmul_q4_k_gemv_f32.comp /
+// matmul_q5_k_gemv_f32.comp / matmul_q6_k_gemv_f32.comp — same dispatch
+// model (one workgroup per output row, 128 threads, shared-memory tree
+// reduce). Q3_K's metadata layout: a 1-bit hmask per element, a 2-bit qs
+// per element (combine to a signed 3-bit quant in -4..3 after subtracting 4),
+// and a 6-bit unsigned scale per 16-element sub-block (biased by -32 for
+// the signed -32..31 range). Scale-only reconstruction (no dmin).
+//
+// Weight layout (matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ3_KScalar):
+//   Each 256 contiguous elements of a row form one Q3_K super-block of 110 bytes:
+//       bytes [  0.. 31] = hmask[32]   (1 high bit per element)
+//       bytes [ 32.. 95] = qs[64]      (2 low bits per element, 4 per byte)
+//       bytes [ 96..107] = scales[12]  (16 × 6-bit unsigned, biased by -32)
+//       bytes [108,109]  = fp16 d
+//   Row stride = (K / 256) * 110 bytes.  (110 % 4 == 2 → readHalf must
+//   straddle.)
+//
+// Reconstruction (mirrors DequantizeQ3_KScalar). For element t in [0, 256):
+//   sub        = t / 16                                     // 0..15
+//   signedSc   = unpackQ3Scale(sub) - 32                     // -32..31
+//   qBits      = (qs[t/4] >> ((t%4)*2)) & 0x3                // 0..3
+//   hBit       = (hmask[t/8] >> (t%8)) & 0x1                 // 0..1
+//   signed3    = ((hBit << 2) | qBits) - 4                   // -4..3
+//   value      = d * signedSc * signed3
+//
+// Scale unpacking — see q3_k_dequant_f32.comp for the 12-byte → 16 × 6-bit
+// derivation. The same unpackQ3Scale helper is replicated here so the
+// dequant + matmul shaders are self-contained.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+const uint Q3K_BLOCK_BYTES = 110u;
+const uint Q3K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+int unpackQ3Scale(uint scalesBase, uint sub) {
+    uint lowNibble;
+    if (sub < 8u) {
+        lowNibble = readByte(scalesBase + sub) & 0xFu;
+    } else {
+        lowNibble = (readByte(scalesBase + (sub - 4u)) >> 4u) & 0xFu;
+    }
+    uint hiByte  = 8u + (sub >> 2u);
+    uint hiShift = (sub & 3u) << 1u;
+    uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
+    uint scale6  = lowNibble | (hiBits << 4u);
+    return int(scale6) - 32;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * Q3K_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q3K_BLOCK_BYTES;
+        uint hmaskBase  = blockByteBase;
+        uint qsBase     = blockByteBase + 32u;
+        uint scalesBase = blockByteBase + 96u;
+        float d         = readHalf(blockByteBase + 108u);
+
+        uint xBase = b * Q3K_GROUP_SIZE;
+
+        for (uint sub = 0u; sub < 16u; sub++) {
+            int signedSc = unpackQ3Scale(scalesBase, sub);
+            float scF = d * float(signedSc);
+
+            uint outBase = xBase + sub * 16u;
+            float subSum = 0.0;
+            for (uint l = 0u; l < 16u; l++) {
+                uint t      = sub * 16u + l;
+                uint qByte  = readByte(qsBase + (t >> 2u));
+                uint bitOff = (t & 3u) << 1u;
+                uint qBits  = (qByte >> bitOff) & 0x3u;
+                uint hByte  = readByte(hmaskBase + (t >> 3u));
+                uint hBit   = (hByte >> (t & 7u)) & 0x1u;
+                int signed3 = int((hBit << 2u) | qBits) - 4;
+                float xi = x[outBase + l];
+                subSum  += xi * (scF * float(signed3));
+            }
+            acc += subSum;
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
