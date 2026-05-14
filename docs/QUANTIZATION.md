@@ -113,8 +113,9 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
 | IQ4_NL | ✓ | ✓ | — | IQ-family Phase 2 |
 | IQ4_XS | ✓ | ✓ | — | IQ-family Phase 2 |
+| IQ1_S | ✓ | ✓ | — | IQ-family — smallest GGUF quant (~1.5-1.7 bpw) |
 
-Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ3_x / IQ2_x / IQ1_S Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints); IQ4_NL and IQ4_XS followed because they are the most-used IQ-family quants in production (Llama-3.1 / Qwen2.5 IQ4_XS). Q2_K + Q3_K + IQ3 / IQ2 / IQ1 are present in the CUDA backend (lighter-weight reference kernels) and are tracked as Vulkan follow-ups.
+Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ3_x / IQ2_x Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints); IQ4_NL and IQ4_XS followed because they are the most-used IQ-family quants in production (Llama-3.1 / Qwen2.5 IQ4_XS). IQ1_S closes the IQ family at the smallest end. Q2_K + Q3_K + IQ3 / IQ2 are present in the CUDA backend (lighter-weight reference kernels) and are tracked as Vulkan follow-ups.
 
 ### IQ4_NL / IQ4_XS layout (Vulkan)
 
@@ -148,6 +149,32 @@ Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `
 
 Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_*, IQ3_* Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K + IQ4_NL + IQ4_XS are present in the CUDA backend and are tracked as Vulkan follow-ups (parallel agent landed CUDA IQ4 in `6f12eab`'s sibling commits). The IQ2 family was prioritised on Vulkan to enable Qwen3.6-A3B-IQ2_M (~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload.
 
+### IQ1_S layout (Vulkan)
+
+IQ1_S is the smallest GGUF quant (~1.5-1.7 bpw) and uses a 2048-entry signed-int8 codebook (`iq1s_grid`) — 8 ternary values {-1, 0, +1} packed into each `uint64` entry — together with a per-32-element `qh` field that carries a 3-bit scale, a sign-of-delta bit, and four 3-bit grid-index high parts. The codebook is duplicated as a `const uint[4096]` (each ggml uint64 split into a low/high uint pair, 16 KB total) inside each shader. SPV blobs are ~24-30 KB — bigger than the IQ4 kernels but still fast to JIT.
+
+**IQ1_S** (256-element super-block, 50 bytes/super-block):
+```
+bytes [0,1]    = fp16 d
+bytes [2..33]  = qs[32]                   // low 8 bits of grid index per group of 8 elements
+bytes [34..49] = qh[8]                    // uint16 LE, per 32-element sub-block:
+                                          //   bits  0..2  = grid-index high 3 bits, group 0
+                                          //   bits  3..5  = ...                       group 1
+                                          //   bits  6..8  = ...                       group 2
+                                          //   bits  9..11 = ...                       group 3
+                                          //   bits 12..14 = 3-bit per-block scale
+                                          //   bit  15     = sign of delta (0 -> +0.125, 1 -> -)
+per sub-block ib (8 sub-blocks per super-block, 4 groups of 8 elements per sub-block):
+    dl    = d * (2 * ((qh[ib] >> 12) & 7) + 1)
+    delta = (qh[ib] & 0x8000) ? -0.125 : +0.125
+per group l in [0..4):
+    idx   = qs[ib*4 + l] | (((qh[ib] >> 3*l) & 7) << 8)   // 11-bit, 2048 entries
+    grid  = iq1s_grid[idx]                                // 8 packed signed-int8 ternary values
+    y[j]  = dl * (grid[j] + delta)                        // for j in [0..8)
+```
+
+Alignment: IQ1_S kernels require `inputDim % 256 == 0`. The upload path's `KeepIq1SOnDevice` predicate gates on this.
+
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
 ## IQ-family (importance-quant) Coverage
@@ -163,5 +190,13 @@ I-quants encode weight values via a small codebook lookup rather than linear qua
 | IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
 
 The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs uploaded once per model load (3 grids + ksigns ≈ 14 KB on device, shared by all 6 IQ2 matmul kernels via `Iq2Codebooks`). Per-element decode is `db * grid[gridIdx*8+j] * sign_j`; per-pair scale uses the same `db = d * (0.5 + sub_scale) * 0.25` arithmetic as the CPU oracle. IQ2_XXS / IQ2_XS resolve `sign_j` via the 128-entry `ksigns_iq2xs` lookup; IQ2_S stores the 8-bit sign mask directly per pair.
+| Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Notes |
+|---|---|---|---|---|---|---|---|
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
+| IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
+| IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
+| IQ1_S | 256 | ~1.5625 | ✓ | dequant-fallback | — | — | **Vulkan-only on GPU.** 2048-entry codebook of 8 ternary {-1, 0, +1} values packed into each uint64. Per-sub-block 3-bit scale + sign-of-delta in `qh[uint16]`. Smallest GGUF quant. |
 
-**dotLLM does not yet support IQ1_S / IQ1_M / IQ3_XXS / IQ3_S** — these are out of scope for the current task. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 family are deferred; prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.
+**IQ1_S** is now supported on CPU and Vulkan (dequant + GEMV + GEMM); the CUDA backend treats it as a CPU-only fallback. **IQ1_M / IQ3_XXS / IQ3_S** remain out of scope. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 family are deferred; prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.
