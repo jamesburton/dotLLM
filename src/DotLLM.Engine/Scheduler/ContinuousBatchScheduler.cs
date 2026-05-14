@@ -10,6 +10,7 @@ using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
 using DotLLM.Engine.Constraints;
 using DotLLM.Engine.KvCache;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
 using DotLLM.Tokenizers;
@@ -54,6 +55,9 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private readonly Func<ModelConfig, int, IKvCache> _kvCacheFactory;
     private readonly ContinuousBatchSchedulerOptions _options;
     private readonly KvBlockPool? _pagedPool;
+    private readonly PrefixTrieManager? _prefixCache;
+    private long _cachedPromptTokens;
+    private long _prefilledPromptTokens;
 
     private readonly ConcurrentQueue<SchedulerRequest> _pendingQueue = new();
     private readonly List<SchedulerRequest> _active = new();
@@ -91,12 +95,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// <param name="pagedPool">Optional reference to the underlying paged-block pool. When provided,
     /// admission uses pool free-block count for capacity gating in addition to
     /// <see cref="ContinuousBatchSchedulerOptions.MaxActiveSequences"/>.</param>
+    /// <param name="prefixCache">Optional cross-request prefix cache. When provided, admission
+    /// seeds new KV-caches from the trie and routes completions back to it (Step 37).</param>
     public ContinuousBatchScheduler(
         IModel model,
         ITokenizer tokenizer,
         Func<ModelConfig, int, IKvCache> kvCacheFactory,
         ContinuousBatchSchedulerOptions? options = null,
-        KvBlockPool? pagedPool = null)
+        KvBlockPool? pagedPool = null,
+        PrefixTrieManager? prefixCache = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(tokenizer);
@@ -106,7 +113,14 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         _kvCacheFactory = kvCacheFactory;
         _options = options ?? new ContinuousBatchSchedulerOptions();
         _pagedPool = pagedPool;
+        _prefixCache = prefixCache;
     }
+
+    /// <summary>Cumulative prompt tokens served from the prefix cache (no prefill needed).</summary>
+    public long CachedPromptTokens => Interlocked.Read(ref _cachedPromptTokens);
+
+    /// <summary>Cumulative prompt tokens that required prefill compute.</summary>
+    public long PrefilledPromptTokens => Interlocked.Read(ref _prefilledPromptTokens);
 
     /// <inheritdoc/>
     public ISchedulerRequest Submit(InferenceRequest request, CancellationToken cancellationToken = default)
@@ -225,11 +239,16 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 break;
             }
 
-            // Block-pool gating: refuse admission if the paged pool can't fit the worst-case footprint.
+            // Block-pool gating: refuse admission if the paged pool can't fit the worst-case
+            // footprint. Try to relieve pressure by evicting zero-refcount trie blocks first.
             if (_pagedPool is not null && _options.ReserveBlocksPerSequence > 0 &&
                 _pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
             {
-                break;
+                int short_ = _options.ReserveBlocksPerSequence - _pagedPool.FreeBlocks;
+                if (_prefixCache is not null)
+                    _prefixCache.TryEvict(short_);
+                if (_pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
+                    break;
             }
 
             if (!_pendingQueue.TryDequeue(out var seq))
@@ -317,21 +336,56 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
         int promptLen = seq.PromptLength;
         int cacheSize = Math.Min(promptLen + seq.MaxTokens, _model.Config.MaxSequenceLength);
-        seq.KvCache = _kvCacheFactory(_model.Config, cacheSize);
+        var promptIds = seq.PromptTokenIds;
+
+        // Prefix-cache-aware admission: when the manager can seed a prefix, only the
+        // suffix is run through the model. Falls back to the configured factory when
+        // the cache is disabled, missed, or no manager is wired.
+        int cachedTokens = 0;
+        if (_prefixCache is not null)
+        {
+            var admission = _prefixCache.Admit(promptIds, cacheSize);
+            seq.KvCache = admission.Cache;
+            seq.IsPrefixCached = true;
+            cachedTokens = admission.CachedTokens;
+        }
+        else
+        {
+            seq.KvCache = _kvCacheFactory(_model.Config, cacheSize);
+        }
+
+        seq.PrefixCachedTokens = cachedTokens;
+        Interlocked.Add(ref _cachedPromptTokens, cachedTokens);
+        Interlocked.Add(ref _prefilledPromptTokens, promptLen - cachedTokens);
         seq.State = SequenceState.Prefilling;
 
         int vocabSize = _model.Config.VocabSize;
-        var promptIds = seq.PromptTokenIds;
 
-        int[] positionsArray = ArrayPool<int>.Shared.Rent(promptLen);
+        int prefillStart = cachedTokens;
+        int prefillLen = promptLen - prefillStart;
+
+        int[] positionsArray = ArrayPool<int>.Shared.Rent(Math.Max(1, prefillLen));
         try
         {
-            var positions = positionsArray.AsSpan(0, promptLen);
-            for (int i = 0; i < promptLen; i++)
-                positions[i] = i;
+            ReadOnlySpan<int> forwardTokens;
+            Span<int> positions;
+            if (prefillLen > 0)
+            {
+                positions = positionsArray.AsSpan(0, prefillLen);
+                for (int i = 0; i < prefillLen; i++)
+                    positions[i] = prefillStart + i;
+                forwardTokens = promptIds.AsSpan(prefillStart);
+            }
+            else
+            {
+                // 100% cache hit — re-forward last prompt token to obtain its logits.
+                positions = positionsArray.AsSpan(0, 1);
+                positions[0] = promptLen - 1;
+                forwardTokens = promptIds.AsSpan(promptLen - 1, 1);
+            }
 
             long ts0 = Stopwatch.GetTimestamp();
-            using ITensor prefillLogits = _model.Forward(promptIds, positions, deviceId: -1, seq.KvCache);
+            using ITensor prefillLogits = _model.Forward(forwardTokens, positions, deviceId: -1, seq.KvCache);
             long ts1 = Stopwatch.GetTimestamp();
             seq.PrefillTicks = ts1 - ts0;
 
@@ -519,6 +573,36 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         var cache = seq.KvCache;
         if (cache is null) return;
         seq.KvCache = null;
+
+        // Push back into the prefix trie before disposal so freshly-computed blocks
+        // can be reused by future requests.
+        if (seq.IsPrefixCached && _prefixCache is not null && cache is PagedKvCache paged)
+        {
+            try
+            {
+                // Build the full token sequence (prompt + generated) covered by the cache.
+                int promptLen = seq.PromptLength;
+                int genCount = seq.GeneratedTokens.Count;
+                int totalLen = promptLen + genCount;
+                var full = ArrayPool<int>.Shared.Rent(totalLen);
+                try
+                {
+                    Array.Copy(seq.PromptTokenIds, full, promptLen);
+                    for (int i = 0; i < genCount; i++)
+                        full[promptLen + i] = seq.GeneratedTokens[i];
+                    _prefixCache.RecordCompletion(paged, full.AsSpan(0, totalLen));
+                }
+                finally
+                {
+                    ArrayPool<int>.Shared.Return(full);
+                }
+            }
+            catch
+            {
+                // Telemetry-only failure; never block the scheduler loop.
+            }
+        }
+
         try { cache.Dispose(); }
         catch
         {

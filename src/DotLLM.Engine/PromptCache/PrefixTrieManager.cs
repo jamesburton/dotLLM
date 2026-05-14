@@ -110,13 +110,12 @@ public sealed class PrefixTrieManager : IDisposable
     private int TryLookupWithRetry(ReadOnlySpan<int> promptTokens, List<int> matched, int maxSeqLen)
     {
         int cachedTokens = _trie.Lookup(promptTokens, matched);
-        // Don't seed blocks that won't leave room for at least one fresh suffix block.
         int blockSize = _trie.BlockSize;
-        int maxSeededTokens = ((maxSeqLen - blockSize) / blockSize) * blockSize;
+        // Cap seeded tokens to whole blocks the cache can hold.
+        int maxSeededTokens = (maxSeqLen / blockSize) * blockSize;
         if (cachedTokens > maxSeededTokens && maxSeededTokens >= 0)
         {
             int desiredBlocks = maxSeededTokens / blockSize;
-            // Release the surplus refs.
             var surplus = matched.GetRange(desiredBlocks, matched.Count - desiredBlocks);
             _trie.Release(surplus);
             matched.RemoveRange(desiredBlocks, matched.Count - desiredBlocks);

@@ -36,6 +36,13 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>KV-cache assigned at admission time. Released when the sequence is evicted.</summary>
     public IKvCache? KvCache { get; set; }
 
+    /// <summary>True when the cache was minted by the prefix trie manager; its completion
+    /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>
+    public bool IsPrefixCached { get; set; }
+
+    /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
+    public int PrefixCachedTokens { get; set; }
+
     /// <summary>Sampler pipeline built from the request's <c>InferenceOptions</c>.</summary>
     public SamplerPipeline SamplerPipeline { get; }
 
