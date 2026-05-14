@@ -19,7 +19,17 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public class VulkanGdnDecayF32KernelTests
 {
-    private const int MaxUlpDiff = 4;
+    // Composition is `exp(log(1 + exp(a)) * A)` — chained transcendentals.
+    // GLSL spec allows 4 ULP per `exp`/`log` call, so the worst-case error
+    // for the composition is bounded between 4 and ~16 ULP depending on the
+    // condition number at the evaluation point. Empirically across the
+    // (seqLen=17, nVHead=32) sweep we see 5 ULP on a single element out of
+    // 544 — the rest are within 4 ULP. An 8-ULP tolerance covers the
+    // observed composition drift with a 1.6× safety margin without masking
+    // any algorithmic divergence (the shader is element-wise scalar with no
+    // reduction, so anything beyond transcendental ULP drift would indicate
+    // a real bug).
+    private const int MaxUlpDiff = 8;
 
     [SkippableTheory]
     [InlineData(1, 16)]
