@@ -340,11 +340,15 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
     private static bool KeepQ4K(QuantizationType qt, int k) => qt == QuantizationType.Q4_K && (k % 256) == 0;
     private static bool KeepQ5K(QuantizationType qt, int k) => qt == QuantizationType.Q5_K && (k % 256) == 0;
     private static bool KeepQ6K(QuantizationType qt, int k) => qt == QuantizationType.Q6_K && (k % 256) == 0;
+    private static bool KeepIq2Xxs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XXS && (k % 256) == 0;
+    private static bool KeepIq2Xs(QuantizationType qt, int k) => qt == QuantizationType.IQ2_XS && (k % 256) == 0;
+    private static bool KeepIq2S(QuantizationType qt, int k) => qt == QuantizationType.IQ2_S && (k % 256) == 0;
     private static bool KeepF16(QuantizationType qt, int k) => qt == QuantizationType.F16 && (k & 1) == 0;
     private static bool KeepBf16(QuantizationType qt, int k) => qt == QuantizationType.BF16 && (k & 1) == 0;
 
     private static bool KeepNative(QuantizationType qt, int k)
         => KeepQ8(qt, k) || KeepQ4K(qt, k) || KeepQ5K(qt, k) || KeepQ6K(qt, k)
+        || KeepIq2Xxs(qt, k) || KeepIq2Xs(qt, k) || KeepIq2S(qt, k)
         || KeepF16(qt, k) || KeepBf16(qt, k);
 
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int k)
@@ -353,6 +357,9 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         if (KeepQ4K(qt, k)) return QuantizationType.Q4_K;
         if (KeepQ5K(qt, k)) return QuantizationType.Q5_K;
         if (KeepQ6K(qt, k)) return QuantizationType.Q6_K;
+        if (KeepIq2Xxs(qt, k)) return QuantizationType.IQ2_XXS;
+        if (KeepIq2Xs(qt, k)) return QuantizationType.IQ2_XS;
+        if (KeepIq2S(qt, k)) return QuantizationType.IQ2_S;
         if (KeepF16(qt, k)) return QuantizationType.F16;
         if (KeepBf16(qt, k)) return QuantizationType.BF16;
         return QuantizationType.F32;

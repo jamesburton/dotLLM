@@ -26,6 +26,20 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulIq4NlGemmF32Kernel MatMulIq4NlGemm { get; }
     public MatMulIq4XsGemvF32Kernel MatMulIq4Xs { get; }
     public MatMulIq4XsGemmF32Kernel MatMulIq4XsGemm { get; }
+    /// <summary>Shared IQ2 codebooks (3 grids + ksigns) backing all 6 IQ2 matmul kernels.</summary>
+    public Iq2Codebooks Iq2Codebooks { get; }
+    /// <summary>IQ2_XXS GEMV (decode).</summary>
+    public MatMulIq2XxsGemvF32Kernel MatMulIq2Xxs { get; }
+    /// <summary>IQ2_XXS GEMM (prefill).</summary>
+    public MatMulIq2XxsGemmF32Kernel MatMulIq2XxsGemm { get; }
+    /// <summary>IQ2_XS GEMV.</summary>
+    public MatMulIq2XsGemvF32Kernel MatMulIq2Xs { get; }
+    /// <summary>IQ2_XS GEMM.</summary>
+    public MatMulIq2XsGemmF32Kernel MatMulIq2XsGemm { get; }
+    /// <summary>IQ2_S GEMV.</summary>
+    public MatMulIq2SGemvF32Kernel MatMulIq2S { get; }
+    /// <summary>IQ2_S GEMM.</summary>
+    public MatMulIq2SGemmF32Kernel MatMulIq2SGemm { get; }
     public MatMulF16GemvF32Kernel MatMulF16 { get; }
     public MatMulF16GemmF32Kernel MatMulF16Gemm { get; }
     public MatMulF16GemmCoopmatKernel? MatMulF16GemmCoopmat { get; }
@@ -67,6 +81,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
         MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
         MatMulIq4XsGemvF32Kernel matmulIq4Xs, MatMulIq4XsGemmF32Kernel matmulIq4XsGemm,
+        Iq2Codebooks iq2Codebooks,
+        MatMulIq2XxsGemvF32Kernel matmulIq2Xxs, MatMulIq2XxsGemmF32Kernel matmulIq2XxsGemm,
+        MatMulIq2XsGemvF32Kernel matmulIq2Xs, MatMulIq2XsGemmF32Kernel matmulIq2XsGemm,
+        MatMulIq2SGemvF32Kernel matmulIq2S, MatMulIq2SGemmF32Kernel matmulIq2SGemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -88,6 +106,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ6K = matmulQ6K; MatMulQ6KGemm = matmulQ6KGemm;
         MatMulIq4Nl = matmulIq4Nl; MatMulIq4NlGemm = matmulIq4NlGemm;
         MatMulIq4Xs = matmulIq4Xs; MatMulIq4XsGemm = matmulIq4XsGemm;
+        Iq2Codebooks = iq2Codebooks;
+        MatMulIq2Xxs = matmulIq2Xxs; MatMulIq2XxsGemm = matmulIq2XxsGemm;
+        MatMulIq2Xs = matmulIq2Xs; MatMulIq2XsGemm = matmulIq2XsGemm;
+        MatMulIq2S = matmulIq2S; MatMulIq2SGemm = matmulIq2SGemm;
         MatMulF16 = matmulF16; MatMulF16Gemm = matmulF16Gemm;
         MatMulF16GemmCoopmat = matmulF16GemmCoopmat;
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
@@ -124,6 +146,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var matmulIq4NlGemm = MatMulIq4NlGemmF32Kernel.Create(device, spvDir);
         var matmulIq4Xs = MatMulIq4XsGemvF32Kernel.Create(device, spvDir);
         var matmulIq4XsGemm = MatMulIq4XsGemmF32Kernel.Create(device, spvDir);
+        var iq2Codebooks = Iq2Codebooks.Create(device);
+        var matmulIq2Xxs     = MatMulIq2XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2XxsGemm = MatMulIq2XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2Xs      = MatMulIq2XsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2XsGemm  = MatMulIq2XsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2S       = MatMulIq2SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2SGemm   = MatMulIq2SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
         var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
@@ -164,6 +193,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulQ6K, matmulQ6KGemm,
             matmulIq4Nl, matmulIq4NlGemm,
             matmulIq4Xs, matmulIq4XsGemm,
+            iq2Codebooks,
+            matmulIq2Xxs, matmulIq2XxsGemm,
+            matmulIq2Xs, matmulIq2XsGemm,
+            matmulIq2S, matmulIq2SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, rope, attention, swiglu, add, silu, conv1d,
@@ -190,6 +223,12 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq4NlGemm.InvalidateDescriptorCache();
         MatMulIq4Xs.InvalidateDescriptorCache();
         MatMulIq4XsGemm.InvalidateDescriptorCache();
+        MatMulIq2Xxs.InvalidateDescriptorCache();
+        MatMulIq2XxsGemm.InvalidateDescriptorCache();
+        MatMulIq2Xs.InvalidateDescriptorCache();
+        MatMulIq2XsGemm.InvalidateDescriptorCache();
+        MatMulIq2S.InvalidateDescriptorCache();
+        MatMulIq2SGemm.InvalidateDescriptorCache();
         MatMulF16.InvalidateDescriptorCache();
         MatMulF16Gemm.InvalidateDescriptorCache();
         MatMulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -246,6 +285,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulIq4Xs.Dispose();
         MatMulIq4NlGemm.Dispose();
         MatMulIq4Nl.Dispose();
+        MatMulIq2SGemm.Dispose();
+        MatMulIq2S.Dispose();
+        MatMulIq2XsGemm.Dispose();
+        MatMulIq2Xs.Dispose();
+        MatMulIq2XxsGemm.Dispose();
+        MatMulIq2Xxs.Dispose();
+        Iq2Codebooks.Dispose();
         MatMulQ6KGemm.Dispose();
         MatMulQ6K.Dispose();
         MatMulQ5KGemm.Dispose();
