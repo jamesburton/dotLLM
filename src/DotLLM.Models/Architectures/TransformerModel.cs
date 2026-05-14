@@ -1058,16 +1058,28 @@ public sealed unsafe class TransformerModel : IModel
 
         float scale = adapter.Alpha / adapter.Rank;
 
-        // Phase 4d.5 / Gap 2 — fast path: both base and adapter B are Q8_0
-        // AND the caller pre-quantised x. Stage 1 becomes a GemmQ8_0 against
-        // the cached xQ8 buffer (no redundant activation quant), stage 2
-        // unchanged. inputDim is always a multiple of 32 for transformer
-        // linear projections, so the Q8_0 row constraint is satisfied
-        // by construction — defensive check anyway.
+        // Phase 4d.5 / Gap 2 — fast-path plumbing: when both base and adapter
+        // B are Q8_0 AND the caller pre-quantised x, we can route stage 1
+        // through `MatMul.GemmQ8_0(preQuantizedInput=preQuantX)` and skip the
+        // activation-quant cost. Kept gated behind
+        // `DOTLLM_LORA_FORCE_Q8_PREQUANT=1` because direct kernel-level
+        // probing (`benchmarks/LoraQ8Stage1Probe`) on Strix Halo measures
+        // the Q8_0 GEMM at M=rank=16, K=hidden=2048, N=seqLen=512 to be
+        // ~1.7× SLOWER per call than Agent 7's dequant-once F32 path. The
+        // Q8_0 integer-dot kernels (VecDotQ8_0Avx512_4Rows) amortise per-block
+        // overhead (Half→F32 conversion, scale broadcast, MultiplyAddAdjacent
+        // chain) across M rows; at M=16 there isn't enough vertical reuse for
+        // the kernel to pay back its constant cost vs the F32 GemvF32 path's
+        // TensorPrimitives.Dot inner loop. See
+        // `.continue-here-lora-final-mile.md` for the diagnosis + the
+        // proposed follow-up: a stage-1 kernel tuned for tiny-M shape
+        // (per-token GEMV over rank rows instead of the tile-then-rows
+        // pattern).
         if (preQuantX is not null
             && preQuantXType == QuantizationType.Q8_0
             && w.WeightDType == LoraWeightDType.Q8_0
-            && (inputDim & 31) == 0)
+            && (inputDim & 31) == 0
+            && Environment.GetEnvironmentVariable("DOTLLM_LORA_FORCE_Q8_PREQUANT") == "1")
         {
             LoraDelta.ApplyQ8_0BWithPreQuantX(
                 preQuantX, (byte*)w.BHandle, (void*)w.AHandle, y,
