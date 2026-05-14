@@ -31,6 +31,9 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(LoraLoadRequest))]
 [JsonSerializable(typeof(LoraLoadResponse))]
 [JsonSerializable(typeof(LoraListResponse))]
+[JsonSerializable(typeof(PromptCacheRegisterRequest))]
+[JsonSerializable(typeof(PromptCacheResponse))]
+[JsonSerializable(typeof(PromptCacheStatsResponse))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

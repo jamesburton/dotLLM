@@ -53,6 +53,22 @@ public static class ChatCompletionEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
+        // Validate prefix_id reference (Step 37): must be registered if supplied.
+        if (!string.IsNullOrWhiteSpace(request.PrefixId))
+        {
+            var mgr = state.PrefixTrieManager;
+            if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null,
+                    httpContext.RequestAborted);
+                return;
+            }
+        }
+
         // Resolve LoRA adapter (if requested) — bad name → 400 with available list
         DotLLM.Core.Lora.ILoraAdapter? adapter;
         try

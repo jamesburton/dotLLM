@@ -129,6 +129,7 @@ public static class ServerStartup
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
+        PrefixTrieManager? prefixTrieManager = null;
         if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (options.UsePaged)
@@ -148,7 +149,9 @@ public static class ServerStartup
             pagedFactory = new PagedKvCacheFactory(
                 config.NumLayers, config.NumKvHeads, config.HeadDim);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
-            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation)");
+            // Cross-request prefix cache (Step 37). Enabled in tandem with paged.
+            prefixTrieManager = new PrefixTrieManager(pagedFactory);
+            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation) with cross-request prefix cache");
         }
         else if (options.UsePaged && kvConfig.IsQuantized)
         {
@@ -198,7 +201,8 @@ public static class ServerStartup
         }
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
-            draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates);
+            draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
+            prefixTrieManager: prefixTrieManager);
 
         // Warm-up: JIT pre-compilation + CUDA kernel loading
         WarmupRunner.Run(generator, tokenizer, options.Warmup);
@@ -213,6 +217,7 @@ public static class ServerStartup
             KvCacheFactory = kvFactory,
             PagedFactory = pagedFactory,
             PrefixCache = prefixCache,
+            PrefixTrieManager = prefixTrieManager,
             IsReady = true,
             Model = model,
             Tokenizer = tokenizer,

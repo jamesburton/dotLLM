@@ -58,6 +58,14 @@ public sealed record CompletionRequest
     [JsonPropertyName("lora_adapter")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? LoraAdapter { get; init; }
+
+    /// <summary>
+    /// Optional named prefix id registered via <c>POST /v1/prompt-cache/{id}</c>.
+    /// Best-effort hint — the trie still does longest-prefix matching.
+    /// </summary>
+    [JsonPropertyName("prefix_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PrefixId { get; init; }
 }
 
 /// <summary>

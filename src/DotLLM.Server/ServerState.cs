@@ -42,6 +42,9 @@ public sealed class ServerState : IDisposable
     /// <summary>Prefix cache for prompt caching (null when disabled).</summary>
     public PrefixCache? PrefixCache { get; set; }
 
+    /// <summary>Cross-request prefix trie manager (Step 37). Non-null when paged KV-cache is active.</summary>
+    public PrefixTrieManager? PrefixTrieManager { get; set; }
+
     /// <summary>Whether a model is loaded and ready to accept requests.</summary>
     public bool IsReady { get; set; }
 
@@ -114,6 +117,8 @@ public sealed class ServerState : IDisposable
         {
             PrefixCache?.Dispose();
             PrefixCache = null;
+            PrefixTrieManager?.Dispose();
+            PrefixTrieManager = null;
             PagedFactory?.Dispose();
             PagedFactory = null;
             DraftModel?.Dispose();
@@ -135,6 +140,7 @@ public sealed class ServerState : IDisposable
     {
         RateLimitManager?.Dispose();
         PrefixCache?.Dispose();
+        PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();
