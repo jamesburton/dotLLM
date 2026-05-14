@@ -1,0 +1,201 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-05-14T01:01:49.402Z",
+  "context": "research",
+  "phase": null,
+  "phase_name": null,
+  "phase_dir": null,
+  "plan": null,
+  "task": null,
+  "total_tasks": null,
+  "status": "paused_clean",
+  "branch": "feature/qwen3.6",
+  "remote_sync": "up_to_date",
+  "head_commit": "21b3c30",
+  "session_focus": "Diagnose + fix Qwen3.6-A3B CPU gibberish output (originally framed as Phase 10 MoE perf regression in commit 71eaae4 — task framing was wrong, root cause was older)",
+  "completed_tasks": [
+    {
+      "id": 1,
+      "name": "Reproduce gibberish and falsify the bisect premise",
+      "status": "done",
+      "outcome": "Bit-exact dump compare HEAD vs pre-71eaae4 reference proved 71eaae4 changed nothing. Bug pre-existed."
+    },
+    {
+      "id": 2,
+      "name": "Cross-reference dotLLM dumps against gguf-py",
+      "status": "done",
+      "outcome": "All checked tensors match within Q8_0/Q6_K quant noise. gguf-py is a false oracle — agrees with dotLLM on incorrect output because both shared the head-broadcast convention."
+    },
+    {
+      "id": 3,
+      "name": "Build llama-eval-callback with binary tensor dump patch",
+      "status": "done",
+      "commit_external": "ephemeral patch in /c/Users/james/tsunami/llama.cpp/common/debug.cpp (reverted after diagnosis)",
+      "outcome": "3586 per-tensor F32 binary dumps from llama.cpp on 'Hi' prompt, dotLLM-TensorDump-compatible format."
+    },
+    {
+      "id": 4,
+      "name": "Localize first divergence",
+      "status": "done",
+      "outcome": "tools/bin_diff.py identified blk.0.attn_output (GDN scan output) as first divergent tensor: SNR 3.0 dB, cos 0.725. Per-head ratio analysis (tools/head_ratio.py) showed cos=1.0 per vh but per-vh scalar magnitude mismatch — classic per-head indexing bug."
+    },
+    {
+      "id": 5,
+      "name": "Root-cause and patch the GDN Q/K head-broadcast bug",
+      "status": "done",
+      "commit": "fdb39b4",
+      "outcome": "Replaced `kh = vh / (NVHead/NKHead)` (interleaved) with `kh = vh % NKHead` (tiled) to match llama.cpp's ggml gated_delta_net op. Fix applied across CPU (GatedDeltaNetScan.cs), CUDA (gated_delta_net_scan.cu + regenerated PTX), and Vulkan (gdn_scan_step_f32.comp + gdn_scan_multi_token_f32.comp shader sources)."
+    },
+    {
+      "id": 6,
+      "name": "Add discriminating regression test",
+      "status": "done",
+      "outcome": "GatedDeltaNetScanTests.HeadBroadcast_IsTiledNotInterleaved_QwenMoeStyle uses NVHead=4 NKHead=2 with distinct per-kh q.k values, fails under interleaved mapping. Pre-existing tests all used NKHead=1 where both mappings degenerate — the gap that hid this bug."
+    },
+    {
+      "id": 7,
+      "name": "Update CLAUDE.md with cross-backend bug-fix mandate",
+      "status": "done",
+      "commit": "fdb39b4",
+      "outcome": "New 'Cross-Backend Critical Bugs' section codifies the requirement to fix all backends when a correctness bug is found in one, even outside task scope."
+    },
+    {
+      "id": 8,
+      "name": "Update Phase 10 architecture notes",
+      "status": "done",
+      "outcome": ".planning/notes/qwen35moe-gdeltanet-architecture.md gained 'Critical Implementation Notes' section documenting the TILED-not-interleaved convention with bug history and llama.cpp reference."
+    },
+    {
+      "id": 9,
+      "name": "End-to-end verification on the production model",
+      "status": "done",
+      "outcome": "dotLLM CPU output token-for-token matches llama.cpp on 'The capital of France is' -> ' Paris, a city renowned for its iconic landmarks such as the Eiffel Tower, the Louvre Museum' (20 tokens greedy). 'Hi' -> ',\\n\\nI am' matches llama.cpp's 'Hi,\\n\\nI'. 7 GDN scan tests + 26 Qwen3MoeHybrid model tests + 1426 non-GPU unit tests all pass."
+    },
+    {
+      "id": 10,
+      "name": "ROADMAP step 63 honest restatement",
+      "status": "done",
+      "commit": "6354676",
+      "outcome": "Replaced the misleading 'bit-exact verified Hi -> Ta' claim (which compared chat-templated llama.cpp output against raw dotLLM and silently masked the bug) with the actual verified continuation."
+    },
+    {
+      "id": 11,
+      "name": "Commit investigation tools",
+      "status": "done",
+      "commit": "0524276",
+      "outcome": "25 parity / per-tensor diff / per-head ratio scripts checked in under tools/. Detailed commit message explains each script's role. User wants a follow-up issue to promote one or more into a CI smoke test."
+    },
+    {
+      "id": 12,
+      "name": "Perf baseline + benchmark dispatch",
+      "status": "done",
+      "commit": "21b3c30",
+      "outcome": "docs/perf/baseline-qwen36-a3b-cpu.json captures 4 dotLLM + 2 llama.cpp runs. Best warm ratio: dotLLM/llama.cpp ~0.28x prefill, ~0.25x decode (~4x slower) under memory-contended conditions. docs/PERFORMANCE.md §3.1 rewritten. ROADMAP steps 64+65 note CUDA/Vulkan still need PTX/SPV regeneration. InferenceBenchmarks.cs now architecture-dispatches to Qwen3MoeHybridTransformerModel.LoadFromGguf when DOTLLM_BENCH_MODEL_PATH points at a qwen35moe GGUF."
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": 13,
+      "name": "Quiescent re-measurement",
+      "status": "not_started",
+      "blocker": "Separate llama-server process holding ~50 GiB of the same GGUF for an unrelated experiment was running during measurement. Numbers in baseline-qwen36-a3b-cpu.json are a floor, not steady-state."
+    },
+    {
+      "id": 14,
+      "name": "SIMD-vectorise GatedDeltaNetScan.Execute",
+      "status": "not_started",
+      "context": "Inner loops (decay multiply, retrieve dot, outer-product update, read dot) are all scalar Vector256-friendly. Roadmap Step 63 'Optimize' subsection lists these. Likely the biggest CPU perf win available."
+    },
+    {
+      "id": 15,
+      "name": "Vectorise per-expert MoE matmul where not already SIMD",
+      "status": "not_started",
+      "context": "MoeSwiGluMlp has quantized-direct GEMM via MatMul.GemmQX kernels (which are SIMD), but check whether routing/scatter/accumulate is on the critical path."
+    },
+    {
+      "id": 16,
+      "name": "CUDA real-GGUF parity re-run",
+      "status": "not_started",
+      "context": "CUDA PTX regenerated alongside the .cu fix. Synthetic CUDA-vs-CPU fixture is in tree (commit bcace4b). Real-GGUF parity test needs actual hardware — see docs/CUDA_PARITY_CLOUD.md (Option D cloud runbook)."
+    },
+    {
+      "id": 17,
+      "name": "Vulkan SPV rebuild + parity",
+      "status": "not_started",
+      "context": "Shader source is fixed but SPV needs glslc-equipped host. User has AMD Strix Halo for Vulkan testing (per ~/.claude memory). Vulkan parametric tests with NVHead=12, NKHead=3 will catch any regression once SPV is regenerated."
+    },
+    {
+      "id": 18,
+      "name": "Open follow-up issue for the tools",
+      "status": "not_started",
+      "context": "User said: 'we can create an issue and assign after these fixes'. Promote at least bin_diff.py + the llama-eval-callback workflow into a CI smoke test against a small (cut-down) Qwen3MoeHybrid GGUF so cross-backend parity becomes automatic."
+    }
+  ],
+  "blockers": [],
+  "human_actions_pending": [
+    {
+      "action": "Stop the running llama-server instance (PID 45928 at last check) before re-measuring CPU perf, OR move to a dedicated test machine",
+      "context": "It holds ~50 GiB resident and contends for OS page cache with our 30 GiB mmap. The current baseline numbers reflect this contention.",
+      "blocking": false
+    },
+    {
+      "action": "Provide glslc-equipped host (Strix Halo per MEMORY) to regenerate Vulkan SPV from the fixed .comp shaders",
+      "context": "Source fix is in place, just needs `native/vulkan/build.ps1` (or build.sh) run on a Vulkan SDK host.",
+      "blocking": false
+    },
+    {
+      "action": "Open GitHub follow-up issue for tools/ promotion to CI smoke test",
+      "context": "Agreed in this session. Branch is feature/qwen3.6; the tools commit is 0524276.",
+      "blocking": false
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Fix all three backend implementations of GDN scan in the same commit, not just CPU",
+      "rationale": "CUDA and Vulkan shared the same vh/(NVHead/NKHead) bug. User explicitly said 'this takes priority over scope narrowing'. Codified in CLAUDE.md 'Cross-Backend Critical Bugs' section so the principle is durable."
+    },
+    {
+      "decision": "Build llama-eval-callback with a diagnostic binary-dump patch rather than rely on parity_check.py (gguf-py)",
+      "rationale": "gguf-py is an independent reimplementation that shared the same head-broadcast convention as dotLLM — false oracle. llama.cpp's ggml is the authoritative reference for GGUF model semantics. Patched debug.cpp to dump per-tensor F32 binaries in dotLLM-TensorDump format; reverted patch after diagnosis so /c/Users/james/tsunami/llama.cpp tree is pristine."
+    },
+    {
+      "decision": "Use kh = vh % NKHead (TILED) not vh / vHeadsPerKHead (INTERLEAVED)",
+      "rationale": "Direct read of ggml-cpu/ops.cpp `ggml_compute_forward_gated_delta_net_one_chunk` line 10489-10490 — `iq1 = iv1 % neq1`. Confirmed empirically via tools/verify_tiled.py: every value head's hand-derived output (beta * v * (q.k) / sqrt(d)) matches llama.cpp's output exactly under TILED, fails under INTERLEAVED. ggml.h also has a TODO comment explicitly naming the 'tiled vs interleaved' configuration knob — currently does TILED."
+    },
+    {
+      "decision": "Add a regression test with NVHead=4, NKHead=2 (where the two mappings diverge), not a Qwen3-shape test",
+      "rationale": "Smallest possible discriminator — fits in <100 lines, hand-checkable arithmetic, fails under the old bug. Project's other Qwen3MoeHybrid tests use full model fixtures; this one targets just the head-broadcast convention."
+    },
+    {
+      "decision": "Honest baseline JSON despite memory-contended conditions",
+      "rationale": "Better to record a floor with clear caveats than withhold numbers. Resuming dev can re-measure on a quiescent system; the JSON's `system.notes` field and `next_steps` array call out the contention explicitly."
+    },
+    {
+      "decision": "Wire benchmark dispatch but don't run BDN-driven Qwen3MoeHybrid yet",
+      "rationale": "InferenceBenchmarks now routes Qwen3MoeHybrid correctly through DOTLLM_BENCH_MODEL_PATH (commit 21b3c30). Actually running BDN with the 30 GB model requires quiescent system + sufficient warm-up budget; deferred to follow-up rather than guess at warm-up sizing."
+    }
+  ],
+  "uncommitted_files": [],
+  "blocking_constraints": [
+    {
+      "name": "Independent oracle requirement for cross-backend correctness checks",
+      "severity": "blocking",
+      "description": "gguf-py-based parity (used by tools/parity_check*.py) is NOT an independent oracle for dotLLM correctness — both are independent reimplementations of llama.cpp's ggml semantics, but they can (and did) share the same convention bug. For any cross-backend semantic verification (head broadcast, accumulation order, sign convention) the authoritative reference is llama.cpp's actual CPU kernels (ggml/src/ggml-cpu/ops.cpp) and the eval-callback tool, not gguf-py.",
+      "structural_mitigation": "Future GGUF-format correctness PRs must include per-tensor parity dumps against llama.cpp's llama-eval-callback (or equivalent), not just gguf-py. tools/bin_diff.py is the reference comparison tool."
+    },
+    {
+      "name": "Discriminating fixture shapes in kernel tests",
+      "severity": "blocking",
+      "description": "All pre-fix GDN unit tests used NVHead=2, NKHead=1 where vh/vHeadsPerKHead and vh%NKHead both equal 0. The bug was undetectable by every existing test. CI ran green for months while the production model produced garbage.",
+      "structural_mitigation": "When a kernel takes parameters that can degenerate (e.g. NKHead=1 collapses head broadcasting), at least one test fixture must use parameter values where the discrimination matters. The new GatedDeltaNetScanTests.HeadBroadcast_IsTiledNotInterleaved_QwenMoeStyle is the template — NVHead != NKHead AND NVHead/NKHead > 1 AND per-kh inputs distinct."
+    },
+    {
+      "name": "Cross-backend duplication requires same-commit fixes",
+      "severity": "advisory",
+      "description": "When a correctness bug is identified in one backend (CPU/CUDA/Vulkan/HIP) and the same logic is duplicated, fixing only the active task's backend leaves a time bomb in the others. Diagnostic information evaporates between sessions.",
+      "structural_mitigation": "CLAUDE.md 'Cross-Backend Critical Bugs' section codifies the rule. Search for the routine across src/DotLLM.{Cpu,Cuda,Vulkan,Hip}/, native/kernels/, native/vulkan/shaders/ before declaring done."
+    }
+  ],
+  "next_action": "Open a GitHub issue for tools/ promotion to CI (per user agreement), then schedule a quiescent re-measurement of CPU perf to replace the memory-contended floor in docs/perf/baseline-qwen36-a3b-cpu.json. After that, the highest-impact perf work is SIMD-vectorising GatedDeltaNetScan.Execute (Step 63 'Optimize' candidates).",
+  "context_notes": "Branch is clean and pushed (origin/feature/qwen3.6 @ 21b3c30). Four commits added this session: fdb39b4 (critical fix), 6354676 (ROADMAP honesty), 0524276 (tools), 21b3c30 (perf baseline + bench dispatch + ROADMAP step 64/65 notes). The task description originally framed this as 'CPU MoE perf regression in commit 71eaae4 from the MoE refactor'; that framing was wrong on three levels — (1) 71eaae4 was bit-identical in output to pre-71eaae4; (2) the gguf-py parity that supposedly confirmed dotLLM-correct was a false oracle sharing the same bug; (3) the original 'bit-exact verified Hi -> Ta' claim compared chat-templated llama.cpp against raw dotLLM, never a valid comparison. The actual bug was a tiled-vs-interleaved head broadcast convention duplicated across CPU+CUDA+Vulkan, hidden by NKHead=1 in every CI fixture. Fix is one character per backend (`/` -> `%`). Production model now produces token-for-token llama.cpp-identical output for the canonical prompt."
+}
