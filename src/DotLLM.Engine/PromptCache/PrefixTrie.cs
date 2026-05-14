@@ -139,10 +139,10 @@ public sealed class PrefixTrie
     /// (or implicitly during insertion of fresh blocks — the caller increments before
     /// calling). The trie's own reference is released only when the node is evicted.
     /// </remarks>
-    public void Insert(ReadOnlySpan<int> fullTokens, int startTokenIndex, IReadOnlyList<int> newBlocks)
+    public int Insert(ReadOnlySpan<int> fullTokens, int startTokenIndex, IReadOnlyList<int> newBlocks)
     {
         ArgumentNullException.ThrowIfNull(newBlocks);
-        if (newBlocks.Count == 0) return;
+        if (newBlocks.Count == 0) return 0;
         if (startTokenIndex < 0 || startTokenIndex > fullTokens.Length)
             throw new ArgumentOutOfRangeException(nameof(startTokenIndex));
         if (startTokenIndex % _blockSize != 0)
@@ -151,7 +151,8 @@ public sealed class PrefixTrie
         long ts = Stopwatch.GetTimestamp();
         int blocksAvailable = (fullTokens.Length - startTokenIndex) / _blockSize;
         int blocksToInsert = Math.Min(newBlocks.Count, blocksAvailable);
-        if (blocksToInsert == 0) return;
+        if (blocksToInsert == 0) return 0;
+        int linked = 0;
 
         lock (_lock)
         {
@@ -166,12 +167,14 @@ public sealed class PrefixTrie
                 if (!current.Children.TryGetValue(key, out var child) || !child.MatchesTokens(chunk))
                 {
                     // The caller is inserting blocks at a position whose prefix is not
-                    // in the trie. This is the expected case for the very first sequence
-                    // that ever filled this prefix — create the prefix nodes too. But the
-                    // caller didn't pass us the physical block IDs for those positions,
-                    // so we cannot link them. Bail out — the suffix will simply not be
-                    // shared. Subsequent fresh-insert calls will fill the prefix path.
-                    return;
+                    // in the trie. The caller (PrefixTrieManager.RecordCompletion) only
+                    // does this when fresh blocks correspond to suffix tokens past a
+                    // matched-prefix boundary; if the prefix path is gone (e.g. evicted
+                    // mid-flight) we can't link the suffix. Caller-supplied AddRef on
+                    // those blocks is then redundant — release them.
+                    for (int j = 0; j < blocksToInsert; j++)
+                        _pool.Release(newBlocks[j]);
+                    return 0;
                 }
                 current = child;
             }
@@ -186,32 +189,30 @@ public sealed class PrefixTrie
 
                 if (current.Children.TryGetValue(key, out var existing) && existing.MatchesTokens(chunk))
                 {
-                    // Already in trie. The caller's block is a duplicate — they should
-                    // release theirs and use the trie's block. We can't free the caller's
-                    // block here (we don't own it on their behalf), so we just update LRU
-                    // and skip.
+                    // Already in trie — the caller's AddRef'd block is a duplicate.
+                    // Release the caller's spare ref (we keep the existing trie node's
+                    // block and ref) and continue walking the trie.
+                    _pool.Release(newBlockId);
                     existing.LastTouchedTicks = ts;
                     current = existing;
                     continue;
                 }
 
-                // New node: caller's block becomes a shared block. The trie holds one
-                // "trie ref" on it; the caller still owns their own ref. We do NOT call
-                // AddRef here — the caller's existing ref BECOMES the trie ref, and the
-                // caller acquires a fresh ref via AddRef so that Release on completion
-                // does not free a still-shared block. Documented in
-                // PrefixTrieManager.RecordCompletion.
+                // New node: caller's pool ref becomes the trie's "trie ref" on the
+                // block. The caller is no longer responsible for that ref.
                 var node = new PrefixTrieNode(newBlockId, current)
                 {
                     LastTouchedTicks = ts,
-                    RefCount = 0, // no external references at insertion time
+                    RefCount = 0,
                 };
                 node.SetTokens(chunk);
                 current.Children[key] = node;
                 _nodeCount++;
                 current = node;
+                linked++;
             }
         }
+        return linked;
     }
 
     /// <summary>
@@ -236,6 +237,27 @@ public sealed class PrefixTrie
 
         for (int i = 0; i < blockIds.Count; i++)
             _pool.Release(blockIds[i]);
+    }
+
+    /// <summary>
+    /// Decrements only the <em>node</em> refcount for each block, leaving the
+    /// pool refcount alone. Used when the pool refcount will be released through
+    /// another path (e.g. <c>PagedKvCache.Dispose()</c> freeing seeded blocks).
+    /// </summary>
+    public void ReleaseNodeRefs(IReadOnlyList<int> blockIds)
+    {
+        ArgumentNullException.ThrowIfNull(blockIds);
+        if (blockIds.Count == 0) return;
+
+        lock (_lock)
+        {
+            for (int i = 0; i < blockIds.Count; i++)
+            {
+                var node = FindNodeByBlockId(blockIds[i]);
+                if (node is not null)
+                    node.RefCount = Math.Max(0, node.RefCount - 1);
+            }
+        }
     }
 
     /// <summary>
