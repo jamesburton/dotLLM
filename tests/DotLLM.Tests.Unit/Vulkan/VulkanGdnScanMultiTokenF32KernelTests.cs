@@ -29,6 +29,13 @@ public class VulkanGdnScanMultiTokenF32KernelTests
     [InlineData(8, 16, 4, 32)]
     [InlineData(16, 32, 8, 64)]             // power-of-two heads
     [InlineData(7, 12, 3, 32)]              // odd seqLen, non-power-of-two heads
+    [InlineData(4, 32, 16, 128)]            // Qwen3.6-A3B production shape (NVHead/NKHead=2, dState=128)
+    [InlineData(3, 4, 2, 16)]               // tiny tiled discriminator — NVHead/NKHead=2 with distinct per-kh inputs;
+                                            // the random k/q per token are different for kh=0 and kh=1, so
+                                            // an interleaved-vs-tiled (vh/2 vs vh%2) head-broadcast bug would
+                                            // produce a numerically different result. Matches the CPU regression
+                                            // template `GatedDeltaNetScanTests.HeadBroadcast_IsTiledNotInterleaved_QwenMoeStyle`
+                                            // referenced in .planning/.continue-here.md CONSTRAINT 2.
     public void Launch_MatchesCpuReference(int seqLen, int nVHead, int nKHead, int dState)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
