@@ -1,0 +1,72 @@
+#version 450
+// Q8_0 GEMV — WG=64 variant for the workgroup-size sensitivity sweep.
+// Identical to matmul_q8_0.comp except local_size_x = 64 and shared[64].
+// Used by the Vulkan Q8_0 GEMV workgroup-size microbench.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+int readQsByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    int b = int((u >> shift) & 0xFFu);
+    return (b ^ 0x80) - 0x80;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[64];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+    uint rowByteStride = pc.blocksPerRow * 34u;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float d = readHalf(blockByteBase);
+        uint xBase = b * 32u;
+        float blockSum = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            int qv = readQsByte(blockByteBase + 2u + j);
+            blockSum += float(qv) * x[xBase + j];
+        }
+        acc += d * blockSum;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
