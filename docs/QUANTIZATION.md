@@ -108,6 +108,8 @@ The Vulkan backend ships native matmul kernels (GEMV decode + GEMM prefill, with
 | F16 | ✓ | ✓ | ✓ (F16xF16→F32, M=N=K=16 tile) | `c9c08c5` |
 | BF16 | ✓ | ✓ | — (BF16 tiles not enumerated on RDNA3.5; use shift-left-16 reinterpret) | `c9c08c5` |
 | Q8_0 | ✓ | ✓ | ✓ (`MatMulQ8_0GemmCoopmatKernel`) | pre-existing |
+| Q2_K | ✓ | ✓ | — | (this branch) |
+| Q3_K | ✓ | ✓ | — | (this branch) |
 | Q4_K_M | ✓ | ✓ | — (Phase 1 follow-up) | `afb2272` + `b1ee6bc` |
 | Q5_K_M | ✓ | ✓ | — | `15099b9` + `83e0732` |
 | Q6_K_M | ✓ | ✓ | — | `29a1459` + `39b7646` |
@@ -174,6 +176,9 @@ per group l in [0..4):
 ```
 
 Alignment: IQ1_S kernels require `inputDim % 256 == 0`. The upload path's `KeepIq1SOnDevice` predicate gates on this.
+Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats, so weight memory is doubled / quadrupled. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K and Q3_K — the densest K-quants — close the K-quant family on Vulkan; matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode, 16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block size.
+
+**Q3_K caveat.** The Q3_K dequant matches the dotLLM CPU oracle (`DequantizeQ3_KScalar`) byte-for-byte. The CPU oracle has a pre-existing layout bug for sub-blocks 12..15 — it reads their low nibbles from the high nibbles of bytes 8..11 of the scales table, which are also fully occupied by the high-2-bits-per-sub-block packing (32 bits of hi2 fully use bytes 8..11). The correct llama.cpp layout puts sub_12..15's low nibbles in the high nibbles of bytes 4..7 (and sub_8..11's in bytes 0..3). Until the CPU oracle is fixed, Q3_K decode produces incorrect values for sub-blocks 12..15 on real GGUF data. The Vulkan kernel matches the (buggy) CPU output bit-for-bit, so cross-backend parity holds — but neither matches llama.cpp on those four sub-blocks. The fixture round-trip test side-steps the bug by zeroing source data in sub_12..15 so the parity assertions remain meaningful.
 
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 

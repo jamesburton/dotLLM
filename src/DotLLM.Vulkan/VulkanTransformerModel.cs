@@ -68,6 +68,14 @@ public sealed class VulkanTransformerModel : IModel
     // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
     // without coopmat — the router falls back to _matmulQ8Gemm then.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Q2_K + Q3_K matmul kernels — completes the K-quant family on Vulkan.
+    // Always created; the dispatcher in RecordMatmul branches on the
+    // device-side QuantizationType per call. No coopmat variants — follow-up
+    // ticket sibling of the Q4_K / Q5_K / Q6_K coopmat work.
+    private readonly MatMulQ2KGemvF32Kernel _matmulQ2K;
+    private readonly MatMulQ2KGemmF32Kernel _matmulQ2KGemm;
+    private readonly MatMulQ3KGemvF32Kernel _matmulQ3K;
+    private readonly MatMulQ3KGemmF32Kernel _matmulQ3KGemm;
     // Q4_K_M matmul kernels — Phase 1 of K-quant work. Always created; the
     // dispatcher in RecordMatmul branches on the device-side QuantizationType
     // per call. Coopmat Q4_K is a follow-up ticket.
@@ -228,6 +236,8 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
+        MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
@@ -272,6 +282,10 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        _matmulQ2K = matmulQ2K;
+        _matmulQ2KGemm = matmulQ2KGemm;
+        _matmulQ3K = matmulQ3K;
+        _matmulQ3KGemm = matmulQ3KGemm;
         _matmulQ4K = matmulQ4K;
         _matmulQ4KGemm = matmulQ4KGemm;
         _matmulQ5K = matmulQ5K;
@@ -504,6 +518,12 @@ public sealed class VulkanTransformerModel : IModel
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
         var matmulQ8Gemm = MatMulQ8_0GemmKernel.Create(device, spvDir);
+        // Q2_K + Q3_K GEMV + GEMM — completes the K-quant family on Vulkan.
+        // Always created; the dispatcher routes per device-side QuantizationType.
+        var matmulQ2K = MatMulQ2KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ2KGemm = MatMulQ2KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ3K = MatMulQ3KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ3KGemm = MatMulQ3KGemmF32Kernel.Create(device, spvDir);
         // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created; the
         // RecordMatmul dispatcher routes per device-side QuantizationType.
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
@@ -628,6 +648,8 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            matmulQ2K, matmulQ2KGemm,
+            matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
@@ -1070,6 +1092,10 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ2K.InvalidateDescriptorCache();
+        _matmulQ2KGemm.InvalidateDescriptorCache();
+        _matmulQ3K.InvalidateDescriptorCache();
+        _matmulQ3KGemm.InvalidateDescriptorCache();
         _matmulQ4K.InvalidateDescriptorCache();
         _matmulQ4KGemm.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
@@ -1829,6 +1855,32 @@ public sealed class VulkanTransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantType.Q2_K)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ2K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ2KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantType.Q3_K)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ3K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ3KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else if (weightQt == QuantType.Q4_K)
         {
             // Q4_K_M decode-path GEMV (seqLen==1) or prefill-path tiled GEMM.
@@ -2126,6 +2178,10 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();
         _matmulQ4K.Dispose();
+        _matmulQ3KGemm.Dispose();
+        _matmulQ3K.Dispose();
+        _matmulQ2KGemm.Dispose();
+        _matmulQ2K.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();

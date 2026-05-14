@@ -303,6 +303,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.Q8_0 && (inputDim % 32) == 0;
 
+    /// <summary>True iff a Q2_K source projection can be kept on device as raw Q2_K
+    /// super-blocks — gated on the input dim being a multiple of 256.</summary>
+    private static bool KeepQ2KOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.Q2_K && (inputDim % 256) == 0;
+
+    /// <summary>True iff a Q3_K source projection can be kept on device as raw Q3_K
+    /// super-blocks — gated on the input dim being a multiple of 256.</summary>
+    private static bool KeepQ3KOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.Q3_K && (inputDim % 256) == 0;
+
     /// <summary>True iff a Q4_K source projection can be kept on device as raw Q4_K
     /// super-blocks — gated on the input dim being a multiple of the Q4_K super-block
     /// size (256). Phase 1 of K-quant work.</summary>
@@ -366,6 +376,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     /// format's group size — i.e. the raw bytes can stay on device verbatim.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int inputDim)
         => KeepQ8OnDevice(qt, inputDim)
+        || KeepQ2KOnDevice(qt, inputDim)
+        || KeepQ3KOnDevice(qt, inputDim)
         || KeepQ4KOnDevice(qt, inputDim)
         || KeepQ5KOnDevice(qt, inputDim)
         || KeepQ6KOnDevice(qt, inputDim)
@@ -384,6 +396,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static QuantizationType DeviceQuantTypeFor(QuantizationType qt, int inputDim)
     {
         if (KeepQ8OnDevice(qt, inputDim)) return QuantizationType.Q8_0;
+        if (KeepQ2KOnDevice(qt, inputDim)) return QuantizationType.Q2_K;
+        if (KeepQ3KOnDevice(qt, inputDim)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(qt, inputDim)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(qt, inputDim)) return QuantizationType.Q5_K;
         if (KeepQ6KOnDevice(qt, inputDim)) return QuantizationType.Q6_K;
@@ -405,6 +419,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     {
         if (KeepQ8OnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ2KOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
+        if (KeepQ3KOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q3_K) * outputDim;
         if (KeepQ4KOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         if (KeepQ5KOnDevice(qt, inputDim))

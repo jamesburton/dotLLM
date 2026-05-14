@@ -16,6 +16,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MatMulQ8_0Kernel MatMulQ8 { get; }
     public MatMulQ8_0GemmKernel MatMulQ8Gemm { get; }
     public MatMulQ8_0GemmCoopmatKernel? MatMulQ8GemmCoopmat { get; }
+    public MatMulQ2KGemvF32Kernel MatMulQ2K { get; }
+    public MatMulQ2KGemmF32Kernel MatMulQ2KGemm { get; }
+    public MatMulQ3KGemvF32Kernel MatMulQ3K { get; }
+    public MatMulQ3KGemmF32Kernel MatMulQ3KGemm { get; }
     public MatMulQ4KGemvF32Kernel MatMulQ4K { get; }
     public MatMulQ4KGemmF32Kernel MatMulQ4KGemm { get; }
     public MatMulQ5KGemvF32Kernel MatMulQ5K { get; }
@@ -78,6 +82,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     private VulkanQwen3MoeHybridKernels(
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
+        MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
@@ -104,6 +110,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         MatMul = matmul; MatMulQ8 = matmulQ8; MatMulQ8Gemm = matmulQ8Gemm;
         MatMulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        MatMulQ2K = matmulQ2K; MatMulQ2KGemm = matmulQ2KGemm;
+        MatMulQ3K = matmulQ3K; MatMulQ3KGemm = matmulQ3KGemm;
         MatMulQ4K = matmulQ4K; MatMulQ4KGemm = matmulQ4KGemm;
         MatMulQ5K = matmulQ5K; MatMulQ5KGemm = matmulQ5KGemm;
         MatMulQ6K = matmulQ6K; MatMulQ6KGemm = matmulQ6KGemm;
@@ -140,6 +148,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
             catch (InvalidOperationException) { /* No usable Q8_0 tile shape — stay on scalar. */ }
         }
+        var matmulQ2K = MatMulQ2KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ2KGemm = MatMulQ2KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ3K = MatMulQ3KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ3KGemm = MatMulQ3KGemmF32Kernel.Create(device, spvDir);
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
         var matmulQ5K = MatMulQ5KGemvF32Kernel.Create(device, spvDir);
@@ -194,6 +206,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
 
         return new VulkanQwen3MoeHybridKernels(
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            matmulQ2K, matmulQ2KGemm,
+            matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
@@ -220,6 +234,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ8.InvalidateDescriptorCache();
         MatMulQ8Gemm.InvalidateDescriptorCache();
         MatMulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        MatMulQ2K.InvalidateDescriptorCache();
+        MatMulQ2KGemm.InvalidateDescriptorCache();
+        MatMulQ3K.InvalidateDescriptorCache();
+        MatMulQ3KGemm.InvalidateDescriptorCache();
         MatMulQ4K.InvalidateDescriptorCache();
         MatMulQ4KGemm.InvalidateDescriptorCache();
         MatMulQ5K.InvalidateDescriptorCache();
@@ -309,6 +327,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulQ5K.Dispose();
         MatMulQ4KGemm.Dispose();
         MatMulQ4K.Dispose();
+        MatMulQ3KGemm.Dispose();
+        MatMulQ3K.Dispose();
+        MatMulQ2KGemm.Dispose();
+        MatMulQ2K.Dispose();
         MatMulQ8GemmCoopmat?.Dispose();
         MatMulQ8Gemm.Dispose();
         MatMulQ8.Dispose();

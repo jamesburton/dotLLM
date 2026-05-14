@@ -9,7 +9,7 @@ namespace DotLLM.Vulkan;
 /// <summary>
 /// Per-layer weight buffers on a Vulkan device. Mirrors
 /// <c>DotLLM.Cuda.CudaWeights</c> but with a two-mode storage model:
-/// Q8_0, Q4_K, Q5_K, Q6_K, F16, and BF16 matrices are kept on device in
+/// Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, F16, and BF16 matrices are kept on device in
 /// their source byte layout when <c>dequantToFp32=false</c> (default) and the
 /// relevant Vulkan kernel supports the contraction shape. Unsupported shapes
 /// fall back to dequantised F32 upload. Bias and norm weights are always FP32
@@ -543,6 +543,18 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepBf16OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.BF16 && (inputDim & 1) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q2_K super-blocks
+    /// (84 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q2_K super-block size (256).</summary>
+    private static bool KeepQ2KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q2_K && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as Q3_K super-blocks
+    /// (110 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q3_K super-block size (256).</summary>
+    private static bool KeepQ3KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q3_K && (inputDim % 256) == 0;
+
     /// <summary>Returns true when the matrix will be kept on device as Q4_K super-blocks
     /// (144 bytes per 256 elements). Gated on the contraction axis being a multiple of
     /// the Q4_K super-block size (256). Phase 1 of the K-quant work.</summary>
@@ -603,10 +615,15 @@ internal sealed class VulkanWeights : IDisposable
     /// Q5_K / Q6_K / IQ2_XXS / IQ2_XS / IQ2_S / F16 / BF16 / F32 depending on the source
     /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / IQ1_S / F16 / BF16 / F32 depending on the source
     /// and the alignment constraints.</summary>
+    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q2_K /
+    /// Q3_K / Q4_K / Q5_K / Q6_K / F16 / BF16 / F32 depending on the source and the
+    /// alignment constraints.</summary>
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
+        if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
+        if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_K;
         if (KeepQ6KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q6_K;
@@ -666,6 +683,10 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
+        if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q3_K) * outputDim;
         if (KeepQ4KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         if (KeepQ5KOnDevice(qt, inputDim, dequantToFp32))
@@ -710,7 +731,7 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
 
         // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
-        // the matmul_q8_0 / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
+        // the matmul_q8_0 / matmul_q2_k / matmul_q3_k / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
         // directly. Mirrors the CPU path's mmap-backed layout.
         QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
         if (keepQt != QuantizationType.F32)

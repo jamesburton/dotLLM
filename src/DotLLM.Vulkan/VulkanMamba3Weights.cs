@@ -370,6 +370,16 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
 
+    /// <summary>True iff a Q2_K overlay can be kept on device as raw Q2_K super-blocks
+    /// — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepQ2KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q2_K && (contractionDim % 256) == 0;
+
+    /// <summary>True iff a Q3_K overlay can be kept on device as raw Q3_K super-blocks
+    /// — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepQ3KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q3_K && (contractionDim % 256) == 0;
+
     /// <summary>True iff a Q4_K overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction dim being a multiple of the Q4_K super-block size
     /// (256). Phase 1 of K-quant work.</summary>
@@ -433,6 +443,8 @@ internal sealed class VulkanMamba3Weights : IDisposable
     /// format's group size.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
         => KeepQ8OnDevice(qt, contractionDim)
+        || KeepQ2KOnDevice(qt, contractionDim)
+        || KeepQ3KOnDevice(qt, contractionDim)
         || KeepQ4KOnDevice(qt, contractionDim)
         || KeepQ5KOnDevice(qt, contractionDim)
         || KeepQ6KOnDevice(qt, contractionDim)

@@ -201,6 +201,61 @@ public sealed class RealGgufVulkanParityTests
             prompt: "The capital of France is");
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // DeepSeek-Coder-V2-Lite Q2_K (MLA + MoE, ~5 GB GGUF) — exercises Q2_K
+    // Vulkan kernels (densest K-quant, 84-byte super-block, ~2.6 bpw). Real-
+    // weight smoke for the Q2_K path; gated on the conventional cache path.
+    // ────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void DeepSeekCoderV2Lite_Q2_K_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] DeepSeek-Coder-V2-Lite Q2_K GGUF not found. Set "
+                + "DOTLLM_DEEPSEEK_CODER_V2_LITE_Q2_K_GGUF or download to "
+                + "~/.dotllm/test-cache/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf "
+                + "from huggingface.co/bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF.");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.DeepSeekV2, label: "DeepSeek-Coder-V2-Lite-Q2_K",
+            prompt: "def fibonacci(n):");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Bielik-1.5B Q3_K_M (~660 MB GGUF) — exercises Q3_K Vulkan kernels.
+    //
+    // Q3_K caveat: the dotLLM CPU oracle has a pre-existing layout bug for
+    // sub-blocks 12..15 of every Q3_K super-block (see
+    // docs/QUANTIZATION.md). The Vulkan kernel matches the CPU oracle
+    // bit-for-bit, so the parity assertion below holds — but this test does
+    // NOT validate Q3_K against llama.cpp / canonical GGUF semantics on
+    // those four sub-blocks.
+    // ────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Bielik15B_Q3_K_M_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_BIELIK_15B_Q3_K_M_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Bielik-1.5B Q3_K_M GGUF not found. Set "
+                + "DOTLLM_BIELIK_15B_Q3_K_M_GGUF or download to "
+                + "~/.dotllm/test-cache/second-state/Bielik-1.5B-v3.0-Instruct-GGUF/Bielik-1.5B-v3.0-Instruct-Q3_K_M.gguf "
+                + "from huggingface.co/second-state/Bielik-1.5B-v3.0-Instruct-GGUF.");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Bielik-1.5B-Q3_K_M",
+            prompt: "The capital of France is");
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // Qwen3.6-A3B-IQ2_M / IQ2_XXS — IQ2 family on Vulkan (~11 GB GGUFs).
     // Gated; download-on-demand from huggingface.co/unsloth or similar

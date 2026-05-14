@@ -827,9 +827,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     // ── Matmul dispatcher (mirrors VulkanNemotronHTransformerModel.RecordMatmul) ─
 
     /// <summary>
-    /// Per-quant-type matmul dispatcher. Routes Q8_0 / Q4_K / Q5_K / Q6_K / F16
-    /// / BF16 / F32 weights through the matching kernel selected by the device
-    /// storage type recorded at upload time.
+    /// Per-quant-type matmul dispatcher. Routes Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K
+    /// / Q6_K / F16 / BF16 / F32 weights through the matching kernel selected by
+    /// the device storage type recorded at upload time.
     /// </summary>
     private void RecordMatmul(
         nint cmdBuf,
@@ -846,6 +846,18 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulQ8GemmCoopmat.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 else
                     _kernels.MatMulQ8Gemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantizationType.Q2_K:
+                if (seqLen == 1)
+                    _kernels.MatMulQ2K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulQ2KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantizationType.Q3_K:
+                if (seqLen == 1)
+                    _kernels.MatMulQ3K.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                else
+                    _kernels.MatMulQ3KGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
                 break;
             case QuantizationType.Q4_K:
                 if (seqLen == 1)
