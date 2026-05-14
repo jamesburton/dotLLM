@@ -743,11 +743,25 @@ public sealed class VulkanDevice : IDisposable
     /// <summary>
     /// Device-owned buffer + backing memory. Caller owns the <see cref="IDisposable"/>.
     /// </summary>
+    /// <remarks>
+    /// A <see cref="Buffer"/> may wrap either a driver-allocated
+    /// <c>VkDeviceMemory</c> (the default path produced by
+    /// <see cref="VulkanDevice.Allocate(long)"/> and
+    /// <see cref="VulkanDevice.AllocateDeviceLocal"/>) <i>or</i> a host-imported
+    /// allocation backed by an mmap'd file (produced by
+    /// <see cref="HostVisibleBuffer.TryCreate"/> and exposed through
+    /// <see cref="VulkanDevice.TryWrapHostVisible"/>). Downstream kernel
+    /// code reads only <see cref="Handle"/>; the distinction matters
+    /// for lifetime — in the host-imported case <see cref="Dispose"/>
+    /// frees the import but does NOT touch the underlying mmap (the
+    /// <c>GgufFile</c> owns that).
+    /// </remarks>
     public sealed class Buffer : IDisposable
     {
         private readonly VulkanDevice _device;
         private nint _buffer;
         private nint _memory;
+        private readonly HostVisibleBuffer? _hostImport;
 
         /// <summary>Buffer size in bytes.</summary>
         public long Size { get; }
@@ -755,12 +769,29 @@ public sealed class VulkanDevice : IDisposable
         /// <summary>Underlying <c>VkBuffer</c> handle.</summary>
         public nint Handle => _buffer;
 
+        /// <summary>
+        /// True when this buffer wraps an mmap'd host pointer via
+        /// <c>VK_EXT_external_memory_host</c> — disposal frees the Vulkan
+        /// import but the underlying pages outlive it.
+        /// </summary>
+        public bool IsHostImported => _hostImport is not null;
+
         internal Buffer(VulkanDevice device, nint buffer, nint memory, long size)
         {
             _device = device;
             _buffer = buffer;
             _memory = memory;
             Size = size;
+            _hostImport = null;
+        }
+
+        internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
+        {
+            _device = device;
+            _buffer = hostImport.Handle;
+            _memory = hostImport.Memory;
+            Size = hostImport.Size;
+            _hostImport = hostImport;
         }
 
         /// <summary>Underlying <c>VkDeviceMemory</c> handle.</summary>
@@ -769,6 +800,17 @@ public sealed class VulkanDevice : IDisposable
         /// <inheritdoc/>
         public void Dispose()
         {
+            if (_hostImport is not null)
+            {
+                // The import wrapper owns lifetime — destroying the buffer +
+                // freeing the memory go through its Dispose. Clear our local
+                // copies so we don't double-free.
+                _hostImport.Dispose();
+                _buffer = 0;
+                _memory = 0;
+                return;
+            }
+
             if (_buffer != 0)
             {
                 VulkanApi.vkDestroyBuffer(_device._device, _buffer, 0);
@@ -807,6 +849,32 @@ public sealed class VulkanDevice : IDisposable
     /// compute shader than host-coherent linear memory. Always measure.
     /// </remarks>
     public Buffer AllocateDeviceLocal(long bytes) => AllocateInternal(bytes, deviceLocal: true);
+
+    /// <summary>
+    /// Attempts to wrap an mmap'd host pointer (e.g. a GGUF tensor's offset
+    /// inside <c>GgufFile.DataBasePointer</c>) in a <see cref="Buffer"/>
+    /// backed by imported host memory via <c>VK_EXT_external_memory_host</c>.
+    /// Returns <c>null</c> when the device does not advertise the extension,
+    /// when the alignment math can't be satisfied, or when the driver rejects
+    /// the import — callers must always have a staging-copy fallback ready.
+    /// </summary>
+    /// <param name="hostPointer">Host pointer to the buffer's logical first byte.</param>
+    /// <param name="size">Logical buffer size in bytes.</param>
+    /// <returns>The wrapped buffer, or <c>null</c> when zero-copy import is not possible.</returns>
+    /// <remarks>
+    /// On a unified-memory APU (Strix Halo, Apple Silicon, Intel iGPU) the
+    /// returned <see cref="Buffer.Handle"/> reads the same DDR pages the host
+    /// mmap exposes — no staging copy, no double-counting of physical RAM.
+    /// On a discrete GPU the extension is still useful (e.g. NVIDIA exposes
+    /// it via PCIe BAR) but the win is smaller. <see cref="Buffer.Dispose"/>
+    /// destroys the import; the underlying <c>MemoryMappedFile</c> is the
+    /// caller's responsibility.
+    /// </remarks>
+    public Buffer? TryWrapHostVisible(nint hostPointer, long size)
+    {
+        var import = HostVisibleBuffer.TryCreate(this, hostPointer, size);
+        return import is null ? null : new Buffer(this, import);
+    }
 
     private Buffer AllocateInternal(long bytes, bool deviceLocal)
     {

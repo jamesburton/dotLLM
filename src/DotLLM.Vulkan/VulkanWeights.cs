@@ -380,6 +380,7 @@ internal sealed class VulkanWeights : IDisposable
         bool dequantToFp32 = false)
     {
         long totalBytes = 0;
+        ResetUploadCounters();
 
         // Size the reusable staging buffer to the largest single weight upload
         // (in its on-device byte form).
@@ -522,6 +523,74 @@ internal sealed class VulkanWeights : IDisposable
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
+    }
+
+    /// <summary>
+    /// Diagnostic counter — number of weight matrices that took the
+    /// <c>VK_EXT_external_memory_host</c> zero-copy path on the most recent
+    /// <see cref="Upload"/> call. Reset to zero at the start of each upload.
+    /// Reported by the benchmark + test harness; not used at runtime.
+    /// </summary>
+    public static int LastUploadZeroCopyMatrices { get; private set; }
+
+    /// <summary>
+    /// Diagnostic counter — number of weight matrices that took the staging
+    /// copy path on the most recent <see cref="Upload"/> call. Sum of this
+    /// plus <see cref="LastUploadZeroCopyMatrices"/> is the total number of
+    /// raw-quant-block matrices uploaded; F32-dequant matrices are counted
+    /// separately as staging (they cannot be zero-copy imported).
+    /// </summary>
+    public static int LastUploadStagingMatrices { get; private set; }
+
+    /// <summary>
+    /// Diagnostic counter — total bytes that took the zero-copy path on the
+    /// most recent <see cref="Upload"/> call. The microbench compares this
+    /// against <c>AllocatedBytes</c> to confirm the path actually fired.
+    /// </summary>
+    public static long LastUploadZeroCopyBytes { get; private set; }
+
+    /// <summary>
+    /// Set <c>DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1</c> in the environment to
+    /// force the staging-copy path even when the driver supports
+    /// <c>VK_EXT_external_memory_host</c>. Used by parity tests to verify
+    /// that the zero-copy import produces bit-identical kernel output, and
+    /// by the microbench to measure the staging baseline.
+    /// </summary>
+    private static bool IsHostImportDisabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT") == "1";
+
+    /// <summary>
+    /// Attempts to wrap <paramref name="srcPtr"/> + <paramref name="bytes"/>
+    /// in a host-imported <c>VkBuffer</c> via
+    /// <see cref="VulkanDevice.TryWrapHostVisible"/>. Returns true on success
+    /// (and increments the diagnostic counters); false otherwise — caller
+    /// falls back to staging.
+    /// </summary>
+    private static bool TryZeroCopyImport(
+        VulkanDevice device, nint srcPtr, long bytes,
+        out VulkanDevice.Buffer? buf)
+    {
+        buf = null;
+        if (!device.HasExternalMemoryHost) return false;
+        if (IsHostImportDisabled()) return false;
+        if (srcPtr == 0) return false;
+
+        var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
+        if (wrapped is null) return false;
+
+        LastUploadZeroCopyMatrices++;
+        LastUploadZeroCopyBytes += bytes;
+        buf = wrapped;
+        return true;
+    }
+
+    /// <summary>Resets the per-upload diagnostic counters. Called from
+    /// <see cref="Upload"/> at the start of each call.</summary>
+    private static void ResetUploadCounters()
+    {
+        LastUploadZeroCopyMatrices = 0;
+        LastUploadStagingMatrices = 0;
+        LastUploadZeroCopyBytes = 0;
     }
 
     /// <summary>Returns true when the matrix will be kept on device as Q8_0 blocks.</summary>
@@ -737,6 +806,24 @@ internal sealed class VulkanWeights : IDisposable
     /// is dequantised to FP32 before upload and <paramref name="deviceQuantType"/> is
     /// <see cref="QuantizationType.F32"/>.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Zero-copy fast path</b> (<c>VK_EXT_external_memory_host</c>): when the matrix is
+    /// kept as raw quant blocks AND <c>device.HasExternalMemoryHost</c> is true AND the
+    /// mmap'd source pointer satisfies the driver's
+    /// <c>minImportedHostPointerAlignment</c> (after page-rounding the start +
+    /// rounding-up the size), the buffer is imported directly from the mmap'd GGUF page
+    /// range — no staging copy, no double-counted physical RAM on a unified-memory APU.
+    /// llama.cpp does not do this today on the Vulkan path; this is dotLLM
+    /// differentiation on Strix Halo and similar UMA iGPUs (see
+    /// <c>.planning/notes/gaia-lemonade-research.md</c> §6 H3).
+    /// </para>
+    /// <para>
+    /// On any failure of the zero-copy path (extension absent, driver rejects import,
+    /// alignment unsolvable) this method silently falls through to the staging-copy
+    /// upload below — the import is opportunistic, not load-bearing.
+    /// </para>
+    /// </remarks>
     private static unsafe VulkanDevice.Buffer UploadMatrix(
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
@@ -755,6 +842,16 @@ internal sealed class VulkanWeights : IDisposable
             long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
+            // Zero-copy import attempt. Opt out via env var so the staging path
+            // can be exercised on a host that does support the extension —
+            // also the parity-test escape hatch.
+            if (TryZeroCopyImport(device, srcPtr, bytes, out var importedBuf))
+            {
+                deviceQuantType = keepQt;
+                uploadedBytes = bytes;
+                return importedBuf!;
+            }
+
             var buf = device.AllocateDeviceLocal(bytes);
             VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
                 .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
@@ -769,6 +866,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
 
+            LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
             return buf;
