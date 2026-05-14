@@ -205,6 +205,46 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
         return (nint)NativeMemory.AlignedAlloc((nuint)(elementCount * sizeof(float)), 64);
     }
 
+    /// <summary>
+    /// Allocates a 64-byte-aligned native byte buffer of <paramref name="byteCount"/>
+    /// bytes. Used for non-F32 LoRA weights — Q8_0, F16, BF16 — where the
+    /// element size is not 4 bytes. Caller transfers ownership to a
+    /// <see cref="LoraAdapter"/> via <see cref="AddLayerWeights"/>.
+    /// </summary>
+    public static nint AllocAlignedBytes(long byteCount)
+    {
+        if (byteCount < 0)
+            throw new ArgumentOutOfRangeException(nameof(byteCount), byteCount, "Byte count must be non-negative.");
+        if (byteCount == 0) return 0;
+        return (nint)NativeMemory.AlignedAlloc((nuint)byteCount, 64);
+    }
+
+    /// <summary>
+    /// Q8_0 block size in bytes — 2-byte F16 scale + 32 sbytes. Matches the
+    /// GGUF on-disk Q8_0 layout and the
+    /// <c>DotLLM.Cpu.Kernels.MatMul</c> kernel format.
+    /// </summary>
+    public const int Q8_0BlockBytes = 34;
+
+    /// <summary>Number of F32 elements per Q8_0 block.</summary>
+    public const int Q8_0GroupSize = 32;
+
+    /// <summary>
+    /// Returns the Q8_0 byte size for a row of <paramref name="elements"/>
+    /// F32 values. Throws when the row is not a multiple of
+    /// <see cref="Q8_0GroupSize"/>.
+    /// </summary>
+    public static long Q8_0ByteSize(long elements)
+    {
+        if (elements < 0)
+            throw new ArgumentOutOfRangeException(nameof(elements), elements, "Element count must be non-negative.");
+        if (elements % Q8_0GroupSize != 0)
+            throw new ArgumentException(
+                $"Q8_0 requires element count multiple of {Q8_0GroupSize}, got {elements}.",
+                nameof(elements));
+        return (elements / Q8_0GroupSize) * Q8_0BlockBytes;
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {

@@ -126,6 +126,20 @@ public static unsafe class LoraDelta
             return;
         }
 
+        // Q8_0 B fast-path (Phase 4d.4) — closes the prefill regression that
+        // F32-on-Q8_0-base introduces. We use GemmQ8_0 for stage 1 (B is
+        // [rank, inputDim] Q8_0; x is [seqLen, inputDim] F32 — the activation
+        // is quantised once and reused across all `rank` weight rows). Stage 2
+        // dequants A on read into the standard F32 path. A stays F16 / BF16 /
+        // F32 because its contracted axis is `rank` (typical 8-16), too short
+        // for a 32-element Q8_0 block.
+        if (bDType == LoraWeightDType.Q8_0)
+        {
+            ApplyQ8_0B(x, (byte*)bWeight, aWeight, y,
+                       seqLen, inputDim, outputDim, rank, scale, aDType);
+            return;
+        }
+
         long bElems = (long)rank * inputDim;
         long aElems = (long)outputDim * rank;
         float[] bBuf = ArrayPool<float>.Shared.Rent((int)bElems);
@@ -145,6 +159,110 @@ public static unsafe class LoraDelta
         {
             ArrayPool<float>.Shared.Return(aBuf);
             ArrayPool<float>.Shared.Return(bBuf);
+        }
+    }
+
+    /// <summary>
+    /// Phase 4d.4 — Q8_0 B-side LoRA delta path. Closes the prefill
+    /// regression (~36% on Strix Halo per Agent 8's macro-bench) that
+    /// landing an F32 LoRA on a Q8_0 base produced. The aggregate LoRA
+    /// byte volume drops from <c>2 × 4 × hidden × rank</c> (F32 both) to
+    /// <c>(1.0625 + sizeof(aDType)) × hidden × rank</c> — for hidden=2048,
+    /// rank=16, F16 A: ~2.6× total LoRA byte reduction.
+    /// </summary>
+    /// <remarks>
+    /// Stage 1 reuses <see cref="MatMul.GemmQ8_0(byte*, float*, float*, int, int, int, byte*)"/>
+    /// so the activation x is quantised once per call and reused across all
+    /// <c>rank</c> rows of B. Stage 2 dequants A into a small F32 scratch
+    /// (rank × outputDim, kilobytes for typical shapes — fits in L2) and
+    /// reuses the F32 stage-2 path; that scratch is rented once per Apply
+    /// call. Stage 2 is bandwidth-light (A is reused across all output cols
+    /// per token) so per-call F32 dequant of A is acceptable here.
+    /// </remarks>
+    [SkipLocalsInit]
+    private static void ApplyQ8_0B(float* x, byte* bQ8, void* aWeight, float* y,
+                                   int seqLen, int inputDim, int outputDim, int rank, float scale,
+                                   LoraWeightDType aDType)
+    {
+        if (inputDim % 32 != 0)
+            throw new ArgumentException(
+                $"Q8_0 LoRA B requires inputDim multiple of 32, got {inputDim}.",
+                nameof(inputDim));
+
+        // Stage 1: tmp[t, r] = sum_i x[t, i] · B[r, i]  via GemmQ8_0.
+        //   weightsQ8 = bQ8        (M=rank, K=inputDim, Q8_0)
+        //   b         = x          (N=seqLen, K=inputDim, F32)
+        //   c         = tmp        (N=seqLen, M=rank,    F32)
+        int tmpElems = seqLen * rank;
+        float[] tmpBuf = ArrayPool<float>.Shared.Rent(tmpElems);
+        try
+        {
+            fixed (float* tmp = tmpBuf)
+            {
+                MatMul.GemmQ8_0(bQ8, x, tmp, rank, inputDim, seqLen, preQuantizedInput: null);
+
+                // Stage 2: dequant A into a small F32 scratch and reuse the
+                // existing per-token GEMV-then-MultiplyAdd loop. A is at most
+                // outputDim × rank floats — for hidden=8192, rank=64 that's
+                // 2 MiB which exceeds L2 but is amortised by outputDim-many
+                // dot products per token.
+                if (aDType == LoraWeightDType.F32)
+                {
+                    Stage2(tmp, (float*)aWeight, y, seqLen, outputDim, rank, scale);
+                    return;
+                }
+
+                long aElems = (long)outputDim * rank;
+                float[] aBuf = ArrayPool<float>.Shared.Rent((int)aElems);
+                try
+                {
+                    DequantToF32(aWeight, aDType, aBuf, (int)aElems);
+                    fixed (float* aF32 = aBuf)
+                    {
+                        Stage2(tmp, aF32, y, seqLen, outputDim, rank, scale);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(aBuf);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(tmpBuf);
+        }
+    }
+
+    /// <summary>
+    /// Per-token stage 2 (A · tmp[t]) accumulator — extracted so the Q8_0-B
+    /// dispatch shares the exact same scalar-equivalent path as the F32 fast
+    /// path above. This is the same code as the inner block of
+    /// <see cref="Apply(float*, float*, float*, float*, int, int, int, int, float)"/>;
+    /// extracting it keeps the two paths bit-equivalent post-stage-1.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Stage2(float* tmp, float* aF32, float* y,
+                               int seqLen, int outputDim, int rank, float scale)
+    {
+        float[] deltaBuf = ArrayPool<float>.Shared.Rent(outputDim);
+        try
+        {
+            fixed (float* delta = deltaBuf)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    MatMul.GemvF32(aF32, tmp + t * rank, delta, outputDim, rank);
+
+                    var deltaSpan = new ReadOnlySpan<float>(delta, outputDim);
+                    var ySpan = new Span<float>(y + t * outputDim, outputDim);
+                    TensorPrimitives.MultiplyAdd(deltaSpan, scale, ySpan, ySpan);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(deltaBuf);
         }
     }
 
@@ -204,6 +322,78 @@ public static unsafe class LoraDelta
         fixed (float* yPtr = y)
         {
             Apply(xPtr, bPtr, aPtr, yPtr, seqLen, inputDim, outputDim, rank, scale);
+        }
+    }
+
+    /// <summary>
+    /// One-shot adapter-load Q8_0 quantiser for the LoRA B factor. Quantises
+    /// the F32 source row-by-row into the destination buffer, where each row
+    /// holds <paramref name="elementsPerRow"/> floats (must be a multiple of
+    /// 32). Output layout matches dotLLM's GGUF Q8_0 layout: per row,
+    /// <c>(elementsPerRow / 32)</c> blocks of 34 bytes each = 2-byte F16
+    /// scale + 32 sbytes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is invoked at adapter load time only — once per
+    /// <c>(layer, projection)</c> pair when the loader opts into Q8_0
+    /// storage for B. Per-row quantisation reuses
+    /// <see cref="MatMul.QuantizeF32ToQ8_0(float*, byte*, int)"/> which
+    /// already has the AVX-512 / AVX2 / scalar fallbacks; the per-row loop
+    /// is intentionally not parallelised because adapter-load is one-shot.
+    /// </para>
+    /// <para>
+    /// Reverse direction (Q8_0 → F32) is not provided here — the runtime
+    /// kernel consumes Q8_0 directly via the integer-dot path. A round-trip
+    /// dequant is only needed by parity tests, which call
+    /// <see cref="DequantizeRowToF32"/> for that purpose.
+    /// </para>
+    /// </remarks>
+    /// <param name="srcF32">Source F32 buffer, <paramref name="rows"/> × <paramref name="elementsPerRow"/> elements.</param>
+    /// <param name="dstQ8">Destination Q8_0 buffer, sized
+    /// <c>rows × (elementsPerRow / 32) × 34</c> bytes.</param>
+    /// <param name="rows">Number of rows (typically <c>rank</c>).</param>
+    /// <param name="elementsPerRow">Elements per row (typically <c>inputDim</c>); must be a multiple of 32.</param>
+    public static void Quantize_F32_To_Q8_0(float* srcF32, byte* dstQ8,
+                                            int rows, int elementsPerRow)
+    {
+        if (rows < 0)
+            throw new ArgumentOutOfRangeException(nameof(rows), rows, "Row count must be non-negative.");
+        if (elementsPerRow <= 0 || elementsPerRow % 32 != 0)
+            throw new ArgumentException(
+                $"elementsPerRow must be a positive multiple of 32, got {elementsPerRow}.",
+                nameof(elementsPerRow));
+
+        int rowBytes = (elementsPerRow / 32) * 34;
+        for (int row = 0; row < rows; row++)
+        {
+            MatMul.QuantizeF32ToQ8_0(srcF32 + (long)row * elementsPerRow,
+                                      dstQ8 + (long)row * rowBytes,
+                                      elementsPerRow);
+        }
+    }
+
+    /// <summary>
+    /// Round-trip helper used by parity tests — dequantises one Q8_0 row
+    /// (<paramref name="elementsPerRow"/> elements split into 32-element
+    /// blocks) back to F32. Not used on the inference hot path.
+    /// </summary>
+    public static void DequantizeRowToF32(byte* srcQ8, float* dstF32, int elementsPerRow)
+    {
+        if (elementsPerRow <= 0 || elementsPerRow % 32 != 0)
+            throw new ArgumentException(
+                $"elementsPerRow must be a positive multiple of 32, got {elementsPerRow}.",
+                nameof(elementsPerRow));
+
+        int blockCount = elementsPerRow / 32;
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* blockSrc = srcQ8 + block * 34;
+            float scale = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            sbyte* qs = (sbyte*)(blockSrc + 2);
+            float* dstBlock = dstF32 + block * 32;
+            for (int i = 0; i < 32; i++)
+                dstBlock[i] = qs[i] * scale;
         }
     }
 }
