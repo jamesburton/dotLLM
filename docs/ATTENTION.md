@@ -50,6 +50,35 @@ Requires its own attention implementation with `LatentKvCache`.
 
 **CUDA**: Phase A primitives landed (`CudaMlaAttention.Forward`, `attention_mla_f32` kernel, `mla_helpers.cu`, `CudaMlaWeights`, `CudaMlaKvCache`). F32 throughout for now, validated against the CPU oracle within FP16 noise. **Not yet wired into `CudaTransformerModel.Forward`** — that wiring blocks on the CUDA MoE FFN port (DeepSeek-V2/V3 layers are MLA + MoE FFN, and the FFN GPU path doesn't exist). Phase B/C and FP16/quantized weight paths are deferred follow-ups.
 
+## Vulkan Flash Attention (prefill GQA path)
+
+Vulkan attention has two F32 paths sharing one descriptor surface:
+
+| Kernel | Shader | Workgroup unit | Use |
+|--------|--------|----------------|-----|
+| `AttentionF32Kernel` | `attention_f32.comp` (+ `_sg`, `_coopmat`) | one (query token, head) | Decode (seq_q = 1); fallback for FA-ineligible shapes |
+| `VulkanFlashAttentionF32Kernel` | `attention_flash_f32.comp` | one (head, query-tile of BR=16 rows) | Prefill (seq_q > 1), head_dim ≤ 128 |
+
+The FA shader is Flash-Attention-v2 style: each workgroup holds BR=16 Q-rows in shared memory and walks the KV stream in BC=64 column tiles. Each KV row is read **once per Q-tile** (= BR× amortisation vs the per-token shader). Online softmax is maintained per Q-row (per-row running max + sum_exp), with one workgroup-wide tree reduce per (Q-row, KV-tile) pair using subgroupMax / subgroupAdd + cross-subgroup shared-memory combine — portable across subgroup widths.
+
+Dispatch decision (`VulkanTransformerModel.RecordAttention` and analogous sites in `VulkanNemotronHTransformerModel` / `VulkanQwen3MoeHybridTransformerModel`):
+
+```
+if (_flashAttention != null && seqQ > 1 && headDim <= 128) -> FA
+else                                                        -> naive per-token
+```
+
+Env-var opt-out: `DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1` forces every dispatch onto the legacy per-token kernel. The FA path is null when the SPV is missing (older builds) or when head_dim exceeds the shader bound — both gates fall back automatically.
+
+Tile sizing rationale (Strix Halo / RDNA3.5, 64-wide wavefronts, 64 KB LDS):
+- WG_SIZE = BC = 64: one wavefront per workgroup, reductions in a single subgroup step.
+- BR = 16, MAX_HEAD_DIM = 128: qTile 8 KB + outAccum 8 KB + scoreMatrix 4 KB ≈ 20 KB. Headroom for raising BR or MAX_HEAD_DIM later.
+- Soft-cap (Gemma 2 / Qwen3 style): optional push constant; raw scores pass through `softCap * tanh(s / softCap)` before softmax when non-zero.
+
+Per-shape kernel microbench (dev-laptop iGPU, GQA-4, 32/8 heads, head_dim 64): **FA is 2.46-2.49× faster than the naive per-token shader at pp512 / pp2048**, matching the BR-amortisation prediction; see `benchmarks/DotLLM.Benchmarks/VulkanFlashAttentionBenchmarks.cs` and `tests/DotLLM.Tests.Unit/Vulkan/VulkanFlashAttentionF32KernelTests.cs` for parity coverage (MHA / GQA-4 / GQA-8, prompt 128 / 512 / 2048, sliding window, soft-cap, ALiBi).
+
+MLA-attention (DeepSeek-V2/V3) keeps `AttentionMlaF32Kernel`; the FA path is GQA-only by design — an MLA FA variant is a separate workstream.
+
 ## IAttentionStrategy — Kernel Selection
 
 ```
@@ -64,6 +93,7 @@ IAttentionStrategy:
 | **Naive** | O(N²) | Reference, fallback, short sequences |
 | **Flash Attention 2** | O(N) | GPU SM80+ (Ampere). Tiled in SRAM, online softmax. 2-7× speedup |
 | **Flash Attention 3** | O(N) | GPU SM90+ (Hopper). Async TMA, FP8 |
+| **Vulkan FA F32**     | O(N) | Vulkan GQA prefill. BR=16 Q-tile × BC=64 KV-tile, online softmax. 2.4-2.5× over naive at pp512/pp2048 on dev iGPU |
 | **CPU Tiled** | O(N) | CPU. Tiles fit L2 cache |
 | **Paged Flash** | O(N) | Flash + non-contiguous KV blocks (PagedAttention) |
 
