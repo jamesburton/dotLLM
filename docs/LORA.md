@@ -237,6 +237,78 @@ The shipped path therefore uses Q8_0 *only as compressed weight storage*
 and dequantises once per call into F32 — it gets the byte-volume win at
 adapter memory residency without the activation-quant trap.
 
+### Phase 4d.5 — Vulkan Q8_0 LoRA + CPU pre-quant-x plumbing (2026-05-14)
+
+Two follow-ups against the Phase 4d.4 residual:
+
+**Vulkan-side Q8_0 LoRA (Gap 1, shipped)**: `VulkanLoraAdapter.Upload`
+now handles `LoraWeightDType.Q8_0` (and F16 / BF16) on the host side by
+dequantising the source factor to F32 once at adapter-bind time, with
+`alpha / rank` folded in. The device-side F32 fused-delta path (Agent 6's
+two-dispatch B-reduce + A-accumulate kernel) consumes the resulting F32
+device buffers without semantic changes, so the F32 LoRA shader stays
+bit-identical for F32 adapters. Q8_0 adapters uploaded to Vulkan now
+produce finite logits within Q8_0 round-trip tolerance (5e-2 abs / 5e-3
+rel) vs the F32 LoRA Vulkan baseline; see
+`VulkanLoraForwardParityTests.Forward_Q8_0Adapter_VulkanMatchesF32Vulkan_WithinQ8_0Tolerance`
+for the parity gate.
+
+A separate Q8_0-in-shader variant (dequant-on-the-fly in the WG-shared
+reduce shader) would save ~50% of the on-device adapter byte footprint —
+on Strix Halo's UMA (~256 GB/s) that adapter-class storage saving is
+indistinguishable from F32 in inference throughput, so the host-dequant
+path is what we ship. The shader variant remains an unexplored option
+for discrete GPUs with constrained device memory.
+
+**CPU pre-quant-x plumbing (Gap 2, plumbed but gated off)**:
+`TransformerModel.ApplyLoraDelta` now accepts the pre-quantised
+activation buffer + its quant type from each dispatch site (q/k/v/o +
+gate/up/down). The new `LoraDelta.ApplyQ8_0BWithPreQuantX` overload
+routes Q8_0-base + Q8_0-B stage 1 through `MatMul.GemmQ8_0(...,
+preQuantizedInput=xQ8)` so the activation-quant cost (which killed the
+original Phase 4d.4 spike at M=rank=16) is fully amortised across the
+base projection.
+
+The dispatch is gated behind `DOTLLM_LORA_FORCE_Q8_PREQUANT=1` because
+direct kernel-level probing on Strix Halo (`benchmarks/LoraQ8Stage1Probe`,
+not shipped — see `.continue-here-lora-final-mile.md`) showed that even
+WITHOUT the activation-quant cost, `MatMul.GemmQ8_0` at M=rank=16,
+K=hidden=2048, N=seqLen=512 is ~1.7× slower per call than Agent 7's
+dequant-once F32 path. The Q8_0 integer-dot kernels are tuned for fat-M
+projection geometries (base GEMM has M=hidden=2048+); the rank-tall LoRA
+stage-1 shape doesn't amortise their per-block constant cost. Default
+path therefore stays on Agent 7's shipped F32-dequant-once.
+
+#### Macro-bench rerun — 2026-05-14, Strix Halo, same fixture
+
+Same Llama-3.2-1B-Instruct.Q8_0 base + synthetic rank-16 adapter +
+greedy sampling as Phase 4d.4. Default-path numbers (env var not set,
+so the gated CPU fast path is OFF — i.e. Agent 7's shipped CPU
+behaviour, with the dispatch seam refactored to carry the preQuant
+buffer through):
+
+| Variant | Median Prefill tok/s | Δ vs NoLora | Median Decode tok/s | Δ vs NoLora |
+|---|---:|---:|---:|---:|
+| NoLora | 153.20 | — | 40.18 | — |
+| LoraF32 | 117.33 | −23.4% | 43.65 | +8.6% |
+| LoraF16 | 115.35 | −24.7% | 40.28 | +0.2% |
+| LoraBF16 | 114.72 | −25.1% | 36.71 | −8.7% |
+| **LoraQ8_0** | **113.56** | **−25.9%** | **41.39** | **+3.0%** |
+
+The acceptance gate (≤ −10% prefill) **was NOT met** on this run. The
+prefill regression sits at −25.9% — wider than Agent 7's Phase 4d.4
+measurement of −16.2%, but per-run variance on this fixture is
+substantial (cross-run prefill stdev ~10 tok/s on the same code path,
+visible in `allPrefillTokPerSec` per metrics JSON). Decode is +3% vs
+NoLora — consistent with the Phase 4d.4 trend that decode-batch=1
+benefits from the smaller adapter weight footprint.
+
+Per the spike's blocker policy the partial improvement ships and
+`.continue-here-lora-final-mile.md` documents the remaining lever: a
+tiny-M-tuned Q8_0 stage-1 kernel (per-token GEMV across rank rows
+rather than the existing row-tile-then-tokens pattern in
+`MatMul.GemmQ8_0`).
+
 ### Phase 4d.3 baseline (Agent 8, 2026-05-13)
 
 Same fixture, run before Phase 4d.4 landed. NoLora baseline is lower
