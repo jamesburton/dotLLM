@@ -1,0 +1,136 @@
+#version 450
+// IQ3_XXS matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k W_iq3xxs[m, k] * x[k]    with W_iq3xxs dequantized on the fly.
+//
+// Weight layout mirrors block_iq3_xxs / DotLLM.Cpu.Kernels.Dequantize.DequantizeIQ3_XXS.
+// Each 256 contiguous columns of a row form one 98-byte super-block:
+//     bytes [0,1]    = fp16 d
+//     bytes [2..65]  = qs[64]     — 64 unsigned 8-bit grid indices
+//     bytes [66..97] = scales_and_signs[8] (uint32 LE)
+//                      per 32-element sub-block ib32:
+//                        aux32 = scales_and_signs[ib32]
+//                        db    = d * (0.5 + (aux32 >> 28)) * 0.5
+//                        for l in [0..4):
+//                          signs    = ksigns[(aux32 >> (7*l)) & 0x7f]
+//                          g1 = qs[ib32*8 + 2*l + 0], g2 = qs[ib32*8 + 2*l + 1]
+//                          y[..+0..3] = db * grid[g1*4 + j] * sign(bit j+0)
+//                          y[..+4..7] = db * grid[g2*4 + j] * sign(bit j+4)
+//
+// Dispatch: one workgroup per output row, 128 threads, shared-memory tree reduce.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY       { float y[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid    { uint  iq3xxsGrid[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufKsigns  { uint  ksigns[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 256
+    uint blocksPerRow;  // = K / 256
+    uint rowUints;
+} pc;
+
+const uint IQ3_XXS_BLOCK_BYTES = 98u;
+const uint IQ3_XXS_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS       = 8u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint readU32(uint absByteOff) {
+    uint b0 = readByte(absByteOff);
+    uint b1 = readByte(absByteOff + 1u);
+    uint b2 = readByte(absByteOff + 2u);
+    uint b3 = readByte(absByteOff + 3u);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq3xxsGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+uint ksignByte(uint absIdx) {
+    uint u = ksigns[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * IQ3_XXS_BLOCK_BYTES;
+    uint rowByteBase   = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * IQ3_XXS_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qsBase             = blockByteBase + 2u;
+        uint scalesAndSignsBase = blockByteBase + 2u + IQ3_XXS_GROUP_SIZE / 4u;
+        uint xBase              = b * IQ3_XXS_GROUP_SIZE;
+
+        for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+            uint aux32 = readU32(scalesAndSignsBase + 4u * ib32);
+            float db = d * (0.5 + float(aux32 >> 28)) * 0.5;
+            uint xSubBase = xBase + ib32 * 32u;
+
+            for (uint l = 0u; l < 4u; l++) {
+                uint g1 = readByte(qsBase + ib32 * 8u + 2u * l + 0u);
+                uint g2 = readByte(qsBase + ib32 * 8u + 2u * l + 1u);
+                uint signsIdx = (aux32 >> (7u * l)) & 0x7Fu;
+                uint signs    = ksignByte(signsIdx);
+                uint xOff = xSubBase + l * 8u;
+                uint gOff1 = g1 * 4u;
+                uint gOff2 = g2 * 4u;
+
+                float pairSum = 0.0;
+                for (uint j = 0u; j < 4u; j++) {
+                    float g0 = float(gridByte(gOff1 + j));
+                    float gH = float(gridByte(gOff2 + j));
+                    float s0 = ((signs & (1u << (j + 0u))) != 0u) ? -1.0 : 1.0;
+                    float sH = ((signs & (1u << (j + 4u))) != 0u) ? -1.0 : 1.0;
+                    pairSum += g0 * s0 * x[xOff + j + 0u];
+                    pairSum += gH * sH * x[xOff + j + 4u];
+                }
+                acc += db * pairSum;
+            }
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
