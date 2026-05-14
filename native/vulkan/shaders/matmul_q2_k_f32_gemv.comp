@@ -1,0 +1,132 @@
+#version 450
+// Q2_K matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k  W_q2k[m, k] * x[k]      with W_q2k dequantized on the fly.
+//
+// Sibling of matmul_q4_k_gemv_f32.comp / matmul_q5_k_gemv_f32.comp /
+// matmul_q6_k_gemv_f32.comp — same dispatch model (one workgroup per output
+// row, 128 threads, shared-memory tree reduce). Q2_K is the densest K-quant
+// (~2.6 bpw, 84 bytes per 256 elements) but its scale layout is structurally
+// the simplest: one byte per sub-block holds a 4-bit unsigned scale and a
+// 4-bit unsigned dmin coefficient (no 6-bit get_scale_min_k4 dance).
+//
+// Weight layout (matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ2_K
+// byte-for-byte):
+//   Each 256 contiguous elements of a row form one Q2_K super-block of 84 bytes:
+//       bytes [ 0.. 15] = scales[16] — sub_lo nibble = scale, sub_hi nibble = dmCoef
+//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte
+//       bytes [80, 81]  = fp16 d
+//       bytes [82, 83]  = fp16 dmin
+//   Row stride = (K / 256) * 84 bytes.
+//
+// Reconstruction (mirrors DequantizeQ2_K). For element t in [0, 256):
+//   sub      = t / 16                                       // 0..15
+//   q2       = (qs[t / 4] >> ((t % 4) * 2)) & 0x3            // 0..3
+//   scale    =  scales[sub] & 0xF                            // 0..15
+//   dmCoef   = (scales[sub] >> 4) & 0xF                      // 0..15
+//   value    = d * scale * q2 - dmin * dmCoef
+//
+// Loop tiling: per super-block we iterate the 16 sub-blocks of 16 elements
+// each. The (scale, dmCoef) pair is loaded once per sub-block and held
+// constant across the 16-element inner loop.
+//
+// Storage-buffer access:
+//   `weight` is bound as `uint[]` because GLSL storage buffers cannot hold
+//   int8 / float16 scalars without optional extensions. Per-byte access goes
+//   through `readByte` with explicit shifts. fp16 d / dmin via
+//   `unpackHalf2x16`. The per-row stride is `blocksPerRow * 84`, NOT
+//   4-aligned in general (84 % 4 == 0 — OK here) but readHalf still handles
+//   straddle for safety.
+//
+// Dispatch:
+//   One workgroup per output row (gl_WorkGroupID.x = m).
+//   local_size_x = 128 — threads stride across super-blocks and accumulate
+//   partial sums, then the workgroup reduces in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+const uint Q2K_BLOCK_BYTES = 84u;
+const uint Q2K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * Q2K_BLOCK_BYTES;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * Q2K_BLOCK_BYTES;
+        uint scalesBase    = blockByteBase;
+        uint qsBase        = blockByteBase + 16u;
+        float d    = readHalf(blockByteBase + 80u);
+        float dmin = readHalf(blockByteBase + 82u);
+
+        uint xBase = b * Q2K_GROUP_SIZE;
+
+        for (uint sub = 0u; sub < 16u; sub++) {
+            uint scByte = readByte(scalesBase + sub);
+            float sc = d * float(scByte & 0xFu);
+            float mn = dmin * float((scByte >> 4u) & 0xFu);
+
+            uint outBase = xBase + sub * 16u;
+            float subSum = 0.0;
+            for (uint l = 0u; l < 16u; l++) {
+                uint t      = sub * 16u + l;
+                uint qByte  = readByte(qsBase + (t >> 2u));
+                uint bitOff = (t & 3u) << 1u;
+                uint q2     = (qByte >> bitOff) & 0x3u;
+                float xi    = x[outBase + l];
+                subSum     += xi * (sc * float(q2) - mn);
+            }
+            acc += subSum;
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
