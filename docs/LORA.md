@@ -192,3 +192,37 @@ dotnet run -c Release --project benchmarks/DotLLM.Benchmarks `
 Metrics are written to `%TEMP%/dotllm-bdn-metrics/Lora_*.json`; the BDN
 summary table surfaces the median values via the custom `Prefill tok/s`
 and `Decode tok/s` columns.
+## Vulkan Backend — Fused Delta Path
+
+The Vulkan backend ships a fused LoRA-delta GEMV (`LoraDeltaGemvFusedF32Kernel`,
+shaders `lora_delta_b_reduce_f32.comp` + `lora_delta_gemv_fused_f32.comp`)
+that replaces the original 4-dispatch chain
+(`matmul B → matmul A → AddKernel → vkCmdCopyBuffer`) with **2 dispatches per delta site**:
+
+1. **B-stage** — `tmp[t, r] = dot(B[r, :], x[t, :])`. One workgroup per `(t, r)` with WG=64
+   threads doing a shared-memory tree reduction; same compute as the un-fused matmul step.
+2. **A-stage in place** — `y[t, m] += sum_r A[m, r] * tmp[t, r]`. Each thread owns one output
+   row in a WG-wide tile; writes accumulate directly into the base-projection output buffer,
+   eliminating the AddKernel + vkCmdCopyBuffer tail.
+
+`B` is pre-scaled by `alpha / rank` at upload time (`VulkanLoraAdapter.Upload`), so neither
+shader carries the scale.
+
+**Routing**: `MaybeApplyLoraDelta` selects the fused path automatically when the adapter
+rank ≤ `LoraDeltaGemvFusedF32Kernel.MaxRank` (= 32, covering common PEFT defaults
+4 / 8 / 16) and both `.spv` blobs are present. Larger ranks and older builds fall back
+to the un-fused 4-dispatch chain. `DOTLLM_VULKAN_DISABLE_FUSED_LORA_DELTA=1` forces the
+fallback path for A/B comparison.
+
+**Bench (Strix Halo / Radeon 8060S iGPU)** — `VulkanLoraDeltaDispatchBenchmark`,
+22 layers × 7 LoRA-adapted projections per token at TinyLlama-1.1B shapes
+(hidden=2048, intermediate=5632), wall-clock for the full 154-site dispatch sequence:
+
+| Rank | Un-fused (4 dispatches × 154) | Fused (2 dispatches × 154) | Speedup |
+|-----:|------------------------------:|---------------------------:|--------:|
+|    8 |                       17.16 ms |                     2.59 ms |   6.6×  |
+|   16 |                       18.97 ms |                     3.42 ms |   5.5×  |
+|   32 |                       19.87 ms |                     4.19 ms |   4.7×  |
+
+Comfortably exceeds the ≥ 2× target on the LoRA-active decode path; the deltaSum-buffer
+round-trip elimination dominates the win at decode (`seqLen=1`) shapes.
