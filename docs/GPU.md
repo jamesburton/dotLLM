@@ -423,11 +423,83 @@ GPU layers compute in FP16 (Half precision). At the boundary, the hidden state i
 - `CudaQuantizedKvCache` — Q8_0/Q4_0 GPU KV-cache with FP16 scratch-buffer attention (see [KV_CACHE.md](KV_CACHE.md))
 - `CudaWeights.LoadFromGguf(numGpuLayers)` — Partial weight upload to VRAM
 
+## Unified-Memory Zero-Copy Weight Upload (Vulkan, UMA APUs)
+
+On unified-memory APUs (AMD Strix Halo / Ryzen AI Max+ 395, Intel iGPUs, Apple Silicon via MoltenVK) the CPU and GPU share the same DDR. The default upload path still pays a host→device copy because the driver allocates a new `VkDeviceMemory` region and the kernel reads from there. On a UMA part that copy is pure waste — the source and destination are the same physical DRAM.
+
+The Vulkan backend supports `VK_EXT_external_memory_host` to eliminate this copy. The same physical pages that back the CPU's `MemoryMappedFile` mmap of the GGUF file are imported directly into a `VkDeviceMemory` via `VkImportMemoryHostPointerInfoEXT`, and a `VkBuffer` is bound to the import. The GPU compute shader reads the bytes in place.
+
+### Code path
+
+```
+GgufFile.Open(path)
+  ├── MemoryMappedFile.CreateFromFile  (host page table populated lazily)
+  └── DataBasePointer = base + dataSectionOffset
+
+VulkanWeights.Upload(weights)
+  └── for each raw quant block (Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16):
+        ├── if device.HasExternalMemoryHost && !DOTLLM_VULKAN_DISABLE_HOST_IMPORT:
+        │     HostVisibleBuffer.TryCreate(device, srcPtr, bytes)
+        │     ├── round srcPtr down to minImportedHostPointerAlignment (4 KiB on x86-64)
+        │     ├── vkGetMemoryHostPointerPropertiesEXT for HOST_ALLOCATION + HOST_MAPPED_FOREIGN
+        │     ├── vkCreateBuffer with VkExternalMemoryBufferCreateInfo in pNext
+        │     ├── vkAllocateMemory with VkImportMemoryHostPointerInfoEXT in pNext
+        │     └── vkBindBufferMemory at bindOffset = srcPtr - aligned(srcPtr)
+        │     → on any failure: fall through to staging path
+        └── staging path: vkAllocateMemory device-local + vkCmdCopyBuffer
+```
+
+### Feature probe
+
+`VulkanDevice` exposes:
+
+- `HasExternalMemoryHost: bool` — true when the extension is supported AND was enabled at device creation.
+- `MinImportedHostPointerAlignment: ulong` — driver-reported page alignment requirement (4096 on x86-64 in practice).
+
+Both come from `VkPhysicalDeviceExternalMemoryHostPropertiesEXT` chained off `vkGetPhysicalDeviceProperties2`. The probe is non-throwing — drivers without the extension or with garbage responses produce `HasExternalMemoryHost = false`.
+
+### Driver-rejection fallback
+
+When the driver rejects a specific import (`vkAllocateMemory` returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`), `HostVisibleBuffer.TryCreate` returns `null` and `VulkanWeights.UploadMatrix` falls through to the staging-copy path. Diagnostic statics make the rejection visible:
+
+- `VulkanWeights.LastUploadFallbackReason` — `"feature_absent"`, `"env_disabled"`, `"null_src"`, or `"import_rejected"`.
+- `HostVisibleBuffer.LastImportFailureStage` — the specific Vulkan call that failed (`"vkAllocateMemory"`, `"vkBindBufferMemory"`, etc.).
+- `HostVisibleBuffer.LastImportFailureCode` — the VkResult error code.
+
+Set `DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1` to force the staging path even when the driver supports the import. Used by parity tests and to measure the staging baseline in the microbench.
+
+### Known driver behavior
+
+| Driver | Strix Halo / gfx1151 | Other |
+|---|---|---|
+| amdvlk (Windows) | Advertises extension. **Rejects** mmap'd `MemoryMappedFile` pages at `vkAllocateMemory` (returns `VK_ERROR_INVALID_EXTERNAL_HANDLE`). Accepts `NativeMemory.AlignedAlloc` heap pages via `HOST_ALLOCATION_BIT_EXT`. | — |
+| Mesa radv (Linux) | Expected to accept foreign-memory imports of mmap'd ranges (unverified on this hardware). | Same on RDNA2/3. |
+| NVIDIA proprietary | Accepts `HOST_ALLOCATION_BIT_EXT` for both mmap'd and heap pages on post-Pascal generations. | — |
+| Intel ANV | Accepts `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT` for mmap'd ranges. | — |
+| MoltenVK | Implements via Metal `MTLBuffer.contents`; accepts mmap'd ranges. | — |
+
+On the Strix Halo amdvlk path, the framework still loads correctly (staging fallback fires on every weight matrix) — the import is opportunistic, not load-bearing. The win arrives when the driver matures or when Linux Mesa radv is used.
+
+### Scope and anti-goals
+
+- **Scope**: raw quant-block weight uploads in `VulkanWeights.UploadMatrix` (Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16). When the contraction axis is aligned to the format's group size and the matrix is kept on device verbatim, the upload is a candidate for zero-copy import.
+- **Out of scope**: F32-dequant uploads (norm vectors, token embeddings, FP32 weights) cannot be zero-copy imported because the bytes have to be transformed host-side before the GPU sees them. Same for MoE expert banks where weights are packed into a single contiguous device buffer — there is no host-side equivalent of the packed layout. KV-cache and forward-pass scratch buffers are device-local (written by kernels, no host alias).
+- **Not changed**: the CPU GGUF loading path. The original read-only `MemoryMappedFile` is the source of truth; the Vulkan import path reads the same pages without modifying mmap semantics.
+
+### Microbench
+
+```
+dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-host-import --gguf path/to/model.gguf
+```
+
+Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace.
+
 ## Future Work
 
 - **Flash Attention**: Replace naive attention with tiled flash attention for O(N) memory and better SM utilization
 - **Fused Quantized GEMM**: Custom PTX kernels for Q4_K × FP16 (Marlin-style or MMQ-style) to eliminate per-projection dequant overhead during prefill
 - **Multi-GPU** (Step 51): NCCL-based tensor parallelism
 - **Fatbin distribution**: Pre-compiled SASS for common architectures to eliminate JIT overhead
+- **Mesa radv host-import validation**: confirm Linux Mesa radv accepts mmap'd GGUF pointers via `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, unblocks zero-copy on Strix Halo Linux.
 
 See [ROADMAP.md](ROADMAP.md) Phase 4 for the full plan.
