@@ -859,6 +859,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 _matmulIq4XsGemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
             }
+        }
         else if (weightQt == QuantizationType.IQ2_XXS)
         {
             if (seqLen == 1)

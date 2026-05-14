@@ -142,6 +142,11 @@ per sub-block ib:
 ```
 
 Alignment: IQ4_NL kernels require `inputDim % 32 == 0`; IQ4_XS kernels require `inputDim % 256 == 0`. The upload path's `KeepIq4NlOnDevice` / `KeepIq4XsOnDevice` predicates gate on these.
+| IQ2_XXS | ✓ | ✓ | — | `79cca9b` |
+| IQ2_XS | ✓ | ✓ | — | `743984c` |
+| IQ2_S (also IQ2_M) | ✓ | ✓ | — | `9ecce75` |
+
+Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q2_K / Q3_K / IQ4_NL / IQ4_XS / IQ1_*, IQ3_* Vulkan kernels are not yet shipped — the upload path falls back to F32 dequant for those formats. K-quant Q4/5/6 priority was chosen because they cover the majority of production GGUF deployments (`*-Q4_K_M.gguf` is the de-facto default for most checkpoints). Q2_K + Q3_K + IQ4_NL + IQ4_XS are present in the CUDA backend and are tracked as Vulkan follow-ups (parallel agent landed CUDA IQ4 in `6f12eab`'s sibling commits). The IQ2 family was prioritised on Vulkan to enable Qwen3.6-A3B-IQ2_M (~11.5 GB GGUFs) on Strix Halo without a 4× expansion to F32 (~46 GB) at upload.
 
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
@@ -149,12 +154,14 @@ See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md]
 
 I-quants encode weight values via a small codebook lookup rather than linear quantization — the on-disk bytes index into a per-quant-type grid table (256/512/1024 entries × 8 bytes) and an 8-bit sign mask. The base scale (`d`, Half) plus 4-bit per-pair sub-scales decode to floats as `db * grid[idx][j] * sign[j]`.
 
-| Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Notes |
-|---|---|---|---|---|---|---|---|
-| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
-| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
-| IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
-| IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
-| IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
+| Format | Block | bpw | CPU dequant | CPU MatMul | CUDA dequant | CUDA GEMV | Vulkan dequant | Vulkan GEMV/GEMM | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| IQ4_NL | 32 | 4.5 | ✓ | dequant-fallback | ✓ (`dequant_iq4_nl_{f16,f32}`) | ✓ (`quantized_gemv_iq4_nl`) | — (parallel agent) | — (parallel agent) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ4_XS | 256 | 4.25 | ✓ | dequant-fallback | ✓ | ✓ | — (parallel agent) | — (parallel agent) | Plus MMQ-preq + MMVQ-large + MoE-grouped. |
+| IQ2_XXS | 256 | 2.0625 | ✓ | dequant-fallback | ✓ (`dequant_iq2_xxs_{f16,f32}`) | ✓ (`quantized_gemv_iq2_xxs`) | ✓ (`iq2_xxs_dequant_f32.spv`) | ✓ (`matmul_iq2_xxs_f32_{gemv,gemm}.spv`) | 256-entry codebook + 4×7-bit sign indices per 32-elem sub-block + shared 4-bit scale. |
+| IQ2_XS | 256 | 2.3125 | ✓ | dequant-fallback | ✓ | ✓ | ✓ | ✓ | 512-entry codebook; 7-bit sign indices in upper bits of `qs[uint16]`. |
+| IQ2_S | 256 | 2.5625 | ✓ | dequant-fallback | ✓ | ✓ | ✓ | ✓ | 1024-entry codebook; high index bits in `qh`. **Also stores `MOSTLY_IQ2_M` file-type tensors** (Qwen3.6-A3B-IQ2_M ~11.5 GB GGUFs). |
+
+The Vulkan IQ2 family kernels store the codebook tables as readonly SSBOs uploaded once per model load (3 grids + ksigns ≈ 14 KB on device, shared by all 6 IQ2 matmul kernels via `Iq2Codebooks`). Per-element decode is `db * grid[gridIdx*8+j] * sign_j`; per-pair scale uses the same `db = d * (0.5 + sub_scale) * 0.25` arithmetic as the CPU oracle. IQ2_XXS / IQ2_XS resolve `sign_j` via the 128-entry `ksigns_iq2xs` lookup; IQ2_S stores the 8-bit sign mask directly per pair.
 
 **dotLLM does not yet support IQ1_S / IQ1_M / IQ3_XXS / IQ3_S** — these are out of scope for the current task. MMQ-preq / MMVQ-large / MoE-grouped variants for the IQ2 family are deferred; prefill falls back to dequant→cuBLAS via the `dequant_iq2_*_f32` kernels.

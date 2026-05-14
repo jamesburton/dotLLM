@@ -210,6 +210,12 @@ Tool calling: `XmlToolCallParser` (Hermes-compatible
 recursing through `str`/`num`/`bool`/`None`/`list`/`dict` literals and
 round-tripping the final object through `System.Text.Json` for
 well-formedness.
+**Vulkan IQ2 family support** (commits `79cca9b` / `743984c` / `9ecce75`)
+unlocks Qwen3.6-A3B-IQ2_M (~11.5 GB GGUF) and IQ2_XXS (~10.8 GB) on
+Strix Halo without 4× F32 expansion at upload — the matmul kernels read
+the on-disk IQ2 bytes directly with shader-side codebook lookup. The
+sibling `MOSTLY_IQ2_M` file-type lands on the same `IQ2_S` block layout
+the kernels accept.
 
 ## Legend
 

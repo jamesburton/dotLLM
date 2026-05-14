@@ -175,6 +175,49 @@ public sealed class RealGgufVulkanParityTests
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // Qwen3.6-A3B-IQ2_M / IQ2_XXS — IQ2 family on Vulkan (~11 GB GGUFs).
+    // Gated; download-on-demand from huggingface.co/unsloth or similar
+    // mradermacher GGUF mirrors. The MOSTLY_IQ2_M file-type lands on the
+    // IQ2_S block layout in ggml; both kernels share the same dispatch.
+    // ════════════════════════════════════════════════════════════════════
+
+    [SkippableFact]
+    public void Qwen36A3B_IQ2_M_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_QWEN36_A3B_IQ2_M_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_M.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Qwen3.6-A3B-IQ2_M GGUF not found. Set DOTLLM_QWEN36_A3B_IQ2_M_GGUF or "
+                + "download to ~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_M.gguf "
+                + "(~11.5 GB).");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Qwen3MoeHybrid, label: "Qwen3.6-A3B-IQ2_M",
+            prompt: "The capital of France is");
+    }
+
+    [SkippableFact]
+    public void Qwen36A3B_IQ2_XXS_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_XXS.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Qwen3.6-A3B-IQ2_XXS GGUF not found. Set DOTLLM_QWEN36_A3B_IQ2_XXS_GGUF or "
+                + "download to ~/.dotllm/test-cache/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-IQ2_XXS.gguf "
+                + "(~10.8 GB).");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Qwen3MoeHybrid, label: "Qwen3.6-A3B-IQ2_XXS",
+            prompt: "The capital of France is");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // Driver
     // ════════════════════════════════════════════════════════════════════
 
