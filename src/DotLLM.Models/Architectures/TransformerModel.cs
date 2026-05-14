@@ -600,6 +600,11 @@ public sealed unsafe class TransformerModel : IModel
                 // RmsNormQuantize decode path skips that intermediate. Force
                 // the unfused path in that case.
             bool adapterActive = _currentAdapter is not null;
+            // Phase 4d.5 / Gap 2: hoist preQuantNorm out of the decode/prefill
+            // sub-branches so the LoRA delta call site (Q8_0-B fast path) can
+            // re-use the buffer for stage 1. Pre-LoRA-Q8_0 this was scoped
+            // inside each sub-branch.
+            byte* preQuantNormQkv = null;
             if (seqLen == 1 && _threadPool != null && !adapterActive)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
@@ -622,6 +627,7 @@ public sealed unsafe class TransformerModel : IModel
                 }
 
                 FusedQkvDecode(in lw, normOut, preQuantNorm, q, k, v);
+                preQuantNormQkv = preQuantNorm;
             }
             else
             {
@@ -645,6 +651,7 @@ public sealed unsafe class TransformerModel : IModel
                     IsCompatiblePreQuant(lw.QQuantType, lw.KQuantType) ? preQuantNorm : null, in rwK);
                 GemmInterleaved(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen,
                     IsCompatiblePreQuant(lw.QQuantType, lw.VQuantType) ? preQuantNorm : null, in rwV);
+                preQuantNormQkv = preQuantNorm;
             }
 
             // Optional bias: y = Wx + b (no-op when null)
@@ -657,11 +664,28 @@ public sealed unsafe class TransformerModel : IModel
             // RoPE so the delta contributes to the same downstream pipeline
             // as the base projection. F32 normOut is guaranteed materialised
             // here (we forced the unfused path above when adapter is active).
+            //
+            // Phase 4d.5 / Gap 2: when the base projection is Q8_0 the
+            // `preQuantNormQkv` buffer is the Q8_0-encoded F32 input. We hand
+            // that to ApplyLoraDelta so a Q8_0-B adapter's stage 1 can re-use
+            // the buffer via `GemmQ8_0(preQuantizedInput=preQuantNormQkv)`,
+            // skipping the activation quantise step that Phase 4d.4 had to
+            // pay per-projection. Re-quantised path (`QuantizeInput` returning
+            // null) drops through to the F32 / dequant-once fallback as before.
             if (_currentAdapter is not null)
             {
-                ApplyLoraDelta(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
-                ApplyLoraDelta(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
-                ApplyLoraDelta(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+                // preQuantNormQkv is only valid for k/v when K/V quant types
+                // are compatible with Q (same IsCompatiblePreQuant check the
+                // base GEMM uses for the shared-input optimisation).
+                byte* preQ_q = preQuantNormQkv;
+                byte* preQ_k = (preQ_q is not null && IsCompatiblePreQuant(lw.QQuantType, lw.KQuantType)) ? preQ_q : null;
+                byte* preQ_v = (preQ_q is not null && IsCompatiblePreQuant(lw.QQuantType, lw.VQuantType)) ? preQ_q : null;
+                ApplyLoraDelta(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim,
+                               preQ_q, lw.QQuantType);
+                ApplyLoraDelta(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim,
+                               preQ_k, lw.KQuantType);
+                ApplyLoraDelta(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim,
+                               preQ_v, lw.VQuantType);
             }
 
             // Optional QK-norms (Qwen3-style): per-head RMSNorm on Q/K after projection, before RoPE
@@ -727,9 +751,12 @@ public sealed unsafe class TransformerModel : IModel
             AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
 
             // LoRA delta (o_proj): y += scale * (attnOut · B) · A.
+            // Phase 4d.5 / Gap 2: pass preQuantAttn so Q8_0-B adapter stage 1
+            // re-uses the activation Q8_0 buffer.
             if (_currentAdapter is not null)
             {
-                ApplyLoraDelta(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
+                ApplyLoraDelta(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim,
+                               preQuantAttn, lw.OQuantType);
             }
 
             // g. Residual add (per token)
@@ -826,6 +853,10 @@ public sealed unsafe class TransformerModel : IModel
             // When a LoRA adapter is active we need F32 normOut for delta —
             // skip the fused decode path so it materialises (same trick as Q/K/V).
             bool ffnAdapterActive = _currentAdapter is not null;
+            // Phase 4d.5 / Gap 2: hoist preQuantFfn out of both sub-branches
+            // so the LoRA delta call site can reuse the activation Q8_0
+            // buffer for stage 1.
+            byte* preQuantFfnHoisted = null;
             if (seqLen == 1 && _threadPool != null && !ffnAdapterActive)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
@@ -847,6 +878,7 @@ public sealed unsafe class TransformerModel : IModel
                 }
 
                 FusedGateUpDecode(in lw, normOut, preQuantFfn, ffnGate, ffnUp);
+                preQuantFfnHoisted = preQuantFfn;
             }
             else
             {
@@ -867,15 +899,22 @@ public sealed unsafe class TransformerModel : IModel
                     preQuantFfn, in rwGate);
                 GemmInterleaved(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen,
                     IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType) ? preQuantFfn : null, in rwUp);
+                preQuantFfnHoisted = preQuantFfn;
             }
             AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
             AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
             // LoRA delta (gate/up): y += scale * (normOut · B) · A.
+            // Phase 4d.5 / Gap 2: pass the hoisted preQuantFfn so the Q8_0-B
+            // adapter stage 1 re-uses the activation Q8_0 buffer.
             if (_currentAdapter is not null)
             {
-                ApplyLoraDelta(layer, "gate_proj", normOut, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
-                ApplyLoraDelta(layer, "up_proj", normOut, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+                byte* preQ_gate = preQuantFfnHoisted;
+                byte* preQ_up = (preQ_gate is not null && IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType)) ? preQ_gate : null;
+                ApplyLoraDelta(layer, "gate_proj", normOut, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim,
+                               preQ_gate, lw.GateQuantType);
+                ApplyLoraDelta(layer, "up_proj", normOut, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim,
+                               preQ_up, lw.UpQuantType);
             }
 
             // Fused SwiGLU: SiLU(gate) * up in a single tiled pass (per token)
@@ -903,9 +942,12 @@ public sealed unsafe class TransformerModel : IModel
             // LoRA delta (down_proj): y += scale * (siluOut · B) · A.
             // Input is post-SwiGLU (siluOut), not normOut. The base GEMM
             // already wrote into normOut, so we accumulate delta in place.
+            // Phase 4d.5 / Gap 2: pass preQuantSilu so Q8_0-B adapter stage 1
+            // re-uses the activation Q8_0 buffer.
             if (_currentAdapter is not null)
             {
-                ApplyLoraDelta(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim);
+                ApplyLoraDelta(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim,
+                               preQuantSilu, lw.DownQuantType);
             }
 
             // k. Residual add (per token)
@@ -979,10 +1021,26 @@ public sealed unsafe class TransformerModel : IModel
     /// Applies the LoRA delta for <paramref name="projName"/> at
     /// <paramref name="layer"/> if the active adapter targets that site.
     /// No-op when there is no active adapter or no entry for this projection.
+    /// <para>
+    /// Phase 4d.5 / Gap 2 — when the caller has already quantised
+    /// <paramref name="x"/> for the base projection's GEMM
+    /// (<see cref="QuantizeInput"/>) and passes the resulting buffer as
+    /// <paramref name="preQuantX"/>, AND <paramref name="preQuantXType"/> is
+    /// <see cref="QuantizationType.Q8_0"/>, AND the adapter's B factor is
+    /// <see cref="LoraWeightDType.Q8_0"/>, the LoRA stage-1 GEMM re-uses
+    /// the pre-quantised buffer via
+    /// <see cref="LoraDelta.ApplyQ8_0BWithPreQuantX"/> instead of dequanting B
+    /// to F32 and running an F32 GEMM. This closes the residual −16% prefill
+    /// regression the Phase 4d.4 dequant-once path left on the table on a
+    /// Q8_0 base (Strix Halo / Llama-3.2-1B). The default arguments give the
+    /// legacy F32 / dequant-once behaviour.
+    /// </para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ApplyLoraDelta(int layer, string projName,
-                                float* x, float* y, int seqLen, int inputDim, int outputDim)
+                                float* x, float* y, int seqLen, int inputDim, int outputDim,
+                                byte* preQuantX = null,
+                                QuantizationType preQuantXType = QuantizationType.F32)
     {
         var adapter = _currentAdapter;
         if (adapter is null) return;
@@ -999,6 +1057,25 @@ public sealed unsafe class TransformerModel : IModel
                 + $"({inputDim}x{outputDim}).");
 
         float scale = adapter.Alpha / adapter.Rank;
+
+        // Phase 4d.5 / Gap 2 — fast path: both base and adapter B are Q8_0
+        // AND the caller pre-quantised x. Stage 1 becomes a GemmQ8_0 against
+        // the cached xQ8 buffer (no redundant activation quant), stage 2
+        // unchanged. inputDim is always a multiple of 32 for transformer
+        // linear projections, so the Q8_0 row constraint is satisfied
+        // by construction — defensive check anyway.
+        if (preQuantX is not null
+            && preQuantXType == QuantizationType.Q8_0
+            && w.WeightDType == LoraWeightDType.Q8_0
+            && (inputDim & 31) == 0)
+        {
+            LoraDelta.ApplyQ8_0BWithPreQuantX(
+                preQuantX, (byte*)w.BHandle, (void*)w.AHandle, y,
+                seqLen, inputDim, outputDim, adapter.Rank, scale,
+                w.ResolvedAWeightDType, _threadPool);
+            return;
+        }
+
         LoraDelta.Apply((float*)x, (void*)w.BHandle, (void*)w.AHandle, (float*)y,
                         seqLen, inputDim, outputDim, adapter.Rank, scale,
                         w.WeightDType, w.ResolvedAWeightDType);

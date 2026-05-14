@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Lora;
+using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -251,6 +252,105 @@ public static unsafe class LoraDelta
         long totalElems = (long)rows * elementsPerRow;
         Dequantize.ToFloat32((nint)srcQ8, totalElems,
             DotLLM.Core.Configuration.QuantizationType.Q8_0, dst);
+    }
+
+    /// <summary>
+    /// Phase 4d.5 / Gap 2 — Q8_0 LoRA-B with pre-quantised activation. When
+    /// the dispatch site has already quantised <c>x</c> to Q8_0 for the base
+    /// projection's GEMM (which is the case on a Q8_0 base via
+    /// <c>TransformerModel.QuantizeInput</c>), we can re-use that buffer for
+    /// LoRA stage 1 and skip both the F32 stage-1 multiply *and* the per-call
+    /// B dequant. Stage 1 becomes a thin <c>GemmQ8_0</c> with <c>m=rank</c>,
+    /// <c>n=seqLen</c>, <c>k=inputDim</c> and <c>preQuantizedInput=xQ8</c>;
+    /// the activation-quantise cost that killed the spike (4d.4) is now
+    /// fully amortised across base GEMM + LoRA stage 1.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stage 2 is unchanged from the F32 / dequant-once path — A is dequanted
+    /// once into F32 scratch (when needed), then the per-token <c>GemvF32</c>
+    /// + scaled <c>MultiplyAdd</c> accumulates into <c>y</c>. We deliberately
+    /// keep stage 2 identical so the Q8_0-with-preQuant path stays bit-
+    /// equivalent (post-stage-1) to the dequant-once path used by
+    /// <see cref="ApplyQ8_0B"/>.
+    /// </para>
+    /// <para>
+    /// The numerical-equivalence claim above holds modulo Q8_1 → Q8_0
+    /// cross-quantisation rounding in stage 1: <c>GemmQ8_0</c>'s
+    /// <c>ComputeRows</c> path multiplies B's int8 weights by the Q8_0-encoded
+    /// input scalars, where the dequant-once path multiplied dequantised F32
+    /// values. The two stage-1 outputs differ by less than the Q8_0
+    /// quantisation step — well within the Q8_0 LoRA tolerance bar (5e-2 abs)
+    /// already documented for <see cref="LoraWeightDType.Q8_0"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="xQ8">Pre-quantised input — same <c>seqLen × (inputDim/32)·34</c> Q8_0 byte buffer the base GEMM consumed.</param>
+    /// <param name="bWeight">Q8_0 LoRA-B weight, <c>rank</c> rows of <c>(inputDim/32)·34</c> bytes each.</param>
+    /// <param name="aWeight">LoRA-A weight in <paramref name="aDType"/> layout (F32 / F16 / BF16).</param>
+    /// <param name="y">Output buffer; LoRA delta is accumulated in place.</param>
+    /// <param name="seqLen">Input token count.</param>
+    /// <param name="inputDim">Projection input dim; must be a multiple of 32.</param>
+    /// <param name="outputDim">Projection output dim.</param>
+    /// <param name="rank">LoRA rank (typical 8..64; no Q8_0-block constraint on rank since rank is on A's contracted axis only).</param>
+    /// <param name="scale">Scaling factor — typically <c>alpha / rank</c>.</param>
+    /// <param name="aDType">A-factor dtype — F32 / F16 / BF16.</param>
+    /// <param name="pool">Optional thread pool — used for the Q8_0 stage-1 GEMM when seqLen warrants it.</param>
+    [SkipLocalsInit]
+    public static void ApplyQ8_0BWithPreQuantX(
+        byte* xQ8, byte* bWeight, void* aWeight, float* y,
+        int seqLen, int inputDim, int outputDim, int rank, float scale,
+        LoraWeightDType aDType, ComputeThreadPool? pool = null)
+    {
+        if (seqLen <= 0 || rank <= 0) return;
+        if (inputDim % 32 != 0)
+            throw new ArgumentException(
+                $"Q8_0 LoRA with pre-quantised x requires inputDim multiple of 32, got {inputDim}.",
+                nameof(inputDim));
+
+        // Stage 1: tmp[seqLen, rank] = x · B^T using the integer-dot path.
+        // GemmQ8_0(weightsQ8=B, m=rank, k=inputDim, n=seqLen, preQuantizedInput=xQ8)
+        // skips the activation-quant step entirely (xQ8 was prepared by the
+        // base projection's QuantizeInput call), so stage 1 is now pure
+        // integer dot + F16-scale multiply per block — same FLOP/byte ratio
+        // as the base Q8_0 GEMM.
+        int tmpElems = seqLen * rank;
+        float[] tmpBuf = ArrayPool<float>.Shared.Rent(tmpElems);
+        try
+        {
+            fixed (float* tmp = tmpBuf)
+            {
+                MatMul.GemmQ8_0(bWeight, b: null, c: tmp, m: rank, k: inputDim, n: seqLen,
+                                pool: pool, preQuantizedInput: xQ8);
+
+                // Stage 2: y[t, o] += scale × sum_r A[o, r] · tmp[t, r].
+                // Same path as the F32 LoRA's stage 2 — share the Stage2
+                // helper so the post-stage-1 numerical contract matches.
+                if (aDType == LoraWeightDType.F32)
+                {
+                    Stage2(tmp, (float*)aWeight, y, seqLen, outputDim, rank, scale);
+                    return;
+                }
+
+                long aElems = (long)outputDim * rank;
+                float[] aBuf = ArrayPool<float>.Shared.Rent((int)aElems);
+                try
+                {
+                    DequantToF32(aWeight, aDType, aBuf, (int)aElems);
+                    fixed (float* aF32 = aBuf)
+                    {
+                        Stage2(tmp, aF32, y, seqLen, outputDim, rank, scale);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(aBuf);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(tmpBuf);
+        }
     }
 
     /// <summary>
