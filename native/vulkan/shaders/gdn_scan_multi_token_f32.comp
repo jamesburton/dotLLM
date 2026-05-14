@@ -41,7 +41,7 @@
 // CRITICAL barrier hazard: every thread MUST reach every barrier() inside
 // the t-loop on every iteration. The only safe early exit is the workgroup-
 // uniform `vh >= n_v_head` short-circuit at function entry. Per-thread
-// `active = tid < d_state` threads still execute every loop iteration —
+// `laneActive = tid < d_state` threads still execute every loop iteration —
 // they only skip the load/store statements between barriers, not the
 // barriers themselves.
 
