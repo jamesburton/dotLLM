@@ -77,6 +77,26 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public IReadOnlyList<CooperativeMatrixShape> SupportedCooperativeMatrixProperties { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_EXT_external_memory_host</c>
+    /// AND the device-create call successfully enabled the extension. When set,
+    /// callers may import a page-aligned host pointer (e.g. the mmap'd GGUF
+    /// tensor data section) directly into a <c>VkDeviceMemory</c> via
+    /// <c>HostVisibleBuffer.TryCreate</c>, eliminating the host→device staging
+    /// copy on unified-memory APUs (Strix Halo, Intel iGPU, MoltenVK).
+    /// </summary>
+    public bool HasExternalMemoryHost { get; }
+
+    /// <summary>
+    /// Minimum alignment (in bytes) a host pointer must satisfy to be
+    /// importable via <c>VK_EXT_external_memory_host</c>. Driver-reported
+    /// (typically 4096 on x86-64 — page size). Zero when
+    /// <see cref="HasExternalMemoryHost"/> is <c>false</c>. Callers can round
+    /// the candidate pointer down to a multiple of this value and use the
+    /// resulting offset as the <c>VkBuffer</c> view offset.
+    /// </summary>
+    public ulong MinImportedHostPointerAlignment { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -86,7 +106,8 @@ public sealed class VulkanDevice : IDisposable
         nint instance, nint physical, nint device, nint queue,
         nint commandPool, string name, uint vendor, int type, uint queueFamily,
         uint subgroupSize, bool hasSubgroupArithmetic,
-        bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes)
+        bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes,
+        bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -101,6 +122,8 @@ public sealed class VulkanDevice : IDisposable
         HasSubgroupArithmetic = hasSubgroupArithmetic;
         HasCooperativeMatrix = hasCooperativeMatrix;
         SupportedCooperativeMatrixProperties = coopmatShapes;
+        HasExternalMemoryHost = hasExternalMemoryHost;
+        MinImportedHostPointerAlignment = minImportedHostPointerAlignment;
     }
 
     /// <summary>
@@ -175,7 +198,17 @@ public sealed class VulkanDevice : IDisposable
                 instance, physical, apiVersion,
                 out bool hasCoopmat, out var coopmatShapes);
 
-            nint device = CreateLogicalDevice(physical, queueFamily, hasCoopmat);
+            // Probe VK_EXT_external_memory_host. Same gating as coopmat — the
+            // extension must be enabled at vkCreateDevice time before
+            // vkAllocateMemory will accept VkImportMemoryHostPointerInfoEXT.
+            // VK_KHR_external_memory is the dependency (core in 1.1) and is
+            // always available on a 1.1+ driver. Falls back silently when
+            // absent — caller checks HasExternalMemoryHost.
+            ProbeExternalMemoryHost(
+                physical, apiVersion,
+                out bool hasExternalMemoryHost, out ulong minImportedHostPointerAlignment);
+
+            nint device = CreateLogicalDevice(physical, queueFamily, hasCoopmat, hasExternalMemoryHost);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -191,7 +224,8 @@ public sealed class VulkanDevice : IDisposable
             // Transfer ownership of instance to the device on success.
             var result = new VulkanDevice(
                 instance, physical, device, queue, pool, name, vendor, type, queueFamily,
-                subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes);
+                subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
+                hasExternalMemoryHost, minImportedHostPointerAlignment);
             instance = 0;
             return result;
         }
@@ -443,6 +477,84 @@ public sealed class VulkanDevice : IDisposable
     private delegate int VkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
         nint physicalDevice, ref uint pPropertyCount, nint pProperties);
 
+    // Delegate matching vkGetMemoryHostPointerPropertiesEXT for dynamic
+    // resolution via vkGetDeviceProcAddr. Resolved lazily after device
+    // creation (the device must have enabled VK_EXT_external_memory_host)
+    // and cached on the VulkanDevice instance.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate int VkGetMemoryHostPointerPropertiesEXT(
+        nint device, uint handleType, nint pHostPointer,
+        ref VkMemoryHostPointerPropertiesExt pMemoryHostPointerProperties);
+
+    /// <summary>
+    /// Probes <c>VK_EXT_external_memory_host</c> support. The extension lets
+    /// callers back a <c>VkDeviceMemory</c> with an existing host mmap'd
+    /// pointer via <c>VkImportMemoryHostPointerInfoEXT</c>, which on
+    /// unified-memory APUs eliminates the host→device staging copy for
+    /// weight uploads. We probe by enumerating device extensions; when
+    /// present we chain a <c>VkPhysicalDeviceExternalMemoryHostPropertiesEXT</c>
+    /// off <c>vkGetPhysicalDeviceProperties2</c> to fetch the minimum
+    /// import alignment.
+    /// </summary>
+    /// <remarks>
+    /// AMD driver coverage (researched 2026-05-14):
+    /// <list type="bullet">
+    ///   <item>amdvlk (Windows + Linux): supports VK_EXT_external_memory_host.</item>
+    ///   <item>Mesa radv (Linux): supports VK_EXT_external_memory_host since
+    ///     Mesa 18.3 (2018).</item>
+    ///   <item>Windows AMD driver (radv stack via OpenCL or amdvlk): exposes
+    ///     the extension on RDNA generations including gfx1151 (Strix Halo).</item>
+    /// </list>
+    /// Intel ANV exposes the extension as well; NVIDIA exposes it on
+    /// post-Pascal hardware. On any driver that does not advertise the
+    /// extension, this probe returns <c>false</c> and the caller falls
+    /// back to the staging-copy upload path.
+    /// </remarks>
+    private static unsafe void ProbeExternalMemoryHost(
+        nint physical, uint apiVersion,
+        out bool hasExternalMemoryHost, out ulong minImportedHostPointerAlignment)
+    {
+        hasExternalMemoryHost = false;
+        minImportedHostPointerAlignment = 0;
+
+        // vkGetPhysicalDeviceProperties2 is core in Vulkan 1.1. Drivers that
+        // only report 1.0 don't expose the extension either. Gate accordingly.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            if (!HasDeviceExtension(physical, "VK_EXT_external_memory_host"u8))
+                return;
+
+            VkPhysicalDeviceExternalMemoryHostPropertiesExt extProps = default;
+            extProps.sType = VkStructureType.PhysicalDeviceExternalMemoryHostPropertiesExt;
+
+            VkPhysicalDeviceProperties2 props2 = default;
+            props2.sType = VkStructureType.PhysicalDeviceProperties2;
+            props2.pNext = (nint)(&extProps);
+
+            VulkanApi.vkGetPhysicalDeviceProperties2(physical, ref props2);
+
+            // Drivers must return a non-zero alignment when the extension is
+            // present. Defensive guard: a buggy driver reporting 0 would let
+            // us divide by zero downstream — treat as "feature unusable".
+            if (extProps.minImportedHostPointerAlignment == 0)
+                return;
+
+            minImportedHostPointerAlignment = extProps.minImportedHostPointerAlignment;
+            hasExternalMemoryHost = true;
+        }
+        catch
+        {
+            // Loader/driver returned garbage — disable feature, callers fall
+            // back to the staging-copy path. Mirrors the cooperative-matrix
+            // probe's defensive posture.
+            hasExternalMemoryHost = false;
+            minImportedHostPointerAlignment = 0;
+        }
+    }
+
     /// <summary>
     /// Returns <c>true</c> when <paramref name="physical"/> advertises the
     /// given device extension. <paramref name="name"/> must be the
@@ -543,7 +655,9 @@ public sealed class VulkanDevice : IDisposable
         throw new VulkanException(-3, "No queue family with COMPUTE capability.");
     }
 
-    private static unsafe nint CreateLogicalDevice(nint physical, uint queueFamily, bool enableCoopmat)
+    private static unsafe nint CreateLogicalDevice(
+        nint physical, uint queueFamily,
+        bool enableCoopmat, bool enableExternalMemoryHost)
     {
         float priority = 1.0f;
 
@@ -560,38 +674,61 @@ public sealed class VulkanDevice : IDisposable
         ci.queueCreateInfoCount = 1;
         ci.pQueueCreateInfos = (nint)(&qci);
 
-        // VK_KHR_cooperative_matrix requires:
-        //   • The device extension itself to be enabled.
-        //   • The feature bit `cooperativeMatrix=VK_TRUE` chained through pNext.
-        // llama.cpp reference: enables the extension only after the probe
-        // confirms at least one usable tile shape. We mirror that — caller
-        // decides enablement via <paramref name="enableCoopmat"/>.
+        // Stack-buffer for the (small) extension-name table. VK_KHR_external_memory
+        // is a hard dependency of VK_EXT_external_memory_host and is core in 1.1,
+        // but conservatively we enable both extension names explicitly — drivers
+        // that promoted the symbol to core ignore the duplicate.
+        ReadOnlySpan<byte> coopmatName = "VK_KHR_cooperative_matrix\0"u8;
+        ReadOnlySpan<byte> extMemHostName = "VK_EXT_external_memory_host\0"u8;
+        ReadOnlySpan<byte> extMemName = "VK_KHR_external_memory\0"u8;
+
+        // Pack name bytes + pointer array onto the stack. Worst case all three
+        // extensions are enabled at once.
+        byte* nameBytes = stackalloc byte[coopmatName.Length + extMemHostName.Length + extMemName.Length];
+        nint* namePtrs = stackalloc nint[3];
+        int nameOffset = 0;
+        uint extCount = 0;
+
         if (enableCoopmat)
         {
-            // Stack-allocate a NUL-terminated "VK_KHR_cooperative_matrix"
-            // string plus a one-element char** array pointing at it; both
-            // live for the duration of this function's stack frame, which
-            // bounds the vkCreateDevice call below.
-            ReadOnlySpan<byte> name = "VK_KHR_cooperative_matrix\0"u8;
-            byte* extBytes = stackalloc byte[name.Length];
-            for (int i = 0; i < name.Length; i++) extBytes[i] = name[i];
+            for (int i = 0; i < coopmatName.Length; i++) nameBytes[nameOffset + i] = coopmatName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += coopmatName.Length;
+        }
 
-            nint extNamePtr = (nint)extBytes;
+        if (enableExternalMemoryHost)
+        {
+            // VK_KHR_external_memory is core in Vulkan 1.1 so the driver
+            // typically does not require us to name it here, but spec is
+            // explicit that the bit type's home extension must be in the
+            // enabled-extension list when external-memory pNext structs are
+            // used at allocation time. Mesa radv tolerates omitting it;
+            // amdvlk is stricter. Enable both — costs one extra string pointer.
+            for (int i = 0; i < extMemName.Length; i++) nameBytes[nameOffset + i] = extMemName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extMemName.Length;
 
-            var coopmatFeatures = new VkPhysicalDeviceCooperativeMatrixFeaturesKhr
-            {
-                sType = VkStructureType.PhysicalDeviceCooperativeMatrixFeaturesKhr,
-                cooperativeMatrix = 1, // VK_TRUE
-                cooperativeMatrixRobustBufferAccess = 0,
-            };
+            for (int i = 0; i < extMemHostName.Length; i++) nameBytes[nameOffset + i] = extMemHostName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extMemHostName.Length;
+        }
 
-            ci.enabledExtensionCount = 1;
-            ci.ppEnabledExtensionNames = (nint)(&extNamePtr);
+        // VK_KHR_cooperative_matrix requires the feature bit `cooperativeMatrix=VK_TRUE`
+        // chained through pNext on top of the extension enable. No other feature
+        // bits need toggling for VK_EXT_external_memory_host.
+        VkPhysicalDeviceCooperativeMatrixFeaturesKhr coopmatFeatures = default;
+        if (enableCoopmat)
+        {
+            coopmatFeatures.sType = VkStructureType.PhysicalDeviceCooperativeMatrixFeaturesKhr;
+            coopmatFeatures.cooperativeMatrix = 1; // VK_TRUE
+            coopmatFeatures.cooperativeMatrixRobustBufferAccess = 0;
             ci.pNext = (nint)(&coopmatFeatures);
+        }
 
-            VulkanApi.vkCreateDevice(physical, ci, 0, out nint devCoopmat)
-                .ThrowOnError("vkCreateDevice (coopmat)");
-            return devCoopmat;
+        if (extCount > 0)
+        {
+            ci.enabledExtensionCount = extCount;
+            ci.ppEnabledExtensionNames = (nint)namePtrs;
         }
 
         VulkanApi.vkCreateDevice(physical, ci, 0, out nint dev)
@@ -838,6 +975,44 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkDestroyFence(_device, fence, 0);
             VulkanApi.vkFreeCommandBuffers(_device, _commandPool, 1, cmdBuf);
         }
+    }
+
+    /// <summary>
+    /// Picks a memory type index for an imported host pointer. The candidate
+    /// <paramref name="typeBits"/> is the intersection of
+    /// <c>vkGetBufferMemoryRequirements.memoryTypeBits</c> and
+    /// <c>VkMemoryHostPointerPropertiesEXT.memoryTypeBits</c>; both filters
+    /// have already been applied by the caller. We additionally prefer a
+    /// type that is HOST_VISIBLE (so the host mmap can still be read/written
+    /// after import) over one that isn't, but accept either since the driver
+    /// is the authority on what's compatible.
+    /// </summary>
+    internal unsafe bool TryFindHostImportMemoryType(uint typeBits, out uint memoryTypeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;
+
+        uint fallbackIdx = uint.MaxValue;
+        for (uint i = 0; i < mem.memoryTypeCount; i++)
+        {
+            if ((typeBits & (1u << (int)i)) == 0) continue;
+            var flags = (VkMemoryPropertyFlags)types[i * 2];
+            if ((flags & VkMemoryPropertyFlags.HostVisible) != 0)
+            {
+                memoryTypeIndex = i;
+                return true;
+            }
+            if (fallbackIdx == uint.MaxValue) fallbackIdx = i;
+        }
+
+        if (fallbackIdx != uint.MaxValue)
+        {
+            memoryTypeIndex = fallbackIdx;
+            return true;
+        }
+
+        memoryTypeIndex = 0;
+        return false;
     }
 
     private unsafe uint FindMemoryType(uint typeBits, VkMemoryPropertyFlags required)
