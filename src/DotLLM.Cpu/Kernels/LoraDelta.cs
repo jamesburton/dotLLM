@@ -163,21 +163,31 @@ public static unsafe class LoraDelta
     }
 
     /// <summary>
-    /// Phase 4d.4 — Q8_0 B-side LoRA delta path. Closes the prefill
-    /// regression (~36% on Strix Halo per Agent 8's macro-bench) that
-    /// landing an F32 LoRA on a Q8_0 base produced. The aggregate LoRA
-    /// byte volume drops from <c>2 × 4 × hidden × rank</c> (F32 both) to
-    /// <c>(1.0625 + sizeof(aDType)) × hidden × rank</c> — for hidden=2048,
-    /// rank=16, F16 A: ~2.6× total LoRA byte reduction.
+    /// Phase 4d.4 — Q8_0 B-side LoRA delta path. Stores B as Q8_0 to halve
+    /// the weight memory footprint of the adapter; on each call B is
+    /// dequantised once into a small F32 scratch and the standard F32 GEMM
+    /// stage 1 runs against it.
     /// </summary>
     /// <remarks>
-    /// Stage 1 reuses <see cref="MatMul.GemmQ8_0(byte*, float*, float*, int, int, int, byte*)"/>
-    /// so the activation x is quantised once per call and reused across all
-    /// <c>rank</c> rows of B. Stage 2 dequants A into a small F32 scratch
-    /// (rank × outputDim, kilobytes for typical shapes — fits in L2) and
-    /// reuses the F32 stage-2 path; that scratch is rented once per Apply
-    /// call. Stage 2 is bandwidth-light (A is reused across all output cols
-    /// per token) so per-call F32 dequant of A is acceptable here.
+    /// <para>
+    /// Spike (4d.4) initially used <c>GemmQ8_0</c> for stage 1 to mirror the
+    /// base-model Q8_0 GEMV. That path measured ~50% slower than the F32
+    /// LoRA on Llama-3.2-1B-Q8_0 + Strix Halo (see
+    /// <c>.continue-here-lora-quantised-delta.md</c> for the full data) —
+    /// the geometry mismatch is the cause: <c>GemmQ8_0</c> with M=rank=16
+    /// quantises the entire <c>(seqLen × inputDim)</c> activation tile per
+    /// call, but the rank-tall stage-1 matmul does not amortise that
+    /// quantisation cost across enough output rows. The activation-quant
+    /// overhead alone exceeds the F32 stage-1 compute.
+    /// </para>
+    /// <para>
+    /// The dequant-then-F32 fallback used here keeps the adapter memory
+    /// halved (Q8_0 storage is ~1.06 B/elem vs F32's 4 B/elem) without
+    /// paying the activation-quantise cost on every Apply call. Per-call
+    /// B dequant is <c>rank × inputDim</c> floats written — typical 128 KiB
+    /// for rank=16, inputDim=2048 — which fits in L2 and is dominated by
+    /// the subsequent F32 GEMM.
+    /// </para>
     /// </remarks>
     [SkipLocalsInit]
     private static void ApplyQ8_0B(float* x, byte* bQ8, void* aWeight, float* y,
@@ -189,26 +199,20 @@ public static unsafe class LoraDelta
                 $"Q8_0 LoRA B requires inputDim multiple of 32, got {inputDim}.",
                 nameof(inputDim));
 
-        // Stage 1: tmp[t, r] = sum_i x[t, i] · B[r, i]  via GemmQ8_0.
-        //   weightsQ8 = bQ8        (M=rank, K=inputDim, Q8_0)
-        //   b         = x          (N=seqLen, K=inputDim, F32)
-        //   c         = tmp        (N=seqLen, M=rank,    F32)
-        int tmpElems = seqLen * rank;
-        float[] tmpBuf = ArrayPool<float>.Shared.Rent(tmpElems);
+        // Dequant B (rank × inputDim Q8_0 → F32 scratch). Block size is
+        // small (~128 KiB at typical shapes), fits in L2.
+        long bElems = (long)rank * inputDim;
+        float[] bF32Buf = ArrayPool<float>.Shared.Rent((int)bElems);
         try
         {
-            fixed (float* tmp = tmpBuf)
-            {
-                MatMul.GemmQ8_0(bQ8, x, tmp, rank, inputDim, seqLen, preQuantizedInput: null);
+            DequantizeQ8_0RowsToF32(bQ8, bF32Buf.AsSpan(0, (int)bElems), rank, inputDim);
 
-                // Stage 2: dequant A into a small F32 scratch and reuse the
-                // existing per-token GEMV-then-MultiplyAdd loop. A is at most
-                // outputDim × rank floats — for hidden=8192, rank=64 that's
-                // 2 MiB which exceeds L2 but is amortised by outputDim-many
-                // dot products per token.
+            fixed (float* bF32 = bF32Buf)
+            {
+                // A handling: F32 → use directly; F16/BF16 → dequant + F32 path.
                 if (aDType == LoraWeightDType.F32)
                 {
-                    Stage2(tmp, (float*)aWeight, y, seqLen, outputDim, rank, scale);
+                    Apply(x, bF32, (float*)aWeight, y, seqLen, inputDim, outputDim, rank, scale);
                     return;
                 }
 
@@ -219,7 +223,7 @@ public static unsafe class LoraDelta
                     DequantToF32(aWeight, aDType, aBuf, (int)aElems);
                     fixed (float* aF32 = aBuf)
                     {
-                        Stage2(tmp, aF32, y, seqLen, outputDim, rank, scale);
+                        Apply(x, bF32, aF32, y, seqLen, inputDim, outputDim, rank, scale);
                     }
                 }
                 finally
@@ -230,8 +234,23 @@ public static unsafe class LoraDelta
         }
         finally
         {
-            ArrayPool<float>.Shared.Return(tmpBuf);
+            ArrayPool<float>.Shared.Return(bF32Buf);
         }
+    }
+
+    /// <summary>
+    /// Dequantises a contiguous Q8_0 block of <paramref name="rows"/> ×
+    /// <paramref name="elementsPerRow"/> into <paramref name="dst"/>. Q8_0
+    /// is a row-wise format so a contiguous range of rows is also a
+    /// contiguous range of elements — we dispatch a single call into
+    /// <see cref="Dequantize.ToFloat32(nint, long, DotLLM.Core.Configuration.QuantizationType, Span{float})"/>
+    /// to use its AVX2 SIMD inner loop.
+    /// </summary>
+    private static void DequantizeQ8_0RowsToF32(byte* srcQ8, Span<float> dst, int rows, int elementsPerRow)
+    {
+        long totalElems = (long)rows * elementsPerRow;
+        Dequantize.ToFloat32((nint)srcQ8, totalElems,
+            DotLLM.Core.Configuration.QuantizationType.Q8_0, dst);
     }
 
     /// <summary>
