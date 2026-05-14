@@ -44,6 +44,16 @@
 // `laneActive = tid < d_state` threads still execute every loop iteration —
 // they only skip the load/store statements between barriers, not the
 // barriers themselves.
+//
+// CRITICAL fp32 parity hazard: every multiply-add in this kernel that
+// participates in a reduction or rank-1 update is qualified `precise` so the
+// driver MAY NOT fuse `a + b*c` into `fma(b, c, a)`. The CPU oracle
+// `DotLLM.Cpu.Kernels.GatedDeltaNetScan.Execute` runs JIT-compiled C# with
+// no implicit FMA — fusing on the GPU produces a per-step rounding
+// divergence that, over a 32-element reduction repeated across rank-1
+// updates and the read phase, accumulates well beyond the 4-ULP tolerance
+// the parity tests assert. Removing `precise` is a regression — verify
+// VulkanGdnScanMultiTokenF32KernelTests still pass before doing so.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -111,37 +121,47 @@ void main() {
         barrier();
 
         // ── Phase 2: Retrieve  tmp[tid] = Σ_row S[row, tid] * k_kh[row] ────
-        float retr = 0.0;
+        // `precise` blocks FMA fusion — CPU oracle is separate mul+add.
+        precise float retr = 0.0;
         if (laneActive) {
             for (uint row = 0u; row < dState; row++) {
-                retr += st[stateBase + row * dState + tid] * k_shared[row];
+                precise float prod = st[stateBase + row * dState + tid] * k_shared[row];
+                retr = retr + prod;
             }
             tmp[tid] = retr;
         }
         barrier();
 
         // ── Phase 3: Delta rule ────────────────────────────────────────────
-        float delta = 0.0;
+        // delta = beta * (v - tmp) — keep as separate (sub, mul) to match CPU.
+        precise float delta = 0.0;
         if (laneActive) {
             float vVh = v_buf[vBase + tid];
-            delta = betaVh * (vVh - tmp[tid]);
+            precise float diff = vVh - tmp[tid];
+            delta = betaVh * diff;
             tmp[tid] = delta;
         }
         barrier();
 
+        // Rank-1 update: S[row, tid] += k_kh[row] * delta. Forbid FMA fusion
+        // — CPU does `S[i] += ki * tmp[col]` as separate mul+add.
         if (laneActive) {
             for (uint row = 0u; row < dState; row++) {
                 uint idx = stateBase + row * dState + tid;
-                st[idx] = st[idx] + k_shared[row] * delta;
+                precise float prod = k_shared[row] * delta;
+                precise float updated = st[idx] + prod;
+                st[idx] = updated;
             }
         }
         barrier();
 
         // ── Phase 4: Read  out[t, vh, tid] = (Σ_row S[row, tid] * q_kh[row]) / √d ──
+        // Same `precise` discipline as Phase 2.
         if (laneActive) {
-            float acc = 0.0;
+            precise float acc = 0.0;
             for (uint row = 0u; row < dState; row++) {
-                acc += st[stateBase + row * dState + tid] * q_shared[row];
+                precise float prod = st[stateBase + row * dState + tid] * q_shared[row];
+                acc = acc + prod;
             }
             out_buf[vBase + tid] = acc * invSqrtD;
         }
