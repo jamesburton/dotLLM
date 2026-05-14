@@ -89,7 +89,7 @@ void main() {
     if (int(vh) >= pc.n_v_head) return;
 
     uint dState = uint(pc.d_state);
-    bool active = tid < dState;          // threads with tid >= dState idle but stay alive
+    bool laneActive = tid < dState;          // threads with tid >= dState idle but stay alive
 
     // TILED head broadcast (matches llama.cpp ggml_gated_delta_net): kh = vh % n_k_head.
     // For NVHead=32, NKHead=16 this maps vh 0..15 → kh 0..15, vh 16..31 → kh 0..15.
@@ -106,7 +106,7 @@ void main() {
     // One thread per d_state element. Each row-iteration of the reductions
     // below will broadcast-read these instead of hitting global memory
     // 128 times per workgroup per phase. Inactive threads skip the store.
-    if (active) {
+    if (laneActive) {
         k_shared[tid] = k_t[qkHeadBase + tid];
         q_shared[tid] = q_t[qkHeadBase + tid];
     }
@@ -115,7 +115,7 @@ void main() {
     // ── Phase 1: Decay  S[row, tid] *= g_vh ────────────────────────────────
     // Thread `tid` owns column `tid` of S throughout. Loop the row dimension
     // and apply the scalar decay. Order independent (scalar multiply).
-    if (active) {
+    if (laneActive) {
         for (uint row = 0u; row < dState; row++) {
             uint idx = stateBase + row * dState + tid;
             st[idx] = st[idx] * gVh;
@@ -126,7 +126,7 @@ void main() {
     // ── Phase 2: Retrieve  tmp[tid] = Σ_row S[row, tid] * k_kh[row] ─────────
     // Row-outer reduction matching the C# inner col-loop accumulation order.
     float retr = 0.0;
-    if (active) {
+    if (laneActive) {
         for (uint row = 0u; row < dState; row++) {
             retr += st[stateBase + row * dState + tid] * k_shared[row];
         }
@@ -142,7 +142,7 @@ void main() {
     // rank-1 update on its column. The first store is to `tmp[tid]` only —
     // no inter-thread hazard until the next barrier.
     float delta = 0.0;
-    if (active) {
+    if (laneActive) {
         float vVh = v_t[vHeadBase + tid];
         delta = betaVh * (vVh - tmp[tid]);
         tmp[tid] = delta;
@@ -151,7 +151,7 @@ void main() {
 
     // Apply rank-1 update to the column `tid` we own. We read k_shared[row]
     // (cooperative shared load above) and `delta` (already in register).
-    if (active) {
+    if (laneActive) {
         for (uint row = 0u; row < dState; row++) {
             uint idx = stateBase + row * dState + tid;
             st[idx] = st[idx] + k_shared[row] * delta;
@@ -163,7 +163,7 @@ void main() {
     // Same row-outer accumulation order as phase 2 — bit-equivalent to the
     // C# implementation. Scale is applied ONCE after the sum, again matching
     // the C# `float scale = 1f / MathF.Sqrt(dState)` pattern.
-    if (active) {
+    if (laneActive) {
         float acc = 0.0;
         for (uint row = 0u; row < dState; row++) {
             acc += st[stateBase + row * dState + tid] * q_shared[row];

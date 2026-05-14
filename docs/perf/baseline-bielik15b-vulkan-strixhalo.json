@@ -1,0 +1,81 @@
+{
+  "label": "vulkan-strixhalo-bielik15b-q8",
+  "timestamp": "2026-05-14T01:22:50+00:00",
+  "git": {
+    "commit": "05242766bf251afa7ea11dd1d6ee137856eb64c5",
+    "branch": "worktree-agent-a480e8ccd7f9935e4",
+    "dirty": true
+  },
+  "system": {
+    "cpu": "AMD64 Family 26 Model 112 Stepping 0, AuthenticAMD",
+    "cores": 32,
+    "os": "Windows 11",
+    "ram_gb": null
+  },
+  "config": {
+    "prompt_size": "short",
+    "max_tokens": 30,
+    "models": [
+      "Bielik-1.5B-v3.0-Instruct-Q8_0.gguf"
+    ],
+    "device": "vulkan"
+  },
+  "results": [
+    {
+      "engine": "dotLLM (vulkan)",
+      "model": "Bielik-1.5B-v3.0-Instruct-Q8_0",
+      "prefill_ms": 51.5188,
+      "decode_ms": 416.87059999999997,
+      "prefill_tokens": 6,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 116.46233996133451,
+      "decode_tok_per_sec": 69.56595164062901,
+      "decode_ms_per_tok": 14.374848275862067,
+      "total_tok_per_sec": 74.72415046113342,
+      "bdn_mean_ns": 797375733.3333334,
+      "bdn_stddev_ns": 60969708.0726432,
+      "median_prefill_tok_per_sec": 93.52014501857154,
+      "median_decode_tok_per_sec": 64.18061931199261,
+      "median_prefill_ms": 64.1573,
+      "median_decode_ms": 451.8498,
+      "decode_cv": 0.04626934630364003,
+      "prefill_cv": 0.29262159787117425,
+      "all_decode_tok_per_sec": [
+        63.64643134459451,
+        66.40203547425708,
+        64.18490919827295,
+        64.18061931199261,
+        69.56595164062901,
+        60.99765663830135,
+        61.198722592732416
+      ],
+      "all_prefill_tok_per_sec": [
+        65.48388223378619,
+        100.1104552022398,
+        111.94176043343849,
+        93.52014501857154,
+        116.46233996133451,
+        44.997817605846116,
+        81.71047255889964
+      ],
+      "all_decode_ms": [
+        455.6422,
+        436.7336,
+        451.8196,
+        451.8498,
+        416.87059999999997,
+        475.42810000000003,
+        473.8661
+      ],
+      "all_prefill_ms": [
+        91.6256,
+        59.933800000000005,
+        53.5993,
+        64.1573,
+        51.5188,
+        133.3398,
+        73.42999999999999
+      ]
+    }
+  ]
+}
