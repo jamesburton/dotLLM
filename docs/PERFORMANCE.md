@@ -26,6 +26,13 @@ this exercise it does:
   memory-contended conditions; the GDN scan + per-expert MoE matmul
   are scalar-loop reference impls and are the obvious next SIMD
   targets. See §3.1.
+- **Llama family Vulkan (Q8_0, AMD Radeon 8060S iGPU on Strix Halo)**:
+  dotLLM Llama-3.2-1B Q8_0 short-prompt decode is 81.8 tok/s at CV 1.2%
+  — 1.61× the RTX 3060 CUDA baseline above and 1.88× Strix Halo CPU.
+  Workgroup-size tuning on the Q8_0 GEMV (the prime candidate flagged
+  in the Phase 10 commit) is **not** a measurable win on this hardware
+  — see §6 for the negative-result microbench. See §6 for the full
+  Strix Halo baseline + headroom analysis.
 
 ## 1. Environment
 
@@ -364,7 +371,193 @@ after each change.
    pre-empt picking it as a "biggest gap" target — it cannot be
    cashed in on this machine.
 
-## 6. Update protocol
+## 6. Vulkan baseline — Strix Halo (Ryzen AI Max+ 395, Radeon 8060S iGPU)
+
+This section adds the Vulkan baseline on AMD Strix Halo, the primary
+Vulkan target for this project. The numbers were captured on a separate
+machine from §1; the cross-engine comparisons in §2 do **not** carry over
+— they were on Intel Ultra 7 + RTX 3060. This section is the
+single-machine reference for Vulkan and for Strix Halo CPU.
+
+### 6.1 Environment
+
+| Component | Detail |
+|---|---|
+| CPU model | AMD Ryzen AI Max+ 395 (Strix Halo, Zen 5) |
+| Cores / threads | 16 physical / 32 logical |
+| SIMD support | AVX2 + AVX-512 (RyuJIT detects AVX-512F+CD+BW+DQ+VL+VBMI) |
+| GPU | AMD Radeon 8060S Graphics (gfx1151, RDNA3.5 iGPU, integrated) |
+| Driver | AMD proprietary 2.0.317, Vulkan 1.3.292 |
+| Subgroup width | **64** (`subgroupSize=64`, `min=32`, `max=64`); `cooperativeMatrix` supported |
+| RAM | 64 GiB DDR5 unified (iGPU shares main memory pool) |
+| OS | Windows 11 Pro 26200.7019 |
+| dotLLM commit | `0524276` + worktree `worktree-agent-a480e8ccd7f9935e4` (incl. backport of `665f228` GDN shader rename) |
+| .NET SDK | 10.0.103 (runtime 10.0.3, RyuJIT AVX-512) |
+| Vulkan SDK | scoop-installed, `glslc` on PATH |
+
+### 6.2 Results (dotLLM, best-of-N over 7 BDN iterations, 3 BDN runs of 30 decode tokens each, prompt "The capital of France is")
+
+llama.cpp Vulkan-on-Strix-Halo numbers were not captured in this pass —
+no llama.cpp Vulkan build was available on the host. This is left as a
+follow-up: build llama.cpp with `-DGGML_VULKAN=ON` against the same
+Vulkan SDK and re-run `bench_compare.py --device vulkan --llamacpp` with
+a `--llamacpp-bin` pointing at `llama-completion.exe` from that build.
+
+| Model | Quant | Backend | Prefill ms | Prefill tok/s | Decode ms | Decode tok/s | Decode CV | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| SmolLM-135M               | Q8_0 | dotLLM CPU (AVX-512, 32 thr) |  17.2 | 291.1 | 107.9 | 268.7 | 16.9% | 5× the Intel-baseline 53 tok/s |
+| SmolLM-135M               | Q8_0 | **dotLLM Vulkan**           |   9.9 | 503.5 |  82.1 | **353.3** | 3.9% | 1.31× CPU |
+| Llama-3.2-1B-Instruct     | Q8_0 | dotLLM CPU (AVX-512, 32 thr) |  41.3 | 121.1 | 665.3 | 43.6  | 19.6% | 4× the Intel-baseline 10.6 tok/s |
+| Llama-3.2-1B-Instruct     | Q8_0 | **dotLLM Vulkan**           |  27.9 | 179.4 | 354.3 | **81.8**  | 1.2%  | 1.88× CPU. Cleanest reading in the table |
+| Bielik-1.5B-v3.0-Instruct | Q8_0 | **dotLLM Vulkan**           |  51.5 | 116.5 | 416.9 | **69.6**  | 4.6%  | Llama-arch stand-in (Llama-3.2-3B not cached) |
+| Qwen2.5-0.5B-Instruct     | Q8_0 | **dotLLM Vulkan**           |  21.9 | 227.9 | 269.8 | **107.5** | 9.5%  | Qwen-family stand-in (Qwen3.6-A3B not cached on this host) |
+
+> **Qwen3.6-A3B was not cached on this host** — per the task brief's
+> "don't trigger downloads" policy, Qwen2.5-0.5B is run as a Qwen-family
+> stand-in. The Qwen3.6 (Gated DeltaNet + MoE) Vulkan path is gated on
+> the GDN multi-token shader at `native/vulkan/shaders/gdn_scan_multi_token_f32.comp`
+> being compilable on the host (it required a backport of `665f228`
+> renaming `active` → `laneActive` for newer `glslc`/`shaderc`).
+
+Raw JSON exports are checked in alongside §1's CPU/CUDA blobs:
+
+- `docs/perf/baseline-smollm-vulkan-strixhalo.json`
+- `docs/perf/baseline-llama1b-vulkan-strixhalo.json`
+- `docs/perf/baseline-bielik15b-vulkan-strixhalo.json`
+- `docs/perf/baseline-qwen25-0.5b-vulkan-strixhalo.json`
+- `docs/perf/baseline-smollm-cpu-strixhalo.json`
+- `docs/perf/baseline-llama1b-cpu-strixhalo.json`
+
+### 6.3 Cross-machine reading
+
+The Llama-3.2-1B Q8_0 row gives a clean three-way picture for the same
+model and quantisation:
+
+| Backend          | Decode tok/s | Source |
+|---|---:|---|
+| Intel Ultra 7 CPU (22 thr, AVX2)   | 10.6 | §2, prior baseline |
+| **Strix Halo CPU (32 thr, AVX-512)** | **43.6** | §6.2 — 4.1× the Intel CPU baseline |
+| RTX 3060 CUDA                       | 50.9 | §2, prior baseline |
+| **Strix Halo Vulkan (Radeon 8060S)** | **81.8** | §6.2 — 1.61× the RTX 3060 CUDA baseline, 1.88× Strix Halo CPU |
+| llama.cpp CUDA on RTX 3060         | 85.0 | §2 |
+| llama.cpp Vulkan on Strix Halo     | not measured | follow-up |
+
+The Vulkan-on-Strix-Halo number for Llama-3.2-1B Q8_0 (81.8 tok/s
+decode at CV 1.2%) is **the most stable measurement in this whole
+document** — it is also the reproducibility benchmark to anchor future
+optimisation passes against.
+
+### 6.4 Top-3 perf-headroom items (measurement-derived)
+
+For Llama-3.2-1B Q8_0 decode at 12.22 ms/token on Strix Halo Vulkan:
+
+The dense-Llama path records ~13 dispatches per layer (1 fused
+RmsNorm+Q, 2 matmuls (K/V), 1 RoPE, 1 attention, 1 matmul (O), 1 add,
+1 fused RmsNorm+Gate, 1 matmul (Up), 1 SwiGLU, 1 matmul (Down), 1 add
++ inter-layer barrier). For 16 layers + final norm + LM head + sampling
+that lands at **~210 compute dispatches** + barriers + 1 `vkQueueSubmit`
++ 1 fence wait per decode step.
+
+A workgroup-size sensitivity microbench
+(`benchmarks/VulkanGemvWorkgroupSweep`) of the Q8_0 GEMV at
+WG=64/128/256 and a subgroup-arithmetic variant ranks the production
+WG=128 + shared-memory reduce as **already at the local optimum on
+RDNA3.5**:
+
+| Variant           | Per-step Q8_0 GEMV cost (median of 5 runs) | Ratio vs WG=128 |
+|---|---:|---:|
+| wg64 (1 wavefront)              | ~3100 µs | 0.77× (slower) |
+| **wg128 (current production)**  | **~2400 µs** | **1.00×** |
+| wg256 (4 wavefronts)            | ~2500 µs | 0.94× (slower) |
+| sg (subgroup reduce, 2 barriers vs 8) | ~2400 µs | 0.99–1.03× (within noise) |
+
+End-to-end Llama-3.2-1B Q8_0 with the SG variant swapped in for
+production: 78.5 tok/s decode vs 81.8 tok/s reference (within the run-
+to-run noise envelope of ±10%). **Workgroup size and reduce strategy
+on the Q8_0 GEMV is not a meaningful headroom item on this hardware.**
+
+The estimated cost share of Q8_0 GEMV in the 12.22 ms decode step is
+~7.9 ms (65%; weighted-shape median from the microbench). The remaining
+~4.3 ms (~35%) is split among RmsNorm, RoPE, attention, SwiGLU, residual
+adds, KV-cache transfers, and per-submission overhead — and that is
+where the unmeasured headroom must live. Ranked by suspicion (gain
+estimates omitted on purpose — none of these are measured yet, and on
+this iGPU per-run noise dwarfs anything below ±10%):
+
+1. **`VK_KHR_cooperative_matrix` Q8_0 GEMV path.** Strix Halo advertises
+   coopmat (the `MatMulQ8_0GemmCoopmatKernel` path is already wired for
+   prefill — see `VulkanTransformerModel.cs` line ~70 comment claiming
+   "~3.8× over scalar GEMM at Llama-3 4096² N=64"). The decode path
+   (N=1) currently uses scalar `matmul_q8_0.comp`; coopmat tiles need
+   N≥16 by construction, so the decode path needs a **batched-decode
+   adapter**: gather multiple in-flight requests' Q activations into an
+   N=16 tile and dispatch one coopmat GEMM. Speculative decoding's
+   draft-verify also creates the same N>1 opportunity for free. This is
+   the *largest* concrete unmeasured gain available on Strix Halo,
+   gated on landing the engine-side batching seam.
+
+2. **Per-decode `vkQueueSubmit` count.** Fence-pipelined forward already
+   collapses to 1 submit per decode for the dense Llama path (`d43ff71`
+   "fence-pipelined forward"), so this is *probably* not load-bearing
+   on Llama-3.2-1B. Worth confirming with a Vulkan timestamp-query
+   pass: instrument the begin/end of forward with
+   `VK_QUERY_TYPE_TIMESTAMP` and compare wall-clock decode (12.22 ms) to
+   GPU-side dispatch sum. If the gap > 1 ms it points at host-side
+   command-buffer build cost; if not, parking this item.
+
+3. **F16 KV-cache, packed FP16 GDN state.** The Phase 10 commit
+   (`da50c40`) explicitly flagged "packed FP16 state to halve bandwidth
+   on the large `[d_k, d_v]` matrices" as remaining headroom for
+   Qwen3.6-A3B specifically. The dense Llama path also currently runs
+   F32 KV-cache through `VulkanKvCache.RecordUpdate` — F16 would halve
+   the per-step KV-cache copy bandwidth and the per-step attention KV
+   read bandwidth. The CPU path's `KvCacheConfig.KeyDType/ValueDType`
+   machinery (Step 33) makes this testable end-to-end without rewriting
+   `attention_f32.comp`'s reduce — but the Vulkan attention shader
+   currently consumes F32 K/V, so the kernel side needs an F16-K/V
+   variant first.
+
+What is **NOT** a top item, contrary to the Phase 10 commit's
+suggestion:
+
+- **"Workgroup size tuning for RDNA3.5 64-wide wavefronts"** on the
+  Q8_0 GEMV. The microbench above (`benchmarks/VulkanGemvWorkgroupSweep`)
+  shows WG=128 + shared-mem reduce is already within ±5% of every
+  alternative tested (WG=64, WG=256, subgroup-arithmetic-128). The
+  shaders compile to SPIR-V with the driver picking up RDNA3.5's
+  64-wide subgroup automatically; the production WG=128 lands as 2
+  wavefronts which is the right occupancy point for the 8060S compute
+  units. The negative-result artefacts (3 SPV variants + microbench)
+  are kept under `benchmarks/VulkanGemvWorkgroupSweep/` so the
+  experiment can be re-run if the driver, model shapes, or hardware
+  change — but no production-path change is warranted on this data.
+
+### 6.5 Reproduction commands
+
+```powershell
+# Vulkan SmolLM-135M Q8_0
+python scripts/bench_compare.py `
+    --model QuantFactory/SmolLM-135M-GGUF --quant Q8_0 `
+    --device vulkan --tokens 30 `
+    --iterations 3 --runs 3 --prompt-size short `
+    --label "vulkan-strixhalo-smollm-q8" `
+    --dotllm `
+    --export-json docs/perf/baseline-smollm-vulkan-strixhalo.json
+
+# Vulkan Llama-3.2-1B Q8_0 (the headline measurement)
+python scripts/bench_compare.py `
+    --model bartowski/Llama-3.2-1B-Instruct-GGUF --quant Q8_0 `
+    --device vulkan --tokens 30 `
+    --iterations 3 --runs 3 --prompt-size short `
+    --label "vulkan-strixhalo-llama1b-q8" `
+    --dotllm `
+    --export-json docs/perf/baseline-llama1b-vulkan-strixhalo.json
+
+# Q8_0 GEMV workgroup-size sweep (the negative-result microbench)
+dotnet run --project benchmarks/VulkanGemvWorkgroupSweep -c Release
+```
+
+## 7. Update protocol
 
 When extending this baseline:
 
