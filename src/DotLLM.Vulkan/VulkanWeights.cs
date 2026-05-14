@@ -571,18 +571,45 @@ internal sealed class VulkanWeights : IDisposable
         out VulkanDevice.Buffer? buf)
     {
         buf = null;
-        if (!device.HasExternalMemoryHost) return false;
-        if (IsHostImportDisabled()) return false;
-        if (srcPtr == 0) return false;
+        if (!device.HasExternalMemoryHost)
+        {
+            LastUploadFallbackReason = "feature_absent";
+            return false;
+        }
+        if (IsHostImportDisabled())
+        {
+            LastUploadFallbackReason = "env_disabled";
+            return false;
+        }
+        if (srcPtr == 0)
+        {
+            LastUploadFallbackReason = "null_src";
+            return false;
+        }
 
         var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
-        if (wrapped is null) return false;
+        if (wrapped is null)
+        {
+            LastUploadFallbackReason = "import_rejected";
+            return false;
+        }
 
         LastUploadZeroCopyMatrices++;
         LastUploadZeroCopyBytes += bytes;
         buf = wrapped;
         return true;
     }
+
+    /// <summary>
+    /// Last reason the most recent <see cref="UploadMatrix"/> call fell back
+    /// from the zero-copy path to staging. Diagnostic only. Values include
+    /// "feature_absent" (driver does not expose VK_EXT_external_memory_host),
+    /// "env_disabled" (DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1), "null_src"
+    /// (source pointer is null), "import_rejected" (driver rejected the
+    /// vkAllocateMemory import). Empty string when the most recent call took
+    /// the zero-copy path or when no fallback decision has been made.
+    /// </summary>
+    public static string LastUploadFallbackReason { get; private set; } = string.Empty;
 
     /// <summary>Resets the per-upload diagnostic counters. Called from
     /// <see cref="Upload"/> at the start of each call.</summary>
@@ -591,6 +618,7 @@ internal sealed class VulkanWeights : IDisposable
         LastUploadZeroCopyMatrices = 0;
         LastUploadStagingMatrices = 0;
         LastUploadZeroCopyBytes = 0;
+        LastUploadFallbackReason = string.Empty;
     }
 
     /// <summary>Returns true when the matrix will be kept on device as Q8_0 blocks.</summary>

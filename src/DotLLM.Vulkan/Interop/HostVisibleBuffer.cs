@@ -71,6 +71,20 @@ public sealed class HostVisibleBuffer : IDisposable
     /// </summary>
     public MemoryDomain Domain => MemoryDomain.HostVisibleZeroCopy;
 
+    /// <summary>
+    /// Diagnostic: VkResult code reported by the most recent failed
+    /// <see cref="TryCreate"/> call. Zero when the last call succeeded.
+    /// </summary>
+    public static int LastImportFailureCode { get; private set; }
+
+    /// <summary>
+    /// Diagnostic: name of the Vulkan call that returned the most recent
+    /// failure. Empty string when the last call succeeded. Possible values:
+    /// "vkGetMemoryHostPointerPropertiesEXT", "vkCreateBuffer",
+    /// "vkAllocateMemory", "vkBindBufferMemory", "memory_type_intersection".
+    /// </summary>
+    public static string LastImportFailureStage { get; private set; } = string.Empty;
+
     private HostVisibleBuffer(
         VulkanDevice device, nint buffer, nint memory, long size, long bindOffset,
         nint importedHostPointer, long importedSize)
@@ -103,6 +117,18 @@ public sealed class HostVisibleBuffer : IDisposable
     /// </param>
     /// <param name="size">Logical buffer size in bytes.</param>
     /// <returns>The imported buffer, or <c>null</c> when import is not possible.</returns>
+    /// <remarks>
+    /// <para>
+    /// <b>Handle type fallback.</b> The implementation first tries
+    /// <c>VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT</c> (process-
+    /// allocated memory, e.g. <see cref="System.Runtime.InteropServices.NativeMemory.AlignedAlloc"/>),
+    /// then falls back to <c>HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT</c> (memory
+    /// mapped from a non-Vulkan source, e.g. <c>MemoryMappedFile</c>). amdvlk
+    /// on Strix Halo (gfx1151) accepts heap-allocated pages via
+    /// HOST_ALLOCATION but rejects read-only mmap'd file views — the foreign-
+    /// memory handle type is the correct path for GGUF mmaps.
+    /// </para>
+    /// </remarks>
     public static unsafe HostVisibleBuffer? TryCreate(
         VulkanDevice device, nint hostPointer, long size)
     {
@@ -136,106 +162,176 @@ public sealed class HostVisibleBuffer : IDisposable
         var getHostPtrProps = Marshal.GetDelegateForFunctionPointer<
             VulkanDevice.VkGetMemoryHostPointerPropertiesEXT>(fn);
 
-        // 2) Query which memory types can host this pointer.
-        VkMemoryHostPointerPropertiesExt hostPtrProps = default;
-        hostPtrProps.sType = VkStructureType.MemoryHostPointerPropertiesExt;
         nint alignedHostPtr = unchecked((nint)alignedAddr);
-        int r = getHostPtrProps(device.Handle,
-            VkExternalMemoryHandleTypeFlags.HostAllocationBitExt,
-            alignedHostPtr, ref hostPtrProps);
-        if (r < 0 || hostPtrProps.memoryTypeBits == 0) return null;
 
-        // 3) Create the buffer with the external-memory create-info chained
-        //    in pNext so the driver knows it will be bound to imported memory.
-        VkExternalMemoryBufferCreateInfo extBci = default;
-        extBci.sType = VkStructureType.ExternalMemoryBufferCreateInfo;
-        extBci.handleTypes = VkExternalMemoryHandleTypeFlags.HostAllocationBitExt;
-
-        var bci = new VkBufferCreateInfo
+        // Candidate handle types, in order of preference for typical workloads.
+        // HOST_ALLOCATION covers heap-allocated process memory (NativeMemory.AlignedAlloc,
+        // malloc) and works on virtually every driver. HOST_MAPPED_FOREIGN_MEMORY is the
+        // correct bit for memory NOT allocated by the process — read-only mmap'd file
+        // views via MemoryMappedFile in particular — and is what amdvlk on gfx1151 requires
+        // for GGUF imports. We don't pick one upfront because vkGetMemoryHostPointerPropertiesEXT
+        // returning success doesn't guarantee vkAllocateMemory will accept the pointer with
+        // that handle type — driver bugs occur. Instead we collect all candidates that
+        // pass the query and try each in sequence inside the buffer/memory construction.
+        ReadOnlySpan<uint> handleTypeCandidates = stackalloc uint[]
         {
-            sType = VkStructureType.BufferCreateInfo,
-            pNext = (nint)(&extBci),
-            size = (ulong)alignedSize,
-            // Imported host memory cannot be the destination of vkCmdCopyBuffer
-            // (write-back to a CPU-coherent mmap'd file is asking for trouble);
-            // omit TransferDst. Read-only storage-buffer reads in compute shaders
-            // is the supported usage.
-            usage = VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferSrc,
-            sharingMode = VkSharingMode.Exclusive,
+            VkExternalMemoryHandleTypeFlags.HostMappedForeignMemoryBitExt,
+            VkExternalMemoryHandleTypeFlags.HostAllocationBitExt,
         };
 
-        int br = VulkanApi.vkCreateBuffer(device.Handle, bci, 0, out nint buffer);
-        if (br < 0) return null;
-
-        bool ownBuffer = true;
-        nint memory = 0;
-        try
+        Span<uint> usable = stackalloc uint[2];
+        Span<uint> usableTypeBits = stackalloc uint[2];
+        int usableCount = 0;
+        foreach (uint candidate in handleTypeCandidates)
         {
-            // 4) Query buffer memory requirements and intersect with the
-            //    pointer-importable type bits to pick a compatible memory type.
-            VulkanApi.vkGetBufferMemoryRequirements(device.Handle, buffer, out var req);
-
-            uint typeBits = req.memoryTypeBits & hostPtrProps.memoryTypeBits;
-            if (typeBits == 0) return null;
-
-            if (!device.TryFindHostImportMemoryType(typeBits, out uint typeIndex))
-                return null;
-
-            // 5) Allocate device memory backed by the imported host pointer.
-            VkImportMemoryHostPointerInfoExt importInfo = default;
-            importInfo.sType = VkStructureType.ImportMemoryHostPointerInfoExt;
-            importInfo.handleType = VkExternalMemoryHandleTypeFlags.HostAllocationBitExt;
-            importInfo.pHostPointer = alignedHostPtr;
-
-            // Spec requires `allocationSize` to be ≥ the buffer's requirements
-            // AND a multiple of `minImportedHostPointerAlignment`. We already
-            // page-aligned alignedSize; pick max(alignedSize, req.size) and
-            // round up if necessary.
-            ulong allocSize = (ulong)alignedSize;
-            if (req.size > allocSize)
+            VkMemoryHostPointerPropertiesExt q = default;
+            q.sType = VkStructureType.MemoryHostPointerPropertiesExt;
+            int rq = getHostPtrProps(device.Handle, candidate, alignedHostPtr, ref q);
+            if (rq >= 0 && q.memoryTypeBits != 0)
             {
-                allocSize = (req.size + alignment - 1) & ~(alignment - 1);
+                usable[usableCount] = candidate;
+                usableTypeBits[usableCount] = q.memoryTypeBits;
+                usableCount++;
             }
+        }
 
-            var mai = new VkMemoryAllocateInfo
+        if (usableCount == 0)
+        {
+            LastImportFailureCode = 0;
+            LastImportFailureStage = "vkGetMemoryHostPointerPropertiesEXT";
+            return null;
+        }
+
+        // Try each viable handle type in order — vkGetMemoryHostPointerPropertiesEXT
+        // returning success doesn't guarantee vkAllocateMemory will accept the
+        // import (driver bugs / handle-type semantics mismatches occur). amdvlk
+        // on gfx1151 in particular returns VK_ERROR_INVALID_EXTERNAL_HANDLE for
+        // HOST_ALLOCATION on read-only MemoryMappedFile views but accepts
+        // HOST_MAPPED_FOREIGN_MEMORY for the same pointer.
+        for (int attempt = 0; attempt < usableCount; attempt++)
+        {
+            uint handleType = usable[attempt];
+            uint typeBitsForHandle = usableTypeBits[attempt];
+
+            // 3) Create the buffer with the external-memory create-info chained
+            //    in pNext so the driver knows it will be bound to imported memory.
+            VkExternalMemoryBufferCreateInfo extBci = default;
+            extBci.sType = VkStructureType.ExternalMemoryBufferCreateInfo;
+            extBci.handleTypes = handleType;
+
+            var bci = new VkBufferCreateInfo
             {
-                sType = VkStructureType.MemoryAllocateInfo,
-                pNext = (nint)(&importInfo),
-                allocationSize = allocSize,
-                memoryTypeIndex = typeIndex,
+                sType = VkStructureType.BufferCreateInfo,
+                pNext = (nint)(&extBci),
+                size = (ulong)alignedSize,
+                // Imported host memory cannot be the destination of vkCmdCopyBuffer
+                // (write-back to a CPU-coherent mmap'd file is asking for trouble);
+                // omit TransferDst. Read-only storage-buffer reads in compute shaders
+                // is the supported usage.
+                usage = VkBufferUsageFlags.StorageBuffer | VkBufferUsageFlags.TransferSrc,
+                sharingMode = VkSharingMode.Exclusive,
             };
-            int ar = VulkanApi.vkAllocateMemory(device.Handle, mai, 0, out memory);
-            if (ar < 0)
+
+            int br = VulkanApi.vkCreateBuffer(device.Handle, bci, 0, out nint buffer);
+            if (br < 0)
             {
-                memory = 0;
-                return null;
+                LastImportFailureCode = br;
+                LastImportFailureStage = "vkCreateBuffer";
+                continue; // try next handle type
             }
 
-            // 6) Bind the buffer to the imported memory at offset=bindOffset.
-            //    Kernels see byte 0 of the descriptor = byte 0 of the caller's
-            //    logical range.
-            int bindRes = VulkanApi.vkBindBufferMemory(
-                device.Handle, buffer, memory, (ulong)bindOffset);
-            if (bindRes < 0) return null;
+            bool ownBuffer = true;
+            nint memory = 0;
+            try
+            {
+                // 4) Query buffer memory requirements and intersect with the
+                //    pointer-importable type bits to pick a compatible memory type.
+                VulkanApi.vkGetBufferMemoryRequirements(device.Handle, buffer, out var req);
 
-            var result = new HostVisibleBuffer(
-                device, buffer, memory,
-                size: size, bindOffset: bindOffset,
-                importedHostPointer: alignedHostPtr,
-                importedSize: (long)alignedSize);
+                uint typeBits = req.memoryTypeBits & typeBitsForHandle;
+                if (typeBits == 0)
+                {
+                    LastImportFailureCode = 0;
+                    LastImportFailureStage = "memory_type_intersection";
+                    continue;
+                }
 
-            // Transfer ownership: prevent the finally-block from destroying.
-            ownBuffer = false;
-            memory = 0;
-            return result;
+                if (!device.TryFindHostImportMemoryType(typeBits, out uint typeIndex))
+                {
+                    LastImportFailureCode = 0;
+                    LastImportFailureStage = "memory_type_intersection";
+                    continue;
+                }
+
+                // 5) Allocate device memory backed by the imported host pointer.
+                VkImportMemoryHostPointerInfoExt importInfo = default;
+                importInfo.sType = VkStructureType.ImportMemoryHostPointerInfoExt;
+                importInfo.handleType = handleType;
+                importInfo.pHostPointer = alignedHostPtr;
+
+                // Spec requires `allocationSize` to be ≥ the buffer's requirements
+                // AND a multiple of `minImportedHostPointerAlignment`. We already
+                // page-aligned alignedSize; pick max(alignedSize, req.size) and
+                // round up if necessary.
+                ulong allocSize = (ulong)alignedSize;
+                if (req.size > allocSize)
+                {
+                    allocSize = (req.size + alignment - 1) & ~(alignment - 1);
+                }
+
+                var mai = new VkMemoryAllocateInfo
+                {
+                    sType = VkStructureType.MemoryAllocateInfo,
+                    pNext = (nint)(&importInfo),
+                    allocationSize = allocSize,
+                    memoryTypeIndex = typeIndex,
+                };
+                int ar = VulkanApi.vkAllocateMemory(device.Handle, mai, 0, out memory);
+                if (ar < 0)
+                {
+                    LastImportFailureCode = ar;
+                    LastImportFailureStage = "vkAllocateMemory";
+                    memory = 0;
+                    continue;
+                }
+
+                // 6) Bind the buffer to the imported memory at offset=bindOffset.
+                //    Kernels see byte 0 of the descriptor = byte 0 of the caller's
+                //    logical range.
+                int bindRes = VulkanApi.vkBindBufferMemory(
+                    device.Handle, buffer, memory, (ulong)bindOffset);
+                if (bindRes < 0)
+                {
+                    LastImportFailureCode = bindRes;
+                    LastImportFailureStage = "vkBindBufferMemory";
+                    continue;
+                }
+
+                var result = new HostVisibleBuffer(
+                    device, buffer, memory,
+                    size: size, bindOffset: bindOffset,
+                    importedHostPointer: alignedHostPtr,
+                    importedSize: (long)alignedSize);
+
+                // Transfer ownership: prevent the finally-block from destroying.
+                ownBuffer = false;
+                memory = 0;
+                LastImportFailureCode = 0;
+                LastImportFailureStage = string.Empty;
+                return result;
+            }
+            finally
+            {
+                if (memory != 0)
+                    VulkanApi.vkFreeMemory(device.Handle, memory, 0);
+                if (ownBuffer)
+                    VulkanApi.vkDestroyBuffer(device.Handle, buffer, 0);
+            }
         }
-        finally
-        {
-            if (memory != 0)
-                VulkanApi.vkFreeMemory(device.Handle, memory, 0);
-            if (ownBuffer)
-                VulkanApi.vkDestroyBuffer(device.Handle, buffer, 0);
-        }
+
+        // All candidate handle types rejected — LastImportFailureCode/Stage
+        // reflect the most recent attempt.
+        return null;
     }
 
     /// <inheritdoc/>
