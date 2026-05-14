@@ -240,10 +240,13 @@ extern "C" __global__ void __launch_bounds__(256) dequant_q3_k_f16(
         // (= 16 elements per sub-block).
         int sub = t / 16;
 
-        // Unpack 6-bit scale for this sub-block from the 12 packed bytes:
-        //   scales12[sub<8 ? sub : sub-4]  → low nibble (sub<8) or high nibble (sub>=8)
-        //   scales12[8 + sub/4]            → high 2 bits at offset (sub%4)*2
-        int lowSrcByte = sub < 8 ? sub : sub - 4;
+        // Unpack 6-bit scale for this sub-block from the 12 packed bytes.
+        // Per llama.cpp ggml-quants.c dequantize_row_q3_K:
+        //   sub 0..7  low nibble = scales12[sub] low nibble
+        //   sub 8..15 low nibble = scales12[sub-8] high nibble (NOT sub-4 — that
+        //   collides with the high-2-bits packing in scales12[8..11]).
+        //   scales12[8 + sub/4]  → high 2 bits at offset (sub%4)*2
+        int lowSrcByte = sub < 8 ? sub : sub - 8;
         int lowNibble = sub < 8
             ? (scales12[lowSrcByte] & 0x0F)
             : ((scales12[lowSrcByte] >> 4) & 0x0F);

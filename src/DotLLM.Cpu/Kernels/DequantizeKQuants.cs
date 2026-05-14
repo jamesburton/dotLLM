@@ -297,18 +297,21 @@ public static unsafe partial class Dequantize
             float d = (float)BitConverter.UInt16BitsToHalf(dHalf);
 
             // Unpack 12 bytes → 16 unsigned 6-bit scales (then biased by -32).
-            // Layout: low 4 bits in scales12[0..7] (sub 0..7) and scales12[4..11]
-            // high nibbles (sub 8..15); high 2 bits packed into scales12[8..11]
-            // (2 bits per scale, 4 scales per byte). See llama.cpp ggml-common.h
-            // dequantize_row_q3_K for the reference unpacking.
-            // bytes 8-11 each hold high 2 bits for 4 sub-blocks.
-            //   byte 8: subs 0..3
-            //   byte 9: subs 4..7
-            //   byte 10: subs 8..11
-            //   byte 11: subs 12..15
+            // Per llama.cpp ggml-quants.c dequantize_row_q3_K, the low 4 bits of
+            // each scale live in scales12[0..7]:
+            //   sub 0..3  low nibble = scales12[0..3] low nibble
+            //   sub 4..7  low nibble = scales12[4..7] low nibble
+            //   sub 8..11 low nibble = scales12[0..3] high nibble
+            //   sub 12..15 low nibble = scales12[4..7] high nibble
+            // Bytes 8..11 hold the high 2 bits packed 4 scales per byte:
+            //   byte 8: subs 0..3,  byte 9: subs 4..7,
+            //   byte 10: subs 8..11, byte 11: subs 12..15.
+            // Earlier dotLLM code read sub 12..15 from bytes 8..11 high nibble,
+            // which collided with the high-2-bits packing — silently corrupting
+            // sub-blocks 12..15 of every Q3_K super-block. Now matches llama.cpp.
             for (int sub = 0; sub < 16; sub++)
             {
-                int lowSrcByte = sub < 8 ? sub : sub - 4;  // sub 8..15 use bytes 4..11 high nibble
+                int lowSrcByte = sub < 8 ? sub : sub - 8;  // sub 8..15 → bytes 0..7 high nibble
                 int lowNibble = sub < 8 ? scales12[lowSrcByte] & 0x0F : (scales12[lowSrcByte] >> 4) & 0x0F;
                 int hiByte = 8 + (sub / 4);
                 int hiShift = (sub % 4) * 2;

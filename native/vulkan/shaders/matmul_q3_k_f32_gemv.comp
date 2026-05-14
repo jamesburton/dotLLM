@@ -73,7 +73,7 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     if (sub < 8u) {
         lowNibble = readByte(scalesBase + sub) & 0xFu;
     } else {
-        lowNibble = (readByte(scalesBase + (sub - 4u)) >> 4u) & 0xFu;
+        lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
     uint hiByte  = 8u + (sub >> 2u);
     uint hiShift = (sub & 3u) << 1u;

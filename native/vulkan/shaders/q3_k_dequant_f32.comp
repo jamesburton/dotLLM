@@ -13,7 +13,7 @@
 //
 // Scale unpacking (mirrors DequantizeQ3_KScalar / llama.cpp's
 // dequantize_row_q3_K). For sub in [0, 16):
-//   lowSrcByte = sub < 8 ? sub : sub - 4         // sub 8..15 use bytes 4..11 high nibble
+//   lowSrcByte = sub < 8 ? sub : sub - 8         // sub 8..15 use bytes 0..7 high nibble
 //   lowNibble  = sub < 8 ? scales[lowSrcByte] & 0xF
 //                        : (scales[lowSrcByte] >> 4) & 0xF
 //   hiByte     = 8 + (sub / 4)                    // 8..11 each hold high 2 bits for 4 subs
@@ -70,7 +70,7 @@ int unpackQ3Scale(uint scalesBase, uint sub) {
     if (sub < 8u) {
         lowNibble = readByte(scalesBase + sub) & 0xFu;
     } else {
-        lowNibble = (readByte(scalesBase + (sub - 4u)) >> 4u) & 0xFu;
+        lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
     }
     uint hiByte  = 8u + (sub >> 2u);
     uint hiShift = (sub & 3u) << 1u;

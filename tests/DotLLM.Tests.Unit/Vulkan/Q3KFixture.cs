@@ -38,37 +38,17 @@ internal static unsafe class Q3KFixture
     public const int NumSubBlocks = 16;
 
     /// <summary>
-    /// Generate a uniform-random FP32 array in [-range, range), with sub-blocks
-    /// 12..15 of every super-block zeroed out. The zeroing works around a
-    /// pre-existing CPU-oracle bug: <c>DequantizeQ3_KScalar</c> reads the low
-    /// nibbles of sub-blocks 12..15 from the high nibbles of bytes 8..11 of
-    /// the scales table, but those bytes are also fully occupied by the high-
-    /// 2-bits-per-sub-block packing (4 sub-blocks × 2 bits per byte × 4 bytes
-    /// = 32 bits = full bytes). There is no free nibble to write sub_12..15's
-    /// low nibbles into without clobbering hi2 bits — the oracle is
-    /// internally inconsistent on those sub-blocks. The CORRECT llama.cpp
-    /// layout puts sub_12..15's low nibbles in the high nibbles of bytes 4..7
-    /// (and sub_8..11's in the high nibbles of bytes 0..3), which is FREE in
-    /// the layout, but the dotLLM CPU port reads them from bytes 8..11 high
-    /// nibbles. Fixing the CPU oracle is out of scope for the Vulkan task; the
-    /// fixture sidesteps the bug by writing zero scales for sub_12..15 so the
-    /// downstream bit-equality test (Vulkan kernel vs CPU oracle) still
-    /// discriminates against shader bugs in sub_0..11.
+    /// Generate a uniform-random FP32 array in [-range, range). All 16
+    /// sub-blocks per super-block carry random data — the CPU-oracle bug
+    /// flagged by Agent 4 (sub_12..15 read from bytes 8..11 high nibble
+    /// instead of bytes 4..7) has been fixed in <c>DequantizeQ3_KScalar</c>
+    /// and the matching CUDA + Vulkan kernels.
     /// </summary>
     public static float[] RandomFloats(Random rng, int count, float range)
     {
         var arr = new float[count];
         for (int i = 0; i < count; i++)
             arr[i] = (float)((rng.NextDouble() * 2.0 - 1.0) * range);
-        // Zero sub-blocks 12..15 of every Q3_K super-block (256 elements each).
-        // See class-level remarks for the CPU-oracle bug this works around.
-        int superBlocks = count / Q3KGroupSize;
-        for (int sb = 0; sb < superBlocks; sb++)
-        {
-            int baseIdx = sb * Q3KGroupSize + 12 * SubBlockSize; // start of sub_12
-            int zeroLen = 4 * SubBlockSize; // sub_12..15 = 64 elements
-            for (int i = 0; i < zeroLen; i++) arr[baseIdx + i] = 0f;
-        }
         return arr;
     }
 
@@ -188,16 +168,11 @@ internal static unsafe class Q3KFixture
         }
 
         // Pack scales[12]: 6-bit unsigned per sub-block (subScalesI[j] + 32, range 0..63).
-        // Bit layout (mirrors DequantizeQ3_KScalar's unpack):
-        //   sub  0..7 : low nibble in scales12[sub] (low) / scales12[sub-4] (sub 8..15 high nibble)
-        //   sub  0..15: high 2 bits in scales12[8 + sub/4], shifted by (sub%4)*2.
-        //
-        // CPU-oracle bug workaround: for sub_12..15 the "low nibble" target
-        // (high nibble of bytes 8..11) collides with the hi2 packing region
-        // (full bytes 8..11). Pass writes split: first write all low nibbles,
-        // THEN all hi2 bits. Hi2 writes use a read-modify-write that preserves
-        // the low nibble it was just stomping on. Source data zeroes sub_12..15
-        // (see RandomFloats), so their low4 = 0 and the collision is benign.
+        // Bit layout (mirrors DequantizeQ3_KScalar's unpack, post Q3_K fix):
+        //   sub  0..7  low nibble = scales12[sub] low nibble
+        //   sub  8..15 low nibble = scales12[sub-8] high nibble (NOT sub-4 — that
+        //   collides with the high-2-bits packing). Bytes 0..7 carry both halves.
+        //   sub  0..15 high 2 bits = scales12[8 + sub/4], shifted by (sub%4)*2.
         for (int sub = 0; sub < 16; sub++)
         {
             int scale6 = (subScalesI[sub] + 32) & 0x3F;
@@ -208,7 +183,7 @@ internal static unsafe class Q3KFixture
             }
             else
             {
-                int srcByte = sub - 4;
+                int srcByte = sub - 8;
                 scalesPtr[srcByte] = (byte)((scalesPtr[srcByte] & 0x0F) | (low4 << 4));
             }
         }
@@ -239,20 +214,10 @@ internal static unsafe class Q3KFixture
     }
 
     /// <summary>
-    /// Smoke check on the fixture round-trip. <strong>Note:</strong> the CPU
-    /// oracle <c>DequantizeQ3_KScalar</c> uses a scales-byte layout that is
-    /// internally inconsistent for sub-blocks 12..15 (the high nibbles of bytes
-    /// 8..11 are also used for those sub-blocks' low nibbles per the oracle's
-    /// <c>lowSrcByte = sub - 4</c> formula, but those same bytes are fully
-    /// occupied by the high-2-bits-per-sub-block packing — there is no free
-    /// nibble to store sub_12..15's low nibbles in). This bug is pre-existing
-    /// in <c>DotLLM.Cpu</c> and out of scope for this Vulkan task. The fixture
-    /// matches the oracle's layout exactly so GPU and CPU produce <em>identical
-    /// wrong values</em> on those sub-blocks (which is what the bit-equality
-    /// assertion downstream requires) — drift versus the source FP32 is
-    /// therefore expected to be larger than for Q4_K / Q5_K / Q6_K. The
-    /// threshold is generous to accommodate this without masking real bugs in
-    /// sub-blocks 0..11 which round-trip cleanly.
+    /// Smoke check on the fixture round-trip. The Q3_K dequant bug
+    /// (sub_12..15 reading from bytes 8..11 high nibble) has been fixed in
+    /// <c>DequantizeQ3_KScalar</c>, so round-trip drift on Q3_K now matches
+    /// the K-quant family at large (~few percent depending on data distribution).
     /// </summary>
     public static void AssertFixtureRoundtrip(float[] srcF32, byte[] q3kBytes, int m, int k)
     {
@@ -393,7 +358,7 @@ internal static unsafe class Q3KFixture
         if (sub < 8)
             lowNibble = scales12[sub] & 0xF;
         else
-            lowNibble = (scales12[sub - 4] >> 4) & 0xF;
+            lowNibble = (scales12[sub - 8] >> 4) & 0xF;
         int hiByte  = 8 + (sub / 4);
         int hiShift = (sub % 4) * 2;
         int hiBits  = (scales12[hiByte] >> hiShift) & 0x3;
