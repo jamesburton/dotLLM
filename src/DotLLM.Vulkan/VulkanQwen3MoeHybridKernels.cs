@@ -56,6 +56,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public RmsNormF32Kernel RmsNorm { get; }
     public RopeF32Kernel Rope { get; }
     public AttentionF32Kernel Attention { get; }
+    /// <summary>
+    /// Optional Flash-Attention prefill kernel. Null when the SPV is missing,
+    /// when the env-var opt-out is set, or when the model's head_dim exceeds
+    /// the shader bound. Callers MUST route decode (seqQ == 1) and large
+    /// head_dim to <see cref="Attention"/>.
+    /// </summary>
+    public VulkanFlashAttentionF32Kernel? FlashAttention { get; }
     public SwiGluF32Kernel SwiGlu { get; }
     public AddKernel Add { get; }
     public SiluInplaceF32Kernel SiluInplace { get; }
@@ -102,6 +109,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope, AttentionF32Kernel attention,
+        VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, AddKernel add, SiluInplaceF32Kernel silu, Conv1dCausalF32Kernel conv1d,
         GdnL2NormalizeHeadsF32Kernel gdnL2,
         GdnScanStepF32Kernel gdnScan, GdnScanMultiTokenF32Kernel gdnScanMulti,
@@ -131,6 +139,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulF16GemmCoopmat = matmulF16GemmCoopmat;
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
         RmsNorm = rmsnorm; Rope = rope; Attention = attention;
+        FlashAttention = flashAttention;
         SwiGlu = swiglu; Add = add; SiluInplace = silu; Conv1dCausal = conv1d;
         GdnL2Normalize = gdnL2;
         GdnScanStep = gdnScan; GdnScanMultiToken = gdnScanMulti;
@@ -191,6 +200,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
+        VulkanFlashAttentionF32Kernel? flashAttention = VulkanTransformerModel.IsFlashAttentionDisabled()
+            ? null
+            : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var silu = SiluInplaceF32Kernel.Create(device, spvDir);
@@ -227,7 +239,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, swiglu, add, silu, conv1d,
+            rmsnorm, rope, attention, flashAttention, swiglu, add, silu, conv1d,
             gdnL2, gdnScan, gdnScanMulti, gdnPost,
             gdnDecay, sigmoidInplace,
             sigGateMul,
@@ -271,6 +283,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         RmsNorm.InvalidateDescriptorCache();
         Rope.InvalidateDescriptorCache();
         Attention.InvalidateDescriptorCache();
+        FlashAttention?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -309,6 +322,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SiluInplace.Dispose();
         Add.Dispose();
         SwiGlu.Dispose();
+        FlashAttention?.Dispose();
         Attention.Dispose();
         Rope.Dispose();
         RmsNorm.Dispose();

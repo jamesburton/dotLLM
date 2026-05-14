@@ -138,6 +138,13 @@ public sealed class VulkanTransformerModel : IModel
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
+    /// <summary>
+    /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
+    /// when the SPV is missing (older builds), when the env-var opt-out is
+    /// set, or when the model's head_dim exceeds the shader's MAX_HEAD_DIM.
+    /// When null, every dispatch falls through to <see cref="_attention"/>.
+    /// </summary>
+    private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
     // Per-feature bias add. Replaces the host-mapped fallback that used to
@@ -259,7 +266,8 @@ public sealed class VulkanTransformerModel : IModel
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
-        AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
+        AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        SwiGluF32Kernel swiglu, AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
@@ -321,6 +329,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
+        _flashAttention = flashAttention;
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
@@ -596,6 +605,14 @@ public sealed class VulkanTransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
+        // Optional Flash-Attention kernel for the GQA prefill path. Disabled by
+        // env-var opt-out, by missing SPV (older builds), or when the model's
+        // head_dim exceeds the shader bound — every gate falls back to the
+        // legacy per-token attention kernel.
+        VulkanFlashAttentionF32Kernel? flashAttention =
+            IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
+                ? null
+                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -678,7 +695,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
-            rmsnorm, rope, attention, swiglu, add,
+            rmsnorm, rope, attention, flashAttention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8, moeIndexedMatmulTiled, moeIndexedLoraDelta,
@@ -691,6 +708,44 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+    }
+
+    /// <summary>
+    /// Env-var opt-out for the Flash-Attention prefill path. Set
+    /// <c>DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1</c> to force every dispatch
+    /// onto the legacy per-token <see cref="AttentionF32Kernel"/>.
+    /// </summary>
+    internal const string DisableFlashAttentionEnvVar = "DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION";
+
+    internal static bool IsFlashAttentionDisabled() =>
+        Environment.GetEnvironmentVariable(DisableFlashAttentionEnvVar) == "1";
+
+    /// <summary>
+    /// Records the attention dispatch using Flash-Attention when the kernel
+    /// is available, head_dim fits the shader bound, and the sequence is in
+    /// the prefill regime (seqQ &gt; 1); falls back to the legacy per-token
+    /// kernel for decode (seqQ == 1). Decode keeps the legacy path because
+    /// Flash-Attention's amortisation factor only kicks in across multiple
+    /// Q-rows.
+    /// </summary>
+    private void RecordAttention(
+        nint cmdBuf,
+        VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
+        int positionOffset, int slidingWindow)
+    {
+        if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        {
+            _flashAttention.Record(cmdBuf, q, k, v, output,
+                seqQ: seqQ, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: slidingWindow);
+            return;
+        }
+        _attention.Record(cmdBuf, q, k, v, output,
+            seqQ: seqQ, seqKv: seqKv,
+            numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+            positionOffset: positionOffset, slidingWindow: slidingWindow);
     }
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
@@ -941,7 +996,7 @@ public sealed class VulkanTransformerModel : IModel
                 positionOffset = 0;
             }
 
-            _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: _slidingWindow);
@@ -1139,6 +1194,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
+        _flashAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -2186,6 +2242,7 @@ public sealed class VulkanTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();

@@ -686,10 +686,20 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             positionOffset = 0;
         }
 
-        _kernels.Attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
-            seqQ: seqLen, seqKv: seqKv,
-            numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-            positionOffset: positionOffset, slidingWindow: 0);
+        if (_kernels.FlashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        {
+            _kernels.FlashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
+        else
+        {
+            _kernels.Attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 7. Apply sigmoid(gate) element-wise to attention output.

@@ -99,6 +99,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
+    /// <summary>
+    /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
+    /// when the SPV is missing, when the env-var opt-out is set, or when the
+    /// model's head_dim exceeds the shader's MAX_HEAD_DIM — every gate falls
+    /// back to <see cref="_attention"/>.
+    /// </summary>
+    private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
     private readonly BiasAddF32Kernel _biasAdd;
@@ -156,7 +163,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
-        AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
+        AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
@@ -211,6 +219,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
+        _flashAttention = flashAttention;
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
@@ -368,6 +377,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
+        VulkanFlashAttentionF32Kernel? flashAttention =
+            VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
+                ? null
+                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -400,7 +413,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, swiglu, add, biasAdd,
+            rmsnorm, rope, attention, flashAttention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit,
@@ -707,10 +720,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
-            seqQ: seqLen, seqKv: seqKv,
-            numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-            positionOffset: positionOffset, slidingWindow: 0);
+        if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        {
+            _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
+        else
+        {
+            _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Output projection → NormOutput (mirrors the GQA contract for the residual add).
@@ -774,6 +797,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
+        _flashAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -1056,6 +1080,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
