@@ -123,6 +123,42 @@ public sealed unsafe class SimpleKvCache : IKvCache
         return new TensorView(shape, DType.Float32, -1, _keys[layerIndex]);
     }
 
+    /// <summary>
+    /// Number of layers in this cache.
+    /// </summary>
+    public int NumLayers => _numLayers;
+
+    /// <summary>
+    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements).
+    /// </summary>
+    public int KvStride => _kvStride;
+
+    /// <summary>
+    /// Returns a <see cref="ReadOnlySpan{T}"/> over the contiguous FP32 keys
+    /// buffer for the given layer, covering positions <c>[0, CurrentLength)</c>.
+    /// Used by the hybrid CPU-prefill / iGPU-decode handoff to upload prefill
+    /// state into a GPU KV cache.
+    /// </summary>
+    public ReadOnlySpan<float> KeysSpan(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int floats = _currentLength * _kvStride;
+        return new ReadOnlySpan<float>((void*)_keys[layerIndex], floats);
+    }
+
+    /// <summary>
+    /// Returns a <see cref="ReadOnlySpan{T}"/> over the contiguous FP32 values
+    /// buffer for the given layer, covering positions <c>[0, CurrentLength)</c>.
+    /// </summary>
+    public ReadOnlySpan<float> ValuesSpan(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int floats = _currentLength * _kvStride;
+        return new ReadOnlySpan<float>((void*)_values[layerIndex], floats);
+    }
+
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ITensor GetValues(int layerIndex)
