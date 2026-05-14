@@ -81,5 +81,18 @@ public enum QuantizationType
     /// layout: <c>d(Half)+qs[64]+qh[8]+scales[8]</c>; signs are stored in the upper
     /// half of <c>qs</c> (bytes 32-63), inline grid indices in the lower half.
     /// </summary>
-    IQ2_S = 22
+    IQ2_S = 22,
+
+    /// <summary>
+    /// 1.5-bit importance quantization (~1.5625 bpw — the smallest GGUF quant
+    /// type). Super-block of 256 elements stored in 50 bytes:
+    /// <c>d(Half@0) + qs[32]@2 + qh[8](uint16)@34</c>. Each 32-element sub-block
+    /// uses one <c>qh</c> uint16 to encode a 3-bit per-block scale (top 3 bits),
+    /// a sign-of-delta bit (bit 15), and four 3-bit grid-index high parts (bits
+    /// 0..11). The 11-bit grid index per group of 8 elements selects from a
+    /// 2048-entry signed-int8 codebook (each entry packs 8 ternary {-1, 0, +1}
+    /// values into a uint64). Per-element decode:
+    /// <c>y = dl * (grid[j] + delta)</c> with <c>delta = +/-0.125</c>.
+    /// </summary>
+    IQ1_S = 19
 }
