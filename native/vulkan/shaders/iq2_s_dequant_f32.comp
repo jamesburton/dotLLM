@@ -1,0 +1,85 @@
+#version 450
+// IQ2_S dequantization to FP32. Also handles MOSTLY_IQ2_M file-type tensors
+// (ggml uses IQ2_S blocks for both presets).
+//
+// One 82-byte super-block per 256 elements. Layout matches llama.cpp's
+// block_iq2_s and DotLLM.Cpu.Kernels.Dequantize.DequantizeIQ2_S:
+//     bytes [0,1]    = fp16 d
+//     bytes [2..33]  = qs[32]    — low 8 bits of grid index per pair
+//     bytes [34..65] = qs_signs[32] — 8-bit sign byte per pair
+//     bytes [66..73] = qh[8]     — 2 high bits per pair, 4 pairs per byte
+//     bytes [74..81] = scales[8] — two 4-bit sub-scales per byte
+//   Per-pair: dl = d * (0.5 + sub_scale) * 0.25
+//   Per-element: val = dl * iq2s_grid[gridIdx*8 + j] * (signs & (1<<j) ? -1 : +1)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY       { float dst[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufGrid    { uint  iq2sGrid[]; };  // 8192 bytes = 2048 uints
+
+layout(push_constant) uniform PushConstants {
+    uint totalSuperblocks;
+    uint srcUints;
+} pc;
+
+const uint IQ2_S_BLOCK_BYTES = 82u;
+const uint IQ2_S_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq2sGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+    uint sb = gl_WorkGroupID.x;
+    if (sb >= pc.totalSuperblocks) return;
+
+    uint t = gl_LocalInvocationID.x;
+    uint blockBase = sb * IQ2_S_BLOCK_BYTES;
+    float d = readHalf(blockBase);
+
+    uint qsLowBase  = blockBase + 2u;
+    uint qsSignBase = blockBase + 2u + 32u;
+    uint qhBase     = blockBase + 2u + 64u;
+    uint scalesBase = blockBase + 2u + 64u + 8u;
+
+    uint ib32 = t >> 5u;
+    uint rem  = t & 31u;
+    uint l    = rem >> 3u;
+    uint j    = rem & 7u;
+
+    uint lo = readByte(qsLowBase + ib32 * 4u + l);
+    uint hi = (readByte(qhBase + ib32) >> (2u * l)) & 0x3u;
+    uint gridIdx = lo | (hi << 8);
+    uint signs   = readByte(qsSignBase + ib32 * 4u + l);
+
+    uint scaleByte = readByte(scalesBase + ib32);
+    uint subScale  = (l < 2u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
+    float dl = d * (0.5 + float(subScale)) * 0.25;
+
+    float g    = float(gridByte(gridIdx * 8u + j));
+    float sign = ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
+
+    dst[sb * IQ2_S_GROUP_SIZE + t] = dl * g * sign;
+}
