@@ -1,0 +1,118 @@
+#version 450
+// IQ2_S matrix-vector multiplication (decode-path GEMV).
+//
+// Each 256 contiguous columns of a row form one 82-byte super-block:
+//     bytes [0,1]    = fp16 d
+//     bytes [2..33]  = qs[32] — low 8 bits of grid index per pair
+//     bytes [34..65] = qs_signs[32] — 8-bit sign byte per pair
+//     bytes [66..73] = qh[8] — 2 high bits per pair
+//     bytes [74..81] = scales[8] — two 4-bit sub-scales per byte
+//
+// Per-pair (l in [0..3]): grid index = qs_low[ib32*4+l] | ((qh[ib32]>>(2*l))&3) << 8;
+// signs are read directly from qs_signs (no ksigns lookup — IQ2_S stores the
+// 8-bit sign mask explicitly).
+//
+// Dispatch: one workgroup per output row, 128 threads, shared-memory tree reduce.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY       { float y[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid    { uint  iq2sGrid[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+const uint IQ2_S_BLOCK_BYTES = 82u;
+const uint IQ2_S_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS     = 8u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq2sGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * IQ2_S_BLOCK_BYTES;
+    uint rowByteBase   = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * IQ2_S_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qsLowBase  = blockByteBase + 2u;
+        uint qsSignBase = blockByteBase + 2u + 32u;
+        uint qhBase     = blockByteBase + 2u + 64u;
+        uint scalesBase = blockByteBase + 2u + 64u + 8u;
+        uint xBase      = b * IQ2_S_GROUP_SIZE;
+
+        for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+            uint scaleByte = readByte(scalesBase + ib32);
+            float db0 = d * (0.5 + float(scaleByte & 0xFu)) * 0.25;
+            float db1 = d * (0.5 + float(scaleByte >> 4u)) * 0.25;
+            uint qhByte = readByte(qhBase + ib32);
+            uint xSubBase = xBase + ib32 * 32u;
+
+            for (uint l = 0u; l < 4u; l++) {
+                uint lo = readByte(qsLowBase + ib32 * 4u + l);
+                uint hi = (qhByte >> (2u * l)) & 0x3u;
+                uint gridIdx = lo | (hi << 8);
+                uint signs   = readByte(qsSignBase + ib32 * 4u + l);
+                uint gridOff = gridIdx * 8u;
+                uint xOff = xSubBase + l * 8u;
+                float dl = (l < 2u) ? db0 : db1;
+
+                float pairSum = 0.0;
+                for (uint j = 0u; j < 8u; j++) {
+                    float g    = float(gridByte(gridOff + j));
+                    float sign = ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
+                    pairSum += g * sign * x[xOff + j];
+                }
+                acc += dl * pairSum;
+            }
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
