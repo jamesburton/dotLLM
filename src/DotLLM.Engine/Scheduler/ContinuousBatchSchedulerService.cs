@@ -2,6 +2,7 @@ using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine.Scheduler;
@@ -31,6 +32,8 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
 {
     private readonly ContinuousBatchScheduler _inner;
     private readonly SemaphoreSlim _wakeup = new(initialCount: 0, maxCount: int.MaxValue);
+    private readonly KvBlockPool? _pagedPool;
+    private readonly bool _ownsTelemetryProviders;
     private bool _disposed;
 
     /// <summary>The underlying step-driven scheduler. Exposed for advanced callers and tests.</summary>
@@ -39,15 +42,44 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
     /// <summary>
     /// Creates a new async scheduler service.
     /// </summary>
+    /// <param name="model">Loaded transformer model.</param>
+    /// <param name="tokenizer">Tokenizer used for response detokenization.</param>
+    /// <param name="kvCacheFactory">Per-sequence KV-cache factory.</param>
+    /// <param name="options">Scheduler options. Null = defaults.</param>
+    /// <param name="pagedPool">Optional paged-block pool, used for admission gating and as the
+    /// source for the <c>dotllm.engine.kvcache.utilization</c> observable gauge.</param>
+    /// <param name="prefixCache">Optional prefix-cache hook (Step 37). Consulted on admission.</param>
+    /// <param name="registerTelemetryProviders">When <see langword="true"/> (default), registers
+    /// engine-telemetry providers (<see cref="EngineTelemetry.SetQueueDepthProvider"/> and
+    /// <see cref="EngineTelemetry.SetKvCacheUtilizationProvider"/>) that report this scheduler's
+    /// live state. Cleared back to <c>null</c> on <see cref="Dispose"/>. Set to <see langword="false"/>
+    /// for multi-scheduler hosts that want to wire the providers themselves.</param>
     public ContinuousBatchSchedulerService(
         IModel model,
         ITokenizer tokenizer,
         Func<ModelConfig, int, IKvCache> kvCacheFactory,
         ContinuousBatchSchedulerOptions? options = null,
         KvBlockPool? pagedPool = null,
-        PrefixTrieManager? prefixCache = null)
+        PrefixTrieManager? prefixCache = null,
+        bool registerTelemetryProviders = true)
     {
         _inner = new ContinuousBatchScheduler(model, tokenizer, kvCacheFactory, options, pagedPool, prefixCache);
+        _pagedPool = pagedPool;
+        _ownsTelemetryProviders = registerTelemetryProviders;
+
+        if (registerTelemetryProviders)
+        {
+            EngineTelemetry.SetQueueDepthProvider(() => _inner.QueueDepth + _inner.ActiveCount);
+            if (_pagedPool is not null)
+            {
+                int total = _pagedPool.TotalBlocks;
+                if (total > 0)
+                {
+                    EngineTelemetry.SetKvCacheUtilizationProvider(
+                        () => 1.0 - (double)_pagedPool.FreeBlocks / total);
+                }
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -116,6 +148,11 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        if (_ownsTelemetryProviders)
+        {
+            EngineTelemetry.SetQueueDepthProvider(null);
+            EngineTelemetry.SetKvCacheUtilizationProvider(null);
+        }
         _inner.Dispose();
         _wakeup.Dispose();
     }
