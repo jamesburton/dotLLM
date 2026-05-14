@@ -76,6 +76,10 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     public MoeTopKSoftmaxF32Kernel MoeTopkSoftmax { get; }
     public MoeBroadcastF32Kernel MoeBroadcast { get; }
     public MoeIndexedMatmulF32Kernel MoeIndexedMatmul { get; }
+    /// <summary>Q6_K-resident MoE indexed matmul — used when the per-layer routed bank is uploaded as raw Q6_K
+    /// (see <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.BankQuantType"/>); enables resident MoE on Strix Halo
+    /// for Qwen3.6-A3B-Q6_K_XL where the F32 layout would not fit.</summary>
+    public MoeIndexedMatmulQ6_KF32Kernel MoeIndexedMatmulQ6K { get; }
     public MoeWeightedScatterF32Kernel MoeWeightedScatter { get; }
     public MoeSigmoidGatedAddF32Kernel MoeSigmoidGatedAdd { get; }
 
@@ -105,7 +109,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         GdnDecayF32Kernel gdnDecay, SigmoidInplaceF32Kernel sigmoidInplace,
         SigmoidGateMulF32Kernel sigmoidGateMul,
         MoeTopKSoftmaxF32Kernel moeTopk, MoeBroadcastF32Kernel moeBroadcast,
-        MoeIndexedMatmulF32Kernel moeIndexedMatmul, MoeWeightedScatterF32Kernel moeWeightedScatter,
+        MoeIndexedMatmulF32Kernel moeIndexedMatmul, MoeIndexedMatmulQ6_KF32Kernel moeIndexedMatmulQ6K,
+        MoeWeightedScatterF32Kernel moeWeightedScatter,
         MoeSigmoidGatedAddF32Kernel moeSigmoidGatedAdd)
     {
         MatMul = matmul; MatMulQ8 = matmulQ8; MatMulQ8Gemm = matmulQ8Gemm;
@@ -133,7 +138,8 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         GdnDecay = gdnDecay; SigmoidInplace = sigmoidInplace;
         SigmoidGateMul = sigmoidGateMul;
         MoeTopkSoftmax = moeTopk; MoeBroadcast = moeBroadcast;
-        MoeIndexedMatmul = moeIndexedMatmul; MoeWeightedScatter = moeWeightedScatter;
+        MoeIndexedMatmul = moeIndexedMatmul; MoeIndexedMatmulQ6K = moeIndexedMatmulQ6K;
+        MoeWeightedScatter = moeWeightedScatter;
         MoeSigmoidGatedAdd = moeSigmoidGatedAdd;
     }
 
@@ -201,6 +207,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var moeTopk = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
         var moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
         var moeIndexed = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
+        var moeIndexedQ6K = MoeIndexedMatmulQ6_KF32Kernel.Create(device, spvDir);
         var moeScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
         var moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
 
@@ -224,7 +231,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             gdnL2, gdnScan, gdnScanMulti, gdnPost,
             gdnDecay, sigmoidInplace,
             sigGateMul,
-            moeTopk, moeBroadcast, moeIndexed, moeScatter, moeSigmoidGatedAdd);
+            moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeScatter, moeSigmoidGatedAdd);
     }
 
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
@@ -278,6 +285,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeTopkSoftmax.InvalidateDescriptorCache();
         MoeBroadcast.InvalidateDescriptorCache();
         MoeIndexedMatmul.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ6K.InvalidateDescriptorCache();
         MoeWeightedScatter.InvalidateDescriptorCache();
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
     }
@@ -286,6 +294,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     {
         MoeSigmoidGatedAdd.Dispose();
         MoeWeightedScatter.Dispose();
+        MoeIndexedMatmulQ6K.Dispose();
         MoeIndexedMatmul.Dispose();
         MoeBroadcast.Dispose();
         MoeTopkSoftmax.Dispose();

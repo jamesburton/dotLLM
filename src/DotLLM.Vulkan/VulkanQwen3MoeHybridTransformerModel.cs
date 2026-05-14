@@ -25,12 +25,17 @@ namespace DotLLM.Vulkan;
 /// scan-step, multi-token scan, post-scan gate, sigmoid-gate-mul, gdn_decay,
 /// sigmoid-inplace). MoE routed experts default to streaming (re-uploaded
 /// every forward — correctness-first, fits any model size); set
-/// <c>DOTLLM_VK_MOE_RESIDENT=1</c> to opt in to per-layer resident caching
-/// when the F32 routed banks fit in device memory. At Qwen3.6-35B-A3B scale
-/// (256 experts × 40 layers × 3 matrices × ~1M elems) the fully-F32 resident
-/// layout would consume roughly 120 GB and won't fit on any current single-
-/// device host — a Q6_K MoE matmul shader (follow-up Priority 3) is the
-/// prerequisite for resident-by-default on Qwen3.6-A3B-Q6_K_XL.
+/// <c>DOTLLM_VK_MOE_RESIDENT=1</c> to opt in to per-layer resident caching.
+/// Resident mode auto-detects uniformly Q6_K source banks at upload time
+/// and keeps them on device as raw Q6_K blocks (≈25 GB at qwen35moe-A3B
+/// scale on a 128 GB Strix Halo unified-memory host — fits) dispatching
+/// through <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>.
+/// Non-Q6_K source banks (or mixed-quant layers) fall back to F32 dequant +
+/// upload — fits when the model is small enough that ≈4× expansion stays
+/// under device-memory bounds; at Qwen3.6-35B-A3B scale (256 experts × 40
+/// layers × 3 matrices × ~1M elems) the fully-F32 resident layout would
+/// consume ~120 GB and would NOT fit, so the Q6_K-resident path is the
+/// only resident option for Qwen3.6-A3B-UD-Q6_K_XL.
 /// </para>
 /// <para>
 /// <b>Submission boundaries.</b> Two submissions per layer × 40 layers + a
@@ -362,7 +367,11 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             // ── 2b. MoE submission. Resolve this layer's routed experts:
             //        either fetch a resident bundle (opt-in) or upload fresh
             //        and dispose after the layer (default — safe for any
-            //        model size). ─────────────────────────────────────────
+            //        model size). When resident-mode is on, the upload also
+            //        opts into a Q6_K-resident bank when the source allows
+            //        (~25 GB Q6_K vs ~120 GB F32 at qwen35moe-A3B scale —
+            //        the only way the resident layout fits on a 128 GB
+            //        Strix Halo unified-memory host). ──────────────────────
             VulkanQwen3MoeMoeUpload.LayerBundle moeBuf;
             bool disposeAfterLayer;
             if (_residentMoeEnabled)
@@ -372,7 +381,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 // for the device-memory caveat — DOTLLM_VK_MOE_RESIDENT=1
                 // is opt-in for models that fit.
                 moeBuf = _residentMoeBundles[layer]
-                    ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(_device, lw.Moe, hiddenSize));
+                    ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(
+                        _device, lw.Moe, hiddenSize, residentQuant: true));
                 disposeAfterLayer = false;
             }
             else
@@ -729,12 +739,17 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 4. Indexed expert matmuls (F32-only banks at the moment — see
-        //    VulkanQwen3MoeMoeUpload.UploadLayer notes on the F32 conversion).
-        _kernels.MoeIndexedMatmul.Record(cmdBuf,
+        // 4. Indexed expert matmuls. Two paths share the same buffer
+        //    contract (bank/x/indices/y) and the same shape (m, k, n,
+        //    numExperts) — only the dequant differs:
+        //       F32 banks  → MoeIndexedMatmul (plain F32 dot)
+        //       Q6_K banks → MoeIndexedMatmulQ6K (per-row Q6_K dequant in
+        //                    the inner loop)
+        //    See VulkanQwen3MoeMoeUpload remarks for the residency caveat.
+        RecordIndexedMoeMatmul(cmdBuf, moeW,
             moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
             m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        _kernels.MoeIndexedMatmul.Record(cmdBuf,
+        RecordIndexedMoeMatmul(cmdBuf, moeW,
             moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
             m: interm, k: hidden, n: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -745,7 +760,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 6. Indexed down matmul.
-        _kernels.MoeIndexedMatmul.Record(cmdBuf,
+        RecordIndexedMoeMatmul(cmdBuf, moeW,
             moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
             m: hidden, k: interm, n: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -760,6 +775,42 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         if (moeW.HasSharedExpert)
         {
             RecordSharedExpert(cmdBuf, moeW, postAttnNormWeight, seqLen, hidden, eps);
+        }
+    }
+
+    /// <summary>
+    /// Per-bank-quant-type dispatcher for a routed-expert indexed matmul. Bank
+    /// storage type is recorded once at upload time on
+    /// <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.BankQuantType"/>; this
+    /// helper picks the matching kernel so the caller stays oblivious to
+    /// whether the layer is F32-streaming or Q6_K-resident.
+    /// </summary>
+    private void RecordIndexedMoeMatmul(
+        nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
+        VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
+        VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
+        int m, int k, int n, int numExperts)
+    {
+        switch (moeW.BankQuantType)
+        {
+            case QuantizationType.Q6_K:
+                _kernels.MoeIndexedMatmulQ6K.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            case QuantizationType.F32:
+                _kernels.MoeIndexedMatmul.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            default:
+                // Other quant types aren't wired through the resident-bank
+                // upload path yet — UploadLayer falls back to F32, so we
+                // should never see them here. Defensive throw catches a
+                // future upload-side regression that introduces a new bank
+                // quant type without updating this dispatch site.
+                throw new InvalidOperationException(
+                    $"Unsupported MoE bank quant type: {moeW.BankQuantType}. " +
+                    "Add a kernel dispatch arm and an upload-side branch in " +
+                    "VulkanQwen3MoeMoeUpload.UploadLayer.");
         }
     }
 
