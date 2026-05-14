@@ -10,6 +10,10 @@ if (args.Length > 0 && args[0] == "profile-cuda-decode")
 {
     return CudaDecodeProfile.Run(args[1..]);
 }
+if (args.Length > 0 && args[0] == "profile-vulkan-host-import")
+{
+    return VulkanHostImportProfile.Run(args[1..]);
+}
 
 // Mutator job: run benchmarks in-process so BDN skips the separate subprocess
 // build step entirely. This avoids the 2-minute build timeout that DotLLM.Cuda's
