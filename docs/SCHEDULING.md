@@ -87,3 +87,27 @@ The `IScheduler` interface allows different policies:
 - **FCFS with priority**: Default. Priority queue ordered by (priority, arrival_time).
 - **Shortest-job-first**: Estimate remaining tokens, prioritize short generations.
 - **Fair-share**: Balance token throughput across API keys/users.
+
+## Prefix Cache Integration (Step 37)
+
+`ContinuousBatchScheduler` takes an optional `PrefixTrieManager` constructor
+argument. When supplied:
+
+1. **Admission**: `AdmitAndPrefill` calls `manager.Admit(promptTokens, cacheSize)`
+   to mint the per-sequence cache; the longest matching trie prefix is seeded
+   (no prefill compute), and only the suffix runs through `Forward`.
+2. **Eviction pressure**: before refusing admission on block-pool exhaustion,
+   the scheduler calls `manager.TryEvict(shortBy)` to recover zero-refcount
+   trie blocks. Active sequences are never preempted in this step — that's
+   the Step 59 surface.
+3. **Completion**: `ReleaseKvCache` calls `manager.RecordCompletion(cache, fullTokens)`
+   so the new blocks become available to future admissions before the cache
+   is disposed.
+
+The scheduler exposes `CachedPromptTokens` and `PrefilledPromptTokens` counters
+so callers can verify the trie is delivering reuse. See
+`PrefixCachedSchedulerTests.FourConcurrentSequences_SharedPrompt_PrefillCounts`
+for the acceptance probe.
+
+See [docs/KV_CACHE.md § Advanced Prompt Caching](KV_CACHE.md#advanced-prompt-caching--prefix-sharing-step-37)
+for the data structure and refcount-lifecycle details.
