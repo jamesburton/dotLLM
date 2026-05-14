@@ -170,8 +170,20 @@ scratch) for the 10 full-attn layers and an on-device MoE dispatcher via
 `VulkanQwen3MoeHybridTransformerModel` with seven GDN-specific compute
 shaders (`gdn_scan_step_f32`, `gdn_scan_multi_token_f32`,
 `gdn_l2_normalize_heads_f32`, `gdn_post_scan_gate_f32`, `gdn_decay_f32`,
-`sigmoid_inplace_f32`, `sigmoid_gate_mul_f32`) and an opt-in
-resident-routed-bank mode (`DOTLLM_VK_MOE_RESIDENT=1`).
+`sigmoid_inplace_f32`, `sigmoid_gate_mul_f32`) plus an opt-in
+resident-routed-bank mode (`DOTLLM_VK_MOE_RESIDENT=1`). Resident mode
+detects uniformly Q6_K source banks at upload time and dispatches the
+`MoeIndexedMatmulQ6_KF32Kernel` (per-row Q6_K dequant in shader inner loop,
+`moe_indexed_matmul_q6_k_f32.comp`) — required for `Qwen3.6-A3B-UD-Q6_K_XL`
+to fit on Strix Halo (≈25 GB Q6_K-resident vs ≈120 GB F32-resident on the
+128 GB unified-memory part). Non-Q6_K source banks fall back to the F32
+streaming path automatically.
+
+| Quant matrix | CPU | CUDA | Vulkan (streaming) | Vulkan (resident) |
+|---|---|---|---|---|
+| F32 / F16 / BF16 | Yes | Yes | Yes (F32 indexed) | Yes (F32 indexed) |
+| Q4_K / Q5_K / Q8_0 | Yes (raw view) | Yes (on-device dequant) | Yes (F32 dequant + upload) | Falls back to F32 (no Q4_K/Q5_K MoE shader yet) |
+| Q6_K (incl. UD-Q6_K_XL) | Yes (raw view) | Yes (on-device dequant) | Yes (F32 dequant + upload) | **Yes (Q6_K-resident, raw blocks on device)** |
 
 GGUF-only — there is no HF safetensors path because the architecture
 ships as `qwen35moe` only. See `docs/ROADMAP.md` Phase 10 and

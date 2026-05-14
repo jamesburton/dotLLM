@@ -182,6 +182,18 @@ Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ-family Vulkan kernels are not yet shipped — the
 
 See [docs/VULKAN.md](VULKAN.md) for runtime selection details and [docs/CUDA.md](CUDA.md) for the CUDA backend's coverage (Q2_K through Q8_0 plus pre-Q8_1 + MMVQ-large + MMQ + grouped-MoE-GEMV variants).
 
+### MoE indexed-expert matmul (per-row routed dispatch)
+
+Sparse-MoE forward (Mixtral / Qwen-MoE / Qwen3MoeHybrid) needs a kernel shape distinct from dense matmul: a single dispatch reads a per-row expert index and reaches into a packed expert bank `[numExperts, M, K]` for that row's weight matrix. The Vulkan backend ships:
+
+| Bank format | Kernel | Source layout on device | Used by |
+|---|---|---|---|
+| F32 | `MoeIndexedMatmulF32Kernel` (`moe_indexed_matmul_f32.comp`) | Dequantised at upload time, `[numExperts, M, K]` floats. | Default for all MoE models (streaming uploads per layer per forward; fits any quant since it dequants on the host). |
+| Q8_0 | `MoeIndexedMatmulQ8_0F32Kernel` (`moe_indexed_matmul_q8_0_f32.comp`) | Raw Q8_0 blocks `[numExperts, M, (K/32)*34]`. Per-row dequant in shader. | Reserved for the resident-quant MoE path (no model wires it yet — Q8_0 banks fit at F32 too). |
+| Q6_K | `MoeIndexedMatmulQ6_KF32Kernel` (`moe_indexed_matmul_q6_k_f32.comp`) | Raw Q6_K super-blocks `[numExperts, M, (K/256)*210]`. Per-row Q6_K dequant in shader (matches `DequantizeQ6_KScalar` byte-for-byte). | Qwen3MoeHybrid (Qwen3.6-A3B) when both `DOTLLM_VK_MOE_RESIDENT=1` AND the source banks are uniformly Q6_K — required for `Qwen3.6-A3B-UD-Q6_K_XL` to fit on Strix Halo's 128 GB unified memory (≈25 GB Q6_K-resident vs ≈120 GB if dequantised to F32). |
+
+The Q6_K MoE kernel completes the original Phase 10 follow-up gap noted in `VulkanQwen3MoeHybridTransformerModel`: with this kernel in place, opting in to `DOTLLM_VK_MOE_RESIDENT=1` on a Q6_K-source Qwen3MoeHybrid model now uploads the routed banks once and keeps them resident across forwards, eliminating the per-forward host→device dequant + upload cost. Mixed-quant layers (e.g. UD checkpoints with Q5_K W2 and Q6_K W1/W3) fall back to the F32 path automatically.
+
 ## IQ-family (importance-quant) Coverage
 
 I-quants encode weight values via a small codebook lookup rather than linear quantization — the on-disk bytes index into a per-quant-type grid table (256/512/1024 entries × 8 bytes) and an 8-bit sign mask. The base scale (`d`, Half) plus 4-bit per-pair sub-scales decode to floats as `db * grid[idx][j] * sign[j]`.
