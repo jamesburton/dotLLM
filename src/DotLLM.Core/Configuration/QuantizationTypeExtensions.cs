@@ -37,6 +37,11 @@ public static class QuantizationTypeExtensions
         QuantizationType.IQ2_S => elementCount / 256 * 82,
         // IQ1_S:    d(2) + qs[QK_K/8] + qh[QK_K/32](uint16) = 2 + 32 + 16 = 50 bytes / 256 (~1.5625 bpw).
         QuantizationType.IQ1_S => elementCount / 256 * 50,
+        // IQ3_XXS:  d(2) + qs[QK_K/4] + scales_and_signs[QK_K/8] = 2 + 64 + 32 = 98 bytes / 256 (3.0625 bpw).
+        QuantizationType.IQ3_XXS => elementCount / 256 * 98,
+        // IQ3_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + signs[QK_K/8] + scales[QK_K/64]
+        //        =  2 + 64 + 8 + 32 + 4 = 110 bytes / 256 (3.4375 bpw).
+        QuantizationType.IQ3_S => elementCount / 256 * 110,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

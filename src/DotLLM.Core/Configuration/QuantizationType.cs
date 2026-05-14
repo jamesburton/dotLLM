@@ -94,5 +94,32 @@ public enum QuantizationType
     /// values into a uint64). Per-element decode:
     /// <c>y = dl * (grid[j] + delta)</c> with <c>delta = +/-0.125</c>.
     /// </summary>
-    IQ1_S = 19
+    IQ1_S = 19,
+
+    /// <summary>
+    /// 3-bit importance quantization, "extra extra small" (3.0625 bpw).
+    /// Super-block of 256 elements stored in 98 bytes:
+    /// <c>d(Half@0) + qs[64]@2 + scales_and_signs[32]@66</c>. The first 64
+    /// <c>qs</c> bytes hold 64 unsigned 8-bit indices into the 256-entry
+    /// <c>iq3xxs_grid</c> (one grid row = 4 unsigned int8 values). The 32-byte
+    /// <c>scales_and_signs</c> tail is 8 little-endian <c>uint32</c>s — one
+    /// per 32-element sub-block — packing four 7-bit sign indices (low 28 bits)
+    /// plus a 4-bit shared sub-scale (top nibble). Per-pair-of-4 decode:
+    /// <c>db = d * (0.5 + s4) * 0.5</c>, sign byte =
+    /// <c>ksigns_iq2xs[(aux32 &gt;&gt; 7*l) &amp; 0x7f]</c>.
+    /// </summary>
+    IQ3_XXS = 18,
+
+    /// <summary>
+    /// 3-bit importance quantization, "standard" (3.4375 bpw). Super-block of
+    /// 256 elements stored in 110 bytes:
+    /// <c>d(Half@0) + qs[64]@2 + qh[8]@66 + signs[32]@74 + scales[4]@106</c>.
+    /// 9-bit codebook indices are split: low 8 bits in <c>qs</c>, high 1 bit
+    /// in <c>qh</c> (4 bits per sub-block). The 32-byte <c>signs[]</c> table
+    /// stores a full 8-bit sign mask per pair (matches IQ2_S — no ksigns
+    /// indirection). Sub-blocks come in pairs that share one
+    /// <c>scales[ib32/2]</c> byte (low nibble = first sub, high = second);
+    /// per-pair scale is <c>db = d * (1 + 2 * sub_scale)</c>.
+    /// </summary>
+    IQ3_S = 21
 }
