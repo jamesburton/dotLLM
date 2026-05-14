@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
     <ProjectReference Include="..\..\src\DotLLM.HuggingFace\DotLLM.HuggingFace.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
   </ItemGroup>
 
   <ItemGroup>
