@@ -113,6 +113,24 @@ public readonly record struct LoraLayerWeights(
 /// or F32. dotLLM stores adapter buffers in their native dtype to halve
 /// memory for typical adapters and avoids an unnecessary up-cast on load.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Phase 4d.4 added <see cref="Q8_0"/> for the down-projection (B) buffer
+/// only. The asymmetry is deliberate: B has shape <c>[rank, inputDim]</c>
+/// where <c>inputDim</c> is the projection input (always a multiple of 32
+/// for transformer linear layers), so each B row is a natural Q8_0 row.
+/// A has shape <c>[outputDim, rank]</c> where the contracted axis is
+/// <c>rank</c> (8–64 typical) — too short for a 32-element Q8_0 block, so
+/// A stays F16 / BF16 / F32. This is the layout exercised by the
+/// quantised-LoRA bench (see <c>docs/LORA.md</c>).
+/// </para>
+/// <para>
+/// For a Q8_0 B buffer the storage layout is <c>(inputDim / 32)</c>
+/// blocks per row, each block 34 bytes (2-byte F16 scale + 32 sbytes),
+/// matching the on-disk GGUF Q8_0 layout. Quantisation happens once at
+/// adapter load via the helper on <see cref="LoraAdapter"/>.
+/// </para>
+/// </remarks>
 public enum LoraWeightDType : byte
 {
     /// <summary>32-bit single-precision float (default).</summary>
@@ -121,4 +139,10 @@ public enum LoraWeightDType : byte
     F16 = 1,
     /// <summary>16-bit bfloat16 (top 16 bits of an F32).</summary>
     BF16 = 2,
+    /// <summary>
+    /// Q8_0 block-quantised storage — only valid for the B (down-projection)
+    /// buffer, which has rows of length <c>inputDim</c> (multiple of 32).
+    /// Each row is <c>(inputDim / 32)</c> blocks × 34 bytes = ~1.0625 B / element.
+    /// </summary>
+    Q8_0 = 3,
 }
