@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Benchmarks.Lora;
 
@@ -97,6 +98,99 @@ internal static unsafe class SyntheticLoraAdapter
         }
 
         return adapter;
+    }
+
+    /// <summary>
+    /// Phase 4d.4 Q8_0-B variant. Builds an adapter where every B
+    /// (down-projection) buffer is Q8_0-quantised and every A
+    /// (up-projection) buffer is F16. The same RNG seed produces the same
+    /// underlying F32 weights as <see cref="Create"/> with
+    /// <see cref="LoraWeightDType.F16"/> — only B differs by the Q8_0
+    /// round-trip error.
+    /// </summary>
+    public static LoraAdapter CreateQ8_0B(
+        string name,
+        ModelConfig baseConfig,
+        int rank,
+        float alpha,
+        int seed)
+    {
+        ArgumentNullException.ThrowIfNull(baseConfig);
+        if (rank <= 0) throw new ArgumentOutOfRangeException(nameof(rank));
+
+        int hidden = baseConfig.HiddenSize;
+        int qOut = baseConfig.NumAttentionHeads * baseConfig.HeadDim;
+        int kvOut = baseConfig.NumKvHeads * baseConfig.HeadDim;
+        int ffn = baseConfig.IntermediateSize;
+
+        var adapter = new LoraAdapter(name, rank, alpha, AllTargetProjections);
+
+        try
+        {
+            var rng = new Random(seed);
+
+            for (int layer = 0; layer < baseConfig.NumLayers; layer++)
+            {
+                AddProjectionQ8_0B(adapter, layer, "q_proj", hidden, qOut, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "k_proj", hidden, kvOut, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "v_proj", hidden, kvOut, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "o_proj", qOut, hidden, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "gate_proj", hidden, ffn, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "up_proj", hidden, ffn, rank, rng);
+                AddProjectionQ8_0B(adapter, layer, "down_proj", ffn, hidden, rank, rng);
+            }
+        }
+        catch
+        {
+            adapter.Dispose();
+            throw;
+        }
+
+        return adapter;
+    }
+
+    private static void AddProjectionQ8_0B(
+        LoraAdapter adapter,
+        int layer,
+        string projName,
+        int inputDim,
+        int outputDim,
+        int rank,
+        Random rng)
+    {
+        long bElems = (long)rank * inputDim;       // B: [rank, inputDim]
+        long aElems = (long)outputDim * rank;       // A: [outputDim, rank]
+
+        // B: generate F32 noise, quantise to Q8_0 in place via a transient
+        // F32 staging buffer (adapter-load is one-shot — no perf concern).
+        long bBytes = LoraAdapter.Q8_0ByteSize(bElems);
+        nint bHandle = LoraAdapter.AllocAlignedBytes(bBytes);
+
+        // Use unmanaged staging so a >2GB adapter doesn't pin the GC heap.
+        nint stagingHandle = LoraAdapter.AllocAligned(bElems);
+        try
+        {
+            FillRandomF32((float*)stagingHandle, bElems, rng);
+            LoraDelta.Quantize_F32_To_Q8_0(
+                (float*)stagingHandle, (byte*)bHandle, rows: rank, elementsPerRow: inputDim);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)stagingHandle);
+        }
+
+        // A: F16 (2 bytes per element).
+        long aBytes = aElems * 2;
+        nint aHandle = LoraAdapter.AllocAlignedBytes(aBytes);
+        FillRandomHalfWidth((byte*)aHandle, aElems, rng, LoraWeightDType.F16);
+
+        adapter.AddLayerWeights(layer, projName, new LoraLayerWeights(
+            AHandle: aHandle,
+            BHandle: bHandle,
+            InputDim: inputDim,
+            OutputDim: outputDim,
+            WeightDType: LoraWeightDType.Q8_0,
+            AWeightDType: LoraWeightDType.F16));
     }
 
     private static void AddProjection(

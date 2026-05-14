@@ -1001,7 +1001,7 @@ public sealed unsafe class TransformerModel : IModel
         float scale = adapter.Alpha / adapter.Rank;
         LoraDelta.Apply((float*)x, (void*)w.BHandle, (void*)w.AHandle, (float*)y,
                         seqLen, inputDim, outputDim, adapter.Rank, scale,
-                        w.WeightDType, w.WeightDType);
+                        w.WeightDType, w.ResolvedAWeightDType);
     }
 
     /// <summary>

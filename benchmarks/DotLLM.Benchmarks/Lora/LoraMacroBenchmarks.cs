@@ -22,6 +22,12 @@ public enum LoraVariant
     LoraF16,
     /// <summary>BF16 adapter — Phase 4d.1 dequant-on-read path.</summary>
     LoraBF16,
+    /// <summary>
+    /// Q8_0 B + F16 A — Phase 4d.4 path. Closes the prefill regression
+    /// that F32-on-Q8_0-base introduces (Agent 8 measured −36% on Strix
+    /// Halo for LoraF32). Stage 1 uses GemmQ8_0; stage 2 dequants A.
+    /// </summary>
+    LoraQ8_0,
 }
 
 /// <summary>Macro-bench scenario — fixes (prompt-len, decode-len) workload pair.</summary>
@@ -89,6 +95,7 @@ public class LoraMacroBenchmarks
     private DotLLM.Core.Lora.LoraAdapter? _adapterF32;
     private DotLLM.Core.Lora.LoraAdapter? _adapterF16;
     private DotLLM.Core.Lora.LoraAdapter? _adapterBF16;
+    private DotLLM.Core.Lora.LoraAdapter? _adapterQ8_0;
     private string _prompt = string.Empty;
     private string _modelLabel = string.Empty;
     private bool _skipped;
@@ -126,6 +133,9 @@ public class LoraMacroBenchmarks
         _adapterF32 = SyntheticLoraAdapter.Create("synth-f32", config, LoraRank, LoraAlpha, LoraWeightDType.F32, AdapterSeed);
         _adapterF16 = SyntheticLoraAdapter.Create("synth-f16", config, LoraRank, LoraAlpha, LoraWeightDType.F16, AdapterSeed);
         _adapterBF16 = SyntheticLoraAdapter.Create("synth-bf16", config, LoraRank, LoraAlpha, LoraWeightDType.BF16, AdapterSeed);
+        // Phase 4d.4: Q8_0 B + F16 A — the new path. Same RNG seed so the
+        // adapter values are identical to the F16 case modulo Q8_0 quantisation.
+        _adapterQ8_0 = SyntheticLoraAdapter.CreateQ8_0B("synth-q8_0", config, LoraRank, LoraAlpha, AdapterSeed);
 
         Console.WriteLine(
             $"[LoraMacroBenchmarks] config: hidden={config.HiddenSize} layers={config.NumLayers} "
@@ -169,6 +179,7 @@ public class LoraMacroBenchmarks
         _adapterF32?.Dispose();
         _adapterF16?.Dispose();
         _adapterBF16?.Dispose();
+        _adapterQ8_0?.Dispose();
         _model?.Dispose();
         _gguf?.Dispose();
     }
@@ -179,6 +190,7 @@ public class LoraMacroBenchmarks
         LoraVariant.LoraF32 => _adapterF32,
         LoraVariant.LoraF16 => _adapterF16,
         LoraVariant.LoraBF16 => _adapterBF16,
+        LoraVariant.LoraQ8_0 => _adapterQ8_0,
         _ => null,
     };
 
