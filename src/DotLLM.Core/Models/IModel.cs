@@ -53,4 +53,39 @@ public interface IModel : IDisposable
     ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
                     IKvCache? kvCache, ILoraAdapter? adapter)
         => Forward(tokenIds, positions, deviceId, kvCache);
+
+    /// <summary>
+    /// Runs a fused forward pass across multiple in-flight sequences.
+    /// </summary>
+    /// <remarks>
+    /// <para>The continuous-batch scheduler calls this once per iteration when 2+ sequences are
+    /// active, instead of looping <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/>
+    /// per sequence. Each <paramref name="requests"/> entry carries its own tokens, positions,
+    /// and KV-cache — sequences are independent at the attention level (no cross-sequence
+    /// attention).</para>
+    /// <para>The default implementation simply loops over <c>Forward</c> per request and returns
+    /// the results in input order. Implementations can override to fuse the per-sequence GEMVs
+    /// into batched GEMMs and avoid the per-iteration kernel-dispatch overhead — this is the
+    /// principal continuous-batching throughput win.</para>
+    /// <para>The returned tensors follow the same shape contract as <c>Forward</c>: each entry
+    /// is <c>[N_i, vocab_size]</c> where <c>N_i</c> matches that request's token count (CPU
+    /// model) or <c>[1, vocab_size]</c> for the last token only (GPU/hybrid). The caller is
+    /// responsible for disposing each returned tensor.</para>
+    /// </remarks>
+    /// <param name="requests">One entry per active sequence. Order is preserved in the result.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <returns>Logits tensors, one per request, in the same order.</returns>
+    IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+        }
+        return results;
+    }
 }
