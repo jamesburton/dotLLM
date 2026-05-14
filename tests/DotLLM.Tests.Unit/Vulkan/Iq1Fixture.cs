@@ -114,6 +114,8 @@ internal static unsafe class Iq1Fixture
         Span<ushort> qhVals = stackalloc ushort[Iq1SNumSubBlocks];
         Span<byte> qsBytes = stackalloc byte[32];
 
+        Span<byte> groupQs = stackalloc byte[4];
+
         for (int ib = 0; ib < Iq1SNumSubBlocks; ib++)
         {
             float* subSrc = src + ib * Iq1SSubBlockSize;
@@ -135,7 +137,6 @@ internal static unsafe class Iq1Fixture
                     float delta = signBit == 0 ? Iq1SDelta : -Iq1SDelta;
                     float totalErr = 0;
                     uint qhLowBits = 0;
-                    Span<byte> groupQs = stackalloc byte[4];
 
                     for (int l = 0; l < 4; l++)
                     {

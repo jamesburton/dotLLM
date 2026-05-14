@@ -344,6 +344,11 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepIq2SOnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.IQ2_S && (inputDim % 256) == 0;
 
+    /// <summary>True iff an IQ1_S source projection can be kept on device as raw
+    /// 50-byte super-blocks — gated on the input dim being a multiple of 256.</summary>
+    private static bool KeepIq1SOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.IQ1_S && (inputDim % 256) == 0;
+
     /// <summary>True iff an F16 source projection can be kept on device as raw 2-byte
     /// F16 elements — gated on the contraction dim being a multiple of 2. Phase 8 of
     /// the native matmul work.</summary>
@@ -369,6 +374,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         || KeepIq2XxsOnDevice(qt, inputDim)
         || KeepIq2XsOnDevice(qt, inputDim)
         || KeepIq2SOnDevice(qt, inputDim)
+        || KeepIq1SOnDevice(qt, inputDim)
         || KeepF16OnDevice(qt, inputDim)
         || KeepBf16OnDevice(qt, inputDim);
 
@@ -386,6 +392,7 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         if (KeepIq2XxsOnDevice(qt, inputDim)) return QuantizationType.IQ2_XXS;
         if (KeepIq2XsOnDevice(qt, inputDim)) return QuantizationType.IQ2_XS;
         if (KeepIq2SOnDevice(qt, inputDim)) return QuantizationType.IQ2_S;
+        if (KeepIq1SOnDevice(qt, inputDim)) return QuantizationType.IQ1_S;
         if (KeepF16OnDevice(qt, inputDim)) return QuantizationType.F16;
         if (KeepBf16OnDevice(qt, inputDim)) return QuantizationType.BF16;
         return QuantizationType.F32;
@@ -414,6 +421,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_XS) * outputDim;
         if (KeepIq2SOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_S) * outputDim;
+        if (KeepIq1SOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ1_S) * outputDim;
         if (KeepF16OnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
         if (KeepBf16OnDevice(qt, inputDim))

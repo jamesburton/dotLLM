@@ -155,6 +155,33 @@ public sealed class RealGgufVulkanParityTests
             prompt: "The capital of France is");
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // IQ1_S real-GGUF smoke. The smallest GGUF quant — production-cached
+    // models are rare (extreme accuracy loss); this gate exists so any
+    // available IQ1_S GGUF on disk (e.g. quant-experimentation cache)
+    // exercises the IQ1_S projection path end-to-end vs the CPU oracle.
+    // ────────────────────────────────────────────────────────────────────
+
+    [SkippableFact]
+    public void Llama31_8B_IQ1_S_VulkanForward_MatchesCpuReference()
+    {
+        string? path = ResolveGgufPath(
+            envVar: "DOTLLM_LLAMA31_8B_IQ1_S_GGUF",
+            conventional: "C:/Users/james/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf");
+        if (path is null)
+        {
+            _output.WriteLine(
+                "[SKIP] Llama-3.1-8B IQ1_S GGUF not found. Set "
+                + "DOTLLM_LLAMA31_8B_IQ1_S_GGUF or download to "
+                + "~/.dotllm/test-cache/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-IQ1_S.gguf "
+                + "(~2.0 GB) — IQ1_S Llama-3.1-8B GGUFs are not always published; "
+                + "any IQ1_S GGUF can be substituted via the env var.");
+            return;
+        }
+        RunGgufParityTest(path, expectedArch: Architecture.Llama, label: "Llama-3.1-8B-IQ1_S",
+            prompt: "The capital of France is");
+    }
+
     [SkippableFact]
     public void DeepSeekV2Lite_Q4_K_M_VulkanForward_MatchesCpuReference()
     {

@@ -82,6 +82,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly MatMulIq2XsGemmF32Kernel _matmulIq2XsGemm;
     private readonly MatMulIq2SGemvF32Kernel _matmulIq2S;
     private readonly MatMulIq2SGemmF32Kernel _matmulIq2SGemm;
+    private readonly MatMulIq1SGemvF32Kernel _matmulIq1S;
+    private readonly MatMulIq1SGemmF32Kernel _matmulIq1SGemm;
     // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat
     // path is opportunistic; BF16 has no coopmat path on this hardware.
     private readonly MatMulF16GemvF32Kernel _matmulF16;
@@ -142,6 +144,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulIq2XxsGemvF32Kernel matmulIq2Xxs, MatMulIq2XxsGemmF32Kernel matmulIq2XxsGemm,
         MatMulIq2XsGemvF32Kernel matmulIq2Xs, MatMulIq2XsGemmF32Kernel matmulIq2XsGemm,
         MatMulIq2SGemvF32Kernel matmulIq2S, MatMulIq2SGemmF32Kernel matmulIq2SGemm,
+        MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -187,6 +190,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq2XsGemm = matmulIq2XsGemm;
         _matmulIq2S = matmulIq2S;
         _matmulIq2SGemm = matmulIq2SGemm;
+        _matmulIq1S = matmulIq1S;
+        _matmulIq1SGemm = matmulIq1SGemm;
         _matmulF16 = matmulF16;
         _matmulF16Gemm = matmulF16Gemm;
         _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
@@ -329,6 +334,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var matmulIq2XsGemm  = MatMulIq2XsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2S       = MatMulIq2SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2SGemm   = MatMulIq2SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        // IQ1_S GEMV + GEMM — smallest GGUF quant.
+        var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
+        var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat
         // is opportunistic.
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
@@ -371,6 +379,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulIq2Xxs, matmulIq2XxsGemm,
             matmulIq2Xs, matmulIq2XsGemm,
             matmulIq2S, matmulIq2SGemm,
+            matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnorm, rope, attention, swiglu, add, biasAdd,
@@ -733,6 +742,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulIq2XsGemm.InvalidateDescriptorCache();
         _matmulIq2S.InvalidateDescriptorCache();
         _matmulIq2SGemm.InvalidateDescriptorCache();
+        _matmulIq1S.InvalidateDescriptorCache();
+        _matmulIq1SGemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -880,6 +891,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
             else
                 _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        else if (weightQt == QuantizationType.IQ1_S)
+        {
+            if (seqLen == 1)
+            {
+                _matmulIq1S.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulIq1SGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
         }
         else if (weightQt == QuantizationType.F16)
         {
@@ -992,6 +1015,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulF16GemmCoopmat?.Dispose();
         _matmulF16Gemm.Dispose();
         _matmulF16.Dispose();
+        _matmulIq1SGemm.Dispose();
+        _matmulIq1S.Dispose();
         _matmulIq4XsGemm.Dispose();
         _matmulIq4Xs.Dispose();
         _matmulIq4NlGemm.Dispose();
