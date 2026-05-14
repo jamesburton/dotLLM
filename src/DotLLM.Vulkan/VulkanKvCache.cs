@@ -183,6 +183,81 @@ public sealed class VulkanKvCache : IKvCache
     /// <summary>Resets the visible length. Used when starting a new sequence.</summary>
     public void Reset() => _currentLength = 0;
 
+    /// <summary>
+    /// Number of layers in this cache.
+    /// </summary>
+    public int LayerCount => _numLayers;
+
+    /// <summary>
+    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements).
+    /// </summary>
+    public int KvStride => _kvStride;
+
+    /// <summary>
+    /// Ingests host-resident K/V rows (FP32, layout <c>[length, kvStride]</c>)
+    /// for the given <paramref name="layerIndex"/> at positions <c>[0, length)</c>.
+    /// Used by the hybrid CPU-prefill / iGPU-decode handoff: after CPU prefill
+    /// has populated a <c>SimpleKvCache</c>, each layer's contiguous host buffer
+    /// is uploaded into the device-local Vulkan KV cache.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// In this scaffold parent every KV layer buffer is host-visible
+    /// host-coherent (see <see cref="VulkanDevice.Allocate"/>), so the handoff
+    /// is a single mapped <c>memcpy</c> per K/V buffer via
+    /// <see cref="VulkanDevice.Upload(System.ReadOnlySpan{float}, VulkanDevice.Buffer)"/>.
+    /// When the scaffold gains a staged device-local KV cache in a later wave
+    /// this method becomes the natural seam for a <c>vkCmdCopyBuffer</c>
+    /// transfer (staging buffer → device-local destination) — the public
+    /// contract (per-layer ingest, advances <see cref="CurrentLength"/>) is
+    /// stable across both backings.
+    /// </para>
+    /// <para>
+    /// Advances <see cref="CurrentLength"/> to <c>max(CurrentLength, length)</c>
+    /// so the subsequent device decode sees positions <c>[0, length)</c> as
+    /// already-cached. Both <c>keys</c> and <c>values</c> must cover exactly
+    /// <c>length × KvStride</c> FP32 elements.
+    /// </para>
+    /// </remarks>
+    public void IngestFromHost(int layerIndex, int length,
+        ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        if (length <= 0)
+            throw new ArgumentOutOfRangeException(nameof(length), "length must be positive.");
+        if (length > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(length),
+                $"length {length} exceeds cache MaxLength {_maxSeqLen}.");
+        long expectedFloats = (long)length * _kvStride;
+        if (keys.Length != expectedFloats || values.Length != expectedFloats)
+            throw new ArgumentException(
+                $"keys/values must contain exactly length × kvStride = {expectedFloats} floats; "
+                + $"got keys={keys.Length}, values={values.Length}.");
+
+        // Direct mapped-memory upload into each layer's host-visible buffer.
+        // On a UMA APU (Strix Halo) the bytes never leave system DRAM.
+        _device.Upload(keys, _keys[layerIndex]);
+        _device.Upload(values, _values[layerIndex]);
+
+        if (length > _currentLength)
+            _currentLength = length;
+    }
+
+    /// <summary>
+    /// Sets the visible length without changing buffer contents. Used after
+    /// <see cref="IngestFromHost"/> calls for every layer to advance the
+    /// observed length atomically across layers (the per-layer call already
+    /// advances individually; this is a no-op for single-layer ingest but
+    /// makes the multi-layer code path explicit at the call site).
+    /// </summary>
+    public void SetCurrentLength(int length)
+    {
+        if ((uint)length > (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _currentLength = length;
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
