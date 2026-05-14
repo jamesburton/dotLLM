@@ -1927,6 +1927,7 @@ public sealed class VulkanTransformerModel : IModel
                 _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
             else
                 _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
         else if (weightQt == QuantType.IQ1_S)
         {
             // IQ1_S: 256-element super-block alignment, ~1.5-1.7 bpw smallest GGUF quant.

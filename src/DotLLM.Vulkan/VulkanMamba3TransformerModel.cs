@@ -1107,6 +1107,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
                 _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
             else
                 _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
         else if (weightQt == QuantizationType.IQ1_S)
         {
             if (seqLen == 1)

@@ -894,6 +894,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                     _kernels.MatMulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 else
                     _kernels.MatMulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
             case QuantizationType.IQ1_S:
                 if (seqLen == 1)
                     _kernels.MatMulIq1S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
