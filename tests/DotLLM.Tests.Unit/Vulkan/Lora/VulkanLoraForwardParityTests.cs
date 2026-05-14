@@ -1,8 +1,10 @@
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.SafeTensors;
 using DotLLM.Tests.Unit.Models.SafeTensors;
@@ -188,6 +190,75 @@ public sealed class VulkanLoraForwardParityTests : IDisposable
     }
 
     [SkippableFact]
+    public unsafe void Forward_Q8_0Adapter_VulkanMatchesF32Vulkan_WithinQ8_0Tolerance()
+    {
+        // Phase 4d.5 / Gap 1 acceptance gate: a Q8_0-B + F16-A adapter uploaded
+        // to Vulkan via the new dequant-on-load path produces finite logits
+        // that match the F32 LoRA Vulkan path within Q8_0 round-trip tolerance.
+        // The Hidden=64 fixture's per-row Q8_0 quant is exact for typical
+        // small-uniform initialisations so the practical tolerance is tight,
+        // but we use the documented Q8_0 abs ~5e-2 bar to stay conservative.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        string fixturePath = Path.Combine(_scratch, $"base-q8_0-vk.safetensors");
+        WriteSyntheticFixture(fixturePath);
+        var cfg = BuildConfig();
+
+        int[] tokenIds = [1, 2, 3];
+        int[] positions = [0, 1, 2];
+        const int seed = 23;
+        const int rank = 8;
+        const float alpha = 32f;
+        const float q8_0AbsTol = 5e-2f;
+        const float q8_0RelTol = 5e-3f;
+
+        // F32 LoRA baseline (Vulkan).
+        float[] f32Logits;
+        using (var sf = SafetensorsFile.Open(fixturePath))
+        using (var model = VulkanTransformerModel.LoadFromSafetensors(sf, cfg, spvDir))
+        using (var f32Adapter = BuildSyntheticAdapter(cfg, rank, alpha, zeroFactors: false, seed))
+        using (ITensor logits = model.Forward(tokenIds, positions, deviceId: -1,
+                                              kvCache: null, adapter: f32Adapter))
+        {
+            f32Logits = CopyLogits(logits);
+        }
+
+        // Q8_0-B + F16-A LoRA via the same RNG seed (same nominal weights,
+        // round-tripped through Q8_0 / F16 encodings).
+        float[] q8Logits;
+        using (var sf = SafetensorsFile.Open(fixturePath))
+        using (var model = VulkanTransformerModel.LoadFromSafetensors(sf, cfg, spvDir))
+        using (var q8Adapter = BuildSyntheticQ8_0BAdapter(cfg, rank, alpha, seed))
+        using (ITensor logits = model.Forward(tokenIds, positions, deviceId: -1,
+                                              kvCache: null, adapter: q8Adapter))
+        {
+            Assert.Equal(1, logits.Shape[0]);
+            Assert.Equal(VocabSize, logits.Shape[1]);
+            q8Logits = CopyLogits(logits);
+        }
+
+        // Finite check first — a malformed Q8_0 upload path most commonly
+        // surfaces as NaN/Inf in the LM head.
+        for (int i = 0; i < q8Logits.Length; i++)
+        {
+            Assert.True(float.IsFinite(q8Logits[i]),
+                $"Q8_0 LoRA forward produced non-finite logit at i={i}: {q8Logits[i]}");
+        }
+
+        // Compare last-row F32 logits to Vulkan Q8_0 logits within tolerance.
+        int lastRow = tokenIds.Length - 1;
+        for (int c = 0; c < VocabSize; c++)
+        {
+            float f32 = f32Logits[c];
+            float q8 = q8Logits[c];
+            float diff = MathF.Abs(f32 - q8);
+            float bar = q8_0AbsTol + q8_0RelTol * MathF.Abs(f32);
+            Assert.True(diff <= bar,
+                $"col={c}: vkF32={f32:F6} vs vkQ8_0={q8:F6} (|diff|={diff:E3} > {bar:E3})");
+        }
+    }
+
+    [SkippableFact]
     public unsafe void Forward_AdapterCache_AmortisesUploadCost()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -228,7 +299,7 @@ public sealed class VulkanLoraForwardParityTests : IDisposable
 
     private static ModelConfig BuildConfig() => new()
     {
-        Architecture = Architecture.Llama,
+        Architecture = DotLLM.Core.Configuration.Architecture.Llama,
         VocabSize = VocabSize,
         HiddenSize = Hidden,
         IntermediateSize = IntermediateSize,
@@ -294,6 +365,88 @@ public sealed class VulkanLoraForwardParityTests : IDisposable
             adapter.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Builds an adapter where every B (down-projection) buffer is Q8_0 and
+    /// every A (up-projection) buffer is F16. Uses the same RNG seed as
+    /// <see cref="BuildSyntheticAdapter"/> so the F32 / Q8_0 adapters
+    /// generate matching nominal weights — they differ only by the
+    /// Q8_0 / F16 round-trip noise.
+    /// </summary>
+    private static unsafe LoraAdapter BuildSyntheticQ8_0BAdapter(
+        ModelConfig cfg, int rank, float alpha, int seed)
+    {
+        var rng = new Random(seed);
+        int qOut = cfg.NumAttentionHeads * cfg.HeadDim;
+        int kvOut = cfg.NumKvHeads * cfg.HeadDim;
+        var adapter = new LoraAdapter("syn-q8_0",
+            rank: rank, alpha: alpha,
+            targetModules: ["q_proj", "v_proj"]);
+        try
+        {
+            for (int layer = 0; layer < cfg.NumLayers; layer++)
+            {
+                AddProjQ8_0B(adapter, layer, "q_proj", inputDim: cfg.HiddenSize, outputDim: qOut, rank, rng);
+                AddProjQ8_0B(adapter, layer, "v_proj", inputDim: cfg.HiddenSize, outputDim: kvOut, rank, rng);
+            }
+            return adapter;
+        }
+        catch
+        {
+            adapter.Dispose();
+            throw;
+        }
+    }
+
+    private static unsafe void AddProjQ8_0B(LoraAdapter adapter, int layer, string proj,
+        int inputDim, int outputDim, int rank, Random rng)
+    {
+        // Q8_0 requires inputDim multiple of 32 (every row is one or more
+        // 32-element blocks). The synthetic fixture's Hidden=64 satisfies this.
+        if (inputDim % 32 != 0)
+            throw new InvalidOperationException(
+                $"Test fixture inputDim must be multiple of 32 for Q8_0 LoRA; got {inputDim}.");
+
+        long bElems = (long)rank * inputDim;
+        long aElems = (long)outputDim * rank;
+
+        // B: stage F32 into transient buffer, quantise to Q8_0, then own bytes.
+        long bBytes = LoraAdapter.Q8_0ByteSize(bElems);
+        nint bHandle = LoraAdapter.AllocAlignedBytes(bBytes);
+        nint stagingHandle = LoraAdapter.AllocAligned(bElems);
+        try
+        {
+            float* bp = (float*)stagingHandle;
+            for (long i = 0; i < bElems; i++) bp[i] = (float)((rng.NextDouble() * 2 - 1) * 0.05);
+            LoraDelta.Quantize_F32_To_Q8_0(
+                (float*)stagingHandle, (byte*)bHandle, rows: rank, elementsPerRow: inputDim);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)stagingHandle);
+        }
+
+        // A: F16, 2 bytes per element.
+        long aBytes = aElems * 2;
+        nint aHandle = LoraAdapter.AllocAlignedBytes(aBytes);
+        byte* ap = (byte*)aHandle;
+        for (long i = 0; i < aElems; i++)
+        {
+            float v = (float)((rng.NextDouble() * 2 - 1) * 0.05);
+            ushort raw = BitConverter.HalfToUInt16Bits((Half)v);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(
+                new Span<byte>(ap + i * 2, 2), raw);
+        }
+
+        adapter.AddLayerWeights(layer, proj,
+            new LoraLayerWeights(
+                AHandle: aHandle,
+                BHandle: bHandle,
+                InputDim: inputDim,
+                OutputDim: outputDim,
+                WeightDType: LoraWeightDType.Q8_0,
+                AWeightDType: LoraWeightDType.F16));
     }
 
     private static unsafe void AddProj(LoraAdapter adapter, int layer, string proj,

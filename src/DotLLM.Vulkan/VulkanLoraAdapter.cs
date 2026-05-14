@@ -1,6 +1,10 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Numerics.Tensors;
+using System.Runtime.CompilerServices;
 using DotLLM.Core.Lora;
+using DotLLM.Cpu.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -170,20 +174,25 @@ internal sealed class VulkanLoraAdapter : IDisposable
         VulkanDevice.Buffer? aBuf = null;
         try
         {
-            // Pre-scale B by alpha/rank into a transient ArrayPool scratch,
-            // then upload via Upload(ReadOnlySpan<float>, Buffer) which
-            // routes through a host-coherent staging map. Buffer is
-            // device-local so the upload uses CopyBufferSynchronous under
-            // the hood. Folding scale here costs one multiply per element
-            // on upload — eliminating any per-forward scale dispatch.
+            // Stage B into an F32 scratch with scale pre-folded. When the
+            // source dtype is non-F32 (F16 / BF16 / Q8_0 — Phase 4d.1 +
+            // Phase 4d.5 / Gap 1) we dequantise on the host once at upload
+            // time so the existing fused F32 device-side kernel runs
+            // unchanged. Adapter upload is one-shot per adapter (cached in
+            // VulkanLoraAdapterCache), so a per-element multiply or per-block
+            // Q8_0 dequant here has zero impact on inference throughput.
             var pool = ArrayPool<float>.Shared;
             float[] scratch = pool.Rent((int)bElems);
             try
             {
-                var src = new ReadOnlySpan<float>((void*)w.BHandle, (int)bElems);
                 var dst = new Span<float>(scratch, 0, (int)bElems);
-                for (int i = 0; i < bElems; i++)
-                    dst[i] = src[i] * scale;
+                DequantAndScale(
+                    src: (void*)w.BHandle,
+                    dtype: w.WeightDType,
+                    elementsPerRow: w.InputDim,
+                    rows: rank,
+                    scale: scale,
+                    dst: dst);
                 UploadF32ToDeviceLocal(device, new ReadOnlySpan<float>(scratch, 0, (int)bElems), bBuf);
             }
             finally
@@ -192,8 +201,37 @@ internal sealed class VulkanLoraAdapter : IDisposable
             }
 
             aBuf = device.AllocateDeviceLocal(aBytes);
-            var aSrc = new ReadOnlySpan<float>((void*)w.AHandle, (int)aElems);
-            UploadF32ToDeviceLocal(device, aSrc, aBuf);
+            // A: convert to F32 in a scratch and upload. Scale is folded
+            // into B only, so A goes verbatim (Q8_0 is invalid for A per
+            // the LoraWeightDType contract — A's contracted axis is rank,
+            // below the Q8_0 block size of 32 — so we only handle
+            // F32 / F16 / BF16 here).
+            var aDType = w.ResolvedAWeightDType;
+            if (aDType == LoraWeightDType.F32)
+            {
+                var aSrc = new ReadOnlySpan<float>((void*)w.AHandle, (int)aElems);
+                UploadF32ToDeviceLocal(device, aSrc, aBuf);
+            }
+            else
+            {
+                float[] aScratch = pool.Rent((int)aElems);
+                try
+                {
+                    var dst = new Span<float>(aScratch, 0, (int)aElems);
+                    DequantAndScale(
+                        src: (void*)w.AHandle,
+                        dtype: aDType,
+                        elementsPerRow: rank, // A has shape [outputDim, rank]; row layout doesn't matter for the unscaled F32/F16/BF16 dequant
+                        rows: w.OutputDim,
+                        scale: 1.0f,
+                        dst: dst);
+                    UploadF32ToDeviceLocal(device, new ReadOnlySpan<float>(aScratch, 0, (int)aElems), aBuf);
+                }
+                finally
+                {
+                    pool.Return(aScratch);
+                }
+            }
         }
         catch
         {
@@ -203,6 +241,100 @@ internal sealed class VulkanLoraAdapter : IDisposable
         }
 
         return new LayerBuffers(bBuf, aBuf, w.InputDim, w.OutputDim, rank);
+    }
+
+    /// <summary>
+    /// Host-side dequant of a LoRA factor buffer into F32, multiplying every
+    /// element by <paramref name="scale"/>. F32 is a straight copy + scale;
+    /// F16 / BF16 use the standard <see cref="TensorPrimitives"/> / scalar
+    /// paths; Q8_0 routes through <see cref="LoraDelta.DequantizeRowToF32"/>
+    /// row-by-row (Q8_0 is row-blocked so a contiguous range of rows is a
+    /// contiguous range of bytes).
+    /// </summary>
+    /// <remarks>
+    /// Adapter upload is one-shot per adapter (cached in
+    /// <see cref="VulkanLoraAdapterCache"/>) so we deliberately don't
+    /// SIMD-tune this path — clarity wins over throughput. The Q8_0 case is
+    /// the only one that exists post-Phase-4d.5 / Gap 1; F16 / BF16 / F32
+    /// paths existed pre-Phase-4d.5 but were silently routed through a
+    /// "read as F32" path that would have produced junk values for any
+    /// non-F32 adapter. This method makes those paths correct as well.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DequantAndScale(
+        void* src, LoraWeightDType dtype, int elementsPerRow, int rows, float scale, Span<float> dst)
+    {
+        long count = (long)rows * elementsPerRow;
+        if (dst.Length < count)
+            throw new ArgumentException(
+                $"Dequant destination span too small: {dst.Length} < {count}.", nameof(dst));
+
+        switch (dtype)
+        {
+            case LoraWeightDType.F32:
+                {
+                    var srcSpan = new ReadOnlySpan<float>(src, (int)count);
+                    if (scale == 1.0f)
+                    {
+                        srcSpan.CopyTo(dst);
+                    }
+                    else
+                    {
+                        TensorPrimitives.Multiply(srcSpan, scale, dst);
+                    }
+                    break;
+                }
+            case LoraWeightDType.F16:
+                {
+                    var srcSpan = new ReadOnlySpan<Half>(src, (int)count);
+                    TensorPrimitives.ConvertToSingle(srcSpan, dst);
+                    if (scale != 1.0f)
+                    {
+                        TensorPrimitives.Multiply((ReadOnlySpan<float>)dst, scale, dst);
+                    }
+                    break;
+                }
+            case LoraWeightDType.BF16:
+                {
+                    byte* p = (byte*)src;
+                    for (long i = 0; i < count; i++)
+                    {
+                        ushort raw = BinaryPrimitives.ReadUInt16LittleEndian(
+                            new ReadOnlySpan<byte>(p + i * 2, 2));
+                        uint asF32 = (uint)raw << 16;
+                        dst[(int)i] = BitConverter.UInt32BitsToSingle(asF32) * scale;
+                    }
+                    break;
+                }
+            case LoraWeightDType.Q8_0:
+                {
+                    if (elementsPerRow % 32 != 0)
+                        throw new ArgumentException(
+                            $"Q8_0 LoRA factor requires elementsPerRow multiple of 32, got {elementsPerRow}.",
+                            nameof(elementsPerRow));
+                    byte* srcQ8 = (byte*)src;
+                    int rowBytes = (elementsPerRow / 32) * LoraAdapter.Q8_0BlockBytes;
+                    fixed (float* dstPtr = dst)
+                    {
+                        for (int r = 0; r < rows; r++)
+                        {
+                            LoraDelta.DequantizeRowToF32(
+                                srcQ8 + (long)r * rowBytes,
+                                dstPtr + (long)r * elementsPerRow,
+                                elementsPerRow);
+                        }
+                    }
+                    // Fold scale once over the dequantised rows.
+                    if (scale != 1.0f)
+                    {
+                        TensorPrimitives.Multiply((ReadOnlySpan<float>)dst[..(int)count], scale, dst[..(int)count]);
+                    }
+                    break;
+                }
+            default:
+                throw new NotSupportedException(
+                    $"LoRA weight dtype {dtype} is not supported by VulkanLoraAdapter upload.");
+        }
     }
 
     /// <summary>
