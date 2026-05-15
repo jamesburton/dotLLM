@@ -302,6 +302,17 @@ public sealed unsafe class TransformerModel : IModel
             return Forward(tokenIds, positions, deviceId, kvCache);
 
         ValidateAdapterForModel(adapter);
+
+        // Phase 4d.6 — eager transposed-A materialisation. The outer-product
+        // stage-2 fast path needs a [rank, outputDim] view of A; building it
+        // is O(outputDim × rank) per (layer, proj) — a few ms total for a
+        // typical Llama-3.2-1B / rank=16 adapter. PrewarmAdapter is
+        // idempotent so the actual cost is paid only on first activation;
+        // hoisting it out of the per-Apply lazy path eliminates first-token
+        // latency contamination AND smooths low-iteration BDN measurement
+        // variance. No-op for rank != 16 or non-AVX-512 hosts.
+        LoraStage2.PrewarmAdapter(adapter as LoraAdapter);
+
         _currentAdapter = adapter;
         try
         {
@@ -1058,23 +1069,28 @@ public sealed unsafe class TransformerModel : IModel
 
         float scale = adapter.Alpha / adapter.Rank;
 
+        // Phase 4d.6 — outer-product stage-2 fast path. At rank=16 with
+        // AVX-512 present, the per-token GEMV-then-MultiplyAdd stage 2
+        // (~outputDim short Dot calls per token, ~1M total at outputDim=2048
+        // / seqLen=512) is replaced by an outer-product kernel that
+        // collapses to ~seqLen × outputDim/16 tile FMAs (~3-4× faster on
+        // Strix Halo). The kernel consumes a [rank, outputDim] transposed-A
+        // buffer; we lazy-build + cache it on the adapter the first time we
+        // dispatch a (layer, proj) pair through this path. The cache also
+        // covers F16 / BF16 / Q8_0-B adapters — the dequant-and-transpose
+        // happens once at first use.
+        nint aTransposedHandle = LoraStage2.EnsureATransposedF32(
+            adapter as LoraAdapter, layer, projName, in w, adapter.Rank);
+
         // Phase 4d.5 / Gap 2 — fast-path plumbing: when both base and adapter
         // B are Q8_0 AND the caller pre-quantised x, we can route stage 1
         // through `MatMul.GemmQ8_0(preQuantizedInput=preQuantX)` and skip the
-        // activation-quant cost. Kept gated behind
-        // `DOTLLM_LORA_FORCE_Q8_PREQUANT=1` because direct kernel-level
-        // probing (`benchmarks/LoraQ8Stage1Probe`) on Strix Halo measures
-        // the Q8_0 GEMM at M=rank=16, K=hidden=2048, N=seqLen=512 to be
-        // ~1.7× SLOWER per call than Agent 7's dequant-once F32 path. The
-        // Q8_0 integer-dot kernels (VecDotQ8_0Avx512_4Rows) amortise per-block
-        // overhead (Half→F32 conversion, scale broadcast, MultiplyAddAdjacent
-        // chain) across M rows; at M=16 there isn't enough vertical reuse for
-        // the kernel to pay back its constant cost vs the F32 GemvF32 path's
-        // TensorPrimitives.Dot inner loop. See
-        // `.continue-here-lora-final-mile.md` for the diagnosis + the
-        // proposed follow-up: a stage-1 kernel tuned for tiny-M shape
-        // (per-token GEMV over rank rows instead of the tile-then-rows
-        // pattern).
+        // activation-quant cost. The original Phase 4d.5 spike gated this
+        // behind `DOTLLM_LORA_FORCE_Q8_PREQUANT=1` because kernel-level
+        // probing showed the Q8_0 GEMM at M=rank=16 was ~1.7× slower than
+        // the dequant-once F32 path. Phase 4d.6 keeps the env-var gate —
+        // independent of the stage-2 outer-product fix below — until a
+        // tiny-M Q8_0 stage-1 kernel can win at this geometry.
         if (preQuantX is not null
             && preQuantXType == QuantizationType.Q8_0
             && w.WeightDType == LoraWeightDType.Q8_0
@@ -1084,13 +1100,13 @@ public sealed unsafe class TransformerModel : IModel
             LoraDelta.ApplyQ8_0BWithPreQuantX(
                 preQuantX, (byte*)w.BHandle, (void*)w.AHandle, y,
                 seqLen, inputDim, outputDim, adapter.Rank, scale,
-                w.ResolvedAWeightDType, _threadPool);
+                w.ResolvedAWeightDType, _threadPool, aTransposedHandle);
             return;
         }
 
         LoraDelta.Apply((float*)x, (void*)w.BHandle, (void*)w.AHandle, (float*)y,
                         seqLen, inputDim, outputDim, adapter.Rank, scale,
-                        w.WeightDType, w.ResolvedAWeightDType);
+                        w.WeightDType, w.ResolvedAWeightDType, aTransposedHandle);
     }
 
     /// <summary>

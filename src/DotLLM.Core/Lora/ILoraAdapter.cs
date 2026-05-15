@@ -109,13 +109,25 @@ public interface ILoraAdapter : IDisposable
 /// for both" — the legacy path. Set explicitly when storing A in a different
 /// dtype than B (e.g. Q8_0 B + F16 A).
 /// </param>
+/// <param name="ATransposedHandle">
+/// Phase 4d.6 — optional cache of <see cref="AHandle"/> transposed to
+/// <c>[rank, OutputDim]</c> row-major F32 layout. When non-zero the
+/// stage-2 outer-product fast path
+/// (<c>DotLLM.Cpu.Kernels.LoraStage2.ApplyF32_R16</c>) consumes it
+/// directly; when zero the runtime either lazy-builds it (via
+/// <see cref="ILoraAdapter"/> implementation hooks) or falls back to the
+/// per-token GEMV stage-2 path. Loaders may leave this <c>0</c> — the
+/// adapter is responsible for materialising it on first use. The buffer,
+/// when present, is freed by the adapter at <see cref="IDisposable.Dispose"/>.
+/// </param>
 public readonly record struct LoraLayerWeights(
     nint AHandle,
     nint BHandle,
     int InputDim,
     int OutputDim,
     LoraWeightDType WeightDType = LoraWeightDType.F32,
-    LoraWeightDType AWeightDType = LoraWeightDType.F32)
+    LoraWeightDType AWeightDType = LoraWeightDType.F32,
+    nint ATransposedHandle = 0)
 {
     /// <summary>
     /// Effective A-buffer dtype. Encodes the "implicit symmetric" rule:

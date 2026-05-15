@@ -245,6 +245,66 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
         return (elements / Q8_0GroupSize) * Q8_0BlockBytes;
     }
 
+    /// <summary>
+    /// Phase 4d.6 — set when the runtime has eagerly built the
+    /// <see cref="LoraLayerWeights.ATransposedHandle"/> for every layer-proj
+    /// pair this adapter targets. Lets callers (e.g.
+    /// <c>DotLLM.Cpu.Kernels.LoraStage2.PrewarmAdapter</c>) early-exit on
+    /// repeat invocation — important because the prewarm hook lives on the
+    /// per-token <c>IModel.Forward(...)</c> path and any per-call work would
+    /// dominate decode-batch=1 throughput.
+    /// </summary>
+    public bool IsStage2FastPathPrewarmed { get; private set; }
+
+    /// <summary>
+    /// Sets <see cref="IsStage2FastPathPrewarmed"/> to <c>true</c>. Called
+    /// by the runtime after a successful prewarm walk completes.
+    /// </summary>
+    public void MarkStage2FastPathPrewarmed()
+    {
+        IsStage2FastPathPrewarmed = true;
+    }
+
+    /// <summary>
+    /// Phase 4d.6 — installs a transposed-A handle on the cached
+    /// <see cref="LoraLayerWeights"/> entry for <paramref name="layerIndex"/> /
+    /// <paramref name="projName"/>. Idempotent: if a handle is already
+    /// installed the new one is freed and the existing one is returned. The
+    /// adapter takes ownership and frees the buffer at <see cref="Dispose"/>.
+    /// </summary>
+    /// <remarks>
+    /// Used by the runtime LoRA dispatch to lazily materialise the
+    /// outer-product stage-2 fast path's <c>[rank, outputDim]</c> A layout
+    /// without forcing every adapter loader to pre-compute it.
+    /// </remarks>
+    /// <returns>
+    /// The cached transposed-A handle (either the freshly installed one or
+    /// the pre-existing one). Returns <c>0</c> when no entry exists for
+    /// <c>(layerIndex, projName)</c>.
+    /// </returns>
+    public nint InstallATransposedHandle(int layerIndex, string projName, nint aTransposed)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(projName);
+        var key = (layerIndex, projName);
+
+        lock (_lock)
+        {
+            if (!_layers.TryGetValue(key, out var w)) return 0;
+            if (w.ATransposedHandle != 0)
+            {
+                // Already cached — discard the newly built one. This shouldn't
+                // happen if callers check first, but keep the semantics clean.
+                if (aTransposed != 0 && aTransposed != w.ATransposedHandle)
+                    NativeMemory.AlignedFree((void*)aTransposed);
+                return w.ATransposedHandle;
+            }
+
+            var updated = w with { ATransposedHandle = aTransposed };
+            _layers[key] = updated;
+            return aTransposed;
+        }
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -256,6 +316,7 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
             {
                 if (w.AHandle != 0) NativeMemory.AlignedFree((void*)w.AHandle);
                 if (w.BHandle != 0) NativeMemory.AlignedFree((void*)w.BHandle);
+                if (w.ATransposedHandle != 0) NativeMemory.AlignedFree((void*)w.ATransposedHandle);
             }
             _layers.Clear();
         }

@@ -1087,9 +1087,16 @@ public static unsafe class MoeSwiGluMlp
                 + $"({inputDim}x{outputDim}).");
 
         float scale = adapter.Alpha / adapter.Rank;
+        // Phase 4d.6 — opt into the outer-product stage-2 fast path when
+        // available (rank=16 + AVX-512). EnsureATransposedF32 caches the
+        // transposed-A on the adapter so subsequent calls hit the fast path
+        // with no extra work; per-expert MoE projections each get their own
+        // cached buffer, indexed by the synthetic projection name.
+        nint aTransposedHandle = LoraStage2.EnsureATransposedF32(
+            adapter as LoraAdapter, layer, projection, in w, adapter.Rank);
         LoraDelta.Apply(input, (void*)w.BHandle, (void*)w.AHandle, output,
             seqLen, inputDim, outputDim, adapter.Rank, scale,
-            w.WeightDType, w.WeightDType);
+            w.WeightDType, w.WeightDType, aTransposedHandle);
     }
 
     /// <summary>
