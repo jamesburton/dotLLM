@@ -64,7 +64,7 @@ public enum LoraScenario
 /// See <c>.continue-here-lora-macro-bench.md</c> for required fixture paths.
 /// </para>
 /// </remarks>
-[SimpleJob(warmupCount: 1, iterationCount: 3)]
+[SimpleJob(warmupCount: 3, iterationCount: 5)]
 public class LoraMacroBenchmarks
 {
     /// <summary>LoRA adapter dtype to apply during the forward pass.</summary>
