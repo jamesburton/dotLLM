@@ -309,6 +309,147 @@ tiny-M-tuned Q8_0 stage-1 kernel (per-token GEMV across rank rows
 rather than the existing row-tile-then-tokens pattern in
 `MatMul.GemmQ8_0`).
 
+### Phase 4d.6 — outer-product stage-2 fast path (2026-05-16)
+
+The Phase 4d.5 macro-bench surfaced a ~−26% Q8_0 LoRA prefill regression
+that the kernel-level probe pinned to `MatMul.GemmQ8_0`. The Phase 4d.6
+investigation followed up with a rebuilt
+`benchmarks/LoraQ8Stage1Probe` and discovered the diagnosis was
+**off by one stage**: stage 1 cost ~440 µs / call (close to F32 GEMM
+peak), but stage 2 cost ~4000 µs / call — ~85% of total LoRA-Apply
+wall time at canonical (rank=16, K=2048, N=512, outputDim=2048)
+shape.
+
+Root cause: the production stage 2 looped tokens, then per token
+called `MatMul.GemvF32(A, tmp_t, delta, outputDim, rank)` followed by
+a per-token scaled `TensorPrimitives.MultiplyAdd` into `y`. The
+inner `GemvF32` itself loops `outputDim` short length-rank Dot calls.
+At outputDim=2048 / N=512 / rank=16 that's ~1 million Dot
+invocations per LoRA-Apply call — function-entry-dominated even
+though each individual Dot is just a 16-element dot product.
+
+The fix (`src/DotLLM.Cpu/Kernels/LoraStage2.cs::ApplyF32_R16`):
+when rank=16 + AVX-512 is available, route stage 2 through an
+outer-product kernel that pre-broadcasts the 16 stage-1 scalars
+once per token into 16 named `Vector512<float>` locals (RyuJIT
+keeps them in ZMM registers across the inner loop), then sweeps
+`outputDim` in tiles of 16 with a 16-FMA chain into one
+tile-accumulator. Each tile reads 16 contiguous 16-float spans
+from a `[rank=16, outputDim]` transposed view of A — built lazily
+on first dispatch per `(layer, proj)` and cached on the
+`LoraAdapter`. Per-call A dequant becomes dead work and is skipped.
+
+Probe results (Strix Halo, µs/call, smaller=better):
+
+| Shape (rank, K, N, outputDim) | S2 production | S2 outer-product | Speedup |
+|---|---:|---:|---:|
+| (16, 2048, 512, 512)  | ~1030 | ~78  | 13.2× |
+| (16, 2048, 512, 2048) | ~4000 | ~580 | 6.9×  |
+| (16, 2048, 512, 5632) | ~11000 | ~1580 | 7.0× |
+
+End-to-end (stage 1 dequant-once F32 + stage 2):
+
+| Shape | Production E2E | New (outer-product S2) | Speedup |
+|---|---:|---:|---:|
+| outputDim=512  | ~1420 µs | ~530 µs  | 2.7× |
+| outputDim=2048 | ~4630 µs | ~1390 µs | 3.3× |
+| outputDim=5632 | ~11430 µs | ~2540 µs | 4.5× |
+
+#### Macro-bench rerun — 2026-05-16, Strix Halo, same fixture
+
+Same Llama-3.2-1B-Instruct.Q8_0 base + synthetic rank-16 adapter +
+greedy sampling. `[SimpleJob(warmupCount: 3, iterationCount: 5)]`
+(per the Phase 4d.6 spec, replaces 4d.5's warmup=1 / iter=3).
+
+| Variant | Median Prefill tok/s | Δ vs NoLora | Median Decode tok/s | Δ vs NoLora |
+|---|---:|---:|---:|---:|
+| NoLora | 150.03 | — | 37.57 | — |
+| LoraF32 | **141.88** | **−5.4%** ✅ | 44.47 | **+18.4%** |
+| LoraF16 | **138.24** | **−7.9%** ✅ | 43.09 | **+14.7%** |
+| LoraBF16 | **136.45** | **−9.1%** ✅ | 40.25 | **+7.1%** |
+| **LoraQ8_0** | **118.09** | **−21.3%** | **43.91** | **+16.9%** |
+
+vs Phase 4d.5 published numbers (LoraF32 −23.4%, LoraF16 −24.7%,
+LoraBF16 −25.1%, LoraQ8_0 −25.9%):
+
+- LoraF32 prefill: −23.4% → **−5.4%** (improvement of 18 percentage points)
+- LoraF16 prefill: −24.7% → **−7.9%** (improvement of 17 pp)
+- LoraBF16 prefill: −25.1% → **−9.1%** (improvement of 16 pp)
+- LoraQ8_0 prefill: −25.9% → **−21.3%** (improvement of 5 pp)
+
+**Acceptance gate**: ≤−10% prefill regression vs NoLora.
+- LoraF32, LoraF16, LoraBF16: all met. ✅
+- LoraQ8_0: −21% prefill remains above the −10% gate. The Q8_0 path
+  pays an extra per-call B dequant (Q8_0 → F32 staging, ~5–10 µs)
+  that the F32/F16/BF16 paths don't, but that alone doesn't account
+  for the 10-pt gap vs LoraBF16 — we suspect Q8_0 dequant SIMD
+  throughput at the rank=16 × inputDim=2048 shape is the residual,
+  to be confirmed with a stage-1 split bench in a follow-up.
+
+**Decode wins outright**: every LoRA variant is now FASTER than
+NoLora at decode (+7% to +18%). The smaller adapter weight footprint
+relieves shared-cache pressure at decode batch=1; with the
+outer-product stage 2 collapsing the per-token Dot fan-out, the
+LoRA surface area is small enough that the cache-hit advantage
+dominates.
+
+#### What did NOT work (Phase 4d.6 negative results)
+
+The original spec hypothesised that the residual −16% was a
+**stage-1** problem and proposed two paths to fix it:
+- **Path C** — manually-unrolled rank-specialised stage-1 kernel
+  with 16 explicit `Vector256<float>` (or `Vector512<float>`) row
+  accumulator locals, mirroring `MatMul.VecDotQ8_0Avx512_4Rows`'s
+  technique extended to 16 rows. Both single-block and dual-block
+  variants tested in `benchmarks/LoraQ8Stage1Probe`.
+- **Path B** — R16 interleaved B layout (16 rows' Q8_0 blocks
+  packed contiguously per K-step) with a kernel that reads
+  sequentially.
+
+Both paths produced kernels that were **2–4× SLOWER** than the
+existing `MatMul.VecDotQ8_0Avx512_4Rows` wrapped in the
+`ComputeRows` 4-row tile loop. Direct probe medians at canonical
+shape:
+
+| Stage-1 kernel | Mean | vs F32 dequant-once |
+|---|---:|---:|
+| F32 dequant-once + GemmF32 (production) | ~470 µs | 1.00× |
+| GemmQ8_0 (preQuantizedInput)            | ~830 µs | 1.77× |
+| Path C — explicit V256 single-block     | ~1700 µs | 3.62× |
+| Path C2 — explicit V512 dual-block      | ~1620 µs | 3.45× |
+| Path BC — Path C + R16 interleaved B    | ~1470 µs | 3.13× |
+
+Why the explicit-locals approach lost: with 16 explicit
+`Vector256<float>` accumulators + working-set registers (vx, absX,
+ones, scratch) live across the inner `ProcessRow` calls, RyuJIT
+spills despite the in-source unrolling. The 4-row pattern wins
+because its working set comfortably fits in YMM registers; ramping
+up to 16 simultaneous accumulators without a register window cracks
+the model. R16 interleaving alone doesn't recover this — the
+problem is computational throughput, not memory layout.
+
+Why the Q8_0 stage 1 fundamentally can't beat dequant-once-F32 at
+tiny-M: per dual-block, the integer-decode chain (`Sign`,
+`MultiplyAddAdjacent` × 2, `ConvertToVector512Single`) competes for
+the same AVX-512 ports as the productive FMA. Per-block constants
+add ~50 µops vs F32's 1 FMA per K-step. F32 dequant-once moves
+those constants out of the inner loop entirely. At M=rank=16 the
+amortisation across rows is too thin to flip the trade.
+
+#### What we shipped instead
+
+The probe surfaced that the bench-published −16/−26% prefill
+regression was **not** a stage-1 problem; stage 1 was within 30%
+of FMA peak. The dominant cost was stage 2 (~85% of LoRA-Apply at
+canonical shape) — and stage 2 had a clean restructuring win:
+swap per-token GEMV for outer-product. That's the
+`LoraStage2.ApplyF32_R16` kernel that ships under Phase 4d.6.
+
+The `DOTLLM_LORA_FORCE_Q8_PREQUANT` env-var gate (Phase 4d.5)
+stays in place — it's orthogonal to the stage-2 fix and gates the
+unshipped `ApplyQ8_0BWithPreQuantX` path. A future stage-1 spike
+could revisit it if a tiny-M Q8_0 kernel ever wins.
+
 ### Phase 4d.3 baseline (Agent 8, 2026-05-13)
 
 Same fixture, run before Phase 4d.4 landed. NoLora baseline is lower
