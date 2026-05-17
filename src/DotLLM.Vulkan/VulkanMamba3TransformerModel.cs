@@ -125,6 +125,14 @@ public sealed class VulkanMamba3TransformerModel : IModel
     private readonly MatMulIq2XsGemmF32Kernel _matmulIq2XsGemm;
     private readonly MatMulIq2SGemvF32Kernel _matmulIq2S;
     private readonly MatMulIq2SGemmF32Kernel _matmulIq2SGemm;
+    // IQ3 family (XXS / S) matmul kernels — IQ-family follow-up. Shares the
+    // same SSBO codebook pattern as IQ2: Iq3Codebooks owns the IQ3_XXS grid
+    // (256 × 4 bytes) + IQ3_S grid (512 × 4 bytes), shared across all 4 kernels.
+    private readonly Iq3Codebooks _iq3Codebooks;
+    private readonly MatMulIq3XxsGemvF32Kernel _matmulIq3Xxs;
+    private readonly MatMulIq3XxsGemmF32Kernel _matmulIq3XxsGemm;
+    private readonly MatMulIq3SGemvF32Kernel _matmulIq3S;
+    private readonly MatMulIq3SGemmF32Kernel _matmulIq3SGemm;
     private readonly MatMulIq1SGemvF32Kernel _matmulIq1S;
     private readonly MatMulIq1SGemmF32Kernel _matmulIq1SGemm;
     // F16 / BF16 native matmul kernels — Phase 8. Always created; the dispatcher
@@ -176,6 +184,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         MatMulIq2XxsGemvF32Kernel matmulIq2Xxs, MatMulIq2XxsGemmF32Kernel matmulIq2XxsGemm,
         MatMulIq2XsGemvF32Kernel matmulIq2Xs, MatMulIq2XsGemmF32Kernel matmulIq2XsGemm,
         MatMulIq2SGemvF32Kernel matmulIq2S, MatMulIq2SGemmF32Kernel matmulIq2SGemm,
+        Iq3Codebooks iq3Codebooks,
+        MatMulIq3XxsGemvF32Kernel matmulIq3Xxs, MatMulIq3XxsGemmF32Kernel matmulIq3XxsGemm,
+        MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
@@ -220,6 +231,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulIq2XsGemm = matmulIq2XsGemm;
         _matmulIq2S = matmulIq2S;
         _matmulIq2SGemm = matmulIq2SGemm;
+        _iq3Codebooks = iq3Codebooks;
+        _matmulIq3Xxs = matmulIq3Xxs;
+        _matmulIq3XxsGemm = matmulIq3XxsGemm;
+        _matmulIq3S = matmulIq3S;
+        _matmulIq3SGemm = matmulIq3SGemm;
         _matmulIq1S = matmulIq1S;
         _matmulIq1SGemm = matmulIq1SGemm;
         _matmulF16 = matmulF16;
@@ -351,6 +367,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         var matmulIq2XsGemm  = MatMulIq2XsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2S       = MatMulIq2SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2SGemm   = MatMulIq2SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var iq3Codebooks = Iq3Codebooks.Create(device);
+        var matmulIq3Xxs     = MatMulIq3XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3XxsGemm = MatMulIq3XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3S       = MatMulIq3SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3SGemm   = MatMulIq3SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat is
         // opportunistic (null on devices without VK_KHR_cooperative_matrix).
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
@@ -389,6 +410,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
             matmulIq2Xxs, matmulIq2XxsGemm,
             matmulIq2Xs, matmulIq2XsGemm,
             matmulIq2S, matmulIq2SGemm,
+            iq3Codebooks,
+            matmulIq3Xxs, matmulIq3XxsGemm,
+            matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
@@ -982,6 +1006,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulIq2XsGemm.InvalidateDescriptorCache();
         _matmulIq2S.InvalidateDescriptorCache();
         _matmulIq2SGemm.InvalidateDescriptorCache();
+        _matmulIq3Xxs.InvalidateDescriptorCache();
+        _matmulIq3XxsGemm.InvalidateDescriptorCache();
+        _matmulIq3S.InvalidateDescriptorCache();
+        _matmulIq3SGemm.InvalidateDescriptorCache();
         _matmulIq1S.InvalidateDescriptorCache();
         _matmulIq1SGemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
@@ -1156,6 +1184,20 @@ public sealed class VulkanMamba3TransformerModel : IModel
             else
                 _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
+        else if (weightQt == QuantizationType.IQ3_XXS)
+        {
+            if (seqLen == 1)
+                _matmulIq3Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq3XxsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ3_S)
+        {
+            if (seqLen == 1)
+                _matmulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
         else if (weightQt == QuantizationType.IQ1_S)
         {
             if (seqLen == 1)
@@ -1235,6 +1277,11 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _matmulIq4Xs.Dispose();
         _matmulIq4NlGemm.Dispose();
         _matmulIq4Nl.Dispose();
+        _matmulIq3SGemm.Dispose();
+        _matmulIq3S.Dispose();
+        _matmulIq3XxsGemm.Dispose();
+        _matmulIq3Xxs.Dispose();
+        _iq3Codebooks.Dispose();
         _matmulIq2SGemm.Dispose();
         _matmulIq2S.Dispose();
         _matmulIq2XsGemm.Dispose();
