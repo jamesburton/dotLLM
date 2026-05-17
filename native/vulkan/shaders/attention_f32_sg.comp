@@ -156,7 +156,7 @@ void main() {
             uint tkv = tStart + t;
             bool masked =
                 tkv > posQ ||
-                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) > pc.slidingWindow);
+                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
             if (masked) {
                 scoreTile[t] = NEG_INF;
                 continue;

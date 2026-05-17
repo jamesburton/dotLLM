@@ -73,10 +73,28 @@ public class VulkanAttentionF32KernelTests
         RunOne(seqQ: 4, seqKv: 8, numHeads: 6, numKvHeads: 2, headDim: 64, positionOffset: 0, useAlibi: true);
     }
 
+    // Discriminates against the legacy `posQ - tkv > slidingWindow` off-by-one
+    // (which kept one extra oldest token visible). With slidingWindow=4 and
+    // posQ=7, the correct mask hides tkv∈{0,1,2,3}; the buggy mask hides only
+    // tkv∈{0,1,2}, leaking tkv=3 into the softmax.
+    [SkippableFact]
+    public void Launch_SlidingWindow_DiscriminatesOffByOne()
+    {
+        RunOne(seqQ: 1, seqKv: 8, numHeads: 1, numKvHeads: 1, headDim: 64, positionOffset: 7,
+            slidingWindow: 4);
+    }
+
+    [SkippableFact]
+    public void Launch_SlidingWindow_MultiTile()
+    {
+        RunOne(seqQ: 1, seqKv: 400, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 399,
+            slidingWindow: 128);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
-        bool useAlibi = false)
+        bool useAlibi = false, int slidingWindow = 0)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -86,16 +104,17 @@ public class VulkanAttentionF32KernelTests
         float[] vh = RandomFloats(rng, seqKv * numKvHeads * headDim);
         float[] expected = new float[seqQ * numHeads * headDim];
 
+        int? sw = slidingWindow > 0 ? slidingWindow : null;
         if (useAlibi)
         {
             Attention.ExecuteScalar(qh, kh, vh, expected,
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-                AlibiPositionEncoding.CreateSlopes(numHeads));
+                AlibiPositionEncoding.CreateSlopes(numHeads), sw);
         }
         else
         {
             Attention.ExecuteScalar(qh, kh, vh, expected,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, sw);
         }
 
         // GPU path.
@@ -112,7 +131,8 @@ public class VulkanAttentionF32KernelTests
         device.Upload(vh.AsSpan(), bufV);
 
         kernel.Launch(bufQ, bufK, bufV, bufOut,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, useAlibi: useAlibi);
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+            slidingWindow: slidingWindow, useAlibi: useAlibi);
 
         float[] actual = new float[expected.Length];
         device.Download(bufOut, actual);

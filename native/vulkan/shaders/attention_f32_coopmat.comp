@@ -215,7 +215,7 @@ void main() {
             bool oob = (tq >= pc.seqQ) || (c >= tileLen);
             uint posQ = pc.positionOffset + tq;
             bool masked = (tkv > posQ) ||
-                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) > pc.slidingWindow);
+                (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
             if (oob || masked) {
                 sTile[idx] = NEG_INF;
             } else {

@@ -84,7 +84,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
         for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
         {
             int tkv = t_start + t;
-            if (tkv > pos_q || (sliding_window > 0 && pos_q - tkv > sliding_window))
+            if (tkv > pos_q || (sliding_window > 0 && pos_q - tkv >= sliding_window))
             { score_tile[t] = -FLT_MAX; continue; }
 
             const float* k_vec = k + (size_t)tkv * kv_stride + hkv * head_dim;
