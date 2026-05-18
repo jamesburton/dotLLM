@@ -9,34 +9,41 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Tests for the Phase 5f-mirror Qwen3MoeHybrid <c>ForwardBatch</c> override.
-/// Qwen3MoeHybrid is a hybrid Gated DeltaNet + sparse MoE architecture; the GDN
-/// recurrent state lives on the model as a single <see cref="VulkanGdnStateCache"/>
-/// instance (not per-sequence) AND every layer routes through MoE FFN (per the
-/// task partitioning, MoE-active layers force the per-seq complex path). The
-/// override therefore THROWS <see cref="NotSupportedException"/> for
-/// <c>requests.Count &gt;= 2</c> and only handles the trivial empty / single-seq
-/// cases — same shape as the Mamba-3 host.
+/// Tests for the Qwen3MoeHybrid <c>ForwardBatch</c> override after the
+/// per-sequence GDN-state plumbing landed. Qwen3MoeHybrid is a hybrid Gated
+/// DeltaNet + sparse MoE architecture; the GDN recurrent state was previously
+/// single-instance on the model and forced a <see cref="NotSupportedException"/>
+/// on multi-seq dispatch. With <see cref="VulkanGdnStateCache"/> now per-seq
+/// (passed via <see cref="SequenceForwardRequest.GdnState"/>), multi-seq dispatch
+/// is correctness-safe — the override loops per-seq Forwards but each one threads
+/// its own state through the GDN scan, so sequences do not corrupt each other.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Three tests cover the supported / unsupported axes. The single-seq parity
-/// test self-skips when no Qwen3MoeHybrid GGUF is cached (set
-/// <c>DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF</c> or stage the file at the conventional
-/// cache path). Empty + multi-seq tests also rely on the same cached GGUF for
-/// model construction.
+/// Four tests cover the supported axes:
 /// </para>
+/// <list type="number">
+///   <item>Empty request list — returns empty.</item>
+///   <item>Single sequence — must equal per-seq Forward.</item>
+///   <item>Multi-seq without per-seq GdnState — throws ArgumentException to
+///         surface the misuse (model-owned GDN cache would leak state).</item>
+///   <item>Multi-seq with per-seq GdnState — logits match the reference produced
+///         by two independent per-seq Forwards on fresh model instances, within
+///         the dense-host tolerance envelope (abs 5e-3 / rel 1e-3).</item>
+/// </list>
 /// <para>
-/// The lm_head fan-out scratch is NOT shipped for this host (unlike the
-/// NemotronH mirror) because the GDN single-state container would corrupt
-/// per-seq Forwards in the same way as Mamba-3 — the scaffolding lands when
-/// per-seq GDN state isolation is wired up.
+/// All tests self-skip when no Qwen3MoeHybrid GGUF is cached. Synthetic fixtures
+/// for the 40+-tensor-per-layer Qwen3MoeHybrid hybrid layout are deferred (same
+/// rationale as the IQ3 forward tests).
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
 public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
 {
+    private const float AbsTol = 5e-3f;
+    private const float RelTol = 1e-3f;
+
     [SkippableFact]
     public void VulkanQwen3MoeHybridForwardBatch_EmptyRequests_ReturnsEmpty()
     {
@@ -73,18 +80,18 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
         int[] positions = [0, 1, 2, 3];
 
         // Per-seq Forward reference (fresh model — recurrent state begins empty).
-        int[] referenceArgmaxes = new int[1];
+        int referenceArgmax;
         float referenceMax;
         {
             using var device = VulkanDevice.Create();
             using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
                 device, gguf, config, spvDir);
             using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
-            (referenceArgmaxes[0], referenceMax) = ArgmaxOf(logits);
+            (referenceArgmax, referenceMax) = ArgmaxOf(logits);
         }
 
-        // ForwardBatch with count==1 — must delegate to Forward and produce the same
-        // argmax on a freshly-built model (with freshly-empty recurrent state).
+        // ForwardBatch with count==1 and GdnState=null delegates to the fallback
+        // Forward overload using the model-owned _gdnCache — same path as Forward.
         int batchedArgmax;
         float batchedMax;
         {
@@ -97,7 +104,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
                 {
                     TokenIds = tokenIds.AsMemory(),
                     Positions = positions.AsMemory(),
-                    KvCache = null!, // Qwen3MoeHybrid's per-seq Forward accepts null; the GDN path doesn't use it
+                    KvCache = null!,
                 },
             };
             var results = model.ForwardBatch(requests, deviceId: -1);
@@ -109,15 +116,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
             finally { foreach (var t in results) t.Dispose(); }
         }
 
-        // Single-seq batched path is a trivial delegation; argmax must match exactly.
-        Assert.Equal(referenceArgmaxes[0], batchedArgmax);
-        // And the max-logit value should be bit-equal (no reduction-order drift
-        // because the same code path runs).
+        // Single-seq batched delegates to Forward; argmax + max-logit must match exactly.
+        Assert.Equal(referenceArgmax, batchedArgmax);
         Assert.Equal(referenceMax, batchedMax);
     }
 
     [SkippableFact]
-    public void VulkanQwen3MoeHybridForwardBatch_MultiSeq_ThrowsNotSupported()
+    public void VulkanQwen3MoeHybridForwardBatch_MultiSeq_NullGdnState_ThrowsArgument()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         string? path = ResolveGgufPath();
@@ -148,11 +153,102 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
             },
         };
 
-        // GDN single-state container + MoE-on-every-layer means no fusion target is
-        // safe. Override throws.
-        var ex = Assert.Throws<NotSupportedException>(() =>
+        // Without per-seq GdnState, the model-owned cache would leak between sequences.
+        // The override rejects this with an ArgumentException naming the missing slot.
+        var ex = Assert.Throws<ArgumentException>(() =>
             model.ForwardBatch(requests, deviceId: -1));
-        Assert.Contains("VulkanGdnStateCache", ex.Message);
+        Assert.Contains("GdnState", ex.Message);
+    }
+
+    [SkippableFact]
+    public void VulkanQwen3MoeHybridForwardBatch_MultiSeq_PerSeqGdnState_MatchesReference()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        string? path = ResolveGgufPath();
+        Skip.If(path is null,
+            "Qwen3.6-A3B GGUF not cached. Set DOTLLM_QWEN36_A3B_Q6_K_XL_GGUF or stage the file " +
+            "at the conventional cache path.");
+
+        using var gguf = GgufFile.Open(path);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        int[] tokensA = [1, 100, 200];
+        int[] positionsA = [0, 1, 2];
+        int[] tokensB = [5, 50, 500];
+        int[] positionsB = [0, 1, 2];
+
+        // Reference: two fresh-model Forwards (each with its own implicit per-model
+        // GDN cache). Captures the per-seq logits produced when no cross-sequence
+        // state corruption can occur.
+        float[] referenceA, referenceB;
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
+                device, gguf, config, spvDir);
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1);
+            referenceA = CopyLogits(logitsA);
+        }
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
+                device, gguf, config, spvDir);
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1);
+            referenceB = CopyLogits(logitsB);
+        }
+
+        // Under test: a single model running ForwardBatch with two requests, each
+        // carrying its own VulkanGdnStateCache. The per-seq state isolation means
+        // sequence A's GDN scan cannot contaminate sequence B's logits.
+        float[] batchedA, batchedB;
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
+                device, gguf, config, spvDir);
+            using var gdnA = model.CreateGdnStateCache();
+            using var gdnB = model.CreateGdnStateCache();
+            var requests = new[]
+            {
+                new SequenceForwardRequest
+                {
+                    TokenIds = tokensA.AsMemory(),
+                    Positions = positionsA.AsMemory(),
+                    KvCache = null!,
+                    GdnState = gdnA,
+                },
+                new SequenceForwardRequest
+                {
+                    TokenIds = tokensB.AsMemory(),
+                    Positions = positionsB.AsMemory(),
+                    KvCache = null!,
+                    GdnState = gdnB,
+                },
+            };
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            try
+            {
+                Assert.Equal(2, results.Count);
+                batchedA = CopyLogits(results[0]);
+                batchedB = CopyLogits(results[1]);
+            }
+            finally { foreach (var t in results) t.Dispose(); }
+        }
+
+        AssertLogitsClose(referenceA, batchedA, "seqA");
+        AssertLogitsClose(referenceB, batchedB, "seqB");
+    }
+
+    private static void AssertLogitsClose(float[] reference, float[] actual, string label)
+    {
+        Assert.Equal(reference.Length, actual.Length);
+        for (int c = 0; c < reference.Length; c++)
+        {
+            float r = reference[c];
+            float a = actual[c];
+            float diff = MathF.Abs(r - a);
+            float bar = AbsTol + RelTol * MathF.Abs(r);
+            Assert.True(diff <= bar,
+                $"{label} col={c}: reference={r:F6} vs batched={a:F6} (|diff|={diff:E3} > {bar:E3})");
+        }
     }
 
     private static string? ResolveGgufPath()
@@ -179,5 +275,13 @@ public sealed class VulkanQwen3MoeHybridTransformerModelForwardBatchTests
             if (span[i] > bestVal) { bestVal = span[i]; bestIdx = i; }
         }
         return (bestIdx, bestVal);
+    }
+
+    private static unsafe float[] CopyLogits(ITensor logits)
+    {
+        int total = checked(logits.Shape[0] * logits.Shape[1]);
+        float[] copy = new float[total];
+        new ReadOnlySpan<float>((void*)logits.DataPointer, total).CopyTo(copy);
+        return copy;
     }
 }

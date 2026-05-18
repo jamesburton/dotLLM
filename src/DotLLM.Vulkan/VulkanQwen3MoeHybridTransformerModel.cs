@@ -114,6 +114,16 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         => new(_device, _kvSlotForLayer, _attentionLayerCount,
                Config.NumKvHeads, Config.HeadDim, maxSeqLen);
 
+    /// <summary>
+    /// Creates a fresh per-sequence <see cref="VulkanGdnStateCache"/> sized for this
+    /// model's GDN-layer count. The scheduler / multi-seq dispatcher should
+    /// allocate one of these per active sequence and pass it via
+    /// <see cref="SequenceForwardRequest.GdnState"/>; without that, multi-seq
+    /// dispatch leaks recurrent state across sequences.
+    /// </summary>
+    public VulkanGdnStateCache CreateGdnStateCache()
+        => new(_device, _gdn, _gdnCache.NumGdnLayers);
+
     private VulkanQwen3MoeHybridTransformerModel(
         VulkanDevice device, bool ownsDevice,
         ModelConfig config,
@@ -278,11 +288,55 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, kvCache: null);
+        => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
+    /// per-sequence GDN recurrent state (for the GDN layers). When
+    /// <paramref name="gdnState"/> is <see langword="null"/>, falls back to the
+    /// model-owned default cache — safe only for single-sequence dispatch from a
+    /// freshly-constructed model. Multi-seq batched dispatch via
+    /// <see cref="ForwardBatch"/> supplies a fresh per-seq
+    /// <see cref="VulkanGdnStateCache"/> for each request to keep recurrent state
+    /// isolated.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <param name="kvCache">Optional per-seq KV-cache for the GQA layers.</param>
+    /// <param name="gdnState">
+    /// Optional per-seq GDN recurrent state container. Must be a
+    /// <see cref="VulkanGdnStateCache"/> sized for this model's GDN-layer count.
+    /// </param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IGdnState? gdnState)
     {
+        // Resolve per-seq GDN state container; model-owned _gdnCache is the
+        // backwards-compat fallback for single-seq Forward callers.
+        VulkanGdnStateCache gdnCache;
+        if (gdnState is null)
+        {
+            gdnCache = _gdnCache;
+        }
+        else if (gdnState is VulkanGdnStateCache vk)
+        {
+            if (vk.NumGdnLayers != _gdnCache.NumGdnLayers)
+                throw new ArgumentException(
+                    $"GdnState NumGdnLayers ({vk.NumGdnLayers}) does not match model GDN-layer count ({_gdnCache.NumGdnLayers}).",
+                    nameof(gdnState));
+            gdnCache = vk;
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"VulkanQwen3MoeHybridTransformerModel requires a VulkanGdnStateCache; got {gdnState.GetType().Name}.",
+                nameof(gdnState));
+        }
+
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
         int seqLen = tokenIds.Length;
@@ -344,7 +398,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
             {
-                RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps);
+                RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache);
             }
             else
             {
@@ -455,35 +509,37 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>
-    /// Phase 5f mirror — Qwen3MoeHybrid <c>ForwardBatch</c> override. Qwen3MoeHybrid
-    /// has a Gated DeltaNet token-mixing recurrence on most layers (per-token
-    /// associative-memory + conv-state) plus a sparse MoE FFN on every layer; the
-    /// GDN state lives on the model in <see cref="VulkanGdnStateCache"/> as a single
-    /// instance (not per-sequence). Multi-sequence dispatch through one model would
-    /// therefore corrupt the GDN state across sequences, so the override THROWS
-    /// <see cref="NotSupportedException"/> for <c>requests.Count &gt;= 2</c>.
-    /// Empty and single-seq requests are handled (delegating to the existing per-seq
-    /// Forward) so the public API shape matches the dense / NemotronH hosts.
+    /// Phase 5f mirror — Qwen3MoeHybrid <c>ForwardBatch</c> override. Loops per-seq
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// using each request's caller-supplied <see cref="SequenceForwardRequest.GdnState"/>
+    /// so multi-sequence dispatch keeps GDN recurrent state isolated across sequences.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Why no per-layer batched fusion.</b> Every Qwen3MoeHybrid layer is either
-    /// GDN (per-token recurrent state cannot share a dispatch across sequences) or
-    /// a full-attention layer wrapped in MoE FFN (the task's partition rule sends
-    /// any MoE-active layer through the complex / per-seq path). The combination
-    /// means no layer admits the dense host's <c>seqLen = Σ N_i</c> batched fusion
-    /// — every layer-body dispatch must run per-sequence.
+    /// <b>Why no per-layer batched fusion (yet).</b> Every Qwen3MoeHybrid layer is
+    /// either a GDN layer (per-token recurrent associative-memory scan that must
+    /// thread one sequence's state through tokens in order) or a full-attention
+    /// layer wrapped in MoE FFN. The GDN scan cannot share a dispatch across
+    /// sequences. MoE routing produces a per-token expert mask that varies across
+    /// tokens / sequences, so the indexed-expert matmuls cannot batch at the
+    /// <c>seqLen = Σ N_i</c> granularity the dense host uses. The surrounding
+    /// matmuls (RMSNorm, projections in / out of the scan) <i>could</i> in
+    /// principle batch across sequences within a single seqLen=Σ row stack, but
+    /// the win is bounded by Amdahl on the per-seq scan + MoE dispatch — left as
+    /// a future workstream (DOTLLM-NN). lm_head fan-out is the same story: it
+    /// could batch across simple seqs, but those seqs still need their own GDN
+    /// state through every preceding layer, so the per-seq Forward loop already
+    /// dispatches lm_head N times anyway.
     /// </para>
     /// <para>
-    /// <b>Why even lm_head fusion needs a follow-up.</b> The lm_head fan-out (the
-    /// Phase 5a CPU stacked-buffer pattern) would be the only fusion target the
-    /// architecture allows, but the GDN single-state container means per-seq
-    /// Forwards inside one model instance corrupt each other's state. Wiring up
-    /// the lm_head fan-out is blocked behind a per-sequence GDN state container
-    /// (similar to <c>VulkanKvCache</c> on the dense host); until that lands, the
-    /// override rejects the unsafe path explicitly. The Mamba-3 host has the same
-    /// shape — see <see cref="VulkanMamba3TransformerModel.ForwardBatch"/> for the
-    /// equivalent rationale.
+    /// <b>Falling back to model-owned state.</b> Single-seq requests with a null
+    /// <see cref="SequenceForwardRequest.GdnState"/> delegate to the per-seq Forward
+    /// overload that pre-dates the per-seq state plumbing — the model-owned
+    /// <see cref="VulkanGdnStateCache"/> is used as the fallback. This keeps the
+    /// shape compatible with the existing single-seq Forward callers and tests.
+    /// Multi-seq requests with a null GdnState would silently share the model-owned
+    /// cache (corrupting state) — those throw with a clear diagnostic to surface
+    /// the misuse loudly.
     /// </para>
     /// </remarks>
     public IReadOnlyList<ITensor> ForwardBatch(
@@ -502,24 +558,32 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                     "an adapter.");
         }
 
-        if (requests.Count == 1)
+        // Multi-seq dispatch without per-seq GDN state would silently corrupt the
+        // model-owned recurrent state across sequences. Detect this misuse before
+        // running anything and emit a diagnostic that names the missing slot.
+        if (requests.Count >= 2)
         {
-            var r0 = requests[0];
-            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+            for (int i = 0; i < requests.Count; i++)
+            {
+                if (requests[i].GdnState is null)
+                    throw new ArgumentException(
+                        $"Multi-seq ForwardBatch requires each SequenceForwardRequest to carry " +
+                        $"its own GdnState (request index {i} has GdnState=null). The " +
+                        "model-owned VulkanGdnStateCache is shared across all calls into this " +
+                        "model instance, so a null slot in a multi-seq batch would leak GDN " +
+                        "recurrent state across sequences. Construct one VulkanGdnStateCache " +
+                        "per active sequence and assign it via SequenceForwardRequest.GdnState.",
+                        nameof(requests));
+            }
         }
 
-        // Multi-seq path — see the remarks above. The GDN single-state container plus
-        // the "any MoE-active layer forces complex/per-seq" partition rule means there
-        // is nothing safe to batch here today. Throwing on count >= 2 surfaces the
-        // limitation loudly rather than silently corrupting recurrent state.
-        throw new NotSupportedException(
-            $"VulkanQwen3MoeHybridTransformerModel.ForwardBatch with {requests.Count} requests " +
-            "is not supported today: the model's recurrent VulkanGdnStateCache is single-instance, " +
-            "so looping per-seq Forwards would corrupt GDN state across sequences. Furthermore " +
-            "every layer routes through MoE FFN (per the task partitioning, MoE-active layers " +
-            "force the per-seq complex path) and every GDN layer's scan is per-token recurrent, " +
-            "so no per-layer batched fusion is available either. Schedule Qwen3MoeHybrid " +
-            "sequences serially through Forward until a per-sequence GDN state container lands.");
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+        }
+        return results;
     }
 
     // ── Token-mixing path: Gated DeltaNet ────────────────────────────────────
@@ -536,7 +600,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private unsafe void RecordGdnLayer(
         nint cmdBuf, int absoluteLayerIdx, VulkanQwen3MoeHybridWeights.GdnLayerBuffers gdnW,
-        int seqLen, float eps)
+        int seqLen, float eps, VulkanGdnStateCache gdnCache)
     {
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
@@ -547,8 +611,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         int kDim = nKHead * dState;
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
-        var convStateBuf = _gdnCache.GetConvStateBuffer(gdnOrdinal);
-        var gdnStateBuf = _gdnCache.GetGdnStateBuffer(gdnOrdinal);
+        var convStateBuf = gdnCache.GetConvStateBuffer(gdnOrdinal);
+        var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,

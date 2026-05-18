@@ -35,7 +35,7 @@ namespace DotLLM.Cuda.Architectures;
 /// <c>conv1d_causal.cu</c> consume and mutate these pointers directly via PInvoke wrappers.
 /// </para>
 /// </remarks>
-internal sealed unsafe class CudaGdnStateCache : IDisposable
+internal sealed unsafe class CudaGdnStateCache : IGdnState
 {
     private readonly int _numGdnLayers;
     private readonly int _convStateElements;
