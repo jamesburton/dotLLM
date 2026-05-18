@@ -228,6 +228,15 @@ public sealed class VulkanTransformerModel : IModel
     // path. Used only when the adapter's rank ≤ LoraDeltaGemvFusedF32Kernel.MaxRank.
     private readonly LoraDeltaGemvFusedF32Kernel? _loraDeltaGemvFused;
 
+    // Phase 5f — ForwardBatch intra-block matmul fusion scratch. Lazy-allocated
+    // on first batched call (zero VRAM cost when only Forward is used). The
+    // scratch holds per-seq Q / attention-output staging buffers (attention is
+    // dispatched per-seq because each sequence has its own VulkanKvCache + own
+    // positionOffset) plus a stacked [N_simple, hidden] last-row buffer + a
+    // [N_simple, vocab] batched lm_head output. See ForwardBatch + the
+    // VulkanForwardBatchScratch summary for the full data-flow.
+    private VulkanForwardBatchScratch? _batchScratch;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -856,6 +865,475 @@ public sealed class VulkanTransformerModel : IModel
             throw new InvalidOperationException(
                 $"LoRA adapter '{adapter.Name}' is not compatible with the loaded model "
                 + "(layer count, hidden size, or per-projection dimensions mismatch).");
+    }
+
+    /// <summary>
+    /// Phase 5f — Vulkan ForwardBatch override. Fuses the intra-block matmuls
+    /// (RMSNorm + Q/K/V/O + gate/up/down + lm_head) across <c>N</c> in-flight
+    /// sequences into single dispatches at <c>seqLen = Σ N_i</c>, while keeping
+    /// attention per-seq (each sequence has its own <see cref="VulkanKvCache"/>
+    /// + own positionOffset). The win amortises ~30 layers × 7 dispatch / submit
+    /// overheads × N sequences for the per-iter overhead, on top of the GEMM
+    /// vs. <c>N</c> GEMV throughput edge.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Sequences that target features the batched path doesn't yet cover are
+    /// peeled off and run through the existing per-seq <c>Forward(... adapter)</c>
+    /// loop. The fall-through set is: MLA layers (<c>_weights.Layers[*].Mla != null</c>),
+    /// MoE layers, LoRA-active sequences, and sequences whose KV-cache is not a
+    /// <see cref="VulkanKvCache"/>. The remaining "simple" sequences run through
+    /// the batched path below.
+    /// </para>
+    /// <para>
+    /// The per-seq attention sub-loop copies each seq's Q-slice from the batched
+    /// <see cref="VulkanForwardState.Q"/> into <see cref="VulkanForwardBatchScratch.PerSeqQ"/>,
+    /// updates that seq's KV-cache from the batched <see cref="VulkanForwardState.K"/>/
+    /// <see cref="VulkanForwardState.V"/> slices, runs <see cref="AttentionF32Kernel.Record"/>
+    /// with the seq's positionOffset, then copies the per-seq attention output
+    /// back into the batched <see cref="VulkanForwardState.AttnOutput"/> slot.
+    /// The PerSeqQ / PerSeqAttn scratch is reused across both layers and
+    /// sequences within a layer — barriers serialise them.
+    /// </para>
+    /// <para>
+    /// For the lm_head: only the last hidden row of each simple sequence is
+    /// fed into the head (matching <c>Forward</c>'s contract that the Vulkan
+    /// return is <c>[1, vocab]</c>). The last rows are gathered into
+    /// <see cref="VulkanForwardBatchScratch.LastRowHidden"/> at slot <c>i</c>,
+    /// a single batched RMSNorm + lm_head matmul produces
+    /// <c>[N_simple, vocab]</c> in <see cref="VulkanForwardBatchScratch.BatchedLogits"/>,
+    /// and per-seq <c>[1, vocab]</c> host tensors are split out post-submit.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span,
+                                   deviceId, r0.KvCache, r0.Adapter) };
+        }
+
+        // Partition into "simple" (fused batched path) and "complex" (per-seq fallback).
+        // Simple = no LoRA adapter, KvCache is VulkanKvCache, and the model itself
+        // carries no MLA / MoE layer (dense VulkanTransformerModel does not support
+        // MoE — that's VulkanQwen3MoeHybridTransformerModel — but MLA can appear
+        // in DeepSeek-V2/V3 dense hosts and falls through to per-seq for now).
+        bool modelHasMlaOrMoe = false;
+        for (int layer = 0; layer < Config.NumLayers && !modelHasMlaOrMoe; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+            if (lw.Mla is not null || lw.Moe is not null) modelHasMlaOrMoe = true;
+        }
+
+        // Build the simple / complex index lists. Preserve input order in the result.
+        var simpleIdx = new List<int>(requests.Count);
+        var complexIdx = new List<int>(requests.Count);
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            bool simple = !modelHasMlaOrMoe
+                       && r.Adapter is null
+                       && r.KvCache is VulkanKvCache;
+            (simple ? simpleIdx : complexIdx).Add(i);
+        }
+
+        var results = new ITensor[requests.Count];
+
+        // Complex / fallback — execute via existing per-seq Forward (which correctly
+        // handles MLA / MoE / LoRA via its own dispatch paths).
+        foreach (int i in complexIdx)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+        }
+
+        // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
+        if (simpleIdx.Count < 2)
+        {
+            foreach (int i in simpleIdx)
+            {
+                var r = requests[i];
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.Adapter);
+            }
+            return results;
+        }
+
+        ForwardBatchSimple(requests, simpleIdx, deviceId, results);
+        return results;
+    }
+
+    /// <summary>
+    /// Inner batched dispatch for the subset of <paramref name="requests"/>
+    /// pre-classified as "simple" (no LoRA adapter, VulkanKvCache,
+    /// non-MLA / non-MoE model). Mirrors the layer-loop structure of
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// but dispatches every intra-block matmul + RMSNorm + RoPE + residual at
+    /// <c>seqLen = Σ N_i</c> against the existing <see cref="VulkanForwardState"/>
+    /// scratch. Attention is per-seq via the <see cref="VulkanForwardBatchScratch"/>
+    /// staging buffers because the kernel API binds whole buffers — see the
+    /// class summary on <see cref="VulkanForwardBatchScratch"/>.
+    /// </summary>
+    private unsafe void ForwardBatchSimple(
+        IReadOnlyList<SequenceForwardRequest> requests,
+        List<int> simpleIdx, int deviceId, ITensor[] results)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int intermediateSize = Config.IntermediateSize;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        int qDim = numHeads * headDim;
+        int kvDim = numKvHeads * headDim;
+        int maxSeq = Config.MaxSequenceLength;
+
+        int simpleCount = simpleIdx.Count;
+        int totalTokens = 0;
+        int maxSingleSeq = 0;
+        for (int s = 0; s < simpleCount; s++)
+        {
+            int n = requests[simpleIdx[s]].TokenIds.Length;
+            if (n <= 0) throw new ArgumentException("Per-seq tokenIds must be non-empty.", nameof(requests));
+            totalTokens += n;
+            if (n > maxSingleSeq) maxSingleSeq = n;
+        }
+
+        // Resize state scratch for the batched seqLen and ensure batch-scratch buffers exist.
+        bool scratchResized = _state.EnsureCapacity(totalTokens);
+
+        _batchScratch ??= new VulkanForwardBatchScratch(_device, hiddenSize, qDim, vocabSize);
+        bool batchResized = _batchScratch.EnsureCapacity(
+            maxSingleSeqTokens: maxSingleSeq, batchSeqs: simpleCount);
+
+        if (scratchResized || batchResized)
+            InvalidateKernelCaches();
+
+        // Build packed tokenIds + positions for the batched dispatch. Per-seq
+        // positions are honoured by RoPE (one rotation angle per row); the
+        // batched RoPE dispatch reads PositionsBuffer[totalTokens] and rotates
+        // each row independently. Validate everything host-side first — a bad
+        // id throws cleanly without leaving the submit context half-written.
+        int[] packedTokens = new int[totalTokens];
+        int[] packedPositions = new int[totalTokens];
+        int off = 0;
+        for (int s = 0; s < simpleCount; s++)
+        {
+            var r = requests[simpleIdx[s]];
+            int n = r.TokenIds.Length;
+            if (r.Positions.Length != n)
+                throw new ArgumentException("Per-seq tokenIds and positions must have the same length.", nameof(requests));
+            var idsSpan = r.TokenIds.Span;
+            var posSpan = r.Positions.Span;
+            for (int t = 0; t < n; t++)
+            {
+                int id = idsSpan[t];
+                int pos = posSpan[t];
+                if ((uint)id >= (uint)vocabSize)
+                    throw new ArgumentOutOfRangeException(nameof(requests), $"Token id {id} is out of range.");
+                if ((uint)pos >= (uint)maxSeq)
+                    throw new ArgumentOutOfRangeException(nameof(requests), $"Position {pos} exceeds max sequence length {maxSeq}.");
+                packedTokens[off + t] = id;
+                packedPositions[off + t] = pos;
+            }
+            off += n;
+        }
+
+        // Upload packed positions to PositionsBuffer (sized for totalTokens by EnsureCapacity above).
+        var posBytes = MemoryMarshal.AsBytes(packedPositions.AsSpan(0, totalTokens));
+        _device.Upload(posBytes, _state.PositionsBuffer);
+
+        // Begin the single per-batch command buffer.
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        _state.ResetHiddenSlot();
+
+        // Embedding gather — batched: one vkCmdCopyBuffer per token writes into
+        // HiddenState[t, :] for t in [0, totalTokens). Order matches packedTokens
+        // (= per-seq concatenation in simpleIdx order).
+        RecordEmbeddingGather(cmdBuf, packedTokens.AsSpan(0, totalTokens));
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        // Per-seq token offset into the batched buffer. Used inside the layer loop
+        // to slice Q/K/V/AttnOutput per sequence (computed once, reused per layer).
+        int[] seqOffsets = new int[simpleCount];
+        off = 0;
+        for (int s = 0; s < simpleCount; s++)
+        {
+            seqOffsets[s] = off;
+            off += requests[simpleIdx[s]].TokenIds.Length;
+        }
+
+        long qRowBytes = (long)qDim * sizeof(float);
+        long kvRowBytes = (long)kvDim * sizeof(float);
+        long hiddenRowBytes = (long)hiddenSize * sizeof(float);
+
+        for (int layer = 0; layer < Config.NumLayers; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+
+            // ── Attention block ────────────────────────────────────────────
+            // Batched RMSNorm → Q/K/V — all at seqLen=totalTokens against the
+            // existing state scratch.
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+                rowCount: totalTokens, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+                lw.QOutputDim, lw.QInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                lw.KOutputDim, lw.KInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                lw.VOutputDim, lw.VInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // Optional Q/K/V biases — add across all totalTokens rows.
+            if (lw.QBias is not null) _biasAdd.Record(cmdBuf, _state.Q, lw.QBias, totalTokens, lw.QOutputDim);
+            if (lw.KBias is not null) _biasAdd.Record(cmdBuf, _state.K, lw.KBias, totalTokens, lw.KOutputDim);
+            if (lw.VBias is not null) _biasAdd.Record(cmdBuf, _state.V, lw.VBias, totalTokens, lw.VOutputDim);
+            if (lw.QBias is not null || lw.KBias is not null || lw.VBias is not null)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // Batched RoPE — reads packed positions [totalTokens] and rotates each
+            // row independently. Per-seq position semantics are preserved by the
+            // packed positions array.
+            _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+                seqLen: totalTokens, numHeads: numHeads, numKvHeads: numKvHeads,
+                headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+                variant: _ropeVariant);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // Per-seq attention sub-loop. Each seq:
+            //   (1) copy this seq's K/V slice from _state.K/V into its VulkanKvCache
+            //       at positions[s]. The existing RecordUpdate assumes srcOffset=0, so
+            //       we issue the vkCmdCopyBuffer commands inline with the per-seq offset.
+            //   (2) copy this seq's Q slice from _state.Q into PerSeqQ (offset 0).
+            //   (3) run attention with PerSeqQ + cache K/V into PerSeqAttn.
+            //   (4) copy PerSeqAttn back into _state.AttnOutput at this seq's offset.
+            // PerSeqQ / PerSeqAttn are shared across seqs within the layer — barriers
+            // serialise consecutive attention dispatches.
+            var perSeqQ = _batchScratch.PerSeqQ!;
+            var perSeqAttn = _batchScratch.PerSeqAttn!;
+
+            for (int s = 0; s < simpleCount; s++)
+            {
+                var req = requests[simpleIdx[s]];
+                int nS = req.TokenIds.Length;
+                int seqOff = seqOffsets[s];
+                var vkCache = (VulkanKvCache)req.KvCache;
+
+                // (1) KV-cache update — copy this seq's contiguous slice from
+                // _state.K / _state.V into the cache at positions[s][0]..[N_s-1].
+                // The simple case is when positions are contiguous-ascending —
+                // single 2-region copy. We restrict to contiguous-ascending for
+                // batched-mode simplicity; the scheduler invariant is that per-seq
+                // positions are always either decode (1 token at currentLength) or
+                // prefill (contiguous from 0). If we encounter a non-contiguous
+                // seq we fall back: copy row-by-row. We assert and rely on the
+                // scheduler emitting contiguous positions per seq.
+                int basePos = req.Positions.Span[0];
+                bool contiguous = true;
+                for (int t = 1; t < nS; t++)
+                {
+                    if (req.Positions.Span[t] != basePos + t) { contiguous = false; break; }
+                }
+
+                if (contiguous)
+                {
+                    var kRegion = new VkBufferCopy
+                    {
+                        srcOffset = (ulong)((long)seqOff * kvRowBytes),
+                        dstOffset = (ulong)((long)basePos * kvRowBytes),
+                        size = (ulong)((long)nS * kvRowBytes),
+                    };
+                    VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.K.Handle,
+                        vkCache.GetKeysBuffer(layer).Handle, 1, kRegion);
+                    VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.V.Handle,
+                        vkCache.GetValuesBuffer(layer).Handle, 1, kRegion);
+                }
+                else
+                {
+                    for (int t = 0; t < nS; t++)
+                    {
+                        int pos = req.Positions.Span[t];
+                        var region = new VkBufferCopy
+                        {
+                            srcOffset = (ulong)((long)(seqOff + t) * kvRowBytes),
+                            dstOffset = (ulong)((long)pos * kvRowBytes),
+                            size = (ulong)kvRowBytes,
+                        };
+                        VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.K.Handle,
+                            vkCache.GetKeysBuffer(layer).Handle, 1, region);
+                        VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.V.Handle,
+                            vkCache.GetValuesBuffer(layer).Handle, 1, region);
+                    }
+                }
+                // Advance cache visible length on the LAST layer only — the cache's
+                // CurrentLength is a single counter shared across layers, and each
+                // layer's RecordUpdate normally advances it. Match the existing
+                // per-layer Forward semantics: advance every layer (idempotent
+                // because each layer sets the same maxPos+1 value).
+                int maxPosThisSeq = basePos;
+                for (int t = 1; t < nS; t++)
+                {
+                    int p = req.Positions.Span[t];
+                    if (p > maxPosThisSeq) maxPosThisSeq = p;
+                }
+                vkCache.SetCurrentLength(Math.Max(vkCache.CurrentLength, maxPosThisSeq + 1));
+
+                // (2) Copy this seq's Q slice into PerSeqQ.
+                var qRegion = new VkBufferCopy
+                {
+                    srcOffset = (ulong)((long)seqOff * qRowBytes),
+                    dstOffset = 0,
+                    size = (ulong)((long)nS * qRowBytes),
+                };
+                VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.Q.Handle, perSeqQ.Handle, 1, qRegion);
+
+                // TRANSFER → COMPUTE before the attention dispatch — attention reads
+                // PerSeqQ (compute, just-written by vkCmdCopyBuffer = TRANSFER) AND
+                // cache K/V (compute, just-written by vkCmdCopyBuffer = TRANSFER).
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+                // (3) Attention dispatch.
+                int seqKv = vkCache.CurrentLength;
+                int positionOffset = basePos;
+                RecordAttention(cmdBuf, perSeqQ, vkCache.GetKeysBuffer(layer), vkCache.GetValuesBuffer(layer),
+                    perSeqAttn,
+                    seqQ: nS, seqKv: seqKv,
+                    numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                    positionOffset: positionOffset, slidingWindow: _slidingWindow);
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+                // (4) Copy PerSeqAttn back into _state.AttnOutput at this seq's offset.
+                var attnRegion = new VkBufferCopy
+                {
+                    srcOffset = 0,
+                    dstOffset = (ulong)((long)seqOff * qRowBytes),
+                    size = (ulong)((long)nS * qRowBytes),
+                };
+                VulkanApi.vkCmdCopyBuffer(cmdBuf, perSeqAttn.Handle, _state.AttnOutput.Handle, 1, attnRegion);
+            }
+            // All per-seq attention dispatches done — TRANSFER → COMPUTE so the
+            // batched O projection reads the freshly-scattered _state.AttnOutput.
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+            // Batched O projection → NormOutput.
+            RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
+                lw.OOutputDim, lw.OInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.OBias is not null)
+            {
+                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, totalTokens, lw.OOutputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
+            // Residual add #1: AddScratch = Residual + NormOutput at totalTokens × hidden.
+            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, totalTokens * hiddenSize);
+            _state.RotateHiddenSlot();
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // ── FFN block (dense — model has no MoE layer in the simple-batched path) ──
+            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+                rowCount: totalTokens, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
+                lw.GateOutputDim, lw.GateInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
+                lw.UpOutputDim, lw.UpInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.GateBias is not null) _biasAdd.Record(cmdBuf, _state.FfnGate, lw.GateBias, totalTokens, lw.GateOutputDim);
+            if (lw.UpBias is not null) _biasAdd.Record(cmdBuf, _state.FfnUp, lw.UpBias, totalTokens, lw.UpOutputDim);
+            if (lw.GateBias is not null || lw.UpBias is not null)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, totalTokens * intermediateSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
+                lw.DownOutputDim, lw.DownInputDim, totalTokens);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (lw.DownBias is not null)
+            {
+                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, totalTokens, lw.DownOutputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
+            // Residual add #2 + rotate.
+            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, totalTokens * hiddenSize);
+            _state.RotateHiddenSlot();
+
+            if (layer < Config.NumLayers - 1)
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
+        // ── lm_head fan-out ────────────────────────────────────────────────
+        // Each simple seq's LAST hidden row → LastRowHidden[s, :]. Matches the
+        // Vulkan Forward contract (lm_head only on the last token, returns
+        // [1, vocab]). Batched lm_head: one RMSNorm + matmul at seqLen=N_simple
+        // against LastRowHidden, producing BatchedLogits[N_simple, vocab].
+        var lastRowHidden = _batchScratch.LastRowHidden!;
+        var batchedLogits = _batchScratch.BatchedLogits!;
+
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        for (int s = 0; s < simpleCount; s++)
+        {
+            int nS = requests[simpleIdx[s]].TokenIds.Length;
+            int seqOff = seqOffsets[s];
+            int lastRowAbs = seqOff + nS - 1;
+            var region = new VkBufferCopy
+            {
+                srcOffset = (ulong)((long)lastRowAbs * hiddenRowBytes),
+                dstOffset = (ulong)((long)s * hiddenRowBytes),
+                size = (ulong)hiddenRowBytes,
+            };
+            VulkanApi.vkCmdCopyBuffer(cmdBuf, _state.HiddenState.Handle, lastRowHidden.Handle, 1, region);
+        }
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _rmsnorm.Record(cmdBuf, lastRowHidden, _weights.OutputNormWeight, lastRowHidden,
+            rowCount: simpleCount, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            lastRowHidden, batchedLogits,
+            _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: simpleCount);
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        // Download per-seq vocab rows and split into individual [1, vocab] host tensors.
+        // BatchedLogits is host-visible (Allocate, not AllocateDeviceLocal — see
+        // VulkanForwardBatchScratch.EnsureCapacity), so the device.Download path
+        // works as for the per-seq Forward.
+        unsafe
+        {
+            // Stage the full batch into a managed buffer once, then split per-seq.
+            // simpleCount × vocabSize fits int — Vulkan vocabSize cap is ~256k and
+            // simpleCount is bounded by the scheduler's MaxActiveSequences (64 today).
+            int totalLogits = checked(simpleCount * vocabSize);
+            float[] hostBuf = new float[totalLogits];
+            _device.Download(batchedLogits, hostBuf.AsSpan());
+            for (int s = 0; s < simpleCount; s++)
+            {
+                int reqIdx = simpleIdx[s];
+                var shape = new TensorShape(1, vocabSize);
+                var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+                var src = hostBuf.AsSpan(s * vocabSize, vocabSize);
+                src.CopyTo(new Span<float>((void*)tensor.DataPointer, vocabSize));
+                results[reqIdx] = tensor;
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -2261,6 +2739,9 @@ public sealed class VulkanTransformerModel : IModel
         // each VulkanLoraAdapter owns VkBuffers that must be freed before
         // the device is disposed.
         _loraCache.Dispose();
+
+        // ForwardBatch scratch — null when batched path was never invoked.
+        _batchScratch?.Dispose();
 
         _submit.Dispose();
         _state.Dispose();
