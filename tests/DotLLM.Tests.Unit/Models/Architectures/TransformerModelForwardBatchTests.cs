@@ -772,4 +772,442 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
             + $"(expected={(firstBad >= 0 ? expected[firstBad].ToString("R") : "n/a")}, "
             + $"actual={(firstBad >= 0 ? actual[firstBad].ToString("R") : "n/a")})");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // H4 audit follow-up — LoRA / MLA+MoE / quantized-KV ForwardBatch parity
+    //
+    // The Phase 5a/5b tests above cover dense-Llama + SmolLM-135M Q8_0 only.
+    // The four tests below close the parity-coverage gap called out in the
+    // 2026-05-18 state audit §H4 by driving each complex-subgroup fallback
+    // scenario through ForwardBatch and asserting per-seq logit parity
+    // against the per-seq Forward loop:
+    //
+    //   1. Two seqs with DIFFERENT non-zero LoRA adapters
+    //   2. DeepSeek-V2-Lite Q4_K_M (MLA + MoE, real GGUF)
+    //   3. SmolLM-135M Q8_0 with QuantizedKvCache decode
+    //   4. Heterogeneous batch: adapter on seq A, none on seq B
+    //
+    // Tests 2 and 3 are SkippableFact — gated on the cached GGUFs. Tests 1
+    // and 4 use the F32 synthetic GQA fixture defined above so they run in
+    // every CI configuration.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static readonly string CachedDeepSeekV2LitePath =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".dotllm", "test-cache", "mradermacher", "DeepSeek-V2-Lite-GGUF", "DeepSeek-V2-Lite.Q4_K_M.gguf");
+
+    /// <summary>
+    /// Two sequences with DIFFERENT non-zero LoRA adapters going through the
+    /// complex-subgroup fallback path. Adapter A targets <c>q_proj</c>;
+    /// adapter B targets <c>gate_proj</c>. Because the two adapters touch
+    /// disjoint projections with non-zero weights, a leak of
+    /// <c>_currentAdapter</c> across sequences would cause seq B's logits to
+    /// reflect adapter A's q_proj delta (and miss adapter B's gate_proj
+    /// delta) — discriminating against the failure mode the audit called out
+    /// ("per-seq Set/Clear of Adapter could leak across sequences in subtle
+    /// ways").
+    /// </summary>
+    [Fact]
+    public void ForwardBatch_TwoSeqs_DifferentLoraAdapters_MatchesPerSeqLoop()
+    {
+        string path = Path.Combine(_scratch, "fbatch-h4-diff-adapters.safetensors");
+        WriteGqaFixture(path, seed: 1337);
+        var cfg = BuildGqaConfig();
+
+        // Adapter A: q_proj only, non-zero (small magnitude so the delta is
+        // measurable but the base logits aren't swamped).
+        using var adapterA = BuildSingleProjectionAdapter(cfg, projName: "q_proj",
+            inputDim: cfg.HiddenSize, outputDim: cfg.NumAttentionHeads * cfg.HeadDim,
+            amplitude: 0.02f, seed: 2001);
+        // Adapter B: gate_proj only — different projection so a per-seq leak
+        // would route into the wrong call site.
+        using var adapterB = BuildSingleProjectionAdapter(cfg, projName: "gate_proj",
+            inputDim: cfg.HiddenSize, outputDim: cfg.IntermediateSize,
+            amplitude: 0.02f, seed: 2002);
+
+        int[] tokensA = [1, 2, 3, 4];
+        int[] positionsA = [0, 1, 2, 3];
+        int[] tokensB = [5, 6, 0];
+        int[] positionsB = [0, 1, 2];
+
+        // Per-seq references — each seq runs with its OWN adapter against a
+        // fresh KV cache, matching what the ForwardBatch complex-fallback
+        // path does internally for each adapter-active sequence.
+        float[] refA, refB;
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, cfg))
+        {
+            using var kvA = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvA, adapterA);
+            refA = CopyLogits(logitsA);
+
+            using var kvB = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvB, adapterB);
+            refB = CopyLogits(logitsB);
+        }
+
+        // Batched — BOTH sequences carry adapters so both fall through to the
+        // per-seq complex-subgroup path. The invariant under test is that
+        // _currentAdapter is set/cleared per-seq inside that loop.
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, cfg))
+        {
+            using var kvA2 = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using var kvB2 = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            var requests = new[]
+            {
+                new SequenceForwardRequest { TokenIds = tokensA, Positions = positionsA, KvCache = kvA2, Adapter = adapterA },
+                new SequenceForwardRequest { TokenIds = tokensB, Positions = positionsB, KvCache = kvB2, Adapter = adapterB },
+            };
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            try
+            {
+                Assert.Equal(2, results.Count);
+                AssertBitEqual(refA, CopyLogits(results[0]),
+                    $"[H4/diff-adapters/seqA-qproj] {tokensA.Length} tokens x {cfg.VocabSize} vocab");
+                AssertBitEqual(refB, CopyLogits(results[1]),
+                    $"[H4/diff-adapters/seqB-gateproj] {tokensB.Length} tokens x {cfg.VocabSize} vocab");
+            }
+            finally
+            {
+                foreach (var t in results) t.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Two sequences through DeepSeek-V2-Lite Q4_K_M GGUF. V2-Lite has BOTH
+    /// MLA attention AND MoE layers (leading_dense_block_count=1 implies
+    /// layer 0 dense FFN + MLA, layers 1+ MoE + MLA). With <c>NumLayers</c>
+    /// trimmed to 2, the test exercises one dense-MLA layer and one
+    /// MoE-MLA layer. Both layer kinds force the entire batch through the
+    /// complex-subgroup fallback because <c>ModelHasMlaOrMoeLayer()</c>
+    /// returns true.
+    /// </summary>
+    /// <remarks>
+    /// <para>Tolerance: Q4_K dequant + MLA absorbed-decode summation order
+    /// produces sub-ULP per-row drift that compounds across layers — looser
+    /// than Q8_0 but tighter than the Vulkan parity tolerance because both
+    /// the per-seq and batched paths run on the same CPU kernels. The
+    /// observed envelope on this fixture is well under absTol 1e-3 /
+    /// relTol 1e-2 for a 2-layer slice.</para>
+    /// <para>The per-seq and batched passes share a single model instance
+    /// because TransformerModel's MLA state lives on the model (internal
+    /// <c>_mlaKvState</c>, reset on <c>positions[0]==0</c>). Running ref
+    /// in the same order as ForwardBatch processes them keeps the per-seq
+    /// state-reset sequence identical between the two paths.</para>
+    /// </remarks>
+    [SkippableFact]
+    public void ForwardBatch_MlaModel_TwoSeqs_MatchesPerSeqLoop()
+    {
+        Skip.IfNot(File.Exists(CachedDeepSeekV2LitePath),
+            $"DeepSeek-V2-Lite Q4_K_M GGUF not cached at {CachedDeepSeekV2LitePath}");
+
+        using var gguf = GgufFile.Open(CachedDeepSeekV2LitePath);
+        var fullConfig = GgufModelConfigExtractor.Extract(gguf.Metadata);
+
+        // Trim to 2 layers (dense layer 0 + MoE layer 1 per
+        // leading_dense_block_count=1) and a small KV horizon to keep the
+        // forward pass tractable on CPU. NumLayers > leading_dense_block_count
+        // guarantees the MoE branch executes on layer 1.
+        var config = fullConfig with { NumLayers = 2, MaxSequenceLength = 16 };
+
+        using var model = TransformerModel.LoadFromGguf(gguf, config);
+
+        int[] tokensA = [100, 200, 300];
+        int[] positionsA = [0, 1, 2];
+        int[] tokensB = [400, 500];
+        int[] positionsB = [0, 1];
+
+        // Per-seq references. MLA path stores state on the model itself
+        // (kvCache parameter is ignored for MLA layers); resetting via
+        // positions[0]==0 on each call makes the per-seq sequence
+        // independent. Compute references in the SAME order ForwardBatch
+        // will process them so the state-reset cadence matches.
+        float[] refA, refB;
+        {
+            // Dummy SimpleKvCache: required by the API surface but ignored on
+            // MLA layers. Allocate at the model's head_dim (qk_nope+qk_rope).
+            using var kvDummy = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvDummy);
+            refA = CopyLogits(logitsA);
+        }
+        {
+            using var kvDummy = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvDummy);
+            refB = CopyLogits(logitsB);
+        }
+
+        // Batched.
+        using var kvA2 = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+        using var kvB2 = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength);
+        var requests = new[]
+        {
+            new SequenceForwardRequest { TokenIds = tokensA, Positions = positionsA, KvCache = kvA2 },
+            new SequenceForwardRequest { TokenIds = tokensB, Positions = positionsB, KvCache = kvB2 },
+        };
+        var results = model.ForwardBatch(requests, deviceId: -1);
+        try
+        {
+            Assert.Equal(2, results.Count);
+            Assert.Equal(tokensA.Length, results[0].Shape[0]);
+            Assert.Equal(tokensB.Length, results[1].Shape[0]);
+            // Q4_K_M envelope: MLA-absorbed-decode reorders dot products,
+            // compounds through MoE expert routing. Per the audit doc, accept
+            // abs 1e-3 / rel 1e-2 (looser than Q8_0).
+            AssertClose(refA, CopyLogits(results[0]), absTol: 1e-3f, relTol: 1e-2f,
+                $"[H4/MLA+MoE/seqA] {tokensA.Length} tokens x {config.VocabSize} vocab");
+            AssertClose(refB, CopyLogits(results[1]), absTol: 1e-3f, relTol: 1e-2f,
+                $"[H4/MLA+MoE/seqB] {tokensB.Length} tokens x {config.VocabSize} vocab");
+        }
+        finally
+        {
+            foreach (var t in results) t.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Two sequences on SmolLM-135M Q8_0 with a quantized KV-cache
+    /// (Q8_0 keys + Q8_0 values, no FP32 window). Decode pattern
+    /// (1 token per seq) so the per-seq attention call dispatches via
+    /// <see cref="DotLLM.Core.Attention.IQuantizedKvCache"/>. The
+    /// surrounding Q/K/V/O/gate/up/down matmuls are eligible for the Phase 5b
+    /// batched fast path because there is no LoRA / MLA / MoE — so this test
+    /// proves quantized-KV update + read-back is correct when the surrounding
+    /// matmuls are fused across sequences.
+    /// </summary>
+    /// <remarks>
+    /// Tolerance reuses the Phase 5b Q8_0 envelope (absTol 0.5 / relTol 0.05)
+    /// because the underlying kernel-dispatch drift mechanism is identical
+    /// (per-seq AVX2-interleaved Down kernel vs batched AVX-512-non-
+    /// interleaved Down kernel). The quantized KV path itself is exercised
+    /// in BOTH the per-seq reference and the batched call, so KV-quant
+    /// rounding does NOT add fresh drift between the two paths.
+    /// </remarks>
+    [SkippableFact]
+    public void ForwardBatch_QuantizedKvCache_TwoSeqs_MatchesPerSeqLoop()
+    {
+        Skip.IfNot(File.Exists(CachedSmolLmPath), $"SmolLM-135M GGUF not cached at {CachedSmolLmPath}");
+
+        using var gguf = GgufFile.Open(CachedSmolLmPath);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        // SmolLM-135M: numKvHeads=3, headDim=64 implies kvStride=192, which
+        // is a multiple of QuantizedKvCache's 32-element block size. Assert
+        // this explicitly so a config change to SmolLM-135M doesn't silently
+        // break the test setup.
+        int kvStride = config.NumKvHeads * config.HeadDim;
+        Skip.If(kvStride % 32 != 0,
+            $"SmolLM-135M kvStride={kvStride} is not a multiple of 32 — QuantizedKvCache requires block-aligned KV strides.");
+
+        using var model = TransformerModel.LoadFromGguf(gguf, config);
+
+        int[] tokensA = [50];
+        int[] positionsA = [0];
+        int[] tokensB = [60];
+        int[] positionsB = [0];
+
+        // Per-seq references with the quantized KV path.
+        float[] refA, refB;
+        {
+            using var kvQ = new QuantizedKvCache(
+                config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength,
+                KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvQ);
+            refA = CopyLogits(logitsA);
+        }
+        {
+            using var kvQ = new QuantizedKvCache(
+                config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength,
+                KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvQ);
+            refB = CopyLogits(logitsB);
+        }
+
+        // Batched — each seq has its OWN quantized KV cache (the per-seq
+        // attention call inside the fused layer loop dispatches the
+        // IQuantizedKvCache code path per-sequence).
+        using var kvA2 = new QuantizedKvCache(
+            config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength,
+            KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
+        using var kvB2 = new QuantizedKvCache(
+            config.NumLayers, config.NumKvHeads, config.HeadDim, config.MaxSequenceLength,
+            KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
+        var requests = new[]
+        {
+            new SequenceForwardRequest { TokenIds = tokensA, Positions = positionsA, KvCache = kvA2 },
+            new SequenceForwardRequest { TokenIds = tokensB, Positions = positionsB, KvCache = kvB2 },
+        };
+        var results = model.ForwardBatch(requests, deviceId: -1);
+        try
+        {
+            Assert.Equal(2, results.Count);
+            Assert.Equal(1, results[0].Shape[0]);
+            Assert.Equal(1, results[1].Shape[0]);
+            // Reuse the Phase 5b Q8_0 envelope (see AssertClose docstring) —
+            // dispatch-arm divergence between N=1 (per-seq) and N>1 (batched)
+            // applies to the surrounding matmuls regardless of which KV cache
+            // implementation is in use.
+            AssertClose(refA, CopyLogits(results[0]), absTol: 0.5f, relTol: 0.05f,
+                $"[H4/QuantKV/seqA] 1 token x {config.VocabSize} vocab");
+            AssertClose(refB, CopyLogits(results[1]), absTol: 0.5f, relTol: 0.05f,
+                $"[H4/QuantKV/seqB] 1 token x {config.VocabSize} vocab");
+        }
+        finally
+        {
+            foreach (var t in results) t.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Heterogeneous batch: seq A carries a non-zero LoRA adapter (complex-
+    /// subgroup fallback path); seq B carries no adapter (simple-subgroup
+    /// batched-matmul path). Both must produce per-seq logits identical to
+    /// their respective per-seq Forward invocations.
+    /// </summary>
+    /// <remarks>
+    /// Discriminates against two failure modes:
+    /// <list type="number">
+    /// <item>If <c>_currentAdapter</c> isn't cleared after the complex-subgroup
+    ///   loop, a subsequent simple-subgroup call could pick up seq A's
+    ///   adapter (defensively — the simple path doesn't go through
+    ///   <c>_currentAdapter</c>, so this is paranoid coverage).</item>
+    /// <item>If the simple-subgroup batched path's stacked hidden buffer
+    ///   accidentally folds adapter-affected residuals from the complex
+    ///   subgroup, seq B's logits would diverge from the no-adapter
+    ///   reference.</item>
+    /// </list>
+    /// Differs from the existing <c>ForwardBatch_Phase5b_ComplexFallback_AdapterActiveOnOneSeq</c>
+    /// test in that this uses a NON-zero adapter — so the seqA reference
+    /// itself diverges from a no-adapter forward, and a leak of the adapter
+    /// onto seq B (or vice versa) would be visible.
+    /// </remarks>
+    [Fact]
+    public void ForwardBatch_HeterogeneousBatch_AdapterOnOneSeqOnly()
+    {
+        string path = Path.Combine(_scratch, "fbatch-h4-hetero.safetensors");
+        WriteGqaFixture(path, seed: 9999);
+        var cfg = BuildGqaConfig();
+
+        using var adapter = BuildSingleProjectionAdapter(cfg, projName: "q_proj",
+            inputDim: cfg.HiddenSize, outputDim: cfg.NumAttentionHeads * cfg.HeadDim,
+            amplitude: 0.02f, seed: 3001);
+
+        int[] tokensA = [1, 2, 3];
+        int[] positionsA = [0, 1, 2];
+        int[] tokensB = [4, 5, 6, 7];
+        int[] positionsB = [0, 1, 2, 3];
+
+        // Per-seq references.
+        float[] refA, refB;
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, cfg))
+        {
+            // SeqA gets the adapter; SeqB does not.
+            using var kvA = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvA, adapter);
+            refA = CopyLogits(logitsA);
+
+            using var kvB = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvB);
+            refB = CopyLogits(logitsB);
+        }
+
+        // Sanity: with a non-zero adapter, refA must NOT be identical to a
+        // no-adapter run on seqA. Otherwise the test isn't discriminating
+        // anything (i.e. the adapter is silently a no-op). Compute the
+        // no-adapter seqA logits and assert they differ — this is what makes
+        // the parity assertion below load-bearing.
+        float[] refA_noAdapter;
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, cfg))
+        {
+            using var kv = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using ITensor logits = model.Forward(tokensA, positionsA, deviceId: -1, kv);
+            refA_noAdapter = CopyLogits(logits);
+        }
+        Assert.NotEqual(refA, refA_noAdapter); // adapter is non-trivial
+
+        // Batched — seq A goes through complex fallback (has adapter), seq B
+        // through the simple batched-matmul path (no adapter). Per-row
+        // results must match the per-seq references bit-for-bit (F32 fixture).
+        using (var sf = SafetensorsFile.Open(path))
+        using (var model = TransformerModel.LoadFromSafetensors(sf, cfg))
+        {
+            using var kvA2 = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            using var kvB2 = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cfg.MaxSequenceLength);
+            var requests = new[]
+            {
+                new SequenceForwardRequest { TokenIds = tokensA, Positions = positionsA, KvCache = kvA2, Adapter = adapter },
+                new SequenceForwardRequest { TokenIds = tokensB, Positions = positionsB, KvCache = kvB2 },
+            };
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            try
+            {
+                Assert.Equal(2, results.Count);
+                AssertBitEqual(refA, CopyLogits(results[0]),
+                    $"[H4/hetero/seqA-complex-adapter] {tokensA.Length} tokens x {cfg.VocabSize} vocab");
+                AssertBitEqual(refB, CopyLogits(results[1]),
+                    $"[H4/hetero/seqB-simple-noadapter] {tokensB.Length} tokens x {cfg.VocabSize} vocab");
+            }
+            finally
+            {
+                foreach (var t in results) t.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds a synthetic LoRA adapter that targets a single projection on
+    /// every layer, with non-zero values drawn from a deterministic seed.
+    /// Used by the H4 audit tests where the adapter must (a) be small enough
+    /// not to swamp the base logits and (b) be non-zero so a per-seq adapter
+    /// leak or missed adapter application produces a measurable difference.
+    /// </summary>
+    private static unsafe DotLLM.Core.Lora.LoraAdapter BuildSingleProjectionAdapter(
+        ModelConfig cfg, string projName, int inputDim, int outputDim,
+        float amplitude, int seed, int rank = 4, float alpha = 16f)
+    {
+        var adapter = new DotLLM.Core.Lora.LoraAdapter(
+            name: $"h4-{projName}-{seed}",
+            rank: rank,
+            alpha: alpha,
+            targetModules: new[] { projName });
+        try
+        {
+            for (int layer = 0; layer < cfg.NumLayers; layer++)
+            {
+                long bElems = (long)rank * inputDim;
+                long aElems = (long)outputDim * rank;
+                nint bPtr = DotLLM.Core.Lora.LoraAdapter.AllocAligned(bElems);
+                nint aPtr = DotLLM.Core.Lora.LoraAdapter.AllocAligned(aElems);
+
+                // Deterministic cos-based fill — mirrors AddDeterministic so
+                // every test run produces the same bytes.
+                var bSpan = new Span<float>((void*)bPtr, (int)bElems);
+                var aSpan = new Span<float>((void*)aPtr, (int)aElems);
+                int sB = seed + layer * 7 + 0;
+                int sA = seed + layer * 7 + 1;
+                for (long i = 0; i < bElems; i++)
+                {
+                    float phi = 0.61803398875f * (i + 1) + sB * 0.37f;
+                    bSpan[(int)i] = amplitude * MathF.Cos(phi);
+                }
+                for (long i = 0; i < aElems; i++)
+                {
+                    float phi = 0.61803398875f * (i + 1) + sA * 0.37f;
+                    aSpan[(int)i] = amplitude * MathF.Cos(phi);
+                }
+
+                adapter.AddLayerWeights(layer, projName,
+                    new DotLLM.Core.Lora.LoraLayerWeights(AHandle: aPtr, BHandle: bPtr,
+                        InputDim: inputDim, OutputDim: outputDim));
+            }
+            return adapter;
+        }
+        catch
+        {
+            adapter.Dispose();
+            throw;
+        }
+    }
 }
