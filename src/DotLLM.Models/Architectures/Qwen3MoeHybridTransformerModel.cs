@@ -479,13 +479,58 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, kvCache: null);
+        => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
+    /// per-sequence GDN recurrent state (for the GDN layers). When
+    /// <paramref name="gdnState"/> is <see langword="null"/>, falls back to the
+    /// model-owned default cache — safe only for single-sequence dispatch from a
+    /// freshly-constructed model. Multi-seq batched dispatch must supply a fresh
+    /// per-seq <see cref="GdnStateCache"/> for each request, otherwise state leaks
+    /// across sequences.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <param name="kvCache">Optional per-seq KV-cache for the GQA layers.</param>
+    /// <param name="gdnState">
+    /// Optional per-seq GDN recurrent state container. Must be a
+    /// <see cref="GdnStateCache"/> sized for this model's GDN-layer count.
+    /// </param>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, IGdnState? gdnState)
     {
+        // Resolve the GDN state: caller-supplied container preferred, model-owned
+        // fallback for the single-seq Forward callers that pre-date the per-seq API.
+        // The fallback is unsafe across multi-seq batched dispatch — that path is
+        // expected to pass a fresh per-seq state via ForwardBatch.
+        GdnStateCache gdnCache;
+        if (gdnState is null)
+        {
+            gdnCache = _gdnCache;
+        }
+        else if (gdnState is GdnStateCache typed)
+        {
+            if (typed.NumGdnLayers != _gdnCache.NumGdnLayers)
+                throw new ArgumentException(
+                    $"GdnState NumGdnLayers ({typed.NumGdnLayers}) does not match model GDN-layer count ({_gdnCache.NumGdnLayers}).",
+                    nameof(gdnState));
+            gdnCache = typed;
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"Qwen3MoeHybridTransformerModel requires a CPU GdnStateCache; got {gdnState.GetType().Name}.",
+                nameof(gdnState));
+        }
+
         int seqLen = tokenIds.Length;
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
@@ -545,7 +590,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
                 TensorDump.Dump2D($"blk.{layer}.attn_norm", normOut, seqLen, hiddenSize);
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
-                ForwardGdnBody(lw.Gdn!, layer, seqLen, hiddenSize, normOut, eps);
+                ForwardGdnBody(lw.Gdn!, layer, seqLen, hiddenSize, normOut, eps, gdnCache);
             else
                 ForwardFullAttnBody(lw.FullAttn!, layer, seqLen, positions,
                     normOut, qAttn, kAttn, vAttn, attnOut,
@@ -615,6 +660,46 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>
+    /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
+    /// — threads each request's GDN state through to the GDN scan, so multi-seq batched
+    /// dispatch is safe as long as every request supplies a fresh
+    /// <see cref="GdnStateCache"/>. The default <see cref="IModel.ForwardBatch"/> would
+    /// silently corrupt state across sequences because it ignores
+    /// <see cref="SequenceForwardRequest.GdnState"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Qwen3MoeHybrid carries no LoRA path today, so adapter-bearing requests throw
+    /// up-front — same shape as the Vulkan host's override. Per-seq fusion across
+    /// the GDN scan + MoE routing is not viable (the scan is per-token recurrent and
+    /// the MoE routing mask is per-token); this override simply loops Forward,
+    /// trading the per-iter dispatch-overhead amortisation for correctness.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "Qwen3MoeHybridTransformerModel.ForwardBatch does not support LoRA adapters " +
+                    "(no Qwen3MoeHybrid LoRA path today). Re-issue the request without an adapter.");
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.GdnState);
+        }
+        return results;
+    }
+
+    /// <summary>
     /// GDN (Gated DeltaNet) token-mixing forward pass. Reads pre-normed activations from
     /// <paramref name="normOut"/> and writes the <c>ssm_out</c> projection back to the same buffer.
     /// Advances the per-layer GDN conv and associative-memory state in place.
@@ -634,7 +719,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     [SkipLocalsInit]
     private void ForwardGdnBody(
         GdnTokenMixingWeights gdnW, int absoluteLayerIdx, int seqLen,
-        int hiddenSize, float* normOut, float eps)
+        int hiddenSize, float* normOut, float eps, GdnStateCache gdnCache)
     {
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
@@ -700,7 +785,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
         // ── 3. Conv1d on QKV concat ────────────────────────────────────────────
         // Fill ConvInput: [conv_state (DConv-1 rows) | qkvBuf (seqLen rows)]
-        var convState = _gdnCache.GetConvState(gdnOrdinal);
+        var convState = gdnCache.GetConvState(gdnOrdinal);
         convState.CopyTo(new Span<float>(convInput, (dConv - 1) * convDim));
         for (int t = 0; t < seqLen; t++)
         {
@@ -756,7 +841,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         }
 
         // ── 5. GDN scan ───────────────────────────────────────────────────────
-        var gdnState = _gdnCache.GetGdnState(gdnOrdinal);
+        var gdnState = gdnCache.GetGdnState(gdnOrdinal);
         GatedDeltaNetScan.Execute(
             state: gdnState,
             q: new ReadOnlySpan<float>(qBuf, seqLen * kDim),

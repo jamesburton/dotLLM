@@ -278,11 +278,55 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, kvCache: null);
+        => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
+
+    /// <summary>
+    /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
+    /// per-sequence GDN recurrent state (for the GDN layers). When
+    /// <paramref name="gdnState"/> is <see langword="null"/>, falls back to the
+    /// model-owned default cache — safe only for single-sequence dispatch from a
+    /// freshly-constructed model. Multi-seq batched dispatch via
+    /// <see cref="ForwardBatch"/> supplies a fresh per-seq
+    /// <see cref="VulkanGdnStateCache"/> for each request to keep recurrent state
+    /// isolated.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <param name="kvCache">Optional per-seq KV-cache for the GQA layers.</param>
+    /// <param name="gdnState">
+    /// Optional per-seq GDN recurrent state container. Must be a
+    /// <see cref="VulkanGdnStateCache"/> sized for this model's GDN-layer count.
+    /// </param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IGdnState? gdnState)
     {
+        // Resolve per-seq GDN state container; model-owned _gdnCache is the
+        // backwards-compat fallback for single-seq Forward callers.
+        VulkanGdnStateCache gdnCache;
+        if (gdnState is null)
+        {
+            gdnCache = _gdnCache;
+        }
+        else if (gdnState is VulkanGdnStateCache vk)
+        {
+            if (vk.NumGdnLayers != _gdnCache.NumGdnLayers)
+                throw new ArgumentException(
+                    $"GdnState NumGdnLayers ({vk.NumGdnLayers}) does not match model GDN-layer count ({_gdnCache.NumGdnLayers}).",
+                    nameof(gdnState));
+            gdnCache = vk;
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"VulkanQwen3MoeHybridTransformerModel requires a VulkanGdnStateCache; got {gdnState.GetType().Name}.",
+                nameof(gdnState));
+        }
+
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
         int seqLen = tokenIds.Length;
@@ -344,7 +388,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
 
             if (kinds[layer] == HybridLayerKind.GatedDeltaNet)
             {
-                RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps);
+                RecordGdnLayer(cmdBuf, layer, layerBuf.Gdn!.Value, seqLen, eps, gdnCache);
             }
             else
             {
@@ -536,7 +580,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     /// </summary>
     private unsafe void RecordGdnLayer(
         nint cmdBuf, int absoluteLayerIdx, VulkanQwen3MoeHybridWeights.GdnLayerBuffers gdnW,
-        int seqLen, float eps)
+        int seqLen, float eps, VulkanGdnStateCache gdnCache)
     {
         int nVHead = _gdn.NVHead;
         int nKHead = _gdn.NKHead;
@@ -547,8 +591,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         int kDim = nKHead * dState;
         int gdnOrdinal = _gdnLayerOrdinal[absoluteLayerIdx];
 
-        var convStateBuf = _gdnCache.GetConvStateBuffer(gdnOrdinal);
-        var gdnStateBuf = _gdnCache.GetGdnStateBuffer(gdnOrdinal);
+        var convStateBuf = gdnCache.GetConvStateBuffer(gdnOrdinal);
+        var gdnStateBuf = gdnCache.GetGdnStateBuffer(gdnOrdinal);
 
         // ── 1. Projections ───────────────────────────────────────────────────
         RecordMatmul(cmdBuf, gdnW.QkvWeight, gdnW.QkvDeviceQuantType,
