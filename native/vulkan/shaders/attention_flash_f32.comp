@@ -31,6 +31,9 @@
 // positionOffset + qRow - slidingWindow + 1.
 // Attention soft-cap (Gemma 2 / Qwen3 style): when softCap > 0, raw scores
 // pass through softCap * tanh(s / softCap) before softmax.
+// Custom attention scale (Gemma 3 query_pre_attn_scalar): when scale > 0,
+// raw scores are multiplied by scale instead of the default 1/sqrt(head_dim).
+// Pass 0.0 to disable (default = 1/sqrt(head_dim)).
 
 #define BR              16
 #define BC              64
@@ -56,9 +59,9 @@ layout(push_constant) uniform PushConstants {
     uint  slidingWindow;   // 0 = disabled
     uint  useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
     float softCap;         // 0.0 = disabled, >0 = tanh-capped scores
+    float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
     uint  _pad0;
     uint  _pad1;
-    uint  _pad2;
 } pc;
 
 shared float qTile[BR * MAX_HEAD_DIM];
@@ -150,7 +153,7 @@ void main() {
     uint qStride  = pc.numHeads   * pc.headDim;
     uint kvStride = pc.numKvHeads * pc.headDim;
 
-    float scale = inversesqrt(float(pc.headDim));
+    float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
     float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
 
     uint rowsInTile = min(uint(BR), pc.seqQ - qStartRow);
