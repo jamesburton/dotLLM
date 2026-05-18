@@ -174,3 +174,259 @@ parity-easy, and ships measurable benefit (the lm_head GEMM is one of the
 biggest single layer costs at prefill). The matmul-fusion inside the transformer
 block is where the complexity is — better to land it deliberately in its own
 session with proper attention to the per-precision paths.
+
+---
+
+## Phase 5a — code-level refactor (CPU)
+
+Scope re-cut after a closer reading: skip batched embedding (it's a
+row-gather, not a GEMM — minimal savings) and target only the lm_head
+fusion. That keeps the refactor surface to two private helpers + a
+ForwardBatch override.
+
+### Step 1 — extract two private helpers from `TransformerModel.Forward(...)`
+
+The current public `Forward(tokenIds, positions, deviceId, kvCache)` body
+(line 337-1005 of `src/DotLLM.Models/Architectures/TransformerModel.cs`)
+splits naturally at line 988 (after the final RMSNorm) into:
+
+- **lines 340-988**: embedding + transformer layer loop + final RMSNorm
+  → leaves the final hidden state at `_state.HiddenState[0..seqLen*hiddenSize]`.
+- **lines 990-1004**: lm_head GEMM + tensor allocation + copy + return.
+
+Extract those two into private helpers:
+
+```csharp
+// Existing body lines 340-988 verbatim, minus the deviceId param (only
+// used in the tensor allocation, which has moved to RunLmHead). All
+// adapter / KV-cache / MLA / MoE / LoRA branches stay exactly as-is.
+private unsafe void RunLayersAndFinalNormCore(
+    ReadOnlySpan<int> tokenIds,
+    ReadOnlySpan<int> positions,
+    IKvCache? kvCache)
+{
+    int maxSeq = Config.MaxSequenceLength;
+    for (int i = 0; i < positions.Length; i++)
+    {
+        if ((uint)positions[i] >= (uint)maxSeq)
+            throw new ArgumentOutOfRangeException(nameof(positions), ...);
+    }
+
+    int seqLen = tokenIds.Length;
+    int hiddenSize = Config.HiddenSize;
+    /* ... rest of original Forward body up to and including step 3 (final RMSNorm) ... */
+}
+
+// Existing lines 990-1004 verbatim.
+private unsafe ITensor RunLmHead(int seqLen, int deviceId)
+{
+    int vocabSize = Config.VocabSize;
+    float* hidden = (float*)_state.HiddenState;
+    float* logits = (float*)_state.Logits;
+
+    var rwOutput = _weights.RepackedOutput ?? default;
+    GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
+        hidden, logits,
+        _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
+        null, in rwOutput);
+
+    var shape = new TensorShape(seqLen, vocabSize);
+    var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+    new Span<float>(logits, seqLen * vocabSize).CopyTo(
+        new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
+    return result;
+}
+
+// Refactored public method — three lines.
+public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                       int deviceId, IKvCache? kvCache)
+{
+    RunLayersAndFinalNormCore(tokenIds, positions, kvCache);
+    return RunLmHead(tokenIds.Length, deviceId);
+}
+```
+
+The LoRA-aware `Forward(..., adapter)` overload (lines 298-325) is
+unchanged — it sets `_currentAdapter` then delegates to the no-adapter
+Forward as before.
+
+### Step 2 — `ForwardBatch` override
+
+```csharp
+public IReadOnlyList<ITensor> ForwardBatch(
+    IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+{
+    ArgumentNullException.ThrowIfNull(requests);
+    if (requests.Count == 0) return Array.Empty<ITensor>();
+    if (requests.Count == 1)
+    {
+        var r0 = requests[0];
+        return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span,
+                               deviceId, r0.KvCache, r0.Adapter) };
+    }
+
+    int hiddenSize = Config.HiddenSize;
+    int vocabSize = Config.VocabSize;
+    int totalTokens = 0;
+    foreach (var r in requests) totalTokens += r.TokenIds.Length;
+
+    _state.EnsureCapacity(totalTokens);
+
+    // Rent a managed snapshot buffer — the per-seq RunLayersAndFinalNormCore
+    // calls all write to _state.HiddenState[0..N_i*hidden], which the next
+    // seq's call would clobber. We snapshot each seq's hidden out, then
+    // stack them at the end for a single batched lm_head GEMM.
+    var pool = ArrayPool<float>.Shared;
+    float[] batched = pool.Rent(totalTokens * hiddenSize);
+    try
+    {
+        int tokOffset = 0;
+        foreach (var r in requests)
+        {
+            int n = r.TokenIds.Length;
+            if (r.Adapter is not null)
+            {
+                ValidateAdapterForModel(r.Adapter);
+                LoraStage2.PrewarmAdapter(r.Adapter as LoraAdapter);
+                _currentAdapter = r.Adapter;
+            }
+            try
+            {
+                RunLayersAndFinalNormCore(r.TokenIds.Span, r.Positions.Span, r.KvCache);
+                new Span<float>((float*)_state.HiddenState, n * hiddenSize)
+                    .CopyTo(batched.AsSpan(tokOffset * hiddenSize, n * hiddenSize));
+            }
+            finally
+            {
+                if (r.Adapter is not null) _currentAdapter = null;
+            }
+            tokOffset += n;
+        }
+
+        // Copy the stacked snapshot back into _state.HiddenState so the existing
+        // GemmInterleaved API consumes it from the expected location.
+        batched.AsSpan(0, totalTokens * hiddenSize)
+            .CopyTo(new Span<float>((float*)_state.HiddenState, totalTokens * hiddenSize));
+
+        // One batched lm_head GEMM at seqLen = ΣN_i. _state.Logits is sized for
+        // this by the EnsureCapacity(totalTokens) above.
+        var rwOutput = _weights.RepackedOutput ?? default;
+        GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
+            (float*)_state.HiddenState, (float*)_state.Logits,
+            _weights.OutputOutputDim, _weights.OutputInputDim, totalTokens,
+            null, in rwOutput);
+
+        // Split logits per-seq.
+        var results = new ITensor[requests.Count];
+        int srcOff = 0;
+        float* logitsPtr = (float*)_state.Logits;
+        for (int i = 0; i < requests.Count; i++)
+        {
+            int n = requests[i].TokenIds.Length;
+            var shape = new TensorShape(n, vocabSize);
+            var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+            new Span<float>(logitsPtr + (long)srcOff * vocabSize, n * vocabSize).CopyTo(
+                new Span<float>((void*)tensor.DataPointer, n * vocabSize));
+            results[i] = tensor;
+            srcOff += n;
+        }
+        return results;
+    }
+    finally
+    {
+        pool.Return(batched);
+    }
+}
+```
+
+### Risks + edge cases
+
+- **`EnsureCapacity` shrinkage**: confirm `_state.EnsureCapacity(N)` is
+  grow-only (does not shrink). If not, the per-seq RunLayersAndFinalNormCore
+  loop will shrink the buffer mid-batch. Mitigation: call EnsureCapacity at
+  the start (with totalTokens) and the per-seq calls re-check but won't
+  shrink. Quick read of `Mamba3ForwardScratch.EnsureCapacity` shows it IS
+  grow-only — same pattern should hold in the dense-transformer state. **Verify
+  before merging.**
+- **Adapter handling**: each seq sets/clears `_currentAdapter` independently
+  inside the loop. The lm_head step has no adapter (lm_head is never a
+  LoRA target). No conflict.
+- **MLA layers**: per-seq `_mlaKvState.Reset()` triggers when `positions[0] == 0`.
+  That semantics carries through unchanged via the per-seq call.
+- **Quantized models**: the lm_head uses the same `GemmInterleaved` path. Q8_0
+  / Q4_K / Q5_K / Q6_K weights work identically at seqLen = totalTokens — the
+  GEMM tile loop iterates over the row dimension which is `totalTokens` here.
+- **Empty seq (N_i == 0)**: should never happen (scheduler invariant) but
+  the loop handles it correctly (zero-size copy + zero-size lm_head row).
+- **Memory pressure**: the ArrayPool rental is `totalTokens × hiddenSize × 4`
+  bytes. At hidden=2048, totalTokens=64 that's 512 KB — well within ArrayPool's
+  large-pool capacity. For very large batches it falls back to a fresh allocation,
+  acceptable.
+
+### Parity test surface
+
+New file: `tests/DotLLM.Tests.Unit/Models/Architectures/TransformerModelForwardBatchTests.cs`
+
+Use the existing synthetic safetensors fixture pattern from
+`TransformerModelMlaForwardTests.cs` lines 39-50 (per-test scratch dir,
+clean-up Dispose) but with a tiny GQA model (HiddenSize=16, NumLayers=2,
+NumHeads=2, NumKvHeads=2, VocabSize=8, IntermediateSize=24, no MLA, no
+MoE).
+
+Required tests:
+1. `ForwardBatch_SingleSeq_EqualsForward` — 1-seq batch matches Forward bit-exact.
+2. `ForwardBatch_TwoSeqs_MatchesPerSeqLoop` — 2-seq batch: each seq's logits
+   equal a separate Forward call's logits, bit-exact.
+3. `ForwardBatch_MixedPrefillDecode_MatchesPerSeqLoop` — 1 seq with 4 tokens
+   + 1 seq with 1 token, both with KV caches at non-zero positions.
+4. `ForwardBatch_F32Weights` `_F16Weights` `_Q8_0Weights` — same parity check
+   across the lm_head's main precision paths (only one parametrised test
+   needed, take `Theory(MemberData)` on the weight DType).
+5. `ForwardBatch_LoRAActiveOnOneSeq` — only one of the two sequences passes
+   a LoRA adapter; both produce correct logits.
+
+Tolerance: byte-identical for non-quantized; abs 1e-5 rel 1e-4 for quantized
+(the GEMM tile boundary at the batched lm_head shouldn't drift this, but
+guard with a small envelope just in case).
+
+## Phase 5e — Vulkan dense host (code-level refactor)
+
+Mirror Phase 5a on `src/DotLLM.Vulkan/VulkanTransformerModel.cs`. The
+Vulkan side has a similar structure — a single `Forward` method that
+ends with the lm_head GEMM dispatched via the appropriate matmul kernel.
+
+Key difference: Vulkan kernels already accept arbitrary `[N, hidden]`
+inputs, so the batched lm_head dispatch is mechanical:
+
+```csharp
+public override IReadOnlyList<ITensor> ForwardBatch(...)
+{
+    // 1. Per-seq RunLayersAndFinalNormCore — each writes to its own
+    //    output device buffer (allocate one per seq up front, or stage
+    //    through a shared scratch and copy out per seq).
+    // 2. Stage N device buffers into a single packed [ΣN_i, hidden]
+    //    device buffer (vkCmdCopyBuffer × N).
+    // 3. Single matmul dispatch on the packed buffer.
+    // 4. Read back per-seq slices into per-seq ITensors.
+}
+```
+
+Risk: descriptor-set invalidation across the per-seq RunLayersAndFinalNormCore
+calls. The existing kernels' `InvalidateDescriptorCache` should not fire
+mid-batch (the bound buffers don't change), but verify by reading
+`MatMulF32Kernel.Record` invalidation conditions before coding.
+
+Parity test: mirror Phase 5a tests but for `VulkanTransformerModel`.
+
+## Verification checklist before merging Phase 5a + 5e
+
+- [ ] All existing TransformerModel tests still pass (1426+ unit tests).
+- [ ] All existing Vulkan model tests still pass (559 with Strix Halo
+      kernels green).
+- [ ] New parity tests cover the 5 cases listed above for each backend.
+- [ ] No allocations added to the per-seq hot path (the ArrayPool rental
+      is per-batch, not per-token).
+- [ ] Run `LoraMacroBenchmarks` once with `MaxActiveSequences=1` vs `=4`
+      to quantify the win on this host (it won't be Strix Halo numbers,
+      but a directional check that ForwardBatch isn't slower than the
+      loop on a tiny test model).
