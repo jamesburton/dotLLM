@@ -342,6 +342,22 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
+    /// Returns the effective sliding-window size for <paramref name="layer"/>.
+    /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each entry
+    /// may be null for full attention or a positive int for sliding); otherwise
+    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>.
+    /// Used for Gemma 3's interleaved local/global pattern.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int? GetLayerSlidingWindow(int layer)
+    {
+        var perLayer = Config.PerLayerSlidingWindow;
+        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
+            return perLayer[layer];
+        return _slidingWindowSize;
+    }
+
+    /// <summary>
     /// Embedding lookup + transformer layer loop + final RMSNorm. Leaves the final
     /// hidden state in <c>_state.HiddenState[0..seqLen*hiddenSize]</c>. Used by both
     /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -735,6 +751,18 @@ public sealed unsafe class TransformerModel : IModel
             }
 
             // e. Attention — with or without KV-cache
+            // Gemma 3 family extras (no-op on every other architecture):
+            //  - PerLayerSlidingWindow[layer]: per-layer sliding-window override
+            //    (Gemma 3 interleaves local/global attention).
+            //  - QueryPreAttnScalar: override the default 1/sqrt(headDim) scale.
+            //  - AttnLogitSoftcap: pre-softmax tanh soft-cap (Gemma 2 sets 50.0;
+            //    Gemma 3 leaves null but the plumbing is wired).
+            int? layerSlidingWindow = GetLayerSlidingWindow(layer);
+            float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
+                ? 1.0f / MathF.Sqrt(qpas)
+                : 1.0f / MathF.Sqrt(headDim);
+            float attnSoftCap = Config.AttnLogitSoftcap ?? 0f;
+
             if (kvCache is not null)
             {
                 // Store new K/V in cache, then attend over full cached context (zero allocations)
@@ -750,7 +778,7 @@ public sealed unsafe class TransformerModel : IModel
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                        layerSlidingWindow, attnSoftCap);
                 }
                 else
                 {
@@ -758,15 +786,15 @@ public sealed unsafe class TransformerModel : IModel
                     var cachedV = kvCache.GetValuesRef(layer);
 
                     Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], attnScale,
+                        _threadPool, layerSlidingWindow, attnSoftCap);
                 }
             }
             else
             {
                 Attention.Execute(q, k, v, attnOut,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, _threadPool,
-                    _slidingWindowSize);
+                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, attnScale, _threadPool,
+                    layerSlidingWindow, attnSoftCap);
             }
 
             // f. Batched O projection
@@ -1021,11 +1049,40 @@ public sealed unsafe class TransformerModel : IModel
             hidden, logits, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
             null, in rwOutput);
 
+        // Optional Gemma 2/3 final-logit soft-cap (z' = cap * tanh(z / cap)).
+        // Fires when Config.FinalLogitSoftcap is non-null and positive. Uses
+        // TensorPrimitives.Tanh for the SIMD-accelerated kernel.
+        ApplyFinalLogitSoftcap(logits, (long)seqLen * vocabSize);
+
         var shape = new TensorShape(seqLen, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
         return result;
+    }
+
+    /// <summary>
+    /// Applies <c>z' = cap * tanh(z / cap)</c> in-place over <paramref name="count"/> floats
+    /// at <paramref name="logits"/> when <see cref="ModelConfig.FinalLogitSoftcap"/> is set
+    /// (Gemma 2 / Gemma 3). No-op when the field is null or non-positive. Uses
+    /// <see cref="TensorPrimitives"/> for SIMD-accelerated multiply/tanh.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private unsafe void ApplyFinalLogitSoftcap(float* logits, long count)
+    {
+        if (Config.FinalLogitSoftcap is not float cap || cap <= 0f) return;
+        // Process in <= int.MaxValue chunks (the span constructor is int-bounded).
+        long offset = 0;
+        while (offset < count)
+        {
+            int chunk = (int)Math.Min(count - offset, int.MaxValue);
+            var span = new Span<float>(logits + offset, chunk);
+            float inv = 1.0f / cap;
+            TensorPrimitives.Multiply(span, inv, span);
+            TensorPrimitives.Tanh(span, span);
+            TensorPrimitives.Multiply(span, cap, span);
+            offset += chunk;
+        }
     }
 
     /// <summary>
@@ -1178,6 +1235,10 @@ public sealed unsafe class TransformerModel : IModel
                 (float*)_state.HiddenState, logitsPtr,
                 _weights.OutputOutputDim, _weights.OutputInputDim, totalTokens,
                 null, in rwOutput);
+
+            // Optional Gemma 2/3 final-logit soft-cap over the entire batched logits
+            // block. Same convention as the per-seq path; no-op when not configured.
+            ApplyFinalLogitSoftcap(logitsPtr, (long)totalTokens * vocabSize);
 
             // Split logits per-seq.
             var results = new ITensor[requests.Count];
@@ -1407,19 +1468,24 @@ public sealed unsafe class TransformerModel : IModel
                 kvCache.Update(kRef, vRef, positions, layer);
 
                 int seqKv = kvCache.CurrentLength;
+                int? layerSlidingWindow = GetLayerSlidingWindow(layer);
+                float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
+                    ? 1.0f / MathF.Sqrt(qpas)
+                    : 1.0f / MathF.Sqrt(headDim);
+                float attnSoftCap = Config.AttnLogitSoftcap ?? 0f;
                 if (kvCache is IQuantizedKvCache qkvCache)
                 {
                     Attention.Execute(qSlice, qkvCache, layer, aSlice,
                         n, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                        layerSlidingWindow, attnSoftCap);
                 }
                 else
                 {
                     var cachedK = kvCache.GetKeysRef(layer);
                     var cachedV = kvCache.GetValuesRef(layer);
                     Attention.Execute(qSlice, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, aSlice,
-                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
-                        _slidingWindowSize);
+                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], attnScale,
+                        _threadPool, layerSlidingWindow, attnSoftCap);
                 }
             }
 
