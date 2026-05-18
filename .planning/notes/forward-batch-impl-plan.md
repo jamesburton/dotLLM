@@ -391,6 +391,37 @@ guard with a small envelope just in case).
 
 ## Phase 5e — Vulkan dense host (code-level refactor)
 
+**Finding from the Phase 5a implementation pass (2026-05-18):** Vulkan's
+existing `Forward` is structured *differently* from CPU's Forward —
+the Vulkan path only runs the lm_head GEMM on the LAST token
+(`seqLen=1`) and returns `[1, vocab]`, while CPU runs it for ALL
+positions and returns `[seqLen, vocab]`. See
+`VulkanTransformerModel.cs` lines 1153-1183: the final block copies
+the last hidden row into `_state.NormOutput`, runs RMSNorm on that
+1-row buffer, dispatches `RecordMatmul` with `seqLen: 1`, downloads
+`[vocab]` floats to host.
+
+That changes the Phase 5e win shape: instead of fusing a
+`[Σ N_i, hidden] × [hidden, vocab]` GEMM (which on CPU saves a lot
+because Σ N_i can be hundreds-of-tokens for prefill batches), Vulkan
+would only fuse a `[N, hidden] × [hidden, vocab]` GEMM (one row per
+sequence, since each seq contributes only its last-token hidden).
+
+For typical N ≤ 8 active sequences and vocab ≈ 32k, that's saving
+N-1 small `[1, hidden] × [hidden, vocab]` dispatches. Each costs
+~20-50 µs on Strix Halo (matmul kernel call overhead + per-dispatch
+barriers); total save ~150-350 µs per batch step. Compared to the
+~5-10 ms per-step prefill cost or 12-15 ms per-step decode cost,
+that's noise-floor savings.
+
+**Decision: defer Phase 5e until Phase 5f (intra-block matmul fusion)
+lands.** The intra-block matmuls (Q/K/V/O/gate/up/down) are the real
+Vulkan win for batched scheduling, not the trailing lm_head. The
+default `ForwardBatch` implementation on `IModel` (per-seq Forward
+loop) is correct on Vulkan — just not optimal.
+
+If Phase 5e were to ship in isolation:
+
 Mirror Phase 5a on `src/DotLLM.Vulkan/VulkanTransformerModel.cs`. The
 Vulkan side has a similar structure — a single `Forward` method that
 ends with the lm_head GEMM dispatched via the appropriate matmul kernel.
