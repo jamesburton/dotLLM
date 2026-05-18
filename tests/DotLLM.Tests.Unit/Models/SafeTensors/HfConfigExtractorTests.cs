@@ -627,4 +627,150 @@ public sealed class HfConfigExtractorTests
         // no_rope_layers=[1,0] -> only layer index 1 skips RoPE.
         Assert.Equal(new[] { 1 }, cfg.NoRopeLayers!.ToArray());
     }
+
+    // ───────────────────── Gemma 3 ─────────────────────
+
+    /// <summary>
+    /// Text-only Gemma 3 checkpoint: <c>model_type=gemma3_text</c>,
+    /// <c>architectures[0]=Gemma3TextForCausalLM</c>. Verifies the activation flips to
+    /// <see cref="ActivationFunction.GELUTanh"/>, the four-norm Gemma layout knobs land,
+    /// soft-cap fields propagate, and the per-layer attention-type list follows the
+    /// <c>sliding_window_pattern</c> formula <c>(i + 1) % pattern == 0 ⇒ full</c>.
+    /// </summary>
+    [Fact]
+    public void Gemma3_TextOnly_PopulatesGemmaFields()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3TextForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "intermediate_size": 128,
+            "vocab_size": 256,
+            "max_position_embeddings": 1024,
+            "head_dim": 32,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "sliding_window": 512,
+            "sliding_window_pattern": 3,
+            "query_pre_attn_scalar": 256,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma3, cfg.Architecture);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(NormType.RMSNorm, cfg.NormType);
+        Assert.Equal(512, cfg.SlidingWindowSize);
+        Assert.Equal(50f, cfg.AttnLogitSoftcap);
+        Assert.Equal(30f, cfg.FinalLogitSoftcap);
+        Assert.Equal(256f, cfg.QueryPreAttnScalar);
+        Assert.True(cfg.TiedEmbeddings, "Gemma 3 default ties word embeddings.");
+
+        // Per-layer attention pattern with sliding_window_pattern=3 on 6 layers:
+        // (i+1) % 3 == 0 ⇒ full, else sliding.
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        var perLayer = cfg.PerLayerSlidingWindow!;
+        Assert.Equal(6, perLayer.Count);
+        Assert.Equal(512, perLayer[0]);
+        Assert.Equal(512, perLayer[1]);
+        Assert.Null(perLayer[2]);   // full attention every 3rd layer
+        Assert.Equal(512, perLayer[3]);
+        Assert.Equal(512, perLayer[4]);
+        Assert.Null(perLayer[5]);
+    }
+
+    /// <summary>
+    /// Multimodal Gemma 3 checkpoint (<c>model_type=gemma3</c>,
+    /// <c>architectures[0]=Gemma3ForConditionalGeneration</c>) embeds the text-tower
+    /// config under a <c>text_config</c> sub-object. The extractor must hoist that
+    /// sub-object so subsequent field lookups see the text-tower shape, and the
+    /// architecture still resolves to <see cref="Architecture.Gemma3"/>.
+    /// </summary>
+    [Fact]
+    public void Gemma3_Multimodal_HoistsTextConfig()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "model_type": "gemma3",
+            "text_config": {
+                "model_type": "gemma3_text",
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "intermediate_size": 128,
+                "vocab_size": 1000,
+                "max_position_embeddings": 1024,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1000000.0,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "sliding_window": 1024,
+                "sliding_window_pattern": 2,
+                "query_pre_attn_scalar": 168,
+                "attn_logit_softcapping": null,
+                "final_logit_softcapping": null
+            },
+            "vision_config": { "model_type": "siglip_vision_model" }
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma3, cfg.Architecture);
+        Assert.Equal(32, cfg.HiddenSize);
+        Assert.Equal(2, cfg.NumLayers);
+        Assert.Equal(1000, cfg.VocabSize);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(1024, cfg.SlidingWindowSize);
+        Assert.Null(cfg.AttnLogitSoftcap);     // null in JSON ⇒ null in config
+        Assert.Null(cfg.FinalLogitSoftcap);
+        Assert.Equal(168f, cfg.QueryPreAttnScalar);
+
+        // sliding_window_pattern=2 on 2 layers → [sliding, full]
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(2, cfg.PerLayerSlidingWindow!.Count);
+        Assert.Equal(1024, cfg.PerLayerSlidingWindow[0]);
+        Assert.Null(cfg.PerLayerSlidingWindow[1]);
+    }
+
+    /// <summary>
+    /// Explicit <c>layer_types</c> array overrides the
+    /// <c>sliding_window_pattern</c> formula. Supports HF's newer convention where the
+    /// per-layer pattern is shipped verbatim.
+    /// </summary>
+    [Fact]
+    public void Gemma3_LayerTypesArray_OverridesSlidingWindowPattern()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma3TextForCausalLM"],
+            "model_type": "gemma3_text",
+            "hidden_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 2, "num_key_value_heads": 1,
+            "intermediate_size": 64, "vocab_size": 100,
+            "max_position_embeddings": 512,
+            "sliding_window": 128,
+            "sliding_window_pattern": 6,
+            "layer_types": ["full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(4, cfg.PerLayerSlidingWindow!.Count);
+        Assert.Null(cfg.PerLayerSlidingWindow[0]);    // full
+        Assert.Equal(128, cfg.PerLayerSlidingWindow[1]); // sliding
+        Assert.Null(cfg.PerLayerSlidingWindow[2]);
+        Assert.Equal(128, cfg.PerLayerSlidingWindow[3]);
+    }
 }

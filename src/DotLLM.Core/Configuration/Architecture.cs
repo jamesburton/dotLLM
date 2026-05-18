@@ -142,5 +142,54 @@ public enum Architecture
     /// loading routes through the standard <see cref="Llama"/> safetensors
     /// path with a conditional RoPE per layer.
     /// </summary>
-    SmolLM3
+    SmolLM3,
+
+    /// <summary>
+    /// Google Gemma 3 family. Text-only checkpoints carry
+    /// <c>model_type=gemma3_text</c> + <c>architectures[0]=Gemma3TextForCausalLM</c>;
+    /// multimodal checkpoints carry <c>model_type=gemma3</c> +
+    /// <c>architectures[0]=Gemma3ForConditionalGeneration</c> and house the text-tower
+    /// config under a <c>text_config</c> sub-object (we read only the text tower).
+    /// <para>
+    /// Distinguishing features vs Llama/Mistral/Qwen:
+    /// <list type="bullet">
+    ///   <item><b>GeGLU MLP</b> — gate path uses GELU (tanh approximation, HF
+    ///     <c>hidden_activation=gelu_pytorch_tanh</c>) instead of SiLU; otherwise
+    ///     shape-identical to SwiGLU (<c>down(act(gate(x)) * up(x))</c>).</item>
+    ///   <item><b>RMSNorm <c>(1 + weight)</c> convention</b> — every RMSNorm scales by
+    ///     <c>(1 + w)</c> rather than <c>w</c>. Absorbed at load time by pre-adding
+    ///     <c>1.0</c> to every dequantised norm weight, so the existing kernel runs
+    ///     unchanged.</item>
+    ///   <item><b>Four RMSNorms per layer</b> — <c>input_layernorm</c>,
+    ///     <c>post_attention_layernorm</c>, <c>pre_feedforward_layernorm</c>,
+    ///     <c>post_feedforward_layernorm</c>. The post-attn and post-FFN norms run
+    ///     <i>between</i> the sublayer output and the residual add (Gemma 2 design,
+    ///     retained in Gemma 3).</item>
+    ///   <item><b>Per-head Q/K RMSNorms</b> applied before RoPE (dim = <c>head_dim</c>,
+    ///     identical plumbing to Qwen3 QK-norm).</item>
+    ///   <item><b>Interleaved local/global attention</b> — most layers use
+    ///     sliding-window attention of size <c>sliding_window</c>; every
+    ///     <c>sliding_window_pattern</c>-th layer (1-indexed) uses full attention.
+    ///     Encoded as a per-layer attention-type list on
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.PerLayerSlidingWindow"/>.</item>
+    ///   <item><b>Query-pre-attn scalar</b> — attention score scale is
+    ///     <c>1 / sqrt(query_pre_attn_scalar)</c> instead of the default
+    ///     <c>1 / sqrt(head_dim)</c>.</item>
+    ///   <item><b>Logit soft-capping</b> — optional <c>tanh(z / cap) * cap</c> applied
+    ///     to attention scores (<c>attn_logit_softcapping</c>) and the final LM-head
+    ///     logits (<c>final_logit_softcapping</c>). Gemma 2 sets both (50.0 and 30.0);
+    ///     Gemma 3 leaves them null but the plumbing is wired regardless via
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.AttnLogitSoftcap"/> and
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.FinalLogitSoftcap"/>.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Gemma 4 was not yet public when this enum variant was added (2026-05). The
+    /// implementation is built for Gemma 3 — the latest publicly-shipped Gemma — and
+    /// will forward-port to Gemma 4 cleanly if Google retains the Gemma 2/3 shape. See
+    /// <c>.continue-here-step57.md</c> at the repo root for the assumption trail and
+    /// the upgrade path when Gemma 4 lands.
+    /// </para>
+    /// </summary>
+    Gemma3
 }
