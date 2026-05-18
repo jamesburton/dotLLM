@@ -450,6 +450,7 @@ public static class Program
         Time("PathC_R16_Single", iters: 200, () => bench.PathC_R16_Single());
         Time("PathC2_R16_Dual", iters: 200, () => bench.PathC2_R16_Dual());
         Time("PathBC_R16Interleaved", iters: 200, () => bench.PathBC_R16Interleaved());
+        Time("Q8_0_R4_Reuse_OuterProduct", iters: 200, () => bench.Q8_0_R4_Reuse_OuterProduct());
         Time("S2_GemvPerToken", iters: 200, () => bench.S2_GemvPerToken());
         Time("S2_OuterProduct_R16", iters: 200, () => bench.S2_OuterProduct_R16());
         Console.WriteLine();
