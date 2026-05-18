@@ -454,6 +454,74 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         return result;
     }
 
+    /// <summary>
+    /// Phase 5f mirror — Qwen3MoeHybrid <c>ForwardBatch</c> override. Qwen3MoeHybrid
+    /// has a Gated DeltaNet token-mixing recurrence on most layers (per-token
+    /// associative-memory + conv-state) plus a sparse MoE FFN on every layer; the
+    /// GDN state lives on the model in <see cref="VulkanGdnStateCache"/> as a single
+    /// instance (not per-sequence). Multi-sequence dispatch through one model would
+    /// therefore corrupt the GDN state across sequences, so the override THROWS
+    /// <see cref="NotSupportedException"/> for <c>requests.Count &gt;= 2</c>.
+    /// Empty and single-seq requests are handled (delegating to the existing per-seq
+    /// Forward) so the public API shape matches the dense / NemotronH hosts.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Why no per-layer batched fusion.</b> Every Qwen3MoeHybrid layer is either
+    /// GDN (per-token recurrent state cannot share a dispatch across sequences) or
+    /// a full-attention layer wrapped in MoE FFN (the task's partition rule sends
+    /// any MoE-active layer through the complex / per-seq path). The combination
+    /// means no layer admits the dense host's <c>seqLen = Σ N_i</c> batched fusion
+    /// — every layer-body dispatch must run per-sequence.
+    /// </para>
+    /// <para>
+    /// <b>Why even lm_head fusion needs a follow-up.</b> The lm_head fan-out (the
+    /// Phase 5a CPU stacked-buffer pattern) would be the only fusion target the
+    /// architecture allows, but the GDN single-state container means per-seq
+    /// Forwards inside one model instance corrupt each other's state. Wiring up
+    /// the lm_head fan-out is blocked behind a per-sequence GDN state container
+    /// (similar to <c>VulkanKvCache</c> on the dense host); until that lands, the
+    /// override rejects the unsafe path explicitly. The Mamba-3 host has the same
+    /// shape — see <see cref="VulkanMamba3TransformerModel.ForwardBatch"/> for the
+    /// equivalent rationale.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        // Qwen3MoeHybrid has no LoRA path today — reject adapter-bearing requests up front.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "VulkanQwen3MoeHybridTransformerModel.ForwardBatch does not support LoRA " +
+                    "adapters (no Qwen3MoeHybrid LoRA path today). Re-issue the request without " +
+                    "an adapter.");
+        }
+
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+        }
+
+        // Multi-seq path — see the remarks above. The GDN single-state container plus
+        // the "any MoE-active layer forces complex/per-seq" partition rule means there
+        // is nothing safe to batch here today. Throwing on count >= 2 surfaces the
+        // limitation loudly rather than silently corrupting recurrent state.
+        throw new NotSupportedException(
+            $"VulkanQwen3MoeHybridTransformerModel.ForwardBatch with {requests.Count} requests " +
+            "is not supported today: the model's recurrent VulkanGdnStateCache is single-instance, " +
+            "so looping per-seq Forwards would corrupt GDN state across sequences. Furthermore " +
+            "every layer routes through MoE FFN (per the task partitioning, MoE-active layers " +
+            "force the per-seq complex path) and every GDN layer's scan is per-token recurrent, " +
+            "so no per-layer batched fusion is available either. Schedule Qwen3MoeHybrid " +
+            "sequences serially through Forward until a per-sequence GDN state container lands.");
+    }
+
     // ── Token-mixing path: Gated DeltaNet ────────────────────────────────────
 
     /// <summary>

@@ -131,6 +131,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly int _ropeDim;
     private readonly float _ropeTheta;
 
+    // Phase 5f mirror — ForwardBatch lm_head-only fusion scratch. Lazy-allocated on
+    // first batched call (zero VRAM cost when only Forward is used). Holds a stacked
+    // [N_simple, hidden] post-final-RMSNorm buffer and a [N_simple, vocab] batched
+    // lm_head output. NemotronH's hybrid SSM/GQA layer loop forces per-seq dispatch
+    // (Mamba2 state is per-token recurrent — cross-seq batching would require an
+    // architecture-specific batched-scan kernel); only the terminal lm_head can
+    // sensibly share a dispatch across sequences. See VulkanNemotronHForwardBatchScratch
+    // and ForwardBatch for the data flow.
+    private VulkanNemotronHForwardBatchScratch? _batchScratch;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -451,6 +461,66 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
     {
+        // Public Forward: run the shared core (embedding + layers + final RMSNorm)
+        // into _state.NormOutput offset 0, then dispatch the lm_head + alloc + download
+        // the per-seq logits tensor. ForwardBatch reuses RunForwardCore with a stacked
+        // capture buffer (one slot per simple seq) instead of running per-seq lm_head.
+        RunForwardCore(tokenIds, positions, kvCache,
+            captureLastNormedRowTo: null, captureSlot: 0);
+
+        int vocabSize = Config.VocabSize;
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, _state.Logits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        unsafe
+        {
+            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
+            _device.Download(_state.Logits, dest);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Runs the shared NemotronH forward body (embedding + per-layer SSM/GQA/FFN +
+    /// final RMSNorm on the last token), leaving the post-final-RMSNorm row in
+    /// <see cref="VulkanNemotronHForwardState.NormOutput"/> at offset 0. When
+    /// <paramref name="captureLastNormedRowTo"/> is non-null, the same row is ALSO
+    /// copied via <c>vkCmdCopyBuffer</c> to <c>captureLastNormedRowTo[captureSlot * hidden]</c>
+    /// in the same submit — this is the snapshot the batched lm_head consumes in
+    /// <see cref="ForwardBatch"/>. Submits and waits before returning.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// All per-layer dispatches (SSM scan, GQA attention, FFN) are dispatched per-seq:
+    /// the NemotronH Mamba2 SSM state is per-token recurrent so it cannot be batched
+    /// across sequences without an architecture-specific batched-scan kernel. The
+    /// terminal lm_head IS amenable to fan-out — that's the only fusion target of the
+    /// batched path, mirroring the Phase 5a CPU stacked-buffer pattern.
+    /// </para>
+    /// <para>
+    /// Identical to the previous monolithic <c>Forward</c> body up to (and including)
+    /// the final RMSNorm; the lm_head matmul + tensor allocation + download have been
+    /// hoisted to the caller. The split has no observable effect on Forward semantics
+    /// — the extra submit boundary between the core forward and the per-seq lm_head
+    /// matmul carries only one extra submit/wait (the previous monolithic submit was
+    /// already waited on at end-of-Forward).
+    /// </para>
+    /// </remarks>
+    private void RunForwardCore(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
+        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot)
+    {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
 
@@ -461,7 +531,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
         int headDim = Config.HeadDim;
-        int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
 
         bool scratchResized = _state.EnsureCapacity(seqLen);
@@ -517,7 +586,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        // Final RMSNorm + LM head on the last token only.
+        // Final RMSNorm on the last token only.
         long rowBytes = (long)hiddenSize * sizeof(float);
         long lastRowOffset = (long)(seqLen - 1) * rowBytes;
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
@@ -527,23 +596,169 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: 1, n: hiddenSize, eps: eps);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Optionally snapshot the normed last row into a caller-owned scratch buffer at
+        // the given slot. Used by ForwardBatch to gather every simple seq's last hidden
+        // row into a stacked [N_simple, hidden] scratch before dispatching one batched
+        // lm_head matmul.
+        if (captureLastNormedRowTo is not null)
+        {
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.NormOutput, captureLastNormedRowTo,
+                srcOffset: 0,
+                dstOffset: (ulong)((long)captureSlot * rowBytes),
+                size: (ulong)rowBytes);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+    }
+
+    /// <summary>
+    /// Phase 5f mirror — NemotronH <c>ForwardBatch</c> override. Mirrors the dense
+    /// <see cref="VulkanTransformerModel.ForwardBatch"/> partition / fall-through
+    /// shape but, because the NemotronH hybrid mixes per-token recurrent Mamba2 SSM
+    /// layers with GQA layers, the entire per-layer loop runs per-sequence. Only the
+    /// terminal RMSNorm + lm_head are fused into a single batched dispatch over a
+    /// stacked <c>[N_simple, hidden]</c> buffer — same stacked-buffer pattern as the
+    /// Phase 5a CPU lm_head fusion.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Per the task partitioning: SSM layers go per-seq (state is per-token recurrent);
+    /// GQA layers could in principle batch at <c>seqLen = Σ N_i</c>, but interleaving
+    /// batched/per-seq dispatches across layers would require unpacking/repacking the
+    /// hidden state between layer boundaries — far more LoC than the win justifies for
+    /// the typical 3-7 GQA layers per NemotronH stack. Future work could add an
+    /// architecture-specific batched Mamba2 scan kernel and revisit; today the dense
+    /// host's full layer-loop fusion does not apply here.
+    /// </para>
+    /// <para>
+    /// Complex sequences (LoRA adapter — the NemotronH path does not support LoRA today
+    /// so this is purely defensive — or a non-<see cref="VulkanNemotronHKvCache"/> cache
+    /// type) fall through to the existing per-seq Forward.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        // NemotronH does not currently expose a LoRA-aware Forward overload — the
+        // IModel default 5-arg Forward simply forwards to the 4-arg version, ignoring
+        // any adapter. Reject adapter-bearing requests up front so callers don't get
+        // silently un-adapted logits.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "VulkanNemotronHTransformerModel.ForwardBatch does not support LoRA adapters " +
+                    "(no NemotronH LoRA path today). Re-issue the request without an adapter or via " +
+                    "a host that supports LoRA (VulkanTransformerModel).");
+        }
+
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+        }
+
+        // Partition simple / complex. Simple = KvCache is a VulkanNemotronHKvCache
+        // (or null — uncached SSM-only forwards are accepted by the per-seq path too).
+        var simpleIdx = new List<int>(requests.Count);
+        var complexIdx = new List<int>(requests.Count);
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            bool simple = r.KvCache is VulkanNemotronHKvCache || r.KvCache is null;
+            (simple ? simpleIdx : complexIdx).Add(i);
+        }
+
+        var results = new ITensor[requests.Count];
+
+        // Complex fallback — delegate to per-seq Forward. Today this is only a
+        // non-Vulkan KvCache; the per-seq Forward will throw if it cannot honour
+        // the cache type, identical to the un-batched contract.
+        foreach (int i in complexIdx)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+        }
+
+        // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
+        if (simpleIdx.Count < 2)
+        {
+            foreach (int i in simpleIdx)
+            {
+                var r = requests[i];
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            }
+            return results;
+        }
+
+        ForwardBatchSimpleLmHeadFan(requests, simpleIdx, deviceId, results);
+        return results;
+    }
+
+    /// <summary>
+    /// Inner batched dispatch for the simple sub-batch: per-seq <see cref="RunForwardCore"/>
+    /// with a stacked capture buffer + one batched lm_head matmul over the stacked
+    /// <c>[N_simple, hidden]</c> normed last-row snapshot.
+    /// </summary>
+    private unsafe void ForwardBatchSimpleLmHeadFan(
+        IReadOnlyList<SequenceForwardRequest> requests,
+        List<int> simpleIdx, int deviceId, ITensor[] results)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int simpleCount = simpleIdx.Count;
+
+        // Ensure batch-scratch is large enough. Allocate lazily on first use.
+        _batchScratch ??= new VulkanNemotronHForwardBatchScratch(_device, hiddenSize, vocabSize);
+        bool batchResized = _batchScratch.EnsureCapacity(simpleCount);
+        if (batchResized)
+            InvalidateKernelCaches();
+
+        var lastRowHidden = _batchScratch.LastRowHidden!;
+        var batchedLogits = _batchScratch.BatchedLogits!;
+
+        // Per-seq forward (with the captured-row hook) — every simple seq writes its
+        // post-final-RMSNorm last row into lastRowHidden at its slot index.
+        for (int s = 0; s < simpleCount; s++)
+        {
+            var r = requests[simpleIdx[s]];
+            RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
+                captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+        }
+
+        // Batched lm_head — one matmul over the stacked [N_simple, hidden] capture
+        // buffer producing [N_simple, vocab].
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            lastRowHidden, batchedLogits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: simpleCount);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
-        var shape = new TensorShape(1, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
-        unsafe
+        // Download + split into per-seq [1, vocab] host tensors.
+        int totalLogits = checked(simpleCount * vocabSize);
+        float[] hostBuf = new float[totalLogits];
+        _device.Download(batchedLogits, hostBuf.AsSpan());
+        for (int s = 0; s < simpleCount; s++)
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            int reqIdx = simpleIdx[s];
+            var shape = new TensorShape(1, vocabSize);
+            var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+            var src = hostBuf.AsSpan(s * vocabSize, vocabSize);
+            src.CopyTo(new Span<float>((void*)tensor.DataPointer, vocabSize));
+            results[reqIdx] = tensor;
         }
-        return result;
     }
 
     /// <summary>
@@ -1107,6 +1322,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
+        _batchScratch?.Dispose();
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();

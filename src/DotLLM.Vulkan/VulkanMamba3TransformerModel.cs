@@ -704,26 +704,14 @@ public sealed class VulkanMamba3TransformerModel : IModel
         // called by the caller.
         _recurrent.MarkBoundaryPrimed();
 
-        // 3. FINAL RMSNORM + LM HEAD on last token only.
-        _submit.Begin();
-        cmdBuf = _submit.CommandBuffer;
-
-        long rowBytes = (long)hiddenSize * sizeof(float);
-        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
-        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.LastTokenHidden,
-            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
-
-        _rmsnorm.Record(cmdBuf, _state.LastTokenHidden, _weights.FinalNormWeight, _state.LastTokenHidden,
-            rowCount: 1, n: hiddenSize, eps: eps);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
-
-        RecordMatmul(cmdBuf, _weights.LmHead, _weights.LmHeadDeviceQuantType,
-            _state.LastTokenHidden, _state.Logits,
-            outputDim: _weights.LmHeadOutputDim, inputDim: _weights.LmHeadInputDim, seqLen: 1);
-
-        KernelSupport.ComputeToHostBarrier(cmdBuf);
-        _submit.SubmitAndWait();
+        // 3. FINAL RMSNORM (last token only) — optionally captures the normed row to a
+        //    caller buffer slot for the batched lm_head fan-out. In the per-seq path
+        //    captureLastNormedRowTo is null and the lm_head runs inside this same
+        //    submit; in the batched path Forward is not the caller and this branch
+        //    returns the normed last row in _state.LastTokenHidden for the batched
+        //    lm_head dispatch to consume after the per-seq loop.
+        RunFinalNormAndLmHead(seqLen, hiddenSize, eps,
+            captureLastNormedRowTo: null, captureSlot: 0);
 
         var shape = new TensorShape(1, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
@@ -741,6 +729,141 @@ public sealed class VulkanMamba3TransformerModel : IModel
             throw;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Records the final RMSNorm on the last token's hidden row, then either:
+    /// dispatches the lm_head matmul into <see cref="VulkanMamba3ForwardScratch.Logits"/>
+    /// (the per-seq <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// path — <paramref name="captureLastNormedRowTo"/> is <see langword="null"/>); OR
+    /// copies the post-norm last row into <paramref name="captureLastNormedRowTo"/> at
+    /// the given <paramref name="captureSlot"/> (the <see cref="ForwardBatch"/> path —
+    /// the batched lm_head dispatches once after every simple seq has reported its
+    /// normed row).
+    /// </summary>
+    /// <remarks>
+    /// In both modes this method begins and submits its own command buffer. The previous
+    /// monolithic Forward had a single submit that fused the per-token layer body's
+    /// final out_proj/residual with the final RMSNorm + lm_head; that single submit was
+    /// already followed by a SubmitAndWait at the end of Forward, so splitting out this
+    /// tail into its own submit adds no extra wait per Forward call.
+    /// </remarks>
+    private void RunFinalNormAndLmHead(
+        int seqLen, int hiddenSize, float eps,
+        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot)
+    {
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.LastTokenHidden,
+            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _rmsnorm.Record(cmdBuf, _state.LastTokenHidden, _weights.FinalNormWeight, _state.LastTokenHidden,
+            rowCount: 1, n: hiddenSize, eps: eps);
+
+        if (captureLastNormedRowTo is not null)
+        {
+            // Batched path — snapshot the normed last row into the caller's stacked
+            // [N_simple, hidden] capture buffer at this seq's slot. The batched lm_head
+            // dispatches once after every simple seq has reported.
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.LastTokenHidden, captureLastNormedRowTo,
+                srcOffset: 0,
+                dstOffset: (ulong)((long)captureSlot * rowBytes),
+                size: (ulong)rowBytes);
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+        }
+        else
+        {
+            // Per-seq path — dispatch lm_head directly into _state.Logits, host-readable
+            // for the subsequent _device.Download in the caller.
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            RecordMatmul(cmdBuf, _weights.LmHead, _weights.LmHeadDeviceQuantType,
+                _state.LastTokenHidden, _state.Logits,
+                outputDim: _weights.LmHeadOutputDim, inputDim: _weights.LmHeadInputDim, seqLen: 1);
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+        }
+
+        _submit.SubmitAndWait();
+    }
+
+    /// <summary>
+    /// Phase 5f mirror — Mamba-3 <c>ForwardBatch</c> override. Mamba-3 is a pure SSM
+    /// architecture: every layer is per-token recurrent (data-RoPE + SSD scan +
+    /// chunk-boundary adjustment), and the recurrent state lives on the model as a
+    /// single <see cref="VulkanMamba3State"/> instance — not per-sequence. Running
+    /// multiple sequences through one model instance therefore corrupts the
+    /// recurrent state across sequences; multi-seq batched dispatch is not safe
+    /// today and the override returns <see cref="NotSupportedException"/> for
+    /// <c>requests.Count &gt;= 2</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// For <c>requests.Count == 0</c> we return an empty list (matches IModel
+    /// contract). For <c>requests.Count == 1</c> we delegate to the per-seq
+    /// <c>Forward</c> overload — the override is effectively a no-op for this
+    /// case but is shipped so the public API shape matches the dense and
+    /// NemotronH hosts.
+    /// </para>
+    /// <para>
+    /// <b>Why the multi-seq path throws instead of delegating to per-seq Forward.</b>
+    /// Per-seq Forward writes into <c>_state.HiddenState</c> AND mutates
+    /// <c>_recurrent</c> (ssm_state, cum_angle, k_state, v_state — one set per
+    /// model, not per seq). A naive loop of per-seq Forwards would silently
+    /// thread sequence A's recurrent state into sequence B's scan and produce
+    /// numerically meaningless logits. The unblocking work is a per-seq
+    /// <see cref="VulkanMamba3State"/> container (similar to <c>VulkanKvCache</c>
+    /// on the dense host); once that lands, the captureLastNormedRowTo hook on
+    /// <see cref="RunFinalNormAndLmHead"/> is ready to fan out the lm_head over
+    /// a stacked [N_simple, hidden] buffer in the same way the dense host's
+    /// VulkanForwardBatchScratch does.
+    /// </para>
+    /// <para>
+    /// The CPU Mamba-3 host has the same single-state design and does not
+    /// override <c>ForwardBatch</c> either (default IModel behavior loops per-seq,
+    /// also unsafe across &gt;1 seq — see Phase 5a CPU which only shipped lm_head
+    /// fusion for the dense path). This mirror keeps Vulkan parity with that
+    /// stance: ship the scaffolding, throw with a clear message on the
+    /// unsupported multi-seq path.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        // Reject LoRA adapters — no Mamba-3 Vulkan LoRA path today.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "VulkanMamba3TransformerModel.ForwardBatch does not support LoRA adapters " +
+                    "(no Mamba-3 LoRA path today). Re-issue the request without an adapter.");
+        }
+
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+        }
+
+        // Multi-seq path — see the remarks above. The RunFinalNormAndLmHead capture
+        // hook is ready (RunFinalNormAndLmHead accepts an optional caller-supplied
+        // stacked snapshot buffer + slot), but the per-seq VulkanMamba3State isolation
+        // it would need to be safe is a follow-up. Until that lands, throwing is the
+        // only correct option — silently returning corrupted logits would be far worse
+        // for callers building on top of this API.
+        throw new NotSupportedException(
+            $"VulkanMamba3TransformerModel.ForwardBatch with {requests.Count} requests is not " +
+            "supported today: the model's recurrent VulkanMamba3State is single-instance, so " +
+            "looping per-seq Forwards would corrupt state across sequences. The lm_head fan-out " +
+            "infrastructure (RunFinalNormAndLmHead's captureLastNormedRowTo parameter) is " +
+            "wired and ready for the follow-up that introduces per-sequence recurrent-state " +
+            "isolation; until then, schedule Mamba-3 sequences serially through Forward.");
     }
 
     /// <summary>
