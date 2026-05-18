@@ -1,13 +1,14 @@
 # IQ3 per-host parity — deferred work surfaced by host-level tests
 
 Created: 2026-05-18 (audit H3 follow-up)
-Updated: 2026-05-18 (session 6 — Qwen3MoeHybrid BuildFromPrebuiltWeights shipped)
-Status: All 4 Vulkan transformer hosts have IQ3 upload-path predicates and
-        prebuilt-weights entrypoints in tree; the only remaining gap is the
-        Qwen3MoeHybrid synthetic-fixture builder on the test side. Mamba3,
-        NemotronH, and dense host IQ3 forward tests pass on Strix Halo (12
-        previously-skipping tests now PASS); Qwen3MoeHybrid IQ3 forward tests
-        ship as 4 SkippableFact placeholders pinning the fixture-builder gap.
+Updated: 2026-05-18 (session 6 — Qwen3MoeHybrid IQ3 fixture-builder shipped, audit-H3 fully closed)
+Status: **CLOSED.** All 4 Vulkan transformer hosts have IQ3 upload-path predicates,
+        prebuilt-weights entrypoints, and host-level forward parity tests PASSING
+        on Strix Halo (16 tests total: 12 from session 5 + 4 Qwen3MoeHybrid from
+        session 6). Audit-H3 trap-the-bug discriminator (kernel-level ✓ ≠
+        dispatch-level ✓) is now closed for IQ3 across the entire Vulkan host
+        matrix. Note: this file is retained as a historical record of the
+        4-host audit closure; new IQ-family work should not extend it.
 
 ## Summary
 
@@ -127,15 +128,14 @@ nobody quietly forgets.
 - (2) NemotronH predicates: SHIPPED (session 5).
 - (3) Qwen3MoeHybrid predicates: SHIPPED (session 5).
 - (4) Qwen3MoeHybrid `BuildFromPrebuiltWeights` factory: SHIPPED (session 6).
-- Qwen3MoeHybrid fixture builder (the test-side scaffolding) and asserting
-  parity: 1-2 hours. **← only remaining item.**
+- (5) Qwen3MoeHybrid IQ3 fixture builder + parity assertions: SHIPPED (session 6).
+  All 4 tests pass on Strix Halo at abs 0.15 / rel 0.15 IQ3 envelope; routed
+  MoE banks stay F32 (Vulkan `moe_indexed_matmul` is F32-only); GDN + full-attn
+  layers + lm_head exercise the IQ3 dispatch end-to-end. The dense host pattern
+  + the existing CPU `Qwen3MoeHybridFixtureBuilder` (in
+  `Qwen3MoeHybridTransformerModelTests.cs`) were the structural templates;
+  dimensions bumped to satisfy IQ3's `% 256 == 0` contraction-axis rule
+  (NVHead×DState=256 for GDN OutWeight, NumAttentionHeads×HeadDim=256 for
+  full-attn OWeight).
 
-After session 6 this work is unblocked end-to-end: the fixture builder just
-needs to construct a `Qwen3MoeLayerWeights[]` with caller-allocated unmanaged
-projection pointers (small per-layer hidden + GDN + MoE banks), quantise the
-matmul targets to IQ3 via `Iq3Fixture`, and hand the same arrays to both
-`Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights` (CPU oracle) and
-`VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights` (Vulkan path
-under test). The Mamba3 IQ3 test file is the closest structural template
-(`tests/DotLLM.Tests.Unit/Vulkan/VulkanMamba3TransformerModelIq3ForwardTests.cs`,
-495 LoC), modulo the MoE expert-bank scaffolding which is novel.
+Total: complete. Audit-H3 IQ3 coverage matrix is full.
