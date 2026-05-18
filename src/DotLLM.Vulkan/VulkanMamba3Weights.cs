@@ -420,6 +420,16 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepIq2SOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.IQ2_S && (contractionDim % 256) == 0;
 
+    /// <summary>True iff an IQ3_XXS overlay can be kept on device as raw 98-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq3XxsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ3_XXS && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ3_S overlay can be kept on device as raw 110-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq3SOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ3_S && (contractionDim % 256) == 0;
+
     /// <summary>True iff an IQ1_S overlay can be kept on device as raw 50-byte
     /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
     private static bool KeepIq1SOnDevice(QuantizationType qt, int contractionDim)
@@ -453,6 +463,8 @@ internal sealed class VulkanMamba3Weights : IDisposable
         || KeepIq2XxsOnDevice(qt, contractionDim)
         || KeepIq2XsOnDevice(qt, contractionDim)
         || KeepIq2SOnDevice(qt, contractionDim)
+        || KeepIq3XxsOnDevice(qt, contractionDim)
+        || KeepIq3SOnDevice(qt, contractionDim)
         || KeepIq1SOnDevice(qt, contractionDim)
         || KeepF16OnDevice(qt, contractionDim)
         || KeepBf16OnDevice(qt, contractionDim);
