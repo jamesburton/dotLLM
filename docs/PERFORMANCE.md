@@ -447,6 +447,47 @@ decode at CV 1.2%) is **the most stable measurement in this whole
 document** — it is also the reproducibility benchmark to anchor future
 optimisation passes against.
 
+### 6.4 Vulkan Flash Attention microbench — Strix Halo (2026-05-18)
+
+Captured on the same Strix Halo host as §6.2 / 6.3. Synthetic
+attention-only Vulkan kernel comparison — no model weights involved.
+Head config: 32 query heads / 8 KV heads / head_dim 64 (Llama-3.2-1B
+shape).
+
+Reproduction: `dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- --filter '*VulkanFlashAttention*'`.
+
+| seqQ × seqKv | Naive (per-token) | Flash Attention | **FA speedup** | Notes |
+|---:|---:|---:|---:|---|
+| 512   |    10.26 ms |   7.60 ms | **1.35×** | Short prompt — naive already amortises K-reads |
+| 2048  |   237.52 ms | 115.56 ms | **2.06×** | Mid-range prompt |
+| 4096  | 1,331.32 ms | 489.38 ms | **2.72×** | Long prompt — BR=BC KV-amortisation pays off |
+
+The 1.35→2.06→2.72× scaling is the textbook Flash-Attention pattern:
+the per-query-row K read is amortised across the BR=16 row block, so
+the longer the sequence the more the FA path beats the naive
+attention-per-token kernel.
+
+llama.cpp Vulkan FA on the same host was not measured in this pass.
+The GAIA H2 acceptance metric (dotLLM FA pp512 t/s ≥ 60% of
+llama.cpp FA pp512 t/s) is still outstanding — gating on a llama.cpp
+Vulkan build configured for this Strix Halo host.
+
+### 6.5 Outstanding measurements (2026-05-18 session)
+
+- **`HybridPrefillDecodeBenchmarks` not discovered by BenchmarkSwitcher.** The class compiles
+  cleanly (visible in the .dll metadata), but `BenchmarkSwitcher.FromAssembly.Run(args, …)`
+  with `--filter '*Hybrid*'` returns zero benchmarks and `--list flat` does not include the
+  class. Other BDN-decorated classes in the same file/namespace work fine. Hypothesis
+  (untested): the `[Params(BenchmarkMode.PureVulkan, BenchmarkMode.Hybrid)]` enum-param attribute
+  conflicts with the `[Params(int…)]` adjacent attribute, or a type-load failure during
+  reflection enumeration silently drops the class. Tracked as a follow-up; doesn't block §6
+  but does block the H4 ≥10 % first-32-tokens win acceptance check.
+- **Qwen3.6-A3B GGUF not directly available** on this host — only an
+  Ollama blob (`bartowski/Qwen_Qwen3.5-35B-A3B-GGUF:Q2_K_L`) is cached, and that's the
+  3.5 series, not 3.6. The HANDOFF.json baseline measurements at `docs/perf/baseline-qwen36-a3b-cpu.json`
+  remain the reference point for the production target until a fresh Qwen3.6-A3B GGUF
+  is downloaded.
+
 ### 6.4 Top-3 perf-headroom items (measurement-derived)
 
 For Llama-3.2-1B Q8_0 decode at 12.22 ms/token on Strix Halo Vulkan:
