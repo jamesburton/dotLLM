@@ -337,6 +337,21 @@ public sealed unsafe class TransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
+        RunLayersAndFinalNormCore(tokenIds, positions, kvCache);
+        return RunLmHead(tokenIds.Length, deviceId);
+    }
+
+    /// <summary>
+    /// Embedding lookup + transformer layer loop + final RMSNorm. Leaves the final
+    /// hidden state in <c>_state.HiddenState[0..seqLen*hiddenSize]</c>. Used by both
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// (which then runs the lm_head per call) and <see cref="ForwardBatch"/> (which
+    /// invokes this once per sequence, snapshots each result, then runs ONE batched
+    /// lm_head GEMM on the stacked snapshot).
+    /// </summary>
+    private unsafe void RunLayersAndFinalNormCore(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
         int maxSeq = Config.MaxSequenceLength;
         for (int i = 0; i < positions.Length; i++)
         {
@@ -986,22 +1001,133 @@ public sealed unsafe class TransformerModel : IModel
 
             new Span<float>(normOutT, hiddenSize).CopyTo(new Span<float>(hiddenT, hiddenSize));
         }
+    }
 
-        // 4. LM HEAD — all positions (enables batched speculative decoding verification)
-        {
-            var rwOutput = _weights.RepackedOutput ?? default;
-            GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
-                hidden, logits, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
-                null, in rwOutput);
-        }
+    /// <summary>
+    /// LM head GEMM at <paramref name="seqLen"/> rows. Reads the final hidden state
+    /// from <c>_state.HiddenState[0..seqLen*hiddenSize]</c> (left there by
+    /// <see cref="RunLayersAndFinalNormCore"/>), writes logits into
+    /// <c>_state.Logits</c>, allocates a freshly-owned tensor and copies the logits
+    /// into it. Caller disposes the tensor.
+    /// </summary>
+    private unsafe ITensor RunLmHead(int seqLen, int deviceId)
+    {
+        int vocabSize = Config.VocabSize;
+        float* hidden = (float*)_state.HiddenState;
+        float* logits = (float*)_state.Logits;
 
-        // 5. RETURN [seqLen, vocabSize]
+        var rwOutput = _weights.RepackedOutput ?? default;
+        GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
+            hidden, logits, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
+            null, in rwOutput);
+
         var shape = new TensorShape(seqLen, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         new Span<float>(logits, seqLen * vocabSize).CopyTo(
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
-
         return result;
+    }
+
+    /// <summary>
+    /// Fused forward across multiple in-flight sequences. Each sequence still
+    /// flows through <see cref="RunLayersAndFinalNormCore"/> independently (per-seq
+    /// attention with each cache's own positions / adapters) — the batched-only
+    /// step is the lm_head: per-seq final hidden states are snapshotted into a
+    /// stacked buffer of shape <c>[Σ N_i, hidden]</c> and a single
+    /// <c>GemmInterleaved</c> dispatch produces <c>[Σ N_i, vocab]</c> logits,
+    /// then split back per-seq. This is the throughput win of Phase 5a — the
+    /// lm_head GEMM is the single biggest layer cost at prefill, and one large
+    /// GEMM is materially faster than N small ones on multi-core CPUs.
+    /// </summary>
+    /// <remarks>
+    /// Phase 5a scope: only the lm_head is fused. The intra-block matmuls
+    /// (Q/K/V/O/gate/up/down) still run per-seq through the unchanged layer
+    /// loop. Phase 5b will lift the matmul-fusion. MLA / MoE / per-seq-LoRA
+    /// flow through correctly because the per-seq call uses the standard
+    /// <see cref="RunLayersAndFinalNormCore"/> code path verbatim.
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span,
+                                   deviceId, r0.KvCache, r0.Adapter) };
+        }
+
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int totalTokens = 0;
+        foreach (var r in requests) totalTokens += r.TokenIds.Length;
+
+        _state.EnsureCapacity(totalTokens);
+
+        // Rent a managed snapshot buffer. Per-seq RunLayersAndFinalNormCore calls
+        // all write to _state.HiddenState[0..N_i*hidden] — the next seq's call
+        // would clobber them — so we snapshot each per-seq hidden state out
+        // immediately, then stack snapshots back into _state.HiddenState for
+        // the batched lm_head.
+        var pool = ArrayPool<float>.Shared;
+        float[] batched = pool.Rent(totalTokens * hiddenSize);
+        try
+        {
+            int tokOffset = 0;
+            foreach (var r in requests)
+            {
+                int n = r.TokenIds.Length;
+                if (r.Adapter is not null)
+                {
+                    ValidateAdapterForModel(r.Adapter);
+                    LoraStage2.PrewarmAdapter(r.Adapter as LoraAdapter);
+                    _currentAdapter = r.Adapter;
+                }
+                try
+                {
+                    RunLayersAndFinalNormCore(r.TokenIds.Span, r.Positions.Span, r.KvCache);
+                    new Span<float>((float*)_state.HiddenState, n * hiddenSize)
+                        .CopyTo(batched.AsSpan(tokOffset * hiddenSize, n * hiddenSize));
+                }
+                finally
+                {
+                    if (r.Adapter is not null) _currentAdapter = null;
+                }
+                tokOffset += n;
+            }
+
+            // Stack the per-seq snapshots back into _state.HiddenState, then run
+            // one batched lm_head dispatch at seqLen = Σ N_i.
+            batched.AsSpan(0, totalTokens * hiddenSize)
+                .CopyTo(new Span<float>((float*)_state.HiddenState, totalTokens * hiddenSize));
+
+            float* logitsPtr = (float*)_state.Logits;
+            var rwOutput = _weights.RepackedOutput ?? default;
+            GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
+                (float*)_state.HiddenState, logitsPtr,
+                _weights.OutputOutputDim, _weights.OutputInputDim, totalTokens,
+                null, in rwOutput);
+
+            // Split logits per-seq.
+            var results = new ITensor[requests.Count];
+            int srcOff = 0;
+            for (int i = 0; i < requests.Count; i++)
+            {
+                int n = requests[i].TokenIds.Length;
+                var shape = new TensorShape(n, vocabSize);
+                var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+                new Span<float>(logitsPtr + (long)srcOff * vocabSize, n * vocabSize).CopyTo(
+                    new Span<float>((void*)tensor.DataPointer, n * vocabSize));
+                results[i] = tensor;
+                srcOff += n;
+            }
+            return results;
+        }
+        finally
+        {
+            pool.Return(batched);
+        }
     }
 
     /// <summary>
