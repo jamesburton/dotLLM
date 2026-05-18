@@ -36,8 +36,8 @@ namespace DotLLM.Tests.Unit.Vulkan;
 [Collection("VulkanKernels")]
 public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
 {
-    private const int HiddenSize = 8;
-    private const int VocabSize = 16;
+    internal const int HiddenSize = 8;
+    internal const int VocabSize = 16;
     private const int NumLayers = 2;
     private const int NumHeads = 4;
     private const int HeadDim = 4;              // d_inner = 16
@@ -395,7 +395,7 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
         return copy;
     }
 
-    private static ModelConfig BuildConfig(int numLayers)
+    internal static ModelConfig BuildConfig(int numLayers)
     {
         var m3 = new Mamba3Config
         {
@@ -535,7 +535,7 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
         b.WriteTo(path);
     }
 
-    private static void WriteFixture(string path, int numLayers, int seed)
+    internal static void WriteFixture(string path, int numLayers, int seed)
     {
         // Mean-zero small-amplitude weights — same shape as the CPU forward test fixture
         // (Mamba3TransformerModelTests.WriteSmallWeightFixture) so the Mamba-3 recurrence
