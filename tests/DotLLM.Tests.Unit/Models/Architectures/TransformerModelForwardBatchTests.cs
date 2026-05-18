@@ -213,7 +213,7 @@ public sealed class TransformerModelForwardBatchTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ForwardBatch_EmptyRequests_ReturnsEmpty()
     {
         Skip.IfNot(File.Exists(CachedSmolLmPath), $"SmolLM-135M GGUF not cached at {CachedSmolLmPath}");

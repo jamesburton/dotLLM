@@ -237,8 +237,10 @@ the same SSBO-codebook pattern as IQ2 — the 1 KB `Iq3XxsGrid` and 2 KB
 IQ3 matmul/dequant kernels via `Iq3Codebooks`. CPU dequant + Vulkan
 dequant + GEMV + GEMM are bit-perfect against the ggml-quants.c
 reference (16 parity tests). Upload-path predicates land in
-`VulkanWeights`; per-host matmul dispatch is the follow-up step (see
-`.continue-here-iq3-dispatch.md`).
+`VulkanWeights`; per-host matmul dispatch shipped in commits `07f391f`
+(dense), `48d65fe` (Qwen3MoeHybrid), `146d747` (NemotronH), `ad6b853`
+(Mamba3) — IQ3 now usable end-to-end across all 4 Vulkan transformer
+hosts.
 
 ## Legend
 

@@ -1,9 +1,11 @@
 ---
 topic: LoRA Q8_0 stage-1 — closing the −21% prefill regression (sequential-exploration item 3)
 owner: cpu-perf
-status: research
+status: disconfirmed
 date: 2026-05-17
+closed: 2026-05-18
 target: Strix Halo (AMD Ryzen AI Max+ 395, Zen 5, AVX-512F+BW+DQ+VL+VBMI+VNNI), .NET 10.0.103
+conclusion: See `.planning/notes/lora-q8-stage1-probe-results.md` — Path B3 (R4 reuse) was disconfirmed empirically at the canonical shape. No in-tree fix path remained; productionisation cancelled.
 ---
 
 ## TL;DR

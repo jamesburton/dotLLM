@@ -59,12 +59,15 @@ readonly record struct SequenceForwardRequest
 }
 ```
 
-The default interface implementation loops over `Forward` per request — backends pay the per-sequence kernel-dispatch overhead until they override with a fused implementation. Override candidates:
+The default interface implementation loops over `Forward` per request — backends pay the per-sequence kernel-dispatch overhead until they override with a fused implementation. Current state:
 
-- **CPU**: bundle N sequences into a single GEMM (currently N GEMVs) for matmul-bound layers; attention stays per-sequence because each has its own K/V.
-- **CUDA / Vulkan**: launch one merged kernel with a per-sequence offset table — same Q·K·V GEMM, separate attention scratch regions.
+- **CPU (`TransformerModel.ForwardBatch`)**: shipped. Phase 5a fuses the lm_head GEMM at `seqLen = Σ N_i` (commit `479c23f`); Phase 5b fuses the intra-block matmuls (Q/K/V/O/gate/up/down) across the simple subgroup — GQA non-MLA non-MoE non-LoRA-active (commit `92c1345`, ~2.09× speedup at 4× decode batch on Strix Halo / SmolLM-135M Q8_0). Attention stays per-sequence; complex requests fall through to the per-seq loop.
+- **Vulkan dense host (`VulkanTransformerModel.ForwardBatch`)**: shipped. Phase 5f path-1 — same intra-block matmul fusion pattern; attention dispatches per-seq via slice copy into shared scratch (commit `1c04887`). Phase 5e (lm_head-only fusion) was skipped on Vulkan because Vulkan's lm_head runs only on the last token (seqLen=1, returns `[1, vocab]`), making the saving ~150-350 µs per step — noise-floor.
+- **Vulkan other hosts (Qwen3MoeHybrid / NemotronH / Mamba3)**: still per-seq fallback. ForwardBatch follow-up to mirror Phase 5f's dense-host pattern.
+- **CUDA**: per-seq fallback. Same mirror needed when a CUDA host is available.
+- **Vulkan block-table attention (Phase 5g)**: deferred — vLLM-style single attention kernel reading per-seq block tables.
 
-The acceptance test (`FourConcurrentSchedulerTests`) drives 4 distinct prompts concurrently through the scheduler and verifies each gets its own per-request response — the API contract is in place even when the underlying backend is still using the per-sequence-loop fallback.
+The acceptance test (`FourConcurrentSchedulerTests`) drives 4 distinct prompts concurrently through the scheduler and verifies each gets its own per-request response — the API contract is in place across all backends.
 
 ## Prefill/Decode Separation
 

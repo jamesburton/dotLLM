@@ -79,6 +79,18 @@ Per-shape kernel microbench (dev-laptop iGPU, GQA-4, 32/8 heads, head_dim 64): *
 
 MLA-attention (DeepSeek-V2/V3) keeps `AttentionMlaF32Kernel`; the FA path is GQA-only by design — an MLA FA variant is a separate workstream.
 
+Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S iGPU) measurement at pp512/pp2048/pp4096 with 32/8 heads, head_dim 64: FA speedup is 1.35× / 2.06× / 2.72× — scales with sequence length per the BR=BC K-amortisation prediction. See `docs/PERFORMANCE.md` §6.4.
+
+### Tuning headroom (deferred — workable WG=64 + BR=16 baseline shipped)
+
+Things worth probing on Strix Halo before tile sizes lock in:
+
+- **BR × BC tradeoff.** Current BR=16, BC=64. Larger BR amortises K reads more but bloats `outAccum` and `scoreMatrix` in LDS; current footprint is ~20 KB out of 64 KB, so BR=32 is room available (scoreMatrix grows to 8 KB, outAccum to 16 KB). Worth measuring whether BR=32 / BC=64 beats BR=16 / BC=64 on Strix Halo's specific occupancy / register-pressure profile.
+- **Streamed vs shared K/V.** Current shader streams K and V directly from global in the inner loops — relies on L1/L2 cache locality across the 64 threads (all hit the same tile rows). On RDNA3.5 that should be fine. Loading the K-tile into LDS once per WG would trade LDS for global reads; might help on devices with weaker L1.
+- **Per-row reduction granularity.** When `subgroupSize == WG_SIZE` (Strix Halo case), the `wgRowMax` / `wgRowSum` cross-subgroup combine is dead code — one `subgroupMax` / `subgroupAdd` is the whole reduce. Could specialise via a constant or a second SPV variant; not a meaningful speed win at the current per-tile barrier count, but cleaner.
+- **Q-tile transpose for memory coalescing.** Currently `qTile[r * head_dim + d]` is row-major; threads access `qTile[r][d]` strided by `d` across rows during the score loop, which is irregular. A `[d][r]` layout might give better LDS bank-conflict behaviour. Trace it before changing.
+- **Soft-cap fold into `scale`.** When `softCap > 0` and the raw score is far from saturation, the `tanh` is wasted work; could skip when score magnitude < softCap × 0.5. Marginal.
+
 ## IAttentionStrategy — Kernel Selection
 
 ```

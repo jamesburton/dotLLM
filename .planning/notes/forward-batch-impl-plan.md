@@ -1,9 +1,17 @@
 ---
 topic: IModel.ForwardBatch backend overrides — implementation plan
-status: drafting
+status: phase-5a-5b-5f-shipped
 date: 2026-05-17
+last_updated: 2026-05-18
 sequence_item: 5
-predecessor: .continue-here-scheduler-batched-forward.md
+phase_status:
+  5a: shipped (CPU lm_head fusion, commit 479c23f)
+  5b: shipped (CPU intra-block matmul fusion, commit 92c1345)
+  5e: deferred — noise-floor for Vulkan (lm_head is last-token only)
+  5f: shipped (Vulkan intra-block matmul fusion, dense host, commit 1c04887)
+  5c: deferred (LoRA fusion in batched path)
+  5d: deferred (MLA / MoE in batched path)
+  5g: deferred (Vulkan block-table attention)
 ---
 
 # Forward batch override — implementation plan

@@ -484,11 +484,11 @@ Vulkan build configured for this Strix Halo host.
   but does block the H4 ≥10 % first-32-tokens win acceptance check.
 - **Qwen3.6-A3B GGUF not directly available** on this host — only an
   Ollama blob (`bartowski/Qwen_Qwen3.5-35B-A3B-GGUF:Q2_K_L`) is cached, and that's the
-  3.5 series, not 3.6. The HANDOFF.json baseline measurements at `docs/perf/baseline-qwen36-a3b-cpu.json`
+  3.5 series, not 3.6. The baseline measurements at `docs/perf/baseline-qwen36-a3b-cpu.json`
   remain the reference point for the production target until a fresh Qwen3.6-A3B GGUF
   is downloaded.
 
-### 6.4 Top-3 perf-headroom items (measurement-derived)
+### 6.6 Top-3 perf-headroom items (measurement-derived)
 
 For Llama-3.2-1B Q8_0 decode at 12.22 ms/token on Strix Halo Vulkan:
 
@@ -573,7 +573,7 @@ suggestion:
   experiment can be re-run if the driver, model shapes, or hardware
   change — but no production-path change is warranted on this data.
 
-### 6.5 Reproduction commands
+### 6.7 Reproduction commands
 
 ```powershell
 # Vulkan SmolLM-135M Q8_0
