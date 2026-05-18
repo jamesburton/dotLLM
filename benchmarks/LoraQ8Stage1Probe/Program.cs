@@ -33,6 +33,7 @@ public unsafe class LoraStage1Bench
     private byte* _xQ8;          // [N, K_blocks * 34] Q8_0 (already quantised)
     private byte* _bRowMajor;    // [Rank, K_blocks * 34] Q8_0
     private byte* _bR16;         // [K_blocks, Rank * 34] R16 interleaved Q8_0
+    private byte* _bR4;          // [fullGroups, blockCount, 4 * 34] R4 layout matching the base-model GEMM
     private float* _bF32;        // [Rank, K] F32 dequant scratch (legacy path)
     private float* _xF32;        // [N, K] F32 (only for GemmF32 baseline)
     private float* _tmp;         // [N, Rank] output (stage-1 result)
@@ -71,6 +72,12 @@ public unsafe class LoraStage1Bench
 
         // Build R16-interleaved B layout once (amortised over many LoRA forwards).
         _bR16 = Kernels.RepackR16(_bRowMajor, Rank, _blockCount, _rowBytes);
+
+        // Build R4-grouped B layout once. Lets us route LoRA stage-1 through the
+        // existing MatMul.OuterProductGemmQ8_0 kernel (4 rows × 6 tokens kept
+        // live in 24 ZMM accumulators) with zero new SIMD. Investigation report
+        // .planning/notes/lora-q8-stage1-investigation.md §3 + §7 for rationale.
+        _bR4 = Kernels.RepackR4(_bRowMajor, Rank, _blockCount, _rowBytes);
 
         // Stage-2 fixtures: A [outputDim, rank] F32 and y [N, outputDim] output buffer.
         _aF32 = (float*)NativeMemory.AlignedAlloc((nuint)((long)OutputDim * Rank * sizeof(float)), 64);
@@ -164,6 +171,7 @@ public unsafe class LoraStage1Bench
         if (_xQ8 != null) NativeMemory.AlignedFree(_xQ8);
         if (_bRowMajor != null) NativeMemory.AlignedFree(_bRowMajor);
         if (_bR16 != null) NativeMemory.AlignedFree(_bR16);
+        if (_bR4 != null) NativeMemory.AlignedFree(_bR4);
         if (_tmp != null) NativeMemory.AlignedFree(_tmp);
         if (_aF32 != null) NativeMemory.AlignedFree(_aF32);
         if (_aT != null) NativeMemory.AlignedFree(_aT);
@@ -264,6 +272,21 @@ public unsafe class LoraStage1Bench
     [Benchmark(Description = "PathBC_R16Interleaved")]
     public void PathBC_R16Interleaved()
         => Kernels.Stage1_PathBC_R16Interleaved_Avx512(_xQ8, _bR16, _tmp, N, _blockCount);
+
+    /// <summary>
+    /// Path B3 — re-use the existing <c>MatMul.OuterProductGemmQ8_0</c> kernel
+    /// by repacking B at adapter-load into R4 layout. Zero new SIMD; the
+    /// 4×6 AVX-512 microkernel (24 ZMM accumulators) is what wins on base-model
+    /// prefill. The investigation in .planning/notes/lora-q8-stage1-investigation.md
+    /// argues this should beat row-major B because the per-token B re-reads
+    /// dissolve into a streamed access pattern that Zen 5's prefetcher tracks.
+    /// </summary>
+    [Benchmark(Description = "Q8_0_R4_Reuse_OuterProduct")]
+    public void Q8_0_R4_Reuse_OuterProduct()
+        => MatMul.OuterProductGemmQ8_0(
+            _bR4, _xQ8, _tmp,
+            fullGroups: Rank / 4, tailRows: Rank % 4,
+            blockCount: _blockCount, m: Rank, n: N);
 
     // ─── Stage-2 baselines & candidates ────────────────────────────────────────
     // Stage 2: y[t, o] += scale * sum_r A[o, r] * tmp[t, r]. Geometry: A is

@@ -288,6 +288,37 @@ public static unsafe class Kernels
     // ─────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Repack <paramref name="bRowMajor"/> from <c>[rank, blockCount * 34]</c>
+    /// row-major Q8_0 into the same R4 layout the base-model GEMM uses (see
+    /// <c>WeightRepacking.RepackR4</c> in the production code), so the existing
+    /// <c>MatMul.OuterProductGemmQ8_0</c> kernel can be invoked directly on a
+    /// LoRA-B factor without rewriting any SIMD. Layout: per fullGroups of 4
+    /// rows, per K-block, 4 consecutive Q8_0 blocks (one per row in the group).
+    /// Tail rows (<c>rank % 4</c>) are dropped here — the probe focuses on
+    /// <c>rank=16</c> which is a clean multiple. Productionisation
+    /// (<c>WeightRepacking.RepackR4_Q8_0</c>) will handle tail rows.
+    /// </summary>
+    public static byte* RepackR4(byte* bRowMajor, int rank, int blockCount, int rowBytes)
+    {
+        int fullGroups = rank / 4;
+        long totalBytes = (long)fullGroups * 4 * blockCount * Q8_0Block;
+        byte* dst = (byte*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)totalBytes, 64);
+        int groupBytes = 4 * blockCount * Q8_0Block;
+        for (int g = 0; g < fullGroups; g++)
+        {
+            byte* groupDst = dst + (long)g * groupBytes;
+            for (int b = 0; b < blockCount; b++)
+                for (int r = 0; r < 4; r++)
+                {
+                    byte* src = bRowMajor + (long)(g * 4 + r) * rowBytes + b * Q8_0Block;
+                    byte* d = groupDst + b * 4 * Q8_0Block + r * Q8_0Block;
+                    Buffer.MemoryCopy(src, d, Q8_0Block, Q8_0Block);
+                }
+        }
+        return dst;
+    }
+
+    /// <summary>
     /// Repack <paramref name="bRowMajor"/> from <c>[rank=16, K_blocks * 34]</c>
     /// row-major Q8_0 into <c>[K_blocks, 16 * 34]</c> R16 interleaved.
     /// Allocates the destination via NativeMemory.AlignedAlloc(_, 64); caller
