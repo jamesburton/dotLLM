@@ -354,6 +354,16 @@ internal sealed class VulkanNemotronHWeights : IDisposable
     private static bool KeepIq2SOnDevice(QuantizationType qt, int inputDim)
         => qt == QuantizationType.IQ2_S && (inputDim % 256) == 0;
 
+    /// <summary>True iff an IQ3_XXS source projection can be kept on device as raw
+    /// 98-byte super-blocks — gated on the input dim being a multiple of 256.</summary>
+    private static bool KeepIq3XxsOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.IQ3_XXS && (inputDim % 256) == 0;
+
+    /// <summary>True iff an IQ3_S source projection can be kept on device as raw
+    /// 110-byte super-blocks — gated on the input dim being a multiple of 256.</summary>
+    private static bool KeepIq3SOnDevice(QuantizationType qt, int inputDim)
+        => qt == QuantizationType.IQ3_S && (inputDim % 256) == 0;
+
     /// <summary>True iff an IQ1_S source projection can be kept on device as raw
     /// 50-byte super-blocks — gated on the input dim being a multiple of 256.</summary>
     private static bool KeepIq1SOnDevice(QuantizationType qt, int inputDim)
@@ -386,6 +396,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         || KeepIq2XxsOnDevice(qt, inputDim)
         || KeepIq2XsOnDevice(qt, inputDim)
         || KeepIq2SOnDevice(qt, inputDim)
+        || KeepIq3XxsOnDevice(qt, inputDim)
+        || KeepIq3SOnDevice(qt, inputDim)
         || KeepIq1SOnDevice(qt, inputDim)
         || KeepF16OnDevice(qt, inputDim)
         || KeepBf16OnDevice(qt, inputDim);
@@ -406,6 +418,8 @@ internal sealed class VulkanNemotronHWeights : IDisposable
         if (KeepIq2XxsOnDevice(qt, inputDim)) return QuantizationType.IQ2_XXS;
         if (KeepIq2XsOnDevice(qt, inputDim)) return QuantizationType.IQ2_XS;
         if (KeepIq2SOnDevice(qt, inputDim)) return QuantizationType.IQ2_S;
+        if (KeepIq3XxsOnDevice(qt, inputDim)) return QuantizationType.IQ3_XXS;
+        if (KeepIq3SOnDevice(qt, inputDim)) return QuantizationType.IQ3_S;
         if (KeepIq1SOnDevice(qt, inputDim)) return QuantizationType.IQ1_S;
         if (KeepF16OnDevice(qt, inputDim)) return QuantizationType.F16;
         if (KeepBf16OnDevice(qt, inputDim)) return QuantizationType.BF16;
@@ -439,6 +453,10 @@ internal sealed class VulkanNemotronHWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_XS) * outputDim;
         if (KeepIq2SOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_S) * outputDim;
+        if (KeepIq3XxsOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_XXS) * outputDim;
+        if (KeepIq3SOnDevice(qt, inputDim))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_S) * outputDim;
         if (KeepIq1SOnDevice(qt, inputDim))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ1_S) * outputDim;
         if (KeepF16OnDevice(qt, inputDim))
