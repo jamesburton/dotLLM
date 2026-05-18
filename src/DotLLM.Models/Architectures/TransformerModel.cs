@@ -1029,22 +1029,25 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
-    /// Fused forward across multiple in-flight sequences. Each sequence still
-    /// flows through <see cref="RunLayersAndFinalNormCore"/> independently (per-seq
-    /// attention with each cache's own positions / adapters) — the batched-only
-    /// step is the lm_head: per-seq final hidden states are snapshotted into a
-    /// stacked buffer of shape <c>[Σ N_i, hidden]</c> and a single
-    /// <c>GemmInterleaved</c> dispatch produces <c>[Σ N_i, vocab]</c> logits,
-    /// then split back per-seq. This is the throughput win of Phase 5a — the
-    /// lm_head GEMM is the single biggest layer cost at prefill, and one large
-    /// GEMM is materially faster than N small ones on multi-core CPUs.
+    /// Fused forward across multiple in-flight sequences. Sequences are partitioned
+    /// into a SIMPLE subgroup (GQA / MHA / MQA, no MLA, no MoE, no adapter) and a
+    /// COMPLEX subgroup (any of those features present). The simple subgroup runs
+    /// through <see cref="RunLayersAndFinalNormBatched"/>, which fuses the per-layer
+    /// Q/K/V/O/gate/up/down GEMMs across sequences (one big <c>[Σ N_i, hidden] × W</c>
+    /// dispatch instead of N small ones — the matmul-fusion win this method exists for).
+    /// Complex sequences fall back to a per-seq <see cref="RunLayersAndFinalNormCore"/>
+    /// loop. The lm_head GEMM is fused across the union of both subgroups.
     /// </summary>
     /// <remarks>
-    /// Phase 5a scope: only the lm_head is fused. The intra-block matmuls
-    /// (Q/K/V/O/gate/up/down) still run per-seq through the unchanged layer
-    /// loop. Phase 5b will lift the matmul-fusion. MLA / MoE / per-seq-LoRA
-    /// flow through correctly because the per-seq call uses the standard
-    /// <see cref="RunLayersAndFinalNormCore"/> code path verbatim.
+    /// <para>Phase 5a fused the lm_head only. Phase 5b adds intra-block matmul fusion
+    /// for the simple subgroup. Attention still runs per-seq (each sequence has its
+    /// own KV cache, positions, and position offset) — only the GEMMs at the seam
+    /// of the attention block are fused.</para>
+    /// <para>Parity contract: byte-identical per-element logits vs the per-seq
+    /// <see cref="Forward(System.ReadOnlySpan{int},System.ReadOnlySpan{int},int,IKvCache?)"/>
+    /// loop. Each batched-GEMM output element is an independent dot product over a
+    /// fixed-length contraction axis, so per-row results don't depend on the batched
+    /// row count.</para>
     /// </remarks>
     public IReadOnlyList<ITensor> ForwardBatch(
         IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
@@ -1065,18 +1068,86 @@ public sealed unsafe class TransformerModel : IModel
 
         _state.EnsureCapacity(totalTokens);
 
-        // Rent a managed snapshot buffer. Per-seq RunLayersAndFinalNormCore calls
-        // all write to _state.HiddenState[0..N_i*hidden] — the next seq's call
-        // would clobber them — so we snapshot each per-seq hidden state out
-        // immediately, then stack snapshots back into _state.HiddenState for
-        // the batched lm_head.
+        // Partition into simple (matmul-fused) vs complex (per-seq fallback)
+        // subgroups. The model-level "has complex layer" check is one-shot — if
+        // ANY layer is MLA or MoE, the batched path can't fuse safely (the per-
+        // layer branch executes for every sequence in the batch, so even a
+        // simple-looking sequence would hit the MLA/MoE branch). LoRA adapters
+        // are per-sequence, so each request is judged individually.
+        bool modelHasComplexLayer = ModelHasMlaOrMoeLayer();
+        Span<int> simpleIdxs = requests.Count <= 256
+            ? stackalloc int[requests.Count]
+            : new int[requests.Count];
+        Span<int> complexIdxs = requests.Count <= 256
+            ? stackalloc int[requests.Count]
+            : new int[requests.Count];
+        int simpleCount = 0;
+        int complexCount = 0;
+        int simpleTotalTokens = 0;
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            bool seqComplex = modelHasComplexLayer || r.Adapter is not null;
+            if (seqComplex)
+            {
+                complexIdxs[complexCount++] = i;
+            }
+            else
+            {
+                simpleIdxs[simpleCount++] = i;
+                simpleTotalTokens += r.TokenIds.Length;
+            }
+        }
+
+        // Per-batch snapshot buffer: each per-seq RunLayersAndFinalNormCore call
+        // and the batched simple-subgroup pass all write final hidden states into
+        // _state.HiddenState (overlapping). We copy each seq's slice OUT to its
+        // index-ordered offset in `batched` immediately after producing it, then
+        // copy the whole thing BACK into _state.HiddenState for the batched
+        // lm_head dispatch. The total snapshot footprint is the same as Phase 5a
+        // (totalTokens * hidden * 4 bytes).
         var pool = ArrayPool<float>.Shared;
         float[] batched = pool.Rent(totalTokens * hiddenSize);
         try
         {
-            int tokOffset = 0;
-            foreach (var r in requests)
+            // Per-seq token offsets in the original (caller-supplied) request
+            // order — drives the lm_head logits-split-back step and the per-seq
+            // copy destination in `batched`.
+            Span<int> tokOffsets = requests.Count <= 256
+                ? stackalloc int[requests.Count]
+                : new int[requests.Count];
+            int running = 0;
+            for (int i = 0; i < requests.Count; i++)
             {
+                tokOffsets[i] = running;
+                running += requests[i].TokenIds.Length;
+            }
+
+            // ── Simple subgroup: batched matmul path ────────────────────────
+            // Writes its sequences' final hidden states into _state.HiddenState
+            // packed in the order of `simpleIdxs[0..simpleCount]`. We snapshot
+            // each one out into its original-index offset in `batched`.
+            if (simpleCount > 0)
+            {
+                RunLayersAndFinalNormBatched(requests, simpleIdxs[..simpleCount], simpleTotalTokens);
+
+                int packedOff = 0;
+                float* hidden = (float*)_state.HiddenState;
+                for (int s = 0; s < simpleCount; s++)
+                {
+                    int origIdx = simpleIdxs[s];
+                    int n = requests[origIdx].TokenIds.Length;
+                    new Span<float>(hidden + packedOff * hiddenSize, n * hiddenSize)
+                        .CopyTo(batched.AsSpan(tokOffsets[origIdx] * hiddenSize, n * hiddenSize));
+                    packedOff += n;
+                }
+            }
+
+            // ── Complex subgroup: per-seq fallback (Phase 5a behaviour) ─────
+            for (int c = 0; c < complexCount; c++)
+            {
+                int origIdx = complexIdxs[c];
+                var r = requests[origIdx];
                 int n = r.TokenIds.Length;
                 if (r.Adapter is not null)
                 {
@@ -1088,17 +1159,16 @@ public sealed unsafe class TransformerModel : IModel
                 {
                     RunLayersAndFinalNormCore(r.TokenIds.Span, r.Positions.Span, r.KvCache);
                     new Span<float>((float*)_state.HiddenState, n * hiddenSize)
-                        .CopyTo(batched.AsSpan(tokOffset * hiddenSize, n * hiddenSize));
+                        .CopyTo(batched.AsSpan(tokOffsets[origIdx] * hiddenSize, n * hiddenSize));
                 }
                 finally
                 {
                     if (r.Adapter is not null) _currentAdapter = null;
                 }
-                tokOffset += n;
             }
 
-            // Stack the per-seq snapshots back into _state.HiddenState, then run
-            // one batched lm_head dispatch at seqLen = Σ N_i.
+            // Stack the per-seq snapshots back into _state.HiddenState in original
+            // request order, then run one batched lm_head dispatch at seqLen = Σ N_i.
             batched.AsSpan(0, totalTokens * hiddenSize)
                 .CopyTo(new Span<float>((float*)_state.HiddenState, totalTokens * hiddenSize));
 
@@ -1111,22 +1181,331 @@ public sealed unsafe class TransformerModel : IModel
 
             // Split logits per-seq.
             var results = new ITensor[requests.Count];
-            int srcOff = 0;
             for (int i = 0; i < requests.Count; i++)
             {
                 int n = requests[i].TokenIds.Length;
+                int srcOff = tokOffsets[i];
                 var shape = new TensorShape(n, vocabSize);
                 var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
                 new Span<float>(logitsPtr + (long)srcOff * vocabSize, n * vocabSize).CopyTo(
                     new Span<float>((void*)tensor.DataPointer, n * vocabSize));
                 results[i] = tensor;
-                srcOff += n;
             }
             return results;
         }
         finally
         {
             pool.Return(batched);
+        }
+    }
+
+    /// <summary>
+    /// Returns true when any layer of this model uses MLA (DeepSeek-V2/V3) or
+    /// MoE (Mixtral / Qwen-MoE / DeepSeek-V2/V3). Such layers carry per-layer
+    /// kernels that aren't trivially batchable across sequences in the Phase 5b
+    /// matmul-fused path, so the entire batch falls back to per-seq when this
+    /// returns true.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool ModelHasMlaOrMoeLayer()
+    {
+        var layers = _weights.Layers;
+        for (int i = 0; i < layers.Length; i++)
+        {
+            if (layers[i].Mla is not null || layers[i].Moe is not null) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Phase 5b matmul-fused layer loop for the SIMPLE subgroup (GQA / MHA / MQA,
+    /// no MLA / no MoE / no LoRA adapter). For each transformer layer:
+    /// <list type="number">
+    /// <item>Concat per-seq hidden states into a single <c>[Σ N_i, hidden]</c>
+    ///   batched buffer (residual copy already does this via the packed layout
+    ///   — sequences are stored contiguously in <c>_state.HiddenState</c>).</item>
+    /// <item>One batched RMSNorm over <c>Σ N_i</c> rows.</item>
+    /// <item>One batched QuantizeInput.</item>
+    /// <item>One batched Q/K/V GEMM at <c>[Σ N_i, hidden] × [hidden, dim]</c>.</item>
+    /// <item>Q/K/V outputs are sliced per-seq for RoPE + attention (each seq has
+    ///   independent positions / position offset / KV cache).</item>
+    /// <item>One batched O projection + residual.</item>
+    /// <item>Same pattern for the FFN block (RMSNorm + gate/up GEMM + SwiGLU +
+    ///   down GEMM + residual).</item>
+    /// </list>
+    /// At return, each simple sequence's final hidden state is packed contiguously
+    /// in <c>_state.HiddenState</c> in <paramref name="simpleIdxs"/> order, having
+    /// passed through the final RMSNorm.
+    /// </summary>
+    /// <remarks>
+    /// Parity contract with <see cref="RunLayersAndFinalNormCore"/>: byte-identical
+    /// per-element output. Each batched-GEMM output element is an independent dot
+    /// product over a fixed-length contraction axis, so the FP accumulation order
+    /// (and therefore the per-row result) does NOT depend on whether the GEMM
+    /// processes 1 or <c>Σ N_i</c> rows.
+    /// </remarks>
+    [SkipLocalsInit]
+    private unsafe void RunLayersAndFinalNormBatched(
+        IReadOnlyList<SequenceForwardRequest> requests,
+        ReadOnlySpan<int> simpleIdxs,
+        int simpleTotalTokens)
+    {
+        int maxSeq = Config.MaxSequenceLength;
+        // Validate positions per-seq (mirrors the per-seq core).
+        for (int s = 0; s < simpleIdxs.Length; s++)
+        {
+            var positions = requests[simpleIdxs[s]].Positions.Span;
+            for (int i = 0; i < positions.Length; i++)
+            {
+                if ((uint)positions[i] >= (uint)maxSeq)
+                    throw new ArgumentOutOfRangeException(nameof(requests),
+                        $"Position {positions[i]} at index {i} of sequence {simpleIdxs[s]} exceeds max sequence length {maxSeq}.");
+            }
+        }
+
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int numKvHeads = Config.NumKvHeads;
+        int headDim = Config.HeadDim;
+        int intermediateSize = Config.IntermediateSize;
+        int kvStride = numKvHeads * headDim;
+        int qStride = numHeads * headDim;
+        float eps = Config.NormEpsilon;
+
+        // Total tokens across simple seqs. The caller has already called
+        // EnsureCapacity on _state for at least this much.
+        int total = simpleTotalTokens;
+
+        // EventBased: batched is by definition multi-token (we early-return at
+        // requests.Count==1 above, so simpleCount + complexCount ≥ 2; even with
+        // 4× decode the batched matmul is "prefill-shaped" relative to a 1-token
+        // dispatch). The per-seq fallback path may flip back to SpinWait inside
+        // RunLayersAndFinalNormCore — that's fine, both modes are independent.
+        _threadPool?.SetDispatchMode(DispatchMode.EventBased);
+
+        float* hidden = (float*)_state.HiddenState;
+        float* residual = (float*)_state.Residual;
+        float* normOut = (float*)_state.NormOutput;
+        float* q = (float*)_state.Q;
+        float* k = (float*)_state.K;
+        float* v = (float*)_state.V;
+        float* attnOut = (float*)_state.AttnOutput;
+        float* ffnGate = (float*)_state.FfnGate;
+        float* ffnUp = (float*)_state.FfnUp;
+        float* siluOut = (float*)_state.SiluOutput;
+
+        // Packed per-seq token offsets (into the batched [total, *] buffers).
+        // simpleIdxs[s] gives the caller-supplied request index for sub-seq s,
+        // packedOffsets[s] gives where that seq starts in the batched buffers.
+        Span<int> packedOffsets = simpleIdxs.Length <= 256
+            ? stackalloc int[simpleIdxs.Length]
+            : new int[simpleIdxs.Length];
+        int run = 0;
+        for (int s = 0; s < simpleIdxs.Length; s++)
+        {
+            packedOffsets[s] = run;
+            run += requests[simpleIdxs[s]].TokenIds.Length;
+        }
+
+        // 1. EMBEDDING LOOKUP — pack per-seq directly into the batched buffer.
+        for (int s = 0; s < simpleIdxs.Length; s++)
+        {
+            var r = requests[simpleIdxs[s]];
+            int n = r.TokenIds.Length;
+            EmbeddingLookup(r.TokenIds.Span, hidden + (long)packedOffsets[s] * hiddenSize, hiddenSize);
+        }
+
+        // 2. TRANSFORMER LAYERS
+        var repackedLayers = _weights.RepackedLayers;
+        int numLayers = DebugMaxLayers switch
+        {
+            < 0 => 0,
+            0 => Config.NumLayers,
+            _ => Math.Min(DebugMaxLayers, Config.NumLayers)
+        };
+
+        for (int layer = 0; layer < numLayers; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+            var rl = repackedLayers?[layer];
+
+            byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
+
+            // a. Copy hidden → residual (whole packed buffer).
+            new Span<float>(hidden, total * hiddenSize).CopyTo(new Span<float>(residual, total * hiddenSize));
+
+            // b. Batched RMSNorm: same per-row math as the prefill path of the
+            // unfused loop (each row is an independent normalisation). Loop is
+            // identical to RunLayersAndFinalNormCore's prefill RMSNorm.
+            for (int t = 0; t < total; t++)
+            {
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                    lw.AttnNormWeight, eps,
+                    new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
+            // c. Batched QuantizeInput + Q/K/V projections at n=total.
+            byte* preQuantNorm = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, total, lw.QQuantType);
+
+            var rwQ = rl?.Q ?? default;
+            var rwK = rl?.K ?? default;
+            var rwV = rl?.V ?? default;
+            GemmInterleaved(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, total,
+                preQuantNorm, in rwQ);
+            GemmInterleaved(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, total,
+                IsCompatiblePreQuant(lw.QQuantType, lw.KQuantType) ? preQuantNorm : null, in rwK);
+            GemmInterleaved(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, total,
+                IsCompatiblePreQuant(lw.QQuantType, lw.VQuantType) ? preQuantNorm : null, in rwV);
+
+            // Optional bias (operates over all batched rows uniformly).
+            AddBias(lw.QBias, q, lw.QOutputDim, total);
+            AddBias(lw.KBias, k, lw.KOutputDim, total);
+            AddBias(lw.VBias, v, lw.VOutputDim, total);
+
+            // Optional QK-norms (Qwen3-style) — independently applied per row.
+            if (lw.QNormWeight is not null)
+                ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, total, eps);
+            if (lw.KNormWeight is not null)
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeads, headDim, total, eps);
+
+            // d/e. Per-sequence RoPE + Attention + KV-cache update. The Q/K/V
+            // slices live at packedOffsets[s] in the batched buffers; we hand
+            // each slice and the seq's own positions to the per-seq kernels.
+            // Attention writes its output back into attnOut at the same offset,
+            // re-stacking the post-attention tokens into a single packed buffer
+            // ready for the next batched GEMM (O projection).
+            bool applyRoPE = !Config.IsNoRopeLayer(layer);
+            for (int s = 0; s < simpleIdxs.Length; s++)
+            {
+                int origIdx = simpleIdxs[s];
+                var r = requests[origIdx];
+                int n = r.TokenIds.Length;
+                int off = packedOffsets[s];
+                var positions = r.Positions.Span;
+
+                float* qSlice = q + (long)off * qStride;
+                float* kSlice = k + (long)off * kvStride;
+                float* vSlice = v + (long)off * kvStride;
+                float* aSlice = attnOut + (long)off * qStride;
+
+                if (applyRoPE)
+                {
+                    RoPE.Execute(
+                        new Span<float>(qSlice, n * qStride),
+                        new Span<float>(kSlice, n * kvStride),
+                        positions,
+                        numHeads, numKvHeads, headDim, _ropeDim,
+                        _state.CosTable, _state.SinTable, _ropeType);
+                }
+
+                IKvCache kvCache = r.KvCache;
+                // KV cache is required on the request — write new K/V then attend
+                // over the cached range.
+                var kRef = new TensorRef(n, kvStride, DType.Float32, -1, (nint)kSlice);
+                var vRef = new TensorRef(n, kvStride, DType.Float32, -1, (nint)vSlice);
+                kvCache.Update(kRef, vRef, positions, layer);
+
+                int seqKv = kvCache.CurrentLength;
+                if (kvCache is IQuantizedKvCache qkvCache)
+                {
+                    Attention.Execute(qSlice, qkvCache, layer, aSlice,
+                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                        _slidingWindowSize);
+                }
+                else
+                {
+                    var cachedK = kvCache.GetKeysRef(layer);
+                    var cachedV = kvCache.GetValuesRef(layer);
+                    Attention.Execute(qSlice, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, aSlice,
+                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                        _slidingWindowSize);
+                }
+            }
+
+            // f. Batched O projection: [total, qStride] × [qStride, hidden] → [total, hidden] into normOut.
+            byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, qStride, total, lw.OQuantType);
+            var rwO = rl?.O ?? default;
+            GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, total,
+                preQuantAttn, in rwO);
+            AddBias(lw.OBias, normOut, lw.OOutputDim, total);
+
+            // g. Residual add: hidden ← residual + normOut (all batched rows).
+            for (int t = 0; t < total; t++)
+            {
+                Add.Execute(
+                    new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                    new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            }
+
+            // h. Copy hidden → residual (snapshot for FFN block).
+            new Span<float>(hidden, total * hiddenSize).CopyTo(new Span<float>(residual, total * hiddenSize));
+
+            // i. Batched FFN RMSNorm + Gate/Up + SwiGLU + Down.
+            for (int t = 0; t < total; t++)
+            {
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                    lw.FfnNormWeight, eps,
+                    new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
+            byte* preQuantFfn = QuantizeInput(normOut, inputQ8Scratch, hiddenSize, total, lw.GateQuantType);
+
+            var rwGate = rl?.Gate ?? default;
+            var rwUp = rl?.Up ?? default;
+            GemmInterleaved(lw.GateWeight, lw.GateQuantType, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, total,
+                preQuantFfn, in rwGate);
+            GemmInterleaved(lw.UpWeight, lw.UpQuantType, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, total,
+                IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType) ? preQuantFfn : null, in rwUp);
+
+            AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, total);
+            AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, total);
+
+            // Fused SwiGLU per row.
+            for (int t = 0; t < total; t++)
+            {
+                float* gateT = ffnGate + t * intermediateSize;
+                float* upT = ffnUp + t * intermediateSize;
+                float* siluT = siluOut + t * intermediateSize;
+
+                FusedOps.SwiGLU(
+                    new ReadOnlySpan<float>(gateT, intermediateSize),
+                    new ReadOnlySpan<float>(upT, intermediateSize),
+                    new Span<float>(siluT, intermediateSize));
+            }
+
+            // Batched Down projection: [total, intermediate] × [intermediate, hidden] → [total, hidden] into normOut.
+            byte* preQuantSilu = QuantizeInput(siluOut, inputQ8Scratch, intermediateSize, total, lw.DownQuantType);
+            var rwDown = rl?.Down ?? default;
+            GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, total,
+                preQuantSilu, in rwDown);
+            AddBias(lw.DownBias, normOut, lw.DownOutputDim, total);
+
+            // k. Final residual add.
+            for (int t = 0; t < total; t++)
+            {
+                Add.Execute(
+                    new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                    new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                    new Span<float>(hidden + t * hiddenSize, hiddenSize));
+            }
+        }
+
+        // 3. FINAL NORM (in-place: hidden → hidden) over all batched rows.
+        for (int t = 0; t < total; t++)
+        {
+            float* hiddenT = hidden + t * hiddenSize;
+            float* normOutT = normOut + t * hiddenSize;
+
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(hiddenT, hiddenSize),
+                _weights.OutputNormWeight,
+                eps,
+                new Span<float>(normOutT, hiddenSize));
+
+            new Span<float>(normOutT, hiddenSize).CopyTo(new Span<float>(hiddenT, hiddenSize));
         }
     }
 
