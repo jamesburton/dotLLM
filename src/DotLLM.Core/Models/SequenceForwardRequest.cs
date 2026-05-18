@@ -28,4 +28,13 @@ public readonly record struct SequenceForwardRequest
 
     /// <summary>Optional per-sequence LoRA adapter. <see langword="null"/> for the base model.</summary>
     public ILoraAdapter? Adapter { get; init; }
+
+    /// <summary>
+    /// Optional per-sequence Gated DeltaNet recurrent state. Used only by hosts that
+    /// have GDN layers (currently <c>Qwen3MoeHybrid</c>). <see langword="null"/>
+    /// causes the host to fall back to its model-owned default state container — safe
+    /// for single-sequence dispatch from a freshly-constructed model, unsafe across
+    /// multi-sequence batched dispatch.
+    /// </summary>
+    public IGdnState? GdnState { get; init; }
 }

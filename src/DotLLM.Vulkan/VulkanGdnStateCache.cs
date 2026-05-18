@@ -22,7 +22,7 @@ namespace DotLLM.Vulkan;
 /// per-token <c>vkCmdCopyBuffer</c> writes.
 /// </para>
 /// </remarks>
-internal sealed class VulkanGdnStateCache : IDisposable
+public sealed class VulkanGdnStateCache : IGdnState
 {
     private readonly VulkanDevice _device;
     private readonly int _numGdnLayers;
@@ -49,6 +49,16 @@ internal sealed class VulkanGdnStateCache : IDisposable
     public long AllocatedBytes =>
         (long)_numGdnLayers * (_convStateElements + _gdnStateElements) * sizeof(float);
 
+    /// <summary>
+    /// Allocates per-layer conv-state and gdn-state device buffers, zero-initialised
+    /// via a single staging upload. Buffers are device-local F32.
+    /// </summary>
+    /// <param name="device">Vulkan device on which to allocate.</param>
+    /// <param name="gdn">GDN hyperparameters shared by all GDN layers.</param>
+    /// <param name="numGdnLayers">
+    /// Count of GDN layers (blocks whose <c>HybridLayerKind</c> is
+    /// <see cref="DotLLM.Core.Models.HybridLayerKind.GatedDeltaNet"/>).
+    /// </param>
     public VulkanGdnStateCache(VulkanDevice device, GatedDeltaNetConfig gdn, int numGdnLayers)
     {
         ArgumentNullException.ThrowIfNull(device);
@@ -83,7 +93,7 @@ internal sealed class VulkanGdnStateCache : IDisposable
     }
 
     /// <summary>Returns the conv-state buffer for GDN-layer ordinal <paramref name="ordinal"/>.</summary>
-    public VulkanDevice.Buffer GetConvStateBuffer(int ordinal)
+    internal VulkanDevice.Buffer GetConvStateBuffer(int ordinal)
     {
         ThrowIfDisposed();
         if ((uint)ordinal >= (uint)_numGdnLayers)
@@ -92,7 +102,7 @@ internal sealed class VulkanGdnStateCache : IDisposable
     }
 
     /// <summary>Returns the gdn-state buffer for GDN-layer ordinal <paramref name="ordinal"/>.</summary>
-    public VulkanDevice.Buffer GetGdnStateBuffer(int ordinal)
+    internal VulkanDevice.Buffer GetGdnStateBuffer(int ordinal)
     {
         ThrowIfDisposed();
         if ((uint)ordinal >= (uint)_numGdnLayers)
@@ -127,6 +137,7 @@ internal sealed class VulkanGdnStateCache : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(VulkanGdnStateCache));
     }
 
+    /// <inheritdoc/>
     public void Dispose()
     {
         if (_disposed) return;

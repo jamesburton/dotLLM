@@ -33,7 +33,7 @@ namespace DotLLM.Models.Architectures;
 /// <see cref="GetConvState"/> and <see cref="GetGdnState"/> and mutate them in place.
 /// </para>
 /// </remarks>
-public sealed unsafe class GdnStateCache : IDisposable
+public sealed unsafe class GdnStateCache : IGdnState
 {
     private readonly int _numGdnLayers;
     private readonly int _convStateElements;
