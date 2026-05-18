@@ -1,8 +1,13 @@
 # IQ3 per-host parity — deferred work surfaced by host-level tests
 
 Created: 2026-05-18 (audit H3 follow-up)
-Status: 3 of 4 Vulkan transformer hosts have a missing IQ3 upload-path predicate;
-        all 4 hosts now have host-level forward tests but 3 are skip-gated.
+Updated: 2026-05-18 (session 6 — Qwen3MoeHybrid BuildFromPrebuiltWeights shipped)
+Status: All 4 Vulkan transformer hosts have IQ3 upload-path predicates and
+        prebuilt-weights entrypoints in tree; the only remaining gap is the
+        Qwen3MoeHybrid synthetic-fixture builder on the test side. Mamba3,
+        NemotronH, and dense host IQ3 forward tests pass on Strix Halo (12
+        previously-skipping tests now PASS); Qwen3MoeHybrid IQ3 forward tests
+        ship as 4 SkippableFact placeholders pinning the fixture-builder gap.
 
 ## Summary
 
@@ -81,21 +86,13 @@ predicate is the authoritative reference.
 The Qwen3MoeHybrid IQ3 host test file is skip-gated on a SECOND missing
 piece on top of (3) above:
 
-4. `src/DotLLM.Vulkan/VulkanQwen3MoeHybridTransformerModel.cs` has no
-   `BuildFromPrebuiltWeights` factory — only `BuildFromGguf`. The other 3
-   IQ3 tests use `BuildFromPrebuiltWeights` on both backends to skip the GGUF
-   loader; for Qwen3MoeHybrid we'd need either:
-   - (a) Add a `BuildFromPrebuiltWeights` factory mirroring the dense /
-     NemotronH equivalents (the CPU-side
-     `Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights` already
-     exists). Estimate: 30 lines.
-   - (b) Synthesise an IQ3 GGUF in-test via the existing `GgufTestData`
-     writer. Qwen3MoeHybrid carries 40+ tensors per layer (GDN recurrence
-     + sparse MoE FFN + optional shared expert); the GGUF-writer wiring is
-     substantial. Estimate: half a session.
-
-Path (a) is the clean fix and unblocks Option A or Option B in the task
-statement — recommended.
+4. `src/DotLLM.Vulkan/VulkanQwen3MoeHybridTransformerModel.cs` `BuildFromPrebuiltWeights`
+   factory — **SHIPPED in session 6** (this commit). Mirrors the
+   `VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights` signature and
+   delegates to `VulkanQwen3MoeHybridWeights.Upload` with the caller-owned
+   pointers. Uses `gguf: null, cpuModel: null` — disposal frees only device-side
+   weights, forward scratch, the GDN state cache, and kernels; the caller owns
+   the unmanaged pointers and the `Qwen3MoeLayerWeights[]` array.
 
 ## Re-enabling the skip-gated tests
 
@@ -126,11 +123,19 @@ nobody quietly forgets.
 
 ## Estimated work to clear the deferred bin
 
-- (1) Mamba3 predicates: 15 min.
-- (2) NemotronH predicates: 15 min.
-- (3) Qwen3MoeHybrid predicates: 15 min.
-- (4) Qwen3MoeHybrid `BuildFromPrebuiltWeights` factory: 30 min.
+- (1) Mamba3 predicates: SHIPPED (session 5).
+- (2) NemotronH predicates: SHIPPED (session 5).
+- (3) Qwen3MoeHybrid predicates: SHIPPED (session 5).
+- (4) Qwen3MoeHybrid `BuildFromPrebuiltWeights` factory: SHIPPED (session 6).
 - Qwen3MoeHybrid fixture builder (the test-side scaffolding) and asserting
-  parity: 1-2 hours.
+  parity: 1-2 hours. **← only remaining item.**
 
-Total: half a session to clear all 4 hosts to PASS-or-fail-loud.
+After session 6 this work is unblocked end-to-end: the fixture builder just
+needs to construct a `Qwen3MoeLayerWeights[]` with caller-allocated unmanaged
+projection pointers (small per-layer hidden + GDN + MoE banks), quantise the
+matmul targets to IQ3 via `Iq3Fixture`, and hand the same arrays to both
+`Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights` (CPU oracle) and
+`VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights` (Vulkan path
+under test). The Mamba3 IQ3 test file is the closest structural template
+(`tests/DotLLM.Tests.Unit/Vulkan/VulkanMamba3TransformerModelIq3ForwardTests.cs`,
+495 LoC), modulo the MoE expert-bank scaffolding which is novel.

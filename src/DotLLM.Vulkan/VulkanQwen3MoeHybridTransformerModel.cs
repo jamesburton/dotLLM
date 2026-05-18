@@ -248,6 +248,101 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             ropeDim, ropeTheta);
     }
 
+    /// <summary>
+    /// Builds a Vulkan Qwen3MoeHybrid model from caller-owned, pre-built
+    /// <see cref="Qwen3MoeLayerWeights"/> — used by synthetic-fixture parity tests
+    /// that bypass the GGUF loader. The caller retains ownership of every
+    /// unmanaged pointer (token embed, output, plus every projection inside
+    /// <paramref name="cpuLayers"/>, including routed MoE expert banks).
+    /// </summary>
+    /// <remarks>
+    /// Mirrors the signature of <see cref="VulkanNemotronHTransformerModel"/>'s
+    /// <c>BuildFromPrebuiltWeights</c>. The constructed Vulkan model holds
+    /// <see langword="null"/> for both the <c>gguf</c> and <c>cpuModel</c> slots —
+    /// disposal frees only device-side weights, forward scratch, the GDN state
+    /// cache, and kernels; weight memory belongs to the caller.
+    /// </remarks>
+    internal static VulkanQwen3MoeHybridTransformerModel BuildFromPrebuiltWeights(
+        VulkanDevice device,
+        ModelConfig config,
+        Qwen3MoeLayerWeights[] cpuLayers,
+        float[] outputNormWeight,
+        nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQt,
+        string spvDir)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(cpuLayers);
+        ArgumentNullException.ThrowIfNull(outputNormWeight);
+        ArgumentNullException.ThrowIfNull(spvDir);
+
+        if (config.Architecture != Architecture.Qwen3MoeHybrid)
+            throw new ArgumentException(
+                $"VulkanQwen3MoeHybridTransformerModel requires Architecture.Qwen3MoeHybrid, got {config.Architecture}.",
+                nameof(config));
+        if (config.HybridLayout is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have HybridLayout populated.", nameof(config));
+        if (config.GdnConfig is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have GdnConfig populated.", nameof(config));
+        if (config.Moe is null)
+            throw new ArgumentException("Qwen3MoeHybrid config must have Moe populated.", nameof(config));
+        if (cpuLayers.Length != config.NumLayers)
+            throw new ArgumentException(
+                $"cpuLayers length {cpuLayers.Length} != config.NumLayers {config.NumLayers}.", nameof(cpuLayers));
+
+        var layout = config.HybridLayout!;
+        var gdn = config.GdnConfig!.Value;
+
+        var kvSlotForLayer = new int[config.NumLayers];
+        var gdnLayerOrdinal = new int[config.NumLayers];
+        int attentionLayerCount = 0;
+        int gdnOrdinal = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (layout.LayerKind[i] == HybridLayerKind.Attention)
+            {
+                kvSlotForLayer[i] = attentionLayerCount++;
+                gdnLayerOrdinal[i] = -1;
+            }
+            else
+            {
+                kvSlotForLayer[i] = -1;
+                gdnLayerOrdinal[i] = gdnOrdinal++;
+            }
+        }
+
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        if (attentionLayerCount > 0)
+        {
+            if ((ropeDim & 1) != 0)
+                throw new ArgumentException(
+                    $"Qwen3MoeHybrid rope_dim={ropeDim} must be even for pair-wise rotation.", nameof(config));
+            if (ropeDim > config.HeadDim)
+                throw new ArgumentException(
+                    $"Qwen3MoeHybrid rope_dim={ropeDim} exceeds head_dim={config.HeadDim}.", nameof(config));
+        }
+
+        // Upload token-mixing weights (norm, GDN per-layer, full-attn per-layer,
+        // token embedding, output norm, LM head). Routed MoE banks stay on host
+        // inside cpuLayers[*].Moe and stream per layer in the forward pass — same
+        // policy as BuildFromGguf.
+        var weights = VulkanQwen3MoeHybridWeights.Upload(device, config, cpuLayers, outputNormWeight,
+            tokenEmbedWeight, tokenEmbedQt, outputWeight, outputQt, outputM, outputK);
+
+        var state = new VulkanQwen3MoeHybridForwardState(device, config, gdn, initialSeqLen: 1);
+        var gdnCache = new VulkanGdnStateCache(device, gdn, gdnOrdinal);
+
+        var kernels = VulkanQwen3MoeHybridKernels.Create(device, spvDir);
+
+        return new VulkanQwen3MoeHybridTransformerModel(
+            device, ownsDevice: false,
+            config, gguf: null, cpuModel: null, cpuLayers, weights, state, gdnCache, kernels,
+            kvSlotForLayer, attentionLayerCount, gdnLayerOrdinal,
+            ropeDim, ropeTheta);
+    }
+
     // ── CPU-model accessors (we share the CPU loader; reach into its layers) ─
 
     private static Qwen3MoeLayerWeights[] ExtractCpuLayers(Qwen3MoeHybridTransformerModel m)

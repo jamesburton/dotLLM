@@ -12,52 +12,33 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Status: deferred (Option C from the task statement).</b>
+/// <b>Status: skip-gated on synthetic-fixture scaffolding only.</b> Both upload-path
+/// prerequisites are now in tree (audit-H3 follow-up): the
+/// <c>KeepIq3XxsOnDevice</c> / <c>KeepIq3SOnDevice</c> predicates landed on
+/// <see cref="VulkanQwen3MoeHybridWeights"/> alongside the Mamba3 + NemotronH
+/// hosts, and <see cref="VulkanQwen3MoeHybridTransformerModel"/> now exposes a
+/// <c>BuildFromPrebuiltWeights</c> factory mirroring the
+/// <see cref="VulkanNemotronHTransformerModel"/> equivalent. The remaining gap
+/// is the test-side fixture builder.
 /// </para>
 /// <para>
-/// Two prerequisites are missing for this test to exercise the IQ3 dispatch end-to-end:
+/// Synthesising a Qwen3MoeHybrid IQ3 fixture is non-trivial — layers carry
+/// GDN-recurrence tensors (ssm_a, ssm_alpha, ssm_beta, ssm_conv1d, ssm_dt.bias,
+/// ssm_norm, ssm_out, attn_qkv fused projection, attn_gate) plus a full sparse
+/// MoE FFN (router gate, per-routed-expert W1/W2/W3 banks in 3D-stacked layout,
+/// optional shared-expert branch). Forty-plus tensors per layer; the fixture
+/// builder is the only piece blocking auto-promotion of these tests from skip
+/// to passing.
 /// </para>
-/// <list type="number">
-///   <item>
-///     <description>
-///       <see cref="VulkanQwen3MoeHybridTransformerModel"/> only exposes
-///       <c>BuildFromGguf</c> — there is no <c>BuildFromPrebuiltWeights</c>
-///       entrypoint that the CPU-side <see cref="Qwen3MoeHybridTransformerModel"/>
-///       already has. The Mamba3 / dense / NemotronH IQ3 forward tests in this folder
-///       all use <c>BuildFromPrebuiltWeights</c> on both backends to skip the GGUF
-///       loader. Synthesising a Qwen3MoeHybrid IQ3 GGUF via the existing
-///       <c>GgufTestData</c> writer is non-trivial — Qwen3MoeHybrid layers carry
-///       GDN-recurrence tensors (ssm_a, ssm_alpha, ssm_beta, ssm_conv1d,
-///       ssm_dt.bias, ssm_norm, ssm_out, attn_qkv fused projection, attn_gate)
-///       plus a full sparse MoE FFN (router gate, per-routed-expert W1/W2/W3 banks
-///       in 3D-stacked layout, optional shared-expert branch). Forty-plus tensors
-///       per layer; the GGUF-writer wiring alone is a session of work.
-///     </description>
-///   </item>
-///   <item>
-///     <description>
-///       <see cref="VulkanQwen3MoeHybridWeights"/>'s upload predicate
-///       <c>DeviceQuantTypeFor</c> currently does NOT recognise
-///       <see cref="QuantizationType.IQ3_S"/> or <see cref="QuantizationType.IQ3_XXS"/>
-///       — the same upload-path gap surfaced by the Mamba3 and NemotronH IQ3
-///       forward tests (both Skip-gated for the same reason). Until
-///       <c>KeepIq3XxsOnDevice</c> / <c>KeepIq3SOnDevice</c> predicates are added
-///       to <see cref="VulkanQwen3MoeHybridWeights"/> (mirroring the dense host's
-///       <see cref="VulkanWeights"/>), the IQ3 dispatch arm in
-///       <see cref="VulkanQwen3MoeHybridTransformerModel"/> is unreachable
-///       regardless of what the test feeds it.
-///     </description>
-///   </item>
-/// </list>
 /// <para>
-/// <b>Next step:</b> see <c>.planning/notes/iq3-per-host-parity-deferred.md</c>. The
-/// precise prescription is (1) add the Iq3 keep-on-device predicates to
-/// <see cref="VulkanQwen3MoeHybridWeights"/>; (2) add a
-/// <c>BuildFromPrebuiltWeights</c> factory on
-/// <see cref="VulkanQwen3MoeHybridTransformerModel"/> (a 30-line mirror of the
-/// dense / NemotronH equivalents); (3) flesh out this skip-gated class with an
-/// <c>NemotronH</c>-style fixture builder that quantises every projection in the
-/// fixture to IQ3 via <see cref="Iq3Fixture"/>. Estimate: half a session.
+/// <b>Next step:</b> see <c>.planning/notes/iq3-per-host-parity-deferred.md</c>.
+/// Flesh out this skip-gated class with a <c>NemotronH</c>-style fixture builder
+/// that quantises every matmul-target projection to IQ3 via
+/// <see cref="Iq3Fixture"/>, hands the resulting <see cref="Qwen3MoeLayerWeights"/>
+/// array to both <see cref="Qwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights"/>
+/// and <see cref="VulkanQwen3MoeHybridTransformerModel.BuildFromPrebuiltWeights"/>,
+/// and asserts CPU-vs-Vulkan logit parity at IQ3 tolerance (abs 1e-1 / rel 1e-1).
+/// Estimate: 1-2 hours once a developer is on the Strix Halo host.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -65,14 +46,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 public sealed class VulkanQwen3MoeHybridTransformerModelIq3ForwardTests
 {
     private const string DeferReason =
-        "Qwen3MoeHybrid IQ3 host parity is deferred (audit H3 Option C). " +
-        "Two prerequisites are missing: " +
-        "(1) VulkanQwen3MoeHybridTransformerModel has no BuildFromPrebuiltWeights factory " +
-        "(only BuildFromGguf), and a synthetic IQ3 GGUF for the hybrid 40+-tensor-per-layer " +
-        "layout is half a session of GGUF-writer scaffolding; " +
-        "(2) VulkanQwen3MoeHybridWeights.DeviceQuantTypeFor does not yet list IQ3_S / IQ3_XXS, " +
-        "so the IQ3 dispatch arm wired in commit 48d65fe is unreachable until the upload-path " +
-        "predicate is added (mirroring the dense host's VulkanWeights). " +
+        "Qwen3MoeHybrid IQ3 host parity: both upload-path prerequisites now in tree " +
+        "(KeepIq3* predicates on VulkanQwen3MoeHybridWeights + BuildFromPrebuiltWeights " +
+        "factory on VulkanQwen3MoeHybridTransformerModel). The remaining gap is the " +
+        "test-side synthetic-fixture builder for the hybrid 40+-tensor-per-layer layout " +
+        "(GDN recurrence + sparse MoE FFN). " +
         "See .planning/notes/iq3-per-host-parity-deferred.md for the concrete next-step.";
 
     [SkippableFact]
