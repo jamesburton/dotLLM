@@ -1,3 +1,5 @@
+using System.Numerics.Tensors;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -760,26 +762,63 @@ public sealed class VulkanTransformerModel : IModel
     /// the prefill regime (seqQ &gt; 1); falls back to the legacy per-token
     /// kernel for decode (seqQ == 1). Decode keeps the legacy path because
     /// Flash-Attention's amortisation factor only kicks in across multiple
-    /// Q-rows.
+    /// Q-rows. Both paths now honour the Gemma-2/3 <paramref name="softCap"/>
+    /// and the Gemma-3 <paramref name="scaleOverride"/> (QPAS) — see
+    /// <c>attention_f32.comp</c> / <c>attention_flash_f32.comp</c> for the
+    /// shared push-constant layout.
     /// </summary>
     private void RecordAttention(
         nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset, int slidingWindow)
+        int positionOffset, int slidingWindow,
+        float softCap = 0.0f, float scaleOverride = 0.0f)
     {
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-                positionOffset: positionOffset, slidingWindow: slidingWindow);
+                positionOffset: positionOffset, slidingWindow: slidingWindow,
+                softCap: softCap, scaleOverride: scaleOverride);
             return;
         }
         _attention.Record(cmdBuf, q, k, v, output,
             seqQ: seqQ, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-            positionOffset: positionOffset, slidingWindow: slidingWindow);
+            positionOffset: positionOffset, slidingWindow: slidingWindow,
+            softCap: softCap, scaleOverride: scaleOverride);
+    }
+
+    /// <summary>
+    /// Returns the effective sliding-window size for <paramref name="layer"/>.
+    /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each
+    /// entry may be null for full attention or a positive int for sliding);
+    /// otherwise falls back to the model-wide <see cref="_slidingWindow"/>.
+    /// Used for Gemma 3's interleaved local/global pattern. Mirrors the CPU
+    /// <c>TransformerModel.GetLayerSlidingWindow</c> helper.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetLayerSlidingWindow(int layer)
+    {
+        var perLayer = Config.PerLayerSlidingWindow;
+        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
+            return perLayer[layer] ?? 0;
+        return _slidingWindow;
+    }
+
+    /// <summary>
+    /// Returns the effective <c>scaleOverride</c> push-constant value for the
+    /// attention dispatch. <c>0</c> = use the shader default <c>1/sqrt(headDim)</c>;
+    /// when <see cref="ModelConfig.QueryPreAttnScalar"/> is set (Gemma 3),
+    /// returns <c>1/sqrt(QPAS)</c> so the shader uses Gemma's alternative scale.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private float GetAttentionScaleOverride()
+    {
+        return Config.QueryPreAttnScalar is float qpas && qpas > 0.0f
+            ? 1.0f / MathF.Sqrt(qpas)
+            : 0.0f;
     }
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
@@ -1203,14 +1242,20 @@ public sealed class VulkanTransformerModel : IModel
                 // cache K/V (compute, just-written by vkCmdCopyBuffer = TRANSFER).
                 KernelSupport.TransferToComputeBarrier(cmdBuf);
 
-                // (3) Attention dispatch.
+                // (3) Attention dispatch — honour Gemma-3 per-layer sliding,
+                // attn soft-cap, and query-pre-attn scalar (no-op on every
+                // other architecture).
                 int seqKv = vkCache.CurrentLength;
                 int positionOffset = basePos;
+                int layerSlidingWindow = GetLayerSlidingWindow(layer);
+                float attnScaleOverride = GetAttentionScaleOverride();
+                float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
                 RecordAttention(cmdBuf, perSeqQ, vkCache.GetKeysBuffer(layer), vkCache.GetValuesBuffer(layer),
                     perSeqAttn,
                     seqQ: nS, seqKv: seqKv,
                     numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-                    positionOffset: positionOffset, slidingWindow: _slidingWindow);
+                    positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
+                    softCap: attnSoftCap, scaleOverride: attnScaleOverride);
                 KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
                 // (4) Copy PerSeqAttn back into _state.AttnOutput at this seq's offset.
@@ -1324,6 +1369,9 @@ public sealed class VulkanTransformerModel : IModel
             int totalLogits = checked(simpleCount * vocabSize);
             float[] hostBuf = new float[totalLogits];
             _device.Download(batchedLogits, hostBuf.AsSpan());
+            // Gemma 2/3 final-logit soft-cap over the full batched block.
+            // No-op when Config.FinalLogitSoftcap is null.
+            ApplyFinalLogitSoftcapHost(hostBuf.AsSpan(0, totalLogits));
             for (int s = 0; s < simpleCount; s++)
             {
                 int reqIdx = simpleIdx[s];
@@ -1499,10 +1547,24 @@ public sealed class VulkanTransformerModel : IModel
                 positionOffset = 0;
             }
 
+            // Gemma 3 family extras (no-op on every other architecture):
+            //  - PerLayerSlidingWindow[layer]: per-layer override for the
+            //    interleaved local/global pattern (e.g. layers 0,2 sliding,
+            //    1,3 full). Resolved via GetLayerSlidingWindow.
+            //  - QueryPreAttnScalar: optional override of the default
+            //    1/sqrt(headDim) attention scale, passed via the shader's
+            //    scaleOverride push constant.
+            //  - AttnLogitSoftcap: pre-softmax tanh soft-cap (Gemma 2 sets
+            //    50.0; Gemma 3 leaves it null). Forwarded via the shader's
+            //    softCap push constant.
+            int layerSlidingWindow = GetLayerSlidingWindow(layer);
+            float attnScaleOverride = GetAttentionScaleOverride();
+            float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-                positionOffset: positionOffset, slidingWindow: _slidingWindow);
+                positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
+                softCap: attnSoftCap, scaleOverride: attnScaleOverride);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Output projection → NormOutput (reuse slot).
@@ -1656,8 +1718,30 @@ public sealed class VulkanTransformerModel : IModel
         {
             var dest = new Span<float>((void*)result.DataPointer, vocabSize);
             _device.Download(_state.Logits, dest);
+            // Gemma 2/3 final-logit soft-cap: z' = cap * tanh(z / cap). The
+            // lm_head download already brings logits to host, so this is the
+            // cheaper option vs an extra device-side dispatch + readback.
+            // Mirrors the CPU TransformerModel.ApplyFinalLogitSoftcap; no-op
+            // when Config.FinalLogitSoftcap is null or non-positive.
+            ApplyFinalLogitSoftcapHost(dest);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Host-side Gemma 2/3 final-logit soft-cap: <c>z' = cap * tanh(z / cap)</c>
+    /// in-place. Uses <see cref="TensorPrimitives.Tanh"/> for the SIMD path.
+    /// No-op when <see cref="ModelConfig.FinalLogitSoftcap"/> is null or
+    /// non-positive. Mirrors <c>TransformerModel.ApplyFinalLogitSoftcap</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ApplyFinalLogitSoftcapHost(Span<float> logits)
+    {
+        if (Config.FinalLogitSoftcap is not float cap || cap <= 0.0f) return;
+        float inv = 1.0f / cap;
+        TensorPrimitives.Multiply(logits, inv, logits);
+        TensorPrimitives.Tanh(logits, logits);
+        TensorPrimitives.Multiply(logits, cap, logits);
     }
 
     private void InvalidateKernelCaches()

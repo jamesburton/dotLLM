@@ -46,7 +46,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
 
     private const int WorkgroupSize = KvTileCols;
 
-    // 8 uints + 1 float + 3 uint padding (= 12 * 4 = 48 bytes).
+    // 8 uints + 2 floats (softCap, scaleOverride) + 2 uint padding (= 12 * 4 = 48 bytes).
     private const int PushConstantBytes = 12 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -136,12 +136,13 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
     public void Launch(
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false, float softCap = 0.0f)
+        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
+        float softCap = 0.0f, float scaleOverride = 0.0f)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-               positionOffset, slidingWindow, useAlibi, softCap);
+               positionOffset, slidingWindow, useAlibi, softCap, scaleOverride);
         ctx.SubmitAndWait();
     }
 
@@ -155,7 +156,8 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false, float softCap = 0.0f)
+        int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
+        float softCap = 0.0f, float scaleOverride = 0.0f)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -174,6 +176,8 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         if (slidingWindow < 0) throw new ArgumentOutOfRangeException(nameof(slidingWindow));
         if (softCap < 0.0f) throw new ArgumentOutOfRangeException(nameof(softCap),
             "softCap must be non-negative (use 0 to disable).");
+        if (scaleOverride < 0.0f) throw new ArgumentOutOfRangeException(nameof(scaleOverride),
+            "scaleOverride must be non-negative (use 0 for the default 1/sqrt(headDim)).");
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
         long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
@@ -194,7 +198,8 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         // Push-constant layout (matches the shader's PushConstants block):
         //   [0] seqQ, [1] seqKv, [2] numHeads, [3] numKvHeads,
         //   [4] headDim, [5] positionOffset, [6] slidingWindow, [7] useAlibi,
-        //   [8] softCap (float, reinterpreted), [9..11] padding for std140 alignment.
+        //   [8] softCap (float, reinterpreted), [9] scaleOverride (float, reinterpreted),
+        //   [10..11] padding for std140 alignment.
         Span<uint> pc = stackalloc uint[12];
         pc[0]  = (uint)seqQ;
         pc[1]  = (uint)seqKv;
@@ -205,7 +210,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         pc[6]  = (uint)slidingWindow;
         pc[7]  = useAlibi ? 1u : 0u;
         pc[8]  = BitConverter.SingleToUInt32Bits(softCap);
-        pc[9]  = 0u;
+        pc[9]  = BitConverter.SingleToUInt32Bits(scaleOverride);
         pc[10] = 0u;
         pc[11] = 0u;
         fixed (uint* pcPtr = pc)

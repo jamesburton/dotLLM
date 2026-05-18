@@ -42,6 +42,10 @@ layout(push_constant) uniform PushConstants {
     uint positionOffset;
     uint slidingWindow;   // 0 = disabled
     uint useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
+    float softCap;        // 0.0 = disabled, >0 = softCap * tanh(s / softCap) before softmax (Gemma 2/3)
+    float scaleOverride;  // 0.0 = use 1/sqrt(headDim), >0 = override (Gemma 3 QPAS)
+    uint _pad0;
+    uint _pad1;
 } pc;
 
 shared float qShared[MAX_HEAD_DIM];
@@ -126,7 +130,7 @@ void main() {
     uint kvStride = pc.numKvHeads * pc.headDim;
 
     uint posQ = pc.positionOffset + tq;
-    float scale = inversesqrt(float(pc.headDim));
+    float scale = (pc.scaleOverride > 0.0) ? pc.scaleOverride : inversesqrt(float(pc.headDim));
     float slope = (pc.useAlibi != 0u) ? alibiSlope(hq, pc.numHeads) : 0.0;
 
     uint qBase = tq * qStride + hq * pc.headDim;
@@ -163,7 +167,11 @@ void main() {
             for (uint d = 0u; d < pc.headDim; d++) {
                 s += qShared[d] * k[kBase + d];
             }
-            scoreTile[t] = s * scale - slope * float(posQ - tkv);
+            float score = s * scale - slope * float(posQ - tkv);
+            if (pc.softCap > 0.0) {
+                score = pc.softCap * tanh(score / pc.softCap);
+            }
+            scoreTile[t] = score;
         }
         barrier();
 
