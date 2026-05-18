@@ -48,7 +48,12 @@ namespace DotLLM.Benchmarks;
 /// </para>
 /// </remarks>
 [SimpleJob(warmupCount: 1, iterationCount: 3)]
-public sealed class HybridPrefillDecodeBenchmarks
+// NOTE: Cannot be `sealed` — BenchmarkDotNet's BenchmarkConverter silently filters out
+// sealed classes during discovery because its runtime toolchains (in-process Emit
+// included) generate a subclass per benchmark case via Reflection.Emit. With `sealed`
+// the type is unsubclassable and BDN drops it without diagnostic. See
+// `.planning/notes/bdn-discovery-skip-finding.md`.
+public class HybridPrefillDecodeBenchmarks
 {
     private const string DefaultModelRepo = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF";
     private const string DefaultModelFile = "tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
