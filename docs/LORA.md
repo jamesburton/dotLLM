@@ -476,6 +476,35 @@ dotnet run -c Release --project benchmarks/DotLLM.Benchmarks `
 Metrics are written to `%TEMP%/dotllm-bdn-metrics/Lora_*.json`; the BDN
 summary table surfaces the median values via the custom `Prefill tok/s`
 and `Decode tok/s` columns.
+
+### Phase 4d.7 — Path B3 probe and disconfirmation (2026-05-17/18)
+
+Stage 1 of the LoRA-B Q8_0 path (commit `dd2892f`) probed **Path B3**:
+reuse `OuterProductGemmQ8_0`'s R4-tiled microkernel for the LoRA stage-1
+GEMM. The hypothesis was that the R4 reuse would close the residual
+~−16% Q8_0 LoRA prefill gap left after Phase 4d.6 (the outer-product
+stage-2 fast path).
+
+**Verdict: disconfirmed.** At the canonical shape (M=hidden, K=rank=16),
+Path B3 measured ~840 µs vs the ≤470 µs acceptance bar — wider than the
+existing `MatMul.GemmQ8_0` dispatch. The R4 microkernel's amortisation
+window is too long for the typical LoRA rank, and no in-tree alternative
+narrows the gap further without an upstream `Avx512Vnni.V512` PR (tracked
+passively at https://github.com/dotnet/runtime/issues/86849).
+
+The probe artefacts live at:
+
+- `.planning/notes/lora-q8-stage1-probe-results.md` — measurements,
+  shape-sweep, conclusion (`status: negative_result_B3`).
+- `.planning/notes/lora-q8-stage1-investigation.md` — superseding
+  conclusion (`status: disconfirmed`).
+
+Stage 1 productionisation is cancelled — the residual −16% LoRA Q8_0
+prefill gap is now bounded above by what an `Avx512Vnni.V512` lane width
+upgrade would buy (~5-10pt by historical pattern), so the path to closing
+it sits in `dotnet/runtime`, not in tree. Stage 2 (outer-product, Phase
+4d.6) and the Vulkan fused-delta path remain the active accelerators.
+
 ## Vulkan Backend — Fused Delta Path
 
 The Vulkan backend ships a fused LoRA-delta GEMV (`LoraDeltaGemvFusedF32Kernel`,
