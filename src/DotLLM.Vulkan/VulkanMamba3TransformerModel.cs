@@ -422,12 +422,67 @@ public sealed class VulkanMamba3TransformerModel : IModel
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
-        => Forward(tokenIds, positions, deviceId, kvCache: null);
+        => Forward(tokenIds, positions, deviceId, kvCache: null, mambaState: null);
 
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, mambaState: null);
+
+    /// <summary>
+    /// Creates a fresh per-sequence <see cref="VulkanMamba3State"/> sized for this
+    /// model. The scheduler / multi-seq dispatcher should allocate one of these per
+    /// active sequence and pass it via <see cref="SequenceForwardRequest.MambaState"/>;
+    /// without that, multi-seq dispatch leaks recurrent state across sequences.
+    /// </summary>
+    public VulkanMamba3State CreateMambaState() => new(_device, Config);
+
+    /// <summary>
+    /// Runs a forward pass with an optional caller-supplied per-sequence
+    /// <see cref="VulkanMamba3State"/>. When <paramref name="mambaState"/> is
+    /// <see langword="null"/>, falls back to the model-owned default container —
+    /// safe only for single-sequence dispatch from a freshly-constructed model.
+    /// Multi-seq batched dispatch via <see cref="ForwardBatch"/> supplies a fresh
+    /// per-seq <see cref="VulkanMamba3State"/> for each request to keep recurrent
+    /// state isolated.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <param name="kvCache">Unused — Mamba-3 maintains an SSM state, not a KV-cache.</param>
+    /// <param name="mambaState">
+    /// Optional per-seq Mamba-3 recurrent state. Must be a
+    /// <see cref="VulkanMamba3State"/> sized for this model.
+    /// </param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                           IKvCache? kvCache, IMambaState? mambaState)
     {
         _ = kvCache; // Mamba-3 uses SSM state, not KV cache.
+
+        // Resolve per-seq recurrent container; model-owned _recurrent is the
+        // backwards-compat fallback for single-seq Forward callers.
+        VulkanMamba3State recurrent;
+        if (mambaState is null)
+        {
+            recurrent = _recurrent;
+        }
+        else if (mambaState is VulkanMamba3State vk)
+        {
+            if (vk.NumLayers != _recurrent.NumLayers)
+                throw new ArgumentException(
+                    $"MambaState NumLayers ({vk.NumLayers}) does not match model layer count ({_recurrent.NumLayers}).",
+                    nameof(mambaState));
+            if (vk.KStateRank != _recurrent.KStateRank)
+                throw new ArgumentException(
+                    $"MambaState KStateRank ({vk.KStateRank}) does not match model KStateRank ({_recurrent.KStateRank}).",
+                    nameof(mambaState));
+            recurrent = vk;
+        }
+        else
+        {
+            throw new ArgumentException(
+                $"VulkanMamba3TransformerModel requires a VulkanMamba3State; got {mambaState.GetType().Name}.",
+                nameof(mambaState));
+        }
 
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
@@ -540,7 +595,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
             // is already primed by a prior Forward (HasBoundary == true). On the first
             // chunk of a sequence we skip both — matches the CPU oracle's empty-span
             // short-circuit in Mamba3Block.ApplyChunkBoundaryAdjustment.
-            bool runBoundary = _recurrent.HasBoundary;
+            bool runBoundary = recurrent.HasBoundary;
             if (runBoundary)
             {
                 for (int h = 0; h < nHead; h++)
@@ -553,10 +608,10 @@ public sealed class VulkanMamba3TransformerModel : IModel
             cmdBuf = _submit.CommandBuffer;
             KernelSupport.HostToComputeBarrier(cmdBuf);
 
-            VulkanDevice.Buffer cumAngle = _recurrent.GetCumAngleBuffer(layer);
-            VulkanDevice.Buffer ssmState = _recurrent.GetSsmStateBuffer(layer);
-            VulkanDevice.Buffer kState = _recurrent.GetKStateBuffer(layer);
-            VulkanDevice.Buffer vState = _recurrent.GetVStateBuffer(layer);
+            VulkanDevice.Buffer cumAngle = recurrent.GetCumAngleBuffer(layer);
+            VulkanDevice.Buffer ssmState = recurrent.GetSsmStateBuffer(layer);
+            VulkanDevice.Buffer kState = recurrent.GetKStateBuffer(layer);
+            VulkanDevice.Buffer vState = recurrent.GetVStateBuffer(layer);
 
             // data-RoPE: B and C are mutated in place (post-RoPE). cum_angle is read at
             // entry (hasCumPrev=true, even on first call — buffer is zero-initialised) and
@@ -591,7 +646,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
                     kState: kState,
                     coef: _state.BoundaryCoef,
                     nHead: nHead, headDim: headDim, dState: dState,
-                    nRank: _recurrent.KStateRank);
+                    nRank: recurrent.KStateRank);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
             }
 
@@ -665,7 +720,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
             // the B and X reads (X was last touched by the scan, also compute-stage).
             KernelSupport.ComputeToTransferBarrier(cmdBuf);
 
-            int kStateElems = _recurrent.KStateRank * nHead * dState;
+            int kStateElems = recurrent.KStateRank * nHead * dState;
             int vStateElems = nHead * headDim;
             // Last-token slice offsets in the post-RoPE B / X scratch.
             // _state.B layout: [seqLen, R, nHead, dState] row-major.
@@ -702,7 +757,7 @@ public sealed class VulkanMamba3TransformerModel : IModel
         // Forward call dispatches the boundary kernel. Idempotent — flipping the flag
         // a second time is a no-op. Stays sticky until VulkanMamba3State.Reset is
         // called by the caller.
-        _recurrent.MarkBoundaryPrimed();
+        recurrent.MarkBoundaryPrimed();
 
         // 3. FINAL RMSNORM (last token only) — optionally captures the normed row to a
         //    caller buffer slot for the batched lm_head fan-out. In the per-seq path
@@ -791,43 +846,25 @@ public sealed class VulkanMamba3TransformerModel : IModel
     }
 
     /// <summary>
-    /// Phase 5f mirror — Mamba-3 <c>ForwardBatch</c> override. Mamba-3 is a pure SSM
-    /// architecture: every layer is per-token recurrent (data-RoPE + SSD scan +
-    /// chunk-boundary adjustment), and the recurrent state lives on the model as a
-    /// single <see cref="VulkanMamba3State"/> instance — not per-sequence. Running
-    /// multiple sequences through one model instance therefore corrupts the
-    /// recurrent state across sequences; multi-seq batched dispatch is not safe
-    /// today and the override returns <see cref="NotSupportedException"/> for
-    /// <c>requests.Count &gt;= 2</c>.
+    /// Mamba-3 <c>ForwardBatch</c> override. Threads each request's per-seq
+    /// <see cref="VulkanMamba3State"/> through the SSD scan so multi-sequence
+    /// batched dispatch keeps recurrent state isolated across sequences.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// For <c>requests.Count == 0</c> we return an empty list (matches IModel
-    /// contract). For <c>requests.Count == 1</c> we delegate to the per-seq
-    /// <c>Forward</c> overload — the override is effectively a no-op for this
-    /// case but is shipped so the public API shape matches the dense and
-    /// NemotronH hosts.
+    /// Mamba-3 is a pure SSM architecture: every layer is per-token recurrent
+    /// (data-RoPE + SSD scan + chunk-boundary adjustment), and the dense host's
+    /// full layer-loop fusion does not apply because the recurrent state must be
+    /// updated token-by-token. The largest fusion target is therefore lm_head
+    /// fan-out (the Phase 5a CPU stacked-buffer pattern); this override ships the
+    /// guard-lifted-but-still-per-seq path. Per-layer batched fusion is deferred
+    /// — the IGdnState precedent on Qwen3MoeHybrid landed the same shape.
     /// </para>
     /// <para>
-    /// <b>Why the multi-seq path throws instead of delegating to per-seq Forward.</b>
-    /// Per-seq Forward writes into <c>_state.HiddenState</c> AND mutates
-    /// <c>_recurrent</c> (ssm_state, cum_angle, k_state, v_state — one set per
-    /// model, not per seq). A naive loop of per-seq Forwards would silently
-    /// thread sequence A's recurrent state into sequence B's scan and produce
-    /// numerically meaningless logits. The unblocking work is a per-seq
-    /// <see cref="VulkanMamba3State"/> container (similar to <c>VulkanKvCache</c>
-    /// on the dense host); once that lands, the captureLastNormedRowTo hook on
-    /// <see cref="RunFinalNormAndLmHead"/> is ready to fan out the lm_head over
-    /// a stacked [N_simple, hidden] buffer in the same way the dense host's
-    /// VulkanForwardBatchScratch does.
-    /// </para>
-    /// <para>
-    /// The CPU Mamba-3 host has the same single-state design and does not
-    /// override <c>ForwardBatch</c> either (default IModel behavior loops per-seq,
-    /// also unsafe across &gt;1 seq — see Phase 5a CPU which only shipped lm_head
-    /// fusion for the dense path). This mirror keeps Vulkan parity with that
-    /// stance: ship the scaffolding, throw with a clear message on the
-    /// unsupported multi-seq path.
+    /// A multi-seq request without per-seq <see cref="SequenceForwardRequest.MambaState"/>
+    /// throws <see cref="ArgumentException"/> at the entry point — surfacing the
+    /// misuse loudly rather than silently sharing the model-owned cache across
+    /// sequences (which would silently corrupt logits).
     /// </para>
     /// </remarks>
     public IReadOnlyList<ITensor> ForwardBatch(
@@ -848,22 +885,29 @@ public sealed class VulkanMamba3TransformerModel : IModel
         if (requests.Count == 1)
         {
             var r0 = requests[0];
-            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache, r0.MambaState) };
         }
 
-        // Multi-seq path — see the remarks above. The RunFinalNormAndLmHead capture
-        // hook is ready (RunFinalNormAndLmHead accepts an optional caller-supplied
-        // stacked snapshot buffer + slot), but the per-seq VulkanMamba3State isolation
-        // it would need to be safe is a follow-up. Until that lands, throwing is the
-        // only correct option — silently returning corrupted logits would be far worse
-        // for callers building on top of this API.
-        throw new NotSupportedException(
-            $"VulkanMamba3TransformerModel.ForwardBatch with {requests.Count} requests is not " +
-            "supported today: the model's recurrent VulkanMamba3State is single-instance, so " +
-            "looping per-seq Forwards would corrupt state across sequences. The lm_head fan-out " +
-            "infrastructure (RunFinalNormAndLmHead's captureLastNormedRowTo parameter) is " +
-            "wired and ready for the follow-up that introduces per-sequence recurrent-state " +
-            "isolation; until then, schedule Mamba-3 sequences serially through Forward.");
+        // Multi-seq path: every request must supply its own MambaState to keep
+        // recurrent state isolated across sequences. Silently sharing the
+        // model-owned cache would produce numerically meaningless logits.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].MambaState is null)
+                throw new ArgumentException(
+                    $"VulkanMamba3TransformerModel.ForwardBatch with {requests.Count} requests " +
+                    $"requires every request to supply a per-seq MambaState; request[{i}] has none. " +
+                    "Construct one per active sequence via VulkanMamba3TransformerModel.CreateMambaState().",
+                    nameof(requests));
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.MambaState);
+        }
+        return results;
     }
 
     /// <summary>

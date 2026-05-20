@@ -228,6 +228,87 @@ public sealed unsafe class Mamba3TransformerModel : IModel
         return ForwardCore(tokenIds, positions, deviceId, state);
     }
 
+    /// <summary>
+    /// Runs a forward pass with an optional caller-supplied per-sequence
+    /// <see cref="IMambaState"/>. Used by <see cref="ForwardBatch"/> to thread
+    /// per-seq recurrent state through a multi-seq batch via
+    /// <see cref="SequenceForwardRequest.MambaState"/>.
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the output tensor (-1 for CPU).</param>
+    /// <param name="kvCache">Unused — Mamba-3 maintains an SSM state, not a KV-cache.</param>
+    /// <param name="mambaState">
+    /// Optional per-seq Mamba-3 recurrent state. Must be a <see cref="Mamba3State"/>
+    /// sized for this model. <see langword="null"/> allocates an ephemeral state
+    /// (equivalent to a fresh sequence — the default <c>Forward(..., IKvCache?)</c>
+    /// behavior).
+    /// </param>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, IMambaState? mambaState)
+    {
+        _ = kvCache; // Mamba-3 uses SSM state, not KV cache.
+
+        if (mambaState is null)
+        {
+            using var scratch = new Mamba3State(Config);
+            return ForwardCore(tokenIds, positions, deviceId, scratch);
+        }
+        if (mambaState is Mamba3State m3)
+            return Forward(tokenIds, positions, deviceId, m3);
+        throw new ArgumentException(
+            $"Mamba3TransformerModel requires a Mamba3State; got {mambaState.GetType().Name}.",
+            nameof(mambaState));
+    }
+
+    /// <summary>
+    /// Mamba-3 <c>ForwardBatch</c> override. Threads each request's per-seq
+    /// <see cref="Mamba3State"/> through the SSD scan so multi-sequence batched
+    /// dispatch keeps recurrent state isolated across sequences. A multi-seq
+    /// request without per-seq <see cref="SequenceForwardRequest.MambaState"/>
+    /// throws <see cref="ArgumentException"/> at the entry point — silently
+    /// sharing an ephemeral state across sequences would still be correct
+    /// numerically here (each ephemeral state is fresh per Forward), but the
+    /// semantics surface the caller's intent: per-seq decoding requires
+    /// per-seq state continuity.
+    /// </summary>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        // Reject LoRA adapters — no Mamba-3 LoRA path today.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "Mamba3TransformerModel.ForwardBatch does not support LoRA adapters " +
+                    "(no Mamba-3 LoRA path today). Re-issue the request without an adapter.");
+        }
+
+        if (requests.Count >= 2)
+        {
+            for (int i = 0; i < requests.Count; i++)
+            {
+                if (requests[i].MambaState is null)
+                    throw new ArgumentException(
+                        $"Mamba3TransformerModel.ForwardBatch with {requests.Count} requests " +
+                        $"requires every request to supply a per-seq MambaState; request[{i}] has none.",
+                        nameof(requests));
+            }
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.MambaState);
+        }
+        return results;
+    }
+
     [SkipLocalsInit]
     private ITensor ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                                 int deviceId, Mamba3State state)

@@ -73,7 +73,7 @@ namespace DotLLM.Models.Architectures;
 /// returns.
 /// </para>
 /// </remarks>
-public sealed unsafe class Mamba3State : IDisposable
+public sealed unsafe class Mamba3State : IMambaState
 {
     private readonly int _numLayers;
     private readonly int _ssmStateElementsPerLayer;   // n_head * head_dim * d_state

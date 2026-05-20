@@ -8,30 +8,22 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Tests for the Phase 5f-mirror Mamba-3 <c>ForwardBatch</c> override. Mamba-3 is a pure
-/// SSM stack — every layer threads a per-token recurrent state — and the model's
-/// <c>VulkanMamba3State</c> is single-instance (not per-sequence). Multi-sequence
-/// dispatch is therefore not safe today (per-seq Forwards would corrupt the recurrent
-/// state across sequences), and the override throws <see cref="NotSupportedException"/>
-/// for <c>requests.Count &gt;= 2</c>. The override DOES handle empty / single-seq
-/// requests so the public API shape matches the dense / NemotronH hosts and so the
-/// scheduler can call it uniformly across architectures.
+/// Tests for the Mamba-3 <c>ForwardBatch</c> override. Mamba-3 is a pure SSM stack —
+/// every layer threads a per-token recurrent state — so multi-sequence dispatch is
+/// only safe when each request carries its own <see cref="VulkanMamba3State"/> via
+/// <see cref="SequenceForwardRequest.MambaState"/>. The override threads each
+/// request's MambaState through the SSD scan so multi-seq dispatch keeps recurrent
+/// state isolated. Mirrors the <see cref="IGdnState"/> pattern from Qwen3MoeHybrid.
 /// </summary>
 /// <remarks>
-/// <para>
-/// Three tests cover the supported / unsupported axes:
+/// Four tests cover the supported / unsupported axes:
 /// <list type="number">
 ///   <item>Empty request list — returns empty.</item>
 ///   <item>Single sequence — must equal per-seq Forward exactly.</item>
-///   <item>Multi-seq request — throws NotSupportedException with the documented message.</item>
+///   <item>Multi-seq with NULL MambaState on any request — throws ArgumentException.</item>
+///   <item>Multi-seq with per-seq MambaState — logits match running each seq through
+///     Forward on a fresh model (state-isolated parity).</item>
 /// </list>
-/// </para>
-/// <para>
-/// The lm_head fan-out scratch infrastructure (the <c>captureLastNormedRowTo</c> hook on
-/// the model's internal <c>RunFinalNormAndLmHead</c>) is ready for the follow-up that
-/// introduces per-sequence recurrent-state isolation; this test class will gain
-/// multi-seq parity tests at that point.
-/// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
 [Collection("VulkanKernels")]
@@ -97,9 +89,10 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
             reference = CopyLogits(logits);
         }
 
-        // Under test: ForwardBatch with one request on a fresh model. Must equal Forward
-        // bit-exactly — the override delegates count==1 directly to Forward without
-        // touching the lm_head fan-out path.
+        // Under test: ForwardBatch with one request on a fresh model. Single-seq
+        // delegates directly to Forward — MambaState slot may be null and the model
+        // falls back to its model-owned default container (equivalent to the
+        // reference path).
         float[] batched;
         {
             using var sf = SafetensorsFile.Open(path);
@@ -110,7 +103,7 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
                 {
                     TokenIds = tokenIds.AsMemory(),
                     Positions = positions.AsMemory(),
-                    KvCache = null!, // Mamba-3 ignores kvCache (uses recurrent state); required by record contract though
+                    KvCache = null!,
                 },
             };
             var results = model.ForwardBatch(requests, deviceId: -1);
@@ -137,11 +130,11 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
     }
 
     [SkippableFact]
-    public void VulkanMamba3ForwardBatch_MultiSeq_ThrowsNotSupported()
+    public void VulkanMamba3ForwardBatch_MultiSeq_NullMambaState_ThrowsArgument()
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
-        string path = Path.Combine(_scratch, "m3-fwdbatch-multi.safetensors");
+        string path = Path.Combine(_scratch, "m3-fwdbatch-multi-null.safetensors");
         VulkanMamba3TransformerModelForwardTests.WriteFixture(path, numLayers: 1, seed: 37);
         ModelConfig config = VulkanMamba3TransformerModelForwardTests.BuildConfig(numLayers: 1);
 
@@ -157,6 +150,7 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
             new SequenceForwardRequest
             {
                 TokenIds = tokensA.AsMemory(), Positions = positionsA.AsMemory(), KvCache = null!,
+                // MambaState deliberately null — should trigger the guard.
             },
             new SequenceForwardRequest
             {
@@ -164,11 +158,93 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
             },
         };
 
-        // Pure SSM stack with a single shared recurrent state means multi-seq batched
-        // dispatch would corrupt state across sequences. Override is documented to throw.
-        var ex = Assert.Throws<NotSupportedException>(() =>
+        // Multi-seq dispatch without per-seq MambaState would silently corrupt
+        // recurrent state across sequences — override surfaces it loudly.
+        var ex = Assert.Throws<ArgumentException>(() =>
             model.ForwardBatch(requests, deviceId: -1));
-        Assert.Contains("VulkanMamba3State", ex.Message);
+        Assert.Contains("MambaState", ex.Message);
+    }
+
+    [SkippableFact]
+    public void VulkanMamba3ForwardBatch_MultiSeq_PerSeqMambaState_MatchesReference()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        string path = Path.Combine(_scratch, "m3-fwdbatch-multi-perseq.safetensors");
+        VulkanMamba3TransformerModelForwardTests.WriteFixture(path, numLayers: 1, seed: 41);
+        ModelConfig config = VulkanMamba3TransformerModelForwardTests.BuildConfig(numLayers: 1);
+
+        int[] tokensA = [0, 1, 2, 3];
+        int[] positionsA = [0, 1, 2, 3];
+        int[] tokensB = [2, 0, 1, 3];
+        int[] positionsB = [0, 1, 2, 3];
+
+        // Reference: run each sequence through a SEPARATE model instance via Forward.
+        // The model-owned _recurrent gets primed by the first sequence on each
+        // instance; using fresh model instances mirrors the "isolated per-seq state"
+        // semantics that ForwardBatch + per-seq MambaState is meant to produce.
+        float[] refA, refB;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var modelA = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using ITensor logitsA = modelA.Forward(tokensA, positionsA, deviceId: -1);
+            refA = CopyLogits(logitsA);
+        }
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var modelB = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using ITensor logitsB = modelB.Forward(tokensB, positionsB, deviceId: -1);
+            refB = CopyLogits(logitsB);
+        }
+
+        // Under test: single model, multi-seq ForwardBatch with per-seq MambaState
+        // containers. Logits must match the reference — i.e. per-seq state is truly
+        // isolated and the recurrent scan does not leak across sequences.
+        float[] batA, batB;
+        {
+            using var sf = SafetensorsFile.Open(path);
+            using var model = VulkanMamba3TransformerModel.LoadFromSafetensors(sf, config, spvDir);
+            using var stateA = model.CreateMambaState();
+            using var stateB = model.CreateMambaState();
+            var requests = new[]
+            {
+                new SequenceForwardRequest
+                {
+                    TokenIds = tokensA.AsMemory(), Positions = positionsA.AsMemory(),
+                    KvCache = null!, MambaState = stateA,
+                },
+                new SequenceForwardRequest
+                {
+                    TokenIds = tokensB.AsMemory(), Positions = positionsB.AsMemory(),
+                    KvCache = null!, MambaState = stateB,
+                },
+            };
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            try
+            {
+                Assert.Equal(2, results.Count);
+                batA = CopyLogits(results[0]);
+                batB = CopyLogits(results[1]);
+            }
+            finally { foreach (var t in results) t.Dispose(); }
+        }
+
+        AssertLogitsClose(refA, batA, "seqA");
+        AssertLogitsClose(refB, batB, "seqB");
+    }
+
+    private static void AssertLogitsClose(float[] reference, float[] actual, string label)
+    {
+        Assert.Equal(reference.Length, actual.Length);
+        for (int c = 0; c < reference.Length; c++)
+        {
+            float r = reference[c];
+            float a = actual[c];
+            float diff = MathF.Abs(r - a);
+            float bar = AbsTol + RelTol * MathF.Abs(r);
+            Assert.True(diff <= bar,
+                $"{label} col={c}: reference={r:F6} vs batched={a:F6} (|diff|={diff:E3} > {bar:E3})");
+        }
     }
 
     private static unsafe float[] CopyLogits(ITensor logits)
