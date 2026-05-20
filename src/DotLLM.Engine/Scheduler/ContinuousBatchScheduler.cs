@@ -59,7 +59,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private long _cachedPromptTokens;
     private long _prefilledPromptTokens;
 
-    private readonly ConcurrentQueue<SchedulerRequest> _pendingQueue = new();
+    // Priority-ordered queue. Element key is (-(int)Priority, submissionOrder), so the min-heap
+    // pops the highest RequestPriority first (Critical < High < Normal < Low by enum value, negated)
+    // and FIFO-orders among the same priority via submissionOrder ascending. PriorityQueue is not
+    // thread-safe; Submit/Step both serialise mutations through _queueLock — the lock is uncontended
+    // in the steady-state single-Step-loop pattern, and Submit happens once per request.
+    private readonly PriorityQueue<SchedulerRequest, (int PriorityRank, long Order)> _pendingQueue = new();
+    private readonly Lock _queueLock = new();
     private readonly List<SchedulerRequest> _active = new();
 
     private long _submissionCounter;
@@ -78,10 +84,16 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     public int ActiveCount => _active.Count;
 
     /// <inheritdoc/>
-    public int QueueDepth => _pendingQueue.Count;
+    public int QueueDepth
+    {
+        get { lock (_queueLock) { return _pendingQueue.Count; } }
+    }
 
     /// <inheritdoc/>
-    public bool IsIdle => _active.Count == 0 && _pendingQueue.IsEmpty;
+    public bool IsIdle
+    {
+        get { lock (_queueLock) { return _active.Count == 0 && _pendingQueue.Count == 0; } }
+    }
 
     /// <summary>
     /// Creates a new continuous-batch scheduler.
@@ -194,7 +206,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }, seq);
         }
 
-        _pendingQueue.Enqueue(seq);
+        // Priority key: most-negative RequestPriority pops first (Critical=3 → -3, Low=0 → 0);
+        // FIFO tie-break within the same tier via ascending submissionOrder.
+        var key = (PriorityRank: -(int)request.Priority, Order: seq.SubmissionOrder);
+        lock (_queueLock)
+        {
+            _pendingQueue.Enqueue(seq, key);
+        }
         return seq;
     }
 
@@ -219,14 +237,22 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
         // 2. Admit new sequences from the queue, subject to capacity. Each admitted sequence
         //    runs prompt prefill in this same iteration (chunked prefill is a stretch goal).
+        //    Queue draining is priority-ordered: highest RequestPriority drains first, FIFO
+        //    within tier (see _pendingQueue key shape).
         int admittedThisStep = 0;
         int prefillTokensThisStep = 0;
-        while (_active.Count < _options.MaxActiveSequences && _pendingQueue.TryPeek(out var head))
+        while (_active.Count < _options.MaxActiveSequences)
         {
+            SchedulerRequest? head;
+            lock (_queueLock)
+            {
+                if (!_pendingQueue.TryPeek(out head, out _)) break;
+            }
+
             // Cancelled while queued — drop without admission.
             if (head.State == SequenceState.Cancelled)
             {
-                _pendingQueue.TryDequeue(out _);
+                lock (_queueLock) { _pendingQueue.TryDequeue(out _, out _); }
                 continue;
             }
 
@@ -251,8 +277,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     break;
             }
 
-            if (!_pendingQueue.TryDequeue(out var seq))
-                break;
+            SchedulerRequest? seq;
+            lock (_queueLock)
+            {
+                if (!_pendingQueue.TryDequeue(out seq, out _)) break;
+            }
 
             try
             {
@@ -323,10 +352,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     }
 
     /// <inheritdoc/>
-    public SchedulerMetrics GetMetrics() => new(
-        ActiveSequences: _active.Count,
-        QueueDepth: _pendingQueue.Count,
-        PreemptionCount: Interlocked.Read(ref _preemptionCount));
+    public SchedulerMetrics GetMetrics()
+    {
+        int queueDepth;
+        lock (_queueLock) { queueDepth = _pendingQueue.Count; }
+        return new(
+            ActiveSequences: _active.Count,
+            QueueDepth: queueDepth,
+            PreemptionCount: Interlocked.Read(ref _preemptionCount));
+    }
 
     // ── Admission & prefill ──
 
@@ -625,10 +659,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         }
         _active.Clear();
 
-        while (_pendingQueue.TryDequeue(out var pending))
+        lock (_queueLock)
         {
-            pending.CompletionSource.TrySetCanceled();
-            pending.CancellationRegistration.Dispose();
+            while (_pendingQueue.TryDequeue(out var pending, out _))
+            {
+                pending.CompletionSource.TrySetCanceled();
+                pending.CancellationRegistration.Dispose();
+            }
         }
     }
 }
