@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text;
 using DotLLM.Tokenizers;
 
@@ -6,10 +7,22 @@ namespace DotLLM.Benchmarks;
 
 internal static class TrieComparisonRunner
 {
-    public static void Run()
+    public static void Run(string? tokenizerJsonPath = null)
     {
-        const int vocabSize = 32_000;
-        string[] vocab = BuildRealVocab(vocabSize);
+        string scenarioName;
+        string[] vocab;
+        if (!string.IsNullOrWhiteSpace(tokenizerJsonPath))
+        {
+            vocab = LoadVocabFromTokenizerJson(tokenizerJsonPath);
+            scenarioName = $"real tokenizer vocab from {Path.GetFileName(tokenizerJsonPath)}";
+        }
+        else
+        {
+            const int vocabSize = 32_000;
+            vocab = BuildRealVocab(vocabSize);
+            scenarioName = "synthetic 32k SentencePiece-like vocab";
+        }
+
         string[] lookupInputs = BuildLookupInputs(vocab);
 
         var legacy = new LegacyTrie();
@@ -38,9 +51,44 @@ internal static class TrieComparisonRunner
         long legacyBytes = MeasureRetainedBytes(vocab, buildFlat: false);
         long flatBytes = MeasureRetainedBytes(vocab, buildFlat: true);
 
-        Console.WriteLine("Trie comparison (32k SentencePiece-like vocab)");
+        Console.WriteLine($"Trie comparison ({scenarioName}, {vocab.Length:N0} tokens)");
         Console.WriteLine($"Lookup throughput (ops/s): legacy={legacyOpsPerSec:N0}, flat={flatOpsPerSec:N0}, speedup={flatOpsPerSec / legacyOpsPerSec:N2}x");
         Console.WriteLine($"Retained managed memory: legacy={legacyBytes / (1024d * 1024d):N2} MB, flat={flatBytes / (1024d * 1024d):N2} MB, reduction={(1d - (double)flatBytes / legacyBytes) * 100d:N1}%");
+    }
+
+    private static string[] LoadVocabFromTokenizerJson(string tokenizerJsonPath)
+    {
+        string json = File.ReadAllText(tokenizerJsonPath);
+        using JsonDocument document = JsonDocument.Parse(json);
+        JsonElement root = document.RootElement;
+
+        JsonElement vocabElement;
+        if (root.TryGetProperty("model", out JsonElement model) && model.TryGetProperty("vocab", out JsonElement modelVocab))
+            vocabElement = modelVocab;
+        else if (root.TryGetProperty("vocab", out JsonElement directVocab))
+            vocabElement = directVocab;
+        else
+            throw new InvalidOperationException("Tokenizer JSON does not contain a recognized vocab structure.");
+
+        var pairs = new List<(int Id, string Token)>();
+        foreach (JsonProperty entry in vocabElement.EnumerateObject())
+        {
+            int id = entry.Value.ValueKind switch
+            {
+                JsonValueKind.Number => entry.Value.GetInt32(),
+                JsonValueKind.String when int.TryParse(entry.Value.GetString(), out int parsed) => parsed,
+                _ => throw new InvalidOperationException($"Unsupported token id format for token '{entry.Name}'.")
+            };
+            pairs.Add((id, entry.Name));
+        }
+
+        pairs.Sort(static (left, right) => left.Id.CompareTo(right.Id));
+
+        var vocab = new string[pairs.Count];
+        for (int i = 0; i < pairs.Count; i++)
+            vocab[i] = pairs[i].Token;
+
+        return vocab;
     }
 
     private static double MeasureLookup(ITrieLike trie, string[] lookupInputs, int iterations)
