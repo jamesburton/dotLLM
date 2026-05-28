@@ -37,8 +37,10 @@ internal static class TrieComparisonRunner
             flat.Add(token, i, score);
         }
 
-        // Ensure flat trie is materialized before measurements.
+        // Exclude one-time initialization from throughput timing:
+        // force flat trie freeze and touch both implementations once before warmup/measure.
         flatTrie.TryMatchLongest(vocab[0], out _, out _, out _);
+        legacy.TryMatchLongest(vocab[0], out _, out _, out _);
 
         ValidateSemantics(legacy, flat, lookupInputs);
 
@@ -52,6 +54,7 @@ internal static class TrieComparisonRunner
         long flatBytes = MeasureRetainedBytes(vocab, buildFlat: true);
 
         Console.WriteLine($"Trie comparison ({scenarioName}, {vocab.Length:N0} tokens)");
+        Console.WriteLine("Methodology: lookup throughput excludes one-time freeze/initialization; memory reports retained managed bytes after construction.");
         Console.WriteLine($"Lookup throughput (ops/s): legacy={legacyOpsPerSec:N0}, flat={flatOpsPerSec:N0}, speedup={flatOpsPerSec / legacyOpsPerSec:N2}x");
         Console.WriteLine($"Retained managed memory: legacy={legacyBytes / (1024d * 1024d):N2} MB, flat={flatBytes / (1024d * 1024d):N2} MB, reduction={(1d - (double)flatBytes / legacyBytes) * 100d:N1}%");
     }

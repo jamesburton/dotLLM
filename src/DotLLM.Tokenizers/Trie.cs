@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace DotLLM.Tokenizers;
 
 /// <summary>
@@ -8,9 +10,11 @@ namespace DotLLM.Tokenizers;
 /// </summary>
 internal sealed class Trie
 {
+    private readonly object _freezeGate = new();
     private List<BuilderNode>? _builderNodes = [new()];
     private FlatNode[] _nodes = [new(0, 0, -1, 0f)];
     private FlatEdge[] _edges = [];
+    private int _isFrozen;
 
     /// <summary>Inserts a token into the trie.</summary>
     /// <param name="key">Token string (e.g. "▁hello").</param>
@@ -18,25 +22,31 @@ internal sealed class Trie
     /// <param name="score">Merge priority score (higher = preferred merge in SentencePiece).</param>
     public void Add(ReadOnlySpan<char> key, int tokenId, float score)
     {
-        if (_builderNodes is null)
+        if (Volatile.Read(ref _isFrozen) != 0)
             throw new InvalidOperationException("Cannot add tokens after trie has been frozen.");
 
-        List<BuilderNode> builderNodes = _builderNodes;
-        int nodeIndex = 0;
-        foreach (char c in key)
+        lock (_freezeGate)
         {
-            Dictionary<char, int> children = builderNodes[nodeIndex].Children ??= [];
-            if (!children.TryGetValue(c, out int childIndex))
-            {
-                childIndex = builderNodes.Count;
-                children[c] = childIndex;
-                builderNodes.Add(new BuilderNode());
-            }
-            nodeIndex = childIndex;
-        }
+            if (Volatile.Read(ref _isFrozen) != 0 || _builderNodes is null)
+                throw new InvalidOperationException("Cannot add tokens after trie has been frozen.");
 
-        builderNodes[nodeIndex].TokenId = tokenId;
-        builderNodes[nodeIndex].Score = score;
+            List<BuilderNode> builderNodes = _builderNodes;
+            int nodeIndex = 0;
+            foreach (char c in key)
+            {
+                Dictionary<char, int> children = builderNodes[nodeIndex].Children ??= [];
+                if (!children.TryGetValue(c, out int childIndex))
+                {
+                    childIndex = builderNodes.Count;
+                    children[c] = childIndex;
+                    builderNodes.Add(new BuilderNode());
+                }
+                nodeIndex = childIndex;
+            }
+
+            builderNodes[nodeIndex].TokenId = tokenId;
+            builderNodes[nodeIndex].Score = score;
+        }
     }
 
     /// <summary>
@@ -87,44 +97,51 @@ internal sealed class Trie
 
     private void EnsureFrozen()
     {
-        if (_builderNodes is null)
+        if (Volatile.Read(ref _isFrozen) != 0)
             return;
 
-        List<BuilderNode> builderNodes = _builderNodes;
-        int edgeCount = 0;
-        for (int i = 0; i < builderNodes.Count; i++)
-            edgeCount += builderNodes[i].Children?.Count ?? 0;
-
-        var nodes = new FlatNode[builderNodes.Count];
-        var edges = new FlatEdge[edgeCount];
-
-        int edgeIndex = 0;
-        for (int i = 0; i < builderNodes.Count; i++)
+        lock (_freezeGate)
         {
-            BuilderNode builder = builderNodes[i];
-            Dictionary<char, int>? children = builder.Children;
-            int childCount = children?.Count ?? 0;
-            nodes[i] = new FlatNode(edgeIndex, childCount, builder.TokenId, builder.Score);
+            if (Volatile.Read(ref _isFrozen) != 0)
+                return;
 
-            if (childCount == 0)
-                continue;
+            List<BuilderNode> builderNodes = _builderNodes ?? throw new InvalidOperationException("Trie builder state is not available.");
+            int edgeCount = 0;
+            for (int i = 0; i < builderNodes.Count; i++)
+                edgeCount += builderNodes[i].Children?.Count ?? 0;
 
-            var sorted = new KeyValuePair<char, int>[childCount];
-            int cursor = 0;
-            foreach (KeyValuePair<char, int> child in children!)
-                sorted[cursor++] = child;
+            var nodes = new FlatNode[builderNodes.Count];
+            var edges = new FlatEdge[edgeCount];
 
-            Array.Sort(sorted, static (left, right) => left.Key.CompareTo(right.Key));
-
-            for (int c = 0; c < sorted.Length; c++)
+            int edgeIndex = 0;
+            for (int i = 0; i < builderNodes.Count; i++)
             {
-                edges[edgeIndex++] = new FlatEdge(sorted[c].Key, sorted[c].Value);
-            }
-        }
+                BuilderNode builder = builderNodes[i];
+                Dictionary<char, int>? children = builder.Children;
+                int childCount = children?.Count ?? 0;
+                nodes[i] = new FlatNode(edgeIndex, childCount, builder.TokenId, builder.Score);
 
-        _nodes = nodes;
-        _edges = edges;
-        _builderNodes = null;
+                if (childCount == 0)
+                    continue;
+
+                var sorted = new KeyValuePair<char, int>[childCount];
+                int cursor = 0;
+                foreach (KeyValuePair<char, int> child in children!)
+                    sorted[cursor++] = child;
+
+                Array.Sort(sorted, static (left, right) => left.Key.CompareTo(right.Key));
+
+                for (int c = 0; c < sorted.Length; c++)
+                {
+                    edges[edgeIndex++] = new FlatEdge(sorted[c].Key, sorted[c].Value);
+                }
+            }
+
+            _nodes = nodes;
+            _edges = edges;
+            _builderNodes = null;
+            Volatile.Write(ref _isFrozen, 1);
+        }
     }
 
     private int FindChild(int nodeIndex, char c)
