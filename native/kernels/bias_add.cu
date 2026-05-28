@@ -44,7 +44,8 @@ extern "C" __global__ void __launch_bounds__(256) bias_add_f16(
         int col = idx % dim;
         output[idx] = __float2half(__half2float(output[idx]) + __half2float(bias[col]));
     }
-    else if (can_vectorize && (total & 1) && idx == 0)
+
+    if (can_vectorize && (total & 1) && idx == total2)
     {
         int last = total - 1;
         int col = last % dim;

@@ -405,16 +405,23 @@ public sealed unsafe class CudaKernels : IDisposable
     public void LaunchSwiGLU(nint gate, nint up, nint output,
                               int n, int seqLen, nint stream)
     {
-        AssertAligned(gate, Half2Alignment, nameof(gate), "swiglu_f16");
-        AssertAligned(up, Half2Alignment, nameof(up), "swiglu_f16");
-        AssertAligned(output, Half2Alignment, nameof(output), "swiglu_f16");
+        bool useVectorizedPath = IsAligned(gate, Half2Alignment)
+            && IsAligned(up, Half2Alignment)
+            && IsAligned(output, Half2Alignment);
+        if (useVectorizedPath)
+        {
+            AssertAligned(gate, Half2Alignment, nameof(gate), "swiglu_f16");
+            AssertAligned(up, Half2Alignment, nameof(up), "swiglu_f16");
+            AssertAligned(output, Half2Alignment, nameof(output), "swiglu_f16");
+        }
 
         nint gateArg = gate, upArg = up, outArg = output;
         int nArg = n, slArg = seqLen;
 
         void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
         int total = n * seqLen;
-        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        int workItems = useVectorizedPath ? (total / 2) + (total & 1) : total;
+        uint gridDim = (uint)((workItems + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_swigluFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
@@ -424,15 +431,22 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Element-wise add: output = a + b. half2 vectorized (2 elements/thread).</summary>
     public void LaunchAdd(nint a, nint b, nint output, int n, nint stream)
     {
-        AssertAligned(a, Half2Alignment, nameof(a), "add_f16");
-        AssertAligned(b, Half2Alignment, nameof(b), "add_f16");
-        AssertAligned(output, Half2Alignment, nameof(output), "add_f16");
+        bool useVectorizedPath = IsAligned(a, Half2Alignment)
+            && IsAligned(b, Half2Alignment)
+            && IsAligned(output, Half2Alignment);
+        if (useVectorizedPath)
+        {
+            AssertAligned(a, Half2Alignment, nameof(a), "add_f16");
+            AssertAligned(b, Half2Alignment, nameof(b), "add_f16");
+            AssertAligned(output, Half2Alignment, nameof(output), "add_f16");
+        }
 
         nint aArg = a, bArg = b, outArg = output;
         int nArg = n;
 
         void** args = stackalloc void*[] {&aArg, &bArg, &outArg, &nArg};
-        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        int workItems = useVectorizedPath ? (n / 2) + (n & 1) : n;
+        uint gridDim = (uint)((workItems + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_addFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
@@ -507,15 +521,21 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Bias add: output[t, :] += bias[:]. half2 vectorized (2 elements/thread).</summary>
     public void LaunchBiasAdd(nint output, nint bias, int dim, int seqLen, nint stream)
     {
-        AssertAligned(output, Half2Alignment, nameof(output), "bias_add_f16");
-        AssertAligned(bias, Half2Alignment, nameof(bias), "bias_add_f16");
+        bool useVectorizedPath = IsAligned(output, Half2Alignment)
+            && IsAligned(bias, Half2Alignment);
+        if (useVectorizedPath)
+        {
+            AssertAligned(output, Half2Alignment, nameof(output), "bias_add_f16");
+            AssertAligned(bias, Half2Alignment, nameof(bias), "bias_add_f16");
+        }
 
         nint outArg = output, biasArg = bias;
         int dimArg = dim, slArg = seqLen;
 
         void** args = stackalloc void*[] {&outArg, &biasArg, &dimArg, &slArg};
         int total = dim * seqLen;
-        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        int workItems = useVectorizedPath ? (total / 2) + (total & 1) : total;
+        uint gridDim = (uint)((workItems + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_biasAddFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
@@ -541,14 +561,20 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Convert FP16 → FP32. half2/float2 vectorized (2 elements/thread).</summary>
     public void LaunchConvertF16ToF32(nint src, nint dst, int n, nint stream)
     {
-        AssertAligned(src, Half2Alignment, nameof(src), "convert_f16_to_f32");
-        AssertAligned(dst, Float2Alignment, nameof(dst), "convert_f16_to_f32");
+        bool useVectorizedPath = IsAligned(src, Half2Alignment)
+            && IsAligned(dst, Float2Alignment);
+        if (useVectorizedPath)
+        {
+            AssertAligned(src, Half2Alignment, nameof(src), "convert_f16_to_f32");
+            AssertAligned(dst, Float2Alignment, nameof(dst), "convert_f16_to_f32");
+        }
 
         nint srcArg = src, dstArg = dst;
         int nArg = n;
 
         void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg};
-        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        int workItems = useVectorizedPath ? (n / 2) + (n & 1) : n;
+        uint gridDim = (uint)((workItems + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_convertF16ToF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
@@ -558,14 +584,20 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>Convert FP32 → FP16. float2/half2 vectorized (2 elements/thread).</summary>
     public void LaunchConvertF32ToF16(nint src, nint dst, int n, nint stream)
     {
-        AssertAligned(src, Float2Alignment, nameof(src), "convert_f32_to_f16");
-        AssertAligned(dst, Half2Alignment, nameof(dst), "convert_f32_to_f16");
+        bool useVectorizedPath = IsAligned(src, Float2Alignment)
+            && IsAligned(dst, Half2Alignment);
+        if (useVectorizedPath)
+        {
+            AssertAligned(src, Float2Alignment, nameof(src), "convert_f32_to_f16");
+            AssertAligned(dst, Half2Alignment, nameof(dst), "convert_f32_to_f16");
+        }
 
         nint srcArg = src, dstArg = dst;
         int nArg = n;
 
         void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg};
-        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        int workItems = useVectorizedPath ? (n / 2) + (n & 1) : n;
+        uint gridDim = (uint)((workItems + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_convertF32ToF16Func,
                 gridDim, 1, 1, BlockSize, 1, 1,

@@ -39,7 +39,8 @@ extern "C" __global__ void __launch_bounds__(256) add_f16(
     {
         output[idx] = __float2half(__half2float(a[idx]) + __half2float(b[idx]));
     }
-    else if (can_vectorize && (n & 1) && idx == 0)
+
+    if (can_vectorize && (n & 1) && idx == n2)
     {
         int last = n - 1;
         output[last] = __float2half(__half2float(a[last]) + __half2float(b[last]));

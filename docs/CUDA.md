@@ -264,6 +264,7 @@ Sanitizer coverage is split into practical default and full mode:
 | Full (`-FullSanitizer`) | `CudaKernelTests`, `CudaKernelComparisonTests` | `memcheck`, `initcheck`, `racecheck` on both suites | Maximize sanitizer depth before release or when debugging kernel faults |
 
 Kernel families exercised by these suites include: add/convert/swiglu/bias_add (misalignment-sensitive vector paths), RMSNorm, RoPE, attention, embedding, and quantized GEMV.
+The safety-net script invokes `compute-sanitizer` directly with `--target-processes all` so instrumentation follows the actual .NET test host process tree.
 
 For sanitizer passes on a CUDA-enabled host:
 

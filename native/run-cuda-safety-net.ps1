@@ -27,8 +27,16 @@ function Invoke-Sanitizer {
     )
 
     Write-Host "compute-sanitizer --tool $SanitizerTool filter: $Filter"
-    $testCommand = "dotnet test $project -c $Configuration --no-build --filter `"$Filter`""
-    & compute-sanitizer --tool $SanitizerTool --error-exitcode 1 cmd /c $testCommand
+    $sanitizerArgs = @(
+        "--tool", $SanitizerTool,
+        "--target-processes", "all",
+        "--error-exitcode", "1",
+        "dotnet", "test", $project,
+        "-c", $Configuration,
+        "--no-build",
+        "--filter", $Filter
+    )
+    & compute-sanitizer @sanitizerArgs
 }
 
 if ($Tool -in @("all", "memcheck")) {

@@ -50,7 +50,8 @@ extern "C" __global__ void __launch_bounds__(256) swiglu_f16(
         float u = __half2float(up[idx]);
         output[idx] = __float2half(g / (1.0f + expf(-g)) * u);
     }
-    else if (can_vectorize && (total & 1) && idx == 0)
+
+    if (can_vectorize && (total & 1) && idx == total2)
     {
         int last = total - 1;
         float g = __half2float(gate[last]);

@@ -40,7 +40,8 @@ extern "C" __global__ void __launch_bounds__(256) convert_f16_to_f32(
     {
         dst[idx] = __half2float(src[idx]);
     }
-    else if (can_vectorize && (n & 1) && idx == 0)
+
+    if (can_vectorize && (n & 1) && idx == n2)
         dst[n - 1] = __half2float(src[n - 1]);
 }
 
@@ -67,6 +68,7 @@ extern "C" __global__ void __launch_bounds__(256) convert_f32_to_f16(
     {
         dst[idx] = __float2half(src[idx]);
     }
-    else if (can_vectorize && (n & 1) && idx == 0)
+
+    if (can_vectorize && (n & 1) && idx == n2)
         dst[n - 1] = __float2half(src[n - 1]);
 }
