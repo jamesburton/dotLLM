@@ -80,6 +80,41 @@ public class SamplerPipelineTests
     }
 
     [Fact]
+    public void Sample_GreedyWithLogitBias_AppliesBiasBeforeArgMax()
+    {
+        var options = new InferenceOptions
+        {
+            Temperature = 0f,
+            LogitBias = new Dictionary<int, float> { [1] = 2.0f },
+        };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [2.0f, 1.0f];
+
+        int result = pipeline.Sample(logits, []);
+
+        Assert.Equal(1, result);
+    }
+
+    [Fact]
+    public void Sample_ComposableViaOptions_PrependsLogitBiasStep()
+    {
+        var options = new InferenceOptions
+        {
+            Temperature = 0f,
+            LogitBias = new Dictionary<int, float> { [2] = 3.0f },
+            SamplerSteps = [new TemperatureSampler(0.8f)],
+        };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [1.0f, 2.0f, 0.0f];
+
+        int result = pipeline.Sample(logits, []);
+
+        Assert.Equal(2, result);
+    }
+
+    [Fact]
     public void Sample_ComposableConstructor_ProducesValidIndex()
     {
         var pipeline = new SamplerPipeline(
