@@ -38,4 +38,16 @@ public class LogitBiasStepTests
         Assert.Equal(1.0f, logits[0]);
         Assert.Equal(2.0f, logits[1]);
     }
+
+    [Fact]
+    public void Apply_EmptyBiasMap_IsNoOp()
+    {
+        float[] logits = [1.0f, 2.0f, 3.0f];
+        float[] original = [1.0f, 2.0f, 3.0f];
+        var step = new LogitBiasStep(new Dictionary<int, float>());
+
+        step.Apply(logits, default(SamplerContext));
+
+        Assert.Equal(original, logits);
+    }
 }
