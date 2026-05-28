@@ -4,6 +4,9 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+#ifndef NDEBUG
+#include <assert.h>
+#endif
 
 __device__ __forceinline__ bool is_aligned_4(const void* ptr)
 {
@@ -30,6 +33,10 @@ extern "C" __global__ void __launch_bounds__(256) bias_add_f16(
         // Map half2 index back to row/col pair index
         // Each row has dim elements = dim/2 half2 elements
         int col2 = idx % dim2;
+#ifndef NDEBUG
+        assert(is_aligned_4(&out2[idx]));
+        assert(is_aligned_4(&bias2[col2]));
+#endif
         out2[idx] = __hadd2(out2[idx], bias2[col2]);
     }
     else if (!can_vectorize && idx < total)

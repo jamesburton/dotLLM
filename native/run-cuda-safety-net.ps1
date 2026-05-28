@@ -2,7 +2,8 @@ param(
     [ValidateSet("all", "memcheck", "initcheck", "racecheck")]
     [string]$Tool = "all",
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$FullSanitizer
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,20 +11,40 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
 $project = "tests\DotLLM.Tests.Unit\DotLLM.Tests.Unit.csproj"
-$filter = "Category=GPU&FullyQualifiedName~CudaKernelTests"
+$coreKernelFilter = "Category=GPU&FullyQualifiedName~DotLLM.Tests.Unit.Cuda.CudaKernelTests"
+$comparisonKernelFilter = "Category=GPU&FullyQualifiedName~DotLLM.Tests.Unit.Cuda.CudaKernelComparisonTests"
+$parityFilter = "Category=GPU&(FullyQualifiedName~DotLLM.Tests.Unit.Cuda.CudaKernelTests|FullyQualifiedName~DotLLM.Tests.Unit.Cuda.CudaKernelComparisonTests)"
+$memcheckFilters = @($coreKernelFilter, $comparisonKernelFilter)
+$followUpFilters = if ($FullSanitizer) { @($coreKernelFilter, $comparisonKernelFilter) } else { @($coreKernelFilter) }
 
-dotnet test $project -c $Configuration --filter $filter
+Write-Host "CUDA safety net parity pass"
+dotnet test $project -c $Configuration --filter $parityFilter
 
-$testCommand = "dotnet test $project -c $Configuration --no-build --filter `"$filter`""
+function Invoke-Sanitizer {
+    param(
+        [Parameter(Mandatory = $true)][string]$SanitizerTool,
+        [Parameter(Mandatory = $true)][string]$Filter
+    )
+
+    Write-Host "compute-sanitizer --tool $SanitizerTool filter: $Filter"
+    $testCommand = "dotnet test $project -c $Configuration --no-build --filter `"$Filter`""
+    & compute-sanitizer --tool $SanitizerTool --error-exitcode 1 cmd /c $testCommand
+}
 
 if ($Tool -in @("all", "memcheck")) {
-    & compute-sanitizer --tool memcheck --error-exitcode 1 cmd /c $testCommand
+    foreach ($filter in $memcheckFilters) {
+        Invoke-Sanitizer -SanitizerTool memcheck -Filter $filter
+    }
 }
 
 if ($Tool -in @("all", "initcheck")) {
-    & compute-sanitizer --tool initcheck --error-exitcode 1 cmd /c $testCommand
+    foreach ($filter in $followUpFilters) {
+        Invoke-Sanitizer -SanitizerTool initcheck -Filter $filter
+    }
 }
 
 if ($Tool -in @("all", "racecheck")) {
-    & compute-sanitizer --tool racecheck --error-exitcode 1 cmd /c $testCommand
+    foreach ($filter in $followUpFilters) {
+        Invoke-Sanitizer -SanitizerTool racecheck -Filter $filter
+    }
 }

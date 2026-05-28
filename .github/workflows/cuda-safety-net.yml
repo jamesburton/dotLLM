@@ -6,6 +6,8 @@ on:
       - 'native/kernels/**'
       - 'src/DotLLM.Cuda/**'
       - 'tests/DotLLM.Tests.Unit/Cuda/**'
+      - 'native/run-cuda-safety-net.ps1'
+      - 'docs/CUDA.md'
       - '.github/workflows/cuda-safety-net.yml'
   workflow_dispatch:
 
@@ -26,14 +28,13 @@ jobs:
       - name: Build unit tests
         run: dotnet build tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-restore
 
-      - name: Parity smoke tests
-        run: dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
-
-      - name: Compute Sanitizer (memcheck)
-        run: compute-sanitizer --tool memcheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
-
-      - name: Compute Sanitizer (initcheck)
-        run: compute-sanitizer --tool initcheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
-
-      - name: Compute Sanitizer (racecheck)
-        run: compute-sanitizer --tool racecheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
+      - name: CUDA safety net (kernel-focused sanitizer coverage)
+        shell: pwsh
+        run: |
+          $full = "${{ vars.DOTLLM_CUDA_FULL_SANITIZER }}" -eq "true"
+          if ($full) {
+            .\native\run-cuda-safety-net.ps1 -Tool all -Configuration Release -FullSanitizer
+          }
+          else {
+            .\native\run-cuda-safety-net.ps1 -Tool all -Configuration Release
+          }

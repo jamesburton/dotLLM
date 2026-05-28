@@ -261,6 +261,117 @@ public class CudaKernelTests : IDisposable
     }
 
     [SkippableFact]
+    public unsafe void BiasAdd_WithMisalignedPointers_MatchesCpuReference()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX files not found");
+
+        int dim = 63;
+        int seqLen = 4;
+        int total = dim * seqLen;
+        nint s = _stream!.Handle;
+        var rng = new Random(2026);
+
+        ushort[] outputHost = new ushort[total];
+        ushort[] biasHost = new ushort[dim];
+        for (int i = 0; i < total; i++)
+            outputHost[i] = BitConverter.HalfToUInt16Bits((Half)(rng.NextSingle() * 2 - 1));
+        for (int i = 0; i < dim; i++)
+            biasHost[i] = BitConverter.HalfToUInt16Bits((Half)(rng.NextSingle() * 2 - 1));
+
+        long outputBytes = (long)total * sizeof(ushort);
+        long biasBytes = (long)dim * sizeof(ushort);
+
+        CudaDriverApi.cuMemAlloc_v2(out nint devOutputBase, (nuint)(outputBytes + 2)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devBiasBase, (nuint)(biasBytes + 2)).ThrowOnError();
+        nint devOutput = devOutputBase + 2;
+        nint devBias = devBiasBase + 2;
+
+        try
+        {
+            fixed (ushort* pOut = outputHost) CudaDriverApi.cuMemcpyHtoD_v2(devOutput, (nint)pOut, (nuint)outputBytes).ThrowOnError();
+            fixed (ushort* pBias = biasHost) CudaDriverApi.cuMemcpyHtoD_v2(devBias, (nint)pBias, (nuint)biasBytes).ThrowOnError();
+
+            _kernels!.LaunchBiasAdd(devOutput, devBias, dim, seqLen, s);
+            _stream!.Synchronize();
+
+            ushort[] gpuOut = new ushort[total];
+            fixed (ushort* pOut = gpuOut) CudaDriverApi.cuMemcpyDtoH_v2((nint)pOut, devOutput, (nuint)outputBytes).ThrowOnError();
+
+            for (int i = 0; i < total; i++)
+            {
+                float expected = (float)BitConverter.UInt16BitsToHalf(outputHost[i]) +
+                                 (float)BitConverter.UInt16BitsToHalf(biasHost[i % dim]);
+                float actual = (float)BitConverter.UInt16BitsToHalf(gpuOut[i]);
+                Assert.True(MathF.Abs(expected - actual) < 0.01f,
+                    $"Mismatch at {i}: expected {expected}, got {actual}");
+            }
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devOutputBase);
+            CudaDriverApi.cuMemFree_v2(devBiasBase);
+        }
+    }
+
+    [SkippableFact]
+    public unsafe void SwiGLU_WithMisalignedPointers_MatchesCpuReference()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
+        Skip.If(_kernels == null, "PTX files not found");
+
+        int n = 131;
+        int seqLen = 1;
+        int total = n * seqLen;
+        nint s = _stream!.Handle;
+        var rng = new Random(4242);
+
+        ushort[] gateHost = new ushort[total];
+        ushort[] upHost = new ushort[total];
+        for (int i = 0; i < total; i++)
+        {
+            gateHost[i] = BitConverter.HalfToUInt16Bits((Half)(rng.NextSingle() * 2 - 1));
+            upHost[i] = BitConverter.HalfToUInt16Bits((Half)(rng.NextSingle() * 2 - 1));
+        }
+
+        long bytes = (long)total * sizeof(ushort);
+        CudaDriverApi.cuMemAlloc_v2(out nint devGateBase, (nuint)(bytes + 2)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devUpBase, (nuint)(bytes + 2)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devOutBase, (nuint)(bytes + 2)).ThrowOnError();
+        nint devGate = devGateBase + 2;
+        nint devUp = devUpBase + 2;
+        nint devOut = devOutBase + 2;
+
+        try
+        {
+            fixed (ushort* pGate = gateHost) CudaDriverApi.cuMemcpyHtoD_v2(devGate, (nint)pGate, (nuint)bytes).ThrowOnError();
+            fixed (ushort* pUp = upHost) CudaDriverApi.cuMemcpyHtoD_v2(devUp, (nint)pUp, (nuint)bytes).ThrowOnError();
+
+            _kernels!.LaunchSwiGLU(devGate, devUp, devOut, n, seqLen, s);
+            _stream!.Synchronize();
+
+            ushort[] gpuOut = new ushort[total];
+            fixed (ushort* pOut = gpuOut) CudaDriverApi.cuMemcpyDtoH_v2((nint)pOut, devOut, (nuint)bytes).ThrowOnError();
+
+            for (int i = 0; i < total; i++)
+            {
+                float gate = (float)BitConverter.UInt16BitsToHalf(gateHost[i]);
+                float up = (float)BitConverter.UInt16BitsToHalf(upHost[i]);
+                float expected = gate / (1.0f + MathF.Exp(-gate)) * up;
+                float actual = (float)BitConverter.UInt16BitsToHalf(gpuOut[i]);
+                Assert.True(MathF.Abs(expected - actual) < 0.01f,
+                    $"Mismatch at {i}: expected {expected}, got {actual}");
+            }
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devGateBase);
+            CudaDriverApi.cuMemFree_v2(devUpBase);
+            CudaDriverApi.cuMemFree_v2(devOutBase);
+        }
+    }
+
+    [SkippableFact]
     public void LaunchAttention_ThrowsForExcessiveSharedMemory()
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");

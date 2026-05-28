@@ -4,6 +4,9 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+#ifndef NDEBUG
+#include <assert.h>
+#endif
 
 __device__ __forceinline__ bool is_aligned_4(const void* ptr)
 {
@@ -26,6 +29,11 @@ extern "C" __global__ void __launch_bounds__(256) swiglu_f16(
     {
         half2 g2 = reinterpret_cast<const half2*>(gate)[idx];
         half2 u2 = reinterpret_cast<const half2*>(up)[idx];
+#ifndef NDEBUG
+        assert(is_aligned_4(&reinterpret_cast<const half2*>(gate)[idx]));
+        assert(is_aligned_4(&reinterpret_cast<const half2*>(up)[idx]));
+        assert(is_aligned_4(&reinterpret_cast<half2*>(output)[idx]));
+#endif
 
         float g0 = __low2float(g2), g1 = __high2float(g2);
         float u0 = __low2float(u2), u1 = __high2float(u2);

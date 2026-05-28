@@ -4,6 +4,9 @@
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+#ifndef NDEBUG
+#include <assert.h>
+#endif
 
 __device__ __forceinline__ bool is_aligned_4(const void* ptr)
 {
@@ -25,6 +28,11 @@ extern "C" __global__ void __launch_bounds__(256) add_f16(
         const half2* a2 = reinterpret_cast<const half2*>(a);
         const half2* b2 = reinterpret_cast<const half2*>(b);
         half2* out2 = reinterpret_cast<half2*>(output);
+#ifndef NDEBUG
+        assert(is_aligned_4(&a2[idx]));
+        assert(is_aligned_4(&b2[idx]));
+        assert(is_aligned_4(&out2[idx]));
+#endif
         out2[idx] = __hadd2(a2[idx], b2[idx]);
     }
     else if (!can_vectorize && idx < n)
