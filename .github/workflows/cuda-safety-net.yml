@@ -1,0 +1,39 @@
+name: CUDA Safety Net
+
+on:
+  pull_request:
+    paths:
+      - 'native/kernels/**'
+      - 'src/DotLLM.Cuda/**'
+      - 'tests/DotLLM.Tests.Unit/Cuda/**'
+      - '.github/workflows/cuda-safety-net.yml'
+  workflow_dispatch:
+
+jobs:
+  kernel-safety-net:
+    if: vars.DOTLLM_ENABLE_CUDA_SAFETY_NET == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, windows, x64, cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build unit tests
+        run: dotnet build tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-restore
+
+      - name: Parity smoke tests
+        run: dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
+
+      - name: Compute Sanitizer (memcheck)
+        run: compute-sanitizer --tool memcheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
+
+      - name: Compute Sanitizer (initcheck)
+        run: compute-sanitizer --tool initcheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"
+
+      - name: Compute Sanitizer (racecheck)
+        run: compute-sanitizer --tool racecheck --error-exitcode 1 dotnet test tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj -c Release --no-build --filter "Category=GPU&FullyQualifiedName~CudaKernelTests"

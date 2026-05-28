@@ -247,6 +247,22 @@ internal static partial class CudaDriverApi
 }
 ```
 
+### Kernel Safety Net (Issue #123)
+
+To prevent misaligned-address regressions in vectorized kernels:
+
+- `native/kernels/add.cu`, `bias_add.cu`, `swiglu.cu`, and `convert.cu` now guard half2/float2 vector paths with pointer-alignment checks and automatically fall back to scalar element-wise paths when device pointers are not sufficiently aligned.
+- `CudaKernels` emits debug-only alignment assertions before launching these kernels.
+- `tests/DotLLM.Tests.Unit/Cuda/CudaKernelTests.cs` includes parity checks for intentionally misaligned device pointers.
+
+For sanitizer passes on a CUDA-enabled host:
+
+```powershell
+.\native\run-cuda-safety-net.ps1
+```
+
+This runs parity tests and `compute-sanitizer` with `memcheck`, `initcheck`, and `racecheck`.
+
 ### cuBLAS Declarations
 
 ~6 function declarations for GEMM operations:
