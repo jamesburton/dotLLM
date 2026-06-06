@@ -108,6 +108,62 @@ public sealed unsafe class FusedOpsTests
             Assert.Equal(scalarResult[i], fusedResult[i], 1e-4f);
     }
 
+    [Fact]
+    public void SwiGLU_GateAndDestAlias_ProducesCorrectOutput()
+    {
+        // Verifies SwiGLU(gate, up, gate) — dest aliases gate — produces the same result
+        // as the non-aliased path. The fix detects only up-aliasing; gate-aliasing is
+        // incidentally safe because gate is consumed before being overwritten.
+        var rng = new Random(11);
+        const int n = 1024;
+        float[] gate = new float[n];
+        float[] up = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            gate[i] = rng.NextSingle() * 20f - 10f;
+            up[i] = rng.NextSingle() * 20f - 10f;
+        }
+
+        // Non-aliased reference
+        float[] reference = new float[n];
+        FusedOps.SwiGLU(gate, up, reference);
+
+        // Aliased: dest aliases gate
+        float[] gateAlias = (float[])gate.Clone();
+        FusedOps.SwiGLU(gateAlias, up, gateAlias);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(reference[i], gateAlias[i], 1e-4f);
+    }
+
+    [Fact]
+    public void SwiGLU_UpAndDestAlias_ProducesCorrectOutput()
+    {
+        // Verifies SwiGLU(gate, up, up) — dest aliases up — produces the same result
+        // as the non-aliased path. Without the fix, step 3 multiplied SiLU(gate)² instead
+        // of SiLU(gate) * up because 'up' had already been overwritten.
+        var rng = new Random(22);
+        const int n = 1024;
+        float[] gate = new float[n];
+        float[] up = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            gate[i] = rng.NextSingle() * 20f - 10f;
+            up[i] = rng.NextSingle() * 20f - 10f;
+        }
+
+        // Non-aliased reference
+        float[] reference = new float[n];
+        FusedOps.SwiGLU(gate, up, reference);
+
+        // Aliased: dest aliases up
+        float[] upAlias = (float[])up.Clone();
+        FusedOps.SwiGLU(gate, upAlias, upAlias);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(reference[i], upAlias[i], 1e-4f);
+    }
+
     // ──────────────────── RmsNormQuantize Q8_0 Tests ────────────────────
 
     [Theory]

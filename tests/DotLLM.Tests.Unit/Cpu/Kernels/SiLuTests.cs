@@ -84,4 +84,27 @@ public sealed class SiLuTests
         for (int i = 0; i < input.Length; i++)
             Assert.Equal(expected[i], result[i], 1e-5f);
     }
+
+    [Fact]
+    public void Execute_AliasedSrcAndDest_ProducesCorrectOutput()
+    {
+        // Verifies the in-place (aliased) path doesn't corrupt output by reading
+        // the sigmoid-overwritten buffer instead of the original input values.
+        var rng = new Random(99);
+        const int n = 1024;
+        float[] original = new float[n];
+        for (int i = 0; i < n; i++)
+            original[i] = rng.NextSingle() * 20f - 10f;
+
+        // Non-aliased reference
+        float[] reference = new float[n];
+        SiLu.Execute(original, reference);
+
+        // Aliased: src == dest (in-place)
+        float[] buffer = (float[])original.Clone();
+        SiLu.Execute(buffer, buffer);
+
+        for (int i = 0; i < n; i++)
+            Assert.Equal(reference[i], buffer[i], 1e-4f);
+    }
 }
