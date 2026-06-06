@@ -64,6 +64,32 @@ public sealed class CudaModule : IDisposable
         return func;
     }
 
+    /// <summary>
+    /// Tries to get a kernel function handle by name. Returns <c>0</c> if the symbol is not
+    /// present in the module (e.g. compiled against an older PTX that predates the kernel).
+    /// Caches both hits and misses for subsequent calls.
+    /// </summary>
+    /// <param name="name">The <c>extern "C"</c> kernel function name.</param>
+    /// <returns>The function handle, or <c>0</c> if the symbol was not found.</returns>
+    public nint TryGetFunction(string name)
+    {
+        if (_functions.TryGetValue(name, out nint func))
+            return func;
+
+        int result = CudaDriverApi.cuModuleGetFunction(out func, _module, name);
+
+        // CUDA_ERROR_NOT_FOUND = 500: symbol absent from PTX (older build).
+        if (result == 500)
+        {
+            _functions[name] = 0;
+            return 0;
+        }
+
+        result.ThrowOnError();
+        _functions[name] = func;
+        return func;
+    }
+
 
     /// <inheritdoc/>
     public void Dispose()
