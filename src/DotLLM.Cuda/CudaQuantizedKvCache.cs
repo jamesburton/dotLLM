@@ -204,6 +204,113 @@ public sealed class CudaQuantizedKvCache : IQuantizedKvCache
     }
 
     /// <summary>
+    /// Graph-capture variant of <see cref="UpdateDevice"/>. All host-observable state
+    /// (eviction counters, ring offsets) is moved device-side via predicated kernels
+    /// that read the absolute decode position from <paramref name="posPtrDevice"/>.
+    /// <para>
+    /// Per layer, three launches:
+    /// <list type="number">
+    /// <item><description><c>kv_write_one_f16_ring</c> for K and V — writes the new FP16 row
+    /// into the per-layer ring at <c>pos % windowSize</c>.</description></item>
+    /// <item><description><c>quant_f16_to_q{8,4}_0_dyn</c> for K and V — predicated; quantizes the
+    /// row that just fell out of the window (<c>evict_pos = pos - windowSize</c>). No-op
+    /// while the window is still filling.</description></item>
+    /// </list>
+    /// Only valid when <see cref="WindowCapacity"/> &gt; 0 (mixed-precision window mode).
+    /// Pure-quantized mode (no FP16 window) is rare and stays on the eager path.
+    /// </para>
+    /// </summary>
+    internal void UpdateDeviceForGraph(nint keysDevice, nint valuesDevice,
+                                         int layerIndex, nint posPtrDevice,
+                                         nint stream, CudaKernels kernels)
+    {
+        if (_windowSize <= 0)
+            throw new InvalidOperationException(
+                "UpdateDeviceForGraph requires a mixed-precision window (windowSize > 0).");
+
+        // Step 1 (must run BEFORE the ring write): predicated quantize-on-evict.
+        // Reads the FP16 row at ring slot `(pos - windowSize) % windowSize` — which is
+        // about to be overwritten by the new write below — and lands it in the Q-cache
+        // at row index `evict_pos = pos - windowSize`. No-op while pos < windowSize.
+        // Critical ordering: if we wrote first then quantized, we'd quantize the NEW
+        // row's bytes into the OLD row's Q-cache slot, corrupting attention reads.
+        kernels.LaunchQuantKvDyn(
+            _keysWindow![layerIndex], _keysQuant[layerIndex],
+            _kvStride, _windowSize, KeyDType, posPtrDevice, stream);
+        kernels.LaunchQuantKvDyn(
+            _valuesWindow![layerIndex], _valuesQuant[layerIndex],
+            _kvStride, _windowSize, ValueDType, posPtrDevice, stream);
+
+        // Step 2: write the new FP16 row into the per-layer ring buffer at
+        // slot `pos % windowSize`. After eviction has read the old contents.
+        kernels.LaunchKvWriteOneF16Ring(
+            keysDevice, _keysWindow[layerIndex], _kvStride, _windowSize, posPtrDevice, stream);
+        kernels.LaunchKvWriteOneF16Ring(
+            valuesDevice, _valuesWindow[layerIndex], _kvStride, _windowSize, posPtrDevice, stream);
+    }
+
+    /// <summary>
+    /// Graph-capture variant of <see cref="PrepareAttentionScratch"/>. Two launches per
+    /// K/V: <c>kv_dequant_q{8,4}_0_dyn</c> dequantizes the live quantized prefix into
+    /// <see cref="_kScratch"/> / <see cref="_vScratch"/>; <c>kv_window_to_scratch_dyn</c>
+    /// scatters the FP16 ring contents into the contiguous tail of the same scratch.
+    /// Both kernels read the decode position from <paramref name="posPtrDevice"/> — the
+    /// "how many quantized rows" / "where does the window start" arithmetic happens
+    /// device-side, so the launch topology is identical across decode steps.
+    /// </summary>
+    internal (nint kPtr, nint vPtr) PrepareAttentionScratchForGraph(int layerIndex,
+                                                                      nint posPtrDevice,
+                                                                      nint stream,
+                                                                      CudaKernels kernels)
+    {
+        if (_windowSize <= 0)
+            throw new InvalidOperationException(
+                "PrepareAttentionScratchForGraph requires a mixed-precision window.");
+
+        // Phase 1: dequant the [0, quantizedLength) prefix (predicated; no-op until window fills).
+        kernels.LaunchKvDequantDyn(
+            _keysQuant[layerIndex], _kScratch,
+            _kvStride, _windowSize, _maxSeqLen, KeyDType, posPtrDevice, stream);
+        kernels.LaunchKvDequantDyn(
+            _valuesQuant[layerIndex], _vScratch,
+            _kvStride, _windowSize, _maxSeqLen, ValueDType, posPtrDevice, stream);
+
+        // Phase 2: scatter the live FP16 window into the scratch tail.
+        kernels.LaunchKvWindowToScratchDyn(
+            _keysWindow![layerIndex], _kScratch, _kvStride, _windowSize, posPtrDevice, stream);
+        kernels.LaunchKvWindowToScratchDyn(
+            _valuesWindow![layerIndex], _vScratch, _kvStride, _windowSize, posPtrDevice, stream);
+
+        return (_kScratch, _vScratch);
+    }
+
+    /// <summary>
+    /// Updates host-side counters (<see cref="CurrentLength"/>, <see cref="QuantizedLength"/>,
+    /// per-layer eviction state) after a CUDA-Graph decode step. The graph itself wrote
+    /// the FP16 ring slot and (when applicable) quantized the evicted row device-side; this
+    /// just keeps the metadata consistent so subsequent eager calls / sampler stop-checks
+    /// see the right values.
+    /// </summary>
+    internal void AdvanceLengthForGraphDecode(int newLength)
+    {
+        if (newLength > _currentLength) _currentLength = newLength;
+
+        if (_windowSize > 0)
+        {
+            int newQuantLen = Math.Max(0, newLength - _windowSize);
+            if (newQuantLen > _quantizedLength) _quantizedLength = newQuantLen;
+            // Each layer evicts in lockstep with the global write position; bump
+            // each layer's counter so a fall-back to the eager path (e.g. after a
+            // rollback) sees the correct prevQuantLen.
+            for (int i = 0; i < _numLayers; i++)
+            {
+                if (newQuantLen > _layerQuantizedLength[i])
+                    _layerQuantizedLength[i] = newQuantLen;
+            }
+        }
+    }
+
+    /// <summary>
     /// Prepares dequantized FP16 scratch buffers for attention. Returns device pointers
     /// to contiguous FP16 K/V covering the full sequence (quantized + window).
     /// </summary>

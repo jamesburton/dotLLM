@@ -84,6 +84,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
+    // Graph-friendly KV-quant variants: read decode position from a device int
+    // and predicate the FP16-row → quantized-row eviction.
+    private readonly nint _quantKvQ8_0DynFunc;
+    private readonly nint _quantKvQ4_0DynFunc;
 
     // Graph-friendly attention variant: reads seq_kv / position_offset from
     // 4-byte device buffers. Pointers stay stable across cuGraphLaunch replays;
@@ -94,6 +98,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // baked into the graph at instantiate time.
     private readonly CudaModule? _kvWriteModule;
     private readonly nint _kvWriteOneF16Func;
+    // Graph-friendly KV-quant scratch helpers (live in kv_write.ptx alongside
+    // the FP16 ring write so they share device-resident pos_ptr conventions).
+    private readonly nint _kvWriteOneF16RingFunc;
+    private readonly nint _kvDequantQ8_0DynFunc;
+    private readonly nint _kvDequantQ4_0DynFunc;
+    private readonly nint _kvWindowToScratchDynFunc;
 
 
     /// <summary>
@@ -173,6 +183,8 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantKvModule = CudaModule.LoadFromFile(quantKvPath);
             _quantKvQ8_0Func = _quantKvModule.GetFunction("quant_f16_to_q8_0");
             _quantKvQ4_0Func = _quantKvModule.GetFunction("quant_f16_to_q4_0");
+            _quantKvQ8_0DynFunc = _quantKvModule.GetFunction("quant_f16_to_q8_0_dyn");
+            _quantKvQ4_0DynFunc = _quantKvModule.GetFunction("quant_f16_to_q4_0_dyn");
         }
 
         // Graph-friendly KV write (optional — only present when CUDA Graphs path is in use).
@@ -181,6 +193,10 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _kvWriteModule = CudaModule.LoadFromFile(kvWritePath);
             _kvWriteOneF16Func = _kvWriteModule.GetFunction("kv_write_one_f16");
+            _kvWriteOneF16RingFunc = _kvWriteModule.GetFunction("kv_write_one_f16_ring");
+            _kvDequantQ8_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q8_0_dyn");
+            _kvDequantQ4_0DynFunc = _kvWriteModule.GetFunction("kv_dequant_q4_0_dyn");
+            _kvWindowToScratchDynFunc = _kvWriteModule.GetFunction("kv_window_to_scratch_dyn");
         }
     }
 
@@ -575,6 +591,93 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Writes a single FP16 row into the per-layer ring buffer at slot
+    /// <c>posPtr[0] % windowSize</c>. Graph-friendly counterpart to a
+    /// host-computed <c>cuMemcpyDtoDAsync</c> into <c>_keysWindow[layer]</c>.
+    /// </summary>
+    public void LaunchKvWriteOneF16Ring(nint src, nint ringBase, int kvStride, int windowSize,
+                                         nint posPtr, nint stream)
+    {
+        if (_kvWriteModule == null)
+            throw new InvalidOperationException(
+                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
+
+        nint srcArg = src, ringArg = ringBase, posArg = posPtr;
+        int kvArg = kvStride, wsArg = windowSize;
+        void** args = stackalloc void*[] { &srcArg, &ringArg, &kvArg, &wsArg, &posArg };
+        uint gridDim = (uint)((kvStride + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_kvWriteOneF16RingFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Dequantizes the <c>[0, max(0, posPtr[0] + 1 - windowSize))</c> prefix of the per-layer
+    /// quantized cache into FP16 attention scratch. Predicated: no-op when the FP16 window
+    /// hasn't yet started evicting. Grid is sized for the maximum quantized region; the
+    /// kernel's grid-stride loop bounds the work to the live prefix.
+    /// </summary>
+    public void LaunchKvDequantDyn(nint quantBase, nint scratchBase, int kvStride, int windowSize,
+                                     int maxSeqLen, KvCacheDType dtype, nint posPtr, nint stream)
+    {
+        if (_kvWriteModule == null)
+            throw new InvalidOperationException(
+                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
+
+        nint qArg = quantBase, sArg = scratchBase, posArg = posPtr;
+        int kvArg = kvStride, wsArg = windowSize;
+        void** args = stackalloc void*[] { &qArg, &sArg, &kvArg, &wsArg, &posArg };
+
+        // Match LaunchDequantToF16's grid sizing: cap at MaxDequantGridSize CUDA blocks.
+        // Each CUDA block has 8 warps (one per quant block of 32 elements).
+        int blocksPerRow = kvStride / 32;
+        int maxQuantRows = Math.Max(0, maxSeqLen - windowSize);
+        int totalBlocks = Math.Max(blocksPerRow, maxQuantRows * blocksPerRow);
+        uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        nint func = dtype switch
+        {
+            KvCacheDType.Q8_0 => _kvDequantQ8_0DynFunc,
+            KvCacheDType.Q4_0 => _kvDequantQ4_0DynFunc,
+            _ => throw new NotSupportedException($"Dynamic KV dequant not supported for {dtype}.")
+        };
+
+        CudaDriverApi.cuLaunchKernel(func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Scatters the live FP16 window from a per-layer ring buffer into the FP16 attention
+    /// scratch starting at row <c>max(0, posPtr[0] + 1 - windowSize)</c>. One CUDA block
+    /// per ring slot — each block predicates on whether its slot is currently populated
+    /// at the device-side decode position.
+    /// </summary>
+    public void LaunchKvWindowToScratchDyn(nint ringBase, nint scratchBase, int kvStride,
+                                             int windowSize, nint posPtr, nint stream)
+    {
+        if (_kvWriteModule == null)
+            throw new InvalidOperationException(
+                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
+
+        nint rArg = ringBase, sArg = scratchBase, posArg = posPtr;
+        int kvArg = kvStride, wsArg = windowSize;
+        void** args = stackalloc void*[] { &rArg, &sArg, &kvArg, &wsArg, &posArg };
+
+        // One CUDA block per ring slot; threads-per-block sized to cover kvStride
+        // with a per-thread stride loop.
+        uint gridDim = (uint)windowSize;
+        uint threadsPerBlock = (uint)Math.Min(BlockSize, kvStride);
+        if (threadsPerBlock == 0) threadsPerBlock = 32;
+
+        CudaDriverApi.cuLaunchKernel(_kvWindowToScratchDynFunc,
+                gridDim, 1, 1, threadsPerBlock, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Bias add: output[t, :] += bias[:]. half2 vectorized (2 elements/thread).</summary>
     public void LaunchBiasAdd(nint output, nint bias, int dim, int seqLen, nint stream)
     {
@@ -799,6 +902,45 @@ public sealed unsafe class CudaKernels : IDisposable
             Core.Configuration.KvCacheDType.Q8_0 => _quantKvQ8_0Func,
             Core.Configuration.KvCacheDType.Q4_0 => _quantKvQ4_0Func,
             _ => throw new NotSupportedException($"KV quantization not supported for {dtype}")
+        };
+
+        CudaDriverApi.cuLaunchKernel(func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Predicated FP16 → Q8_0 / Q4_0 KV-row quantizer for the CUDA Graphs
+    /// decode path. Source row is selected from <paramref name="windowBase"/>
+    /// (FP16 ring buffer) and destination row in <paramref name="quantBase"/>
+    /// (per-layer Q-cache) using the absolute decode position read from
+    /// <paramref name="posPtr"/>. Until the FP16 window fills (i.e.
+    /// <c>pos &lt; windowSize</c>) the kernel returns immediately, so it is
+    /// safe to launch on every decode step. One CUDA block of <c>kvStride/32</c>
+    /// threads quantizes a single row.
+    /// </summary>
+    public void LaunchQuantKvDyn(nint windowBase, nint quantBase, int kvStride, int windowSize,
+                                   KvCacheDType dtype, nint posPtr, nint stream)
+    {
+        if (_quantKvModule == null)
+            throw new InvalidOperationException(
+                "KV-cache quantization kernels not available. Compile native/kernels/quant_kv.cu to PTX.");
+
+        nint wArg = windowBase, qArg = quantBase, posArg = posPtr;
+        int kvArg = kvStride, wsArg = windowSize;
+        void** args = stackalloc void*[] { &wArg, &qArg, &kvArg, &wsArg, &posArg };
+
+        int totalBlocksPerRow = kvStride / 32;
+        // Single CUDA block per row covers up to 256 quant blocks (kvStride ≤ 8192) at
+        // 256 threads/block — typical models stay well under that.
+        uint gridDim = (uint)((totalBlocksPerRow + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        nint func = dtype switch
+        {
+            KvCacheDType.Q8_0 => _quantKvQ8_0DynFunc,
+            KvCacheDType.Q4_0 => _quantKvQ4_0DynFunc,
+            _ => throw new NotSupportedException($"Dynamic KV quantization not supported for {dtype}.")
         };
 
         CudaDriverApi.cuLaunchKernel(func,
