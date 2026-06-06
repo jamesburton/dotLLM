@@ -34,7 +34,7 @@ namespace DotLLM.Models.SafeTensors;
 /// No managed copies of tensor data are made at open time.
 /// </para>
 /// </remarks>
-public sealed unsafe class SafetensorsFile : IDisposable
+public sealed unsafe class SafetensorsFile : ISafetensorsTensorSource
 {
     private MemoryMappedFile? _mmf;
     private MemoryMappedViewAccessor? _accessor;

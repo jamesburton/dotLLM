@@ -130,15 +130,16 @@ public sealed unsafe class TransformerModel : IModel
     /// anchored to prevent GC, but the caller must still dispose it after
     /// disposing the model.
     /// </summary>
-    public static TransformerModel LoadFromSafetensors(SafetensorsFile file, ModelConfig config)
+    public static TransformerModel LoadFromSafetensors(ISafetensorsTensorSource file, ModelConfig config)
         => LoadFromSafetensors(file, config, ThreadingConfig.SingleThreaded);
 
     /// <summary>
     /// Loads a transformer model from an opened HuggingFace-convention
-    /// safetensors file with threading configuration.
+    /// safetensors source (single-file or multi-shard) with threading
+    /// configuration.
     /// </summary>
     public static TransformerModel LoadFromSafetensors(
-        SafetensorsFile file, ModelConfig config, ThreadingConfig threading)
+        ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
