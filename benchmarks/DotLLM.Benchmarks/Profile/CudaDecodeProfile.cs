@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
 using DotLLM.Cuda;
 using DotLLM.HuggingFace;
 using DotLLM.Models.Gguf;
@@ -47,6 +48,14 @@ internal static class CudaDecodeProfile
         bool useGraph = args.Contains("--graph");
         bool compare = args.Contains("--compare");
         bool noProfiling = args.Contains("--no-profiling");
+        // --kv-quant : run with the mixed-precision quantized KV cache
+        //              (Q8_0 stored region + 16-row FP16 window). Validates the
+        //              quantized-cache CUDA Graphs decode path lands the same
+        //              ~2× speedup as the FP16 cache.
+        bool kvQuant = args.Contains("--kv-quant");
+        KvCacheConfig kvCfg = kvQuant
+            ? new KvCacheConfig(KvCacheDType.Q8_0, KvCacheDType.Q8_0, MixedPrecisionWindowSize: 16)
+            : KvCacheConfig.Default;
 
         string modelPath = ResolveModelPath();
         Console.WriteLine($"Model: {modelPath}");
@@ -60,17 +69,20 @@ internal static class CudaDecodeProfile
 
         if (compare)
         {
+            string cacheLabel = kvQuant ? "KV-quant Q8_0 + W16 window" : "FP16 KV";
+            Console.WriteLine($"Cache config: {cacheLabel}");
             Console.WriteLine();
             Console.WriteLine("════════ EAGER (with per-category profiling) ════════");
-            var eagerResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: false);
+            var eagerResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: false, kvCfg: kvCfg);
             Console.WriteLine();
             Console.WriteLine("════════ EAGER (no profiling — true wall) ════════");
-            var eagerCleanResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: true);
+            var eagerCleanResult = RunOne(gguf, config, promptTokens, useGraphCapture: false, disableProfiling: true, kvCfg: kvCfg);
             Console.WriteLine();
             Console.WriteLine("════════ CUDA GRAPH (capture+replay) ════════");
-            var graphResult = RunOne(gguf, config, promptTokens, useGraphCapture: true, disableProfiling: true);
+            var graphResult = RunOne(gguf, config, promptTokens, useGraphCapture: true, disableProfiling: true, kvCfg: kvCfg);
             Console.WriteLine();
             Console.WriteLine("════════ SUMMARY ════════");
+            Console.WriteLine($"  cache config                = {cacheLabel}");
             Console.WriteLine($"  eager+profile  median tok/s = {1000.0 / eagerResult.MedianWallMs,7:F1}  (wall {eagerResult.MedianWallMs:F2} ms)");
             Console.WriteLine($"  eager (clean)  median tok/s = {1000.0 / eagerCleanResult.MedianWallMs,7:F1}  (wall {eagerCleanResult.MedianWallMs:F2} ms)");
             Console.WriteLine($"  graph          median tok/s = {1000.0 / graphResult.MedianWallMs,7:F1}  (wall {graphResult.MedianWallMs:F2} ms)");
@@ -78,7 +90,7 @@ internal static class CudaDecodeProfile
             return 0;
         }
 
-        var single = RunOne(gguf, config, promptTokens, useGraphCapture: useGraph, disableProfiling: noProfiling);
+        var single = RunOne(gguf, config, promptTokens, useGraphCapture: useGraph, disableProfiling: noProfiling, kvCfg: kvCfg);
         return 0;
     }
 
@@ -90,7 +102,8 @@ internal static class CudaDecodeProfile
 
     private static DecodeStats RunOne(GgufFile gguf, DotLLM.Core.Models.ModelConfig config,
                                        int[] promptTokens, bool useGraphCapture,
-                                       bool disableProfiling = false)
+                                       bool disableProfiling = false,
+                                       KvCacheConfig kvCfg = default)
     {
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0);
         model.UseGraphCapture = useGraphCapture;
@@ -99,7 +112,9 @@ internal static class CudaDecodeProfile
         int[] prefill = promptTokens[..prefillLen];
 
         int kvCapacity = prefillLen + DefaultWarmupTokens + DefaultDecodeTokens + 8;
-        using var kv = (IKvCache)model.CreateKvCache(kvCapacity);
+        using var kv = kvCfg.IsQuantized
+            ? (IKvCache)model.CreateKvCache(kvCapacity, kvCfg)
+            : (IKvCache)model.CreateKvCache(kvCapacity);
 
         int[] prefillPositions = new int[prefillLen];
         for (int i = 0; i < prefillLen; i++) prefillPositions[i] = i;
