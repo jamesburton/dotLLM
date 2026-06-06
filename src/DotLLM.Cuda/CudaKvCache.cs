@@ -113,6 +113,39 @@ public sealed class CudaKvCache : IKvCache
     /// <summary>Returns device pointer to cached values for the given layer.</summary>
     internal nint GetValuesPtr(int layerIndex) => _values[layerIndex];
 
+    /// <summary>
+    /// Single-token KV-cache write where the destination row index is read from a
+    /// device-resident int. Used by the CUDA Graphs decode replay path: under graph
+    /// capture, host-computed addresses (as in <see cref="UpdateDevice"/>) get baked
+    /// into the graph at instantiate time and the next replay would clobber the
+    /// same row. Writing through a device-side index keeps the graph topology
+    /// invariant while still landing each token at the correct position.
+    /// </summary>
+    /// <param name="newKeyDevice">Device pointer to new K row (FP16, kvStride elements).</param>
+    /// <param name="newValueDevice">Device pointer to new V row (FP16, kvStride elements).</param>
+    /// <param name="layerIndex">Layer index.</param>
+    /// <param name="posPtrDevice">Device pointer to a 4-byte int holding the absolute row index.</param>
+    /// <param name="stream">CUDA stream.</param>
+    /// <param name="kernels">Kernel dispatcher.</param>
+    internal void UpdateDeviceSingleDevicePos(
+        nint newKeyDevice, nint newValueDevice,
+        int layerIndex, nint posPtrDevice, nint stream, CudaKernels kernels)
+    {
+        kernels.LaunchKvWriteOneF16(newKeyDevice, _keys[layerIndex], _kvStride, posPtrDevice, stream);
+        kernels.LaunchKvWriteOneF16(newValueDevice, _values[layerIndex], _kvStride, posPtrDevice, stream);
+    }
+
+    /// <summary>
+    /// Updates the host-side <see cref="CurrentLength"/> after a graph-launched
+    /// decode step. The graph itself wrote to the cache at the device-side index;
+    /// this just keeps the metadata in sync so subsequent prefill / non-graph
+    /// callers see the right length.
+    /// </summary>
+    internal void AdvanceLengthForGraphDecode(int newLength)
+    {
+        if (newLength > _currentLength) _currentLength = newLength;
+    }
+
     // ── IKvCache interface implementation ─────────────────────────────
 
     /// <inheritdoc/>

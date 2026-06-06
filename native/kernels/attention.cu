@@ -10,11 +10,33 @@
 // 2. Parallel warp-shuffle reductions (not serial thread-0 scan)
 // 3. Tiled online softmax — bounded shared memory O(TILE_KV + headDim)
 //    regardless of sequence length (no crash at long contexts)
+//
+// Two entry points share the body:
+//   attention_f16        — scalar seq_kv / position_offset (eager / prefill).
+//   attention_f16_dyn    — reads seq_kv / position_offset from device pointers.
+//                          Used by CUDA-Graphs decode replay where launch params
+//                          are baked into the graph at instantiate time but the
+//                          KV length grows by 1 per replay. Zero extra sync —
+//                          host bumps a 4-byte cuMemcpyHtoD before each launch.
 
 #include <cuda_fp16.h>
 #include <float.h>
 
 #define TILE_KV 256
+
+// Body shared by both entry points. Inlined into each.
+__device__ __forceinline__ void attention_f16_body(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ output,
+    int seq_q,
+    int seq_kv,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int position_offset,
+    int sliding_window);
 
 extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const half* __restrict__ q,
@@ -27,7 +49,46 @@ extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const int num_kv_heads,
     const int head_dim,
     const int position_offset,
-    const int sliding_window)  // 0 = no sliding window
+    const int sliding_window)
+{
+    attention_f16_body(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
+                       head_dim, position_offset, sliding_window);
+}
+
+// Graph-friendly entry point: seq_kv and position_offset are dereferenced from
+// 4-byte device buffers. Host increments these via cuMemcpyHtoD between
+// cuGraphLaunch calls (~1 µs vs 22 µs/launch on WDDM).
+extern "C" __global__ void __launch_bounds__(256) attention_f16_dyn(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ output,
+    const int seq_q,
+    const int* __restrict__ seq_kv_ptr,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_dim,
+    const int* __restrict__ position_offset_ptr,
+    const int sliding_window)
+{
+    int seq_kv = seq_kv_ptr[0];
+    int position_offset = position_offset_ptr[0];
+    attention_f16_body(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
+                       head_dim, position_offset, sliding_window);
+}
+
+__device__ __forceinline__ void attention_f16_body(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    half* __restrict__ output,
+    int seq_q,
+    int seq_kv,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int position_offset,
+    int sliding_window)
 {
     int block_id = blockIdx.x;
     int total_blocks = seq_q * num_heads;

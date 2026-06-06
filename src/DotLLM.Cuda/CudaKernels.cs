@@ -85,6 +85,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
 
+    // Graph-friendly attention variant: reads seq_kv / position_offset from
+    // 4-byte device buffers. Pointers stay stable across cuGraphLaunch replays;
+    // host bumps the underlying ints via cuMemcpyHtoD between launches (~1 µs).
+    private readonly nint _attentionDynFunc;
+    // Decode-step KV-cache write: dst row is dst_base + posPtr[0] * kv_stride.
+    // Replaces a host-side cuMemcpyDtoDAsync where the dst address would be
+    // baked into the graph at instantiate time.
+    private readonly CudaModule? _kvWriteModule;
+    private readonly nint _kvWriteOneF16Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -139,6 +149,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _embeddingF16Func = _embeddingModule.GetFunction("embedding_lookup_f16");
         _embeddingQ8_0Func = _embeddingModule.GetFunction("embedding_lookup_q8_0");
         _attentionFunc = _attentionModule.GetFunction("attention_f16");
+        _attentionDynFunc = _attentionModule.GetFunction("attention_f16_dyn");
         _biasAddFunc = _biasAddModule.GetFunction("bias_add_f16");
         _perHeadRmsNormFunc = _perHeadRmsNormModule.GetFunction("per_head_rmsnorm_f16");
         _convertF16ToF32Func = _convertModule.GetFunction("convert_f16_to_f32");
@@ -162,6 +173,14 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantKvModule = CudaModule.LoadFromFile(quantKvPath);
             _quantKvQ8_0Func = _quantKvModule.GetFunction("quant_f16_to_q8_0");
             _quantKvQ4_0Func = _quantKvModule.GetFunction("quant_f16_to_q4_0");
+        }
+
+        // Graph-friendly KV write (optional — only present when CUDA Graphs path is in use).
+        string kvWritePath = Path.Combine(ptxDir, "kv_write.ptx");
+        if (File.Exists(kvWritePath))
+        {
+            _kvWriteModule = CudaModule.LoadFromFile(kvWritePath);
+            _kvWriteOneF16Func = _kvWriteModule.GetFunction("kv_write_one_f16");
         }
     }
 
@@ -495,6 +514,67 @@ public sealed unsafe class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Decode-step attention with device-resident <c>seqKv</c> and <c>positionOffset</c>.
+    /// Identical body to <see cref="LaunchAttention"/> but reads the two scalars via
+    /// pointer dereferences inside the kernel — letting CUDA Graphs replay the same
+    /// instantiated graph across decode steps where only the KV-cache length changes.
+    /// <c>seqKvPtr</c> and <c>positionOffsetPtr</c> are device pointers to 4-byte
+    /// ints; the host bumps them via <c>cuMemcpyHtoD</c> between <c>cuGraphLaunch</c> calls.
+    /// </summary>
+    #pragma warning disable CS1573 // match LaunchAttention; params are self-documenting
+    public void LaunchAttentionDyn(nint q, nint k, nint v, nint output,
+                                    int seqQ, nint seqKvPtr,
+                                    int numHeads, int numKvHeads, int headDim,
+                                    nint positionOffsetPtr, int slidingWindow, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int sqArg = seqQ;
+        nint skvPtrArg = seqKvPtr;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        nint poPtrArg = positionOffsetPtr;
+        int swArg = slidingWindow;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &sqArg, &skvPtrArg, &nhArg, &nkvArg, &hdArg,
+                        &poPtrArg, &swArg};
+
+        int numBlocks = seqQ * numHeads;
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_attentionDynFunc,
+                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+    #pragma warning restore CS1573
+
+    /// <summary>True when the graph-friendly KV write kernel is loaded (PTX present).</summary>
+    public bool HasKvWriteKernel => _kvWriteModule != null;
+
+    /// <summary>
+    /// Writes one row of <paramref name="kvStride"/> FP16 elements from
+    /// <paramref name="src"/> to <paramref name="dstBase"/><c> + posPtr[0] * kvStride</c>.
+    /// Replaces a host-side <c>cuMemcpyDtoDAsync</c> for the decode KV-cache
+    /// update so the destination address is computed device-side and stable
+    /// across <c>cuGraphLaunch</c> replays.
+    /// </summary>
+    public void LaunchKvWriteOneF16(nint src, nint dstBase, int kvStride, nint posPtr, nint stream)
+    {
+        if (_kvWriteModule == null)
+            throw new InvalidOperationException(
+                "KV write kernel not available. Compile native/kernels/kv_write.cu to PTX.");
+
+        nint srcArg = src, dstArg = dstBase, posArg = posPtr;
+        int kvArg = kvStride;
+        void** args = stackalloc void*[] { &srcArg, &dstArg, &kvArg, &posArg };
+        uint gridDim = (uint)((kvStride + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_kvWriteOneF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Bias add: output[t, :] += bias[:]. half2 vectorized (2 elements/thread).</summary>
     public void LaunchBiasAdd(nint output, nint bias, int dim, int seqLen, nint stream)
     {
@@ -753,5 +833,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
         _quantKvModule?.Dispose();
+        _kvWriteModule?.Dispose();
     }
 }
