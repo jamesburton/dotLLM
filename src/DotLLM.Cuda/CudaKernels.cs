@@ -42,6 +42,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _perHeadRmsNormF32Module;
     private readonly CudaModule _rmsnormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
+    private readonly CudaModule? _quantizedGemvMmqModule;
+    private readonly nint _quantizedGemvQ4_KMmqFunc;
+    private readonly nint _quantizedGemvQ5_KMmqFunc;
+    private readonly nint _quantizedGemvQ6_KMmqFunc;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -118,6 +122,17 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "per_head_rmsnorm_f32.ptx"));
         _rmsnormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm_f32.ptx"));
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
+
+        // MMQ-style fused dequant+matmul GEMV (optional — PTX may not be compiled yet).
+        // Provides a faster Q4_K decode path via dp4a-packed INT8 multiply-add.
+        string mmqPath = Path.Combine(ptxDir, "quantized_gemv_mmq.ptx");
+        if (File.Exists(mmqPath))
+        {
+            _quantizedGemvMmqModule = CudaModule.LoadFromFile(mmqPath);
+            _quantizedGemvQ4_KMmqFunc = _quantizedGemvMmqModule.GetFunction("quantized_gemv_q4_k_mmq");
+            _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
+            _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
+        }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
         _rmsnormF32Func = _rmsnormF32Module.GetFunction("rmsnorm_f32");
@@ -596,6 +611,98 @@ public sealed unsafe class CudaKernels : IDisposable
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K;
 
+    /// <summary>
+    /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
+    /// kernel for the given quant type. Block-32 quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0)
+    /// require <c>K % 32 == 0</c>; K-quants (Q3_K/Q4_K/Q5_K/Q6_K) require
+    /// <c>K % 256 == 0</c>. Caller-side gates use this to decide between the
+    /// direct-GEMV fast path and the dequant-then-GEMM fallback.
+    /// </summary>
+    /// <remarks>
+    /// V2-Lite's <c>ffn_down_exps</c> is stored at K=intermediate=1408 with quant
+    /// type Q8_0 (Q4_K_M mix) or Q5_0 (Q3_K_M mix). 1408 is a multiple of 32 but
+    /// not 256; the previous unconditional <c>K % 256</c> gate locked these
+    /// projections out of the GEMV fast path. The block-32 kernels handle K=1408
+    /// natively (<c>blocks_per_row = K/32 = 44</c>).
+    /// </remarks>
+    public static int MinKAlignmentFor(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_0 or QuantizationType.Q4_1
+            or QuantizationType.Q5_0 or QuantizationType.Q5_1
+            or QuantizationType.Q8_0 => 32,
+        QuantizationType.Q3_K or QuantizationType.Q4_K
+            or QuantizationType.Q5_K or QuantizationType.Q6_K => 256,
+        _ => int.MaxValue,  // unsupported types — gate always fails
+    };
+
+
+    /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
+
+    /// <summary>True when the MMQ-style Q5_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableMmqQ5K;
+
+    /// <summary>True when the MMQ-style Q6_K GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
+
+    /// <summary>Test/benchmark hook to force the legacy Q4_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ4K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q4K") == "1";
+
+    /// <summary>Test/benchmark hook to force the legacy Q5_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ5K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q5K") == "1";
+
+    /// <summary>Test/benchmark hook to force the legacy Q6_K GEMV kernel even when MMQ is loaded.</summary>
+    public static bool DisableMmqQ6K { get; set; } = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMQ_Q6K") == "1";
+
+    /// <summary>True when this MMQ GEMV variant is available for the given quantization type.</summary>
+    public bool HasMmq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q4_K => HasMmqQ4K,
+        QuantizationType.Q5_K => HasMmqQ5K,
+        QuantizationType.Q6_K => HasMmqQ6K,
+        _ => false,
+    };
+
+    /// <summary>
+    /// MMQ-style fused dequant+matmul GEMV. Quantizes the input activation to
+    /// INT8 (per-32-element scale) and accumulates the dot product via __dp4a
+    /// (packed 4×INT8 multiply-add) instead of FP fmuladd. Lossy on the input
+    /// quantization but matches CPU output within K-quant tolerance.
+    /// One CUDA block processes <c>MMQ_ROWS_PER_BLOCK</c> (4) output rows so the
+    /// input-quantization pass amortizes across rows.
+    /// Supports Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>.
+    /// </summary>
+    public void LaunchQuantizedGemvMmq(nint quantWeight, QuantizationType qt,
+                                         nint x, nint y, int n, int k, nint stream)
+    {
+        if (_quantizedGemvMmqModule == null)
+            throw new InvalidOperationException(
+                "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
+
+        nint func = qt switch
+        {
+            QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
+            QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
+            QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
+            _ => 0,
+        };
+
+        if (func == 0)
+            throw new NotSupportedException($"MMQ GEMV not available for {qt}.");
+
+        nint wArg = quantWeight, xArg = x, yArg = y;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &wArg, &xArg, &yArg, &nArg, &kArg };
+
+        // Must mirror MMQ_ROWS_PER_BLOCK in quantized_gemv_mmq.cu.
+        const int MmqRowsPerBlock = 4;
+        uint gridDim = (uint)((n + MmqRowsPerBlock - 1) / MmqRowsPerBlock);
+
+        CudaDriverApi.cuLaunchKernel(func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>
     /// <param name="src">Device pointer to quantized weight data.</param>
     /// <param name="srcDtype">Source quantization type.</param>
@@ -805,6 +912,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module.Dispose();
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
+        _quantizedGemvMmqModule?.Dispose();
         _quantKvModule?.Dispose();
     }
 }
