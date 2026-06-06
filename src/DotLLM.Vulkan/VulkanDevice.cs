@@ -415,6 +415,29 @@ public sealed class VulkanDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// Copies raw <paramref name="source"/> bytes from host memory into the start of <paramref name="dst"/>.
+    /// Used for quantized weight blobs (Q8_0, Q4_K, etc.) where the GPU sees the
+    /// data as <c>uint[]</c> and the shader extracts bytes.
+    /// </summary>
+    public unsafe void Upload(ReadOnlySpan<byte> source, Buffer dst)
+    {
+        if (source.Length > dst.Size)
+            throw new ArgumentException("Source larger than destination buffer.", nameof(source));
+
+        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)source.Length, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory");
+        try
+        {
+            var destSpan = new Span<byte>((void*)mapped, source.Length);
+            source.CopyTo(destSpan);
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(_device, dst.Memory);
+        }
+    }
+
     /// <summary>Copies from the start of <paramref name="src"/> into <paramref name="destination"/> host memory.</summary>
     public unsafe void Download(Buffer src, Span<float> destination)
     {
