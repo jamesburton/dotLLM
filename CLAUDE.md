@@ -165,6 +165,20 @@ All development follows an issue-driven workflow.
 6. **Read the relevant docs first.** Before starting, read docs listed in the Documentation Index for the module being implemented.
 7. **Keep README in sync.** When a PR completes a roadmap step, update `docs/ROADMAP.md` (add `:white_check_mark:` to the step) and `README.md` (bump the step count in the Roadmap table, e.g., "4/9" → "5/9"; when a phase completes change status to "Done"; add a News entry for significant milestones).
 
+### Working through large pre-existing feature branches
+
+When a long-lived experimental branch (e.g. `feature/mamba-3`, `feature/qwen3.6`) needs to be decomposed into small, reviewable PRs:
+
+1. **Maintain a `dev` branch** off `main`. `dev` is the integration mirror that tracks the latest in-progress code while keeping individual PRs to upstream small and focused.
+2. **As each focused PR is opened against upstream `main`, merge the same commits into `dev`.** `dev` thus accumulates everything that has been extracted.
+3. **Use `git diff dev...feature/<name>` to see what is still uncovered** in the source branch. Each remaining diff hunk is a candidate for the next issue / PR pair.
+4. **Work one source branch to completion before moving to the next.** When `feature/<name>` is fully covered by extracted PRs, move on to the branch that built on top of it (e.g. `feature/qwen3.6` after `feature/mamba-3`).
+5. **Do not push direct commits to `dev`.** Only merge from extracted PR branches — that keeps `dev`'s history reflecting the actual upstream-ready chunks, and the diff against `feature/<name>` continues to mean "what's left to extract".
+
+### Pinging idle upstream PRs
+
+If a PR to upstream sits without maintainer activity for **two weeks**, post a polite re-ping summarising current status (CI state, threads resolved, anything still pending). Fortnightly cadence — not weekly.
+
 ## What Claude Should Know
 
 - **Author**: Konrad — expert .NET dev, "Pro .NET Memory Management" (2nd ed.), MVP, 20+ yrs perf. AI/agents at Nethermind. Do NOT over-explain .NET basics.
