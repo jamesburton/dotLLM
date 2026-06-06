@@ -2,7 +2,8 @@
 # Requires: nvcc (CUDA Toolkit) on PATH
 # Output: native\ptx\*.ptx
 #
-# PTX is forward-compatible: compute_61 PTX runs on all GPUs from Pascal onward.
+# PTX is forward-compatible: compute_75 PTX runs on all GPUs from Turing onward.
+# CUDA 13 dropped Pascal (SM 6.x) and Volta (SM 7.0); Turing (SM 7.5) is the floor.
 
 $ErrorActionPreference = "Stop"
 
@@ -12,7 +13,7 @@ $kernelDir = Join-Path $scriptDir "kernels"
 
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
 
-$arch = "compute_61"
+$arch = "compute_75"
 
 Write-Host "Compiling CUDA kernels -> PTX (target: $arch)..."
 

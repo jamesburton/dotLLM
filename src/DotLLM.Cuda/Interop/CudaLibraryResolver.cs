@@ -6,10 +6,18 @@ namespace DotLLM.Cuda.Interop;
 /// <summary>
 /// Resolves "cuda" and "cublas" library names to platform-specific paths.
 /// Linux: libcuda.so.1, libcublas.so. Windows: nvcuda.dll, cublas64_*.dll.
+///
+/// CUDA 13 relocated runtime DLLs from <c>bin\</c> to <c>bin\x64\</c> on Windows;
+/// the installer no longer adds that subdir to PATH, so the bare-name load fails
+/// unless a co-located copy is present. This resolver falls back to probing
+/// <c>%CUDA_PATH%</c> (and versioned <c>CUDA_PATH_V13_1</c>, <c>CUDA_PATH_V12_*</c>, ...)
+/// under both the new <c>bin\x64\</c> and the legacy <c>bin\</c> layouts.
 /// </summary>
 internal static class CudaLibraryResolver
 {
     private static int _registered;
+
+    private static readonly string[] CublasVersions = ["13", "12", "11"];
 
     /// <summary>
     /// Registers the resolver. Safe to call multiple times (idempotent).
@@ -28,6 +36,7 @@ internal static class CudaLibraryResolver
     {
         if (libraryName == "cuda")
         {
+            // nvcuda.dll ships with the driver in C:\Windows\System32; libcuda.so.1 is on the ld cache.
             string osLib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? "nvcuda.dll"
                 : "libcuda.so.1";
@@ -40,9 +49,12 @@ internal static class CudaLibraryResolver
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                foreach (var ver in new[] { "13", "12", "11" })
+                foreach (var ver in CublasVersions)
                 {
-                    if (NativeLibrary.TryLoad($"cublas64_{ver}.dll", out nint h))
+                    string fileName = $"cublas64_{ver}.dll";
+                    if (NativeLibrary.TryLoad(fileName, out nint h))
+                        return h;
+                    if (TryLoadFromCudaInstall(fileName, out h))
                         return h;
                 }
             }
@@ -50,8 +62,7 @@ internal static class CudaLibraryResolver
             {
                 if (NativeLibrary.TryLoad("libcublas.so", out nint h))
                     return h;
-                // Try versioned names
-                foreach (var ver in new[] { "13", "12", "11" })
+                foreach (var ver in CublasVersions)
                 {
                     if (NativeLibrary.TryLoad($"libcublas.so.{ver}", out nint h2))
                         return h2;
@@ -59,6 +70,44 @@ internal static class CudaLibraryResolver
             }
         }
 
-        return 0; // fall through to default resolution
+        return 0;
+    }
+
+    /// <summary>
+    /// Probes <c>%CUDA_PATH%</c> and versioned <c>CUDA_PATH_V*</c> variables for the DLL,
+    /// checking both the CUDA-13 <c>bin\x64\</c> layout and the legacy <c>bin\</c> layout.
+    /// </summary>
+    private static bool TryLoadFromCudaInstall(string fileName, out nint handle)
+    {
+        foreach (string? root in EnumerateCudaRoots())
+        {
+            if (string.IsNullOrEmpty(root)) continue;
+
+            string x64 = Path.Combine(root, "bin", "x64", fileName);
+            if (File.Exists(x64) && NativeLibrary.TryLoad(x64, out handle))
+                return true;
+
+            string flat = Path.Combine(root, "bin", fileName);
+            if (File.Exists(flat) && NativeLibrary.TryLoad(flat, out handle))
+                return true;
+        }
+
+        handle = 0;
+        return false;
+    }
+
+    private static IEnumerable<string?> EnumerateCudaRoots()
+    {
+        yield return Environment.GetEnvironmentVariable("CUDA_PATH");
+        yield return Environment.GetEnvironmentVariable("CUDA_HOME");
+
+        // Versioned vars like CUDA_PATH_V13_1, CUDA_PATH_V12_6, CUDA_PATH_V11_8.
+        // Enumerating the process block lets us find whichever release the user has.
+        var vars = Environment.GetEnvironmentVariables();
+        foreach (System.Collections.DictionaryEntry e in vars)
+        {
+            if (e.Key is string key && key.StartsWith("CUDA_PATH_V", StringComparison.OrdinalIgnoreCase))
+                yield return e.Value as string;
+        }
     }
 }
