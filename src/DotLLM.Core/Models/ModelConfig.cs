@@ -60,6 +60,42 @@ public record ModelConfig
     /// <summary>Sliding window size for local attention. Null = full attention.</summary>
     public int? SlidingWindowSize { get; init; }
 
+    /// <summary>
+    /// Per-layer sliding-window override (length = <see cref="NumLayers"/>). Each
+    /// entry is the per-layer window size, or <see langword="null"/> for a full-attention
+    /// layer. Null at the model level means "no per-layer override — every layer uses
+    /// <see cref="SlidingWindowSize"/>". Populated for Gemma 3's interleaved local/global
+    /// attention pattern (<c>sliding_window_pattern</c>); ignored for every architecture
+    /// where every layer behaves the same.
+    /// </summary>
+    public IReadOnlyList<int?>? PerLayerSlidingWindow { get; init; }
+
+    /// <summary>
+    /// Optional attention-logit soft-cap (Gemma 2 / Gemma 3 <c>attn_logit_softcapping</c>).
+    /// When non-null, attention scores <c>z</c> are transformed in-place between scaling
+    /// and softmax as <c>z' = tanh(z / cap) * cap</c>. Gemma 2 sets this to 50.0;
+    /// Gemma 3 leaves it null but the field is wired regardless.
+    /// </summary>
+    public float? AttnLogitSoftcap { get; init; }
+
+    /// <summary>
+    /// Optional final-logit soft-cap (Gemma 2 / Gemma 3 <c>final_logit_softcapping</c>).
+    /// When non-null, the LM-head logits <c>z</c> are transformed as
+    /// <c>z' = tanh(z / cap) * cap</c> after the LM-head projection and before sampling.
+    /// Gemma 2 sets this to 30.0; Gemma 3 leaves it null but the field is wired
+    /// regardless.
+    /// </summary>
+    public float? FinalLogitSoftcap { get; init; }
+
+    /// <summary>
+    /// Optional attention-score scale multiplier override (Gemma's
+    /// <c>query_pre_attn_scalar</c>). When non-null the kernel uses
+    /// <c>1 / sqrt(query_pre_attn_scalar)</c> instead of the default
+    /// <c>1 / sqrt(<see cref="HeadDim"/>)</c>. Gemma 3 ships this as 256 (matching the
+    /// pre-attn-scalar value used when training the 2.6B/9B/27B SKUs).
+    /// </summary>
+    public float? QueryPreAttnScalar { get; init; }
+
     /// <summary>MLA configuration. Only set for DeepSeek-style MLA attention.</summary>
     public MlaConfig? MlaConfig { get; init; }
 
