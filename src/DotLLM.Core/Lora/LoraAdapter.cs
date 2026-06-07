@@ -116,9 +116,7 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
                 return false;
 
             // Validate the projection's input/output dimensions match the
-            // base model's per-projection shape. MLA-specific projections
-            // (q_a_proj, kv_a_proj_with_mqa, etc.) are deferred — only the
-            // standard q/k/v/o + gate/up/down sites are covered today.
+            // base model's per-projection shape.
             switch (proj)
             {
                 case "q_proj":
@@ -138,13 +136,59 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
                 case "down_proj":
                     if (w.InputDim != baseConfig.IntermediateSize || w.OutputDim != baseConfig.HiddenSize) return false;
                     break;
+                case "q_a_proj":
+                    if (baseConfig.MlaConfig is not { } qAMla || qAMla.QLoraRank <= 0) return false;
+                    if (w.InputDim != baseConfig.HiddenSize || w.OutputDim != qAMla.QLoraRank) return false;
+                    break;
+                case "q_b_proj":
+                    if (baseConfig.MlaConfig is not { } qBMla || qBMla.QLoraRank <= 0) return false;
+                    if (w.InputDim != qBMla.QLoraRank ||
+                        w.OutputDim != baseConfig.NumAttentionHeads * (qBMla.QkNopeHeadDim + qBMla.QkRopeHeadDim)) return false;
+                    break;
+                case "kv_a_proj_with_mqa":
+                    if (baseConfig.MlaConfig is not { } kvAMla) return false;
+                    if (w.InputDim != baseConfig.HiddenSize ||
+                        w.OutputDim != kvAMla.KvLoraRank + kvAMla.QkRopeHeadDim) return false;
+                    break;
+                case "kv_b_proj":
+                    if (baseConfig.MlaConfig is not { } kvBMla) return false;
+                    if (w.InputDim != kvBMla.KvLoraRank ||
+                        w.OutputDim != baseConfig.NumAttentionHeads * (kvBMla.QkNopeHeadDim + kvBMla.VHeadDim)) return false;
+                    break;
                 default:
-                    // Unknown projection name — fail compatibility check rather than silently
-                    // accept (the runtime would not apply it anyway).
-                    return false;
+                    if (!TryValidatePerExpertMoeProjection(proj, w, baseConfig))
+                        return false;
+                    break;
             }
         }
         return true;
+    }
+
+    private static bool TryValidatePerExpertMoeProjection(
+        string proj,
+        LoraLayerWeights weights,
+        ModelConfig baseConfig)
+    {
+        const string prefix = "mlp.experts.";
+        if (!proj.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        if (baseConfig.Moe is not { } moe) return false;
+
+        ReadOnlySpan<char> rest = proj.AsSpan(prefix.Length);
+        int dot = rest.IndexOf('.');
+        if (dot <= 0) return false;
+        if (!int.TryParse(rest[..dot], out int expert) || (uint)expert >= (uint)moe.NumExperts)
+            return false;
+
+        string projection = rest[(dot + 1)..].ToString();
+        int intermediate = moe.MoeIntermediateSize > 0 ? moe.MoeIntermediateSize : baseConfig.IntermediateSize;
+        return projection switch
+        {
+            "gate_proj" or "up_proj" =>
+                weights.InputDim == baseConfig.HiddenSize && weights.OutputDim == intermediate,
+            "down_proj" =>
+                weights.InputDim == intermediate && weights.OutputDim == baseConfig.HiddenSize,
+            _ => false,
+        };
     }
 
     /// <summary>

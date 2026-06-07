@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
+using DotLLM.Core.Lora;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -61,6 +62,8 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
     /// <param name="intermediateSize">Per-expert MLP intermediate dimension (I).</param>
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
+    /// <param name="loraAdapter">Optional active LoRA adapter for per-expert projection deltas.</param>
+    /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     [SkipLocalsInit]
     public static void Execute(
         ReadOnlySpan<float> hidden,
@@ -73,7 +76,9 @@ public static unsafe class MoeSwiGluMlp
         int numExpertsPerTok,
         int hiddenSize,
         int intermediateSize,
-        int seqLen)
+        int seqLen,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         // Default overload keeps the Mixtral contract: always renormalise top-k,
         // no shared expert. Qwen-MoE / DeepSeek callers go through
@@ -85,7 +90,8 @@ public static unsafe class MoeSwiGluMlp
             sharedGateProj: ReadOnlySpan<nint>.Empty,
             sharedUpProj: ReadOnlySpan<nint>.Empty,
             sharedDownProj: ReadOnlySpan<nint>.Empty,
-            sharedIntermediateSize: 0, sharedExpertGate: default);
+            sharedIntermediateSize: 0, sharedExpertGate: default,
+            loraAdapter, loraLayer);
     }
 
     /// <summary>
@@ -125,6 +131,8 @@ public static unsafe class MoeSwiGluMlp
     /// Optional F32 [hiddenSize] sigmoid-gate weight. Length 0 → no sigmoid
     /// scaling (DeepSeek; Qwen-MoE variants without <c>shared_expert_gate</c>).
     /// </param>
+    /// <param name="loraAdapter">Optional active LoRA adapter for routed per-expert projection deltas.</param>
+    /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     [SkipLocalsInit]
     public static void ExecuteWithSharedExpert(
         ReadOnlySpan<float> hidden,
@@ -143,14 +151,17 @@ public static unsafe class MoeSwiGluMlp
         ReadOnlySpan<nint> sharedUpProj,
         ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
-        ReadOnlySpan<float> sharedExpertGate)
+        ReadOnlySpan<float> sharedExpertGate,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         ExecuteCore(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
             numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
             normTopKProb,
             sharedGateProj, sharedUpProj, sharedDownProj,
-            sharedIntermediateSize, sharedExpertGate);
+            sharedIntermediateSize, sharedExpertGate,
+            loraAdapter, loraLayer);
     }
 
     [SkipLocalsInit]
@@ -171,7 +182,9 @@ public static unsafe class MoeSwiGluMlp
         ReadOnlySpan<nint> sharedUpProj,
         ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
-        ReadOnlySpan<float> sharedExpertGate)
+        ReadOnlySpan<float> sharedExpertGate,
+        ILoraAdapter? loraAdapter,
+        int loraLayer)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -282,11 +295,25 @@ public static unsafe class MoeSwiGluMlp
                         MatMul.GemvF32(w1, x, gateBufPtr, intermediateSize, hiddenSize);
                         MatMul.GemvF32(w3, x, upBufPtr, intermediateSize, hiddenSize);
 
+                        // LoRA per-expert deltas — gate_proj / up_proj. The
+                        // routed-token path is GEMV-equivalent (batch=1), so we
+                        // reuse the same ApplyLoraDelta helper as the batched
+                        // path with seqLen=1. No-op when adapter is null or the
+                        // adapter has no target for this expert/projection.
+                        ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(eIdx, "gate_proj"),
+                            x, gateBufPtr, 1, hiddenSize, intermediateSize);
+                        ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(eIdx, "up_proj"),
+                            x, upBufPtr, 1, hiddenSize, intermediateSize);
+
                         // silu = SwiGLU(gate, up) = sigmoid(gate) * gate * up
                         FusedOps.SwiGLU(routedGate, routedUp, routedSilu);
 
                         // down = w2 @ silu    [H]
                         MatMul.GemvF32(w2, siluBufPtr, downBufPtr, hiddenSize, intermediateSize);
+
+                        // LoRA per-expert delta — down_proj.
+                        ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(eIdx, "down_proj"),
+                            siluBufPtr, downBufPtr, 1, intermediateSize, hiddenSize);
 
                         // acc += w * down
                         TensorPrimitives.MultiplyAdd(down, w, acc, acc);
@@ -349,6 +376,34 @@ public static unsafe class MoeSwiGluMlp
             ArrayPool<float>.Shared.Return(downBuf);
             ArrayPool<float>.Shared.Return(accBuf);
         }
+    }
+
+    private static string ExpertProjectionName(int expert, string projection)
+        => $"mlp.experts.{expert}.{projection}";
+
+    private static void ApplyLoraDelta(
+        ILoraAdapter? adapter,
+        int layer,
+        string projection,
+        float* input,
+        float* output,
+        int seqLen,
+        int inputDim,
+        int outputDim)
+    {
+        if (adapter is null || layer < 0) return;
+        var lora = adapter.GetLayerWeights(layer, projection);
+        if (lora is not { } w) return;
+        if (w.InputDim != inputDim || w.OutputDim != outputDim)
+            throw new InvalidOperationException(
+                $"LoRA adapter '{adapter.Name}' layer={layer} proj='{projection}' shape "
+                + $"({w.InputDim}x{w.OutputDim}) does not match MoE projection "
+                + $"({inputDim}x{outputDim}).");
+
+        float scale = adapter.Alpha / adapter.Rank;
+        LoraDelta.Apply(input, (void*)w.BHandle, (void*)w.AHandle, output,
+            seqLen, inputDim, outputDim, adapter.Rank, scale,
+            w.WeightDType, w.WeightDType);
     }
 
     /// <summary>
