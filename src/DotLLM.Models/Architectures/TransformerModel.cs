@@ -604,6 +604,7 @@ public sealed unsafe class TransformerModel : IModel
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
             FfnBranch:
+
             // ── MoE branch ──────────────────────────────────────────────
             // Mixtral-convention top-k dense routing replaces the dense FFN
             // block entirely. Takes post-attn hidden + FFN RMSNorm weight,
