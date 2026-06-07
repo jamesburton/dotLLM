@@ -75,6 +75,104 @@ public static unsafe class MoeSwiGluMlp
         int intermediateSize,
         int seqLen)
     {
+        // Default overload keeps the Mixtral contract: always renormalise top-k,
+        // no shared expert. Qwen-MoE / DeepSeek callers go through
+        // ExecuteWithSharedExpert.
+        ExecuteCore(
+            hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
+            numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
+            normTopKProb: true,
+            sharedGateProj: ReadOnlySpan<nint>.Empty,
+            sharedUpProj: ReadOnlySpan<nint>.Empty,
+            sharedDownProj: ReadOnlySpan<nint>.Empty,
+            sharedIntermediateSize: 0, sharedExpertGate: default);
+    }
+
+    /// <summary>
+    /// Qwen-MoE / DeepSeek overload: computes routed top-k output + summed
+    /// dense shared-expert output (optionally sigmoid-gated). Supports
+    /// multiple shared experts (DeepSeek-V2/V3 <c>n_shared_experts &gt;= 1</c>):
+    /// each runs a dense SwiGLU on the token and their outputs are summed
+    /// before the (optional) per-token sigmoid scale is applied. Pass three
+    /// empty pointer spans with <paramref name="sharedIntermediateSize"/> = 0
+    /// to fall back to the pure routed path (equivalent to <see cref="Execute"/>).
+    /// </summary>
+    /// <param name="hidden">F32 input activations [seqLen × hiddenSize].</param>
+    /// <param name="gateWeights">F32 router weight [numExperts × hiddenSize] row-major.</param>
+    /// <param name="expertsW1">Per-expert gate_proj pointers — F32 [intermediateSize × hiddenSize] row-major.</param>
+    /// <param name="expertsW2">Per-expert down_proj pointers — F32 [hiddenSize × intermediateSize] row-major.</param>
+    /// <param name="expertsW3">Per-expert up_proj pointers — F32 [intermediateSize × hiddenSize] row-major.</param>
+    /// <param name="output">F32 output activations [seqLen × hiddenSize]. Fully overwritten.</param>
+    /// <param name="numExperts">Total expert count per layer (E).</param>
+    /// <param name="numExpertsPerTok">Top-k: number of routed experts activated per token.</param>
+    /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
+    /// <param name="intermediateSize">Per-routed-expert MLP intermediate dimension (I).</param>
+    /// <param name="seqLen">Number of tokens in this batch (T).</param>
+    /// <param name="normTopKProb">
+    /// <c>true</c> → renormalise the selected top-k probabilities to sum to 1.0
+    /// (Mixtral + Qwen3-MoE). <c>false</c> → use raw softmax values as gating
+    /// weights (Qwen1.5-MoE default).
+    /// </param>
+    /// <param name="sharedGateProj">
+    /// Per-shared-expert gate_proj pointers — F32 [sharedIntermediateSize × hiddenSize]
+    /// row-major. Length = number of shared experts (1 for Qwen1.5-MoE; 1..N
+    /// for DeepSeek-V2/V3). Empty span ⇒ no shared expert.
+    /// </param>
+    /// <param name="sharedUpProj">Per-shared-expert up_proj pointers, same length as <paramref name="sharedGateProj"/>.</param>
+    /// <param name="sharedDownProj">Per-shared-expert down_proj pointers, same length as <paramref name="sharedGateProj"/>.</param>
+    /// <param name="sharedIntermediateSize">Per-shared-expert intermediate width (0 to disable).</param>
+    /// <param name="sharedExpertGate">
+    /// Optional F32 [hiddenSize] sigmoid-gate weight. Length 0 → no sigmoid
+    /// scaling (DeepSeek; Qwen-MoE variants without <c>shared_expert_gate</c>).
+    /// </param>
+    [SkipLocalsInit]
+    public static void ExecuteWithSharedExpert(
+        ReadOnlySpan<float> hidden,
+        ReadOnlySpan<float> gateWeights,
+        ReadOnlySpan<nint> expertsW1,
+        ReadOnlySpan<nint> expertsW2,
+        ReadOnlySpan<nint> expertsW3,
+        Span<float> output,
+        int numExperts,
+        int numExpertsPerTok,
+        int hiddenSize,
+        int intermediateSize,
+        int seqLen,
+        bool normTopKProb,
+        ReadOnlySpan<nint> sharedGateProj,
+        ReadOnlySpan<nint> sharedUpProj,
+        ReadOnlySpan<nint> sharedDownProj,
+        int sharedIntermediateSize,
+        ReadOnlySpan<float> sharedExpertGate)
+    {
+        ExecuteCore(
+            hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
+            numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
+            normTopKProb,
+            sharedGateProj, sharedUpProj, sharedDownProj,
+            sharedIntermediateSize, sharedExpertGate);
+    }
+
+    [SkipLocalsInit]
+    private static void ExecuteCore(
+        ReadOnlySpan<float> hidden,
+        ReadOnlySpan<float> gateWeights,
+        ReadOnlySpan<nint> expertsW1,
+        ReadOnlySpan<nint> expertsW2,
+        ReadOnlySpan<nint> expertsW3,
+        Span<float> output,
+        int numExperts,
+        int numExpertsPerTok,
+        int hiddenSize,
+        int intermediateSize,
+        int seqLen,
+        bool normTopKProb,
+        ReadOnlySpan<nint> sharedGateProj,
+        ReadOnlySpan<nint> sharedUpProj,
+        ReadOnlySpan<nint> sharedDownProj,
+        int sharedIntermediateSize,
+        ReadOnlySpan<float> sharedExpertGate)
+    {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
             throw new ArgumentOutOfRangeException(nameof(numExpertsPerTok));
@@ -86,17 +184,30 @@ public static unsafe class MoeSwiGluMlp
             throw new ArgumentException("gateWeights too small", nameof(gateWeights));
         if (expertsW1.Length != numExperts || expertsW2.Length != numExperts || expertsW3.Length != numExperts)
             throw new ArgumentException("Expert weight arrays must each have numExperts entries.");
+        if (sharedGateProj.Length != sharedUpProj.Length || sharedGateProj.Length != sharedDownProj.Length)
+            throw new ArgumentException("Shared-expert weight spans must all have the same length.");
+
+        int numSharedExperts = sharedGateProj.Length;
+        bool hasSharedExpert = sharedIntermediateSize > 0 && numSharedExperts > 0;
+        bool hasSharedGate = hasSharedExpert && sharedExpertGate.Length >= hiddenSize;
 
         // Scratch buffers — rented from the pool so per-call allocations are free.
         // The per-token 'acc' buffer is the MoE output for that token; it
         // accumulates expert contributions without touching 'output' until the
         // end of the token, which keeps this kernel safe to call with
         // <c>hidden</c> and <c>output</c> aliasing.
+        //
+        // Intermediate scratch (gate/up/silu) is sized for the MAX of routed-
+        // expert and shared-expert intermediate widths so a single rent covers
+        // both paths.
+        int maxIntermediate = hasSharedExpert
+            ? Math.Max(intermediateSize, sharedIntermediateSize)
+            : intermediateSize;
         float[] gateLogitsBuf = ArrayPool<float>.Shared.Rent(numExperts);
         float[] routingBuf = ArrayPool<float>.Shared.Rent(numExperts);
-        float[] gateBuf = ArrayPool<float>.Shared.Rent(intermediateSize);
-        float[] upBuf = ArrayPool<float>.Shared.Rent(intermediateSize);
-        float[] siluBuf = ArrayPool<float>.Shared.Rent(intermediateSize);
+        float[] gateBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
+        float[] upBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
+        float[] siluBuf = ArrayPool<float>.Shared.Rent(maxIntermediate);
         float[] downBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
         float[] accBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
         Span<int> topkIdx = stackalloc int[numExpertsPerTok];
@@ -106,20 +217,18 @@ public static unsafe class MoeSwiGluMlp
         {
             var gateLogits = gateLogitsBuf.AsSpan(0, numExperts);
             var routing = routingBuf.AsSpan(0, numExperts);
-            var gate = gateBuf.AsSpan(0, intermediateSize);
-            var up = upBuf.AsSpan(0, intermediateSize);
-            var silu = siluBuf.AsSpan(0, intermediateSize);
             var down = downBuf.AsSpan(0, hiddenSize);
             var acc = accBuf.AsSpan(0, hiddenSize);
 
             fixed (float* hiddenPtr = hidden)
             fixed (float* gateWPtr = gateWeights)
             fixed (float* outPtr = output)
-            fixed (float* gateBufPtr = gate)
-            fixed (float* upBufPtr = up)
-            fixed (float* siluBufPtr = silu)
+            fixed (float* gateBufPtr = gateBuf)
+            fixed (float* upBufPtr = upBuf)
+            fixed (float* siluBufPtr = siluBuf)
             fixed (float* downBufPtr = down)
             fixed (float* logitsPtr = gateLogits)
+            fixed (float* sharedGatePtr = sharedExpertGate)
             {
                 for (int t = 0; t < seqLen; t++)
                 {
@@ -138,18 +247,26 @@ public static unsafe class MoeSwiGluMlp
                     //    temporary sort allocation.
                     SelectTopK(routing, topkIdx, topkProb);
 
-                    // 4) Renormalise the top-k probabilities by sum (Mixtral
-                    //    convention — NOT a second softmax).
-                    float sum = 0f;
-                    for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
-                    float invSum = sum > 0f ? 1.0f / sum : 0f;
-                    for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
+                    // 4) Optionally renormalise the top-k probabilities by sum
+                    //    (Mixtral + Qwen3-MoE convention). Qwen1.5-MoE leaves
+                    //    them as raw softmax values — their sum < 1 softens
+                    //    the routed contribution before the shared-expert add.
+                    if (normTopKProb)
+                    {
+                        float sum = 0f;
+                        for (int i = 0; i < numExpertsPerTok; i++) sum += topkProb[i];
+                        float invSum = sum > 0f ? 1.0f / sum : 0f;
+                        for (int i = 0; i < numExpertsPerTok; i++) topkProb[i] *= invSum;
+                    }
 
                     // 5) Accumulate weighted expert outputs into 'acc'. Starts
                     //    zeroed; aliasing 'hidden' with 'output' is safe because
                     //    we only write to 'output' at the end of each token,
                     //    after all reads from 'x' are complete.
                     acc.Clear();
+                    var routedGate = new Span<float>(gateBufPtr, intermediateSize);
+                    var routedUp = new Span<float>(upBufPtr, intermediateSize);
+                    var routedSilu = new Span<float>(siluBufPtr, intermediateSize);
                     for (int i = 0; i < numExpertsPerTok; i++)
                     {
                         int eIdx = topkIdx[i];
@@ -166,7 +283,7 @@ public static unsafe class MoeSwiGluMlp
                         MatMul.GemvF32(w3, x, upBufPtr, intermediateSize, hiddenSize);
 
                         // silu = SwiGLU(gate, up) = sigmoid(gate) * gate * up
-                        FusedOps.SwiGLU(gate, up, silu);
+                        FusedOps.SwiGLU(routedGate, routedUp, routedSilu);
 
                         // down = w2 @ silu    [H]
                         MatMul.GemvF32(w2, siluBufPtr, downBufPtr, hiddenSize, intermediateSize);
@@ -175,7 +292,49 @@ public static unsafe class MoeSwiGluMlp
                         TensorPrimitives.MultiplyAdd(down, w, acc, acc);
                     }
 
-                    // 6) Write accumulated output for this token.
+                    // 6) Optional shared-expert branch — one or more dense
+                    //    SwiGLU MLPs that run on every token (no routing).
+                    //    Outputs are summed into 'acc' (Qwen1.5-MoE uses a
+                    //    single shared expert with an optional sigmoid scalar
+                    //    gate; DeepSeek-V2/V3 uses N parallel shared experts
+                    //    summed equally with no gate). The per-shared sigmoid
+                    //    scale only fires when N==1 + hasSharedGate, so the
+                    //    single-shared path is bit-identical to the previous
+                    //    scalar implementation.
+                    if (hasSharedExpert)
+                    {
+                        var sharedGateSpan = new Span<float>(gateBufPtr, sharedIntermediateSize);
+                        var sharedUpSpan = new Span<float>(upBufPtr, sharedIntermediateSize);
+                        var sharedSiluSpan = new Span<float>(siluBufPtr, sharedIntermediateSize);
+
+                        for (int k = 0; k < numSharedExperts; k++)
+                        {
+                            float* sharedW1k = (float*)sharedGateProj[k];
+                            float* sharedW3k = (float*)sharedUpProj[k];
+                            float* sharedW2k = (float*)sharedDownProj[k];
+
+                            MatMul.GemvF32(sharedW1k, x, gateBufPtr, sharedIntermediateSize, hiddenSize);
+                            MatMul.GemvF32(sharedW3k, x, upBufPtr, sharedIntermediateSize, hiddenSize);
+                            FusedOps.SwiGLU(sharedGateSpan, sharedUpSpan, sharedSiluSpan);
+                            MatMul.GemvF32(sharedW2k, siluBufPtr, downBufPtr, hiddenSize, sharedIntermediateSize);
+
+                            float sharedScale = 1.0f;
+                            if (hasSharedGate)
+                            {
+                                // sigmoid(hidden . SharedExpertGate) — per-token scalar ∈ (0,1).
+                                // Only meaningful for Qwen1.5-MoE (numSharedExperts==1);
+                                // DeepSeek (no gate) keeps the scale at 1.0.
+                                float logit = 0f;
+                                for (int j = 0; j < hiddenSize; j++)
+                                    logit += sharedGatePtr[j] * x[j];
+                                sharedScale = 1.0f / (1.0f + MathF.Exp(-logit));
+                            }
+
+                            TensorPrimitives.MultiplyAdd(down, sharedScale, acc, acc);
+                        }
+                    }
+
+                    // 7) Write accumulated output for this token.
                     acc.CopyTo(new Span<float>(y, hiddenSize));
                 }
             }
