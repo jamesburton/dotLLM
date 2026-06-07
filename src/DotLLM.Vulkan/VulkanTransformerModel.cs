@@ -61,6 +61,11 @@ public sealed class VulkanTransformerModel : IModel
     // MoE kernel set — constructed only when the model carries a MoE layer.
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
+    // Tiled (shared-memory) variant of the indexed matmul. Wins on prefill at
+    // large N (seqLen * topK >= TiledMinRows) by amortising the x-row load
+    // across a TILE_M-wide output tile; the scalar variant remains for decode
+    // (small N) where the GEMV-style scalar dispatch wins.
+    private readonly MoeIndexedMatmulTiledF32Kernel? _moeIndexedMatmulTiled;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
     private readonly MoeBroadcastF32Kernel? _moeBroadcast;
 
@@ -90,6 +95,7 @@ public sealed class VulkanTransformerModel : IModel
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax,
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
+        MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled,
         MoeWeightedScatterF32Kernel? moeWeightedScatter,
         MoeBroadcastF32Kernel? moeBroadcast,
         GgufFile? gguf,
@@ -109,6 +115,7 @@ public sealed class VulkanTransformerModel : IModel
         _add = add;
         _moeTopkSoftmax = moeTopkSoftmax;
         _moeIndexedMatmul = moeIndexedMatmul;
+        _moeIndexedMatmulTiled = moeIndexedMatmulTiled;
         _moeWeightedScatter = moeWeightedScatter;
         _moeBroadcast = moeBroadcast;
         _gguf = gguf;
@@ -265,12 +272,14 @@ public sealed class VulkanTransformerModel : IModel
 
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
+        MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled = null;
         MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
         MoeBroadcastF32Kernel? moeBroadcast = null;
         if (moeNumExperts > 0)
         {
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
+            moeIndexedMatmulTiled = MoeIndexedMatmulTiledF32Kernel.Create(device, spvDir);
             moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
             moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
         }
@@ -287,7 +296,8 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, rmsnorm, rope, attention, swiglu, add,
-            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter, moeBroadcast,
+            moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulTiled,
+            moeWeightedScatter, moeBroadcast,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
     }
@@ -499,12 +509,12 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hiddenSize);
 
         // 5. Indexed matmul W1 (gate_proj): ExpandedInput → GateInter.
-        _moeIndexedMatmul!.Launch(
+        RunMoeIndexedMatmul(
             moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
             m: interm, k: hiddenSize, n: nExpanded, numExperts: numE);
 
         // 6. Indexed matmul W3 (up_proj): ExpandedInput → UpInter.
-        _moeIndexedMatmul.Launch(
+        RunMoeIndexedMatmul(
             moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
             m: interm, k: hiddenSize, n: nExpanded, numExperts: numE);
 
@@ -513,7 +523,7 @@ public sealed class VulkanTransformerModel : IModel
             n: nExpanded * interm);
 
         // 8. Indexed matmul W2 (down_proj): SiluInter → DownRows [seqLen*topK, hidden].
-        _moeIndexedMatmul.Launch(
+        RunMoeIndexedMatmul(
             moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
             m: hiddenSize, k: interm, n: nExpanded, numExperts: numE);
 
@@ -531,6 +541,48 @@ public sealed class VulkanTransformerModel : IModel
         if (moeW.NumSharedExperts > 0)
         {
             RunMoeSharedExperts(moeW, ffnNormWeight, seqLen, hiddenSize, eps);
+        }
+    }
+
+    /// <summary>
+    /// Routes between the scalar and tiled (shared-memory) variants of the
+    /// MoE indexed expert matmul based on dispatch shape. Tiled wins on
+    /// prefill at large N (each token's x-row is reloaded TILE_M times by
+    /// the scalar variant — the tile amortises that), scalar wins on decode
+    /// where N is tiny and a TILE_M-wide cooperative load is mostly idle.
+    /// </summary>
+    /// <remarks>
+    /// Heuristic: use the tiled kernel when <c>n &gt;= TiledMinRows</c> AND
+    /// <c>m % TILE_M == 0</c>. The first guard keeps decode (N &lt;= 16, e.g.
+    /// 1 token × topK=8 = 8 expanded rows) on the scalar fast path. The
+    /// second avoids the shader's tail-bounds path on prefill — the tile
+    /// kernel handles ragged m correctly via its in-shader bounds checks,
+    /// but on a divisible m we get the cleanest dispatch shape with no
+    /// branching in the inner loop. The threshold is conservative; a
+    /// future perf-wave should re-tune from device benchmarks.
+    /// </remarks>
+    private const int TiledMinRows = 32;
+
+    private void RunMoeIndexedMatmul(
+        VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
+        VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
+        int m, int k, int n, int numExperts)
+    {
+        bool useTiled = _moeIndexedMatmulTiled is not null
+            && n >= TiledMinRows
+            && (m % MoeIndexedMatmulTiledF32Kernel.TileM) == 0;
+
+        if (useTiled)
+        {
+            _moeIndexedMatmulTiled!.Launch(
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+        }
+        else
+        {
+            _moeIndexedMatmul!.Launch(
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
         }
     }
 
@@ -785,6 +837,7 @@ public sealed class VulkanTransformerModel : IModel
 
         _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
+        _moeIndexedMatmulTiled?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
 
