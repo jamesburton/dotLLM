@@ -62,6 +62,7 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
+    private readonly MoeBroadcastF32Kernel? _moeBroadcast;
 
     private readonly TransformerWeights _cpuWeights; // retained for embedding lookup
     private readonly GgufFile? _gguf;
@@ -90,6 +91,7 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax,
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
         MoeWeightedScatterF32Kernel? moeWeightedScatter,
+        MoeBroadcastF32Kernel? moeBroadcast,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow)
     {
@@ -108,6 +110,7 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax = moeTopkSoftmax;
         _moeIndexedMatmul = moeIndexedMatmul;
         _moeWeightedScatter = moeWeightedScatter;
+        _moeBroadcast = moeBroadcast;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
@@ -256,11 +259,13 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
         MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
+        MoeBroadcastF32Kernel? moeBroadcast = null;
         if (moeNumExperts > 0)
         {
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
             moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
+            moeBroadcast = MoeBroadcastF32Kernel.Create(device, spvDir);
         }
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -275,7 +280,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, rmsnorm, rope, attention, swiglu, add,
-            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter,
+            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter, moeBroadcast,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
     }
@@ -478,10 +483,13 @@ public sealed class VulkanTransformerModel : IModel
             seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
 
         // 4. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
-        //    Each token's row is replicated topK times. Host round-trip: all
-        //    buffers are host-visible host-coherent on this base, and the
-        //    prior kernel-launch's vkQueueWaitIdle already published writes.
-        BroadcastForExpansion(_state.NormOutput, _state.MoeExpandedInput!, seqLen, topK, hiddenSize);
+        //    Each token's row is replicated topK times. One compute dispatch
+        //    replaces the seqLen × topK loop of vkCmdCopyBuffer regions the
+        //    previous implementation issued — same math (no FP arithmetic,
+        //    bit-exact), no transfer↔compute stage transitions, dispatch
+        //    count drops from O(seqLen·topK) to 1 per MoE layer.
+        _moeBroadcast!.Launch(_state.NormOutput, _state.MoeExpandedInput!,
+            seqLen: seqLen, topK: topK, hidden: hiddenSize);
 
         // 5. Indexed matmul W1 (gate_proj): ExpandedInput → GateInter.
         _moeIndexedMatmul!.Launch(
@@ -508,45 +516,6 @@ public sealed class VulkanTransformerModel : IModel
         _moeWeightedScatter!.Launch(
             _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput,
             seqLen: seqLen, topK: topK, hiddenSize: hiddenSize);
-    }
-
-    /// <summary>
-    /// Replicates each row of <paramref name="src"/> (shape
-    /// <c>[seqLen, hiddenSize]</c>) into <paramref name="dst"/> (shape
-    /// <c>[seqLen * topK, hiddenSize]</c>) so each (token, slot) sees its
-    /// per-token input row. Host map → memcpy → unmap; safe because the
-    /// prior kernel launch ended in <c>vkQueueWaitIdle</c>.
-    /// </summary>
-    private unsafe void BroadcastForExpansion(
-        VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int seqLen, int topK, int hiddenSize)
-    {
-        long rowBytes = (long)hiddenSize * sizeof(float);
-        long srcBytes = (long)seqLen * rowBytes;
-        long dstBytes = srcBytes * topK;
-
-        VulkanApi.vkMapMemory(_device.Handle, src.Memory, 0, (ulong)srcBytes, 0, out nint srcMapped)
-            .ThrowOnError("vkMapMemory BroadcastForExpansion.src");
-        VulkanApi.vkMapMemory(_device.Handle, dst.Memory, 0, (ulong)dstBytes, 0, out nint dstMapped)
-            .ThrowOnError("vkMapMemory BroadcastForExpansion.dst");
-        try
-        {
-            byte* s = (byte*)srcMapped;
-            byte* d = (byte*)dstMapped;
-            for (int t = 0; t < seqLen; t++)
-            {
-                byte* tokenRow = s + (long)t * rowBytes;
-                byte* dstBase = d + (long)t * topK * rowBytes;
-                for (int slot = 0; slot < topK; slot++)
-                {
-                    System.Buffer.MemoryCopy(tokenRow, dstBase + (long)slot * rowBytes, rowBytes, rowBytes);
-                }
-            }
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(_device.Handle, dst.Memory);
-            VulkanApi.vkUnmapMemory(_device.Handle, src.Memory);
-        }
     }
 
     /// <summary>
@@ -695,6 +664,7 @@ public sealed class VulkanTransformerModel : IModel
         _state.Dispose();
         _weights.Dispose();
 
+        _moeBroadcast?.Dispose();
         _moeWeightedScatter?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
