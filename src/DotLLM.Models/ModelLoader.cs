@@ -76,15 +76,43 @@ public static class ModelLoader
             string configJson = File.ReadAllText(configPath);
             using var doc = JsonDocument.Parse(configJson);
 
-            ModelConfig config = HfConfigExtractor.Extract(doc.RootElement);
+            // Peek at the architecture so we can dispatch to the right
+            // ModelConfig extractor before fully extracting. Mamba-3 uses a
+            // dedicated extractor that knows the SSM-specific fields.
+            Architecture arch;
+            try
+            {
+                arch = HfConfigExtractor.ResolveArchitecture(doc.RootElement);
+            }
+            catch (InvalidDataException)
+            {
+                // Fall through to a Mamba-3 probe: model_type=mamba3 is handled
+                // by Mamba3ConfigExtractor, which HfConfigExtractor.ResolveArchitecture
+                // does not recognise.
+                string? modelType = doc.RootElement.TryGetProperty("model_type", out var mt)
+                                    && mt.ValueKind == JsonValueKind.String
+                    ? mt.GetString()
+                    : null;
+                if (!string.Equals(modelType, "mamba3", StringComparison.Ordinal))
+                    throw;
+                arch = Architecture.Mamba3;
+            }
+
+            ModelConfig config = arch switch
+            {
+                Architecture.Mamba3 => Mamba3ConfigExtractor.Extract(doc.RootElement),
+                _ => HfConfigExtractor.Extract(doc.RootElement),
+            };
 
             IModel model = config.Architecture switch
             {
                 Architecture.Llama or Architecture.Mistral or Architecture.Phi or Architecture.Qwen
                     => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
+                Architecture.Mamba3
+                    => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mamba3."),
             };
 
             return (model, source, config);

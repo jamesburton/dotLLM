@@ -127,4 +127,67 @@ internal sealed class SafetensorsFixtureBuilder
         return headerLen;
     }
 
+    /// <summary>
+    /// Writes a tiny synthetic Mamba-3 checkpoint to <paramref name="path"/>
+    /// covering every tensor named by <see cref="DotLLM.Models.Architectures.Mamba3TensorMapping"/>
+    /// at the dimensions implied by the parameters. Each tensor is filled with
+    /// a per-layer-offset ramp so loader tests can assert on specific elements.
+    /// Used by both the Mamba-3 weight-loader tests and the
+    /// <c>TinyMamba3SafetensorsLoadTests</c> end-to-end fixtures.
+    /// </summary>
+    public static (string Path, long HeaderLength) WriteTinyMamba3Fixture(
+        string path,
+        int numLayers,
+        int hiddenSize,
+        int vocabSize,
+        int numHeads,
+        int headDim,
+        int stateSize,
+        int dInProj,
+        int dInner,
+        bool includeLmHead = true,
+        bool includeALog = false)
+    {
+        var b = new SafetensorsFixtureBuilder();
+        b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.TokenEmbedding,
+            [vocabSize, hiddenSize], startValue: 0.0f);
+        b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.FinalNorm,
+            [hiddenSize], startValue: 0.5f);
+        if (includeLmHead)
+        {
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.LmHead,
+                [vocabSize, hiddenSize], startValue: 1.0f);
+        }
+
+        for (int i = 0; i < numLayers; i++)
+        {
+            float basis = 10.0f * (i + 1);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.LayerNorm(i),
+                [hiddenSize], startValue: basis + 0.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.InProj(i),
+                [dInProj, hiddenSize], startValue: basis + 1.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.OutProj(i),
+                [hiddenSize, dInner], startValue: basis + 2.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.BNorm(i),
+                [stateSize], startValue: basis + 3.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.CNorm(i),
+                [stateSize], startValue: basis + 4.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.BBias(i),
+                [numHeads, 1, stateSize], startValue: basis + 5.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.CBias(i),
+                [numHeads, 1, stateSize], startValue: basis + 6.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.D(i),
+                [numHeads], startValue: basis + 7.0f);
+            b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.DtBias(i),
+                [numHeads], startValue: basis + 8.0f);
+            if (includeALog)
+            {
+                b.AddFloat32(DotLLM.Models.Architectures.Mamba3TensorMapping.ReferenceKeys.ALog(i),
+                    [numHeads], startValue: basis + 9.0f);
+            }
+        }
+
+        long headerLen = b.WriteTo(path);
+        return (path, headerLen);
+    }
 }
