@@ -53,8 +53,8 @@ public static class CudaGemm
     /// FP32 linear projection: <c>Y_f32[m, n] = X_f32[m, k] × W_f32^T</c> where
     /// <c>W</c> is row-major <c>[n, k]</c>. Uses <c>cublasGemmEx</c> with
     /// <c>CUDA_R_32F</c> + <c>CUBLAS_COMPUTE_32F</c>. Used by the MLA Phase 1
-    /// path which keeps the entire attention block in F32 for byte-near-equivalence
-    /// with the CPU oracle.
+    /// path (which keeps the entire attention block in F32 for byte-near-equivalence
+    /// with the CPU oracle) and by the MoE forward path (per-expert F32 GEMMs).
     /// </summary>
     /// <remarks>
     /// Mirrors the layout convention of <see cref="LinearF16"/>: caller-side
