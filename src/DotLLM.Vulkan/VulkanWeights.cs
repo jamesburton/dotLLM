@@ -248,6 +248,13 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
 
+    /// <summary>Returns true when the matrix will be kept on device as Q4_K super-blocks
+    /// (144 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q4_K super-block size (256). Phase 1 of the K-quant work — Q5_K / Q6_K are
+    /// follow-up tickets and still dequantise to F32 at upload.</summary>
+    private static bool KeepQ4KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q4_K && (inputDim % 256) == 0;
+
     private static long ComputeMaxUploadBytes(
         TransformerWeights weights, int numLayers, bool dequantToFp32)
     {
@@ -273,15 +280,19 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ4KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         return elems * sizeof(float);
     }
 
     /// <summary>
     /// Uploads a single weight matrix. When <paramref name="dequantToFp32"/> is false and
-    /// <paramref name="qt"/> is Q8_0 the raw Q8_0 block bytes are copied to device memory
-    /// and the returned <paramref name="deviceQuantType"/> is <see cref="QuantizationType.Q8_0"/>.
-    /// Otherwise the source is dequantised to FP32 before upload and
-    /// <paramref name="deviceQuantType"/> is <see cref="QuantizationType.F32"/>.
+    /// the source is a quantised format with a matching Vulkan kernel (Q8_0 / Q4_K) and
+    /// the contraction axis satisfies the kernel's group-size constraint, the raw block
+    /// bytes are copied to device memory verbatim and the returned
+    /// <paramref name="deviceQuantType"/> reflects the source format. Otherwise the source
+    /// is dequantised to FP32 before upload and <paramref name="deviceQuantType"/> is
+    /// <see cref="QuantizationType.F32"/>.
     /// </summary>
     private static unsafe VulkanDevice.Buffer UploadMatrix(
         VulkanDevice device, VulkanDevice.Buffer staging,
@@ -292,15 +303,20 @@ internal sealed class VulkanWeights : IDisposable
     {
         long elems = (long)outputDim * inputDim;
 
-        if (KeepQ8OnDevice(qt, dequantToFp32))
+        // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
+        // the matmul_q8_0 / matmul_q4_k kernels can read it directly. Mirrors the CPU
+        // path's mmap-backed layout.
+        if (KeepQ8OnDevice(qt, dequantToFp32) || KeepQ4KOnDevice(qt, inputDim, dequantToFp32))
         {
-            // Raw Q8_0 blob upload — mirrors the CPU path's mmap-backed layout.
-            long rowBytes = Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0);
+            QuantizationType keepQt = KeepQ8OnDevice(qt, dequantToFp32)
+                ? QuantizationType.Q8_0
+                : QuantizationType.Q4_K;
+            long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
 
             var buf = device.AllocateDeviceLocal(bytes);
             VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (Q8_0)");
+                .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
             try
             {
                 new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -312,7 +328,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
 
-            deviceQuantType = QuantizationType.Q8_0;
+            deviceQuantType = keepQt;
             uploadedBytes = bytes;
             return buf;
         }
