@@ -122,17 +122,18 @@ public class CudaMmqKernelTests
         using var kernels = new CudaKernels(ptxDir!);
         Skip.IfNot(kernels.HasMmq(qt), $"MMQ kernel for {qt} not loaded (PTX may be stale)");
 
-        // MMVQ-large is opt-in via env var (default off due to perf regression on RTX 3060
-        // — see HasMmvqLargeQ4K remarks). Tests that exercise the new kernel toggle the
-        // enable knob in-process. Must be reset in `finally` to avoid state leak.
-        bool prevEnableQ4K = CudaKernels.EnableMmvqLargeQ4K;
-        bool prevEnableQ5K = CudaKernels.EnableMmvqLargeQ5K;
-        bool prevEnableQ6K = CudaKernels.EnableMmvqLargeQ6K;
+        // MMVQ-large is default-ON post #218 (k>=1024 wire-up with pre-Q8_1). Tests that
+        // exercise the new kernel selectively disable the OTHER quant types in-process so
+        // only the one under test routes through MMVQ-large. Must be reset in `finally`
+        // to avoid state leak.
+        bool prevDisableQ4K = CudaKernels.DisableMmvqLargeQ4K;
+        bool prevDisableQ5K = CudaKernels.DisableMmvqLargeQ5K;
+        bool prevDisableQ6K = CudaKernels.DisableMmvqLargeQ6K;
         if (requireMmvqLarge)
         {
-            CudaKernels.EnableMmvqLargeQ4K = qt == QuantizationType.Q4_K;
-            CudaKernels.EnableMmvqLargeQ5K = qt == QuantizationType.Q5_K;
-            CudaKernels.EnableMmvqLargeQ6K = qt == QuantizationType.Q6_K;
+            CudaKernels.DisableMmvqLargeQ4K = qt != QuantizationType.Q4_K;
+            CudaKernels.DisableMmvqLargeQ5K = qt != QuantizationType.Q5_K;
+            CudaKernels.DisableMmvqLargeQ6K = qt != QuantizationType.Q6_K;
             Skip.IfNot(kernels.HasMmvqLarge(qt), $"MMVQ-large kernel for {qt} not loaded (PTX may be stale)");
         }
 
@@ -192,10 +193,10 @@ public class CudaMmqKernelTests
             if (devX != 0) CudaDriverApi.cuMemFree_v2(devX);
             if (devYLegacy != 0) CudaDriverApi.cuMemFree_v2(devYLegacy);
             if (devYMmq != 0) CudaDriverApi.cuMemFree_v2(devYMmq);
-            // Restore prior MMVQ-large enable knobs (see top of method).
-            CudaKernels.EnableMmvqLargeQ4K = prevEnableQ4K;
-            CudaKernels.EnableMmvqLargeQ5K = prevEnableQ5K;
-            CudaKernels.EnableMmvqLargeQ6K = prevEnableQ6K;
+            // Restore prior MMVQ-large disable knobs (see top of method).
+            CudaKernels.DisableMmvqLargeQ4K = prevDisableQ4K;
+            CudaKernels.DisableMmvqLargeQ5K = prevDisableQ5K;
+            CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
         }
 
         // Compare against the **peak magnitude** of the legacy output rather than
