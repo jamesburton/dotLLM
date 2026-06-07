@@ -437,8 +437,6 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
             TiedEmbeddings = false,
             SlidingWindowSize = null,
             MlaConfig = null,
-            HybridLayout = null,
-            SsmConfig = null,
             Mamba3Config = m3,
             ChatTemplate = null,
         };
@@ -486,8 +484,6 @@ public sealed class VulkanMamba3TransformerModelForwardTests : IDisposable
             TiedEmbeddings = false,
             SlidingWindowSize = null,
             MlaConfig = null,
-            HybridLayout = null,
-            SsmConfig = null,
             Mamba3Config = m3,
             ChatTemplate = null,
         };

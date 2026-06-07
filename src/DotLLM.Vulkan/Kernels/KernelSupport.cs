@@ -163,6 +163,34 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// Inserts a <c>COMPUTE_SHADER → TRANSFER</c> barrier so a later
+    /// <c>vkCmdCopyBuffer</c> (TRANSFER stage) can read data a compute
+    /// kernel just wrote. Used by the Mamba-3 streaming-chunk boundary
+    /// path to snapshot the last token's post-RoPE B slice and X into the
+    /// per-layer k_state / v_state buffers after the SSD scan completes,
+    /// and is the natural pair to <see cref="TransferToComputeBarrier"/>.
+    /// A compute→compute barrier does not synchronise transfer reads
+    /// against prior compute writes, so this dedicated helper is required.
+    /// </summary>
+    internal static unsafe void ComputeToTransferBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.ShaderWrite,
+            dstAccessMask = VkAccessFlags.TransferRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.ComputeShader,
+            dstStageMask: VkPipelineStageFlags.Transfer,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>HOST → COMPUTE_SHADER</c> barrier so compute kernels see
     /// host writes to host-visible host-coherent buffers that were made
     /// before the submit. Vulkan's host-coherent guarantee covers visibility

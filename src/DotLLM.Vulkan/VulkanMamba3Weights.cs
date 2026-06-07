@@ -7,7 +7,7 @@ namespace DotLLM.Vulkan;
 
 /// <summary>
 /// Per-layer weight buffers on a Vulkan device for the Mamba-3 model (SISO and MIMO).
-/// Mirrors <see cref="VulkanNemotronHWeights"/>'s upload/lifetime pattern but with a
+/// Mirrors <c>VulkanNemotronHWeights</c>'s upload/lifetime pattern but with a
 /// single per-layer projection bundle (the Mamba-3 mixer tensors) rather than the three
 /// hybrid sub-bundles of NemotronH.
 /// </summary>

@@ -6,7 +6,7 @@ namespace DotLLM.Vulkan;
 /// <summary>
 /// Per-forward scratch buffers for the Mamba-3 Vulkan path (SISO and MIMO). Sized for the
 /// maximum <c>seqLen</c> seen so far; grows monotonically with <see cref="EnsureCapacity"/>.
-/// Mirrors <see cref="VulkanNemotronHForwardState"/> in slot management but with the
+/// Mirrors <c>VulkanNemotronHForwardState</c> in slot management but with the
 /// Mamba-3-specific scratch shapes (Proj, X, Z, Dt, Adt, Trap, Gamma, Scale, AnglesRaw,
 /// B, C, QkPreDot, YScan).
 /// </summary>
