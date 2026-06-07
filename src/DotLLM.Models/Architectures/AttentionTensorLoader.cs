@@ -20,9 +20,15 @@ namespace DotLLM.Models.Architectures;
 /// Llama-style attention layout; only the FFN differs).
 /// </para>
 /// <para>
-/// The DeepSeek-V2 / V3 Multi-head Latent Attention (MLA) variant ships in
-/// a follow-up PR after the MLA chain (DeepSeek-V2/V3 config detection +
-/// MLA forward path) lands upstream.
+/// <see cref="Mla"/> covers DeepSeek-V2 / V3 Multi-head Latent Attention,
+/// whose attention block factors Q via an optional LoRA pair
+/// (<c>q_a_proj</c>/<c>q_b_proj</c> + intermediate RMSNorm) or a monolithic
+/// <c>q_proj</c>, and KV through a low-rank <c>kv_a_proj_with_mqa</c> +
+/// RMSNorm + <c>kv_b_proj</c> pipeline (with the rope-K rows appended to
+/// the kv-down output). All projections are coerced to F32 — the scalar
+/// MLA kernel consumes F32 row-major throughout. The
+/// <see cref="AttentionLayerTensors.Mla"/> slot carries the resolved
+/// <see cref="MlaLayerWeights"/> bundle.
 /// </para>
 /// </remarks>
 internal enum AttentionVariant
@@ -32,6 +38,16 @@ internal enum AttentionVariant
     /// Phi-3 fused <c>qkv_proj</c> layout and splits it at load time.
     /// </summary>
     Gqa,
+
+    /// <summary>
+    /// DeepSeek-V2 / V3 Multi-head Latent Attention. Q is either LoRA-
+    /// factored (<c>q_a_proj</c> + <c>q_a_layernorm</c> + <c>q_b_proj</c>)
+    /// or monolithic (<c>q_proj</c>); KV is always LoRA-factored with a
+    /// shared rope-K tail emitted by <c>kv_a_proj_with_mqa</c>. Populates
+    /// the <see cref="AttentionLayerTensors.Mla"/> slot in addition to the
+    /// shared O slot.
+    /// </summary>
+    Mla,
 }
 
 /// <summary>
@@ -45,7 +61,10 @@ internal enum AttentionVariant
 /// <remarks>
 /// <para>
 /// The Q/K/V/O slots are populated by the GQA variant; optional projection
-/// biases (Qwen2) and per-head QK-norms (Qwen3) are read when present.
+/// biases (Qwen2) and per-head QK-norms (Qwen3) are read when present. The
+/// <see cref="Mla"/> slot is populated by the MLA variant only — Q/K/V are
+/// left zeroed (the MLA forward path reads everything from the bundle) and
+/// only the O slot (+ optional O-bias) is shared with the standard layout.
 /// </para>
 /// <para>
 /// All pointer fields alias either (a) zero-copy mmap views into the
@@ -71,7 +90,10 @@ internal readonly record struct AttentionLayerTensors(
     float[]? OBias,
     // Optional QK-norms (Qwen3)
     float[]? QNormWeight,
-    float[]? KNormWeight);
+    float[]? KNormWeight,
+    // Optional MLA bundle (DeepSeek-V2 / V3). Non-null when loaded via
+    // AttentionVariant.Mla; null otherwise.
+    MlaLayerWeights? Mla = null);
 
 /// <summary>
 /// Shared tensor-name resolver for per-layer transformer attention weights.
@@ -110,6 +132,7 @@ internal static class AttentionTensorLoader
         return variant switch
         {
             AttentionVariant.Gqa => LoadGqa(file, config, layerIdx, owned),
+            AttentionVariant.Mla => LoadMla(file, config, layerIdx, owned),
             _ => throw new ArgumentOutOfRangeException(nameof(variant), variant,
                 "Unknown attention variant."),
         };
@@ -182,5 +205,108 @@ internal static class AttentionTensorLoader
             oPtr, oQt, oM, oK,
             qBias, kBias, vBias, oBias,
             QNormWeight: qNorm, KNormWeight: kNorm);
+    }
+
+    /// <summary>
+    /// DeepSeek-V2 / V3 MLA path: factored Q (LoRA pair
+    /// <c>q_a_proj</c>/<c>q_b_proj</c> with an intermediate RMSNorm) or
+    /// monolithic <c>q_proj</c>; LoRA-factored KV (<c>kv_a_proj_with_mqa</c>
+    /// emits the kv-down rows followed by the MQA-shared rope-K rows, then
+    /// <c>kv_a_layernorm</c> + <c>kv_b_proj</c>); and the standard
+    /// <c>o_proj</c>. All projections coerced to F32 — the scalar MLA
+    /// kernel consumes F32 row-major throughout. Bit-identical with the
+    /// pre-extraction inline body in
+    /// <see cref="TransformerWeightsSafetensorsLoader"/>.
+    /// </summary>
+    private static AttentionLayerTensors LoadMla(
+        ISafetensorsTensorSource file, ModelConfig config, int layerIdx, List<nint> owned)
+    {
+        var mlaCfg = config.MlaConfig
+                     ?? throw new InvalidOperationException(
+                         "AttentionTensorLoader.LoadMla called but ModelConfig.MlaConfig is null.");
+
+        string prefix = $"model.layers.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int numHeads = config.NumAttentionHeads;
+        int qkNope = mlaCfg.QkNopeHeadDim;
+        int qkRope = mlaCfg.QkRopeHeadDim;
+        int qkHead = qkNope + qkRope;
+        int vHead = mlaCfg.VHeadDim;
+        int qLoraRank = mlaCfg.QLoraRank;
+        int kvLoraRank = mlaCfg.KvLoraRank;
+        int qTotalOut = numHeads * qkHead;
+        int kvBOut = numHeads * (qkNope + vHead);
+        int oInputDim = numHeads * vHead;
+
+        // Q path: LoRA-factored (V2 full, V3) or monolithic (V2-Lite). The
+        // kernel decides which path to take based on qLoraRank; we pass zero
+        // pointers for the unused set.
+        nint qAProj = 0, qBProj = 0, qProj = 0;
+        float[]? qALayernorm = null;
+        if (qLoraRank > 0)
+        {
+            (qAProj, _, int qAm, int qAk) = SafetensorsTensorResolver.ResolveLinearAsF32(
+                file, $"{prefix}.self_attn.q_a_proj.weight", owned);
+            SafetensorsTensorResolver.ValidateProjectionShape(qAm, qAk, qLoraRank, hiddenSize,
+                $"{prefix}.self_attn.q_a_proj.weight");
+            qALayernorm = SafetensorsTensorResolver.ResolveNorm(
+                file, $"{prefix}.self_attn.q_a_layernorm.weight", qLoraRank);
+            (qBProj, _, int qBm, int qBk) = SafetensorsTensorResolver.ResolveLinearAsF32(
+                file, $"{prefix}.self_attn.q_b_proj.weight", owned);
+            SafetensorsTensorResolver.ValidateProjectionShape(qBm, qBk, qTotalOut, qLoraRank,
+                $"{prefix}.self_attn.q_b_proj.weight");
+        }
+        else
+        {
+            (qProj, _, int qM, int qK) = SafetensorsTensorResolver.ResolveLinearAsF32(
+                file, $"{prefix}.self_attn.q_proj.weight", owned);
+            SafetensorsTensorResolver.ValidateProjectionShape(qM, qK, qTotalOut, hiddenSize,
+                $"{prefix}.self_attn.q_proj.weight");
+        }
+
+        // KV path: always LoRA-factored. kv_a_proj_with_mqa emits
+        // [kvLoraRank + qkRopeHeadDim] per token — the first kvLoraRank rows
+        // feed kv_a_layernorm then kv_b_proj, the last qkRopeHeadDim rows are
+        // the MQA-shared rope-K. No separate LayerNorm on the rope-K side.
+        int kvADim = kvLoraRank + qkRope;
+        (nint kvAProj, _, int kvaM, int kvaK) = SafetensorsTensorResolver.ResolveLinearAsF32(
+            file, $"{prefix}.self_attn.kv_a_proj_with_mqa.weight", owned);
+        SafetensorsTensorResolver.ValidateProjectionShape(kvaM, kvaK, kvADim, hiddenSize,
+            $"{prefix}.self_attn.kv_a_proj_with_mqa.weight");
+        float[] kvALayernorm = SafetensorsTensorResolver.ResolveNorm(
+            file, $"{prefix}.self_attn.kv_a_layernorm.weight", kvLoraRank);
+        (nint kvBProj, _, int kvbM, int kvbK) = SafetensorsTensorResolver.ResolveLinearAsF32(
+            file, $"{prefix}.self_attn.kv_b_proj.weight", owned);
+        SafetensorsTensorResolver.ValidateProjectionShape(kvbM, kvbK, kvBOut, kvLoraRank,
+            $"{prefix}.self_attn.kv_b_proj.weight");
+
+        // Output projection: hidden ← n_heads * v_head_dim. Lives in the
+        // standard O slot (shared with GQA) because the forward path still
+        // applies bias (if any) through the same AddBias logic.
+        var (oPtr, oQt, oM, oK) = SafetensorsTensorResolver.ResolveLinearAsF32(
+            file, $"{prefix}.self_attn.o_proj.weight", owned);
+        SafetensorsTensorResolver.ValidateProjectionShape(oM, oK, hiddenSize, oInputDim,
+            $"{prefix}.self_attn.o_proj.weight");
+        float[]? oBias = SafetensorsTensorResolver.ResolveOptionalBias(
+            file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
+
+        var mla = new MlaLayerWeights(
+            qAProj: qAProj, qALayernormWeight: qALayernorm, qBProj: qBProj, qProj: qProj,
+            kvAProjWithMqa: kvAProj, kvALayernormWeight: kvALayernorm, kvBProj: kvBProj,
+            numHeads: numHeads,
+            qkNopeHeadDim: qkNope, qkRopeHeadDim: qkRope, vHeadDim: vHead,
+            qLoraRank: qLoraRank, kvLoraRank: kvLoraRank);
+
+        // Q/K/V slots intentionally zeroed — the MLA forward path reads
+        // everything from the Mla bundle. Only the O slot (+ optional bias)
+        // is shared with the standard layout.
+        return new AttentionLayerTensors(
+            QWeight: 0, QQuantType: QuantizationType.F32, QOutputDim: 0, QInputDim: 0,
+            KWeight: 0, KQuantType: QuantizationType.F32, KOutputDim: 0, KInputDim: 0,
+            VWeight: 0, VQuantType: QuantizationType.F32, VOutputDim: 0, VInputDim: 0,
+            OWeight: oPtr, OQuantType: oQt, OOutputDim: oM, OInputDim: oK,
+            QBias: null, KBias: null, VBias: null, OBias: oBias,
+            QNormWeight: null, KNormWeight: null,
+            Mla: mla);
     }
 }
