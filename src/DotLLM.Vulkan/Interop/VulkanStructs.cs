@@ -401,3 +401,11 @@ internal struct VkSubmitInfo
     internal uint signalSemaphoreCount;
     internal nint pSignalSemaphores;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkBufferCopy
+{
+    internal ulong srcOffset;
+    internal ulong dstOffset;
+    internal ulong size;
+}

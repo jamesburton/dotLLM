@@ -217,6 +217,11 @@ internal static partial class VulkanApi
         nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
 
     [LibraryImport(LibName)]
+    internal static partial void vkCmdCopyBuffer(
+        nint commandBuffer, nint srcBuffer, nint dstBuffer,
+        uint regionCount, in VkBufferCopy pRegions);
+
+    [LibraryImport(LibName)]
     internal static partial int vkQueueSubmit(
         nint queue, uint submitCount, in VkSubmitInfo pSubmits, nint fence);
 
