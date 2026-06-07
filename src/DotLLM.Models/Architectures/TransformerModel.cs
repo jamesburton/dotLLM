@@ -39,6 +39,7 @@ public sealed unsafe class TransformerModel : IModel
     // Phase B distinction (correctness oracle vs ~7× memory win).
     private MlaExpandedKvState? _mlaKvState;
     private MlaLatentKvState? _mlaLatentKvState;
+
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
