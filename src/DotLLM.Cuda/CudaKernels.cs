@@ -85,6 +85,12 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
 
+    // ── MLA (Multi-head Latent Attention) Phase A naive forward kernel ──
+    // F32 throughout to match the CPU MlaAttention.Execute oracle byte-for-byte
+    // algorithmically. Optional — PTX may not be present on stale builds.
+    private readonly CudaModule? _attentionMlaModule;
+    private readonly nint _attentionMlaF32Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -163,7 +169,19 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantKvQ8_0Func = _quantKvModule.GetFunction("quant_f16_to_q8_0");
             _quantKvQ4_0Func = _quantKvModule.GetFunction("quant_f16_to_q4_0");
         }
+
+        // MLA Phase A naive forward kernel (F32). Optional — only required when
+        // the model is DeepSeek-V2 / V3 with MLA attention.
+        string attentionMlaPath = Path.Combine(ptxDir, "attention_mla.ptx");
+        if (File.Exists(attentionMlaPath))
+        {
+            _attentionMlaModule = CudaModule.LoadFromFile(attentionMlaPath);
+            _attentionMlaF32Func = _attentionMlaModule.GetFunction("attention_mla_f32");
+        }
     }
+
+    /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
+    public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
 
     /// <summary>RMS normalization. One block per row.</summary>
     public void LaunchRmsNorm(nint input, nint weight, nint output,
@@ -726,6 +744,65 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Multi-head Latent Attention (MLA) Phase A naive forward — F32 throughout.
+    /// One CUDA block per (query_token, head) pair. Computes the equivalent of
+    /// <c>MlaAttention.Execute</c>'s attention loop:
+    /// <c>scores = Q_nope · K_nope_per_head + Q_pe · K_pe_shared, scaled by softmax_scale,
+    /// causal-masked, softmaxed, then weighted sum over per-head V (which has its own
+    /// vHead dim — typically 128 vs the 192-wide attention score dim).</c>
+    /// </summary>
+    /// <param name="q">F32 [seqQ, numHeads, qkNopeHeadDim + qkRopeHeadDim] (per-head Q with split dims).</param>
+    /// <param name="kNope">F32 [seqKv, numHeads, qkNopeHeadDim] (per-head K_nope cache slice).</param>
+    /// <param name="kPe">F32 [seqKv, qkRopeHeadDim] (MQA-shared K_pe cache slice, RoPE-applied).</param>
+    /// <param name="v">F32 [seqKv, numHeads, vHeadDim] (per-head V cache slice).</param>
+    /// <param name="output">F32 [seqQ, numHeads, vHeadDim] (per-head attention output).</param>
+    /// <param name="seqQ">Number of query tokens this call produces output for.</param>
+    /// <param name="seqKv">Total cached length the queries attend over (= cachedLength + seqQ in autoregression).</param>
+    /// <param name="numHeads">Number of attention heads.</param>
+    /// <param name="qkNopeHeadDim">Per-head non-rope Q·K dim.</param>
+    /// <param name="qkRopeHeadDim">Per-head rope Q·K dim (must be even).</param>
+    /// <param name="vHeadDim">Per-head V dim (may differ from qkHeadDim).</param>
+    /// <param name="positionOffset">Absolute position of query token 0 (for the causal mask).</param>
+    /// <param name="softmaxScale">Combined softmax scale: <c>(1 / sqrt(qk_head_dim)) * yarn_mscale²</c>.</param>
+    /// <param name="stream">CUDA stream.</param>
+    public void LaunchAttentionMla(
+        nint q, nint kNope, nint kPe, nint v, nint output,
+        int seqQ, int seqKv,
+        int numHeads, int qkNopeHeadDim, int qkRopeHeadDim, int vHeadDim,
+        int positionOffset, float softmaxScale, nint stream)
+    {
+        if (_attentionMlaF32Func == 0)
+            throw new InvalidOperationException(
+                "MLA attention kernel not available. Compile native/kernels/attention_mla.cu to PTX.");
+
+        nint qArg = q, kNopeArg = kNope, kPeArg = kPe, vArg = v, outArg = output;
+        int sqArg = seqQ, skvArg = seqKv;
+        int nhArg = numHeads;
+        int nopeArg = qkNopeHeadDim, ropeArg = qkRopeHeadDim, vhArg = vHeadDim;
+        int poArg = positionOffset;
+        float scaleArg = softmaxScale;
+
+        void** args = stackalloc void*[] {
+            &qArg, &kNopeArg, &kPeArg, &vArg, &outArg,
+            &sqArg, &skvArg,
+            &nhArg, &nopeArg, &ropeArg, &vhArg,
+            &poArg, &scaleArg
+        };
+
+        int numBlocks = seqQ * numHeads;
+        // Shared memory layout: q_nope[qkNope] + q_pe[qkRope] + score_tile[128] + out_accum[vHead] + warp_scratch[32]
+        const int TileKv = 128;
+        uint sharedBytes = (uint)((qkNopeHeadDim + qkRopeHeadDim + TileKv + vHeadDim + 32) * sizeof(float));
+        // Block size is 128 (matches __launch_bounds__ in attention_mla.cu).
+        const uint MlaBlockSize = 128;
+
+        CudaDriverApi.cuLaunchKernel(_attentionMlaF32Func,
+                (uint)numBlocks, 1, 1, MlaBlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -753,5 +830,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
         _quantKvModule?.Dispose();
+        _attentionMlaModule?.Dispose();
     }
 }
