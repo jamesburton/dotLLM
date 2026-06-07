@@ -420,9 +420,11 @@ def run_dotllm(
 
     # When env var overrides the model, narrow to a single enum value to avoid
     # running 3 identical benchmarks (all [ParamsAllValues] load the same file).
+    # Anchor on the leading namespace path to avoid sibling benchmark classes
+    # (e.g. CudaInferenceBenchmarks) matching the same SmolLM_135M parameter.
     effective_filter = bdn_filter
     if model_path and bdn_filter == "*InferenceBenchmarks*":
-        effective_filter = "*SmolLM_135M*"
+        effective_filter = "DotLLM.Benchmarks.InferenceBenchmarks*SmolLM_135M*"
 
     cmd = [
         "dotnet", "run",
@@ -1363,8 +1365,8 @@ def main() -> int:
     parser.add_argument("--label", type=str, default=None,
                         help="Human label for this benchmark run (used in --export-json)")
     parser.add_argument("--device", type=str, default="cpu",
-                        choices=["cpu", "gpu", "both"],
-                        help="Compute device: cpu (default), gpu, or both (runs each engine on both devices)")
+                        choices=["cpu", "gpu", "vulkan", "both"],
+                        help="Compute device: cpu (default), gpu, vulkan, or both (runs each engine on both cpu+gpu)")
     parser.add_argument("--hybrid-modes", type=str, default=None,
                         help="Comma-separated fractions (0-1) of layers to offload to GPU. "
                              "E.g. '0.25,0.5,0.75' runs hybrid mode at 25%%, 50%%, 75%% of layers. "
