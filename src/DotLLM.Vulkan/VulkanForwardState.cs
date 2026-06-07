@@ -21,6 +21,11 @@ internal sealed class VulkanForwardState : IDisposable
     private readonly int _headDim;
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
+
+    // MoE dims — zero unless the model carries a MoE layer.
+    private readonly int _moeNumExperts;
+    private readonly int _moeTopK;
+    private readonly int _moeIntermediateSize;
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
@@ -36,6 +41,19 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer FfnUp { get; private set; } = null!;
     public VulkanDevice.Buffer SiluOutput { get; private set; } = null!;
 
+    // ── MoE scratch (Mixtral / Qwen-MoE) ─────────────────────────────
+    // Allocated only when the model carries a MoE layer (moeNumExperts > 0
+    // at construction). Sizes are seqLen-dependent so they grow with
+    // EnsureCapacity. Names mirror the steps in MoeSwiGluMlp.Execute.
+    public VulkanDevice.Buffer? MoeRouterLogits { get; private set; }   // [seqLen, numExperts]
+    public VulkanDevice.Buffer? MoeTopkIndices { get; private set; }    // [seqLen, topK]   int32
+    public VulkanDevice.Buffer? MoeTopkWeights { get; private set; }    // [seqLen, topK]   F32
+    public VulkanDevice.Buffer? MoeExpandedInput { get; private set; }  // [seqLen * topK, hidden] (broadcast of NormOutput)
+    public VulkanDevice.Buffer? MoeGateInter { get; private set; }      // [seqLen * topK, intermediate]
+    public VulkanDevice.Buffer? MoeUpInter { get; private set; }        // [seqLen * topK, intermediate]
+    public VulkanDevice.Buffer? MoeSiluInter { get; private set; }      // [seqLen * topK, intermediate]
+    public VulkanDevice.Buffer? MoeDownRows { get; private set; }       // [seqLen * topK, hidden]
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 
@@ -49,7 +67,8 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanForwardState(
         VulkanDevice device,
         int hiddenSize, int numHeads, int numKvHeads, int headDim,
-        int intermediateSize, int vocabSize, int initialSeqLen)
+        int intermediateSize, int vocabSize, int initialSeqLen,
+        int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0)
     {
         _device = device;
         _hiddenSize = hiddenSize;
@@ -58,6 +77,9 @@ internal sealed class VulkanForwardState : IDisposable
         _headDim = headDim;
         _intermediateSize = intermediateSize;
         _vocabSize = vocabSize;
+        _moeNumExperts = moeNumExperts;
+        _moeTopK = moeTopK;
+        _moeIntermediateSize = moeIntermediateSize;
 
         // LM-head logits are always one token (last). Positions buffer sized for some reasonable
         // default; grows with EnsureCapacity.
@@ -100,6 +122,8 @@ internal sealed class VulkanForwardState : IDisposable
         FfnUp = _device.Allocate(ffnBytes);
         SiluOutput = _device.Allocate(ffnBytes);
 
+        long moeBytes = AllocateMoeScratch(seqLen);
+
         // Resize positions buffer.
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
@@ -107,7 +131,32 @@ internal sealed class VulkanForwardState : IDisposable
         _capacitySeqLen = seqLen;
 
         AllocatedBytes = hiddenBytes * 4 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
+                       + moeBytes
                        + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
+    }
+
+    private long AllocateMoeScratch(int seqLen)
+    {
+        if (_moeNumExperts == 0) return 0;
+
+        long routerBytes = (long)seqLen * _moeNumExperts * sizeof(float);
+        long topkIdxBytes = (long)seqLen * _moeTopK * sizeof(int);
+        long topkWtBytes = (long)seqLen * _moeTopK * sizeof(float);
+        long expandedBytes = (long)seqLen * _moeTopK * _hiddenSize * sizeof(float);
+        long interBytes = (long)seqLen * _moeTopK * _moeIntermediateSize * sizeof(float);
+        long downBytes = expandedBytes;
+
+        MoeRouterLogits = _device.Allocate(routerBytes);
+        MoeTopkIndices = _device.Allocate(topkIdxBytes);
+        MoeTopkWeights = _device.Allocate(topkWtBytes);
+        MoeExpandedInput = _device.Allocate(expandedBytes);
+        MoeGateInter = _device.Allocate(interBytes);
+        MoeUpInter = _device.Allocate(interBytes);
+        MoeSiluInter = _device.Allocate(interBytes);
+        MoeDownRows = _device.Allocate(downBytes);
+
+        return routerBytes + topkIdxBytes + topkWtBytes + expandedBytes
+             + interBytes * 3 + downBytes;
     }
 
     private void ReleaseLayerScratch()
@@ -123,6 +172,15 @@ internal sealed class VulkanForwardState : IDisposable
         FfnGate?.Dispose();
         FfnUp?.Dispose();
         SiluOutput?.Dispose();
+
+        MoeRouterLogits?.Dispose(); MoeRouterLogits = null;
+        MoeTopkIndices?.Dispose(); MoeTopkIndices = null;
+        MoeTopkWeights?.Dispose(); MoeTopkWeights = null;
+        MoeExpandedInput?.Dispose(); MoeExpandedInput = null;
+        MoeGateInter?.Dispose(); MoeGateInter = null;
+        MoeUpInter?.Dispose(); MoeUpInter = null;
+        MoeSiluInter?.Dispose(); MoeSiluInter = null;
+        MoeDownRows?.Dispose(); MoeDownRows = null;
     }
 
     public void Dispose()

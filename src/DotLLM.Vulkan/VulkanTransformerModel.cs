@@ -7,6 +7,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -22,9 +23,10 @@ namespace DotLLM.Vulkan;
 /// <remarks>
 /// <para>
 /// Scope: F32-only. Quantised weights are dequantised to FP32 at
-/// construction time via <see cref="VulkanWeights.Upload"/>. The model
-/// assumes a pure-Transformer Llama-family architecture — MLA, MoE, and
-/// SSM layers are rejected at load time.
+/// construction time via <see cref="VulkanWeights.Upload"/>. Llama-family
+/// dense and Mixtral-convention MoE FFNs are supported; MLA attention
+/// and SSM layers are rejected at load time. DeepSeek-V2/V3 shared-expert
+/// MoE is not yet wired in.
 /// </para>
 /// <para>
 /// The forward pass is synchronous: every kernel dispatch in the chain
@@ -56,6 +58,11 @@ public sealed class VulkanTransformerModel : IModel
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
 
+    // MoE kernel set — constructed only when the model carries a MoE layer.
+    private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
+    private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
+    private readonly MoeWeightedScatterF32Kernel? _moeWeightedScatter;
+
     private readonly TransformerWeights _cpuWeights; // retained for embedding lookup
     private readonly GgufFile? _gguf;
     private readonly float _ropeTheta;
@@ -80,6 +87,9 @@ public sealed class VulkanTransformerModel : IModel
         VulkanForwardState state,
         MatMulF32Kernel matmul, RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
+        MoeTopKSoftmaxF32Kernel? moeTopkSoftmax,
+        MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
+        MoeWeightedScatterF32Kernel? moeWeightedScatter,
         GgufFile? gguf,
         float ropeTheta, int ropeDim, RopeF32Kernel.Variant ropeVariant, int slidingWindow)
     {
@@ -95,6 +105,9 @@ public sealed class VulkanTransformerModel : IModel
         _attention = attention;
         _swiglu = swiglu;
         _add = add;
+        _moeTopkSoftmax = moeTopkSoftmax;
+        _moeIndexedMatmul = moeIndexedMatmul;
+        _moeWeightedScatter = moeWeightedScatter;
         _gguf = gguf;
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
@@ -156,16 +169,82 @@ public sealed class VulkanTransformerModel : IModel
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
+    /// <summary>
+    /// Loads a model from an opened HuggingFace-convention safetensors file
+    /// onto a new Vulkan device. The caller owns the returned model; disposing
+    /// it tears down the device, pipelines, and weight buffers. The safetensors
+    /// file must remain alive (its mmap is referenced by the weight pointers).
+    /// </summary>
+    public static VulkanTransformerModel LoadFromSafetensors(
+        SafetensorsFile file, ModelConfig config, string? spvDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        RejectUnsupportedArchitecture(config);
+
+        var device = VulkanDevice.Create();
+        try
+        {
+            spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
+            var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+            return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf: null);
+        }
+        catch
+        {
+            device.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Loads a model from an opened HuggingFace-convention safetensors file
+    /// onto an existing <see cref="VulkanDevice"/>. The device is NOT disposed
+    /// when the model is disposed.
+    /// </summary>
+    public static VulkanTransformerModel LoadFromSafetensors(
+        VulkanDevice device, SafetensorsFile file, ModelConfig config, string? spvDir = null)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        RejectUnsupportedArchitecture(config);
+
+        spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null);
+    }
+
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
         TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
     {
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
 
+        // MoE forward scratch is sized from the layer that carries the MoE
+        // bundle (any/all of them — they share the per-layer MoE shape).
+        // When no layer carries one, leave the MoE dims at zero so
+        // VulkanForwardState skips allocation entirely.
+        int moeNumExperts = 0, moeTopK = 0, moeIntermediate = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (weights.Layers[i].Moe is { } m)
+            {
+                moeNumExperts = m.NumExperts;
+                moeTopK = m.NumExpertsPerTok;
+                moeIntermediate = m.IntermediateSize;
+                break;
+            }
+        }
+
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize,
-            initialSeqLen: 1);
+            initialSeqLen: 1,
+            moeNumExperts: moeNumExperts,
+            moeTopK: moeTopK,
+            moeIntermediateSize: moeIntermediate);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
@@ -173,6 +252,16 @@ public sealed class VulkanTransformerModel : IModel
         var attention = AttentionF32Kernel.Create(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
+
+        MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
+        MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
+        MoeWeightedScatterF32Kernel? moeWeightedScatter = null;
+        if (moeNumExperts > 0)
+        {
+            moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
+            moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
+            moeWeightedScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
+        }
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
@@ -186,6 +275,7 @@ public sealed class VulkanTransformerModel : IModel
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, rmsnorm, rope, attention, swiglu, add,
+            moeTopkSoftmax, moeIndexedMatmul, moeWeightedScatter,
             gguf,
             ropeTheta, ropeDim, ropeVariant, slidingWindow);
     }
@@ -303,26 +393,33 @@ public sealed class VulkanTransformerModel : IModel
             CopyDeviceBuffer(_state.HiddenState, _state.Residual, (long)seqLen * hiddenSize * sizeof(float));
 
             // ── FFN block ───────────────────────────────────────────────
+            if (lw.Moe is { } moeW)
+            {
+                // MoE FFN — writes the combined output into NormOutput.
+                RunMoeLayer(moeW, lw.FfnNormWeight, seqLen, hiddenSize, eps);
+            }
+            else
+            {
+                // h. RMSNorm ffn_in
+                _rmsnorm.Launch(_state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
 
-            // h. RMSNorm ffn_in
-            _rmsnorm.Launch(_state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
-                rowCount: seqLen, n: hiddenSize, eps: eps);
+                // i. Gate/Up projections
+                _matmul.Launch(lw.Gate, _state.NormOutput, _state.FfnGate,
+                    lw.GateOutputDim, lw.GateInputDim, seqLen);
+                _matmul.Launch(lw.Up, _state.NormOutput, _state.FfnUp,
+                    lw.UpOutputDim, lw.UpInputDim, seqLen);
+                if (lw.GateBias is { } gb) AddBiasRows(_state.FfnGate, gb, lw.GateOutputDim, seqLen);
+                if (lw.UpBias is { } ub) AddBiasRows(_state.FfnUp, ub, lw.UpOutputDim, seqLen);
 
-            // i. Gate/Up projections
-            _matmul.Launch(lw.Gate, _state.NormOutput, _state.FfnGate,
-                lw.GateOutputDim, lw.GateInputDim, seqLen);
-            _matmul.Launch(lw.Up, _state.NormOutput, _state.FfnUp,
-                lw.UpOutputDim, lw.UpInputDim, seqLen);
-            if (lw.GateBias is { } gb) AddBiasRows(_state.FfnGate, gb, lw.GateOutputDim, seqLen);
-            if (lw.UpBias is { } ub) AddBiasRows(_state.FfnUp, ub, lw.UpOutputDim, seqLen);
+                // j. SwiGLU: silu(gate) * up -> SiluOutput
+                _swiglu.Launch(_state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
 
-            // j. SwiGLU: silu(gate) * up -> SiluOutput
-            _swiglu.Launch(_state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
-
-            // k. Down projection -> NormOutput
-            _matmul.Launch(lw.Down, _state.SiluOutput, _state.NormOutput,
-                lw.DownOutputDim, lw.DownInputDim, seqLen);
-            if (lw.DownBias is { } db) AddBiasRows(_state.NormOutput, db, lw.DownOutputDim, seqLen);
+                // k. Down projection -> NormOutput
+                _matmul.Launch(lw.Down, _state.SiluOutput, _state.NormOutput,
+                    lw.DownOutputDim, lw.DownInputDim, seqLen);
+                if (lw.DownBias is { } db) AddBiasRows(_state.NormOutput, db, lw.DownOutputDim, seqLen);
+            }
 
             // l. Residual add: hidden = residual + ffn_out
             _add.Launch(_state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
@@ -347,6 +444,109 @@ public sealed class VulkanTransformerModel : IModel
             _device.Download(_state.Logits, dest);
         }
         return result;
+    }
+
+    /// <summary>
+    /// Runs the MoE FFN sub-layer using the Vulkan MoE kernel set —
+    /// rmsnorm → gate matmul → top-k softmax → broadcast → indexed
+    /// matmul (W1 / W3) → SwiGLU → indexed matmul (W2) → weighted
+    /// scatter. Mirrors the per-(token, slot) accumulation order of
+    /// <c>MoeSwiGluMlp.Execute</c> on the CPU, so the result is
+    /// numerically parity with the CPU reference modulo F32 rounding.
+    /// Writes the combined per-token output into <see cref="VulkanForwardState.NormOutput"/>.
+    /// </summary>
+    private unsafe void RunMoeLayer(
+        VulkanWeights.MoeLayerBuffers moeW, VulkanDevice.Buffer ffnNormWeight,
+        int seqLen, int hiddenSize, float eps)
+    {
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int interm = moeW.IntermediateSize;
+        int nExpanded = seqLen * topK;
+
+        // 1. RMSNorm into NormOutput.
+        _rmsnorm.Launch(_state.HiddenState, ffnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+
+        // 2. Router gate matmul -> MoeRouterLogits [seqLen, numExperts].
+        _matmul.Launch(moeW.Gate, _state.NormOutput, _state.MoeRouterLogits!,
+            m: numE, k: hiddenSize, n: seqLen);
+
+        // 3. Top-k softmax: writes MoeTopkIndices (int) and MoeTopkWeights.
+        _moeTopkSoftmax!.Launch(
+            _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+
+        // 4. Broadcast NormOutput[seqLen, hidden] → MoeExpandedInput[seqLen*topK, hidden].
+        //    Each token's row is replicated topK times. Host round-trip: all
+        //    buffers are host-visible host-coherent on this base, and the
+        //    prior kernel-launch's vkQueueWaitIdle already published writes.
+        BroadcastForExpansion(_state.NormOutput, _state.MoeExpandedInput!, seqLen, topK, hiddenSize);
+
+        // 5. Indexed matmul W1 (gate_proj): ExpandedInput → GateInter.
+        _moeIndexedMatmul!.Launch(
+            moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+            m: interm, k: hiddenSize, n: nExpanded, numExperts: numE);
+
+        // 6. Indexed matmul W3 (up_proj): ExpandedInput → UpInter.
+        _moeIndexedMatmul.Launch(
+            moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+            m: interm, k: hiddenSize, n: nExpanded, numExperts: numE);
+
+        // 7. SwiGLU: silu(GateInter) * UpInter → SiluInter.
+        _swiglu.Launch(_state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!,
+            n: nExpanded * interm);
+
+        // 8. Indexed matmul W2 (down_proj): SiluInter → DownRows [seqLen*topK, hidden].
+        _moeIndexedMatmul.Launch(
+            moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+            m: hiddenSize, k: interm, n: nExpanded, numExperts: numE);
+
+        // 9. Weighted scatter: collapse [seqLen*topK, hidden] into [seqLen, hidden],
+        //    overwriting NormOutput with the combined per-token MoE output so the
+        //    residual-add tail runs unchanged.
+        _moeWeightedScatter!.Launch(
+            _state.MoeDownRows!, _state.MoeTopkWeights!, _state.NormOutput,
+            seqLen: seqLen, topK: topK, hiddenSize: hiddenSize);
+    }
+
+    /// <summary>
+    /// Replicates each row of <paramref name="src"/> (shape
+    /// <c>[seqLen, hiddenSize]</c>) into <paramref name="dst"/> (shape
+    /// <c>[seqLen * topK, hiddenSize]</c>) so each (token, slot) sees its
+    /// per-token input row. Host map → memcpy → unmap; safe because the
+    /// prior kernel launch ended in <c>vkQueueWaitIdle</c>.
+    /// </summary>
+    private unsafe void BroadcastForExpansion(
+        VulkanDevice.Buffer src, VulkanDevice.Buffer dst, int seqLen, int topK, int hiddenSize)
+    {
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        long srcBytes = (long)seqLen * rowBytes;
+        long dstBytes = srcBytes * topK;
+
+        VulkanApi.vkMapMemory(_device.Handle, src.Memory, 0, (ulong)srcBytes, 0, out nint srcMapped)
+            .ThrowOnError("vkMapMemory BroadcastForExpansion.src");
+        VulkanApi.vkMapMemory(_device.Handle, dst.Memory, 0, (ulong)dstBytes, 0, out nint dstMapped)
+            .ThrowOnError("vkMapMemory BroadcastForExpansion.dst");
+        try
+        {
+            byte* s = (byte*)srcMapped;
+            byte* d = (byte*)dstMapped;
+            for (int t = 0; t < seqLen; t++)
+            {
+                byte* tokenRow = s + (long)t * rowBytes;
+                byte* dstBase = d + (long)t * topK * rowBytes;
+                for (int slot = 0; slot < topK; slot++)
+                {
+                    System.Buffer.MemoryCopy(tokenRow, dstBase + (long)slot * rowBytes, rowBytes, rowBytes);
+                }
+            }
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(_device.Handle, dst.Memory);
+            VulkanApi.vkUnmapMemory(_device.Handle, src.Memory);
+        }
     }
 
     /// <summary>
@@ -494,6 +694,10 @@ public sealed class VulkanTransformerModel : IModel
     {
         _state.Dispose();
         _weights.Dispose();
+
+        _moeWeightedScatter?.Dispose();
+        _moeIndexedMatmul?.Dispose();
+        _moeTopkSoftmax?.Dispose();
 
         _add.Dispose();
         _swiglu.Dispose();
