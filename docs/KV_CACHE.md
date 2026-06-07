@@ -230,23 +230,84 @@ Each turn's prompt = previous prompt + assistant response + new user message. Th
 
 `InferenceTimings.CachedTokenCount` reports how many prompt tokens were served from cache. Displayed in CLI output, API `timings.cached_tokens`, and Chat UI stats bar.
 
-## Advanced Prompt Caching / Prefix Sharing (Future — Step 36+)
+## Advanced Prompt Caching / Prefix Sharing (Step 37)
 
-Requires paged KV-cache. Enables cross-request prefix sharing (e.g., shared system prompts across users).
+Cross-request prefix sharing on top of paged KV-cache. Shared system prompts
+are computed once and reused by every subsequent request, regardless of which
+sequence first filled the trie.
 
 ### Problem
+
 Many requests share the same system prompt (e.g., all chat requests in a deployment).
 Recomputing KV-cache for the shared prefix is wasteful.
 
-### Solution: Prefix Trie
-- Maintain a **trie** of recently computed prompt prefixes, keyed by token sequences.
-- On new request: walk the trie matching the prompt's token sequence.
-- If match found: share the cached KV blocks (read-only), only prefill the new suffix.
+### Solution: Prefix Trie (RadixAttention-style)
 
-### Implementation
-- Shared blocks use **reference counting**. Freed when all referencing sequences complete.
-- **LRU eviction** when memory scarce. Frequently used prefixes (system prompts) stay cached.
-- **Explicit registration**: Server API accepts `prefix_id` for deterministic caching.
+A block-granular radix trie of computed KV blocks. Each path from the root
+corresponds to a sequence of physical blocks in the shared `KvBlockPool`; the
+tokens that filled each block are the "label" on that edge.
 
-### Integration with PagedAttention
-The prefix trie stores references to physical KV blocks. New sequences get their own block table with shared prefix entries pointing to existing blocks, plus new blocks for the suffix. Copy-on-write if modification needed (rare — KV cache is append-only).
+- Walks one step per `BlockSize` (16) tokens of prompt.
+- FNV-1a 64-bit hash keys the child map; full-token comparison guards against
+  collisions (the trie reuses **full** blocks only).
+- Per-node `RefCount` + `LastTouchedTicks` so zero-refcount LRU leaves are
+  evictable on block-pool pressure.
+
+### Key Classes
+
+- `PrefixTrie` — the radix structure itself. `Lookup` / `Insert` /
+  `Release` / `EvictOneLru` / `RegisterNamedPrefix` / `UnpinNamedPrefix`.
+- `PrefixTrieManager` — single integration seam in front of `PagedKvCache`.
+  Owns the trie + the paged-cache factory; mints per-sequence caches seeded
+  with the longest matching prefix and routes completion back into the trie.
+- `PrefixCacheConfig` — `Enabled` (default true when paged is active),
+  `MaxPrefixDepth` (token cap, 0 = unbounded), `EvictionEnabled`.
+
+### Refcount Lifecycle
+
+For each block in the trie:
+
+1. **Trie ref**: created when `Insert` links a freshly-computed block.
+   Released when the node is evicted.
+2. **Sequence ref**: created when `Lookup` matches a block (one per
+   `Admit` call). Released when the sequence's `PagedKvCache.Dispose` runs.
+3. **Named-prefix pin**: created when `RegisterNamedPrefix` pins a path.
+   Released by `UnpinNamedPrefix`.
+
+LRU eviction picks zero-refcount nodes (no active sequence, no pin); the
+trie ref is then released and the block returns to the pool.
+
+### Scheduler Integration
+
+`ContinuousBatchScheduler` accepts an optional `PrefixTrieManager`. When
+present, admission seeds a new sequence's cache from the trie (only the
+suffix runs through `Forward`) and completion pushes new blocks back so
+later requests reuse them. The admission loop calls `TryEvict` to relieve
+block-pool pressure before refusing admission — active sequences are NOT
+preempted (that's Step 59).
+
+`TextGenerator` accepts an optional `PrefixTrieManager` too; it takes
+precedence over the simple `PrefixCache` from Step 54. Both engine paths
+(scheduler + single-session generator) benefit from the trie.
+
+### Server API
+
+- `GET /v1/prompt-cache` — stats for the active trie.
+- `GET /v1/prompt-cache/{id}` — inspect a named prefix.
+- `POST /v1/prompt-cache/{id}` — pre-warm + pin a named prefix
+  (body: `{ "prompt": "..." }` or `{ "token_ids": [...] }`).
+- `DELETE /v1/prompt-cache/{id}` — unpin a named prefix.
+- `DELETE /v1/prompt-cache` — clear the entire trie.
+- `prefix_id` field on chat/completion requests — best-effort hint that
+  validates the named prefix exists before the request runs.
+
+### Limitations (Step 37 MVP)
+
+- Block-level (16-token) match granularity — partial trailing blocks
+  are NOT shared.
+- Paged KV-cache only (CPU). GPU caches fall back to the per-sequence
+  Step 54 behaviour. Quantized KV-cache fall back too.
+- Eviction only frees zero-refcount blocks. Preempting active sequences
+  to make room is deferred to Step 59 (priority-based scheduling).
+- The trie walks linearly to find a node by block id during `Release`;
+  good enough for typical depths (< 1024 blocks) but a future tweak.

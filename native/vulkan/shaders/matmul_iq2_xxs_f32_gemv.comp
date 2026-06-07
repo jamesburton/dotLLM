@@ -1,0 +1,126 @@
+#version 450
+// IQ2_XXS matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_k W_iq2xxs[m, k] * x[k]    with W_iq2xxs dequantized on the fly.
+//
+// Weight layout mirrors block_iq2_xxs / DotLLM.Cpu.Kernels.Dequantize.DequantizeIQ2_XXS.
+// Each 256 contiguous columns of a row form one 66-byte super-block. Per
+// sub-block (32 elements): two uint32s (a0, a1) — a0 = 4 grid-byte indices,
+// a1 = 4*7-bit sign indices in the low 28 bits + 4-bit shared sub-scale in
+// the top nibble. Shared sub-scale is `db = d * (0.5 + (a1 >> 28)) * 0.25`.
+//
+// Per-pair (8 elements) decode: g_j = grid[gridIdx*8 + j],
+// sign_j = ksigns[signsIdx] bit j (0->+1, 1->-1).
+//
+// Dispatch: one workgroup per output row, 128 threads, shared-memory tree
+// reduce. Mirrors matmul_iq4_xs_f32_gemv.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW       { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX       { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY       { float y[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer BufGrid    { uint  iq2xxsGrid[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufKsigns  { uint  ksigns[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 256
+    uint blocksPerRow;  // = K / 256
+    uint rowUints;
+} pc;
+
+const uint IQ2_XXS_BLOCK_BYTES = 66u;
+const uint IQ2_XXS_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS       = 8u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq2xxsGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+uint ksignByte(uint absIdx) {
+    uint u = ksigns[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * IQ2_XXS_BLOCK_BYTES;
+    uint rowByteBase   = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * IQ2_XXS_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+        uint qsBase = blockByteBase + 2u;
+        uint xBase  = b * IQ2_XXS_GROUP_SIZE;
+
+        for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+            uint p = qsBase + 8u * ib32;
+            uint a0 = readByte(p)
+                    | (readByte(p + 1u) << 8)
+                    | (readByte(p + 2u) << 16)
+                    | (readByte(p + 3u) << 24);
+            uint a1 = readByte(p + 4u)
+                    | (readByte(p + 5u) << 8)
+                    | (readByte(p + 6u) << 16)
+                    | (readByte(p + 7u) << 24);
+            float db = d * (0.5 + float(a1 >> 28)) * 0.25;
+            uint xSubBase = xBase + ib32 * 32u;
+
+            for (uint l = 0u; l < 4u; l++) {
+                uint gridIdx  = (a0 >> (8u * l)) & 0xFFu;
+                uint signsIdx = (a1 >> (7u * l)) & 0x7Fu;
+                uint signs    = ksignByte(signsIdx);
+                uint gridOff  = gridIdx * 8u;
+                uint xOff     = xSubBase + l * 8u;
+
+                float pairSum = 0.0;
+                for (uint j = 0u; j < 8u; j++) {
+                    float g    = float(gridByte(gridOff + j));
+                    float sign = ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
+                    pairSum += g * sign * x[xOff + j];
+                }
+                acc += db * pairSum;
+            }
+        }
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

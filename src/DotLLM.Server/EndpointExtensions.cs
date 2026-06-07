@@ -21,6 +21,7 @@ public static class EndpointExtensions
         HealthEndpoint.Map(app);
         PropsEndpoint.Map(app);
         ConfigEndpoint.Map(app);
+        PromptCacheEndpoint.Map(app);
         ModelManagementEndpoint.Map(app);
         ModelInspectEndpoint.Map(app);
         LoraEndpoints.Map(app);

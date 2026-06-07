@@ -9,22 +9,19 @@ namespace DotLLM.Vulkan;
 /// <summary>
 /// Per-layer weight buffers on a Vulkan device. Mirrors
 /// <c>DotLLM.Cuda.CudaWeights</c> but with a two-mode storage model:
-/// Q8_0 matrices are kept on device as raw 34-byte blocks when
-/// <c>dequantToFp32=false</c> (default) so the <c>matmul_q8_0</c> /
-/// <c>matmul_q8_0_gemm</c> kernels can read them directly — 4× less VRAM
-/// and 4× less per-forward bandwidth vs the dequantised F32 path.
-/// F16 and other quant types are still dequantised to FP32 at upload time
-/// (those kernels don't exist yet); passing <c>dequantToFp32=true</c> forces
-/// the legacy all-F32 path as a fallback. Bias and norm weights are always
-/// FP32 device buffers (tiny, kernels consume FP32).
+/// Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, F16, and BF16 matrices are kept on device in
+/// their source byte layout when <c>dequantToFp32=false</c> (default) and the
+/// relevant Vulkan kernel supports the contraction shape. Unsupported shapes
+/// fall back to dequantised F32 upload. Bias and norm weights are always FP32
+/// device buffers (tiny, kernels consume FP32).
 /// </summary>
 internal sealed class VulkanWeights : IDisposable
 {
     /// <summary>
     /// Per-layer device-resident MoE (Mixtral / Qwen-MoE) weight bundle.
-    /// Per-expert weights are <i>packed</i> into one contiguous F32 device
-    /// bank per projection so the indexed-matmul kernel can address any
-    /// expert via a single descriptor binding plus a per-row index lookup.
+    /// Per-expert weights are <i>packed</i> into one contiguous device bank
+    /// per projection so either the indexed-matmul path or the grouped F16
+    /// coopmat path can address any expert via a single descriptor binding.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -46,9 +43,8 @@ internal sealed class VulkanWeights : IDisposable
     /// weight-offset push constant on the matmul kernel. Shared experts are
     /// few (typically 1..2) and small, so per-expert buffers keep the wiring
     /// simple while costing one extra buffer per shared expert per layer.
-    /// Qwen1.5-MoE's per-token sigmoid gate is intentionally NOT wired here —
-    /// the upload guard rejects layers carrying a <c>SharedExpertGate</c>
-    /// until a dedicated sigmoid + scalar-multiply kernel pair lands.
+    /// Qwen1.5-MoE's per-token sigmoid gate is uploaded as a one-row matrix
+    /// and consumed by the fused sigmoid-gated add kernel when present.
     /// </para>
     /// </remarks>
     internal readonly struct MoeLayerBuffers
@@ -57,6 +53,9 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer W1Bank;     // [numExperts, intermediate, hidden]
         public readonly VulkanDevice.Buffer W2Bank;     // [numExperts, hidden, intermediate]
         public readonly VulkanDevice.Buffer W3Bank;     // [numExperts, intermediate, hidden]
+        public readonly QuantizationType W1DeviceQuantType;
+        public readonly QuantizationType W2DeviceQuantType;
+        public readonly QuantizationType W3DeviceQuantType;
 
         // Device-side storage type for the router gate. Q8_0 when the source carried a
         // Q8_0 overlay (and hidden % 32 == 0); F32 otherwise — same two-mode policy as
@@ -99,6 +98,7 @@ internal sealed class VulkanWeights : IDisposable
         public MoeLayerBuffers(
             VulkanDevice.Buffer gate, QuantizationType gateDeviceQt,
             VulkanDevice.Buffer w1, VulkanDevice.Buffer w2, VulkanDevice.Buffer w3,
+            QuantizationType w1DeviceQt, QuantizationType w2DeviceQt, QuantizationType w3DeviceQt,
             int numExperts, int numExpertsPerTok,
             int hiddenSize, int intermediateSize, bool normTopKProb,
             VulkanDevice.Buffer[]? sharedW1, VulkanDevice.Buffer[]? sharedW2, VulkanDevice.Buffer[]? sharedW3,
@@ -111,6 +111,9 @@ internal sealed class VulkanWeights : IDisposable
             W1Bank = w1;
             W2Bank = w2;
             W3Bank = w3;
+            W1DeviceQuantType = w1DeviceQt;
+            W2DeviceQuantType = w2DeviceQt;
+            W3DeviceQuantType = w3DeviceQt;
             NumExperts = numExperts;
             NumExpertsPerTok = numExpertsPerTok;
             HiddenSize = hiddenSize;
@@ -377,6 +380,7 @@ internal sealed class VulkanWeights : IDisposable
         bool dequantToFp32 = false)
     {
         long totalBytes = 0;
+        ResetUploadCounters();
 
         // Size the reusable staging buffer to the largest single weight upload
         // (in its on-device byte form).
@@ -521,6 +525,102 @@ internal sealed class VulkanWeights : IDisposable
             totalBytes);
     }
 
+    /// <summary>
+    /// Diagnostic counter — number of weight matrices that took the
+    /// <c>VK_EXT_external_memory_host</c> zero-copy path on the most recent
+    /// <see cref="Upload"/> call. Reset to zero at the start of each upload.
+    /// Reported by the benchmark + test harness; not used at runtime.
+    /// </summary>
+    public static int LastUploadZeroCopyMatrices { get; private set; }
+
+    /// <summary>
+    /// Diagnostic counter — number of weight matrices that took the staging
+    /// copy path on the most recent <see cref="Upload"/> call. Sum of this
+    /// plus <see cref="LastUploadZeroCopyMatrices"/> is the total number of
+    /// raw-quant-block matrices uploaded; F32-dequant matrices are counted
+    /// separately as staging (they cannot be zero-copy imported).
+    /// </summary>
+    public static int LastUploadStagingMatrices { get; private set; }
+
+    /// <summary>
+    /// Diagnostic counter — total bytes that took the zero-copy path on the
+    /// most recent <see cref="Upload"/> call. The microbench compares this
+    /// against <c>AllocatedBytes</c> to confirm the path actually fired.
+    /// </summary>
+    public static long LastUploadZeroCopyBytes { get; private set; }
+
+    /// <summary>
+    /// Set <c>DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1</c> in the environment to
+    /// force the staging-copy path even when the driver supports
+    /// <c>VK_EXT_external_memory_host</c>. Used by parity tests to verify
+    /// that the zero-copy import produces bit-identical kernel output, and
+    /// by the microbench to measure the staging baseline.
+    /// </summary>
+    private static bool IsHostImportDisabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_HOST_IMPORT") == "1";
+
+    /// <summary>
+    /// Attempts to wrap <paramref name="srcPtr"/> + <paramref name="bytes"/>
+    /// in a host-imported <c>VkBuffer</c> via
+    /// <see cref="VulkanDevice.TryWrapHostVisible"/>. Returns true on success
+    /// (and increments the diagnostic counters); false otherwise — caller
+    /// falls back to staging.
+    /// </summary>
+    private static bool TryZeroCopyImport(
+        VulkanDevice device, nint srcPtr, long bytes,
+        out VulkanDevice.Buffer? buf)
+    {
+        buf = null;
+        if (!device.HasExternalMemoryHost)
+        {
+            LastUploadFallbackReason = "feature_absent";
+            return false;
+        }
+        if (IsHostImportDisabled())
+        {
+            LastUploadFallbackReason = "env_disabled";
+            return false;
+        }
+        if (srcPtr == 0)
+        {
+            LastUploadFallbackReason = "null_src";
+            return false;
+        }
+
+        var wrapped = device.TryWrapHostVisible(srcPtr, bytes);
+        if (wrapped is null)
+        {
+            LastUploadFallbackReason = "import_rejected";
+            return false;
+        }
+
+        LastUploadZeroCopyMatrices++;
+        LastUploadZeroCopyBytes += bytes;
+        buf = wrapped;
+        return true;
+    }
+
+    /// <summary>
+    /// Last reason the most recent <see cref="UploadMatrix"/> call fell back
+    /// from the zero-copy path to staging. Diagnostic only. Values include
+    /// "feature_absent" (driver does not expose VK_EXT_external_memory_host),
+    /// "env_disabled" (DOTLLM_VULKAN_DISABLE_HOST_IMPORT=1), "null_src"
+    /// (source pointer is null), "import_rejected" (driver rejected the
+    /// vkAllocateMemory import). Empty string when the most recent call took
+    /// the zero-copy path or when no fallback decision has been made.
+    /// </summary>
+    public static string LastUploadFallbackReason { get; private set; } = string.Empty;
+
+    /// <summary>Resets the per-upload diagnostic counters. Called from
+    /// <see cref="Upload"/> at the start of each call.</summary>
+    private static void ResetUploadCounters()
+    {
+        LastUploadZeroCopyMatrices = 0;
+        LastUploadStagingMatrices = 0;
+        LastUploadZeroCopyBytes = 0;
+        LastUploadFallbackReason = string.Empty;
+    }
+
     /// <summary>Returns true when the matrix will be kept on device as Q8_0 blocks.</summary>
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
@@ -539,6 +639,18 @@ internal sealed class VulkanWeights : IDisposable
     /// Phase 8 sibling of <see cref="KeepF16OnDevice"/>.</summary>
     private static bool KeepBf16OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.BF16 && (inputDim & 1) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as Q2_K super-blocks
+    /// (84 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q2_K super-block size (256).</summary>
+    private static bool KeepQ2KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q2_K && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as Q3_K super-blocks
+    /// (110 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the Q3_K super-block size (256).</summary>
+    private static bool KeepQ3KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.Q3_K && (inputDim % 256) == 0;
 
     /// <summary>Returns true when the matrix will be kept on device as Q4_K super-blocks
     /// (144 bytes per 256 elements). Gated on the contraction axis being a multiple of
@@ -559,16 +671,77 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ6KOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q6_K && (inputDim % 256) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as IQ4_NL blocks
+    /// (18 bytes per 32 elements). Gated on the contraction axis being a multiple of
+    /// the IQ4_NL block size (32).</summary>
+    private static bool KeepIq4NlOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ4_NL && (inputDim % 32) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ4_XS super-blocks
+    /// (136 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the IQ4_XS super-block size (256).</summary>
+    private static bool KeepIq4XsOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ4_XS && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ1_S super-blocks
+    /// (50 bytes per 256 elements). Gated on the contraction axis being a multiple of
+    /// the IQ1_S super-block size (256). The smallest GGUF quant — ~1.5-1.7 bpw.</summary>
+    private static bool KeepIq1SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ1_S && (inputDim % 256) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
-    /// Q5_K / Q6_K / F16 / BF16 / F32 depending on the source and the alignment
-    /// constraints.</summary>
+    /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / F16 / BF16 / F32 depending on the source and the
+    /// alignment constraints.</summary>
+    /// <summary>Returns true when the matrix will be kept on device as IQ2_XXS super-blocks
+    /// (66 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq2XxsOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ2_XXS && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ2_XS super-blocks
+    /// (74 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq2XsOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ2_XS && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ2_S super-blocks
+    /// (82 bytes per 256 elements). Also covers MOSTLY_IQ2_M file-type tensors.
+    /// Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq2SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ2_S && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ3_XXS super-blocks
+    /// (98 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq3XxsOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ3_XXS && (inputDim % 256) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as IQ3_S super-blocks
+    /// (110 bytes per 256 elements). Gated on the contraction axis being a multiple of 256.</summary>
+    private static bool KeepIq3SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.IQ3_S && (inputDim % 256) == 0;
+
+    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
+    /// Q5_K / Q6_K / IQ2_XXS / IQ2_XS / IQ2_S / F16 / BF16 / F32 depending on the source
+    /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / IQ1_S / F16 / BF16 / F32 depending on the source
+    /// and the alignment constraints.</summary>
+    /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q2_K /
+    /// Q3_K / Q4_K / Q5_K / Q6_K / F16 / BF16 / F32 depending on the source and the
+    /// alignment constraints.</summary>
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
+        if (KeepQ2KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q2_K;
+        if (KeepQ3KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q3_K;
         if (KeepQ4KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q4_K;
         if (KeepQ5KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q5_K;
         if (KeepQ6KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q6_K;
+        if (KeepIq4NlOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ4_NL;
+        if (KeepIq4XsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ4_XS;
+        if (KeepIq2XxsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_XXS;
+        if (KeepIq2XsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_XS;
+        if (KeepIq2SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ2_S;
+        if (KeepIq3XxsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_XXS;
+        if (KeepIq3SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_S;
+        if (KeepIq1SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ1_S;
         if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
         if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
         return QuantizationType.F32;
@@ -619,12 +792,32 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
         if (KeepQ8OnDevice(qt, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
+        if (KeepQ2KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q2_K) * outputDim;
+        if (KeepQ3KOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.Q3_K) * outputDim;
         if (KeepQ4KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q4_K) * outputDim;
         if (KeepQ5KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q5_K) * outputDim;
         if (KeepQ6KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q6_K) * outputDim;
+        if (KeepIq4NlOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ4_NL) * outputDim;
+        if (KeepIq4XsOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ4_XS) * outputDim;
+        if (KeepIq2XxsOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_XXS) * outputDim;
+        if (KeepIq2XsOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_XS) * outputDim;
+        if (KeepIq2SOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ2_S) * outputDim;
+        if (KeepIq3XxsOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_XXS) * outputDim;
+        if (KeepIq3SOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_S) * outputDim;
+        if (KeepIq1SOnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.IQ1_S) * outputDim;
         if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
         if (KeepBf16OnDevice(qt, inputDim, dequantToFp32))
@@ -641,6 +834,24 @@ internal sealed class VulkanWeights : IDisposable
     /// is dequantised to FP32 before upload and <paramref name="deviceQuantType"/> is
     /// <see cref="QuantizationType.F32"/>.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Zero-copy fast path</b> (<c>VK_EXT_external_memory_host</c>): when the matrix is
+    /// kept as raw quant blocks AND <c>device.HasExternalMemoryHost</c> is true AND the
+    /// mmap'd source pointer satisfies the driver's
+    /// <c>minImportedHostPointerAlignment</c> (after page-rounding the start +
+    /// rounding-up the size), the buffer is imported directly from the mmap'd GGUF page
+    /// range — no staging copy, no double-counted physical RAM on a unified-memory APU.
+    /// llama.cpp does not do this today on the Vulkan path; this is dotLLM
+    /// differentiation on Strix Halo and similar UMA iGPUs (see
+    /// <c>.planning/notes/gaia-lemonade-research.md</c> §6 H3).
+    /// </para>
+    /// <para>
+    /// On any failure of the zero-copy path (extension absent, driver rejects import,
+    /// alignment unsolvable) this method silently falls through to the staging-copy
+    /// upload below — the import is opportunistic, not load-bearing.
+    /// </para>
+    /// </remarks>
     private static unsafe VulkanDevice.Buffer UploadMatrix(
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
@@ -651,13 +862,23 @@ internal sealed class VulkanWeights : IDisposable
         long elems = (long)outputDim * inputDim;
 
         // Raw quant-block upload — keeps the GGUF on-disk byte layout intact on device so
-        // the matmul_q8_0 / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
+        // the matmul_q8_0 / matmul_q2_k / matmul_q3_k / matmul_q4_k / matmul_q5_k / matmul_q6_k kernels can read it
         // directly. Mirrors the CPU path's mmap-backed layout.
         QuantizationType keepQt = DeviceQuantTypeFor(qt, inputDim, dequantToFp32);
         if (keepQt != QuantizationType.F32)
         {
             long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
+
+            // Zero-copy import attempt. Opt out via env var so the staging path
+            // can be exercised on a host that does support the extension —
+            // also the parity-test escape hatch.
+            if (TryZeroCopyImport(device, srcPtr, bytes, out var importedBuf))
+            {
+                deviceQuantType = keepQt;
+                uploadedBytes = bytes;
+                return importedBuf!;
+            }
 
             var buf = device.AllocateDeviceLocal(bytes);
             VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
@@ -673,6 +894,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
 
+            LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
             uploadedBytes = bytes;
             return buf;
@@ -831,17 +1053,25 @@ internal sealed class VulkanWeights : IDisposable
         int sharedI = moe.SharedIntermediateSize;
         bool hasShared = moe.HasSharedExpert;
 
-        // Two-mode byte sizes for the quant-overlayable projections (gate, per-shared-
-        // expert gate/up/down, shared-expert sigmoid gate). The per-routed-expert banks
-        // are always F32 since the Vulkan indexed-matmul kernel is F32-only.
+        // Two-mode byte sizes for the quant-overlayable projections (gate, routed
+        // expert banks, per-shared-expert gate/up/down, shared-expert sigmoid gate).
         // `*KeepQuant` is true when the overlay declares a supported quant format (Q8_0
         // or Q4_K) AND the contraction axis is aligned to that format's group size.
         bool gateKeepQuant = MoeOverlayKeepsQuantized(moe.GateQuantTypeOverlay, hidden);
         long gateBytes = MoeOverlayUploadBytes(moe.GateQuantTypeOverlay, numE, hidden);
 
-        long perExpertW1Bytes = (long)interm * hidden * sizeof(float);
-        long perExpertW2Bytes = (long)hidden * interm * sizeof(float);
-        long perExpertW3Bytes = perExpertW1Bytes;
+        QuantizationType routedW1Qt = MoeRoutedRawDeviceQuantType(device, moe.GateExpsRaw, moe.GateExpsRawQt, moe.GateExpsMDim, moe.GateExpsKDim, interm, hidden);
+        QuantizationType routedW2Qt = MoeRoutedRawDeviceQuantType(device, moe.DownExpsRaw, moe.DownExpsRawQt, moe.DownExpsMDim, moe.DownExpsKDim, hidden, interm);
+        QuantizationType routedW3Qt = MoeRoutedRawDeviceQuantType(device, moe.UpExpsRaw, moe.UpExpsRawQt, moe.UpExpsMDim, moe.UpExpsKDim, interm, hidden);
+        long perExpertW1Bytes = routedW1Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW1Qt, interm, hidden)
+            : (long)interm * hidden * sizeof(float);
+        long perExpertW2Bytes = routedW2Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW2Qt, hidden, interm)
+            : (long)hidden * interm * sizeof(float);
+        long perExpertW3Bytes = routedW3Qt != QuantizationType.F32
+            ? MoeOverlayUploadBytes(routedW3Qt, interm, hidden)
+            : (long)interm * hidden * sizeof(float);
 
         bool sharedW1KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, hidden);
         bool sharedW2KeepQuant = hasShared && MoeOverlayKeepsQuantized(moe.SharedExpertProjQuantTypeOverlay, sharedI);
@@ -904,9 +1134,20 @@ internal sealed class VulkanWeights : IDisposable
 
         for (int e = 0; e < numE; e++)
         {
-            UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
-            UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
-            UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
+            if (routedW1Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.GateExpsRaw + (nint)((long)e * perExpertW1Bytes), perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
+
+            if (routedW2Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.DownExpsRaw + (nint)((long)e * perExpertW2Bytes), perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
+
+            if (routedW3Qt != QuantizationType.F32)
+                UploadRawBankSlot(device, stage, moe.UpExpsRaw + (nint)((long)e * perExpertW3Bytes), perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
+            else
+                UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
         }
         uploadedBytes += w1BankBytes + w2BankBytes + w3BankBytes;
 
@@ -982,6 +1223,9 @@ internal sealed class VulkanWeights : IDisposable
         }
 
         return new MoeLayerBuffers(gate, gateDeviceQt, w1Bank, w2Bank, w3Bank,
+            routedW1Qt,
+            routedW2Qt,
+            routedW3Qt,
             moe.NumExperts, moe.NumExpertsPerTok,
             moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
             sharedW1, sharedW2, sharedW3,
@@ -996,6 +1240,39 @@ internal sealed class VulkanWeights : IDisposable
     /// gated on the contraction-axis dim being a multiple of the Q8_0 group size (32).</summary>
     private static bool MoeOverlayKeepsQ8(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
+
+    private static bool MoeRoutedRawKeepsQ8(
+        nint raw, QuantizationType qt,
+        int rawM, int rawK,
+        int expectedM, int expectedK)
+        => raw != 0
+        && qt == QuantizationType.Q8_0
+        && rawM == expectedM
+        && rawK == expectedK
+        && (expectedK % 32) == 0;
+
+    private static QuantizationType MoeRoutedRawDeviceQuantType(
+        VulkanDevice device,
+        nint raw, QuantizationType qt,
+        int rawM, int rawK,
+        int expectedM, int expectedK)
+    {
+        if (MoeRoutedRawKeepsQ8(raw, qt, rawM, rawK, expectedM, expectedK))
+            return QuantizationType.Q8_0;
+
+        // Strategy C path: keep routed F16 expert banks raw only when the
+        // coopmat grouped matmul can consume them. Otherwise upload F32 so
+        // the existing indexed path remains the fallback.
+        if (raw != 0
+            && qt == QuantizationType.F16
+            && device.HasCooperativeMatrix
+            && rawM == expectedM
+            && rawK == expectedK
+            && (expectedK % 32) == 0)
+            return QuantizationType.F16;
+
+        return QuantizationType.F32;
+    }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction-axis dim being a multiple of the Q4_K super-block size
@@ -1079,6 +1356,24 @@ internal sealed class VulkanWeights : IDisposable
             VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
         }
         device.CopyBufferSynchronous(staging, dst, (ulong)bytes);
+    }
+
+    private static unsafe void UploadRawBankSlot(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
+    {
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory UploadRawBankSlot");
+        try
+        {
+            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
+                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
     }
 
     /// <summary>

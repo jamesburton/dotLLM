@@ -245,10 +245,9 @@ internal struct SchemaTracker
         ref readonly var node = ref GetNode(nodeIndex);
         var types = node.AllowedTypes;
 
-        // If anyOf, merge types from all alternatives.
-        // TODO: This is an overapproximation — after the first character disambiguates the
-        // branch, nested constraints (required keys, enums, object shapes) from each branch
-        // are not enforced. Full branch narrowing requires parallel tracker states.
+        // If anyOf, merge types from all alternatives. This is intentionally an
+        // overapproximation: nested branch constraints would require parallel
+        // tracker states after the first disambiguating character.
         if (node.AnyOfNodeIndices != null)
         {
             types = JsonSchemaType.None;
@@ -535,9 +534,9 @@ internal struct SchemaTracker
 
     // ── Value string (enum/const) tracking ──────────────────────────
 
-    // TODO: Non-string enum/const values (e.g. {"const":1}, {"enum":[true,false]}) are not
-    // character-level constrained — only type restriction applies. Full enforcement requires
-    // character-sequence matching for literals/numbers, a fundamentally different mechanism.
+    // Non-string enum/const values (e.g. {"const":1}, {"enum":[true,false]}) are
+    // type-constrained but not character-sequence constrained. Literal/number
+    // matching belongs in a separate tracker mechanism from string-prefix matching.
     private void StartValueString()
     {
         ref readonly var node = ref GetNode(_currentNodeIndex);

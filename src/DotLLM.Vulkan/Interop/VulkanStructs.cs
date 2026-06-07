@@ -36,6 +36,19 @@ internal static class VkStructureType
     internal const int PhysicalDeviceCooperativeMatrixFeaturesKhr = 1000506000;
     internal const int CooperativeMatrixPropertiesKhr = 1000506001;
     internal const int PhysicalDeviceCooperativeMatrixPropertiesKhr = 1000506002;
+    // VK_KHR_external_memory / Vulkan 1.1 core — VkExternalMemoryBufferCreateInfo
+    // chains off VkBufferCreateInfo.pNext to declare the buffer will be bound
+    // to imported memory.
+    internal const int ExternalMemoryBufferCreateInfo = 1000072002;
+    // VK_EXT_external_memory_host extension structures.
+    // Drives the host-mmap zero-copy weight path (see MemoryDomain.HostVisibleZeroCopy
+    // / HostVisibleBuffer). The Properties struct carries
+    // `minImportedHostPointerAlignment`, the alignment a host pointer must satisfy
+    // to be importable by vkAllocateMemory; the ImportInfo struct chains off
+    // VkMemoryAllocateInfo.pNext to declare the imported pointer + handle type.
+    internal const int ImportMemoryHostPointerInfoExt = 1000178000;
+    internal const int MemoryHostPointerPropertiesExt = 1000178001;
+    internal const int PhysicalDeviceExternalMemoryHostPropertiesExt = 1000178002;
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -584,4 +597,68 @@ internal struct VkCooperativeMatrixPropertiesKhr
     internal int ResultType;               // VkComponentTypeKHR
     internal uint saturatingAccumulation;  // VkBool32
     internal int scope;                    // VkScopeKHR
+}
+
+// VkExternalMemoryHandleTypeFlagBits — for the host-pointer import path we
+// only ever use HOST_ALLOCATION_BIT_EXT. HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT is
+// also defined by the extension for importing memory the application did not
+// allocate itself; not used here because MemoryMappedFile pages are owned by
+// our process via the OS mmap.
+internal static class VkExternalMemoryHandleTypeFlags
+{
+    internal const uint HostAllocationBitExt = 0x00000080;
+    internal const uint HostMappedForeignMemoryBitExt = 0x00000100;
+}
+
+// VkPhysicalDeviceExternalMemoryHostPropertiesEXT — chained off
+// VkPhysicalDeviceProperties2.pNext to fetch the minimum alignment a host
+// pointer must satisfy before VK_EXT_external_memory_host will import it.
+// On x86-64 amdvlk / radv this is typically 4096 (page size). We use it to
+// decide whether a given mmap'd GGUF tensor offset can be imported directly
+// or whether we must fall back to the staging-copy path.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceExternalMemoryHostPropertiesExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal ulong minImportedHostPointerAlignment;
+}
+
+// VkImportMemoryHostPointerInfoEXT — chained off VkMemoryAllocateInfo.pNext to
+// declare that the allocation should be backed by an existing host pointer
+// rather than by driver-managed device memory. The pointer must be aligned to
+// at least `minImportedHostPointerAlignment` (see the Properties struct above);
+// otherwise vkAllocateMemory returns VK_ERROR_INVALID_EXTERNAL_HANDLE.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkImportMemoryHostPointerInfoExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleType;   // VkExternalMemoryHandleTypeFlagBits
+    internal nint pHostPointer;
+}
+
+// VkMemoryHostPointerPropertiesEXT — returned by
+// vkGetMemoryHostPointerPropertiesEXT. `memoryTypeBits` is a bitmask of the
+// physical-device memory type indices that can host an import of this
+// specific pointer/handleType combination. We AND it with the buffer's
+// vkGetBufferMemoryRequirements bits to pick a compatible memory type.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryHostPointerPropertiesExt
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint memoryTypeBits;
+}
+
+// VkExternalMemoryBufferCreateInfo — chained off VkBufferCreateInfo.pNext to
+// declare that the buffer will be bound to imported external memory rather
+// than driver-managed memory. `handleTypes` must include the same bit used
+// in VkImportMemoryHostPointerInfoEXT.handleType.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkExternalMemoryBufferCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleTypes;
 }

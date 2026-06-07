@@ -1,0 +1,129 @@
+{
+  "label": "qwen36-a3b-cpu-post-fdb39b4-fix",
+  "timestamp": "2026-05-13T21:50:00+00:00",
+  "git": {
+    "commit": "05242766bf251afa7ea11dd1d6ee137856eb64c5",
+    "branch": "feature/qwen3.6",
+    "dirty": false
+  },
+  "system": {
+    "cpu": "Intel Core Ultra 7 155H (Meteor Lake)",
+    "cores": 22,
+    "os": "Windows 11 Pro 26220.8370",
+    "ram_gb": 96,
+    "notes": "System under memory pressure during measurement — a separate llama-server instance (~50 GiB resident) holding the same 30 GiB GGUF for an unrelated experiment. dotLLM and llama.cpp runs competed for OS page cache. Numbers represent a floor, not steady-state achievable on a quiescent system. Re-measure on isolated hardware before treating as the authoritative baseline."
+  },
+  "config": {
+    "prompt": "The capital of France is",
+    "prompt_size": "short",
+    "prompt_tokens": 5,
+    "max_tokens": 20,
+    "decode_tokens": 19,
+    "models": [
+      "Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+    ],
+    "device": "cpu",
+    "threads": 8,
+    "sampling": "greedy (temp=0, top_k=1)"
+  },
+  "verification": {
+    "dotllm_output": "The capital of France is Paris, a city renowned for its iconic landmarks such as the Eiffel Tower, the Louvre Museum",
+    "llamacpp_output": "The capital of France is Paris, a city renowned for its iconic landmarks such as the Eiffel Tower, the Louvre Museum",
+    "match": "token-for-token greedy match for all 20 generated tokens"
+  },
+  "results": [
+    {
+      "engine": "dotLLM",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 1,
+      "prefill_ms": 17135.2,
+      "decode_ms": 33437.4,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 0.3,
+      "decode_tok_per_sec": 0.6,
+      "sampling_ms": 168.6,
+      "note": "Cold-ish (mmap not fully hot)"
+    },
+    {
+      "engine": "dotLLM",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 2,
+      "prefill_ms": 6090.3,
+      "decode_ms": 26640.1,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 0.8,
+      "decode_tok_per_sec": 0.7,
+      "sampling_ms": 140.5
+    },
+    {
+      "engine": "dotLLM",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 3,
+      "prefill_ms": 6030.4,
+      "decode_ms": 19122.0,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 0.8,
+      "decode_tok_per_sec": 1.0,
+      "sampling_ms": 144.0,
+      "note": "Best decode of the four"
+    },
+    {
+      "engine": "dotLLM",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 4,
+      "prefill_ms": 9294.7,
+      "decode_ms": 29608.1,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 0.5,
+      "decode_tok_per_sec": 0.6,
+      "sampling_ms": 167.3
+    },
+    {
+      "engine": "llama.cpp",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 1,
+      "prefill_ms": 1751.29,
+      "decode_ms": 4851.23,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 2.86,
+      "decode_tok_per_sec": 3.92,
+      "sampling_ms": 13.67,
+      "load_ms": 1776.90,
+      "total_ms": 6642.82,
+      "args": "-no-cnv --no-warmup -t 8 --temp 0 --top-k 1 -ngl 0"
+    },
+    {
+      "engine": "llama.cpp",
+      "model": "Qwen3.6-35B-A3B-UD-Q6_K_XL",
+      "run": 2,
+      "prefill_ms": 10443.03,
+      "decode_ms": 41791.35,
+      "prefill_tokens": 5,
+      "decode_tokens": 19,
+      "prefill_tok_per_sec": 0.48,
+      "decode_tok_per_sec": 0.45,
+      "sampling_ms": 24.34,
+      "load_ms": 10443.51,
+      "total_ms": 52261.16,
+      "note": "Hit memory contention during this run"
+    }
+  ],
+  "ratios": {
+    "best_warm": {
+      "prefill_dotllm_over_llamacpp": 0.28,
+      "decode_dotllm_over_llamacpp": 0.25,
+      "interpretation": "Using best (lowest-contention) runs: dotLLM 0.8 prefill / 1.0 decode vs llama.cpp 2.86 / 3.92"
+    }
+  },
+  "next_steps": [
+    "Extend InferenceBenchmarks (BDN harness) to dispatch Qwen3MoeHybrid via Qwen3MoeHybridTransformerModel.LoadFromGguf — currently it only uses base TransformerModel.LoadFromGguf which doesn't handle this arch. Track as follow-up issue.",
+    "Re-measure on quiescent system (no concurrent llama-server) for steady-state baseline.",
+    "SIMD-vectorise GatedDeltaNetScan.Execute (Vector256<float> for decay/retrieve/update/read inner loops; per Step 63 'Optimize' notes).",
+    "Vectorise per-expert MoE matmul in MoeSwiGluMlp where the quantized-direct GEMM is not already vectorised."
+  ]
+}

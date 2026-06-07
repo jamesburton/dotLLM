@@ -79,7 +79,7 @@ public static class CudaGemm
             xF32, CublasApi.CUDA_R_32F, k,
             (nint)(&beta),
             yF32, CublasApi.CUDA_R_32F, n,
-            CublasApi.CUBLAS_COMPUTE_32F,
+            CublasApi.CUBLAS_COMPUTE_32F_PEDANTIC,
             CublasApi.CUBLAS_GEMM_DEFAULT
         ).ThrowOnCublasError();
     }

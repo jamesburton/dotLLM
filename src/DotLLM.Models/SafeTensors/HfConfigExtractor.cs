@@ -55,6 +55,18 @@ public static class HfConfigExtractor
 
         Architecture architecture = ResolveArchitecture(root);
 
+        // Gemma 3 multimodal checkpoints wrap the text-tower config under a
+        // `text_config` sub-object (the top level carries vision_config / model_type
+        // = gemma3). Hoist the text sub-object so every field lookup below sees the
+        // text-tower shape. Text-only checkpoints (model_type = gemma3_text) have no
+        // wrapper.
+        if (architecture == Architecture.Gemma3
+            && root.TryGetProperty("text_config", out var textCfg)
+            && textCfg.ValueKind == JsonValueKind.Object)
+        {
+            root = textCfg;
+        }
+
         int hiddenSize = GetInt32(root, "hidden_size");
         int numLayers = GetInt32(root, "num_hidden_layers");
         int numAttentionHeads = GetInt32(root, "num_attention_heads");
@@ -91,6 +103,70 @@ public static class HfConfigExtractor
 
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
+        // ── Gemma-family extras ─────────────────────────────────────────────
+        // Per-layer attention-type pattern (Gemma 2/3 interleaves local/global).
+        IReadOnlyList<int?>? perLayerSlidingWindow = null;
+        float? attnLogitSoftcap = null;
+        float? finalLogitSoftcap = null;
+        float? queryPreAttnScalar = null;
+        ActivationFunction activation = ActivationFunction.SiLU;
+        if (architecture == Architecture.Gemma3)
+        {
+            // Default sliding_window for Gemma3 if not specified (HF default is 4096).
+            if (slidingWindow is null)
+                slidingWindow = 4096;
+
+            // sliding_window_pattern (HF default = 6 on Gemma 2/3): every Nth layer
+            // (1-indexed) is full-attention, all others are sliding-window. tiny-random
+            // ships small values like 2 — handle defensively.
+            int swPattern = GetInt32OrDefault(root, "sliding_window_pattern", 6);
+            if (swPattern <= 0) swPattern = 1;
+
+            // Prefer the explicit `layer_types` array when present (HF emits one entry
+            // per layer: "sliding_attention" or "full_attention"); fall back to the
+            // sliding_window_pattern formula.
+            var layerTypes = new int?[numLayers];
+            if (root.TryGetProperty("layer_types", out var lt) && lt.ValueKind == JsonValueKind.Array
+                && lt.GetArrayLength() == numLayers)
+            {
+                int i = 0;
+                foreach (var el in lt.EnumerateArray())
+                {
+                    string? s = el.ValueKind == JsonValueKind.String ? el.GetString() : null;
+                    bool isFull = string.Equals(s, "full_attention", StringComparison.Ordinal);
+                    layerTypes[i] = isFull ? null : slidingWindow;
+                    i++;
+                }
+            }
+            else
+            {
+                for (int i = 0; i < numLayers; i++)
+                {
+                    bool isFull = ((i + 1) % swPattern) == 0; // HF Gemma3 formula
+                    layerTypes[i] = isFull ? null : slidingWindow;
+                }
+            }
+            perLayerSlidingWindow = layerTypes;
+
+            attnLogitSoftcap = GetFloatNullableIfPositive(root, "attn_logit_softcapping");
+            finalLogitSoftcap = GetFloatNullableIfPositive(root, "final_logit_softcapping");
+
+            int qpas = GetInt32OrDefault(root, "query_pre_attn_scalar", 0);
+            if (qpas > 0) queryPreAttnScalar = qpas;
+
+            // Gemma 3 ships "gelu_pytorch_tanh" (gelu_pytorch_tanh ≡ approximate GELU with
+            // tanh). Match HF naming variants defensively.
+            string? hiddenAct = GetStringOrDefault(root, "hidden_activation", null)
+                              ?? GetStringOrDefault(root, "hidden_act", null);
+            activation = (hiddenAct?.ToLowerInvariant()) switch
+            {
+                "gelu_pytorch_tanh" or "gelu_new" or "gelu_tanh" or "gelu_fast" => ActivationFunction.GELUTanh,
+                "gelu" => ActivationFunction.GELU,
+                "silu" or "swish" or null => ActivationFunction.GELUTanh, // Gemma default
+                _ => ActivationFunction.GELUTanh,
+            };
+        }
+
         // RoPE element-pairing convention for HF safetensors.
         //
         // CRITICAL: This extractor differs from GgufModelConfigExtractor because HF
@@ -121,10 +197,34 @@ public static class HfConfigExtractor
         // shared-expert PoC only — multi-shared is a follow-up).
         MoeConfig? moe = ExtractMoeConfig(root, intermediateSize, numLayers, architecture);
 
+        // Dense-path YaRN scaling. MLA handles its own rope_scaling extraction
+        // above (carried inside MlaConfig); for non-MLA architectures we surface
+        // YaRN into RoPEConfig so TransformerModel can rebuild the cos/sin
+        // tables via PrecomputeFrequencyTableYarn. The base SmolLM3-3B ships
+        // rope_scaling=null — for the long-context 128k SKUs the same checkpoint
+        // family ships {"rope_type":"yarn","factor":...,"original_max_position_embeddings":...}.
+        (RoPEScalingType ropeScalingType, float ropeScalingFactor,
+         int ropeScalingOrigMax, float ropeScalingBetaFast, float ropeScalingBetaSlow,
+         float ropeScalingAttnFactor) = ExtractDenseRopeScaling(root);
+
+        // SmolLM3 NoPE mask: per-layer 0/1 array where the layer skips RoPE
+        // when the value is 0 (HF naming is counterintuitive — see
+        // modeling_smollm3.py: self.use_rope = config.no_rope_layers[layer_idx]
+        // then `if self.use_rope: apply_rotary_pos_emb(...)`). Convert to a
+        // list of layer INDICES where RoPE is skipped so the forward pass can
+        // gate via ModelConfig.IsNoRopeLayer.
+        IReadOnlyList<int>? noRopeLayers = ExtractNoRopeLayers(root);
+
         var ropeConfig = new RoPEConfig(
             Theta: ropeTheta,
             DimensionCount: headDim,
-            Type: ropeType);
+            Type: ropeType,
+            ScalingType: ropeScalingType,
+            ScalingFactor: ropeScalingFactor,
+            OrigMaxSeqLen: ropeScalingOrigMax,
+            AttnFactor: ropeScalingAttnFactor,
+            BetaFast: ropeScalingBetaFast,
+            BetaSlow: ropeScalingBetaSlow);
 
         return new ModelConfig
         {
@@ -140,15 +240,111 @@ public static class HfConfigExtractor
             AttentionType = isMla ? AttentionType.MLA : AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = ropeConfig,
-            ActivationFunction = ActivationFunction.SiLU,
+            ActivationFunction = activation,
             NormType = NormType.RMSNorm,
             NormEpsilon = normEps,
             TiedEmbeddings = tieEmbeddings,
             SlidingWindowSize = slidingWindow,
+            PerLayerSlidingWindow = perLayerSlidingWindow,
+            AttnLogitSoftcap = attnLogitSoftcap,
+            FinalLogitSoftcap = finalLogitSoftcap,
+            QueryPreAttnScalar = queryPreAttnScalar,
             MlaConfig = mla,
             Moe = moe,
             ChatTemplate = null,
+            NoRopeLayers = noRopeLayers,
         };
+    }
+
+    /// <summary>
+    /// Pulls the optional <c>rope_scaling</c> block for non-MLA architectures
+    /// (SmolLM3, Llama 3.1+, ...). Returns defaults
+    /// (<see cref="RoPEScalingType.None"/>, factor=1) when the block is
+    /// absent or declares <c>rope_type=default</c>. Recognises HF's modern
+    /// keys (<c>rope_type</c>, <c>type</c>) alongside the legacy
+    /// <c>linear</c> / <c>dynamic</c> family.
+    /// </summary>
+    private static (RoPEScalingType Type, float Factor, int OrigMax, float BetaFast, float BetaSlow, float AttnFactor)
+        ExtractDenseRopeScaling(JsonElement root)
+    {
+        if (!root.TryGetProperty("rope_scaling", out var rs) || rs.ValueKind != JsonValueKind.Object)
+            return (RoPEScalingType.None, 1.0f, 0, 32.0f, 1.0f, 1.0f);
+
+        // HF rope_scaling sometimes uses `rope_type`, sometimes `type`.
+        string? typeName = null;
+        if (rs.TryGetProperty("rope_type", out var rt) && rt.ValueKind == JsonValueKind.String)
+            typeName = rt.GetString();
+        else if (rs.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String)
+            typeName = t.GetString();
+
+        RoPEScalingType scalingType = typeName?.ToLowerInvariant() switch
+        {
+            "linear" => RoPEScalingType.Linear,
+            "yarn" => RoPEScalingType.YaRN,
+            "ntk" => RoPEScalingType.NTK,
+            "dynamic" or "dynamic_ntk" => RoPEScalingType.DynamicNTK,
+            "su" or "longrope" => RoPEScalingType.Su,
+            _ => RoPEScalingType.None,
+        };
+
+        float factor = 1.0f;
+        if (rs.TryGetProperty("factor", out var f) && f.ValueKind == JsonValueKind.Number
+            && f.TryGetSingle(out float fv))
+            factor = fv;
+
+        int origMax = 0;
+        if (rs.TryGetProperty("original_max_position_embeddings", out var om)
+            && om.ValueKind == JsonValueKind.Number
+            && om.TryGetInt32(out int omv))
+            origMax = omv;
+
+        float betaFast = 32.0f;
+        if (rs.TryGetProperty("beta_fast", out var bf) && bf.ValueKind == JsonValueKind.Number
+            && bf.TryGetSingle(out float bfv))
+            betaFast = bfv;
+
+        float betaSlow = 1.0f;
+        if (rs.TryGetProperty("beta_slow", out var bs) && bs.ValueKind == JsonValueKind.Number
+            && bs.TryGetSingle(out float bsv))
+            betaSlow = bsv;
+
+        // attention_factor (HF) — softmax scale multiplier folded into cos/sin.
+        // Defaults to 1.0 (SmolLM3 doesn't ship it).
+        float attnFactor = 1.0f;
+        if (rs.TryGetProperty("attention_factor", out var af) && af.ValueKind == JsonValueKind.Number
+            && af.TryGetSingle(out float afv))
+            attnFactor = afv;
+
+        return (scalingType, factor, origMax, betaFast, betaSlow, attnFactor);
+    }
+
+    /// <summary>
+    /// Parses SmolLM3's <c>no_rope_layers</c> per-layer mask. HF encodes
+    /// <c>1 = apply RoPE</c>, <c>0 = skip RoPE</c> — we invert and return
+    /// the indices that SKIP RoPE so downstream code reads naturally
+    /// (<c>IsNoRopeLayer(i)</c> matches the field name). Returns null when
+    /// the key is absent or every layer applies RoPE.
+    /// </summary>
+    private static IReadOnlyList<int>? ExtractNoRopeLayers(JsonElement root)
+    {
+        if (!root.TryGetProperty("no_rope_layers", out var prop) || prop.ValueKind != JsonValueKind.Array)
+            return null;
+        int len = prop.GetArrayLength();
+        if (len == 0) return null;
+
+        List<int>? skipped = null;
+        int i = 0;
+        foreach (var el in prop.EnumerateArray())
+        {
+            // 1 = apply RoPE; 0 = skip RoPE (NoPE).
+            if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out int v) && v == 0)
+            {
+                skipped ??= new List<int>();
+                skipped.Add(i);
+            }
+            i++;
+        }
+        return skipped;
     }
 
     /// <summary>
@@ -434,6 +630,19 @@ public static class HfConfigExtractor
             // layout requires its own loader path.
             (var a, _) when a is not null && a.Contains("granitemoe") => Architecture.GraniteMoe,
             (_, "granitemoe" or "granite_moe") => Architecture.GraniteMoe,
+            // SmolLM3 — `SmolLM3ForCausalLM` / `model_type=smollm3`. Llama-shaped
+            // tensors but carries `no_rope_layers` mask + (optional) YaRN scaling.
+            (var a, _) when a is not null && a.Contains("smollm3") => Architecture.SmolLM3,
+            (_, "smollm3") => Architecture.SmolLM3,
+            // Gemma 3 — text-only and multimodal. The text-only variant lands directly
+            // on the dense-transformer path. The multimodal variant carries
+            // model_type=gemma3 and houses the text tower under `text_config`; we hoist
+            // that sub-object after architecture resolution. Must be checked before
+            // the generic "gemma" → fall-through to ensure later Gemma versions don't
+            // silently pick up this row.
+            (var a, _) when a is not null
+                && (a.Contains("gemma3") || a.Contains("gemma_3")) => Architecture.Gemma3,
+            (_, "gemma3" or "gemma3_text" or "gemma_3" or "gemma_3_text") => Architecture.Gemma3,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,
@@ -457,6 +666,7 @@ public static class HfConfigExtractor
     private static bool DefaultTieForArch(Architecture arch) => arch switch
     {
         Architecture.Phi => true,
+        Architecture.Gemma3 => true,
         _ => false,
     };
 
@@ -484,6 +694,14 @@ public static class HfConfigExtractor
         if (prop.ValueKind != JsonValueKind.Number) return null;
         if (!prop.TryGetInt32(out int v)) return null;
         return v > 0 ? v : null;
+    }
+
+    private static float? GetFloatNullableIfPositive(JsonElement root, string key)
+    {
+        if (!root.TryGetProperty(key, out var prop)) return null;
+        if (prop.ValueKind != JsonValueKind.Number) return null;
+        if (!prop.TryGetSingle(out float v)) return null;
+        return v > 0f ? v : null;
     }
 
     private static float GetFloatOrDefault(JsonElement root, string key, float fallback)

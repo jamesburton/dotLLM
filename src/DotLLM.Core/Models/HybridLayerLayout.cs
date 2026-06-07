@@ -14,7 +14,13 @@ public enum HybridLayerKind
     Attention,
 
     /// <summary>Position-wise MLP with squared-ReLU activation (no SwiGLU gate).</summary>
-    Ffn
+    Ffn,
+
+    /// <summary>
+    /// Gated DeltaNet recurrence layer (Qwen3MoeHybrid). Carries a full
+    /// <c>[n_head, d_k, d_v]</c> matrix state updated via the delta rule.
+    /// </summary>
+    GatedDeltaNet
 }
 
 /// <summary>

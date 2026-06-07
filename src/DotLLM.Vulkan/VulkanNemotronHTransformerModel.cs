@@ -55,6 +55,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // Coopmat-accelerated Q8_0 prefill kernel — created opportunistically; null on devices
     // without VK_KHR_cooperative_matrix support, in which case the scalar Q8_0 GEMM is used.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Q2_K + Q3_K matmul kernels — completes the K-quant family on Vulkan.
+    private readonly MatMulQ2KGemvF32Kernel _matmulQ2K;
+    private readonly MatMulQ2KGemmF32Kernel _matmulQ2KGemm;
+    private readonly MatMulQ3KGemvF32Kernel _matmulQ3K;
+    private readonly MatMulQ3KGemmF32Kernel _matmulQ3KGemm;
     // Q4_K_M matmul kernels — Phase 1 of K-quant work. Always created; the dispatcher
     // in RecordMatmul branches on the device-side QuantizationType per call.
     private readonly MatMulQ4KGemvF32Kernel _matmulQ4K;
@@ -66,6 +71,32 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     // K-quant matmul kernel coverage. Always created.
     private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
     private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
+    // IQ4_NL / IQ4_XS matmul kernels — IQ-family follow-up to the K-quant
+    // Phase 1 work. Always created; dispatcher routes per device-side
+    // QuantizationType.
+    private readonly MatMulIq4NlGemvF32Kernel _matmulIq4Nl;
+    private readonly MatMulIq4NlGemmF32Kernel _matmulIq4NlGemm;
+    private readonly MatMulIq4XsGemvF32Kernel _matmulIq4Xs;
+    private readonly MatMulIq4XsGemmF32Kernel _matmulIq4XsGemm;
+    // IQ2 family matmul kernels — IQ-family follow-up. All six share one
+    // Iq2Codebooks instance (3 grids + ksigns).
+    private readonly Iq2Codebooks _iq2Codebooks;
+    private readonly MatMulIq2XxsGemvF32Kernel _matmulIq2Xxs;
+    private readonly MatMulIq2XxsGemmF32Kernel _matmulIq2XxsGemm;
+    private readonly MatMulIq2XsGemvF32Kernel _matmulIq2Xs;
+    private readonly MatMulIq2XsGemmF32Kernel _matmulIq2XsGemm;
+    private readonly MatMulIq2SGemvF32Kernel _matmulIq2S;
+    private readonly MatMulIq2SGemmF32Kernel _matmulIq2SGemm;
+    // IQ3 family (XXS / S) matmul kernels — IQ-family follow-up. Shares the
+    // same SSBO codebook pattern as IQ2: Iq3Codebooks owns the IQ3_XXS grid
+    // (256 × 4 bytes) + IQ3_S grid (512 × 4 bytes), shared across all 4 kernels.
+    private readonly Iq3Codebooks _iq3Codebooks;
+    private readonly MatMulIq3XxsGemvF32Kernel _matmulIq3Xxs;
+    private readonly MatMulIq3XxsGemmF32Kernel _matmulIq3XxsGemm;
+    private readonly MatMulIq3SGemvF32Kernel _matmulIq3S;
+    private readonly MatMulIq3SGemmF32Kernel _matmulIq3SGemm;
+    private readonly MatMulIq1SGemvF32Kernel _matmulIq1S;
+    private readonly MatMulIq1SGemmF32Kernel _matmulIq1SGemm;
     // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat
     // path is opportunistic; BF16 has no coopmat path on this hardware.
     private readonly MatMulF16GemvF32Kernel _matmulF16;
@@ -76,6 +107,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
+    /// <summary>
+    /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
+    /// when the SPV is missing, when the env-var opt-out is set, or when the
+    /// model's head_dim exceeds the shader's MAX_HEAD_DIM — every gate falls
+    /// back to <see cref="_attention"/>.
+    /// </summary>
+    private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
     private readonly BiasAddF32Kernel _biasAdd;
@@ -92,6 +130,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
     private readonly int _ropeDim;
     private readonly float _ropeTheta;
+
+    // Phase 5f mirror — ForwardBatch lm_head-only fusion scratch. Lazy-allocated on
+    // first batched call (zero VRAM cost when only Forward is used). Holds a stacked
+    // [N_simple, hidden] post-final-RMSNorm buffer and a [N_simple, vocab] batched
+    // lm_head output. NemotronH's hybrid SSM/GQA layer loop forces per-seq dispatch
+    // (Mamba2 state is per-token recurrent — cross-seq batching would require an
+    // architecture-specific batched-scan kernel); only the terminal lm_head can
+    // sensibly share a dispatch across sequences. See VulkanNemotronHForwardBatchScratch
+    // and ForwardBatch for the data flow.
+    private VulkanNemotronHForwardBatchScratch? _batchScratch;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -117,14 +165,27 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int[] kvSlotForLayer, int attentionLayerCount,
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
+        MatMulQ2KGemvF32Kernel matmulQ2K, MatMulQ2KGemmF32Kernel matmulQ2KGemm,
+        MatMulQ3KGemvF32Kernel matmulQ3K, MatMulQ3KGemmF32Kernel matmulQ3KGemm,
         MatMulQ4KGemvF32Kernel matmulQ4K, MatMulQ4KGemmF32Kernel matmulQ4KGemm,
         MatMulQ5KGemvF32Kernel matmulQ5K, MatMulQ5KGemmF32Kernel matmulQ5KGemm,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
+        MatMulIq4NlGemvF32Kernel matmulIq4Nl, MatMulIq4NlGemmF32Kernel matmulIq4NlGemm,
+        MatMulIq4XsGemvF32Kernel matmulIq4Xs, MatMulIq4XsGemmF32Kernel matmulIq4XsGemm,
+        Iq2Codebooks iq2Codebooks,
+        MatMulIq2XxsGemvF32Kernel matmulIq2Xxs, MatMulIq2XxsGemmF32Kernel matmulIq2XxsGemm,
+        MatMulIq2XsGemvF32Kernel matmulIq2Xs, MatMulIq2XsGemmF32Kernel matmulIq2XsGemm,
+        MatMulIq2SGemvF32Kernel matmulIq2S, MatMulIq2SGemmF32Kernel matmulIq2SGemm,
+        Iq3Codebooks iq3Codebooks,
+        MatMulIq3XxsGemvF32Kernel matmulIq3Xxs, MatMulIq3XxsGemmF32Kernel matmulIq3XxsGemm,
+        MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
+        MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
-        AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
+        AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
         GroupRmsNormF32Kernel groupRmsNorm, ReluSquaredInplaceF32Kernel reluSquared,
@@ -148,12 +209,34 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ8 = matmulQ8;
         _matmulQ8Gemm = matmulQ8Gemm;
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
+        _matmulQ2K = matmulQ2K;
+        _matmulQ2KGemm = matmulQ2KGemm;
+        _matmulQ3K = matmulQ3K;
+        _matmulQ3KGemm = matmulQ3KGemm;
         _matmulQ4K = matmulQ4K;
         _matmulQ4KGemm = matmulQ4KGemm;
         _matmulQ5K = matmulQ5K;
         _matmulQ5KGemm = matmulQ5KGemm;
         _matmulQ6K = matmulQ6K;
         _matmulQ6KGemm = matmulQ6KGemm;
+        _matmulIq4Nl = matmulIq4Nl;
+        _matmulIq4NlGemm = matmulIq4NlGemm;
+        _matmulIq4Xs = matmulIq4Xs;
+        _matmulIq4XsGemm = matmulIq4XsGemm;
+        _iq2Codebooks = iq2Codebooks;
+        _matmulIq2Xxs = matmulIq2Xxs;
+        _matmulIq2XxsGemm = matmulIq2XxsGemm;
+        _matmulIq2Xs = matmulIq2Xs;
+        _matmulIq2XsGemm = matmulIq2XsGemm;
+        _matmulIq2S = matmulIq2S;
+        _matmulIq2SGemm = matmulIq2SGemm;
+        _iq3Codebooks = iq3Codebooks;
+        _matmulIq3Xxs = matmulIq3Xxs;
+        _matmulIq3XxsGemm = matmulIq3XxsGemm;
+        _matmulIq3S = matmulIq3S;
+        _matmulIq3SGemm = matmulIq3SGemm;
+        _matmulIq1S = matmulIq1S;
+        _matmulIq1SGemm = matmulIq1SGemm;
         _matmulF16 = matmulF16;
         _matmulF16Gemm = matmulF16Gemm;
         _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
@@ -162,6 +245,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
+        _flashAttention = flashAttention;
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
@@ -273,6 +357,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             try { matmulQ8GemmCoopmat = MatMulQ8_0GemmCoopmatKernel.Create(device, spvDir); }
             catch (InvalidOperationException) { /* Kernel threw: no usable tile shape. Stay on scalar. */ }
         }
+        // Q2_K + Q3_K GEMV + GEMM — completes the K-quant family on Vulkan.
+        var matmulQ2K = MatMulQ2KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ2KGemm = MatMulQ2KGemmF32Kernel.Create(device, spvDir);
+        var matmulQ3K = MatMulQ3KGemvF32Kernel.Create(device, spvDir);
+        var matmulQ3KGemm = MatMulQ3KGemmF32Kernel.Create(device, spvDir);
         // Q4_K_M GEMV + GEMM — Phase 1 of K-quant work. Always created.
         var matmulQ4K = MatMulQ4KGemvF32Kernel.Create(device, spvDir);
         var matmulQ4KGemm = MatMulQ4KGemmF32Kernel.Create(device, spvDir);
@@ -282,6 +371,28 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         // Q6_K_M GEMV + GEMM — Phase 1 sibling of Q4_K / Q5_K. Always created.
         var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
         var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
+        // IQ4_NL / IQ4_XS GEMV + GEMM — IQ-family follow-up. Always created.
+        var matmulIq4Nl = MatMulIq4NlGemvF32Kernel.Create(device, spvDir);
+        var matmulIq4NlGemm = MatMulIq4NlGemmF32Kernel.Create(device, spvDir);
+        var matmulIq4Xs = MatMulIq4XsGemvF32Kernel.Create(device, spvDir);
+        var matmulIq4XsGemm = MatMulIq4XsGemmF32Kernel.Create(device, spvDir);
+        // IQ2 family — IQ-family follow-up. Always created. Codebook tables
+        // (3 grids + ksigns) shared across all 6 IQ2 matmul kernels.
+        var iq2Codebooks = Iq2Codebooks.Create(device);
+        var matmulIq2Xxs     = MatMulIq2XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2XxsGemm = MatMulIq2XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2Xs      = MatMulIq2XsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2XsGemm  = MatMulIq2XsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2S       = MatMulIq2SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var matmulIq2SGemm   = MatMulIq2SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
+        var iq3Codebooks = Iq3Codebooks.Create(device);
+        var matmulIq3Xxs     = MatMulIq3XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3XxsGemm = MatMulIq3XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3S       = MatMulIq3SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3SGemm   = MatMulIq3SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        // IQ1_S GEMV + GEMM — smallest GGUF quant.
+        var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
+        var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created. F16 GEMM coopmat
         // is opportunistic.
         var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
@@ -297,6 +408,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
+        VulkanFlashAttentionF32Kernel? flashAttention =
+            VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
+                ? null
+                : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -315,12 +430,24 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             config, weights, state, ssmCache,
             ssmLayerOrdinal, kvSlotForLayer, attentionLayerCount,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
+            matmulQ2K, matmulQ2KGemm,
+            matmulQ3K, matmulQ3KGemm,
             matmulQ4K, matmulQ4KGemm,
             matmulQ5K, matmulQ5KGemm,
             matmulQ6K, matmulQ6KGemm,
+            matmulIq4Nl, matmulIq4NlGemm,
+            matmulIq4Xs, matmulIq4XsGemm,
+            iq2Codebooks,
+            matmulIq2Xxs, matmulIq2XxsGemm,
+            matmulIq2Xs, matmulIq2XsGemm,
+            matmulIq2S, matmulIq2SGemm,
+            iq3Codebooks,
+            matmulIq3Xxs, matmulIq3XxsGemm,
+            matmulIq3S, matmulIq3SGemm,
+            matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, swiglu, add, biasAdd,
+            rmsnorm, rope, attention, flashAttention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit,
@@ -334,6 +461,66 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
     {
+        // Public Forward: run the shared core (embedding + layers + final RMSNorm)
+        // into _state.NormOutput offset 0, then dispatch the lm_head + alloc + download
+        // the per-seq logits tensor. ForwardBatch reuses RunForwardCore with a stacked
+        // capture buffer (one slot per simple seq) instead of running per-seq lm_head.
+        RunForwardCore(tokenIds, positions, kvCache,
+            captureLastNormedRowTo: null, captureSlot: 0);
+
+        int vocabSize = Config.VocabSize;
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, _state.Logits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        unsafe
+        {
+            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
+            _device.Download(_state.Logits, dest);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Runs the shared NemotronH forward body (embedding + per-layer SSM/GQA/FFN +
+    /// final RMSNorm on the last token), leaving the post-final-RMSNorm row in
+    /// <see cref="VulkanNemotronHForwardState.NormOutput"/> at offset 0. When
+    /// <paramref name="captureLastNormedRowTo"/> is non-null, the same row is ALSO
+    /// copied via <c>vkCmdCopyBuffer</c> to <c>captureLastNormedRowTo[captureSlot * hidden]</c>
+    /// in the same submit — this is the snapshot the batched lm_head consumes in
+    /// <see cref="ForwardBatch"/>. Submits and waits before returning.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// All per-layer dispatches (SSM scan, GQA attention, FFN) are dispatched per-seq:
+    /// the NemotronH Mamba2 SSM state is per-token recurrent so it cannot be batched
+    /// across sequences without an architecture-specific batched-scan kernel. The
+    /// terminal lm_head IS amenable to fan-out — that's the only fusion target of the
+    /// batched path, mirroring the Phase 5a CPU stacked-buffer pattern.
+    /// </para>
+    /// <para>
+    /// Identical to the previous monolithic <c>Forward</c> body up to (and including)
+    /// the final RMSNorm; the lm_head matmul + tensor allocation + download have been
+    /// hoisted to the caller. The split has no observable effect on Forward semantics
+    /// — the extra submit boundary between the core forward and the per-seq lm_head
+    /// matmul carries only one extra submit/wait (the previous monolithic submit was
+    /// already waited on at end-of-Forward).
+    /// </para>
+    /// </remarks>
+    private void RunForwardCore(
+        ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache,
+        VulkanDevice.Buffer? captureLastNormedRowTo, int captureSlot)
+    {
         if (tokenIds.Length != positions.Length)
             throw new ArgumentException("tokenIds and positions must have the same length.");
 
@@ -344,7 +531,6 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
         int headDim = Config.HeadDim;
-        int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
 
         bool scratchResized = _state.EnsureCapacity(seqLen);
@@ -400,7 +586,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
 
-        // Final RMSNorm + LM head on the last token only.
+        // Final RMSNorm on the last token only.
         long rowBytes = (long)hiddenSize * sizeof(float);
         long lastRowOffset = (long)(seqLen - 1) * rowBytes;
         KernelSupport.ComputeToTransferBarrier(cmdBuf);
@@ -410,23 +596,169 @@ public sealed class VulkanNemotronHTransformerModel : IModel
 
         _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
             rowCount: 1, n: hiddenSize, eps: eps);
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Optionally snapshot the normed last row into a caller-owned scratch buffer at
+        // the given slot. Used by ForwardBatch to gather every simple seq's last hidden
+        // row into a stacked [N_simple, hidden] scratch before dispatching one batched
+        // lm_head matmul.
+        if (captureLastNormedRowTo is not null)
+        {
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.NormOutput, captureLastNormedRowTo,
+                srcOffset: 0,
+                dstOffset: (ulong)((long)captureSlot * rowBytes),
+                size: (ulong)rowBytes);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+    }
+
+    /// <summary>
+    /// Phase 5f mirror — NemotronH <c>ForwardBatch</c> override. Mirrors the dense
+    /// <see cref="VulkanTransformerModel.ForwardBatch"/> partition / fall-through
+    /// shape but, because the NemotronH hybrid mixes per-token recurrent Mamba2 SSM
+    /// layers with GQA layers, the entire per-layer loop runs per-sequence. Only the
+    /// terminal RMSNorm + lm_head are fused into a single batched dispatch over a
+    /// stacked <c>[N_simple, hidden]</c> buffer — same stacked-buffer pattern as the
+    /// Phase 5a CPU lm_head fusion.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Per the task partitioning: SSM layers go per-seq (state is per-token recurrent);
+    /// GQA layers could in principle batch at <c>seqLen = Σ N_i</c>, but interleaving
+    /// batched/per-seq dispatches across layers would require unpacking/repacking the
+    /// hidden state between layer boundaries — far more LoC than the win justifies for
+    /// the typical 3-7 GQA layers per NemotronH stack. Future work could add an
+    /// architecture-specific batched Mamba2 scan kernel and revisit; today the dense
+    /// host's full layer-loop fusion does not apply here.
+    /// </para>
+    /// <para>
+    /// Complex sequences (LoRA adapter — the NemotronH path does not support LoRA today
+    /// so this is purely defensive — or a non-<see cref="VulkanNemotronHKvCache"/> cache
+    /// type) fall through to the existing per-seq Forward.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ITensor> ForwardBatch(
+        IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        // NemotronH does not currently expose a LoRA-aware Forward overload — the
+        // IModel default 5-arg Forward simply forwards to the 4-arg version, ignoring
+        // any adapter. Reject adapter-bearing requests up front so callers don't get
+        // silently un-adapted logits.
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "VulkanNemotronHTransformerModel.ForwardBatch does not support LoRA adapters " +
+                    "(no NemotronH LoRA path today). Re-issue the request without an adapter or via " +
+                    "a host that supports LoRA (VulkanTransformerModel).");
+        }
+
+        if (requests.Count == 1)
+        {
+            var r0 = requests[0];
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+        }
+
+        // Partition simple / complex. Simple = KvCache is a VulkanNemotronHKvCache
+        // (or null — uncached SSM-only forwards are accepted by the per-seq path too).
+        var simpleIdx = new List<int>(requests.Count);
+        var complexIdx = new List<int>(requests.Count);
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            bool simple = r.KvCache is VulkanNemotronHKvCache || r.KvCache is null;
+            (simple ? simpleIdx : complexIdx).Add(i);
+        }
+
+        var results = new ITensor[requests.Count];
+
+        // Complex fallback — delegate to per-seq Forward. Today this is only a
+        // non-Vulkan KvCache; the per-seq Forward will throw if it cannot honour
+        // the cache type, identical to the un-batched contract.
+        foreach (int i in complexIdx)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+        }
+
+        // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
+        if (simpleIdx.Count < 2)
+        {
+            foreach (int i in simpleIdx)
+            {
+                var r = requests[i];
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            }
+            return results;
+        }
+
+        ForwardBatchSimpleLmHeadFan(requests, simpleIdx, deviceId, results);
+        return results;
+    }
+
+    /// <summary>
+    /// Inner batched dispatch for the simple sub-batch: per-seq <see cref="RunForwardCore"/>
+    /// with a stacked capture buffer + one batched lm_head matmul over the stacked
+    /// <c>[N_simple, hidden]</c> normed last-row snapshot.
+    /// </summary>
+    private unsafe void ForwardBatchSimpleLmHeadFan(
+        IReadOnlyList<SequenceForwardRequest> requests,
+        List<int> simpleIdx, int deviceId, ITensor[] results)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        int simpleCount = simpleIdx.Count;
+
+        // Ensure batch-scratch is large enough. Allocate lazily on first use.
+        _batchScratch ??= new VulkanNemotronHForwardBatchScratch(_device, hiddenSize, vocabSize);
+        bool batchResized = _batchScratch.EnsureCapacity(simpleCount);
+        if (batchResized)
+            InvalidateKernelCaches();
+
+        var lastRowHidden = _batchScratch.LastRowHidden!;
+        var batchedLogits = _batchScratch.BatchedLogits!;
+
+        // Per-seq forward (with the captured-row hook) — every simple seq writes its
+        // post-final-RMSNorm last row into lastRowHidden at its slot index.
+        for (int s = 0; s < simpleCount; s++)
+        {
+            var r = requests[simpleIdx[s]];
+            RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
+                captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+        }
+
+        // Batched lm_head — one matmul over the stacked [N_simple, hidden] capture
+        // buffer producing [N_simple, vocab].
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
 
         RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, _state.Logits,
-            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
+            lastRowHidden, batchedLogits,
+            outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: simpleCount);
 
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
 
-        var shape = new TensorShape(1, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
-        unsafe
+        // Download + split into per-seq [1, vocab] host tensors.
+        int totalLogits = checked(simpleCount * vocabSize);
+        float[] hostBuf = new float[totalLogits];
+        _device.Download(batchedLogits, hostBuf.AsSpan());
+        for (int s = 0; s < simpleCount; s++)
         {
-            var dest = new Span<float>((void*)result.DataPointer, vocabSize);
-            _device.Download(_state.Logits, dest);
+            int reqIdx = simpleIdx[s];
+            var shape = new TensorShape(1, vocabSize);
+            var tensor = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+            var src = hostBuf.AsSpan(s * vocabSize, vocabSize);
+            src.CopyTo(new Span<float>((void*)tensor.DataPointer, vocabSize));
+            results[reqIdx] = tensor;
         }
-        return result;
     }
 
     /// <summary>
@@ -627,10 +959,20 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
-            seqQ: seqLen, seqKv: seqKv,
-            numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-            positionOffset: positionOffset, slidingWindow: 0);
+        if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        {
+            _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
+        else
+        {
+            _attention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Output projection → NormOutput (mirrors the GQA contract for the residual add).
@@ -664,12 +1006,32 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulQ8.InvalidateDescriptorCache();
         _matmulQ8Gemm.InvalidateDescriptorCache();
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulQ2K.InvalidateDescriptorCache();
+        _matmulQ2KGemm.InvalidateDescriptorCache();
+        _matmulQ3K.InvalidateDescriptorCache();
+        _matmulQ3KGemm.InvalidateDescriptorCache();
         _matmulQ4K.InvalidateDescriptorCache();
         _matmulQ4KGemm.InvalidateDescriptorCache();
         _matmulQ5K.InvalidateDescriptorCache();
         _matmulQ5KGemm.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
         _matmulQ6KGemm.InvalidateDescriptorCache();
+        _matmulIq4Nl.InvalidateDescriptorCache();
+        _matmulIq4NlGemm.InvalidateDescriptorCache();
+        _matmulIq4Xs.InvalidateDescriptorCache();
+        _matmulIq4XsGemm.InvalidateDescriptorCache();
+        _matmulIq2Xxs.InvalidateDescriptorCache();
+        _matmulIq2XxsGemm.InvalidateDescriptorCache();
+        _matmulIq2Xs.InvalidateDescriptorCache();
+        _matmulIq2XsGemm.InvalidateDescriptorCache();
+        _matmulIq2S.InvalidateDescriptorCache();
+        _matmulIq2SGemm.InvalidateDescriptorCache();
+        _matmulIq3Xxs.InvalidateDescriptorCache();
+        _matmulIq3XxsGemm.InvalidateDescriptorCache();
+        _matmulIq3S.InvalidateDescriptorCache();
+        _matmulIq3SGemm.InvalidateDescriptorCache();
+        _matmulIq1S.InvalidateDescriptorCache();
+        _matmulIq1SGemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -678,6 +1040,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
+        _flashAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -728,6 +1091,32 @@ public sealed class VulkanNemotronHTransformerModel : IModel
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
+        else if (weightQt == QuantizationType.Q2_K)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ2K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ2KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.Q3_K)
+        {
+            if (seqLen == 1)
+            {
+                _matmulQ3K.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulQ3KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else if (weightQt == QuantizationType.Q4_K)
         {
             if (seqLen == 1)
@@ -768,6 +1157,80 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             else
             {
                 _matmulQ6KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.IQ4_NL)
+        {
+            if (seqLen == 1)
+            {
+                _matmulIq4Nl.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulIq4NlGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.IQ4_XS)
+        {
+            if (seqLen == 1)
+            {
+                _matmulIq4Xs.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulIq4XsGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantizationType.IQ2_XXS)
+        {
+            if (seqLen == 1)
+                _matmulIq2Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq2XxsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ2_XS)
+        {
+            if (seqLen == 1)
+                _matmulIq2Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq2XsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ2_S)
+        {
+            if (seqLen == 1)
+                _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ3_XXS)
+        {
+            if (seqLen == 1)
+                _matmulIq3Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq3XxsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ3_S)
+        {
+            if (seqLen == 1)
+                _matmulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            else
+                _matmulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
+        }
+        else if (weightQt == QuantizationType.IQ1_S)
+        {
+            if (seqLen == 1)
+            {
+                _matmulIq1S.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulIq1SGemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
@@ -859,6 +1322,8 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        // Phase 5f mirror — ForwardBatch lm_head scratch (null when never invoked).
+        _batchScratch?.Dispose();
         _submit.Dispose();
         _state.Dispose();
         _weights.Dispose();
@@ -874,6 +1339,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
@@ -882,12 +1348,34 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _matmulF16GemmCoopmat?.Dispose();
         _matmulF16Gemm.Dispose();
         _matmulF16.Dispose();
+        _matmulIq1SGemm.Dispose();
+        _matmulIq1S.Dispose();
+        _matmulIq4XsGemm.Dispose();
+        _matmulIq4Xs.Dispose();
+        _matmulIq4NlGemm.Dispose();
+        _matmulIq4Nl.Dispose();
+        _matmulIq3SGemm.Dispose();
+        _matmulIq3S.Dispose();
+        _matmulIq3XxsGemm.Dispose();
+        _matmulIq3Xxs.Dispose();
+        _iq3Codebooks.Dispose();
+        _matmulIq2SGemm.Dispose();
+        _matmulIq2S.Dispose();
+        _matmulIq2XsGemm.Dispose();
+        _matmulIq2Xs.Dispose();
+        _matmulIq2XxsGemm.Dispose();
+        _matmulIq2Xxs.Dispose();
+        _iq2Codebooks.Dispose();
         _matmulQ6KGemm.Dispose();
         _matmulQ6K.Dispose();
         _matmulQ5KGemm.Dispose();
         _matmulQ5K.Dispose();
         _matmulQ4KGemm.Dispose();
         _matmulQ4K.Dispose();
+        _matmulQ3KGemm.Dispose();
+        _matmulQ3K.Dispose();
+        _matmulQ2KGemm.Dispose();
+        _matmulQ2K.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();

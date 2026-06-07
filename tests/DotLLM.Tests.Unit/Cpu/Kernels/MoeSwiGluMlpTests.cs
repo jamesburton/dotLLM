@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Lora;
 using DotLLM.Cpu.Kernels;
 using Xunit;
 
@@ -83,6 +84,51 @@ public sealed unsafe class MoeSwiGluMlpTests
         MoeSwiGluMlp.Execute(
             hidden, gate, pin.W1, pin.W2, pin.W3, actual,
             NumExperts, TopK, Hidden, Intermediate, SeqLen);
+
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) < 1e-4f,
+                $"[i={i}] actual={actual[i]} expected={expected[i]} diff={actual[i] - expected[i]}");
+    }
+
+    [Fact]
+    public void Execute_PerExpertGateProjLora_MatchesEquivalentMergedWeight()
+    {
+        var rng = new Random(20260428);
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -0.5f, 0.5f);
+        float[] gate = new float[NumExperts * Hidden]; // uniform routing: stable top-k selects experts 0 and 1.
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.25f, 0.25f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.25f, 0.25f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.25f, 0.25f);
+        }
+
+        float[] b = Enumerable.Range(0, Hidden).Select(i => (i + 1) * 0.004f).ToArray();
+        float[] a = Enumerable.Range(0, Intermediate).Select(i => (i - 5) * 0.003f).ToArray();
+        using var adapter = BuildRankOneAdapter("mlp.experts.0.gate_proj", Hidden, Intermediate, b, a);
+
+        float[] actual = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        {
+            MoeSwiGluMlp.Execute(
+                hidden, gate, pin.W1, pin.W2, pin.W3, actual,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                loraAdapter: adapter,
+                loraLayer: 0);
+        }
+
+        float[][] mergedW1 = w1.Select(row => (float[])row.Clone()).ToArray();
+        AddOuterProduct(mergedW1[0], Intermediate, Hidden, a, b);
+        float[] expected = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(mergedW1, w2, w3))
+        {
+            MoeSwiGluMlp.Execute(
+                hidden, gate, pin.W1, pin.W2, pin.W3, expected,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen);
+        }
 
         for (int i = 0; i < actual.Length; i++)
             Assert.True(Math.Abs(actual[i] - expected[i]) < 1e-4f,
@@ -605,6 +651,33 @@ public sealed unsafe class MoeSwiGluMlpTests
         float[] arr = new float[count];
         for (int i = 0; i < count; i++) arr[i] = (float)(rng.NextDouble() * (hi - lo) + lo);
         return arr;
+    }
+
+    private static LoraAdapter BuildRankOneAdapter(
+        string projection,
+        int inputDim,
+        int outputDim,
+        float[] b,
+        float[] a)
+    {
+        var adapter = new LoraAdapter("moe-test", rank: 1, alpha: 1f, targetModules: [projection]);
+        nint bHandle = LoraAdapter.AllocAligned(inputDim);
+        nint aHandle = LoraAdapter.AllocAligned(outputDim);
+        b.CopyTo(new Span<float>((void*)bHandle, inputDim));
+        a.CopyTo(new Span<float>((void*)aHandle, outputDim));
+        adapter.AddLayerWeights(0, projection, new LoraLayerWeights(
+            AHandle: aHandle,
+            BHandle: bHandle,
+            InputDim: inputDim,
+            OutputDim: outputDim));
+        return adapter;
+    }
+
+    private static void AddOuterProduct(float[] matrix, int rows, int cols, float[] a, float[] b)
+    {
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                matrix[r * cols + c] += a[r] * b[c];
     }
 
     /// <summary>

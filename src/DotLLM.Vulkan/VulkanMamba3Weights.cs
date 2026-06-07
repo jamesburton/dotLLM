@@ -370,6 +370,16 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q8_0 && (contractionDim % 32) == 0;
 
+    /// <summary>True iff a Q2_K overlay can be kept on device as raw Q2_K super-blocks
+    /// — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepQ2KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q2_K && (contractionDim % 256) == 0;
+
+    /// <summary>True iff a Q3_K overlay can be kept on device as raw Q3_K super-blocks
+    /// — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepQ3KOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.Q3_K && (contractionDim % 256) == 0;
+
     /// <summary>True iff a Q4_K overlay can be kept on device as raw Q4_K super-blocks
     /// — gated on the contraction dim being a multiple of the Q4_K super-block size
     /// (256). Phase 1 of K-quant work.</summary>
@@ -389,6 +399,42 @@ internal sealed class VulkanMamba3Weights : IDisposable
     private static bool KeepQ6KOnDevice(QuantizationType qt, int contractionDim)
         => qt == QuantizationType.Q6_K && (contractionDim % 256) == 0;
 
+    /// <summary>True iff an IQ4_NL overlay can be kept on device as raw 18-byte blocks
+    /// — gated on the contraction dim being a multiple of 32.</summary>
+    private static bool KeepIq4NlOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ4_NL && (contractionDim % 32) == 0;
+
+    /// <summary>True iff an IQ4_XS overlay can be kept on device as raw 136-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq4XsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ4_XS && (contractionDim % 256) == 0;
+    /// <summary>True iff an IQ2_XXS overlay can be kept on device.</summary>
+    private static bool KeepIq2XxsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ2_XXS && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ2_XS overlay can be kept on device.</summary>
+    private static bool KeepIq2XsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ2_XS && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ2_S overlay can be kept on device. Also covers MOSTLY_IQ2_M.</summary>
+    private static bool KeepIq2SOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ2_S && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ3_XXS overlay can be kept on device as raw 98-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq3XxsOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ3_XXS && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ3_S overlay can be kept on device as raw 110-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq3SOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ3_S && (contractionDim % 256) == 0;
+
+    /// <summary>True iff an IQ1_S overlay can be kept on device as raw 50-byte
+    /// super-blocks — gated on the contraction dim being a multiple of 256.</summary>
+    private static bool KeepIq1SOnDevice(QuantizationType qt, int contractionDim)
+        => qt == QuantizationType.IQ1_S && (contractionDim % 256) == 0;
+
     /// <summary>True iff an F16 overlay can be kept on device as raw 2-byte F16 elements
     /// — gated on the contraction dim being a multiple of 2. Phase 8 of the native
     /// matmul work — unblocks BF16 / F16 SafeTensors loads that previously had to expand
@@ -407,9 +453,19 @@ internal sealed class VulkanMamba3Weights : IDisposable
     /// format's group size.</summary>
     private static bool KeepQuantOnDevice(QuantizationType qt, int contractionDim)
         => KeepQ8OnDevice(qt, contractionDim)
+        || KeepQ2KOnDevice(qt, contractionDim)
+        || KeepQ3KOnDevice(qt, contractionDim)
         || KeepQ4KOnDevice(qt, contractionDim)
         || KeepQ5KOnDevice(qt, contractionDim)
         || KeepQ6KOnDevice(qt, contractionDim)
+        || KeepIq4NlOnDevice(qt, contractionDim)
+        || KeepIq4XsOnDevice(qt, contractionDim)
+        || KeepIq2XxsOnDevice(qt, contractionDim)
+        || KeepIq2XsOnDevice(qt, contractionDim)
+        || KeepIq2SOnDevice(qt, contractionDim)
+        || KeepIq3XxsOnDevice(qt, contractionDim)
+        || KeepIq3SOnDevice(qt, contractionDim)
+        || KeepIq1SOnDevice(qt, contractionDim)
         || KeepF16OnDevice(qt, contractionDim)
         || KeepBf16OnDevice(qt, contractionDim);
 

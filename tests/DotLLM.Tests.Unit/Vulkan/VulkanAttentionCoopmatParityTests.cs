@@ -69,9 +69,18 @@ public class VulkanAttentionCoopmatParityTests
         // loop's online-softmax running max/sum rescale path multiple times.
         => RunParity(seqQ: 1, seqKv: 400, numHeads: 4, numKvHeads: 2, headDim: 64,  positionOffset: 399);
 
+    // Pins all three paths to the correct sliding-window mask
+    // (posQ - tkv >= window). With window=4 and posQ=7 the buggy >-mask leaks
+    // tkv=3 into the softmax; the corrected >=-mask hides it.
+    [SkippableFact]
+    public void CrossPath_SlidingWindow_DiscriminatesOffByOne()
+        => RunParity(seqQ: 1, seqKv: 8, numHeads: 1, numKvHeads: 1, headDim: 64, positionOffset: 7,
+            slidingWindow: 4);
+
     // ─────────────────────────────────────────────────────────────
 
-    private static void RunParity(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset)
+    private static void RunParity(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
+        int slidingWindow = 0)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -94,15 +103,16 @@ public class VulkanAttentionCoopmatParityTests
 
         // Scalar reference — the strict oracle every path is compared against.
         float[] expected = new float[seqQ * numHeads * headDim];
+        int? sw = slidingWindow > 0 ? slidingWindow : null;
         Attention.ExecuteScalar(qh, kh, vh, expected,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, sw);
 
         // Force each path in turn via the env overrides. The kernel caches
         // its dispatch mode at Create() time, so re-create per variant.
         float[]? sharedResult   = RunVariant(device, bufQ, bufK, bufV, bufOut, spvDir,
             forceSharedReduce: true, useCoopmat: false,
             expectedMode: AttentionF32Kernel.DispatchMode.SharedMem,
-            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow);
         Skip.If(sharedResult is null, "shared-mem variant not available (this should never happen).");
 
         float[]? subgroupResult = null;
@@ -111,7 +121,7 @@ public class VulkanAttentionCoopmatParityTests
             subgroupResult = RunVariant(device, bufQ, bufK, bufV, bufOut, spvDir,
                 forceSharedReduce: false, useCoopmat: false,
                 expectedMode: AttentionF32Kernel.DispatchMode.Subgroup,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow);
         }
 
         float[]? coopmatResult = null;
@@ -120,7 +130,7 @@ public class VulkanAttentionCoopmatParityTests
             coopmatResult = RunVariant(device, bufQ, bufK, bufV, bufOut, spvDir,
                 forceSharedReduce: false, useCoopmat: true,
                 expectedMode: AttentionF32Kernel.DispatchMode.Coopmat,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, slidingWindow);
         }
 
         // 1. Every active variant vs the scalar oracle — strict on shared/
@@ -154,7 +164,8 @@ public class VulkanAttentionCoopmatParityTests
         string spvDir,
         bool forceSharedReduce, bool useCoopmat,
         AttentionF32Kernel.DispatchMode expectedMode,
-        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset)
+        int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
+        int slidingWindow)
     {
         string? prevShared  = Environment.GetEnvironmentVariable(RmsNormF32Kernel.ForceSharedReduceEnvVar);
         string? prevCoopmat = Environment.GetEnvironmentVariable(AttentionF32Kernel.UseCoopmatEnvVar);
@@ -167,7 +178,8 @@ public class VulkanAttentionCoopmatParityTests
             Assert.Equal(expectedMode, kernel.Mode);
 
             kernel.Launch(bufQ, bufK, bufV, bufOut,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset);
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                slidingWindow: slidingWindow);
             float[] outHost = new float[seqQ * numHeads * headDim];
             device.Download(bufOut, outHost);
             return outHost;

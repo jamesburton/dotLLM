@@ -17,7 +17,12 @@ public enum Architecture
     /// <summary>Alibaba Qwen family.</summary>
     Qwen,
 
-    /// <summary>DeepSeek family (pre-V2; legacy placeholder).</summary>
+    /// <summary>
+    /// DeepSeek family (pre-V2; legacy GGUF metadata placeholder).
+    /// Prefer <see cref="DeepSeekV2"/> or <see cref="DeepSeekV3"/> for supported
+    /// MLA-based checkpoints.
+    /// </summary>
+    [System.Obsolete("Architecture.DeepSeek is a legacy pre-V2 placeholder kept for GGUF metadata compatibility. Use DeepSeekV2 or DeepSeekV3.")]
     DeepSeek,
 
     /// <summary>
@@ -96,5 +101,95 @@ public enum Architecture
     /// No shared expert; top-k is unusually large (8 of 40 for the 3B-A800M
     /// SKU). See <see cref="DotLLM.Core.Models.MoeConfig"/>.
     /// </summary>
-    GraniteMoe
+    GraniteMoe,
+
+    /// <summary>
+    /// Alibaba Qwen3.6 — Gated DeltaNet (GDN) SSM + sparse MoE hybrid.
+    /// GGUF architecture string: <c>qwen35moe</c>.
+    /// Layers alternate between Gated DeltaNet recurrence (3 of every 4) and full
+    /// GQA attention (every 4th layer, controlled by
+    /// <c>qwen35moe.full_attention_interval</c>). Both layer types share a sparse
+    /// MoE FFN sublayer. The GDN carries a full <c>[n_head, d_k, d_v]</c> matrix
+    /// state updated via the delta rule. See
+    /// <see cref="DotLLM.Core.Models.GatedDeltaNetConfig"/> for GDN-specific parameters.
+    /// References: <see href="https://arxiv.org/abs/2412.06464">Gated Delta Networks
+    /// (NVlabs, ICLR 2025)</see>; <see href="https://arxiv.org/abs/2505.09388">Qwen3
+    /// Technical Report</see>.
+    /// </summary>
+    Qwen3MoeHybrid,
+
+    /// <summary>
+    /// HuggingFace SmolLM3 — Llama-shaped GQA transformer (3B SKU: 36 layers,
+    /// 16 Q-heads, 4 KV-heads, head_dim=128, hidden=2048, intermediate=11008,
+    /// vocab=128256, max_pos=65536). Distinguishing features vs Llama:
+    /// <list type="bullet">
+    ///   <item><b>NoPE layers</b> — every 4th layer (indices 3, 7, 11, ...
+    ///     in the 3B config, supplied via the HF <c>no_rope_layers</c> 0/1
+    ///     mask) skips RoPE entirely, attending on position-free Q/K.
+    ///     Threaded as a per-layer boolean inside the forward dispatch;
+    ///     see <see cref="DotLLM.Core.Models.ModelConfig.NoRopeLayers"/>.</item>
+    ///   <item><b>YaRN context extension</b> — long-context SKUs ship
+    ///     <c>rope_scaling</c> (<c>type=yarn</c>, factor &gt; 1) that lifts
+    ///     the effective context to 128k. The base 3B checkpoint ships
+    ///     <c>rope_scaling=null</c>; YaRN fields are surfaced via
+    ///     <see cref="DotLLM.Core.PositionEncoding.RoPEConfig.ScalingType"/>.</item>
+    ///   <item>Tool calling — Hermes-compatible
+    ///     <c>&lt;tool_call&gt;{...}&lt;/tool_call&gt;</c> XML wrapper or
+    ///     Pythonic <c>function_name(arg=value, ...)</c> syntax.</item>
+    /// </list>
+    /// HF discriminators: <c>architectures[0]=SmolLM3ForCausalLM</c>,
+    /// <c>model_type=smollm3</c>. Tensor naming is identical to Llama, so
+    /// loading routes through the standard <see cref="Llama"/> safetensors
+    /// path with a conditional RoPE per layer.
+    /// </summary>
+    SmolLM3,
+
+    /// <summary>
+    /// Google Gemma 3 family. Text-only checkpoints carry
+    /// <c>model_type=gemma3_text</c> + <c>architectures[0]=Gemma3TextForCausalLM</c>;
+    /// multimodal checkpoints carry <c>model_type=gemma3</c> +
+    /// <c>architectures[0]=Gemma3ForConditionalGeneration</c> and house the text-tower
+    /// config under a <c>text_config</c> sub-object (we read only the text tower).
+    /// <para>
+    /// Distinguishing features vs Llama/Mistral/Qwen:
+    /// <list type="bullet">
+    ///   <item><b>GeGLU MLP</b> — gate path uses GELU (tanh approximation, HF
+    ///     <c>hidden_activation=gelu_pytorch_tanh</c>) instead of SiLU; otherwise
+    ///     shape-identical to SwiGLU (<c>down(act(gate(x)) * up(x))</c>).</item>
+    ///   <item><b>RMSNorm <c>(1 + weight)</c> convention</b> — every RMSNorm scales by
+    ///     <c>(1 + w)</c> rather than <c>w</c>. Absorbed at load time by pre-adding
+    ///     <c>1.0</c> to every dequantised norm weight, so the existing kernel runs
+    ///     unchanged.</item>
+    ///   <item><b>Four RMSNorms per layer</b> — <c>input_layernorm</c>,
+    ///     <c>post_attention_layernorm</c>, <c>pre_feedforward_layernorm</c>,
+    ///     <c>post_feedforward_layernorm</c>. The post-attn and post-FFN norms run
+    ///     <i>between</i> the sublayer output and the residual add (Gemma 2 design,
+    ///     retained in Gemma 3).</item>
+    ///   <item><b>Per-head Q/K RMSNorms</b> applied before RoPE (dim = <c>head_dim</c>,
+    ///     identical plumbing to Qwen3 QK-norm).</item>
+    ///   <item><b>Interleaved local/global attention</b> — most layers use
+    ///     sliding-window attention of size <c>sliding_window</c>; every
+    ///     <c>sliding_window_pattern</c>-th layer (1-indexed) uses full attention.
+    ///     Encoded as a per-layer attention-type list on
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.PerLayerSlidingWindow"/>.</item>
+    ///   <item><b>Query-pre-attn scalar</b> — attention score scale is
+    ///     <c>1 / sqrt(query_pre_attn_scalar)</c> instead of the default
+    ///     <c>1 / sqrt(head_dim)</c>.</item>
+    ///   <item><b>Logit soft-capping</b> — optional <c>tanh(z / cap) * cap</c> applied
+    ///     to attention scores (<c>attn_logit_softcapping</c>) and the final LM-head
+    ///     logits (<c>final_logit_softcapping</c>). Gemma 2 sets both (50.0 and 30.0);
+    ///     Gemma 3 leaves them null but the plumbing is wired regardless via
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.AttnLogitSoftcap"/> and
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.FinalLogitSoftcap"/>.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Gemma 4 was not yet public when this enum variant was added (2026-05). The
+    /// implementation is built for Gemma 3 — the latest publicly-shipped Gemma — and
+    /// will forward-port to Gemma 4 cleanly if Google retains the Gemma 2/3 shape. See
+    /// <c>.continue-here-step57.md</c> at the repo root for the assumption trail and
+    /// the upgrade path when Gemma 4 lands.
+    /// </para>
+    /// </summary>
+    Gemma3
 }

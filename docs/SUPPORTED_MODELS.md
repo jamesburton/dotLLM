@@ -27,20 +27,23 @@ for system context.
 
 | Architecture | Enum | Tokenizer | RoPE | KV-cache | MoE | Required config fields | Verified on | Notes |
 |---|---|---|---|---|---|---|---|---|
-| Meta Llama | `Architecture.Llama` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm (interleaved pairs) | GQA | no | `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `vocab_size`, `max_position_embeddings`, `rope_theta`, `rms_norm_eps`, `tie_word_embeddings` | `verified: real weights` (CPU + Vulkan) — TinyLlama-1.1B-Chat-v1.0 (2.1 GB, CPU `TinyLlama_11B_LoadsAndForwardsEndToEnd`; Vulkan `TinyLlama_VulkanForward_MatchesCpuReference_OnEightDecodeSteps`); Llama-3.2-1B-Instruct.Q8_0 GGUF (1.3 GB, Vulkan `Llama32_1B_Q8_0_VulkanForward_MatchesCpuReference`); Bielik-1.5B-v3.0 Q4_K_M GGUF (Vulkan `Bielik15B_Q4_K_M_VulkanForward_MatchesCpuReference`) | Dense SwiGLU, standard `q/k/v/o_proj`, `mlp.{gate,up,down}_proj`. GGUF `general.architecture = llama`. |
-| Mistral AI | `Architecture.Mistral` | HF tokenizer.json (BPE + ByteLevel or SPM) | RoPE Norm | GQA, optional `sliding_window` | no | Same as Llama plus optional `sliding_window` | `verified: tiny-random` (config only) — `HfConfigExtractorTests.Mistral_UsesNormRoPE` | Routes through the same `LoadLayer` path as Llama; GGUF `general.architecture = mistral` (or `mistral3`). End-to-end forward on real Mistral weights is untested in CI. |
+| Meta Llama | `Architecture.Llama` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm (interleaved pairs) | GQA | no | `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `vocab_size`, `max_position_embeddings`, `rope_theta`, `rms_norm_eps`, `tie_word_embeddings` | `verified: real weights` (CPU + Vulkan) — TinyLlama-1.1B-Chat-v1.0 (2.1 GB, CPU `TinyLlama_11B_LoadsAndForwardsEndToEnd`; Vulkan `TinyLlama_VulkanForward_MatchesCpuReference_OnEightDecodeSteps`); Llama-3.2-1B-Instruct.Q8_0 GGUF (1.3 GB, Vulkan `Llama32_1B_Q8_0_VulkanForward_MatchesCpuReference`); Bielik-1.5B-v3.0 Q4_K_M GGUF (Vulkan `Bielik15B_Q4_K_M_VulkanForward_MatchesCpuReference`); Llama-3.1-8B-Instruct IQ4_XS GGUF (~4.5 GB, Vulkan `Llama31_8B_IQ4_XS_VulkanForward_MatchesCpuReference` when `DOTLLM_LLAMA31_8B_IQ4_XS_GGUF` is set — exercises the IQ4_XS native matmul kernels); Llama-3.1-8B-Instruct IQ1_S GGUF (~2.0 GB if available, Vulkan `Llama31_8B_IQ1_S_VulkanForward_MatchesCpuReference` when `DOTLLM_LLAMA31_8B_IQ1_S_GGUF` is set — exercises the IQ1_S native matmul kernels) | Dense SwiGLU, standard `q/k/v/o_proj`, `mlp.{gate,up,down}_proj`. GGUF `general.architecture = llama`. |
+| Meta Llama | `Architecture.Llama` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm (interleaved pairs) | GQA | no | `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `vocab_size`, `max_position_embeddings`, `rope_theta`, `rms_norm_eps`, `tie_word_embeddings` | `verified: real weights` (CPU + Vulkan) — TinyLlama-1.1B-Chat-v1.0 (2.1 GB, CPU `TinyLlama_11B_LoadsAndForwardsEndToEnd`; Vulkan `TinyLlama_VulkanForward_MatchesCpuReference_OnEightDecodeSteps`); Llama-3.2-1B-Instruct.Q8_0 GGUF (1.3 GB, Vulkan `Llama32_1B_Q8_0_VulkanForward_MatchesCpuReference`); Bielik-1.5B-v3.0 Q4_K_M GGUF (Vulkan `Bielik15B_Q4_K_M_VulkanForward_MatchesCpuReference`). Q2_K + Q3_K Vulkan kernels also shipped this branch — synthetic-fixture parity only; real-weight Q2_K (DeepSeek-Coder-V2-Lite-Q2_K) and Q3_K (Bielik / Llama-3 Q3_K_M) gates pending checkpoint download. See [docs/QUANTIZATION.md](QUANTIZATION.md) Vulkan coverage table for the per-format kernel matrix. | Dense SwiGLU, standard `q/k/v/o_proj`, `mlp.{gate,up,down}_proj`. GGUF `general.architecture = llama`. |
+| Mistral AI | `Architecture.Mistral` | HF tokenizer.json (BPE + ByteLevel or SPM) | RoPE Norm | GQA, optional `sliding_window` | no | Same as Llama plus optional `sliding_window` | `verified: tiny-random` (config only) — `HfConfigExtractorTests.Mistral_UsesNormRoPE`; `verified: real weights (gated)` — Mistral-7B-Instruct-v0.2.Q4_K_M GGUF via Vulkan `Mistral7B_Q4_K_M_VulkanForward_MatchesCpuReference` when `DOTLLM_MISTRAL_7B_Q4_K_M_GGUF` is set or the conventional cache path exists | Routes through the same `LoadLayer` path as Llama; GGUF `general.architecture = mistral` (or `mistral3`). |
 | Microsoft Phi | `Architecture.Phi` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX (non-interleaved) | GQA | no | Llama set plus `architectures[0]` starting with `phi` or `model_type` in `{phi, phi2, phi3}`. `tie_word_embeddings` defaults to true. | `verified: real weights` (CPU + Vulkan) — Phi-3.5-mini-instruct (7.6 GB, CPU `Phi35Mini_LoadsAndForwardsEndToEnd`; Vulkan `Phi35Mini_VulkanForward_MatchesCpuReference_OnEightDecodeSteps`) | Fused tensors: `self_attn.qkv_proj.weight [Q+K+V, H]` and `mlp.gate_up_proj.weight [2*I, H]` are split at load time into independent F32 slabs (see `SplitFusedProjection`). |
 | Alibaba Qwen | `Architecture.Qwen` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX | GQA, optional `sliding_window` | no | Llama set plus optional `head_dim` (Qwen3). Qwen2/3 commonly ship `q/k/v` biases; Qwen3 ships per-head `q_norm`/`k_norm` RMSNorms. | `verified: real weights` (CPU + Vulkan) — Qwen2.5-0.5B (999 MB, CPU `Qwen25_0_5B_LoadsAndForwardsEndToEnd`; Vulkan `Qwen25_0_5B_VulkanForward_MatchesCpuReference_OnEightDecodeSteps`) | `ResolveOptionalBias` picks up Qwen2 biases; `ResolveOptionalNorm` picks up Qwen3 QK-norms. `tied_embeddings=true` typical for small SKUs. |
-| DeepSeek (legacy) | `Architecture.DeepSeek` | GGUF tokenizer only (no HF safetensors dispatch) | RoPE | GQA (no MLA) | no | GGUF `general.architecture` in `{deepseek, deepseek2}` | `planned` — no working forward path. `TransformerArchitecture.CreateModel` throws `NotSupportedException("DeepSeek models require Multi-Latent Attention (MLA) which is not yet implemented.")` | Kept for GGUF metadata parsing back-compat. New checkpoints land on `DeepSeekV2`/`DeepSeekV3`; this variant is a placeholder. |
+| DeepSeek (legacy) | `Architecture.DeepSeek` (**obsolete**) | GGUF tokenizer only (no HF safetensors dispatch) | RoPE | GQA (no MLA) | no | GGUF `general.architecture = deepseek` only | `legacy placeholder` — no working forward path. `TransformerArchitecture.CreateModel` throws for the pre-V2 arch and points users at DeepSeek-V2/V3. | Kept for GGUF metadata parsing back-compat. New checkpoints land on `DeepSeekV2`/`DeepSeekV3`; this variant is intentionally not a capability claim. |
 | DeepSeek-V2 | `Architecture.DeepSeekV2` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm + YaRN softmax mscale² + ramped frequency rescaling (long context >4K) | **MLA Phase A / B / C — Phase C (hybrid latent + absorbed decode) is now the loader default for both HF and GGUF**, with Phase A retained as the numerical oracle. Vulkan keeps Phase A (no-cache forward path) | yes: routed + multi-shared expert; `first_k_dense_replace` dense prefix | Llama set plus MLA block (`kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`, optional `q_lora_rank`), MoE block (`n_routed_experts`, `num_experts_per_tok`, `moe_intermediate_size`, `n_shared_experts`, `first_k_dense_replace`), optional `rope_scaling` | `verified: real weights` (CPU + Vulkan) — DeepSeek-V2-Lite (30 GB BF16 SafeTensors CPU `DeepSeekV2Lite_LoadsAndForwardsEndToEnd` + `_LogitsMatchPyTorchReference` short-prompt + `_LongContext_LogitsMatchPyTorchReference` 4920-token ramped-YaRN — both within `DriftTolerances.Tight`); DeepSeek-V2-Lite-Q4_K_M GGUF (10.4 GB, Vulkan `DeepSeekV2Lite_Q4_K_M_VulkanForward_MatchesCpuReference` 19m 27s end-to-end). The HF SafeTensors path on Vulkan self-skips on hosts where the F32-expansion would exceed the configured budget (default 24 GB; override via `DOTLLM_VULKAN_F32_EXPANDED_BUDGET_GB`) | Attention routes through `LoadDeepSeekMlaLayer` → `MlaLayerWeights`; scalar `MlaAttention` kernel with optional cache pointers. `MlaExpandedKvState` caches expanded K_nope / V / K_pe across calls (Phase A); `MlaLatentKvState` stores compact `c_kv + k_pe` per token (Phase B/C). Phase C wires expand-to-MHA on prefill + absorbed MQA-style read on decode through the SAME latent cache (commit `5b2add7` merged `feature/mamba-3-phase-c`). Loader default to Phase C at `4b54a72` (HF) + `4724397` (GGUF). |
 | DeepSeek-V3 | `Architecture.DeepSeekV3` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm with optional YaRN | MLA | yes: sigmoid-router top-k, multi-shared expert | Same as DeepSeek-V2. Router discriminator is `architectures[0] = DeepseekV3ForCausalLM` or `model_type = deepseek_v3`. | `verified: tiny-random` — `yujiepan/deepseek-v3-tiny-random`, `katuni4ka/tiny-random-deepseek-v3` (same test) | Same attention path as V2; V3's node-level aux-loss-free routing + sigmoid scoring are V3-specific MoE refinements. No real-weight forward run in CI. |
 | NVIDIA Nemotron-H | `Architecture.NemotronH` | GGUF BPE (via `GgufBpeTokenizerFactory`) | RoPE on attention layers, none on SSM layers | GQA per attention layer; per-layer SSM state cache | no | GGUF `general.architecture = nemotron_h` with per-layer `head_count_kv` + `feed_forward_length` arrays (hybrid layout), plus SSM config keys (`ssm.*`) | `planned`/`verified: real weights (gated)` — `NemotronHTextGeneratorTests` run end-to-end against a local Nemotron-3-Nano-4B Q4_K_M GGUF when `DOTLLM_NEMOTRON_H_GGUF` is set; CI does not pull the checkpoint. Config-level detection is covered by `GgufModelConfigExtractorTests`. **Vulkan**: full forward path landed (`VulkanNemotronHTransformerModel` at `4abe4c2`) including SSM scan, attention, FFN, hybrid layer dispatch, plus Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16 projection upload via the Phase 1 + Phase 8 Vulkan kernels. | **GGUF-only** — safetensors dispatch in `ModelLoader.LoadFromSafetensors` does NOT enumerate `NemotronH`. Activation function is `ReluSquared`, not SiLU. Dedicated `NemotronHTransformerModel` (CPU) and `VulkanNemotronHTransformerModel` (Vulkan) with a hybrid Mamba-2 / attention forward. |
 | Mamba-3 (pure SSM) | `Architecture.Mamba3` | HF tokenizer.json (SPM + Metaspace + ByteFallback for `ib-ssm`) | Data-dependent RoPE on B/C inside the SSM block | SSM state cache (no KV-cache) | no | `model_type = mamba3`, `hidden_size`, `num_hidden_layers`, `num_heads`, `head_dim`, `state_size`, `vocab_size`, `expand`, `n_groups`, `chunk_size`, `mimo_rank`, `is_mimo`, `is_outproj_norm`, `use_l2warp`, `tie_word_embeddings`, `rescale_prenorm_residual`, `rope_fraction` | `verified: real weights` (CPU + Vulkan) — `ib-ssm/mamba3-370M-10BT` (1.55 GB, CPU `IbSsmMamba3RealWeightsLoadTests`, Vulkan `Mamba3_VulkanForward_MatchesCpuReference_OnPromptPrefill`); `verified: tiny-random (synthetic)` — `TinyMamba3SafetensorsLoadTests` synthesises a deterministic miniature on disk; MIMO forward exercised by CPU `Mamba3TransformerModelMimoTests` and Vulkan `VulkanMamba3TransformerModelForwardTests` (SISO + MIMO + streaming-chunk + Q4_K + Q5_K + Q6_K + Q8_0 + F16 + BF16) synthetic fixtures | Non-MIMO real-weight + MIMO synthetic (commit `0499465`). No public MIMO checkpoint — real-weight MIMO verification deferred P4.3. No upstream GGUF mapping. **Vulkan**: full forward path landed (`VulkanMamba3TransformerModel` at `e40ada4` SISO + `7142f31` MIMO + `dfc9759` streaming-chunk + `effd8fc` Q8_0). |
-| Mistral Mixtral | `Architecture.Mixtral` | HF tokenizer.json | RoPE Norm | GQA | yes: `block_sparse_moe.gate` + per-expert `experts.{j}.w{1,2,3}` | Llama set plus `num_local_experts`, `num_experts_per_tok`. `architectures[0] = MixtralForCausalLM` or `model_type = mixtral`. | `verified: tiny-random` — `yujiepan/mixtral-tiny-random` (520 KB, `TinyMixtralSafetensorsLoadTests`). **Vulkan**: kernel-level + synthetic-fixture parity for the Mixtral MoE convention via `VulkanTransformerModelMoe*ForwardTests` (Q8_0 router/shared variants too). | Mixtral-convention MoE loader (`LoadMixtralMoeLayer`); no shared experts by design. Real-weight Mixtral / OLMoE 14 GB run tracked as PLANS.md P2.5. |
-| Qwen-MoE (1.5 / 2 / 3) | `Architecture.QwenMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX | GQA, optional `sliding_window` | yes: `mlp.gate` + per-expert `experts.{j}.{gate,up,down}_proj`; optional shared-expert branch (Qwen1.5-MoE) with sigmoid gate; layer-level sparsity (Qwen3-MoE) via `decoder_sparse_step` + `mlp_only_layers` | Llama set plus `num_experts` or `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`, optional `shared_expert_intermediate_size`, optional `norm_topk_prob`, optional `decoder_sparse_step`, optional `mlp_only_layers` | `verified: tiny-random` — `yujiepan/qwen3-moe-tiny-random` (20 MB, `TinyQwenMoeSafetensorsLoadTests`) and synthetic unit fixtures in `TransformerSafetensorsLoadTests` covering shared-expert + sigmoid-gate paths | `LoadQwenMoeLayer` resolves both singular `shared_expert.*` (Qwen1.5-MoE-A2.7B) and plural `shared_experts.{k}.*` (DeepSeek, reused). Real-weight Qwen1.5-MoE-A2.7B (14 GB) is gated but not exercised in CI. |
+| Mistral Mixtral | `Architecture.Mixtral` | HF tokenizer.json | RoPE Norm | GQA | yes: `block_sparse_moe.gate` + per-expert `experts.{j}.w{1,2,3}` | Llama set plus `num_local_experts`, `num_experts_per_tok`. `architectures[0] = MixtralForCausalLM` or `model_type = mixtral`. | `verified: tiny-random` — `yujiepan/mixtral-tiny-random` (520 KB, `TinyMixtralSafetensorsLoadTests`); `verified: real weights (gated)` — `Mixtral8x7B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent` when `DOTLLM_MIXTRAL_8X7B_CHECKPOINT_PATH` or `C:/temp/dotllm-mixtral-8x7b` is present. **Vulkan**: kernel-level + synthetic-fixture parity for the Mixtral MoE convention via `VulkanTransformerModelMoe*ForwardTests` (Q8_0 router/shared variants too). | Mixtral-convention MoE loader (`LoadMixtralMoeLayer`); no shared experts by design. |
+| Qwen-MoE (1.5 / 2 / 3) | `Architecture.QwenMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX | GQA, optional `sliding_window` | yes: `mlp.gate` + per-expert `experts.{j}.{gate,up,down}_proj`; optional shared-expert branch (Qwen1.5-MoE) with sigmoid gate; layer-level sparsity (Qwen3-MoE) via `decoder_sparse_step` + `mlp_only_layers` | Llama set plus `num_experts` or `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`, optional `shared_expert_intermediate_size`, optional `norm_topk_prob`, optional `decoder_sparse_step`, optional `mlp_only_layers` | `verified: tiny-random` — `yujiepan/qwen3-moe-tiny-random` (20 MB, `TinyQwenMoeSafetensorsLoadTests`) and synthetic unit fixtures in `TransformerSafetensorsLoadTests` covering shared-expert + sigmoid-gate paths; `verified: real weights (gated)` — `Qwen15MoeA27B_LoadsAndForwardsEndToEnd_WhenCheckpointPresent` when `DOTLLM_QWEN15_MOE_A27B_CHECKPOINT_PATH` or `C:/temp/dotllm-qwen15-moe-a27b` is present | `LoadQwenMoeLayer` resolves both singular `shared_expert.*` (Qwen1.5-MoE-A2.7B) and plural `shared_experts.{k}.*` (DeepSeek, reused). |
 | IBM Granite-3.x MoE | `Architecture.GraniteMoe` | HF tokenizer.json (BPE + ByteLevel) | RoPE Norm | GQA | yes: fused per-layer `block_sparse_moe.{router.layer, input_linear, output_linear}` | Llama set plus `num_local_experts`, `num_experts_per_tok`, `moe_intermediate_size`. `architectures[0] = GraniteMoeForCausalLM` or `model_type = granitemoe`. | `verified: real weights` (CPU + Vulkan) — `ibm-granite/granite-3.0-3b-a800m-instruct` (6.3 GB, CPU `Granite3Moe_LoadsAndForwardsEndToEnd`; Vulkan `Granite3Moe_VulkanForward_MatchesCpuReference_OnEightDecodeSteps` 3m 56s) | Fused per-expert layout: `input_linear [E, 2*I, H]` packs w1 (rows `[0..I)`) + w3 (rows `[I..2*I)`), `output_linear [E, H, I]` packs w2. Each expert is upcast into its own F32 slab via `AllocPartAsF32`. No shared expert; typical top-k is unusually high (8 of 40). |
+| Alibaba Qwen3MoeHybrid | `Architecture.Qwen3MoeHybrid` | GGUF BPE (via `GgufBpeTokenizerFactory`) | RoPE NeoX (full-attn only) + MultiRope (`ggml_rope_multi`) | Hybrid: Gated DeltaNet (GDN) linear-attention recurrence on 38 of 40 layers + full GQA every 4th layer (`qwen35moe.full_attention_interval`); per-layer GDN state cache `[NVHead, DState, DState]` | yes: 256 routed experts top-8 + a sigmoid-gated shared expert on every layer; expert tensors stored as fused-per-projection (`ffn_{gate,up,down}_exps`) with per-expert byte stride | GGUF `general.architecture = qwen35moe` with `qwen35moe.full_attention_interval`, GDN config (`d_inner`, `n_v_head`, `n_k_head`, `d_state`, `d_conv`), MoE config (`n_routed_experts`, `n_shared_experts`, `n_experts_per_tok`, `expert_feed_forward_length`, `norm_topk_prob`) | **CPU bit-exact vs llama.cpp** — `Qwen3MoeHybridTransformerModelTests` (5/5 synthetic F32: GDN-only / mixed / shared-expert / GDN+full-attn / determinism); real Qwen3.6-35B-A3B-UD-Q6_K_XL GGUF top-1 token ("Ta") matches the `gguf-py` Python reference. **CUDA**: implementation landed (CudaQwen3MoeHybridTransformerModel, CudaGdnStateCache, on-device MoE dispatcher via CudaMoeFfn, F32 KV cache for full-attn layers) — real-GGUF GPU parity test pending hardware (29.6 GiB exceeds local 12 GiB). **Vulkan**: implementation landed (VulkanQwen3MoeHybridTransformerModel + 7 GDN compute shaders, multi-token scan, opt-in resident routed banks via `DOTLLM_VK_MOE_RESIDENT=1`) — real-GGUF parity test pending Strix Halo + glslc. | **GGUF-only** — no HF safetensors path. CPU `Qwen3MoeHybridTransformerModel` consumes the GGUF raw quant view directly (Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16), eliminating the previous ~30 GiB per-forward dequant scratch (commit landed as Step 26). Each layer carries either a `GdnTokenMixingWeights` or a `Qwen3FullAttnWeights` plus a shared `Qwen3MoeLayerWeights`. Refer to `docs/ROADMAP.md` Phase 10 and `.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full architecture map. |
+| HuggingFace SmolLM3 | `Architecture.SmolLM3` | HF tokenizer.json (BPE + ByteLevel) | RoPE NeoX (rotate_half) with optional dense-path YaRN (long-context SKUs) | GQA-4; per-layer `NoPE` gating via `ModelConfig.NoRopeLayers` | no | Llama set plus `no_rope_layers` mask (HF: 1=apply RoPE, 0=skip; surfaced as a SKIP-index list), optional `rope_scaling`. `architectures[0] = SmolLM3ForCausalLM` or `model_type = smollm3`. | `verified: tiny-random (synthetic)` — `SmolLM3SafetensorsLoadTests` synthesises a 4-layer Llama-shaped fixture and exercises three correctness invariants: AllNoPe-bit-identical-across-positions, NoNoPe-positions-affect-logits, and YaRN-at-position-beyond-origMax-diverges-from-baseline. Real-weight HuggingFaceTB/SmolLM3-3B test is gated (`~/.dotllm/test-cache/HuggingFaceTB/SmolLM3-3B/`) and returns early in CI. | Llama-shaped attention + SwiGLU FFN — the new code is the per-layer RoPE skip, the `RoPE.PrecomputeFrequencyTableYarn` wiring for the dense path (`TransformerModel.BuildFromPrebuiltWeightsInternal`), and the SmolLM3-style tool-call parsers (`XmlToolCallParser` + `PythonicToolCallParser`). |
 
-**Row count: 12 / 12 `Architecture` enum variants covered.**
+**Row count: 14 / 14 `Architecture` enum variants covered.**
 
 ## Per-architecture notes
 
@@ -71,12 +74,12 @@ resolved optionally so Qwen2 weights load without Qwen3 tensors and vice
 versa. Small SKUs tie embeddings (`tied_embeddings=true`).
 
 ### DeepSeek legacy (`Architecture.DeepSeek`)
-Placeholder for older `general.architecture = deepseek` / `deepseek2` GGUF
-labels. `TransformerArchitecture.CreateModel` explicitly throws
-`NotSupportedException` because MLA was not wired at the time this enum
-value was introduced. New work targets `DeepSeekV2` / `DeepSeekV3` instead.
-This row exists as a capability claim audit: the enum member is visible
-from the public API but there is no forward path.
+Obsolete placeholder for older `general.architecture = deepseek` GGUF labels.
+`TransformerArchitecture.CreateModel` explicitly throws for this pre-V2
+variant and directs users to `DeepSeekV2` / `DeepSeekV3`, which are the
+supported MLA-based DeepSeek paths. This row exists as a capability claim
+audit: the enum member remains visible for public API and metadata
+compatibility, but it is intentionally not a forward-path claim.
 
 ### DeepSeek-V2 (`Architecture.DeepSeekV2`) and DeepSeek-V3 (`Architecture.DeepSeekV3`)
 MLA attention (see [docs/ATTENTION.md](ATTENTION.md) and
@@ -88,15 +91,13 @@ slice only. MoE side: multi-shared-expert (DeepSeek uses plural
 `mlp.shared_experts.{k}.*` with no sigmoid gate), plus a dense-MLP prefix
 for the first `first_k_dense_replace` layers that is folded into
 `MlpOnlyLayers`. YaRN softmax mscale² correction is applied when
-`rope_scaling.factor > 1` and `mscale_all_dim != 0` (commit `3091944`,
-`MlaConfig.ComputeYarnSoftmaxScaleMultiplier()`); YaRN RoPE frequency
-rescaling is deferred. **Phase A KV-cache** is active: `MlaExpandedKvState`
-stores expanded per-head K_nope / V / shared K_pe across calls (commit
-`6d2dc0b`), so autoregressive decode is no longer the O(N²) re-recompute
-path the PoC was. Phase B (latent `[kv_lora_rank + qk_rope_head_dim]`
-cache + `W_UK` absorption — the ~7× KV-memory win) is the current open
-optimisation; Phase A is its numerical oracle (split-call matches
-single-call within 1e-4).
+`rope_scaling.factor > 1` and `mscale_all_dim != 0`; ramped YaRN frequency
+rescaling is covered by the long-context DeepSeek-V2-Lite reference test.
+**Phase C hybrid latent KV-cache** is the loader default for HF and GGUF:
+prefill keeps Phase-A-equivalent numerics while decode stores compact
+`[kv_lora_rank + qk_rope_head_dim]` latent state and uses the absorbed
+read path. `MlaExpandedKvState` remains the Phase A oracle for tests that
+construct `MlaConfig` directly.
 
 ### NemotronH (`Architecture.NemotronH`)
 Hybrid Mamba-2 SSM + attention per-layer. Loaded **only** from GGUF —
@@ -146,6 +147,101 @@ tensors (`router.layer`, `input_linear`, `output_linear`). The loader
 (`[E, H, I]` — w2), allocating per-expert F32 buffers via `AllocPartAsF32`.
 Unusually high top-k (8 of 40 on the 3B-A800M SKU). No shared expert.
 
+### Qwen3MoeHybrid (`Architecture.Qwen3MoeHybrid`)
+GGUF `qwen35moe` — Alibaba's Gated DeltaNet (GDN) linear-attention + sparse
+MoE hybrid (Qwen3.6-35B-A3B). Each of the 40 layers carries:
+- a token-mixing path: GDN (3 of every 4) or full GQA attention (every 4th
+  layer, set by `qwen35moe.full_attention_interval`),
+- a shared sparse MoE FFN with 256 routed experts (top-8) plus a
+  sigmoid-gated shared expert.
+
+GDN recurrence carries a full `[NVHead, DState, DState]` matrix state
+updated via the delta rule (`GdnStateCache`); the CPU forward path
+short-circuits all 256 routed experts through the GGUF raw quant view
+(Q4_K / Q5_K / Q6_K / Q8_0 / Q5_0 / F32 / F16) without a per-forward
+dequant scratch, parallelising the per-expert work across
+`ComputeThreadPool`. Full-attention layers use a Q+Gate fused projection,
+QK-norm, partial-rotary NeoX MultiRope, GQA SDPA, and a
+sigmoid-gate-on-output before the O projection. CUDA implementation lives
+in `CudaQwen3MoeHybridTransformerModel` with a model-private F16 KV cache
+(F32→F16 staging on write, F16→F32 dequant on read into a shared per-call
+scratch) for the 10 full-attn layers and an on-device MoE dispatcher via
+`CudaMoeFfn`. Vulkan implementation lives in
+`VulkanQwen3MoeHybridTransformerModel` with seven GDN-specific compute
+shaders (`gdn_scan_step_f32`, `gdn_scan_multi_token_f32`,
+`gdn_l2_normalize_heads_f32`, `gdn_post_scan_gate_f32`, `gdn_decay_f32`,
+`sigmoid_inplace_f32`, `sigmoid_gate_mul_f32`) plus an opt-in
+resident-routed-bank mode (`DOTLLM_VK_MOE_RESIDENT=1`). Resident mode
+detects uniformly Q6_K source banks at upload time and dispatches the
+`MoeIndexedMatmulQ6_KF32Kernel` (per-row Q6_K dequant in shader inner loop,
+`moe_indexed_matmul_q6_k_f32.comp`) — required for `Qwen3.6-A3B-UD-Q6_K_XL`
+to fit on Strix Halo (≈25 GB Q6_K-resident vs ≈120 GB F32-resident on the
+128 GB unified-memory part). Non-Q6_K source banks fall back to the F32
+streaming path automatically.
+
+| Quant matrix | CPU | CUDA | Vulkan (streaming) | Vulkan (resident) |
+|---|---|---|---|---|
+| F32 / F16 / BF16 | Yes | Yes | Yes (F32 indexed) | Yes (F32 indexed) |
+| Q4_K / Q5_K / Q8_0 | Yes (raw view) | Yes (on-device dequant) | Yes (F32 dequant + upload) | Falls back to F32 (no Q4_K/Q5_K MoE shader yet) |
+| Q6_K (incl. UD-Q6_K_XL) | Yes (raw view) | Yes (on-device dequant) | Yes (F32 dequant + upload) | **Yes (Q6_K-resident, raw blocks on device)** |
+
+GGUF-only — there is no HF safetensors path because the architecture
+ships as `qwen35moe` only. See `docs/ROADMAP.md` Phase 10 and
+`.planning/notes/qwen35moe-gdeltanet-architecture.md` for the full map.
+
+### SmolLM3 (`Architecture.SmolLM3`)
+Llama-shaped GQA-4 dense transformer with two SmolLM3-specific extensions:
+
+1. **NoPE layers.** The HF config supplies a per-layer 0/1 mask
+   (`no_rope_layers`) where `0` marks layers that skip RoPE entirely
+   (the 3B SKU runs NoPE on layers `3, 7, 11, ..., 35`).
+   `HfConfigExtractor` inverts the mask into the layer indices that
+   SKIP RoPE and stores them on `ModelConfig.NoRopeLayers`;
+   `TransformerModel.Forward` gates the per-layer `RoPE.Execute` call
+   via `Config.IsNoRopeLayer(layer)`. The rest of the GQA pipeline
+   (Q/K/V projections, attention, O-projection) is unchanged. When
+   `NoRopeLayers` is null or empty the gate compiles to a fast-path
+   bool check — non-SmolLM3 models pay no cost.
+2. **Dense-path YaRN.** Long-context SKUs ship `rope_scaling.rope_type
+   = yarn` with `factor > 1` and `original_max_position_embeddings`,
+   lifting the effective context to 128k.
+   `HfConfigExtractor.ExtractDenseRopeScaling` surfaces these onto
+   `RoPEConfig` (`ScalingType=YaRN`, `ScalingFactor`, `OrigMaxSeqLen`,
+   `BetaFast`, `BetaSlow`, `AttnFactor`), and
+   `TransformerModel.BuildFromPrebuiltWeightsInternal` calls
+   `RoPE.PrecomputeFrequencyTableYarn` (the same kernel DeepSeek-V2
+   uses) to rebuild the cos/sin tables. The base 3B checkpoint ships
+   `rope_scaling=null` and routes through the plain precompute path —
+   bit-identical to non-YaRN behaviour.
+
+Tool calling: `XmlToolCallParser` (Hermes-compatible
+`<tool_call>{...}</tool_call>` wrapper, thin alias of
+`HermesToolCallParser`) is the default for `Architecture.SmolLM3`;
+`PythonicToolCallParser` is selected when the chat template references
+`python_tools` but not `xml_tools`. The Pythonic parser converts
+`function_name(arg=value, ...)` expressions to JSON arguments,
+recursing through `str`/`num`/`bool`/`None`/`list`/`dict` literals and
+round-tripping the final object through `System.Text.Json` for
+well-formedness.
+**Vulkan IQ2 family support** (commits `79cca9b` / `743984c` / `9ecce75`)
+unlocks Qwen3.6-A3B-IQ2_M (~11.5 GB GGUF) and IQ2_XXS (~10.8 GB) on
+Strix Halo without 4× F32 expansion at upload — the matmul kernels read
+the on-disk IQ2 bytes directly with shader-side codebook lookup. The
+sibling `MOSTLY_IQ2_M` file-type lands on the same `IQ2_S` block layout
+the kernels accept.
+
+**Vulkan IQ3 family support** (this branch) adds IQ3_XXS (3.0625 bpw,
+98 B / 256 elements) and IQ3_S (3.4375 bpw, 110 B / 256 elements) on
+the same SSBO-codebook pattern as IQ2 — the 1 KB `Iq3XxsGrid` and 2 KB
+`Iq3SGrid` tables are uploaded once per model and shared across the 6
+IQ3 matmul/dequant kernels via `Iq3Codebooks`. CPU dequant + Vulkan
+dequant + GEMV + GEMM are bit-perfect against the ggml-quants.c
+reference (16 parity tests). Upload-path predicates land in
+`VulkanWeights`; per-host matmul dispatch shipped in commits `07f391f`
+(dense), `48d65fe` (Qwen3MoeHybrid), `146d747` (NemotronH), `ad6b853`
+(Mamba3) — IQ3 now usable end-to-end across all 4 Vulkan transformer
+hosts.
+
 ## Legend
 
 | Tag | Meaning |
@@ -154,6 +250,7 @@ Unusually high top-k (8 of 40 on the 3B-A800M SKU). No shared expert.
 | `verified: tiny-random` | A tiny-random HF checkpoint (KB–MB, weights are random but shapes match the architecture) is fetched by the test runner into `~/.dotllm/test-cache/`, config is parsed and asserted, and — where the tiny-random ships usable weights — a forward pass runs. |
 | `verified: tiny-random (synthetic)` | The test builds a deterministic miniature checkpoint on disk at run time because no public tiny-random exists (Mamba-3 is the sole case). |
 | `planned` | Enum variant exists but no working load-and-forward path. Tagged when the loader throws `NotSupportedException` or no dispatch arm covers the variant. |
+| `legacy placeholder` | Public enum value is retained for metadata/API compatibility but is obsolete and intentionally not a supported forward path. |
 
 Evidence citations point to test types under
 [`tests/DotLLM.Tests.Integration/Models/Loaders/`](../tests/DotLLM.Tests.Integration/Models/Loaders/)

@@ -46,7 +46,7 @@ namespace DotLLM.Vulkan;
 /// <b>Ownership.</b> Single-sequence, non-paged. Caller owns disposal.
 /// </para>
 /// </remarks>
-public sealed class VulkanMamba3State : IDisposable
+public sealed class VulkanMamba3State : IMambaState
 {
     private readonly VulkanDevice _device;
     private readonly int _numLayers;

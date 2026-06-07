@@ -1147,7 +1147,8 @@ internal sealed class TransformerWeights : IDisposable
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
         ModelConfig config,
         List<nint> owned,
-        bool skipF32Dequant = false)
+        bool skipF32Dequant = false,
+        bool skipRoutedF32Only = false)
     {
         var moe = config.Moe
             ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
@@ -1176,8 +1177,15 @@ internal sealed class TransformerWeights : IDisposable
         var upDesc = tensors[$"{prefix}.ffn_up_exps.weight"];
         var downDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
 
+        // skipRoutedF32Only is a Qwen3MoeHybrid CPU optimization: skip the F32 dequant of routed
+        // experts (~120 GB at Qwen3.6-35B-A3B scale) but keep shared-expert F32 (always small,
+        // ~10 MB per layer). The caller dequantizes the routed experts on-demand per layer using
+        // the raw-quant view.
+        bool skipRoutedDequant = skipF32Dequant || skipRoutedF32Only;
+        bool skipSharedDequant = skipF32Dequant; // shared stays unless caller asks for full skip
+
         nint[] w1, w3, w2;
-        if (skipF32Dequant)
+        if (skipRoutedDequant)
         {
             // GPU-only callers skip the F32 host dequant of the per-expert
             // 3D tensors — saves ~2.2 GB host RAM per V2-Lite Q4_K_M MoE
@@ -1225,11 +1233,11 @@ internal sealed class TransformerWeights : IDisposable
             var sharedUpDesc = tensors[$"{prefix}.ffn_up_shexp.weight"];
             var sharedDownDesc = tensors[$"{prefix}.ffn_down_shexp.weight"];
 
-            // Single fused shared MLP — small enough that skipping the F32
-            // dequant only saves ~10 MB host RAM per layer (vs ~2.2 GB for
-            // routed experts). Skip when caller asks for it anyway, for
-            // consistency.
-            if (skipF32Dequant)
+            // Single fused shared MLP — small enough that skipping the F32 dequant only saves
+            // ~10 MB host RAM per layer (vs ~2.2 GB for routed experts). With skipRoutedF32Only
+            // we still dequant shared so the CPU MoE kernel can use them directly without a
+            // separate on-the-fly path for the (small) shared branch.
+            if (skipSharedDequant)
             {
                 sharedGate = [(nint)0];
                 sharedUp = [(nint)0];
@@ -1250,8 +1258,22 @@ internal sealed class TransformerWeights : IDisposable
             sharedDownRawQt = sharedDownDesc.QuantizationType;
         }
 
-        // DeepSeek convention: no per-token sigmoid gate on the shared branch.
-        // (HfConfigExtractor + MoeConfig keep HasSharedExpertGate=false here.)
+        // Qwen1.5-MoE / qwen35moe convention: a per-token sigmoid gate scales the shared-expert
+        // output. The tensor key is "ffn_gate_inp_shexp.weight" (shape [hiddenSize], F32-dequant).
+        // DeepSeek-V2/V3 GGUFs don't carry this tensor — the TryGetValue returns null and the
+        // shared branch is added unscaled, preserving the DeepSeek code path unchanged.
+        float[]? sharedExpertGate = null;
+        if (sharedIntermediate > 0
+            && tensors.TryGetValue($"{prefix}.ffn_gate_inp_shexp.weight", out var shGateDesc))
+        {
+            sharedExpertGate = new float[hiddenSize];
+            Dequantize.ToFloat32(
+                dataBase + (nint)shGateDesc.DataOffset,
+                hiddenSize,
+                shGateDesc.QuantizationType,
+                sharedExpertGate);
+        }
+
         return new MoeLayerWeights(
             gate: router,
             w1: w1,
@@ -1266,7 +1288,7 @@ internal sealed class TransformerWeights : IDisposable
             sharedUpProj: sharedUp,
             sharedDownProj: sharedDown,
             sharedIntermediateSize: sharedIntermediate,
-            sharedExpertGate: null,
+            sharedExpertGate: sharedExpertGate,
             gateExpsRaw: gateRaw, gateExpsRawQt: gateDesc.QuantizationType,
             gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
             upExpsRaw: upRaw, upExpsRawQt: upDesc.QuantizationType,

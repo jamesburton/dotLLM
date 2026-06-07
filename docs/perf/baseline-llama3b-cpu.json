@@ -1,0 +1,169 @@
+{
+  "label": "unlabeled",
+  "timestamp": "2026-05-13T14:40:05+00:00",
+  "git": {
+    "commit": "bcace4be49f79cbfbd477590da90da0373ff15ca",
+    "branch": "feature/qwen3.6",
+    "dirty": true
+  },
+  "system": {
+    "cpu": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+    "cores": 22,
+    "os": "Windows 11",
+    "ram_gb": 95.5
+  },
+  "config": {
+    "prompt_size": "short",
+    "max_tokens": 30,
+    "models": [
+      "Llama-3.2-3B-Instruct-Q8_0.gguf"
+    ],
+    "device": "cpu"
+  },
+  "results": [
+    {
+      "engine": "dotLLM",
+      "model": "Llama-3.2-3B-Instruct-Q8_0",
+      "prefill_ms": 642.4223999999999,
+      "decode_ms": 7374.6871,
+      "prefill_tokens": 5,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 7.78304118909926,
+      "decode_tok_per_sec": 3.9323702289687654,
+      "decode_ms_per_tok": 254.2995551724138,
+      "total_tok_per_sec": 4.2409299760718,
+      "bdn_mean_ns": 1797257733.3333333,
+      "bdn_stddev_ns": 217294032.69257852,
+      "median_prefill_tok_per_sec": 6.714178944724125,
+      "median_decode_tok_per_sec": 3.5818525996406,
+      "median_prefill_ms": 744.96165,
+      "median_decode_ms": 8096.92905,
+      "decode_cv": 0.06687921932103967,
+      "prefill_cv": 0.2967031797474224,
+      "all_decode_tok_per_sec": [
+        3.1967748994702485,
+        3.9323702289687654,
+        3.5476369037668625,
+        3.7030600428201432,
+        3.6116445447834025,
+        3.552060654497797
+      ],
+      "all_prefill_tok_per_sec": [
+        2.594867984274892,
+        7.78304118909926,
+        7.227426290370235,
+        6.431102251052996,
+        6.841754461200205,
+        6.586603428248045
+      ],
+      "all_decode_ms": [
+        9071.6428,
+        7374.6871,
+        8174.455500000001,
+        7831.361,
+        8029.5831,
+        8164.275
+      ],
+      "all_prefill_ms": [
+        1926.8803,
+        642.4223999999999,
+        691.8092,
+        777.4716999999999,
+        730.8067,
+        759.1166000000001
+      ]
+    },
+    {
+      "engine": "dotLLM",
+      "model": "Llama-3.2-3B-Instruct-Q8_0",
+      "prefill_ms": 642.4223999999999,
+      "decode_ms": 7374.6871,
+      "prefill_tokens": 5,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 7.78304118909926,
+      "decode_tok_per_sec": 3.9323702289687654,
+      "decode_ms_per_tok": 254.2995551724138,
+      "total_tok_per_sec": 4.2409299760718,
+      "bdn_mean_ns": 8778915266.666666,
+      "bdn_stddev_ns": 162891365.91717604,
+      "median_prefill_tok_per_sec": 6.714178944724125,
+      "median_decode_tok_per_sec": 3.5818525996406,
+      "median_prefill_ms": 744.96165,
+      "median_decode_ms": 8096.92905,
+      "decode_cv": 0.06687921932103967,
+      "prefill_cv": 0.2967031797474224,
+      "all_decode_tok_per_sec": [
+        3.1967748994702485,
+        3.9323702289687654,
+        3.5476369037668625,
+        3.7030600428201432,
+        3.6116445447834025,
+        3.552060654497797
+      ],
+      "all_prefill_tok_per_sec": [
+        2.594867984274892,
+        7.78304118909926,
+        7.227426290370235,
+        6.431102251052996,
+        6.841754461200205,
+        6.586603428248045
+      ],
+      "all_decode_ms": [
+        9071.6428,
+        7374.6871,
+        8174.455500000001,
+        7831.361,
+        8029.5831,
+        8164.275
+      ],
+      "all_prefill_ms": [
+        1926.8803,
+        642.4223999999999,
+        691.8092,
+        777.4716999999999,
+        730.8067,
+        759.1166000000001
+      ]
+    },
+    {
+      "engine": "llama.cpp",
+      "model": "Llama-3.2-3B-Instruct-Q8_0",
+      "prefill_ms": 803.94,
+      "decode_ms": 13316.44,
+      "prefill_tokens": 6,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 7.46,
+      "decode_tok_per_sec": 2.18,
+      "decode_ms_per_tok": 459.1875862068966,
+      "total_tok_per_sec": 2.478686834207011,
+      "bdn_mean_ns": null,
+      "bdn_stddev_ns": null,
+      "median_prefill_tok_per_sec": 2.82,
+      "median_decode_tok_per_sec": 1.2,
+      "median_prefill_ms": 2124.65,
+      "median_decode_ms": 24201.71,
+      "decode_cv": 0.8102528588600344,
+      "prefill_cv": 0.9265717006883368,
+      "all_decode_tok_per_sec": [
+        1.2,
+        0.23,
+        2.18
+      ],
+      "all_prefill_tok_per_sec": [
+        0.79,
+        2.82,
+        7.46
+      ],
+      "all_decode_ms": [
+        24201.71,
+        124196.31,
+        13316.44
+      ],
+      "all_prefill_ms": [
+        7570.7,
+        2124.65,
+        803.94
+      ]
+    }
+  ]
+}

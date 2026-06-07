@@ -78,6 +78,13 @@ internal static partial class VulkanApi
     [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint vkGetInstanceProcAddr(nint instance, string pName);
 
+    // vkGetDeviceProcAddr — Vulkan 1.0 core. Returns a native function
+    // pointer for a device-level entry point. Used to resolve
+    // vkGetMemoryHostPointerPropertiesEXT for the host-import zero-copy
+    // weight path (VK_EXT_external_memory_host).
+    [LibraryImport(LibName, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint vkGetDeviceProcAddr(nint device, string pName);
+
     // ── Logical device ──────────────────────────────────────────────
 
     [LibraryImport(LibName)]

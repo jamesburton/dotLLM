@@ -108,6 +108,108 @@ public sealed unsafe class FusedOpsTests
             Assert.Equal(scalarResult[i], fusedResult[i], 1e-4f);
     }
 
+    // ──────────────────── GeGLU (tanh) Tests ────────────────────
+    // GeGLU = gelu_tanh(gate) * up; used by Gemma 2 / Gemma 3 MLP blocks
+    // (hidden_activation = "gelu_pytorch_tanh"). Bit-parity-within-tolerance
+    // vs the scalar reference is the contract; absolute floats are also
+    // verified at known inputs against the closed-form formula.
+
+    [Theory]
+    [InlineData(8)]
+    [InlineData(32)]
+    [InlineData(128)]
+    [InlineData(256)]    // exactly one tile
+    [InlineData(257)]    // one tile + 1 (covers tail path)
+    [InlineData(513)]
+    [InlineData(1024)]
+    [InlineData(4096)]
+    public void GeGLUTanh_ScalarMatchesFused(int size)
+    {
+        var rng = new Random(20260513);
+        float[] gate = new float[size];
+        float[] up = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            gate[i] = rng.NextSingle() * 20f - 10f;
+            up[i] = rng.NextSingle() * 20f - 10f;
+        }
+
+        float[] scalarResult = new float[size];
+        float[] fusedResult = new float[size];
+
+        FusedOps.GeGLUTanhScalar(gate, up, scalarResult);
+        FusedOps.GeGLUTanh(gate, up, fusedResult);
+
+        // F32 reorder noise from the polynomial decomposition + TensorPrimitives
+        // accumulation order: 5e-5 relative is comfortably loose.
+        for (int i = 0; i < size; i++)
+            Assert.Equal(scalarResult[i], fusedResult[i], 5e-4f);
+    }
+
+    [Fact]
+    public void GeGLUTanh_ZeroGate_ProducesZero()
+    {
+        float[] gate = [0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f];
+        float[] up = [1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f];
+        float[] result = new float[8];
+
+        FusedOps.GeGLUTanh(gate, up, result);
+
+        // gelu_tanh(0) = 0.5 * 0 * (1 + tanh(0)) = 0  ⇒  result = 0 * up = 0
+        for (int i = 0; i < 8; i++)
+            Assert.Equal(0f, result[i], 1e-6f);
+    }
+
+    /// <summary>
+    /// Sanity check at known input points against the closed-form formula
+    /// <c>gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))</c>.
+    /// Cross-validates that the tiled fused path is computing what the docs claim.
+    /// </summary>
+    [Theory]
+    [InlineData(0.0f, 1.0f, 0.0f)]                     // gelu(0) = 0
+    [InlineData(1.0f, 1.0f, 0.8411919906f)]           // PyTorch torch.nn.functional.gelu(approximate='tanh')(1.0) = 0.8411919906
+    [InlineData(-1.0f, 1.0f, -0.158808009f)]          // gelu(-1) ≈ -0.158808
+    [InlineData(2.0f, 0.5f, 1.954597831f * 0.5f)]     // gelu(2) ≈ 1.954597, times up=0.5
+    public void GeGLUTanh_KnownValues_MatchPyTorchReference(float gateVal, float upVal, float expected)
+    {
+        float[] gate = [gateVal];
+        float[] up = [upVal];
+        float[] result = new float[1];
+
+        FusedOps.GeGLUTanh(gate, up, result);
+
+        Assert.Equal(expected, result[0], 1e-5f);
+    }
+
+    /// <summary>
+    /// In-place aliasing: <c>GeGLUTanh(gate, up, up)</c> must produce the same
+    /// result as <c>GeGLUTanh(gate, up_copy, fresh)</c>. Mirrors the SwiGLU
+    /// alias-snapshot contract.
+    /// </summary>
+    [Fact]
+    public void GeGLUTanh_InPlace_AliasingUp_ProducesCorrectResult()
+    {
+        var rng = new Random(7);
+        const int size = 512;
+        float[] gate = new float[size];
+        float[] up = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            gate[i] = rng.NextSingle() * 4f - 2f;
+            up[i] = rng.NextSingle() * 4f - 2f;
+        }
+        float[] upCopy = (float[])up.Clone();
+
+        float[] freshResult = new float[size];
+        FusedOps.GeGLUTanh(gate, upCopy, freshResult);
+
+        // In-place: result aliases up.
+        FusedOps.GeGLUTanh(gate, up, up);
+
+        for (int i = 0; i < size; i++)
+            Assert.Equal(freshResult[i], up[i], 1e-5f);
+    }
+
     // ──────────────────── RmsNormQuantize Q8_0 Tests ────────────────────
 
     [Theory]

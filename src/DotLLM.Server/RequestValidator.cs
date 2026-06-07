@@ -53,8 +53,6 @@ public static class RequestValidator
         string prompt, ITokenizer tokenizer, int maxSequenceLength,
         int requestedMaxTokens, out int effectiveMaxTokens, out int promptTokenCount)
     {
-        // TODO: BpeTokenizer.CountTokens currently delegates to Encode().Length (same allocation).
-        // When a streaming/counting-only tokenizer path is added, this will benefit automatically.
         promptTokenCount = tokenizer.CountTokens(prompt);
 
         if (promptTokenCount >= maxSequenceLength)

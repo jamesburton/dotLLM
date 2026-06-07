@@ -637,6 +637,8 @@ All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaun
 | Dequant Q4_K | `dequant.cu` | `dequant_q4_k_f16` |
 | Dequant Q5_K | `dequant.cu` | `dequant_q5_k_f16` |
 | Dequant Q6_K | `dequant.cu` | `dequant_q6_k_f16` |
+| Dequant IQ4_NL / IQ4_XS | `dequant_iquants.cu` | `dequant_iq4_{nl,xs}_{f16,f32}` |
+| Dequant IQ2_XXS / IQ2_XS / IQ2_S | `iq2.cu` | `dequant_iq2_{xxs,xs,s}_{f16,f32}` (IQ2_S also stores `MOSTLY_IQ2_M` file-type tensors) |
 
 **Quantized GEMV (decode path — operate directly on quantized weights):**
 
@@ -652,6 +654,8 @@ All kernels compiled to PTX, loaded via `cuModuleLoadData`, launched via `cuLaun
 | Q{4,5,6}_K MMVQ-large | `quantized_gemv_mmq.cu` | `quantized_gemv_q*_k_mmvq_large` | dp4a, 1 row/block × 128 threads; default for k≥1024 (paired with `_preq` variants) |
 | Q{4,5,6}_K MMQ/MMVQ `_preq` | `quantized_gemv_mmq.cu` | `*_preq` suffix | Read pre-quantized x from scratch; skips Stage 1 input quant |
 | Pre-Q8_1 input quant | `quantize_x.cu` | `quantize_x_to_q8_1` | Quantizes activation x[k] once per fused-GEMV-input — feeds the `_preq` variants. Auto-engages for k≥1024 |
+| IQ4_NL / IQ4_XS GEMV | `quantized_gemv.cu` | `quantized_gemv_iq4_{nl,xs}` | FP fmuladd, legacy |
+| IQ2_XXS / IQ2_XS / IQ2_S GEMV | `iq2.cu` | `quantized_gemv_iq2_{xxs,xs,s}` | 2-bit codebook-lookup decode; one block per output row; warp-reduction accumulator. IQ2_S handles `MOSTLY_IQ2_M` GGUFs (Qwen3.6-A3B-IQ2_M ~11.5 GB). MMQ-preq / MMVQ-large / MoE-grouped variants deferred — prefill falls back to dequant→cuBLAS via `dequant_iq2_*_f32`. |
 
 **Embedding lookup (per-row dequant, no full-table FP16):**
 

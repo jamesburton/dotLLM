@@ -5,8 +5,11 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Engine.Scheduler;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
+using DotLLM.Server.RateLimiting;
+using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 
@@ -127,6 +130,7 @@ public static class ServerStartup
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
+        PrefixTrieManager? prefixTrieManager = null;
         if (model is DotLLM.Cuda.CudaTransformerModel cudaModel)
         {
             if (options.UsePaged)
@@ -146,7 +150,9 @@ public static class ServerStartup
             pagedFactory = new PagedKvCacheFactory(
                 config.NumLayers, config.NumKvHeads, config.HeadDim);
             kvFactory = (cfg, size) => pagedFactory.Create(size);
-            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation)");
+            // Cross-request prefix cache (Step 37). Enabled in tandem with paged.
+            prefixTrieManager = new PrefixTrieManager(pagedFactory);
+            Console.WriteLine("[dotllm] Using paged KV-cache (block-based allocation) with cross-request prefix cache");
         }
         else if (options.UsePaged && kvConfig.IsQuantized)
         {
@@ -196,11 +202,28 @@ public static class ServerStartup
         }
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
-            draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates);
+            draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
+            prefixTrieManager: prefixTrieManager);
 
         // Warm-up: JIT pre-compilation + CUDA kernel loading
         WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
+
+        // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
+        // decoding is off — the scheduler doesn't support draft models in this iteration, and
+        // GPU/hybrid models keep their existing single-request path until the IModel.ForwardBatch
+        // override lands in those backends.
+        ContinuousBatchSchedulerService? scheduler = null;
+        if (pagedFactory is not null && kvFactory is not null && draftModel is null)
+        {
+            scheduler = new ContinuousBatchSchedulerService(
+                model,
+                tokenizer,
+                kvFactory,
+                options: null,
+                pagedPool: pagedFactory.Pool);
+            Console.WriteLine("[dotllm] Continuous-batch scheduler active");
+        }
 
         return new ServerState
         {
@@ -211,11 +234,13 @@ public static class ServerStartup
             KvCacheFactory = kvFactory,
             PagedFactory = pagedFactory,
             PrefixCache = prefixCache,
+            PrefixTrieManager = prefixTrieManager,
             IsReady = true,
             Model = model,
             Tokenizer = tokenizer,
             ChatTemplate = chatTemplate,
             Generator = generator,
+            Scheduler = scheduler,
             LoadedModelPath = resolvedPath,
             CurrentGguf = gguf,
             DraftModel = draftModel,
@@ -244,13 +269,54 @@ public static class ServerStartup
         builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
             p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
 
+        // Rate limiting — only wired when enabled in config. The manager and
+        // resolver are singletons; the middleware is registered later in the
+        // pipeline (below). When disabled this is a pure no-op.
+        var rateLimitConfig = state.Options.RateLimit;
+        if (rateLimitConfig is { Enabled: true })
+        {
+            var manager = new RateLimitManager(rateLimitConfig);
+            state.RateLimitManager = manager;
+            builder.Services.AddSingleton(manager);
+            builder.Services.AddSingleton<IApiKeyResolver, HeaderApiKeyResolver>();
+        }
+
         // Keep only warning+ logging to avoid noisy request logs
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+
+        // OpenTelemetry — opt-in via the standard OTEL_EXPORTER_OTLP_ENDPOINT env var.
+        // No listener means EngineTelemetry stays zero-overhead.
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT")))
+        {
+            builder.Services.AddDotLLMOpenTelemetry(state.Options.ModelId);
+        }
 
         var app = builder.Build();
         app.UseDeveloperExceptionPage();
         app.UseCors();
+
+        if (state.RateLimitManager is { } rlm)
+        {
+            var resolver = app.Services.GetRequiredService<IApiKeyResolver>();
+            app.UseDotLLMRateLimiting(rlm, resolver);
+        }
+
         app.MapDotLLMEndpoints(serveUi);
+
+        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
+        // the host shuts down. Stopped earlier in SwapModelAsync when the model is swapped.
+        if (state.Scheduler is { } scheduler)
+        {
+            var loopCts = new CancellationTokenSource();
+            state.SchedulerLoopCts = loopCts;
+            state.SchedulerLoopTask = Task.Run(() => scheduler.RunLoopAsync(loopCts.Token));
+
+            var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+            lifetime.ApplicationStopping.Register(() =>
+            {
+                try { loopCts.Cancel(); } catch { /* already disposed */ }
+            });
+        }
 
         return app;
     }

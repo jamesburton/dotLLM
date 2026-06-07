@@ -30,6 +30,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _perHeadRmsNormModule;
     private readonly CudaModule _convertModule;
     private readonly CudaModule _dequantModule;
+    private readonly CudaModule? _dequantIQuantsModule;
     private readonly CudaModule _quantizedGemvModule;
     private readonly CudaModule _fusedAddRmsNormModule;
     private readonly CudaModule _rmsnormF32InModule;
@@ -47,12 +48,16 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmqFunc;
     private readonly nint _quantizedGemvQ5_KMmqFunc;
     private readonly nint _quantizedGemvQ6_KMmqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmqFunc;
     // MMVQ-large variants — 1 row per CUDA block, 128 threads (4 warps).
     // Tuned for k≥1024 (≥4 super-blocks/row); fall back to MMQ-4-rows for smaller k.
     private readonly nint _quantizedGemvQ2_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmvqLargeFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmvqLargeFunc;
     // Pre-Q8_1 variants. Read INT8/dx/sx2 from device-resident scratch (populated
     // once per fused projection group via _quantizeXToQ8_1Func) instead of
     // re-quantizing the input inside every CUDA block. Eliminates the redundant
@@ -63,10 +68,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ6_KMmqPreqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmqPreqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmqPreqFunc;
     private readonly nint _quantizedGemvQ2_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargePreqFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvIQ4_NLMmvqLargePreqFunc;
+    private readonly nint _quantizedGemvIQ4_XSMmvqLargePreqFunc;
     /// <summary>
     /// Device's maximum opt-in dynamic shared-memory bytes per block (queried once at
     /// kernel-load via CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN). The
@@ -112,6 +121,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ5_0Func;
     private readonly nint _quantizedGemvQ5_KFunc;
     private readonly nint _quantizedGemvQ6_KFunc;
+    private readonly nint _quantizedGemvIQ4_NLFunc;
+    private readonly nint _quantizedGemvIQ4_XSFunc;
     private readonly nint _dequantQ8_0Func;
     private readonly nint _dequantQ4_0Func;
     private readonly nint _dequantQ4_1Func;
@@ -121,7 +132,27 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantQ3_KFunc;
     private readonly nint _dequantQ4_KFunc;
     private readonly nint _dequantQ5_KFunc;
+    private readonly nint _dequantQ5_KF32Func;
     private readonly nint _dequantQ6_KFunc;
+    private readonly nint _dequantIQ4_NLFunc;
+    private readonly nint _dequantIQ4_XSFunc;
+    private readonly nint _dequantIQ4_NLF32Func;
+    private readonly nint _dequantIQ4_XSF32Func;
+
+    // IQ2 family (iq2.ptx). Each format ships a F16 dequant, a F32 dequant, and a
+    // legacy per-row quantized GEMV. IQ2_S doubles as the on-disk format for the
+    // MOSTLY_IQ2_M file-type recipe. MMQ / MMVQ-large / MoE-grouped variants are
+    // deferred — prefill falls back to dequant+cuBLAS for IQ2 weights.
+    private readonly CudaModule? _iq2Module;
+    private readonly nint _dequantIQ2_XXSFunc;
+    private readonly nint _dequantIQ2_XSFunc;
+    private readonly nint _dequantIQ2_SFunc;
+    private readonly nint _dequantIQ2_XXSF32Func;
+    private readonly nint _dequantIQ2_XSF32Func;
+    private readonly nint _dequantIQ2_SF32Func;
+    private readonly nint _quantizedGemvIQ2_XXSFunc;
+    private readonly nint _quantizedGemvIQ2_XSFunc;
+    private readonly nint _quantizedGemvIQ2_SFunc;
     private readonly CudaModule? _quantKvModule;
     private readonly nint _quantKvQ8_0Func;
     private readonly nint _quantKvQ4_0Func;
@@ -220,6 +251,41 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeGroupedGemvQ5_KFunc;
     private readonly nint _moeGroupedGemvQ6_KFunc;
     private readonly nint _moeGroupedGemvQ8_0Func;
+    private readonly nint _moeGroupedGemvIQ4_NLFunc;
+    private readonly nint _moeGroupedGemvIQ4_XSFunc;
+
+    // ── Qwen3MoeHybrid recurrence-path kernels (F32) ─────────────────────────
+    // Optional kernels backing the Gated DeltaNet (GDN) recurrence and the post-
+    // attention sigmoid-gate used by Qwen3MoeHybrid models. Each is a numerically
+    // equivalent FP32 port of the CPU reference in DotLLM.Cpu.Kernels
+    // (Conv1dCausal, GatedDeltaNetScan) / Qwen3MoeHybridTransformerModel forward
+    // body. All call expf/logf — compiled with -fmad=false (see build_ptx.bat
+    // NO_FMA list and DotLLM.Cuda.csproj FmadFlag metadata) to disable FMA
+    // fusion. Numerical accuracy against the CPU oracle is within ≤1 ULP per
+    // element on Ampere+; not strictly bit-equal across all inputs (CUDA's
+    // precise expf is not guaranteed bit-identical to MathF.Exp), but matches
+    // the CPU oracle's existing host fallback to within negligible tolerance.
+    //   • conv1d_causal_f32        — depthwise causal 1-D convolution
+    //   • gdn_scan_step_f32        — per-token GDN recurrence step (host loops over seqLen)
+    //   • l2_normalize_heads_f32   — in-place per-head L2 normalisation (pre-scan)
+    //   • gdn_decay_f32            — fused softplus + exp for the per-token decay g
+    //   • sigmoid_f32              — in-place elementwise sigmoid
+    //   • silu_f32                 — in-place elementwise SiLU
+    //   • sigmoid_mul_f32          — out[i] *= sigmoid(b[i])
+    // PTX may be absent on stale builds; the Has* properties report false and
+    // callers fall back to the host-side path or surface an error.
+    private readonly CudaModule? _conv1dCausalF32Module;
+    private readonly nint _conv1dCausalF32Func;
+    private readonly CudaModule? _gdnScanF32Module;
+    private readonly nint _gdnScanStepF32Func;
+    private readonly CudaModule? _l2NormHeadsF32Module;
+    private readonly nint _l2NormHeadsF32Func;
+    private readonly nint _gdnDecayF32Func;
+    private readonly CudaModule? _elementwiseF32Module;
+    private readonly nint _sigmoidF32Func;
+    private readonly nint _siluF32Func;
+    private readonly nint _sigmoidMulF32Func;
+    private readonly nint _dequantQ6_KF32Func;
 
 
     /// <summary>
@@ -262,6 +328,8 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ2_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq");
             _quantizedGemvQ5_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq");
             _quantizedGemvQ6_KMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq");
+            _quantizedGemvIQ4_NLMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmq");
+            _quantizedGemvIQ4_XSMmqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmq");
             // MMVQ-large variants (k≥1024). TryGetFunction so a stale PTX without the
             // new kernels still loads — HasMmvqLarge* will report false and the dispatcher
             // will fall back to the MMQ-4-rows path.
@@ -269,16 +337,22 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
             _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
+            _quantizedGemvIQ4_NLMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large");
+            _quantizedGemvIQ4_XSMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large");
             // Pre-quantized GEMV variants (consume scratch from quantize_x.ptx kernel).
             // TryGetFunction so a stale PTX without the new symbols still loads.
             _quantizedGemvQ2_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmq_preq");
             _quantizedGemvQ4_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmq_preq");
             _quantizedGemvQ5_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmq_preq");
             _quantizedGemvQ6_KMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmq_preq");
+            _quantizedGemvIQ4_NLMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmq_preq");
+            _quantizedGemvIQ4_XSMmqPreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmq_preq");
             _quantizedGemvQ2_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmvq_large_preq");
             _quantizedGemvQ4_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large_preq");
             _quantizedGemvQ5_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large_preq");
             _quantizedGemvQ6_KMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large_preq");
+            _quantizedGemvIQ4_NLMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large_preq");
+            _quantizedGemvIQ4_XSMmvqLargePreqFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_xs_mmvq_large_preq");
 
             // The on-the-fly MMQ kernels size their per-chunk Stage 1 scratch (s_xq/s_dx/s_sx[2])
             // dynamically from `k`. For k up to ~12 KiB-shmem-worth (Qwen3-8B intermediate=12288)
@@ -297,10 +371,14 @@ public sealed unsafe class CudaKernels : IDisposable
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmqFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmvqLargeFunc, optIn);
             }
         }
 
@@ -351,6 +429,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvQ5_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q5_0");
         _quantizedGemvQ5_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q5_k");
         _quantizedGemvQ6_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q6_k");
+        _quantizedGemvIQ4_NLFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_iq4_nl");
+        _quantizedGemvIQ4_XSFunc = _quantizedGemvModule.TryGetFunction("quantized_gemv_iq4_xs");
         _dequantQ8_0Func = _dequantModule.GetFunction("dequant_q8_0_f16");
         _dequantQ4_0Func = _dequantModule.GetFunction("dequant_q4_0_f16");
         _dequantQ4_1Func = _dequantModule.TryGetFunction("dequant_q4_1_f16");
@@ -362,7 +442,39 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantQ3_KFunc = _dequantModule.TryGetFunction("dequant_q3_k_f16");
         _dequantQ4_KFunc = _dequantModule.GetFunction("dequant_q4_k_f16");
         _dequantQ5_KFunc = _dequantModule.GetFunction("dequant_q5_k_f16");
+        _dequantQ5_KF32Func = _dequantModule.TryGetFunction("dequant_q5_k_f32");
         _dequantQ6_KFunc = _dequantModule.GetFunction("dequant_q6_k_f16");
+        // F32 sibling for Q6_K — optional, falls back to a NotSupportedException
+        // in LaunchDequantToF32 if absent on a stale PTX.
+        _dequantQ6_KF32Func = _dequantModule.TryGetFunction("dequant_q6_k_f32");
+
+        string dequantIQuantsPath = Path.Combine(ptxDir, "dequant_iquants.ptx");
+        if (File.Exists(dequantIQuantsPath))
+        {
+            _dequantIQuantsModule = CudaModule.LoadFromFile(dequantIQuantsPath);
+            _dequantIQ4_NLFunc = _dequantIQuantsModule.TryGetFunction("dequant_iq4_nl_f16");
+            _dequantIQ4_XSFunc = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f16");
+            _dequantIQ4_NLF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_nl_f32");
+            _dequantIQ4_XSF32Func = _dequantIQuantsModule.TryGetFunction("dequant_iq4_xs_f32");
+        }
+
+        // IQ2 module bundles the 2-bit dequant + GEMV kernels (iq2_xxs / iq2_xs / iq2_s).
+        // Optional: older PTX builds may pre-date this kernel, so the file is allowed to be
+        // absent. Each function pointer is independently nullable so partial loads still work.
+        string iq2Path = Path.Combine(ptxDir, "iq2.ptx");
+        if (File.Exists(iq2Path))
+        {
+            _iq2Module = CudaModule.LoadFromFile(iq2Path);
+            _dequantIQ2_XXSFunc = _iq2Module.TryGetFunction("dequant_iq2_xxs_f16");
+            _dequantIQ2_XSFunc = _iq2Module.TryGetFunction("dequant_iq2_xs_f16");
+            _dequantIQ2_SFunc = _iq2Module.TryGetFunction("dequant_iq2_s_f16");
+            _dequantIQ2_XXSF32Func = _iq2Module.TryGetFunction("dequant_iq2_xxs_f32");
+            _dequantIQ2_XSF32Func = _iq2Module.TryGetFunction("dequant_iq2_xs_f32");
+            _dequantIQ2_SF32Func = _iq2Module.TryGetFunction("dequant_iq2_s_f32");
+            _quantizedGemvIQ2_XXSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xxs");
+            _quantizedGemvIQ2_XSFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_xs");
+            _quantizedGemvIQ2_SFunc = _iq2Module.TryGetFunction("quantized_gemv_iq2_s");
+        }
 
         // KV-cache quantization (optional — PTX may not be compiled yet)
         string quantKvPath = Path.Combine(ptxDir, "quant_kv.ptx");
@@ -467,6 +579,43 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeGroupedGemvQ5_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q5_k_f16");
             _moeGroupedGemvQ6_KFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q6_k_f16");
             _moeGroupedGemvQ8_0Func = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_q8_0_f16");
+            _moeGroupedGemvIQ4_NLFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_nl_f16");
+            _moeGroupedGemvIQ4_XSFunc = _moeGroupedGemvModule.TryGetFunction("moe_grouped_gemv_iq4_xs_f16");
+        }
+
+        // Qwen3MoeHybrid recurrence-path kernels (optional — present only when
+        // the GDN/conv1d CUDA path has been built). Each .cu file compiles to
+        // a separate .ptx; build_ptx.bat auto-globs native/kernels/*.cu so no
+        // script change is required.
+        string conv1dCausalF32Path = Path.Combine(ptxDir, "conv1d_causal.ptx");
+        if (File.Exists(conv1dCausalF32Path))
+        {
+            _conv1dCausalF32Module = CudaModule.LoadFromFile(conv1dCausalF32Path);
+            _conv1dCausalF32Func = _conv1dCausalF32Module.TryGetFunction("conv1d_causal_f32");
+        }
+
+        string gdnScanF32Path = Path.Combine(ptxDir, "gated_delta_net_scan.ptx");
+        if (File.Exists(gdnScanF32Path))
+        {
+            _gdnScanF32Module = CudaModule.LoadFromFile(gdnScanF32Path);
+            _gdnScanStepF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32");
+            // The L2-norm and decay helpers live in the same .cu translation unit,
+            // so they are in the same .ptx module — query each function pointer here.
+            _l2NormHeadsF32Module = _gdnScanF32Module;
+            _l2NormHeadsF32Func = _gdnScanF32Module.TryGetFunction("l2_normalize_heads_f32");
+            _gdnDecayF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_f32");
+        }
+
+        // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
+        // attention gating and the Qwen3MoeHybrid GDN body. Optional — TryGetFunction
+        // so a stale PTX still loads gracefully and HasElementwiseF32 reports false.
+        string elementwiseF32Path = Path.Combine(ptxDir, "elementwise_f32.ptx");
+        if (File.Exists(elementwiseF32Path))
+        {
+            _elementwiseF32Module = CudaModule.LoadFromFile(elementwiseF32Path);
+            _sigmoidF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_f32");
+            _siluF32Func = _elementwiseF32Module.TryGetFunction("silu_f32");
+            _sigmoidMulF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_mul_f32");
         }
     }
 
@@ -504,6 +653,29 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
 
+    /// <summary>
+    /// True when all Qwen3MoeHybrid recurrence-path FP32 kernels (causal conv1d,
+    /// per-token GDN scan step, per-head L2 normalize) are available. Required
+    /// by the CUDA Qwen3MoeHybrid forward path.
+    /// </summary>
+    public bool HasGdnKernels =>
+        _conv1dCausalF32Func != 0 && _gdnScanStepF32Func != 0 && _l2NormHeadsF32Func != 0;
+
+    /// <summary>
+    /// True when the fused GDN decay kernel (softplus + exp) is available on the
+    /// loaded gated_delta_net_scan.ptx module. When false, callers must use the
+    /// host-side fallback that D2Hs / H2Ds alpha.
+    /// </summary>
+    public bool HasGdnDecayF32 => _gdnDecayF32Func != 0;
+
+    /// <summary>
+    /// True when all three FP32 pointwise activations (sigmoid, silu, sigmoid_mul)
+    /// are loaded from elementwise_f32.ptx. When false, the Qwen3MoeHybrid forward
+    /// path must keep its host-side fallbacks.
+    /// </summary>
+    public bool HasElementwiseF32 =>
+        _sigmoidF32Func != 0 && _siluF32Func != 0 && _sigmoidMulF32Func != 0;
+
     /// <summary>True when the Phase-B Q2_K grouped-GEMV kernel is loaded (PTX present).</summary>
     /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
     /// fallback for A/B comparison.</remarks>
@@ -528,10 +700,36 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasMoeGroupedGemvQ8_0 =>
         _moeGroupedGemvQ8_0Func != 0 && !DisableMoeGroupedGemv;
 
+    /// <summary>True when the MoE grouped IQ4_NL GEMV kernel is loaded and enabled.</summary>
+    public bool HasMoeGroupedGemvIQ4_NL =>
+        _moeGroupedGemvIQ4_NLFunc != 0 && !DisableMoeGroupedGemv;
+
+    /// <summary>True when the MoE grouped IQ4_XS GEMV kernel is loaded and enabled.</summary>
+    public bool HasMoeGroupedGemvIQ4_XS =>
+        _moeGroupedGemvIQ4_XSFunc != 0 && !DisableMoeGroupedGemv;
+
     /// <summary>Disable the Phase-B grouped-GEMV path. Forces the per-expert
     /// <see cref="LaunchQuantizedGemv"/> fallback in <see cref="CudaMoeFfn"/>.</summary>
     public static bool DisableMoeGroupedGemv { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MOE_GROUPED_GEMV") == "1";
+
+    /// <summary>Force direct GEMV path, disabling MMQ and MMVQ-Large variants.
+    /// Useful for diagnostics to isolate dequant vs advanced GEMV kernels.
+    /// Set environment variable DOTLLM_FORCE_DIRECT_GEMV=1 to enable.</summary>
+    public static bool ForceDirectGemv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_FORCE_DIRECT_GEMV") == "1";
+
+    /// <summary>Force dequant-then-cuBLAS fallback instead of quantized GEMV.</summary>
+    public static bool DisableQuantizedGemv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_QUANTIZED_GEMV") == "1";
+
+    /// <summary>Disable decode-time packed QKV upload/dispatch for diagnostics.</summary>
+    public static bool DisablePackedQkv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PACKED_QKV") == "1";
+
+    /// <summary>Disable decode-time packed Gate/Up upload/dispatch for diagnostics.</summary>
+    public static bool DisablePackedGateUp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PACKED_GATEUP") == "1";
 
     /// <summary>True when a grouped-GEMV kernel is available for the given quant type.</summary>
     public bool HasMoeGroupedGemv(QuantizationType qt) => qt switch
@@ -541,6 +739,8 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q5_K => HasMoeGroupedGemvQ5K,
         QuantizationType.Q6_K => HasMoeGroupedGemvQ6K,
         QuantizationType.Q8_0 => HasMoeGroupedGemvQ8_0,
+        QuantizationType.IQ4_NL => HasMoeGroupedGemvIQ4_NL,
+        QuantizationType.IQ4_XS => HasMoeGroupedGemvIQ4_XS,
         _ => false,
     };
 
@@ -687,6 +887,32 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>
+    /// Translates the public C# <see cref="DotLLM.Core.Configuration.RoPEType"/>
+    /// enum to the integer encoding the CUDA RoPE kernels expect.
+    /// </summary>
+    /// <remarks>
+    /// The C# enum is a public API surface (used by <c>RoPEConfig</c>) and
+    /// historically encodes <c>Norm = 0</c>, <c>NeoX = 2</c>. The CUDA kernels
+    /// in <c>native/kernels/rope_f32.cu</c>, <c>rope.cu</c>, and
+    /// <c>fused_rope_kv_write.cu</c> encode the pair pattern as <c>0 = GPT-J /
+    /// Norm interleaved</c>, <c>1 = NeoX / rotate-half</c>. Casting the C#
+    /// enum value straight to <see cref="int"/> would feed <c>NeoX == 2</c>
+    /// into the kernel which falls into the "anything but 1 → interleaved"
+    /// branch — silently running Qwen / Phi (NeoX) models with the GPT-J
+    /// rotation pattern. This translator is the single chokepoint that maps
+    /// between the two conventions. The Vulkan and CPU paths consume the
+    /// <see cref="DotLLM.Core.Configuration.RoPEType"/> enum directly so this
+    /// helper is CUDA-only.
+    /// </remarks>
+    /// <param name="type">The element-pairing convention from <see cref="DotLLM.Core.PositionEncoding.RoPEConfig"/>.</param>
+    /// <returns><c>0</c> for <see cref="DotLLM.Core.Configuration.RoPEType.Norm"/>, <c>1</c> for <see cref="DotLLM.Core.Configuration.RoPEType.NeoX"/>.</returns>
+    public static int ToCudaRopeType(DotLLM.Core.Configuration.RoPEType type) => type switch
+    {
+        DotLLM.Core.Configuration.RoPEType.NeoX => 1,
+        _ => 0,
+    };
+
     /// <summary>FP32 RoPE: in-place rotation on FP32 Q and K.</summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
@@ -775,6 +1001,259 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_perHeadRmsNormF32Func,
                 (uint)(seqLen * numHeads), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Depthwise causal 1-D convolution (FP32). Bit-perfect port of the CPU
+    /// <c>Conv1dCausal.ExecuteScalar</c> reference.
+    /// </summary>
+    /// <param name="input">
+    /// Device pointer to <c>[d_conv-1+seqLen, channels]</c> FP32 input, row-major.
+    /// Caller must prepend the cached <c>conv_state</c> (d_conv-1 rows) before
+    /// the new activations.
+    /// </param>
+    /// <param name="weight">
+    /// Device pointer to <c>[d_conv, channels]</c> FP32 weight in GGUF
+    /// channel-major layout: element (k, c) at <c>c * d_conv + k</c>.
+    /// </param>
+    /// <param name="bias">
+    /// Device pointer to per-channel FP32 bias (<c>channels</c> elements). Pass
+    /// a zero-filled buffer when the model has no bias — the add is unconditional.
+    /// </param>
+    /// <param name="output">
+    /// Device pointer to <c>[seqLen, channels]</c> FP32 output, row-major.
+    /// </param>
+    /// <param name="dConv">Convolution kernel width (4 for Qwen3MoeHybrid).</param>
+    /// <param name="channels">Number of channels (depthwise width).</param>
+    /// <param name="seqLen">Number of output time steps.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchConv1dCausalF32(nint input, nint weight, nint bias, nint output,
+                                        int dConv, int channels, int seqLen, nint stream)
+    {
+        nint inArg = input, wArg = weight, bArg = bias, outArg = output;
+        int dcArg = dConv, chArg = channels, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&inArg, &wArg, &bArg, &outArg,
+                        &dcArg, &chArg, &slArg};
+
+        int total = seqLen * channels;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_conv1dCausalF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gated DeltaNet (GDN) recurrence — one token step. Bit-perfect port of the
+    /// CPU <c>GatedDeltaNetScan.Execute</c> per-token inner body. The host loops
+    /// over <c>seqLen</c> and calls this once per token, advancing the
+    /// <paramref name="qT"/>/<paramref name="kT"/>/<paramref name="vT"/>/<paramref name="gT"/>/<paramref name="betaT"/>/<paramref name="outputT"/>
+    /// pointers by one token-stride per call. The recurrence on <paramref name="state"/>
+    /// flows automatically through the in-place update.
+    /// </summary>
+    /// <param name="state">
+    /// Device pointer to <c>[nVHead, dState, dState]</c> FP32 state matrix
+    /// (row-major: <c>S[vh, row, col]</c>, row = key dim, col = value dim).
+    /// Updated in place.
+    /// </param>
+    /// <param name="qT">Device pointer to this token's Q vectors, <c>[nKHead, dState]</c>. Caller must have L2-normalised per head.</param>
+    /// <param name="kT">Device pointer to this token's K vectors, <c>[nKHead, dState]</c>. Caller must have L2-normalised per head.</param>
+    /// <param name="vT">Device pointer to this token's V vectors, <c>[nVHead, dState]</c>.</param>
+    /// <param name="gT">Device pointer to this token's per-head decay scalars, <c>[nVHead]</c>.</param>
+    /// <param name="betaT">Device pointer to this token's per-head write-gate scalars, <c>[nVHead]</c>.</param>
+    /// <param name="outputT">Device pointer to this token's output, <c>[nVHead, dState]</c>. Overwritten.</param>
+    /// <param name="nVHead">Number of value heads.</param>
+    /// <param name="nKHead">Number of key heads (must divide <paramref name="nVHead"/> evenly).</param>
+    /// <param name="dState">
+    /// Per-head state dimension. The kernel launches with <c>blockDim.x == dState</c>
+    /// and is compiled with <c>__launch_bounds__(128)</c>, so the upper bound is
+    /// 128 — the universal Qwen3MoeHybrid configuration. Larger <c>dState</c> would
+    /// fail launch validation; this method throws on out-of-range values rather than
+    /// silently failing inside <c>cuLaunchKernel</c>.
+    /// </param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="dState"/> is outside (0, 128].
+    /// </exception>
+    public void LaunchGdnScanStepF32(nint state, nint qT, nint kT, nint vT,
+                                       nint gT, nint betaT, nint outputT,
+                                       int nVHead, int nKHead, int dState, nint stream)
+    {
+        if (dState <= 0 || dState > 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; gdn_scan_step_f32 is compiled with __launch_bounds__(128).");
+
+        nint sArg = state, qArg = qT, kArg = kT, vArg = vT;
+        nint gArg = gT, bArg = betaT, oArg = outputT;
+        int nvArg = nVHead, nkArg = nKHead, dsArg = dState;
+
+        void** args = stackalloc void*[] {&sArg, &qArg, &kArg, &vArg,
+                        &gArg, &bArg, &oArg,
+                        &nvArg, &nkArg, &dsArg};
+
+        // Shared memory: k_shared[dState] + q_shared[dState]
+        uint sharedBytes = (uint)(2 * dState * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_gdnScanStepF32Func,
+                (uint)nVHead, 1, 1, (uint)dState, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place per-head L2 normalisation (FP32). Bit-perfect port of the CPU
+    /// <c>GatedDeltaNetScan.L2NormalizeHeads</c> reference — the sum-of-squares
+    /// is computed serially in thread 0 of each block to preserve the CPU's
+    /// 0..dState-1 float-add order exactly.
+    /// </summary>
+    /// <param name="x">
+    /// Device pointer to a flat FP32 buffer of <c>totalHeads × dState</c> elements.
+    /// Each <c>dState</c>-element slice is normalised independently to unit norm.
+    /// </param>
+    /// <param name="totalHeads">Number of head vectors to normalise (e.g. <c>seqLen × nKHead</c>).</param>
+    /// <param name="dState">Dimension of each head vector.</param>
+    /// <param name="eps">Epsilon added to the L2 norm for numerical stability (default 1e-6 in the CPU code).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchL2NormalizeHeadsF32(nint x, int totalHeads, int dState, float eps, nint stream)
+    {
+        if (dState <= 0 || dState > 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; l2_normalize_heads_f32 is compiled with __launch_bounds__(128).");
+
+        nint xArg = x;
+        int thArg = totalHeads, dsArg = dState;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&xArg, &thArg, &dsArg, &epsArg};
+
+        // One block per head; dState threads per block. The kernel's serial-sum
+        // phase runs in thread 0 only, but the broadcast multiply uses all
+        // threads via a grid-stride loop, so blockDim can equal dState exactly.
+        CudaDriverApi.cuLaunchKernel(_l2NormHeadsF32Func,
+                (uint)totalHeads, 1, 1, (uint)dState, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Per-token GDN decay: in place transforms <paramref name="alphaBuf"/> via
+    /// <c>g[t, vh] = exp(softplus(alpha[t, vh] + dt_bias[vh]) * A[vh])</c>, with
+    /// <c>softplus(x) = log(1 + exp(x))</c> (no <c>x &gt; 20</c> short-circuit —
+    /// matches the Qwen3MoeHybrid CPU oracle exactly, see
+    /// <c>Qwen3MoeHybridTransformerModel.ForwardGdnBody</c>).
+    /// </summary>
+    /// <remarks>
+    /// Compiled with <c>-fmad=false</c>; CUDA's precise expf/logf are within
+    /// ≤1 ULP of <see cref="MathF.Exp(float)"/> / <see cref="MathF.Log(float)"/>
+    /// on Ampere+, so the result matches the CPU host fallback to within
+    /// negligible tolerance — not strictly bit-equal across every input, but
+    /// numerically equivalent for any well-conditioned alpha.
+    /// </remarks>
+    /// <param name="alphaBuf">Device pointer to <c>[seqLen, nVHead]</c> FP32, in/out.</param>
+    /// <param name="dtBias">Device pointer to per-head FP32 bias, <c>[nVHead]</c>.</param>
+    /// <param name="a">Device pointer to per-head FP32 decay coefficient, <c>[nVHead]</c>.</param>
+    /// <param name="seqLen">Number of tokens (rows of <paramref name="alphaBuf"/>).</param>
+    /// <param name="nVHead">Number of value heads (columns of <paramref name="alphaBuf"/>).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnDecayF32(nint alphaBuf, nint dtBias, nint a,
+                                    int seqLen, int nVHead, nint stream)
+    {
+        nint alphaArg = alphaBuf, dtArg = dtBias, aArg = a;
+        int slArg = seqLen, nvArg = nVHead;
+
+        void** args = stackalloc void*[] {&alphaArg, &dtArg, &aArg, &slArg, &nvArg};
+
+        int total = seqLen * nVHead;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_gdnDecayF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place elementwise sigmoid: <c>buf[i] = 1 / (1 + exp(-buf[i]))</c>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSigmoidHostFallback</c>.
+    /// </summary>
+    /// <param name="buf">Device pointer to FP32 buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSigmoidF32(nint buf, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; sigmoid_f32 takes an int count to match CUDA driver param size.");
+
+        nint bufArg = buf;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&bufArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_sigmoidF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// In-place elementwise SiLU: <c>buf[i] = buf[i] * sigmoid(buf[i])</c>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSiluHostFallback</c>.
+    /// </summary>
+    /// <param name="buf">Device pointer to FP32 buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSiluF32(nint buf, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; silu_f32 takes an int count to match CUDA driver param size.");
+
+        nint bufArg = buf;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&bufArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_siluF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Elementwise <c>a[i] *= sigmoid(b[i])</c>, in place on <paramref name="a"/>.
+    /// Matches the host fallback at
+    /// <c>CudaQwen3MoeHybridTransformerModel.LaunchSigmoidMulHostFallback</c>.
+    /// </summary>
+    /// <param name="a">Device pointer to FP32 in/out buffer of length <paramref name="n"/>.</param>
+    /// <param name="b">Device pointer to FP32 gate buffer of length <paramref name="n"/>.</param>
+    /// <param name="n">Number of elements.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchSigmoidMulF32(nint a, nint b, long n, nint stream)
+    {
+        if (n <= 0) return;
+        if (n > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(n),
+                $"n={n}; sigmoid_mul_f32 takes an int count to match CUDA driver param size.");
+
+        nint aArg = a, bArg = b;
+        int nArg = (int)n;
+
+        void** args = stackalloc void*[] {&aArg, &bArg, &nArg};
+
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_sigmoidMulF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -1248,6 +1727,11 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.Q5_0 => _quantizedGemvQ5_0Func,
             QuantizationType.Q5_K => _quantizedGemvQ5_KFunc,
             QuantizationType.Q6_K => _quantizedGemvQ6_KFunc,
+            QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLFunc,
+            QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSFunc,
+            QuantizationType.IQ2_XXS => _quantizedGemvIQ2_XXSFunc,
+            QuantizationType.IQ2_XS => _quantizedGemvIQ2_XSFunc,
+            QuantizationType.IQ2_S => _quantizedGemvIQ2_SFunc,
             _ => 0
         };
 
@@ -1265,7 +1749,37 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool HasQuantizedGemv(QuantizationType qt) =>
         qt is QuantizationType.Q8_0 or QuantizationType.Q4_K or QuantizationType.Q5_0
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K;
+            or QuantizationType.Q2_K
+            or QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+            or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
+
+    /// <summary>
+    /// True when the legacy per-row quantized GEMV kernel function is loaded for
+    /// the given type. Unlike <see cref="HasQuantizedGemv"/>, this is runtime PTX
+    /// capability, not static type-support metadata.
+    /// </summary>
+    public bool HasQuantizedGemvKernel(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q8_0 => !DisableQuantizedGemv && _quantizedGemvQ8_0Func != 0,
+        QuantizationType.Q2_K => !DisableQuantizedGemv && _quantizedGemvQ2_KFunc != 0,
+        QuantizationType.Q4_K => !DisableQuantizedGemv && _quantizedGemvQ4_KFunc != 0,
+        QuantizationType.Q5_0 => !DisableQuantizedGemv && _quantizedGemvQ5_0Func != 0,
+        QuantizationType.Q5_K => !DisableQuantizedGemv && _quantizedGemvQ5_KFunc != 0,
+        QuantizationType.Q6_K => !DisableQuantizedGemv && _quantizedGemvQ6_KFunc != 0,
+        QuantizationType.IQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLFunc != 0,
+        QuantizationType.IQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSFunc != 0,
+        QuantizationType.IQ2_XXS => !DisableQuantizedGemv && _quantizedGemvIQ2_XXSFunc != 0,
+        QuantizationType.IQ2_XS => !DisableQuantizedGemv && _quantizedGemvIQ2_XSFunc != 0,
+        QuantizationType.IQ2_S => !DisableQuantizedGemv && _quantizedGemvIQ2_SFunc != 0,
+        _ => false,
+    };
+
+    /// <summary>
+    /// True when any loaded decode-time quantized GEMV implementation can execute
+    /// this type (MMQ/MMVQ-large or the legacy per-row kernel).
+    /// </summary>
+    public bool HasLoadedQuantizedGemv(QuantizationType qt) =>
+        HasMmq(qt) || HasQuantizedGemvKernel(qt);
 
     /// <summary>
     /// Minimum K alignment required by the per-call <see cref="LaunchQuantizedGemv"/>
@@ -1285,10 +1799,12 @@ public sealed unsafe class CudaKernels : IDisposable
     {
         QuantizationType.Q4_0 or QuantizationType.Q4_1
             or QuantizationType.Q5_0 or QuantizationType.Q5_1
-            or QuantizationType.Q8_0 => 32,
+            or QuantizationType.Q8_0 or QuantizationType.IQ4_NL => 32,
         QuantizationType.Q3_K or QuantizationType.Q4_K
             or QuantizationType.Q5_K or QuantizationType.Q6_K
-            or QuantizationType.Q2_K => 256,
+            or QuantizationType.Q2_K or QuantizationType.IQ4_XS
+            or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS
+            or QuantizationType.IQ2_S => 256,
         _ => int.MaxValue,  // unsupported types — gate always fails
     };
 
@@ -1327,6 +1843,8 @@ public sealed unsafe class CudaKernels : IDisposable
             QuantizationType.Q5_K => _moeGroupedGemvQ5_KFunc,
             QuantizationType.Q6_K => _moeGroupedGemvQ6_KFunc,
             QuantizationType.Q8_0 => _moeGroupedGemvQ8_0Func,
+            QuantizationType.IQ4_NL => _moeGroupedGemvIQ4_NLFunc,
+            QuantizationType.IQ4_XS => _moeGroupedGemvIQ4_XSFunc,
             _ => 0,
         };
         if (func == 0)
@@ -1344,16 +1862,22 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>True when the MMQ-style Q2_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ2K => _quantizedGemvQ2_KMmqFunc != 0 && !DisableMmqQ2K;
+    public bool HasMmqQ2K => _quantizedGemvQ2_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ2K;
 
     /// <summary>True when the MMQ-style Q4_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableMmqQ4K;
+    public bool HasMmqQ4K => _quantizedGemvMmqModule != null && !DisableQuantizedGemv && !DisableMmqQ4K;
 
     /// <summary>True when the MMQ-style Q5_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableMmqQ5K;
+    public bool HasMmqQ5K => _quantizedGemvQ5_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ5K;
 
     /// <summary>True when the MMQ-style Q6_K GEMV kernel is loaded (PTX present).</summary>
-    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableMmqQ6K;
+    public bool HasMmqQ6K => _quantizedGemvQ6_KMmqFunc != 0 && !DisableQuantizedGemv && !DisableMmqQ6K;
+
+    /// <summary>True when the MMQ-style IQ4_NL GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqIQ4_NL => !DisableQuantizedGemv && _quantizedGemvIQ4_NLMmqFunc != 0;
+
+    /// <summary>True when the MMQ-style IQ4_XS GEMV kernel is loaded (PTX present).</summary>
+    public bool HasMmqIQ4_XS => !DisableQuantizedGemv && _quantizedGemvIQ4_XSMmqFunc != 0;
 
     /// <summary>True when the MMVQ-large Q2_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ2K => _quantizedGemvQ2_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ2K;
@@ -1370,6 +1894,12 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>True when the MMVQ-large Q6_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ6K => _quantizedGemvQ6_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ6K;
+
+    /// <summary>True when the MMVQ-large IQ4_NL GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeIQ4_NL => _quantizedGemvIQ4_NLMmvqLargeFunc != 0 && !DisableMmvqLargeIQ4_NL;
+
+    /// <summary>True when the MMVQ-large IQ4_XS GEMV kernel is loaded and not disabled.</summary>
+    public bool HasMmvqLargeIQ4_XS => _quantizedGemvIQ4_XSMmvqLargeFunc != 0 && !DisableMmvqLargeIQ4_XS;
 
     /// <summary>True when the pre-Q8_1 input-quantization kernel is loaded and not disabled.
     /// When this is on (default) and a scratch buffer is provided to the MMQ GEMV launcher,
@@ -1406,6 +1936,14 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool DisableMmvqLargeQ6K { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_Q6K") == "1";
 
+    /// <summary>Disable MMVQ-large routing for IQ4_NL.</summary>
+    public static bool DisableMmvqLargeIQ4_NL { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_IQ4_NL") == "1";
+
+    /// <summary>Disable MMVQ-large routing for IQ4_XS.</summary>
+    public static bool DisableMmvqLargeIQ4_XS { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_DISABLE_MMVQ_LARGE_IQ4_XS") == "1";
+
     /// <summary>Disable pre-Q8_1 input quantization (falls back to on-the-fly Stage 1 in every GEMV).</summary>
     /// <remarks>Useful for A/B comparison or when the model's max k makes the pre-quant scratch
     /// buffer awkward to size. Default off — pre-Q8_1 is the recommended path.</remarks>
@@ -1419,6 +1957,8 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q4_K => HasMmqQ4K,
         QuantizationType.Q5_K => HasMmqQ5K,
         QuantizationType.Q6_K => HasMmqQ6K,
+        QuantizationType.IQ4_NL => HasMmqIQ4_NL,
+        QuantizationType.IQ4_XS => HasMmqIQ4_XS,
         _ => false,
     };
 
@@ -1429,6 +1969,32 @@ public sealed unsafe class CudaKernels : IDisposable
         QuantizationType.Q4_K => HasMmvqLargeQ4K,
         QuantizationType.Q5_K => HasMmvqLargeQ5K,
         QuantizationType.Q6_K => HasMmvqLargeQ6K,
+        QuantizationType.IQ4_NL => HasMmvqLargeIQ4_NL,
+        QuantizationType.IQ4_XS => HasMmvqLargeIQ4_XS,
+        _ => false,
+    };
+
+    /// <summary>True when the 4-rows pre-Q8_1 MMQ variant is loaded for the given quantization type.</summary>
+    public bool HasMmqPreq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q2_K => _quantizedGemvQ2_KMmqPreqFunc != 0,
+        QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc != 0,
+        QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc != 0,
+        QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc != 0,
+        QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqPreqFunc != 0,
+        QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqPreqFunc != 0,
+        _ => false,
+    };
+
+    /// <summary>True when the MMVQ-large pre-Q8_1 variant is loaded for the given quantization type.</summary>
+    public bool HasMmvqLargePreq(QuantizationType qt) => qt switch
+    {
+        QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargePreqFunc != 0,
+        QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargePreqFunc != 0,
+        QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargePreqFunc != 0,
+        QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargePreqFunc != 0,
         _ => false,
     };
 
@@ -1489,8 +2055,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <item>k &lt; 1024: MMQ-4-rows kernel — 4 rows per block, 256 threads, cross-row reduction.
     /// Optimal for SmolLM-135M-class shapes (k=576) where rows are small (≤3 super-blocks).</item>
     /// </list>
-    /// Supports Q2_K, Q4_K, Q5_K, Q6_K — gate the call with <see cref="HasMmq"/>. All four
-    /// quant types have full MMQ + MMVQ-large coverage in both on-the-fly and pre-Q8_1 modes.
+    /// Supports Q2_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS — gate the call with
+    /// <see cref="HasMmq"/>. These quant types have MMQ + MMVQ-large coverage in both
+    /// on-the-fly and pre-Q8_1 modes when the corresponding PTX symbols are present.
     /// On-the-fly Stage 1 input quantization. Use the overload taking a <c>preqScratch</c>
     /// pointer for the pre-Q8_1 path (eliminates per-block redundant Stage 1).
     /// </summary>
@@ -1519,28 +2086,35 @@ public sealed unsafe class CudaKernels : IDisposable
         // force the MMQ-4-rows path for A/B comparison without bypassing dp4a entirely.
         if (k >= MmvqLargeKThreshold && HasMmvqLarge(qt))
         {
-            nint largeFunc = usePreq
+            nint largePreqFunc = usePreq
                 ? qt switch
                 {
                     QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargePreqFunc,
                     QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargePreqFunc,
                     QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargePreqFunc,
                     QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargePreqFunc,
+                    QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargePreqFunc,
+                    QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargePreqFunc,
                     _ => 0,
                 }
-                : qt switch
-                {
-                    QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargeFunc,
-                    QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
-                    QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
-                    QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
-                    _ => 0,
-                };
+                : 0;
+            nint largeOnTheFlyFunc = qt switch
+            {
+                QuantizationType.Q2_K => _quantizedGemvQ2_KMmvqLargeFunc,
+                QuantizationType.Q4_K => _quantizedGemvQ4_KMmvqLargeFunc,
+                QuantizationType.Q5_K => _quantizedGemvQ5_KMmvqLargeFunc,
+                QuantizationType.Q6_K => _quantizedGemvQ6_KMmvqLargeFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmvqLargeFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmvqLargeFunc,
+                _ => 0,
+            };
+            bool useLargePreq = largePreqFunc != 0;
+            nint largeFunc = useLargePreq ? largePreqFunc : largeOnTheFlyFunc;
             if (largeFunc != 0)
             {
                 // Must mirror MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu.
                 const uint MmvqLargeThreads = 128;
-                if (usePreq)
+                if (useLargePreq)
                 {
                     int numChunks = k >> 5;
                     nint xqPtr  = preqScratch;
@@ -1576,6 +2150,8 @@ public sealed unsafe class CudaKernels : IDisposable
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqPreqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqPreqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqPreqFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqPreqFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqPreqFunc,
                 _ => 0,
             }
             : qt switch
@@ -1584,6 +2160,8 @@ public sealed unsafe class CudaKernels : IDisposable
                 QuantizationType.Q4_K => _quantizedGemvQ4_KMmqFunc,
                 QuantizationType.Q5_K => _quantizedGemvQ5_KMmqFunc,
                 QuantizationType.Q6_K => _quantizedGemvQ6_KMmqFunc,
+                QuantizationType.IQ4_NL => _quantizedGemvIQ4_NLMmqFunc,
+                QuantizationType.IQ4_XS => _quantizedGemvIQ4_XSMmqFunc,
                 _ => 0,
             };
 
@@ -1663,6 +2241,109 @@ public sealed unsafe class CudaKernels : IDisposable
         int numChunks = k >> 5;
         int bytesPerChunk = (qt == QuantizationType.Q6_K || qt == QuantizationType.Q2_K) ? 38 : 36;
         return numChunks * bytesPerChunk;
+    }
+
+    /// <summary>Dequantize a weight matrix to FP32 on the GPU.</summary>
+    public void LaunchDequantToF32(nint src, QuantizationType srcDtype,
+                                     nint dst, int totalElements, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+
+        switch (srcDtype)
+        {
+            case QuantizationType.F32:
+                CudaDriverApi.cuMemcpyDtoD_v2(dst, src, (nuint)(totalElements * sizeof(float))).ThrowOnError();
+                return;
+
+            case QuantizationType.F16:
+                LaunchConvertF16ToF32(src, dst, totalElements, stream);
+                return;
+
+            case QuantizationType.IQ4_NL:
+            {
+                if (_dequantIQ4_NLF32Func == 0)
+                    break;
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min((totalBlocks + 7) / 8, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_XS:
+            {
+                if (_dequantIQ4_XSF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_XSF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            {
+                // All three IQ2 dequant F32 kernels share the same launch shape (one
+                // thread per element within a 256-element super-block). Resolve the
+                // function by quant type and fall through to break (-> NotSupported)
+                // when the PTX hasn't shipped the symbol.
+                nint func = srcDtype switch
+                {
+                    QuantizationType.IQ2_XXS => _dequantIQ2_XXSF32Func,
+                    QuantizationType.IQ2_XS => _dequantIQ2_XSF32Func,
+                    QuantizationType.IQ2_S => _dequantIQ2_SF32Func,
+                    _ => 0
+                };
+                if (func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.Q5_K:
+            {
+                if (_dequantQ5_KF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantQ5_KF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.Q6_K:
+            {
+                if (_dequantQ6_KF32Func == 0)
+                    break;
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantQ6_KF32Func,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+        }
+
+        throw new NotSupportedException($"GPU FP32 dequantization not supported directly for {srcDtype}.");
     }
 
     /// <summary>Dequantize a weight matrix to FP16 on the GPU.</summary>
@@ -1767,6 +2448,66 @@ public sealed unsafe class CudaKernels : IDisposable
                 void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
                 uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
                 CudaDriverApi.cuLaunchKernel(_dequantQ2_KFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_NL:
+            {
+                if (_dequantIQ4_NLFunc == 0)
+                    throw new InvalidOperationException(
+                        "IQ4_NL dequant kernel not present in dequant_iquants.ptx - rebuild PTX from " +
+                        "native/kernels/dequant_iquants.cu.");
+                int totalBlocks = totalElements / 32;
+                int tbArg = totalBlocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tbArg};
+                uint gridDim = (uint)Math.Min(totalBlocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_NLFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ4_XS:
+            {
+                if (_dequantIQ4_XSFunc == 0)
+                    throw new InvalidOperationException(
+                        "IQ4_XS dequant kernel not present in dequant_iquants.ptx - rebuild PTX from " +
+                        "native/kernels/dequant_iquants.cu.");
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(_dequantIQ4_XSFunc,
+                        gridDim, 1, 1, BlockSize, 1, 1,
+                        0, stream, (nint)args, 0).ThrowOnError();
+                return;
+            }
+
+            case QuantizationType.IQ2_XXS:
+            case QuantizationType.IQ2_XS:
+            case QuantizationType.IQ2_S:
+            {
+                // All three IQ2 dequant F16 kernels follow IQ4_XS's super-block shape
+                // (one thread per element within a 256-element block). IQ2_S doubles
+                // as the on-disk format for IQ2_M file-type GGUFs (e.g. Qwen3.6-A3B-IQ2_M).
+                nint func = srcDtype switch
+                {
+                    QuantizationType.IQ2_XXS => _dequantIQ2_XXSFunc,
+                    QuantizationType.IQ2_XS => _dequantIQ2_XSFunc,
+                    QuantizationType.IQ2_S => _dequantIQ2_SFunc,
+                    _ => 0
+                };
+                if (func == 0)
+                    throw new InvalidOperationException(
+                        $"{srcDtype} dequant kernel not present in iq2.ptx — rebuild PTX from " +
+                        "native/kernels/iq2.cu.");
+                int totalSuperblocks = totalElements / 256;
+                int tsbArg = totalSuperblocks;
+                void** args = stackalloc void*[] {&srcArg, &dstArg, &tsbArg};
+                uint gridDim = (uint)Math.Min(totalSuperblocks, MaxDequantGridSize);
+                CudaDriverApi.cuLaunchKernel(func,
                         gridDim, 1, 1, BlockSize, 1, 1,
                         0, stream, (nint)args, 0).ThrowOnError();
                 return;
@@ -2510,6 +3251,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormModule.Dispose();
         _convertModule.Dispose();
         _dequantModule.Dispose();
+        _dequantIQuantsModule?.Dispose();
+        _iq2Module?.Dispose();
         _quantizedGemvModule.Dispose();
         _fusedAddRmsNormModule.Dispose();
         _rmsnormF32InModule.Dispose();
@@ -2531,5 +3274,11 @@ public sealed unsafe class CudaKernels : IDisposable
         _moeFfnModule?.Dispose();
         _moeGroupedGemvModule?.Dispose();
         _attentionMlaLatentModule?.Dispose();
+        // GDN/conv1d modules: _l2NormHeadsF32Module aliases _gdnScanF32Module
+        // (same .ptx file), so dispose only the scan module — disposing both
+        // would double-free the underlying CUmodule handle.
+        _conv1dCausalF32Module?.Dispose();
+        _gdnScanF32Module?.Dispose();
+        _elementwiseF32Module?.Dispose();
     }
 }

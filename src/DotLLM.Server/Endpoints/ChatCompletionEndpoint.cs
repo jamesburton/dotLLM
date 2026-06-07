@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using DotLLM.Engine;
 using DotLLM.Server.Models;
+using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Server.Endpoints;
@@ -51,6 +52,22 @@ public static class ChatCompletionEndpoint
         var requestId = RequestConverter.GenerateRequestId();
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
+
+        // Validate prefix_id reference (Step 37): must be registered if supplied.
+        if (!string.IsNullOrWhiteSpace(request.PrefixId))
+        {
+            var mgr = state.PrefixTrieManager;
+            if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null,
+                    httpContext.RequestAborted);
+                return;
+            }
+        }
 
         // Resolve LoRA adapter (if requested) — bad name → 400 with available list
         DotLLM.Core.Lora.ILoraAdapter? adapter;
@@ -128,10 +145,26 @@ public static class ChatCompletionEndpoint
     {
         InferenceResponse? result = null;
 
-        await state.ExecuteAsync(async () =>
+        // Route through the continuous-batch scheduler when it's the right shape for it: no LoRA
+        // adapter, no logprobs capture. Multiple concurrent requests pipeline through one model
+        // dispatch per scheduler iteration.
+        if (state.Scheduler is { } scheduler && adapter is null && !options.Logprobs)
         {
-            result = generator.Generate(prompt, options, adapter: adapter);
-        }, ct);
+            int[] promptIds = state.Tokenizer!.Encode(prompt);
+            var inferenceRequest = new InferenceRequest
+            {
+                TokenIds = promptIds,
+                Options = options,
+            };
+            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+        }
+        else
+        {
+            await state.ExecuteAsync(async () =>
+            {
+                result = generator.Generate(prompt, options, adapter: adapter);
+            }, ct);
+        }
 
         // Detect tool calls
         string text = result!.Text;
@@ -187,6 +220,10 @@ public static class ChatCompletionEndpoint
                 TotalTokens = result.PromptTokenCount + result.GeneratedTokenCount,
             },
         };
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(result.PromptTokenCount + result.GeneratedTokenCount);
 
         httpContext.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(httpContext.Response.Body, response, ServerJsonContext.Default.ChatCompletionResponse, ct);
@@ -273,6 +310,10 @@ public static class ChatCompletionEndpoint
             : new ChatDeltaDto();
 
         int promptTokens = timings?.PrefillTokenCount ?? 0;
+
+        // Report actuals to the rate-limit lease so unused token budget is refunded.
+        RateLimitMiddleware.GetLease(httpContext)
+            ?.ReportActualTokens(promptTokens + completionTokens);
 
         var finalChunk = new ChatCompletionChunk
         {

@@ -1,4 +1,5 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
@@ -69,7 +70,19 @@ public sealed class VulkanTransformerModelMoeForwardTests : IDisposable
         AssertVulkanMatchesCpu(seqLen: 3, seed: 7);
     }
 
-    private void AssertVulkanMatchesCpu(int seqLen, int seed)
+    [SkippableFact]
+    public void Forward_PerExpertLora_SingleToken_MatchesCpuReference()
+    {
+        AssertVulkanMatchesCpu(seqLen: 1, seed: 142, adapterSeed: 19);
+    }
+
+    [SkippableFact]
+    public void Forward_PerExpertLora_PrefillTiledRows_MatchesCpuReference()
+    {
+        AssertVulkanMatchesCpu(seqLen: 16, seed: 207, adapterSeed: 23);
+    }
+
+    private void AssertVulkanMatchesCpu(int seqLen, int seed, int? adapterSeed = null)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -91,7 +104,9 @@ public sealed class VulkanTransformerModelMoeForwardTests : IDisposable
         {
             using var sf = SafetensorsFile.Open(path);
             using var model = TransformerModel.LoadFromSafetensors(sf, config);
-            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            using var adapter = adapterSeed is int s ? BuildPerExpertAdapter(config, s) : null;
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1,
+                kvCache: null, adapter: adapter);
             cpuLogits = CopyLogits(logits);
         }
 
@@ -100,7 +115,9 @@ public sealed class VulkanTransformerModelMoeForwardTests : IDisposable
         {
             using var sf = SafetensorsFile.Open(path);
             using var model = VulkanTransformerModel.LoadFromSafetensors(sf, config, spvDir);
-            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            using var adapter = adapterSeed is int s ? BuildPerExpertAdapter(config, s) : null;
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1,
+                kvCache: null, adapter: adapter);
             // Vulkan returns single-row [1, vocab] of last-token logits.
             Assert.Equal(1, logits.Shape[0]);
             Assert.Equal(VocabSize, logits.Shape[1]);
@@ -220,5 +237,65 @@ public sealed class VulkanTransformerModelMoeForwardTests : IDisposable
                 values[i] = amplitude * cos;
         }
         b.AddFloat32(name, shape, values);
+    }
+
+    private static unsafe LoraAdapter BuildPerExpertAdapter(ModelConfig config, int seed)
+    {
+        const int rank = 2;
+        var targets = new List<string>();
+        for (int e = 0; e < NumExperts; e++)
+        {
+            targets.Add($"mlp.experts.{e}.gate_proj");
+            targets.Add($"mlp.experts.{e}.up_proj");
+            targets.Add($"mlp.experts.{e}.down_proj");
+        }
+
+        var adapter = new LoraAdapter("vk-moe-lora", rank, alpha: 4f, targetModules: targets);
+        for (int layer = 0; layer < config.NumLayers; layer++)
+        {
+            for (int e = 0; e < NumExperts; e++)
+            {
+                AddLora(adapter, layer, $"mlp.experts.{e}.gate_proj",
+                    inputDim: HiddenSize, outputDim: IntermediateSize, rank, seed + layer * 100 + e * 10 + 1);
+                AddLora(adapter, layer, $"mlp.experts.{e}.up_proj",
+                    inputDim: HiddenSize, outputDim: IntermediateSize, rank, seed + layer * 100 + e * 10 + 2);
+                AddLora(adapter, layer, $"mlp.experts.{e}.down_proj",
+                    inputDim: IntermediateSize, outputDim: HiddenSize, rank, seed + layer * 100 + e * 10 + 3);
+            }
+        }
+
+        Assert.True(adapter.IsCompatible(config));
+        return adapter;
+    }
+
+    private static unsafe void AddLora(
+        LoraAdapter adapter,
+        int layer,
+        string projection,
+        int inputDim,
+        int outputDim,
+        int rank,
+        int seed)
+    {
+        nint b = LoraAdapter.AllocAligned((long)rank * inputDim);
+        nint a = LoraAdapter.AllocAligned((long)outputDim * rank);
+        var bSpan = new Span<float>((void*)b, rank * inputDim);
+        var aSpan = new Span<float>((void*)a, outputDim * rank);
+        FillSmall(bSpan, seed, 0.002f);
+        FillSmall(aSpan, seed + 17, 0.002f);
+        adapter.AddLayerWeights(layer, projection, new LoraLayerWeights(
+            AHandle: a,
+            BHandle: b,
+            InputDim: inputDim,
+            OutputDim: outputDim));
+    }
+
+    private static void FillSmall(Span<float> dst, int seed, float amplitude)
+    {
+        for (int i = 0; i < dst.Length; i++)
+        {
+            float phi = 0.61803398875f * (i + 1) + seed * 0.37f;
+            dst[i] = amplitude * MathF.Sin(phi);
+        }
     }
 }

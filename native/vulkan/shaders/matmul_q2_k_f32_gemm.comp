@@ -1,0 +1,148 @@
+#version 450
+// Q2_K batched matrix multiplication (prefill-path GEMM).
+//
+//   C[N, M] = B[N, K] @ W_q2k[M, K]^T      with W_q2k dequantized on the fly.
+//
+// Companion to matmul_q2_k_f32_gemv.comp (decode-path GEMV) and structural
+// sibling of matmul_q4_k_gemm_f32.comp / matmul_q5_k_gemm_f32.comp /
+// matmul_q6_k_gemm_f32.comp. Q2_K's natural sub-block size is 16 (one
+// 4-bit scale + 4-bit dmCoef per 16 elements), so the K-chunk for the
+// shared-memory tile is 16 elements — half the 32 used by Q4/5/6_K.
+// The output tile geometry stays 16×16; each row is loaded by one thread
+// (lane = 0..15 -> column).
+//
+// Block layout (matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ2_K):
+//   Each row holds (K / 256) Q2_K super-blocks of 84 bytes each:
+//       bytes [ 0.. 15] = scales[16] — sub_lo nibble = scale, sub_hi = dmCoef
+//       bytes [16.. 79] = qs[64]     — 256 × 2-bit values, 4 per byte
+//       bytes [80, 81]  = fp16 d
+//       bytes [82, 83]  = fp16 dmin
+//   Row stride = (K / 256) * 84 bytes.
+//
+// Tiling:
+//   Output tile  = 16 rows of C (TILE_N) × 16 cols of C (TILE_M) = 256 cells.
+//   Workgroup    = (16, 16, 1) = 256 threads, one thread per output cell.
+//   K-chunk      = 16 elements (one Q2_K sub-block).
+//
+// Per K-chunk we cooperatively dequantize a 16×16 weight tile into shared
+// memory once and reuse it across all 16 token rows of B.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint blocksPerRow;
+    uint rowUints;
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint SUBBLOCK = 16u;            // K-chunk = one Q2_K sub-block
+const uint Q2K_BLOCK_BYTES = 84u;
+const uint Q2K_GROUP_SIZE  = 256u;
+const uint NUM_SUBBLOCKS   = 16u;
+
+shared float sharedB[TILE_N * SUBBLOCK];
+shared float sharedW[TILE_M * SUBBLOCK];
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y;
+
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x;
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * Q2K_BLOCK_BYTES;
+
+    float acc = 0.0;
+
+    uint totalChunks = pc.blocksPerRow * NUM_SUBBLOCKS;
+    for (uint chunk = 0u; chunk < totalChunks; chunk++) {
+        uint kBlock = chunk / NUM_SUBBLOCKS;
+        uint subIdx = chunk - kBlock * NUM_SUBBLOCKS; // 0..15
+        uint kBase  = kBlock * Q2K_GROUP_SIZE + subIdx * SUBBLOCK;
+
+        // ── 1. Stage sharedB[TILE_N, 16] = 256 floats. 256 threads, 1 each. ──
+        {
+            uint row = tid >> 4u;             // 0..15
+            uint col = tid & 15u;             // 0..15
+            uint tGlobal = tBase + row;
+            float v = 0.0;
+            if (tGlobal < pc.N) v = b[tGlobal * pc.K + kBase + col];
+            sharedB[row * SUBBLOCK + col] = v;
+        }
+
+        // ── 2. Dequantize sharedW[TILE_M, 16] = 256 floats. ──
+        // 16 weight rows × 16 columns. Assign one thread per (row, col).
+        {
+            uint mLocal  = tid >> 4u;       // 0..15
+            uint col     = tid & 15u;       // 0..15
+            uint mGlobal = mBase + mLocal;
+
+            float w = 0.0;
+            if (mGlobal < pc.M) {
+                uint blockByteBase = mGlobal * rowByteStride + kBlock * Q2K_BLOCK_BYTES;
+                uint scByte = readByte(blockByteBase + subIdx);
+                float d    = readHalf(blockByteBase + 80u);
+                float dmin = readHalf(blockByteBase + 82u);
+                float sc = d * float(scByte & 0xFu);
+                float mn = dmin * float((scByte >> 4u) & 0xFu);
+
+                // Element index within the super-block:
+                uint elem   = subIdx * SUBBLOCK + col; // 0..255
+                uint qByte  = readByte(blockByteBase + 16u + (elem >> 2u));
+                uint bitOff = (elem & 3u) << 1u;
+                uint q2     = (qByte >> bitOff) & 0x3u;
+                w = sc * float(q2) - mn;
+            }
+            sharedW[mLocal * SUBBLOCK + col] = w;
+        }
+
+        barrier();
+
+        // ── 3. Partial dot product for this K-chunk. ──
+        {
+            uint bOff = gl_LocalInvocationID.y * SUBBLOCK;
+            uint wOff = gl_LocalInvocationID.x * SUBBLOCK;
+            float chunkSum = 0.0;
+            for (uint j = 0u; j < SUBBLOCK; j++) {
+                chunkSum += sharedB[bOff + j] * sharedW[wOff + j];
+            }
+            acc += chunkSum;
+        }
+
+        barrier();
+    }
+
+    if (m < pc.M && t < pc.N) {
+        c[t * pc.M + m] = acc;
+    }
+}

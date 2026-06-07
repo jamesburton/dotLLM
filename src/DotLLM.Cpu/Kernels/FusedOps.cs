@@ -92,6 +92,128 @@ public static unsafe class FusedOps
         }
     }
 
+    // ──────────────────── GeGLU (tanh) Fusion ────────────────────
+    // Fuses GELU-tanh-approximate(gate) + Multiply(geluOut, up) into one tiled
+    // operation. Used by Gemma 2 / Gemma 3 MLP blocks (hidden_activation =
+    // "gelu_pytorch_tanh"); shape-identical to SwiGLU, only the gate activation
+    // differs.
+    //
+    //   gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    //   result[i]    = gelu_tanh(gate[i]) * up[i]
+    //
+    // This matches PyTorch's `nn.functional.gelu(approximate="tanh")` and HF's
+    // ACT2FN["gelu_pytorch_tanh"] / ACT2FN["gelu_new"] used by Gemma checkpoints.
+    // Uses TensorPrimitives.Tanh for SIMD-accelerated tanh; the polynomial inside
+    // the tanh argument is computed with element-wise primitives.
+
+    /// <summary>Tile size for GeGLU. 256 floats = 1024 bytes — fits in L1 data cache.</summary>
+    private const int GeGLUTileSize = 256;
+
+    /// <summary>The constant <c>sqrt(2/π)</c> used in the tanh-approximate GELU formula.</summary>
+    private const float GeluTanhSqrt2OverPi = 0.7978845608028654f;
+
+    /// <summary>The cubic coefficient in the tanh-approximate GELU formula.</summary>
+    private const float GeluTanhCubicCoeff = 0.044715f;
+
+    /// <summary>
+    /// Fused GeGLU activation (tanh-approximate GELU):
+    /// <c>result[i] = gelu_tanh(gate[i]) * up[i]</c> where
+    /// <c>gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))</c>.
+    /// Used by Gemma 2 / Gemma 3 MLP blocks. Bit-equivalent (within F32 reorder noise)
+    /// to <see cref="GeGLUTanhScalar"/>. Safe to call in-place when
+    /// <paramref name="up"/> aliases <paramref name="result"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void GeGLUTanh(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        int length = gate.Length;
+
+        // Snapshot up per tile when it aliases result, mirroring the SwiGLU fix.
+        bool upAliases = up.Overlaps(result);
+
+        Span<float> innerBuf = stackalloc float[GeGLUTileSize]; // sqrt(2/π) * (x + 0.044715 * x^3)
+        Span<float> tanhBuf = stackalloc float[GeGLUTileSize];  // tanh(innerBuf)
+        Span<float> upBuf = stackalloc float[GeGLUTileSize];
+
+        int i = 0;
+        for (; i + GeGLUTileSize <= length; i += GeGLUTileSize)
+        {
+            var gTile = gate.Slice(i, GeGLUTileSize);
+            var uTile = up.Slice(i, GeGLUTileSize);
+            var rTile = result.Slice(i, GeGLUTileSize);
+
+            if (upAliases) uTile.CopyTo(upBuf);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upBuf : uTile;
+
+            GeluTanhTile(gTile, innerBuf, tanhBuf, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
+        }
+
+        if (i < length)
+        {
+            int remaining = length - i;
+            var gTile = gate.Slice(i, remaining);
+            var uTile = up.Slice(i, remaining);
+            var rTile = result.Slice(i, remaining);
+            var innerTail = innerBuf.Slice(0, remaining);
+            var tanhTail = tanhBuf.Slice(0, remaining);
+            var upTail = upBuf.Slice(0, remaining);
+
+            if (upAliases) uTile.CopyTo(upTail);
+            ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upTail : uTile;
+
+            GeluTanhTile(gTile, innerTail, tanhTail, rTile);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, uReadable, rTile);
+        }
+    }
+
+    /// <summary>
+    /// Computes <c>rTile = gelu_tanh(gTile)</c> using the three-stage decomposition:
+    /// (1) inner = sqrt(2/π) * (gate + 0.044715 * gate^3);
+    /// (2) tanh(inner);
+    /// (3) rTile = 0.5 * gate * (1 + tanh(inner)).
+    /// All ops route through <see cref="TensorPrimitives"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void GeluTanhTile(
+        ReadOnlySpan<float> gTile, Span<float> innerBuf, Span<float> tanhBuf, Span<float> rTile)
+    {
+        // inner = gate * gate * gate  (g^3 in tanhBuf as scratch)
+        TensorPrimitives.Multiply(gTile, gTile, tanhBuf);
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)tanhBuf, gTile, innerBuf);
+        // inner = 0.044715 * inner
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)innerBuf, GeluTanhCubicCoeff, innerBuf);
+        // inner = gate + inner
+        TensorPrimitives.Add(gTile, (ReadOnlySpan<float>)innerBuf, innerBuf);
+        // inner = sqrt(2/π) * inner
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)innerBuf, GeluTanhSqrt2OverPi, innerBuf);
+        // tanh(inner) → tanhBuf
+        TensorPrimitives.Tanh((ReadOnlySpan<float>)innerBuf, tanhBuf);
+        // rTile = 1 + tanh(inner)
+        TensorPrimitives.Add((ReadOnlySpan<float>)tanhBuf, 1.0f, rTile);
+        // rTile = gate * (1 + tanh(inner))
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, gTile, rTile);
+        // rTile = 0.5 * rTile
+        TensorPrimitives.Multiply((ReadOnlySpan<float>)rTile, 0.5f, rTile);
+    }
+
+    /// <summary>
+    /// Scalar GeGLU reference implementation for correctness verification.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GeGLUTanhScalar(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        for (int i = 0; i < gate.Length; i++)
+        {
+            float g = gate[i];
+            float u = up[i];
+            float inner = GeluTanhSqrt2OverPi * (g + GeluTanhCubicCoeff * g * g * g);
+            float gelu = 0.5f * g * (1.0f + MathF.Tanh(inner));
+            result[i] = gelu * u;
+        }
+    }
+
     // ──────────────────── RMSNorm + Quantize Fusion ────────────────────
     // Fuses RmsNorm(hidden → normOut) + Quantize(normOut → Q8 scratch) into one kernel
     // that reads hidden once and writes quantized output directly — skipping normOut.

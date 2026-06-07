@@ -1,0 +1,50 @@
+Loading model: C:/Development/KTransformerTests/models/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf
+Model: Qwen3MoeHybrid, 40 layers, 248320 vocab
+Prompt: "Hi"
+
+Hi[tensor] token_embd: shape=[1,2048] n=2048 min=-0.055895 max=0.038021 mean=0.000096 rms=0.012597 abs_max=0.055895
+[tensor] blk.0.attn_norm: shape=[1,2048] n=2048 min=-4.701715 max=3.163490 mean=0.006202 rms=1.024478 abs_max=4.701715
+[tensor] blk.0.linear_attn_qkv_mixed: shape=[1,8192] n=8192 min=-34.750397 max=32.804558 mean=-0.025588 rms=2.370357 abs_max=34.750397
+[tensor] blk.0.z: shape=[1,4096] n=4096 min=-12.500140 max=5.686852 mean=-0.337351 rms=1.894568 abs_max=12.500140
+[tensor] blk.0.alpha_proj: shape=[1,32] n=32 min=-3.233691 max=3.167601 mean=0.220577 rms=1.680738 abs_max=3.233691
+[tensor] blk.0.beta_proj: shape=[1,32] n=32 min=-1.151441 max=5.851654 mean=1.100569 rms=2.032751 abs_max=5.851654
+[tensor] blk.0.g: shape=[1,32] n=32 min=0.000000 max=0.999995 mean=0.719561 rms=0.826984 abs_max=0.999995
+[tensor] blk.0.beta_sigmoid: shape=[1,32] n=32 min=0.240226 max=0.997133 mean=0.656919 rms=0.695674 abs_max=0.997133
+[tensor] blk.0.conv_output_silu: shape=[1,8192] n=8192 min=-0.278394 max=9.551792 mean=0.025907 rms=0.373131 abs_max=9.551792
+[tensor] blk.0.q_conv: shape=[1,16,128] n=2048 min=-0.278250 max=2.219653 mean=0.002628 rms=0.096161 abs_max=2.219653
+[tensor] blk.0.k_conv: shape=[1,16,128] n=2048 min=-0.277323 max=0.822848 mean=0.001823 rms=0.039946 abs_max=0.822848
+[tensor] blk.0.v_conv: shape=[1,32,128] n=4096 min=-0.278394 max=9.551792 mean=0.049588 rms=0.522525 abs_max=9.551792
+[tensor] blk.0.q_conv_predelta: shape=[1,16,128] n=2048 min=-0.601156 max=0.993199 mean=0.002342 rms=0.088388 abs_max=0.993199
+[tensor] blk.0.k_conv_predelta: shape=[1,16,128] n=2048 min=-0.713302 max=0.884949 mean=0.005432 rms=0.088388 abs_max=0.884949
+[tensor] blk.0.attn_output: shape=[1,32,128] n=4096 min=-0.005804 max=0.217787 mean=0.000523 rms=0.007196 abs_max=0.217787
+[tensor] blk.0.final_output: shape=[1,32,128] n=4096 min=-2.005183 max=0.222313 mean=-0.001200 rms=0.034707 abs_max=2.005183
+[tensor] blk.0.linear_attn_out: shape=[1,2048] n=2048 min=-0.224069 max=0.536141 mean=0.000398 rms=0.021787 abs_max=0.536141
+[tensor] blk.0.attn_post_norm: shape=[1,2048] n=2048 min=-7.228548 max=6.069700 mean=0.003518 rms=0.699804 abs_max=7.228548
+[tensor] blk.0.ffn_out: shape=[1,2048] n=2048 min=-0.159870 max=0.092252 mean=0.000146 rms=0.016741 abs_max=0.159870
+[tensor] blk.0.l_out: shape=[1,2048] n=2048 min=-0.346790 max=0.398030 mean=0.000640 rms=0.032433 abs_max=0.398030
+[tensor] blk.1.attn_norm: shape=[1,2048] n=2048 min=-13.609632 max=9.714921 mean=0.016873 rms=1.064191 abs_max=13.609632
+[tensor] blk.1.linear_attn_qkv_mixed: shape=[1,8192] n=8192 min=-43.391659 max=42.505978 mean=0.008225 rms=2.032536 abs_max=43.391659
+[tensor] blk.1.z: shape=[1,4096] n=4096 min=-12.083134 max=10.458652 mean=-0.509475 rms=1.626131 abs_max=12.083134
+[tensor] blk.1.alpha_proj: shape=[1,32] n=32 min=-1.055440 max=4.663507 mean=1.517265 rms=2.158130 abs_max=4.663507
+[tensor] blk.1.beta_proj: shape=[1,32] n=32 min=-2.840988 max=4.539105 mean=1.764329 rms=2.450067 abs_max=4.539105
+[tensor] blk.1.g: shape=[1,32] n=32 min=0.000383 max=0.998781 mean=0.583694 rms=0.670765 abs_max=0.998781
+[tensor] blk.1.beta_sigmoid: shape=[1,32] n=32 min=0.055149 max=0.989430 mean=0.778242 rms=0.817657 abs_max=0.989430
+[tensor] blk.1.conv_output_silu: shape=[1,8192] n=8192 min=-0.278145 max=10.792312 mean=0.012023 rms=0.266524 abs_max=10.792312
+[tensor] blk.1.q_conv: shape=[1,16,128] n=2048 min=-0.278145 max=2.814400 mean=0.003539 rms=0.098235 abs_max=2.814400
+[tensor] blk.1.k_conv: shape=[1,16,128] n=2048 min=-0.275562 max=1.136785 mean=0.002111 rms=0.060837 abs_max=1.136785
+[tensor] blk.1.v_conv: shape=[1,32,128] n=4096 min=-0.269572 max=10.792312 mean=0.021221 rms=0.367959 abs_max=10.792312
+[tensor] blk.1.q_conv_predelta: shape=[1,16,128] n=2048 min=-0.652613 max=0.987722 mean=0.002916 rms=0.088388 abs_max=0.987722
+[tensor] blk.1.k_conv_predelta: shape=[1,16,128] n=2048 min=-0.835374 max=0.991932 mean=0.002684 rms=0.088388 abs_max=0.991932
+[tensor] blk.1.attn_output: shape=[1,32,128] n=4096 min=-0.002106 max=0.060669 mean=0.000059 rms=0.001383 abs_max=0.060669
+[tensor] blk.1.final_output: shape=[1,32,128] n=4096 min=-0.586936 max=0.144270 mean=-0.000342 rms=0.012941 abs_max=0.586936
+[tensor] blk.1.linear_attn_out: shape=[1,2048] n=2048 min=-0.044277 max=0.222597 mean=0.000226 rms=0.011959 abs_max=0.222597
+[tensor] blk.1.attn_post_norm: shape=[1,2048] n=2048 min=-4.750022 max=5.340179 mean=0.008939 rms=0.804070 abs_max=5.340179
+[tensor] blk.1.ffn_out: shape=[1,2048] n=2048 min=-0.064013 max=0.029142 mean=-0.000065 rms=0.007499 abs_max=0.064013
+[tensor] blk.1.l_out: shape=[1,2048] n=2048 min=-0.390835 max=0.556615 mean=0.000801 rms=0.039446 abs_max=0.556615
+[tensor] blk.2.attn_norm: shape=[1,2048] n=2048 min=-11.829883 max=11.971127 mean=0.019500 rms=1.032091 abs_max=11.971127
+[tensor] blk.2.linear_attn_qkv_mixed: shape=[1,8192] n=8192 min=-28.971672 max=38.017967 mean=0.034144 rms=1.688010 abs_max=38.017967
+[tensor] blk.2.z: shape=[1,4096] n=4096 min=-10.224721 max=7.999328 mean=-0.520403 rms=1.649714 abs_max=10.224721
+[tensor] blk.2.alpha_proj: shape=[1,32] n=32 min=-0.788333 max=5.284286 mean=2.102162 rms=2.517458 abs_max=5.284286
+[tensor] blk.2.beta_proj: shape=[1,32] n=32 min=-2.511165 max=5.441223 mean=1.507409 rms=2.266643 abs_max=5.441223
+[tensor] blk.2.g: shape=[1,32] n=32 min=0.002450 max=0.999785 mean=0.445457 rms=0.527300 abs_max=0.999785
+[tensor] blk.2.beta_sigmoid: shape=[1,32] n=32 min=0.075079 max=0.995685 mean=0.744043 rms=0.785069 abs_max=0.995685

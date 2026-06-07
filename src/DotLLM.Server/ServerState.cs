@@ -5,7 +5,9 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Engine.Scheduler;
 using DotLLM.Models.Gguf;
+using DotLLM.Server.RateLimiting;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ChatTemplates;
 
@@ -41,6 +43,9 @@ public sealed class ServerState : IDisposable
     /// <summary>Prefix cache for prompt caching (null when disabled).</summary>
     public PrefixCache? PrefixCache { get; set; }
 
+    /// <summary>Cross-request prefix trie manager (Step 37). Non-null when paged KV-cache is active.</summary>
+    public PrefixTrieManager? PrefixTrieManager { get; set; }
+
     /// <summary>Whether a model is loaded and ready to accept requests.</summary>
     public bool IsReady { get; set; }
 
@@ -57,6 +62,23 @@ public sealed class ServerState : IDisposable
 
     /// <summary>Text generator wired to the current model.</summary>
     public TextGenerator? Generator { get; set; }
+
+    /// <summary>
+    /// Async continuous-batch scheduler. When non-null, endpoint handlers route concurrent
+    /// requests through <see cref="ContinuousBatchSchedulerService.EnqueueAsync"/> instead of
+    /// serialising through <see cref="ExecuteAsync"/>. Falls back to the direct-generator path
+    /// when null (e.g. quantized KV-cache, hybrid/CUDA models).
+    /// </summary>
+    public ContinuousBatchSchedulerService? Scheduler { get; set; }
+
+    /// <summary>
+    /// Cancellation source for <see cref="Scheduler"/>'s background run-loop. Cancelled at
+    /// shutdown so the loop exits cleanly.
+    /// </summary>
+    public CancellationTokenSource? SchedulerLoopCts { get; set; }
+
+    /// <summary>Task driving <see cref="ContinuousBatchSchedulerService.RunLoopAsync"/>. Awaited at shutdown.</summary>
+    public Task? SchedulerLoopTask { get; set; }
 
     /// <summary>Mutable sampling parameter defaults (changeable from the UI).</summary>
     public SamplingDefaults SamplingDefaults { get; set; } = new();
@@ -84,6 +106,13 @@ public sealed class ServerState : IDisposable
     public ILoraAdapterRegistry? LoraRegistry { get; set; }
 
     /// <summary>
+    /// Per-API-key rate limiter manager. <c>null</c> when rate limiting is
+    /// disabled or not configured (see <see cref="ServerOptions.RateLimit"/>).
+    /// Owned by <see cref="ServerState"/> and disposed at server shutdown.
+    /// </summary>
+    public RateLimitManager? RateLimitManager { get; set; }
+
+    /// <summary>
     /// Executes a request with sequential access control.
     /// Only one request is processed at a time (Step 35 adds batching).
     /// </summary>
@@ -104,8 +133,11 @@ public sealed class ServerState : IDisposable
         IsReady = false;
         try
         {
+            await StopSchedulerAsync().ConfigureAwait(false);
             PrefixCache?.Dispose();
             PrefixCache = null;
+            PrefixTrieManager?.Dispose();
+            PrefixTrieManager = null;
             PagedFactory?.Dispose();
             PagedFactory = null;
             DraftModel?.Dispose();
@@ -122,10 +154,38 @@ public sealed class ServerState : IDisposable
         finally { _requestGate.Release(); }
     }
 
+    /// <summary>
+    /// Cancels the scheduler's run loop and awaits its exit. Idempotent.
+    /// </summary>
+    public async Task StopSchedulerAsync()
+    {
+        var cts = SchedulerLoopCts;
+        var task = SchedulerLoopTask;
+        if (cts is not null)
+        {
+            try { cts.Cancel(); } catch { /* already disposed */ }
+        }
+        if (task is not null)
+        {
+            try { await task.ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* expected */ }
+            catch { /* loop swallows other errors */ }
+        }
+        Scheduler?.Dispose();
+        cts?.Dispose();
+        Scheduler = null;
+        SchedulerLoopCts = null;
+        SchedulerLoopTask = null;
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
+        try { StopSchedulerAsync().GetAwaiter().GetResult(); }
+        catch { /* shutdown best-effort */ }
+        RateLimitManager?.Dispose();
         PrefixCache?.Dispose();
+        PrefixTrieManager?.Dispose();
         PagedFactory?.Dispose();
         DraftModel?.Dispose();
         DraftGguf?.Dispose();

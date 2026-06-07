@@ -155,7 +155,7 @@ __device__ __forceinline__ void attention_f16_body(
             }
 
             // Sliding window: skip if outside window
-            if (sliding_window > 0 && pos_q - tkv > sliding_window)
+            if (sliding_window > 0 && pos_q - tkv >= sliding_window)
             {
                 score_tile[t] = -FLT_MAX;
                 continue;

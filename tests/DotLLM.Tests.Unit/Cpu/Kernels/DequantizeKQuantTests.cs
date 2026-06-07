@@ -9,9 +9,12 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
 public sealed unsafe class DequantizeKQuantTests
 {
+    private const int IQ4_NL_BlockBytes = 18;
+    private const int IQ4_XS_BlockBytes = 136;
     private const int Q4_K_BlockBytes = 144;
     private const int Q5_K_BlockBytes = 176;
     private const int Q6_K_BlockBytes = 210;
+    private const int IQ4_NL_GroupSize = 32;
     private const int KQuantGroupSize = 256;
 
     // ──────────────────── Scale unpacking ────────────────────
@@ -383,6 +386,101 @@ public sealed unsafe class DequantizeKQuantTests
         {
             NativeMemory.AlignedFree((void*)ptr);
         }
+    }
+
+    // ──────────────────── IQ4_NL / IQ4_XS dequant ────────────────────
+
+    [Fact]
+    public void IQ4_NL_SingleBlock_HandCalculated()
+    {
+        nuint totalBytes = IQ4_NL_BlockBytes;
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            NativeMemory.Clear((void*)ptr, totalBytes);
+            byte* block = (byte*)ptr;
+
+            Unsafe.WriteUnaligned(block, (Half)0.5f);
+            block[2] = 0xF0; // low nibble 0 -> element 0, high nibble 15 -> element 16
+
+            float[] dest = new float[IQ4_NL_GroupSize];
+            Dequantize.ToFloat32(ptr, IQ4_NL_GroupSize, QuantizationType.IQ4_NL, dest);
+
+            Assert.Equal(-63.5f, dest[0], 0.01f);
+            Assert.Equal(56.5f, dest[16], 0.01f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void IQ4_NL_RowByteSize_Matches()
+    {
+        Assert.Equal(18L, Dequantize.RowByteSize(32, QuantizationType.IQ4_NL));
+        Assert.Equal(72L, Dequantize.RowByteSize(128, QuantizationType.IQ4_NL));
+    }
+
+    [Fact]
+    public void IQ4_NL_NonAlignedCount_Throws()
+    {
+        float[] dest = new float[31];
+        Assert.Throws<ArgumentException>(() =>
+            Dequantize.ToFloat32(nint.Zero, 31, QuantizationType.IQ4_NL, dest));
+    }
+
+    [Fact]
+    public void IQ4_XS_SingleBlock_HandCalculated()
+    {
+        nuint totalBytes = IQ4_XS_BlockBytes;
+        nint ptr = (nint)NativeMemory.AlignedAlloc(totalBytes, 64);
+        try
+        {
+            NativeMemory.Clear((void*)ptr, totalBytes);
+            byte* block = (byte*)ptr;
+
+            Unsafe.WriteUnaligned(block, (Half)0.25f);
+
+            // Sub-block 0 scale = 33, so dl = 0.25 * (33 - 32) = 0.25.
+            block[4] = 0x01; // low 4 bits for sub-block 0
+            Unsafe.WriteUnaligned(block + 2, (ushort)0x0002); // high 2 bits = 2 for sub-block 0
+            block[8] = 0xF0; // low nibble 0 -> element 0, high nibble 15 -> element 16
+
+            // Sub-block 1 scale = 31, so dl = 0.25 * (31 - 32) = -0.25.
+            block[4] |= 0xF0; // low 4 bits for sub-block 1
+            ushort scalesH = Unsafe.ReadUnaligned<ushort>(block + 2);
+            scalesH |= (ushort)(1 << 2); // high 2 bits = 1 for sub-block 1
+            Unsafe.WriteUnaligned(block + 2, scalesH);
+            block[8 + 16] = 0x10; // sub-block 1: low nibble 0, high nibble 1
+
+            float[] dest = new float[KQuantGroupSize];
+            Dequantize.ToFloat32(ptr, KQuantGroupSize, QuantizationType.IQ4_XS, dest);
+
+            Assert.Equal(-31.75f, dest[0], 0.01f);
+            Assert.Equal(28.25f, dest[16], 0.01f);
+            Assert.Equal(31.75f, dest[32], 0.01f);
+            Assert.Equal(26.0f, dest[48], 0.01f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree((void*)ptr);
+        }
+    }
+
+    [Fact]
+    public void IQ4_XS_RowByteSize_Matches()
+    {
+        Assert.Equal(136L, Dequantize.RowByteSize(256, QuantizationType.IQ4_XS));
+        Assert.Equal(544L, Dequantize.RowByteSize(1024, QuantizationType.IQ4_XS));
+    }
+
+    [Fact]
+    public void IQ4_XS_NonAlignedCount_Throws()
+    {
+        float[] dest = new float[128];
+        Assert.Throws<ArgumentException>(() =>
+            Dequantize.ToFloat32(nint.Zero, 128, QuantizationType.IQ4_XS, dest));
     }
 
     // ──────────────────── Q4_K dequant ────────────────────

@@ -466,7 +466,7 @@ public static unsafe class CudaMoeFfn
             int minKAlign = CudaKernels.MinKAlignmentFor(weightQt);
             bool gemvEligible = batch == 1
                 && (K % minKAlign) == 0
-                && CudaKernels.HasQuantizedGemv(weightQt);
+                && kernels.HasQuantizedGemvKernel(weightQt);
             if (gemvEligible)
             {
                 kernels.LaunchConvertF32ToF16(inputF32, gemvInputF16, K, stream);

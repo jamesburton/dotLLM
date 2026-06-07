@@ -169,7 +169,6 @@ extern "C" __global__ void __launch_bounds__(256) embedding_lookup_q5_k(
 
     int sub = tid / 32;
     int pos = tid % 32;
-    int j = pos / 2;
 
     for (int b = 0; b < superblocks_per_row; b++)
     {
@@ -195,12 +194,11 @@ extern "C" __global__ void __launch_bounds__(256) embedding_lookup_q5_k(
         float scale = d * (float)sc;
         float min_val = dmin * (float)m;
 
-        const uint8_t* sub_qs = qs + sub * 16;
-        const uint8_t* sub_qh = qh + sub * 4;
-
-        uint8_t packed = sub_qs[j];
-        int nibble = (pos & 1) ? (packed >> 4) : (packed & 0x0F);
-        int bit = (sub_qh[j / 4] >> ((j % 4) * 2 + (pos & 1))) & 1;
+        int pair_idx = sub >> 1;
+        int nibble_half = sub & 1;
+        uint8_t packed = qs[pair_idx * 32 + pos];
+        int nibble = nibble_half ? (packed >> 4) : (packed & 0x0F);
+        int bit = (qh[pos] >> sub) & 1;
         int val = nibble | (bit << 4);
 
         out_row[b * K_QUANT_SUPER_BLOCK_SIZE + tid] = __float2half(scale * (float)val - min_val);

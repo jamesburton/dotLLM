@@ -1,0 +1,81 @@
+#version 450
+// Q2_K dequantization to FP32.
+//
+// Reads a tightly-packed Q2_K blob (one 84-byte super-block per 256 elements)
+// and produces a contiguous FP32 buffer of the dequantized values. Layout
+// matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ2_K and llama.cpp's
+// block_q2_K byte-for-byte:
+//
+//   bytes [ 0.. 15] = scales[16]  — per-sub-block low nibble = 4-bit unsigned
+//                     scale (0..15), high nibble = 4-bit unsigned dmin
+//                     coefficient (0..15). 16 sub-blocks of 16 elements each.
+//   bytes [16.. 79] = qs[64]      — 2-bit unsigned quants, 4 elements per byte
+//                     (element t: byteIdx = t/4, bit offset = (t%4)*2).
+//   bytes [80, 81]  = fp16 d      — global delta.
+//   bytes [82, 83]  = fp16 dmin   — global min delta.
+//
+// Per-element decode (sub = t / 16):
+//   q2     = (qs[t/4] >> ((t%4)*2)) & 0x3              // 0..3
+//   scale  =  scales[sub] & 0xF                         // 0..15
+//   dmCoef = (scales[sub] >> 4) & 0xF                   // 0..15
+//   value  =  d * scale * q2  -  dmin * dmCoef
+//
+// Dispatch:
+//   One workgroup per 84-byte super-block, 256 threads, one element per thread.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcUints;
+} pc;
+
+const uint Q2K_BLOCK_BYTES = 84u;
+const uint Q2K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    if (block >= pc.totalBlocks) return;
+
+    uint t = gl_LocalInvocationID.x;       // 0..255 — element within block
+    uint blockBase = block * Q2K_BLOCK_BYTES;
+
+    float d    = readHalf(blockBase + 80u);
+    float dmin = readHalf(blockBase + 82u);
+
+    uint sub      = t >> 4u;                // 0..15
+    uint scByte   = readByte(blockBase + sub);
+    uint scale    = scByte & 0xFu;
+    uint dmCoef   = (scByte >> 4u) & 0xFu;
+
+    uint qByteOff = blockBase + 16u + (t >> 2u);
+    uint qByte    = readByte(qByteOff);
+    uint bitOff   = (t & 3u) << 1u;
+    uint q2       = (qByte >> bitOff) & 0x3u;
+
+    float value = d * float(scale) * float(q2) - dmin * float(dmCoef);
+    dst[block * Q2K_GROUP_SIZE + t] = value;
+}

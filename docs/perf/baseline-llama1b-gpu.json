@@ -1,0 +1,65 @@
+{
+  "label": "unlabeled",
+  "timestamp": "2026-05-13T14:45:09+00:00",
+  "git": {
+    "commit": "bcace4be49f79cbfbd477590da90da0373ff15ca",
+    "branch": "feature/qwen3.6",
+    "dirty": true
+  },
+  "system": {
+    "cpu": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel",
+    "cores": 22,
+    "os": "Windows 11",
+    "ram_gb": 95.5
+  },
+  "config": {
+    "prompt_size": "short",
+    "max_tokens": 30,
+    "models": [
+      "Llama-3.2-1B-Instruct-Q8_0.gguf"
+    ],
+    "device": "gpu"
+  },
+  "results": [
+    {
+      "engine": "llama.cpp (gpu)",
+      "model": "Llama-3.2-1B-Instruct-Q8_0",
+      "prefill_ms": 32.56,
+      "decode_ms": 341.13,
+      "prefill_tokens": 6,
+      "decode_tokens": 29,
+      "prefill_tok_per_sec": 184.28,
+      "decode_tok_per_sec": 85.01,
+      "decode_ms_per_tok": 11.763103448275862,
+      "total_tok_per_sec": 93.66052075249537,
+      "bdn_mean_ns": null,
+      "bdn_stddev_ns": null,
+      "median_prefill_tok_per_sec": 155.14,
+      "median_decode_tok_per_sec": 72.5,
+      "median_prefill_ms": 38.67,
+      "median_decode_ms": 400.03,
+      "decode_cv": 0.7325354448943041,
+      "prefill_cv": 0.8729572208419771,
+      "all_decode_tok_per_sec": [
+        9.12,
+        72.5,
+        85.01
+      ],
+      "all_prefill_tok_per_sec": [
+        0.34,
+        155.14,
+        184.28
+      ],
+      "all_decode_ms": [
+        3179.89,
+        400.03,
+        341.13
+      ],
+      "all_prefill_ms": [
+        17476.96,
+        38.67,
+        32.56
+      ]
+    }
+  ]
+}
