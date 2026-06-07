@@ -97,3 +97,11 @@ GGUF files can have different types per tensor. Dispatch to correct kernel based
 - Vec_dot dominant for decode (GEMV). Dequant+BLAS may win for prefill (GEMM).
 - GPU: custom CUDA kernels dequantize in shared memory, use tensor cores. Ref: llama.cpp `ggml-cuda/mmq.cu`.
 - Block alignment awkward for SIMD — handle tail elements carefully.
+
+## Vulkan Q2_K / Q3_K Coverage
+
+Q2_K and Q3_K — the densest K-quants — close the K-quant family on Vulkan. Matmul kernels share the dispatch shape of Q4/5/6_K (one workgroup per output row at decode, 16×16 output tile at prefill) but use a 16-element K-chunk to match Q2/3_K's 16-element sub-block size (vs 32-element for Q4/5/6_K).
+
+Source bytes stay on device — dequantisation happens in the shader inner loop, so memory cost is the GGUF source size (not 2-4× expanded F32).
+
+**Q3_K layout note.** The Q3_K dequant matches `DequantizeQ3_KScalar` (CPU) and `dequant_q3_k_block` (CUDA) byte-for-byte. Per llama.cpp `ggml-quants.c` `dequantize_row_q3_K`, the correct sub-block-scales layout is: sub 0..7 low nibble = `scales12[sub] & 0xF`; sub 8..15 low nibble = `(scales12[sub - 8] >> 4) & 0xF`; sub 0..15 high 2 bits = `scales12[8 + sub/4] >> ((sub%4)*2)`. An earlier revision of all three implementations read the sub_12..15 low nibbles from bytes 8..11 high nibble (which are occupied by the hi2 packing); that bug was fixed in CPU + CUDA via #156 / #168 and in Vulkan via this branch.
