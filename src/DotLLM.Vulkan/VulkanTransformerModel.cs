@@ -75,6 +75,17 @@ public sealed class VulkanTransformerModel : IModel
     // but has a more intricate (ql, qh) byte-extraction.
     private readonly MatMulQ6KGemvF32Kernel _matmulQ6K;
     private readonly MatMulQ6KGemmF32Kernel _matmulQ6KGemm;
+    // F16 / BF16 native matmul kernels — Phase 8. Always created; the
+    // RecordMatmul dispatcher routes per device-side QuantizationType. The
+    // F16 GEMM coopmat path is optional (null when the device does not
+    // advertise VK_KHR_cooperative_matrix); the scalar GEMM picks up the
+    // slack on those devices. BF16 has no coopmat path — KHR_coopmat exposes
+    // F16 / Sint8 operands on mainstream drivers, not BF16.
+    private readonly MatMulF16GemvF32Kernel _matmulF16;
+    private readonly MatMulF16GemmF32Kernel _matmulF16Gemm;
+    private readonly MatMulF16GemmCoopmatKernel? _matmulF16GemmCoopmat;
+    private readonly MatMulBf16GemvF32Kernel _matmulBf16;
+    private readonly MatMulBf16GemmF32Kernel _matmulBf16Gemm;
     // Optional decode-path fusion of rmsnorm + Q8_0 GEMV. Eliminates one
     // dispatch + one barrier per attn-norm/Q proj and per ffn-norm/Gate proj
     // (60 dispatches per decode at 30 layers). Null when the SPV is missing
@@ -118,6 +129,9 @@ public sealed class VulkanTransformerModel : IModel
         MatMulF32Kernel matmul, MatMulQ8_0Kernel matmulQ8, MatMulQ8_0GemmKernel matmulQ8Gemm,
         MatMulQ8_0GemmCoopmatKernel? matmulQ8GemmCoopmat,
         MatMulQ6KGemvF32Kernel matmulQ6K, MatMulQ6KGemmF32Kernel matmulQ6KGemm,
+        MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
+        MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
+        MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, SwiGluF32Kernel swiglu, AddKernel add,
@@ -137,6 +151,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8GemmCoopmat = matmulQ8GemmCoopmat;
         _matmulQ6K = matmulQ6K;
         _matmulQ6KGemm = matmulQ6KGemm;
+        _matmulF16 = matmulF16;
+        _matmulF16Gemm = matmulF16Gemm;
+        _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
+        _matmulBf16 = matmulBf16;
+        _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
         _rmsnorm = rmsnorm;
         _rope = rope;
@@ -226,6 +245,19 @@ public sealed class VulkanTransformerModel : IModel
         // RecordMatmul dispatcher routes per device-side QuantizationType.
         var matmulQ6K = MatMulQ6KGemvF32Kernel.Create(device, spvDir);
         var matmulQ6KGemm = MatMulQ6KGemmF32Kernel.Create(device, spvDir);
+        // F16 / BF16 native matmul kernels — Phase 8. Always created; the
+        // dispatcher routes per device-side QuantizationType. The F16 GEMM
+        // coopmat path is opportunistic (null on devices without coopmat).
+        var matmulF16 = MatMulF16GemvF32Kernel.Create(device, spvDir);
+        var matmulF16Gemm = MatMulF16GemmF32Kernel.Create(device, spvDir);
+        MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat = null;
+        if (device.HasCooperativeMatrix)
+        {
+            try { matmulF16GemmCoopmat = MatMulF16GemmCoopmatKernel.Create(device, spvDir); }
+            catch (InvalidOperationException) { /* No usable F16 tile shape; stay on scalar. */ }
+        }
+        var matmulBf16 = MatMulBf16GemvF32Kernel.Create(device, spvDir);
+        var matmulBf16Gemm = MatMulBf16GemmF32Kernel.Create(device, spvDir);
         // Optional coopmat prefill GEMM — 3.8× over scalar on AMD RDNA3.5 at
         // Llama-3 4096² N=64. Null on devices without KHR_cooperative_matrix;
         // router falls back to the scalar GEMM. Tolerance: abs 5e-3 / rel 5e-3
@@ -264,6 +296,8 @@ public sealed class VulkanTransformerModel : IModel
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
             matmulQ6K, matmulQ6KGemm,
+            matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
+            matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
             rmsnorm, rope, attention, swiglu, add,
             submit,
@@ -581,6 +615,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8GemmCoopmat?.InvalidateDescriptorCache();
         _matmulQ6K.InvalidateDescriptorCache();
         _matmulQ6KGemm.InvalidateDescriptorCache();
+        _matmulF16.InvalidateDescriptorCache();
+        _matmulF16Gemm.InvalidateDescriptorCache();
+        _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
+        _matmulBf16.InvalidateDescriptorCache();
+        _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
@@ -683,6 +722,48 @@ public sealed class VulkanTransformerModel : IModel
             else
             {
                 _matmulQ6KGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantType.F16)
+        {
+            // Phase 8: native F16 weights stay 2 bytes / element on device.
+            // Decode (seqLen==1) -> GEMV; prefill -> coopmat GEMM when
+            // available, scalar tiled GEMM otherwise. Alignment: inputDim %
+            // 32 == 0 for the GEMM path (K-chunk = 32); inputDim % 2 == 0 for
+            // the GEMV. Both enforced by the upload path's KeepF16OnDevice
+            // predicate (which itself requires inputDim % 2 == 0; layers with
+            // inputDim % 32 != 0 are decode-only and stay on the GEMV).
+            if (seqLen == 1)
+            {
+                _matmulF16.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else if (_matmulF16GemmCoopmat is not null)
+            {
+                _matmulF16GemmCoopmat.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+            else
+            {
+                _matmulF16Gemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
+        else if (weightQt == QuantType.BF16)
+        {
+            // Phase 8: native BF16 weights stay 2 bytes / element on device.
+            // No coopmat path for BF16 (KHR_cooperative_matrix exposes F16 /
+            // Sint8 operands on mainstream drivers, not BF16) — decode goes
+            // through the scalar GEMV, prefill through the scalar tiled GEMM.
+            if (seqLen == 1)
+            {
+                _matmulBf16.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulBf16Gemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
             }
         }
@@ -815,6 +896,11 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
+        _matmulBf16Gemm.Dispose();
+        _matmulBf16.Dispose();
+        _matmulF16GemmCoopmat?.Dispose();
+        _matmulF16Gemm.Dispose();
+        _matmulF16.Dispose();
         _matmulQ6KGemm.Dispose();
         _matmulQ6K.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();

@@ -248,6 +248,21 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.Q8_0;
 
+    /// <summary>Returns true when the matrix will be kept on device as native F16
+    /// (2 bytes per element). Gated on the contraction axis being a multiple of 2
+    /// (each storage uint holds two F16 elements via <c>unpackHalf2x16</c>).
+    /// Phase 8 of the K-quant / native-float work — unblocks BF16 / F16 SafeTensors
+    /// loads that previously had to expand to F32 at upload, doubling VRAM.</summary>
+    private static bool KeepF16OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.F16 && (inputDim & 1) == 0;
+
+    /// <summary>Returns true when the matrix will be kept on device as native BF16
+    /// (2 bytes per element). Gated on the contraction axis being a multiple of 2.
+    /// BF16 expand on read: shift-left-16 + reinterpret-as-F32 in the matmul shader.
+    /// Phase 8 sibling of <see cref="KeepF16OnDevice"/>.</summary>
+    private static bool KeepBf16OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.BF16 && (inputDim & 1) == 0;
+
     /// <summary>Returns true when the matrix will be kept on device as Q6_K super-blocks
     /// (210 bytes per 256 elements). Gated on the contraction axis being a multiple of
     /// the Q6_K super-block size (256). Phase 1 of the K-quant work on Vulkan
@@ -256,12 +271,14 @@ internal sealed class VulkanWeights : IDisposable
         => !dequantToFp32 && qt == QuantizationType.Q6_K && (inputDim % 256) == 0;
 
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q6_K /
-    /// F32 depending on the source and the alignment constraints.</summary>
+    /// F16 / BF16 / F32 depending on the source and the alignment constraints.</summary>
     private static QuantizationType DeviceQuantTypeFor(
         QuantizationType srcQt, int inputDim, bool dequantToFp32)
     {
         if (KeepQ8OnDevice(srcQt, dequantToFp32)) return QuantizationType.Q8_0;
         if (KeepQ6KOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.Q6_K;
+        if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
+        if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
         return QuantizationType.F32;
     }
 
@@ -293,6 +310,10 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q8_0) * outputDim;
         if (KeepQ6KOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.Q6_K) * outputDim;
+        if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
+        if (KeepBf16OnDevice(qt, inputDim, dequantToFp32))
+            return Dequantize.RowByteSize(inputDim, QuantizationType.BF16) * outputDim;
         return elems * sizeof(float);
     }
 
