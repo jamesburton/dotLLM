@@ -1,9 +1,51 @@
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Gguf;
 
 namespace DotLLM.Models.Architectures;
+
+/// <summary>
+/// Per-layer dense-routing MoE weight bundle. Present on a
+/// <see cref="TransformerLayerWeights"/> when the layer replaces its FFN
+/// with a Mixtral-convention MoE block. All pointers are F32 row-major —
+/// bf16 and F16 tensors are upcast at load time so the MoE kernel can
+/// feed <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/> directly without
+/// per-call dequant.
+/// </summary>
+internal sealed class MoeLayerWeights
+{
+    /// <summary>Router gate.weight as F32 [numExperts, hiddenSize] row-major.</summary>
+    public readonly float[] Gate;
+
+    /// <summary>Per-expert <c>w1</c> (gate_proj) F32 pointers [intermediateSize, hiddenSize] row-major.</summary>
+    public readonly nint[] W1;
+
+    /// <summary>Per-expert <c>w2</c> (down_proj) F32 pointers [hiddenSize, intermediateSize] row-major.</summary>
+    public readonly nint[] W2;
+
+    /// <summary>Per-expert <c>w3</c> (up_proj) F32 pointers [intermediateSize, hiddenSize] row-major.</summary>
+    public readonly nint[] W3;
+
+    public readonly int NumExperts;
+    public readonly int NumExpertsPerTok;
+    public readonly int HiddenSize;
+    public readonly int IntermediateSize;
+
+    public MoeLayerWeights(
+        float[] gate,
+        nint[] w1, nint[] w2, nint[] w3,
+        int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize)
+    {
+        Gate = gate;
+        W1 = w1; W2 = w2; W3 = w3;
+        NumExperts = numExperts;
+        NumExpertsPerTok = numExpertsPerTok;
+        HiddenSize = hiddenSize;
+        IntermediateSize = intermediateSize;
+    }
+}
 
 /// <summary>
 /// Holds per-layer weight references for a single transformer layer.
@@ -80,6 +122,13 @@ internal readonly struct TransformerLayerWeights
     /// <summary>Optional down projection bias [DownOutputDim]. Null when absent.</summary>
     public readonly float[]? DownBias;
 
+    /// <summary>
+    /// MoE FFN bundle for Mixtral-convention layers. When non-null the dense
+    /// <see cref="GateWeight"/>/<see cref="UpWeight"/>/<see cref="DownWeight"/>
+    /// slots are ignored by the forward pass and MoE routing runs instead.
+    /// </summary>
+    public readonly MoeLayerWeights? Moe;
+
     public TransformerLayerWeights(
         float[] attnNormWeight,
         nint qWeight, QuantizationType qQuantType, int qOutputDim, int qInputDim,
@@ -92,7 +141,8 @@ internal readonly struct TransformerLayerWeights
         nint downWeight, QuantizationType downQuantType, int downOutputDim, int downInputDim,
         float[]? qBias = null, float[]? kBias = null, float[]? vBias = null, float[]? oBias = null,
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
-        float[]? qNormWeight = null, float[]? kNormWeight = null)
+        float[]? qNormWeight = null, float[]? kNormWeight = null,
+        MoeLayerWeights? moe = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -105,6 +155,7 @@ internal readonly struct TransformerLayerWeights
         GateWeight = gateWeight; GateQuantType = gateQuantType; GateOutputDim = gateOutputDim; GateInputDim = gateInputDim; GateBias = gateBias;
         UpWeight = upWeight; UpQuantType = upQuantType; UpOutputDim = upOutputDim; UpInputDim = upInputDim; UpBias = upBias;
         DownWeight = downWeight; DownQuantType = downQuantType; DownOutputDim = downOutputDim; DownInputDim = downInputDim; DownBias = downBias;
+        Moe = moe;
     }
 }
 
@@ -155,11 +206,19 @@ internal sealed class TransformerWeights : IDisposable
     /// <summary>R4-interleaved LM head weights. Null until <see cref="RepackWeights"/> is called or if type is not repackable.</summary>
     public WeightRepacking.RepackedWeight? RepackedOutput { get; private set; }
 
+    /// <summary>
+    /// Loader-owned 64-byte-aligned allocations created at load time (e.g.
+    /// bf16 → F32 upcasts for the safetensors path). Freed by
+    /// <see cref="Dispose"/>. Empty for pure-mmap GGUF loads.
+    /// </summary>
+    private readonly List<nint>? _ownedAllocations;
+
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
         TransformerLayerWeights[] layers,
         float[] outputNormWeight,
-        nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim)
+        nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
+        List<nint>? ownedAllocations = null)
     {
         TokenEmbedWeight = tokenEmbedWeight;
         TokenEmbedQuantType = tokenEmbedQuantType;
@@ -171,6 +230,27 @@ internal sealed class TransformerWeights : IDisposable
         OutputQuantType = outputQuantType;
         OutputOutputDim = outputOutputDim;
         OutputInputDim = outputInputDim;
+        _ownedAllocations = ownedAllocations;
+    }
+
+    /// <summary>
+    /// Factory used by the safetensors loader. Wraps the private constructor
+    /// and accepts the list of owned allocations (bf16→F32 upcast buffers)
+    /// that must be freed when the weights are disposed.
+    /// </summary>
+    internal static TransformerWeights CreateFromSafetensors(
+        nint tokenEmbedWeight, QuantizationType tokenEmbedQt, int vocabSize, int hiddenSize,
+        TransformerLayerWeights[] layers,
+        float[] outputNormWeight,
+        nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
+        List<nint> ownedAllocations)
+    {
+        return new TransformerWeights(
+            tokenEmbedWeight, tokenEmbedQt, vocabSize, hiddenSize,
+            layers,
+            outputNormWeight,
+            outputWeight, outputQt, outputM, outputK,
+            ownedAllocations);
     }
 
     /// <summary>
@@ -237,15 +317,20 @@ internal sealed class TransformerWeights : IDisposable
         for (int i = 0; i < Layers.Length; i++)
         {
             ref readonly var lw = ref Layers[i];
+            // MoE layers don't populate the dense gate/up/down slots —
+            // repack only the attention projections. The MoE FFN path runs
+            // without R4 interleaving (the per-expert GEMMs are tiny and
+            // the win would be microscopic).
+            bool isMoe = lw.Moe is not null;
             repacked[i] = new RepackedLayerWeights
             {
                 Q = TryRepack(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim),
                 K = TryRepack(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim),
                 V = TryRepack(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim),
                 O = TryRepack(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim),
-                Gate = TryRepack(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim),
-                Up = TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
-                Down = TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),
+                Gate = isMoe ? default : TryRepack(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim),
+                Up = isMoe ? default : TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
+                Down = isMoe ? default : TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),
             };
         }
         RepackedLayers = repacked;
@@ -261,8 +346,8 @@ internal sealed class TransformerWeights : IDisposable
         return WeightRepacking.RepackR4(ptr, qt, m, k);
     }
 
-    /// <summary>Frees all R4-interleaved weight buffers.</summary>
-    public void Dispose()
+    /// <summary>Frees all R4-interleaved weight buffers and any owned aligned allocations.</summary>
+    public unsafe void Dispose()
     {
         if (RepackedLayers is not null)
         {
@@ -272,6 +357,16 @@ internal sealed class TransformerWeights : IDisposable
         }
         RepackedOutput?.Dispose();
         RepackedOutput = null;
+
+        if (_ownedAllocations is not null)
+        {
+            foreach (var ptr in _ownedAllocations)
+            {
+                if (ptr != nint.Zero)
+                    NativeMemory.AlignedFree((void*)ptr);
+            }
+            _ownedAllocations.Clear();
+        }
     }
 
     private static TransformerLayerWeights LoadLayer(

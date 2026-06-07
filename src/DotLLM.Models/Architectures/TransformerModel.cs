@@ -9,6 +9,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using DotLLM.Models.Gguf;
+using DotLLM.Models.SafeTensors;
 
 namespace DotLLM.Models.Architectures;
 
@@ -29,7 +30,12 @@ public sealed unsafe class TransformerModel : IModel
 
     private readonly TransformerWeights _weights;
     private readonly TransformerForwardState _state;
-    private readonly GgufFile _gguf; // prevent premature GC of mmap
+    // Lifetime anchor for the underlying mmap-backed weight file. Holds a
+    // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
+    // while weight pointers are still in use. Not null for any loaded model.
+#pragma warning disable IDE0052, CA1823 // field used only as a GC root
+    private readonly object _mmapAnchor;
+#pragma warning restore IDE0052, CA1823
     private readonly int _ropeDim;
     private readonly RoPEType _ropeType;
     private readonly int? _slidingWindowSize;
@@ -46,13 +52,13 @@ public sealed unsafe class TransformerModel : IModel
     internal int DebugMaxLayers { get; set; }
 
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
-                       GgufFile gguf, int ropeDim, RoPEType ropeType,
+                       object mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
     {
         Config = config;
         _weights = weights;
         _state = state;
-        _gguf = gguf;
+        _mmapAnchor = mmapAnchor;
         _ropeDim = ropeDim;
         _ropeType = ropeType;
         _slidingWindowSize = config.SlidingWindowSize;
@@ -115,6 +121,65 @@ public sealed unsafe class TransformerModel : IModel
         }
 
         return new TransformerModel(config, weights, state, gguf, ropeDim, ropeType, pool, ownsPool: pool is not null);
+    }
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention
+    /// safetensors file (single-threaded). The <paramref name="file"/> must
+    /// remain alive for the lifetime of the returned model — internally
+    /// anchored to prevent GC, but the caller must still dispose it after
+    /// disposing the model.
+    /// </summary>
+    public static TransformerModel LoadFromSafetensors(SafetensorsFile file, ModelConfig config)
+        => LoadFromSafetensors(file, config, ThreadingConfig.SingleThreaded);
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention
+    /// safetensors file with threading configuration.
+    /// </summary>
+    public static TransformerModel LoadFromSafetensors(
+        SafetensorsFile file, ModelConfig config, ThreadingConfig threading)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        weights.RepackWeights();
+
+        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
+        if (ropeDim == 0) ropeDim = config.HeadDim;
+        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
+        RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
+
+        var state = new TransformerForwardState(
+            config.HiddenSize,
+            config.NumAttentionHeads,
+            config.NumKvHeads,
+            config.HeadDim,
+            config.IntermediateSize,
+            config.VocabSize,
+            config.MaxSequenceLength,
+            ropeDim,
+            ropeTheta);
+
+        ComputeThreadPool? pool = null;
+        if (threading.IsParallel)
+        {
+            int effectiveThreads = threading.EffectiveThreadCount;
+            if (threading.EnableNumaPinning || threading.EnablePCorePinning)
+            {
+                var topology = NumaTopology.Detect();
+                if (threading.EnablePCorePinning && topology.IsHybrid)
+                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
+                pool = new ComputeThreadPool(effectiveThreads, topology, threading);
+            }
+            else
+            {
+                pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
+            }
+        }
+
+        return new TransformerModel(config, weights, state, file, ropeDim, ropeType, pool, ownsPool: pool is not null);
     }
 
     /// <inheritdoc/>
@@ -312,6 +377,48 @@ public sealed unsafe class TransformerModel : IModel
 
             // h. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+
+            // ── MoE branch ──────────────────────────────────────────────
+            // Mixtral-convention top-k dense routing replaces the dense FFN
+            // block entirely. Takes post-attn hidden + FFN RMSNorm weight,
+            // runs router + top-k experts, writes into normOut, then residual
+            // adds into hidden and continues to the next layer. No R4 repack
+            // (expert GEMMs are tiny), no pre-quantise (experts are F32).
+            if (lw.Moe is not null)
+            {
+                // FFN RMSNorm per token into normOut.
+                for (int t = 0; t < seqLen; t++)
+                {
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                        lw.FfnNormWeight, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                }
+
+                MoeLayerWeights moe = lw.Moe!;
+                MoeSwiGluMlp.Execute(
+                    hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                    gateWeights: moe.Gate,
+                    expertsW1: moe.W1,
+                    expertsW2: moe.W2,
+                    expertsW3: moe.W3,
+                    output: new Span<float>(normOut, seqLen * hiddenSize),
+                    numExperts: moe.NumExperts,
+                    numExpertsPerTok: moe.NumExpertsPerTok,
+                    hiddenSize: hiddenSize,
+                    intermediateSize: moe.IntermediateSize,
+                    seqLen: seqLen);
+
+                // Residual add (per token) → hidden. Same as dense path.
+                for (int t = 0; t < seqLen; t++)
+                {
+                    Add.Execute(
+                        new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        new Span<float>(hidden + t * hiddenSize, hiddenSize));
+                }
+                continue;
+            }
 
             // i. FFN RMSNorm + Pre-quantize + Gate/Up projections
             if (seqLen == 1 && _threadPool != null)
@@ -816,7 +923,7 @@ public sealed unsafe class TransformerModel : IModel
         if (_ownsThreadPool)
             _threadPool?.Dispose();
         _state.Dispose();
-        _weights.Dispose(); // free R4-interleaved weight buffers
-        // _gguf is not owned by us — caller manages GgufFile lifetime.
+        _weights.Dispose(); // free R4-interleaved weight buffers and any owned bf16→F32 scratch
+        // _mmapAnchor is not owned by us — caller disposes the GgufFile / SafetensorsFile.
     }
 }
