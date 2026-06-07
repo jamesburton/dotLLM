@@ -43,8 +43,15 @@ public static unsafe class PeftAdapterLoader
     /// validates layer count, hidden size, and per-projection dimensions and
     /// throws <see cref="InvalidDataException"/> at load time on mismatch.
     /// </param>
+    /// <param name="preserveSourceDType">
+    /// When <c>true</c>, F16 / BF16 source tensors are stored verbatim in the
+    /// adapter and dequantised on read by the runtime delta kernel (Phase 4d.1).
+    /// When <c>false</c> (default — backward compat with Phase 4a), source
+    /// tensors are upcast to F32 at load time.
+    /// </param>
     /// <returns>A loaded <see cref="LoraAdapter"/> owned by the caller.</returns>
-    public static LoraAdapter LoadFromDirectory(string name, string path, ModelConfig? baseConfig = null)
+    public static LoraAdapter LoadFromDirectory(string name, string path, ModelConfig? baseConfig = null,
+                                                bool preserveSourceDType = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentException.ThrowIfNullOrEmpty(path);
@@ -84,7 +91,7 @@ public static unsafe class PeftAdapterLoader
         try
         {
             using var safetensors = SafetensorsFile.Open(safetensorsPath);
-            LoadTensors(safetensors, adapter, meta.Rank);
+            LoadTensors(safetensors, adapter, meta.Rank, preserveSourceDType);
 
             if (baseConfig is not null && !adapter.IsCompatible(baseConfig))
             {
@@ -105,7 +112,7 @@ public static unsafe class PeftAdapterLoader
         }
     }
 
-    private static void LoadTensors(SafetensorsFile file, LoraAdapter adapter, int rank)
+    private static void LoadTensors(SafetensorsFile file, LoraAdapter adapter, int rank, bool preserveSourceDType = false)
     {
         // Group tensors by (layer, proj) so we can validate that A and B
         // arrive in matched pairs. Per PEFT convention the writer typically
@@ -220,26 +227,66 @@ public static unsafe class PeftAdapterLoader
             long bElems = (long)rank * inputDim;
             long aElems = (long)outputDim * rank;
 
-            nint bHandle = LoraAdapter.AllocAligned(bElems);
-            nint aHandle = LoraAdapter.AllocAligned(aElems);
-
-            try
+            // Phase 4d.1: when preserveSourceDType is set AND both tensors share
+            // a supported quantised dtype (F16 or BF16), keep the bytes verbatim.
+            // Otherwise upcast to F32 (the original Phase 4a behaviour).
+            LoraWeightDType storeDType = LoraWeightDType.F32;
+            if (preserveSourceDType
+                && pair.ATensor.DType == pair.BTensor.DType
+                && (pair.ATensor.DType == SafetensorsDType.F16 || pair.ATensor.DType == SafetensorsDType.BF16))
             {
-                CopyTensorAsF32(file, pair.ATensor, (float*)bHandle, bElems);
-                CopyTensorAsF32(file, pair.BTensor, (float*)aHandle, aElems);
+                storeDType = pair.ATensor.DType == SafetensorsDType.F16
+                    ? LoraWeightDType.F16
+                    : LoraWeightDType.BF16;
             }
-            catch
+
+            nint bHandle;
+            nint aHandle;
+            if (storeDType == LoraWeightDType.F32)
             {
-                if (aHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)aHandle);
-                if (bHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)bHandle);
-                throw;
+                bHandle = LoraAdapter.AllocAligned(bElems);
+                aHandle = LoraAdapter.AllocAligned(aElems);
+                try
+                {
+                    CopyTensorAsF32(file, pair.ATensor, (float*)bHandle, bElems);
+                    CopyTensorAsF32(file, pair.BTensor, (float*)aHandle, aElems);
+                }
+                catch
+                {
+                    if (aHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)aHandle);
+                    if (bHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)bHandle);
+                    throw;
+                }
+            }
+            else
+            {
+                // 2 bytes per element for F16/BF16. Use AlignedAllocBytes so
+                // the parent dispose path still uses AlignedFree.
+                long bBytes = bElems * 2;
+                long aBytes = aElems * 2;
+                bHandle = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)bBytes, 64);
+                aHandle = (nint)System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)aBytes, 64);
+                try
+                {
+                    byte* bSrc = (byte*)file.DataBasePointer + pair.ATensor.DataBeginOffset;
+                    byte* aSrc = (byte*)file.DataBasePointer + pair.BTensor.DataBeginOffset;
+                    Buffer.MemoryCopy(bSrc, (void*)bHandle, bBytes, bBytes);
+                    Buffer.MemoryCopy(aSrc, (void*)aHandle, aBytes, aBytes);
+                }
+                catch
+                {
+                    if (aHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)aHandle);
+                    if (bHandle != 0) System.Runtime.InteropServices.NativeMemory.AlignedFree((void*)bHandle);
+                    throw;
+                }
             }
 
             adapter.AddLayerWeights(layer, proj, new LoraLayerWeights(
                 AHandle: aHandle,
                 BHandle: bHandle,
                 InputDim: inputDim,
-                OutputDim: outputDim));
+                OutputDim: outputDim,
+                WeightDType: storeDType));
         }
     }
 

@@ -89,15 +89,36 @@ public interface ILoraAdapter : IDisposable
 /// </para>
 /// </remarks>
 /// <param name="AHandle">
-/// Up-projection pointer — F32 row-major <c>[OutputDim, Rank]</c>.
+/// Up-projection pointer — row-major <c>[OutputDim, Rank]</c>.
 /// </param>
 /// <param name="BHandle">
-/// Down-projection pointer — F32 row-major <c>[Rank, InputDim]</c>.
+/// Down-projection pointer — row-major <c>[Rank, InputDim]</c>.
 /// </param>
 /// <param name="InputDim">Input dimension of the projection (d_in).</param>
 /// <param name="OutputDim">Output dimension of the projection (d_out).</param>
+/// <param name="WeightDType">
+/// Element dtype of the A/B buffers. F32 (default — backward compatible),
+/// F16, or BF16. The CPU LoRA delta path dequantises on read; Vulkan
+/// dispatches to the matching native matmul kernel.
+/// </param>
 public readonly record struct LoraLayerWeights(
     nint AHandle,
     nint BHandle,
     int InputDim,
-    int OutputDim);
+    int OutputDim,
+    LoraWeightDType WeightDType = LoraWeightDType.F32);
+
+/// <summary>
+/// LoRA adapter weight dtype. Most PEFT trainers ship F16; some ship BF16
+/// or F32. dotLLM stores adapter buffers in their native dtype to halve
+/// memory for typical adapters and avoids an unnecessary up-cast on load.
+/// </summary>
+public enum LoraWeightDType : byte
+{
+    /// <summary>32-bit single-precision float (default).</summary>
+    F32 = 0,
+    /// <summary>16-bit IEEE half-precision float (PEFT default).</summary>
+    F16 = 1,
+    /// <summary>16-bit bfloat16 (top 16 bits of an F32).</summary>
+    BF16 = 2,
+}
