@@ -451,11 +451,18 @@ internal sealed class TransformerWeights : IDisposable
         var embDesc = tensors["token_embd.weight"];
         nint embPtr = dataBase + (nint)embDesc.DataOffset;
 
+        // MLA (DeepSeek-V2/V3) loads its projection tensors as F32 dequant
+        // buffers since the CPU MlaAttention.Execute oracle is F32-only. Track
+        // them on the loader so Dispose can free them. Empty for non-MLA models.
+        var owned = config.MlaConfig is not null ? new List<nint>() : null;
+
         // Per-layer weights
         var layers = new TransformerLayerWeights[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
         {
-            layers[i] = LoadLayer(i, dataBase, tensors, config);
+            layers[i] = config.MlaConfig is not null
+                ? LoadMlaLayer(i, dataBase, tensors, config, owned!)
+                : LoadLayer(i, dataBase, tensors, config);
         }
 
         // Output norm
@@ -488,7 +495,8 @@ internal sealed class TransformerWeights : IDisposable
             embPtr, embDesc.QuantizationType, config.VocabSize, config.HiddenSize,
             layers,
             outputNormWeight,
-            outputPtr, outputQt, outputM, outputK);
+            outputPtr, outputQt, outputM, outputK,
+            ownedAllocations: owned);
     }
 
     /// <summary>
@@ -703,6 +711,316 @@ internal sealed class TransformerWeights : IDisposable
         int k = desc.Shape[0];
         int m = desc.Shape[1];
         return (ptr, desc.QuantizationType, m, k);
+    }
+
+    /// <summary>
+    /// Loads a single DeepSeek-V2 / V3 MLA layer's projection tensors from GGUF.
+    /// Each MLA-specific tensor is dequantized to a 64-byte-aligned F32 host
+    /// buffer (to match the CPU oracle <see cref="DotLLM.Cpu.Kernels.MlaAttention.Execute"/>'s
+    /// F32 contract); the returned <see cref="TransformerLayerWeights"/> carries
+    /// these F32 pointers in <c>lw.Mla</c> and zeroes the legacy GQA Q/K/V slots.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Tensor naming</b> (per llama.cpp's <c>convert_hf_to_gguf.py</c>
+    /// <c>DeepseekV2Model</c>):
+    /// <list type="bullet">
+    ///   <item><c>blk.{N}.attn_q_a.weight</c> + <c>attn_q_a_norm.weight</c> +
+    ///     <c>attn_q_b.weight</c> when <c>q_lora_rank &gt; 0</c></item>
+    ///   <item><c>blk.{N}.attn_q.weight</c> when <c>q_lora_rank == 0</c> (V2-Lite)</item>
+    ///   <item><c>blk.{N}.attn_kv_a_mqa.weight</c> + <c>attn_kv_a_norm.weight</c> +
+    ///     <c>attn_kv_b.weight</c></item>
+    ///   <item><c>blk.{N}.attn_output.weight</c> (same name as GQA — reused as o_proj)</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Memory budget.</b> Q4_K_M → F32 dequant inflates ~4× per element.
+    /// V2-Lite MLA per-layer footprint ≈ 12 MB raw → 48 MB F32 (×27 layers ≈
+    /// 1.3 GB total). Dense FFN (separate path) is the main pressure.
+    /// Full-V2 MLA is ~10× this (160 GB) — that needs an on-device dequant
+    /// path; flagged as a follow-up.
+    /// </para>
+    /// </remarks>
+    private static unsafe TransformerLayerWeights LoadMlaLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var mla = config.MlaConfig
+            ?? throw new InvalidOperationException("LoadMlaLayer called without MlaConfig.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int qLora = mla.QLoraRank;
+        int kvLora = mla.KvLoraRank;
+        int qkNope = mla.QkNopeHeadDim;
+        int qkRope = mla.QkRopeHeadDim;
+        int vHead = mla.VHeadDim;
+        int numHeads = config.NumAttentionHeads;
+        int qTotal = numHeads * (qkNope + qkRope);
+        int kvAOut = kvLora + qkRope;
+        int kvBOut = numHeads * (qkNope + vHead);
+        int oInput = numHeads * vHead;
+
+        // ── Norms ─────────────────────────────────────────────────────
+        float[] attnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_norm.weight"], hiddenSize);
+        float[] ffnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_norm.weight"], hiddenSize);
+
+        // ── Q path ─────────────────────────────────────────────────────
+        nint qAProj = 0, qBProj = 0, qProj = 0;
+        float[]? qANorm = null;
+        if (qLora > 0)
+        {
+            qAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_a.weight"],
+                                  (long)qLora * hiddenSize, owned);
+            qANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_q_a_norm.weight"], qLora);
+            qBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q_b.weight"],
+                                  (long)qTotal * qLora, owned);
+        }
+        else
+        {
+            qProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_q.weight"],
+                                 (long)qTotal * hiddenSize, owned);
+        }
+
+        // ── KV path (always factored) ────────────────────────────────
+        nint kvAProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_a_mqa.weight"],
+                                    (long)kvAOut * hiddenSize, owned);
+        float[] kvANorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_kv_a_norm.weight"], kvLora);
+        nint kvBProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_kv_b.weight"],
+                                    (long)kvBOut * kvLora, owned);
+
+        // ── O projection (same tensor name as GQA: attn_output) ──────
+        nint oProj = DequantToF32(dataBase, tensors[$"{prefix}.attn_output.weight"],
+                                  (long)hiddenSize * oInput, owned);
+
+        var mlaBundle = new MlaLayerWeights(
+            numHeads: numHeads,
+            qkNopeHeadDim: qkNope,
+            qkRopeHeadDim: qkRope,
+            vHeadDim: vHead,
+            qLoraRank: qLora,
+            kvLoraRank: kvLora,
+            qAProj: qAProj,
+            qALayernormWeight: qANorm,
+            qBProj: qBProj,
+            qProj: qProj,
+            kvAProjWithMqa: kvAProj,
+            kvALayernormWeight: kvANorm,
+            kvBProj: kvBProj);
+
+        // ── FFN ────────────────────────────────────────────────────────
+        // DeepSeek-V2/V3 layouts:
+        //   * Pre-MoE dense layers (layerIdx < leading_dense_block_count) carry
+        //     `blk.{N}.ffn_gate.weight` / `ffn_up.weight` / `ffn_down.weight`.
+        //   * MoE layers carry instead a 3D-stacked expert block and (optionally)
+        //     a single fused shared-expert MLP — see LoadDeepSeekMoeLayer.
+        bool layerIsMoe = config.Moe is not null && config.Moe.IsMoeLayer(layerIdx);
+
+
+        nint gatePtr = 0; QuantizationType gateQt = QuantizationType.F32; int gateM = 0, gateK = 0;
+        nint upPtr = 0; QuantizationType upQt = QuantizationType.F32; int upM = 0, upK = 0;
+        nint downPtr = 0; QuantizationType downQt = QuantizationType.F32; int downM = 0, downK = 0;
+        MoeLayerWeights? moeBundle = null;
+
+        if (layerIsMoe)
+        {
+            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned);
+        }
+        else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
+        {
+            (gatePtr, gateQt, gateM, gateK) = LoadLinear(dataBase, gateDesc);
+            (upPtr, upQt, upM, upK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_up.weight"]);
+            (downPtr, downQt, downM, downK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_down.weight"]);
+        }
+        else
+        {
+            throw new InvalidDataException(
+                $"DeepSeek-V2 layer {layerIdx} has neither dense ffn_gate.weight nor MoE ffn_*_exps tensors.");
+        }
+
+        // GGUF: Dimensions[0] = input dim (K), Dimensions[1] = output dim (M)
+        return new TransformerLayerWeights(
+            attnNormWeight: attnNorm,
+            qWeight: 0, qQuantType: QuantizationType.F32, qOutputDim: 0, qInputDim: 0,
+            kWeight: 0, kQuantType: QuantizationType.F32, kOutputDim: 0, kInputDim: 0,
+            vWeight: 0, vQuantType: QuantizationType.F32, vOutputDim: 0, vInputDim: 0,
+            oWeight: oProj, oQuantType: QuantizationType.F32,
+            oOutputDim: hiddenSize, oInputDim: oInput,
+            ffnNormWeight: ffnNorm,
+            gateWeight: gatePtr, gateQuantType: gateQt, gateOutputDim: gateM, gateInputDim: gateK,
+            upWeight: upPtr, upQuantType: upQt, upOutputDim: upM, upInputDim: upK,
+            downWeight: downPtr, downQuantType: downQt, downOutputDim: downM, downInputDim: downK,
+            mla: mlaBundle,
+            moe: moeBundle);
+    }
+
+    /// <summary>
+    /// Loads a single DeepSeek-V2 / V3 MoE layer's expert tensors from GGUF.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>3D-stacked expert layout</b> (per llama.cpp's <c>convert_hf_to_gguf.py</c>
+    /// <c>DeepseekV2Model</c>):
+    /// <list type="bullet">
+    ///   <item><c>blk.{N}.ffn_gate_inp.weight</c> — router gate <c>[hidden, num_experts]</c>.</item>
+    ///   <item><c>blk.{N}.ffn_gate_exps.weight</c> — fused per-expert gate_proj
+    ///     <c>[hidden, intermediate, num_experts]</c>. Each expert is a contiguous
+    ///     <c>[hidden, intermediate]</c> slice in GGUF on-disk order.</item>
+    ///   <item><c>blk.{N}.ffn_up_exps.weight</c> — fused per-expert up_proj, same layout.</item>
+    ///   <item><c>blk.{N}.ffn_down_exps.weight</c> — fused per-expert down_proj
+    ///     <c>[intermediate, hidden, num_experts]</c>.</item>
+    ///   <item>Optional shared experts: <c>ffn_gate_shexp.weight</c> / <c>ffn_up_shexp.weight</c>
+    ///     / <c>ffn_down_shexp.weight</c>. DeepSeek fuses N shared experts into a single
+    ///     MLP of width <c>moe_intermediate × n_shared_experts</c>.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Memory pressure.</b> Each expert is dequantized to a contiguous F32 host
+    /// buffer. For V2-Lite (64 experts × 2048 hidden × 1408 intermediate × 3 mats
+    /// × 4 bytes ≈ 2.2 GB per layer × 26 MoE layers ≈ 57 GB of F32 host RAM).
+    /// This is acknowledged untenable for full-V2 and is what tasks #9/#10
+    /// (on-device dequant) replace.
+    /// </para>
+    /// </remarks>
+    internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var moe = config.Moe
+            ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int numExperts = moe.NumExperts;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        // Router (2D, F32 — small, dequant inline).
+        var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        float[] router = new float[numExperts * hiddenSize];
+        Dequantize.ToFloat32(
+            dataBase + (nint)routerDesc.DataOffset,
+            (long)numExperts * hiddenSize,
+            routerDesc.QuantizationType,
+            router);
+
+        // Per-expert routed projections — slice the 3D tensor by expert index.
+        var w1 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_gate_exps.weight"],
+            numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        var w3 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_up_exps.weight"],
+            numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        var w2 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_down_exps.weight"],
+            numExperts, M: hiddenSize, K: moeIntermediate, owned);
+
+        // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
+        nint[] sharedGate = Array.Empty<nint>();
+        nint[] sharedUp = Array.Empty<nint>();
+        nint[] sharedDown = Array.Empty<nint>();
+        int sharedIntermediate = 0;
+        if (moe.SharedExpertIntermediateSize is int sharedI && sharedI > 0
+            && tensors.ContainsKey($"{prefix}.ffn_gate_shexp.weight"))
+        {
+            sharedIntermediate = sharedI;
+            sharedGate = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_gate_shexp.weight"],
+                                        (long)sharedI * hiddenSize, owned)];
+            sharedUp = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_up_shexp.weight"],
+                                        (long)sharedI * hiddenSize, owned)];
+            sharedDown = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_down_shexp.weight"],
+                                        (long)hiddenSize * sharedI, owned)];
+        }
+
+        // DeepSeek convention: no per-token sigmoid gate on the shared branch.
+        // (HfConfigExtractor + MoeConfig keep HasSharedExpertGate=false here.)
+        return new MoeLayerWeights(
+            gate: router,
+            w1: w1,
+            w2: w2,
+            w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: sharedGate,
+            sharedUpProj: sharedUp,
+            sharedDownProj: sharedDown,
+            sharedIntermediateSize: sharedIntermediate,
+            sharedExpertGate: null);
+    }
+
+    /// <summary>
+    /// Slices a 3D fused-experts tensor and dequantizes each expert's [M, K]
+    /// sub-block into its own F32 buffer. Returns the per-expert pointer array.
+    /// </summary>
+    /// <remarks>
+    /// GGUF on-disk layout for <c>ffn_gate_exps</c>/<c>ffn_up_exps</c>:
+    /// <c>Shape = [K, M, num_experts]</c> (K innermost). Each expert's slice
+    /// has byte size <c>M * RowByteSize(K, qt)</c>. The offset to expert e's
+    /// slice is <c>baseOffset + e * (M * RowByteSize(K, qt))</c>. We dequant
+    /// each expert as a contiguous run of <c>M*K</c> elements (every Q4_K-family
+    /// row aligns on the start of a 256-element super-block when K%256==0,
+    /// which holds for every shipping DeepSeek-V2/V3 size).
+    /// </remarks>
+    private static unsafe nint[] SliceExpertsToF32(
+        nint dataBase, GgufTensorDescriptor desc,
+        int numExperts, int M, int K, List<nint> owned)
+    {
+        if (desc.Shape.Rank != 3)
+            throw new InvalidDataException(
+                $"Expected 3D fused-experts tensor; got rank {desc.Shape.Rank}.");
+
+        // GGUF Shape ordering: [innermost, ..., outermost]. For ffn_*_exps
+        // the on-disk shape is [K, M, num_experts] — verify against expected
+        // dims so we fail fast on mis-shaped checkpoints.
+        if (desc.Shape[0] != K || desc.Shape[1] != M || desc.Shape[2] != numExperts)
+            throw new InvalidDataException(
+                $"Fused-experts tensor shape {desc.Shape[0]}×{desc.Shape[1]}×{desc.Shape[2]} " +
+                $"does not match expected K={K} × M={M} × E={numExperts}.");
+
+        long perExpertBytes = M * Dequantize.RowByteSize(K, desc.QuantizationType);
+        long perExpertElements = (long)M * K;
+        nint base_ = dataBase + (nint)desc.DataOffset;
+
+        var ptrs = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            nuint dstBytes = (nuint)(perExpertElements * sizeof(float));
+            nint dst = (nint)NativeMemory.AlignedAlloc(dstBytes, 64);
+            owned.Add(dst);
+            Dequantize.ToFloat32(
+                base_ + (nint)(e * perExpertBytes),
+                perExpertElements,
+                desc.QuantizationType,
+                new Span<float>((void*)dst, (int)perExpertElements));
+            ptrs[e] = dst;
+        }
+        return ptrs;
+    }
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned F32 buffer and dequantizes <paramref name="elementCount"/>
+    /// values from the GGUF tensor at <paramref name="desc"/>'s data offset into it.
+    /// Tracks the allocation in <paramref name="owned"/> so the loader's Dispose
+    /// can free it. Returns the pointer.
+    /// </summary>
+    private static unsafe nint DequantToF32(nint dataBase, GgufTensorDescriptor desc,
+                                            long elementCount, List<nint> owned)
+    {
+        nuint bytes = (nuint)(elementCount * sizeof(float));
+        nint dst = (nint)NativeMemory.AlignedAlloc(bytes, 64);
+        owned.Add(dst);
+        nint src = dataBase + (nint)desc.DataOffset;
+        Dequantize.ToFloat32(src, elementCount, desc.QuantizationType,
+                              new Span<float>((void*)dst, (int)elementCount));
+        return dst;
     }
 
     private static float[] DequantizeNorm(nint dataBase, GgufTensorDescriptor desc, int expectedSize)

@@ -627,8 +627,6 @@ internal static class TransformerWeightsSafetensorsLoader
         return result;
     }
 
-
-
     private static void ValidateProjectionShape(int actualM, int actualK, int expectedM, int expectedK, string name)
     {
         if (actualM != expectedM || actualK != expectedK)
