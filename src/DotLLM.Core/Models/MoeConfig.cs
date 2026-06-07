@@ -73,23 +73,39 @@ public sealed record MoeConfig
     public bool NormTopKProb { get; init; } = true;
 
     /// <summary>
-    /// Optional shared-expert intermediate width. Present on Qwen1.5-MoE-A2.7B
-    /// (<c>shared_expert_intermediate_size: 5632</c>) and DeepSeek-V2/V3
-    /// (<c>moe_intermediate_size × n_shared_experts</c>, modelled below).
-    /// When non-null, the MoE block runs an additional dense SwiGLU MLP in
-    /// parallel with the routed top-k path on EVERY token and adds its
-    /// (optionally sigmoid-gated) output to the routed sum. When null, the
-    /// layer is Mixtral-style — routed-only. See
-    /// <see cref="HasSharedExpertGate"/> for the optional scalar gate.
+    /// Optional shared-expert intermediate width <b>per shared expert</b>.
+    /// Present on Qwen1.5-MoE-A2.7B (<c>shared_expert_intermediate_size: 5632</c>,
+    /// one shared expert) and DeepSeek-V2/V3 (<c>moe_intermediate_size</c> per
+    /// shared expert; multiple shared experts summed — see
+    /// <see cref="NumSharedExperts"/>). When non-null, the MoE block runs
+    /// <see cref="NumSharedExperts"/> dense SwiGLU MLPs (each
+    /// <see cref="SharedExpertIntermediateSize"/> wide) in parallel with the
+    /// routed top-k path on EVERY token and adds their summed (optionally
+    /// sigmoid-gated) output to the routed sum. When null, the layer is
+    /// Mixtral-style — routed-only. See <see cref="HasSharedExpertGate"/> for
+    /// the optional scalar gate (Qwen1.5-MoE only, single shared).
     /// </summary>
     public int? SharedExpertIntermediateSize { get; init; }
+
+    /// <summary>
+    /// Number of parallel shared experts whose outputs are summed into the
+    /// shared-expert branch. Defaults to 1 — matches Qwen1.5-MoE's single
+    /// <c>mlp.shared_expert.*</c> tensor set. DeepSeek-V2/V3 ship with
+    /// <c>n_shared_experts &gt;= 1</c> and plural
+    /// <c>mlp.shared_experts.{k}.*</c> tensor naming; each is
+    /// <see cref="SharedExpertIntermediateSize"/> wide and they are summed
+    /// (equally-weighted, no gating) into the routed-MoE sum. Must be
+    /// <c>&gt;= 1</c> whenever <see cref="SharedExpertIntermediateSize"/> is
+    /// non-null; ignored otherwise.
+    /// </summary>
+    public int NumSharedExperts { get; init; } = 1;
 
     /// <summary>
     /// When <c>true</c> the shared-expert contribution is multiplied by a
     /// per-token sigmoid scalar computed from a dense <c>[hidden_size → 1]</c>
     /// projection (HF: <c>mlp.shared_expert_gate.weight</c>). Qwen1.5-MoE uses
-    /// this gate; DeepSeek-V2/V3 does not. Ignored when
-    /// <see cref="SharedExpertIntermediateSize"/> is null.
+    /// this gate (always with <see cref="NumSharedExperts"/> = 1); DeepSeek-V2/V3
+    /// does not. Ignored when <see cref="SharedExpertIntermediateSize"/> is null.
     /// </summary>
     public bool HasSharedExpertGate { get; init; }
 

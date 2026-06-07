@@ -16,14 +16,18 @@ namespace DotLLM.Models.Architectures;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Qwen-MoE adds optional shared-expert pointers (<see cref="SharedGateProj"/>,
-/// <see cref="SharedUpProj"/>, <see cref="SharedDownProj"/>) and an optional
-/// sigmoid gate (<see cref="SharedExpertGate"/>). When
-/// <see cref="HasSharedExpert"/> is true, the forward pass runs a dense
-/// SwiGLU over the token and adds its (optionally gated) output to the
-/// routed top-k sum. The <see cref="NormTopKProb"/> flag controls whether
-/// the selected top-k probabilities are renormalised to sum to 1.0 (Mixtral
-/// + Qwen3-MoE) or left as raw softmax values (Qwen1.5-MoE-A2.7B).
+/// Qwen-MoE and DeepSeek-V2/V3 add optional shared-expert pointers — each
+/// carried as parallel arrays (<see cref="SharedGateProj"/>, <see cref="SharedUpProj"/>,
+/// <see cref="SharedDownProj"/>) of length <see cref="NumSharedExperts"/>.
+/// Qwen1.5-MoE ships a single shared expert optionally gated by a
+/// <see cref="SharedExpertGate"/> sigmoid; DeepSeek-V2/V3 ships
+/// <c>n_shared_experts</c> shared experts (often 1 or 2) and does not gate.
+/// When <see cref="HasSharedExpert"/> is true, the forward pass runs each
+/// shared expert as a dense SwiGLU over the token, sums their outputs, and
+/// adds the (optionally gated) sum to the routed top-k sum. The
+/// <see cref="NormTopKProb"/> flag controls whether the selected top-k
+/// probabilities are renormalised to sum to 1.0 (Mixtral + Qwen3-MoE) or
+/// left as raw softmax values (Qwen1.5-MoE-A2.7B).
 /// </para>
 /// </remarks>
 internal sealed class MoeLayerWeights
@@ -52,25 +56,46 @@ internal sealed class MoeLayerWeights
     /// </summary>
     public readonly bool NormTopKProb;
 
-    /// <summary>Optional shared-expert <c>gate_proj</c> pointer — F32 [sharedIntermediateSize, hiddenSize].</summary>
-    public readonly nint SharedGateProj;
-    /// <summary>Optional shared-expert <c>up_proj</c> pointer — F32 [sharedIntermediateSize, hiddenSize].</summary>
-    public readonly nint SharedUpProj;
-    /// <summary>Optional shared-expert <c>down_proj</c> pointer — F32 [hiddenSize, sharedIntermediateSize].</summary>
-    public readonly nint SharedDownProj;
-    /// <summary>Shared-expert intermediate width (0 when no shared expert).</summary>
+    /// <summary>
+    /// Per-shared-expert <c>gate_proj</c> pointers — F32
+    /// [sharedIntermediateSize, hiddenSize] row-major, one per shared expert.
+    /// Length equals <see cref="NumSharedExperts"/>; empty when no shared
+    /// experts are present.
+    /// </summary>
+    public readonly nint[] SharedGateProj;
+    /// <summary>
+    /// Per-shared-expert <c>up_proj</c> pointers — F32
+    /// [sharedIntermediateSize, hiddenSize] row-major, one per shared expert.
+    /// </summary>
+    public readonly nint[] SharedUpProj;
+    /// <summary>
+    /// Per-shared-expert <c>down_proj</c> pointers — F32
+    /// [hiddenSize, sharedIntermediateSize] row-major, one per shared expert.
+    /// </summary>
+    public readonly nint[] SharedDownProj;
+    /// <summary>
+    /// Per-shared-expert intermediate width (0 when no shared expert).
+    /// Applies uniformly across all shared experts (they share width).
+    /// </summary>
     public readonly int SharedIntermediateSize;
+    /// <summary>
+    /// Number of parallel shared experts whose outputs are summed. 1 for
+    /// Qwen1.5-MoE, &gt;=1 for DeepSeek-V2/V3 (<c>n_shared_experts</c>).
+    /// Zero only when there is no shared-expert branch.
+    /// </summary>
+    public readonly int NumSharedExperts;
     /// <summary>
     /// Optional shared-expert sigmoid gate weight — F32 [hiddenSize]. When
     /// present, per-token <c>sigmoid(hidden . SharedExpertGate)</c> scales
-    /// the shared-expert output before it's added to the routed sum
-    /// (Qwen1.5-MoE convention). Null = no gate, shared-expert output added
-    /// unscaled.
+    /// the summed shared-expert output before it's added to the routed sum
+    /// (Qwen1.5-MoE convention; ALWAYS paired with a single shared expert).
+    /// Null = no gate, summed shared-expert output added unscaled
+    /// (DeepSeek-V2/V3 convention).
     /// </summary>
     public readonly float[]? SharedExpertGate;
 
     /// <summary>True iff a shared-expert branch is present on this layer.</summary>
-    public bool HasSharedExpert => SharedIntermediateSize > 0;
+    public bool HasSharedExpert => SharedIntermediateSize > 0 && NumSharedExperts > 0;
 
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
@@ -79,20 +104,32 @@ internal sealed class MoeLayerWeights
         int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize)
         : this(gate, w1, w2, w3, numExperts, numExpertsPerTok, hiddenSize, intermediateSize,
                normTopKProb: true,
-               sharedGateProj: nint.Zero, sharedUpProj: nint.Zero, sharedDownProj: nint.Zero,
-               sharedIntermediateSize: 0, sharedExpertGate: null)
+               sharedGateProj: Array.Empty<nint>(),
+               sharedUpProj: Array.Empty<nint>(),
+               sharedDownProj: Array.Empty<nint>(),
+               sharedIntermediateSize: 0,
+               sharedExpertGate: null)
     {
     }
 
-    /// <summary>Full ctor covering Qwen-MoE extensions (shared expert + <c>norm_topk_prob</c> flag).</summary>
+    /// <summary>
+    /// Full ctor covering Qwen-MoE and DeepSeek extensions: per-shared-expert
+    /// pointer arrays, <c>norm_topk_prob</c> flag, optional sigmoid gate.
+    /// Length of the three shared arrays must agree; a zero-length array set
+    /// disables the shared-expert branch.
+    /// </summary>
     public MoeLayerWeights(
         float[] gate,
         nint[] w1, nint[] w2, nint[] w3,
         int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize,
         bool normTopKProb,
-        nint sharedGateProj, nint sharedUpProj, nint sharedDownProj,
+        nint[] sharedGateProj, nint[] sharedUpProj, nint[] sharedDownProj,
         int sharedIntermediateSize, float[]? sharedExpertGate)
     {
+        if (sharedGateProj.Length != sharedUpProj.Length || sharedGateProj.Length != sharedDownProj.Length)
+            throw new ArgumentException(
+                "Shared-expert pointer arrays must all have the same length (number of shared experts).");
+
         Gate = gate;
         W1 = w1; W2 = w2; W3 = w3;
         NumExperts = numExperts;
@@ -104,6 +141,7 @@ internal sealed class MoeLayerWeights
         SharedUpProj = sharedUpProj;
         SharedDownProj = sharedDownProj;
         SharedIntermediateSize = sharedIntermediateSize;
+        NumSharedExperts = sharedGateProj.Length;
         SharedExpertGate = sharedExpertGate;
     }
 }

@@ -359,4 +359,82 @@ public sealed class HfConfigExtractorTests
         Assert.False(cfg.Moe.IsMoeLayer(2));  // forced dense
         Assert.True(cfg.Moe.IsMoeLayer(3));
     }
+
+    [Fact]
+    public void DeepSeekStyleMoE_MultiSharedExpert_PopulatesNumSharedExperts()
+    {
+        // DeepSeek-V2/V3 MoE config: n_routed_experts + n_shared_experts +
+        // moe_intermediate_size. We drive through a Llama-shaped attention
+        // (the MLA attention path lands separately with the MLA chain); this
+        // PR's contract is only that the MoE extractor maps n_shared_experts
+        // into MoeConfig.NumSharedExperts, with SharedExpertIntermediateSize
+        // remaining the per-shared-expert width (NOT the pre-folded total)
+        // and HasSharedExpertGate disabled because DeepSeek does not gate.
+        const string json = """
+        {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 10944,
+            "vocab_size": 102400,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1408,
+            "n_shared_experts": 2,
+            "norm_topk_prob": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(6, cfg.Moe.NumExpertsPerTok);
+        Assert.Equal(1408, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // Each shared expert is moe_intermediate_size wide; count = n_shared_experts.
+        Assert.Equal(1408, cfg.Moe.SharedExpertIntermediateSize);
+        Assert.Equal(2, cfg.Moe.NumSharedExperts);
+        Assert.False(cfg.Moe.HasSharedExpertGate); // DeepSeek does NOT gate
+    }
+
+    [Fact]
+    public void QwenMoE_SingleSharedExpert_DefaultsNumSharedExpertsToOne()
+    {
+        // Qwen1.5-MoE convention: shared_expert_intermediate_size set,
+        // n_shared_experts absent. Must default NumSharedExperts to 1 and
+        // keep the sigmoid gate enabled.
+        const string json = """
+        {
+            "architectures": ["Qwen2MoeForCausalLM"],
+            "model_type": "qwen2_moe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 5632,
+            "vocab_size": 151936,
+            "max_position_embeddings": 8192,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "num_experts": 60,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1408,
+            "shared_expert_intermediate_size": 5632,
+            "norm_topk_prob": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(5632, cfg.Moe!.SharedExpertIntermediateSize);
+        Assert.Equal(1, cfg.Moe.NumSharedExperts);
+        Assert.True(cfg.Moe.HasSharedExpertGate);
+    }
 }

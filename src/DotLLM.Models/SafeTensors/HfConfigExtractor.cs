@@ -134,6 +134,8 @@ public static class HfConfigExtractor
         if (numExperts <= 0)
             numExperts = GetInt32OrDefault(root, "num_experts", 0);
         if (numExperts <= 0)
+            numExperts = GetInt32OrDefault(root, "n_routed_experts", 0); // DeepSeek convention
+        if (numExperts <= 0)
             return null;
 
         int numExpertsPerTok = GetInt32OrDefault(root, "num_experts_per_tok", 0);
@@ -144,23 +146,62 @@ public static class HfConfigExtractor
             throw new InvalidDataException(
                 $"HF config.json has num_experts_per_tok={numExpertsPerTok} > num_experts={numExperts}.");
 
-        // Phi-3.5-MoE + Qwen-MoE expose moe_intermediate_size. Mixtral reuses
-        // intermediate_size for the expert width.
+        // Phi-3.5-MoE + Qwen-MoE + DeepSeek-V2/V3 expose moe_intermediate_size.
+        // Mixtral reuses intermediate_size for the expert width.
         int moeIntermediateSize = GetInt32OrDefault(root, "moe_intermediate_size", defaultIntermediateSize);
 
-        // Qwen-MoE: norm_topk_prob governs whether top-k probs are renormalised
-        // to sum to 1. Mixtral always does this so its config never ships the
-        // key — default to true to preserve Mixtral behaviour.
+        // Qwen-MoE / DeepSeek: norm_topk_prob governs whether top-k probs are
+        // renormalised to sum to 1. Mixtral always does this so its config
+        // never ships the key — default to true to preserve Mixtral behaviour.
         bool normTopKProb = GetBoolOrDefault(root, "norm_topk_prob", true);
 
-        // Qwen1.5-MoE-A2.7B ships shared_expert_intermediate_size; absent on
-        // Mixtral, Phi-3.5-MoE, and Qwen3-MoE.
-        int? sharedExpertIntermediate = GetInt32NullableIfPositive(root, "shared_expert_intermediate_size");
-        // shared_expert_gate is a tensor (not a config key), so we default to
-        // "present iff the model declares a shared expert" — the safetensors
-        // loader turns this back off if the tensor is missing. Qwen1.5-MoE
-        // always ships it when shared_expert_intermediate_size is set.
-        bool hasSharedGate = sharedExpertIntermediate is not null;
+        // Shared-expert intermediate width and count.
+        //   Qwen1.5-MoE-A2.7B: ships `shared_expert_intermediate_size` directly
+        //     with a single shared expert (singular `mlp.shared_expert.*`),
+        //     optionally sigmoid-gated by `mlp.shared_expert_gate.weight`.
+        //   DeepSeek-V2/V3: ships `moe_intermediate_size` per shared expert
+        //     with `n_shared_experts` plural shared experts (tensor naming
+        //     `mlp.shared_experts.{k}.*`). Each shared expert is
+        //     moe_intermediate_size wide; outputs are summed (equally
+        //     weighted, no sigmoid gate). The MoE kernel iterates over
+        //     individual experts and sums their dense SwiGLU outputs into
+        //     the routed sum.
+        //
+        // DeepSeek is detected by the presence of `n_shared_experts` (which
+        // neither Qwen nor any other MoE family ships). Architecture enum
+        // dispatch (Architecture.DeepSeekV2 / V3) lands separately with the
+        // MLA chain; this PR does not depend on it.
+        int? sharedExpertIntermediate;
+        int numSharedExperts = 1;
+        bool hasSharedGate;
+        bool isDeepSeek = root.TryGetProperty("n_shared_experts", out _);
+        if (isDeepSeek)
+        {
+            int nShared = GetInt32OrDefault(root, "n_shared_experts", 0);
+            if (nShared > 0)
+            {
+                sharedExpertIntermediate = moeIntermediateSize;
+                numSharedExperts = nShared;
+            }
+            else
+            {
+                sharedExpertIntermediate = null;
+            }
+            hasSharedGate = false; // DeepSeek does NOT gate the shared expert.
+        }
+        else
+        {
+            // Qwen1.5-MoE-A2.7B ships shared_expert_intermediate_size; absent
+            // on Mixtral, Phi-3.5-MoE, and Qwen3-MoE.
+            sharedExpertIntermediate = GetInt32NullableIfPositive(root, "shared_expert_intermediate_size");
+            // shared_expert_gate is a tensor (not a config key), so we default
+            // to "present iff the model declares a shared expert" — the
+            // safetensors loader turns this back off if the tensor is missing.
+            // Qwen1.5-MoE always ships it when shared_expert_intermediate_size
+            // is set.
+            hasSharedGate = sharedExpertIntermediate is not null;
+            // Qwen1.5-MoE ships a single shared expert; keep the default of 1.
+        }
 
         // Qwen3-MoE layer-level sparsity: decoder_sparse_step (default 1 —
         // every layer is MoE) and mlp_only_layers (force-dense overrides).
@@ -175,6 +216,7 @@ public static class HfConfigExtractor
             MoeIntermediateSize = moeIntermediateSize,
             NormTopKProb = normTopKProb,
             SharedExpertIntermediateSize = sharedExpertIntermediate,
+            NumSharedExperts = numSharedExperts,
             HasSharedExpertGate = hasSharedGate,
             DecoderSparseStep = decoderSparseStep,
             MlpOnlyLayers = mlpOnlyLayers,

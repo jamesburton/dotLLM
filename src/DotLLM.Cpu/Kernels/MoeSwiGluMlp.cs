@@ -76,20 +76,26 @@ public static unsafe class MoeSwiGluMlp
         int seqLen)
     {
         // Default overload keeps the Mixtral contract: always renormalise top-k,
-        // no shared expert. Qwen-MoE callers go through ExecuteWithSharedExpert.
+        // no shared expert. Qwen-MoE / DeepSeek callers go through
+        // ExecuteWithSharedExpert.
         ExecuteCore(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
             numExperts, numExpertsPerTok, hiddenSize, intermediateSize, seqLen,
             normTopKProb: true,
-            sharedGateProj: null, sharedUpProj: null, sharedDownProj: null,
+            sharedGateProj: ReadOnlySpan<nint>.Empty,
+            sharedUpProj: ReadOnlySpan<nint>.Empty,
+            sharedDownProj: ReadOnlySpan<nint>.Empty,
             sharedIntermediateSize: 0, sharedExpertGate: default);
     }
 
     /// <summary>
-    /// Qwen-MoE overload: computes routed top-k output + (optionally sigmoid-gated)
-    /// dense shared-expert output. Set <paramref name="sharedIntermediateSize"/> = 0
-    /// and the three shared pointers to <c>null</c> to fall back to the pure
-    /// routed path (equivalent to <see cref="Execute"/>).
+    /// Qwen-MoE / DeepSeek overload: computes routed top-k output + summed
+    /// dense shared-expert output (optionally sigmoid-gated). Supports
+    /// multiple shared experts (DeepSeek-V2/V3 <c>n_shared_experts &gt;= 1</c>):
+    /// each runs a dense SwiGLU on the token and their outputs are summed
+    /// before the (optional) per-token sigmoid scale is applied. Pass three
+    /// empty pointer spans with <paramref name="sharedIntermediateSize"/> = 0
+    /// to fall back to the pure routed path (equivalent to <see cref="Execute"/>).
     /// </summary>
     /// <param name="hidden">F32 input activations [seqLen × hiddenSize].</param>
     /// <param name="gateWeights">F32 router weight [numExperts × hiddenSize] row-major.</param>
@@ -107,13 +113,17 @@ public static unsafe class MoeSwiGluMlp
     /// (Mixtral + Qwen3-MoE). <c>false</c> → use raw softmax values as gating
     /// weights (Qwen1.5-MoE default).
     /// </param>
-    /// <param name="sharedGateProj">F32 [sharedIntermediateSize × hiddenSize] row-major, or null.</param>
-    /// <param name="sharedUpProj">F32 [sharedIntermediateSize × hiddenSize] row-major, or null.</param>
-    /// <param name="sharedDownProj">F32 [hiddenSize × sharedIntermediateSize] row-major, or null.</param>
-    /// <param name="sharedIntermediateSize">Shared-expert intermediate width (0 to disable).</param>
+    /// <param name="sharedGateProj">
+    /// Per-shared-expert gate_proj pointers — F32 [sharedIntermediateSize × hiddenSize]
+    /// row-major. Length = number of shared experts (1 for Qwen1.5-MoE; 1..N
+    /// for DeepSeek-V2/V3). Empty span ⇒ no shared expert.
+    /// </param>
+    /// <param name="sharedUpProj">Per-shared-expert up_proj pointers, same length as <paramref name="sharedGateProj"/>.</param>
+    /// <param name="sharedDownProj">Per-shared-expert down_proj pointers, same length as <paramref name="sharedGateProj"/>.</param>
+    /// <param name="sharedIntermediateSize">Per-shared-expert intermediate width (0 to disable).</param>
     /// <param name="sharedExpertGate">
     /// Optional F32 [hiddenSize] sigmoid-gate weight. Length 0 → no sigmoid
-    /// scaling (Qwen-MoE variants without <c>shared_expert_gate</c>).
+    /// scaling (DeepSeek; Qwen-MoE variants without <c>shared_expert_gate</c>).
     /// </param>
     [SkipLocalsInit]
     public static void ExecuteWithSharedExpert(
@@ -129,9 +139,9 @@ public static unsafe class MoeSwiGluMlp
         int intermediateSize,
         int seqLen,
         bool normTopKProb,
-        float* sharedGateProj,
-        float* sharedUpProj,
-        float* sharedDownProj,
+        ReadOnlySpan<nint> sharedGateProj,
+        ReadOnlySpan<nint> sharedUpProj,
+        ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
         ReadOnlySpan<float> sharedExpertGate)
     {
@@ -157,9 +167,9 @@ public static unsafe class MoeSwiGluMlp
         int intermediateSize,
         int seqLen,
         bool normTopKProb,
-        float* sharedGateProj,
-        float* sharedUpProj,
-        float* sharedDownProj,
+        ReadOnlySpan<nint> sharedGateProj,
+        ReadOnlySpan<nint> sharedUpProj,
+        ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize,
         ReadOnlySpan<float> sharedExpertGate)
     {
@@ -174,11 +184,11 @@ public static unsafe class MoeSwiGluMlp
             throw new ArgumentException("gateWeights too small", nameof(gateWeights));
         if (expertsW1.Length != numExperts || expertsW2.Length != numExperts || expertsW3.Length != numExperts)
             throw new ArgumentException("Expert weight arrays must each have numExperts entries.");
+        if (sharedGateProj.Length != sharedUpProj.Length || sharedGateProj.Length != sharedDownProj.Length)
+            throw new ArgumentException("Shared-expert weight spans must all have the same length.");
 
-        bool hasSharedExpert = sharedIntermediateSize > 0
-                               && sharedGateProj is not null
-                               && sharedUpProj is not null
-                               && sharedDownProj is not null;
+        int numSharedExperts = sharedGateProj.Length;
+        bool hasSharedExpert = sharedIntermediateSize > 0 && numSharedExperts > 0;
         bool hasSharedGate = hasSharedExpert && sharedExpertGate.Length >= hiddenSize;
 
         // Scratch buffers — rented from the pool so per-call allocations are free.
@@ -282,32 +292,46 @@ public static unsafe class MoeSwiGluMlp
                         TensorPrimitives.MultiplyAdd(down, w, acc, acc);
                     }
 
-                    // 6) Optional shared-expert branch — dense SwiGLU MLP that
-                    //    runs on every token (no routing), with optional
-                    //    sigmoid scalar gate. Output is added to 'acc' before
-                    //    write-back. Qwen1.5-MoE-A2.7B convention.
+                    // 6) Optional shared-expert branch — one or more dense
+                    //    SwiGLU MLPs that run on every token (no routing).
+                    //    Outputs are summed into 'acc' (Qwen1.5-MoE uses a
+                    //    single shared expert with an optional sigmoid scalar
+                    //    gate; DeepSeek-V2/V3 uses N parallel shared experts
+                    //    summed equally with no gate). The per-shared sigmoid
+                    //    scale only fires when N==1 + hasSharedGate, so the
+                    //    single-shared path is bit-identical to the previous
+                    //    scalar implementation.
                     if (hasSharedExpert)
                     {
                         var sharedGateSpan = new Span<float>(gateBufPtr, sharedIntermediateSize);
                         var sharedUpSpan = new Span<float>(upBufPtr, sharedIntermediateSize);
                         var sharedSiluSpan = new Span<float>(siluBufPtr, sharedIntermediateSize);
 
-                        MatMul.GemvF32(sharedGateProj, x, gateBufPtr, sharedIntermediateSize, hiddenSize);
-                        MatMul.GemvF32(sharedUpProj, x, upBufPtr, sharedIntermediateSize, hiddenSize);
-                        FusedOps.SwiGLU(sharedGateSpan, sharedUpSpan, sharedSiluSpan);
-                        MatMul.GemvF32(sharedDownProj, siluBufPtr, downBufPtr, hiddenSize, sharedIntermediateSize);
-
-                        float sharedScale = 1.0f;
-                        if (hasSharedGate)
+                        for (int k = 0; k < numSharedExperts; k++)
                         {
-                            // sigmoid(hidden . SharedExpertGate) — per-token scalar ∈ (0,1).
-                            float logit = 0f;
-                            for (int j = 0; j < hiddenSize; j++)
-                                logit += sharedGatePtr[j] * x[j];
-                            sharedScale = 1.0f / (1.0f + MathF.Exp(-logit));
-                        }
+                            float* sharedW1k = (float*)sharedGateProj[k];
+                            float* sharedW3k = (float*)sharedUpProj[k];
+                            float* sharedW2k = (float*)sharedDownProj[k];
 
-                        TensorPrimitives.MultiplyAdd(down, sharedScale, acc, acc);
+                            MatMul.GemvF32(sharedW1k, x, gateBufPtr, sharedIntermediateSize, hiddenSize);
+                            MatMul.GemvF32(sharedW3k, x, upBufPtr, sharedIntermediateSize, hiddenSize);
+                            FusedOps.SwiGLU(sharedGateSpan, sharedUpSpan, sharedSiluSpan);
+                            MatMul.GemvF32(sharedW2k, siluBufPtr, downBufPtr, hiddenSize, sharedIntermediateSize);
+
+                            float sharedScale = 1.0f;
+                            if (hasSharedGate)
+                            {
+                                // sigmoid(hidden . SharedExpertGate) — per-token scalar ∈ (0,1).
+                                // Only meaningful for Qwen1.5-MoE (numSharedExperts==1);
+                                // DeepSeek (no gate) keeps the scale at 1.0.
+                                float logit = 0f;
+                                for (int j = 0; j < hiddenSize; j++)
+                                    logit += sharedGatePtr[j] * x[j];
+                                sharedScale = 1.0f / (1.0f + MathF.Exp(-logit));
+                            }
+
+                            TensorPrimitives.MultiplyAdd(down, sharedScale, acc, acc);
+                        }
                     }
 
                     // 7) Write accumulated output for this token.

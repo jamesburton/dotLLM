@@ -247,38 +247,84 @@ internal static class TransformerWeightsSafetensorsLoader
                 $"{prefix}.experts.{e}.down_proj.weight");
         }
 
-        // Shared expert (Qwen1.5-MoE-A2.7B). The HF modelling code declares a
-        // shared_expert when shared_expert_intermediate_size is set; if the
-        // tensors are missing despite the config flag, we fall back silently
-        // to routed-only.
-        nint sharedGate = nint.Zero, sharedUp = nint.Zero, sharedDown = nint.Zero;
+        // Shared expert(s). Two naming conventions:
+        //   - Qwen1.5-MoE-A2.7B: singular mlp.shared_expert.{gate,up,down}_proj
+        //     (always exactly one shared expert; optionally gated by
+        //     mlp.shared_expert_gate.weight).
+        //   - DeepSeek-V2/V3: plural mlp.shared_experts.{k}.{gate,up,down}_proj
+        //     (n_shared_experts >= 1, summed, no gate).
+        // We resolve whichever set of tensors the file actually contains; the
+        // kernel sees a uniform pointer-array API. If the config flags a shared
+        // expert but the tensors are absent, we silently fall back to routed-only.
+        nint[] sharedGate = Array.Empty<nint>();
+        nint[] sharedUp = Array.Empty<nint>();
+        nint[] sharedDown = Array.Empty<nint>();
         int sharedIntermediate = 0;
         float[]? sharedExpertGate = null;
-        if (moe.SharedExpertIntermediateSize is int sharedI
-            && file.TensorsByName.ContainsKey($"{prefix}.shared_expert.gate_proj.weight"))
+        if (moe.SharedExpertIntermediateSize is int sharedI)
         {
-            sharedIntermediate = sharedI;
-            (sharedGate, _, int sgM, int sgK) = ResolveLinearAsF32(file,
-                $"{prefix}.shared_expert.gate_proj.weight", owned);
-            ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
-                $"{prefix}.shared_expert.gate_proj.weight");
-            (sharedUp, _, int suM, int suK) = ResolveLinearAsF32(file,
-                $"{prefix}.shared_expert.up_proj.weight", owned);
-            ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
-                $"{prefix}.shared_expert.up_proj.weight");
-            (sharedDown, _, int sdM, int sdK) = ResolveLinearAsF32(file,
-                $"{prefix}.shared_expert.down_proj.weight", owned);
-            ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
-                $"{prefix}.shared_expert.down_proj.weight");
+            int numShared = moe.NumSharedExperts;
+            // Detect the tensor-name convention. Prefer plural (DeepSeek) when
+            // present — this is the forward-compatible format. Fall back to
+            // singular (Qwen1.5-MoE) when only that exists.
+            bool hasPlural = numShared >= 1
+                && file.TensorsByName.ContainsKey($"{prefix}.shared_experts.0.gate_proj.weight");
+            bool hasSingular = numShared == 1
+                && file.TensorsByName.ContainsKey($"{prefix}.shared_expert.gate_proj.weight");
 
-            // Optional sigmoid gate — HF stores it as [1, hiddenSize] (a plain
-            // Linear(hidden -> 1, bias=False)). ElementCount == hiddenSize, so
-            // ResolveNorm slots in cleanly.
-            string gateName = $"{prefix}.shared_expert_gate.weight";
-            if (moe.HasSharedExpertGate && file.TensorsByName.ContainsKey(gateName))
+            if (hasPlural)
             {
-                sharedExpertGate = ResolveNorm(file, gateName, hiddenSize);
+                sharedIntermediate = sharedI;
+                sharedGate = new nint[numShared];
+                sharedUp = new nint[numShared];
+                sharedDown = new nint[numShared];
+                for (int k = 0; k < numShared; k++)
+                {
+                    (sharedGate[k], _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.gate_proj.weight", owned);
+                    ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                        $"{prefix}.shared_experts.{k}.gate_proj.weight");
+                    (sharedUp[k], _, int suM, int suK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.up_proj.weight", owned);
+                    ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                        $"{prefix}.shared_experts.{k}.up_proj.weight");
+                    (sharedDown[k], _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.down_proj.weight", owned);
+                    ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                        $"{prefix}.shared_experts.{k}.down_proj.weight");
+                }
             }
+            else if (hasSingular)
+            {
+                sharedIntermediate = sharedI;
+                sharedGate = new nint[1];
+                sharedUp = new nint[1];
+                sharedDown = new nint[1];
+                (sharedGate[0], _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.gate_proj.weight", owned);
+                ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                    $"{prefix}.shared_expert.gate_proj.weight");
+                (sharedUp[0], _, int suM, int suK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.up_proj.weight", owned);
+                ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                    $"{prefix}.shared_expert.up_proj.weight");
+                (sharedDown[0], _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.down_proj.weight", owned);
+                ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                    $"{prefix}.shared_expert.down_proj.weight");
+
+                // Optional sigmoid gate — HF stores it as [1, hiddenSize] (a plain
+                // Linear(hidden -> 1, bias=False)). ElementCount == hiddenSize, so
+                // ResolveNorm slots in cleanly.
+                string gateName = $"{prefix}.shared_expert_gate.weight";
+                if (moe.HasSharedExpertGate && file.TensorsByName.ContainsKey(gateName))
+                {
+                    sharedExpertGate = ResolveNorm(file, gateName, hiddenSize);
+                }
+            }
+            // else: config declared a shared branch but the file has neither
+            // plural nor singular tensors — silently fall back to routed-only
+            // (sharedIntermediate stays 0, arrays stay empty).
         }
 
         return new MoeLayerWeights(
