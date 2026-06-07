@@ -51,15 +51,15 @@ public static class GgufModelConfigExtractor
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
 
-        // DeepSeek-V2/V3: extract MLA config and patch HeadDim to the full
+        // DeepSeek-V2/V3: extract MLA + MoE config and patch HeadDim to the full
         // qk_head_dim (key_length stores qk_nope only; total = qk_nope + qk_rope).
-        // MoE config detection ships in the parallel DeepSeek-GGUF A-2 PR
-        // (3D-stacked-expert tensor loader).
         MlaConfig? mlaConfig = null;
+        MoeConfig? moeConfig = null;
         AttentionType attentionType = AttentionType.GQA;
         if (architecture is Architecture.DeepSeekV2 or Architecture.DeepSeekV3)
         {
             mlaConfig = ExtractMlaConfig(metadata, arch, ropeConfig);
+            moeConfig = TryExtractDeepseekMoeConfig(metadata, arch, intermediateSize, numLayers);
             attentionType = AttentionType.MLA;
             // GGUF's attention.key_length is qk_nope only. Total per-head dim
             // for MLA attention is qk_nope + qk_rope — patch HeadDim so the
@@ -85,6 +85,7 @@ public static class GgufModelConfigExtractor
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
             MlaConfig = mlaConfig,
+            Moe = moeConfig,
             ChatTemplate = chatTemplate,
         };
     }
@@ -155,6 +156,64 @@ public static class GgufModelConfigExtractor
             RopeScalingMscale = ropeScalingMscale,
             RopeScalingMscaleAllDim = ropeScalingMscaleAllDim,
             RopeScalingOriginalMaxPositionEmbeddings = ropeScalingOrigCtx,
+        };
+    }
+
+    /// <summary>
+    /// Extracts a <see cref="MoeConfig"/> from DeepSeek-V2/V3 GGUF metadata when
+    /// the model declares MoE FFN (<c>{arch}.expert_count</c> &gt; 0). Returns null
+    /// for non-MoE checkpoints (e.g. dense-only V2 fine-tunes).
+    /// </summary>
+    /// <remarks>
+    /// Per llama.cpp's gguf_writer: <c>{arch}.expert_count</c> = total routed
+    /// experts; <c>{arch}.expert_used_count</c> = top-k; <c>{arch}.expert_shared_count</c>
+    /// = N shared experts (V2-Lite=2, V2-full=2, V3=1); <c>{arch}.expert_feed_forward_length</c>
+    /// = moe_intermediate_size per expert; <c>{arch}.leading_dense_block_count</c>
+    /// = first_k_dense_replace (number of leading layers that stay dense FFN).
+    /// </remarks>
+    private static MoeConfig? TryExtractDeepseekMoeConfig(GgufMetadata metadata, string arch,
+                                                           int denseIntermediate, int numLayers)
+    {
+        uint expertCount = metadata.GetUInt32OrDefault($"{arch}.expert_count", 0);
+        if (expertCount == 0) return null;
+
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int expertShared = (int)metadata.GetUInt32OrDefault($"{arch}.expert_shared_count", 0);
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+        int leadingDense = (int)metadata.GetUInt32OrDefault($"{arch}.leading_dense_block_count", 0);
+
+        // DeepSeek convention: leading_dense_block_count = N means layers
+        // [0, N) are dense FFN, [N, numLayers) are MoE. Map this to MoeConfig's
+        // MlpOnlyLayers (the explicit per-index dense override) so the existing
+        // IsMoeLayer dispatcher works without extra plumbing.
+        int[]? mlpOnlyLayers = null;
+        if (leadingDense > 0)
+        {
+            mlpOnlyLayers = new int[leadingDense];
+            for (int i = 0; i < leadingDense; i++) mlpOnlyLayers[i] = i;
+        }
+
+        // Shared-expert intermediate: DeepSeek-V2/V3 fuses N shared experts into
+        // a single MLP of width (moe_intermediate * n_shared_experts) on disk
+        // (HfConfigExtractor docs the same convention). The CudaMoe loader / CPU
+        // path consume `SharedExpertIntermediateSize` as the *total* width and
+        // `NumSharedExperts` as the count.
+        int? sharedIntermediate = null;
+        if (expertShared > 0)
+            sharedIntermediate = moeIntermediate * expertShared;
+
+        return new MoeConfig
+        {
+            NumExperts = (int)expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            NormTopKProb = true,   // V2 + V3 both renormalize
+            SharedExpertIntermediateSize = sharedIntermediate,
+            NumSharedExperts = expertShared,
+            HasSharedExpertGate = false,  // DeepSeek convention: no per-token sigmoid gate
+            DecoderSparseStep = 1,
+            MlpOnlyLayers = mlpOnlyLayers,
         };
     }
 

@@ -812,16 +812,24 @@ internal sealed class TransformerWeights : IDisposable
             kvBProj: kvBProj);
 
         // ── FFN ────────────────────────────────────────────────────────
-        // Dense FFN only in this extraction. MoE config detection + the
-        // 3D-stacked ffn_*_exps tensor loader ship in the parallel
-        // DeepSeek-GGUF A-2 PR. Layers in the MoE band (when MoE config
-        // arrives) will route to that loader instead; until then, any
-        // checkpoint that lacks dense ffn_gate.weight (i.e. is actually MoE)
-        // throws a clear error here.
+        // DeepSeek-V2/V3 layouts:
+        //   * Pre-MoE dense layers (layerIdx < leading_dense_block_count) carry
+        //     `blk.{N}.ffn_gate.weight` / `ffn_up.weight` / `ffn_down.weight`.
+        //   * MoE layers carry instead a 3D-stacked expert block and (optionally)
+        //     a single fused shared-expert MLP — see LoadDeepSeekMoeLayer.
+        bool layerIsMoe = config.Moe is not null && config.Moe.IsMoeLayer(layerIdx);
+
+
         nint gatePtr = 0; QuantizationType gateQt = QuantizationType.F32; int gateM = 0, gateK = 0;
         nint upPtr = 0; QuantizationType upQt = QuantizationType.F32; int upM = 0, upK = 0;
         nint downPtr = 0; QuantizationType downQt = QuantizationType.F32; int downM = 0, downK = 0;
-        if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
+        MoeLayerWeights? moeBundle = null;
+
+        if (layerIsMoe)
+        {
+            moeBundle = LoadDeepSeekMoeLayer(layerIdx, dataBase, tensors, config, owned);
+        }
+        else if (tensors.TryGetValue($"{prefix}.ffn_gate.weight", out var gateDesc))
         {
             (gatePtr, gateQt, gateM, gateK) = LoadLinear(dataBase, gateDesc);
             (upPtr, upQt, upM, upK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_up.weight"]);
@@ -830,8 +838,7 @@ internal sealed class TransformerWeights : IDisposable
         else
         {
             throw new InvalidDataException(
-                $"DeepSeek-V2 layer {layerIdx} has no dense ffn_gate.weight; MoE 3D-stacked " +
-                "ffn_*_exps tensor loader ships in the parallel DeepSeek-GGUF A-2 PR.");
+                $"DeepSeek-V2 layer {layerIdx} has neither dense ffn_gate.weight nor MoE ffn_*_exps tensors.");
         }
 
         // GGUF: Dimensions[0] = input dim (K), Dimensions[1] = output dim (M)
@@ -846,7 +853,156 @@ internal sealed class TransformerWeights : IDisposable
             gateWeight: gatePtr, gateQuantType: gateQt, gateOutputDim: gateM, gateInputDim: gateK,
             upWeight: upPtr, upQuantType: upQt, upOutputDim: upM, upInputDim: upK,
             downWeight: downPtr, downQuantType: downQt, downOutputDim: downM, downInputDim: downK,
-            mla: mlaBundle);
+            mla: mlaBundle,
+            moe: moeBundle);
+    }
+
+    /// <summary>
+    /// Loads a single DeepSeek-V2 / V3 MoE layer's expert tensors from GGUF.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>3D-stacked expert layout</b> (per llama.cpp's <c>convert_hf_to_gguf.py</c>
+    /// <c>DeepseekV2Model</c>):
+    /// <list type="bullet">
+    ///   <item><c>blk.{N}.ffn_gate_inp.weight</c> — router gate <c>[hidden, num_experts]</c>.</item>
+    ///   <item><c>blk.{N}.ffn_gate_exps.weight</c> — fused per-expert gate_proj
+    ///     <c>[hidden, intermediate, num_experts]</c>. Each expert is a contiguous
+    ///     <c>[hidden, intermediate]</c> slice in GGUF on-disk order.</item>
+    ///   <item><c>blk.{N}.ffn_up_exps.weight</c> — fused per-expert up_proj, same layout.</item>
+    ///   <item><c>blk.{N}.ffn_down_exps.weight</c> — fused per-expert down_proj
+    ///     <c>[intermediate, hidden, num_experts]</c>.</item>
+    ///   <item>Optional shared experts: <c>ffn_gate_shexp.weight</c> / <c>ffn_up_shexp.weight</c>
+    ///     / <c>ffn_down_shexp.weight</c>. DeepSeek fuses N shared experts into a single
+    ///     MLP of width <c>moe_intermediate × n_shared_experts</c>.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Memory pressure.</b> Each expert is dequantized to a contiguous F32 host
+    /// buffer. For V2-Lite (64 experts × 2048 hidden × 1408 intermediate × 3 mats
+    /// × 4 bytes ≈ 2.2 GB per layer × 26 MoE layers ≈ 57 GB of F32 host RAM).
+    /// This is acknowledged untenable for full-V2 and is what tasks #9/#10
+    /// (on-device dequant) replace.
+    /// </para>
+    /// </remarks>
+    internal static unsafe MoeLayerWeights LoadDeepSeekMoeLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint> owned)
+    {
+        var moe = config.Moe
+            ?? throw new InvalidOperationException("LoadDeepSeekMoeLayer called without Moe config.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int numExperts = moe.NumExperts;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        // Router (2D, F32 — small, dequant inline).
+        var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        float[] router = new float[numExperts * hiddenSize];
+        Dequantize.ToFloat32(
+            dataBase + (nint)routerDesc.DataOffset,
+            (long)numExperts * hiddenSize,
+            routerDesc.QuantizationType,
+            router);
+
+        // Per-expert routed projections — slice the 3D tensor by expert index.
+        var w1 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_gate_exps.weight"],
+            numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        var w3 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_up_exps.weight"],
+            numExperts, M: moeIntermediate, K: hiddenSize, owned);
+        var w2 = SliceExpertsToF32(
+            dataBase, tensors[$"{prefix}.ffn_down_exps.weight"],
+            numExperts, M: hiddenSize, K: moeIntermediate, owned);
+
+        // Shared expert (DeepSeek-V2/V3 fuses N shared into a single wider MLP).
+        nint[] sharedGate = Array.Empty<nint>();
+        nint[] sharedUp = Array.Empty<nint>();
+        nint[] sharedDown = Array.Empty<nint>();
+        int sharedIntermediate = 0;
+        if (moe.SharedExpertIntermediateSize is int sharedI && sharedI > 0
+            && tensors.ContainsKey($"{prefix}.ffn_gate_shexp.weight"))
+        {
+            sharedIntermediate = sharedI;
+            sharedGate = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_gate_shexp.weight"],
+                                        (long)sharedI * hiddenSize, owned)];
+            sharedUp = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_up_shexp.weight"],
+                                        (long)sharedI * hiddenSize, owned)];
+            sharedDown = [DequantToF32(dataBase, tensors[$"{prefix}.ffn_down_shexp.weight"],
+                                        (long)hiddenSize * sharedI, owned)];
+        }
+
+        // DeepSeek convention: no per-token sigmoid gate on the shared branch.
+        // (HfConfigExtractor + MoeConfig keep HasSharedExpertGate=false here.)
+        return new MoeLayerWeights(
+            gate: router,
+            w1: w1,
+            w2: w2,
+            w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: sharedGate,
+            sharedUpProj: sharedUp,
+            sharedDownProj: sharedDown,
+            sharedIntermediateSize: sharedIntermediate,
+            sharedExpertGate: null);
+    }
+
+    /// <summary>
+    /// Slices a 3D fused-experts tensor and dequantizes each expert's [M, K]
+    /// sub-block into its own F32 buffer. Returns the per-expert pointer array.
+    /// </summary>
+    /// <remarks>
+    /// GGUF on-disk layout for <c>ffn_gate_exps</c>/<c>ffn_up_exps</c>:
+    /// <c>Shape = [K, M, num_experts]</c> (K innermost). Each expert's slice
+    /// has byte size <c>M * RowByteSize(K, qt)</c>. The offset to expert e's
+    /// slice is <c>baseOffset + e * (M * RowByteSize(K, qt))</c>. We dequant
+    /// each expert as a contiguous run of <c>M*K</c> elements (every Q4_K-family
+    /// row aligns on the start of a 256-element super-block when K%256==0,
+    /// which holds for every shipping DeepSeek-V2/V3 size).
+    /// </remarks>
+    private static unsafe nint[] SliceExpertsToF32(
+        nint dataBase, GgufTensorDescriptor desc,
+        int numExperts, int M, int K, List<nint> owned)
+    {
+        if (desc.Shape.Rank != 3)
+            throw new InvalidDataException(
+                $"Expected 3D fused-experts tensor; got rank {desc.Shape.Rank}.");
+
+        // GGUF Shape ordering: [innermost, ..., outermost]. For ffn_*_exps
+        // the on-disk shape is [K, M, num_experts] — verify against expected
+        // dims so we fail fast on mis-shaped checkpoints.
+        if (desc.Shape[0] != K || desc.Shape[1] != M || desc.Shape[2] != numExperts)
+            throw new InvalidDataException(
+                $"Fused-experts tensor shape {desc.Shape[0]}×{desc.Shape[1]}×{desc.Shape[2]} " +
+                $"does not match expected K={K} × M={M} × E={numExperts}.");
+
+        long perExpertBytes = M * Dequantize.RowByteSize(K, desc.QuantizationType);
+        long perExpertElements = (long)M * K;
+        nint base_ = dataBase + (nint)desc.DataOffset;
+
+        var ptrs = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            nuint dstBytes = (nuint)(perExpertElements * sizeof(float));
+            nint dst = (nint)NativeMemory.AlignedAlloc(dstBytes, 64);
+            owned.Add(dst);
+            Dequantize.ToFloat32(
+                base_ + (nint)(e * perExpertBytes),
+                perExpertElements,
+                desc.QuantizationType,
+                new Span<float>((void*)dst, (int)perExpertElements));
+            ptrs[e] = dst;
+        }
+        return ptrs;
     }
 
     /// <summary>
