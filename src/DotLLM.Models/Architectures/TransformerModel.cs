@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
@@ -317,13 +318,19 @@ public sealed unsafe class TransformerModel : IModel
             if (lw.KNormWeight is not null)
                 ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeads, headDim, seqLen, eps);
 
-            // d. RoPE (in-place on Q and K for all tokens)
-            RoPE.Execute(
-                new Span<float>(q, seqLen * numHeads * headDim),
-                new Span<float>(k, seqLen * kvStride),
-                positions,
-                numHeads, numKvHeads, headDim, _ropeDim,
-                _state.CosTable, _state.SinTable, _ropeType);
+            // d. RoPE (in-place on Q and K for all tokens). SmolLM3 marks
+            // selected layers as NoPE (skip RoPE entirely) via
+            // ModelConfig.NoRopeLayers — the attention math runs unmodified on
+            // position-free Q/K, which is the whole point of NoPE.
+            if (!Config.IsNoRopeLayer(layer))
+            {
+                RoPE.Execute(
+                    new Span<float>(q, seqLen * numHeads * headDim),
+                    new Span<float>(k, seqLen * kvStride),
+                    positions,
+                    numHeads, numKvHeads, headDim, _ropeDim,
+                    _state.CosTable, _state.SinTable, _ropeType);
+            }
 
             // e. Attention — with or without KV-cache
             if (kvCache is not null)
