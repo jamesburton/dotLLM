@@ -141,7 +141,51 @@ internal static class TransformerWeightsSafetensorsLoader
         // Post-attention (pre-FFN) RMSNorm
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
 
-        // FFN projections — HF SwiGLU names: gate_proj, up_proj, down_proj.
+        // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
+        // Qwen-MoE-convention MoE (possibly interleaved with dense layers via
+        // decoder_sparse_step / mlp_only_layers).
+        if (config.Moe is not null)
+        {
+            MoeLayerWeights? moe = null;
+            bool useRoutedMoE = config.Architecture switch
+            {
+                // Mixtral: every layer is MoE.
+                DotLLM.Core.Configuration.Architecture.Mixtral => true,
+                // Qwen-MoE: per-layer decision based on decoder_sparse_step
+                // and mlp_only_layers. A "dense" Qwen-MoE layer uses the
+                // standard Llama-style mlp.{gate,up,down}_proj names — fall
+                // through to the dense path below.
+                DotLLM.Core.Configuration.Architecture.QwenMoe => config.Moe.IsMoeLayer(layerIdx),
+                _ => true,
+            };
+
+            if (useRoutedMoE)
+            {
+                moe = config.Architecture switch
+                {
+                    DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
+                };
+                return new TransformerLayerWeights(
+                    attnNorm,
+                    qPtr, qQt, qM, qK,
+                    kPtr, kQt, kM, kK,
+                    vPtr, vQt, vM, vK,
+                    oPtr, oQt, oM, oK,
+                    ffnNorm,
+                    gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                    upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                    downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                    qBias, kBias, vBias, oBias,
+                    gateBias: null, upBias: null, downBias: null,
+                    qNormWeight: qNorm, kNormWeight: kNorm,
+                    moe: moe);
+            }
+            // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
+            // the Llama-style dense SwiGLU resolution below.
+        }
+
+        // Dense FFN — HF SwiGLU names: gate_proj, up_proj, down_proj.
         var (gatePtr, gateQt, gateM, gateK) = ResolveLinear(file, $"{prefix}.mlp.gate_proj.weight", owned);
         var (upPtr, upQt, upM, upK) = ResolveLinear(file, $"{prefix}.mlp.up_proj.weight", owned);
         var (downPtr, downQt, downM, downK) = ResolveLinear(file, $"{prefix}.mlp.down_proj.weight", owned);
@@ -340,6 +384,222 @@ internal static class TransformerWeightsSafetensorsLoader
                     $"Tensor '{name}' has dtype {desc.DType} — MLA loader supports F32/F16/BF16 only.");
         }
     }
+
+    /// <summary>
+    /// Loads Qwen-MoE-convention MoE weights for one transformer layer:
+    /// <c>model.layers.{i}.mlp.gate.weight</c> and
+    /// <c>model.layers.{i}.mlp.experts.{j}.{gate_proj,up_proj,down_proj}.weight</c>
+    /// — math-identical to Mixtral but with HF Llama-style tensor names.
+    /// When <see cref="MoeConfig.SharedExpertIntermediateSize"/> is set the
+    /// parallel shared-expert branch (<c>mlp.shared_expert.*</c>) and
+    /// optionally the <c>mlp.shared_expert_gate.weight</c> sigmoid gate are
+    /// resolved too. Everything lands in F32 via
+    /// <see cref="ResolveLinearAsF32"/> so the kernel is uniform in dtype.
+    /// </summary>
+    private static MoeLayerWeights LoadQwenMoeLayer(
+        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadQwenMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.mlp";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router gate — F32 [E, H].
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            // w1 ≡ gate_proj: [intermediate, hidden]
+            (w1[e], _, int w1M, int w1K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.gate_proj.weight", owned);
+            ValidateProjectionShape(w1M, w1K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.gate_proj.weight");
+            // w3 ≡ up_proj: [intermediate, hidden]
+            (w3[e], _, int w3M, int w3K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.up_proj.weight", owned);
+            ValidateProjectionShape(w3M, w3K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.up_proj.weight");
+            // w2 ≡ down_proj: [hidden, intermediate]
+            (w2[e], _, int w2M, int w2K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.down_proj.weight", owned);
+            ValidateProjectionShape(w2M, w2K, hiddenSize, intermediateSize,
+                $"{prefix}.experts.{e}.down_proj.weight");
+        }
+
+        // Shared expert(s). Two naming conventions:
+        //   - Qwen1.5-MoE-A2.7B: singular mlp.shared_expert.{gate,up,down}_proj
+        //     (always exactly one shared expert; optionally gated by
+        //     mlp.shared_expert_gate.weight).
+        //   - DeepSeek-V2/V3: plural mlp.shared_experts.{k}.{gate,up,down}_proj
+        //     (n_shared_experts >= 1, summed, no gate).
+        // We resolve whichever set of tensors the file actually contains; the
+        // kernel sees a uniform pointer-array API. If the config flags a shared
+        // expert but the tensors are absent, we silently fall back to routed-only.
+        nint[] sharedGate = Array.Empty<nint>();
+        nint[] sharedUp = Array.Empty<nint>();
+        nint[] sharedDown = Array.Empty<nint>();
+        int sharedIntermediate = 0;
+        float[]? sharedExpertGate = null;
+        if (moe.SharedExpertIntermediateSize is int sharedI)
+        {
+            int numShared = moe.NumSharedExperts;
+            // Detect the tensor-name convention. Prefer plural (DeepSeek) when
+            // present — this is the forward-compatible format. Fall back to
+            // singular (Qwen1.5-MoE) when only that exists.
+            bool hasPlural = numShared >= 1
+                && file.TensorsByName.ContainsKey($"{prefix}.shared_experts.0.gate_proj.weight");
+            bool hasSingular = numShared == 1
+                && file.TensorsByName.ContainsKey($"{prefix}.shared_expert.gate_proj.weight");
+
+            if (hasPlural)
+            {
+                sharedIntermediate = sharedI;
+                sharedGate = new nint[numShared];
+                sharedUp = new nint[numShared];
+                sharedDown = new nint[numShared];
+                for (int k = 0; k < numShared; k++)
+                {
+                    (sharedGate[k], _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.gate_proj.weight", owned);
+                    ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                        $"{prefix}.shared_experts.{k}.gate_proj.weight");
+                    (sharedUp[k], _, int suM, int suK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.up_proj.weight", owned);
+                    ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                        $"{prefix}.shared_experts.{k}.up_proj.weight");
+                    (sharedDown[k], _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                        $"{prefix}.shared_experts.{k}.down_proj.weight", owned);
+                    ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                        $"{prefix}.shared_experts.{k}.down_proj.weight");
+                }
+            }
+            else if (hasSingular)
+            {
+                sharedIntermediate = sharedI;
+                sharedGate = new nint[1];
+                sharedUp = new nint[1];
+                sharedDown = new nint[1];
+                (sharedGate[0], _, int sgM, int sgK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.gate_proj.weight", owned);
+                ValidateProjectionShape(sgM, sgK, sharedI, hiddenSize,
+                    $"{prefix}.shared_expert.gate_proj.weight");
+                (sharedUp[0], _, int suM, int suK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.up_proj.weight", owned);
+                ValidateProjectionShape(suM, suK, sharedI, hiddenSize,
+                    $"{prefix}.shared_expert.up_proj.weight");
+                (sharedDown[0], _, int sdM, int sdK) = ResolveLinearAsF32(file,
+                    $"{prefix}.shared_expert.down_proj.weight", owned);
+                ValidateProjectionShape(sdM, sdK, hiddenSize, sharedI,
+                    $"{prefix}.shared_expert.down_proj.weight");
+
+                // Optional sigmoid gate — HF stores it as [1, hiddenSize] (a plain
+                // Linear(hidden -> 1, bias=False)). ElementCount == hiddenSize, so
+                // ResolveNorm slots in cleanly.
+                string gateName = $"{prefix}.shared_expert_gate.weight";
+                if (moe.HasSharedExpertGate && file.TensorsByName.ContainsKey(gateName))
+                {
+                    sharedExpertGate = ResolveNorm(file, gateName, hiddenSize);
+                }
+            }
+            // else: config declared a shared branch but the file has neither
+            // plural nor singular tensors — silently fall back to routed-only
+            // (sharedIntermediate stays 0, arrays stay empty).
+        }
+
+        return new MoeLayerWeights(
+            gate: gate,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: sharedGate,
+            sharedUpProj: sharedUp,
+            sharedDownProj: sharedDown,
+            sharedIntermediateSize: sharedIntermediate,
+            sharedExpertGate: sharedExpertGate);
+    }
+
+    /// <summary>
+    /// Loads Mixtral-convention MoE weights for one transformer layer:
+    /// <c>model.layers.{i}.block_sparse_moe.gate.weight</c> and
+    /// <c>model.layers.{i}.block_sparse_moe.experts.{j}.(w1|w2|w3).weight</c>.
+    /// Router gate is resolved into a managed <c>float[]</c> (tiny —
+    /// numExperts × hiddenSize). Per-expert weights are F32 pointers; bf16/
+    /// F16 tensors are upcast at load time into 64-byte-aligned scratch and
+    /// registered in <paramref name="owned"/>.
+    /// </summary>
+    private static MoeLayerWeights LoadMixtralMoeLayer(
+        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadMixtralMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.block_sparse_moe";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router gate — F32 [E, H].
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+        for (int e = 0; e < numExperts; e++)
+        {
+            // w1 (gate_proj): [intermediate, hidden]
+            (w1[e], _, int w1M, int w1K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w1.weight", owned);
+            ValidateProjectionShape(w1M, w1K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.w1.weight");
+            // w3 (up_proj): [intermediate, hidden]
+            (w3[e], _, int w3M, int w3K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w3.weight", owned);
+            ValidateProjectionShape(w3M, w3K, intermediateSize, hiddenSize,
+                $"{prefix}.experts.{e}.w3.weight");
+            // w2 (down_proj): [hidden, intermediate]
+            (w2[e], _, int w2M, int w2K) = ResolveLinearAsF32(file, $"{prefix}.experts.{e}.w2.weight", owned);
+            ValidateProjectionShape(w2M, w2K, hiddenSize, intermediateSize,
+                $"{prefix}.experts.{e}.w2.weight");
+        }
+
+        return new MoeLayerWeights(
+            gate: gate,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize);
+    }
+
+    /// <summary>
+    /// Resolves a rank-2 tensor as a managed <c>float[]</c>, up-casting F16 /
+    /// BF16 on the way in. Used for small weights (router gate) where a copy
+    /// costs nothing and is simpler than tracking owned allocations.
+    /// </summary>
+    private static unsafe float[] ResolveDense2D(
+        SafetensorsFile file, string name, int expectedM, int expectedK)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+        if (m != expectedM || k != expectedK)
+            throw new InvalidDataException(
+                $"Tensor '{name}' shape [{m},{k}] does not match expected [{expectedM},{expectedK}].");
+
+        int count = m * k;
+        var result = new float[count];
+        nint src = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        DecodeFloatTensor(src, desc.DType, count, result, name);
+        return result;
+    }
+
+
 
     private static void ValidateProjectionShape(int actualM, int actualK, int expectedM, int expectedK, string name)
     {
