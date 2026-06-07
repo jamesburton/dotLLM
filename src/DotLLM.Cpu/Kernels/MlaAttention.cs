@@ -457,12 +457,17 @@ public static class MlaAttention
                 + $"({inputDim}x{outputDim}).");
 
         float scale = adapter.Alpha / adapter.Rank;
+        // Phase 4d.6 — opt into the outer-product stage-2 fast path when
+        // available (rank=16 + AVX-512). EnsureATransposedF32 is idempotent
+        // and cheap on the cached path.
+        nint aTransposedHandle = LoraStage2.EnsureATransposedF32(
+            adapter as LoraAdapter, layer, projection, in w, adapter.Rank);
         fixed (float* x = input)
         fixed (float* y = output)
         {
             LoraDelta.Apply(x, (void*)w.BHandle, (void*)w.AHandle, y,
                 seqLen, inputDim, outputDim, adapter.Rank, scale,
-                w.WeightDType, w.WeightDType);
+                w.WeightDType, w.WeightDType, aTransposedHandle);
         }
     }
 
