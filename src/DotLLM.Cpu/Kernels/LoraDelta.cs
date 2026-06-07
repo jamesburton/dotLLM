@@ -313,6 +313,17 @@ public static unsafe class LoraDelta
         // base projection's QuantizeInput call), so stage 1 is now pure
         // integer dot + F16-scale multiply per block — same FLOP/byte ratio
         // as the base Q8_0 GEMM.
+        //
+        // Threading: rank is small (typical PEFT 8..64), so the row dimension
+        // M=rank doesn't tile. The Q8_0 GEMM's 2D N-partition would spread
+        // ~16 tokens × 16 weight rows ≈ 256 dot products per thread per call;
+        // with 32 threads on Strix Halo the per-thread work is too small to
+        // amortise the pool dispatch cost (~100 us round-trip for the
+        // ComputeThreadPool.Dispatch wake / wait). Single-threaded stage 1
+        // mirrors what the F32 dequant-once path already does (GemmF32 with
+        // M=16 also falls back to single-threaded because totalTiles<2), so
+        // this isn't pessimising vs Agent 7's Phase 4d.4 dequant-once path.
+        // Stage 1 work is bandwidth-bound on the activation read anyway.
         int tmpElems = seqLen * rank;
         float[] tmpBuf = ArrayPool<float>.Shared.Rent(tmpElems);
         try
@@ -320,7 +331,7 @@ public static unsafe class LoraDelta
             fixed (float* tmp = tmpBuf)
             {
                 MatMul.GemmQ8_0(bWeight, b: null, c: tmp, m: rank, k: inputDim, n: seqLen,
-                                pool: pool, preQuantizedInput: xQ8);
+                                preQuantizedInput: xQ8);
 
                 // Stage 2: y[t, o] += scale × sum_r A[o, r] · tmp[t, r].
                 // Same path as the F32 LoRA's stage 2 — share the Stage2
