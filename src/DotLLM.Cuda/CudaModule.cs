@@ -64,6 +64,26 @@ public sealed class CudaModule : IDisposable
         return func;
     }
 
+    /// <summary>
+    /// Attempts to resolve a kernel function by name. Returns <c>0</c> when the
+    /// symbol is not present in the module (e.g. stale PTX without the new
+    /// kernel). Caches negative results too so repeated lookups stay cheap.
+    /// </summary>
+    /// <param name="name">The <c>extern "C"</c> kernel function name.</param>
+    public nint TryGetFunction(string name)
+    {
+        if (_functions.TryGetValue(name, out nint func))
+            return func;
+
+        int status = CudaDriverApi.cuModuleGetFunction(out func, _module, name);
+        if (status != 0)
+        {
+            func = 0;
+        }
+        _functions[name] = func;
+        return func;
+    }
+
 
     /// <inheritdoc/>
     public void Dispose()
