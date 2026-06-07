@@ -1,0 +1,49 @@
+#version 450
+// MoE weighted scatter — final combine step that collapses the per-(token,
+// slot) expert outputs into per-token outputs by summing each token's
+// topK rows scaled by the corresponding routing weight:
+//
+//   out[t, h] = sum_{slot=0..topK-1} weights[t * topK + slot] * x[t * topK + slot, h]
+//
+// Mirrors the per-(token, slot) accumulation tail of
+// DotLLM.Cpu.Kernels.MoeSwiGluMlp.Execute — same per-token slot order so
+// the resulting sum is bit-stable wrt the CPU reference (modulo the F32
+// rounding order in the matmul / SwiGLU upstream).
+//
+// Dispatch: 2D grid, one thread per output cell (t, h). Workgroup (16, 16).
+// groupCount = (ceil(hiddenSize/16), ceil(seqLen/16)).
+//
+// Buffer layout:
+//   x        : [seqLen, topK, hiddenSize]   F32 row-major   (post-down expert outputs)
+//   weights  : [seqLen, topK]               F32 row-major   (renormalised top-k probs)
+//   out      : [seqLen, hiddenSize]         F32 row-major   (fully overwritten)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { float x[]; };       // [seqLen * topK * hiddenSize]
+layout(set = 0, binding = 1, std430) readonly  buffer BufW   { float weights[]; }; // [seqLen * topK]
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float outBuf[]; };  // [seqLen * hiddenSize]
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint topK;
+    uint hiddenSize;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x; // 0..hiddenSize
+    uint t = gl_GlobalInvocationID.y; // 0..seqLen
+    if (h >= pc.hiddenSize || t >= pc.seqLen) return;
+
+    uint rowBase = t * pc.topK;
+    uint xBase = rowBase * pc.hiddenSize;
+    uint stride = pc.hiddenSize;
+
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.topK; slot++) {
+        float w = weights[rowBase + slot];
+        acc += w * x[xBase + slot * stride + h];
+    }
+
+    outBuf[t * pc.hiddenSize + h] = acc;
+}
