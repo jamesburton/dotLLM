@@ -665,6 +665,78 @@ public sealed unsafe class TransformerModel : IModel
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
             FfnBranch:
+            // ── MoE branch ──────────────────────────────────────────────
+            // Mixtral-convention top-k dense routing replaces the dense FFN
+            // block entirely. Takes post-attn hidden + FFN RMSNorm weight,
+            // runs router + top-k experts, writes into normOut, then residual
+            // adds into hidden and continues to the next layer. No R4 repack
+            // (expert GEMMs are tiny), no pre-quantise (experts are F32).
+            if (lw.Moe is not null)
+            {
+                // FFN RMSNorm per token into normOut.
+                for (int t = 0; t < seqLen; t++)
+                {
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                        lw.FfnNormWeight, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+                }
+
+                MoeLayerWeights moe = lw.Moe!;
+                // Route through the shared-expert-aware overload iff we need
+                // shared-expert addition OR the raw-softmax (non-renormalised)
+                // Qwen1.5-MoE gating. The simple Mixtral path stays the call
+                // target for the common case.
+                if (moe.HasSharedExpert || !moe.NormTopKProb)
+                {
+                    ReadOnlySpan<float> sharedGateSpan = moe.SharedExpertGate is not null
+                        ? moe.SharedExpertGate.AsSpan()
+                        : ReadOnlySpan<float>.Empty;
+                    MoeSwiGluMlp.ExecuteWithSharedExpert(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        expertsW1: moe.W1,
+                        expertsW2: moe.W2,
+                        expertsW3: moe.W3,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen,
+                        normTopKProb: moe.NormTopKProb,
+                        sharedGateProj: moe.SharedGateProj,
+                        sharedUpProj: moe.SharedUpProj,
+                        sharedDownProj: moe.SharedDownProj,
+                        sharedIntermediateSize: moe.SharedIntermediateSize,
+                        sharedExpertGate: sharedGateSpan);
+                }
+                else
+                {
+                    MoeSwiGluMlp.Execute(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        expertsW1: moe.W1,
+                        expertsW2: moe.W2,
+                        expertsW3: moe.W3,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen);
+                }
+
+                // Residual add (per token) → hidden. Same as dense path.
+                for (int t = 0; t < seqLen; t++)
+                {
+                    Add.Execute(
+                        new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        new Span<float>(hidden + t * hiddenSize, hiddenSize));
+                }
+                continue;
+            }
 
             // i. FFN RMSNorm + Pre-quantize + Gate/Up projections
             // When a LoRA adapter is active we need F32 normOut for delta —

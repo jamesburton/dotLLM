@@ -7,6 +7,146 @@ using DotLLM.Models.Gguf;
 namespace DotLLM.Models.Architectures;
 
 /// <summary>
+/// Per-layer dense-routing MoE weight bundle. Present on a
+/// <see cref="TransformerLayerWeights"/> when the layer replaces its FFN
+/// with a Mixtral-convention or Qwen-MoE-convention MoE block. All pointers
+/// are F32 row-major — bf16 and F16 tensors are upcast at load time so the
+/// MoE kernel can feed <see cref="DotLLM.Cpu.Kernels.MoeSwiGluMlp"/>
+/// directly without per-call dequant.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Qwen-MoE and DeepSeek-V2/V3 add optional shared-expert pointers — each
+/// carried as parallel arrays (<see cref="SharedGateProj"/>, <see cref="SharedUpProj"/>,
+/// <see cref="SharedDownProj"/>) of length <see cref="NumSharedExperts"/>.
+/// Qwen1.5-MoE ships a single shared expert optionally gated by a
+/// <see cref="SharedExpertGate"/> sigmoid; DeepSeek-V2/V3 ships
+/// <c>n_shared_experts</c> shared experts (often 1 or 2) and does not gate.
+/// When <see cref="HasSharedExpert"/> is true, the forward pass runs each
+/// shared expert as a dense SwiGLU over the token, sums their outputs, and
+/// adds the (optionally gated) sum to the routed top-k sum. The
+/// <see cref="NormTopKProb"/> flag controls whether the selected top-k
+/// probabilities are renormalised to sum to 1.0 (Mixtral + Qwen3-MoE) or
+/// left as raw softmax values (Qwen1.5-MoE-A2.7B).
+/// </para>
+/// </remarks>
+internal sealed class MoeLayerWeights
+{
+    /// <summary>Router gate.weight as F32 [numExperts, hiddenSize] row-major.</summary>
+    public readonly float[] Gate;
+
+    /// <summary>Per-expert <c>w1</c> (gate_proj) F32 pointers [intermediateSize, hiddenSize] row-major.</summary>
+    public readonly nint[] W1;
+
+    /// <summary>Per-expert <c>w2</c> (down_proj) F32 pointers [hiddenSize, intermediateSize] row-major.</summary>
+    public readonly nint[] W2;
+
+    /// <summary>Per-expert <c>w3</c> (up_proj) F32 pointers [intermediateSize, hiddenSize] row-major.</summary>
+    public readonly nint[] W3;
+
+    public readonly int NumExperts;
+    public readonly int NumExpertsPerTok;
+    public readonly int HiddenSize;
+    public readonly int IntermediateSize;
+
+    /// <summary>
+    /// When <c>true</c>, the kernel renormalises the selected top-k
+    /// probabilities to sum to 1.0 (Mixtral + Qwen3-MoE). When <c>false</c>,
+    /// the raw softmax probabilities are used as gating weights (Qwen1.5-MoE).
+    /// </summary>
+    public readonly bool NormTopKProb;
+
+    /// <summary>
+    /// Per-shared-expert <c>gate_proj</c> pointers — F32
+    /// [sharedIntermediateSize, hiddenSize] row-major, one per shared expert.
+    /// Length equals <see cref="NumSharedExperts"/>; empty when no shared
+    /// experts are present.
+    /// </summary>
+    public readonly nint[] SharedGateProj;
+    /// <summary>
+    /// Per-shared-expert <c>up_proj</c> pointers — F32
+    /// [sharedIntermediateSize, hiddenSize] row-major, one per shared expert.
+    /// </summary>
+    public readonly nint[] SharedUpProj;
+    /// <summary>
+    /// Per-shared-expert <c>down_proj</c> pointers — F32
+    /// [hiddenSize, sharedIntermediateSize] row-major, one per shared expert.
+    /// </summary>
+    public readonly nint[] SharedDownProj;
+    /// <summary>
+    /// Per-shared-expert intermediate width (0 when no shared expert).
+    /// Applies uniformly across all shared experts (they share width).
+    /// </summary>
+    public readonly int SharedIntermediateSize;
+    /// <summary>
+    /// Number of parallel shared experts whose outputs are summed. 1 for
+    /// Qwen1.5-MoE, &gt;=1 for DeepSeek-V2/V3 (<c>n_shared_experts</c>).
+    /// Zero only when there is no shared-expert branch.
+    /// </summary>
+    public readonly int NumSharedExperts;
+    /// <summary>
+    /// Optional shared-expert sigmoid gate weight — F32 [hiddenSize]. When
+    /// present, per-token <c>sigmoid(hidden . SharedExpertGate)</c> scales
+    /// the summed shared-expert output before it's added to the routed sum
+    /// (Qwen1.5-MoE convention; ALWAYS paired with a single shared expert).
+    /// Null = no gate, summed shared-expert output added unscaled
+    /// (DeepSeek-V2/V3 convention).
+    /// </summary>
+    public readonly float[]? SharedExpertGate;
+
+    /// <summary>True iff a shared-expert branch is present on this layer.</summary>
+    public bool HasSharedExpert => SharedIntermediateSize > 0 && NumSharedExperts > 0;
+
+    /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
+    public MoeLayerWeights(
+        float[] gate,
+        nint[] w1, nint[] w2, nint[] w3,
+        int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize)
+        : this(gate, w1, w2, w3, numExperts, numExpertsPerTok, hiddenSize, intermediateSize,
+               normTopKProb: true,
+               sharedGateProj: Array.Empty<nint>(),
+               sharedUpProj: Array.Empty<nint>(),
+               sharedDownProj: Array.Empty<nint>(),
+               sharedIntermediateSize: 0,
+               sharedExpertGate: null)
+    {
+    }
+
+    /// <summary>
+    /// Full ctor covering Qwen-MoE and DeepSeek extensions: per-shared-expert
+    /// pointer arrays, <c>norm_topk_prob</c> flag, optional sigmoid gate.
+    /// Length of the three shared arrays must agree; a zero-length array set
+    /// disables the shared-expert branch.
+    /// </summary>
+    public MoeLayerWeights(
+        float[] gate,
+        nint[] w1, nint[] w2, nint[] w3,
+        int numExperts, int numExpertsPerTok, int hiddenSize, int intermediateSize,
+        bool normTopKProb,
+        nint[] sharedGateProj, nint[] sharedUpProj, nint[] sharedDownProj,
+        int sharedIntermediateSize, float[]? sharedExpertGate)
+    {
+        if (sharedGateProj.Length != sharedUpProj.Length || sharedGateProj.Length != sharedDownProj.Length)
+            throw new ArgumentException(
+                "Shared-expert pointer arrays must all have the same length (number of shared experts).");
+
+        Gate = gate;
+        W1 = w1; W2 = w2; W3 = w3;
+        NumExperts = numExperts;
+        NumExpertsPerTok = numExpertsPerTok;
+        HiddenSize = hiddenSize;
+        IntermediateSize = intermediateSize;
+        NormTopKProb = normTopKProb;
+        SharedGateProj = sharedGateProj;
+        SharedUpProj = sharedUpProj;
+        SharedDownProj = sharedDownProj;
+        SharedIntermediateSize = sharedIntermediateSize;
+        NumSharedExperts = sharedGateProj.Length;
+        SharedExpertGate = sharedExpertGate;
+    }
+}
+
+/// <summary>
 /// Holds per-layer weight references for a single transformer layer.
 /// Norm weights are dequantized to <c>float[]</c> at load time (small).
 /// Linear projection weights remain as mmap pointers with their quantization type.
@@ -95,6 +235,12 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly MlaLayerWeights? Mla;
 
+    /// <summary>
+    /// MoE FFN bundle for Mixtral-convention layers. When non-null the dense
+    /// <see cref="GateWeight"/>/<see cref="UpWeight"/>/<see cref="DownWeight"/>
+    /// slots are ignored by the forward pass and MoE routing runs instead.
+    /// </summary>
+    public readonly MoeLayerWeights? Moe;
 
     public TransformerLayerWeights(
         float[] attnNormWeight,
@@ -109,7 +255,8 @@ internal readonly struct TransformerLayerWeights
         float[]? qBias = null, float[]? kBias = null, float[]? vBias = null, float[]? oBias = null,
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
         float[]? qNormWeight = null, float[]? kNormWeight = null,
-        MlaLayerWeights? mla = null)
+        MlaLayerWeights? mla = null,
+        MoeLayerWeights? moe = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -123,6 +270,7 @@ internal readonly struct TransformerLayerWeights
         UpWeight = upWeight; UpQuantType = upQuantType; UpOutputDim = upOutputDim; UpInputDim = upInputDim; UpBias = upBias;
         DownWeight = downWeight; DownQuantType = downQuantType; DownOutputDim = downOutputDim; DownInputDim = downInputDim; DownBias = downBias;
         Mla = mla;
+        Moe = moe;
     }
 }
 
@@ -357,15 +505,20 @@ internal sealed class TransformerWeights : IDisposable
             // takes its weights from lw.Mla and calls the scalar MlaAttention
             // kernel which does not consume R4 repacks.
             bool isMla = lw.Mla is not null;
+            // MoE layers don't populate the dense gate/up/down slots —
+            // repack only the attention projections. The MoE FFN path runs
+            // without R4 interleaving (the per-expert GEMMs are tiny and
+            // the win would be microscopic).
+            bool isMoe = lw.Moe is not null;
             repacked[i] = new RepackedLayerWeights
             {
                 Q = isMla ? default : TryRepack(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim),
                 K = isMla ? default : TryRepack(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim),
                 V = isMla ? default : TryRepack(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim),
                 O = isMla ? default : TryRepack(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim),
-                Gate = TryRepack(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim),
-                Up = TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
-                Down = TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),
+                Gate = isMoe ? default : TryRepack(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim),
+                Up = isMoe ? default : TryRepack(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim),
+                Down = isMoe ? default : TryRepack(lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim),
             };
         }
         RepackedLayers = repacked;
