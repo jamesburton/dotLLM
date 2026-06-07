@@ -119,6 +119,77 @@ On each new token write, the oldest window entry is quantized and appended to th
 
 Orthogonal to weight quantization — Q4_K_M model can use Q8_0 KV-cache.
 
+## MLA KV-Cache (DeepSeek-V2 / V3)
+
+MLA decouples Q head-dim from V head-dim (V2-Lite: qk=192, v=128) and adds
+a shared MQA-style rope-K that broadcasts across heads — neither fits the
+per-head-uniform `IKvCache` shape that GQA/MHA caches assume. A dedicated
+`MlaExpandedKvState` lives next to `TransformerModel` for this reason.
+
+**Loader default**: HF and GGUF config extractors both set `MlaConfig.UseHybridMlaCache = true` for `Architecture.DeepSeekV2` / `Architecture.DeepSeekV3`, so production code paths get **Phase C** (hybrid latent + absorbed decode) without needing per-call configuration. Phase A remains active and is the numerical oracle; tests that build `MlaConfig` directly (bypassing the loader) still default to Phase A. The default flip lives at commits `4b54a72` (HF) and `4724397` (GGUF) — pre-flip, V2-Lite at `max_position_embeddings=163840` allocated ~68 GB and OOM'd on most hosts.
+
+### Phase A — expanded reference cache
+
+`src/DotLLM.Models/Architectures/MlaExpandedKvState.cs`. Per layer:
+
+- `K_nope[layer]` : `[maxSeqLen, numHeads * qkNopeHeadDim]` — per-head non-rope K
+- `V[layer]` : `[maxSeqLen, numHeads * vHeadDim]` — per-head V
+- `KPe[layer]` : `[maxSeqLen, qkRopeHeadDim]` — shared rope-K (post-rotation)
+
+All 64-byte aligned native memory, lazily constructed on the first MLA
+forward and reset when the caller signals a fresh sequence by passing
+`positions[0] == 0`. Not re-entrant; single-stream only (beam search or
+batching needs per-sequence instances). Caller-supplied `IKvCache` is
+ignored for MLA layers.
+
+This layout is the PoC scalar kernel's scratch layout made persistent —
+storage is 1:1 with what the kernel already computes, so zero shape
+translation. Memory: ~16.6 KB per token per layer at F32 for V2-Lite;
+on a 27-layer 8K context that's ~3.6 GB. The purpose of Phase A is
+**correctness oracle**: generation works end-to-end and a split call
+(prefill + step-by-step decode) produces logits that match a single-call
+forward over the combined range within 1e-4.
+
+### Phase B — pure latent + W_UK absorbed (landed)
+
+The production memory win (per the DeepSeek-V2 paper, §2.1.2): store
+the *compressed* latent `c_kv[kv_lora_rank]` per token (512 floats for
+V2-Lite) alongside the shared `k_pe[qk_rope_head_dim]` (64 floats) —
+a single `[kv_lora_rank + qk_rope_head_dim] = 576` value per token per
+layer, 7.2× smaller than Phase A at F32. Attention math absorbs `W_UK`
+into Q on-the-fly: `Q_latent[h] = Q_nope[h] @ W_UK_T[h]` (size
+kv_lora_rank) and `score[h, t, s] = Q_latent[h] · c_kv[s] + Q_pe[h]
+· k_pe[s]`. Output uses absorbed `W_UV`: `out[h] = W_UV[h] @ (softmax
+· c_kv)`. vLLM's MLA backend is the reference implementation.
+
+Lives at `src/DotLLM.Models/Architectures/MlaLatentKvState.cs` +
+`src/DotLLM.Cpu/Kernels/MlaAttention.ExecuteLatent`. Selected via
+`MlaConfig.UseLatentCache = true` (mutually exclusive with
+`UseHybridMlaCache`).
+
+### Phase C — hybrid: latent persistence + Phase A-equivalent prefill expand + absorbed decode (landed, default)
+
+The production-shipping path mirrors vLLM's MLA backend: prefill
+(`seqLen > 1`) expands cached latents through `W_UK` / `W_UV` into
+local scratch and runs the standard 192-dim per-head MHA loop
+(compute-bound at long seqKv); decode (`seqLen == 1`) delegates to
+`ExecuteLatent` — the absorbed 576-dim MQA-style read of the compact
+latent cache (bandwidth-bound at decode). Both paths persist the
+SAME latent form (c_kv + k_pe per token) to `MlaLatentKvState` —
+Phase A's expanded per-head K_nope/V is local prefill scratch and is
+discarded. A decode step therefore consumes exactly the latents a
+pure-Phase-B prefill would have written, so the absorbed kernel can
+run over them without re-expansion.
+
+Lives at `src/DotLLM.Cpu/Kernels/MlaAttention.ExecuteLatentHybrid`.
+Selected via `MlaConfig.UseHybridMlaCache = true` (mutually
+exclusive with `UseLatentCache`). **Default for DeepSeek-V2/V3 from
+the loaders.**
+
+Phase A is the numerical oracle for Phase B / Phase C: oracle tests
+prove split-call match against the expanded-cache reference at 1e-3
+drift on real-weight prompts.
+
 ## Simple Prompt Caching (Step 54)
 
 Live KV-cache reuse for multi-turn conversations. No paged attention required — works with `SimpleKvCache`.
