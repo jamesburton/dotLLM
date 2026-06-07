@@ -12,6 +12,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+    <ProjectReference Include="..\DotLLM.Models\DotLLM.Models.csproj" />
   </ItemGroup>
 
   <!-- Pre-compiled SPIR-V shaders ship alongside the managed assembly.
