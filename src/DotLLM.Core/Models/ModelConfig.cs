@@ -63,6 +63,15 @@ public record ModelConfig
     /// <summary>MLA configuration. Only set for DeepSeek-style MLA attention.</summary>
     public MlaConfig? MlaConfig { get; init; }
 
+    /// <summary>
+    /// Mamba-3 architecture configuration. Non-null iff <see cref="Architecture"/>
+    /// is <see cref="DotLLM.Core.Configuration.Architecture.Mamba3"/>.
+    /// Carries the Mamba-3 specific hyperparameters (state size, head count,
+    /// MIMO flag, trapezoidal/RoPE floors, …) that do not map onto the
+    /// other config records.
+    /// </summary>
+    public Mamba3Config? Mamba3Config { get; init; }
+
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
 }
