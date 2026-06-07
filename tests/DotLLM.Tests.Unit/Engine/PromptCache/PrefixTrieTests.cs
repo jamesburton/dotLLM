@@ -131,12 +131,19 @@ public sealed class PrefixTrieTests
         AllocateAndInsert(trie, pool, tokens);
 
         int countBefore = trie.NodeCount;
-        // Re-insert identical tokens with new (dummy) block ids — should NOT add new nodes.
-        var dummyBlocks = new List<int> { 99, 98, 97, 96 };
-        trie.Insert(tokens, 0, dummyBlocks);
-        int countAfter = trie.NodeCount;
+        int freeBefore = pool.FreeBlocks;
 
-        Assert.Equal(countBefore, countAfter);
+        // Re-insert identical tokens with freshly allocated (duplicate-content) blocks.
+        // Trie should release them rather than adding duplicate nodes.
+        var dupBlocks = new List<int>
+        {
+            pool.Allocate(), pool.Allocate(), pool.Allocate(), pool.Allocate(),
+        };
+        int linked = trie.Insert(tokens, 0, dupBlocks);
+
+        Assert.Equal(0, linked);
+        Assert.Equal(countBefore, trie.NodeCount);
+        Assert.Equal(freeBefore, pool.FreeBlocks); // duplicates returned to pool
     }
 
     [Fact]
