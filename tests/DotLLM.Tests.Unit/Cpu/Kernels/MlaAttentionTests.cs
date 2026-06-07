@@ -130,6 +130,48 @@ public sealed class MlaAttentionTests
         }
     }
 
+    [Fact]
+    public void Execute_AttnScaleMultiplier_ChangesOutput_RemainsFinite()
+    {
+        // YaRN softmax correction: pass multiplier != 1.0f → attention
+        // weights must redistribute → output must differ from the default
+        // multiplier=1.0f case, while remaining finite. Default 1.0f is
+        // bit-identical with the pre-YaRN behaviour (covered by the
+        // reference-matching tests above which call Execute without the
+        // parameter).
+        const int seqLen = 4;
+        const int hiddenSize = 12;
+        const int numHeads = 3;
+        const int qkNope = 4;
+        const int qkRope = 2;
+        const int vHead = 4;
+        const int qLora = 8;
+        const int kvLora = 6;
+        const float eps = 1e-6f;
+        const int maxSeq = 8;
+
+        var fixture = BuildFixture(seqLen, hiddenSize, numHeads, qkNope, qkRope, vHead,
+                                   qLora, kvLora, eps, maxSeq, seed: 99);
+
+        float[] unit = new float[seqLen * hiddenSize];
+        RunKernelWithScale(fixture, unit, attnScaleMultiplier: 1.0f);
+
+        float[] yarn = new float[seqLen * hiddenSize];
+        // Approximately DeepSeek-V2-Lite's mscale² ≈ 1.59.
+        RunKernelWithScale(fixture, yarn, attnScaleMultiplier: 1.59f);
+
+        foreach (float x in yarn) Assert.True(float.IsFinite(x), $"non-finite YaRN output: {x}");
+
+        // Outputs must differ — softmax renormalises nonlinearly when scale
+        // changes, so even with identical inputs the attended vectors shift.
+        bool anyDifferent = false;
+        for (int i = 0; i < unit.Length; i++)
+        {
+            if (MathF.Abs(unit[i] - yarn[i]) > 1e-5f) { anyDifferent = true; break; }
+        }
+        Assert.True(anyDifferent, "attnScaleMultiplier had no effect on output");
+    }
+
     // ───────────────────────── helpers ─────────────────────────
 
     private sealed class Fixture
@@ -222,7 +264,10 @@ public sealed class MlaAttentionTests
         };
     }
 
-    private static void RunKernel(Fixture f, Span<float> output)
+    private static void RunKernel(Fixture f, Span<float> output) =>
+        RunKernelWithScale(f, output, attnScaleMultiplier: 1.0f);
+
+    private static void RunKernelWithScale(Fixture f, Span<float> output, float attnScaleMultiplier)
     {
         MlaAttention.Execute(
             hidden: f.Hidden,
@@ -246,7 +291,8 @@ public sealed class MlaAttentionTests
             kvAProjWithMqa: f.KvAProj,
             kvALayernormWeight: f.KvANorm,
             kvBProj: f.KvBProj,
-            oProj: f.OProj);
+            oProj: f.OProj,
+            attnScaleMultiplier: attnScaleMultiplier);
     }
 
     /// <summary>

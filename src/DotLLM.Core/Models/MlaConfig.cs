@@ -134,4 +134,75 @@ public sealed record MlaConfig
     /// Used for the attention scale <c>1 / sqrt(qk_head_dim)</c>.
     /// </summary>
     public int QkHeadDim => QkNopeHeadDim + QkRopeHeadDim;
+
+    /// <summary>
+    /// When <see langword="true"/>, the forward pass uses the latent MLA
+    /// KV-cache (<c>MlaLatentKvState</c>) and the absorbed-form attention
+    /// kernel — <c>Q_latent[h] = W_UK[h]^T @ Q_nope[h]</c>, scores against
+    /// the shared latent, output expanded via <c>W_UV</c>. Storage drops
+    /// ~7× vs the Phase A expanded cache (see <c>docs/KV_CACHE.md</c>).
+    /// </summary>
+    /// <remarks>
+    /// Default <see langword="false"/> = Phase A cache (expanded per-head
+    /// K_nope/V, the numerical oracle). Flip to <see langword="true"/>
+    /// once the Phase B path is validated against Phase A within 1e-3 on
+    /// the target checkpoint. Set per-config, not globally — an integration
+    /// test can load the same model twice with different settings and
+    /// diff the logits.
+    /// </remarks>
+    public bool UseLatentCache { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/>, the forward pass uses the latent
+    /// <c>MlaLatentKvState</c> cache (same ~7× memory win as
+    /// <see cref="UseLatentCache"/>) but dispatches the attention kernel by
+    /// sequence length: <b>prefill</b> (<c>seqLen &gt; 1</c>) expands the
+    /// cached latents into per-head K_nope/V in a local scratch buffer and
+    /// runs the standard 192-dim MHA attention loop (compute-bound, cheaper
+    /// than the 576-dim absorbed form at long prefill seqKv); <b>decode</b>
+    /// (<c>seqLen == 1</c>) uses the Phase B absorbed kernel verbatim
+    /// (bandwidth-bound — 576-dim MQA-style read of the compact latent
+    /// cache). Mirrors vLLM's production MLA backend split.
+    /// </summary>
+    /// <remarks>
+    /// Mutually exclusive with <see cref="UseLatentCache"/>. The cache
+    /// format stored on disk is identical to Phase B
+    /// (<c>c_kv + k_pe</c> per token), so a decode step after a Phase C
+    /// prefill consumes the same latents a pure-Phase-B prefill would
+    /// have produced — Phase A's expanded K_nope/V is scratch only during
+    /// the prefill step and is discarded.
+    /// </remarks>
+    public bool UseHybridMlaCache { get; init; }
+
+    /// <summary>
+    /// Compute the YaRN softmax-scale multiplier to fold into the attention
+    /// scale: returns <c>mscale² = (yarn_get_mscale(factor, mscale_all_dim))²</c>
+    /// when YaRN scaling is configured and active (<c>factor &gt; 1</c>), else
+    /// <c>1.0f</c>. The caller applies this as
+    /// <c>softmax_scale = 1/sqrt(qk_head_dim) * multiplier</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Mirrors the HF reference <c>modeling_deepseek.yarn_get_mscale</c>:
+    /// <code>
+    ///   def yarn_get_mscale(scale=1, mscale=1):
+    ///       if scale &lt;= 1: return 1.0
+    ///       return 0.1 * mscale * math.log(scale) + 1.0
+    /// </code>
+    /// and the softmax correction <c>scale *= mscale * mscale</c>. Uses
+    /// <see cref="RopeScalingMscaleAllDim"/>, NOT <see cref="RopeScalingMscale"/> —
+    /// the V2 reference applies <c>mscale_all_dim</c> to the softmax scale and
+    /// uses <c>mscale</c> only for RoPE frequency scaling (not wired here yet).
+    /// </para>
+    /// </remarks>
+    public float ComputeYarnSoftmaxScaleMultiplier()
+    {
+        if (RopeScalingFactor is not float factor || factor <= 1.0f)
+            return 1.0f;
+        if (RopeScalingMscaleAllDim is not float mscaleAllDim || mscaleAllDim == 0.0f)
+            return 1.0f;
+
+        float mscale = 0.1f * mscaleAllDim * MathF.Log(factor) + 1.0f;
+        return mscale * mscale;
+    }
 }
