@@ -1,6 +1,7 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Models;
 using DotLLM.Engine.KvCache;
+using DotLLM.Engine.PromptCache;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine.Scheduler;
@@ -43,9 +44,10 @@ public sealed class ContinuousBatchSchedulerService : IScheduler, IDisposable
         ITokenizer tokenizer,
         Func<ModelConfig, int, IKvCache> kvCacheFactory,
         ContinuousBatchSchedulerOptions? options = null,
-        KvBlockPool? pagedPool = null)
+        KvBlockPool? pagedPool = null,
+        PrefixTrieManager? prefixCache = null)
     {
-        _inner = new ContinuousBatchScheduler(model, tokenizer, kvCacheFactory, options, pagedPool);
+        _inner = new ContinuousBatchScheduler(model, tokenizer, kvCacheFactory, options, pagedPool, prefixCache);
     }
 
     /// <inheritdoc/>
