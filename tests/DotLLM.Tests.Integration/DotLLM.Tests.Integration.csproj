@@ -19,8 +19,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Update="Fixtures\Mamba3\fixture_canonical.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures\Mamba3\fixture_canonical_mimo.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Xunit.SkippableFact" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
   </ItemGroup>
 
