@@ -109,5 +109,35 @@ internal static class CudaLibraryResolver
             if (e.Key is string key && key.StartsWith("CUDA_PATH_V", StringComparison.OrdinalIgnoreCase))
                 yield return e.Value as string;
         }
+
+        // Fallback: probe standard install dirs when env vars are absent or
+        // stale (e.g. CUDA_PATH still points at an older v11.8 alongside a
+        // newer toolkit). Newest version first by lexical sort over the
+        // "v<major>.<minor>" subdir names ("v13.1" > "v12.6" > "v11.8").
+        if (OperatingSystem.IsWindows())
+        {
+            string baseDir = @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA";
+            if (Directory.Exists(baseDir))
+            {
+                foreach (var dir in Directory.EnumerateDirectories(baseDir)
+                    .OrderByDescending(d => d, StringComparer.OrdinalIgnoreCase))
+                {
+                    yield return dir;
+                }
+            }
+        }
+        else
+        {
+            yield return "/usr/local/cuda";
+            const string linuxBase = "/usr/local";
+            if (Directory.Exists(linuxBase))
+            {
+                foreach (var dir in Directory.EnumerateDirectories(linuxBase, "cuda-*")
+                    .OrderByDescending(d => d, StringComparer.Ordinal))
+                {
+                    yield return dir;
+                }
+            }
+        }
     }
 }
