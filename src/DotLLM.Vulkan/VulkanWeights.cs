@@ -44,9 +44,10 @@ internal sealed class VulkanWeights : IDisposable
     /// weight-offset push constant on the matmul kernel. Shared experts are
     /// few (typically 1..2) and small, so per-expert buffers keep the wiring
     /// simple while costing one extra buffer per shared expert per layer.
-    /// Qwen1.5-MoE's per-token sigmoid gate is intentionally NOT wired here —
-    /// the upload guard rejects layers carrying a <c>SharedExpertGate</c>
-    /// until a dedicated sigmoid + scalar-multiply kernel pair lands.
+    /// Qwen1.5-MoE's per-token sigmoid gate is wired via the optional
+    /// <see cref="SharedExpertGate"/> buffer below; the forward pass folds the
+    /// gated shared-expert sum into <c>NormOutput</c> in place using the fused
+    /// <c>MoeSigmoidGatedAddF32Kernel</c>.
     /// </para>
     /// </remarks>
     internal readonly struct MoeLayerBuffers
@@ -63,6 +64,14 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer[]? SharedW1;     // [sharedIntermediate, hidden]
         public readonly VulkanDevice.Buffer[]? SharedW2;     // [hidden, sharedIntermediate]
         public readonly VulkanDevice.Buffer[]? SharedW3;     // [sharedIntermediate, hidden]
+
+        // Optional Qwen1.5-MoE sigmoid gate weight for the shared-expert
+        // branch (HF: <c>mlp.shared_expert_gate.weight</c>, [hidden]). Stored
+        // as a [1, hidden] buffer so the existing F32 matmul kernel (M=1) can
+        // produce per-token gate logits in one dispatch. Null on
+        // DeepSeek-V2/V3 (ungated shared experts) and on Mixtral-style
+        // routed-only layers.
+        public readonly VulkanDevice.Buffer? SharedExpertGate;
 
         public readonly int NumExperts;
         public readonly int NumExpertsPerTok;
@@ -84,7 +93,8 @@ internal sealed class VulkanWeights : IDisposable
             int numExperts, int numExpertsPerTok,
             int hiddenSize, int intermediateSize, bool normTopKProb,
             VulkanDevice.Buffer[]? sharedW1, VulkanDevice.Buffer[]? sharedW2, VulkanDevice.Buffer[]? sharedW3,
-            int sharedIntermediateSize, int numSharedExperts)
+            int sharedIntermediateSize, int numSharedExperts,
+            VulkanDevice.Buffer? sharedExpertGate)
         {
             Gate = gate;
             W1Bank = w1;
@@ -100,6 +110,7 @@ internal sealed class VulkanWeights : IDisposable
             SharedW3 = sharedW3;
             SharedIntermediateSize = sharedIntermediateSize;
             NumSharedExperts = numSharedExperts;
+            SharedExpertGate = sharedExpertGate;
         }
 
         public void Dispose()
@@ -114,6 +125,7 @@ internal sealed class VulkanWeights : IDisposable
                 for (int i = 0; i < SharedW2.Length; i++) SharedW2[i].Dispose();
             if (SharedW3 is not null)
                 for (int i = 0; i < SharedW3.Length; i++) SharedW3[i].Dispose();
+            SharedExpertGate?.Dispose();
         }
     }
 
@@ -274,14 +286,11 @@ internal sealed class VulkanWeights : IDisposable
                 down = device.Allocate(64);
                 gateBias = upBias = downBias = null;
                 // Qwen1.5-MoE's per-token sigmoid gate (mlp.shared_expert_gate.weight)
-                // needs a sigmoid kernel + per-row scalar multiply that we don't
-                // have on the Vulkan side yet. DeepSeek-V2/V3 ships shared experts
-                // WITHOUT the gate so we accept that path here; gated shared
-                // experts are still rejected until the kernels land.
-                if (lw.Moe.SharedExpertGate is not null)
-                    throw new NotSupportedException(
-                        "MoE shared expert sigmoid gate (Qwen1.5-MoE convention) is not supported on the Vulkan backend yet; only ungated shared experts (DeepSeek-V2/V3) are supported.");
-                moe = UploadMoeLayer(device, lw.Moe, normTopKProb: true, out long moeBytes);
+                // is uploaded here and the fused sigmoid + per-row scalar multiply
+                // is dispatched from VulkanTransformerModel.RunMoeSharedExperts.
+                // DeepSeek-V2/V3 ungated shared experts continue to flow through
+                // the plain-add + host-mapped fold path.
+                moe = UploadMoeLayer(device, lw.Moe, normTopKProb: lw.Moe.NormTopKProb, out long moeBytes);
                 totalBytes += moeBytes;
             }
             else
@@ -465,12 +474,23 @@ internal sealed class VulkanWeights : IDisposable
             uploadedBytes += (long)numShared * (perSharedW1Bytes + perSharedW2Bytes + perSharedW3Bytes);
         }
 
+        // Optional Qwen1.5-MoE per-token sigmoid gate — F32 [hiddenSize].
+        // Uploaded as a [1, hidden] device buffer so the F32 matmul kernel
+        // (M=1) can produce per-token gate logits in one dispatch.
+        VulkanDevice.Buffer? sharedExpertGate = null;
+        if (moe.SharedExpertGate is not null)
+        {
+            sharedExpertGate = UploadNormVec(device, moe.SharedExpertGate);
+            uploadedBytes += (long)moe.SharedExpertGate.Length * sizeof(float);
+        }
+
         return new MoeLayerBuffers(gate, w1Bank, w2Bank, w3Bank,
             moe.NumExperts, moe.NumExpertsPerTok,
             moe.HiddenSize, moe.IntermediateSize, normTopKProb,
             sharedW1, sharedW2, sharedW3,
             sharedIntermediateSize: hasShared ? sharedI : 0,
-            numSharedExperts: hasShared ? numShared : 0);
+            numSharedExperts: hasShared ? numShared : 0,
+            sharedExpertGate: sharedExpertGate);
     }
 
     /// <summary>

@@ -1,0 +1,49 @@
+#version 450
+// MoE sigmoid-gated add — combines a per-token gate logit, a sigmoid, and
+// a weighted in-place add into a single dispatch. Used by the Qwen1.5-MoE
+// shared-expert path:
+//
+//   scale[t] = sigmoid(gateLogits[t])
+//   out[t, h] += scale[t] * b[t, h]
+//
+// Mirrors the per-token loop in
+// DotLLM.Cpu.Kernels.MoeSwiGluMlp.ExecuteCoreGrouped — gate logits are
+// computed upstream (via a 1×hidden matmul against the SharedExpertGate
+// weight on the post-FFN-RMSNorm hidden state), passed in here as a
+// [seqLen] buffer, and the sigmoid is folded into the final accumulation
+// so we don't need a separate sigmoid_inplace pass.
+//
+// Dispatch: one workgroup per token. 64 threads stride over hidden dim.
+// groupCount.x = seqLen.
+//
+// Buffer layout:
+//   out         : [seqLen, hiddenSize]  F32 row-major   (read-modify-write)
+//   b           : [seqLen, hiddenSize]  F32 row-major   (shared-expert sum)
+//   gateLogits  : [seqLen]              F32             (raw, pre-sigmoid)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430)          buffer BufOut   { float outBuf[];     };
+layout(set = 0, binding = 1, std430) readonly buffer BufB     { float b[];          };
+layout(set = 0, binding = 2, std430) readonly buffer BufLogit { float gateLogits[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint seqLen;
+    uint hiddenSize;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.seqLen) return;
+
+    // Read the per-token gate logit once and broadcast the sigmoid scalar
+    // across all threads in the workgroup. exp() is monotonic so this
+    // matches the CPU's `1 / (1 + exp(-logit))` exactly under F32 rounding.
+    float scale = 1.0 / (1.0 + exp(-gateLogits[t]));
+
+    uint base = t * pc.hiddenSize;
+    uint threads = gl_WorkGroupSize.x;
+    for (uint h = gl_LocalInvocationID.x; h < pc.hiddenSize; h += threads) {
+        outBuf[base + h] = outBuf[base + h] + scale * b[base + h];
+    }
+}
