@@ -8,7 +8,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Mirrors the CPU reference <see cref="DotLLM.Cpu.Kernels.Mamba3QkNorm.Execute"/>:
+/// Mirrors the CPU reference <c>DotLLM.Cpu.Kernels.Mamba3QkNorm.Execute</c>:
 /// in the VikramKarLex/mamba3-minimal reference, <c>B_norm</c> / <c>C_norm</c> are
 /// a pair of <c>RMSNorm(bc_dim)</c> layers applied before group reshape. In our
 /// split shape <c>[T, n_group, d_state]</c> the same per-<c>d_state</c>-slice

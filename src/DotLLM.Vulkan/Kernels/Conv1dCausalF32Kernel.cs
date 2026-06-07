@@ -14,7 +14,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// <remarks>
 /// <para>
 /// Memory layout mirrors the CPU reference
-/// (<see cref="DotLLM.Cpu.Kernels.Conv1dCausal"/>) and llama.cpp /
+/// (<c>DotLLM.Cpu.Kernels.Conv1dCausal</c>) and llama.cpp /
 /// GGUF exactly:
 /// </para>
 /// <list type="bullet">
