@@ -33,7 +33,7 @@ namespace DotLLM.Cuda;
 /// loader uploads it the same way (F32 here, matching the rest of MLA Phase 1).
 /// </para>
 /// </remarks>
-internal readonly struct CudaMlaLayerWeights
+public readonly struct CudaMlaLayerWeights
 {
     /// <summary>Q down-projection F32 [qLoraRank, hidden]. 0 when <see cref="QLoraRank"/>==0.</summary>
     public readonly nint QAProj;
@@ -63,15 +63,22 @@ internal readonly struct CudaMlaLayerWeights
     /// <summary>Optional O bias F32 [hidden]. 0 when absent (DeepSeek default).</summary>
     public readonly nint OBias;
 
-    // Hyperparameters mirrored from MlaConfig for kernel-launch convenience.
+    /// <summary>Number of attention heads.</summary>
     public readonly int NumHeads;
+    /// <summary>Per-head non-rope Q·K dimension.</summary>
     public readonly int QkNopeHeadDim;
+    /// <summary>Per-head rope Q·K dimension (must be even).</summary>
     public readonly int QkRopeHeadDim;
+    /// <summary>Per-head V dimension (may differ from <see cref="QkNopeHeadDim"/>+<see cref="QkRopeHeadDim"/>).</summary>
     public readonly int VHeadDim;
+    /// <summary>Q LoRA bottleneck rank. 0 selects the monolithic <see cref="QProj"/> path.</summary>
     public readonly int QLoraRank;
+    /// <summary>KV LoRA bottleneck rank.</summary>
     public readonly int KvLoraRank;
+    /// <summary>Model hidden size.</summary>
     public readonly int HiddenSize;
 
+    /// <summary>Constructs a fully-populated MLA layer weight bundle.</summary>
     public CudaMlaLayerWeights(
         nint qAProj, nint qALayernormWeight, nint qBProj, nint qProj,
         nint kvAProjWithMqa, nint kvALayernormWeight, nint kvBProj,
