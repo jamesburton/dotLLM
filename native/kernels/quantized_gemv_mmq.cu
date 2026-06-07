@@ -21,11 +21,23 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-// MMQ_MAX_CHUNKS: per-block shared-memory budget for input quantization scratch.
-// Each chunk = 32 int8 + 1 half scale + 1 half sum = 36 bytes; 384 chunks fits in 13.5 KiB.
-// Supports k up to 12288 — covers Qwen3-8B MlpDown (k=intermediate=12288, 384 chunks).
-// SmolLM-135M k=576 → 18 chunks; Qwen3-8B QkvProj/GateUp k=4096 → 128 chunks.
-#define MMQ_MAX_CHUNKS 384
+// Per-chunk Stage 1 scratch lives in dynamic shared memory, sized at launch from `k`.
+// Layout (one extern __shared__ block, host passes `sharedMemBytes` to cuLaunchKernel):
+//   int8_t  s_xq [num_chunks * 32]                   // INT8-quantized x bytes
+//   half    s_dx [num_chunks]                        // per-chunk FP16 scale
+//   half    s_sx [num_chunks]   (Q4_K, Q5_K)         // Σ xq per full chunk
+//   half    s_sx2[num_chunks * 2] (Q6_K)             // Σ xq per half-chunk (lo, hi)
+// The static __shared__ regions (s_acc, s_warp_partials) sit alongside; the dynamic
+// region starts after them. With 32-element chunks, num_chunks*32 is always multiple
+// of 32 so the half pointers downstream stay naturally aligned.
+//
+// Limits: dynamic shmem caps at the device's MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+// (≥ 100 KB on sm_86 / RTX 3060). The host side calls cuFuncSetAttribute once
+// per kernel to opt in, so any k that fits in that budget works at runtime.
+//   - SmolLM-135M k=576    → 18 chunks  → ~660 bytes
+//   - Qwen3-8B   k=12288   → 384 chunks → ~13.5 KB (Q4_K/Q5_K), ~14.2 KB (Q6_K)
+//   - Llama-70B  k=14336   → 448 chunks → ~15.7 KB
+//   - Llama-405B k=53248   → 1664 chunks → ~58.4 KB (still under 100 KB optin)
 
 // Output rows per CUDA block. 4 rows × 2 superblocks/row (for SmolLM-135M) = 8 superblocks
 // distributed across 256 threads → 32 superblocks per warp before grouping. Larger models
@@ -48,9 +60,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q4_k_mmq(
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;            // 8 chunks per super-block
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    // Dynamic shmem: [s_xq | s_dx | s_sx]. Sized by the host as
+    // num_chunks * (32 + 2 + 2) bytes. Static s_acc lives separately.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx = s_dx + num_chunks;
 
     // Per-row partial sums staged in shared memory between Stage 2 and Stage 3.
     // Each row's dp4a contributions are scattered across all threads (whichever
@@ -240,9 +255,12 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q5_k_mmq(
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    // Dynamic shmem: [s_xq | s_dx | s_sx]. See Q4_K MMQ above for layout.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx = s_dx + num_chunks;
+
     __shared__ float   s_acc[MMQ_ROWS_PER_BLOCK * 256];
 
     const int tid = threadIdx.x;
@@ -421,9 +439,14 @@ extern "C" __global__ void __launch_bounds__(256, 2) quantized_gemv_q6_k_mmq(
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx2[MMQ_MAX_CHUNKS * 2];   // [a, b] per chunk
+    // Dynamic shmem: [s_xq | s_dx | s_sx2]. s_sx2 is 2 halves per chunk
+    // (one per half-chunk) instead of 1, so the dynamic budget here is
+    // num_chunks * (32 + 2 + 4) bytes.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq  = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx  = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx2 = s_dx + num_chunks;            // [a, b] per chunk
+
     __shared__ float   s_acc[MMQ_ROWS_PER_BLOCK * 256];
 
     const int tid = threadIdx.x;
@@ -617,9 +640,12 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    // Dynamic shmem: [s_xq | s_dx | s_sx]. See Q4_K MMQ above for layout.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx = s_dx + num_chunks;
+
     __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
 
     const int tid = threadIdx.x;
@@ -770,9 +796,12 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx[MMQ_MAX_CHUNKS];
+    // Dynamic shmem: [s_xq | s_dx | s_sx]. See Q4_K MMQ above for layout.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx = s_dx + num_chunks;
+
     __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
 
     const int tid = threadIdx.x;
@@ -927,9 +956,12 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
     const int superblocks_per_row = k / 256;
     const int num_chunks = k / 32;
 
-    __shared__ int8_t  s_xq[MMQ_MAX_CHUNKS * 32];
-    __shared__ half    s_dx[MMQ_MAX_CHUNKS];
-    __shared__ half    s_sx2[MMQ_MAX_CHUNKS * 2];   // [a, b] per chunk
+    // Dynamic shmem: [s_xq | s_dx | s_sx2]. See Q6_K MMQ above for layout.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq  = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx  = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx2 = s_dx + num_chunks;            // [a, b] per chunk
+
     __shared__ float   s_warp_partials[MMVQ_LARGE_NWARPS];
 
     const int tid = threadIdx.x;

@@ -73,6 +73,21 @@ public class CudaMmqKernelTests
             (rng, span) => SynthesiseQ4KBlock(rng, span), requireMmvqLarge: true);
     }
 
+    /// <summary>
+    /// Synthetic Llama-70B-class shape: intermediate=14336 → 448 input chunks. Validates
+    /// the dynamic shared-memory sizing works past the legacy compile-time MMQ_MAX_CHUNKS=384
+    /// budget. We don't have a real 70B model locally; this case exists purely to prove
+    /// the kernel adapts at launch time.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(4096, 14336)]
+    public void MmvqLargeQ4K_MatchesLegacy_Llama70B_Synthetic(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q4_K, n, k, blockBytes: 144,
+            (rng, span) => SynthesiseQ4KBlock(rng, span), requireMmvqLarge: true);
+    }
+
     [SkippableTheory]
     [InlineData(4096, 4096)]
     [InlineData(11008, 4096)]
