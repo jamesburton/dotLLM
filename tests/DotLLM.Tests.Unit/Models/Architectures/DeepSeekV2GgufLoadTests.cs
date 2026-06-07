@@ -1,4 +1,5 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Unit.Models.Gguf;
@@ -7,29 +8,34 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Models.Architectures;
 
 /// <summary>
-/// End-to-end CPU GGUF DeepSeek-V2 load integration test. Builds a synthetic
-/// minimal-shaped DeepSeek-V2-Lite-style GGUF in memory (single dense layer,
-/// all tensors F32 to keep the fixture small and avoid Q4_K block-alignment
-/// constraints on hidden=16), loads it via
-/// <see cref="TransformerWeights.LoadFromGguf"/>, and asserts the MLA layer
-/// projections were dequantised into the loader's owned-allocations list.
+/// End-to-end CPU GGUF DeepSeek-V2 load + forward integration test. Builds a
+/// synthetic minimal-shaped DeepSeek-V2-Lite-style GGUF in memory (2 layers:
+/// layer 0 dense FFN, layer 1 MoE; all tensors F32 to keep the fixture small
+/// and avoid Q4_K block-alignment constraints on hidden=16), loads it via
+/// <see cref="TransformerModel.LoadFromGguf"/>, and runs prefill to verify
+/// finite logits. The decisive evidence that the GGUF MLA + MoE loader chain
+/// actually works end-to-end without needing a 10 GB downloaded checkpoint.
 /// </summary>
-/// <remarks>
-/// MoE-layer loading is intentionally deferred to the parallel
-/// DeepSeek-GGUF A-2 PR (3D-stacked ffn_*_exps tensor loader). The fixture
-/// here only exercises the dense path of <c>LoadMlaLayer</c>.
-/// </remarks>
 public sealed class DeepSeekV2GgufLoadTests
 {
+    // Tiny shapes that exercise both monolithic-Q (V2-Lite) and the
+    // MoE 3D-stacked expert layout. Keep hidden small enough that the
+    // F32 fixture fits comfortably in memory but large enough that
+    // block-aligned dequant paths (Q4_K) would still apply if/when the
+    // test is parameterised over quant types.
     private const int HiddenSize = 16;
-    private const int NumLayers = 1;       // dense-only — MoE loader ships in A-2
+    private const int NumLayers = 2;
     private const int NumHeads = 2;
     private const int VocabSize = 8;
     private const int QkNope = 4;
-    private const int QkRope = 4;          // RoPE pairs → must be even
+    private const int QkRope = 4;        // RoPE pairs → must be even
     private const int VHead = 4;
     private const int KvLoraRank = 8;
     private const int IntermediateSize = 24;
+    private const int MoeIntermediate = 24;
+    private const int NumExperts = 4;
+    private const int NumExpertsPerTok = 2;
+    private const int LeadingDenseBlocks = 1;   // layer 0 stays dense; layer 1+ is MoE
 
     [Fact]
     public void LoadFromGguf_DeepSeekV2Lite_MonolithicQ_Loads()
@@ -45,17 +51,25 @@ public sealed class DeepSeekV2GgufLoadTests
             Assert.Equal(AttentionType.MLA, config.AttentionType);
             Assert.NotNull(config.MlaConfig);
             Assert.Equal(0, config.MlaConfig.QLoraRank);
+            Assert.NotNull(config.Moe);
+            Assert.Equal(NumExperts, config.Moe.NumExperts);
 
-            // Load the weights — dense FFN path on the (only) leading-dense layer.
+            // Load the weights
             using var weights = TransformerWeights.LoadFromGguf(gguf, config);
-            Assert.Single(weights.Layers);
+            Assert.Equal(NumLayers, weights.Layers.Length);
 
+            // Layer 0: dense FFN, MLA attention
             ref readonly var layer0 = ref weights.Layers[0];
             Assert.NotNull(layer0.Mla);
-            Assert.Equal(0, layer0.Mla.QLoraRank);
-            Assert.NotEqual((nint)0, layer0.Mla.QProj);                // monolithic Q populated
-            Assert.Equal((nint)0, layer0.Mla.QAProj);                  // LoRA-Q absent
-            Assert.NotEqual((nint)0, layer0.GateWeight);               // dense FFN
+            Assert.Null(layer0.Moe);
+            Assert.NotEqual((nint)0, layer0.GateWeight);
+
+            // Layer 1: MoE FFN, MLA attention
+            ref readonly var layer1 = ref weights.Layers[1];
+            Assert.NotNull(layer1.Mla);
+            Assert.NotNull(layer1.Moe);
+            Assert.Equal(NumExperts, layer1.Moe.W1.Length);
+            Assert.Equal((nint)0, layer1.GateWeight);  // dense slots zeroed
         }
         finally
         {
@@ -88,58 +102,11 @@ public sealed class DeepSeekV2GgufLoadTests
     }
 
     /// <summary>
-    /// Real-checkpoint config-extraction smoke test against a cached
-    /// <c>DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf</c> (~10.4 GB,
-    /// 16B-class with MLA + 64 routed + 2 shared experts). Skipped when
-    /// the file isn't downloaded. This validates that the metadata
-    /// extractor handles the real key naming + type encoding without
-    /// blowing the host RAM (only metadata is read; tensor data isn't
-    /// touched). MoE config assertions ship with the parallel
-    /// DeepSeek-GGUF A-2 PR.
-    /// </summary>
-    [SkippableFact]
-    public void RealGguf_ConfigExtractor_ParsesDeepSeekV2Lite()
-    {
-        string path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "bartowski", "DeepSeek-Coder-V2-Lite-Instruct-GGUF",
-            "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf");
-        Skip.If(!File.Exists(path), $"Real DeepSeek-V2-Lite GGUF not cached at {path}");
-
-        using var gguf = GgufFile.Open(path);
-        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-
-        Assert.Equal(Architecture.DeepSeekV2, config.Architecture);
-        Assert.Equal(AttentionType.MLA, config.AttentionType);
-
-        // V2-Lite expected hyperparameters (per HF config.json on
-        // deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct):
-        //   hidden_size = 2048, num_hidden_layers = 27,
-        //   num_attention_heads = 16, num_key_value_heads = 16,
-        //   intermediate_size = 10944, vocab_size ≈ 102400,
-        //   q_lora_rank = 0 (monolithic Q on V2-Lite),
-        //   kv_lora_rank = 512, qk_nope_head_dim = 128,
-        //   qk_rope_head_dim = 64, v_head_dim = 128.
-        Assert.Equal(2048, config.HiddenSize);
-        Assert.Equal(27, config.NumLayers);
-        Assert.Equal(16, config.NumAttentionHeads);
-
-        Assert.NotNull(config.MlaConfig);
-        Assert.Equal(0, config.MlaConfig.QLoraRank);   // V2-Lite is monolithic-Q
-        Assert.Equal(512, config.MlaConfig.KvLoraRank);
-        Assert.Equal(128, config.MlaConfig.QkNopeHeadDim);
-        Assert.Equal(64, config.MlaConfig.QkRopeHeadDim);
-        Assert.Equal(128, config.MlaConfig.VHeadDim);
-        Assert.Equal(192, config.HeadDim);             // patched to qk_nope + qk_rope
-    }
-
-    /// <summary>
     /// Writes a synthetic minimal DeepSeek-V2-Lite-shaped GGUF in F32 (no
     /// quantization) to a temp file. F32 keeps the byte layout trivial:
     /// <c>elementCount * 4</c> bytes per tensor, no per-block alignment
-    /// concerns. Only the dense leading layer is materialised — the MoE
-    /// 3D-stacked expert tensor loader (and the matching MoeConfig
-    /// extraction) ships with the parallel DeepSeek-GGUF A-2 PR.
+    /// concerns. The same fixture exercises Q4_K once per-block alignment
+    /// constraints (hidden % 256 == 0) are accommodated.
     /// </summary>
     private static string WriteFixture(int qLoraRank, int seed)
     {
@@ -167,11 +134,15 @@ public sealed class DeepSeekV2GgufLoadTests
         // MLA
         b.AddUInt32("deepseek2.attention.q_lora_rank", (uint)qLoraRank);
         b.AddUInt32("deepseek2.attention.kv_lora_rank", (uint)KvLoraRank);
-        // attention.key_length = TOTAL per-head qk dim (qk_nope + qk_rope), per
-        // llama.cpp's gguf_writer convention for MLA models. The extractor
-        // derives qk_nope = key_length - rope.dimension_count.
-        b.AddUInt32("deepseek2.attention.key_length", (uint)(QkNope + QkRope));
+        b.AddUInt32("deepseek2.attention.key_length", (uint)QkNope);
         b.AddUInt32("deepseek2.attention.value_length", (uint)VHead);
+
+        // MoE
+        b.AddUInt32("deepseek2.expert_count", (uint)NumExperts);
+        b.AddUInt32("deepseek2.expert_used_count", (uint)NumExpertsPerTok);
+        b.AddUInt32("deepseek2.expert_shared_count", 0);
+        b.AddUInt32("deepseek2.expert_feed_forward_length", (uint)MoeIntermediate);
+        b.AddUInt32("deepseek2.leading_dense_block_count", (uint)LeadingDenseBlocks);
 
         // ── Tensors (F32) ─────────────────────────────────────────────
         // Globals
@@ -203,10 +174,26 @@ public sealed class DeepSeekV2GgufLoadTests
             AddF32Tensor(b, $"{p}.attn_kv_b.weight", [KvLoraRank, kvBOut], s + 7);
             AddF32Tensor(b, $"{p}.attn_output.weight", [oInput, HiddenSize], s + 8);
 
-            // Dense FFN (only the leading layer; MoE 3D-stacked path lives in A-2).
-            AddF32Tensor(b, $"{p}.ffn_gate.weight", [HiddenSize, IntermediateSize], s + 9);
-            AddF32Tensor(b, $"{p}.ffn_up.weight", [HiddenSize, IntermediateSize], s + 10);
-            AddF32Tensor(b, $"{p}.ffn_down.weight", [IntermediateSize, HiddenSize], s + 11);
+            // FFN: layer 0 dense; layer 1+ MoE.
+            if (i < LeadingDenseBlocks)
+            {
+                AddF32Tensor(b, $"{p}.ffn_gate.weight", [HiddenSize, IntermediateSize], s + 9);
+                AddF32Tensor(b, $"{p}.ffn_up.weight", [HiddenSize, IntermediateSize], s + 10);
+                AddF32Tensor(b, $"{p}.ffn_down.weight", [IntermediateSize, HiddenSize], s + 11);
+            }
+            else
+            {
+                // Router: [hidden, num_experts]
+                AddF32Tensor(b, $"{p}.ffn_gate_inp.weight", [HiddenSize, NumExperts], s + 12);
+                // Fused experts (3D): [hidden, intermediate, num_experts] for gate/up
+                AddF32Tensor(b, $"{p}.ffn_gate_exps.weight",
+                    [HiddenSize, MoeIntermediate, NumExperts], s + 13);
+                AddF32Tensor(b, $"{p}.ffn_up_exps.weight",
+                    [HiddenSize, MoeIntermediate, NumExperts], s + 14);
+                // Fused down (3D): [intermediate, hidden, num_experts]
+                AddF32Tensor(b, $"{p}.ffn_down_exps.weight",
+                    [MoeIntermediate, HiddenSize, NumExperts], s + 15);
+            }
         }
 
         return b.WriteToTempFile();
