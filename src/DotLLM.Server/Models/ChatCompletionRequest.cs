@@ -73,6 +73,16 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("prefix_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PrefixId { get; init; }
+
+    /// <summary>
+    /// Optional LoRA adapter name (must already be registered with the server's
+    /// <c>LoraAdapterRegistry</c>). When null/empty, the request runs against
+    /// the base model with no adapter delta. Phase 4c additive field — does not
+    /// alter behaviour for existing requests.
+    /// </summary>
+    [JsonPropertyName("lora_adapter")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LoraAdapter { get; init; }
 }
 
 /// <summary>

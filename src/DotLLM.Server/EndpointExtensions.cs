@@ -24,6 +24,7 @@ public static class EndpointExtensions
         PromptCacheEndpoint.Map(app);
         ModelManagementEndpoint.Map(app);
         ModelInspectEndpoint.Map(app);
+        LoraEndpoints.Map(app);
 
         if (serveUi)
             WebUIEndpoint.Map(app);

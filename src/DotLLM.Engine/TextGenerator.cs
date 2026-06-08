@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Constraints;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
@@ -12,6 +13,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
+using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine;
@@ -70,9 +72,11 @@ public sealed class TextGenerator
     /// <param name="prompt">Input text prompt.</param>
     /// <param name="options">Inference options controlling sampling and stopping. Null uses defaults.</param>
     /// <param name="onTokenGenerated">Optional callback invoked after each token is generated, receiving the token ID.</param>
+    /// <param name="adapter">Optional LoRA adapter to apply during the forward passes (Phase 4c).</param>
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
     public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
-        Action<int>? onTokenGenerated = null)
+        Action<int>? onTokenGenerated = null,
+        ILoraAdapter? adapter = null)
     {
         options ??= new InferenceOptions();
 
@@ -100,6 +104,8 @@ public sealed class TextGenerator
                 GeneratedTokenCount = 0
             };
         }
+
+        var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
         var pipeline = new SamplerPipeline(options);
@@ -180,30 +186,60 @@ public sealed class TextGenerator
             int firstTokenId;
             long ts0 = Stopwatch.GetTimestamp();
 
-            if (prefillLen > 0)
+            using (var prefillSpan = telemetry.StartPrefill())
             {
-                // Prefill suffix tokens — span slice avoids array allocation
-                ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
-                int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
-                try
+                if (prefillLen > 0)
                 {
-                    Span<int> positions = positionsArray.AsSpan(0, prefillLen);
-                    for (int i = 0; i < prefillLen; i++)
-                        positions[i] = prefillStart + i;
+                    // Prefill suffix tokens — span slice avoids array allocation
+                    ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
+                    int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
+                    try
+                    {
+                        Span<int> positions = positionsArray.AsSpan(0, prefillLen);
+                        for (int i = 0; i < prefillLen; i++)
+                            positions[i] = prefillStart + i;
 
-                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache))
+                        using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, adapter))
+                        {
+                            long ts1 = Stopwatch.GetTimestamp();
+                            prefillTicks = ts1 - ts0;
+
+                            unsafe
+                            {
+                                using var sampleSpan = telemetry.StartSample();
+                                long samplerStart = Stopwatch.GetTimestamp();
+                                // GPU/hybrid models return [1, vocabSize] (last token only);
+                                // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
+                                float* logitPtr = (float*)prefillLogits.DataPointer;
+                                int logitRows = prefillLogits.Shape[0];
+                                var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                                if (constraint != null)
+                                    TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                                var (tid, lp) = SampleWithLogprobs(logitSpan);
+                                firstTokenId = tid;
+                                if (lp.HasValue) logprobsList!.Add(lp.Value);
+                                samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<int>.Shared.Return(positionsArray);
+                    }
+                }
+                else if (promptLen > 0)
+                {
+                    // 100% cache hit — re-forward last prompt token to get logits
+                    using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, adapter))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
+                            using var sampleSpan = telemetry.StartSample();
                             long samplerStart = Stopwatch.GetTimestamp();
-                            // GPU/hybrid models return [1, vocabSize] (last token only);
-                            // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
-                            float* logitPtr = (float*)prefillLogits.DataPointer;
-                            int logitRows = prefillLogits.Shape[0];
-                            var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                            var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             var (tid, lp) = SampleWithLogprobs(logitSpan);
@@ -213,38 +249,20 @@ public sealed class TextGenerator
                         }
                     }
                 }
-                finally
+                else
                 {
-                    ArrayPool<int>.Shared.Return(positionsArray);
+                    // Unreachable: empty prompt guard ensures promptLen >= 1
+                    throw new InvalidOperationException("Prompt is empty after guard.");
+                }
+
+                if (prefillSpan is { IsAllDataRequested: true })
+                {
+                    prefillSpan.SetTag(TelemetryTags.PrefillTokenCount, prefillLen);
+                    prefillSpan.SetTag(TelemetryTags.PrefillDurationMs, prefillTicks * 1000.0 / Stopwatch.Frequency);
                 }
             }
-            else if (promptLen > 0)
-            {
-                // 100% cache hit — re-forward last prompt token to get logits
-                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache))
-                {
-                    long ts1 = Stopwatch.GetTimestamp();
-                    prefillTicks = ts1 - ts0;
 
-                    unsafe
-                    {
-                        long samplerStart = Stopwatch.GetTimestamp();
-                        var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
-                        if (constraint != null)
-                            TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
-                        var (tid, lp) = SampleWithLogprobs(logitSpan);
-                        firstTokenId = tid;
-                        if (lp.HasValue) logprobsList!.Add(lp.Value);
-                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
-                    }
-                }
-            }
-            else
-            {
-                // Unreachable: empty prompt guard ensures promptLen >= 1
-                throw new InvalidOperationException("Prompt is empty after guard.");
-            }
-
+            telemetry.RecordFirstToken();
             constraint?.Advance(firstTokenId);
 
             // Check stop conditions for first token
@@ -262,6 +280,10 @@ public sealed class TextGenerator
 
                 finishReason = stopResult == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
                 StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+                telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
+                    prefillTicks * 1000.0 / Stopwatch.Frequency,
+                    decodeTicks * 1000.0 / Stopwatch.Frequency,
+                    finishReason);
                 return BuildResponse(promptLen, generatedIds, finishReason,
                     prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
                     logprobs: logprobsList?.ToArray());
@@ -354,16 +376,19 @@ public sealed class TextGenerator
                     if (pos >= cacheSize)
                         break;
 
+                    using var decodeStepSpan = telemetry.StartDecodeStep(step);
+
                     int lastToken = generatedIds[^1];
                     int nextTokenId;
 
                     long fwdStart = Stopwatch.GetTimestamp();
-                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache))
+                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, adapter))
                     {
                         decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
+                            using var sampleSpan = telemetry.StartSample();
                             long samplerStart = Stopwatch.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
@@ -398,6 +423,10 @@ public sealed class TextGenerator
             }
 
             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
+            telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
+                prefillTicks * 1000.0 / Stopwatch.Frequency,
+                decodeTicks * 1000.0 / Stopwatch.Frequency,
+                finishReason);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
                 specDrafted, specAccepted, logprobsList?.ToArray());
@@ -407,6 +436,7 @@ public sealed class TextGenerator
             ArrayPool<char>.Shared.Return(stopScratch);
             if (ownsKvCache)
                 kvCache.Dispose();
+            telemetry.RequestSpan?.Dispose();
         }
     }
 
@@ -417,11 +447,13 @@ public sealed class TextGenerator
     /// <param name="prompt">Input text prompt.</param>
     /// <param name="options">Inference options controlling sampling and stopping. Null uses defaults.</param>
     /// <param name="cancellationToken">Token to cancel generation cooperatively between decode steps.</param>
+    /// <param name="adapter">Optional LoRA adapter to apply during the forward passes (Phase 4c).</param>
     /// <returns>An async enumerable of <see cref="GenerationToken"/> values.</returns>
     public async IAsyncEnumerable<GenerationToken> GenerateStreamingTokensAsync(
         string prompt,
         InferenceOptions? options = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        ILoraAdapter? adapter = null)
     {
         options ??= new InferenceOptions();
 
@@ -442,6 +474,8 @@ public sealed class TextGenerator
             yield break;
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
         var pipeline = new SamplerPipeline(options);
@@ -486,12 +520,12 @@ public sealed class TextGenerator
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
+        var generatedIds = new List<int>(maxTokens);
+        long prefillTicks = 0;
+        long decodeTicks = 0;
 
         try
         {
-            var generatedIds = new List<int>(maxTokens);
-            long prefillTicks = 0;
-            long decodeTicks = 0;
             long samplerTicks = 0;
             int cacheSize = kvCache.MaxLength;
 
@@ -522,30 +556,58 @@ public sealed class TextGenerator
             TokenLogprobInfo? firstLogprobInfo = null;
             long ts0 = Stopwatch.GetTimestamp();
 
-            if (prefillLen > 0)
+            using (var prefillSpan = telemetry.StartPrefill())
             {
-                // Span slice avoids array allocation for suffix tokens
-                ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
-                int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
-                try
+                if (prefillLen > 0)
                 {
-                    Span<int> positions = positionsArray.AsSpan(0, prefillLen);
-                    for (int i = 0; i < prefillLen; i++)
-                        positions[i] = prefillStart + i;
+                    // Span slice avoids array allocation for suffix tokens
+                    ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
+                    int[] positionsArray = ArrayPool<int>.Shared.Rent(prefillLen);
+                    try
+                    {
+                        Span<int> positions = positionsArray.AsSpan(0, prefillLen);
+                        for (int i = 0; i < prefillLen; i++)
+                            positions[i] = prefillStart + i;
 
-                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache))
+                        using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, adapter))
+                        {
+                            long ts1 = Stopwatch.GetTimestamp();
+                            prefillTicks = ts1 - ts0;
+
+                            unsafe
+                            {
+                                using var sampleSpan = telemetry.StartSample();
+                                long samplerStart = Stopwatch.GetTimestamp();
+                                // GPU/hybrid models return [1, vocabSize] (last token only);
+                                // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
+                                float* logitPtr = (float*)prefillLogits.DataPointer;
+                                int logitRows = prefillLogits.Shape[0];
+                                var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                                if (constraint != null)
+                                    TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                                (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
+                                samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<int>.Shared.Return(positionsArray);
+                    }
+                }
+                else if (promptLen > 0)
+                {
+                    // 100% cache hit — re-forward last prompt token to get logits
+                    using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, adapter))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
 
                         unsafe
                         {
+                            using var sampleSpan = telemetry.StartSample();
                             long samplerStart = Stopwatch.GetTimestamp();
-                            // GPU/hybrid models return [1, vocabSize] (last token only);
-                            // CPU model returns [seqLen, vocabSize]. Use actual shape to index.
-                            float* logitPtr = (float*)prefillLogits.DataPointer;
-                            int logitRows = prefillLogits.Shape[0];
-                            var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+                            var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
                                 TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
                             (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
@@ -553,36 +615,20 @@ public sealed class TextGenerator
                         }
                     }
                 }
-                finally
+                else
                 {
-                    ArrayPool<int>.Shared.Return(positionsArray);
+                    // Unreachable: empty prompt guard ensures promptLen >= 1
+                    throw new InvalidOperationException("Prompt is empty after guard.");
+                }
+
+                if (prefillSpan is { IsAllDataRequested: true })
+                {
+                    prefillSpan.SetTag(TelemetryTags.PrefillTokenCount, prefillLen);
+                    prefillSpan.SetTag(TelemetryTags.PrefillDurationMs, prefillTicks * 1000.0 / Stopwatch.Frequency);
                 }
             }
-            else if (promptLen > 0)
-            {
-                // 100% cache hit — re-forward last prompt token to get logits
-                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache))
-                {
-                    long ts1 = Stopwatch.GetTimestamp();
-                    prefillTicks = ts1 - ts0;
 
-                    unsafe
-                    {
-                        long samplerStart = Stopwatch.GetTimestamp();
-                        var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
-                        if (constraint != null)
-                            TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
-                        (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
-                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
-                    }
-                }
-            }
-            else
-            {
-                // Unreachable: empty prompt guard ensures promptLen >= 1
-                throw new InvalidOperationException("Prompt is empty after guard.");
-            }
-
+            telemetry.RecordFirstToken();
             constraint?.Advance(firstTokenId);
 
             // Check stop conditions for first token
@@ -735,17 +781,20 @@ public sealed class TextGenerator
                     if (pos >= cacheSize)
                         break;
 
+                    Activity? decodeStepSpan = telemetry.StartDecodeStep(step);
+
                     int lastToken = generatedIds[^1];
                     int nextTokenId;
                     TokenLogprobInfo? tokenLogprob;
 
                     long fwdStart = Stopwatch.GetTimestamp();
-                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache))
+                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, adapter))
                     {
                         decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
 
                         unsafe
                         {
+                            using var sampleSpan = telemetry.StartSample();
                             long samplerStart = Stopwatch.GetTimestamp();
                             var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
                             if (constraint != null)
@@ -755,6 +804,7 @@ public sealed class TextGenerator
                         }
                     }
 
+                    decodeStepSpan?.Dispose();
                     constraint?.Advance(nextTokenId);
 
                     generatedIds.Add(nextTokenId);
@@ -801,6 +851,10 @@ public sealed class TextGenerator
         }
         finally
         {
+            telemetry.Complete(promptLen, cachedTokenCount, generatedIds.Count,
+                prefillTicks * 1000.0 / Stopwatch.Frequency,
+                decodeTicks * 1000.0 / Stopwatch.Frequency,
+                FinishReason.Length);
             ArrayPool<char>.Shared.Return(stopScratch);
             if (ownsKvCache)
                 kvCache.Dispose();
@@ -814,13 +868,15 @@ public sealed class TextGenerator
     /// <param name="prompt">Input text prompt.</param>
     /// <param name="options">Inference options controlling sampling and stopping. Null uses defaults.</param>
     /// <param name="cancellationToken">Token to cancel generation cooperatively between decode steps.</param>
+    /// <param name="adapter">Optional LoRA adapter to apply during the forward passes (Phase 4c).</param>
     /// <returns>An async enumerable of incremental text strings.</returns>
     public async IAsyncEnumerable<string> GenerateStreamingAsync(
         string prompt,
         InferenceOptions? options = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        ILoraAdapter? adapter = null)
     {
-        await foreach (var token in GenerateStreamingTokensAsync(prompt, options, cancellationToken))
+        await foreach (var token in GenerateStreamingTokensAsync(prompt, options, cancellationToken, adapter))
             yield return token.Text;
     }
 
