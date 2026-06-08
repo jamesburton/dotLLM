@@ -26,6 +26,7 @@ public sealed class TextGenerator
     private readonly ITokenizer _tokenizer;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _kvCacheFactory;
     private readonly PrefixCache? _prefixCache;
+    private readonly PrefixTrieManager? _prefixTrieManager;
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
@@ -42,17 +43,22 @@ public sealed class TextGenerator
     /// <param name="draftModel">Optional draft model for speculative decoding.</param>
     /// <param name="draftKvCacheFactory">Optional factory for creating the draft model's KV-cache.</param>
     /// <param name="speculativeCandidates">Number of draft tokens per speculative step (K). Default 5.</param>
+    /// <param name="prefixTrieManager">Optional cross-request prefix trie manager (Step 37).
+    /// Takes precedence over <paramref name="prefixCache"/> when supplied — multiple sessions
+    /// share KV blocks via the trie.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
-                          int speculativeCandidates = 5)
+                          int speculativeCandidates = 5,
+                          PrefixTrieManager? prefixTrieManager = null)
     {
         _model = model;
         _tokenizer = tokenizer;
         _kvCacheFactory = kvCacheFactory;
         _prefixCache = prefixCache;
+        _prefixTrieManager = prefixTrieManager;
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
@@ -825,6 +831,14 @@ public sealed class TextGenerator
     private (Core.Attention.IKvCache KvCache, int CachedTokenCount, bool OwnsKvCache) ResolveKvCache(
         int[] promptIds, int promptLen, int maxTokens)
     {
+        // Cross-request prefix trie (Step 37) takes priority — multiple sessions share blocks.
+        if (_prefixTrieManager != null)
+        {
+            int cacheSize = Math.Min(promptLen + maxTokens, _model.Config.MaxSequenceLength);
+            var admission = _prefixTrieManager.Admit(promptIds, cacheSize);
+            return (admission.Cache, admission.CachedTokens, true);
+        }
+
         if (_prefixCache != null)
         {
             var (entry, matchedTokens) = _prefixCache.FindMatch(promptIds);
@@ -889,6 +903,27 @@ public sealed class TextGenerator
     private void StoreInPrefixCache(Core.Attention.IKvCache kvCache, int[] promptIds,
         List<int> generatedIds, ref bool ownsKvCache)
     {
+        // Cross-request trie (Step 37): record completion so freshly-computed
+        // blocks become available to future sequences, then let Dispose run.
+        if (_prefixTrieManager != null && kvCache is KvCache.PagedKvCache paged)
+        {
+            int total = promptIds.Length + generatedIds.Count;
+            var full = ArrayPool<int>.Shared.Rent(total);
+            try
+            {
+                Array.Copy(promptIds, full, promptIds.Length);
+                CollectionsMarshal.AsSpan(generatedIds).CopyTo(full.AsSpan(promptIds.Length));
+                _prefixTrieManager.RecordCompletion(paged, full.AsSpan(0, total));
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(full);
+            }
+            // ownsKvCache stays unchanged — caller disposes the cache, the trie has
+            // already promoted the new blocks to "trie-owned".
+            return;
+        }
+
         if (_prefixCache == null)
             return;
 

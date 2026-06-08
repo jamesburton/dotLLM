@@ -48,6 +48,23 @@ public static class CompletionEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
+        // Validate prefix_id reference (Step 37).
+        if (!string.IsNullOrWhiteSpace(request.PrefixId))
+        {
+            var mgr = state.PrefixTrieManager;
+            if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null,
+                    httpContext.RequestAborted);
+                return;
+            }
+        }
+
+
         // Validate prompt length against model context
         int maxTokens = request.MaxTokens ?? state.SamplingDefaults.MaxTokens;
         var promptError = RequestValidator.ValidatePromptLength(

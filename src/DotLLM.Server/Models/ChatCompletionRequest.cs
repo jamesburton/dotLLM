@@ -64,6 +64,15 @@ public sealed record ChatCompletionRequest
 
     [JsonPropertyName("n")]
     public int N { get; init; } = 1;
+
+    /// <summary>
+    /// Optional named prefix id registered via <c>POST /v1/prompt-cache/{id}</c>.
+    /// When supplied the engine ensures the named prefix is honoured for this
+    /// request (best-effort hint — the trie still does longest-prefix matching).
+    /// </summary>
+    [JsonPropertyName("prefix_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PrefixId { get; init; }
 }
 
 /// <summary>

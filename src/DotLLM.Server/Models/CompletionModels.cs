@@ -49,6 +49,14 @@ public sealed record CompletionRequest
 
     [JsonPropertyName("top_logprobs")]
     public int? TopLogprobs { get; init; }
+
+    /// <summary>
+    /// Optional named prefix id registered via <c>POST /v1/prompt-cache/{id}</c>.
+    /// Best-effort hint — the trie still does longest-prefix matching.
+    /// </summary>
+    [JsonPropertyName("prefix_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PrefixId { get; init; }
 }
 
 /// <summary>

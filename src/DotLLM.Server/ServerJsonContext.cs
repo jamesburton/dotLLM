@@ -28,6 +28,9 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(ModelInspectResponse))]
 [JsonSerializable(typeof(ErrorResponse))]
 [JsonSerializable(typeof(StatusResponse))]
+[JsonSerializable(typeof(PromptCacheRegisterRequest))]
+[JsonSerializable(typeof(PromptCacheResponse))]
+[JsonSerializable(typeof(PromptCacheStatsResponse))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]

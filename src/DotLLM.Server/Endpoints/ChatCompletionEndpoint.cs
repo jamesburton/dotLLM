@@ -52,6 +52,23 @@ public static class ChatCompletionEndpoint
         var modelId = state.Options.ModelId;
         var generator = state.Generator;
 
+        // Validate prefix_id reference (Step 37): must be registered if supplied.
+        if (!string.IsNullOrWhiteSpace(request.PrefixId))
+        {
+            var mgr = state.PrefixTrieManager;
+            if (mgr is null || mgr.InspectNamedPrefix(request.PrefixId) is null)
+            {
+                httpContext.Response.StatusCode = 400;
+                await httpContext.Response.WriteAsJsonAsync(
+                    new ErrorResponse { Error = $"prefix_id '{request.PrefixId}' is not registered. POST /v1/prompt-cache/{request.PrefixId} first." },
+                    ServerJsonContext.Default.ErrorResponse,
+                    contentType: null,
+                    httpContext.RequestAborted);
+                return;
+            }
+        }
+
+
         // Convert DTOs to engine types
         var messages = RequestConverter.ToMessages(request.Messages);
         var tools = RequestConverter.ToTools(request.Tools);

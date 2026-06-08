@@ -63,6 +63,8 @@ public static class ModelManagementEndpoint
                     state.KvCacheConfig = newState.KvCacheConfig;
                     state.KvCacheFactory = newState.KvCacheFactory;
                     state.PrefixCache = newState.PrefixCache;
+                    state.PrefixTrieManager = newState.PrefixTrieManager;
+                    state.PagedFactory = newState.PagedFactory;
                     state.LoadedModelPath = resolvedPath;
                     state.CurrentGguf = newState.CurrentGguf;
                     state.DraftModel = newState.DraftModel;
