@@ -583,7 +583,9 @@ internal sealed class JinjaEvaluator
         return true;
     }
 
-    internal static string Stringify(object? value)
+    internal static string Stringify(object? value) => Stringify(value, visited: null);
+
+    private static string Stringify(object? value, HashSet<object>? visited)
     {
         if (value is null || ReferenceEquals(value, Undefined))
             return "";
@@ -594,16 +596,46 @@ internal sealed class JinjaEvaluator
         if (value is int or double or long)
             return value.ToString()!;
         if (value is IList list)
-            return "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item))) + "]";
+        {
+            visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (!visited.Add(list))
+            {
+                throw new JinjaException(
+                    "Circular reference detected while stringifying a list — context contains self-referencing data.");
+            }
+            try
+            {
+                return "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item, visited))) + "]";
+            }
+            finally
+            {
+                visited.Remove(list);
+            }
+        }
         if (value is Dictionary<string, object?> dict)
-            return "{" + string.Join(", ", dict.Select(kvp => $"'{kvp.Key}': {StringifyRepr(kvp.Value)}")) + "}";
+        {
+            visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
+            if (!visited.Add(dict))
+            {
+                throw new JinjaException(
+                    "Circular reference detected while stringifying a dict — context contains self-referencing data.");
+            }
+            try
+            {
+                return "{" + string.Join(", ", dict.Select(kvp => $"'{kvp.Key}': {StringifyRepr(kvp.Value, visited)}")) + "}";
+            }
+            finally
+            {
+                visited.Remove(dict);
+            }
+        }
         return value.ToString() ?? "";
     }
 
-    private static string StringifyRepr(object? value)
+    private static string StringifyRepr(object? value, HashSet<object>? visited)
     {
         if (value is string s) return $"'{s}'";
-        return Stringify(value);
+        return Stringify(value, visited);
     }
 
     private static string ToJson(object? value, int indent = 0)
