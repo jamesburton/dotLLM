@@ -100,6 +100,23 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>AVX2 Q8_K quantization: 256 floats per block.</summary>
+    /// <remarks>
+    /// <para>
+    /// <b>MXCSR rounding-mode assumption.</b> The AVX2 path uses
+    /// <c>vcvtps2dq</c> (<see cref="Avx.ConvertToVector256Int32(Vector256{float})"/>)
+    /// to convert per-element <c>float × invScale</c> to <c>int32</c>. <c>vcvtps2dq</c>
+    /// does not take an explicit rounding mode — it uses the current MXCSR rounding
+    /// control field. .NET initialises MXCSR to round-to-nearest-even on every
+    /// managed thread, which matches the scalar fallback that uses
+    /// <see cref="MathF.Round(float)"/>. The kernel does not save / restore MXCSR
+    /// around its conversions; if another library or runtime call has left MXCSR in
+    /// a different rounding mode on the same thread, the AVX2 path will diverge
+    /// from the scalar reference. No supported caller currently changes MXCSR, but
+    /// any future P/Invoke into native code that toggles rounding mode must restore
+    /// it (or, if MXCSR is no longer reliable, switch to an explicit
+    /// <c>vcvtps2dq</c>-with-truncation followed by a rounding helper).
+    /// </para>
+    /// </remarks>
     [SkipLocalsInit]
     internal static void QuantizeF32ToQ8_KAvx2(float* src, byte* dest, int elementCount)
     {
