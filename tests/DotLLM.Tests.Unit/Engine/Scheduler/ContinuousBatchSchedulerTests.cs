@@ -216,6 +216,123 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Equal(FinishReason.Length, r.FinishReason);
     }
 
+    // ── Priority-ordered admission (Step 59 first piece) ──
+
+    [Fact]
+    public async Task Priority_HighAfterLowQueue_AdmittedFirst()
+    {
+        // Cap to 1 active sequence so admission order is observable. Submit three Low
+        // requests, then a High request; verify the High request admits before the
+        // two queued Lows.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 });
+
+        var hLow1 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Low));
+        var hLow2 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Low));
+        var hLow3 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Low));
+        var hHigh = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.High));
+
+        // Drain in admission order via DriveUntilCompleted on each handle — the order
+        // of completion mirrors admission order since MaxActiveSequences=1.
+        DriveUntilCompleted(fix.Scheduler, hHigh);
+        var rHigh = await hHigh.Completion;
+        Assert.Equal(FinishReason.Stop, rHigh.FinishReason);
+
+        // At this point at most one Low should have started; the others are still queued.
+        // hLow1 (oldest Low) should be next.
+        DriveUntilCompleted(fix.Scheduler, hLow1);
+        DriveUntilCompleted(fix.Scheduler, hLow2);
+        DriveUntilCompleted(fix.Scheduler, hLow3);
+
+        // All four completed, no exceptions.
+        Assert.True(fix.Scheduler.IsIdle);
+    }
+
+    [Fact]
+    public async Task Priority_SameTier_DrainsInSubmissionOrder()
+    {
+        // Three Normal requests with MaxActiveSequences=1; verify FIFO order
+        // by checking which handle completes first via Task.WhenAny.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 });
+
+        var h1 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4));
+        var h2 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4));
+        var h3 = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4));
+
+        // Drain to completion; with MaxActiveSequences=1 the completion order is
+        // the admission order.
+        DriveUntilCompleted(fix.Scheduler, h1);
+        Assert.True(h1.Completion.IsCompletedSuccessfully);
+        Assert.False(h2.Completion.IsCompleted);
+        Assert.False(h3.Completion.IsCompleted);
+
+        DriveUntilCompleted(fix.Scheduler, h2);
+        Assert.True(h2.Completion.IsCompletedSuccessfully);
+        Assert.False(h3.Completion.IsCompleted);
+
+        DriveUntilCompleted(fix.Scheduler, h3);
+        Assert.True(h3.Completion.IsCompletedSuccessfully);
+
+        // Sanity: all three actually finished cleanly.
+        var r1 = await h1.Completion;
+        var r2 = await h2.Completion;
+        var r3 = await h3.Completion;
+        Assert.Equal(FinishReason.Stop, r1.FinishReason);
+        Assert.Equal(FinishReason.Stop, r2.FinishReason);
+        Assert.Equal(FinishReason.Stop, r3.FinishReason);
+    }
+
+    [Fact]
+    public void Priority_InferenceRequest_DefaultsToNormal()
+    {
+        // Constructed without an explicit Priority, the field defaults to Normal.
+        // Guards against accidental default changes in the InferenceRequest record.
+        var req = new InferenceRequest { TokenIds = new[] { 1, 2, 3 } };
+        Assert.Equal(RequestPriority.Normal, req.Priority);
+    }
+
+    [Fact]
+    public async Task Priority_CriticalBeatsHighBeatsNormalBeatsLow()
+    {
+        // Submit Low, Normal, High, Critical in that order; with MaxActiveSequences=1
+        // the completion order should reverse priority (Critical, High, Normal, Low).
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 });
+
+        var hLow = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Low));
+        var hNormal = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Normal));
+        var hHigh = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.High));
+        var hCritical = fix.Scheduler.Submit(MakeRequest(promptLen: 2, maxTokens: 4, priority: RequestPriority.Critical));
+
+        DriveUntilCompleted(fix.Scheduler, hCritical);
+        Assert.True(hCritical.Completion.IsCompletedSuccessfully);
+        Assert.False(hHigh.Completion.IsCompleted);
+        Assert.False(hNormal.Completion.IsCompleted);
+        Assert.False(hLow.Completion.IsCompleted);
+
+        DriveUntilCompleted(fix.Scheduler, hHigh);
+        Assert.True(hHigh.Completion.IsCompletedSuccessfully);
+        Assert.False(hNormal.Completion.IsCompleted);
+        Assert.False(hLow.Completion.IsCompleted);
+
+        DriveUntilCompleted(fix.Scheduler, hNormal);
+        Assert.True(hNormal.Completion.IsCompletedSuccessfully);
+        Assert.False(hLow.Completion.IsCompleted);
+
+        DriveUntilCompleted(fix.Scheduler, hLow);
+        Assert.True(hLow.Completion.IsCompletedSuccessfully);
+
+        // Drain remaining task results to ensure no exceptions hide.
+        await hCritical.Completion;
+        await hHigh.Completion;
+        await hNormal.Completion;
+        await hLow.Completion;
+    }
+
     // ── Helpers ──
 
     private static void DriveUntilIdle(IBatchScheduler scheduler, int maxIterations = 1000)
@@ -238,7 +355,8 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Fail("Sequence did not complete within iteration cap.");
     }
 
-    private static InferenceRequest MakeRequest(int promptLen, int maxTokens)
+    private static InferenceRequest MakeRequest(int promptLen, int maxTokens,
+                                                 RequestPriority priority = RequestPriority.Normal)
     {
         // Build prompt: avoid 0 (EOS) to keep things clean. Tokens 1..promptLen.
         var tokens = new int[promptLen];
@@ -248,6 +366,7 @@ public sealed class ContinuousBatchSchedulerTests
         {
             TokenIds = tokens,
             Options = new InferenceOptions { Temperature = 0f, MaxTokens = maxTokens },
+            Priority = priority,
         };
     }
 
