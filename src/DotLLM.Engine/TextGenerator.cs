@@ -246,11 +246,17 @@ public sealed class TextGenerator
             detok.Append(firstTokenId);
 
             var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds,
-                detok.GetTailView(stopTailSize, stopScratch));
+                detok.GetTailView(stopTailSize, stopScratch), out int firstMatchedIdx);
             if (stopResult != StopResult.Continue)
             {
+                bool isStopStringMatch = IsStopStringMatch(stopConditions, firstMatchedIdx);
                 if (stopResult == StopResult.Stop)
-                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                {
+                    if (!isStopStringMatch)
+                        generatedIds.RemoveAt(generatedIds.Count - 1);
+                    // Stop-string match: keep the last token in the id list; BuildResponse
+                    // will trim the matched stop-string suffix at the character boundary.
+                }
                 else
                     onTokenGenerated?.Invoke(firstTokenId);
 
@@ -258,7 +264,8 @@ public sealed class TextGenerator
                 StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
                 return BuildResponse(promptLen, generatedIds, finishReason,
                     prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
-                    logprobs: logprobsList?.ToArray());
+                    logprobs: logprobsList?.ToArray(),
+                    stopConditionsForSuffixTrim: stopConditions);
             }
 
             onTokenGenerated?.Invoke(firstTokenId);
@@ -309,11 +316,16 @@ public sealed class TextGenerator
                             detok.Append(tokenId);
 
                             stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
-                                detok.GetTailView(stopTailSize, stopScratch));
+                                detok.GetTailView(stopTailSize, stopScratch), out int specMatchedIdx);
                             if (stopResult != StopResult.Continue)
                             {
+                                bool isStopStringMatch = IsStopStringMatch(stopConditions, specMatchedIdx);
                                 if (stopResult == StopResult.Stop)
-                                    generatedIds.RemoveAt(generatedIds.Count - 1);
+                                {
+                                    if (!isStopStringMatch)
+                                        generatedIds.RemoveAt(generatedIds.Count - 1);
+                                    // Stop-string match: keep the last token; trim suffix in BuildResponse.
+                                }
                                 else
                                 {
                                     specAccepted++;
@@ -375,11 +387,16 @@ public sealed class TextGenerator
                     detok.Append(nextTokenId);
 
                     stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds,
-                        detok.GetTailView(stopTailSize, stopScratch));
+                        detok.GetTailView(stopTailSize, stopScratch), out int decMatchedIdx);
                     if (stopResult != StopResult.Continue)
                     {
+                        bool isStopStringMatch = IsStopStringMatch(stopConditions, decMatchedIdx);
                         if (stopResult == StopResult.Stop)
-                            generatedIds.RemoveAt(generatedIds.Count - 1);
+                        {
+                            if (!isStopStringMatch)
+                                generatedIds.RemoveAt(generatedIds.Count - 1);
+                            // Stop-string match: keep the last token; trim suffix in BuildResponse.
+                        }
                         else
                             onTokenGenerated?.Invoke(nextTokenId);
 
@@ -394,7 +411,8 @@ public sealed class TextGenerator
             StoreInPrefixCache(kvCache, promptIds, generatedIds, ref ownsKvCache);
             return BuildResponse(promptLen, generatedIds, finishReason,
                 prefillTicks, decodeTicks, samplerTicks, GetKvCacheBytes(kvCache), cachedTokenCount,
-                specDrafted, specAccepted, logprobsList?.ToArray());
+                specDrafted, specAccepted, logprobsList?.ToArray(),
+                stopConditionsForSuffixTrim: stopConditions);
         }
         finally
         {
@@ -905,14 +923,37 @@ public sealed class TextGenerator
         List<IStopCondition> conditions, int tokenId,
         IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail)
     {
+        return CheckStopConditions(conditions, tokenId, generatedTokens, decodedTail, out _);
+    }
+
+    private static StopResult CheckStopConditions(
+        List<IStopCondition> conditions, int tokenId,
+        IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail,
+        out int matchedIndex)
+    {
         for (int i = 0; i < conditions.Count; i++)
         {
             var result = conditions[i].ShouldStop(tokenId, generatedTokens, decodedTail);
             if (result != StopResult.Continue)
+            {
+                matchedIndex = i;
                 return result;
+            }
         }
+        matchedIndex = -1;
         return StopResult.Continue;
     }
+
+    /// <summary>
+    /// True when a <see cref="StopResult.Stop"/> result came from a
+    /// <see cref="StopStringCondition"/> match. Determines whether the last token
+    /// should be kept in <c>generatedIds</c> (true — its text contains a partial
+    /// suffix overlap with the stop string and must be character-trimmed later) or
+    /// removed (false — EOS / similar single-token termination where the token's
+    /// text is conceptually the terminator itself).
+    /// </summary>
+    private static bool IsStopStringMatch(List<IStopCondition> conditions, int matchedIndex)
+        => matchedIndex >= 0 && matchedIndex < conditions.Count && conditions[matchedIndex] is StopStringCondition;
 
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
@@ -975,11 +1016,23 @@ public sealed class TextGenerator
         FinishReason finishReason, long prefillTicks, long decodeTicks, long samplerTicks,
         long kvCacheBytes = 0, int cachedTokenCount = 0,
         int specDrafted = 0, int specAccepted = 0,
-        TokenLogprobInfo[]? logprobs = null)
+        TokenLogprobInfo[]? logprobs = null,
+        List<IStopCondition>? stopConditionsForSuffixTrim = null)
     {
         string text = generatedIds.Count > 0
             ? _tokenizer.Decode(CollectionsMarshal.AsSpan(generatedIds), stripBosSpace: false)
             : string.Empty;
+
+        // Character-level stop-string suffix trim. When generation stopped because a
+        // StopStringCondition matched, the last token is kept in `generatedIds` so the
+        // user can see how many tokens were actually emitted, but its decoded text may
+        // contain a partial overlap with the stop string (e.g. last token decodes to
+        // "ld<|im_end|>", stop string "<|im_end|>"). Trim at the char boundary so the
+        // returned text preserves the "ld" prefix and excludes the matched suffix.
+        if (stopConditionsForSuffixTrim is not null && finishReason == FinishReason.Stop)
+        {
+            text = StopSuffixTrimmer.TrimMatchedSuffix(text, stopConditionsForSuffixTrim);
+        }
 
         return new InferenceResponse
         {
