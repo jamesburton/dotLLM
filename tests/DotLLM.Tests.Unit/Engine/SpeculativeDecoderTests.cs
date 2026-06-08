@@ -23,16 +23,15 @@ public sealed class SpeculativeDecoderTests
     private const int HeadDim = 4;
 
     /// <summary>
-    /// Probabilistic speculative decoding is not yet distributionally correct under the
-    /// sampler pipeline (see Wave 8 / issue #121). The constructor must reject
-    /// <c>greedy: false</c> so callers cannot silently produce non-target-distribution samples.
+    /// Non-greedy speculative decoding is supported once <c>q</c> and <c>p</c> are computed
+    /// from the post-transform distribution (Wave 8 / issue #121). The constructor accepts
+    /// <c>greedy: false</c>; behaviour is driven by the pipeline's mode at call time.
     /// </summary>
     [Fact]
-    public void Constructor_Throws_WhenNonGreedy()
+    public void Constructor_AcceptsNonGreedy()
     {
-        var ex = Assert.Throws<NotSupportedException>(
-            () => new SpeculativeDecoder(greedy: false, seed: 42));
-        Assert.Contains("greedy", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var decoder = new SpeculativeDecoder(greedy: false, seed: 42);
+        Assert.NotNull(decoder);
     }
 
     /// <summary>
@@ -200,6 +199,100 @@ public sealed class SpeculativeDecoderTests
             outputBuffer: outputBuffer);
 
         Assert.Equal(0, result.AcceptedCount);
+    }
+
+    /// <summary>
+    /// Non-greedy distributional correctness (Wave 8 / issue #121).
+    ///
+    /// The modified rejection sampling scheme produces samples from the target distribution only
+    /// when <c>q</c> and <c>p</c> are computed from the post-transform distribution the pipeline
+    /// actually samples from. The previous implementation used raw softmax for both, while sampling
+    /// the draft token via the full pipeline — so the empirical output distribution diverged from
+    /// the target whenever the pipeline transforms (here: temperature ≠ 1) shifted probability mass.
+    ///
+    /// Test design — draft and target have reversed logits so the buggy path frequently rejects
+    /// and corrects to the wrong token. Across N trials, the speculative output token frequencies
+    /// must match what the target-pipeline-alone produces (Pearson chi-squared, 99.9% CI).
+    /// Verified to FAIL on the unfixed implementation when only the constructor guard is removed
+    /// — see PR notes.
+    /// </summary>
+    [Fact]
+    public void NonGreedy_OutputDistributionMatchesTargetPipeline()
+    {
+        // Strongly skewed, reversed distributions amplify the bug.
+        float[] targetLogits = [4f, 2f, 0f, -2f];
+        float[] draftLogits = [-2f, 0f, 2f, 4f];
+        int vocabSize = targetLogits.Length;
+        const int N = 4000;
+        const float temperature = 0.5f;
+
+        // ── Reference: sample directly from the target pipeline N times ──
+        var referenceCounts = new int[vocabSize];
+        for (int trial = 0; trial < N; trial++)
+        {
+            var refPipeline = new SamplerPipeline(new InferenceOptions
+            {
+                Temperature = temperature,
+                Seed = trial,
+            });
+            var logits = (float[])targetLogits.Clone();
+            int sampled = refPipeline.Sample(logits, new List<int> { 1 });
+            referenceCounts[sampled]++;
+        }
+
+        // ── Spec decoder: take the first accepted/corrected token from each trial ──
+        var specCounts = new int[vocabSize];
+        var outputBufferArr = new int[3];
+        for (int trial = 0; trial < N; trial++)
+        {
+            var target = new MockModel(targetLogits, vocabSize);
+            var draft = new MockModel(draftLogits, vocabSize);
+            // Distinct seeds for pipeline and decoder so rejection-sampling RNG is decoupled
+            // from draft-sampling RNG — mirrors production where both share the InferenceOptions
+            // seed lineage but draw from separate Random instances.
+            var pipeline = new SamplerPipeline(new InferenceOptions
+            {
+                Temperature = temperature,
+                Seed = trial,
+            });
+            var decoder = new SpeculativeDecoder(greedy: false, seed: trial ^ 0x5A5A_5A5A);
+            var generatedIds = new List<int> { 1 };
+
+            using var targetCache = CreateCache();
+            using var draftCache = CreateCache();
+            PrefillCache(targetCache, target);
+            PrefillCache(draftCache, draft);
+
+            var result = decoder.DraftAndVerify(
+                target, draft, targetCache, draftCache,
+                pipeline, generatedIds, constraint: null,
+                position: 1, targetVocabSize: vocabSize, draftVocabSize: vocabSize, numCandidates: 2,
+                outputBuffer: outputBufferArr);
+
+            Assert.True(result.AcceptedCount > 0, "spec decoder must emit at least one token");
+            int firstToken = outputBufferArr[0];
+            specCounts[firstToken]++;
+        }
+
+        // ── Pearson chi-squared on observed (spec) vs expected (reference) ──
+        double chiSq = 0.0;
+        int dof = 0;
+        for (int i = 0; i < vocabSize; i++)
+        {
+            double expected = referenceCounts[i];
+            if (expected < 5) continue; // standard chi-squared validity cutoff
+            double diff = specCounts[i] - expected;
+            chiSq += diff * diff / expected;
+            dof++;
+        }
+        dof = Math.Max(1, dof - 1);
+
+        // Conservative critical value at α = 0.001 covering up to 4 dof (16.27).
+        // The bug produces chi-squared in the hundreds on this fixture; well-separated.
+        const double criticalChiSq = 16.27;
+        Assert.True(chiSq < criticalChiSq,
+            $"empirical distribution diverges from target pipeline: chiSq={chiSq:F2} dof={dof} " +
+            $"ref=[{string.Join(",", referenceCounts)}] spec=[{string.Join(",", specCounts)}]");
     }
 
     // ── Helpers ──
