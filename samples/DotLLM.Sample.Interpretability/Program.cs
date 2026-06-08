@@ -7,16 +7,32 @@ using DotLLM.Tokenizers.Bpe;
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine("Usage: dotLLM.Sample.Interpretability <model.gguf> [prompt]");
-    Console.Error.WriteLine("  model.gguf  Path to a GGUF model file");
-    Console.Error.WriteLine("  prompt      Text prompt (default: \"The capital of France is\")");
+    Console.Error.WriteLine("Usage: dotLLM.Sample.Interpretability <model.gguf> [--sae <sae.safetensors>] [prompt]");
+    Console.Error.WriteLine("  model.gguf          Path to a GGUF model file");
+    Console.Error.WriteLine("  --sae <path>        Optional path to a pre-trained SAE safetensors file");
+    Console.Error.WriteLine("                      (with optional sibling cfg.json). When omitted, the");
+    Console.Error.WriteLine("                      logit-lens workflow runs alone.");
+    Console.Error.WriteLine("  prompt              Text prompt (default: \"The capital of France is\")");
     Console.Error.WriteLine();
     Console.Error.WriteLine("Tip: a small model such as QuantFactory/SmolLM-135M-GGUF Q8_0 works well.");
     return 1;
 }
 
 string modelPath = args[0];
-string prompt = args.Length > 1 ? string.Join(' ', args.Skip(1)) : "The capital of France is";
+string? saePath = null;
+var positional = new List<string>();
+for (int i = 1; i < args.Length; i++)
+{
+    if (args[i] == "--sae" && i + 1 < args.Length)
+    {
+        saePath = args[++i];
+    }
+    else
+    {
+        positional.Add(args[i]);
+    }
+}
+string prompt = positional.Count > 0 ? string.Join(' ', positional) : "The capital of France is";
 
 Console.WriteLine($"Loading model: {modelPath}");
 using var gguf = GgufFile.Open(modelPath);
@@ -49,7 +65,38 @@ var lens = new LogitLensHook(model, hookConfig);
 model.Hooks ??= new HookRegistry();
 model.Hooks.Register(lens);
 
-// Single forward pass over the prompt — no KV cache needed for one-shot logit lens.
+// Optionally register an SAE hook at a single mid-network layer (the standard SAE
+// inspection workflow — one SAE per layer). When no --sae path is provided, this block
+// is skipped and only the logit lens runs.
+SparseAutoencoder? sae = null;
+SaeHook? saeHook = null;
+int saeLayer = config.NumLayers / 2;
+if (saePath is not null)
+{
+    Console.WriteLine($"Loading SAE: {saePath}");
+    sae = SaeLoader.Load(saePath, topK: 16);
+    if (sae.HiddenSize != config.HiddenSize)
+    {
+        Console.Error.WriteLine(
+            $"SAE HiddenSize={sae.HiddenSize} does not match model HiddenSize={config.HiddenSize}; aborting SAE inspection.");
+        sae.Dispose();
+        sae = null;
+    }
+    else
+    {
+        var saeConfig = new SaeConfig
+        {
+            Layers = LogitLensLayerSelector.Specific([saeLayer]),
+            TopK = 16,
+            TokenPositions = [finalPosition],
+        };
+        saeHook = new SaeHook(sae, saeConfig);
+        model.Hooks.Register(saeHook);
+        Console.WriteLine($"SAE bound to layer {saeLayer} (d_in={sae.HiddenSize}, d_sae={sae.FeatureCount}, top-{saeConfig.TopK})");
+    }
+}
+
+// Single forward pass over the prompt — no KV cache needed for one-shot logit lens/SAE.
 using var logitsTensor = model.Forward(promptTokens, positions, deviceId: -1);
 
 // Identify the actual top-1 token the full model predicts at the final position.
@@ -100,8 +147,33 @@ unsafe
     Console.WriteLine($"Confidence trajectory for token {finalTopToken}:");
     foreach (var (layer, p) in trajectory)
         Console.WriteLine($"  layer {layer,2}: p = {p:F4}");
+
+    // SAE workflow: top-K active features at the chosen layer / final prompt position.
+    if (saeHook is not null)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"SAE features at layer {saeLayer}, position {finalPosition}:");
+        var saeResults = saeHook.GetResults();
+        if (saeResults.Count == 0)
+        {
+            Console.WriteLine("  (no SAE results — hook did not fire; check layer selection)");
+        }
+        else
+        {
+            foreach (var r in saeResults)
+            {
+                Console.WriteLine($"  layer={r.LayerIndex} pos={r.TokenPosition} active={r.ActiveFeatureCount}/{sae!.FeatureCount} recon_err={r.ReconstructionError:F4}");
+                int show = Math.Min(8, r.FeatureIndices.Length);
+                for (int i = 0; i < show; i++)
+                    Console.WriteLine($"    feat[{i}] id={r.FeatureIndices[i],-6} mag={r.FeatureMagnitudes[i]:F4}");
+                if (r.FeatureIndices.Length > show)
+                    Console.WriteLine($"    … (and {r.FeatureIndices.Length - show} more)");
+            }
+        }
+    }
 }
 
+sae?.Dispose();
 return 0;
 
 static string TryDecode(ITokenizer tokenizer, int tokenId)
