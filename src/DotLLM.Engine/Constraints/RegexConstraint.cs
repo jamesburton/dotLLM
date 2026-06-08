@@ -10,6 +10,16 @@ namespace DotLLM.Engine.Constraints;
 /// Compiles the pattern to a minimized DFA at construction time.
 /// Token masks are cached by DFA state ID — typically &lt;50 entries for practical patterns.
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>Unicode coverage: BMP only.</b> The DFA equivalence-class table is indexed by
+/// <see cref="char"/> (UTF-16 code unit), so only code points in the Basic Multilingual
+/// Plane (U+0000–U+FFFF) are supported. Supplementary code points (emoji, CJK Extension B,
+/// most historic scripts) arrive as surrogate pairs and are rejected — any token that
+/// decodes to text containing a UTF-16 surrogate is treated as non-matching and excluded
+/// from the allowed-tokens mask.
+/// </para>
+/// </remarks>
 public sealed class RegexConstraint : IDecodingConstraint
 {
     private DfaSimulator _simulator;
