@@ -33,27 +33,47 @@ public sealed class TopPSampler : ISamplerStep
         try
         {
             var probs = rentedProbs.AsSpan(0, vocabSize);
-            var indices = rentedIndices.AsSpan(0, vocabSize);
 
-            // Softmax to get probabilities
+            // Softmax to get probabilities (full vocab — needed for the cutoff computation
+            // and the mask write-back).
             TensorPrimitives.SoftMax(logits, probs);
 
-            // Initialize indices
+            // Pre-filter cutoff (Karpathy llama2.c / run.c:sample_topp): any token with
+            // probability strictly less than `cutoff = (1 - topP) / (n - 1)` cannot be
+            // part of the nucleus. Proof: the dropped tokens collectively contribute at
+            // most `(n - 1) * cutoff = 1 - topP`, so the surviving (filtered) set holds
+            // at least `topP` of the mass. Walking it in descending order will hit `topP`
+            // within the filtered set, so dropping the rest is safe.
+            //
+            // At typical vocabSize=32K–128K and topP=0.9, this eliminates ~99% of tokens
+            // from the subsequent sort, turning O(V log V) into O(V) (single pass to
+            // build the candidate set) + O(K log K) (sort the much smaller candidate set,
+            // typically a few hundred entries).
+            float cutoff = vocabSize > 1 ? (1.0f - topP) / (vocabSize - 1) : 0.0f;
+
+            int candidateCount = 0;
             for (int i = 0; i < vocabSize; i++)
-                indices[i] = i;
+            {
+                if (rentedProbs[i] >= cutoff)
+                {
+                    rentedProbs[candidateCount] = rentedProbs[i];
+                    rentedIndices[candidateCount] = i;
+                    candidateCount++;
+                }
+            }
 
-            // Sort ascending by probability using Array.Sort (IntroSort — O(V log V))
-            Array.Sort(rentedProbs, rentedIndices, 0, vocabSize);
+            // Sort the filtered candidates ascending by probability (IntroSort — O(K log K)).
+            Array.Sort(rentedProbs, rentedIndices, 0, candidateCount);
 
-            // Walk backwards (descending probability), accumulate until we exceed topP
+            // Walk backwards (descending probability), accumulate until we exceed topP.
             float cumulative = 0f;
-            int cutoffCount = vocabSize;
-            for (int i = vocabSize - 1; i >= 0; i--)
+            int cutoffCount = candidateCount;
+            for (int i = candidateCount - 1; i >= 0; i--)
             {
                 cumulative += rentedProbs[i];
                 if (cumulative >= topP)
                 {
-                    cutoffCount = vocabSize - i; // keep this many from the top
+                    cutoffCount = candidateCount - i; // keep this many from the top
                     break;
                 }
             }
@@ -62,8 +82,8 @@ public sealed class TopPSampler : ISamplerStep
             var keep = rentedKeep.AsSpan(0, vocabSize);
             keep.Clear();
 
-            int keepStart = vocabSize - cutoffCount;
-            for (int i = keepStart; i < vocabSize; i++)
+            int keepStart = candidateCount - cutoffCount;
+            for (int i = keepStart; i < candidateCount; i++)
                 keep[rentedIndices[i]] = true;
 
             for (int i = 0; i < vocabSize; i++)
