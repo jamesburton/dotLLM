@@ -27,6 +27,7 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(LogprobsDto))]
 [JsonSerializable(typeof(ModelInspectResponse))]
 [JsonSerializable(typeof(ErrorResponse))]
+[JsonSerializable(typeof(OpenAiErrorResponse))]
 [JsonSerializable(typeof(StatusResponse))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,

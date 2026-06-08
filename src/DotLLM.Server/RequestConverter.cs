@@ -141,6 +141,46 @@ public static class RequestConverter
     }
 
     /// <summary>
+    /// Returns true when the supplied tool_choice value is one the server can currently honour.
+    /// Today only <c>"auto"</c> (or unset) is enforceable; <c>"none"</c>, <c>"required"</c>, and
+    /// a specific function require constrained-decoding wiring that hasn't landed yet, so requests
+    /// using them must be rejected rather than silently behaving as <c>"auto"</c>.
+    /// </summary>
+    /// <param name="element">Raw <c>tool_choice</c> JSON value from the request.</param>
+    /// <param name="rejectedValue">A short string describing what the client sent, for the error
+    /// body. Empty when the call returns <c>true</c>.</param>
+    public static bool IsToolChoiceSupported(JsonElement? element, out string rejectedValue)
+    {
+        rejectedValue = string.Empty;
+
+        if (element is null || element.Value.ValueKind == JsonValueKind.Undefined ||
+            element.Value.ValueKind == JsonValueKind.Null)
+        {
+            return true;
+        }
+
+        if (element.Value.ValueKind == JsonValueKind.String)
+        {
+            string? s = element.Value.GetString();
+            if (string.Equals(s, "auto", StringComparison.Ordinal))
+                return true;
+            rejectedValue = s ?? string.Empty;
+            return false;
+        }
+
+        if (element.Value.ValueKind == JsonValueKind.Object &&
+            element.Value.TryGetProperty("function", out var funcProp) &&
+            funcProp.TryGetProperty("name", out var nameProp))
+        {
+            rejectedValue = $"function:{nameProp.GetString()}";
+            return false;
+        }
+
+        rejectedValue = element.Value.ValueKind.ToString();
+        return false;
+    }
+
+    /// <summary>
     /// Parses the response_format JSON element into a <see cref="ResponseFormat"/> record.
     /// </summary>
     public static ResponseFormat? ParseResponseFormat(JsonElement? element)
