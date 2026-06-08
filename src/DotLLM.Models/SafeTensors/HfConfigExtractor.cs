@@ -55,12 +55,13 @@ public static class HfConfigExtractor
 
         Architecture architecture = ResolveArchitecture(root);
 
-        // Gemma 3 multimodal checkpoints wrap the text-tower config under a
+        // Gemma 3 / Gemma 4 multimodal checkpoints wrap the text-tower config under a
         // `text_config` sub-object (the top level carries vision_config / model_type
-        // = gemma3). Hoist the text sub-object so every field lookup below sees the
-        // text-tower shape. Text-only checkpoints (model_type = gemma3_text) have no
-        // wrapper.
-        if (architecture == Architecture.Gemma3
+        // = gemma3 / gemma4 / gemma4_unified). Hoist the text sub-object so every field
+        // lookup below sees the text-tower shape. Text-only checkpoints
+        // (model_type = gemma3_text / gemma4_text) have no wrapper.
+        bool isGemmaFamily = architecture is Architecture.Gemma3 or Architecture.Gemma4;
+        if (isGemmaFamily
             && root.TryGetProperty("text_config", out var textCfg)
             && textCfg.ValueKind == JsonValueKind.Object)
         {
@@ -104,27 +105,30 @@ public static class HfConfigExtractor
         int? slidingWindow = GetInt32NullableIfPositive(root, "sliding_window");
 
         // ── Gemma-family extras ─────────────────────────────────────────────
-        // Per-layer attention-type pattern (Gemma 2/3 interleaves local/global).
+        // Per-layer attention-type pattern (Gemma 2/3/4 interleaves local/global).
         IReadOnlyList<int?>? perLayerSlidingWindow = null;
         float? attnLogitSoftcap = null;
         float? finalLogitSoftcap = null;
         float? queryPreAttnScalar = null;
         ActivationFunction activation = ActivationFunction.SiLU;
-        if (architecture == Architecture.Gemma3)
+        if (isGemmaFamily)
         {
             // Default sliding_window for Gemma3 if not specified (HF default is 4096).
+            // Gemma 4 ships sliding_window=1024 explicitly on the 12B/31B SKUs; the
+            // fallback only fires for synthetic configs that omit the field.
             if (slidingWindow is null)
                 slidingWindow = 4096;
 
-            // sliding_window_pattern (HF default = 6 on Gemma 2/3): every Nth layer
-            // (1-indexed) is full-attention, all others are sliding-window. tiny-random
-            // ships small values like 2 — handle defensively.
+            // sliding_window_pattern (HF default = 6 on Gemma 2/3/4): every Nth layer
+            // (1-indexed) is full-attention, all others are sliding-window. Gemma 4
+            // emits `layer_types` directly (so the pattern formula doesn't fire); tiny
+            // synthetic Gemma3 fixtures ship small values like 2 — handle defensively.
             int swPattern = GetInt32OrDefault(root, "sliding_window_pattern", 6);
             if (swPattern <= 0) swPattern = 1;
 
             // Prefer the explicit `layer_types` array when present (HF emits one entry
             // per layer: "sliding_attention" or "full_attention"); fall back to the
-            // sliding_window_pattern formula.
+            // sliding_window_pattern formula. Gemma 4 ALWAYS emits `layer_types`.
             var layerTypes = new int?[numLayers];
             if (root.TryGetProperty("layer_types", out var lt) && lt.ValueKind == JsonValueKind.Array
                 && lt.GetArrayLength() == numLayers)
@@ -154,7 +158,7 @@ public static class HfConfigExtractor
             int qpas = GetInt32OrDefault(root, "query_pre_attn_scalar", 0);
             if (qpas > 0) queryPreAttnScalar = qpas;
 
-            // Gemma 3 ships "gelu_pytorch_tanh" (gelu_pytorch_tanh ≡ approximate GELU with
+            // Gemma 3 / Gemma 4 both ship "gelu_pytorch_tanh" (≡ approximate GELU with
             // tanh). Match HF naming variants defensively.
             string? hiddenAct = GetStringOrDefault(root, "hidden_activation", null)
                               ?? GetStringOrDefault(root, "hidden_act", null);
@@ -172,9 +176,22 @@ public static class HfConfigExtractor
         // use non-interleaved (NeoX). SmolLM3 is Llama-shaped and llama.cpp's
         // llama_model_rope_type maps LLM_ARCH_SMOLLM3 to LLAMA_ROPE_TYPE_NORM
         // alongside LLM_ARCH_LLAMA — so SmolLM3 falls through the Llama default.
+        //
+        // Gemma family (Gemma2/3/4) — NeoX. Cross-referenced against llama.cpp's
+        // `llama_model_rope_type` (src/llama-model.cpp): LLM_ARCH_GEMMA,
+        // LLM_ARCH_GEMMA2, LLM_ARCH_GEMMA3, LLM_ARCH_GEMMA3N, LLM_ARCH_GEMMA4,
+        // LLM_ARCH_GEMMA4_ASSISTANT, LLM_ARCH_GEMMA_EMBEDDING all return
+        // LLAMA_ROPE_TYPE_NEOX. Gemma 3 was historically mapped to Norm here
+        // (the now-removed catch-all _ branch); we correct that alongside the
+        // Gemma 4 addition so the family is consistent. The Gemma 3 forward
+        // tests are insensitive to the pairing convention on synthetic random
+        // weights (they only assert finiteness + non-zero variance + soft-cap
+        // bounds — all RoPE-pairing-invariant), so flipping Norm -> NeoX here
+        // is byte-safe for the stack's existing test coverage.
         RoPEType ropeType = architecture switch
         {
-            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi => RoPEType.NeoX,
+            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi
+                or Architecture.Gemma3 or Architecture.Gemma4 => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 
@@ -570,6 +587,20 @@ public static class HfConfigExtractor
             // tensors but carries `no_rope_layers` mask + (optional) YaRN scaling.
             (var a, _) when a is not null && a.Contains("smollm3") => Architecture.SmolLM3,
             (_, "smollm3") => Architecture.SmolLM3,
+            // Gemma 4 — text-only, multimodal, and "unified" multimodal (the newer
+            // gemma4_unified family with combined audio+vision towers). Must be
+            // checked before Gemma 3 so the version-specific row wins. HF emits:
+            //   - text-only: architectures[0]=Gemma4ForCausalLM, model_type=gemma4_text
+            //   - multimodal: architectures[0]=Gemma4ForConditionalGeneration, model_type=gemma4
+            //   - unified: architectures[0]=Gemma4UnifiedForConditionalGeneration,
+            //              model_type=gemma4_unified (text-tower carried under text_config
+            //              with model_type=gemma4_unified_text)
+            // Underscored variants ("gemma_4_*") are accepted defensively though HF
+            // does not currently emit them.
+            (var a, _) when a is not null
+                && (a.Contains("gemma4") || a.Contains("gemma_4")) => Architecture.Gemma4,
+            (_, "gemma4" or "gemma4_text" or "gemma4_unified" or "gemma4_unified_text"
+                or "gemma_4" or "gemma_4_text") => Architecture.Gemma4,
             // Gemma 3 — text-only and multimodal. The text-only variant lands directly
             // on the dense-transformer path. The multimodal variant carries
             // model_type=gemma3 and houses the text tower under `text_config`; we hoist
@@ -603,6 +634,7 @@ public static class HfConfigExtractor
     {
         Architecture.Phi => true,
         Architecture.Gemma3 => true,
+        Architecture.Gemma4 => true,
         _ => false,
     };
 

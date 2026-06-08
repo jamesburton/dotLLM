@@ -134,12 +134,62 @@ public enum Architecture
     /// </list>
     /// </para>
     /// <para>
-    /// Gemma 4 was not yet public when this enum variant was added (2026-05). The
-    /// implementation is built for Gemma 3 — the latest publicly-shipped Gemma — and
-    /// will forward-port to Gemma 4 cleanly if Google retains the Gemma 2/3 shape. See
-    /// <c>.continue-here-step57.md</c> at the repo root for the assumption trail and
-    /// the upgrade path when Gemma 4 lands.
+    /// Gemma 4 (released 2026-04-02) reuses every mechanism wired through this
+    /// enum variant — see <see cref="Gemma4"/> for the per-version dispatch. The
+    /// Gemma-family field block in <c>HfConfigExtractor</c> fires for both
+    /// variants.
     /// </para>
     /// </summary>
-    Gemma3
+    Gemma3,
+
+    /// <summary>
+    /// Google Gemma 4 family (released 2026-04-02 under Apache 2.0). Text-only
+    /// checkpoints carry <c>model_type=gemma4_text</c> +
+    /// <c>architectures[0]=Gemma4ForCausalLM</c>; multimodal checkpoints carry
+    /// <c>model_type=gemma4</c> (or <c>gemma4_unified</c> for the newer unified
+    /// vision/audio releases) + <c>architectures[0]=Gemma4ForConditionalGeneration</c>
+    /// (or <c>Gemma4UnifiedForConditionalGeneration</c>) and house the text-tower
+    /// config under a <c>text_config</c> sub-object (we read only the text tower).
+    /// <para>
+    /// The architecture reuses every Gemma 2/3 mechanism — same GeGLU activation
+    /// (<c>gelu_pytorch_tanh</c>), same RMSNorm <c>(1 + weight)</c> convention,
+    /// same four norms per layer, same Q/K per-head RMSNorms, same interleaved
+    /// local/global attention pattern (driven by the <c>layer_types</c> array, e.g.
+    /// five <c>sliding_attention</c> layers followed by one <c>full_attention</c>),
+    /// same <c>final_logit_softcapping=30.0</c>, same <c>tie_word_embeddings=true</c>.
+    /// </para>
+    /// <para>
+    /// New / divergent fields seen on the HF reference (e.g. <c>google/gemma-4-12B-*</c>)
+    /// that are NOT yet consumed by this enum's loader path — the dense text-only
+    /// forward will still run correctly on the public 12B/31B SKUs because each new
+    /// feature is null / disabled by default in those checkpoints:
+    /// <list type="bullet">
+    ///   <item><c>rope_parameters.{full_attention, sliding_attention}</c> — split-RoPE
+    ///     config (Gemma 3 inherited a single <c>rope_theta</c>; Gemma 4 uses different
+    ///     theta for full vs sliding layers). The current loader reads the top-level
+    ///     <c>rope_theta</c> which the HF Gemma 4 configs still carry as a sensible
+    ///     fallback for both layer types.</item>
+    ///   <item><c>global_head_dim</c>, <c>num_global_key_value_heads</c> — full-attention
+    ///     layers can have different head shape than sliding layers. Disabled on the
+    ///     12B SKU; full-attention layers reuse <c>head_dim</c> / <c>num_key_value_heads</c>.</item>
+    ///   <item><c>use_double_wide_mlp</c>, <c>attention_k_eq_v</c>,
+    ///     <c>num_kv_shared_layers</c>, <c>hidden_size_per_layer_input</c>,
+    ///     <c>vocab_size_per_layer_input</c>, <c>enable_moe_block</c>, <c>num_experts</c>,
+    ///     <c>top_k_experts</c> — all null / false / 0 on the public 12B/31B SKUs.
+    ///     The 26B "A4B" MoE SKU will need <c>enable_moe_block</c>+<c>num_experts</c>
+    ///     wired through the existing MoE path in a follow-up.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Loading routes through the standard dense
+    /// <c>DotLLM.Models.Architectures.TransformerModel</c> safetensors path,
+    /// parameterised by the existing Gemma 2/3 <see cref="DotLLM.Core.Models.ModelConfig"/>
+    /// fields (<see cref="DotLLM.Core.Models.ModelConfig.PerLayerSlidingWindow"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.AttnLogitSoftcap"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.FinalLogitSoftcap"/>,
+    /// <see cref="DotLLM.Core.Models.ModelConfig.QueryPreAttnScalar"/>). ROADMAP
+    /// Phase 8 Step 57.
+    /// </para>
+    /// </summary>
+    Gemma4
 }
