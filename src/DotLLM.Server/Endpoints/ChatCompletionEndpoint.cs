@@ -210,9 +210,13 @@ public static class ChatCompletionEndpoint
         {
             await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct))
             {
+                // GenerationToken.Text may be empty for incomplete UTF-8 continuation bytes — the
+                // token still counts toward completion_tokens (matches the non-streaming path).
+                // Only the SSE delta.content emission is gated on Text being non-empty.
+                completionTokens++;
+
                 if (token.Text.Length > 0)
                 {
-                    completionTokens++;
                     sb.Append(token.Text);
                     var tokenLogprobs = token.Logprobs.HasValue
                         ? RequestConverter.ToLogprobsDto(token.Logprobs.Value)
