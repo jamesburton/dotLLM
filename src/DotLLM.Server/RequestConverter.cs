@@ -200,6 +200,34 @@ public static class RequestConverter
     }
 
     /// <summary>
+    /// Converts an incremental <see cref="ToolCallFragment"/> emitted by an
+    /// <see cref="IIncrementalToolCallParser"/> to the streaming
+    /// <see cref="ToolCallDeltaDto"/> shape used on the wire. Opening fragments
+    /// (those carrying <c>Id</c> or <c>Name</c>) include <c>type:"function"</c>
+    /// to match the OpenAI SSE contract; subsequent argument-only fragments
+    /// omit <c>id</c>, <c>type</c>, and <c>function.name</c>.
+    /// </summary>
+    public static ToolCallDeltaDto ToToolCallDeltaDto(ToolCallFragment fragment)
+    {
+        bool isOpening = fragment.Id is not null || fragment.Name is not null;
+        ToolCallFunctionDeltaDto? function = isOpening || fragment.ArgumentsDelta is not null
+            ? new ToolCallFunctionDeltaDto
+            {
+                Name = fragment.Name,
+                Arguments = fragment.ArgumentsDelta,
+            }
+            : null;
+
+        return new ToolCallDeltaDto
+        {
+            Index = fragment.Index,
+            Id = fragment.Id,
+            Type = isOpening ? "function" : null,
+            Function = function,
+        };
+    }
+
+    /// <summary>
     /// Generates a unique request ID in the OpenAI format.
     /// </summary>
     public static string GenerateRequestId() => $"chatcmpl-{Guid.NewGuid():N}";
