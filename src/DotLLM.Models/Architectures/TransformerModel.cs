@@ -134,6 +134,48 @@ public sealed unsafe class TransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
+        int seqLen = tokenIds.Length;
+        var shape = new TensorShape(seqLen, Config.VocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
+        ForwardCore(tokenIds, positions, kvCache, (float*)result.DataPointer);
+        return result;
+    }
+
+    /// <summary>
+    /// Runs a forward pass and writes the resulting logits directly into <paramref name="logitsOut"/>,
+    /// avoiding the <see cref="UnmanagedTensor"/> allocation and the final memcpy that
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/> performs.
+    /// This is the recommended entry point for tight decode loops that already own a
+    /// reusable logits buffer (typical of <c>TextGenerator</c>'s sampling path).
+    /// </summary>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="kvCache">Optional KV-cache.</param>
+    /// <param name="logitsOut">Destination span for logits. Must have length &gt;= seqLen × vocabSize.</param>
+    public void ForwardInto(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                            IKvCache? kvCache, Span<float> logitsOut)
+    {
+        int seqLen = tokenIds.Length;
+        int needed = seqLen * Config.VocabSize;
+        if (logitsOut.Length < needed)
+            throw new ArgumentException(
+                $"logitsOut span is too small: need {needed} floats ({seqLen} × {Config.VocabSize}), got {logitsOut.Length}.",
+                nameof(logitsOut));
+
+        fixed (float* logitsDst = logitsOut)
+        {
+            ForwardCore(tokenIds, positions, kvCache, logitsDst);
+        }
+    }
+
+    /// <summary>
+    /// Shared forward-pass core. Performs embedding → transformer layers → final norm → LM head
+    /// and writes the resulting [seqLen, vocab_size] logits directly into <paramref name="logitsDst"/>.
+    /// Callers are responsible for sizing the destination buffer (seqLen × vocabSize floats).
+    /// </summary>
+    private void ForwardCore(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                             IKvCache? kvCache, float* logitsDst)
+    {
         int maxSeq = Config.MaxSequenceLength;
         for (int i = 0; i < positions.Length; i++)
         {
@@ -168,7 +210,6 @@ public sealed unsafe class TransformerModel : IModel
         float* ffnGate = (float*)_state.FfnGate;
         float* ffnUp = (float*)_state.FfnUp;
         float* siluOut = (float*)_state.SiluOutput;
-        float* logits = (float*)_state.Logits;
 
         // 1. EMBEDDING LOOKUP
         EmbeddingLookup(tokenIds, hidden, hiddenSize);
@@ -407,21 +448,18 @@ public sealed unsafe class TransformerModel : IModel
             new Span<float>(normOutT, hiddenSize).CopyTo(new Span<float>(hiddenT, hiddenSize));
         }
 
-        // 4. LM HEAD — all positions (enables batched speculative decoding verification)
+        // 4. LM HEAD — all positions (enables batched speculative decoding verification).
+        //    Writes directly into the caller-provided `logitsDst` buffer, eliminating the
+        //    previous `_state.Logits → result` copy. The `Forward(...)` entry point passes
+        //    a freshly-allocated UnmanagedTensor's pointer; `ForwardInto(...)` passes the
+        //    caller's pinned Span<float>, avoiding the allocation altogether for hot-path
+        //    decode loops.
         {
             var rwOutput = _weights.RepackedOutput ?? default;
             GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
-                hidden, logits, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
+                hidden, logitsDst, _weights.OutputOutputDim, _weights.OutputInputDim, seqLen,
                 null, in rwOutput);
         }
-
-        // 5. RETURN [seqLen, vocabSize]
-        var shape = new TensorShape(seqLen, vocabSize);
-        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
-        new Span<float>(logits, seqLen * vocabSize).CopyTo(
-            new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
-
-        return result;
     }
 
     /// <summary>
