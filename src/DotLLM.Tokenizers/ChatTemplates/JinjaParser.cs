@@ -6,8 +6,16 @@ namespace DotLLM.Tokenizers.ChatTemplates;
 /// </summary>
 internal sealed class JinjaParser
 {
+    /// <summary>
+    /// Maximum recursion depth for nested parse calls (expression-level and template-body
+    /// level). Prevents <see cref="StackOverflowException"/> on adversarial templates with
+    /// very deep paren/bracket/if/for nesting. Real chat templates rarely exceed depth ~20.
+    /// </summary>
+    internal const int MaxRecursionDepth = 100;
+
     private readonly List<JinjaToken> _tokens;
     private int _pos;
+    private int _depth;
 
     public JinjaParser(List<JinjaToken> tokens)
     {
@@ -25,41 +33,49 @@ internal sealed class JinjaParser
 
     private List<ITemplateNode> ParseBody(params JinjaTokenType[] stopAt)
     {
-        var nodes = new List<ITemplateNode>();
-
-        while (!IsAtEnd())
+        EnterRecursion();
+        try
         {
-            var token = Current();
+            var nodes = new List<ITemplateNode>();
 
-            // Check stop conditions (endfor, endif, elif, else, etc.)
-            if (token.Type == JinjaTokenType.StmtStart && stopAt.Length > 0)
+            while (!IsAtEnd())
             {
-                var next = Peek(1);
-                if (next.HasValue && Array.IndexOf(stopAt, next.Value.Type) >= 0)
-                    break;
+                var token = Current();
+
+                // Check stop conditions (endfor, endif, elif, else, etc.)
+                if (token.Type == JinjaTokenType.StmtStart && stopAt.Length > 0)
+                {
+                    var next = Peek(1);
+                    if (next.HasValue && Array.IndexOf(stopAt, next.Value.Type) >= 0)
+                        break;
+                }
+
+                switch (token.Type)
+                {
+                    case JinjaTokenType.Text:
+                        nodes.Add(new TextNode((string)token.Value!));
+                        Advance();
+                        break;
+
+                    case JinjaTokenType.ExprStart:
+                        nodes.Add(ParseExpressionOutput());
+                        break;
+
+                    case JinjaTokenType.StmtStart:
+                        nodes.Add(ParseStatement());
+                        break;
+
+                    default:
+                        throw Error($"Unexpected token {token.Type}");
+                }
             }
 
-            switch (token.Type)
-            {
-                case JinjaTokenType.Text:
-                    nodes.Add(new TextNode((string)token.Value!));
-                    Advance();
-                    break;
-
-                case JinjaTokenType.ExprStart:
-                    nodes.Add(ParseExpressionOutput());
-                    break;
-
-                case JinjaTokenType.StmtStart:
-                    nodes.Add(ParseStatement());
-                    break;
-
-                default:
-                    throw Error($"Unexpected token {token.Type}");
-            }
+            return nodes;
         }
-
-        return nodes;
+        finally
+        {
+            ExitRecursion();
+        }
     }
 
     private ExpressionOutputNode ParseExpressionOutput()
@@ -191,7 +207,18 @@ internal sealed class JinjaParser
 
     // ── Expression parsing with precedence climbing ──
 
-    private IExpression ParseExpression() => ParseConditional();
+    private IExpression ParseExpression()
+    {
+        EnterRecursion();
+        try
+        {
+            return ParseConditional();
+        }
+        finally
+        {
+            ExitRecursion();
+        }
+    }
 
     /// <summary>
     /// conditional → or_expr (IF or_expr ELSE conditional)?
@@ -721,5 +748,28 @@ internal sealed class JinjaParser
     {
         var token = Current();
         return new JinjaException(message, token.Line, token.Column);
+    }
+
+    /// <summary>
+    /// Increments the recursion depth counter and throws when the configured maximum
+    /// is exceeded. Called from every recursive parse entry point so that malicious or
+    /// pathological templates (deeply nested parens, brackets, or if/for) raise a
+    /// catchable <see cref="JinjaException"/> rather than a fatal
+    /// <see cref="StackOverflowException"/>.
+    /// </summary>
+    private void EnterRecursion()
+    {
+        _depth++;
+        if (_depth > MaxRecursionDepth)
+        {
+            throw Error(
+                $"Jinja template parser exceeded maximum recursion depth ({MaxRecursionDepth}). " +
+                $"Template is too deeply nested.");
+        }
+    }
+
+    private void ExitRecursion()
+    {
+        _depth--;
     }
 }
