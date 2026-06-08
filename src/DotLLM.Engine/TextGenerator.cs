@@ -13,6 +13,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
+using DotLLM.Engine.Strategies;
 using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 
@@ -32,6 +33,7 @@ public sealed class TextGenerator
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private readonly HybridPrefillDecodeStrategy? _hybridStrategy;
 
     /// <summary>
     /// Creates a new text generator.
@@ -48,13 +50,19 @@ public sealed class TextGenerator
     /// <param name="prefixTrieManager">Optional cross-request prefix trie manager (Step 37).
     /// Takes precedence over <paramref name="prefixCache"/> when supplied — multiple sessions
     /// share KV blocks via the trie.</param>
+    /// <param name="hybridStrategy">Optional CPU-prefill / GPU-decode hybrid strategy. When set
+    /// and the prompt length is below the strategy's crossover threshold, prefill runs on the
+    /// strategy's CPU model and the KV state is handed off to <paramref name="model"/> (the
+    /// decode model) before the decode loop. When the prompt exceeds the threshold, or when
+    /// the strategy is null, the existing single-backend path runs unchanged.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
                           int speculativeCandidates = 5,
-                          PrefixTrieManager? prefixTrieManager = null)
+                          PrefixTrieManager? prefixTrieManager = null,
+                          HybridPrefillDecodeStrategy? hybridStrategy = null)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -64,6 +72,16 @@ public sealed class TextGenerator
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
+        _hybridStrategy = hybridStrategy;
+
+        if (hybridStrategy is not null
+            && !ReferenceEquals(hybridStrategy.DecodeModel, model))
+        {
+            throw new ArgumentException(
+                "When a HybridPrefillDecodeStrategy is supplied, its DecodeModel must be the same "
+                + "instance as the TextGenerator's primary model (which runs the decode loop).",
+                nameof(hybridStrategy));
+        }
     }
 
     /// <summary>
@@ -146,6 +164,13 @@ public sealed class TextGenerator
         // Resolve KV-cache: reuse from prefix cache or allocate fresh
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
 
+        // Hybrid mode is enabled when a strategy is wired up, the prompt is short enough,
+        // and we have a clean cache (no prefix-cache reuse, no speculative draft model).
+        bool useHybrid = _hybridStrategy is not null
+            && _hybridStrategy.ShouldRunHybrid(promptLen)
+            && cachedTokenCount == 0
+            && _draftModel is null;
+
         // Stop-check scratch buffer: rented up-front and returned in the outer finally to preserve
         // the zero-GC-pressure guarantee on the inference hot path.
         int stopTailSize = ComputeStopTailSize(stopConditions);
@@ -188,7 +213,34 @@ public sealed class TextGenerator
 
             using (var prefillSpan = telemetry.StartPrefill())
             {
-                if (prefillLen > 0)
+                if (useHybrid)
+                {
+                    // ── Hybrid prefill: CPU model populates a SimpleKvCache, then we hand
+                    //    off into the decode-side cache (kvCache) and sample the first
+                    //    token from the CPU-produced logits. The decode loop below sees a
+                    //    fully populated decode KV cache exactly as if pure-GPU prefill ran.
+                    var handoff = _hybridStrategy!.RunPrefill(promptIds.AsSpan(0, promptLen), cacheSize);
+                    try
+                    {
+                        _hybridStrategy.Handoff(handoff.HostCache, kvCache);
+                        prefillTicks = handoff.PrefillTicks;
+
+                        using var sampleSpan = telemetry.StartSample();
+                        long samplerStart = Stopwatch.GetTimestamp();
+                        var logitSpan = handoff.LastLogits.AsSpan(0, vocabSize);
+                        if (constraint != null)
+                            TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                        var (tid, lp) = SampleWithLogprobs(logitSpan);
+                        firstTokenId = tid;
+                        if (lp.HasValue) logprobsList!.Add(lp.Value);
+                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                    }
+                    finally
+                    {
+                        handoff.HostCache.Dispose();
+                    }
+                }
+                else if (prefillLen > 0)
                 {
                     // Prefill suffix tokens — span slice avoids array allocation
                     ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
@@ -515,6 +567,12 @@ public sealed class TextGenerator
         var (kvCache, cachedTokenCount, ownsKvCache) = ResolveKvCache(promptIds, promptLen, maxTokens);
         long kvBytes = GetKvCacheBytes(kvCache);
 
+        // Hybrid mode: same gating as the non-streaming path.
+        bool useHybrid = _hybridStrategy is not null
+            && _hybridStrategy.ShouldRunHybrid(promptLen)
+            && cachedTokenCount == 0
+            && _draftModel is null;
+
         // Stop-check scratch buffer: rented up-front and returned in the outer finally. try/finally
         // is preserved across yield points by the async-iterator state machine, so Return runs on
         // normal completion, exception, or consumer-side cancellation (Dispose of the enumerator).
@@ -558,7 +616,29 @@ public sealed class TextGenerator
 
             using (var prefillSpan = telemetry.StartPrefill())
             {
-                if (prefillLen > 0)
+                if (useHybrid)
+                {
+                    // ── Hybrid prefill: CPU populates a SimpleKvCache, hand off to kvCache.
+                    var handoff = _hybridStrategy!.RunPrefill(promptIds.AsSpan(0, promptLen), cacheSize);
+                    try
+                    {
+                        _hybridStrategy.Handoff(handoff.HostCache, kvCache);
+                        prefillTicks = handoff.PrefillTicks;
+
+                        using var sampleSpan = telemetry.StartSample();
+                        long samplerStart = Stopwatch.GetTimestamp();
+                        var logitSpan = handoff.LastLogits.AsSpan(0, vocabSize);
+                        if (constraint != null)
+                            TokenMaskApplier.Apply(logitSpan, constraint.GetAllowedTokens());
+                        (firstTokenId, firstLogprobInfo) = SampleWithLogprobs(logitSpan);
+                        samplerTicks += Stopwatch.GetTimestamp() - samplerStart;
+                    }
+                    finally
+                    {
+                        handoff.HostCache.Dispose();
+                    }
+                }
+                else if (prefillLen > 0)
                 {
                     // Span slice avoids array allocation for suffix tokens
                     ReadOnlySpan<int> suffixTokens = promptIds.AsSpan(prefillStart);
