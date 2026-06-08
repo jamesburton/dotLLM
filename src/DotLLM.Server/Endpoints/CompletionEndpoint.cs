@@ -84,10 +84,27 @@ public static class CompletionEndpoint
         string requestId, string modelId, CancellationToken ct)
     {
         InferenceResponse? result = null;
-        await state.ExecuteAsync(async () =>
+
+        // Route through the continuous-batch scheduler when it's the right shape for it: no
+        // per-token logprobs capture (scheduler doesn't surface those yet). Multiple concurrent
+        // requests pipeline through one model dispatch per scheduler iteration.
+        if (state.Scheduler is { } scheduler && !options.Logprobs)
         {
-            result = generator.Generate(prompt, options);
-        }, ct);
+            int[] promptIds = state.Tokenizer!.Encode(prompt);
+            var inferenceRequest = new InferenceRequest
+            {
+                TokenIds = promptIds,
+                Options = options,
+            };
+            result = await scheduler.EnqueueAsync(inferenceRequest, ct);
+        }
+        else
+        {
+            await state.ExecuteAsync(async () =>
+            {
+                result = generator.Generate(prompt, options);
+            }, ct);
+        }
 
         var logprobsDto = result!.Logprobs is { Length: > 0 }
             ? RequestConverter.ToLogprobsDto(result.Logprobs)
