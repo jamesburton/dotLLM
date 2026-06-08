@@ -17,7 +17,7 @@ namespace DotLLM.Models.Architectures;
 /// Transformer forward pass: embedding lookup → N × transformer blocks → final norm → LM head → logits.
 /// Operates entirely on the CPU using pre-allocated scratch buffers for zero-allocation inference.
 /// </summary>
-public sealed unsafe class TransformerModel : IModel
+public sealed unsafe class TransformerModel : IModel, ILogitsProjector
 {
     /// <summary>Q8_0 block: 2 bytes (Half scale) + 32 bytes (sbyte values).</summary>
     private const int Q8_0BlockBytes = 34;
@@ -907,6 +907,73 @@ public sealed unsafe class TransformerModel : IModel
             (byte*)lw.UpWeight, lw.UpQuantType, ffnUp, lw.UpOutputDim,
             normOut, preQuantFfn, lw.GateInputDim,
             _threadPool!);
+    }
+
+    /// <inheritdoc/>
+    int ILogitsProjector.HiddenSize => Config.HiddenSize;
+
+    /// <inheritdoc/>
+    int ILogitsProjector.VocabSize => Config.VocabSize;
+
+    /// <summary>
+    /// Applies the model's final RMSNorm and language-model head to a residual-stream
+    /// hidden state, writing raw logits to <paramref name="logits"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Reuses the same final-norm + LM-head kernel path that <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// takes for a single-token step (<c>seqLen == 1</c>). For a single-token forward call,
+    /// projecting the post-last-layer hidden state with this method returns logits equal
+    /// (within the same kernel's tolerance) to the row returned by <c>Forward</c>.
+    /// </para>
+    /// <para>
+    /// This method overwrites the model's internal scratch buffers. It is <b>not</b>
+    /// safe to invoke while a <c>Forward</c> call is in flight on the same instance.
+    /// Intended to be called after a forward pass returns, by diagnostics tools such as
+    /// the logit lens.
+    /// </para>
+    /// </remarks>
+    /// <param name="hiddenState">Residual-stream hidden state of length <see cref="ModelConfig.HiddenSize"/>.</param>
+    /// <param name="logits">Destination buffer of length <see cref="ModelConfig.VocabSize"/>.</param>
+    /// <exception cref="ArgumentException">When the input or output spans have the wrong length.</exception>
+    public void ProjectToLogits(ReadOnlySpan<float> hiddenState, Span<float> logits)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        if (hiddenState.Length != hiddenSize)
+            throw new ArgumentException(
+                $"hiddenState length {hiddenState.Length} does not match model HiddenSize {hiddenSize}.",
+                nameof(hiddenState));
+        if (logits.Length != vocabSize)
+            throw new ArgumentException(
+                $"logits length {logits.Length} does not match model VocabSize {vocabSize}.",
+                nameof(logits));
+
+        _state.EnsureCapacity(1);
+
+        float eps = Config.NormEpsilon;
+        float* hidden = (float*)_state.HiddenState;
+        float* normOut = (float*)_state.NormOutput;
+        float* statesLogits = (float*)_state.Logits;
+
+        // Copy input hidden state into scratch (NormOutput acts as our input source for the head).
+        hiddenState.CopyTo(new Span<float>(hidden, hiddenSize));
+
+        // Final RMSNorm — mirrors the `// 3. FINAL NORM` block of Forward at seqLen == 1.
+        RmsNorm.Execute(
+            new ReadOnlySpan<float>(hidden, hiddenSize),
+            _weights.OutputNormWeight,
+            eps,
+            new Span<float>(normOut, hiddenSize));
+        new Span<float>(normOut, hiddenSize).CopyTo(new Span<float>(hidden, hiddenSize));
+
+        // LM head — same call as `// 4. LM HEAD` in Forward, with seqLen = 1.
+        var rwOutput = _weights.RepackedOutput ?? default;
+        GemmInterleaved(_weights.OutputWeight, _weights.OutputQuantType,
+            hidden, statesLogits, _weights.OutputOutputDim, _weights.OutputInputDim, 1,
+            null, in rwOutput);
+
+        new ReadOnlySpan<float>(statesLogits, vocabSize).CopyTo(logits);
     }
 
     /// <inheritdoc/>
