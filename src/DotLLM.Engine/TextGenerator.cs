@@ -176,6 +176,11 @@ public sealed class TextGenerator
         int stopTailSize = ComputeStopTailSize(stopConditions);
         char[] stopScratch = ArrayPool<char>.Shared.Rent(stopTailSize);
 
+        // Incremental detokenizer keeps stop-check cost O(1) amortized per token
+        // instead of decoding the entire generated sequence each step (O(n²)).
+        // Declared outside the try so the finally can deterministically return its pooled buffers.
+        var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+
         try
         {
             var generatedIds = new List<int>(maxTokens);
@@ -184,10 +189,6 @@ public sealed class TextGenerator
             long decodeTicks = 0;
             long samplerTicks = 0;
             int cacheSize = kvCache.MaxLength;
-
-            // Incremental detokenizer keeps stop-check cost O(1) amortized per token
-            // instead of decoding the entire generated sequence each step (O(n²)).
-            var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
 
             // Local helper: snapshot log-softmax before sampling (which modifies logits in-place),
             // sample a token, then build logprob info.
@@ -502,6 +503,7 @@ public sealed class TextGenerator
         finally
         {
             ArrayPool<char>.Shared.Return(stopScratch);
+            detok.Dispose();
             if (ownsKvCache)
                 kvCache.Dispose();
             telemetry.RequestSpan?.Dispose();
@@ -598,20 +600,22 @@ public sealed class TextGenerator
         long prefillTicks = 0;
         long decodeTicks = 0;
 
+        // Incremental detokenizer: O(1) amortized per token for stop-check + streaming delta,
+        // instead of decoding the full generated sequence at every step. Lifted out of the try
+        // so the finally can return its pooled buffers even on cancellation.
+        var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
+
         try
         {
             long samplerTicks = 0;
             int cacheSize = kvCache.MaxLength;
-
-            // Incremental detokenizer: O(1) amortized per token for stop-check + streaming delta,
-            // instead of decoding the full generated sequence at every step.
-            var detok = new IncrementalDetokenizer(_tokenizer, initialCapacity: Math.Max(64, maxTokens * 4));
 
             // Streaming holdback buffer: keeps the last max-stop-string chars un-emitted so a
             // stop-string match split across multiple tokens can be trimmed character-exactly
             // before any part of it leaks to the SSE consumer (#121 item #8). No-op when no
             // StopStringCondition is registered — preserves zero-latency EOS-only behaviour.
             var streamBuffer = new StreamingStopBuffer(stopConditions);
+
 
             // Local helper: snapshot log-softmax before sampling (which modifies logits in-place),
             // sample a token, then build logprob info.
@@ -1015,6 +1019,7 @@ public sealed class TextGenerator
                 decodeTicks * 1000.0 / Stopwatch.Frequency,
                 FinishReason.Length);
             ArrayPool<char>.Shared.Return(stopScratch);
+            detok.Dispose();
             if (ownsKvCache)
                 kvCache.Dispose();
         }
