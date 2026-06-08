@@ -446,9 +446,34 @@ internal sealed class TransformerWeights : IDisposable
         IReadOnlyDictionary<string, GgufTensorDescriptor> tensors, string name)
     {
         if (!tensors.TryGetValue(name, out var desc)) return null;
-        int size = (int)desc.Shape.ElementCount;
+        int size = ToInt32SizeChecked(desc.Shape.ElementCount, name);
         float[] result = new float[size];
         Dequantize.ToFloat32(dataBase + (nint)desc.DataOffset, size, desc.QuantizationType, result);
         return result;
+    }
+
+    /// <summary>
+    /// Narrows a tensor element count from <see cref="long"/> to <see cref="int"/>.
+    /// Throws <see cref="OverflowException"/> when the count exceeds <see cref="int.MaxValue"/>
+    /// instead of silently wrapping — which previously turned counts like 2^32 (4,294,967,296)
+    /// into a positive but completely wrong size such as 0, leading to corrupt data with no error.
+    /// </summary>
+    /// <param name="elementCount">Element count to narrow.</param>
+    /// <param name="tensorName">Tensor name for the error message.</param>
+    /// <returns>The element count narrowed to <see cref="int"/>.</returns>
+    /// <exception cref="OverflowException">Thrown when <paramref name="elementCount"/> exceeds <see cref="int.MaxValue"/>.</exception>
+    internal static int ToInt32SizeChecked(long elementCount, string tensorName)
+    {
+        try
+        {
+            return checked((int)elementCount);
+        }
+        catch (OverflowException ex)
+        {
+            throw new OverflowException(
+                $"Tensor '{tensorName}' element count {elementCount} exceeds Int32.MaxValue " +
+                $"({int.MaxValue}); cannot be represented as a managed array length.",
+                ex);
+        }
     }
 }
