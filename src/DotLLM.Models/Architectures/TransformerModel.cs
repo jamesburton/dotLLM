@@ -142,20 +142,27 @@ public sealed unsafe class TransformerModel : IModel
 
     /// <summary>
     /// Loads a transformer model from an opened HuggingFace-convention
-    /// safetensors file (single-threaded). The <paramref name="file"/> must
+    /// safetensors source (single-threaded). The <paramref name="file"/> must
     /// remain alive for the lifetime of the returned model — internally
     /// anchored to prevent GC, but the caller must still dispose it after
     /// disposing the model.
     /// </summary>
-    public static TransformerModel LoadFromSafetensors(SafetensorsFile file, ModelConfig config)
+    /// <param name="file">The safetensors source (single-file or multi-shard).</param>
+    /// <param name="config">The model configuration.</param>
+    /// <returns>The loaded transformer model.</returns>
+    public static TransformerModel LoadFromSafetensors(ISafetensorsTensorSource file, ModelConfig config)
         => LoadFromSafetensors(file, config, ThreadingConfig.SingleThreaded);
 
     /// <summary>
     /// Loads a transformer model from an opened HuggingFace-convention
-    /// safetensors file with threading configuration.
+    /// safetensors source with threading configuration.
     /// </summary>
+    /// <param name="file">The safetensors source (single-file or multi-shard).</param>
+    /// <param name="config">The model configuration.</param>
+    /// <param name="threading">Threading configuration for parallel execution.</param>
+    /// <returns>The loaded transformer model.</returns>
     public static TransformerModel LoadFromSafetensors(
-        SafetensorsFile file, ModelConfig config, ThreadingConfig threading)
+        ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);

@@ -8,7 +8,7 @@ namespace DotLLM.Models.Architectures;
 
 /// <summary>
 /// Loads <see cref="TransformerWeights"/> from a HuggingFace-convention
-/// <see cref="SafetensorsFile"/>. Mirrors <see cref="TransformerWeights.LoadFromGguf"/>
+/// safetensors source. Mirrors <see cref="TransformerWeights.LoadFromGguf"/>
 /// but reads the HF tensor naming scheme
 /// (<c>model.layers.{i}.self_attn.q_proj.weight</c>,
 /// <c>model.embed_tokens.weight</c>, <c>lm_head.weight</c>, …).
@@ -29,6 +29,15 @@ namespace DotLLM.Models.Architectures;
 /// resulting <c>TransformerWeights</c> treats that alias as a plain pointer
 /// with no extra ownership — the mmap anchor keeps it alive.
 /// </para>
+/// <para>
+/// The loader consumes an <see cref="ISafetensorsTensorSource"/> so that
+/// both the single-file (<see cref="SafetensorsFile"/>) and future
+/// multi-shard implementations can be plugged in without branching on the
+/// concrete type. Tensor-pointer access goes through
+/// <see cref="ISafetensorsTensorSource.GetTensorPointer(string)"/> — for
+/// <see cref="SafetensorsFile"/> that is byte-identical to the previous
+/// <c>DataBasePointer + DataBeginOffset</c> arithmetic.
+/// </para>
 /// </remarks>
 internal static class TransformerWeightsSafetensorsLoader
 {
@@ -37,7 +46,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// against the HF naming scheme for the architectures in
     /// <paramref name="config"/>. Throws on missing required tensors.
     /// </summary>
-    public static TransformerWeights Load(SafetensorsFile file, ModelConfig config)
+    public static TransformerWeights Load(ISafetensorsTensorSource file, ModelConfig config)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -105,7 +114,7 @@ internal static class TransformerWeightsSafetensorsLoader
     }
 
     private static TransformerLayerWeights LoadLayer(
-        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -221,7 +230,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// row-major throughout.
     /// </summary>
     private static TransformerLayerWeights LoadDeepSeekMlaLayer(
-        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
         var mlaCfg = config.MlaConfig
                      ?? throw new InvalidOperationException(
@@ -345,7 +354,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// follow-up).
     /// </summary>
     private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsF32(
-        SafetensorsFile file, string name, List<nint> owned)
+        ISafetensorsTensorSource file, string name, List<nint> owned)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc))
             throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
@@ -397,7 +406,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// <see cref="ResolveLinearAsF32"/> so the kernel is uniform in dtype.
     /// </summary>
     private static MoeLayerWeights LoadQwenMoeLayer(
-        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
         var moe = config.Moe
                   ?? throw new InvalidOperationException("LoadQwenMoeLayer called with null Moe config.");
@@ -534,7 +543,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// registered in <paramref name="owned"/>.
     /// </summary>
     private static MoeLayerWeights LoadMixtralMoeLayer(
-        int layerIdx, SafetensorsFile file, ModelConfig config, List<nint> owned)
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
     {
         var moe = config.Moe
                   ?? throw new InvalidOperationException("LoadMixtralMoeLayer called with null Moe config.");
@@ -581,7 +590,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// costs nothing and is simpler than tracking owned allocations.
     /// </summary>
     private static unsafe float[] ResolveDense2D(
-        SafetensorsFile file, string name, int expectedM, int expectedK)
+        ISafetensorsTensorSource file, string name, int expectedM, int expectedK)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc))
             throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
@@ -594,7 +603,7 @@ internal static class TransformerWeightsSafetensorsLoader
 
         int count = m * k;
         var result = new float[count];
-        nint src = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        nint src = file.GetTensorPointer(name);
         DecodeFloatTensor(src, desc.DType, count, result, name);
         return result;
     }
@@ -614,7 +623,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// <paramref name="owned"/>.
     /// </summary>
     private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinear(
-        SafetensorsFile file, string name, List<nint> owned)
+        ISafetensorsTensorSource file, string name, List<nint> owned)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc))
             throw new InvalidDataException(
@@ -627,7 +636,7 @@ internal static class TransformerWeightsSafetensorsLoader
         int m = desc.Shape[0];
         int k = desc.Shape[1];
 
-        nint srcPtr = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        nint srcPtr = file.GetTensorPointer(name);
 
         switch (desc.DType)
         {
@@ -659,7 +668,7 @@ internal static class TransformerWeightsSafetensorsLoader
     /// are small and read once per forward call, so the load-time copy has
     /// no measurable inference cost.
     /// </summary>
-    private static float[] ResolveNorm(SafetensorsFile file, string name, int expectedSize)
+    private static float[] ResolveNorm(ISafetensorsTensorSource file, string name, int expectedSize)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc))
             throw new InvalidDataException(
@@ -671,18 +680,18 @@ internal static class TransformerWeightsSafetensorsLoader
                 $"Tensor '{name}' has {elementCount} elements, expected {expectedSize}.");
 
         var result = new float[expectedSize];
-        nint src = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        nint src = file.GetTensorPointer(name);
         DecodeFloatTensor(src, desc.DType, expectedSize, result, name);
         return result;
     }
 
-    private static float[]? ResolveOptionalNorm(SafetensorsFile file, string name, int expectedSize)
+    private static float[]? ResolveOptionalNorm(ISafetensorsTensorSource file, string name, int expectedSize)
     {
         if (!file.TensorsByName.ContainsKey(name)) return null;
         return ResolveNorm(file, name, expectedSize);
     }
 
-    private static float[]? ResolveOptionalBias(SafetensorsFile file, string name, int expectedSize)
+    private static float[]? ResolveOptionalBias(ISafetensorsTensorSource file, string name, int expectedSize)
     {
         if (!file.TensorsByName.TryGetValue(name, out var desc)) return null;
 
@@ -692,7 +701,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 $"Bias tensor '{name}' has {elementCount} elements, expected {expectedSize}.");
 
         var result = new float[expectedSize];
-        nint src = file.DataBasePointer + (nint)desc.DataBeginOffset;
+        nint src = file.GetTensorPointer(name);
         DecodeFloatTensor(src, desc.DType, expectedSize, result, name);
         return result;
     }
