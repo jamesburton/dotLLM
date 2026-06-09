@@ -95,7 +95,7 @@ public sealed class SmolLM3SafetensorsLoadTests : IDisposable
             RoPEConfig = new RoPEConfig(
                 Theta: 10000.0f,
                 DimensionCount: HeadDim,
-                Type: RoPEType.NeoX,
+                Type: RoPEType.Norm,
                 ScalingType: scalingType,
                 ScalingFactor: scalingFactor,
                 OrigMaxSeqLen: origMaxSeqLen,
