@@ -40,7 +40,7 @@ public sealed class HookRegistryTests
     }
 
     [Fact]
-    public void Unregister_RemovesHook_AndFiresStop()
+    public void Unregister_ThenFire_IsNoOp()
     {
         var registry = new HookRegistry();
         var hook = new CountingHook(HookPoint.PostLayer);
@@ -180,6 +180,11 @@ public sealed class HookRegistryTests
             GuardedFire(hookSlot, buf, in ctx);
         long after = GC.GetAllocatedBytesForCurrentThread();
 
+        // Strict == 0 is intentional, not flaky: "zero-cost when disabled" is a hard project
+        // mandate, the warm-up loop above settles JIT/tiered compilation, the measured region has
+        // no boxing/closure/enumerator allocation, and GetAllocatedBytesForCurrentThread is
+        // per-thread so concurrent test allocations cannot leak in. A threshold would silently
+        // permit a regression that introduces hot-path allocation.
         Assert.Equal(0L, after - before);
     }
 

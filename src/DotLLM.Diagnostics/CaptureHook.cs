@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using DotLLM.Core.Diagnostics;
 
 namespace DotLLM.Diagnostics;
@@ -23,6 +24,11 @@ public sealed class CaptureHook : IInferenceHook
     private readonly HashSet<int>? _positionFilter;
     private readonly Dictionary<CaptureKey, float[]> _captures = new();
 
+    // Live read-only view over _captures, cached once. ReadOnlyDictionary wraps the same backing
+    // store, so it reflects later adds and Clear() without re-allocation while preventing callers
+    // from mutating the captures through the public surface.
+    private readonly ReadOnlyDictionary<CaptureKey, float[]> _capturesView;
+
     /// <summary>
     /// Creates a capture hook for the given <paramref name="point"/>.
     /// </summary>
@@ -43,6 +49,7 @@ public sealed class CaptureHook : IInferenceHook
         HookPoint = point;
         _layerFilter = layers is null ? null : new HashSet<int>(layers);
         _positionFilter = tokenPositions is null ? null : new HashSet<int>(tokenPositions);
+        _capturesView = new ReadOnlyDictionary<CaptureKey, float[]>(_captures);
     }
 
     /// <inheritdoc/>
@@ -50,8 +57,9 @@ public sealed class CaptureHook : IInferenceHook
 
     /// <summary>
     /// All captured activations keyed by (layer, position). Layer is -1 for non-layer points.
+    /// Returned as an immutable view; callers cannot mutate the underlying capture store.
     /// </summary>
-    public IReadOnlyDictionary<CaptureKey, float[]> Captures => _captures;
+    public IReadOnlyDictionary<CaptureKey, float[]> Captures => _capturesView;
 
     /// <summary>Clears all previously-captured activations.</summary>
     public void Clear() => _captures.Clear();

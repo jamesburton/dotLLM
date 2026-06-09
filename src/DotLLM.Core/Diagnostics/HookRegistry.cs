@@ -8,10 +8,19 @@ namespace DotLLM.Core.Diagnostics;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Registration and unregistration are thread-safe (locked). Hot-path methods
-/// (<see cref="HasHookAt(HookPoint)"/>, <see cref="Fire"/>) are lock-free and allocation-free; the
-/// per-point hook list is replaced atomically on mutation (copy-on-write) so iteration
-/// is safe without locking.
+/// Registration and unregistration are thread-safe with respect to each other (locked). Hot-path
+/// methods (<see cref="HasHookAt(HookPoint)"/>, <see cref="Fire"/>) are lock-free and
+/// allocation-free; the per-point hook list is replaced atomically on mutation (copy-on-write) so
+/// iteration is safe without locking.
+/// </para>
+/// <para>
+/// <b>Threading contract:</b> hook registration is a setup-time operation — register the hooks for
+/// an interpretability session, then run inference. Registration concurrent with <see cref="Fire"/>
+/// on the inference hot path is not a supported scenario, so the read path deliberately avoids
+/// <c>Volatile</c>/barrier costs that the "zero-cost when disabled" mandate forbids. When hooks are
+/// registered before inference starts (the intended pattern) a happens-before relationship is
+/// established and firing threads observe them. A stale read under unsupported concurrent
+/// registration is benign and cannot tear (see field notes).
 /// </para>
 /// <para>
 /// The intended hot-path usage is a null/flag guard that elides the call entirely when
@@ -24,7 +33,9 @@ namespace DotLLM.Core.Diagnostics;
 /// </remarks>
 public sealed class HookRegistry
 {
-    private const int HookPointCount = 8;
+    // Derived from the enum once so adding a HookPoint cannot silently desync the array sizing.
+    // HookPoint is contiguous from 0, so the count equals the largest valid (int) index + 1.
+    private static readonly int HookPointCount = Enum.GetValues<HookPoint>().Length;
 
     // One ordered list of hooks per HookPoint. Indexed by (int)HookPoint.
     // Lists are replaced (not mutated) on register/unregister so Fire/HasHookAt can read
@@ -32,8 +43,11 @@ public sealed class HookRegistry
     private readonly IInferenceHook[]?[] _hooksByPoint = new IInferenceHook[]?[HookPointCount];
 
     // Mirror flags for O(1) `HasHookAt` without dereferencing the list array.
-    // Volatile read in HasHookAt is implicit via field load on .NET; we publish via the
-    // assignment after the list update, paired by the lock in mutators.
+    // Registration is a setup-time operation expected to complete before the inference hot path
+    // runs (see class remarks) — it is not designed for registration concurrent with Fire. On
+    // supported usage a happens-before is established before inference begins, so firing threads
+    // observe registered hooks. A stale read under unsupported concurrent registration is benign:
+    // the hook simply isn't observed until the next read, and bool reads are atomic so cannot tear.
     private readonly bool[] _hasHookAt = new bool[HookPointCount];
 
     private readonly object _mutationLock = new();
