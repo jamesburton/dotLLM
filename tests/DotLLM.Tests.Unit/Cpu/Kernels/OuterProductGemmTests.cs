@@ -380,6 +380,141 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // ──────────────────── AVX-512 VNNI microkernel (net11.0) ────────────────────
+
+#if NET11_0_OR_GREATER
+    // Parity for the AVX-512 VNNI 4×6 tile (VPDPBUSD-512 via AvxVnni.V512) against the
+    // scalar oracle, over discriminating shapes:
+    //   - full dual-block coverage (even blockCount),
+    //   - odd blockCount (exercises the AVX2 odd-trailing-block tail path),
+    //   - K=1 block (the dual-block loop never runs; everything goes through the tail),
+    //   - deep K (128 blocks = 4096).
+    // Whole test gated to net11.0 (AvxVnni.V512 is a .NET 11 API); body additionally
+    // gated on AvxVnni.V512.IsSupported so it only executes on AVX512-VNNI hardware.
+    [Theory]
+    [InlineData(1)]    // K=32: no dual-block iteration, pure tail
+    [InlineData(2)]    // K=64: one dual-block iteration, no tail
+    [InlineData(3)]    // K=96: one dual-block iteration + odd tail block
+    [InlineData(8)]    // K=256
+    [InlineData(17)]   // odd: 8 dual-block iterations + tail
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(48)]   // K=1536
+    [InlineData(128)]  // K=4096
+    public void OuterProductAvx512Vnni_4x6_MatchesScalar(int blockCount)
+    {
+        if (!AvxVnni.V512.IsSupported)
+            return;
+
+        var rng = new Random(0xA512 ^ blockCount);
+        int m = 4;
+        int n = 6;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            // Scalar reference per (token, row): the same VecDotQ8_0ScalarR4 oracle the
+            // other outer-product parity tests use.
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < 4; r++)
+                    cScalar[t * m + r] = MatMul.VecDotQ8_0ScalarR4(weights, r, xPtrs[t], blockCount);
+
+            MatMul.OuterProductQ8_0Avx512Vnni_4x6(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
+                cVnni, blockCount, m);
+
+            float maxAbs = 0;
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                {
+                    Assert.Equal(cScalar[t * m + r], cVnni[t * m + r], 1e-2f);
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(cScalar[t * m + r]));
+                }
+
+            // Guard against a vacuous (all-near-zero) comparison.
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+
+    // Discriminating sanity check: the AVX-512 VNNI 4×6 parity comparison must FAIL when a
+    // single output cell is perturbed beyond tolerance — guards against a vacuous test.
+    [Fact]
+    public void OuterProductAvx512Vnni_4x6_ParityTestIsDiscriminating()
+    {
+        if (!AvxVnni.V512.IsSupported)
+            return;
+
+        var rng = new Random(0x512D);
+        int m = 4;
+        int n = 6;
+        int blockCount = 18;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < 4; r++)
+                    cScalar[t * m + r] = MatMul.VecDotQ8_0ScalarR4(weights, r, xPtrs[t], blockCount);
+
+            MatMul.OuterProductQ8_0Avx512Vnni_4x6(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
+                cVnni, blockCount, m);
+
+            float maxAbs = 0;
+            for (int i = 0; i < n * m; i++)
+            {
+                Assert.Equal(cScalar[i], cVnni[i], 1e-2f);
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(cScalar[i]));
+            }
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+
+            // Perturb one cell (token=4, row=2 — a high-token lane) and confirm the
+            // equality assertion now rejects it.
+            int idx = 4 * m + 2;
+            cVnni[idx] += 1.0f;
+            Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+                () => Assert.Equal(cScalar[idx], cVnni[idx], 1e-2f));
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+#endif
+
     // ──────────────────── Full GEMM tests ────────────────────
 
     [Theory]

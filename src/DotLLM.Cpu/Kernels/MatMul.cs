@@ -1766,6 +1766,221 @@ public static unsafe partial class MatMul
         acc = Avx512F.FusedMultiplyAdd(fsum, scale, acc);
     }
 
+#if NET11_0_OR_GREATER
+    /// <summary>
+    /// AVX-512 VNNI dual-block reduction + dual-scale FMA — the VPDPBUSD-512 counterpart of
+    /// <see cref="Avx512DualBlockFma"/>. Replaces the two 256-bit <c>maddubs</c>+<c>madd(ones)</c>
+    /// reductions (one per block half) with a single 512-bit <c>VPDPBUSD</c>
+    /// (<see cref="AvxVnni.V512.MultiplyWideningAndAdd(Vector512{int}, Vector512{byte}, Vector512{sbyte})"/>):
+    /// unsigned <c>|x|</c> × sign-adjusted <c>sign(x)·w</c> → int32 partials, fused. Drops the
+    /// <c>ones256</c> register and the per-half <c>prod</c> temporaries.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Lane mapping is preserved.</b> Both <c>maddubs</c>+<c>madd</c> and <c>VPDPBUSD</c> group
+    /// four adjacent int8 products into one int32 lane: int32 lane <c>j</c> = Σ products[4j..4j+3].
+    /// <c>Vector512.Create(absXLo, absXHi)</c> places block-0 activations in bytes 0–31 → VPDPBUSD
+    /// int32 lanes 0–7, and block-1 activations in bytes 32–63 → lanes 8–15 — exactly where
+    /// <see cref="Avx512DualBlockFma"/>'s <c>Vector512.Create(isum0, isum1)</c> places them. So the
+    /// existing dual-scale FMA (lanes 0–7 × <c>dx0·dw0</c>, lanes 8–15 × <c>dx1·dw1</c>) is preserved
+    /// byte-for-byte.
+    /// </para>
+    /// <para>
+    /// <b>Operand roles match the working 256-bit path</b> (see
+    /// <see cref="OuterProductQ8_0Vnni_4x3"/>): the unsigned <c>left</c> operand is <c>|x|</c>; the
+    /// signed <c>right</c> operand is <c>sign(x)·w</c> via <see cref="Avx2.Sign(Vector256{sbyte}, Vector256{sbyte})"/>.
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Avx512DualBlockVnniFma(
+        Vector256<sbyte> vwLo, Vector256<sbyte> vwHi,
+        Vector256<sbyte> vxLo, Vector256<sbyte> vxHi,
+        Vector256<sbyte> absXLo, Vector256<sbyte> absXHi,
+        float scale0, float scale1,
+        ref Vector512<float> acc)
+    {
+        // Unsigned activations (|x|), 64 bytes: block-0 → bytes 0-31, block-1 → bytes 32-63.
+        Vector512<byte> absX512 = Vector512.Create(absXLo, absXHi).AsByte();
+
+        // Sign-adjusted weights (sign(x)·w), 64 bytes, same block ordering.
+        Vector512<sbyte> adjW512 = Vector512.Create(Avx2.Sign(vwLo, vxLo), Avx2.Sign(vwHi, vxHi));
+
+        // Single VPDPBUSD-512: |x|(unsigned) × sign(x)·w(signed) → int32 partials.
+        // Lanes 0-7 = block 0, lanes 8-15 = block 1.
+        Vector512<int> isum512 = AvxVnni.V512.MultiplyWideningAndAdd(Vector512<int>.Zero, absX512, adjW512);
+
+        // Identical dual-scale fold as Avx512DualBlockFma: lanes 0-7 × (dx0·dw0), lanes 8-15 × (dx1·dw1).
+        Vector512<float> fsum = Avx512F.ConvertToVector512Single(isum512);
+        Vector512<float> scale = Vector512.Create(
+            Vector256.Create(scale0),
+            Vector256.Create(scale1));
+
+        acc = Avx512F.FusedMultiplyAdd(fsum, scale, acc);
+    }
+
+    /// <summary>
+    /// AVX-512 VNNI outer-product microkernel for Q8_0 R4 layout — the VPDPBUSD-512 counterpart of
+    /// <see cref="OuterProductQ8_0Avx512_4x6"/>. Identical in every respect (same 4 weight rows × 6
+    /// tokens, 24 ZMM accumulators, dual-block-per-iteration scheme, AVX2 odd-trailing-block tail)
+    /// EXCEPT the per-cell integer reduction uses a single 512-bit <c>VPDPBUSD</c> via
+    /// <see cref="Avx512DualBlockVnniFma"/> instead of the <c>maddubs</c>-on-256-bit-halves pair.
+    /// Requires AVX512-VNNI (gated on <see cref="AvxVnni.V512.IsSupported"/>; true on Zen5).
+    /// </summary>
+    /// <param name="groupBase">R4-interleaved weight group base (4 rows, blocks interleaved).</param>
+    /// <param name="x0">Token 0 Q8_0 blocks.</param>
+    /// <param name="x1">Token 1 Q8_0 blocks.</param>
+    /// <param name="x2">Token 2 Q8_0 blocks.</param>
+    /// <param name="x3">Token 3 Q8_0 blocks.</param>
+    /// <param name="x4">Token 4 Q8_0 blocks.</param>
+    /// <param name="x5">Token 5 Q8_0 blocks.</param>
+    /// <param name="c">Output base for this tile; cells written at <c>c[token * cStride + row]</c>.</param>
+    /// <param name="blockCount">Number of Q8_0 blocks per row (K / 32).</param>
+    /// <param name="cStride">Row stride of the output matrix (M).</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0Avx512Vnni_4x6(
+        byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+
+        // 24 accumulators: acc_r{row}t{token}.
+        Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
+        Vector512<float> a0t3 = Vector512<float>.Zero, a0t4 = Vector512<float>.Zero, a0t5 = Vector512<float>.Zero;
+        Vector512<float> a1t0 = Vector512<float>.Zero, a1t1 = Vector512<float>.Zero, a1t2 = Vector512<float>.Zero;
+        Vector512<float> a1t3 = Vector512<float>.Zero, a1t4 = Vector512<float>.Zero, a1t5 = Vector512<float>.Zero;
+        Vector512<float> a2t0 = Vector512<float>.Zero, a2t1 = Vector512<float>.Zero, a2t2 = Vector512<float>.Zero;
+        Vector512<float> a2t3 = Vector512<float>.Zero, a2t4 = Vector512<float>.Zero, a2t5 = Vector512<float>.Zero;
+        Vector512<float> a3t0 = Vector512<float>.Zero, a3t1 = Vector512<float>.Zero, a3t2 = Vector512<float>.Zero;
+        Vector512<float> a3t3 = Vector512<float>.Zero, a3t4 = Vector512<float>.Zero, a3t5 = Vector512<float>.Zero;
+
+        int block = 0;
+
+        // Process 2 blocks per iteration (512-bit).
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* blockBase0 = groupBase + block * wStride;
+            byte* blockBase1 = groupBase + (block + 1) * wStride;
+
+            // Load 6 token pairs.
+            LoadDualBlockToken(x0, block, out float dx0_0, out float dx0_1, out var vx0Lo, out var vx0Hi, out var absX0Lo, out var absX0Hi);
+            LoadDualBlockToken(x1, block, out float dx1_0, out float dx1_1, out var vx1Lo, out var vx1Hi, out var absX1Lo, out var absX1Hi);
+            LoadDualBlockToken(x2, block, out float dx2_0, out float dx2_1, out var vx2Lo, out var vx2Hi, out var absX2Lo, out var absX2Hi);
+            LoadDualBlockToken(x3, block, out float dx3_0, out float dx3_1, out var vx3Lo, out var vx3Hi, out var absX3Lo, out var absX3Hi);
+            LoadDualBlockToken(x4, block, out float dx4_0, out float dx4_1, out var vx4Lo, out var vx4Hi, out var absX4Lo, out var absX4Hi);
+            LoadDualBlockToken(x5, block, out float dx5_0, out float dx5_1, out var vx5Lo, out var vx5Hi, out var absX5Lo, out var absX5Hi);
+
+            // Row 0.
+            {
+                byte* wb0 = blockBase0;
+                byte* wb1 = blockBase1;
+                float dw0 = HalfBitsToFloat(wb0);
+                float dw1 = HalfBitsToFloat(wb1);
+                Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
+                Vector256<sbyte> vwHi = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb1 + 2);
+
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx0Lo, vx0Hi, absX0Lo, absX0Hi, dx0_0 * dw0, dx0_1 * dw1, ref a0t0);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx1Lo, vx1Hi, absX1Lo, absX1Hi, dx1_0 * dw0, dx1_1 * dw1, ref a0t1);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx2Lo, vx2Hi, absX2Lo, absX2Hi, dx2_0 * dw0, dx2_1 * dw1, ref a0t2);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx3Lo, vx3Hi, absX3Lo, absX3Hi, dx3_0 * dw0, dx3_1 * dw1, ref a0t3);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx4Lo, vx4Hi, absX4Lo, absX4Hi, dx4_0 * dw0, dx4_1 * dw1, ref a0t4);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx5Lo, vx5Hi, absX5Lo, absX5Hi, dx5_0 * dw0, dx5_1 * dw1, ref a0t5);
+            }
+
+            // Row 1.
+            {
+                byte* wb0 = blockBase0 + Q8_0BlockBytes;
+                byte* wb1 = blockBase1 + Q8_0BlockBytes;
+                float dw0 = HalfBitsToFloat(wb0);
+                float dw1 = HalfBitsToFloat(wb1);
+                Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
+                Vector256<sbyte> vwHi = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb1 + 2);
+
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx0Lo, vx0Hi, absX0Lo, absX0Hi, dx0_0 * dw0, dx0_1 * dw1, ref a1t0);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx1Lo, vx1Hi, absX1Lo, absX1Hi, dx1_0 * dw0, dx1_1 * dw1, ref a1t1);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx2Lo, vx2Hi, absX2Lo, absX2Hi, dx2_0 * dw0, dx2_1 * dw1, ref a1t2);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx3Lo, vx3Hi, absX3Lo, absX3Hi, dx3_0 * dw0, dx3_1 * dw1, ref a1t3);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx4Lo, vx4Hi, absX4Lo, absX4Hi, dx4_0 * dw0, dx4_1 * dw1, ref a1t4);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx5Lo, vx5Hi, absX5Lo, absX5Hi, dx5_0 * dw0, dx5_1 * dw1, ref a1t5);
+            }
+
+            // Row 2.
+            {
+                byte* wb0 = blockBase0 + 2 * Q8_0BlockBytes;
+                byte* wb1 = blockBase1 + 2 * Q8_0BlockBytes;
+                float dw0 = HalfBitsToFloat(wb0);
+                float dw1 = HalfBitsToFloat(wb1);
+                Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
+                Vector256<sbyte> vwHi = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb1 + 2);
+
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx0Lo, vx0Hi, absX0Lo, absX0Hi, dx0_0 * dw0, dx0_1 * dw1, ref a2t0);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx1Lo, vx1Hi, absX1Lo, absX1Hi, dx1_0 * dw0, dx1_1 * dw1, ref a2t1);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx2Lo, vx2Hi, absX2Lo, absX2Hi, dx2_0 * dw0, dx2_1 * dw1, ref a2t2);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx3Lo, vx3Hi, absX3Lo, absX3Hi, dx3_0 * dw0, dx3_1 * dw1, ref a2t3);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx4Lo, vx4Hi, absX4Lo, absX4Hi, dx4_0 * dw0, dx4_1 * dw1, ref a2t4);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx5Lo, vx5Hi, absX5Lo, absX5Hi, dx5_0 * dw0, dx5_1 * dw1, ref a2t5);
+            }
+
+            // Row 3.
+            {
+                byte* wb0 = blockBase0 + 3 * Q8_0BlockBytes;
+                byte* wb1 = blockBase1 + 3 * Q8_0BlockBytes;
+                float dw0 = HalfBitsToFloat(wb0);
+                float dw1 = HalfBitsToFloat(wb1);
+                Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
+                Vector256<sbyte> vwHi = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb1 + 2);
+
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx0Lo, vx0Hi, absX0Lo, absX0Hi, dx0_0 * dw0, dx0_1 * dw1, ref a3t0);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx1Lo, vx1Hi, absX1Lo, absX1Hi, dx1_0 * dw0, dx1_1 * dw1, ref a3t1);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx2Lo, vx2Hi, absX2Lo, absX2Hi, dx2_0 * dw0, dx2_1 * dw1, ref a3t2);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx3Lo, vx3Hi, absX3Lo, absX3Hi, dx3_0 * dw0, dx3_1 * dw1, ref a3t3);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx4Lo, vx4Hi, absX4Lo, absX4Hi, dx4_0 * dw0, dx4_1 * dw1, ref a3t4);
+                Avx512DualBlockVnniFma(vwLo, vwHi, vx5Lo, vx5Hi, absX5Lo, absX5Hi, dx5_0 * dw0, dx5_1 * dw1, ref a3t5);
+            }
+        }
+
+        // Store results: c[token * cStride + row].
+        c[0 * cStride + 0] = HorizontalSumAvx512Float(a0t0);
+        c[0 * cStride + 1] = HorizontalSumAvx512Float(a1t0);
+        c[0 * cStride + 2] = HorizontalSumAvx512Float(a2t0);
+        c[0 * cStride + 3] = HorizontalSumAvx512Float(a3t0);
+        c[1 * cStride + 0] = HorizontalSumAvx512Float(a0t1);
+        c[1 * cStride + 1] = HorizontalSumAvx512Float(a1t1);
+        c[1 * cStride + 2] = HorizontalSumAvx512Float(a2t1);
+        c[1 * cStride + 3] = HorizontalSumAvx512Float(a3t1);
+        c[2 * cStride + 0] = HorizontalSumAvx512Float(a0t2);
+        c[2 * cStride + 1] = HorizontalSumAvx512Float(a1t2);
+        c[2 * cStride + 2] = HorizontalSumAvx512Float(a2t2);
+        c[2 * cStride + 3] = HorizontalSumAvx512Float(a3t2);
+        c[3 * cStride + 0] = HorizontalSumAvx512Float(a0t3);
+        c[3 * cStride + 1] = HorizontalSumAvx512Float(a1t3);
+        c[3 * cStride + 2] = HorizontalSumAvx512Float(a2t3);
+        c[3 * cStride + 3] = HorizontalSumAvx512Float(a3t3);
+        c[4 * cStride + 0] = HorizontalSumAvx512Float(a0t4);
+        c[4 * cStride + 1] = HorizontalSumAvx512Float(a1t4);
+        c[4 * cStride + 2] = HorizontalSumAvx512Float(a2t4);
+        c[4 * cStride + 3] = HorizontalSumAvx512Float(a3t4);
+        c[5 * cStride + 0] = HorizontalSumAvx512Float(a0t5);
+        c[5 * cStride + 1] = HorizontalSumAvx512Float(a1t5);
+        c[5 * cStride + 2] = HorizontalSumAvx512Float(a2t5);
+        c[5 * cStride + 3] = HorizontalSumAvx512Float(a3t5);
+
+        // Handle odd trailing block via AVX2 (shared with the maddubs kernel — no VNNI dependency).
+        if (block < blockCount)
+        {
+            byte* blockBase = groupBase + block * wStride;
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            ProcessAvx512TailBlock(blockBase, x0, block, ones, c, cStride, 0);
+            ProcessAvx512TailBlock(blockBase, x1, block, ones, c, cStride, 1);
+            ProcessAvx512TailBlock(blockBase, x2, block, ones, c, cStride, 2);
+            ProcessAvx512TailBlock(blockBase, x3, block, ones, c, cStride, 3);
+            ProcessAvx512TailBlock(blockBase, x4, block, ones, c, cStride, 4);
+            ProcessAvx512TailBlock(blockBase, x5, block, ones, c, cStride, 5);
+        }
+    }
+#endif
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ProcessAvx512TailBlock(byte* blockBase, byte* x, int block,
         Vector256<short> ones, float* c, int cStride, int tokenIdx)
