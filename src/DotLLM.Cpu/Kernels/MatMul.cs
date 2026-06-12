@@ -2045,7 +2045,7 @@ public static unsafe partial class MatMul
     /// <summary>
     /// AVX-512 VNNI <b>zero-point</b> dual-block reduction + dual-scale FMA. Unlike
     /// <see cref="Avx512DualBlockVnniFma"/> (which rebuilds a sign-adjusted weight vector per cell via
-    /// <see cref="Avx2.Sign"/>), this consumes a pre-built unsigned activation vector <c>u512 = x + 128</c>
+    /// <see cref="Avx2.Sign(Vector256{sbyte}, Vector256{sbyte})"/>), this consumes a pre-built unsigned activation vector <c>u512 = x + 128</c>
     /// (hoisted per token) and a pre-built signed weight vector <c>w512</c> (hoisted per row), so the only
     /// per-cell work is one <c>VPDPBUSD</c>, one int→float convert, one FMA, and a scalar compensation
     /// update. No sign/abs anywhere.
