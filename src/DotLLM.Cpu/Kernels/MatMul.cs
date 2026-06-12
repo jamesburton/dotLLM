@@ -4,6 +4,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+#if NET11_0_OR_GREATER
+using System.Numerics; // System.Numerics.BFloat16 for the Avx512Bf16 path
+#endif
 using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
