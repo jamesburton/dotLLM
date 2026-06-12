@@ -124,6 +124,25 @@ public unsafe class OuterProductAvx512VnniBenchmarks : IDisposable
             x + 3 * _rowBytes, x + 4 * _rowBytes, x + 5 * _rowBytes,
             _output, BlockCount, M);
     }
+
+    /// <summary>
+    /// AVX-512 BF16 dequant-and-accumulate: same 4×6 tile, but each Q8_0 block is dequantized to bf16
+    /// with its scale folded in, then accumulated via <c>VDPBF16PS</c> (<c>Avx512Bf16</c>) into a single
+    /// fp32 accumulator per cell — no per-block integer reduction, dual-scale fold, or compensation.
+    /// Weights are dequant'd per row (reused across tokens) and activations per token (reused across
+    /// rows). This is an <i>approximation</i> (bf16 rounding) — see the parity test for the measured error.
+    /// </summary>
+    [Benchmark]
+    public void Avx512_4x6_Bf16()
+    {
+        byte* groupBase = (byte*)_repackedWeights;
+        byte* x = (byte*)_inputQ8;
+        MatMul.OuterProductQ8_0Avx512Bf16_4x6(
+            groupBase,
+            x, x + _rowBytes, x + 2 * _rowBytes,
+            x + 3 * _rowBytes, x + 4 * _rowBytes, x + 5 * _rowBytes,
+            _output, BlockCount, M);
+    }
 #endif
 
     public void Dispose()

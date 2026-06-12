@@ -520,6 +520,100 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // Parity for the AVX-512 BF16 dequant-and-accumulate 4×6 tile (VDPBF16PS via Avx512Bf16) against
+    // the same scalar oracle. UNLIKE the int kernels, this is an APPROXIMATION: each Q8_0 value is
+    // dequantized to bf16 (8-bit mantissa) before the dot, so a bf16-appropriate relative tolerance is
+    // used (NOT the int kernels' absolute 1e-2). The dual-block loop dequants to bf16; the odd trailing
+    // block uses the EXACT AVX2 tail (no rounding), so blockCount=1 has ~0 bf16 error and is vacuous as
+    // an approximation measurement — the genuine bf16 error signal comes from the even / deep-K cases
+    // (2/8/18/48/128), with K=128 the worst case for accumulated rounding.
+    //
+    // Tolerance reasoning: bf16 has an 8-bit mantissa → ~2^-8 ≈ 3.9e-3 relative per dequantized value.
+    // Each product carries two such roundings and a K-block accumulation chain partially compounds them;
+    // measured worst-case relative error over these shapes stays well under 3e-2, so the assertion is
+    //   |bf16 − scalar| <= 3e-2 * (|scalar| + 1e-3)
+    // (relative with a small absolute floor for near-zero cells). The test also tracks and exposes the
+    // max relative error in the assert message so accuracy can be reported alongside speed.
+    [Theory]
+    [InlineData(1)]    // K=32: pure exact tail (no bf16 rounding) — error ~0, not an approximation probe
+    [InlineData(2)]    // K=64: one dual-block iteration, no tail — first real bf16 signal
+    [InlineData(3)]    // K=96: one dual-block iteration + odd exact tail block
+    [InlineData(8)]    // K=256
+    [InlineData(17)]   // odd: 8 dual-block iterations + exact tail
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(48)]   // K=1536
+    [InlineData(128)]  // K=4096 — worst case for accumulated bf16 rounding
+    public void OuterProductAvx512Bf16_4x6_MatchesScalar(int blockCount)
+    {
+        if (!Avx512Bf16.IsSupported)
+            return;
+
+        var rng = new Random(0xB16 ^ blockCount);
+        int m = 4;
+        int n = 6;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cBf16 = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < 4; r++)
+                    cScalar[t * m + r] = MatMul.VecDotQ8_0ScalarR4(weights, r, xPtrs[t], blockCount);
+
+            MatMul.OuterProductQ8_0Avx512Bf16_4x6(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
+                cBf16, blockCount, m);
+
+            float maxAbs = 0;
+            float maxRelErr = 0;
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                {
+                    float scalar = cScalar[t * m + r];
+                    float actual = cBf16[t * m + r];
+                    float diff = MathF.Abs(actual - scalar);
+                    float denom = MathF.Abs(scalar) + 1e-3f;
+                    maxRelErr = MathF.Max(maxRelErr, diff / denom);
+                    Assert.True(
+                        diff <= 3e-2f * denom,
+                        $"bf16 outer-product exceeded tolerance at token={t}, row={r}: " +
+                        $"scalar={scalar}, bf16={actual}, |diff|={diff}, relErr={diff / denom}, blockCount={blockCount}");
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(scalar));
+                }
+
+            // Guard against a vacuous (all-near-zero) comparison.
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+
+            // Surface and discriminate on the measured accuracy. For shapes that actually exercise the
+            // bf16 dual-block path (blockCount >= 2) the rounding MUST be observable (relErr > 0) — a
+            // zero would mean the bf16 dequant was silently bypassed and the parity check is comparing
+            // an exact path (vacuous). blockCount==1 is pure exact-tail, so it is exempt. The failure
+            // message always carries the measured max relative error so accuracy is reported on failure.
+            Assert.True(
+                blockCount == 1 || maxRelErr > 0f,
+                $"bf16 dual-block path exercised but max relative error is 0 — dequant may be bypassed " +
+                $"(blockCount={blockCount}, maxRelErr={maxRelErr})");
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cBf16);
+        }
+    }
+
     // Discriminating sanity check: the AVX-512 VNNI 4×6 parity comparison must FAIL when a
     // single output cell is perturbed beyond tolerance — guards against a vacuous test.
     [Fact]
