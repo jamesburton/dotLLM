@@ -4,9 +4,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-#if NET11_0_OR_GREATER
-using System.Numerics; // System.Numerics.BFloat16 for the Avx512Bf16 path
-#endif
 using DotLLM.Cpu.Threading;
 
 namespace DotLLM.Cpu.Kernels;
@@ -2263,11 +2260,17 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Dequantizes one Q8_0 block (32 int8 values + an fp16 scale already widened to <paramref name="d"/>)
-    /// to a single 64-byte <c>Vector512&lt;BFloat16&gt;</c> with the scale folded into each value —
+    /// to a single 64-byte <c>Vector512&lt;ushort&gt;</c> with the scale folded into each value —
     /// the foundation of the BF16 dequant-and-accumulate Q8_0 kernel
     /// (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>).
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// The bf16 values are carried in <c>ushort</c> lanes (raw bf16 bit-patterns), not
+    /// <c>BFloat16</c>: the <c>Avx512Bf16</c> intrinsics ship their initial signatures over
+    /// <c>Vector512&lt;ushort&gt;</c>, with <c>BFloat16</c> overloads to follow later. <c>VCVTNE2PS2BF16</c>
+    /// / <c>VDPBF16PS</c> are bit-pattern operations, so <c>ushort</c> is exact here.
+    /// </para>
     /// <para>
     /// Folding the per-block scale <c>d</c> into the bf16 value is the whole point: downstream
     /// accumulation is a plain <c>VDPBF16PS</c> chain into one fp32 accumulator with <b>no</b>
@@ -2291,7 +2294,7 @@ public static unsafe partial class MatMul
     /// <param name="d">The block's fp16 scale, already widened to float.</param>
     /// <returns>32 bf16 values <c>= (float)q[i] · d</c>, rounded to bf16.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector512<BFloat16> DequantBlockToBf16(byte* qBlock, float d)
+    private static Vector512<ushort> DequantBlockToBf16(byte* qBlock, float d)
     {
         // Load 32 signed int8 (one Q8_0 block).
         Vector256<sbyte> q = Unsafe.ReadUnaligned<Vector256<sbyte>>(qBlock);
@@ -2310,7 +2313,7 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Per-token hoist for the BF16 kernel (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>): dequantizes
-    /// a dual-block (2 Q8_0 blocks) activation token to two scale-folded <c>Vector512&lt;BFloat16&gt;</c>
+    /// a dual-block (2 Q8_0 blocks) activation token to two scale-folded <c>Vector512&lt;ushort&gt;</c>
     /// (one per block of the pair), reused across all 4 weight rows. Counterpart of
     /// <see cref="LoadDualBlockToken"/>, but the output operands are dequant'd bf16 — no int8 / sign / abs.
     /// </summary>
@@ -2320,7 +2323,7 @@ public static unsafe partial class MatMul
     /// <param name="xb1">Block 1's scale-folded bf16 activations.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void LoadDualBlockTokenBf16(byte* x, int block,
-        out Vector512<BFloat16> xb0, out Vector512<BFloat16> xb1)
+        out Vector512<ushort> xb0, out Vector512<ushort> xb1)
     {
         byte* b0 = x + block * Q8_0BlockBytes;
         byte* b1 = x + (block + 1) * Q8_0BlockBytes;
@@ -2330,7 +2333,7 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// Per-row hoist for the BF16 kernel (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>): dequantizes a
-    /// dual-block weight row to two scale-folded <c>Vector512&lt;BFloat16&gt;</c>, reused across all 6
+    /// dual-block weight row to two scale-folded <c>Vector512&lt;ushort&gt;</c>, reused across all 6
     /// tokens. Same packing as <see cref="LoadDualBlockTokenBf16"/> (shared <see cref="DequantBlockToBf16"/>),
     /// which is what guarantees lane-aligned products.
     /// </summary>
@@ -2340,7 +2343,7 @@ public static unsafe partial class MatMul
     /// <param name="wbf1">Block 1's scale-folded bf16 weights.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void LoadDualBlockRowBf16(byte* wb0, byte* wb1,
-        out Vector512<BFloat16> wbf0, out Vector512<BFloat16> wbf1)
+        out Vector512<ushort> wbf0, out Vector512<ushort> wbf1)
     {
         wbf0 = DequantBlockToBf16(wb0 + 2, HalfBitsToFloat(wb0));
         wbf1 = DequantBlockToBf16(wb1 + 2, HalfBitsToFloat(wb1));
@@ -2348,7 +2351,7 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// BF16 dual-block multiply-accumulate: two <c>VDPBF16PS</c>
-    /// (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{BFloat16}, Vector512{BFloat16})"/>)
+    /// (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{ushort}, Vector512{ushort})"/>)
     /// into one fp32 accumulator — the bf16 counterpart of <see cref="Avx512DualBlockFma"/>. Because the
     /// per-block scale is already folded into the bf16 values, there is <b>no</b> dual-scale fold and the
     /// accumulator is a single uniform fp32 vector reduced in full at the end. The long fp32 accumulation
@@ -2361,8 +2364,8 @@ public static unsafe partial class MatMul
     /// <param name="acc">fp32 accumulator for this cell.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Avx512DualBlockBf16Mac(
-        Vector512<BFloat16> wbf0, Vector512<BFloat16> wbf1,
-        Vector512<BFloat16> xbf0, Vector512<BFloat16> xbf1,
+        Vector512<ushort> wbf0, Vector512<ushort> wbf1,
+        Vector512<ushort> xbf0, Vector512<ushort> xbf1,
         ref Vector512<float> acc)
     {
         // VDPBF16PS: acc[i] += x[2i]·w[2i] + x[2i+1]·w[2i+1]. One call per block of the pair.
@@ -2378,7 +2381,7 @@ public static unsafe partial class MatMul
     /// 6 tokens, 24 ZMM accumulators, dual-block-per-iteration scheme, and shared AVX2
     /// odd-trailing-block tail. The difference is the arithmetic: each Q8_0 block is dequantized to
     /// bf16 with its scale folded in (<see cref="DequantBlockToBf16"/>), then accumulated via
-    /// <c>VDPBF16PS</c> (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{BFloat16}, Vector512{BFloat16})"/>)
+    /// <c>VDPBF16PS</c> (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{ushort}, Vector512{ushort})"/>)
     /// into a single fp32 accumulator per cell — <b>no per-block integer reduction, dual-scale fold, or
     /// compensation term</b>. Weights are dequant'd once per row (4×, reused across all 6 tokens) and
     /// activations once per token (6×, reused across all 4 rows); the dequant is never repeated per cell.
