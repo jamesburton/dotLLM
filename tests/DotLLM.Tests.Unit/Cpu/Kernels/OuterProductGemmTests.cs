@@ -454,6 +454,72 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // Parity for the AVX-512 VNNI ZERO-POINT 4×6 tile (VPDPBUSD-512 with u = x + 128 and a
+    // deferred −128·Σw compensation) against the same scalar oracle, over the same discriminating
+    // shapes as the sign-trick variant above. The zero-point method is more cancellation-prone
+    // (acc and comp are both larger than the true result and partially cancel), so the 1e-2
+    // tolerance leaves headroom; deep K=128 is the worst case for that cancellation.
+    [Theory]
+    [InlineData(1)]    // K=32: no dual-block iteration, pure tail
+    [InlineData(2)]    // K=64: one dual-block iteration, no tail
+    [InlineData(3)]    // K=96: one dual-block iteration + odd tail block
+    [InlineData(8)]    // K=256
+    [InlineData(17)]   // odd: 8 dual-block iterations + tail
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(48)]   // K=1536
+    [InlineData(128)]  // K=4096
+    public void OuterProductAvx512VnniZp_4x6_MatchesScalar(int blockCount)
+    {
+        if (!AvxVnni.V512.IsSupported)
+            return;
+
+        var rng = new Random(0x512F ^ blockCount);
+        int m = 4;
+        int n = 6;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < 4; r++)
+                    cScalar[t * m + r] = MatMul.VecDotQ8_0ScalarR4(weights, r, xPtrs[t], blockCount);
+
+            MatMul.OuterProductQ8_0Avx512VnniZp_4x6(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
+                cVnni, blockCount, m);
+
+            float maxAbs = 0;
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                {
+                    Assert.Equal(cScalar[t * m + r], cVnni[t * m + r], 1e-2f);
+                    maxAbs = MathF.Max(maxAbs, MathF.Abs(cScalar[t * m + r]));
+                }
+
+            // Guard against a vacuous (all-near-zero) comparison.
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+
     // Discriminating sanity check: the AVX-512 VNNI 4×6 parity comparison must FAIL when a
     // single output cell is perturbed beyond tolerance — guards against a vacuous test.
     [Fact]

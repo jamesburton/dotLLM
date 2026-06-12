@@ -1766,6 +1766,68 @@ public static unsafe partial class MatMul
         acc = Avx512F.FusedMultiplyAdd(fsum, scale, acc);
     }
 
+    /// <summary>
+    /// Loads a dual-block (2 Q8_0 blocks) activation token for the zero-point AVX-512 VNNI kernel
+    /// (<c>OuterProductQ8_0Avx512VnniZp_4x6</c>): the two fp16 scales plus a single 64-byte
+    /// <b>unsigned</b> vector <c>u512 = x XOR 0x80 = x + 128</c> (block 0 → bytes 0–31, block 1 →
+    /// bytes 32–63). Unlike <see cref="LoadDualBlockToken"/> this does <b>no</b> <c>Avx2.Sign</c>
+    /// work — the whole point of the zero-point method is to remove the per-cell sign/abs overhead —
+    /// and produces the unsigned operand <c>VPDPBUSD</c> needs directly. Plain SIMD (no AVX512-VNNI
+    /// dependency), so it builds on all target frameworks; only its caller is net11-gated.
+    /// </summary>
+    /// <param name="x">Token Q8_0 block stream.</param>
+    /// <param name="block">Index of the first block of the pair.</param>
+    /// <param name="dx0">fp16 scale of block 0.</param>
+    /// <param name="dx1">fp16 scale of block 1.</param>
+    /// <param name="u512">Unsigned activations <c>(x + 128)</c> for both blocks, bytes 0–31 / 32–63.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockTokenZp(byte* x, int block,
+        out float dx0, out float dx1, out Vector512<byte> u512)
+    {
+        byte* xb0 = x + block * Q8_0BlockBytes;
+        byte* xb1 = x + (block + 1) * Q8_0BlockBytes;
+        dx0 = HalfBitsToFloat(xb0);
+        dx1 = HalfBitsToFloat(xb1);
+
+        // u = x + 128 in [0,255]. In two's-complement bytes this is exactly x XOR 0x80 (flip sign bit).
+        Vector256<byte> signBit = Vector256.Create((byte)0x80);
+        Vector256<byte> uLo = Unsafe.ReadUnaligned<Vector256<byte>>(xb0 + 2) ^ signBit;
+        Vector256<byte> uHi = Unsafe.ReadUnaligned<Vector256<byte>>(xb1 + 2) ^ signBit;
+        u512 = Vector512.Create(uLo, uHi);
+    }
+
+    /// <summary>
+    /// Per-row hoisted weight setup for the zero-point AVX-512 VNNI kernel
+    /// (<c>OuterProductQ8_0Avx512VnniZp_4x6</c>): loads the two fp16 weight scales, the raw
+    /// <b>signed</b> int8 weights for both blocks as a single 64-byte vector (<c>w512</c>, block 0 →
+    /// bytes 0–31, block 1 → bytes 32–63), and the per-block signed weight sums <c>sw0</c>/<c>sw1</c>
+    /// used by the <c>−128·Σw</c> compensation term. Plain SIMD (no AVX512-VNNI dependency).
+    /// </summary>
+    /// <param name="wb0">Pointer to block 0's Q8_0 record for this row.</param>
+    /// <param name="wb1">Pointer to block 1's Q8_0 record for this row.</param>
+    /// <param name="dw0">fp16 scale of block 0.</param>
+    /// <param name="dw1">fp16 scale of block 1.</param>
+    /// <param name="w512">Signed weights for both blocks, bytes 0–31 / 32–63.</param>
+    /// <param name="sw0">Signed sum of block 0's 32 int8 weights.</param>
+    /// <param name="sw1">Signed sum of block 1's 32 int8 weights.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockRowZp(byte* wb0, byte* wb1,
+        out float dw0, out float dw1, out Vector512<sbyte> w512, out int sw0, out int sw1)
+    {
+        dw0 = HalfBitsToFloat(wb0);
+        dw1 = HalfBitsToFloat(wb1);
+        Vector256<sbyte> vwLo = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb0 + 2);
+        Vector256<sbyte> vwHi = Unsafe.ReadUnaligned<Vector256<sbyte>>(wb1 + 2);
+        w512 = Vector512.Create(vwLo, vwHi);
+
+        // Signed weight sums (Σw per block). Sign-extend int8 → int16 and sum; max |sum| = 32·127 = 4064,
+        // well within int16/int32 range. This is the per-row part of the −128·Σw compensation.
+        (Vector256<short> lo0, Vector256<short> hi0) = Vector256.Widen(vwLo);
+        (Vector256<short> lo1, Vector256<short> hi1) = Vector256.Widen(vwHi);
+        sw0 = Vector256.Sum(lo0) + Vector256.Sum(hi0);
+        sw1 = Vector256.Sum(lo1) + Vector256.Sum(hi1);
+    }
+
 #if NET11_0_OR_GREATER
     /// <summary>
     /// AVX-512 VNNI dual-block reduction + dual-scale FMA — the VPDPBUSD-512 counterpart of
@@ -1966,6 +2028,222 @@ public static unsafe partial class MatMul
         c[5 * cStride + 3] = HorizontalSumAvx512Float(a3t5);
 
         // Handle odd trailing block via AVX2 (shared with the maddubs kernel — no VNNI dependency).
+        if (block < blockCount)
+        {
+            byte* blockBase = groupBase + block * wStride;
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            ProcessAvx512TailBlock(blockBase, x0, block, ones, c, cStride, 0);
+            ProcessAvx512TailBlock(blockBase, x1, block, ones, c, cStride, 1);
+            ProcessAvx512TailBlock(blockBase, x2, block, ones, c, cStride, 2);
+            ProcessAvx512TailBlock(blockBase, x3, block, ones, c, cStride, 3);
+            ProcessAvx512TailBlock(blockBase, x4, block, ones, c, cStride, 4);
+            ProcessAvx512TailBlock(blockBase, x5, block, ones, c, cStride, 5);
+        }
+    }
+
+    /// <summary>
+    /// AVX-512 VNNI <b>zero-point</b> dual-block reduction + dual-scale FMA. Unlike
+    /// <see cref="Avx512DualBlockVnniFma"/> (which rebuilds a sign-adjusted weight vector per cell via
+    /// <see cref="Avx2.Sign"/>), this consumes a pre-built unsigned activation vector <c>u512 = x + 128</c>
+    /// (hoisted per token) and a pre-built signed weight vector <c>w512</c> (hoisted per row), so the only
+    /// per-cell work is one <c>VPDPBUSD</c>, one int→float convert, one FMA, and a scalar compensation
+    /// update. No sign/abs anywhere.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>VPDPBUSD(0, u512, w512)</c> computes int32 partials <c>Σ u·w = Σ(x+128)·w = Σx·w + 128·Σw</c>
+    /// per block (lanes 0–7 = block 0, lanes 8–15 = block 1 — the same lane layout the dual-scale FMA
+    /// expects). The <c>+128·Σw</c> bias is removed afterwards via the scalar <paramref name="comp"/>
+    /// accumulator: <c>comp += scale0·128·sw0 + scale1·128·sw1</c>, with the cell's final value being
+    /// <c>HorizontalSum(acc) − comp</c>. Algebraically the FMA-accumulated value is
+    /// <c>Σ_blocks scaleB·(Σx·w + 128·swB)</c> and subtracting <c>comp = Σ_blocks scaleB·128·swB</c>
+    /// leaves <c>Σ_blocks scaleB·Σx·w</c> — the true scaled dot.
+    /// </para>
+    /// </remarks>
+    /// <param name="u512">Unsigned activations <c>(x + 128)</c> for both blocks (per-token, hoisted).</param>
+    /// <param name="w512">Signed weights for both blocks (per-row, hoisted).</param>
+    /// <param name="scale0">Block-0 fp16 scale product <c>dx0·dw0</c>.</param>
+    /// <param name="scale1">Block-1 fp16 scale product <c>dx1·dw1</c>.</param>
+    /// <param name="comp128_0">Pre-multiplied block-0 compensation factor <c>128·sw0</c>.</param>
+    /// <param name="comp128_1">Pre-multiplied block-1 compensation factor <c>128·sw1</c>.</param>
+    /// <param name="acc">Float accumulator (lanes 0–7 scaled by <paramref name="scale0"/>, 8–15 by <paramref name="scale1"/>).</param>
+    /// <param name="comp">Scalar compensation accumulator for this cell.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Avx512DualBlockVnniZpFma(
+        Vector512<byte> u512, Vector512<sbyte> w512,
+        float scale0, float scale1,
+        float comp128_0, float comp128_1,
+        ref Vector512<float> acc, ref float comp)
+    {
+        // Single VPDPBUSD-512: u(unsigned, x+128) × w(signed) → int32 partials = Σx·w + 128·Σw.
+        // Lanes 0-7 = block 0, lanes 8-15 = block 1.
+        Vector512<int> isum512 = AvxVnni.V512.MultiplyWideningAndAdd(Vector512<int>.Zero, u512, w512);
+
+        // Identical dual-scale fold as Avx512DualBlockFma: lanes 0-7 × scale0, lanes 8-15 × scale1.
+        Vector512<float> fsum = Avx512F.ConvertToVector512Single(isum512);
+        Vector512<float> scale = Vector512.Create(
+            Vector256.Create(scale0),
+            Vector256.Create(scale1));
+        acc = Avx512F.FusedMultiplyAdd(fsum, scale, acc);
+
+        // Defer the −128·Σw bias as a scalar correction (subtracted once at the end).
+        comp += scale0 * comp128_0 + scale1 * comp128_1;
+    }
+
+    /// <summary>
+    /// AVX-512 VNNI <b>zero-point</b> outer-product microkernel for Q8_0 R4 layout — a second
+    /// 512-native VPDPBUSD variant alongside <see cref="OuterProductQ8_0Avx512Vnni_4x6"/>. Same 4 weight
+    /// rows × 6 tokens, 24 ZMM accumulators, dual-block-per-iteration scheme, and shared AVX2
+    /// odd-trailing-block tail. The difference is the integer reduction: instead of the sign trick
+    /// (per-cell <c>Avx2.Sign</c> + <c>Vector256→Vector512</c> packs), it uses the zero-point
+    /// (<c>+128</c>) method — <c>VPDPBUSD(u, w)</c> with <c>u = x + 128</c> (unsigned), correcting the
+    /// resulting <c>+128·Σw</c> bias as a deferred scalar per cell. This lets the <c>u512</c>/<c>w512</c>
+    /// packs and the signed weight sums be hoisted out of the 24× per-cell loop (<c>u512</c> per token,
+    /// <c>w512</c>+<c>sw</c> per row), eliminating the per-cell packing/sign overhead.
+    /// Requires AVX512-VNNI (gated on <see cref="AvxVnni.V512.IsSupported"/>; true on Zen5).
+    /// </summary>
+    /// <param name="groupBase">R4-interleaved weight group base (4 rows, blocks interleaved).</param>
+    /// <param name="x0">Token 0 Q8_0 blocks.</param>
+    /// <param name="x1">Token 1 Q8_0 blocks.</param>
+    /// <param name="x2">Token 2 Q8_0 blocks.</param>
+    /// <param name="x3">Token 3 Q8_0 blocks.</param>
+    /// <param name="x4">Token 4 Q8_0 blocks.</param>
+    /// <param name="x5">Token 5 Q8_0 blocks.</param>
+    /// <param name="c">Output base for this tile; cells written at <c>c[token * cStride + row]</c>.</param>
+    /// <param name="blockCount">Number of Q8_0 blocks per row (K / 32).</param>
+    /// <param name="cStride">Row stride of the output matrix (M).</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0Avx512VnniZp_4x6(
+        byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+        const float k128 = 128f;
+
+        // 24 float accumulators: acc_r{row}t{token}.
+        Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
+        Vector512<float> a0t3 = Vector512<float>.Zero, a0t4 = Vector512<float>.Zero, a0t5 = Vector512<float>.Zero;
+        Vector512<float> a1t0 = Vector512<float>.Zero, a1t1 = Vector512<float>.Zero, a1t2 = Vector512<float>.Zero;
+        Vector512<float> a1t3 = Vector512<float>.Zero, a1t4 = Vector512<float>.Zero, a1t5 = Vector512<float>.Zero;
+        Vector512<float> a2t0 = Vector512<float>.Zero, a2t1 = Vector512<float>.Zero, a2t2 = Vector512<float>.Zero;
+        Vector512<float> a2t3 = Vector512<float>.Zero, a2t4 = Vector512<float>.Zero, a2t5 = Vector512<float>.Zero;
+        Vector512<float> a3t0 = Vector512<float>.Zero, a3t1 = Vector512<float>.Zero, a3t2 = Vector512<float>.Zero;
+        Vector512<float> a3t3 = Vector512<float>.Zero, a3t4 = Vector512<float>.Zero, a3t5 = Vector512<float>.Zero;
+
+        // 24 scalar compensation accumulators (mirror the 24 acc): comp_r{row}t{token}.
+        float c0t0 = 0, c0t1 = 0, c0t2 = 0, c0t3 = 0, c0t4 = 0, c0t5 = 0;
+        float c1t0 = 0, c1t1 = 0, c1t2 = 0, c1t3 = 0, c1t4 = 0, c1t5 = 0;
+        float c2t0 = 0, c2t1 = 0, c2t2 = 0, c2t3 = 0, c2t4 = 0, c2t5 = 0;
+        float c3t0 = 0, c3t1 = 0, c3t2 = 0, c3t3 = 0, c3t4 = 0, c3t5 = 0;
+
+        int block = 0;
+
+        // Process 2 blocks per iteration (512-bit).
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* blockBase0 = groupBase + block * wStride;
+            byte* blockBase1 = groupBase + (block + 1) * wStride;
+
+            // Per-token hoist: one u512 (x + 128) per token, reused across all 4 rows.
+            LoadDualBlockTokenZp(x0, block, out float dx0_0, out float dx0_1, out Vector512<byte> u0);
+            LoadDualBlockTokenZp(x1, block, out float dx1_0, out float dx1_1, out Vector512<byte> u1);
+            LoadDualBlockTokenZp(x2, block, out float dx2_0, out float dx2_1, out Vector512<byte> u2);
+            LoadDualBlockTokenZp(x3, block, out float dx3_0, out float dx3_1, out Vector512<byte> u3);
+            LoadDualBlockTokenZp(x4, block, out float dx4_0, out float dx4_1, out Vector512<byte> u4);
+            LoadDualBlockTokenZp(x5, block, out float dx5_0, out float dx5_1, out Vector512<byte> u5);
+
+            // Row 0.
+            {
+                // Per-row hoist: w512 + per-block signed weight sums, reused across all 6 tokens.
+                LoadDualBlockRowZp(blockBase0, blockBase1, out float dw0, out float dw1,
+                    out Vector512<sbyte> w512, out int sw0, out int sw1);
+                float cmp0 = k128 * sw0;
+                float cmp1 = k128 * sw1;
+
+                Avx512DualBlockVnniZpFma(u0, w512, dx0_0 * dw0, dx0_1 * dw1, cmp0, cmp1, ref a0t0, ref c0t0);
+                Avx512DualBlockVnniZpFma(u1, w512, dx1_0 * dw0, dx1_1 * dw1, cmp0, cmp1, ref a0t1, ref c0t1);
+                Avx512DualBlockVnniZpFma(u2, w512, dx2_0 * dw0, dx2_1 * dw1, cmp0, cmp1, ref a0t2, ref c0t2);
+                Avx512DualBlockVnniZpFma(u3, w512, dx3_0 * dw0, dx3_1 * dw1, cmp0, cmp1, ref a0t3, ref c0t3);
+                Avx512DualBlockVnniZpFma(u4, w512, dx4_0 * dw0, dx4_1 * dw1, cmp0, cmp1, ref a0t4, ref c0t4);
+                Avx512DualBlockVnniZpFma(u5, w512, dx5_0 * dw0, dx5_1 * dw1, cmp0, cmp1, ref a0t5, ref c0t5);
+            }
+
+            // Row 1.
+            {
+                LoadDualBlockRowZp(blockBase0 + Q8_0BlockBytes, blockBase1 + Q8_0BlockBytes,
+                    out float dw0, out float dw1, out Vector512<sbyte> w512, out int sw0, out int sw1);
+                float cmp0 = k128 * sw0;
+                float cmp1 = k128 * sw1;
+
+                Avx512DualBlockVnniZpFma(u0, w512, dx0_0 * dw0, dx0_1 * dw1, cmp0, cmp1, ref a1t0, ref c1t0);
+                Avx512DualBlockVnniZpFma(u1, w512, dx1_0 * dw0, dx1_1 * dw1, cmp0, cmp1, ref a1t1, ref c1t1);
+                Avx512DualBlockVnniZpFma(u2, w512, dx2_0 * dw0, dx2_1 * dw1, cmp0, cmp1, ref a1t2, ref c1t2);
+                Avx512DualBlockVnniZpFma(u3, w512, dx3_0 * dw0, dx3_1 * dw1, cmp0, cmp1, ref a1t3, ref c1t3);
+                Avx512DualBlockVnniZpFma(u4, w512, dx4_0 * dw0, dx4_1 * dw1, cmp0, cmp1, ref a1t4, ref c1t4);
+                Avx512DualBlockVnniZpFma(u5, w512, dx5_0 * dw0, dx5_1 * dw1, cmp0, cmp1, ref a1t5, ref c1t5);
+            }
+
+            // Row 2.
+            {
+                LoadDualBlockRowZp(blockBase0 + 2 * Q8_0BlockBytes, blockBase1 + 2 * Q8_0BlockBytes,
+                    out float dw0, out float dw1, out Vector512<sbyte> w512, out int sw0, out int sw1);
+                float cmp0 = k128 * sw0;
+                float cmp1 = k128 * sw1;
+
+                Avx512DualBlockVnniZpFma(u0, w512, dx0_0 * dw0, dx0_1 * dw1, cmp0, cmp1, ref a2t0, ref c2t0);
+                Avx512DualBlockVnniZpFma(u1, w512, dx1_0 * dw0, dx1_1 * dw1, cmp0, cmp1, ref a2t1, ref c2t1);
+                Avx512DualBlockVnniZpFma(u2, w512, dx2_0 * dw0, dx2_1 * dw1, cmp0, cmp1, ref a2t2, ref c2t2);
+                Avx512DualBlockVnniZpFma(u3, w512, dx3_0 * dw0, dx3_1 * dw1, cmp0, cmp1, ref a2t3, ref c2t3);
+                Avx512DualBlockVnniZpFma(u4, w512, dx4_0 * dw0, dx4_1 * dw1, cmp0, cmp1, ref a2t4, ref c2t4);
+                Avx512DualBlockVnniZpFma(u5, w512, dx5_0 * dw0, dx5_1 * dw1, cmp0, cmp1, ref a2t5, ref c2t5);
+            }
+
+            // Row 3.
+            {
+                LoadDualBlockRowZp(blockBase0 + 3 * Q8_0BlockBytes, blockBase1 + 3 * Q8_0BlockBytes,
+                    out float dw0, out float dw1, out Vector512<sbyte> w512, out int sw0, out int sw1);
+                float cmp0 = k128 * sw0;
+                float cmp1 = k128 * sw1;
+
+                Avx512DualBlockVnniZpFma(u0, w512, dx0_0 * dw0, dx0_1 * dw1, cmp0, cmp1, ref a3t0, ref c3t0);
+                Avx512DualBlockVnniZpFma(u1, w512, dx1_0 * dw0, dx1_1 * dw1, cmp0, cmp1, ref a3t1, ref c3t1);
+                Avx512DualBlockVnniZpFma(u2, w512, dx2_0 * dw0, dx2_1 * dw1, cmp0, cmp1, ref a3t2, ref c3t2);
+                Avx512DualBlockVnniZpFma(u3, w512, dx3_0 * dw0, dx3_1 * dw1, cmp0, cmp1, ref a3t3, ref c3t3);
+                Avx512DualBlockVnniZpFma(u4, w512, dx4_0 * dw0, dx4_1 * dw1, cmp0, cmp1, ref a3t4, ref c3t4);
+                Avx512DualBlockVnniZpFma(u5, w512, dx5_0 * dw0, dx5_1 * dw1, cmp0, cmp1, ref a3t5, ref c3t5);
+            }
+        }
+
+        // Store results: c[token * cStride + row] = HorizontalSum(acc) − comp.
+        c[0 * cStride + 0] = HorizontalSumAvx512Float(a0t0) - c0t0;
+        c[0 * cStride + 1] = HorizontalSumAvx512Float(a1t0) - c1t0;
+        c[0 * cStride + 2] = HorizontalSumAvx512Float(a2t0) - c2t0;
+        c[0 * cStride + 3] = HorizontalSumAvx512Float(a3t0) - c3t0;
+        c[1 * cStride + 0] = HorizontalSumAvx512Float(a0t1) - c0t1;
+        c[1 * cStride + 1] = HorizontalSumAvx512Float(a1t1) - c1t1;
+        c[1 * cStride + 2] = HorizontalSumAvx512Float(a2t1) - c2t1;
+        c[1 * cStride + 3] = HorizontalSumAvx512Float(a3t1) - c3t1;
+        c[2 * cStride + 0] = HorizontalSumAvx512Float(a0t2) - c0t2;
+        c[2 * cStride + 1] = HorizontalSumAvx512Float(a1t2) - c1t2;
+        c[2 * cStride + 2] = HorizontalSumAvx512Float(a2t2) - c2t2;
+        c[2 * cStride + 3] = HorizontalSumAvx512Float(a3t2) - c3t2;
+        c[3 * cStride + 0] = HorizontalSumAvx512Float(a0t3) - c0t3;
+        c[3 * cStride + 1] = HorizontalSumAvx512Float(a1t3) - c1t3;
+        c[3 * cStride + 2] = HorizontalSumAvx512Float(a2t3) - c2t3;
+        c[3 * cStride + 3] = HorizontalSumAvx512Float(a3t3) - c3t3;
+        c[4 * cStride + 0] = HorizontalSumAvx512Float(a0t4) - c0t4;
+        c[4 * cStride + 1] = HorizontalSumAvx512Float(a1t4) - c1t4;
+        c[4 * cStride + 2] = HorizontalSumAvx512Float(a2t4) - c2t4;
+        c[4 * cStride + 3] = HorizontalSumAvx512Float(a3t4) - c3t4;
+        c[5 * cStride + 0] = HorizontalSumAvx512Float(a0t5) - c0t5;
+        c[5 * cStride + 1] = HorizontalSumAvx512Float(a1t5) - c1t5;
+        c[5 * cStride + 2] = HorizontalSumAvx512Float(a2t5) - c2t5;
+        c[5 * cStride + 3] = HorizontalSumAvx512Float(a3t5) - c3t5;
+
+        // Handle odd trailing block via AVX2 (shared with the maddubs/sign kernels — no zp bookkeeping:
+        // ProcessAvx512TailBlock computes the true dot independently and accumulates with +=).
         if (block < blockCount)
         {
             byte* blockBase = groupBase + block * wStride;

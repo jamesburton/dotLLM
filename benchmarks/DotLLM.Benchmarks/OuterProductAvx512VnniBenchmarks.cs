@@ -106,6 +106,24 @@ public unsafe class OuterProductAvx512VnniBenchmarks : IDisposable
             x + 3 * _rowBytes, x + 4 * _rowBytes, x + 5 * _rowBytes,
             _output, BlockCount, M);
     }
+
+    /// <summary>
+    /// AVX-512 VNNI <b>zero-point</b>: same 4×6 tile, single VPDPBUSD-512 per cell, but using the
+    /// <c>+128</c> compensation method (<c>u = x + 128</c> unsigned) instead of the per-cell sign trick.
+    /// The <c>u512</c>/<c>w512</c> packs and signed weight sums are hoisted out of the per-cell loop
+    /// (<c>u512</c> per token, <c>w512</c>+<c>sw</c> per row), with no <c>Avx2.Sign</c> in the hot path.
+    /// </summary>
+    [Benchmark]
+    public void Avx512_4x6_VnniZp()
+    {
+        byte* groupBase = (byte*)_repackedWeights;
+        byte* x = (byte*)_inputQ8;
+        MatMul.OuterProductQ8_0Avx512VnniZp_4x6(
+            groupBase,
+            x, x + _rowBytes, x + 2 * _rowBytes,
+            x + 3 * _rowBytes, x + 4 * _rowBytes, x + 5 * _rowBytes,
+            _output, BlockCount, M);
+    }
 #endif
 
     public void Dispose()
