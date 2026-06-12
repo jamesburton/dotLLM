@@ -529,11 +529,18 @@ public sealed unsafe class OuterProductGemmTests
     // (2/8/18/48/128), with K=128 the worst case for accumulated rounding.
     //
     // Tolerance reasoning: bf16 has an 8-bit mantissa → ~2^-8 ≈ 3.9e-3 relative per dequantized value.
-    // Each product carries two such roundings and a K-block accumulation chain partially compounds them;
-    // measured worst-case relative error over these shapes stays well under 3e-2, so the assertion is
-    //   |bf16 − scalar| <= 3e-2 * (|scalar| + 1e-3)
-    // (relative with a small absolute floor for near-zero cells). The test also tracks and exposes the
-    // max relative error in the assert message so accuracy can be reported alongside speed.
+    // The KEY subtlety is what the relative error is relative TO. A bf16 dot's ABSOLUTE error scales with
+    // the magnitude of the *terms* (≈ the term-walk magnitude σ ≈ √Σ(x_k·w_k)²), NOT with the magnitude
+    // of the *result*. For random mean-zero Q8_0 dots, individual cells can cancel near zero while
+    // carrying the same ~bf16_eps·σ absolute error — so a per-cell |scalar| denominator would make those
+    // cancellation cells show enormous relative error and false-fail, even though the kernel is correct.
+    // The tolerance is therefore relative to the TILE's representative magnitude (max |scalar| over the
+    // 24 cells), with a small absolute floor:
+    //   |bf16 − scalar| <= 3e-2 * (maxAbs + 1e-3)
+    // This still discriminates real bugs: a lane misalignment yields an ~σ-sized wrong value, which busts
+    // a ~0.03·σ tolerance; bf16 rounding (~0.003·σ) passes; cancellation cells no longer false-fail.
+    // The per-CELL relative error (diff / (|scalar| + 1e-3)) is still tracked and surfaced in the message
+    // for REPORTING only — it does not gate pass/fail.
     [Theory]
     [InlineData(1)]    // K=32: pure exact tail (no bf16 rounding) — error ~0, not an approximation probe
     [InlineData(2)]    // K=64: one dual-block iteration, no tail — first real bf16 signal
@@ -574,7 +581,16 @@ public sealed unsafe class OuterProductGemmTests
                 weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
                 cBf16, blockCount, m);
 
+            // Pre-pass: tile's representative magnitude. cScalar is already filled above, so this is the
+            // denominator for the (term-magnitude-relative) tolerance — see the reasoning comment.
             float maxAbs = 0;
+            for (int i = 0; i < n * m; i++)
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(cScalar[i]));
+
+            // Guard against a vacuous (all-near-zero) comparison.
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+
+            float tol = 3e-2f * (maxAbs + 1e-3f);
             float maxRelErr = 0;
             for (int t = 0; t < n; t++)
                 for (int r = 0; r < m; r++)
@@ -582,17 +598,14 @@ public sealed unsafe class OuterProductGemmTests
                     float scalar = cScalar[t * m + r];
                     float actual = cBf16[t * m + r];
                     float diff = MathF.Abs(actual - scalar);
-                    float denom = MathF.Abs(scalar) + 1e-3f;
-                    maxRelErr = MathF.Max(maxRelErr, diff / denom);
+                    // Per-cell relative error tracked for REPORTING only (not the pass/fail gate).
+                    maxRelErr = MathF.Max(maxRelErr, diff / (MathF.Abs(scalar) + 1e-3f));
                     Assert.True(
-                        diff <= 3e-2f * denom,
-                        $"bf16 outer-product exceeded tolerance at token={t}, row={r}: " +
-                        $"scalar={scalar}, bf16={actual}, |diff|={diff}, relErr={diff / denom}, blockCount={blockCount}");
-                    maxAbs = MathF.Max(maxAbs, MathF.Abs(scalar));
+                        diff <= tol,
+                        $"bf16 outer-product exceeded tile tolerance at token={t}, row={r}: " +
+                        $"scalar={scalar}, bf16={actual}, |diff|={diff}, tol={tol}, " +
+                        $"cellRelErr={diff / (MathF.Abs(scalar) + 1e-3f)}, blockCount={blockCount}");
                 }
-
-            // Guard against a vacuous (all-near-zero) comparison.
-            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
 
             // Surface and discriminate on the measured accuracy. For shapes that actually exercise the
             // bf16 dual-block path (blockCount >= 2) the rounding MUST be observable (relErr > 0) — a
