@@ -1801,11 +1801,23 @@ public static unsafe partial class MatMul
     /// Parallel outer-product GEMM for Q8_0 R4 weights.
     /// Partitions R4 groups across threads. Last thread handles tail rows.
     /// </summary>
+    /// <summary>
+    /// Debug counter incremented each time the parallel Q8_0 outer-product GEMM entry point
+    /// is invoked. Used by parity tests to prove the outer-product path actually executed —
+    /// a passing logits comparison alone cannot distinguish "outer-product ran" from
+    /// "fell back to inner-product" because both paths are integer-exact. Not thread-safe by
+    /// design (tests read it after a single-threaded-from-the-caller's-view forward pass);
+    /// the GEMM itself is internally parallel but this counter is bumped once per call.
+    /// </summary>
+    internal static long OuterProductGemmQ8_0InvocationCount;
+
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void OuterProductGemmQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
         int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool)
     {
+        OuterProductGemmQ8_0InvocationCount++;
+
         if (pool is null || m < ParallelMinRows)
         {
             OuterProductGemmQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n);

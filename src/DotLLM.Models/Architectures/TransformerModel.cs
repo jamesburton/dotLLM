@@ -67,6 +67,18 @@ public sealed unsafe class TransformerModel : IModel
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
+    /// <summary>
+    /// Routes Q8_0 multi-token (prefill, n &gt; 1) GEMMs through the R4 outer-product
+    /// microkernels (<c>OuterProductGemmQ8_0</c>) instead of the default inner-product /
+    /// cache-tiled path. Both paths consume the same R4-repacked weights and are
+    /// integer-exact Q8_0 reductions differing only in summation order, so output logits
+    /// must match to near-FP-epsilon. Off by default; flip per model instance.
+    /// Read at runtime in <see cref="GemmInterleaved"/> — no load-time caching, so the
+    /// flag can be toggled between forward passes (used by A/B parity tests and the
+    /// perplexity harness). Only affects Q8_0; other quant types are unaffected.
+    /// </summary>
+    public bool UseOuterProductQ8Prefill { get; set; }
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
@@ -1876,6 +1888,18 @@ public sealed unsafe class TransformerModel : IModel
                                  int m, int k, int n, byte* preQuantizedInput,
                                  in WeightRepacking.RepackedWeight rw)
     {
+        // Q8_0 prefill (n > 1) outer-product routing — opt-in via UseOuterProductQ8Prefill.
+        // Deliberately NOT gated on rw.RowBytes >= InterleavedMinRowBytes: that threshold is a
+        // decode-path performance heuristic, and on small-hidden models (e.g. SmolLM, hidden=576
+        // → 612 row bytes < 1024) it would silently keep every projection AND the LM head on the
+        // inner-product path, making any A/B parity comparison vacuous. R4 repacks always exist
+        // here (RepackWeights runs unconditionally), so this is a pure routing decision.
+        if (rw.Ptr != 0 && n > 1 && qt == QuantizationType.Q8_0 && UseOuterProductQ8Prefill)
+        {
+            GemmOuterProductQ8_0(b, c, m, k, n, preQuantizedInput, in rw);
+            return;
+        }
+
         if (rw.Ptr == 0 || n > 1 || rw.RowBytes < InterleavedMinRowBytes)
         {
             // Multi-token or small row stride: use original tiled GEMM path
@@ -1893,6 +1917,48 @@ public sealed unsafe class TransformerModel : IModel
 
         // Single-token without pre-quantized: quantize + interleaved dispatch
         GemvInterleaved(origWeights, qt, b, c, m, k, in rw);
+    }
+
+    /// <summary>
+    /// Q8_0 prefill GEMM via the R4 outer-product microkernels.
+    /// Consumes the same R4-repacked weights (<paramref name="rw"/>) as the decode-path
+    /// interleaved GEMV. Requires Q8_0-quantized input for all <paramref name="n"/> tokens:
+    /// reuses <paramref name="preQuantizedInput"/> when the caller already quantized the
+    /// activations (Q/K/V, Gate/Up share a buffer), otherwise quantizes all rows into the
+    /// per-forward scratch (e.g. the LM head, which passes null).
+    /// </summary>
+    /// <param name="b">f32 input matrix [n, k], row-major. Only read when <paramref name="preQuantizedInput"/> is null.</param>
+    /// <param name="c">Output matrix [n, m], row-major (C[token * m + row]) — matches the dispatcher's layout.</param>
+    /// <param name="m">Output rows (weight rows).</param>
+    /// <param name="k">Input dimension (multiple of 32).</param>
+    /// <param name="n">Token count (&gt; 1).</param>
+    /// <param name="preQuantizedInput">Optional caller-supplied Q8_0 input [n × q8RowBytes]; null to quantize here.</param>
+    /// <param name="rw">R4-repacked Q8_0 weights for this projection.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void GemmOuterProductQ8_0(float* b, float* c, int m, int k, int n,
+                                      byte* preQuantizedInput, in WeightRepacking.RepackedWeight rw)
+    {
+        int blockCount = k / Q8_0GroupSize;
+
+        byte* inputQ8 = preQuantizedInput;
+        if (inputQ8 == null)
+        {
+            // No caller-supplied pre-quant (e.g. LM head): quantize all n rows into scratch.
+            // InputQ8Scratch is sized seqLen × max(hidden, intermediate) Q8_0 row bytes, so it
+            // holds n × (blockCount × Q8_0BlockBytes) for any projection including the LM head.
+            int q8RowBytes = blockCount * Q8_0BlockBytes;
+            byte* scratch = (byte*)_state.InputQ8Scratch;
+            for (int t = 0; t < n; t++)
+                MatMul.QuantizeF32ToQ8_0(b + t * k, scratch + (long)t * q8RowBytes, k);
+            inputQ8 = scratch;
+        }
+
+        // BF16 dispatch seam — a future net11 build adds OuterProductQ8_0Avx512Bf16_4x6
+        // (branch issue/322-q8-avx512-vnni-net11) selected here under #if NET11_0_OR_GREATER.
+        // It slots in as an alternative entry that consumes the same R4 weights + Q8_0 input;
+        // only the microkernel reduction changes. Until then, all targets use the integer path.
+        MatMul.OuterProductGemmQ8_0((byte*)rw.Ptr, inputQ8, c,
+            rw.FullGroupCount, rw.TailRows, blockCount, m, n, _threadPool);
     }
 
     /// <summary>
