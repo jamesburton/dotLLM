@@ -199,14 +199,28 @@ internal static class OuterProductBf16Accuracy
         // Normalize the worst absolute deviation by the vector (tile-max) scale.
         float scaleNormDiff = maxBaselineAbs > absFloor ? maxAbsDiff / maxBaselineAbs : maxAbsDiff;
 
-        // --- Perplexity A/B on a fixed passage ---
+        // --- Perplexity A/B/C on a fixed passage ---
+        // Three paths on the SAME passage so the bf16 cost is anchored against the TRUE baseline:
+        //   inner   = flag off entirely (inner-product / cache-tiled reduction) — the production default
+        //   integer = exact-integer outer-product (R4 maddubs microkernel)
+        //   bf16    = bf16 outer-product (VDPBF16PS microkernel)
+        // The headline "bf16 accuracy cost" is bf16-vs-inner; integer-vs-inner proves the outer-product
+        // restructuring alone (no bf16) introduces no quality regression — without it, a bf16 delta
+        // measured only against integer-outer would hide any cost the outer-product path already carries.
         int[] passageTokens = tokenizer.Encode(PerplexityPassage);
+        model.UseOuterProductQ8Prefill = false;
+        var innerPpl = PerplexityEvaluator.Evaluate(model, passageTokens);
+        model.UseOuterProductQ8Prefill = true;
         model.UseBf16OuterProductQ8Prefill = false;
         var intPpl = PerplexityEvaluator.Evaluate(model, passageTokens);
         model.UseBf16OuterProductQ8Prefill = true;
         var bf16Ppl = PerplexityEvaluator.Evaluate(model, passageTokens);
-        double pplDelta = bf16Ppl.Perplexity - intPpl.Perplexity;
-        double pplRelDelta = intPpl.Perplexity != 0 ? pplDelta / intPpl.Perplexity : pplDelta;
+        // bf16 cost anchored against the true inner-product baseline (the production default path).
+        double pplDelta = bf16Ppl.Perplexity - innerPpl.Perplexity;
+        double pplRelDelta = innerPpl.Perplexity != 0 ? pplDelta / innerPpl.Perplexity : pplDelta;
+        // Outer-product restructuring (no bf16) vs inner-product — should be ~0 (no quality regression).
+        double intInnerDelta = intPpl.Perplexity - innerPpl.Perplexity;
+        double intInnerRelDelta = innerPpl.Perplexity != 0 ? intInnerDelta / innerPpl.Perplexity : intInnerDelta;
 
         string worst = worstIdx >= 0
             ? $"at index {worstIdx} (integer={integerLogits[worstIdx]}, bf16={bf16Logits[worstIdx]})"
@@ -221,14 +235,28 @@ internal static class OuterProductBf16Accuracy
             $"maxRelDiff={maxRelDiff:E3} (per-elem, diagnostic) rmsDiff={rmsDiff:E3} " +
             $"maxBaselineAbs={maxBaselineAbs:E3} {worst}");
         Console.WriteLine(
-            $"  perplexity: integer={intPpl.Perplexity:F6} bf16={bf16Ppl.Perplexity:F6} " +
-            $"delta={pplDelta:+0.000000;-0.000000} relDelta={pplRelDelta:+0.######%;-0.######%} " +
-            $"(scored={intPpl.ScoredTokenCount} tokens)");
+            $"  perplexity: inner={innerPpl.Perplexity:F6} integer={intPpl.Perplexity:F6} bf16={bf16Ppl.Perplexity:F6} " +
+            $"(scored={innerPpl.ScoredTokenCount} tokens)");
+        Console.WriteLine(
+            $"  integer-vs-inner: delta={intInnerDelta:+0.000000;-0.000000} relDelta={intInnerRelDelta:+0.######%;-0.######%} (outer-product restructuring cost)");
+        Console.WriteLine(
+            $"  bf16-vs-inner:    delta={pplDelta:+0.000000;-0.000000} relDelta={pplRelDelta:+0.######%;-0.######%} (headline bf16 accuracy cost)");
 
         // Gate on the vector (tile-max) scale, per the task's "≤5e-2 relative on the tile-max scale".
         Assert.True(scaleNormDiff <= scaleRelTol,
             $"BF16 outer-product logits diverged from the integer baseline beyond tolerance. " +
             $"scaleNormDiff={scaleNormDiff:E3} (tol={scaleRelTol:E3}, = maxAbsDiff/maxBaselineAbs) " +
             $"maxAbsDiff={maxAbsDiff:E3} maxBaselineAbs={maxBaselineAbs:E3} maxRelDiff={maxRelDiff:E3} rmsDiff={rmsDiff:E3} {worst}.");
+
+        // No-quality-regression gate for the outer-product restructuring itself (no bf16): the integer
+        // outer-product and the inner-product baseline both match exact scalar Q8_0 truth, so their
+        // perplexities differ only by accumulated FP rounding — bounded well under 1% on this passage.
+        // A genuine restructuring bug (mis-packed lanes, wrong reduction) blows far past this.
+        const double outerRestructuringPplTol = 0.01;   // 1% relative perplexity
+        Assert.True(Math.Abs(intInnerRelDelta) <= outerRestructuringPplTol,
+            $"Integer outer-product perplexity regressed from the inner-product baseline beyond FP-rounding " +
+            $"tolerance: inner={innerPpl.Perplexity:F6} integer={intPpl.Perplexity:F6} " +
+            $"relDelta={intInnerRelDelta:+0.######%;-0.######%} (tol={outerRestructuringPplTol:P0}). " +
+            "The outer-product restructuring changed model quality — this is a kernel/integration bug, not bf16 cost.");
     }
 }
