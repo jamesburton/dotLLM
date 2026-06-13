@@ -366,6 +366,68 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // Reproduces the exact regime real prefill hit on AVX-512 Strix but that no prior test covered:
+    // realistic output dims (m) → parallel dispatch, with token counts whose tiling ends in a
+    // single-token tail (n=4 → 3+1, n=5 → 3+1+1, n=10 → 6+3+1). Compares the parallel outer-product
+    // against the inner-product reference (ComputeRowsQ8_0Interleaved — what the flag-off path uses),
+    // looped to surface any nondeterministic (thread-count-dependent) corruption. Uses a
+    // ProcessorCount-sized pool to match ThreadingConfig.Auto.
+    [Theory]
+    [InlineData(576, 4, 576)]     // SmolLM Q/K/V, 4-token prompt
+    [InlineData(576, 5, 576)]     // SmolLM Q/K/V, 5-token prompt
+    [InlineData(576, 10, 576)]    // SmolLM Q/K/V, 10-token prompt
+    [InlineData(1536, 10, 576)]   // SmolLM gate/up
+    [InlineData(576, 10, 1536)]   // SmolLM down
+    public void OuterProductGemm_RealisticParallel_MatchesReference(int m, int n, int k)
+    {
+        var rng = new System.Random(42);
+        int blockCount = k / Q8_0GroupSize;
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int fullGroups = m / 4;
+        int tailRows = m % 4;
+
+        byte* rowMajorWeights = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * q8RowBytes), 64);
+        for (int r = 0; r < m; r++)
+            FillRandomQ8_0Blocks(rowMajorWeights + r * q8RowBytes, blockCount, rng);
+
+        using var repacked = WeightRepacking.RepackR4((nint)rowMajorWeights, QuantizationType.Q8_0, m, k);
+
+        byte* inputQ8 = (byte*)NativeMemory.AlignedAlloc((nuint)((long)n * q8RowBytes), 64);
+        for (int t = 0; t < n; t++)
+            FillRandomQ8_0Blocks(inputQ8 + t * q8RowBytes, blockCount, rng);
+
+        float* cRef = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cPar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            for (int t = 0; t < n; t++)
+                MatMul.ComputeRowsQ8_0Interleaved((byte*)repacked.Ptr, inputQ8 + t * q8RowBytes,
+                    cRef + t * m, fullGroups, tailRows, blockCount);
+
+            using var pool = new ComputeThreadPool(System.Environment.ProcessorCount);
+            for (int iter = 0; iter < 8; iter++)
+            {
+                for (int i = 0; i < n * m; i++) cPar[i] = 0f;
+                MatMul.OuterProductGemmQ8_0((byte*)repacked.Ptr, inputQ8, cPar,
+                    fullGroups, tailRows, blockCount, m, n, pool);
+
+                for (int t = 0; t < n; t++)
+                    for (int r = 0; r < m; r++)
+                        Assert.True(System.MathF.Abs(cRef[t * m + r] - cPar[t * m + r]) <= 1e-2f,
+                            $"iter={iter} token={t} row={r}: ref={cRef[t * m + r]} par={cPar[t * m + r]} " +
+                            $"(m={m} n={n} k={k} threads={System.Environment.ProcessorCount})");
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(rowMajorWeights);
+            NativeMemory.AlignedFree(inputQ8);
+            NativeMemory.AlignedFree(cRef);
+            NativeMemory.AlignedFree(cPar);
+        }
+    }
+
     // ──────────────────── Helpers ────────────────────
 
     /// <summary>
