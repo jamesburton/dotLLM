@@ -259,4 +259,58 @@ internal static class OuterProductBf16Accuracy
             $"relDelta={intInnerRelDelta:+0.######%;-0.######%} (tol={outerRestructuringPplTol:P0}). " +
             "The outer-product restructuring changed model quality — this is a kernel/integration bug, not bf16 cost.");
     }
+
+    /// <summary>
+    /// Inner / integer / bf16 perplexity over a longer corpus (not just the short fixed passage), so the
+    /// bf16-vs-inner accuracy cost averages out sample noise. Compares the three prefill reductions on the
+    /// identical token stream — only the relative deltas are meaningful (absolute perplexity is irrelevant
+    /// to an A/B/C on the same tokens). Skips when AVX512-BF16 is unavailable.
+    /// </summary>
+    /// <param name="ggufPath">Path to a Q8_0 GGUF model file.</param>
+    /// <param name="corpus">A multi-paragraph passage; scored over the model's context window.</param>
+    public static void AssertPerplexityOverCorpus(string ggufPath, string corpus)
+    {
+        Skip.IfNot(Bf16KernelAvailable,
+            "AVX512-BF16 not available (or not built for net11) — bf16 falls back to the integer path, " +
+            "making this A/B/C vacuous. Runs only on Zen4/Zen5/Strix.");
+
+        var gguf = GgufFile.Open(ggufPath);
+        using var _ = gguf;
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        using var model = TransformerModel.LoadFromGguf(gguf, config, ThreadingConfig.Auto);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+
+        int[] tokens = tokenizer.Encode(corpus);
+        Assert.True(tokens.Length >= 64,
+            $"Corpus too short for a robust A/B/C (got {tokens.Length} tokens); supply a longer passage.");
+
+        model.UseOuterProductQ8Prefill = false;
+        var innerPpl = PerplexityEvaluator.Evaluate(model, tokens);
+        model.UseOuterProductQ8Prefill = true;
+        model.UseBf16OuterProductQ8Prefill = false;
+        var intPpl = PerplexityEvaluator.Evaluate(model, tokens);
+        model.UseBf16OuterProductQ8Prefill = true;
+        var bf16Ppl = PerplexityEvaluator.Evaluate(model, tokens);
+
+        double bf16Rel = innerPpl.Perplexity != 0 ? (bf16Ppl.Perplexity - innerPpl.Perplexity) / innerPpl.Perplexity : 0;
+        double intRel = innerPpl.Perplexity != 0 ? (intPpl.Perplexity - innerPpl.Perplexity) / innerPpl.Perplexity : 0;
+
+        Console.WriteLine(
+            $"[Bf16PerplexityCorpus] model={System.IO.Path.GetFileName(ggufPath)} corpusTokens={tokens.Length} " +
+            $"scored={innerPpl.ScoredTokenCount}");
+        Console.WriteLine(
+            $"  perplexity: inner={innerPpl.Perplexity:F6} integer={intPpl.Perplexity:F6} bf16={bf16Ppl.Perplexity:F6}");
+        Console.WriteLine(
+            $"  integer-vs-inner: relDelta={intRel:+0.######%;-0.######%} (outer-product restructuring cost)");
+        Console.WriteLine(
+            $"  bf16-vs-inner:    relDelta={bf16Rel:+0.######%;-0.######%} (headline bf16 accuracy cost, longer corpus)");
+
+        // Restructuring must stay quality-neutral; bf16 is an approximation so it gets a looser bound but
+        // still must not blow up (a real bf16 bug — wrong scale fold / mis-packed lanes — degrades ppl
+        // by many percent, not a fraction of one).
+        Assert.True(Math.Abs(intRel) <= 0.01,
+            $"Integer outer-product perplexity regressed from inner over the corpus: relDelta={intRel:+0.######%;-0.######%} (tol=1%).");
+        Assert.True(Math.Abs(bf16Rel) <= 0.05,
+            $"bf16 perplexity diverged from inner beyond 5% over the corpus: relDelta={bf16Rel:+0.######%;-0.######%} — likely a bf16 kernel bug, not rounding.");
+    }
 }

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
+using DotLLM.Engine.KvCache;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tests.Integration.Fixtures;
@@ -99,6 +100,44 @@ public class Llama32PrefillOperatorBenchmark
             if (bf16 is { } b)
                 Report(b, baseline: inner);
         }
+
+        // ── Decode (single-token, n=1) ─────────────────────────────────────────────────────────────
+        // These operators are PREFILL-only (gated on n>1); decode routes to the inner-product GEMV path
+        // and never touches the outer-product / bf16 kernel. We measure decode anyway because it is the
+        // *blend denominator*: real generation speed is a prompt:completion-weighted mix of the prefill
+        // speedup and the (unchanged) decode speed — a reader needs the decode tok/s to compute their
+        // workload's blended number. The bf16Tiles==0 delta across the decode loop is the proof the
+        // operators do not engage; decode tok/s vs the RAM-bandwidth ceiling indicates whether a future
+        // decode GEMV kernel (AVX-512 / VNNI / bf16) could help at all (decode is usually BW-bound).
+        const int decodeContext = 256;   // prefill this many tokens into the KV-cache first
+        const int decodeSteps = 32;      // then time this many single-token decode steps
+        var dRng = new Random(7);
+        int[] ctxTokens = new int[decodeContext];
+        int[] ctxPositions = new int[decodeContext];
+        for (int i = 0; i < decodeContext; i++)
+        {
+            ctxTokens[i] = dRng.Next(1, Math.Min(vocab, 32000));
+            ctxPositions[i] = i;
+        }
+        int decodeToken = dRng.Next(1, Math.Min(vocab, 32000));
+
+        using var kvCache = new SimpleKvCache(config.NumLayers, config.NumKvHeads, config.HeadDim,
+            decodeContext + Warmup + decodeSteps + 8);
+
+        var dInner = MeasureDecode(model, kvCache, "inner-product", ctxTokens, ctxPositions, decodeToken, decodeSteps, outer: false, bf16: false);
+        var dInteger = MeasureDecode(model, kvCache, "integer-outer", ctxTokens, ctxPositions, decodeToken, decodeSteps, outer: true, bf16: false);
+        BenchResult? dBf16 = Bf16KernelAvailable
+            ? MeasureDecode(model, kvCache, "bf16-outer", ctxTokens, ctxPositions, decodeToken, decodeSteps, outer: true, bf16: true)
+            : null;
+
+        Console.WriteLine($"--- decode 1 token/step, {decodeContext}-token context (median of {decodeSteps}, after {Warmup} warmup) ---");
+        Report(dInner, baseline: dInner);
+        Report(dInteger, baseline: dInner);
+        if (dBf16 is { } db)
+            Report(db, baseline: dInner);
+        Console.WriteLine(
+            "  (decode is the blend denominator — operators are prefill-only, so decode speed is unchanged; " +
+            "bf16Tiles=0 confirms the bf16 kernel never engages on n=1.)");
     }
 
     private static BenchResult Measure(
@@ -144,6 +183,62 @@ public class Llama32PrefillOperatorBenchmark
         double min = times[0];
         int n = tokenIds.Length;
         return new BenchResult(name, median, min, n / (median / 1000.0), gemmDelta, bf16Delta);
+    }
+
+    // Realistic decode timing: prefill `context` tokens into the KV-cache, then time `steps` single-token
+    // forwards at advancing positions (each attends to the growing cache). Rolls the cache back to the
+    // post-prefill length between warmup and timing so every timed step starts from the same state.
+    private static BenchResult MeasureDecode(
+        TransformerModel model, SimpleKvCache kvCache, string name,
+        int[] ctxTokens, int[] ctxPositions, int decodeToken, int steps, bool outer, bool bf16)
+    {
+        model.UseOuterProductQ8Prefill = outer;
+        model.UseBf16OuterProductQ8Prefill = bf16;
+
+        int basePos = ctxTokens.Length;
+        int[] one = { decodeToken };
+        int[] pos = new int[1];
+
+        // Fresh prefill of the context into the cache (sets CurrentLength = basePos).
+        kvCache.Rollback(0);
+        using (var _ = model.Forward(ctxTokens, ctxPositions, deviceId: -1, kvCache)) { }
+
+        // Warm the decode path (tier-up applies here too), then reset to the post-prefill state.
+        for (int w = 0; w < Warmup; w++)
+        {
+            pos[0] = basePos + w;
+            using var warm = model.Forward(one, pos, deviceId: -1, kvCache);
+        }
+        kvCache.Rollback(basePos);
+
+        long bf16Before = MatMul.OuterProductQ8_0Avx512Bf16TileCount;
+        long gemmBefore = MatMul.OuterProductGemmQ8_0InvocationCount;
+
+        var times = new double[steps];
+        var sw = new Stopwatch();
+        for (int s = 0; s < steps; s++)
+        {
+            pos[0] = basePos + s;
+            sw.Restart();
+            using var logits = model.Forward(one, pos, deviceId: -1, kvCache);
+            sw.Stop();
+            times[s] = sw.Elapsed.TotalMilliseconds;
+        }
+
+        long bf16Delta = MatMul.OuterProductQ8_0Avx512Bf16TileCount - bf16Before;
+        long gemmDelta = MatMul.OuterProductGemmQ8_0InvocationCount - gemmBefore;
+
+        // The discriminating fact for decode: the outer-product operators are prefill-only (n>1), so on
+        // single-token decode they must NEVER engage regardless of the flags — proving decode speed is
+        // genuinely unaffected by these operators (not merely "happened to be the same").
+        Assert.True(gemmDelta == 0 && bf16Delta == 0,
+            $"{name}: an outer-product/bf16 kernel ran during n=1 decode (gemm={gemmDelta}, bf16={bf16Delta}) — " +
+            "the n>1 prefill gate is broken; decode should never use these operators.");
+
+        Array.Sort(times);
+        double median = times[steps / 2];
+        double min = times[0];
+        return new BenchResult(name, median, min, 1.0 / (median / 1000.0), gemmDelta, bf16Delta);
     }
 
     private static void Report(BenchResult r, BenchResult baseline)
