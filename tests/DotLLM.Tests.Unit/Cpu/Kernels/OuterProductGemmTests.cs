@@ -446,9 +446,19 @@ public sealed unsafe class OuterProductGemmTests
     // the one that diverges on AVX-512. Reports max diffs for both; only hard-fails if BOTH are wrong
     // (which would mean the harness/scalar truth is off).
     [Theory]
-    [InlineData(576, 4, 576)]     // the real failing prompt shape (n=4)
-    [InlineData(576, 10, 576)]
-    [InlineData(1536, 10, 576)]
+    [InlineData(576, 4, 576)]      // SmolLM-135M: the real failing prompt shape (n=4)
+    [InlineData(576, 10, 576)]     // SmolLM-135M: Q/K/V
+    [InlineData(1536, 10, 576)]    // SmolLM-135M: gate/up
+    // Llama-3.2-1B shapes — 4.5× SmolLM's accumulation depth, where inner-vs-outer reduction-order
+    // divergence is largest. The arbiter (vs scalar truth) is the discriminator between "correct
+    // kernel, FP compounding" and "real bug": if OUTER_vs_truth stays ~1e-3 rel here, any larger
+    // end-to-end logit drift on Llama is accumulated FP order, NOT a kernel bug — do not loosen the
+    // e2e tolerance to chase it. k=2048 → 64 blocks, k=8192 → 256 blocks (down_proj, deepest).
+    [InlineData(2048, 4, 2048)]    // Llama-3.2-1B: Q/O proj, n=4
+    [InlineData(2048, 10, 2048)]   // Llama-3.2-1B: Q/O proj, n=10
+    [InlineData(512, 10, 2048)]    // Llama-3.2-1B: K/V proj (GQA, 8 kv heads × 64)
+    [InlineData(8192, 10, 2048)]   // Llama-3.2-1B: gate/up proj
+    [InlineData(2048, 10, 8192)]   // Llama-3.2-1B: down proj — deepest K (256 blocks)
     public void GroundTruth_GemmAndOuter_AtRealisticShapes(int m, int n, int k)
     {
         var rng = new System.Random(42);
