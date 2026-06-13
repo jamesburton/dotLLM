@@ -440,6 +440,81 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // ARBITER: compares BOTH real prefill matmul paths against a scalar ground truth derived from the
+    // ORIGINAL row-major weights — sharing neither path's R4 repack, so it can tell whether the
+    // baseline (GemmQ8_0 / ComputeGemmTiled) or the outer-product (which consumes RepackR4 weights) is
+    // the one that diverges on AVX-512. Reports max diffs for both; only hard-fails if BOTH are wrong
+    // (which would mean the harness/scalar truth is off).
+    [Theory]
+    [InlineData(576, 4, 576)]     // the real failing prompt shape (n=4)
+    [InlineData(576, 10, 576)]
+    [InlineData(1536, 10, 576)]
+    public void GroundTruth_GemmAndOuter_AtRealisticShapes(int m, int n, int k)
+    {
+        var rng = new System.Random(42);
+        int blockCount = k / Q8_0GroupSize;
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int fullGroups = m / 4;
+        int tailRows = m % 4;
+
+        // Original row-major Q8_0 weights — the source of truth (no repack).
+        byte* W = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * q8RowBytes), 64);
+        for (int r = 0; r < m; r++)
+            FillRandomQ8_0Blocks(W + r * q8RowBytes, blockCount, rng);
+        using var repacked = WeightRepacking.RepackR4((nint)W, QuantizationType.Q8_0, m, k);
+
+        // f32 input + its shared Q8_0 quantization (both kernels consume the identical Xq8).
+        float* X = (float*)NativeMemory.AlignedAlloc((nuint)((long)n * k * sizeof(float)), 64);
+        for (int i = 0; i < n * k; i++) X[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+        byte* Xq8 = (byte*)NativeMemory.AlignedAlloc((nuint)((long)n * q8RowBytes), 64);
+        for (int t = 0; t < n; t++)
+            MatMul.QuantizeF32ToQ8_0(X + t * k, Xq8 + t * q8RowBytes, k);
+
+        float* cTruth = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cGemm = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cOuter = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            // Scalar ground truth from row-major W (exact int dot × fp16 scales).
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    cTruth[t * m + r] = MatMul.VecDotQ8_0Scalar(W + (long)r * q8RowBytes, Xq8 + (long)t * q8RowBytes, blockCount);
+
+            using var pool = new ComputeThreadPool(System.Environment.ProcessorCount);
+
+            // Baseline inner path (flag-off): GemmQ8_0 on row-major weights, preQuant input.
+            MatMul.GemmQ8_0(W, X, cGemm, m, k, n, pool, Xq8);
+
+            // Outer-product path (flag-on): repacked weights.
+            MatMul.OuterProductGemmQ8_0((byte*)repacked.Ptr, Xq8, cOuter, fullGroups, tailRows, blockCount, m, n, pool);
+
+            float gemmAbs = 0f, gemmRel = 0f, outerAbs = 0f, outerRel = 0f;
+            for (int i = 0; i < n * m; i++)
+            {
+                float tr = cTruth[i];
+                float denom = System.MathF.Max(System.MathF.Abs(tr), 1e-6f);
+                float ga = System.MathF.Abs(cGemm[i] - tr); if (ga > gemmAbs) gemmAbs = ga; if (ga / denom > gemmRel) gemmRel = ga / denom;
+                float oa = System.MathF.Abs(cOuter[i] - tr); if (oa > outerAbs) outerAbs = oa; if (oa / denom > outerRel) outerRel = oa / denom;
+            }
+            System.Console.WriteLine($"[Arbiter] m={m} n={n} k={k}  GEMM_vs_truth abs={gemmAbs:E3} rel={gemmRel:E3}  OUTER_vs_truth abs={outerAbs:E3} rel={outerRel:E3}");
+
+            // Both should match the scalar truth to fp tolerance. Hard-fail only if BOTH diverge
+            // (harness error); otherwise the Console line reports which path is the culprit.
+            Assert.True(gemmAbs <= 1e-2f || outerAbs <= 1e-2f,
+                $"both paths diverge from scalar truth (m={m} n={n} k={k}) — harness suspect");
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(W);
+            NativeMemory.AlignedFree(X);
+            NativeMemory.AlignedFree(Xq8);
+            NativeMemory.AlignedFree(cTruth);
+            NativeMemory.AlignedFree(cGemm);
+            NativeMemory.AlignedFree(cOuter);
+        }
+    }
+
     // ──────────────────── Helpers ────────────────────
 
     /// <summary>
