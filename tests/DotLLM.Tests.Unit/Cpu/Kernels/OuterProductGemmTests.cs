@@ -406,6 +406,7 @@ public sealed unsafe class OuterProductGemmTests
                     cRef + t * m, fullGroups, tailRows, blockCount);
 
             using var pool = new ComputeThreadPool(System.Environment.ProcessorCount);
+            float maxAbs = 0f, maxRel = 0f;
             for (int iter = 0; iter < 8; iter++)
             {
                 for (int i = 0; i < n * m; i++) cPar[i] = 0f;
@@ -414,10 +415,21 @@ public sealed unsafe class OuterProductGemmTests
 
                 for (int t = 0; t < n; t++)
                     for (int r = 0; r < m; r++)
-                        Assert.True(System.MathF.Abs(cRef[t * m + r] - cPar[t * m + r]) <= 1e-2f,
-                            $"iter={iter} token={t} row={r}: ref={cRef[t * m + r]} par={cPar[t * m + r]} " +
-                            $"(m={m} n={n} k={k} threads={System.Environment.ProcessorCount})");
+                    {
+                        float a = cRef[t * m + r], b = cPar[t * m + r];
+                        float ad = System.MathF.Abs(a - b);
+                        float denom = System.MathF.Max(System.MathF.Abs(a), System.MathF.Abs(b));
+                        float rd = denom > 1e-6f ? ad / denom : ad;
+                        if (ad > maxAbs) maxAbs = ad;
+                        if (rd > maxRel) maxRel = rd;
+                    }
             }
+            // Report the ACTUAL per-matmul divergence vs the interleaved-GEMV reference. This is the
+            // number that compounds across 30 layers in real prefill: ~1e-2 explains the observed
+            // end-to-end logit divergence as FP reduction-order accumulation (no kernel bug); ~1e-5
+            // would mean the end divergence is too large to be FP order → a real integration bug.
+            System.Console.WriteLine($"[RealisticParallel] m={m} n={n} k={k} maxAbsDiff={maxAbs:E3} maxRelDiff={maxRel:E3}");
+            Assert.True(maxAbs <= 1e-2f, $"m={m} n={n} k={k} maxAbsDiff={maxAbs:E3} maxRelDiff={maxRel:E3}");
         }
         finally
         {
