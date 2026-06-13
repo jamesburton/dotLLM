@@ -52,6 +52,15 @@ app.Configure(config =>
         .WithDescription("Launch API server with built-in web chat UI.")
         .WithExample("serve", "Qwen/Qwen3-0.6B-GGUF", "--port", "8080");
 
+    config.AddBranch("eval", eval =>
+    {
+        eval.SetDescription("Evaluate model quality metrics.");
+
+        eval.AddCommand<EvalPerplexityCommand>("perplexity")
+            .WithDescription("Compute perplexity (exp(mean NLL)) over a text corpus.")
+            .WithExample("eval", "perplexity", "QuantFactory/SmolLM-135M-GGUF", "--text", "corpus.txt");
+    });
+
 #if DEBUG
     config.AddBranch("debug", debug =>
     {
