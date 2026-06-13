@@ -1592,6 +1592,288 @@ public static unsafe partial class MatMul
         }
     }
 
+#if NET11_0_OR_GREATER
+    /// <summary>
+    /// Dequantizes one Q8_0 block (32 int8 values + an fp16 scale already widened to <paramref name="d"/>)
+    /// to a single 64-byte <c>Vector512&lt;ushort&gt;</c> with the scale folded into each value —
+    /// the foundation of the BF16 dequant-and-accumulate Q8_0 kernel
+    /// (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The bf16 values are carried in <c>ushort</c> lanes (raw bf16 bit-patterns), not
+    /// <c>BFloat16</c>: the <c>Avx512Bf16</c> intrinsics ship their initial signatures over
+    /// <c>Vector512&lt;ushort&gt;</c>, with <c>BFloat16</c> overloads to follow later. <c>VCVTNE2PS2BF16</c>
+    /// / <c>VDPBF16PS</c> are bit-pattern operations, so <c>ushort</c> is exact here.
+    /// </para>
+    /// <para>
+    /// Folding the per-block scale <c>d</c> into the bf16 value is the whole point: downstream
+    /// accumulation is a plain <c>VDPBF16PS</c> chain into one fp32 accumulator with <b>no</b>
+    /// per-block reduction, dual-scale fold, or compensation bookkeeping. Because the scale lives
+    /// in the value, the result is uniform across all 16 lanes and the final reduction is a full
+    /// <see cref="HorizontalSumAvx512Float"/>.
+    /// </para>
+    /// <para>
+    /// <b>This rounds.</b> Each scaled value <c>q·d</c> is rounded to bf16 (8-bit mantissa), so the
+    /// kernel is an <i>approximation</i> of the exact int8-dot×scale the maddubs/VNNI kernels compute.
+    /// </para>
+    /// <para>
+    /// <b>Lane mapping is irrelevant to correctness</b> as long as activations and weights are packed
+    /// by this same function: <c>VDPBF16PS</c> sums products pairwise per lane and the kernel sums all
+    /// 16 lanes, so element <c>k</c> of <c>x</c> meeting element <c>k</c> of <c>w</c> in the same
+    /// physical bf16 slot is all that's required. The two-arg <c>ConvertToBFloat16(lo, hi)</c> packs
+    /// the low 16 floats then the high 16; both operands go through it identically.
+    /// </para>
+    /// </remarks>
+    /// <param name="qBlock">Pointer to the 32 raw int8 values (the block record's bytes 2..33).</param>
+    /// <param name="d">The block's fp16 scale, already widened to float.</param>
+    /// <returns>32 bf16 values <c>= (float)q[i] · d</c>, rounded to bf16.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<ushort> DequantBlockToBf16(byte* qBlock, float d)
+    {
+        // Load 32 signed int8 (one Q8_0 block).
+        Vector256<sbyte> q = Unsafe.ReadUnaligned<Vector256<sbyte>>(qBlock);
+
+        // Sign-extend each 16-byte half int8 → int32 (VPMOVSXBD), then int32 → float.
+        // Lower half = elements 0..15, upper half = elements 16..31.
+        Vector512<int> lo32 = Avx512F.ConvertToVector512Int32(q.GetLower());
+        Vector512<int> hi32 = Avx512F.ConvertToVector512Int32(q.GetUpper());
+        Vector512<float> scale = Vector512.Create(d);
+        Vector512<float> loF = Avx512F.ConvertToVector512Single(lo32) * scale;
+        Vector512<float> hiF = Avx512F.ConvertToVector512Single(hi32) * scale;
+
+        // Pack 2×16 fp32 → 32 bf16 (VCVTNE2PS2BF16): low 16 lanes = loF, high 16 = hiF.
+        return Avx512Bf16.ConvertToBFloat16(loF, hiF);
+    }
+
+    /// <summary>
+    /// Per-token hoist for the BF16 kernel (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>): dequantizes
+    /// a dual-block (2 Q8_0 blocks) activation token to two scale-folded <c>Vector512&lt;ushort&gt;</c>
+    /// (one per block of the pair), reused across all 4 weight rows. Counterpart of
+    /// <see cref="LoadDualBlockToken"/>, but the output operands are dequant'd bf16 — no int8 / sign / abs.
+    /// </summary>
+    /// <param name="x">Token Q8_0 block stream.</param>
+    /// <param name="block">Index of the first block of the pair.</param>
+    /// <param name="xb0">Block 0's scale-folded bf16 activations.</param>
+    /// <param name="xb1">Block 1's scale-folded bf16 activations.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockTokenBf16(byte* x, int block,
+        out Vector512<ushort> xb0, out Vector512<ushort> xb1)
+    {
+        byte* b0 = x + block * Q8_0BlockBytes;
+        byte* b1 = x + (block + 1) * Q8_0BlockBytes;
+        xb0 = DequantBlockToBf16(b0 + 2, HalfBitsToFloat(b0));
+        xb1 = DequantBlockToBf16(b1 + 2, HalfBitsToFloat(b1));
+    }
+
+    /// <summary>
+    /// Per-row hoist for the BF16 kernel (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>): dequantizes a
+    /// dual-block weight row to two scale-folded <c>Vector512&lt;ushort&gt;</c>, reused across all 6
+    /// tokens. Same packing as <see cref="LoadDualBlockTokenBf16"/> (shared <see cref="DequantBlockToBf16"/>),
+    /// which is what guarantees lane-aligned products.
+    /// </summary>
+    /// <param name="wb0">Pointer to block 0's Q8_0 record for this row.</param>
+    /// <param name="wb1">Pointer to block 1's Q8_0 record for this row.</param>
+    /// <param name="wbf0">Block 0's scale-folded bf16 weights.</param>
+    /// <param name="wbf1">Block 1's scale-folded bf16 weights.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockRowBf16(byte* wb0, byte* wb1,
+        out Vector512<ushort> wbf0, out Vector512<ushort> wbf1)
+    {
+        wbf0 = DequantBlockToBf16(wb0 + 2, HalfBitsToFloat(wb0));
+        wbf1 = DequantBlockToBf16(wb1 + 2, HalfBitsToFloat(wb1));
+    }
+
+    /// <summary>
+    /// BF16 dual-block multiply-accumulate: two <c>VDPBF16PS</c>
+    /// (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{ushort}, Vector512{ushort})"/>)
+    /// into one fp32 accumulator — the bf16 counterpart of <see cref="Avx512DualBlockFma"/>. Because the
+    /// per-block scale is already folded into the bf16 values, there is <b>no</b> dual-scale fold and the
+    /// accumulator is a single uniform fp32 vector reduced in full at the end. The long fp32 accumulation
+    /// (no per-block convert/reduce round-trip) is exactly the precision/throughput trade being measured.
+    /// </summary>
+    /// <param name="wbf0">Block 0's scale-folded bf16 weights (per-row hoist).</param>
+    /// <param name="wbf1">Block 1's scale-folded bf16 weights (per-row hoist).</param>
+    /// <param name="xbf0">Block 0's scale-folded bf16 activations (per-token hoist).</param>
+    /// <param name="xbf1">Block 1's scale-folded bf16 activations (per-token hoist).</param>
+    /// <param name="acc">fp32 accumulator for this cell.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Avx512DualBlockBf16Mac(
+        Vector512<ushort> wbf0, Vector512<ushort> wbf1,
+        Vector512<ushort> xbf0, Vector512<ushort> xbf1,
+        ref Vector512<float> acc)
+    {
+        // VDPBF16PS: acc[i] += x[2i]·w[2i] + x[2i+1]·w[2i+1]. One call per block of the pair.
+        acc = Avx512Bf16.MultiplyWideningAndAdd(acc, xbf0, wbf0);
+        acc = Avx512Bf16.MultiplyWideningAndAdd(acc, xbf1, wbf1);
+    }
+
+    /// <summary>
+    /// BF16 dequant-and-accumulate outer-product microkernel for Q8_0 R4 layout — a bf16 variant
+    /// alongside the integer <see cref="OuterProductQ8_0Avx512_4x6"/> (maddubs). Same 4 weight rows ×
+    /// 6 tokens, 24 ZMM accumulators, dual-block-per-iteration scheme, and shared AVX2
+    /// odd-trailing-block tail. The difference is the arithmetic: each Q8_0 block is dequantized to
+    /// bf16 with its scale folded in (<see cref="DequantBlockToBf16"/>), then accumulated via
+    /// <c>VDPBF16PS</c> (<see cref="Avx512Bf16.MultiplyWideningAndAdd(Vector512{float}, Vector512{ushort}, Vector512{ushort})"/>)
+    /// into a single fp32 accumulator per cell — <b>no per-block integer reduction, dual-scale fold, or
+    /// compensation term</b>. Weights are dequant'd once per row (4×, reused across all 6 tokens) and
+    /// activations once per token (6×, reused across all 4 rows); the dequant is never repeated per cell.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is an approximation.</b> Unlike the int kernel (exact int8 dot × scale), bf16 dequant
+    /// rounds each scaled value to an 8-bit mantissa, so the result carries bf16 rounding error. The
+    /// purpose is a fair perf + accuracy measurement of whether bf16's long fp32 accumulation (no
+    /// per-block reduction) beats the int8 maddubs kernel on Zen5.
+    /// </para>
+    /// <para>
+    /// The odd trailing block falls back to the shared exact AVX2 path
+    /// (<see cref="ProcessAvx512TailBlock"/>), so a <c>blockCount == 1</c> tile runs entirely through
+    /// the exact tail and exhibits ~0 bf16 error — the genuine bf16 error signal comes from the
+    /// even / deep-K cases.
+    /// </para>
+    /// <para>Requires AVX512-BF16 (gated on <see cref="Avx512Bf16.IsSupported"/>; true on Zen4/Zen5).</para>
+    /// </remarks>
+    /// <param name="groupBase">R4-interleaved weight group base (4 rows, blocks interleaved).</param>
+    /// <param name="x0">Token 0 Q8_0 blocks.</param>
+    /// <param name="x1">Token 1 Q8_0 blocks.</param>
+    /// <param name="x2">Token 2 Q8_0 blocks.</param>
+    /// <param name="x3">Token 3 Q8_0 blocks.</param>
+    /// <param name="x4">Token 4 Q8_0 blocks.</param>
+    /// <param name="x5">Token 5 Q8_0 blocks.</param>
+    /// <param name="c">Output base for this tile; cells written at <c>c[token * cStride + row]</c>.</param>
+    /// <param name="blockCount">Number of Q8_0 blocks per row (K / 32).</param>
+    /// <param name="cStride">Row stride of the output matrix (M).</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0Avx512Bf16_4x6(
+        byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+
+        // 24 fp32 accumulators: acc_r{row}t{token}.
+        Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
+        Vector512<float> a0t3 = Vector512<float>.Zero, a0t4 = Vector512<float>.Zero, a0t5 = Vector512<float>.Zero;
+        Vector512<float> a1t0 = Vector512<float>.Zero, a1t1 = Vector512<float>.Zero, a1t2 = Vector512<float>.Zero;
+        Vector512<float> a1t3 = Vector512<float>.Zero, a1t4 = Vector512<float>.Zero, a1t5 = Vector512<float>.Zero;
+        Vector512<float> a2t0 = Vector512<float>.Zero, a2t1 = Vector512<float>.Zero, a2t2 = Vector512<float>.Zero;
+        Vector512<float> a2t3 = Vector512<float>.Zero, a2t4 = Vector512<float>.Zero, a2t5 = Vector512<float>.Zero;
+        Vector512<float> a3t0 = Vector512<float>.Zero, a3t1 = Vector512<float>.Zero, a3t2 = Vector512<float>.Zero;
+        Vector512<float> a3t3 = Vector512<float>.Zero, a3t4 = Vector512<float>.Zero, a3t5 = Vector512<float>.Zero;
+
+        int block = 0;
+
+        // Process 2 blocks per iteration (two VDPBF16PS per cell).
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* blockBase0 = groupBase + block * wStride;
+            byte* blockBase1 = groupBase + (block + 1) * wStride;
+
+            // Per-token hoist: dequant each token's block pair to bf16 once, reused across all 4 rows.
+            LoadDualBlockTokenBf16(x0, block, out var x0b0, out var x0b1);
+            LoadDualBlockTokenBf16(x1, block, out var x1b0, out var x1b1);
+            LoadDualBlockTokenBf16(x2, block, out var x2b0, out var x2b1);
+            LoadDualBlockTokenBf16(x3, block, out var x3b0, out var x3b1);
+            LoadDualBlockTokenBf16(x4, block, out var x4b0, out var x4b1);
+            LoadDualBlockTokenBf16(x5, block, out var x5b0, out var x5b1);
+
+            // Row 0.
+            {
+                // Per-row hoist: dequant the weight block pair once, reused across all 6 tokens.
+                LoadDualBlockRowBf16(blockBase0, blockBase1, out var w0, out var w1);
+
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a0t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a0t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a0t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a0t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a0t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a0t5);
+            }
+
+            // Row 1.
+            {
+                LoadDualBlockRowBf16(blockBase0 + Q8_0BlockBytes, blockBase1 + Q8_0BlockBytes,
+                    out var w0, out var w1);
+
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a1t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a1t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a1t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a1t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a1t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a1t5);
+            }
+
+            // Row 2.
+            {
+                LoadDualBlockRowBf16(blockBase0 + 2 * Q8_0BlockBytes, blockBase1 + 2 * Q8_0BlockBytes,
+                    out var w0, out var w1);
+
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a2t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a2t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a2t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a2t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a2t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a2t5);
+            }
+
+            // Row 3.
+            {
+                LoadDualBlockRowBf16(blockBase0 + 3 * Q8_0BlockBytes, blockBase1 + 3 * Q8_0BlockBytes,
+                    out var w0, out var w1);
+
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a3t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a3t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a3t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a3t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a3t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a3t5);
+            }
+        }
+
+        // Store results: c[token * cStride + row]. Full 16-lane reduction (uniform acc, no dual-scale).
+        c[0 * cStride + 0] = HorizontalSumAvx512Float(a0t0);
+        c[0 * cStride + 1] = HorizontalSumAvx512Float(a1t0);
+        c[0 * cStride + 2] = HorizontalSumAvx512Float(a2t0);
+        c[0 * cStride + 3] = HorizontalSumAvx512Float(a3t0);
+        c[1 * cStride + 0] = HorizontalSumAvx512Float(a0t1);
+        c[1 * cStride + 1] = HorizontalSumAvx512Float(a1t1);
+        c[1 * cStride + 2] = HorizontalSumAvx512Float(a2t1);
+        c[1 * cStride + 3] = HorizontalSumAvx512Float(a3t1);
+        c[2 * cStride + 0] = HorizontalSumAvx512Float(a0t2);
+        c[2 * cStride + 1] = HorizontalSumAvx512Float(a1t2);
+        c[2 * cStride + 2] = HorizontalSumAvx512Float(a2t2);
+        c[2 * cStride + 3] = HorizontalSumAvx512Float(a3t2);
+        c[3 * cStride + 0] = HorizontalSumAvx512Float(a0t3);
+        c[3 * cStride + 1] = HorizontalSumAvx512Float(a1t3);
+        c[3 * cStride + 2] = HorizontalSumAvx512Float(a2t3);
+        c[3 * cStride + 3] = HorizontalSumAvx512Float(a3t3);
+        c[4 * cStride + 0] = HorizontalSumAvx512Float(a0t4);
+        c[4 * cStride + 1] = HorizontalSumAvx512Float(a1t4);
+        c[4 * cStride + 2] = HorizontalSumAvx512Float(a2t4);
+        c[4 * cStride + 3] = HorizontalSumAvx512Float(a3t4);
+        c[5 * cStride + 0] = HorizontalSumAvx512Float(a0t5);
+        c[5 * cStride + 1] = HorizontalSumAvx512Float(a1t5);
+        c[5 * cStride + 2] = HorizontalSumAvx512Float(a2t5);
+        c[5 * cStride + 3] = HorizontalSumAvx512Float(a3t5);
+
+        // Handle odd trailing block via the shared exact AVX2 path (no bf16 rounding for the tail;
+        // accumulates with +=, so a blockCount==1 tile = 0 + exact_tail).
+        if (block < blockCount)
+        {
+            byte* blockBase = groupBase + block * wStride;
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            ProcessAvx512TailBlock(blockBase, x0, block, ones, c, cStride, 0);
+            ProcessAvx512TailBlock(blockBase, x1, block, ones, c, cStride, 1);
+            ProcessAvx512TailBlock(blockBase, x2, block, ones, c, cStride, 2);
+            ProcessAvx512TailBlock(blockBase, x3, block, ones, c, cStride, 3);
+            ProcessAvx512TailBlock(blockBase, x4, block, ones, c, cStride, 4);
+            ProcessAvx512TailBlock(blockBase, x5, block, ones, c, cStride, 5);
+        }
+    }
+#endif
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void LoadDualBlockToken(byte* x, int block,
         out float dx0, out float dx1,
@@ -1661,6 +1943,59 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// Debug counter incremented each time the AVX-512 4×6 <b>BF16</b> tile actually executes
+    /// (net11 + <c>Avx512Bf16.IsSupported</c> + the bf16 flag selected). Mirrors
+    /// <see cref="OuterProductGemmQ8_0InvocationCount"/> but discriminates the bf16 path from the
+    /// integer one: the A/B accuracy test asserts this advanced, so a silent fallback to the integer
+    /// kernel (which would make "bf16 is perfectly accurate" a vacuous pass) is caught loudly.
+    /// Declared unconditionally (so the net10 test build can reference it); it is only ever bumped
+    /// inside the <c>#if NET11_0_OR_GREATER</c> bf16 branch, so on net10 it stays zero — which is
+    /// exactly why the test gates the assertion on <c>Avx512Bf16.IsSupported</c>.
+    /// Not thread-safe by design (incremented per tile across the parallel workers); the test only
+    /// checks it strictly increased, not its exact value.
+    /// </summary>
+    internal static long OuterProductQ8_0Avx512Bf16TileCount;
+
+    /// <summary>
+    /// Selects between the integer and BF16 AVX-512 4×6 outer-product tiles. The single point where
+    /// the bf16-vs-integer microkernel choice is made — both the serial and parallel-worker dispatch
+    /// paths call here so the proven N-tiling / remainder / partitioning logic is never duplicated.
+    /// </summary>
+    /// <remarks>
+    /// Fallback semantics: on net10 the bf16 kernel does not exist, so this is unconditionally the
+    /// integer tile. On net11 the bf16 tile is taken only when <paramref name="useBf16"/> is set AND
+    /// <c>Avx512Bf16.IsSupported</c>; otherwise it silently falls back to the integer tile
+    /// (never throws). Caller has already confirmed <see cref="Avx512BW.IsSupported"/>.
+    /// </remarks>
+    /// <param name="useBf16">When true, prefer the bf16 tile (net11 + AVX512-BF16 only).</param>
+    /// <param name="groupBase">R4-interleaved weight group base.</param>
+    /// <param name="x0">Token 0 Q8_0 blocks.</param>
+    /// <param name="x1">Token 1 Q8_0 blocks.</param>
+    /// <param name="x2">Token 2 Q8_0 blocks.</param>
+    /// <param name="x3">Token 3 Q8_0 blocks.</param>
+    /// <param name="x4">Token 4 Q8_0 blocks.</param>
+    /// <param name="x5">Token 5 Q8_0 blocks.</param>
+    /// <param name="c">Output base for this tile.</param>
+    /// <param name="blockCount">Blocks per row (K / 32).</param>
+    /// <param name="cStride">Output row stride (M).</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DispatchOuterProductQ8_0Avx512_4x6(
+        bool useBf16,
+        byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
+        float* c, int blockCount, int cStride)
+    {
+#if NET11_0_OR_GREATER
+        if (useBf16 && Avx512Bf16.IsSupported)
+        {
+            OuterProductQ8_0Avx512Bf16TileCount++;
+            OuterProductQ8_0Avx512Bf16_4x6(groupBase, x0, x1, x2, x3, x4, x5, c, blockCount, cStride);
+            return;
+        }
+#endif
+        OuterProductQ8_0Avx512_4x6(groupBase, x0, x1, x2, x3, x4, x5, c, blockCount, cStride);
+    }
+
+    /// <summary>
     /// Outer-product GEMM for Q8_0 R4-interleaved weights.
     /// Processes weight groups in steps of 4 rows and token batches of 3 (AVX2) or 6 (AVX-512).
     /// Falls back to existing <see cref="VecDotQ8_0Avx2_4RowsR4"/> for tail tokens
@@ -1674,10 +2009,12 @@ public static unsafe partial class MatMul
     /// <param name="blockCount">Blocks per row (K / 32).</param>
     /// <param name="m">Total output rows.</param>
     /// <param name="n">Number of tokens (batch size).</param>
+    /// <param name="useBf16">When true, the AVX-512 4×6 tile uses the bf16 microkernel (net11 +
+    /// AVX512-BF16 only; otherwise a no-op fallback to the integer tile).</param>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void OuterProductGemmQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
-        int fullGroups, int tailRows, int blockCount, int m, int n)
+        int fullGroups, int tailRows, int blockCount, int m, int n, bool useBf16 = false)
     {
         int q8RowBytes = blockCount * Q8_0BlockBytes;
         int groupBytes = 4 * q8RowBytes;
@@ -1694,7 +2031,8 @@ public static unsafe partial class MatMul
                 int nFull6 = (n / 6) * 6;
                 for (; t < nFull6; t += 6)
                 {
-                    OuterProductQ8_0Avx512_4x6(
+                    DispatchOuterProductQ8_0Avx512_4x6(
+                        useBf16,
                         groupBase,
                         inputQ8 + (long)t * q8RowBytes,
                         inputQ8 + (long)(t + 1) * q8RowBytes,
@@ -1795,6 +2133,7 @@ public static unsafe partial class MatMul
         public int BlockCount;
         public int M;
         public int N;
+        public bool UseBf16;
     }
 
     /// <summary>
@@ -1814,13 +2153,14 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static void OuterProductGemmQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
-        int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool)
+        int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool,
+        bool useBf16 = false)
     {
         OuterProductGemmQ8_0InvocationCount++;
 
         if (pool is null || m < ParallelMinRows)
         {
-            OuterProductGemmQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n);
+            OuterProductGemmQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n, useBf16);
             return;
         }
 
@@ -1828,7 +2168,7 @@ public static unsafe partial class MatMul
         {
             RepackedWeights = repackedWeights, InputQ8 = inputQ8, C = c,
             FullGroups = fullGroups, TailRows = tailRows,
-            BlockCount = blockCount, M = m, N = n
+            BlockCount = blockCount, M = m, N = n, UseBf16 = useBf16
         };
         pool.Dispatch((nint)(&ctx), &OuterProductGemmQ8_0Worker);
     }
@@ -1861,7 +2201,8 @@ public static unsafe partial class MatMul
                     int nFull6 = (ctx.N / 6) * 6;
                     for (; t < nFull6; t += 6)
                     {
-                        OuterProductQ8_0Avx512_4x6(
+                        DispatchOuterProductQ8_0Avx512_4x6(
+                            ctx.UseBf16,
                             groupBase,
                             ctx.InputQ8 + (long)t * q8RowBytes,
                             ctx.InputQ8 + (long)(t + 1) * q8RowBytes,

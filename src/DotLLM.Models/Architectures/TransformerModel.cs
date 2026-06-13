@@ -79,6 +79,21 @@ public sealed unsafe class TransformerModel : IModel
     /// </summary>
     public bool UseOuterProductQ8Prefill { get; set; }
 
+    /// <summary>
+    /// When <see cref="UseOuterProductQ8Prefill"/> is also true, routes the AVX-512 4×6 outer-product
+    /// tile through the <b>BF16</b> dequant-and-accumulate microkernel
+    /// (<c>OuterProductQ8_0Avx512Bf16_4x6</c>) instead of the exact-integer one. Unlike the integer
+    /// path this is an <i>approximation</i> (each scaled Q8_0 value is rounded to bf16's 8-bit
+    /// mantissa), so logits differ from the integer path by bf16 rounding error rather than just
+    /// summation order — it exists to A/B BF16's end-to-end accuracy and throughput on AVX512-BF16
+    /// hardware (Zen4/Zen5, Strix). No effect unless built for net11 AND
+    /// <c>System.Runtime.Intrinsics.X86.Avx512Bf16.IsSupported</c>; on any other target it is a
+    /// silent no-op fallback to the integer outer-product path (never throws). Off by default; read at
+    /// runtime in <see cref="GemmOuterProductQ8_0"/> so it can be toggled between forward passes.
+    /// Only affects Q8_0 prefill (n &gt; 1).
+    /// </summary>
+    public bool UseBf16OuterProductQ8Prefill { get; set; }
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
@@ -1953,12 +1968,13 @@ public sealed unsafe class TransformerModel : IModel
             inputQ8 = scratch;
         }
 
-        // BF16 dispatch seam — a future net11 build adds OuterProductQ8_0Avx512Bf16_4x6
-        // (branch issue/322-q8-avx512-vnni-net11) selected here under #if NET11_0_OR_GREATER.
-        // It slots in as an alternative entry that consumes the same R4 weights + Q8_0 input;
-        // only the microkernel reduction changes. Until then, all targets use the integer path.
+        // BF16 dispatch: the AVX-512 4×6 tile selects OuterProductQ8_0Avx512Bf16_4x6 when
+        // UseBf16OuterProductQ8Prefill is set. The selection is fully resolved inside MatMul
+        // (under #if NET11_0_OR_GREATER + Avx512Bf16.IsSupported); on net10 or non-AVX512-BF16
+        // hardware it is a silent no-op fallback to the integer kernel — the same R4 weights +
+        // Q8_0 input feed both, only the microkernel reduction changes.
         MatMul.OuterProductGemmQ8_0((byte*)rw.Ptr, inputQ8, c,
-            rw.FullGroupCount, rw.TailRows, blockCount, m, n, _threadPool);
+            rw.FullGroupCount, rw.TailRows, blockCount, m, n, _threadPool, UseBf16OuterProductQ8Prefill);
     }
 
     /// <summary>
