@@ -128,6 +128,45 @@ internal static class DecodeThreadScalingSweep
             "NOT the pre-fix ~0.4x (cap-2) regression.");
     }
 
+    /// <summary>
+    /// Edge discriminator: for each decode thread count, takes several independent reps (each a median of
+    /// <see cref="Steps"/> decodes) and reports min/median/max per count, so the 32T-cliff finding can be
+    /// checked for reproducibility, the exact collapse edge located, and the mechanism read off:
+    /// a clean cliff <i>only</i> at full-core-count = OS oversubscription (Option C padding won't help);
+    /// a gradual sag across 24→30→32 = cache-line contention (Option C is worth it).
+    /// </summary>
+    public static void RunEdgeProbe(string modelPath, int[] decodeThreadCounts, int context, int reps)
+    {
+        int vocab;
+        using (var probe = GgufFile.Open(modelPath))
+            vocab = GgufModelConfigExtractor.Extract(probe.Metadata).VocabSize;
+
+        (int[] ctxTokens, int[] ctxPositions, int decodeToken) = BuildContext(vocab, context);
+
+        Console.WriteLine(
+            $"[DecodeEdgeProbe] model={Path.GetFileName(modelPath)} cores={Environment.ProcessorCount} " +
+            $"context={context} steps={Steps} reps={reps}");
+
+        foreach (int decodeThreads in decodeThreadCounts)
+        {
+            var config = new ThreadingConfig(ThreadCount: 0, DecodeThreadCount: decodeThreads);
+            var repTokPerSec = new double[reps];
+            for (int r = 0; r < reps; r++)
+                repTokPerSec[r] = MeasureDecode(modelPath, config, ctxTokens, ctxPositions, decodeToken, context);
+
+            var sorted = (double[])repTokPerSec.Clone();
+            Array.Sort(sorted);
+            double min = sorted[0], max = sorted[reps - 1], median = sorted[reps / 2];
+            string reps_s = string.Join(" ", repTokPerSec.Select(t => t.ToString("F1")));
+            Console.WriteLine(
+                $"  decodeThreads={decodeThreads,2}  min={min,7:F1}  median={median,7:F1}  max={max,7:F1} tok/s  reps=[{reps_s}]");
+        }
+
+        Console.WriteLine(
+            "  Mechanism: clean cliff only at the full-core count ⇒ OS oversubscription (cap at threadCount-N); " +
+            "gradual sag from 24T up ⇒ cache-line contention (Option C padding worth pursuing).");
+    }
+
     private static double MeasureDecode(
         string modelPath, ThreadingConfig config,
         int[] ctxTokens, int[] ctxPositions, int decodeToken, int context)

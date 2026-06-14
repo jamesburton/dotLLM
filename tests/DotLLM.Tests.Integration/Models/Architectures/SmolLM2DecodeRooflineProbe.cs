@@ -40,4 +40,19 @@ public class SmolLM2DecodeRooflineProbe
 
         DecodeThreadScalingSweep.RunProductionConfigPaths(_fixture.FilePath);
     }
+
+    /// <summary>
+    /// Edge discriminator for the 32T collapse: SmolLM-135M at the short context where the sweep saw the
+    /// sharpest cliff (466 tok/s @30T → 16.5 @32T). Multiple reps at {24,28,30,31,32} confirm reproducibility,
+    /// locate the exact edge (leave-1 vs leave-2 cores), and reveal the mechanism (clean cliff = oversubscription).
+    /// </summary>
+    [SkippableFact]
+    public void DecodeEdge_32T_CollapseDiscriminator()
+    {
+        Skip.If(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_RUN_PREFILL_BENCH")),
+            "Decode edge probe is opt-in — set DOTLLM_RUN_PREFILL_BENCH=1 to run.");
+
+        DecodeThreadScalingSweep.RunEdgeProbe(
+            _fixture.FilePath, decodeThreadCounts: new[] { 24, 28, 30, 31, 32 }, context: 128, reps: 4);
+    }
 }
