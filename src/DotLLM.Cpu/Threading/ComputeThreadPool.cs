@@ -101,13 +101,17 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // busy-spin a generation counter, so running one worker per logical core (zero free cores)
         // intermittently starves the scheduler: when an OS/GC task needs a core mid-dispatch, that
         // dispatch stalls and the token tanks. Measured end-to-end on a 32-core Zen5 (Strix Halo),
-        // SmolLM-135M / Bielik-1.5B / Llama-3.2-1B all scale to ~24-30 decode threads (1.5-1.9x over
-        // the previous flat cap of 8 — which was far too conservative even for the small model it was
-        // tuned on), with a *flat* median plateau across 28-32T and a catastrophic tail isolated to the
-        // full-core count (32T occasionally collapsed to ~15 tok/s while 30T held ~474; the cliff is OS
-        // oversubscription, not the per-dispatch coordination cost the old synthetic microbench
-        // implied — see .docs/decode-threading-investigation.md §5). Leaving OsReserveCores free
-        // captures the full plateau without the tail.
+        // decode scales well past the previous flat cap of 8 — which was far too conservative even for
+        // the small model it was tuned on (its "plateaus by 8T" premise was a synthetic-microbench
+        // artifact; e2e it scales to ~30T). Median throughput plateaus across ~24-32T with a
+        // catastrophic tail isolated to the full-core count (32T occasionally collapsed to ~15 tok/s
+        // while 30T held a ~474 median; the cliff is OS oversubscription, not the per-dispatch
+        // coordination cost the old comment assumed). Net effect of leaving OsReserveCores free:
+        //   - 1B-class models (Llama-3.2-1B, Bielik-1.5B): a clean ~1.6-1.9x decode gain, low variance.
+        //   - tiny models (SmolLM-135M): the *median* improves, but non-pinned many-thread spin-wait is
+        //     inherently jittery at any count >=24, so a single run can look like a regression (pinning
+        //     stabilises it). The cap captures the plateau and excludes the full-core catastrophic tail.
+        // See .docs/decode-threading-investigation.md §5.
         //
         // This supersedes the old min(8, threadCount) / MemoryChannelEstimate logic: decode is not
         // memory-channel-limited at these sizes (it scaled to ~30 cores on this host). Because the cap
