@@ -53,9 +53,12 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx512F.IsSupported)
-            Q8_0ToF32Avx512(src, dest, elementCount);
-        else if (Avx2.IsSupported)
+        // AVX-512 is deliberately NOT dispatched here: on Zen5 the 512-bit `vpmovsxbd` byte→dword widen
+        // this kernel relies on runs ~8x slower than the AVX2 256-bit form (measured; disasm confirms
+        // identical-but-wider codegen — fundamental hardware, not a codegen bug). The Avx512 method is
+        // kept and unit-tested for a future Intel-gated revisit, where 512-bit widening is fast.
+        // See .docs/decode-threading-investigation.md / .claude/strix/avx512-zen5-vpmovsxbd-perfscore-gap.md.
+        if (Avx2.IsSupported)
             Q8_0ToF32Avx2(src, dest, elementCount);
         else
             Q8_0ToF32Scalar(src, dest, elementCount);
@@ -154,9 +157,9 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx512F.IsSupported)
-            F32ToQ4_0Avx512(src, dest, elementCount);
-        else if (Avx2.IsSupported)
+        // AVX-512 not dispatched on Zen5: measured ~0.9x vs AVX2 (no win), consistent with the slow
+        // 512-bit integer-narrowing/widening path. Method kept + unit-tested for a future Intel gate.
+        if (Avx2.IsSupported)
             F32ToQ4_0Avx2(src, dest, elementCount);
         else
             F32ToQ4_0Scalar(src, dest, elementCount);
@@ -338,6 +341,9 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
+        // AVX-512 IS dispatched here (unlike the sibling Q8_0/F32->Q4_0 quantizers): the Q4_0 nibble-unpack
+        // path measured a real win on Zen5 (~1.08x net10 / ~1.17x net11), so it avoids the slow 512-bit
+        // byte-widen pattern that sinks the others.
         if (Avx512F.IsSupported)
             Q4_0ToF32Avx512(src, dest, elementCount);
         else if (Avx2.IsSupported)

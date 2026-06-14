@@ -261,6 +261,9 @@ public static unsafe class FusedOps
                                             byte* dest, int dim)
     {
         float rmsScale = ComputeRmsScale(input, dim, eps);
+        // AVX-512 IS dispatched here (unlike the sibling Q8_1/Q8_K fused quantizers): the Q8_0 fused path
+        // measured a real win on Zen5 (~1.01x net10 / ~1.20x net11) — its normalize+narrow mix avoids the
+        // slow 512-bit widen pattern that sinks the others.
         if (Avx512F.IsSupported)
             RmsNormQuantizeQ8_0Avx512(input, weight, rmsScale, dest, dim);
         else if (Avx2.IsSupported)
@@ -462,9 +465,9 @@ public static unsafe class FusedOps
                                             byte* dest, int dim)
     {
         float rmsScale = ComputeRmsScale(input, dim, eps);
-        if (Avx512F.IsSupported)
-            RmsNormQuantizeQ8_1Avx512(input, weight, rmsScale, dest, dim);
-        else if (Avx2.IsSupported)
+        // AVX-512 not dispatched on Zen5: measured ~0.9x vs AVX2 (the 512-bit int narrow/widen path is
+        // slow on Zen5). Method kept + unit-tested for a future Intel-gated revisit.
+        if (Avx2.IsSupported)
             RmsNormQuantizeQ8_1Avx2(input, weight, rmsScale, dest, dim);
         else
             RmsNormQuantizeQ8_1Scalar(input, weight, rmsScale, dest, dim);
@@ -679,9 +682,9 @@ public static unsafe class FusedOps
                                             byte* dest, int dim)
     {
         float rmsScale = ComputeRmsScale(input, dim, eps);
-        if (Avx512F.IsSupported)
-            RmsNormQuantizeQ8_KAvx512(input, weight, rmsScale, dest, dim);
-        else if (Avx2.IsSupported)
+        // AVX-512 not dispatched on Zen5: measured ~parity-to-slightly-slower (1.02x net10 / 0.96x net11),
+        // i.e. no reliable win on this uarch. Method kept + unit-tested for a future Intel-gated revisit.
+        if (Avx2.IsSupported)
             RmsNormQuantizeQ8_KAvx2(input, weight, rmsScale, dest, dim);
         else
             RmsNormQuantizeQ8_KScalar(input, weight, rmsScale, dest, dim);
