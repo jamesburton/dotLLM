@@ -407,4 +407,40 @@ public sealed unsafe class FusedOpsTests
             Assert.True(result == destPtr);
         }
     }
+
+    [SkippableFact]
+    public void RmsNormQuantizeQ8_0_Avx512_MatchesScalar()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx512F.IsSupported,
+            "AVX-512F not available — the AVX-512 fused RMSNorm+quantize path doesn't execute on this host.");
+
+        const int dim = 256; // 8 Q8_0 blocks
+        var rng = new Random(42);
+        float[] input = new float[dim];
+        float[] weight = new float[dim];
+        double sumSq = 0;
+        for (int i = 0; i < dim; i++)
+        {
+            input[i] = (float)(rng.NextDouble() * 2 - 1) * 5f;
+            weight[i] = (float)(rng.NextDouble() * 2 - 1);
+            sumSq += (double)input[i] * input[i];
+        }
+        // Same RMS scale fed to both paths; byte-exactness is independent of its exact value.
+        float rmsScale = 1f / MathF.Sqrt((float)(sumSq / dim) + 1e-5f);
+
+        int q8Bytes = (dim / 32) * 34;
+        byte[] outScalar = new byte[q8Bytes];
+        byte[] outAvx512 = new byte[q8Bytes];
+
+        fixed (float* ip = input)
+        fixed (byte* sp = outScalar)
+        fixed (byte* ap = outAvx512)
+        {
+            FusedOps.RmsNormQuantizeQ8_0Scalar(ip, weight, rmsScale, sp, dim);
+            FusedOps.RmsNormQuantizeQ8_0Avx512(ip, weight, rmsScale, ap, dim);
+        }
+
+        // Byte-exact: same MXCSR round + signed saturation; VPMOVSDB preserves lane order.
+        Assert.Equal(outScalar, outAvx512);
+    }
 }

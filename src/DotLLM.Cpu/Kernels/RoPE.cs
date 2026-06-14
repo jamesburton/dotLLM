@@ -315,6 +315,30 @@ public static class RoPE
         int halfDim = headDim / 2;
         int i = 0;
 
+        if (Vector512.IsHardwareAccelerated && halfDim >= 16)
+        {
+            ref float vecRef = ref MemoryMarshal.GetReference(vec);
+            ref float cosRef = ref Unsafe.AsRef(in MemoryMarshal.GetReference(cos));
+            ref float sinRef = ref Unsafe.AsRef(in MemoryMarshal.GetReference(sin));
+
+            // Process 16 dimension pairs per iteration (contiguous halves — no deinterleave needed).
+            for (; i + 16 <= halfDim; i += 16)
+            {
+                var even = Vector512.LoadUnsafe(ref Unsafe.Add(ref vecRef, i));
+                var odd  = Vector512.LoadUnsafe(ref Unsafe.Add(ref vecRef, i + halfDim));
+
+                var cosVec = Vector512.LoadUnsafe(ref Unsafe.Add(ref cosRef, i));
+                var sinVec = Vector512.LoadUnsafe(ref Unsafe.Add(ref sinRef, i));
+
+                // even' = even*cos - odd*sin ; odd' = even*sin + odd*cos
+                var newEven = Vector512.FusedMultiplyAdd(-odd, sinVec, even * cosVec);
+                var newOdd  = Vector512.FusedMultiplyAdd(even, sinVec, odd * cosVec);
+
+                newEven.StoreUnsafe(ref Unsafe.Add(ref vecRef, i));
+                newOdd.StoreUnsafe(ref Unsafe.Add(ref vecRef, i + halfDim));
+            }
+        }
+
         if (Avx2.IsSupported && halfDim >= 8)
         {
             ref float vecRef = ref MemoryMarshal.GetReference(vec);

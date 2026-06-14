@@ -589,4 +589,44 @@ public sealed class RoPETests
             }
         }
     }
+
+    [SkippableFact]
+    public void ApplyRotationNeoX_Avx512_MatchesScalar()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated,
+            "AVX-512 (Vector512) not hardware-accelerated — the 16-wide NeoX path doesn't execute on this host.");
+
+        const int headDim = 128;       // halfDim 64 → exercises the 16-wide AVX-512 loop (4 iterations)
+        const int halfDim = headDim / 2;
+        const int pos = 3;
+        const int maxSeqLen = 8;
+
+        float[] cos = new float[maxSeqLen * halfDim];
+        float[] sin = new float[maxSeqLen * halfDim];
+        RoPE.PrecomputeFrequencyTable(maxSeqLen, headDim, 10000f, cos, sin);
+
+        var rng = new Random(42);
+        float[] vec = new float[headDim];
+        for (int i = 0; i < headDim; i++)
+            vec[i] = (float)(rng.NextDouble() * 2 - 1) * 3f;
+
+        var cosSlice = cos.AsSpan(pos * halfDim, halfDim);
+        var sinSlice = sin.AsSpan(pos * halfDim, halfDim);
+
+        // Scalar NeoX reference: pairs (vec[i], vec[i+halfDim]).
+        float[] expected = new float[headDim];
+        for (int i = 0; i < halfDim; i++)
+        {
+            float e = vec[i], o = vec[i + halfDim];
+            expected[i] = e * cosSlice[i] - o * sinSlice[i];
+            expected[i + halfDim] = e * sinSlice[i] + o * cosSlice[i];
+        }
+
+        float[] actual = (float[])vec.Clone();
+        RoPE.ApplyRotationNeoX(actual, cosSlice, sinSlice, headDim);
+
+        // Tolerance (not byte-exact): the SIMD path uses FMA, the scalar reference does not.
+        for (int i = 0; i < headDim; i++)
+            Assert.Equal(expected[i], actual[i], 4);
+    }
 }

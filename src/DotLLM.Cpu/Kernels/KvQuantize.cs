@@ -53,10 +53,42 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (Avx512F.IsSupported)
+            Q8_0ToF32Avx512(src, dest, elementCount);
+        else if (Avx2.IsSupported)
             Q8_0ToF32Avx2(src, dest, elementCount);
         else
             Q8_0ToF32Scalar(src, dest, elementCount);
+    }
+
+    /// <summary>
+    /// AVX-512 Q8_0 → FP32 dequantization. Widens 16 int8 values per instruction (VPMOVSXBD), halving
+    /// the inner-loop trip count vs the AVX2 path. Numerically identical to <see cref="Q8_0ToF32Scalar"/>
+    /// (<c>d * qs[i]</c>) — pure widen + scale, no rounding or lane-crossing.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void Q8_0ToF32Avx512(byte* src, float* dest, int elementCount)
+    {
+        int blockCount = elementCount / BlockSize;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* blockSrc = src + block * Q8_0BlockBytes;
+            float* blockDst = dest + block * BlockSize;
+
+            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            Vector512<float> vScale = Vector512.Create(d);
+            sbyte* qs = (sbyte*)(blockSrc + 2);
+
+            // 2 iterations of 16 for the 32-element block.
+            for (int i = 0; i < BlockSize; i += 16)
+            {
+                Vector128<sbyte> bytes = Vector128.LoadUnsafe(ref Unsafe.AsRef<sbyte>(qs + i));
+                Vector512<int> ints = Avx512F.ConvertToVector512Int32(bytes);       // VPMOVSXBD
+                Vector512<float> floats = Avx512F.ConvertToVector512Single(ints);
+                (floats * vScale).StoreUnsafe(ref Unsafe.AsRef<float>(blockDst + i));
+            }
+        }
     }
 
     [SkipLocalsInit]
@@ -122,10 +154,67 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (Avx512F.IsSupported)
+            F32ToQ4_0Avx512(src, dest, elementCount);
+        else if (Avx2.IsSupported)
             F32ToQ4_0Avx2(src, dest, elementCount);
         else
             F32ToQ4_0Scalar(src, dest, elementCount);
+    }
+
+    /// <summary>
+    /// AVX-512 FP32 → Q4_0 quantization. Widens the max-abs scan and the round-to-int step to 16-wide;
+    /// nibble packing stays scalar (inter-element dependency), exactly as the AVX2 path. Byte-identical
+    /// to <see cref="F32ToQ4_0Scalar"/>: same round-to-nearest-even (VRNDSCALEPS, control 0) + clamp[0,15]
+    /// the AVX2 path uses (<c>RoundToNearestInteger</c> then <c>Min</c>/<c>Max</c>).
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void F32ToQ4_0Avx512(float* src, byte* dest, int elementCount)
+    {
+        int blockCount = elementCount / BlockSize;
+        Vector512<float> vEight = Vector512.Create(8.0f);
+        Vector512<float> vZero = Vector512<float>.Zero;
+        Vector512<float> vFifteen = Vector512.Create(15.0f);
+        int* rounded = stackalloc int[BlockSize];
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float* blockSrc = src + block * BlockSize;
+            byte* blockDst = dest + block * Q4_0BlockBytes;
+
+            // Max-abs scan: 2 loads of 16 floats.
+            Vector512<float> a0 = Vector512.Abs(Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(blockSrc)));
+            Vector512<float> a1 = Vector512.Abs(Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(blockSrc + 16)));
+            Vector512<float> maxAll = Vector512.Max(a0, a1);
+            float maxAbs = HorizontalMaxAvx2(Avx.Max(maxAll.GetLower(), maxAll.GetUpper()));
+
+            float d = maxAbs / 7.0f;
+            Unsafe.WriteUnaligned(blockDst, (Half)d);
+
+            byte* qs = blockDst + 2;
+            if (d == 0)
+            {
+                for (int j = 0; j < 16; j++)
+                    qs[j] = 0x88;
+            }
+            else
+            {
+                Vector512<float> vInvD = Vector512.Create(1.0f / d);
+
+                // Round (to nearest even) + offset +8, clamp to [0,15], convert to int. 2 × 16-wide.
+                for (int i = 0; i < BlockSize; i += 16)
+                {
+                    Vector512<float> vals = Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(blockSrc + i));
+                    Vector512<float> shifted = Avx512F.RoundScale(vals * vInvD, 0) + vEight;
+                    Vector512<float> clamped = Vector512.Min(Vector512.Max(shifted, vZero), vFifteen);
+                    Avx512F.ConvertToVector512Int32(clamped).StoreUnsafe(ref Unsafe.AsRef<int>(rounded + i));
+                }
+
+                // Pack nibbles: lo = even element, hi = odd element.
+                for (int j = 0; j < 16; j++)
+                    qs[j] = (byte)((rounded[2 * j + 1] << 4) | rounded[2 * j]);
+            }
+        }
     }
 
     /// <summary>
