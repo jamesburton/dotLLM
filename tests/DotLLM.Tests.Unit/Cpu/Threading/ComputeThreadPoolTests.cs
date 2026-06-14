@@ -77,22 +77,19 @@ public sealed unsafe class ComputeThreadPoolTests
 
     /// <summary>
     /// Regression for the pinning cap-2 footgun: enabling NUMA/P-core pinning must never produce a
-    /// *smaller* decode thread cap than running without pinning. On a single-node host
-    /// <see cref="NumaTopology.MemoryChannelEstimate"/> is 2, which previously dropped the decode cap
-    /// from 8 to 2 the moment pinning was enabled (~3× decode regression on Strix Halo). The cap is
-    /// now floored at the no-topology default, so the topology branch can only ever raise it.
+    /// *smaller* decode thread cap than running without pinning. The auto cap is now topology-independent
+    /// (<c>threadCount - OsReserveCores</c>), so pinning only affects core placement and the footgun is
+    /// gone by construction — but the invariant is kept under test in case the cap derivation changes.
     /// </summary>
     [Fact]
     public void DecodeThreadCap_PinningNeverLowersBelowNoTopology()
     {
-        // threadCount must exceed the no-topology default cap (8) so a channel-estimate of 2 would
-        // be observably below it — that's the regression this discriminates.
         const int threadCount = 16;
 
         var topology = NumaTopology.Detect();
         var pinnedConfig = new ThreadingConfig(
             ThreadCount: threadCount,
-            DecodeThreadCount: 0, // let the cap derive from topology
+            DecodeThreadCount: 0, // let the cap derive automatically
             EnableNumaPinning: true,
             EnablePCorePinning: true);
 
@@ -102,10 +99,24 @@ public sealed unsafe class ComputeThreadPoolTests
         Assert.True(pinned.DecodeThreadCount >= unpinned.DecodeThreadCount,
             $"Pinning lowered the decode cap ({pinned.DecodeThreadCount}) below the no-topology " +
             $"default ({unpinned.DecodeThreadCount}) — the cap-2 footgun has regressed.");
+        Assert.Equal(unpinned.DecodeThreadCount, pinned.DecodeThreadCount);
+    }
 
-        // On a single-node host (the common case incl. Strix) the floor pins both to 8.
-        if (topology.NumaNodeCount == 1)
-            Assert.Equal(unpinned.DecodeThreadCount, pinned.DecodeThreadCount);
+    /// <summary>
+    /// The auto decode cap (no explicit <see cref="ThreadingConfig.DecodeThreadCount"/>) leaves headroom
+    /// for the OS/GC rather than spinning a worker on every logical core — running spin-wait decode on all
+    /// cores produced an intermittent catastrophic dispatch stall on 32-core Zen5
+    /// (.docs/decode-threading-investigation.md §5). The cap is therefore <c>threadCount - 2</c>, floored at 2.
+    /// </summary>
+    [Theory]
+    [InlineData(32, 30)]
+    [InlineData(16, 14)]
+    [InlineData(4, 2)]
+    [InlineData(3, 2)] // floor: never below 2
+    public void DecodeThreadCap_AutoLeavesOsHeadroom(int threadCount, int expectedDecodeCap)
+    {
+        using var pool = new ComputeThreadPool(threadCount, topology: null, config: default);
+        Assert.Equal(expectedDecodeCap, pool.DecodeThreadCount);
     }
 
     /// <summary>

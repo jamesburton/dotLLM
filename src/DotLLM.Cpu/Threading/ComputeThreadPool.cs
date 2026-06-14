@@ -97,27 +97,31 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // Compute decode thread count using the pool's actual threadCount, not the config's
         // EffectiveThreadCount (which may be wrong when using the simple constructor with default config).
         //
-        // Decode dispatches are short and happen 30-40 times per token per layer, so the per-dispatch
-        // coordination cost dominates once worker count gets large. ThreadPoolDispatchBenchmarks on
-        // Strix Halo (32 logical) showed SpinWait dispatch collapses at 32 threads — the 30-dispatch
-        // decode burst measured 10.6 ms at 32T vs 32 µs at 8T (see .perf-runs/.../dispatch-microbench.md).
-        // When no NumaTopology is available we therefore fall back to a conservative default of
-        // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
-        // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
-        // Invariant: enabling NUMA/P-core pinning must never produce a *smaller* decode cap than
-        // running without pinning. On a single-node host NumaTopology.MemoryChannelEstimate is 2
-        // (NumaTopology.cs:112), so a naive `topology -> MemoryChannelEstimate` branch dropped the
-        // decode cap from 8 to 2 the moment a user passed --numa-pin / --pcore-only — a ~3× decode
-        // regression on Strix Halo (cap 2 = 14.8 tok/s vs cap 8 = 38.4 tok/s; see
-        // .docs/decode-threading-investigation.md §1.4). We therefore floor the topology branch at
-        // DefaultDecodeThreadCountCap: pinning may raise the cap on a true multi-socket box
-        // (MemoryChannelEstimate = 4·nodes) but can never lower it below the no-topology default.
-        const int DefaultDecodeThreadCountCap = 8;
+        // Auto decode cap = "use the cores, but leave headroom for the OS/GC." SpinWait decode workers
+        // busy-spin a generation counter, so running one worker per logical core (zero free cores)
+        // intermittently starves the scheduler: when an OS/GC task needs a core mid-dispatch, that
+        // dispatch stalls and the token tanks. Measured end-to-end on a 32-core Zen5 (Strix Halo),
+        // SmolLM-135M / Bielik-1.5B / Llama-3.2-1B all scale to ~24-30 decode threads (1.5-1.9x over
+        // the previous flat cap of 8 — which was far too conservative even for the small model it was
+        // tuned on), with a *flat* median plateau across 28-32T and a catastrophic tail isolated to the
+        // full-core count (32T occasionally collapsed to ~15 tok/s while 30T held ~474; the cliff is OS
+        // oversubscription, not the per-dispatch coordination cost the old synthetic microbench
+        // implied — see .docs/decode-threading-investigation.md §5). Leaving OsReserveCores free
+        // captures the full plateau without the tail.
+        //
+        // This supersedes the old min(8, threadCount) / MemoryChannelEstimate logic: decode is not
+        // memory-channel-limited at these sizes (it scaled to ~30 cores on this host). Because the cap
+        // no longer depends on topology, enabling --numa-pin / --pcore-only can no longer lower it
+        // (the prior cap-2 footgun is gone by construction; pinning only affects core *placement* now).
+        //
+        // Validated on a single 32-core single-node Zen5 box. On >=64-core or multi-socket hosts the
+        // 2-core reserve and full-span behaviour are untested (spinning 60+ workers may need more
+        // headroom, and decode may want to stay on one socket); re-measure before trusting it there.
+        const int OsReserveCores = 2;
+        int autoDecodeCap = Math.Clamp(threadCount - OsReserveCores, 2, threadCount);
         _decodeThreadCount = config.DecodeThreadCount > 0
             ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
-            : topology is not null
-                ? Math.Clamp(Math.Max(topology.MemoryChannelEstimate, DefaultDecodeThreadCountCap), 2, threadCount)
-                : Math.Clamp(DefaultDecodeThreadCountCap, 2, threadCount);
+            : autoDecodeCap;
 
         // Build core assignment map (and caller core if pinning is enabled).
         (int[] workerAssignment, int callerCore) = BuildCoreAssignment(workerCount, topology, config);
