@@ -443,4 +443,74 @@ public sealed unsafe class FusedOpsTests
         // Byte-exact: same MXCSR round + signed saturation; VPMOVSDB preserves lane order.
         Assert.Equal(outScalar, outAvx512);
     }
+
+    [SkippableFact]
+    public void RmsNormQuantizeQ8_1_Avx512_MatchesScalar()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx512F.IsSupported,
+            "AVX-512F not available — the AVX-512 fused RMSNorm+Q8_1 path doesn't execute on this host.");
+
+        const int dim = 256; // 8 Q8_1 blocks
+        var rng = new Random(42);
+        float[] input = new float[dim];
+        float[] weight = new float[dim];
+        double sumSq = 0;
+        for (int i = 0; i < dim; i++)
+        {
+            input[i] = (float)(rng.NextDouble() * 2 - 1) * 5f;
+            weight[i] = (float)(rng.NextDouble() * 2 - 1);
+            sumSq += (double)input[i] * input[i];
+        }
+        float rmsScale = 1f / MathF.Sqrt((float)(sumSq / dim) + 1e-5f);
+
+        int q81Bytes = (dim / 32) * 36; // Half d + Half s + 32 sbyte
+        byte[] outScalar = new byte[q81Bytes];
+        byte[] outAvx512 = new byte[q81Bytes];
+
+        fixed (float* ip = input)
+        fixed (byte* sp = outScalar)
+        fixed (byte* ap = outAvx512)
+        {
+            FusedOps.RmsNormQuantizeQ8_1Scalar(ip, weight, rmsScale, sp, dim);
+            FusedOps.RmsNormQuantizeQ8_1Avx512(ip, weight, rmsScale, ap, dim);
+        }
+
+        // Byte-exact incl. the block-sum field (int clamp to [-127,127] matches scalar).
+        Assert.Equal(outScalar, outAvx512);
+    }
+
+    [SkippableFact]
+    public void RmsNormQuantizeQ8_K_Avx512_MatchesScalar()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx512F.IsSupported,
+            "AVX-512F not available — the AVX-512 fused RMSNorm+Q8_K path doesn't execute on this host.");
+
+        const int dim = 512; // 2 Q8_K blocks (256 each)
+        var rng = new Random(42);
+        float[] input = new float[dim];
+        float[] weight = new float[dim];
+        double sumSq = 0;
+        for (int i = 0; i < dim; i++)
+        {
+            input[i] = (float)(rng.NextDouble() * 2 - 1) * 5f;
+            weight[i] = (float)(rng.NextDouble() * 2 - 1);
+            sumSq += (double)input[i] * input[i];
+        }
+        float rmsScale = 1f / MathF.Sqrt((float)(sumSq / dim) + 1e-5f);
+
+        int q8kBytes = (dim / 256) * 292; // f32 scale + 256 sbyte + 16 int16 bsums
+        byte[] outScalar = new byte[q8kBytes];
+        byte[] outAvx512 = new byte[q8kBytes];
+
+        fixed (float* ip = input)
+        fixed (byte* sp = outScalar)
+        fixed (byte* ap = outAvx512)
+        {
+            FusedOps.RmsNormQuantizeQ8_KScalar(ip, weight, rmsScale, sp, dim);
+            FusedOps.RmsNormQuantizeQ8_KAvx512(ip, weight, rmsScale, ap, dim);
+        }
+
+        // Byte-exact incl. the 16 bsums (computed from the stored int8 values in both paths).
+        Assert.Equal(outScalar, outAvx512);
+    }
 }

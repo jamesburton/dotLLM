@@ -338,10 +338,54 @@ public static unsafe partial class KvQuantize
                 $"elementCount must be a multiple of {BlockSize}, got {elementCount}",
                 nameof(elementCount));
 
-        if (Avx2.IsSupported)
+        if (Avx512F.IsSupported)
+            Q4_0ToF32Avx512(src, dest, elementCount);
+        else if (Avx2.IsSupported)
             Q4_0ToF32Avx2(src, dest, elementCount);
         else
             Q4_0ToF32Scalar(src, dest, elementCount);
+    }
+
+    /// <summary>
+    /// AVX-512 Q4_0 → FP32 dequantization. Unpacks the 16 packed nibble bytes into the same interleaved
+    /// order as the AVX2/scalar paths (<c>dest[2j]=d*(lo-8)</c>, <c>dest[2j+1]=d*(hi-8)</c>), then widens
+    /// each 16-byte interleaved half with a single VPMOVSXBD instead of two 256-bit converts. Numerically
+    /// identical to <see cref="Q4_0ToF32Scalar"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void Q4_0ToF32Avx512(byte* src, float* dest, int elementCount)
+    {
+        int blockCount = elementCount / BlockSize;
+        Vector512<int> vEight = Vector512.Create(8);
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* blockSrc = src + block * Q4_0BlockBytes;
+            float* blockDst = dest + block * BlockSize;
+
+            float d = (float)Unsafe.ReadUnaligned<Half>(blockSrc);
+            Vector512<float> vScale = Vector512.Create(d);
+            byte* qs = blockSrc + 2;
+
+            // Extract nibbles (same as AVX2): lo = packed & 0x0F, hi = (packed >> 4) & 0x0F.
+            Vector128<byte> packed = Vector128.LoadUnsafe(ref Unsafe.AsRef<byte>(qs));
+            Vector128<byte> loMask = Vector128.Create((byte)0x0F);
+            Vector128<byte> loNibbles = packed & loMask;
+            Vector128<byte> hiNibbles = Vector128.ShiftRightLogical(packed.AsUInt16(), 4).AsByte() & loMask;
+
+            // Interleave to output order: [lo0,hi0,...,lo7,hi7] | [lo8,hi8,...,lo15,hi15]
+            Vector128<byte> interLo = Sse2.UnpackLow(loNibbles, hiNibbles);
+            Vector128<byte> interHi = Sse2.UnpackHigh(loNibbles, hiNibbles);
+
+            // Widen 16 sbytes → 16 int32 (VPMOVSXBD), subtract 8, scale, store.
+            Vector512<int> i0 = Avx512F.ConvertToVector512Int32(interLo.AsSByte());
+            (Avx512F.ConvertToVector512Single(i0 - vEight) * vScale)
+                .StoreUnsafe(ref Unsafe.AsRef<float>(blockDst));
+
+            Vector512<int> i1 = Avx512F.ConvertToVector512Int32(interHi.AsSByte());
+            (Avx512F.ConvertToVector512Single(i1 - vEight) * vScale)
+                .StoreUnsafe(ref Unsafe.AsRef<float>(blockDst + 16));
+        }
     }
 
     /// <summary>

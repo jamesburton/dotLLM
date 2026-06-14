@@ -462,103 +462,48 @@ public static unsafe class FusedOps
                                             byte* dest, int dim)
     {
         float rmsScale = ComputeRmsScale(input, dim, eps);
+        if (Avx512F.IsSupported)
+            RmsNormQuantizeQ8_1Avx512(input, weight, rmsScale, dest, dim);
+        else if (Avx2.IsSupported)
+            RmsNormQuantizeQ8_1Avx2(input, weight, rmsScale, dest, dim);
+        else
+            RmsNormQuantizeQ8_1Scalar(input, weight, rmsScale, dest, dim);
+    }
+
+    /// <summary>
+    /// AVX-512 fused RMSNorm + Q8_1 quantization (16-wide). Clamps to [-127,127] in the int domain (as the
+    /// AVX2 path) so the block sum matches, then narrows with order-preserving <c>VPMOVSDB</c>. Byte-exact
+    /// with <see cref="RmsNormQuantizeQ8_1Scalar"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_1Avx512(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                   byte* dest, int dim)
+    {
         int blockCount = dim / Q8_1GroupSize;
         float* normBuf = stackalloc float[Q8_1GroupSize];
 
-        if (Avx2.IsSupported)
+        fixed (float* wPtr = weight)
         {
-            fixed (float* wPtr = weight)
-            {
-                Vector256<float> vScale = Vector256.Create(rmsScale);
-                Vector256<int> permMask = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
-
-                for (int block = 0; block < blockCount; block++)
-                {
-                    float* blockInput = input + block * Q8_1GroupSize;
-                    byte* blockDst = dest + block * Q8_1BlockBytes;
-                    float* wBlock = wPtr + block * Q8_1GroupSize;
-
-                    // Normalize: input * rmsScale * weight → normBuf
-                    for (int j = 0; j < Q8_1GroupSize; j += 8)
-                    {
-                        var norm = Avx.Multiply(Avx.Multiply(
-                            Avx.LoadVector256(blockInput + j), vScale),
-                            Avx.LoadVector256(wBlock + j));
-                        Avx.Store(normBuf + j, norm);
-                    }
-
-                    // MaxAbs scan
-                    Vector256<float> v0 = Vector256.Abs(Avx.LoadVector256(normBuf));
-                    Vector256<float> v1 = Vector256.Abs(Avx.LoadVector256(normBuf + 8));
-                    Vector256<float> v2 = Vector256.Abs(Avx.LoadVector256(normBuf + 16));
-                    Vector256<float> v3 = Vector256.Abs(Avx.LoadVector256(normBuf + 24));
-                    float maxAbs = HorizontalMaxAvx2(Avx.Max(Avx.Max(v0, v1), Avx.Max(v2, v3)));
-
-                    float scale = maxAbs / 127.0f;
-                    Unsafe.WriteUnaligned(blockDst, (Half)scale);
-
-                    sbyte* qs = (sbyte*)(blockDst + 4);
-                    if (scale == 0)
-                    {
-                        Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs));
-                        Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
-                    }
-                    else
-                    {
-                        Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
-
-                        Vector256<int> i0 = Avx.ConvertToVector256Int32(
-                            Avx.Multiply(Avx.LoadVector256(normBuf), vInvScale));
-                        Vector256<int> i1 = Avx.ConvertToVector256Int32(
-                            Avx.Multiply(Avx.LoadVector256(normBuf + 8), vInvScale));
-                        Vector256<int> i2 = Avx.ConvertToVector256Int32(
-                            Avx.Multiply(Avx.LoadVector256(normBuf + 16), vInvScale));
-                        Vector256<int> i3 = Avx.ConvertToVector256Int32(
-                            Avx.Multiply(Avx.LoadVector256(normBuf + 24), vInvScale));
-
-                        // Clamp to [-127, 127] before summing
-                        Vector256<int> clampMin = Vector256.Create(-127);
-                        Vector256<int> clampMax = Vector256.Create(127);
-                        i0 = Avx2.Min(Avx2.Max(i0, clampMin), clampMax);
-                        i1 = Avx2.Min(Avx2.Max(i1, clampMin), clampMax);
-                        i2 = Avx2.Min(Avx2.Max(i2, clampMin), clampMax);
-                        i3 = Avx2.Min(Avx2.Max(i3, clampMin), clampMax);
-
-                        // Sum all 32 int32 values
-                        Vector256<int> isum = Avx2.Add(Avx2.Add(i0, i1), Avx2.Add(i2, i3));
-                        int sum = Vector256.Sum(isum);
-                        Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
-
-                        // Pack int32 → int16 → int8
-                        Vector256<short> s01 = Avx2.PackSignedSaturate(i0, i1);
-                        Vector256<short> s23 = Avx2.PackSignedSaturate(i2, i3);
-                        Vector256<sbyte> packed = Avx2.PackSignedSaturate(s01, s23);
-
-                        Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(), permMask);
-                        permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)qs));
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Scalar fallback
-            ref float wRef = ref MemoryMarshal.GetReference(weight);
+            Vector512<float> vScale = Vector512.Create(rmsScale);
+            Vector512<int> clampMin = Vector512.Create(-127);
+            Vector512<int> clampMax = Vector512.Create(127);
 
             for (int block = 0; block < blockCount; block++)
             {
                 float* blockInput = input + block * Q8_1GroupSize;
                 byte* blockDst = dest + block * Q8_1BlockBytes;
-                int wOff = block * Q8_1GroupSize;
+                float* wBlock = wPtr + block * Q8_1GroupSize;
 
-                float maxAbs = 0;
-                for (int i = 0; i < Q8_1GroupSize; i++)
+                for (int j = 0; j < Q8_1GroupSize; j += 16)
                 {
-                    float normalized = blockInput[i] * rmsScale * Unsafe.Add(ref wRef, wOff + i);
-                    normBuf[i] = normalized;
-                    float abs = MathF.Abs(normalized);
-                    if (abs > maxAbs) maxAbs = abs;
+                    Vector512<float> norm = Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(blockInput + j)) * vScale
+                        * Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(wBlock + j));
+                    norm.StoreUnsafe(ref Unsafe.AsRef<float>(normBuf + j));
                 }
+
+                Vector512<float> a0 = Vector512.Abs(Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(normBuf)));
+                Vector512<float> a1 = Vector512.Abs(Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(normBuf + 16)));
+                float maxAbs = HorizontalMaxAvx2(Avx.Max(Vector512.Max(a0, a1).GetLower(), Vector512.Max(a0, a1).GetUpper()));
 
                 float scale = maxAbs / 127.0f;
                 Unsafe.WriteUnaligned(blockDst, (Half)scale);
@@ -566,23 +511,159 @@ public static unsafe class FusedOps
                 sbyte* qs = (sbyte*)(blockDst + 4);
                 if (scale == 0)
                 {
-                    for (int i = 0; i < Q8_1GroupSize; i++)
-                        qs[i] = 0;
+                    Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs));
                     Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
                 }
                 else
                 {
-                    float invScale = 1.0f / scale;
-                    int sum = 0;
-                    for (int i = 0; i < Q8_1GroupSize; i++)
-                    {
-                        int v = (int)MathF.Round(normBuf[i] * invScale);
-                        v = Math.Clamp(v, -127, 127);
-                        qs[i] = (sbyte)v;
-                        sum += v;
-                    }
+                    Vector512<float> vInvScale = Vector512.Create(1.0f / scale);
+
+                    Vector512<int> i0 = Avx512F.ConvertToVector512Int32(
+                        Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(normBuf)) * vInvScale);
+                    Vector512<int> i1 = Avx512F.ConvertToVector512Int32(
+                        Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(normBuf + 16)) * vInvScale);
+
+                    i0 = Vector512.Min(Vector512.Max(i0, clampMin), clampMax);
+                    i1 = Vector512.Min(Vector512.Max(i1, clampMin), clampMax);
+
+                    int sum = Vector512.Sum(i0) + Vector512.Sum(i1);
                     Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
+
+                    Avx512F.ConvertToVector128SByteWithSaturation(i0).StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs));
+                    Avx512F.ConvertToVector128SByteWithSaturation(i1).StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs + 16));
                 }
+            }
+        }
+    }
+
+    /// <summary>AVX2 fused RMSNorm + Q8_1 quantization (8-wide). Extracted verbatim from the original kernel.</summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_1Avx2(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                 byte* dest, int dim)
+    {
+        int blockCount = dim / Q8_1GroupSize;
+        float* normBuf = stackalloc float[Q8_1GroupSize];
+
+        fixed (float* wPtr = weight)
+        {
+            Vector256<float> vScale = Vector256.Create(rmsScale);
+            Vector256<int> permMask = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockInput = input + block * Q8_1GroupSize;
+                byte* blockDst = dest + block * Q8_1BlockBytes;
+                float* wBlock = wPtr + block * Q8_1GroupSize;
+
+                // Normalize: input * rmsScale * weight → normBuf
+                for (int j = 0; j < Q8_1GroupSize; j += 8)
+                {
+                    var norm = Avx.Multiply(Avx.Multiply(
+                        Avx.LoadVector256(blockInput + j), vScale),
+                        Avx.LoadVector256(wBlock + j));
+                    Avx.Store(normBuf + j, norm);
+                }
+
+                // MaxAbs scan
+                Vector256<float> v0 = Vector256.Abs(Avx.LoadVector256(normBuf));
+                Vector256<float> v1 = Vector256.Abs(Avx.LoadVector256(normBuf + 8));
+                Vector256<float> v2 = Vector256.Abs(Avx.LoadVector256(normBuf + 16));
+                Vector256<float> v3 = Vector256.Abs(Avx.LoadVector256(normBuf + 24));
+                float maxAbs = HorizontalMaxAvx2(Avx.Max(Avx.Max(v0, v1), Avx.Max(v2, v3)));
+
+                float scale = maxAbs / 127.0f;
+                Unsafe.WriteUnaligned(blockDst, (Half)scale);
+
+                sbyte* qs = (sbyte*)(blockDst + 4);
+                if (scale == 0)
+                {
+                    Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs));
+                    Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
+                }
+                else
+                {
+                    Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
+
+                    Vector256<int> i0 = Avx.ConvertToVector256Int32(
+                        Avx.Multiply(Avx.LoadVector256(normBuf), vInvScale));
+                    Vector256<int> i1 = Avx.ConvertToVector256Int32(
+                        Avx.Multiply(Avx.LoadVector256(normBuf + 8), vInvScale));
+                    Vector256<int> i2 = Avx.ConvertToVector256Int32(
+                        Avx.Multiply(Avx.LoadVector256(normBuf + 16), vInvScale));
+                    Vector256<int> i3 = Avx.ConvertToVector256Int32(
+                        Avx.Multiply(Avx.LoadVector256(normBuf + 24), vInvScale));
+
+                    // Clamp to [-127, 127] before summing
+                    Vector256<int> clampMin = Vector256.Create(-127);
+                    Vector256<int> clampMax = Vector256.Create(127);
+                    i0 = Avx2.Min(Avx2.Max(i0, clampMin), clampMax);
+                    i1 = Avx2.Min(Avx2.Max(i1, clampMin), clampMax);
+                    i2 = Avx2.Min(Avx2.Max(i2, clampMin), clampMax);
+                    i3 = Avx2.Min(Avx2.Max(i3, clampMin), clampMax);
+
+                    // Sum all 32 int32 values
+                    Vector256<int> isum = Avx2.Add(Avx2.Add(i0, i1), Avx2.Add(i2, i3));
+                    int sum = Vector256.Sum(isum);
+                    Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
+
+                    // Pack int32 → int16 → int8
+                    Vector256<short> s01 = Avx2.PackSignedSaturate(i0, i1);
+                    Vector256<short> s23 = Avx2.PackSignedSaturate(i2, i3);
+                    Vector256<sbyte> packed = Avx2.PackSignedSaturate(s01, s23);
+
+                    Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(), permMask);
+                    permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)qs));
+                }
+            }
+        }
+    }
+
+    /// <summary>Scalar reference for fused RMSNorm + Q8_1 quantization. Extracted verbatim from the original kernel.</summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_1Scalar(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                   byte* dest, int dim)
+    {
+        int blockCount = dim / Q8_1GroupSize;
+        float* normBuf = stackalloc float[Q8_1GroupSize];
+        ref float wRef = ref MemoryMarshal.GetReference(weight);
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float* blockInput = input + block * Q8_1GroupSize;
+            byte* blockDst = dest + block * Q8_1BlockBytes;
+            int wOff = block * Q8_1GroupSize;
+
+            float maxAbs = 0;
+            for (int i = 0; i < Q8_1GroupSize; i++)
+            {
+                float normalized = blockInput[i] * rmsScale * Unsafe.Add(ref wRef, wOff + i);
+                normBuf[i] = normalized;
+                float abs = MathF.Abs(normalized);
+                if (abs > maxAbs) maxAbs = abs;
+            }
+
+            float scale = maxAbs / 127.0f;
+            Unsafe.WriteUnaligned(blockDst, (Half)scale);
+
+            sbyte* qs = (sbyte*)(blockDst + 4);
+            if (scale == 0)
+            {
+                for (int i = 0; i < Q8_1GroupSize; i++)
+                    qs[i] = 0;
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)0f);
+            }
+            else
+            {
+                float invScale = 1.0f / scale;
+                int sum = 0;
+                for (int i = 0; i < Q8_1GroupSize; i++)
+                {
+                    int v = (int)MathF.Round(normBuf[i] * invScale);
+                    v = Math.Clamp(v, -127, 127);
+                    qs[i] = (sbyte)v;
+                    sum += v;
+                }
+                Unsafe.WriteUnaligned(blockDst + 2, (Half)(scale * sum));
             }
         }
     }
@@ -598,106 +679,46 @@ public static unsafe class FusedOps
                                             byte* dest, int dim)
     {
         float rmsScale = ComputeRmsScale(input, dim, eps);
+        if (Avx512F.IsSupported)
+            RmsNormQuantizeQ8_KAvx512(input, weight, rmsScale, dest, dim);
+        else if (Avx2.IsSupported)
+            RmsNormQuantizeQ8_KAvx2(input, weight, rmsScale, dest, dim);
+        else
+            RmsNormQuantizeQ8_KScalar(input, weight, rmsScale, dest, dim);
+    }
+
+    /// <summary>
+    /// AVX-512 fused RMSNorm + Q8_K quantization (16-wide). Normalizes 256 floats with interleaved max-abs,
+    /// quantizes via order-preserving <c>VPMOVSDB</c> (no permute), and computes the 16 bsums from the stored
+    /// int8 values (as the AVX2 path). Byte-exact with <see cref="RmsNormQuantizeQ8_KScalar"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_KAvx512(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                   byte* dest, int dim)
+    {
         int blockCount = dim / Q8_K_GroupSize;
         float* normBuf = stackalloc float[Q8_K_GroupSize];
 
-        if (Avx2.IsSupported)
+        fixed (float* wPtr = weight)
         {
-            fixed (float* wPtr = weight)
-            {
-                Vector256<float> vScale = Vector256.Create(rmsScale);
-                Vector256<int> permMask = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
-
-                for (int block = 0; block < blockCount; block++)
-                {
-                    float* blockInput = input + block * Q8_K_GroupSize;
-                    byte* blockDst = dest + block * Q8_K_BlockBytes;
-                    float* wBlock = wPtr + block * Q8_K_GroupSize;
-
-                    // Normalize 256 floats: input * rmsScale * weight → normBuf (32 × 8-wide)
-                    // Interleave with maxAbs accumulation to avoid a second pass over normBuf
-                    Vector256<float> maxVec = Vector256<float>.Zero;
-                    for (int j = 0; j < Q8_K_GroupSize; j += 8)
-                    {
-                        var norm = Avx.Multiply(Avx.Multiply(
-                            Avx.LoadVector256(blockInput + j), vScale),
-                            Avx.LoadVector256(wBlock + j));
-                        Avx.Store(normBuf + j, norm);
-                        maxVec = Avx.Max(maxVec, Vector256.Abs(norm));
-                    }
-                    float maxAbs = HorizontalMaxAvx2(maxVec);
-
-                    float scale = maxAbs / 127.0f;
-                    Unsafe.WriteUnaligned(blockDst, scale);
-
-                    sbyte* qs = (sbyte*)(blockDst + 4);
-                    short* bsums = (short*)(blockDst + 260);
-
-                    if (scale == 0)
-                    {
-                        for (int i = 0; i < Q8_K_GroupSize; i += 32)
-                            Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs + i));
-                        for (int i = 0; i < 16; i++)
-                            bsums[i] = 0;
-                    }
-                    else
-                    {
-                        Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
-
-                        // Quantize 32 floats at a time (8 chunks for 256 total)
-                        for (int chunk = 0; chunk < 8; chunk++)
-                        {
-                            float* chunkSrc = normBuf + chunk * 32;
-                            sbyte* chunkDst = qs + chunk * 32;
-
-                            Vector256<int> i0 = Avx.ConvertToVector256Int32(
-                                Avx.Multiply(Avx.LoadVector256(chunkSrc), vInvScale));
-                            Vector256<int> i1 = Avx.ConvertToVector256Int32(
-                                Avx.Multiply(Avx.LoadVector256(chunkSrc + 8), vInvScale));
-                            Vector256<int> i2 = Avx.ConvertToVector256Int32(
-                                Avx.Multiply(Avx.LoadVector256(chunkSrc + 16), vInvScale));
-                            Vector256<int> i3 = Avx.ConvertToVector256Int32(
-                                Avx.Multiply(Avx.LoadVector256(chunkSrc + 24), vInvScale));
-
-                            Vector256<short> s01 = Avx2.PackSignedSaturate(i0, i1);
-                            Vector256<short> s23 = Avx2.PackSignedSaturate(i2, i3);
-                            Vector256<sbyte> packed = Avx2.PackSignedSaturate(s01, s23);
-
-                            Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(), permMask);
-                            permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)chunkDst));
-                        }
-
-                        // Compute bsums: sum each group of 16 consecutive sbyte values
-                        for (int g = 0; g < 16; g++)
-                        {
-                            int sum = 0;
-                            for (int i = 0; i < 16; i++)
-                                sum += qs[g * 16 + i];
-                            bsums[g] = (short)sum;
-                        }
-                    }
-                }
-            }
-        }
-        else
-        {
-            // Scalar fallback
-            ref float wRef = ref MemoryMarshal.GetReference(weight);
+            Vector512<float> vScale = Vector512.Create(rmsScale);
 
             for (int block = 0; block < blockCount; block++)
             {
                 float* blockInput = input + block * Q8_K_GroupSize;
                 byte* blockDst = dest + block * Q8_K_BlockBytes;
-                int wOff = block * Q8_K_GroupSize;
+                float* wBlock = wPtr + block * Q8_K_GroupSize;
 
-                float maxAbs = 0;
-                for (int i = 0; i < Q8_K_GroupSize; i++)
+                // Normalize 256 floats (16 × 16-wide) with interleaved max-abs accumulation.
+                Vector512<float> maxVec = Vector512<float>.Zero;
+                for (int j = 0; j < Q8_K_GroupSize; j += 16)
                 {
-                    float normalized = blockInput[i] * rmsScale * Unsafe.Add(ref wRef, wOff + i);
-                    normBuf[i] = normalized;
-                    float abs = MathF.Abs(normalized);
-                    if (abs > maxAbs) maxAbs = abs;
+                    Vector512<float> norm = Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(blockInput + j)) * vScale
+                        * Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(wBlock + j));
+                    norm.StoreUnsafe(ref Unsafe.AsRef<float>(normBuf + j));
+                    maxVec = Vector512.Max(maxVec, Vector512.Abs(norm));
                 }
+                float maxAbs = HorizontalMaxAvx2(Avx.Max(maxVec.GetLower(), maxVec.GetUpper()));
 
                 float scale = maxAbs / 127.0f;
                 Unsafe.WriteUnaligned(blockDst, scale);
@@ -707,27 +728,174 @@ public static unsafe class FusedOps
 
                 if (scale == 0)
                 {
-                    for (int i = 0; i < Q8_K_GroupSize; i++)
-                        qs[i] = 0;
+                    for (int i = 0; i < Q8_K_GroupSize; i += 32)
+                        Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs + i));
                     for (int i = 0; i < 16; i++)
                         bsums[i] = 0;
                 }
                 else
                 {
-                    float invScale = 1.0f / scale;
+                    Vector512<float> vInvScale = Vector512.Create(1.0f / scale);
+
+                    // Quantize 256 values, 16 at a time (16 narrows).
+                    for (int j = 0; j < Q8_K_GroupSize; j += 16)
+                    {
+                        Vector512<int> iv = Avx512F.ConvertToVector512Int32(
+                            Vector512.LoadUnsafe(ref Unsafe.AsRef<float>(normBuf + j)) * vInvScale);
+                        Avx512F.ConvertToVector128SByteWithSaturation(iv)
+                            .StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs + j));
+                    }
+
+                    // Compute bsums: sum each group of 16 consecutive sbyte values (from stored qs).
                     for (int g = 0; g < 16; g++)
                     {
                         int sum = 0;
-                        for (int j = 0; j < 16; j++)
-                        {
-                            int idx = g * 16 + j;
-                            int v = (int)MathF.Round(normBuf[idx] * invScale);
-                            sbyte qv = (sbyte)Math.Clamp(v, -127, 127);
-                            qs[idx] = qv;
-                            sum += qv;
-                        }
+                        for (int i = 0; i < 16; i++)
+                            sum += qs[g * 16 + i];
                         bsums[g] = (short)sum;
                     }
+                }
+            }
+        }
+    }
+
+    /// <summary>AVX2 fused RMSNorm + Q8_K quantization (8-wide). Extracted verbatim from the original kernel.</summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_KAvx2(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                 byte* dest, int dim)
+    {
+        int blockCount = dim / Q8_K_GroupSize;
+        float* normBuf = stackalloc float[Q8_K_GroupSize];
+
+        fixed (float* wPtr = weight)
+        {
+            Vector256<float> vScale = Vector256.Create(rmsScale);
+            Vector256<int> permMask = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+
+            for (int block = 0; block < blockCount; block++)
+            {
+                float* blockInput = input + block * Q8_K_GroupSize;
+                byte* blockDst = dest + block * Q8_K_BlockBytes;
+                float* wBlock = wPtr + block * Q8_K_GroupSize;
+
+                // Normalize 256 floats: input * rmsScale * weight → normBuf (32 × 8-wide)
+                // Interleave with maxAbs accumulation to avoid a second pass over normBuf
+                Vector256<float> maxVec = Vector256<float>.Zero;
+                for (int j = 0; j < Q8_K_GroupSize; j += 8)
+                {
+                    var norm = Avx.Multiply(Avx.Multiply(
+                        Avx.LoadVector256(blockInput + j), vScale),
+                        Avx.LoadVector256(wBlock + j));
+                    Avx.Store(normBuf + j, norm);
+                    maxVec = Avx.Max(maxVec, Vector256.Abs(norm));
+                }
+                float maxAbs = HorizontalMaxAvx2(maxVec);
+
+                float scale = maxAbs / 127.0f;
+                Unsafe.WriteUnaligned(blockDst, scale);
+
+                sbyte* qs = (sbyte*)(blockDst + 4);
+                short* bsums = (short*)(blockDst + 260);
+
+                if (scale == 0)
+                {
+                    for (int i = 0; i < Q8_K_GroupSize; i += 32)
+                        Vector256<sbyte>.Zero.StoreUnsafe(ref Unsafe.AsRef<sbyte>(qs + i));
+                    for (int i = 0; i < 16; i++)
+                        bsums[i] = 0;
+                }
+                else
+                {
+                    Vector256<float> vInvScale = Vector256.Create(1.0f / scale);
+
+                    // Quantize 32 floats at a time (8 chunks for 256 total)
+                    for (int chunk = 0; chunk < 8; chunk++)
+                    {
+                        float* chunkSrc = normBuf + chunk * 32;
+                        sbyte* chunkDst = qs + chunk * 32;
+
+                        Vector256<int> i0 = Avx.ConvertToVector256Int32(
+                            Avx.Multiply(Avx.LoadVector256(chunkSrc), vInvScale));
+                        Vector256<int> i1 = Avx.ConvertToVector256Int32(
+                            Avx.Multiply(Avx.LoadVector256(chunkSrc + 8), vInvScale));
+                        Vector256<int> i2 = Avx.ConvertToVector256Int32(
+                            Avx.Multiply(Avx.LoadVector256(chunkSrc + 16), vInvScale));
+                        Vector256<int> i3 = Avx.ConvertToVector256Int32(
+                            Avx.Multiply(Avx.LoadVector256(chunkSrc + 24), vInvScale));
+
+                        Vector256<short> s01 = Avx2.PackSignedSaturate(i0, i1);
+                        Vector256<short> s23 = Avx2.PackSignedSaturate(i2, i3);
+                        Vector256<sbyte> packed = Avx2.PackSignedSaturate(s01, s23);
+
+                        Vector256<int> permuted = Avx2.PermuteVar8x32(packed.AsInt32(), permMask);
+                        permuted.AsByte().StoreUnsafe(ref Unsafe.AsRef<byte>((byte*)chunkDst));
+                    }
+
+                    // Compute bsums: sum each group of 16 consecutive sbyte values
+                    for (int g = 0; g < 16; g++)
+                    {
+                        int sum = 0;
+                        for (int i = 0; i < 16; i++)
+                            sum += qs[g * 16 + i];
+                        bsums[g] = (short)sum;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Scalar reference for fused RMSNorm + Q8_K quantization. Extracted verbatim from the original kernel.</summary>
+    [SkipLocalsInit]
+    internal static void RmsNormQuantizeQ8_KScalar(float* input, ReadOnlySpan<float> weight, float rmsScale,
+                                                   byte* dest, int dim)
+    {
+        int blockCount = dim / Q8_K_GroupSize;
+        float* normBuf = stackalloc float[Q8_K_GroupSize];
+        ref float wRef = ref MemoryMarshal.GetReference(weight);
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            float* blockInput = input + block * Q8_K_GroupSize;
+            byte* blockDst = dest + block * Q8_K_BlockBytes;
+            int wOff = block * Q8_K_GroupSize;
+
+            float maxAbs = 0;
+            for (int i = 0; i < Q8_K_GroupSize; i++)
+            {
+                float normalized = blockInput[i] * rmsScale * Unsafe.Add(ref wRef, wOff + i);
+                normBuf[i] = normalized;
+                float abs = MathF.Abs(normalized);
+                if (abs > maxAbs) maxAbs = abs;
+            }
+
+            float scale = maxAbs / 127.0f;
+            Unsafe.WriteUnaligned(blockDst, scale);
+
+            sbyte* qs = (sbyte*)(blockDst + 4);
+            short* bsums = (short*)(blockDst + 260);
+
+            if (scale == 0)
+            {
+                for (int i = 0; i < Q8_K_GroupSize; i++)
+                    qs[i] = 0;
+                for (int i = 0; i < 16; i++)
+                    bsums[i] = 0;
+            }
+            else
+            {
+                float invScale = 1.0f / scale;
+                for (int g = 0; g < 16; g++)
+                {
+                    int sum = 0;
+                    for (int j = 0; j < 16; j++)
+                    {
+                        int idx = g * 16 + j;
+                        int v = (int)MathF.Round(normBuf[idx] * invScale);
+                        sbyte qv = (sbyte)Math.Clamp(v, -127, 127);
+                        qs[idx] = qv;
+                        sum += qv;
+                    }
+                    bsums[g] = (short)sum;
                 }
             }
         }

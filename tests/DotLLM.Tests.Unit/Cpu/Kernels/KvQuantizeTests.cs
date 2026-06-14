@@ -216,6 +216,36 @@ public sealed unsafe class KvQuantizeTests
         Assert.Equal(quantScalar, quantAvx512);
     }
 
+    [SkippableFact]
+    public void Q4_0_Dequant_Avx512_MatchesScalar()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx512F.IsSupported,
+            "AVX-512F not available — the AVX-512 dequant path doesn't execute on this host.");
+
+        float[] input = GenerateTestData(BlockSize * 8);
+        byte[] quantized = new byte[KvQuantize.Q4_0BlockBytes * 8];
+        float[] outScalar = new float[input.Length];
+        float[] outAvx512 = new float[input.Length];
+
+        fixed (float* ip = input)
+        fixed (byte* qp = quantized)
+        {
+            KvQuantize.F32ToQ4_0Scalar(ip, qp, input.Length);
+        }
+
+        fixed (byte* qp = quantized)
+        fixed (float* sp = outScalar)
+        fixed (float* ap = outAvx512)
+        {
+            KvQuantize.Q4_0ToF32Scalar(qp, sp, input.Length);
+            KvQuantize.Q4_0ToF32Avx512(qp, ap, input.Length);
+        }
+
+        // Pure widen + (nibble-8) * d in matching order — bit-identical to scalar.
+        for (int i = 0; i < input.Length; i++)
+            Assert.Equal(outScalar[i], outAvx512[i]);
+    }
+
     [Fact]
     public void QuantizedRowBytes_ReturnsCorrectSize()
     {
