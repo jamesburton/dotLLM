@@ -55,6 +55,14 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     public int ThreadCount => _threadCount;
 
     /// <summary>
+    /// Effective decode thread count — the number of threads (caller + workers) that
+    /// <see cref="DispatchMode.SpinWait"/> dispatches drive. Capped below <see cref="ThreadCount"/>
+    /// because short, frequent decode dispatches are dominated by coordination cost once worker
+    /// count grows. Exposed for observability and testing; see the cap derivation in the constructor.
+    /// </summary>
+    public int DecodeThreadCount => _decodeThreadCount;
+
+    /// <summary>
     /// Whether the caller (inference) thread has been successfully pinned to a logical
     /// processor. <c>false</c> when pinning is disabled, unsupported on the current OS,
     /// the caller ran on a ThreadPool thread, or the pin syscall failed. Exposed for
@@ -96,11 +104,19 @@ public sealed unsafe class ComputeThreadPool : IDisposable
         // When no NumaTopology is available we therefore fall back to a conservative default of
         // min(8, threadCount) rather than using every thread; 8 matches typical "memory channels × 2"
         // for desktop/workstation x86 hosts and keeps the pool in the regime where SpinWait is a win.
+        // Invariant: enabling NUMA/P-core pinning must never produce a *smaller* decode cap than
+        // running without pinning. On a single-node host NumaTopology.MemoryChannelEstimate is 2
+        // (NumaTopology.cs:112), so a naive `topology -> MemoryChannelEstimate` branch dropped the
+        // decode cap from 8 to 2 the moment a user passed --numa-pin / --pcore-only — a ~3× decode
+        // regression on Strix Halo (cap 2 = 14.8 tok/s vs cap 8 = 38.4 tok/s; see
+        // .docs/decode-threading-investigation.md §1.4). We therefore floor the topology branch at
+        // DefaultDecodeThreadCountCap: pinning may raise the cap on a true multi-socket box
+        // (MemoryChannelEstimate = 4·nodes) but can never lower it below the no-topology default.
         const int DefaultDecodeThreadCountCap = 8;
         _decodeThreadCount = config.DecodeThreadCount > 0
             ? Math.Clamp(config.DecodeThreadCount, 2, threadCount)
             : topology is not null
-                ? Math.Clamp(topology.MemoryChannelEstimate, 2, threadCount)
+                ? Math.Clamp(Math.Max(topology.MemoryChannelEstimate, DefaultDecodeThreadCountCap), 2, threadCount)
                 : Math.Clamp(DefaultDecodeThreadCountCap, 2, threadCount);
 
         // Build core assignment map (and caller core if pinning is enabled).

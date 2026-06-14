@@ -76,6 +76,39 @@ public sealed unsafe class ComputeThreadPoolTests
     }
 
     /// <summary>
+    /// Regression for the pinning cap-2 footgun: enabling NUMA/P-core pinning must never produce a
+    /// *smaller* decode thread cap than running without pinning. On a single-node host
+    /// <see cref="NumaTopology.MemoryChannelEstimate"/> is 2, which previously dropped the decode cap
+    /// from 8 to 2 the moment pinning was enabled (~3× decode regression on Strix Halo). The cap is
+    /// now floored at the no-topology default, so the topology branch can only ever raise it.
+    /// </summary>
+    [Fact]
+    public void DecodeThreadCap_PinningNeverLowersBelowNoTopology()
+    {
+        // threadCount must exceed the no-topology default cap (8) so a channel-estimate of 2 would
+        // be observably below it — that's the regression this discriminates.
+        const int threadCount = 16;
+
+        var topology = NumaTopology.Detect();
+        var pinnedConfig = new ThreadingConfig(
+            ThreadCount: threadCount,
+            DecodeThreadCount: 0, // let the cap derive from topology
+            EnableNumaPinning: true,
+            EnablePCorePinning: true);
+
+        using var pinned = new ComputeThreadPool(threadCount, topology, pinnedConfig);
+        using var unpinned = new ComputeThreadPool(threadCount, topology: null, config: default);
+
+        Assert.True(pinned.DecodeThreadCount >= unpinned.DecodeThreadCount,
+            $"Pinning lowered the decode cap ({pinned.DecodeThreadCount}) below the no-topology " +
+            $"default ({unpinned.DecodeThreadCount}) — the cap-2 footgun has regressed.");
+
+        // On a single-node host (the common case incl. Strix) the floor pins both to 8.
+        if (topology.NumaNodeCount == 1)
+            Assert.Equal(unpinned.DecodeThreadCount, pinned.DecodeThreadCount);
+    }
+
+    /// <summary>
     /// Stress test: rapidly switch modes while dispatching to ensure no deadlocks.
     /// </summary>
     [Fact]
