@@ -51,10 +51,33 @@ public sealed class MatMulQ8_0Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
     }
 
-    /// <summary>Loads <c>matmul_q8_0.spv</c> from the given directory and creates the pipeline.</summary>
+    /// <summary>
+    /// Loads the best Q8_0 GEMV SPIR-V variant for the device and creates the pipeline. The optimal
+    /// workgroup variant is vendor-dependent (measured on this box, decode-weighted vs the wg128 default):
+    /// Intel Arc → <c>_sg</c> (subgroup-add, ~1.05x, up to 1.23x on QKV/FFN shapes); NVIDIA → <c>_wg64</c>
+    /// (~1.07x; <c>_sg</c> is no help there); everything else → the wg128 default. Override with
+    /// <c>DOTLLM_VULKAN_Q8_GEMV_VARIANT</c> = <c>sg</c>|<c>wg64</c>|<c>wg128</c>|<c>wg256</c>. Falls back to
+    /// the wg128 default if the chosen variant's .spv is absent. See .docs/local-optimization-campaign.md (V1).
+    /// </summary>
     public static MatMulQ8_0Kernel Create(VulkanDevice device, string spvDir)
     {
-        string path = Path.Combine(spvDir, "matmul_q8_0.spv");
+        const uint VendorIntel = 0x8086, VendorNvidia = 0x10DE;
+        string? variant = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_Q8_GEMV_VARIANT")?.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(variant))
+        {
+            variant = device.VendorId switch
+            {
+                VendorIntel when device.HasSubgroupArithmetic => "sg",
+                VendorNvidia => "wg64",
+                _ => "wg128",
+            };
+        }
+
+        // wg128 is the canonical "matmul_q8_0.spv"; the others are suffixed.
+        string fileName = variant is "wg128" or "" ? "matmul_q8_0.spv" : $"matmul_q8_0_{variant}.spv";
+        string path = Path.Combine(spvDir, fileName);
+        if (!File.Exists(path))
+            path = Path.Combine(spvDir, "matmul_q8_0.spv"); // fall back to the always-present default
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
