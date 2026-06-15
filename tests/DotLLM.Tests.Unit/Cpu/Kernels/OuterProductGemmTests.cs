@@ -315,6 +315,22 @@ public sealed unsafe class OuterProductGemmTests
     }
 
     /// <summary>
+    /// Diagnostic: dump the detected CPU topology (per-logical CoreType / PhysicalCoreId + the
+    /// PerformanceCoreIds list) so the ZP microbenches can pin a GENUINE efficiency core rather than a
+    /// P-core SMT sibling. Opt-in via <c>DOTLLM_RUN_KERNEL_BENCH=1</c>.
+    /// </summary>
+    [SkippableFact]
+    public void DumpCpuTopology()
+    {
+        Skip.If(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_RUN_KERNEL_BENCH")),
+            "Opt-in — set DOTLLM_RUN_KERNEL_BENCH=1.");
+        var topo = DotLLM.Cpu.Threading.NumaTopology.Detect();
+        Console.WriteLine($"[Topology] hybrid={topo.IsHybrid} logical={topo.Processors.Count} perfIds=[{string.Join(",", topo.PerformanceCoreIds)}]");
+        foreach (var p in topo.Processors)
+            Console.WriteLine($"  logical={p.ProcessorId,2} phys={p.PhysicalCoreId,2} type={p.CoreType} numa={p.NumaNode}");
+    }
+
+    /// <summary>
     /// Zero-point counterpart bench: AVX-VNNI ZP 4×3 (no sign trick) vs the sign-trick AVX-VNNI 4×3,
     /// PAIRED per-round median ratio on a pinned P-core (and E-core). This is the gate for adopting the
     /// 256-bit ZP kernel ported from strix's AVX-512 <c>OuterProductQ8_0Avx512VnniZp_4x6</c> (#322):
@@ -407,8 +423,13 @@ public sealed unsafe class OuterProductGemmTests
         var topo = DotLLM.Cpu.Threading.NumaTopology.Detect();
         var pcores = topo.PerformanceCoreIds;
         int pCore = pcores.Count > 0 ? pcores[0] : 0;
-        int eCore = Enumerable.Range(0, Environment.ProcessorCount).FirstOrDefault(i => !pcores.Contains(i), pCore);
-        Console.WriteLine($"[OuterProductVnniZpPreMicroBench] iters={Iters} rounds={Rounds} hybrid={topo.IsHybrid} pCore={pCore} eCore={eCore} (min ns/call, 4x3 tile; Sw precomputed)");
+        // Pin to a GENUINE Crestmont efficiency core (CoreType.Efficiency), not merely "first non-P index"
+        // (which on an SMT host would be a P-core sibling). HT is disabled here so they coincide, but the
+        // principled selection keeps this correct on SMT-enabled machines too.
+        int eCore = topo.Processors
+            .Where(p => p.CoreType == DotLLM.Cpu.Threading.CoreType.Efficiency)
+            .Select(p => p.ProcessorId).DefaultIfEmpty(pCore).First();
+        Console.WriteLine($"[OuterProductVnniZpPreMicroBench] iters={Iters} rounds={Rounds} hybrid={topo.IsHybrid} pCore={pCore}(Performance) eCore={eCore}(Efficiency) (min ns/call, 4x3 tile; Sw precomputed)");
 
         BenchZpPreVsVnniOnCore("P-core", pCore, blockCounts, Iters, Rounds);
         if (eCore != pCore) BenchZpPreVsVnniOnCore("E-core", eCore, blockCounts, Iters, Rounds);
