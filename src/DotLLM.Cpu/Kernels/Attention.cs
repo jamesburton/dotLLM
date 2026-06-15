@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
@@ -138,12 +139,59 @@ public static class Attention
         }
     }
 
+    /// <summary>
+    /// Bidirectional (non-causal) scaled dot-product attention with GQA head broadcast: every query
+    /// position attends to every key position — no causal mask, no sliding window, no ALiBi. This is the
+    /// attention mode used by diffusion / encoder language models that denoise a full sequence with full
+    /// self-attention (see <c>docs/ATTENTION.md</c>). <paramref name="seq"/> is both the query and key length.
+    /// </summary>
+    /// <param name="q">Query tensor [seq, numHeads * headDim], row-major.</param>
+    /// <param name="k">Key tensor [seq, numKvHeads * headDim], row-major.</param>
+    /// <param name="v">Value tensor [seq, numKvHeads * headDim], row-major.</param>
+    /// <param name="output">Output tensor [seq, numHeads * headDim], row-major.</param>
+    /// <param name="seq">Sequence length (query length == key length for self-attention).</param>
+    /// <param name="numHeads">Number of query heads.</param>
+    /// <param name="numKvHeads">Number of key/value heads (GQA); must divide <paramref name="numHeads"/>.</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="scale">Score scale (typically 1/sqrt(headDim)).</param>
+    [SkipLocalsInit]
+    public static void ExecuteBidirectional(ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
+                                            Span<float> output, int seq, int numHeads, int numKvHeads,
+                                            int headDim, float scale)
+    {
+        if (headDim <= 0)
+            throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
+        if (numHeads % numKvHeads != 0)
+            throw new ArgumentException(
+                $"numHeads ({numHeads}) must be divisible by numKvHeads ({numKvHeads})", nameof(numKvHeads));
+
+        int groupSize = numHeads / numKvHeads;
+        int qStride = numHeads * headDim;
+        int kvStride = numKvHeads * headDim;
+        int scoreSize = seq * seq;
+
+        // seq² scores can exceed the stack threshold for a denoising canvas (e.g. 256² = 256 KB), so
+        // rent from the pool rather than stackalloc. This is the spike path; a tiled bidirectional
+        // online-softmax variant is future work if memory becomes a concern.
+        float[] rented = ArrayPool<float>.Shared.Rent(scoreSize);
+        try
+        {
+            ExecuteCore(q, k, v, output, rented.AsSpan(0, scoreSize), seq, seq, numHeads, headDim,
+                        groupSize, scale, qStride, kvStride, positionOffset: 0, default,
+                        slidingWindowSize: null, softCap: 0f, causal: false);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
     private static void ExecuteCore(ReadOnlySpan<float> q, ReadOnlySpan<float> k, ReadOnlySpan<float> v,
                                      Span<float> output, Span<float> scores,
                                      int seqQ, int seqKv, int numHeads, int headDim,
                                      int groupSize, float scale, int qStride, int kvStride,
                                      int positionOffset, ReadOnlySpan<float> alibiSlopes,
-                                     int? slidingWindowSize = null, float softCap = 0f)
+                                     int? slidingWindowSize = null, float softCap = 0f, bool causal = true)
     {
         for (int h = 0; h < numHeads; h++)
         {
@@ -154,10 +202,13 @@ public static class Attention
                                    h, kvH, qStride, kvStride);
 
             // 2. Apply optional ALiBi, then optional soft-cap (Gemma 2/3), then causal mask.
+            //    Diffusion / encoder models pass causal=false: every query attends to every key
+            //    (full bidirectional self-attention over the denoising canvas), so the mask is skipped.
             ApplyAlibiBias(scores, seqQ, seqKv, positionOffset, GetAlibiSlope(alibiSlopes, h));
             if (softCap > 0f)
                 ApplySoftCap(scores, softCap);
-            ApplyCausalMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+            if (causal)
+                ApplyCausalMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
 
             // 3. Fast softmax per row (approximate exp — sufficient for attention)
             for (int i = 0; i < seqQ; i++)
