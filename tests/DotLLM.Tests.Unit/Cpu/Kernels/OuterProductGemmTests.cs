@@ -213,8 +213,8 @@ public sealed unsafe class OuterProductGemmTests
             "Kernel microbench is opt-in — set DOTLLM_RUN_KERNEL_BENCH=1.");
         Skip.IfNot(AvxVnni.IsSupported, "AVX-VNNI not available.");
 
-        const int Iters = 20000, Rounds = 6;
-        int[] blockCounts = { 64, 256 }; // K = 2048 (Llama hidden), 8192 (Llama intermediate)
+        const int Iters = 20000, Rounds = 15;
+        int[] blockCounts = { 64, 128, 256 }; // K = 2048 (hidden), 4096, 8192 (intermediate/Down)
 
         // Meteor Lake is hybrid: an unpinned bench thread migrates between P- and (much weaker for VNNI)
         // E-cores, and min-of-rounds can lock onto an E-core run. Pin to a P-core for the headline C1
@@ -233,8 +233,13 @@ public sealed unsafe class OuterProductGemmTests
     private static void BenchOnCore(string label, int coreId, int[] blockCounts, int iters, int rounds)
     {
         bool pinned = DotLLM.Cpu.Threading.CpuAffinity.PinCurrentThread(coreId);
-        Console.WriteLine($"  {label} (core {coreId}, pinned={pinned})   {"K",6} {"AVX2",10} {"VNNI",10}  speedup");
+        // PAIRED measurement: this laptop's clocks drift (turbo/thermal), so timing AVX2 and VNNI in
+        // separate rounds and dividing the mins gives a bogus ratio. Instead, each round times AVX2 then
+        // VNNI back-to-back (same clock state) and records THAT round's ratio; report the median ratio.
+        rounds = Math.Max(rounds, 15);
+        Console.WriteLine($"  {label} (core {coreId}, pinned={pinned})   {"K",6} {"AVX2(min)",11} {"VNNI(min)",11} {"ratio(med)",11}");
         var rng = new Random(99);
+        var sw = new System.Diagnostics.Stopwatch();
         foreach (int blockCount in blockCounts)
         {
             int rowBytes = blockCount * Q8_0BlockBytes;
@@ -248,9 +253,23 @@ public sealed unsafe class OuterProductGemmTests
             float* c = (float*)NativeMemory.AlignedAlloc((nuint)(3 * 4 * sizeof(float)), 64);
             try
             {
-                double a2 = MinNsPerCall(() => MatMul.OuterProductQ8_0Avx2_4x3(weights, x0, x1, x2, c, blockCount, 4), iters, rounds);
-                double vn = MinNsPerCall(() => MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4), iters, rounds);
-                Console.WriteLine($"  {label,-22}     {blockCount * 32,6} {a2,10:F1} {vn,10:F1}  {(vn > 0 ? a2 / vn : 0),5:F2}x");
+                for (int i = 0; i < 1000; i++) { MatMul.OuterProductQ8_0Avx2_4x3(weights, x0, x1, x2, c, blockCount, 4); MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4); }
+                double a2min = double.MaxValue, vnmin = double.MaxValue;
+                var ratios = new double[rounds];
+                for (int r = 0; r < rounds; r++)
+                {
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0Avx2_4x3(weights, x0, x1, x2, c, blockCount, 4);
+                    sw.Stop(); double a2 = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4);
+                    sw.Stop(); double vn = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    ratios[r] = vn > 0 ? a2 / vn : 0;
+                    if (a2 < a2min) a2min = a2;
+                    if (vn < vnmin) vnmin = vn;
+                }
+                Array.Sort(ratios);
+                Console.WriteLine($"  {label,-22}     {blockCount * 32,6} {a2min,11:F1} {vnmin,11:F1} {ratios[rounds / 2],10:F2}x");
             }
             finally
             {
@@ -258,22 +277,6 @@ public sealed unsafe class OuterProductGemmTests
                 NativeMemory.AlignedFree(x1); NativeMemory.AlignedFree(x2); NativeMemory.AlignedFree(c);
             }
         }
-    }
-
-    private static double MinNsPerCall(Action call, int iters, int rounds)
-    {
-        for (int i = 0; i < 500; i++) call();
-        double best = double.MaxValue;
-        var sw = new System.Diagnostics.Stopwatch();
-        for (int r = 0; r < rounds; r++)
-        {
-            sw.Restart();
-            for (int i = 0; i < iters; i++) call();
-            sw.Stop();
-            double ns = sw.Elapsed.TotalMilliseconds * 1_000_000.0 / iters;
-            if (ns < best) best = ns;
-        }
-        return best;
     }
 
     // VNNI vs the AVX2 maddubs+madd microkernel: both vector paths fold each
