@@ -2306,6 +2306,81 @@ public static unsafe partial class MatMul
         OuterProductQ8_0Avx512_4x6(groupBase, x0, x1, x2, x3, x4, x5, c, blockCount, cStride);
     }
 
+    // ── Zero-point VNNI on E-cores (issue #22) ──────────────────────────────────────────────────────
+    // On Intel hybrid CPUs the AVX-VNNI sign-trick Q8_0 kernel is VPDPBUSD-throughput-bound on P-cores
+    // (dropping VPSIGNB buys nothing there) but VPSIGNB-bound on the weaker E-cores, where the zero-point
+    // kernel measures ~1.1-1.6x faster. When enabled, an outer-product worker currently running on an
+    // Efficiency core precomputes its group's per-block weight sums into scratch and uses the ZP kernel;
+    // P-core workers keep the sign trick. Σw is reused across all token tiles of the group within one GEMM
+    // call, so no weight-layout change is needed. Opt-in (default off) until the end-to-end prefill win is
+    // proven: DOTLLM_CPU_ZP_ECORE=1.
+
+    // Mutable (not readonly) so an in-process A/B bench can toggle it between runs; defaults from env.
+    internal static bool ZpOnEfficiencyCoresEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_CPU_ZP_ECORE") == "1";
+
+    // logical-processor-id -> is this an Efficiency core? Built once; empty on non-hybrid hosts.
+    private static readonly bool[] EfficiencyCoreMap = BuildEfficiencyCoreMap();
+
+    private static bool[] BuildEfficiencyCoreMap()
+    {
+        try
+        {
+            var topo = NumaTopology.Detect();
+            if (!topo.IsHybrid) return Array.Empty<bool>();
+            int max = 0;
+            foreach (var p in topo.Processors) if (p.ProcessorId > max) max = p.ProcessorId;
+            var map = new bool[max + 1];
+            foreach (var p in topo.Processors)
+                map[p.ProcessorId] = p.CoreType == CoreType.Efficiency;
+            return map;
+        }
+        catch { return Array.Empty<bool>(); }
+    }
+
+    /// <summary>
+    /// True when the ZP-on-E path is enabled AND the calling thread is currently on an Efficiency core.
+    /// Snapshot only (unpinned workers may migrate between groups) — biases a perf choice, never correctness.
+    /// </summary>
+    /// <summary>
+    /// Test-only: when set (with <see cref="ZpOnEfficiencyCoresEnabled"/> on), routes the ZP kernel on
+    /// ALL cores regardless of core type, so a forward-parity test can deterministically exercise the ZP
+    /// dispatch path (the production gate fires only on Efficiency cores, which a single unpinned forward
+    /// won't reliably land on).
+    /// </summary>
+    internal static bool ForceZpAllCoresForTesting;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool UseZpForCurrentCore()
+    {
+        if (!ZpOnEfficiencyCoresEnabled) return false;
+        if (ForceZpAllCoresForTesting) return true;
+        bool[] map = EfficiencyCoreMap;
+        if (map.Length == 0) return false;
+        int cpu = CpuAffinity.GetCurrentProcessorId();
+        return (uint)cpu < (uint)map.Length && map[cpu];
+    }
+
+    /// <summary>
+    /// Precomputes <c>128·Σw</c> per (block, row) for one R4 weight group into <paramref name="outSw"/>
+    /// (indexed <c>[b * 4 + r]</c>) for the zero-point VNNI kernel. Paid once per group and reused across
+    /// all of the group's token tiles within a single GEMM call.
+    /// </summary>
+    private static void ComputeGroupRowBlock128Sw(byte* groupBase, int blockCount, float* outSw)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+        for (int b = 0; b < blockCount; b++)
+        {
+            byte* blockBase = groupBase + b * wStride;
+            for (int r = 0; r < 4; r++)
+            {
+                Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(blockBase + r * Q8_0BlockBytes + 2);
+                (Vector256<short> lo, Vector256<short> hi) = Vector256.Widen(vw);
+                outSw[b * 4 + r] = 128f * (Vector256.Sum(lo) + Vector256.Sum(hi));
+            }
+        }
+    }
+
     /// <summary>
     /// Outer-product GEMM for Q8_0 R4-interleaved weights.
     /// Processes weight groups in steps of 4 rows and token batches of 3 (AVX2) or 6 (AVX-512).
@@ -2329,6 +2404,8 @@ public static unsafe partial class MatMul
     {
         int q8RowBytes = blockCount * Q8_0BlockBytes;
         int groupBytes = 4 * q8RowBytes;
+        // Scratch for the per-group ZP weight sums (E-core path only; zero-size when disabled).
+        float* swScratch = stackalloc float[ZpOnEfficiencyCoresEnabled ? 4 * blockCount : 0];
 
         for (int g = 0; g < fullGroups; g++)
         {
@@ -2374,15 +2451,27 @@ public static unsafe partial class MatMul
             else if (AvxVnni.IsSupported)
             {
                 // AVX2-VNNI: 4×3 tiles via VPDPBUSD (Meteor Lake / AVX2+VNNI hosts without AVX-512).
+                // On an Efficiency core (when enabled) use the zero-point kernel; precompute this group's
+                // Σw once and reuse it across all token tiles.
+                bool useZp = UseZpForCurrentCore();
+                if (useZp) ComputeGroupRowBlock128Sw(groupBase, blockCount, swScratch);
                 int nFull3 = (n / 3) * 3;
                 for (; t < nFull3; t += 3)
                 {
-                    OuterProductQ8_0Vnni_4x3(
-                        groupBase,
-                        inputQ8 + (long)t * q8RowBytes,
-                        inputQ8 + (long)(t + 1) * q8RowBytes,
-                        inputQ8 + (long)(t + 2) * q8RowBytes,
-                        c + (long)t * m + baseRow, blockCount, m);
+                    if (useZp)
+                        OuterProductQ8_0VnniZpPre_4x3(
+                            groupBase,
+                            inputQ8 + (long)t * q8RowBytes,
+                            inputQ8 + (long)(t + 1) * q8RowBytes,
+                            inputQ8 + (long)(t + 2) * q8RowBytes,
+                            c + (long)t * m + baseRow, blockCount, m, swScratch);
+                    else
+                        OuterProductQ8_0Vnni_4x3(
+                            groupBase,
+                            inputQ8 + (long)t * q8RowBytes,
+                            inputQ8 + (long)(t + 1) * q8RowBytes,
+                            inputQ8 + (long)(t + 2) * q8RowBytes,
+                            c + (long)t * m + baseRow, blockCount, m);
                 }
                 for (; t < n; t++)
                 {
@@ -2517,6 +2606,8 @@ public static unsafe partial class MatMul
 
         int q8RowBytes = ctx.BlockCount * Q8_0BlockBytes;
         int groupBytes = 4 * q8RowBytes;
+        // Scratch for the per-group ZP weight sums (E-core path only; zero-size when disabled).
+        float* swScratch = stackalloc float[ZpOnEfficiencyCoresEnabled ? 4 * ctx.BlockCount : 0];
 
         for (int g = startGroup; g < endGroup; g++)
         {
@@ -2561,15 +2652,27 @@ public static unsafe partial class MatMul
                 else if (AvxVnni.IsSupported)
                 {
                     // AVX2-VNNI: 4×3 tiles via VPDPBUSD (Meteor Lake / AVX2+VNNI hosts without AVX-512).
+                    // On an Efficiency core (when enabled) use the zero-point kernel; precompute this group's
+                    // Σw once and reuse it across all token tiles.
+                    bool useZp = UseZpForCurrentCore();
+                    if (useZp) ComputeGroupRowBlock128Sw(groupBase, ctx.BlockCount, swScratch);
                     int nFull3 = (ctx.N / 3) * 3;
                     for (; t < nFull3; t += 3)
                     {
-                        OuterProductQ8_0Vnni_4x3(
-                            groupBase,
-                            ctx.InputQ8 + (long)t * q8RowBytes,
-                            ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
-                            ctx.InputQ8 + (long)(t + 2) * q8RowBytes,
-                            ctx.C + (long)t * ctx.M + baseRow, ctx.BlockCount, ctx.M);
+                        if (useZp)
+                            OuterProductQ8_0VnniZpPre_4x3(
+                                groupBase,
+                                ctx.InputQ8 + (long)t * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 2) * q8RowBytes,
+                                ctx.C + (long)t * ctx.M + baseRow, ctx.BlockCount, ctx.M, swScratch);
+                        else
+                            OuterProductQ8_0Vnni_4x3(
+                                groupBase,
+                                ctx.InputQ8 + (long)t * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 2) * q8RowBytes,
+                                ctx.C + (long)t * ctx.M + baseRow, ctx.BlockCount, ctx.M);
                     }
                     for (; t < ctx.N; t++)
                     {

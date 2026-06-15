@@ -29,6 +29,21 @@ internal static partial class CpuAffinity
         return false;
     }
 
+    /// <summary>
+    /// Returns the logical processor the calling thread is currently running on, or <c>-1</c> on
+    /// unsupported platforms. Cheap (no real syscall on modern Windows/Linux). For an unpinned thread
+    /// the value is a snapshot — it can change after the call — so callers use it only to bias a
+    /// performance choice (e.g. a P-core vs E-core kernel), never for correctness.
+    /// </summary>
+    public static int GetCurrentProcessorId()
+    {
+        if (OperatingSystem.IsWindows())
+            return (int)WindowsNative.GetCurrentProcessorNumber();
+        if (OperatingSystem.IsLinux())
+            return LinuxNative.sched_getcpu();
+        return -1;
+    }
+
     // ── Windows ──
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
@@ -57,6 +72,9 @@ internal static partial class CpuAffinity
 
         [LibraryImport("kernel32.dll")]
         internal static partial nint SetThreadAffinityMask(nint hThread, nint dwThreadAffinityMask);
+
+        [LibraryImport("kernel32.dll")]
+        internal static partial uint GetCurrentProcessorNumber();
     }
 
     // ── Linux ──
@@ -97,5 +115,8 @@ internal static partial class CpuAffinity
     {
         [LibraryImport("libc")]
         internal static partial int sched_setaffinity(int pid, nuint cpusetsize, ulong* mask);
+
+        [LibraryImport("libc")]
+        internal static partial int sched_getcpu();
     }
 }
