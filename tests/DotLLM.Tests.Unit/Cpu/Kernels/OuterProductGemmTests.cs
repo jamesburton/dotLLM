@@ -144,6 +144,318 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // ──────────────────── AVX2-VNNI microkernel ────────────────────
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(8)]    // K=256
+    [InlineData(16)]
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(32)]   // K=1024
+    [InlineData(48)]   // K=1536
+    [InlineData(128)]  // K=4096
+    public void OuterProductVnni_4x3_MatchesScalar(int blockCount)
+    {
+        if (!AvxVnni.IsSupported)
+            return;
+
+        var rng = new Random(1234);
+        int m = 4;
+        int n = 3;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            MatMul.OuterProductQ8_0Scalar_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2],
+                cScalar, blockCount, m);
+
+            MatMul.OuterProductQ8_0Vnni_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2],
+                cVnni, blockCount, m);
+
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    Assert.Equal(cScalar[t * m + r], cVnni[t * m + r], 1e-2f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+
+    /// <summary>
+    /// Directional microbench (C1): AVX-VNNI VPDPBUSD 4×3 vs the AVX2 maddubs 4×3 on the same Q8_0
+    /// buffers, min-of-rounds. On Meteor Lake (AVX-VNNI, no AVX-512) the VNNI path is what the
+    /// outer-product prefill GEMM dispatches; this isolates the kernel-level speedup. Opt-in via
+    /// <c>DOTLLM_RUN_KERNEL_BENCH=1</c>.
+    /// </summary>
+    [SkippableFact]
+    public void OuterProductVnni_VsAvx2_MicroBench()
+    {
+        Skip.If(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_RUN_KERNEL_BENCH")),
+            "Kernel microbench is opt-in — set DOTLLM_RUN_KERNEL_BENCH=1.");
+        Skip.IfNot(AvxVnni.IsSupported, "AVX-VNNI not available.");
+
+        const int Iters = 20000, Rounds = 6;
+        int[] blockCounts = { 64, 256 }; // K = 2048 (Llama hidden), 8192 (Llama intermediate)
+
+        // Meteor Lake is hybrid: an unpinned bench thread migrates between P- and (much weaker for VNNI)
+        // E-cores, and min-of-rounds can lock onto an E-core run. Pin to a P-core for the headline C1
+        // number, and also measure an E-core (C3 P-vs-E data). Restore affinity to all cores after.
+        var topo = DotLLM.Cpu.Threading.NumaTopology.Detect();
+        var pcores = topo.PerformanceCoreIds;
+        int pCore = pcores.Count > 0 ? pcores[0] : 0;
+        int eCore = Enumerable.Range(0, Environment.ProcessorCount).FirstOrDefault(i => !pcores.Contains(i), pCore);
+        Console.WriteLine($"[OuterProductVnniMicroBench] iters={Iters} rounds={Rounds} hybrid={topo.IsHybrid} pCore={pCore} eCore={eCore} (min ns/call, 4x3 tile)");
+
+        // Runs in isolation (opt-in filter); leaving the thread pinned at the end is harmless.
+        BenchOnCore("P-core", pCore, blockCounts, Iters, Rounds);
+        if (eCore != pCore) BenchOnCore("E-core", eCore, blockCounts, Iters, Rounds);
+    }
+
+    private static void BenchOnCore(string label, int coreId, int[] blockCounts, int iters, int rounds)
+    {
+        bool pinned = DotLLM.Cpu.Threading.CpuAffinity.PinCurrentThread(coreId);
+        Console.WriteLine($"  {label} (core {coreId}, pinned={pinned})   {"K",6} {"AVX2",10} {"VNNI",10}  speedup");
+        var rng = new Random(99);
+        foreach (int blockCount in blockCounts)
+        {
+            int rowBytes = blockCount * Q8_0BlockBytes;
+            byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+            byte* x0 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x1 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x2 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(x0, blockCount, rng);
+            FillRandomQ8_0Blocks(x1, blockCount, rng);
+            FillRandomQ8_0Blocks(x2, blockCount, rng);
+            float* c = (float*)NativeMemory.AlignedAlloc((nuint)(3 * 4 * sizeof(float)), 64);
+            try
+            {
+                double a2 = MinNsPerCall(() => MatMul.OuterProductQ8_0Avx2_4x3(weights, x0, x1, x2, c, blockCount, 4), iters, rounds);
+                double vn = MinNsPerCall(() => MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4), iters, rounds);
+                Console.WriteLine($"  {label,-22}     {blockCount * 32,6} {a2,10:F1} {vn,10:F1}  {(vn > 0 ? a2 / vn : 0),5:F2}x");
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(weights); NativeMemory.AlignedFree(x0);
+                NativeMemory.AlignedFree(x1); NativeMemory.AlignedFree(x2); NativeMemory.AlignedFree(c);
+            }
+        }
+    }
+
+    private static double MinNsPerCall(Action call, int iters, int rounds)
+    {
+        for (int i = 0; i < 500; i++) call();
+        double best = double.MaxValue;
+        var sw = new System.Diagnostics.Stopwatch();
+        for (int r = 0; r < rounds; r++)
+        {
+            sw.Restart();
+            for (int i = 0; i < iters; i++) call();
+            sw.Stop();
+            double ns = sw.Elapsed.TotalMilliseconds * 1_000_000.0 / iters;
+            if (ns < best) best = ns;
+        }
+        return best;
+    }
+
+    // VNNI vs the AVX2 maddubs+madd microkernel: both vector paths fold each
+    // block's int32 sum by dx*dw in the same order, so they should agree to a
+    // tighter tolerance than either does to the scalar reference.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(16)]
+    [InlineData(18)]
+    [InlineData(48)]
+    [InlineData(128)]
+    public void OuterProductVnni_4x3_MatchesAvx2(int blockCount)
+    {
+        if (!AvxVnni.IsSupported || !Avx2.IsSupported)
+            return;
+
+        var rng = new Random(777);
+        int m = 4;
+        int n = 3;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cAvx2 = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            MatMul.OuterProductQ8_0Avx2_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2],
+                cAvx2, blockCount, m);
+
+            MatMul.OuterProductQ8_0Vnni_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2],
+                cVnni, blockCount, m);
+
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    Assert.Equal(cAvx2[t * m + r], cVnni[t * m + r], 1e-3f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cAvx2);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+
+    // Discriminating sanity check: the VNNI microkernel parity test must FAIL
+    // when the kernel output is deliberately perturbed. This guards against a
+    // vacuous test (e.g. one that compares all-zero buffers, or a tolerance so
+    // wide that a real tile bug slips through). We corrupt a single (token,row)
+    // cell of the VNNI result and assert the comparison rejects it.
+    [Fact]
+    public void OuterProductVnni_4x3_ParityTestIsDiscriminating()
+    {
+        if (!AvxVnni.IsSupported)
+            return;
+
+        var rng = new Random(31337);
+        int m = 4;
+        int n = 3;
+        int blockCount = 18;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            MatMul.OuterProductQ8_0Scalar_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cScalar, blockCount, m);
+            MatMul.OuterProductQ8_0Vnni_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cVnni, blockCount, m);
+
+            // Unperturbed: every cell must match (and must be meaningfully nonzero,
+            // so the comparison is not trivially satisfied by zeros).
+            float maxAbs = 0;
+            for (int i = 0; i < n * m; i++)
+            {
+                Assert.Equal(cScalar[i], cVnni[i], 1e-2f);
+                maxAbs = MathF.Max(maxAbs, MathF.Abs(cScalar[i]));
+            }
+            Assert.True(maxAbs > 1e-3f, "reference output is ~0; parity check would be vacuous");
+
+            // Perturb one cell (token=1, row=2) by an amount far exceeding tolerance
+            // and confirm the same equality assertion now fails — i.e. the test
+            // discriminates broken from correct output.
+            int idx = 1 * m + 2;
+            cVnni[idx] += 1.0f;
+            Assert.ThrowsAny<Xunit.Sdk.XunitException>(
+                () => Assert.Equal(cScalar[idx], cVnni[idx], 1e-2f));
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cVnni);
+        }
+    }
+
+    // Full GEMM through the public OuterProductGemmQ8_0 dispatch, which routes
+    // to the VNNI microkernel on this CPU (AvxVnni.IsSupported). Exercises
+    // discriminating shapes: multi-block K, full tile, all tail combinations,
+    // and a large (M>=128, N>=32) shape.
+    [Theory]
+    [InlineData(4, 3, 64)]       // single full tile, K=64 (2 blocks)
+    [InlineData(8, 6, 256)]      // 2 groups, 2 token-tiles, K=256 (8 blocks)
+    [InlineData(4, 3, 1024)]     // deep K (32 blocks)
+    [InlineData(7, 5, 64)]       // row tail (m%4) + token tail (n%3)
+    [InlineData(5, 4, 128)]      // row tail + token tail, K=128
+    [InlineData(13, 11, 256)]    // 3 groups + 1 tail row, token tail
+    [InlineData(128, 32, 64)]    // large: 32 groups, 32 tokens
+    [InlineData(132, 33, 256)]   // large with row + token tails, deep K
+    public void OuterProductGemmVnni_Dispatch_MatchesReference(int m, int n, int k)
+    {
+        if (!AvxVnni.IsSupported)
+            return;
+
+        var rng = new Random(0xBEEF ^ (m * 131 + n) * 17 + k);
+        int blockCount = k / Q8_0GroupSize;
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int fullGroups = m / 4;
+        int tailRows = m % 4;
+
+        byte* rowMajorWeights = (byte*)NativeMemory.AlignedAlloc((nuint)((long)m * q8RowBytes), 64);
+        for (int r = 0; r < m; r++)
+            FillRandomQ8_0Blocks(rowMajorWeights + r * q8RowBytes, blockCount, rng);
+
+        using var repacked = WeightRepacking.RepackR4((nint)rowMajorWeights, QuantizationType.Q8_0, m, k);
+
+        byte* inputQ8 = (byte*)NativeMemory.AlignedAlloc((nuint)((long)n * q8RowBytes), 64);
+        for (int t = 0; t < n; t++)
+            FillRandomQ8_0Blocks(inputQ8 + t * q8RowBytes, blockCount, rng);
+
+        float* cOuter = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cRef = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            for (int t = 0; t < n; t++)
+            {
+                MatMul.ComputeRowsQ8_0Interleaved(
+                    (byte*)repacked.Ptr, inputQ8 + t * q8RowBytes,
+                    cRef + t * m, fullGroups, tailRows, blockCount);
+            }
+
+            MatMul.OuterProductGemmQ8_0(
+                (byte*)repacked.Ptr, inputQ8, cOuter,
+                fullGroups, tailRows, blockCount, m, n);
+
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    Assert.Equal(cRef[t * m + r], cOuter[t * m + r], 1e-2f);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(rowMajorWeights);
+            NativeMemory.AlignedFree(inputQ8);
+            NativeMemory.AlignedFree(cOuter);
+            NativeMemory.AlignedFree(cRef);
+        }
+    }
+
     // ──────────────────── Full GEMM tests ────────────────────
 
     [Theory]

@@ -1442,6 +1442,95 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// AVX2-VNNI outer-product microkernel for Q8_0 R4 layout — VPDPBUSD-256 fast path.
+    /// Produces the same 4-row × 3-token output tile as <see cref="OuterProductQ8_0Avx2_4x3"/>,
+    /// but replaces the two-instruction <c>maddubs</c> + <c>madd(ones)</c> integer reduction with a
+    /// single fused <c>AvxVnni.MultiplyWideningAndAdd</c> (VPDPBUSD): unsigned-byte × signed-byte →
+    /// widening multiply-accumulate into int32, in one instruction. On Meteor Lake (AVX-VNNI present,
+    /// no AVX-512) this is the dispatched Q8_0 prefill path; measured ~1.3-1.6x vs the AVX2 maddubs
+    /// path (PR #321/#323). Ported into this branch's outer-product GEMM by spike/local-platform-opt.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0Vnni_4x3(
+        byte* groupBase, byte* x0, byte* x1, byte* x2,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+
+        // Two sub-passes over the 4-row R4 group, 2 rows each, holding 6 float
+        // accumulators (2 rows × 3 tokens) live across the block loop.
+        for (int rPair = 0; rPair < 4; rPair += 2)
+        {
+            int r0 = rPair;
+            int r1 = rPair + 1;
+
+            Vector256<float> a00 = Vector256<float>.Zero, a01 = Vector256<float>.Zero, a02 = Vector256<float>.Zero;
+            Vector256<float> a10 = Vector256<float>.Zero, a11 = Vector256<float>.Zero, a12 = Vector256<float>.Zero;
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                byte* blockBase = groupBase + b * wStride;
+
+                byte* xb0 = x0 + b * Q8_0BlockBytes;
+                byte* xb1 = x1 + b * Q8_0BlockBytes;
+                byte* xb2 = x2 + b * Q8_0BlockBytes;
+                float dx0 = HalfBitsToFloat(xb0);
+                float dx1 = HalfBitsToFloat(xb1);
+                float dx2 = HalfBitsToFloat(xb2);
+                Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb0 + 2);
+                Vector256<sbyte> vx1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb1 + 2);
+                Vector256<sbyte> vx2 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb2 + 2);
+
+                // Row r0.
+                {
+                    byte* wBlock = blockBase + r0 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx0, vx0).AsByte(), Avx2.Sign(vw, vx0));
+                    a00 = Fma.MultiplyAdd(Vector256.Create(dx0 * dw), Avx.ConvertToVector256Single(isum0), a00);
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx1, vx1).AsByte(), Avx2.Sign(vw, vx1));
+                    a01 = Fma.MultiplyAdd(Vector256.Create(dx1 * dw), Avx.ConvertToVector256Single(isum1), a01);
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx2, vx2).AsByte(), Avx2.Sign(vw, vx2));
+                    a02 = Fma.MultiplyAdd(Vector256.Create(dx2 * dw), Avx.ConvertToVector256Single(isum2), a02);
+                }
+
+                // Row r1.
+                {
+                    byte* wBlock = blockBase + r1 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx0, vx0).AsByte(), Avx2.Sign(vw, vx0));
+                    a10 = Fma.MultiplyAdd(Vector256.Create(dx0 * dw), Avx.ConvertToVector256Single(isum0), a10);
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx1, vx1).AsByte(), Avx2.Sign(vw, vx1));
+                    a11 = Fma.MultiplyAdd(Vector256.Create(dx1 * dw), Avx.ConvertToVector256Single(isum1), a11);
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(
+                        Vector256<int>.Zero, Avx2.Sign(vx2, vx2).AsByte(), Avx2.Sign(vw, vx2));
+                    a12 = Fma.MultiplyAdd(Vector256.Create(dx2 * dw), Avx.ConvertToVector256Single(isum2), a12);
+                }
+            }
+
+            c[0 * cStride + r0] = HorizontalSumAvx2Float(a00);
+            c[1 * cStride + r0] = HorizontalSumAvx2Float(a01);
+            c[2 * cStride + r0] = HorizontalSumAvx2Float(a02);
+            c[0 * cStride + r1] = HorizontalSumAvx2Float(a10);
+            c[1 * cStride + r1] = HorizontalSumAvx2Float(a11);
+            c[2 * cStride + r1] = HorizontalSumAvx2Float(a12);
+        }
+    }
+
+    /// <summary>
     /// AVX-512 outer-product microkernel for Q8_0 R4 layout.
     /// Processes 4 weight rows × 6 tokens with 24 ZMM accumulators via dual-block (2 blocks/iteration).
     /// Uses 256-bit sign trick on each block half, then combines into 512-bit for FMA.
@@ -2060,6 +2149,25 @@ public static unsafe partial class MatMul
                         blockCount, c + (long)t * m + baseRow);
                 }
             }
+            else if (AvxVnni.IsSupported)
+            {
+                // AVX2-VNNI: 4×3 tiles via VPDPBUSD (Meteor Lake / AVX2+VNNI hosts without AVX-512).
+                int nFull3 = (n / 3) * 3;
+                for (; t < nFull3; t += 3)
+                {
+                    OuterProductQ8_0Vnni_4x3(
+                        groupBase,
+                        inputQ8 + (long)t * q8RowBytes,
+                        inputQ8 + (long)(t + 1) * q8RowBytes,
+                        inputQ8 + (long)(t + 2) * q8RowBytes,
+                        c + (long)t * m + baseRow, blockCount, m);
+                }
+                for (; t < n; t++)
+                {
+                    VecDotQ8_0Avx2_4RowsR4(groupBase, inputQ8 + (long)t * q8RowBytes,
+                        blockCount, c + (long)t * m + baseRow);
+                }
+            }
             else if (Avx2.IsSupported)
             {
                 // AVX2: 4×3 tiles
@@ -2216,6 +2324,25 @@ public static unsafe partial class MatMul
                     for (; t < nFull3; t += 3)
                     {
                         OuterProductQ8_0Avx2_4x3(
+                            groupBase,
+                            ctx.InputQ8 + (long)t * q8RowBytes,
+                            ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
+                            ctx.InputQ8 + (long)(t + 2) * q8RowBytes,
+                            ctx.C + (long)t * ctx.M + baseRow, ctx.BlockCount, ctx.M);
+                    }
+                    for (; t < ctx.N; t++)
+                    {
+                        VecDotQ8_0Avx2_4RowsR4(groupBase, ctx.InputQ8 + (long)t * q8RowBytes,
+                            ctx.BlockCount, ctx.C + (long)t * ctx.M + baseRow);
+                    }
+                }
+                else if (AvxVnni.IsSupported)
+                {
+                    // AVX2-VNNI: 4×3 tiles via VPDPBUSD (Meteor Lake / AVX2+VNNI hosts without AVX-512).
+                    int nFull3 = (ctx.N / 3) * 3;
+                    for (; t < nFull3; t += 3)
+                    {
+                        OuterProductQ8_0Vnni_4x3(
                             groupBase,
                             ctx.InputQ8 + (long)t * q8RowBytes,
                             ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
