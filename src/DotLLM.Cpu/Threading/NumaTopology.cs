@@ -228,14 +228,17 @@ public sealed partial class NumaTopology
             int core = coreMap.TryGetValue(i, out var c) ? c : i;
             byte eff = efficiencyMap.TryGetValue(i, out var e) ? e : (byte)0;
 
-            // On Win11 + Intel 12th gen+: EfficiencyClass 0 = P-core, 1 = E-core
-            // On non-hybrid: all are 0 → Unknown
+            // Windows PROCESSOR_RELATIONSHIP.EfficiencyClass convention: HIGHER value = higher-performing
+            // core. So the P-cores carry the MAX efficiency class; E-cores (and Meteor Lake's LP-E cores)
+            // carry lower values. The previous code took the MIN as "Performance" — inverted — which on
+            // Meteor Lake put the (slow) E/LP-E cores into PerformanceCoreIds and made --pcore-only pin to
+            // the weak cores (empirically ~6x slower; see the VNNI microbench). Fixed to MAX.
+            // On non-hybrid (all equal): Unknown → treated as all-performance by the ctor.
             CoreType coreType;
             if (efficiencyMap.Count > 0 && efficiencyMap.Values.Distinct().Count() > 1)
             {
-                // Hybrid detected: lowest efficiency class = P-core
-                byte minEff = efficiencyMap.Values.Min();
-                coreType = eff == minEff ? CoreType.Performance : CoreType.Efficiency;
+                byte maxEff = efficiencyMap.Values.Max();
+                coreType = eff == maxEff ? CoreType.Performance : CoreType.Efficiency;
             }
             else
             {
