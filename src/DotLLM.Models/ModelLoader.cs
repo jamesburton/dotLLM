@@ -142,6 +142,11 @@ public static class ModelLoader
             if (string.Equals(topModelType, "diffusion_gemma", StringComparison.Ordinal)
                 || string.Equals(topModelType, "diffusion_gemma_text", StringComparison.Ordinal))
             {
+                // The DiffusionConfig itself (canvas length, denoising schedule,
+                // tokenizer-resolved mask token id) is extractable today via
+                // DiffusionConfigExtractor.ExtractFromDirectory(weightsDir, root);
+                // the wrapper model/loader that consumes it (config hoist onto the
+                // Gemma-4 text tower + diffusion sampling head) lands in issue #29.
                 throw new NotSupportedException(
                     $"model_type='{topModelType}' (DiffusionGemma) is not yet loadable — the diffusion "
                     + "model wrapper (config hoist + diffusion sampling head) is implemented in issue #29. "

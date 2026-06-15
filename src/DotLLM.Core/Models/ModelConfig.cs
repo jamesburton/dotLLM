@@ -147,6 +147,15 @@ public record ModelConfig
     /// </summary>
     public GatedDeltaNetConfig? GdnConfig { get; init; }
 
+    /// <summary>
+    /// Diffusion-decoding configuration for masked-canvas text-diffusion models
+    /// (DiffusionGemma). Non-null only for a diffusion checkpoint; null for every
+    /// autoregressive architecture — those models are unaffected by this slot.
+    /// Carries the canvas length, denoising-step budget, entropy/temperature
+    /// schedule, and the tokenizer-resolved mask token id.
+    /// </summary>
+    public DiffusionConfig? DiffusionConfig { get; init; }
+
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
 
