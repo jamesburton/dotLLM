@@ -1,0 +1,99 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q8_0 decode-path GEMV, DP4a variant with PRE-QUANTIZED activation.
+//
+//   y[m] = sum_k  W_q8[m, k] * x[k]
+//
+// Identical to matmul_q8_0_dp4a.comp except the activation is already quantized
+// to INT8 (by quantize_q8_act.comp) and supplied as a packed int8 buffer xq[K/4]
+// plus per-block FP32 scales dx[K/32]. This removes the per-workgroup activation
+// re-quantization that made the inline variant regress on high-M shapes — x is
+// quantized once, then every output row reads the shared xq/dx.
+//
+//   d   = fp16 weight scale (block bytes [0,1])
+//   dxb = dx[b]                      (activation scale for block b)
+//   dot = Σ qw[i] * xq[i]            (int32, 8 packed-4x8 dot calls)
+//   y  += d * dxb * dot
+//
+// Dispatch: one workgroup per output row, 128 threads, shared-memory reduction.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW  { uint weight[]; }; // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq { uint xq[]; };     // [K/4] packed int8
+layout(set = 0, binding = 2, std430) readonly  buffer BufDx { float dx[]; };    // [K/32]
+layout(set = 0, binding = 3, std430) writeonly buffer BufY  { float y[]; };     // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;     // = K / 32
+    uint rowUints;
+} pc;
+
+// Read 4 bytes at absByteOff as a little-endian uint (straddle-safe — see
+// matmul_q8_0_dp4a.comp). The weight buffer is rounded up to a uint multiple so
+// the second word read is always in bounds.
+uint readU32(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint sh = (absByteOff & 3u) * 8u;
+    if (sh == 0u) return weight[idx];
+    uint lo = weight[idx] >> sh;
+    uint hi = weight[idx + 1u] << (32u - sh);
+    return lo | hi;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * 34u;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float d = readHalf(blockByteBase);
+        float dxb = dx[b];
+
+        uint qsByteBase = blockByteBase + 2u;
+        uint xqBase = b * 8u;
+        int dot = 0;
+        for (uint g = 0u; g < 8u; g++) {
+            int wpack = int(readU32(qsByteBase + g * 4u));
+            int xpack = int(xq[xqBase + g]);
+            dot = dotPacked4x8AccSatEXT(wpack, xpack, dot);
+        }
+
+        acc += d * dxb * float(dot);
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
