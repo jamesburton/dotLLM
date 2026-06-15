@@ -9,24 +9,30 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Opt-in micro-benchmark: DP4a (integer dot product) Q8_0 GEMV vs the scalar
-/// Q8_0 GEMV, decode-path (N=1) shapes. Enable with
+/// Opt-in micro-benchmark: DP4a (integer dot product) Q8_0 GEMV — scalar vs
+/// inline-x-quant vs shared-prequant — on decode-path (N=1) shapes. Enable with
 /// <c>DOTLLM_VULKAN_DP4A_BENCH=1</c>. Emits a Markdown table to stdout.
 /// </summary>
 /// <remarks>
-/// Method: build a pool of kernel instances per side (descriptor pool is
-/// maxSets=1, so one Launch per instance), warm up, then time the scalar batch
-/// and the DP4a batch in alternating rounds, taking the per-side <b>min</b>
-/// ms/iter across rounds to suppress the laptop's ~2× turbo/thermal drift. Sync
-/// submission (<c>vkQueueWaitIdle</c>) per Launch includes per-dispatch overhead.
-///
 /// <para>
-/// Q8_0 decode GEMV is largely <b>memory-bound</b> (≈34 weight bytes read per
-/// 32-element block, ≈1 MAC/byte), so DP4a — which accelerates the MACs, not the
-/// weight reads — is not expected to give the headline compute-bound INT8 speedup
-/// here; the inline per-row activation re-quantization adds work. This bench
-/// measures the real effect on the decode path rather than assuming one. The
-/// compute-bound win belongs to a batched/GEMM (prefill) DP4a path (future work).
+/// Methodology (fixed per advisor review): each side is timed with a
+/// <b>batched fence</b> — N iterations recorded into one command buffer, a single
+/// <c>vkQueueSubmit</c> + <c>vkQueueWaitIdle</c>, time divided by N. This removes
+/// the per-Launch sync floor that pins small shapes at ~1.4 ms. A
+/// <c>ComputeToComputeBarrier</c> after each iteration serializes them, so the
+/// measurement is true per-matmul GPU time (including, for prequant, its internal
+/// quantize→gemv barrier — an intrinsic per-matmul cost that does not amortize).
+/// The three kernels are interleaved <b>within</b> each round and the reported
+/// speedup is the <b>median of per-round ratios</b> (paired), so thermal/turbo
+/// drift cancels instead of biasing independent per-side minima.
+/// </para>
+/// <para>
+/// Q8_0 decode GEMV on Arc Xe-LPG is ALU/dequant-bound (not weight-read bound like
+/// the discrete 3060), so DP4a wins on high-M / deep-K shapes once the activation
+/// quantization is amortized. Small isolated matmuls retain the prequant pass's
+/// extra-dispatch+barrier overhead; the real recovery there is sharing one
+/// quantized activation across same-input projections (Q/K/V, gate/up) in the
+/// forward pass — which this per-matmul bench structurally cannot show.
 /// </para>
 /// </remarks>
 [Trait("Category", "GPU")]
@@ -34,8 +40,7 @@ namespace DotLLM.Tests.Unit.Vulkan;
 public class VulkanQ8_0Dp4aMicroBench
 {
     private const int Iterations = 100;
-    private const int WarmupIterations = 10;
-    private const int Rounds = 5;
+    private const int Rounds = 7;
     private const int Q8_0BlockBytes = 34;
     private const int Q8_0GroupSize = 32;
 
@@ -56,23 +61,19 @@ public class VulkanQ8_0Dp4aMicroBench
             $"Device '{device.DeviceName}' does not support VK_KHR_shader_integer_dot_product.");
 
         var sb = new StringBuilder();
-        sb.AppendLine("| Shape (M×K) | Scalar ms/iter | DP4a inline ms/iter | DP4a+prequant ms/iter | inline× | prequant× |");
+        sb.AppendLine("| Shape (M×K) | Scalar ms | Inline ms | Prequant ms | inline× | prequant× |");
         sb.AppendLine("|---|---:|---:|---:|---:|---:|");
 
         (int m, int k)[] shapes =
         {
-            (576, 576),     // SmolLM q/k/v projection
-            (1536, 576),    // SmolLM gate/up
-            (576, 1536),    // SmolLM down
-            (49152, 576),   // SmolLM lm_head
-            (4096, 4096),   // larger decode GEMV (deeper k)
-            (4096, 14336),  // Llama-ish FFN down (deep k)
+            (576, 576), (1536, 576), (576, 1536),
+            (49152, 576), (4096, 4096), (4096, 14336),
         };
         foreach (var (m, k) in shapes)
             sb.AppendLine(BenchShape(device, spvDir, m, k));
 
         _output.WriteLine("Device: " + device.DeviceName);
-        _output.WriteLine($"Iterations/round: {Iterations}, rounds: {Rounds}, warmup: {WarmupIterations}");
+        _output.WriteLine($"Batched fence; iterations/submit: {Iterations}, rounds: {Rounds} (median of per-round ratios)");
         _output.WriteLine(string.Empty);
         _output.WriteLine(sb.ToString());
     }
@@ -108,59 +109,56 @@ public class VulkanQ8_0Dp4aMicroBench
         device.Upload(new ReadOnlySpan<byte>(weightsQ8), bufW);
         device.Upload(x, bufX);
 
-        var scalar = new MatMulQ8_0Kernel[Iterations + WarmupIterations];
-        var dp4a = new MatMulQ8_0Dp4aKernel[Iterations + WarmupIterations];
-        var pq = new MatMulQ8_0Dp4aPqKernel[Iterations + WarmupIterations];
-        for (int i = 0; i < scalar.Length; i++)
-        {
-            scalar[i] = MatMulQ8_0Kernel.Create(device, spvDir);
-            dp4a[i] = MatMulQ8_0Dp4aKernel.Create(device, spvDir);
-            pq[i] = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir);
-        }
-        try
-        {
-            for (int w = 0; w < WarmupIterations; w++)
-            {
-                scalar[w].Launch(bufW, bufX, bufY, m, k);
-                dp4a[w].Launch(bufW, bufX, bufY, m, k);
-                pq[w].Launch(bufW, bufX, bufXq, bufDx, bufY, m, k);
-            }
+        using var scalar = MatMulQ8_0Kernel.Create(device, spvDir);
+        using var inlineK = MatMulQ8_0Dp4aKernel.Create(device, spvDir);
+        using var pq = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir);
 
-            double scalarMin = double.MaxValue, dp4aMin = double.MaxValue, pqMin = double.MaxValue;
-            for (int r = 0; r < Rounds; r++)
-            {
-                scalarMin = Math.Min(scalarMin, TimeBatch(() =>
-                {
-                    for (int i = 0; i < Iterations; i++) scalar[WarmupIterations + i].Launch(bufW, bufX, bufY, m, k);
-                }));
-                dp4aMin = Math.Min(dp4aMin, TimeBatch(() =>
-                {
-                    for (int i = 0; i < Iterations; i++) dp4a[WarmupIterations + i].Launch(bufW, bufX, bufY, m, k);
-                }));
-                pqMin = Math.Min(pqMin, TimeBatch(() =>
-                {
-                    for (int i = 0; i < Iterations; i++) pq[WarmupIterations + i].Launch(bufW, bufX, bufXq, bufDx, bufY, m, k);
-                }));
-            }
+        Action<nint> recScalar = cb => { scalar.Record(cb, bufW, bufX, bufY, m, k); KernelSupport.ComputeToComputeBarrier(cb); };
+        Action<nint> recInline = cb => { inlineK.Record(cb, bufW, bufX, bufY, m, k); KernelSupport.ComputeToComputeBarrier(cb); };
+        Action<nint> recPq = cb => { pq.Record(cb, bufW, bufX, bufXq, bufDx, bufY, m, k); KernelSupport.ComputeToComputeBarrier(cb); };
 
-            double scalarMs = scalarMin / Iterations;
-            double dp4aMs = dp4aMin / Iterations;
-            double pqMs = pqMin / Iterations;
-            return $"| {m}×{k} | {scalarMs:F4} | {dp4aMs:F4} | {pqMs:F4} | {scalarMs / dp4aMs:F2}x | {scalarMs / pqMs:F2}x |";
-        }
-        finally
+        // Warm up each side once (pipeline ISA compile + first-submit cost).
+        TimeBatched(device, recScalar, Iterations);
+        TimeBatched(device, recInline, Iterations);
+        TimeBatched(device, recPq, Iterations);
+
+        var inlineRatios = new double[Rounds];
+        var pqRatios = new double[Rounds];
+        double scalarMed = 0, inlineMed = 0, pqMed = 0;
+        var scalarMs = new double[Rounds];
+        var inlineMs = new double[Rounds];
+        var pqMs = new double[Rounds];
+        for (int r = 0; r < Rounds; r++)
         {
-            foreach (var s in scalar) s.Dispose();
-            foreach (var d in dp4a) d.Dispose();
-            foreach (var p in pq) p.Dispose();
+            scalarMs[r] = TimeBatched(device, recScalar, Iterations);
+            inlineMs[r] = TimeBatched(device, recInline, Iterations);
+            pqMs[r] = TimeBatched(device, recPq, Iterations);
+            inlineRatios[r] = scalarMs[r] / inlineMs[r];
+            pqRatios[r] = scalarMs[r] / pqMs[r];
         }
+        scalarMed = Median(scalarMs);
+        inlineMed = Median(inlineMs);
+        pqMed = Median(pqMs);
+
+        return $"| {m}×{k} | {scalarMed:F4} | {inlineMed:F4} | {pqMed:F4} | {Median(inlineRatios):F2}x | {Median(pqRatios):F2}x |";
     }
 
-    private static double TimeBatch(Action batch)
+    private static double TimeBatched(VulkanDevice device, Action<nint> recordOne, int n)
     {
+        using var ctx = device.CreateSubmitContext();
+        ctx.Begin();
+        for (int i = 0; i < n; i++) recordOne(ctx.CommandBuffer);
         var sw = Stopwatch.StartNew();
-        batch();
+        ctx.SubmitAndWait();
         sw.Stop();
-        return sw.Elapsed.TotalMilliseconds;
+        return sw.Elapsed.TotalMilliseconds / n;
+    }
+
+    private static double Median(double[] vals)
+    {
+        var s = (double[])vals.Clone();
+        Array.Sort(s);
+        int n = s.Length;
+        return n % 2 == 1 ? s[n / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2]);
     }
 }
