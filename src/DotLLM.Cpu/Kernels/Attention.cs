@@ -106,7 +106,8 @@ public static class Attention
                                 Span<float> output,
                                 int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                 int positionOffset, float scale, ReadOnlySpan<float> alibiSlopes,
-                                int? slidingWindowSize = null, float softCap = 0f)
+                                int? slidingWindowSize = null, float softCap = 0f,
+                                AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (headDim <= 0)
             throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
@@ -125,7 +126,8 @@ public static class Attention
         {
             Span<float> scores = stackalloc float[scoreSize];
             ExecuteCore(q, k, v, output, scores, seqQ, seqKv, numHeads, headDim,
-                        groupSize, scale, qStride, kvStride, positionOffset, alibiSlopes, slidingWindowSize, softCap);
+                        groupSize, scale, qStride, kvStride, positionOffset, alibiSlopes, slidingWindowSize, softCap,
+                        maskMode, prefixLen);
         }
         else
         {
@@ -134,7 +136,7 @@ public static class Attention
             Span<float> tileScores = stackalloc float[MaxTileSize];
             ExecuteTiledCore(q, k, v, output, tileScores, seqQ, seqKv, numHeads, headDim,
                              groupSize, scale, qStride, kvStride, positionOffset, tileSize, slidingWindowSize ?? 0,
-                             alibiSlopes, softCap);
+                             alibiSlopes, softCap, maskMode, prefixLen);
         }
     }
 
@@ -143,7 +145,8 @@ public static class Attention
                                      int seqQ, int seqKv, int numHeads, int headDim,
                                      int groupSize, float scale, int qStride, int kvStride,
                                      int positionOffset, ReadOnlySpan<float> alibiSlopes,
-                                     int? slidingWindowSize = null, float softCap = 0f)
+                                     int? slidingWindowSize = null, float softCap = 0f,
+                                     AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         for (int h = 0; h < numHeads; h++)
         {
@@ -153,11 +156,12 @@ public static class Attention
             ScaledDotProductScores(q, k, scores, seqQ, seqKv, headDim, scale,
                                    h, kvH, qStride, kvStride);
 
-            // 2. Apply optional ALiBi, then optional soft-cap (Gemma 2/3), then causal mask.
+            // 2. Apply optional ALiBi, then optional soft-cap (Gemma 2/3), then the mask.
+            //    For the default Causal mode ApplyMask delegates to the original ApplyCausalMask.
             ApplyAlibiBias(scores, seqQ, seqKv, positionOffset, GetAlibiSlope(alibiSlopes, h));
             if (softCap > 0f)
                 ApplySoftCap(scores, softCap);
-            ApplyCausalMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+            ApplyMask(scores, seqQ, seqKv, positionOffset, maskMode, prefixLen, slidingWindowSize);
 
             // 3. Fast softmax per row (approximate exp — sufficient for attention)
             for (int i = 0; i < seqQ; i++)
@@ -195,13 +199,14 @@ public static class Attention
                                           int seqQ, int seqKv, int numHeads, int headDim,
                                           int groupSize, float scale, int qStride, int kvStride,
                                           int positionOffset, int tileSize, int slidingWindowSize,
-                                          ReadOnlySpan<float> alibiSlopes, float softCap = 0f)
+                                          ReadOnlySpan<float> alibiSlopes, float softCap = 0f,
+                                          AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         for (int h = 0; h < numHeads; h++)
         {
             ExecuteTiledCore(q, k, v, output, tileScores, seqQ, seqKv, 1, headDim,
                              1, scale, qStride, kvStride, positionOffset, tileSize, slidingWindowSize,
-                             h, h / groupSize, GetAlibiSlope(alibiSlopes, h), softCap);
+                             h, h / groupSize, GetAlibiSlope(alibiSlopes, h), softCap, maskMode, prefixLen);
         }
     }
 
@@ -237,9 +242,10 @@ public static class Attention
     public static unsafe void Execute(float* q, float* k, float* v, float* output,
                                       int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                       int positionOffset, float scale, ComputeThreadPool? pool,
-                                      int? slidingWindowSize = null, float softCap = 0f)
+                                      int? slidingWindowSize = null, float softCap = 0f,
+                                      AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
         => Execute(q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-                   positionOffset, scale, null, pool, slidingWindowSize, softCap);
+                   positionOffset, scale, null, pool, slidingWindowSize, softCap, maskMode, prefixLen);
 
     /// <summary>
     /// Pointer-based attention with caller-provided scale, optional head-parallel execution, and ALiBi.
@@ -249,7 +255,8 @@ public static class Attention
                                       int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                       int positionOffset, float scale, float* alibiSlopes,
                                       ComputeThreadPool? pool, int? slidingWindowSize = null,
-                                      float softCap = 0f)
+                                      float softCap = 0f,
+                                      AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (headDim <= 0)
             throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
@@ -269,7 +276,7 @@ public static class Attention
                 new Span<float>(output, qLen),
                 seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, scale,
                 alibiSlopes is null ? default : new ReadOnlySpan<float>(alibiSlopes, numHeads),
-                slidingWindowSize, softCap);
+                slidingWindowSize, softCap, maskMode, prefixLen);
             return;
         }
 
@@ -296,7 +303,9 @@ public static class Attention
                 ScratchPtrs = scratchPtrs,
                 SlidingWindowSize = slidingWindowSize ?? 0,
                 AlibiSlopes = alibiSlopes,
-                SoftCap = softCap
+                SoftCap = softCap,
+                MaskMode = maskMode,
+                PrefixLen = prefixLen
             };
             pool.Dispatch((nint)(&ctx), &AttentionWorker);
         }
@@ -316,7 +325,9 @@ public static class Attention
                 TileSize = tileSize,
                 SlidingWindowSize = slidingWindowSize ?? 0,
                 AlibiSlopes = alibiSlopes,
-                SoftCap = softCap
+                SoftCap = softCap,
+                MaskMode = maskMode,
+                PrefixLen = prefixLen
             };
             pool.Dispatch((nint)(&ctx), &TiledAttentionWorker);
         }
@@ -345,6 +356,10 @@ public static class Attention
         public float* AlibiSlopes;
         /// <summary>Gemma 2/3 attention-logit soft-cap. 0 = disabled.</summary>
         public float SoftCap;
+        /// <summary>Attention mask mode. Causal (default) preserves the original fast path.</summary>
+        public AttentionMaskMode MaskMode;
+        /// <summary>Causal-prefix length for <see cref="AttentionMaskMode.Hybrid"/>.</summary>
+        public int PrefixLen;
     }
 
     private static unsafe void AttentionWorker(nint ctxPtr, int threadIdx, int threadCount)
@@ -378,7 +393,8 @@ public static class Attention
                            ctx.AlibiSlopes is null ? 0f : ctx.AlibiSlopes[h]);
             if (ctx.SoftCap > 0f)
                 ApplySoftCap(scoresSpan, ctx.SoftCap);
-            ApplyCausalMask(scoresSpan, ctx.SeqQ, ctx.SeqKv, ctx.PositionOffset, slidingWindow);
+            ApplyMask(scoresSpan, ctx.SeqQ, ctx.SeqKv, ctx.PositionOffset,
+                      ctx.MaskMode, ctx.PrefixLen, slidingWindow);
 
             for (int i = 0; i < ctx.SeqQ; i++)
             {
@@ -413,6 +429,10 @@ public static class Attention
         public float* AlibiSlopes;
         /// <summary>Gemma 2/3 attention-logit soft-cap. 0 = disabled.</summary>
         public float SoftCap;
+        /// <summary>Attention mask mode. Causal (default) preserves the original fast path.</summary>
+        public AttentionMaskMode MaskMode;
+        /// <summary>Causal-prefix length for <see cref="AttentionMaskMode.Hybrid"/>.</summary>
+        public int PrefixLen;
     }
 
     [SkipLocalsInit]
@@ -442,7 +462,7 @@ public static class Attention
                              ctx.PositionOffset, ctx.TileSize, ctx.SlidingWindowSize,
                              h, h / ctx.GroupSize,
                              ctx.AlibiSlopes is null ? 0f : ctx.AlibiSlopes[h],
-                             ctx.SoftCap);
+                             ctx.SoftCap, ctx.MaskMode, ctx.PrefixLen);
         }
     }
 
@@ -456,7 +476,8 @@ public static class Attention
                                           int groupSize, float scale, int qStride, int kvStride,
                                           int positionOffset, int tileSize, int slidingWindowSize,
                                           int headIdx, int kvHeadIdx, float alibiSlope,
-                                          float softCap = 0f)
+                                          float softCap = 0f,
+                                          AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         int window = slidingWindowSize;
 
@@ -466,8 +487,9 @@ public static class Attention
             var outRow = output.Slice(i * qStride + headIdx * headDim, headDim);
             outRow.Clear();
 
-            // Causal + sliding window bounds
-            int visibleEnd = Math.Min(seqKv, positionOffset + i + 1);
+            // Per-mode visible upper bound + sliding window lower bound. For Causal this is the
+            // exact original Math.Min(seqKv, positionOffset + i + 1) bound (byte-identical fast path).
+            int visibleEnd = VisibleEnd(maskMode, positionOffset + i, prefixLen, seqKv);
             int visibleStart = (window > 0)
                 ? Math.Max(0, positionOffset + i - window + 1)
                 : 0;
@@ -568,7 +590,8 @@ public static class Attention
                                         Span<float> output,
                                         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
                                         int positionOffset, float scale, ReadOnlySpan<float> alibiSlopes,
-                                        int? slidingWindowSize = null, float softCap = 0f)
+                                        int? slidingWindowSize = null, float softCap = 0f,
+                                        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (headDim <= 0)
             throw new ArgumentException($"headDim must be positive, got {headDim}", nameof(headDim));
@@ -607,14 +630,14 @@ public static class Attention
                     scores[i] = softCap * MathF.Tanh(scores[i] / softCap);
             }
 
-            // Causal mask
+            // Attention mask. Causal (default) reproduces the original j > positionOffset+i rule;
+            // Bidirectional applies no upper bound; Hybrid is causal below prefixLen, open above.
             for (int i = 0; i < seqQ; i++)
             {
-                for (int j = 0; j < seqKv; j++)
-                {
-                    if (j > positionOffset + i)
-                        scores[i * seqKv + j] = float.NegativeInfinity;
-                }
+                int qPos = positionOffset + i;
+                int upperExclusive = VisibleEnd(maskMode, qPos, prefixLen, seqKv);
+                for (int j = upperExclusive; j < seqKv; j++)
+                    scores[i * seqKv + j] = float.NegativeInfinity;
             }
 
             // Sliding window mask
@@ -735,17 +758,93 @@ public static class Attention
             }
         }
 
-        if (slidingWindowSize.HasValue)
+        ApplySlidingWindowMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+    }
+
+    /// <summary>
+    /// Applies the optional sliding-window lower bound in place: masks any key earlier than
+    /// <c>positionOffset + i - window + 1</c>. Shared by every mask mode (the window limit composes
+    /// with causal / bidirectional / hybrid alike). No-op when <paramref name="slidingWindowSize"/>
+    /// is null.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ApplySlidingWindowMask(Span<float> scores, int seqQ, int seqKv,
+                                               int positionOffset, int? slidingWindowSize)
+    {
+        if (!slidingWindowSize.HasValue) return;
+
+        int window = slidingWindowSize.Value;
+        for (int i = 0; i < seqQ; i++)
         {
-            int window = slidingWindowSize.Value;
-            for (int i = 0; i < seqQ; i++)
+            int earliestVisible = positionOffset + i - window + 1;
+            for (int j = 0; j < seqKv && j < earliestVisible; j++)
             {
-                int earliestVisible = positionOffset + i - window + 1;
-                for (int j = 0; j < seqKv && j < earliestVisible; j++)
-                {
-                    scores[i * seqKv + j] = float.NegativeInfinity;
-                }
+                scores[i * seqKv + j] = float.NegativeInfinity;
             }
+        }
+    }
+
+    /// <summary>
+    /// Applies the attention mask selected by <paramref name="mode"/>:
+    /// <list type="bullet">
+    /// <item><see cref="AttentionMaskMode.Causal"/> — identical to <see cref="ApplyCausalMask"/>
+    /// (the byte-identical fast path).</item>
+    /// <item><see cref="AttentionMaskMode.Bidirectional"/> — no causal upper bound; only the optional
+    /// sliding window is applied.</item>
+    /// <item><see cref="AttentionMaskMode.Hybrid"/> — query positions <c>&lt; prefixLen</c> stay causal;
+    /// query positions <c>&gt;= prefixLen</c> attend to the full <c>[0, seqKv)</c> range.</item>
+    /// </list>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ApplyMask(Span<float> scores, int seqQ, int seqKv, int positionOffset,
+                                   AttentionMaskMode mode, int prefixLen, int? slidingWindowSize = null)
+    {
+        switch (mode)
+        {
+            case AttentionMaskMode.Causal:
+                // Exact original fast path — preserved verbatim for byte-identical causal output.
+                ApplyCausalMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+                return;
+
+            case AttentionMaskMode.Bidirectional:
+                // No causal upper bound; sliding window (if any) still applies.
+                ApplySlidingWindowMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+                return;
+
+            case AttentionMaskMode.Hybrid:
+                // Causal prefix; bidirectional canvas. A prefix query (qPos < prefixLen) masks
+                // future keys exactly like the causal path; a canvas query (qPos >= prefixLen)
+                // attends to every key in [0, seqKv).
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int qPos = positionOffset + i;
+                    if (qPos < prefixLen)
+                    {
+                        for (int j = qPos + 1; j < seqKv; j++)
+                            scores[i * seqKv + j] = float.NegativeInfinity;
+                    }
+                }
+                ApplySlidingWindowMask(scores, seqQ, seqKv, positionOffset, slidingWindowSize);
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Computes the per-query exclusive visible upper bound for the tiled / online-softmax paths.
+    /// Causal: <c>min(seqKv, qPos+1)</c>. Bidirectional: <c>seqKv</c>. Hybrid: causal for prefix
+    /// queries, <c>seqKv</c> for canvas queries.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int VisibleEnd(AttentionMaskMode mode, int qPos, int prefixLen, int seqKv)
+    {
+        switch (mode)
+        {
+            case AttentionMaskMode.Bidirectional:
+                return seqKv;
+            case AttentionMaskMode.Hybrid:
+                return qPos < prefixLen ? Math.Min(seqKv, qPos + 1) : seqKv;
+            default: // Causal
+                return Math.Min(seqKv, qPos + 1);
         }
     }
 

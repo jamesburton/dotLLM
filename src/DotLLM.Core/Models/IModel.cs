@@ -55,6 +55,35 @@ public interface IModel : IDisposable
         => Forward(tokenIds, positions, deviceId, kvCache);
 
     /// <summary>
+    /// Runs a forward pass with an explicit attention-mask mode (causal / bidirectional / hybrid).
+    /// </summary>
+    /// <remarks>
+    /// <para>The default implementation forwards to
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/>
+    /// when <paramref name="maskSpec"/> is the causal default, so EVERY existing implementor keeps the
+    /// byte-identical autoregressive behaviour with no code change. Implementations that do not support
+    /// non-causal masking throw <see cref="NotSupportedException"/> for the non-causal modes via this
+    /// default — only backends that implement bidirectional / hybrid attention (currently the CPU
+    /// <c>TransformerModel</c>) override this method.</para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="kvCache">Optional KV-cache. When null, behaves identically to the uncached forward pass.</param>
+    /// <param name="adapter">Optional LoRA adapter. When null, behaves like the adapter-less overload.</param>
+    /// <param name="maskSpec">Attention-mask mode. Defaults to <see cref="AttentionMaskSpec.Causal"/>.</param>
+    /// <returns>Logits tensor of shape [seq, vocab_size] for all input positions.</returns>
+    ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+                    IKvCache? kvCache, ILoraAdapter? adapter, AttentionMaskSpec maskSpec)
+    {
+        if (!maskSpec.IsCausal)
+            throw new NotSupportedException(
+                $"{GetType().Name} does not support non-causal attention (mask mode {maskSpec.Mode}). " +
+                "Only the CPU TransformerModel currently implements bidirectional / hybrid attention.");
+        return Forward(tokenIds, positions, deviceId, kvCache, adapter);
+    }
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>

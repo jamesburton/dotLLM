@@ -46,6 +46,11 @@ public sealed unsafe class TransformerModel : IModel
     // single-threaded per instance (forward state buffers, MLA caches are
     // also instance-scoped) so this is consistent with existing semantics.
     private ILoraAdapter? _currentAdapter;
+    // Active attention-mask spec for the current Forward call. Set by the mask-aware
+    // Forward overload, cleared back to Causal in the try/finally surrounding the call.
+    // Same single-threaded-per-instance contract as _currentAdapter. Defaults to Causal
+    // so every existing call path is byte-identical to the pre-bidirectional code.
+    private AttentionMaskSpec _currentMaskSpec = AttentionMaskSpec.Causal;
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
@@ -384,6 +389,53 @@ public sealed unsafe class TransformerModel : IModel
         finally
         {
             _currentAdapter = null;
+        }
+    }
+
+    /// <summary>
+    /// Mask-mode-aware forward (causal / bidirectional / hybrid). When
+    /// <paramref name="maskSpec"/> is the causal default this is byte-identical to the
+    /// adapter-aware overload — the mask spec only diverts the core attention masking for
+    /// the non-causal modes.
+    /// </summary>
+    /// <remarks>
+    /// Non-causal masking is wired through the cacheless GQA attention path only. A non-null
+    /// <paramref name="kvCache"/> combined with a non-causal mask throws
+    /// <see cref="NotSupportedException"/> — the canvas/KV-cache interaction is a later PR (#28).
+    /// MLA layers are causal-only and likewise reject non-causal masks.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter, AttentionMaskSpec maskSpec)
+    {
+        if (maskSpec.IsCausal)
+            return Forward(tokenIds, positions, deviceId, kvCache, adapter);
+
+        if (kvCache is not null)
+            throw new NotSupportedException(
+                "Non-causal attention (bidirectional / hybrid) is only supported on the cacheless "
+                + "forward path. KV-cache wiring for the diffusion canvas is tracked separately (#28).");
+        if (Config.MlaConfig is not null)
+            throw new NotSupportedException(
+                "Non-causal attention is not supported for MLA (DeepSeek-V2/V3) layers.");
+        if (maskSpec.Mode == AttentionMaskMode.Hybrid && maskSpec.PrefixLength > tokenIds.Length)
+            throw new ArgumentOutOfRangeException(nameof(maskSpec),
+                $"Hybrid prefix length {maskSpec.PrefixLength} exceeds sequence length {tokenIds.Length}.");
+
+        _currentMaskSpec = maskSpec;
+        _currentAdapter = adapter;
+        try
+        {
+            if (adapter is not null)
+            {
+                ValidateAdapterForModel(adapter);
+                LoraStage2.PrewarmAdapter(adapter as LoraAdapter);
+            }
+            return Forward(tokenIds, positions, deviceId, kvCache: null);
+        }
+        finally
+        {
+            _currentAdapter = null;
+            _currentMaskSpec = AttentionMaskSpec.Causal;
         }
     }
 
@@ -896,9 +948,14 @@ public sealed unsafe class TransformerModel : IModel
             }
             else
             {
+                // Cacheless attention. _currentMaskSpec is Causal for every existing caller
+                // (the field defaults to Causal and only the mask-aware Forward overload sets
+                // it otherwise), so this call is byte-identical to the pre-bidirectional code
+                // on the causal path. Bidirectional / hybrid divert masking inside the kernel.
                 Attention.Execute(q, k, v, attnOut,
                     seqLen, seqLen, numHeads, numKvHeadsLayer, headDim, 0, attnScale, _threadPool,
-                    layerSlidingWindow, attnSoftCap);
+                    layerSlidingWindow, attnSoftCap,
+                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
             }
 
             // f. Batched O projection
