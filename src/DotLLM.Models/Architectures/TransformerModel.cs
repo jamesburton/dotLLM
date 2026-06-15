@@ -57,6 +57,14 @@ public sealed unsafe class TransformerModel : IModel
     private readonly int? _slidingWindowSize;
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
+    // Gemma-family embedding scale: input embeddings are multiplied by
+    // sqrt(hidden_size) immediately after the lookup. 1.0f (a no-op) for every
+    // architecture that leaves ModelConfig.EmbeddingScale null.
+    private readonly float _embeddingScale;
+    // True when the dense FFN must use the GeGLU (tanh-approximate GELU) gate
+    // activation instead of SwiGLU (SiLU). Gemma sets ActivationFunction =
+    // GELUTanh; every other dense architecture keeps SwiGLU.
+    private readonly bool _useGeGLU;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -83,6 +91,8 @@ public sealed unsafe class TransformerModel : IModel
         _slidingWindowSize = config.SlidingWindowSize;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
+        _embeddingScale = config.EmbeddingScale ?? 1.0f;
+        _useGeGLU = config.ActivationFunction == ActivationFunction.GELUTanh;
     }
 
     /// <summary>
@@ -813,6 +823,18 @@ public sealed unsafe class TransformerModel : IModel
                                preQuantAttn, lw.OQuantType);
             }
 
+            // g0. Gemma post-attention RMSNorm — applied to the attention
+            // sublayer output (normOut) BEFORE the residual add (four-norm
+            // layout). No-op for non-Gemma (PostAttnNormWeight is null).
+            if (lw.PostAttnNormWeight is float[] postAttnNorm)
+            {
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        postAttnNorm, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
             // g. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
             {
@@ -971,17 +993,23 @@ public sealed unsafe class TransformerModel : IModel
                                preQ_up, lw.UpQuantType);
             }
 
-            // Fused SwiGLU: SiLU(gate) * up in a single tiled pass (per token)
+            // Fused gate activation: GeGLU (tanh-approx GELU) for Gemma when
+            // ActivationFunction == GELUTanh, otherwise SwiGLU (SiLU). Single
+            // tiled pass per token; both kernels are shape-identical
+            // (down(act(gate) * up)).
             for (int t = 0; t < seqLen; t++)
             {
                 float* gateT = ffnGate + t * intermediateSize;
                 float* upT = ffnUp + t * intermediateSize;
                 float* siluT = siluOut + t * intermediateSize;
 
-                FusedOps.SwiGLU(
-                    new ReadOnlySpan<float>(gateT, intermediateSize),
-                    new ReadOnlySpan<float>(upT, intermediateSize),
-                    new Span<float>(siluT, intermediateSize));
+                var gateSpan = new ReadOnlySpan<float>(gateT, intermediateSize);
+                var upSpan = new ReadOnlySpan<float>(upT, intermediateSize);
+                var outSpan = new Span<float>(siluT, intermediateSize);
+                if (_useGeGLU)
+                    FusedOps.GeGLUTanh(gateSpan, upSpan, outSpan);
+                else
+                    FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
             }
 
             // Pre-quantize siluOutput for Down projection (different input dim = intermediateSize)
@@ -1002,6 +1030,18 @@ public sealed unsafe class TransformerModel : IModel
             {
                 ApplyLoraDelta(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim,
                                preQuantSilu, lw.DownQuantType);
+            }
+
+            // j0. Gemma post-FFN RMSNorm — applied to the FFN sublayer output
+            // (normOut) BEFORE the residual add (four-norm layout). No-op for
+            // non-Gemma (PostFfnNormWeight is null).
+            if (lw.PostFfnNormWeight is float[] postFfnNorm)
+            {
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        postFfnNorm, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
             }
 
             // k. Residual add (per token)
@@ -1496,6 +1536,17 @@ public sealed unsafe class TransformerModel : IModel
                 preQuantAttn, in rwO);
             AddBias(lw.OBias, normOut, lw.OOutputDim, total);
 
+            // g0. Gemma post-attention RMSNorm before the residual add (no-op
+            // when PostAttnNormWeight is null — non-Gemma two-norm layout).
+            if (lw.PostAttnNormWeight is float[] postAttnNorm)
+            {
+                for (int t = 0; t < total; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        postAttnNorm, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
+
             // g. Residual add: hidden ← residual + normOut (all batched rows).
             for (int t = 0; t < total; t++)
             {
@@ -1529,17 +1580,20 @@ public sealed unsafe class TransformerModel : IModel
             AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, total);
             AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, total);
 
-            // Fused SwiGLU per row.
+            // Fused gate activation per row: GeGLU (Gemma) or SwiGLU.
             for (int t = 0; t < total; t++)
             {
                 float* gateT = ffnGate + t * intermediateSize;
                 float* upT = ffnUp + t * intermediateSize;
                 float* siluT = siluOut + t * intermediateSize;
 
-                FusedOps.SwiGLU(
-                    new ReadOnlySpan<float>(gateT, intermediateSize),
-                    new ReadOnlySpan<float>(upT, intermediateSize),
-                    new Span<float>(siluT, intermediateSize));
+                var gateSpan = new ReadOnlySpan<float>(gateT, intermediateSize);
+                var upSpan = new ReadOnlySpan<float>(upT, intermediateSize);
+                var outSpan = new Span<float>(siluT, intermediateSize);
+                if (_useGeGLU)
+                    FusedOps.GeGLUTanh(gateSpan, upSpan, outSpan);
+                else
+                    FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
             }
 
             // Batched Down projection: [total, intermediate] × [intermediate, hidden] → [total, hidden] into normOut.
@@ -1548,6 +1602,16 @@ public sealed unsafe class TransformerModel : IModel
             GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, total,
                 preQuantSilu, in rwDown);
             AddBias(lw.DownBias, normOut, lw.DownOutputDim, total);
+
+            // j0. Gemma post-FFN RMSNorm before the residual add (no-op when null).
+            if (lw.PostFfnNormWeight is float[] postFfnNorm)
+            {
+                for (int t = 0; t < total; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        postFfnNorm, eps,
+                        new Span<float>(normOut + t * hiddenSize, hiddenSize));
+            }
 
             // k. Final residual add.
             for (int t = 0; t < total; t++)
@@ -2025,6 +2089,12 @@ public sealed unsafe class TransformerModel : IModel
                 nint rowPtr = embPtr + (nint)rowOffset;
                 Dequantize.ToFloat32(rowPtr, hiddenSize, qt, destSpan);
             }
+
+            // Gemma embedding scaling: multiply by sqrt(hidden_size). No-op for
+            // every architecture that leaves ModelConfig.EmbeddingScale null
+            // (_embeddingScale == 1.0f), so non-Gemma output is bit-identical.
+            if (_embeddingScale != 1.0f)
+                TensorPrimitives.Multiply(destSpan, _embeddingScale, destSpan);
         }
     }
 

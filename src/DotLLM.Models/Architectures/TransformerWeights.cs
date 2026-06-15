@@ -357,8 +357,27 @@ internal readonly struct TransformerLayerWeights
     /// <summary>Optional output projection bias [OOutputDim]. Null when absent.</summary>
     public readonly float[]? OBias;
 
-    /// <summary>Pre-FFN RMSNorm weight [hiddenSize].</summary>
+    /// <summary>
+    /// Pre-FFN RMSNorm weight [hiddenSize]. For the standard two-norm layout
+    /// (Llama/Mistral/Qwen/…) this is the <c>post_attention_layernorm</c>. For
+    /// Gemma's four-norm layout this is the <c>pre_feedforward_layernorm</c> (the
+    /// <c>post_attention_layernorm</c> moves to <see cref="PostAttnNormWeight"/>).
+    /// </summary>
     public readonly float[] FfnNormWeight;
+
+    /// <summary>
+    /// Optional Gemma <c>post_attention_layernorm</c> weight [hiddenSize], applied
+    /// to the attention sublayer output BEFORE the residual add. Null on every
+    /// non-Gemma architecture (which keeps the standard two-norm residual layout).
+    /// </summary>
+    public readonly float[]? PostAttnNormWeight;
+
+    /// <summary>
+    /// Optional Gemma <c>post_feedforward_layernorm</c> weight [hiddenSize], applied
+    /// to the FFN sublayer output BEFORE the residual add. Null on every non-Gemma
+    /// architecture.
+    /// </summary>
+    public readonly float[]? PostFfnNormWeight;
 
     /// <summary>SwiGLU gate projection.</summary>
     public readonly nint GateWeight;
@@ -419,7 +438,8 @@ internal readonly struct TransformerLayerWeights
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
         float[]? qNormWeight = null, float[]? kNormWeight = null,
         MoeLayerWeights? moe = null,
-        MlaLayerWeights? mla = null)
+        MlaLayerWeights? mla = null,
+        float[]? postAttnNormWeight = null, float[]? postFfnNormWeight = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -429,6 +449,8 @@ internal readonly struct TransformerLayerWeights
         VWeight = vWeight; VQuantType = vQuantType; VOutputDim = vOutputDim; VInputDim = vInputDim; VBias = vBias;
         OWeight = oWeight; OQuantType = oQuantType; OOutputDim = oOutputDim; OInputDim = oInputDim; OBias = oBias;
         FfnNormWeight = ffnNormWeight;
+        PostAttnNormWeight = postAttnNormWeight;
+        PostFfnNormWeight = postFfnNormWeight;
         GateWeight = gateWeight; GateQuantType = gateQuantType; GateOutputDim = gateOutputDim; GateInputDim = gateInputDim; GateBias = gateBias;
         UpWeight = upWeight; UpQuantType = upQuantType; UpOutputDim = upOutputDim; UpInputDim = upInputDim; UpBias = upBias;
         DownWeight = downWeight; DownQuantType = downQuantType; DownOutputDim = downOutputDim; DownInputDim = downInputDim; DownBias = downBias;

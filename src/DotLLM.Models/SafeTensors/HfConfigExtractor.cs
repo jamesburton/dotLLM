@@ -249,6 +249,12 @@ public static class HfConfigExtractor
             AttnLogitSoftcap = attnLogitSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             QueryPreAttnScalar = queryPreAttnScalar,
+            // Gemma scales input embeddings by sqrt(hidden_size) (HF
+            // Gemma3TextScaledWordEmbedding). Null for every other architecture
+            // so the forward-path multiply is a no-op there.
+            EmbeddingScale = architecture == Architecture.Gemma3
+                ? MathF.Sqrt(hiddenSize)
+                : null,
             MlaConfig = mla,
             Moe = moe,
             ChatTemplate = null,

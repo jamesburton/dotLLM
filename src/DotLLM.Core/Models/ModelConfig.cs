@@ -57,6 +57,16 @@ public record ModelConfig
     /// <summary>Whether input and output embeddings share weights.</summary>
     public bool TiedEmbeddings { get; init; }
 
+    /// <summary>
+    /// Optional multiplier applied to the input embeddings immediately after the
+    /// token-embedding lookup. Gemma scales embeddings by <c>sqrt(hidden_size)</c>
+    /// (the "normalizer" in HF's <c>Gemma3TextScaledWordEmbedding</c>). Null means
+    /// no scaling — every non-Gemma architecture leaves this null and is unaffected.
+    /// The value is stored explicitly (rather than derived from the architecture)
+    /// so the forward path stays a single multiply with no per-architecture branch.
+    /// </summary>
+    public float? EmbeddingScale { get; init; }
+
     /// <summary>Sliding window size for local attention. Null = full attention.</summary>
     public int? SlidingWindowSize { get; init; }
 
@@ -151,6 +161,16 @@ public record ModelConfig
     /// (Mamba-3, MLA decoupled-rope, ...) ignore this field.
     /// </summary>
     public IReadOnlyList<int>? NoRopeLayers { get; init; }
+
+    /// <summary>
+    /// True when this configuration targets a Gemma-family architecture. Gemma
+    /// requires the four-RMSNorm-per-layer residual layout, the <c>(1+w)</c>
+    /// RMSNorm weight convention, GeGLU FFN activation, and <c>sqrt(hidden)</c>
+    /// embedding scaling — all gated behind this single predicate so every other
+    /// architecture keeps the standard two-norm SwiGLU path untouched.
+    /// </summary>
+    public bool IsGemmaArchitecture =>
+        Architecture is DotLLM.Core.Configuration.Architecture.Gemma3;
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> should skip the per-layer
