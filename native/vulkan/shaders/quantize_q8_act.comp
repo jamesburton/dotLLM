@@ -1,0 +1,60 @@
+#version 450
+// Activation quantization pass for the DP4a Q8_0 GEMV.
+//
+// Quantizes an FP32 activation vector x[K] to INT8 per 32-element block, writing:
+//   xq[K/4] : packed INT8 (4 signed int8 lanes per uint, little-endian — ready
+//             to feed dotPacked4x8AccSatEXT directly)
+//   dx[K/32]: per-block FP32 scale = max(|x|)/127
+//
+// This runs ONCE per activation vector, so the matmul_q8_0_dp4a_pq GEMV that
+// consumes it does no per-row x re-quantization (the inline matmul_q8_0_dp4a
+// shader re-quantizes x in every one of its M workgroups; for high-M shapes like
+// lm_head that redundancy dominates — see .docs/local-optimization-campaign.md V2).
+//
+// Dispatch: one workgroup per 32-element block, 32 threads (one per element).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX  { float x[]; };   // [K]
+layout(set = 0, binding = 1, std430) writeonly buffer BufXq { uint xq[]; };   // [K/4] packed int8
+layout(set = 0, binding = 2, std430) writeonly buffer BufDx { float dx[]; };  // [K/32]
+
+layout(push_constant) uniform PushConstants {
+    uint K;             // length of x (multiple of 32)
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+shared float smax[32];
+shared int sxq[32];
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    if (b >= pc.blocksPerRow) return;
+    uint j = gl_LocalInvocationID.x;
+
+    float v = x[b * 32u + j];
+    smax[j] = abs(v);
+    barrier();
+
+    // Tree max-reduction over the 32 elements of this block.
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (j < s) smax[j] = max(smax[j], smax[j + s]);
+        barrier();
+    }
+
+    float maxabs = smax[0];
+    float inv = maxabs > 0.0 ? (127.0 / maxabs) : 0.0;
+    int q = clamp(int(round(v * inv)), -127, 127);
+    sxq[j] = q & 0xFF;
+    barrier();
+
+    // 8 threads pack the 32 int8 lanes into 8 uints (little-endian byte order).
+    if (j < 8u) {
+        uint packed = uint(sxq[j * 4u])
+                    | (uint(sxq[j * 4u + 1u]) << 8)
+                    | (uint(sxq[j * 4u + 2u]) << 16)
+                    | (uint(sxq[j * 4u + 3u]) << 24);
+        xq[b * 8u + j] = packed;
+    }
+    if (j == 0u) dx[b] = maxabs * (1.0 / 127.0);
+}

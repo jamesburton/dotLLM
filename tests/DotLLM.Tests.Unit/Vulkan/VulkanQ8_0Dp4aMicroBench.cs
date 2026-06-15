@@ -56,8 +56,8 @@ public class VulkanQ8_0Dp4aMicroBench
             $"Device '{device.DeviceName}' does not support VK_KHR_shader_integer_dot_product.");
 
         var sb = new StringBuilder();
-        sb.AppendLine("| Shape (M×K) | Scalar ms/iter | DP4a ms/iter | Speedup |");
-        sb.AppendLine("|---|---:|---:|---:|");
+        sb.AppendLine("| Shape (M×K) | Scalar ms/iter | DP4a inline ms/iter | DP4a+prequant ms/iter | inline× | prequant× |");
+        sb.AppendLine("|---|---:|---:|---:|---:|---:|");
 
         (int m, int k)[] shapes =
         {
@@ -103,15 +103,19 @@ public class VulkanQ8_0Dp4aMicroBench
         using var bufW = device.Allocate(weightsBufBytes);
         using var bufX = device.Allocate((long)k * sizeof(float));
         using var bufY = device.Allocate((long)m * sizeof(float));
+        using var bufXq = device.Allocate(MatMulQ8_0Dp4aPqKernel.XqScratchBytes(k));
+        using var bufDx = device.Allocate(MatMulQ8_0Dp4aPqKernel.DxScratchBytes(k));
         device.Upload(new ReadOnlySpan<byte>(weightsQ8), bufW);
         device.Upload(x, bufX);
 
         var scalar = new MatMulQ8_0Kernel[Iterations + WarmupIterations];
         var dp4a = new MatMulQ8_0Dp4aKernel[Iterations + WarmupIterations];
+        var pq = new MatMulQ8_0Dp4aPqKernel[Iterations + WarmupIterations];
         for (int i = 0; i < scalar.Length; i++)
         {
             scalar[i] = MatMulQ8_0Kernel.Create(device, spvDir);
             dp4a[i] = MatMulQ8_0Dp4aKernel.Create(device, spvDir);
+            pq[i] = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir);
         }
         try
         {
@@ -119,9 +123,10 @@ public class VulkanQ8_0Dp4aMicroBench
             {
                 scalar[w].Launch(bufW, bufX, bufY, m, k);
                 dp4a[w].Launch(bufW, bufX, bufY, m, k);
+                pq[w].Launch(bufW, bufX, bufXq, bufDx, bufY, m, k);
             }
 
-            double scalarMin = double.MaxValue, dp4aMin = double.MaxValue;
+            double scalarMin = double.MaxValue, dp4aMin = double.MaxValue, pqMin = double.MaxValue;
             for (int r = 0; r < Rounds; r++)
             {
                 scalarMin = Math.Min(scalarMin, TimeBatch(() =>
@@ -132,16 +137,22 @@ public class VulkanQ8_0Dp4aMicroBench
                 {
                     for (int i = 0; i < Iterations; i++) dp4a[WarmupIterations + i].Launch(bufW, bufX, bufY, m, k);
                 }));
+                pqMin = Math.Min(pqMin, TimeBatch(() =>
+                {
+                    for (int i = 0; i < Iterations; i++) pq[WarmupIterations + i].Launch(bufW, bufX, bufXq, bufDx, bufY, m, k);
+                }));
             }
 
             double scalarMs = scalarMin / Iterations;
             double dp4aMs = dp4aMin / Iterations;
-            return $"| {m}×{k} | {scalarMs:F4} | {dp4aMs:F4} | {scalarMs / dp4aMs:F2}x |";
+            double pqMs = pqMin / Iterations;
+            return $"| {m}×{k} | {scalarMs:F4} | {dp4aMs:F4} | {pqMs:F4} | {scalarMs / dp4aMs:F2}x | {scalarMs / pqMs:F2}x |";
         }
         finally
         {
             foreach (var s in scalar) s.Dispose();
             foreach (var d in dp4a) d.Dispose();
+            foreach (var p in pq) p.Dispose();
         }
     }
 
