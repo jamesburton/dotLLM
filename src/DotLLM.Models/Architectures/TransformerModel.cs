@@ -94,6 +94,17 @@ public sealed unsafe class TransformerModel : IModel
     /// </summary>
     public bool UseBf16OuterProductQ8Prefill { get; set; }
 
+    /// <summary>
+    /// When true, the no-KV-cache attention path uses full <b>bidirectional</b> (non-causal) self-attention
+    /// instead of the causal mask — every position attends to every other. Required by text-diffusion /
+    /// encoder language models (e.g. open-dcoder, LLaDA) whose denoising loop refines a full sequence with
+    /// full attention. Off by default (autoregressive behaviour unchanged). Only affects the
+    /// <c>kvCache == null</c> forward; the cached decode path is autoregressive by construction. Read at
+    /// runtime so it can be toggled between forward passes (e.g. causal prefill of a prompt, then
+    /// bidirectional denoising of a canvas).
+    /// </summary>
+    public bool BidirectionalAttention { get; set; }
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool)
@@ -816,6 +827,18 @@ public sealed unsafe class TransformerModel : IModel
                         seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], attnScale,
                         _threadPool, layerSlidingWindow, attnSoftCap);
                 }
+            }
+            else if (BidirectionalAttention)
+            {
+                // Full bidirectional self-attention (diffusion / encoder forward): no causal mask, no
+                // sliding window. q is [seqLen, numHeads*headDim]; k/v are [seqLen, numKvHeads*headDim].
+                int qS = numHeads * headDim, kvS = numKvHeads * headDim;
+                Attention.ExecuteBidirectional(
+                    new ReadOnlySpan<float>(q, seqLen * qS),
+                    new ReadOnlySpan<float>(k, seqLen * kvS),
+                    new ReadOnlySpan<float>(v, seqLen * kvS),
+                    new Span<float>(attnOut, seqLen * qS),
+                    seqLen, numHeads, numKvHeads, headDim, attnScale);
             }
             else
             {
