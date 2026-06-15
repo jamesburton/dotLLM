@@ -200,6 +200,90 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+    // Zero-point VNNI (no sign trick) must meet the SAME accuracy bar as the sign-trick VNNI path
+    // (1e-2 vs the scalar reference), INCLUDING the longest prefill K we run (256 blocks = K8192) where
+    // the deferred −128·Σw compensation's fp32 cancellation is worst. If ZP degraded accuracy, the
+    // K=8192 case would breach the bar the sign-trick kernel clears.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(8)]    // K=256
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(32)]   // K=1024
+    [InlineData(64)]   // K=2048
+    [InlineData(128)]  // K=4096
+    [InlineData(256)]  // K=8192 — worst-case compensation cancellation
+    public void OuterProductVnniZp_4x3_MatchesScalar(int blockCount)
+    {
+        if (!AvxVnni.IsSupported)
+            return;
+
+        var rng = new Random(1234);
+        int m = 4;
+        int n = 3;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cZp = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cZpPre = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cVnni = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* sw128 = (float*)NativeMemory.AlignedAlloc((nuint)(blockCount * 4 * sizeof(float)), 64);
+
+        try
+        {
+            // Precompute 128·Σw per (block, row) for the ZpPre probe kernel.
+            const int wStride = 4 * Q8_0BlockBytes;
+            for (int b = 0; b < blockCount; b++)
+                for (int r = 0; r < 4; r++)
+                {
+                    sbyte* w = (sbyte*)(weights + b * wStride + r * Q8_0BlockBytes + 2);
+                    int s = 0;
+                    for (int i = 0; i < 32; i++) s += w[i];
+                    sw128[b * 4 + r] = 128f * s;
+                }
+
+            MatMul.OuterProductQ8_0Scalar_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cScalar, blockCount, m);
+            MatMul.OuterProductQ8_0VnniZp_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cZp, blockCount, m);
+            MatMul.OuterProductQ8_0VnniZpPre_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cZpPre, blockCount, m, sw128);
+            MatMul.OuterProductQ8_0Vnni_4x3(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], cVnni, blockCount, m);
+
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                {
+                    // Same bar as the sign-trick path against the scalar reference.
+                    Assert.Equal(cScalar[t * m + r], cZp[t * m + r], 1e-2f);
+                    // The precompute probe must produce identical math to the in-loop ZP form.
+                    Assert.Equal(cScalar[t * m + r], cZpPre[t * m + r], 1e-2f);
+                    // And ZP must agree with the proven sign-trick kernel to a tighter bound: any
+                    // larger divergence would be the compensation-cancellation failure mode.
+                    Assert.Equal(cVnni[t * m + r], cZp[t * m + r], 5e-3f);
+                }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cZp);
+            NativeMemory.AlignedFree(cZpPre);
+            NativeMemory.AlignedFree(cVnni);
+            NativeMemory.AlignedFree(sw128);
+        }
+    }
+
     /// <summary>
     /// Directional microbench (C1): AVX-VNNI VPDPBUSD 4×3 vs the AVX2 maddubs 4×3 on the same Q8_0
     /// buffers, min-of-rounds. On Meteor Lake (AVX-VNNI, no AVX-512) the VNNI path is what the
@@ -228,6 +312,164 @@ public sealed unsafe class OuterProductGemmTests
         // Runs in isolation (opt-in filter); leaving the thread pinned at the end is harmless.
         BenchOnCore("P-core", pCore, blockCounts, Iters, Rounds);
         if (eCore != pCore) BenchOnCore("E-core", eCore, blockCounts, Iters, Rounds);
+    }
+
+    /// <summary>
+    /// Zero-point counterpart bench: AVX-VNNI ZP 4×3 (no sign trick) vs the sign-trick AVX-VNNI 4×3,
+    /// PAIRED per-round median ratio on a pinned P-core (and E-core). This is the gate for adopting the
+    /// 256-bit ZP kernel ported from strix's AVX-512 <c>OuterProductQ8_0Avx512VnniZp_4x6</c> (#322):
+    /// dispatch only if ZP shows a clean, consistent &gt;1× across K=2048/4096/8192. Opt-in via
+    /// <c>DOTLLM_RUN_KERNEL_BENCH=1</c>.
+    /// </summary>
+    [SkippableFact]
+    public void OuterProductVnniZp_VsVnni_MicroBench()
+    {
+        Skip.If(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_RUN_KERNEL_BENCH")),
+            "Kernel microbench is opt-in — set DOTLLM_RUN_KERNEL_BENCH=1.");
+        Skip.IfNot(AvxVnni.IsSupported, "AVX-VNNI not available.");
+
+        const int Iters = 20000, Rounds = 15;
+        int[] blockCounts = { 64, 128, 256 }; // K = 2048, 4096, 8192
+
+        var topo = DotLLM.Cpu.Threading.NumaTopology.Detect();
+        var pcores = topo.PerformanceCoreIds;
+        int pCore = pcores.Count > 0 ? pcores[0] : 0;
+        int eCore = Enumerable.Range(0, Environment.ProcessorCount).FirstOrDefault(i => !pcores.Contains(i), pCore);
+        Console.WriteLine($"[OuterProductVnniZpMicroBench] iters={Iters} rounds={Rounds} hybrid={topo.IsHybrid} pCore={pCore} eCore={eCore} (min ns/call, 4x3 tile)");
+
+        BenchZpVsVnniOnCore("P-core", pCore, blockCounts, Iters, Rounds);
+        if (eCore != pCore) BenchZpVsVnniOnCore("E-core", eCore, blockCounts, Iters, Rounds);
+    }
+
+    private static void BenchZpVsVnniOnCore(string label, int coreId, int[] blockCounts, int iters, int rounds)
+    {
+        bool pinned = DotLLM.Cpu.Threading.CpuAffinity.PinCurrentThread(coreId);
+        rounds = Math.Max(rounds, 15);
+        Console.WriteLine($"  {label} (core {coreId}, pinned={pinned})   {"K",6} {"VNNI(min)",11} {"ZP(min)",11} {"ratio(med)",11}");
+        var rng = new Random(99);
+        var sw = new System.Diagnostics.Stopwatch();
+        foreach (int blockCount in blockCounts)
+        {
+            int rowBytes = blockCount * Q8_0BlockBytes;
+            byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+            byte* x0 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x1 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x2 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(x0, blockCount, rng);
+            FillRandomQ8_0Blocks(x1, blockCount, rng);
+            FillRandomQ8_0Blocks(x2, blockCount, rng);
+            float* c = (float*)NativeMemory.AlignedAlloc((nuint)(3 * 4 * sizeof(float)), 64);
+            try
+            {
+                for (int i = 0; i < 1000; i++) { MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4); MatMul.OuterProductQ8_0VnniZp_4x3(weights, x0, x1, x2, c, blockCount, 4); }
+                double vnmin = double.MaxValue, zpmin = double.MaxValue;
+                var ratios = new double[rounds];
+                for (int r = 0; r < rounds; r++)
+                {
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4);
+                    sw.Stop(); double vn = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0VnniZp_4x3(weights, x0, x1, x2, c, blockCount, 4);
+                    sw.Stop(); double zp = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    ratios[r] = zp > 0 ? vn / zp : 0;
+                    if (vn < vnmin) vnmin = vn;
+                    if (zp < zpmin) zpmin = zp;
+                }
+                Array.Sort(ratios);
+                Console.WriteLine($"  {label,-22}     {blockCount * 32,6} {vnmin,11:F1} {zpmin,11:F1} {ratios[rounds / 2],10:F2}x");
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(weights); NativeMemory.AlignedFree(x0);
+                NativeMemory.AlignedFree(x1); NativeMemory.AlignedFree(x2); NativeMemory.AlignedFree(c);
+            }
+        }
+    }
+
+    /// <summary>
+    /// PROBE bench: AVX-VNNI sign-trick 4×3 vs ZP-with-precomputed-Σw 4×3. Σw (= 128·Σw) is filled ONCE
+    /// outside the timed loop — modelling the amortized real case (Σw reused across all of N). This isolates
+    /// the pure "drop VPSIGNB, keep 3 VPDPBUSD" trade with no in-loop Σw cost, answering whether a
+    /// WeightRepacking change to precompute Σw could ever beat the sign trick on this core. Opt-in via
+    /// <c>DOTLLM_RUN_KERNEL_BENCH=1</c>.
+    /// </summary>
+    [SkippableFact]
+    public void OuterProductVnniZpPre_VsVnni_MicroBench()
+    {
+        Skip.If(string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DOTLLM_RUN_KERNEL_BENCH")),
+            "Kernel microbench is opt-in — set DOTLLM_RUN_KERNEL_BENCH=1.");
+        Skip.IfNot(AvxVnni.IsSupported, "AVX-VNNI not available.");
+
+        const int Iters = 20000, Rounds = 15;
+        int[] blockCounts = { 64, 128, 256 };
+
+        var topo = DotLLM.Cpu.Threading.NumaTopology.Detect();
+        var pcores = topo.PerformanceCoreIds;
+        int pCore = pcores.Count > 0 ? pcores[0] : 0;
+        int eCore = Enumerable.Range(0, Environment.ProcessorCount).FirstOrDefault(i => !pcores.Contains(i), pCore);
+        Console.WriteLine($"[OuterProductVnniZpPreMicroBench] iters={Iters} rounds={Rounds} hybrid={topo.IsHybrid} pCore={pCore} eCore={eCore} (min ns/call, 4x3 tile; Sw precomputed)");
+
+        BenchZpPreVsVnniOnCore("P-core", pCore, blockCounts, Iters, Rounds);
+        if (eCore != pCore) BenchZpPreVsVnniOnCore("E-core", eCore, blockCounts, Iters, Rounds);
+    }
+
+    private static void BenchZpPreVsVnniOnCore(string label, int coreId, int[] blockCounts, int iters, int rounds)
+    {
+        bool pinned = DotLLM.Cpu.Threading.CpuAffinity.PinCurrentThread(coreId);
+        rounds = Math.Max(rounds, 15);
+        Console.WriteLine($"  {label} (core {coreId}, pinned={pinned})   {"K",6} {"VNNI(min)",11} {"ZPpre(min)",11} {"ratio(med)",11}");
+        var rng = new Random(99);
+        var sw = new System.Diagnostics.Stopwatch();
+        foreach (int blockCount in blockCounts)
+        {
+            int rowBytes = blockCount * Q8_0BlockBytes;
+            byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+            byte* x0 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x1 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            byte* x2 = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(x0, blockCount, rng);
+            FillRandomQ8_0Blocks(x1, blockCount, rng);
+            FillRandomQ8_0Blocks(x2, blockCount, rng);
+            float* c = (float*)NativeMemory.AlignedAlloc((nuint)(3 * 4 * sizeof(float)), 64);
+            // Precompute 128·Σw per (block, row), ONCE — the amortized real cost lives here, not in the loop.
+            float* sw128 = (float*)NativeMemory.AlignedAlloc((nuint)(blockCount * 4 * sizeof(float)), 64);
+            const int wStride = 4 * Q8_0BlockBytes;
+            for (int b = 0; b < blockCount; b++)
+                for (int r = 0; r < 4; r++)
+                {
+                    sbyte* w = (sbyte*)(weights + b * wStride + r * Q8_0BlockBytes + 2);
+                    int s = 0;
+                    for (int i = 0; i < 32; i++) s += w[i];
+                    sw128[b * 4 + r] = 128f * s;
+                }
+            try
+            {
+                for (int i = 0; i < 1000; i++) { MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4); MatMul.OuterProductQ8_0VnniZpPre_4x3(weights, x0, x1, x2, c, blockCount, 4, sw128); }
+                double vnmin = double.MaxValue, zpmin = double.MaxValue;
+                var ratios = new double[rounds];
+                for (int r = 0; r < rounds; r++)
+                {
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0Vnni_4x3(weights, x0, x1, x2, c, blockCount, 4);
+                    sw.Stop(); double vn = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    sw.Restart();
+                    for (int i = 0; i < iters; i++) MatMul.OuterProductQ8_0VnniZpPre_4x3(weights, x0, x1, x2, c, blockCount, 4, sw128);
+                    sw.Stop(); double zp = sw.Elapsed.TotalMilliseconds * 1e6 / iters;
+                    ratios[r] = zp > 0 ? vn / zp : 0;
+                    if (vn < vnmin) vnmin = vn;
+                    if (zp < zpmin) zpmin = zp;
+                }
+                Array.Sort(ratios);
+                Console.WriteLine($"  {label,-22}     {blockCount * 32,6} {vnmin,11:F1} {zpmin,11:F1} {ratios[rounds / 2],10:F2}x");
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(weights); NativeMemory.AlignedFree(x0);
+                NativeMemory.AlignedFree(x1); NativeMemory.AlignedFree(x2); NativeMemory.AlignedFree(c);
+                NativeMemory.AlignedFree(sw128);
+            }
+        }
     }
 
     private static void BenchOnCore(string label, int coreId, int[] blockCounts, int iters, int rounds)

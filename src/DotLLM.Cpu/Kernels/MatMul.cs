@@ -1531,6 +1531,228 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// AVX2-VNNI outer-product microkernel for Q8_0 R4 layout — VPDPBUSD-256 <b>zero-point</b> fast path.
+    /// Same 4-row × 3-token output tile as <see cref="OuterProductQ8_0Vnni_4x3"/> and the 256-bit
+    /// counterpart of strix's AVX-512 <c>OuterProductQ8_0Avx512VnniZp_4x6</c> (PR #322).
+    /// <para>
+    /// <see cref="OuterProductQ8_0Vnni_4x3"/> feeds <c>VPDPBUSD</c> (which needs an <i>unsigned</i> × signed
+    /// operand pair) via the sign trick: <c>VPDPBUSD(|x|, sign(x)·w)</c>, costing one <c>VPSIGNB</c> per cell
+    /// (the <c>sign(w, x)</c> depends on both operands so it cannot be hoisted). The zero-point method removes
+    /// that per-cell <c>VPSIGNB</c> entirely: shift activations to unsigned with <c>u = x ^ 0x80 = x + 128</c>
+    /// (one XOR per token-block, hoisted across the two rows) and feed <c>VPDPBUSD(u, w)</c> directly. The
+    /// shift adds a bias <c>Σ(x_i+128)·w_i = Σx_i·w_i + 128·Σw_i</c>, removed by the <c>−128·Σw</c>
+    /// compensation: <c>Σw</c> is summed once per (row, block) and folded into a scalar accumulator, then
+    /// subtracted from the dot at the end.
+    /// </para>
+    /// <para>
+    /// Accuracy note: the compensation is <b>deferred</b> (large bias accumulated then subtracted), so the
+    /// final result is a difference of two same-sign-growing fp32 sums. The bias is only ~3-4× the true value
+    /// per block, so the cancellation costs ~1-2 mantissa bits — verified within tolerance against the scalar
+    /// reference at K up to 8192 by the gated parity tests. Per-block scale folding (one <c>dx·dw</c> FMA per
+    /// block, identical to the sign-trick path) keeps the dynamic range bounded.
+    /// </para>
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0VnniZp_4x3(
+        byte* groupBase, byte* x0, byte* x1, byte* x2,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+        const float k128 = 128f;
+        Vector256<byte> signBit = Vector256.Create((byte)0x80);
+
+        // Two sub-passes over the 4-row R4 group, 2 rows each. Per cell: a vector fp32 accumulator
+        // (the +128-biased dot, scale-folded per block) plus a scalar compensation accumulator
+        // (the 128·Σw·dx·dw bias), subtracted at the end.
+        for (int rPair = 0; rPair < 4; rPair += 2)
+        {
+            int r0 = rPair;
+            int r1 = rPair + 1;
+
+            Vector256<float> a00 = Vector256<float>.Zero, a01 = Vector256<float>.Zero, a02 = Vector256<float>.Zero;
+            Vector256<float> a10 = Vector256<float>.Zero, a11 = Vector256<float>.Zero, a12 = Vector256<float>.Zero;
+            float comp00 = 0, comp01 = 0, comp02 = 0, comp10 = 0, comp11 = 0, comp12 = 0;
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                byte* blockBase = groupBase + b * wStride;
+
+                byte* xb0 = x0 + b * Q8_0BlockBytes;
+                byte* xb1 = x1 + b * Q8_0BlockBytes;
+                byte* xb2 = x2 + b * Q8_0BlockBytes;
+                float dx0 = HalfBitsToFloat(xb0);
+                float dx1 = HalfBitsToFloat(xb1);
+                float dx2 = HalfBitsToFloat(xb2);
+
+                // u = x + 128 (== x XOR 0x80 in two's-complement bytes): the unsigned VPDPBUSD operand.
+                // No Avx2.Sign — that is the whole point. Hoisted per token across both rows of the pair.
+                Vector256<byte> u0 = Unsafe.ReadUnaligned<Vector256<byte>>(xb0 + 2) ^ signBit;
+                Vector256<byte> u1 = Unsafe.ReadUnaligned<Vector256<byte>>(xb1 + 2) ^ signBit;
+                Vector256<byte> u2 = Unsafe.ReadUnaligned<Vector256<byte>>(xb2 + 2) ^ signBit;
+
+                // Row r0.
+                {
+                    byte* wBlock = blockBase + r0 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+
+                    // Σw for this block's row (signed). Reused across all 3 tokens.
+                    (Vector256<short> wlo, Vector256<short> whi) = Vector256.Widen(vw);
+                    float cmp = k128 * (Vector256.Sum(wlo) + Vector256.Sum(whi));
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u0, vw);
+                    float sc0 = dx0 * dw;
+                    a00 = Fma.MultiplyAdd(Vector256.Create(sc0), Avx.ConvertToVector256Single(isum0), a00);
+                    comp00 += sc0 * cmp;
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u1, vw);
+                    float sc1 = dx1 * dw;
+                    a01 = Fma.MultiplyAdd(Vector256.Create(sc1), Avx.ConvertToVector256Single(isum1), a01);
+                    comp01 += sc1 * cmp;
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u2, vw);
+                    float sc2 = dx2 * dw;
+                    a02 = Fma.MultiplyAdd(Vector256.Create(sc2), Avx.ConvertToVector256Single(isum2), a02);
+                    comp02 += sc2 * cmp;
+                }
+
+                // Row r1.
+                {
+                    byte* wBlock = blockBase + r1 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+
+                    (Vector256<short> wlo, Vector256<short> whi) = Vector256.Widen(vw);
+                    float cmp = k128 * (Vector256.Sum(wlo) + Vector256.Sum(whi));
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u0, vw);
+                    float sc0 = dx0 * dw;
+                    a10 = Fma.MultiplyAdd(Vector256.Create(sc0), Avx.ConvertToVector256Single(isum0), a10);
+                    comp10 += sc0 * cmp;
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u1, vw);
+                    float sc1 = dx1 * dw;
+                    a11 = Fma.MultiplyAdd(Vector256.Create(sc1), Avx.ConvertToVector256Single(isum1), a11);
+                    comp11 += sc1 * cmp;
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u2, vw);
+                    float sc2 = dx2 * dw;
+                    a12 = Fma.MultiplyAdd(Vector256.Create(sc2), Avx.ConvertToVector256Single(isum2), a12);
+                    comp12 += sc2 * cmp;
+                }
+            }
+
+            c[0 * cStride + r0] = HorizontalSumAvx2Float(a00) - comp00;
+            c[1 * cStride + r0] = HorizontalSumAvx2Float(a01) - comp01;
+            c[2 * cStride + r0] = HorizontalSumAvx2Float(a02) - comp02;
+            c[0 * cStride + r1] = HorizontalSumAvx2Float(a10) - comp10;
+            c[1 * cStride + r1] = HorizontalSumAvx2Float(a11) - comp11;
+            c[2 * cStride + r1] = HorizontalSumAvx2Float(a12) - comp12;
+        }
+    }
+
+    /// <summary>
+    /// PROBE variant of <see cref="OuterProductQ8_0VnniZp_4x3"/> with the per-(row, block) weight sums
+    /// <b>precomputed</b> and passed in via <paramref name="rowBlock128Sw"/> (<c>= 128·Σw</c>, indexed
+    /// <c>[b * 4 + r]</c>). This models the amortized real case: <c>Σw</c> is a static property of the
+    /// quantized weights and is reused across the whole token (N) dimension, so in a real GEMM it would be
+    /// computed once at weight-repack time, not per call. The point of this probe is to measure the pure
+    /// "drop <c>VPSIGNB</c>, keep 3 <c>VPDPBUSD</c>" trade with <b>no</b> in-loop <c>Σw</c> cost — the only
+    /// form of ZP that could beat the sign trick — without yet doing the <c>WeightRepacking</c> layout change.
+    /// Not dispatched; benchmark/probe only.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0VnniZpPre_4x3(
+        byte* groupBase, byte* x0, byte* x1, byte* x2,
+        float* c, int blockCount, int cStride, float* rowBlock128Sw)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+        Vector256<byte> signBit = Vector256.Create((byte)0x80);
+
+        for (int rPair = 0; rPair < 4; rPair += 2)
+        {
+            int r0 = rPair;
+            int r1 = rPair + 1;
+
+            Vector256<float> a00 = Vector256<float>.Zero, a01 = Vector256<float>.Zero, a02 = Vector256<float>.Zero;
+            Vector256<float> a10 = Vector256<float>.Zero, a11 = Vector256<float>.Zero, a12 = Vector256<float>.Zero;
+            float comp00 = 0, comp01 = 0, comp02 = 0, comp10 = 0, comp11 = 0, comp12 = 0;
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                byte* blockBase = groupBase + b * wStride;
+                float* swBlock = rowBlock128Sw + b * 4;
+
+                byte* xb0 = x0 + b * Q8_0BlockBytes;
+                byte* xb1 = x1 + b * Q8_0BlockBytes;
+                byte* xb2 = x2 + b * Q8_0BlockBytes;
+                float dx0 = HalfBitsToFloat(xb0);
+                float dx1 = HalfBitsToFloat(xb1);
+                float dx2 = HalfBitsToFloat(xb2);
+
+                Vector256<byte> u0 = Unsafe.ReadUnaligned<Vector256<byte>>(xb0 + 2) ^ signBit;
+                Vector256<byte> u1 = Unsafe.ReadUnaligned<Vector256<byte>>(xb1 + 2) ^ signBit;
+                Vector256<byte> u2 = Unsafe.ReadUnaligned<Vector256<byte>>(xb2 + 2) ^ signBit;
+
+                // Row r0.
+                {
+                    byte* wBlock = blockBase + r0 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+                    float cmp = swBlock[r0]; // precomputed 128·Σw
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u0, vw);
+                    float sc0 = dx0 * dw;
+                    a00 = Fma.MultiplyAdd(Vector256.Create(sc0), Avx.ConvertToVector256Single(isum0), a00);
+                    comp00 += sc0 * cmp;
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u1, vw);
+                    float sc1 = dx1 * dw;
+                    a01 = Fma.MultiplyAdd(Vector256.Create(sc1), Avx.ConvertToVector256Single(isum1), a01);
+                    comp01 += sc1 * cmp;
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u2, vw);
+                    float sc2 = dx2 * dw;
+                    a02 = Fma.MultiplyAdd(Vector256.Create(sc2), Avx.ConvertToVector256Single(isum2), a02);
+                    comp02 += sc2 * cmp;
+                }
+
+                // Row r1.
+                {
+                    byte* wBlock = blockBase + r1 * Q8_0BlockBytes;
+                    float dw = HalfBitsToFloat(wBlock);
+                    Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
+                    float cmp = swBlock[r1];
+
+                    Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u0, vw);
+                    float sc0 = dx0 * dw;
+                    a10 = Fma.MultiplyAdd(Vector256.Create(sc0), Avx.ConvertToVector256Single(isum0), a10);
+                    comp10 += sc0 * cmp;
+
+                    Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u1, vw);
+                    float sc1 = dx1 * dw;
+                    a11 = Fma.MultiplyAdd(Vector256.Create(sc1), Avx.ConvertToVector256Single(isum1), a11);
+                    comp11 += sc1 * cmp;
+
+                    Vector256<int> isum2 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u2, vw);
+                    float sc2 = dx2 * dw;
+                    a12 = Fma.MultiplyAdd(Vector256.Create(sc2), Avx.ConvertToVector256Single(isum2), a12);
+                    comp12 += sc2 * cmp;
+                }
+            }
+
+            c[0 * cStride + r0] = HorizontalSumAvx2Float(a00) - comp00;
+            c[1 * cStride + r0] = HorizontalSumAvx2Float(a01) - comp01;
+            c[2 * cStride + r0] = HorizontalSumAvx2Float(a02) - comp02;
+            c[0 * cStride + r1] = HorizontalSumAvx2Float(a10) - comp10;
+            c[1 * cStride + r1] = HorizontalSumAvx2Float(a11) - comp11;
+            c[2 * cStride + r1] = HorizontalSumAvx2Float(a12) - comp12;
+        }
+    }
+
+    /// <summary>
     /// AVX-512 outer-product microkernel for Q8_0 R4 layout.
     /// Processes 4 weight rows × 6 tokens with 24 ZMM accumulators via dual-block (2 blocks/iteration).
     /// Uses 256-bit sign trick on each block half, then combines into 512-bit for FMA.
