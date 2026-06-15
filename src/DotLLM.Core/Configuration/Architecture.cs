@@ -239,8 +239,41 @@ public enum Architecture
     /// <c>Gemma4TextForCausalLM</c>, <c>model_type=gemma4</c> / <c>gemma4_text</c>.
     /// The DiffusionGemma wrapper (<c>model_type=diffusion_gemma</c> /
     /// <c>diffusion_gemma_text</c>) embeds a Gemma-4 text tower; loading the
-    /// diffusion wrapper itself is a later PR (issue #29).
+    /// diffusion wrapper itself is <see cref="DiffusionGemma"/> (issue #29).
     /// </para>
     /// </summary>
-    Gemma4
+    Gemma4,
+
+    /// <summary>
+    /// Google DiffusionGemma — a <b>block masked-diffusion</b> text model built on the
+    /// Gemma-4 MoE backbone. HF discriminators: <c>model_type=diffusion_gemma</c>
+    /// (text-tower-only checkpoints carry <c>model_type=diffusion_gemma_text</c>),
+    /// <c>architectures=["DiffusionGemmaForBlockDiffusion"]</c>.
+    /// <para>
+    /// <b>Backbone.</b> The transformer tower is byte-identical in shape to
+    /// <see cref="Gemma4"/> — four RMSNorms per layer, the <c>(1 + weight)</c>
+    /// RMSNorm convention, GeGLU sparse MoE experts, <c>sqrt(hidden)</c> embedding
+    /// scaling, per-head Q/K RMSNorms, interleaved local/global attention with
+    /// per-attention-type RoPE (full layers <c>rope_theta = 1e6</c> +
+    /// <c>partial_rotary_factor = 0.25</c>; sliding layers <c>rope_theta = 1e4</c>),
+    /// dual KV-head counts, and final-logit soft-capping. It is therefore handled by
+    /// the same <c>DotLLM.Models</c> transformer forward path as <see cref="Gemma4"/>
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.IsGemmaArchitecture"/> includes both).
+    /// The real 26B-A4B SKU: hidden 2816, 30 layers, 16 heads, 8 sliding-KV / 2
+    /// global-KV heads, head_dim 256 (global_head_dim 512), 128 experts top-8,
+    /// vocab 262144.
+    /// </para>
+    /// <para>
+    /// <b>Diffusion delta.</b> Instead of autoregressive next-token decoding, the
+    /// model refines a fixed-length <c>canvas_length</c> (default 256) canvas of
+    /// masked positions over a denoising schedule, attending bidirectionally over the
+    /// canvas while cross-attending the causal prompt prefix (the hybrid attention
+    /// mask). The diffusion decode parameters (canvas length, denoise schedule,
+    /// tokenizer-resolved mask token id) are carried on
+    /// <see cref="DotLLM.Core.Models.ModelConfig.DiffusionConfig"/> and consumed by
+    /// <c>DiffusionTextGenerator</c>; the backbone weights load through the standard
+    /// Gemma-4 MoE safetensors path.
+    /// </para>
+    /// </summary>
+    DiffusionGemma
 }

@@ -169,6 +169,10 @@ internal static class TransformerWeightsSafetensorsLoader
                 // the DiffusionGemma text tower). Uses the Qwen-MoE tensor names
                 // (mlp.gate + mlp.experts.{j}.{gate,up,down}_proj).
                 DotLLM.Core.Configuration.Architecture.Gemma4 => config.Moe.IsMoeLayer(layerIdx),
+                // DiffusionGemma: identical Gemma-4 MoE text tower (same Qwen-MoE
+                // expert tensor names); the diffusion decode seam is independent of
+                // weight loading.
+                DotLLM.Core.Configuration.Architecture.DiffusionGemma => config.Moe.IsMoeLayer(layerIdx),
                 _ => true,
             };
 
@@ -178,6 +182,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 {
                     DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
                     DotLLM.Core.Configuration.Architecture.Gemma4 => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.DiffusionGemma => LoadQwenMoeLayer(layerIdx, file, config, owned),
                     DotLLM.Core.Configuration.Architecture.GraniteMoe => LoadGraniteMoeLayer(layerIdx, file, config, owned),
                     _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
                 };

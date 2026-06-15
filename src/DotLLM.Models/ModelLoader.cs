@@ -81,12 +81,19 @@ public static class ModelLoader
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
                     or Architecture.Gemma3 or Architecture.Gemma4
+                    or Architecture.DiffusionGemma
+                    // DiffusionGemma reuses the Gemma-4 MoE transformer tower verbatim
+                    // (same forward path, same safetensors loader). The diffusion decode
+                    // seam is NOT a model concern — it lives in DiffusionTextGenerator,
+                    // which consumes this IModel + ModelConfig.DiffusionConfig (populated
+                    // by DiffusionGemmaConfigExtractor). The model exposes the hybrid-mask
+                    // canvas Forward (PR-3) the generator drives, so no wrapper is needed.
                     => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, DiffusionGemma, Mamba3."),
             };
 
             return (model, source, config);
@@ -129,12 +136,14 @@ public static class ModelLoader
             using var doc = JsonDocument.Parse(configJson);
 
             // DiffusionGemma wrapper: model_type=diffusion_gemma /
-            // diffusion_gemma_text houses a Gemma-4 text tower under a diffusion
-            // model head. Loading the diffusion wrapper itself (config hoist,
-            // diffusion sampling head) lands in issue #29 — route it to a clear
-            // NotSupportedException rather than mis-routing it into the dense
-            // Gemma path here. Checked BEFORE ResolveArchitecture so the
-            // dedicated message wins over the generic "unsupported" error.
+            // diffusion_gemma_text houses a Gemma-4 MoE text tower plus the block
+            // masked-diffusion decode parameters. DiffusionGemmaConfigExtractor
+            // hoists `text_config`, reads top-level `canvas_length`, builds the full
+            // Gemma-4 MoE ModelConfig, and attaches a DiffusionConfig (resolving the
+            // mask token id from the checkpoint tokenizer files). Checked BEFORE
+            // ResolveArchitecture so the dedicated path wins over the generic
+            // "unsupported architecture" error (issue #29). Mirrors the Mamba-3
+            // model_type probe below.
             string? topModelType = doc.RootElement.TryGetProperty("model_type", out var topMt)
                                    && topMt.ValueKind == JsonValueKind.String
                 ? topMt.GetString()
@@ -142,15 +151,9 @@ public static class ModelLoader
             if (string.Equals(topModelType, "diffusion_gemma", StringComparison.Ordinal)
                 || string.Equals(topModelType, "diffusion_gemma_text", StringComparison.Ordinal))
             {
-                // The DiffusionConfig itself (canvas length, denoising schedule,
-                // tokenizer-resolved mask token id) is extractable today via
-                // DiffusionConfigExtractor.ExtractFromDirectory(weightsDir, root);
-                // the wrapper model/loader that consumes it (config hoist onto the
-                // Gemma-4 text tower + diffusion sampling head) lands in issue #29.
-                throw new NotSupportedException(
-                    $"model_type='{topModelType}' (DiffusionGemma) is not yet loadable — the diffusion "
-                    + "model wrapper (config hoist + diffusion sampling head) is implemented in issue #29. "
-                    + "The Gemma-4 text tower itself loads via model_type='gemma4'/'gemma4_text'.");
+                ModelConfig diffusionConfig =
+                    DiffusionGemmaConfigExtractor.ExtractFromDirectory(doc.RootElement, weightsDir);
+                return (source, diffusionConfig);
             }
 
             Architecture arch;

@@ -180,7 +180,8 @@ public record ModelConfig
     /// </summary>
     public bool IsGemmaArchitecture =>
         Architecture is DotLLM.Core.Configuration.Architecture.Gemma3
-                     or DotLLM.Core.Configuration.Architecture.Gemma4;
+                     or DotLLM.Core.Configuration.Architecture.Gemma4
+                     or DotLLM.Core.Configuration.Architecture.DiffusionGemma;
 
     /// <summary>
     /// Optional per-attention-type RoPE override for the FULL-attention layers
