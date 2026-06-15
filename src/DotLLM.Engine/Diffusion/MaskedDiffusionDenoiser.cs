@@ -73,7 +73,10 @@ public static class MaskedDiffusionDenoiser
             {
                 if (committed[p]) continue;
                 remaining++;
-                ArgmaxWithConfidence(logits.AsSpan(p * vocabSize, vocabSize), out bestToken[p], out bestConf[p]);
+                // Forbid predicting the absorbing/mask token itself — it is not a valid output in
+                // absorbing-state masked diffusion (a position must denoise to a real token).
+                ArgmaxWithConfidence(logits.AsSpan(p * vocabSize, vocabSize), maskTokenId,
+                    out bestToken[p], out bestConf[p]);
             }
             if (remaining == 0) break;
 
@@ -114,19 +117,27 @@ public static class MaskedDiffusionDenoiser
     }
 
     /// <summary>
-    /// Returns the argmax token and its softmax probability (confidence) for one logits row.
+    /// Returns the argmax token and its softmax probability (confidence) for one logits row, excluding
+    /// <paramref name="forbidToken"/> (the mask/absorbing id) from both the argmax and the softmax
+    /// normalization so it is never selected and doesn't dilute the confidence. Pass -1 to forbid nothing.
     /// </summary>
-    private static void ArgmaxWithConfidence(ReadOnlySpan<float> row, out int token, out float confidence)
+    private static void ArgmaxWithConfidence(ReadOnlySpan<float> row, int forbidToken, out int token, out float confidence)
     {
-        int argmax = 0;
-        float max = row[0];
-        for (int i = 1; i < row.Length; i++)
+        int argmax = -1;
+        float max = float.NegativeInfinity;
+        for (int i = 0; i < row.Length; i++)
+        {
+            if (i == forbidToken) continue;
             if (row[i] > max) { max = row[i]; argmax = i; }
+        }
 
-        // softmax probability of the argmax = 1 / Σ exp(logit_i - max).
+        // softmax probability of the argmax over the allowed vocabulary = 1 / Σ_{i≠forbid} exp(logit_i - max).
         float sum = 0f;
         for (int i = 0; i < row.Length; i++)
+        {
+            if (i == forbidToken) continue;
             sum += MathF.Exp(row[i] - max);
+        }
 
         token = argmax;
         confidence = sum > 0f ? 1f / sum : 1f;

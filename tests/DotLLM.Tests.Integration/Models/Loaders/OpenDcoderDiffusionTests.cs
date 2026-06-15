@@ -1,6 +1,7 @@
 using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
+using DotLLM.Engine.Diffusion;
 using DotLLM.Models;
 using Xunit;
 using Xunit.Abstractions;
@@ -149,6 +150,64 @@ public sealed class OpenDcoderDiffusionTests
             _output.WriteLine($"position-0 argmax: causal-ref={causal0} bidir-ref={bidir0} (differ={causal0 != bidir0})");
 
             CompareLogits("BIDIRECTIONAL", got, refBidir, L, V);
+        }
+        finally
+        {
+            model.Dispose();
+            (source as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// End-to-end capstone: runs the full masked-diffusion loop (B1 denoiser + B0 bidirectional forward)
+    /// on the real open-dcoder-0.5B weights and confirms it denoises a fully-masked canvas to concrete
+    /// tokens. Proves the composition works on real weights — each component is already validated by the
+    /// numeric gates and the denoiser unit tests; this exercises them together end-to-end.
+    /// </summary>
+    [Fact]
+    public unsafe void OpenDcoder_DiffusionGeneration_DenoisesCanvas()
+    {
+        string modelDir = Path.Combine(RefDir, "open-dcoder-0.5B");
+        if (!Directory.Exists(modelDir))
+        {
+            _output.WriteLine($"[SKIP] model dir not found: {modelDir}");
+            return;
+        }
+
+        const int maskTokenId = 151643; // open-dcoder absorbing/mask state (= <|endoftext|>, per generation_config.json)
+        const int canvasLen = 16;
+        const int steps = 16;
+
+        var (model, source, config) = ModelLoader.LoadFromSafetensors(modelDir);
+        try
+        {
+            var tm = (DotLLM.Models.Architectures.TransformerModel)model;
+            tm.BidirectionalAttention = true; // full self-attention over the canvas every denoising step
+            int vocab = config.VocabSize;
+            int[] positions = new int[canvasLen];
+            for (int i = 0; i < canvasLen; i++) positions[i] = i;
+
+            int forwardCalls = 0;
+            float[] Forward(int[] canvas)
+            {
+                forwardCalls++;
+                using ITensor logits = model.Forward(canvas, positions, deviceId: -1);
+                int n = logits.Shape[0] * logits.Shape[1];
+                float[] outp = new float[n];
+                new ReadOnlySpan<float>((void*)logits.DataPointer, n).CopyTo(outp);
+                return outp;
+            }
+
+            var result = MaskedDiffusionDenoiser.Denoise(canvasLen, maskTokenId, vocab, steps, Forward);
+
+            _output.WriteLine($"forward calls={forwardCalls}  tokens=[{string.Join(",", result.Tokens)}]");
+            _output.WriteLine($"commit steps=[{string.Join(",", result.CommitStep)}]");
+
+            // Every position denoised to a real (non-mask) token, and the loop terminated within budget.
+            Assert.All(result.Tokens, t => Assert.NotEqual(maskTokenId, t));
+            Assert.All(result.Tokens, t => Assert.InRange(t, 0, vocab - 1));
+            Assert.All(result.CommitStep, s => Assert.True(s >= 0, "a position was never committed"));
+            Assert.True(forwardCalls <= steps, $"forward called {forwardCalls} times, expected <= {steps}");
         }
         finally
         {
