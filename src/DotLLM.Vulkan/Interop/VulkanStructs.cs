@@ -17,6 +17,7 @@ internal static class VkStructureType
     internal const int FenceCreateInfo = 8;
     internal const int BufferCreateInfo = 12;
     internal const int ShaderModuleCreateInfo = 16;
+    internal const int PipelineCacheCreateInfo = 17;
     internal const int PipelineLayoutCreateInfo = 30;
     internal const int ComputePipelineCreateInfo = 29;
     internal const int PipelineShaderStageCreateInfo = 18;
@@ -308,6 +309,21 @@ internal struct VkShaderModuleCreateInfo
     internal uint flags;
     internal nuint codeSize;
     internal nint pCode; // uint32_t array
+}
+
+// VkPipelineCacheCreateInfo — Vulkan 1.0 core (sType = 17).
+// Pass initialDataSize=0 / pInitialData=0 for a fresh empty cache.
+// Pass prior bytes from vkGetPipelineCacheData to warm from disk.
+// The driver validates the embedded header (vendorID/deviceID/driverVersion/UUID)
+// and silently starts empty if the blob doesn't match — no need to validate here.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineCacheCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal nuint initialDataSize; // size_t → nuint
+    internal nint pInitialData;     // const void* — must be pinned for the duration of the call
 }
 
 [StructLayout(LayoutKind.Sequential)]

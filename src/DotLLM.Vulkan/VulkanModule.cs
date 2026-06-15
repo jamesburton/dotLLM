@@ -12,8 +12,10 @@ namespace DotLLM.Vulkan;
 /// <remarks>
 /// SPIR-V is architecturally analogous to PTX: a forward-compatible shader IR
 /// that the Vulkan driver translates to the vendor-specific ISA at pipeline-creation time.
-/// The driver caches compiled pipelines on disk (implementation-dependent:
-/// AMDGPU-PRO, Mesa-shader-cache, NVIDIA blob) so first-load cost is amortized.
+/// All <c>vkCreateComputePipelines</c> calls pass the device-level
+/// <see cref="VulkanDevice.PipelineCache"/> so compiled ISA is reused across
+/// process launches. The cache is seeded from and persisted to disk by
+/// <see cref="VulkanDevice"/> at init/shutdown.
 /// </remarks>
 public sealed class VulkanModule : IDisposable
 {
@@ -141,7 +143,7 @@ public sealed class VulkanModule : IDisposable
                     basePipelineIndex = -1,
                 };
 
-                VulkanApi.vkCreateComputePipelines(_device.Handle, 0, 1, pipeCi, 0, out pipeline)
+                VulkanApi.vkCreateComputePipelines(_device.Handle, _device.PipelineCache, 1, pipeCi, 0, out pipeline)
                     .ThrowOnError("vkCreateComputePipelines");
             }
 
