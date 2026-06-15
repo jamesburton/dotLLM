@@ -50,6 +50,10 @@ internal static class VkStructureType
     internal const int ImportMemoryHostPointerInfoExt = 1000178000;
     internal const int MemoryHostPointerPropertiesExt = 1000178001;
     internal const int PhysicalDeviceExternalMemoryHostPropertiesExt = 1000178002;
+    // VK_KHR_shader_integer_dot_product extension (promoted to core in Vulkan 1.3).
+    // Feature struct chains off VkPhysicalDeviceFeatures2.pNext to enable the
+    // shaderIntegerDotProduct capability that the DP4a Q8_0 GEMV shader requires.
+    internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -594,6 +598,19 @@ internal struct VkPhysicalDeviceCooperativeMatrixFeaturesKhr
     internal nint pNext;
     internal uint cooperativeMatrix;                // VkBool32
     internal uint cooperativeMatrixRobustBufferAccess; // VkBool32
+}
+
+// VkPhysicalDeviceShaderIntegerDotProductFeatures — feature bit from the
+// VK_KHR_shader_integer_dot_product extension. Chained off
+// VkPhysicalDeviceFeatures2 via pNext both to probe support and to enable the
+// capability at device creation (the DP4a Q8_0 GEMV shader uses
+// GL_EXT_integer_dot_product → dotPacked4x8AccSatEXT, which requires it).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint shaderIntegerDotProduct; // VkBool32
 }
 
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape

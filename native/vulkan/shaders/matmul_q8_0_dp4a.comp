@@ -1,0 +1,132 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q8_0 matrix-vector multiplication (decode-path GEMV), DP4a / integer-dot variant.
+//
+//   y[m] = sum_k  W_q8[m, k] * x[k]
+//
+// Same weight layout, dispatch and buffers as matmul_q8_0.comp, but instead of
+// dequantizing each int8 weight to FP32 and doing an FP multiply-add, this
+// quantizes the FP32 activation slice to INT8 on the fly and uses the hardware
+// 4×8-bit packed signed dot product (dotPacked4x8AccSatEXT, backed by DP4a on
+// Xe-LPG / sm_61+) to accumulate four products per instruction.
+//
+// Per 32-element Q8_0 block b (one block owned wholly by one thread):
+//   d           = fp16 weight scale (bytes [0,1] of the block)
+//   qw[0..31]   = int8 weights      (bytes [2..33])
+//   dx          = max(|x|) / 127    over the matching 32-element x slice
+//   xq[i]       = round(x[i] / dx)  clamped to [-127, 127]   (int8)
+//   dot         = Σ qw[i] * xq[i]   (int32, via 8 packed-4x8 dot calls)
+//   y          += d * dx * dot
+// This reconstructs Σ (d·qw)·(dx·xq) = d·dx·Σ qw·xq, the same product the scalar
+// shader forms in FP32 — only the activation is rounded to INT8 first (≈0.8%
+// per-element), which is why the parity test quantizes x identically for a tight
+// bound and also reports drift vs the FP32-activation reference.
+//
+// NOTE: x is re-quantized independently by every workgroup (one row each). For a
+// decode GEMV with M rows this repeats the per-row INT8 quant M times; a shared
+// pre-quantization pass (llama.cpp's quantize_q8_1 style) is the productionisation
+// step. This kernel is the correctness-first single-dispatch form.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint weight[]; };  // Q8_0 blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };      // [K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };      // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;                // number of output rows
+    uint K;                // columns (must be a multiple of 32)
+    uint blocksPerRow;     // = K / 32
+    uint rowUints;         // = ceil(blocksPerRow * 34 / 4) — buffer-bounds-safe row uint count
+} pc;
+
+// Read 4 bytes starting at `absByteOff` as a little-endian uint. The Q8_0 block
+// is 34 bytes so the qs region is not 4-byte aligned; reads may straddle two
+// uints (same straddle handling as readHalf in matmul_q8_0.comp). The weight
+// buffer is rounded up to a uint multiple, so the second word read here is always
+// in bounds.
+uint readU32(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint sh = (absByteOff & 3u) * 8u;
+    if (sh == 0u) return weight[idx];
+    uint lo = weight[idx] >> sh;
+    uint hi = weight[idx + 1u] << (32u - sh);
+    return lo | hi;
+}
+
+// Fetch the fp16 scale `d` (2 bytes at `absByteOff`) and convert to float.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // Per-row byte stride from blocksPerRow directly (not rowUints*4) — see the
+    // matmul_q8_0.comp comment / issue #1 stride note.
+    uint rowByteStride = pc.blocksPerRow * 34u;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float d = readHalf(blockByteBase);
+
+        uint xBase = b * 32u;
+
+        // Activation scale for this 32-element slice: dx = max(|x|) / 127.
+        float maxabs = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            maxabs = max(maxabs, abs(x[xBase + j]));
+        }
+        float inv = maxabs > 0.0 ? (127.0 / maxabs) : 0.0;
+        float dx = maxabs * (1.0 / 127.0);
+
+        // 8 packed-4x8 dot products cover the 32-element block. qsByteBase points
+        // at qs[0] (block byte offset 2).
+        uint qsByteBase = blockByteBase + 2u;
+        int dot = 0;
+        for (uint g = 0u; g < 8u; g++) {
+            int wpack = int(readU32(qsByteBase + g * 4u));
+
+            int xpack = 0;
+            for (uint b4 = 0u; b4 < 4u; b4++) {
+                float xf = x[xBase + g * 4u + b4];
+                int xq = int(round(xf * inv));
+                xq = clamp(xq, -127, 127);
+                xpack |= (xq & 0xFF) << (b4 * 8u);
+            }
+
+            dot = dotPacked4x8AccSatEXT(wpack, xpack, dot);
+        }
+
+        acc += d * dx * float(dot);
+    }
+
+    // Workgroup reduction via shared memory (matches matmul_q8_0.comp).
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
