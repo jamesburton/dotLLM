@@ -31,6 +31,17 @@ namespace DotLLM.Server;
 [JsonSerializable(typeof(LoraLoadRequest))]
 [JsonSerializable(typeof(LoraLoadResponse))]
 [JsonSerializable(typeof(LoraListResponse))]
+[JsonSerializable(typeof(AnthropicMessagesRequest))]
+[JsonSerializable(typeof(AnthropicMessageResponse))]
+[JsonSerializable(typeof(AnthropicCountTokensResponse))]
+[JsonSerializable(typeof(AnthropicErrorResponse))]
+[JsonSerializable(typeof(AnthropicMessageStartEvent))]
+[JsonSerializable(typeof(AnthropicContentBlockStartEvent))]
+[JsonSerializable(typeof(AnthropicContentBlockDeltaEvent))]
+[JsonSerializable(typeof(AnthropicContentBlockStopEvent))]
+[JsonSerializable(typeof(AnthropicMessageDeltaEvent))]
+[JsonSerializable(typeof(AnthropicMessageStopEvent))]
+[JsonSerializable(typeof(AnthropicPingEvent))]
 [JsonSourceGenerationOptions(
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
