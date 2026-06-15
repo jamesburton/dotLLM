@@ -83,6 +83,41 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("prefix_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PrefixId { get; init; }
+
+    /// <summary>
+    /// Optional diffusion-decode overrides. Honoured only when the loaded model
+    /// is a diffusion model (its <c>ModelConfig.DiffusionConfig</c> is non-null);
+    /// ignored entirely on the autoregressive path. When null, the model's
+    /// verified <c>DiffusionConfig</c> defaults are used unchanged.
+    /// </summary>
+    [JsonPropertyName("diffusion")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiffusionOptionsDto? Diffusion { get; init; }
+}
+
+/// <summary>
+/// Per-request diffusion-decode overrides (additive — only consulted on the
+/// diffusion path). Every field is nullable; a null field falls back to the
+/// model's <c>DiffusionConfig</c> default. <c>max_tokens</c> still maps to the
+/// overall target length; these tune the canvas/schedule shape.
+/// </summary>
+public sealed record DiffusionOptionsDto
+{
+    /// <summary>Override the per-canvas length (<c>DiffusionConfig.CanvasLength</c>).</summary>
+    [JsonPropertyName("canvas_length")]
+    public int? CanvasLength { get; init; }
+
+    /// <summary>Override the max denoise steps per canvas (<c>DiffusionConfig.MaxDenoisingSteps</c>).</summary>
+    [JsonPropertyName("max_denoising_steps")]
+    public int? MaxDenoisingSteps { get; init; }
+
+    /// <summary>Override the upper bound of the linear temperature schedule (<c>t_max</c>).</summary>
+    [JsonPropertyName("temperature_max")]
+    public float? TemperatureMax { get; init; }
+
+    /// <summary>Override the lower bound of the linear temperature schedule (<c>t_min</c>).</summary>
+    [JsonPropertyName("temperature_min")]
+    public float? TemperatureMin { get; init; }
 }
 
 /// <summary>
