@@ -90,6 +90,55 @@ public sealed unsafe class MoeSwiGluMlpTests
                 $"[i={i}] actual={actual[i]} expected={expected[i]} diff={actual[i] - expected[i]}");
     }
 
+    /// <summary>
+    /// GeGLU expert path (Gemma 4 MoE): with <c>useGeGLU: true</c> the kernel
+    /// must match a scalar reference that applies tanh-approximate GELU to the
+    /// gate instead of SiLU — and must DIFFER from the default SwiGLU path on the
+    /// same weights.
+    /// </summary>
+    [Fact]
+    public void Execute_GeGLU_MatchesGeluReference_AndDiffersFromSwiGLU()
+    {
+        var rng = new Random(20260615);
+        // Amplify gate/up so GELU(tanh) and SiLU diverge meaningfully.
+        float[] hidden = RandomF32(rng, SeqLen * Hidden, -1.5f, 1.5f);
+        float[] gate = RandomF32(rng, NumExperts * Hidden, -0.5f, 0.5f);
+        float[][] w1 = new float[NumExperts][];
+        float[][] w2 = new float[NumExperts][];
+        float[][] w3 = new float[NumExperts][];
+        for (int e = 0; e < NumExperts; e++)
+        {
+            w1[e] = RandomF32(rng, Intermediate * Hidden, -0.8f, 0.8f);
+            w3[e] = RandomF32(rng, Intermediate * Hidden, -0.8f, 0.8f);
+            w2[e] = RandomF32(rng, Hidden * Intermediate, -0.8f, 0.8f);
+        }
+
+        float[] geglu = new float[SeqLen * Hidden];
+        float[] swiglu = new float[SeqLen * Hidden];
+        using (var pin = new Pinned(w1, w2, w3))
+        {
+            MoeSwiGluMlp.Execute(
+                hidden, gate, pin.W1, pin.W2, pin.W3, geglu,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                useGeGLU: true);
+            MoeSwiGluMlp.Execute(
+                hidden, gate, pin.W1, pin.W2, pin.W3, swiglu,
+                NumExperts, TopK, Hidden, Intermediate, SeqLen,
+                useGeGLU: false);
+        }
+
+        float[] expectedGeglu = ReferenceMoe(hidden, gate, w1, w2, w3, TopK, useGeGLU: true);
+        for (int i = 0; i < geglu.Length; i++)
+            Assert.True(Math.Abs(geglu[i] - expectedGeglu[i]) < 1e-4f,
+                $"GeGLU [i={i}] actual={geglu[i]} expected={expectedGeglu[i]} diff={geglu[i] - expectedGeglu[i]}");
+
+        // Discriminative: GeGLU and SwiGLU must differ on the same weights.
+        float maxDiff = 0f;
+        for (int i = 0; i < geglu.Length; i++)
+            maxDiff = Math.Max(maxDiff, Math.Abs(geglu[i] - swiglu[i]));
+        Assert.True(maxDiff > 1e-4f, $"GeGLU vs SwiGLU experts identical (maxDiff={maxDiff}).");
+    }
+
     [Fact]
     public void Execute_PerExpertGateProjLora_MatchesEquivalentMergedWeight()
     {
@@ -514,7 +563,8 @@ public sealed unsafe class MoeSwiGluMlpTests
         float[] hidden, float[] gate,
         float[][] w1, float[][] w2, float[][] w3,
         int topk,
-        bool normTopKProb = true)
+        bool normTopKProb = true,
+        bool useGeGLU = false)
     {
         int seqLen = hidden.Length / Hidden;
         float[] output = new float[seqLen * Hidden];
@@ -559,7 +609,9 @@ public sealed unsafe class MoeSwiGluMlpTests
             for (int s = 0; s < topk; s++)
             {
                 int e = idx[s];
-                float[] dense = DenseSwiGlu(x.ToArray(), w1[e], w2[e], w3[e]);
+                float[] dense = useGeGLU
+                    ? DenseGeGlu(x.ToArray(), w1[e], w2[e], w3[e])
+                    : DenseSwiGlu(x.ToArray(), w1[e], w2[e], w3[e]);
                 for (int h = 0; h < Hidden; h++) acc[h] += p[s] * dense[h];
             }
         }
@@ -630,6 +682,47 @@ public sealed unsafe class MoeSwiGluMlpTests
         {
             float d = 0f;
             for (int i = 0; i < Intermediate; i++) d += w2[h * Intermediate + i] * silu[i];
+            outBuf[h] = d;
+        }
+        return outBuf;
+    }
+
+    /// <summary>
+    /// Dense GeGLU MLP reference — identical to <see cref="DenseSwiGlu"/> but the
+    /// gate non-linearity is tanh-approximate GELU
+    /// (<c>0.5·x·(1 + tanh(sqrt(2/π)·(x + 0.044715·x³)))</c>), matching
+    /// <c>FusedOps.GeGLUTanh</c>. Used to validate the Gemma 4 MoE expert path.
+    /// </summary>
+    private static float[] DenseGeGlu(float[] x, float[] w1, float[] w2, float[] w3)
+    {
+        const float sqrt2OverPi = 0.7978845608028654f;
+        const float cubicCoeff = 0.044715f;
+
+        float[] gate = new float[Intermediate];
+        float[] up = new float[Intermediate];
+        for (int i = 0; i < Intermediate; i++)
+        {
+            float g = 0f, u = 0f;
+            for (int h = 0; h < Hidden; h++)
+            {
+                g += w1[i * Hidden + h] * x[h];
+                u += w3[i * Hidden + h] * x[h];
+            }
+            gate[i] = g; up[i] = u;
+        }
+        float[] act = new float[Intermediate];
+        for (int i = 0; i < Intermediate; i++)
+        {
+            float v = gate[i];
+            float inner = sqrt2OverPi * (v + cubicCoeff * v * v * v);
+            float gelu = 0.5f * v * (1f + MathF.Tanh(inner));
+            act[i] = gelu * up[i];
+        }
+        float[] outBuf = new float[Hidden];
+        for (int h = 0; h < Hidden; h++)
+        {
+            float d = 0f;
+            for (int i = 0; i < Intermediate; i++) d += w2[h * Intermediate + i] * act[i];
             outBuf[h] = d;
         }
         return outBuf;

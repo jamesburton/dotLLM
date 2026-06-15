@@ -80,12 +80,13 @@ public static class ModelLoader
                     or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
+                    or Architecture.Gemma3 or Architecture.Gemma4
                     => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, Mamba3."),
             };
 
             return (model, source, config);
@@ -126,6 +127,27 @@ public static class ModelLoader
 
             string configJson = File.ReadAllText(configPath);
             using var doc = JsonDocument.Parse(configJson);
+
+            // DiffusionGemma wrapper: model_type=diffusion_gemma /
+            // diffusion_gemma_text houses a Gemma-4 text tower under a diffusion
+            // model head. Loading the diffusion wrapper itself (config hoist,
+            // diffusion sampling head) lands in issue #29 — route it to a clear
+            // NotSupportedException rather than mis-routing it into the dense
+            // Gemma path here. Checked BEFORE ResolveArchitecture so the
+            // dedicated message wins over the generic "unsupported" error.
+            string? topModelType = doc.RootElement.TryGetProperty("model_type", out var topMt)
+                                   && topMt.ValueKind == JsonValueKind.String
+                ? topMt.GetString()
+                : null;
+            if (string.Equals(topModelType, "diffusion_gemma", StringComparison.Ordinal)
+                || string.Equals(topModelType, "diffusion_gemma_text", StringComparison.Ordinal))
+            {
+                throw new NotSupportedException(
+                    $"model_type='{topModelType}' (DiffusionGemma) is not yet loadable — the diffusion "
+                    + "model wrapper (config hoist + diffusion sampling head) is implemented in issue #29. "
+                    + "The Gemma-4 text tower itself loads via model_type='gemma4'/'gemma4_text'.");
+            }
+
             Architecture arch;
             try
             {

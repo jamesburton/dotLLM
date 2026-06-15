@@ -165,6 +165,10 @@ internal static class TransformerWeightsSafetensorsLoader
                 // standard Llama-style mlp.{gate,up,down}_proj names — fall
                 // through to the dense path below.
                 DotLLM.Core.Configuration.Architecture.QwenMoe => config.Moe.IsMoeLayer(layerIdx),
+                // Gemma 4 MoE: every layer is MoE (no dense/MoE interleaving in
+                // the DiffusionGemma text tower). Uses the Qwen-MoE tensor names
+                // (mlp.gate + mlp.experts.{j}.{gate,up,down}_proj).
+                DotLLM.Core.Configuration.Architecture.Gemma4 => config.Moe.IsMoeLayer(layerIdx),
                 _ => true,
             };
 
@@ -173,6 +177,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 moe = config.Architecture switch
                 {
                     DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.Gemma4 => LoadQwenMoeLayer(layerIdx, file, config, owned),
                     DotLLM.Core.Configuration.Architecture.GraniteMoe => LoadGraniteMoeLayer(layerIdx, file, config, owned),
                     _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
                 };

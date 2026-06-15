@@ -170,7 +170,77 @@ public record ModelConfig
     /// architecture keeps the standard two-norm SwiGLU path untouched.
     /// </summary>
     public bool IsGemmaArchitecture =>
-        Architecture is DotLLM.Core.Configuration.Architecture.Gemma3;
+        Architecture is DotLLM.Core.Configuration.Architecture.Gemma3
+                     or DotLLM.Core.Configuration.Architecture.Gemma4;
+
+    /// <summary>
+    /// Optional per-attention-type RoPE override for the FULL-attention layers
+    /// (Gemma 4 / DiffusionGemma). When non-null, every layer flagged as a
+    /// full-attention layer by <see cref="IsFullAttentionLayer(int)"/> applies
+    /// this RoPE configuration instead of <see cref="RoPEConfig"/>; sliding-window
+    /// layers always use <see cref="RoPEConfig"/>. Gemma 4 ships full layers with a
+    /// larger base (<c>rope_theta = 1e6</c>) and a partial-rotary factor (see
+    /// <see cref="PartialRotaryFactor"/>) while the sliding layers keep the local
+    /// base (<c>rope_theta = 1e4</c>). Null for every architecture that uses a
+    /// single RoPE configuration across all layers (including Gemma 3) — the
+    /// per-layer dispatch then collapses to the single <see cref="RoPEConfig"/>.
+    /// </summary>
+    public RoPEConfig? GlobalRoPEConfig { get; init; }
+
+    /// <summary>
+    /// Optional partial-rotary factor applied to the FULL-attention layers
+    /// (Gemma 4 <c>partial_rotary_factor</c>, e.g. 0.25). When non-null, only the
+    /// leading <c>round(PartialRotaryFactor * head_dim)</c> (rounded down to an
+    /// even count) dimensions of each head are rotated by the full-attention RoPE;
+    /// the remaining dimensions pass through unchanged. Mirrors HF's
+    /// <c>partial_rotary_factor</c> on the global attention type. Null means full
+    /// rotation (factor 1.0) — the default for every architecture and for Gemma 4's
+    /// sliding-window layers.
+    /// </summary>
+    public float? PartialRotaryFactor { get; init; }
+
+    /// <summary>
+    /// Optional KV-head count for the FULL-attention layers (Gemma 4
+    /// <c>num_global_key_value_heads</c>, e.g. 2). When non-null, full-attention
+    /// layers use this GQA group size instead of <see cref="NumKvHeads"/>;
+    /// sliding-window layers always use <see cref="NumKvHeads"/>
+    /// (Gemma 4 <c>num_key_value_heads</c>, e.g. 8). Null means a single uniform
+    /// KV-head count across all layer types — the default for every architecture
+    /// other than Gemma 4.
+    /// </summary>
+    public int? NumGlobalKvHeads { get; init; }
+
+    /// <summary>
+    /// Optional per-head dimension for the FULL-attention layers (Gemma 4
+    /// <c>global_head_dim</c>, e.g. 512 vs the sliding <c>head_dim</c> 256). When
+    /// non-null and different from <see cref="HeadDim"/>, the full-attention layers
+    /// would project Q/K/V at a different per-head width than the sliding layers.
+    /// The current CPU forward path uses a single uniform head_dim for its scratch
+    /// buffers and KV cache, so a config whose <see cref="GlobalHeadDim"/> differs
+    /// from <see cref="HeadDim"/> is not yet supported by the forward pass (it is
+    /// validated and rejected with a clear deferral message at model-build time).
+    /// Null, or equal to <see cref="HeadDim"/>, means a uniform head dimension —
+    /// the supported configuration.
+    /// </summary>
+    public int? GlobalHeadDim { get; init; }
+
+    /// <summary>
+    /// Returns true when <paramref name="layerIdx"/> is a FULL-attention layer.
+    /// A layer is full-attention when <see cref="PerLayerSlidingWindow"/> is set
+    /// and the entry for that layer is <see langword="null"/> (no sliding window);
+    /// it is a sliding-window layer when the entry is a positive window size. When
+    /// <see cref="PerLayerSlidingWindow"/> is null the model has no per-layer
+    /// attention-type distinction — every layer is treated as full-attention
+    /// (returns true), so the per-attention-type RoPE / KV-head overrides collapse
+    /// to the model-wide defaults.
+    /// </summary>
+    public bool IsFullAttentionLayer(int layerIdx)
+    {
+        var perLayer = PerLayerSlidingWindow;
+        if (perLayer is null || (uint)layerIdx >= (uint)perLayer.Count)
+            return true;
+        return perLayer[layerIdx] is null;
+    }
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> should skip the per-layer

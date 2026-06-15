@@ -54,6 +54,9 @@ public sealed unsafe class TransformerModel : IModel
 #pragma warning restore IDE0052, CA1823
     private readonly int _ropeDim;
     private readonly RoPEType _ropeType;
+    // Per-attention-type RoPE element-pairing convention for the FULL-attention
+    // layers (Gemma 4). Equal to _ropeType when no global RoPE table is present.
+    private readonly RoPEType _globalRopeType;
     private readonly int? _slidingWindowSize;
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
@@ -77,7 +80,7 @@ public sealed unsafe class TransformerModel : IModel
 
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
-                       ComputeThreadPool? threadPool, bool ownsPool)
+                       ComputeThreadPool? threadPool, bool ownsPool, RoPEType globalRopeType = RoPEType.Norm)
     {
         Config = config;
         _weights = weights;
@@ -88,6 +91,7 @@ public sealed unsafe class TransformerModel : IModel
         _mmapAnchor = mmapAnchor!;
         _ropeDim = ropeDim;
         _ropeType = ropeType;
+        _globalRopeType = globalRopeType;
         _slidingWindowSize = config.SlidingWindowSize;
         _threadPool = threadPool;
         _ownsThreadPool = ownsPool;
@@ -209,16 +213,48 @@ public sealed unsafe class TransformerModel : IModel
         float ropeTheta = config.MlaConfig?.RopeTheta ?? config.RoPEConfig?.Theta ?? 10000.0f;
         RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
 
+        // Per-attention-type RoPE (Gemma 4 / DiffusionGemma). Full-attention
+        // layers may use a different base theta AND a partial-rotary factor than
+        // the sliding-window layers. We build a secondary cos/sin table for the
+        // full-attention layers and dispatch per layer in the forward pass.
+        // Until the shared forward-state / KV-cache plumbing supports a per-layer
+        // head_dim, we require GlobalHeadDim == HeadDim (the uniform-head-dim
+        // case). The dual-KV-head count (NumGlobalKvHeads != NumKvHeads) IS
+        // supported because it only changes the K/V projection width — buffers
+        // are sized for the max KV-head count.
+        int globalRopeDim = 0;
+        float globalRopeTheta = 0f;
+        RoPEType globalRopeType = ropeType;
+        if (config.GlobalRoPEConfig is RoPEConfig gcfg && config.MlaConfig is null)
+        {
+            ValidateGemma4UniformHeadDim(config);
+            int baseDim = gcfg.DimensionCount > 0 ? gcfg.DimensionCount : config.HeadDim;
+            // Partial-rotary factor (Gemma 4 full-attention layers): only the
+            // leading round-down-to-even fraction of each head rotates.
+            float prf = config.PartialRotaryFactor ?? 1.0f;
+            int rotated = (int)MathF.Floor(prf * baseDim);
+            rotated &= ~1; // round down to even (RoPE rotates dim pairs)
+            if (rotated < 2) rotated = 2;
+            globalRopeDim = Math.Min(rotated, baseDim);
+            globalRopeTheta = gcfg.Theta;
+            globalRopeType = gcfg.Type;
+        }
+
         var state = new TransformerForwardState(
             config.HiddenSize,
             config.NumAttentionHeads,
-            config.NumKvHeads,
+            // Size the K/V scratch + KV cache for the LARGER of the two KV-head
+            // counts so both sliding (NumKvHeads) and full (NumGlobalKvHeads)
+            // layers fit. Per-layer dispatch uses the layer's own count.
+            Math.Max(config.NumKvHeads, config.NumGlobalKvHeads ?? config.NumKvHeads),
             config.HeadDim,
             config.IntermediateSize,
             config.VocabSize,
             config.MaxSequenceLength,
             ropeDim,
-            ropeTheta);
+            ropeTheta,
+            globalRopeDim,
+            globalRopeTheta);
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
@@ -286,7 +322,24 @@ public sealed unsafe class TransformerModel : IModel
             }
         }
 
-        return new TransformerModel(config, weights, state, anchorSource, ropeDim, ropeType, pool, ownsPool: pool is not null);
+        return new TransformerModel(config, weights, state, anchorSource, ropeDim, ropeType, pool, ownsPool: pool is not null, globalRopeType);
+    }
+
+    /// <summary>
+    /// Guards the unsupported Gemma 4 configuration where the full-attention
+    /// layers use a different per-head dimension (<c>global_head_dim</c>) than the
+    /// sliding-window layers (<c>head_dim</c>). The shared forward-state scratch
+    /// buffers and KV cache are sized for a single uniform head_dim; supporting a
+    /// per-layer head_dim is tracked separately. Throws a clear deferral message.
+    /// </summary>
+    private static void ValidateGemma4UniformHeadDim(ModelConfig config)
+    {
+        if (config.GlobalHeadDim is int ghd && ghd != config.HeadDim)
+            throw new NotSupportedException(
+                $"Gemma 4 with distinct global_head_dim ({ghd}) and head_dim ({config.HeadDim}) "
+                + "is not yet supported by the CPU forward path — the shared forward-state and "
+                + "KV-cache buffers assume a uniform per-head dimension across layer types. "
+                + "Configure a uniform head_dim (per-layer head_dim support is tracked as issue #36).");
     }
 
     /// <inheritdoc/>
@@ -368,6 +421,40 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
+    /// Resolves the per-attention-type RoPE table set + rotated-dim + element
+    /// pairing for <paramref name="layer"/>. Returns the secondary (global)
+    /// table — different base theta and optional partial-rotary — for the
+    /// full-attention layers when a global RoPE table is present (Gemma 4);
+    /// otherwise returns the primary (sliding) table. When no global table
+    /// exists every layer uses the primary table, so non-Gemma-4 architectures
+    /// are unaffected.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private (float[] Cos, float[] Sin, int RopeDim, RoPEType Type) GetLayerRope(int layer)
+    {
+        if (_state.GlobalCosTable is float[] gCos && _state.GlobalSinTable is float[] gSin
+            && Config.IsFullAttentionLayer(layer))
+        {
+            return (gCos, gSin, _state.GlobalRopeDim, _globalRopeType);
+        }
+        return (_state.CosTable, _state.SinTable, _ropeDim, _ropeType);
+    }
+
+    /// <summary>
+    /// Resolves the KV-head count for <paramref name="layer"/>. Full-attention
+    /// layers use <see cref="ModelConfig.NumGlobalKvHeads"/> when set (Gemma 4);
+    /// sliding-window layers and every other architecture use
+    /// <see cref="ModelConfig.NumKvHeads"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetLayerKvHeads(int layer)
+    {
+        if (Config.NumGlobalKvHeads is int g && Config.IsFullAttentionLayer(layer))
+            return g;
+        return Config.NumKvHeads;
+    }
+
+    /// <summary>
     /// Embedding lookup + transformer layer loop + final RMSNorm. Leaves the final
     /// hidden state in <c>_state.HiddenState[0..seqLen*hiddenSize]</c>. Used by both
     /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -389,11 +476,9 @@ public sealed unsafe class TransformerModel : IModel
         int seqLen = tokenIds.Length;
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
-        int numKvHeads = Config.NumKvHeads;
         int headDim = Config.HeadDim;
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
-        int kvStride = numKvHeads * headDim;
         float eps = Config.NormEpsilon;
 
         _state.EnsureCapacity(seqLen);
@@ -475,6 +560,12 @@ public sealed unsafe class TransformerModel : IModel
         {
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
+
+            // Per-attention-type KV-head count (Gemma 4: full-attention layers
+            // use NumGlobalKvHeads, sliding layers use NumKvHeads). Collapses to
+            // the uniform Config.NumKvHeads for every other architecture.
+            int numKvHeadsLayer = GetLayerKvHeads(layer);
+            int kvStrideLayer = numKvHeadsLayer * headDim;
 
             // Declared once for the whole layer so both the GQA and MLA
             // paths share the same input-quantisation scratch region.
@@ -744,20 +835,23 @@ public sealed unsafe class TransformerModel : IModel
             if (lw.QNormWeight is not null)
                 ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, seqLen, eps);
             if (lw.KNormWeight is not null)
-                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeads, headDim, seqLen, eps);
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDim, seqLen, eps);
 
             // d. RoPE (in-place on Q and K for all tokens). SmolLM3 marks
             // selected layers as NoPE (skip RoPE entirely) via
             // ModelConfig.NoRopeLayers — the attention math runs unmodified on
-            // position-free Q/K, which is the whole point of NoPE.
+            // position-free Q/K, which is the whole point of NoPE. Gemma 4 picks
+            // a per-attention-type table/dim/pairing via GetLayerRope (full vs
+            // sliding); every other architecture resolves to the single table.
             if (!Config.IsNoRopeLayer(layer))
             {
+                var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
                 RoPE.Execute(
                     new Span<float>(q, seqLen * numHeads * headDim),
-                    new Span<float>(k, seqLen * kvStride),
+                    new Span<float>(k, seqLen * kvStrideLayer),
                     positions,
-                    numHeads, numKvHeads, headDim, _ropeDim,
-                    _state.CosTable, _state.SinTable, _ropeType);
+                    numHeads, numKvHeadsLayer, headDim, ropeDimLayer,
+                    ropeCos, ropeSin, ropeTypeLayer);
             }
 
             // e. Attention — with or without KV-cache
@@ -776,8 +870,8 @@ public sealed unsafe class TransformerModel : IModel
             if (kvCache is not null)
             {
                 // Store new K/V in cache, then attend over full cached context (zero allocations)
-                var kRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)k);
-                var vRef = new TensorRef(seqLen, kvStride, DType.Float32, -1, (nint)v);
+                var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
+                var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
 
                 kvCache.Update(kRef, vRef, positions, layer);
 
@@ -787,7 +881,7 @@ public sealed unsafe class TransformerModel : IModel
                 {
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap);
                 }
                 else
@@ -796,14 +890,14 @@ public sealed unsafe class TransformerModel : IModel
                     var cachedV = kvCache.GetValuesRef(layer);
 
                     Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim, positions[0], attnScale,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], attnScale,
                         _threadPool, layerSlidingWindow, attnSoftCap);
                 }
             }
             else
             {
                 Attention.Execute(q, k, v, attnOut,
-                    seqLen, seqLen, numHeads, numKvHeads, headDim, 0, attnScale, _threadPool,
+                    seqLen, seqLen, numHeads, numKvHeadsLayer, headDim, 0, attnScale, _threadPool,
                     layerSlidingWindow, attnSoftCap);
             }
 
@@ -894,7 +988,8 @@ public sealed unsafe class TransformerModel : IModel
                         sharedIntermediateSize: moe.SharedIntermediateSize,
                         sharedExpertGate: sharedGateSpan,
                         loraAdapter: _currentAdapter,
-                        loraLayer: layer);
+                        loraLayer: layer,
+                        useGeGLU: _useGeGLU);
                 }
                 else
                 {
@@ -911,7 +1006,8 @@ public sealed unsafe class TransformerModel : IModel
                         intermediateSize: moe.IntermediateSize,
                         seqLen: seqLen,
                         loraAdapter: _currentAdapter,
-                        loraLayer: layer);
+                        loraLayer: layer,
+                        useGeGLU: _useGeGLU);
                 }
 
                 // Residual add (per token) → hidden. Same as dense path.
@@ -1366,10 +1462,8 @@ public sealed unsafe class TransformerModel : IModel
 
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
-        int numKvHeads = Config.NumKvHeads;
         int headDim = Config.HeadDim;
         int intermediateSize = Config.IntermediateSize;
-        int kvStride = numKvHeads * headDim;
         int qStride = numHeads * headDim;
         float eps = Config.NormEpsilon;
 
@@ -1430,6 +1524,11 @@ public sealed unsafe class TransformerModel : IModel
             ref readonly var lw = ref _weights.Layers[layer];
             var rl = repackedLayers?[layer];
 
+            // Per-attention-type KV-head count (Gemma 4 dual-KV-head). Uniform
+            // Config.NumKvHeads for every other architecture.
+            int numKvHeadsLayer = GetLayerKvHeads(layer);
+            int kvStrideLayer = numKvHeadsLayer * headDim;
+
             byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
 
             // a. Copy hidden → residual (whole packed buffer).
@@ -1468,7 +1567,7 @@ public sealed unsafe class TransformerModel : IModel
             if (lw.QNormWeight is not null)
                 ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, total, eps);
             if (lw.KNormWeight is not null)
-                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeads, headDim, total, eps);
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDim, total, eps);
 
             // d/e. Per-sequence RoPE + Attention + KV-cache update. The Q/K/V
             // slices live at packedOffsets[s] in the batched buffers; we hand
@@ -1477,6 +1576,7 @@ public sealed unsafe class TransformerModel : IModel
             // re-stacking the post-attention tokens into a single packed buffer
             // ready for the next batched GEMM (O projection).
             bool applyRoPE = !Config.IsNoRopeLayer(layer);
+            var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
             for (int s = 0; s < simpleIdxs.Length; s++)
             {
                 int origIdx = simpleIdxs[s];
@@ -1486,25 +1586,25 @@ public sealed unsafe class TransformerModel : IModel
                 var positions = r.Positions.Span;
 
                 float* qSlice = q + (long)off * qStride;
-                float* kSlice = k + (long)off * kvStride;
-                float* vSlice = v + (long)off * kvStride;
+                float* kSlice = k + (long)off * kvStrideLayer;
+                float* vSlice = v + (long)off * kvStrideLayer;
                 float* aSlice = attnOut + (long)off * qStride;
 
                 if (applyRoPE)
                 {
                     RoPE.Execute(
                         new Span<float>(qSlice, n * qStride),
-                        new Span<float>(kSlice, n * kvStride),
+                        new Span<float>(kSlice, n * kvStrideLayer),
                         positions,
-                        numHeads, numKvHeads, headDim, _ropeDim,
-                        _state.CosTable, _state.SinTable, _ropeType);
+                        numHeads, numKvHeadsLayer, headDim, ropeDimLayer,
+                        ropeCos, ropeSin, ropeTypeLayer);
                 }
 
                 IKvCache kvCache = r.KvCache;
                 // KV cache is required on the request — write new K/V then attend
                 // over the cached range.
-                var kRef = new TensorRef(n, kvStride, DType.Float32, -1, (nint)kSlice);
-                var vRef = new TensorRef(n, kvStride, DType.Float32, -1, (nint)vSlice);
+                var kRef = new TensorRef(n, kvStrideLayer, DType.Float32, -1, (nint)kSlice);
+                var vRef = new TensorRef(n, kvStrideLayer, DType.Float32, -1, (nint)vSlice);
                 kvCache.Update(kRef, vRef, positions, layer);
 
                 int seqKv = kvCache.CurrentLength;
@@ -1516,7 +1616,7 @@ public sealed unsafe class TransformerModel : IModel
                 if (kvCache is IQuantizedKvCache qkvCache)
                 {
                     Attention.Execute(qSlice, qkvCache, layer, aSlice,
-                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], _threadPool,
+                        n, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap);
                 }
                 else
@@ -1524,7 +1624,7 @@ public sealed unsafe class TransformerModel : IModel
                     var cachedK = kvCache.GetKeysRef(layer);
                     var cachedV = kvCache.GetValuesRef(layer);
                     Attention.Execute(qSlice, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, aSlice,
-                        n, seqKv, numHeads, numKvHeads, headDim, positions[0], attnScale,
+                        n, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], attnScale,
                         _threadPool, layerSlidingWindow, attnSoftCap);
                 }
             }
