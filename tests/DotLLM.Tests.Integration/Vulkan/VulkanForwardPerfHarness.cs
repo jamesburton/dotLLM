@@ -64,7 +64,13 @@ public class VulkanForwardPerfHarness
         int warmupSteps = ParseEnvInt("DOTLLM_VULKAN_PERF_WARMUP", 4);
         int decodeSteps = ParseEnvInt("DOTLLM_VULKAN_PERF_DECODE_STEPS", 32);
 
-        using var gguf = GgufFile.Open(_fixture.FilePath);
+        // DOTLLM_VULKAN_PERF_MODEL overrides the SmolLM-135M fixture with any
+        // GGUF path so the harness can profile larger / differently-quantized
+        // models (e.g. Q4_K) for the decode-GEMV optimisation work.
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PERF_MODEL") is { Length: > 0 } mp
+            ? mp : _fixture.FilePath;
+        _output.WriteLine($"model={modelPath}");
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
