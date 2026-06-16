@@ -247,6 +247,20 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? QBias, KBias, VBias, OBias;
 
         /// <summary>
+        /// Gemma four-norm layout: optional post-attention RMSNorm applied to
+        /// the attention sublayer output BEFORE the residual add. Null on
+        /// non-Gemma architectures (standard two-norm layout).
+        /// </summary>
+        public readonly VulkanDevice.Buffer? PostAttnNormWeight;
+
+        /// <summary>
+        /// Gemma four-norm layout: optional post-FFN RMSNorm applied to the
+        /// FFN sublayer output BEFORE the residual add. Null on non-Gemma
+        /// architectures.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? PostFfnNormWeight;
+
+        /// <summary>
         /// Non-null when the layer uses MLA attention (DeepSeek-V2/V3).
         /// Forward routes through <c>RecordMlaLayer</c> and the Q/K/V slots
         /// above are unused (zero buffers).
@@ -286,10 +300,14 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer up, QuantizationType upQt, int upM, int upK,
             VulkanDevice.Buffer down, QuantizationType downQt, int downM, int downK,
             VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias,
+            VulkanDevice.Buffer? postAttnNorm = null,
+            VulkanDevice.Buffer? postFfnNorm = null,
             MlaLayerBuffers? mla = null,
             MoeLayerBuffers? moe = null)
         {
             AttnNormWeight = attnNorm;
+            PostAttnNormWeight = postAttnNorm;
+            PostFfnNormWeight = postFfnNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
             K = k; KDeviceQuantType = kQt; KOutputDim = kM; KInputDim = kK;
             V = v; VDeviceQuantType = vQt; VOutputDim = vM; VInputDim = vK;
@@ -309,6 +327,8 @@ internal sealed class VulkanWeights : IDisposable
             AttnNormWeight.Dispose();
             Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
             QBias?.Dispose(); KBias?.Dispose(); VBias?.Dispose(); OBias?.Dispose();
+            PostAttnNormWeight?.Dispose();
+            PostFfnNormWeight?.Dispose();
             FfnNormWeight.Dispose();
             Gate.Dispose(); Up.Dispose(); Down.Dispose();
             GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
@@ -409,6 +429,13 @@ internal sealed class VulkanWeights : IDisposable
             var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
 
+            // Gemma four-norm layout: optional post-attention RMSNorm weight
+            // applied to the attention output before the residual add. Null on
+            // non-Gemma architectures (UploadOptionalVec returns null).
+            var postAttnNorm = UploadOptionalVec(device, staging, lw.PostAttnNormWeight);
+            if (lw.PostAttnNormWeight is not null)
+                totalBytes += (long)lw.PostAttnNormWeight.Length * sizeof(float);
+
             // MLA layers carry their projections in lw.Mla; the standard
             // Q/K/V slots are zeroed by the loader. Replace each with a
             // 64-byte stub so the LayerBuffers contract still holds — the
@@ -451,6 +478,12 @@ internal sealed class VulkanWeights : IDisposable
 
             var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
             totalBytes += (long)lw.FfnNormWeight.Length * sizeof(float);
+
+            // Gemma four-norm layout: optional post-FFN RMSNorm weight applied
+            // to the FFN output before the residual add. Null on non-Gemma.
+            var postFfnNorm = UploadOptionalVec(device, staging, lw.PostFfnNormWeight);
+            if (lw.PostFfnNormWeight is not null)
+                totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
 
             // MoE layers replace the dense Gate/Up/Down with per-expert
             // banks (lw.Moe). Stub the dense slots with 64-byte buffers so
@@ -501,6 +534,7 @@ internal sealed class VulkanWeights : IDisposable
                 up, upDeviceQt, lw.UpOutputDim, lw.UpInputDim,
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
                 gateBias, upBias, downBias,
+                postAttnNorm, postFfnNorm,
                 mla, moe);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes

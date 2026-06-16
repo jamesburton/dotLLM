@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -47,7 +48,7 @@ public sealed class AttentionF32Kernel : IDisposable
     public const int MaxHeadDim = 256;
 
     private const int WorkgroupSize = 256;
-    // 8 uints + 2 floats (softCap, scaleOverride) + 2 uint pad = 12 * 4 = 48 bytes.
+    // 8 uints + 2 floats (softCap, scaleOverride) + 2 uints (maskMode, prefixLen) = 12 * 4 = 48 bytes.
     // Matches the FA shader's push-constant layout so kernel + FA share size.
     private const int PushConstantBytes = 12 * sizeof(uint);
 
@@ -276,16 +277,24 @@ public sealed class AttentionF32Kernel : IDisposable
     /// <param name="scaleOverride">Optional Gemma-3 <c>query_pre_attn_scalar</c> override.
     /// <c>0</c> = use <c>1/sqrt(headDim)</c>; when &gt; 0, the shader scales raw scores by this
     /// value instead. Caller passes the final multiplicative factor (e.g. <c>1/sqrt(QPAS)</c>).</param>
+    /// <param name="maskMode">Attention mask pattern. <see cref="AttentionMaskMode.Causal"/> (default)
+    /// is the byte-identical autoregressive fast path; <see cref="AttentionMaskMode.Bidirectional"/>
+    /// drops the causal upper bound; <see cref="AttentionMaskMode.Hybrid"/> keeps positions
+    /// <c>&lt; prefixLen</c> causal and lets positions <c>&gt;= prefixLen</c> attend bidirectionally
+    /// (diffusion canvas). Mirrors the CPU <c>Attention.Execute</c> <c>maskMode</c> parameter.</param>
+    /// <param name="prefixLen">Hybrid-only prefix length (number of leading causal positions).
+    /// Ignored unless <paramref name="maskMode"/> is <see cref="AttentionMaskMode.Hybrid"/>.</param>
     public void Launch(
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
-        float softCap = 0.0f, float scaleOverride = 0.0f)
+        float softCap = 0.0f, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-               positionOffset, slidingWindow, useAlibi, softCap, scaleOverride);
+               positionOffset, slidingWindow, useAlibi, softCap, scaleOverride, maskMode, prefixLen);
         ctx.SubmitAndWait();
     }
 
@@ -295,7 +304,8 @@ public sealed class AttentionF32Kernel : IDisposable
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
-        float softCap = 0.0f, float scaleOverride = 0.0f)
+        float softCap = 0.0f, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -315,6 +325,7 @@ public sealed class AttentionF32Kernel : IDisposable
             "softCap must be non-negative (use 0 to disable).");
         if (scaleOverride < 0.0f) throw new ArgumentOutOfRangeException(nameof(scaleOverride),
             "scaleOverride must be non-negative (use 0 for the default 1/sqrt(headDim)).");
+        if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
         long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
@@ -343,7 +354,7 @@ public sealed class AttentionF32Kernel : IDisposable
         //   [0] seqQ, [1] seqKv, [2] numHeads, [3] numKvHeads,
         //   [4] headDim, [5] positionOffset, [6] slidingWindow, [7] useAlibi,
         //   [8] softCap (float, reinterpreted), [9] scaleOverride (float, reinterpreted),
-        //   [10..11] padding for std140 alignment.
+        //   [10] maskMode (0=Causal,1=Bidirectional,2=Hybrid), [11] prefixLen (Hybrid only).
         Span<uint> pc = stackalloc uint[12];
         pc[0]  = (uint)seqQ;
         pc[1]  = (uint)seqKv;
@@ -355,8 +366,8 @@ public sealed class AttentionF32Kernel : IDisposable
         pc[7]  = useAlibi ? 1u : 0u;
         pc[8]  = BitConverter.SingleToUInt32Bits(softCap);
         pc[9]  = BitConverter.SingleToUInt32Bits(scaleOverride);
-        pc[10] = 0u;
-        pc[11] = 0u;
+        pc[10] = (uint)maskMode;
+        pc[11] = (uint)prefixLen;
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(

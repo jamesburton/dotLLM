@@ -44,9 +44,22 @@ layout(push_constant) uniform PushConstants {
     uint useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
     float softCap;        // 0.0 = disabled, >0 = softCap * tanh(s / softCap) before softmax (Gemma 2/3)
     float scaleOverride;  // 0.0 = use 1/sqrt(headDim), >0 = override (Gemma 3 QPAS)
-    uint _pad0;
-    uint _pad1;
+    uint maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
+    uint prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
 } pc;
+
+// Causal-component mask for the (key, query) pair under the selected mode.
+// Sliding-window masking composes with this exactly as in the CPU reference
+// (DotLLM.Cpu.Kernels.Attention.ApplyMask):
+//   Causal        -> tkv > posQ
+//   Bidirectional -> false (no causal upper bound)
+//   Hybrid        -> (posQ < prefixLen) ? (tkv > posQ) : false
+// maskMode==0 with prefixLen==0 reproduces the original hardcoded check byte-for-byte.
+bool isMasked(uint tkv, uint posQ, uint maskMode, uint prefixLen) {
+    if (maskMode == 1u) return false;
+    if (maskMode == 2u && posQ >= prefixLen) return false;
+    return tkv > posQ;
+}
 
 shared float qShared[MAX_HEAD_DIM];
 shared float scoreTile[TILE_KV];
@@ -156,7 +169,7 @@ void main() {
         for (uint t = tid; t < tileLen; t += threads) {
             uint tkv = tStart + t;
             bool masked =
-                tkv > posQ ||
+                isMasked(tkv, posQ, pc.maskMode, pc.prefixLen) ||
                 (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
             if (masked) {
                 scoreTile[t] = NEG_INF;

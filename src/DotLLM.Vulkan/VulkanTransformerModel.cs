@@ -157,6 +157,13 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
     private readonly SwiGluF32Kernel _swiglu;
+    // GeGLU (tanh-approximate GELU) FFN activation — created only when the
+    // model's ActivationFunction is GELUTanh (Gemma 2 / Gemma 3). Null on
+    // every SwiGLU architecture so the standard path is byte-identical.
+    private readonly GeGluTanhF32Kernel? _geglu;
+    // In-place scalar multiply for the Gemma sqrt(hidden) embedding scale —
+    // created only when Config.EmbeddingScale is set. Null otherwise.
+    private readonly ScaleInplaceF32Kernel? _embedScale;
     private readonly AddKernel _add;
     // Per-feature bias add. Replaces the host-mapped fallback that used to
     // split the forward into multiple submits whenever Phi-3 / Qwen3 /
@@ -290,7 +297,7 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
-        SwiGluF32Kernel swiglu, AddKernel add,
+        SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ScaleInplaceF32Kernel? embedScale, AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
@@ -359,6 +366,8 @@ public sealed class VulkanTransformerModel : IModel
         _attention = attention;
         _flashAttention = flashAttention;
         _swiglu = swiglu;
+        _geglu = geglu;
+        _embedScale = embedScale;
         _add = add;
         _biasAdd = biasAdd;
         _mlaAttention = mlaAttention;
@@ -647,6 +656,17 @@ public sealed class VulkanTransformerModel : IModel
                 ? null
                 : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
+        // Gemma GeGLU-tanh FFN activation — created only for GELUTanh models so
+        // the SwiGLU path stays untouched. The embedding-scale kernel is
+        // created only when Config.EmbeddingScale is set (Gemma sqrt(hidden)).
+        GeGluTanhF32Kernel? geglu =
+            config.ActivationFunction == ActivationFunction.GELUTanh
+                ? GeGluTanhF32Kernel.Create(device, spvDir)
+                : null;
+        ScaleInplaceF32Kernel? embedScale =
+            config.EmbeddingScale is float es && es != 1.0f
+                ? ScaleInplaceF32Kernel.Create(device, spvDir)
+                : null;
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
 
@@ -731,7 +751,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
-            rmsnorm, rope, attention, flashAttention, swiglu, add,
+            rmsnorm, rope, attention, flashAttention, swiglu, geglu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8, moeIndexedMatmulTiled, moeIndexedLoraDelta,
@@ -1451,6 +1471,17 @@ public sealed class VulkanTransformerModel : IModel
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
 
+        // Gemma sqrt(hidden) embedding scaling — multiply the gathered
+        // embedding rows in-place before the first layer. No-op on every
+        // architecture that leaves Config.EmbeddingScale null (_embedScale is
+        // null), so non-Gemma output is byte-identical.
+        if (_embedScale is not null)
+        {
+            _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize,
+                Config.EmbeddingScale!.Value);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
@@ -1597,6 +1628,17 @@ public sealed class VulkanTransformerModel : IModel
             }
             }  // end of GQA branch (else of MLA)
 
+            // Gemma four-norm layout: post-attention RMSNorm applied to the
+            // attention sublayer output (NormOutput) BEFORE the residual add.
+            // In-place row-wise norm. No-op for non-Gemma (PostAttnNormWeight
+            // null) — the standard two-norm residual is byte-identical.
+            if (lw.PostAttnNormWeight is { } postAttnNorm1)
+            {
+                _rmsnorm.Record(cmdBuf, _state.NormOutput, postAttnNorm1, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
             // Residual add #1: AddScratch = Residual + NormOutput. The add
             // reads from HiddenState (which aliases Residual — same slot)
             // and writes to AddScratch (the alternate slot). After the
@@ -1658,8 +1700,13 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.UpInputDim, lw.UpOutputDim);
             }
 
-            // SwiGLU
-            _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+            // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
+            // otherwise the standard SwiGLU. Both fuse gate*act + up into
+            // SiluOutput; only the gate non-linearity differs.
+            if (_geglu is not null)
+                _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+            else
+                _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // Down projection
@@ -1682,6 +1729,16 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.DownInputDim, lw.DownOutputDim);
             }
             }  // end of dense-FFN branch (else of MoE)
+
+            // Gemma four-norm layout: post-FFN RMSNorm applied to the FFN
+            // sublayer output (NormOutput) BEFORE the residual add. In-place
+            // row-wise norm. No-op for non-Gemma (PostFfnNormWeight null).
+            if (lw.PostFfnNormWeight is { } postFfnNorm1)
+            {
+                _rmsnorm.Record(cmdBuf, _state.NormOutput, postFfnNorm1, _state.NormOutput,
+                    rowCount: seqLen, n: hiddenSize, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
             // Residual add #2: AddScratch = Residual + NormOutput; then rotate
             // the slot so the new hidden state lives in the buffer we just
@@ -1798,6 +1855,8 @@ public sealed class VulkanTransformerModel : IModel
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
+        _geglu?.InvalidateDescriptorCache();
+        _embedScale?.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
         _mlaAttention?.InvalidateDescriptorCache();
@@ -2861,6 +2920,8 @@ public sealed class VulkanTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _geglu?.Dispose();
+        _embedScale?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
