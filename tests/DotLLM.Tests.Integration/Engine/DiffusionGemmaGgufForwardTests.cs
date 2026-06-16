@@ -51,11 +51,13 @@ public sealed class DiffusionGemmaGgufForwardTests
     }
 
     /// <summary>
-    /// End-to-end DiffusionGemma GENERATION via the denoise loop (the real deliverable):
-    /// drive <see cref="DiffusionTextGenerator"/> over a small canvas and assert the
-    /// produced text is non-degenerate (no surviving mask tokens, finite valid ids,
-    /// non-empty). A single forward shows mask-token argmax (the model unmasks
-    /// iteratively); the loop is what materialises coherent text. SLOW — small canvas.
+    /// End-to-end DiffusionGemma GENERATION via the denoise loop with SELF-CONDITIONING
+    /// (the real deliverable): drive <see cref="DiffusionTextGenerator"/> over a small canvas
+    /// and assert the produced text is non-degenerate (no surviving mask tokens, finite valid
+    /// ids, non-empty) AND coherent (NOT a single repeated token — distinct-token count > 2).
+    /// SC feeds each step's canvas logits back into the next step's canvas embedding; without
+    /// it the canvas collapses to a repeated low-information token. SC ~doubles per-step cost
+    /// (the soft-embed vocab sweep). SLOW — small canvas (N=16, 16 steps).
     /// </summary>
     [SkippableFact]
     public void DiffusionGemma_26B_DenoiseLoop_ProducesNonDegenerateText()
@@ -93,8 +95,11 @@ public sealed class DiffusionGemmaGgufForwardTests
         DiffusionResult result = generator.Generate(promptIds);
         sw.Stop();
 
+        int distinctTokens = result.GeneratedTokenIds.Distinct().Count();
         _output.WriteLine($"[diffusiongemma-26B] gen wall {sw.Elapsed.TotalSeconds:F1}s  steps={result.TotalDenoisingSteps}  genToks={result.GeneratedTokenCount}");
         _output.WriteLine($"  finish : {result.FinishReason}");
+        _output.WriteLine($"  distinct tokens : {distinctTokens}/{result.GeneratedTokenCount}");
+        _output.WriteLine($"  token ids : [{string.Join(",", result.GeneratedTokenIds)}]");
         _output.WriteLine($"  text   : {result.Text}");
 
         Assert.True(result.GeneratedTokenCount > 0, "Expected at least one generated token.");
@@ -102,6 +107,14 @@ public sealed class DiffusionGemmaGgufForwardTests
         foreach (int id in result.GeneratedTokenIds)
             Assert.InRange(id, 0, config.VocabSize - 1);
         Assert.False(string.IsNullOrWhiteSpace(result.Text), "Decoded text should be non-empty.");
+
+        // COHERENCE BAR (the real deliverable of self-conditioning): without SC the canvas
+        // denoised to a single repeated low-information token ("de de de…"). With SC the
+        // output must carry actual information — assert the canvas is NOT a single token
+        // repeated (distinct-token count > 2). "Paris"/"France"/"city" appearing is strong.
+        Assert.True(distinctTokens > 2,
+            $"Self-conditioned canvas must be non-degenerate (distinct tokens {distinctTokens} > 2); "
+            + $"got text: '{result.Text}'.");
     }
 
     /// <summary>

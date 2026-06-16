@@ -364,6 +364,47 @@ internal sealed class Gemma4LayerWeights
 }
 
 /// <summary>
+/// Model-level DiffusionGemma self-conditioning (SC) weights. Present ONLY on the
+/// diffusion-gemma GGUF (absent on autoregressive gemma4, where SC is meaningless).
+/// SC feeds the PREVIOUS denoise step's canvas logits back into the canvas region
+/// embedding via a gated GeGLU MLP over a soft token-embedding of those logits
+/// (<c>diffusion-gemma.cpp</c> <c>dg_canvas_embed</c>):
+/// <code>
+/// soft   = sqrt(n_embd) * Σ_v softmax(prev_logits)[v] * tok_embd[v]   // [n_embd] per canvas col
+/// normed = rms_norm(soft, eps) * self_cond_pre_norm                   // [n_embd]
+/// sc_sig = self_cond_down( gelu_tanh(self_cond_gate·normed) * (self_cond_up·normed) )  // [n_embd]
+/// canvas = rms_noscale(canvas + sc_sig)
+/// </code>
+/// The gate/up projections widen to the DENSE feed-forward width (n_ff = 2112), and
+/// down projects back to n_embd. Weights stay as raw mmap pointers + quant type
+/// (the same dequant GEMV primitive serves them); the pre-norm is dequantized to
+/// <c>float[]</c> at load. Null on every non-diffusion-gemma model.
+/// </summary>
+internal sealed class Gemma4SelfCondWeights
+{
+    /// <summary>RMSNorm weight <c>self_cond_pre_norm.weight</c> [n_embd] (F32) — applied (with scale) to the soft-embedding.</summary>
+    public required float[] PreNorm;
+
+    /// <summary>Gate projection <c>self_cond_gate.weight</c>: ptr, quant, out dim (n_ff), in dim (n_embd).</summary>
+    public required nint GatePtr;
+    public required QuantizationType GateQt;
+    public required int GateOut;
+    public required int GateIn;
+
+    /// <summary>Up projection <c>self_cond_up.weight</c>: ptr, quant, out dim (n_ff), in dim (n_embd).</summary>
+    public required nint UpPtr;
+    public required QuantizationType UpQt;
+    public required int UpOut;
+    public required int UpIn;
+
+    /// <summary>Down projection <c>self_cond_down.weight</c>: ptr, quant, out dim (n_embd), in dim (n_ff).</summary>
+    public required nint DownPtr;
+    public required QuantizationType DownQt;
+    public required int DownOut;
+    public required int DownIn;
+}
+
+/// <summary>
 /// Holds per-layer weight references for a single transformer layer.
 /// Norm weights are dequantized to <c>float[]</c> at load time (small).
 /// Linear projection weights remain as mmap pointers with their quantization type.
@@ -688,6 +729,12 @@ internal sealed class TransformerWeights : IDisposable
     public int OutputOutputDim { get; }
     public int OutputInputDim { get; }
 
+    /// <summary>
+    /// Model-level DiffusionGemma self-conditioning weights. Non-null ONLY when the
+    /// GGUF carries the <c>self_cond_*</c> tensors (diffusion-gemma); null otherwise.
+    /// </summary>
+    public Gemma4SelfCondWeights? SelfCond { get; }
+
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
 
@@ -706,7 +753,8 @@ internal sealed class TransformerWeights : IDisposable
         TransformerLayerWeights[] layers,
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
-        List<nint>? ownedAllocations = null)
+        List<nint>? ownedAllocations = null,
+        Gemma4SelfCondWeights? selfCond = null)
     {
         TokenEmbedWeight = tokenEmbedWeight;
         TokenEmbedQuantType = tokenEmbedQuantType;
@@ -719,6 +767,7 @@ internal sealed class TransformerWeights : IDisposable
         OutputOutputDim = outputOutputDim;
         OutputInputDim = outputInputDim;
         _ownedAllocations = ownedAllocations;
+        SelfCond = selfCond;
     }
 
     /// <summary>
@@ -788,15 +837,31 @@ internal sealed class TransformerWeights : IDisposable
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeNorm(dataBase, outNormDesc, config.HiddenSize);
 
-        // TODO(diffusiongemma self-conditioning): the diffusion-gemma GGUF carries
-        // model-level self_cond_pre_norm / self_cond_gate / self_cond_up /
-        // self_cond_down tensors used by the self-conditioning gated GeGLU MLP on
-        // the previous-step canvas logits. Self-conditioning is OFF on the first
-        // denoise step (sc_use=0), so the zero-SC single-forward validation does
-        // NOT consume them. The GGUF loader reads only the tensors it references,
-        // so leaving these unreferenced does NOT fail loading. When the PKV /
-        // multi-step denoise path lands, load and wire them here (region embed:
-        // canvas = rms_noscale(canvas + sc_down(geglu(sc_gate·n)*(sc_up·n)))).
+        // DiffusionGemma self-conditioning (model-level). On denoise steps > 0 the
+        // canvas region embed becomes rms_noscale(scaled_embed + sc_sig(prev_logits)),
+        // where sc_sig is a gated GeGLU MLP over a soft token-embedding of the previous
+        // step's canvas logits (diffusion-gemma.cpp dg_canvas_embed). Present ONLY on
+        // the diffusion-gemma GGUF — absent ⇒ SelfCond stays null and the forward keeps
+        // the byte-identical zero-SC path. The pre-norm dequantizes to float[]; the
+        // gate/up/down projections stay as raw mmap pointers (same dequant GEMV serves them).
+        Gemma4SelfCondWeights? selfCond = null;
+        if (tensors.TryGetValue("self_cond_pre_norm.weight", out var scPreDesc)
+            && tensors.TryGetValue("self_cond_gate.weight", out var scGateDesc)
+            && tensors.TryGetValue("self_cond_up.weight", out var scUpDesc)
+            && tensors.TryGetValue("self_cond_down.weight", out var scDownDesc))
+        {
+            float[] scPreNorm = DequantizeNorm(dataBase, scPreDesc, config.HiddenSize);
+            var (scGatePtr, scGateQt, scGateM, scGateK) = LoadLinear(dataBase, scGateDesc);
+            var (scUpPtr, scUpQt, scUpM, scUpK) = LoadLinear(dataBase, scUpDesc);
+            var (scDownPtr, scDownQt, scDownM, scDownK) = LoadLinear(dataBase, scDownDesc);
+            selfCond = new Gemma4SelfCondWeights
+            {
+                PreNorm = scPreNorm,
+                GatePtr = scGatePtr, GateQt = scGateQt, GateOut = scGateM, GateIn = scGateK,
+                UpPtr = scUpPtr, UpQt = scUpQt, UpOut = scUpM, UpIn = scUpK,
+                DownPtr = scDownPtr, DownQt = scDownQt, DownOut = scDownM, DownIn = scDownK,
+            };
+        }
 
         // LM head — may be tied to token embeddings
         nint outputPtr;
@@ -825,7 +890,8 @@ internal sealed class TransformerWeights : IDisposable
             layers,
             outputNormWeight,
             outputPtr, outputQt, outputM, outputK,
-            ownedAllocations: owned);
+            ownedAllocations: owned,
+            selfCond: selfCond);
     }
 
     /// <summary>

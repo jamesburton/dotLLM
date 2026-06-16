@@ -51,6 +51,14 @@ public sealed unsafe class TransformerModel : IModel
     // Same single-threaded-per-instance contract as _currentAdapter. Defaults to Causal
     // so every existing call path is byte-identical to the pre-bidirectional code.
     private AttentionMaskSpec _currentMaskSpec = AttentionMaskSpec.Causal;
+    // DiffusionGemma self-conditioning state for the NEXT forward (set by the diffusion
+    // generator via SetDiffusionSelfCond each denoise step). _scUse is the SC gate (0 on
+    // step 0 ⇒ zero-SC, exactly the AR/LLaDA-identical path; 1 on steps > 0). _scPrevLogits
+    // holds the previous step's canvas-region logits [_scCanvasLen × vocab] (post-softcap);
+    // null/zero-length on step 0. Single-threaded per generation, like _currentMaskSpec.
+    private float[]? _scPrevLogits;
+    private int _scCanvasLen;
+    private float _scUse;
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
@@ -447,6 +455,33 @@ public sealed unsafe class TransformerModel : IModel
         }
     }
 
+    /// <inheritdoc/>
+    public void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse)
+    {
+        // Stash the previous step's canvas logits for the canvas region-embed in the
+        // NEXT forward. scUse == 0 (step 0) ⇒ no SC: clear the buffer so the region
+        // embed keeps the byte-identical zero-SC rms_noscale path. We copy into a model-
+        // owned buffer (the caller's span is a view into a pooled/disposed tensor).
+        if (scUse > 0f && !prevCanvasLogits.IsEmpty && canvasLen > 0)
+        {
+            int need = canvasLen * Config.VocabSize;
+            if (prevCanvasLogits.Length < need)
+                throw new ArgumentException(
+                    $"prevCanvasLogits length {prevCanvasLogits.Length} < canvasLen*vocab {need}.",
+                    nameof(prevCanvasLogits));
+            if (_scPrevLogits is null || _scPrevLogits.Length < need)
+                _scPrevLogits = new float[need];
+            prevCanvasLogits[..need].CopyTo(_scPrevLogits);
+            _scCanvasLen = canvasLen;
+            _scUse = scUse;
+        }
+        else
+        {
+            _scCanvasLen = 0;
+            _scUse = 0f;
+        }
+    }
+
     /// <summary>
     /// Runs a forward pass with optional KV-cache. When <paramref name="kvCache"/> is provided,
     /// K/V projections are stored in the cache after RoPE, and attention reads from the full
@@ -573,12 +608,15 @@ public sealed unsafe class TransformerModel : IModel
         // [prompt | canvas] forward splits at P = _currentMaskSpec.PrefixLength
         // (the Hybrid prompt length / region split). Prompt rows [0, P) keep the
         // scaled embedding; canvas rows [P, seqLen) get an EXTRA weight-less
-        // rms_norm(row, eps) (no scale) — the zero-self-conditioning path
-        // (diffusion-gemma.cpp:363-365,378-386). Gated on DiffusionConfig so the
-        // autoregressive gemma4 / every other architecture is byte-identical.
-        // TODO(self-conditioning): on denoise steps > 0 the canvas rms_noscale is
-        // applied to (embed + sc_signal); sc_signal is OFF on step 0, so the
-        // single-forward validation is exactly this zero-SC path.
+        // rms_norm(row, eps) (no scale) (diffusion-gemma.cpp:363-365,378-386).
+        // Gated on DiffusionConfig so the autoregressive gemma4 / every other
+        // architecture is byte-identical.
+        //
+        // SELF-CONDITIONING: on denoise steps > 0 (_scUse > 0 with prev canvas logits
+        // set + the SC weights present), the canvas rms_noscale is applied to
+        // (scaled_embed + sc_signal), where sc_signal is a gated GeGLU MLP over a soft
+        // token-embedding of the previous step's canvas logits (dg_canvas_embed). On
+        // step 0 (_scUse == 0) this term is skipped ⇒ exactly the zero-SC path.
         if (Config.DiffusionConfig is not null)
         {
             int p = _currentMaskSpec.Mode == AttentionMaskMode.Hybrid
@@ -586,6 +624,20 @@ public sealed unsafe class TransformerModel : IModel
                 : 0;
             if (p < 0) p = 0;
             if (p > seqLen) p = seqLen;
+
+            int canvasLen = seqLen - p;
+            bool applySc = _scUse > 0f
+                && _weights.SelfCond is not null
+                && _scPrevLogits is not null
+                && _scCanvasLen == canvasLen
+                && canvasLen > 0;
+            if (applySc)
+            {
+                // Add sc_signal to the canvas rows of `hidden` (scaled embeddings)
+                // BEFORE the weight-less rms_norm. soft-embed sweeps the vocab once.
+                ApplySelfConditioning(hidden, p, canvasLen, hiddenSize, eps);
+            }
+
             for (int t = p; t < seqLen; t++)
             {
                 var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
@@ -2724,6 +2776,152 @@ public sealed unsafe class TransformerModel : IModel
             // (_embeddingScale == 1.0f), so non-Gemma output is bit-identical.
             if (_embeddingScale != 1.0f)
                 TensorPrimitives.Multiply(destSpan, _embeddingScale, destSpan);
+        }
+    }
+
+    /// <summary>
+    /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into
+    /// <paramref name="dest"/> [hiddenSize], WITHOUT the Gemma embedding scale. Mirrors the
+    /// per-row dequant in <see cref="EmbeddingLookup"/> but raw (the SC soft-embed folds
+    /// the sqrt(n_embd) scale once, per canvas column, after the vocab sweep).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void DequantEmbeddingRowRaw(int tokenId, Span<float> dest, int hiddenSize)
+    {
+        nint embPtr = _weights.TokenEmbedWeight;
+        var qt = _weights.TokenEmbedQuantType;
+        if (qt == QuantizationType.F32)
+        {
+            float* src = (float*)embPtr + (long)tokenId * hiddenSize;
+            new ReadOnlySpan<float>(src, hiddenSize).CopyTo(dest);
+        }
+        else if (qt == QuantizationType.F16)
+        {
+            Half* src = (Half*)embPtr + (long)tokenId * hiddenSize;
+            TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, hiddenSize), dest);
+        }
+        else
+        {
+            long rowBytes = Dequantize.RowByteSize(hiddenSize, qt);
+            nint rowPtr = embPtr + (nint)((long)tokenId * rowBytes);
+            Dequantize.ToFloat32(rowPtr, hiddenSize, qt, dest);
+        }
+    }
+
+    /// <summary>
+    /// DiffusionGemma self-conditioning (dg_canvas_embed). For each of the
+    /// <paramref name="canvasLen"/> canvas rows (sequence rows [P, P+canvasLen)), adds a
+    /// gated GeGLU MLP signal of the PREVIOUS step's canvas logits to the canvas embedding
+    /// IN PLACE on <paramref name="hidden"/>, BEFORE the caller's weight-less rms_norm:
+    /// <code>
+    /// soft[c]   = sqrt(n_embd) * Σ_v softmax(prev_logits[c])[v] * tok_embd[v]
+    /// normed[c] = rms_norm(soft[c]) * self_cond_pre_norm
+    /// sc_sig[c] = self_cond_down( gelu_tanh(self_cond_gate·normed[c]) * (self_cond_up·normed[c]) )
+    /// hidden[P+c] += sc_sig[c]
+    /// </code>
+    /// The soft-embed sweeps the (vocab × n_embd) table ONCE per step — each embedding row is
+    /// dequantized once and scatter-accumulated into all C canvas soft-vectors weighted by that
+    /// token's probability. The gate/up/down are batched as single [C × …] GEMMs. SC consumes the
+    /// FULL distribution (no mask suppression). Caller guarantees <c>_weights.SelfCond</c>,
+    /// <c>_scPrevLogits</c>, and <c>_scCanvasLen == canvasLen</c> are valid.
+    /// </summary>
+    private void ApplySelfConditioning(float* hidden, int p, int canvasLen, int hiddenSize, float eps)
+    {
+        var sc = _weights.SelfCond!;
+        int vocab = Config.VocabSize;
+        int ff = sc.GateOut;            // dense FFN width (2112)
+        float embScale = _embeddingScale; // sqrt(n_embd)
+        float[] prev = _scPrevLogits!;
+
+        // soft[c] : weighted token-embedding sum per canvas column [canvasLen × hidden].
+        float[] softBuf = ArrayPool<float>.Shared.Rent(canvasLen * hiddenSize);
+        // probs[c] : softmax of prev_logits[c] over vocab (sc_temp_inv = 1.0).
+        float[] probsBuf = ArrayPool<float>.Shared.Rent(canvasLen * vocab);
+        float[] rowBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+        // GeGLU MLP scratch (batched over canvasLen).
+        float[] normedBuf = ArrayPool<float>.Shared.Rent(canvasLen * hiddenSize);
+        float[] gateBuf = ArrayPool<float>.Shared.Rent(canvasLen * ff);
+        float[] upBuf = ArrayPool<float>.Shared.Rent(canvasLen * ff);
+        float[] geluBuf = ArrayPool<float>.Shared.Rent(canvasLen * ff);
+        float[] sigBuf = ArrayPool<float>.Shared.Rent(canvasLen * hiddenSize);
+        try
+        {
+            var softSpan = softBuf.AsSpan(0, canvasLen * hiddenSize);
+            softSpan.Clear();
+
+            // probs[c] = softmax(prev_logits[c]) over the full vocab (post-softcap logits,
+            // sc_temp_inv = 1.0 so no rescale).
+            for (int c = 0; c < canvasLen; c++)
+                Softmax.Execute(
+                    prev.AsSpan(c * vocab, vocab),
+                    probsBuf.AsSpan(c * vocab, vocab));
+
+            // Single vocab sweep: read each embedding row ONCE, accumulate into every
+            // canvas soft-vector weighted by that token's probability. soft += prob * row.
+            var rowSpan = rowBuf.AsSpan(0, hiddenSize);
+            for (int v = 0; v < vocab; v++)
+            {
+                DequantEmbeddingRowRaw(v, rowSpan, hiddenSize);
+                for (int c = 0; c < canvasLen; c++)
+                {
+                    float w = probsBuf[c * vocab + v];
+                    if (w == 0f) continue;
+                    TensorPrimitives.MultiplyAdd(
+                        rowSpan, w, softSpan.Slice(c * hiddenSize, hiddenSize),
+                        softSpan.Slice(c * hiddenSize, hiddenSize));
+                }
+            }
+
+            // soft *= sqrt(n_embd); normed = rms_norm(soft) * self_cond_pre_norm.
+            for (int c = 0; c < canvasLen; c++)
+            {
+                var softC = softSpan.Slice(c * hiddenSize, hiddenSize);
+                if (embScale != 1.0f)
+                    TensorPrimitives.Multiply(softC, embScale, softC);
+                RmsNorm.Execute(
+                    softC, sc.PreNorm, eps,
+                    normedBuf.AsSpan(c * hiddenSize, hiddenSize));
+            }
+
+            fixed (float* normedP = normedBuf)
+            fixed (float* gateP = gateBuf)
+            fixed (float* upP = upBuf)
+            fixed (float* sigP = sigBuf)
+            {
+                // g = gate·normed ; u = up·normed  (batched [canvasLen × ff]).
+                Gemm(sc.GatePtr, sc.GateQt, normedP, gateP, sc.GateOut, sc.GateIn, canvasLen);
+                Gemm(sc.UpPtr, sc.UpQt, normedP, upP, sc.UpOut, sc.UpIn, canvasLen);
+
+                // gelu_tanh(g) * u   (SAME GeGLU-tanh as the dense FFN).
+                for (int c = 0; c < canvasLen; c++)
+                    FusedOps.GeGLUTanh(
+                        gateBuf.AsSpan(c * ff, ff),
+                        upBuf.AsSpan(c * ff, ff),
+                        geluBuf.AsSpan(c * ff, ff));
+
+                // sc_sig = down·(gelu*u)   [canvasLen × hidden].
+                fixed (float* geluP = geluBuf)
+                    Gemm(sc.DownPtr, sc.DownQt, geluP, sigP, sc.DownOut, sc.DownIn, canvasLen);
+
+                // canvas += sc_sig (added to the scaled embeddings; caller rms_noscales after).
+                for (int c = 0; c < canvasLen; c++)
+                {
+                    var dst = new Span<float>(hidden + (p + c) * hiddenSize, hiddenSize);
+                    TensorPrimitives.Add(
+                        dst, sigBuf.AsSpan(c * hiddenSize, hiddenSize), dst);
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(softBuf);
+            ArrayPool<float>.Shared.Return(probsBuf);
+            ArrayPool<float>.Shared.Return(rowBuf);
+            ArrayPool<float>.Shared.Return(normedBuf);
+            ArrayPool<float>.Shared.Return(gateBuf);
+            ArrayPool<float>.Shared.Return(upBuf);
+            ArrayPool<float>.Shared.Return(geluBuf);
+            ArrayPool<float>.Shared.Return(sigBuf);
         }
     }
 

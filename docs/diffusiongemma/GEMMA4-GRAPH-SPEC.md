@@ -97,8 +97,33 @@ residual). Only THREE things are region-aware + (optional) self-conditioning:
    which dotLLM already supports. Use Hybrid(P) for validation (short canvas).  [diffusion-gemma.cpp:34-66]
 
 Final: output_norm, lm_head (tied to token_embd), softcap 30 — same as gemma4. attention.causal=False.
-New tensors to load: per-layer `enc_layer_output_scale` [1]; model-level `self_cond_pre_norm/gate/up/down` (defer use).
+New tensors to load: per-layer `enc_layer_output_scale` [1]; model-level `self_cond_pre_norm/gate/up/down`.
 P comes from the diffusion canvas split = AttentionMaskSpec.Hybrid prefixLength (prompt length).
+
+## SELF-CONDITIONING (diffusion-gemma.cpp dg_canvas_embed) — REQUIRED for coherent generation
+Without SC the canvas denoises to uniform low-information tokens. SC feeds the PREVIOUS denoise step's
+canvas logits back into the canvas embedding. Tensors (n_ff = 2112 = feed_forward_length, the dense width):
+`self_cond_pre_norm` [2816] (RMSNorm weight), `self_cond_gate` [2816→2112], `self_cond_up` [2816→2112],
+`self_cond_down` [2112→2816]. Per denoise step, for canvas rows only, REPLACING the plain canvas
+rms_noscale embed when sc_use=1:
+```
+probs  = softmax(prev_canvas_logits[v] * sc_temp_inv)   # over vocab, fp32; prev = LAST step's canvas logits (post-softcap), [n_vocab, C]
+soft   = (tok_embd^T @ probs) * sqrt(n_embd)            # [n_embd, C]; weighted sum of token embeddings. Batch over C (one matmul/step).
+normed = rms_norm(soft, eps) * self_cond_pre_norm       # [n_embd, C]
+g      = gelu_tanh(self_cond_gate · normed)             # [2112, C]  (ggml_gelu = tanh approx)
+u      = self_cond_up · normed                          # [2112, C]
+sc_sig = self_cond_down · (g * u)                       # [n_embd, C]
+canvas = canvas + sc_use * sc_sig                       # sc_use ∈ {0,1}
+canvas = rms_norm(canvas, eps)                          # no scale  (the SAME post-norm as the zero-SC path)
+```
+CONSTANTS (confirmed examples/diffusion/diffusion.cpp:226,547 + eval): `sc_temp_inv = 1.0`;
+`sc_use = (step_idx == 0) ? 0.0 : 1.0` (step 0 = zero-SC, exactly the current behavior). So on step 0 the
+canvas embed is `rms_noscale(scaled_embed)` (already implemented); on steps > 0 it is
+`rms_noscale(scaled_embed + sc_sig(prev_logits))`. The prev_canvas_logits come from the generator's
+previous forward (the canvas rows of its [seqLen,vocab] logits). Plumb them into the forward (e.g. a
+settable field on TransformerModel the generator sets each step) + the SC weights. tok_embd is the tied
+token embedding (same quantized table the LM head uses) — `soft = tok_embd^T @ probs` is the transpose
+contraction; reuse the existing dequant/matmul primitive (batch over the C canvas columns once per step).
 
 ## DiffusionGemma deltas (diffusion-gemma.cpp) — backbone identical to gemma4
 - attention.causal=False: unified [prompt|canvas] forward, custom additive mask. Prompt queries causal

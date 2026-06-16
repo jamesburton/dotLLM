@@ -215,6 +215,14 @@ public sealed class DiffusionTextGenerator
         int[] maskedPositions = ArrayPool<int>.Shared.Rent(blockLen);
         float[] maskedLogits = ArrayPool<float>.Shared.Rent((int)logitElems);
 
+        // Self-conditioning (DiffusionGemma): the FULL canvas-region logits [blockLen × vocab]
+        // (post-softcap, NOT mask-suppressed) from the PREVIOUS step, fed back into the next
+        // step's canvas embedding. _scValid flips true after the first forward populates it.
+        // On non-SC models SetDiffusionSelfCond is a no-op so this is harmless overhead-free
+        // bookkeeping (the buffer fills but the model ignores it).
+        float[] scPrevCanvasLogits = ArrayPool<float>.Shared.Rent((int)logitElems);
+        bool scValid = false;
+
         // Canvas attention pattern is model-specific: DiffusionGemma is block-AR (Hybrid —
         // causal prompt prefix + bidirectional canvas); LLaDA is fully Bidirectional over
         // [prompt | canvas] (Hybrid yields degenerate all-EOS output on LLaDA).
@@ -238,6 +246,16 @@ public sealed class DiffusionTextGenerator
                 for (int i = 0; i < blockLen; i++)
                     seqTokens[prefixLen + i] = canvas[i];
 
+                // Self-conditioning: feed the PREVIOUS step's canvas logits into THIS forward's
+                // canvas embedding. Step 0 (no prior forward) → scUse=0 (zero-SC, the AR/LLaDA-
+                // identical path); steps > 0 → scUse=1 + the prior forward's canvas-region logits.
+                // No-op on non-DiffusionGemma models (default IModel implementation).
+                if (scValid)
+                    _model.SetDiffusionSelfCond(
+                        scPrevCanvasLogits.AsSpan(0, blockLen * vocabSize), blockLen, scUse: 1f);
+                else
+                    _model.SetDiffusionSelfCond(ReadOnlySpan<float>.Empty, 0, scUse: 0f);
+
                 // ── Cacheless hybrid forward. NEVER pass a KV-cache here: PR-3 throws for a
                 //    non-causal mask + non-null cache. Recompute the whole prompt+canvas each step.
                 int beforeMasked = maskedCount;
@@ -247,6 +265,13 @@ public sealed class DiffusionTextGenerator
                            positions.AsSpan(0, seqLen),
                            deviceId: -1, kvCache: null, adapter: null, hybrid))
                 {
+                    // Capture the FULL canvas-region logits ([blockLen × vocab], rows
+                    // prefixLen..prefixLen+blockLen) for the NEXT step's self-conditioning.
+                    // These are post-softcap and NOT mask-suppressed (SC uses the full
+                    // distribution; mask-suppression is only for the unmask COMMIT below).
+                    CaptureCanvasLogits(logits, prefixLen, blockLen, vocabSize, scPrevCanvasLogits);
+                    scValid = true;
+
                     // Gather logit rows for the still-masked canvas positions only.
                     int rows = GatherMaskedRows(canvas, maskTokenId, prefixLen, vocabSize, logits,
                         maskedPositions, maskedLogits);
@@ -308,7 +333,25 @@ public sealed class DiffusionTextGenerator
             ArrayPool<int>.Shared.Return(positions);
             ArrayPool<int>.Shared.Return(maskedPositions);
             ArrayPool<float>.Shared.Return(maskedLogits);
+            ArrayPool<float>.Shared.Return(scPrevCanvasLogits);
+            // Clear the model's SC state so a later non-diffusion / next-canvas forward
+            // starts clean (the next RunCanvas re-primes step 0 with scUse=0 anyway).
+            _model.SetDiffusionSelfCond(ReadOnlySpan<float>.Empty, 0, scUse: 0f);
         }
+    }
+
+    /// <summary>
+    /// Copies the canvas-region logit rows ([blockLen × vocab], sequence rows
+    /// prefixLen..prefixLen+blockLen) out of the forward result into
+    /// <paramref name="dst"/> for the next denoise step's self-conditioning. Logits are
+    /// taken AS-IS (post-softcap, full distribution — no mask suppression).
+    /// </summary>
+    private static unsafe void CaptureCanvasLogits(
+        ITensor logits, int prefixLen, int blockLen, int vocabSize, float[] dst)
+    {
+        float* basePtr = (float*)logits.DataPointer;
+        var src = new ReadOnlySpan<float>(basePtr + (long)prefixLen * vocabSize, blockLen * vocabSize);
+        src.CopyTo(dst.AsSpan(0, blockLen * vocabSize));
     }
 
     /// <summary>

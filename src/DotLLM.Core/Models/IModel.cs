@@ -84,6 +84,29 @@ public interface IModel : IDisposable
     }
 
     /// <summary>
+    /// Supplies the DiffusionGemma self-conditioning (SC) state consumed by the NEXT
+    /// <c>Forward</c> over a <see cref="AttentionMaskSpec.Hybrid(int)"/> canvas: the
+    /// PREVIOUS denoise step's canvas-region logits (post-softcap) plus the SC gate.
+    /// </summary>
+    /// <remarks>
+    /// <para>On a diffusion-gemma model with <c>scUse &gt; 0</c> and a non-empty
+    /// <paramref name="prevCanvasLogits"/>, the next forward replaces the canvas region's
+    /// plain <c>rms_noscale(scaled_embed)</c> with <c>rms_noscale(scaled_embed + sc_sig)</c>,
+    /// where <c>sc_sig</c> is a gated GeGLU MLP over a soft token-embedding of the previous
+    /// logits (the trained self-conditioning denoiser feedback). On step 0 of a canvas the
+    /// generator passes <c>scUse = 0</c> (and may pass an empty span), reproducing the
+    /// zero-SC first-step behaviour byte-for-byte.</para>
+    /// <para>The default implementation is a no-op — only the CPU <c>TransformerModel</c>
+    /// implements diffusion self-conditioning. Single-threaded per generation (the model's
+    /// forward state is instance-scoped), matching the existing mask/adapter state contract.</para>
+    /// </remarks>
+    /// <param name="prevCanvasLogits">Previous step's canvas-region logits, row-major
+    /// <c>[canvasLen, vocabSize]</c> (post-softcap). Empty when <paramref name="scUse"/> is 0.</param>
+    /// <param name="canvasLen">Number of canvas rows in <paramref name="prevCanvasLogits"/>.</param>
+    /// <param name="scUse">Self-conditioning gate: 0 on the first denoise step (zero-SC), 1 thereafter.</param>
+    void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse) { }
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>
