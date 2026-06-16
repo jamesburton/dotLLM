@@ -19,6 +19,14 @@ public static unsafe partial class MatMul
     private const int Q6_K_BlockBytes = 210;
     private const int KQuantGroupSize = 256;
 
+    /// <summary>
+    /// GFNI affine matrix that maps each byte <c>x</c> to <c>(x &gt;&gt; 4) &amp; 0x0F</c> in a single
+    /// <c>VGF2P8AFFINEQB</c> (matrix broadcast per qword lane, constant byte 0). Replaces the
+    /// two-op AVX2 high-nibble extract (<c>vpsrlw</c> + <c>vpand</c>). Verified exhaustively over
+    /// all 256 byte values; the identity matrix under the same convention is <c>0x0102040810204080</c>.
+    /// </summary>
+    private const ulong GfniHighNibbleMatrix = 0x1020408000000000UL;
+
     /// <summary>Q8_K block: float d(4) + sbyte qs[256](256) + short bsums[16](32) = 292 bytes.</summary>
     public const int Q8_K_BlockBytes = 292;
 
@@ -580,10 +588,41 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// True 4-row Q4_K × Q8_K: integer accumulation, scale-in-madd, bsums min correction.
-    /// Loads Q8_K activation once per iteration, computes 4 dot products.
+    /// Loads Q8_K activation once per iteration, computes 4 dot products. Dispatches to the
+    /// GFNI high-nibble-extract variant when available (see <see cref="EnableGfniQ4K"/>),
+    /// else the AVX2 shift/mask variant, else scalar.
     /// </summary>
     [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void VecDotQ4_K_Q8_K_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, float* results)
+    {
+        // GFNI high-nibble extract is a measured wash/loss on Meteor Lake (Redwood Cove):
+        // VGF2P8AFFINEQB competes on ports 0/1 with the vpmaddubsw/vpmaddwd that bound this
+        // loop. The variant is retained behind an opt-in toggle (default off) for benchmarking
+        // and for parts where the affine may land on a less-contended port. See task C2 writeup.
+        if (EnableGfniQ4K && Gfni.V256.IsSupported)
+        {
+            VecDotQ4_K_Q8_K_4Rows_Gfni(w0, w1, w2, w3, q8k, superBlockCount, results);
+            return;
+        }
+
+        VecDotQ4_K_Q8_K_4Rows_Avx2(w0, w1, w2, w3, q8k, superBlockCount, results);
+    }
+
+    /// <summary>
+    /// Opt-in toggle for the GFNI high-nibble variant of <see cref="VecDotQ4_K_Q8_K_4Rows"/>.
+    /// Default false: benchmarking on Meteor Lake showed no win (see C2 writeup). Settable by
+    /// tests/benchmarks to compare paths.
+    /// </summary>
+    internal static bool EnableGfniQ4K;
+
+    /// <summary>
+    /// AVX2 4-row Q4_K × Q8_K (shift/mask high-nibble extract). The original hot-path body.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4Rows_Avx2(
         byte* w0, byte* w1, byte* w2, byte* w3,
         byte* q8k, int superBlockCount, float* results)
     {
