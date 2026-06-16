@@ -73,6 +73,33 @@ ffn_down_exps[704,2816,128]; ffn_down_exps.scale[128] applied per-expert after d
 cur = rms(inpL)*output_norm ; logits = output·cur (tied to token_embd) ; softcap 30·tanh(logits/30).
 Input embed: tok_embd[ids]·sqrt(n_embd) once.
 
+## DiffusionGemma UNIFIED single-forward (diffusion-gemma.cpp build graph) — IMPLEMENTATION TARGET
+
+The reference no-cache UNIFIED forward (ignore the PKV prefill/decode cache optimization — that
+just reproduces this). Split `P = n_tokens - canvas_length`; canvas = last `canvas_length` rows.
+Backbone is the EXACT gemma4 layer (attn_norm, gemma4 Q/K/V with V-from-K + weight-less V-norm +
+attn scale 1.0 + partial rope, attn_post_norm, residual, dual dense+MoE FFN, ffn_post_norm,
+residual). Only THREE things are region-aware + (optional) self-conditioning:
+
+1. **Region embedding** (before layers): `inpL = tok_embd[ids] * sqrt(n_embd)`, then
+   - prompt rows [0,P): unchanged (scaled embedding).
+   - canvas rows [P,n_tokens): `rms_norm(canvas, eps)` **no scale** (zero-SC path).  [diffusion-gemma.cpp:363-365,378-386]
+   With self-conditioning ON (NOT step 0): `canvas = rms_noscale(canvas + sc_signal)` where
+   `sc_signal = sc_down(gelu_tanh(sc_gate·n)*(sc_up·n))`, `n = rms(softmax(prev_logits/sc_temp)·tok_embd·sqrt(n_embd))*sc_pre_norm`, gated by `sc_use∈{0,1}` (0 on first step). DEFER — first step / single forward is zero-SC.
+
+2. **Region per-layer scalar** (replaces gemma4's single `cur * layer_output_scale`, applied at the
+   SAME position = after ffn residual, last per-layer op): prompt rows `× enc_layer_output_scale`,
+   canvas rows `× layer_output_scale`. Same backbone weights; encoder only contributes the scalar.  [diffusion-gemma.cpp:475-489]
+
+3. **Mask**: region-aware additive. Prompt query: causal over earlier prompt, never canvas. Canvas
+   query: bidirectional over all (global) / last (n_swa-1) prompt + all canvas (sliding). For
+   n_tokens < n_swa (=1024) the sliding clip is a no-op ⇒ identical to **Hybrid(prefixLength=P)**
+   which dotLLM already supports. Use Hybrid(P) for validation (short canvas).  [diffusion-gemma.cpp:34-66]
+
+Final: output_norm, lm_head (tied to token_embd), softcap 30 — same as gemma4. attention.causal=False.
+New tensors to load: per-layer `enc_layer_output_scale` [1]; model-level `self_cond_pre_norm/gate/up/down` (defer use).
+P comes from the diffusion canvas split = AttentionMaskSpec.Hybrid prefixLength (prompt length).
+
 ## DiffusionGemma deltas (diffusion-gemma.cpp) — backbone identical to gemma4
 - attention.causal=False: unified [prompt|canvas] forward, custom additive mask. Prompt queries causal
   (SWA-clipped on sliding); canvas queries bidirectional over all (global) / last n_swa-1 prompt+canvas

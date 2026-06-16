@@ -339,8 +339,15 @@ internal sealed class Gemma4LayerWeights
     public required float[] RouterScale;
     /// <summary>Per-expert down-projection scale <c>ffn_down_exps.scale</c> [numExperts].</summary>
     public required float[] DownExpertScale;
-    /// <summary>Per-layer output scale <c>layer_output_scale</c> — single scalar applied as the LAST per-layer op.</summary>
+    /// <summary>Per-layer output scale <c>layer_output_scale</c> — single scalar applied as the LAST per-layer op (canvas rows on diffusion-gemma; ALL rows on gemma4).</summary>
     public required float LayerOutputScale;
+    /// <summary>
+    /// DiffusionGemma-only per-layer encoder output scale <c>enc_layer_output_scale</c> —
+    /// single scalar applied as the LAST per-layer op to the PROMPT rows [0, P) of the
+    /// unified [prompt | canvas] forward. <see langword="null"/> on autoregressive gemma4
+    /// (the tensor is absent), in which case every row uses <see cref="LayerOutputScale"/>.
+    /// </summary>
+    public float? EncLayerOutputScale;
     /// <summary>True on a V-less (global/full-attention) layer where V branches off the RAW K projection.</summary>
     public required bool VFromK;
 
@@ -781,6 +788,16 @@ internal sealed class TransformerWeights : IDisposable
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeNorm(dataBase, outNormDesc, config.HiddenSize);
 
+        // TODO(diffusiongemma self-conditioning): the diffusion-gemma GGUF carries
+        // model-level self_cond_pre_norm / self_cond_gate / self_cond_up /
+        // self_cond_down tensors used by the self-conditioning gated GeGLU MLP on
+        // the previous-step canvas logits. Self-conditioning is OFF on the first
+        // denoise step (sc_use=0), so the zero-SC single-forward validation does
+        // NOT consume them. The GGUF loader reads only the tensors it references,
+        // so leaving these unreferenced does NOT fail loading. When the PKV /
+        // multi-step denoise path lands, load and wire them here (region embed:
+        // canvas = rms_noscale(canvas + sc_down(geglu(sc_gate·n)*(sc_up·n)))).
+
         // LM head — may be tied to token embeddings
         nint outputPtr;
         QuantizationType outputQt;
@@ -1173,6 +1190,13 @@ internal sealed class TransformerWeights : IDisposable
         float[] downExpertScale = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_down_exps.scale"], numExperts);
         float[] layerOutScaleArr = DequantizeNorm(dataBase, tensors[$"{prefix}.layer_output_scale.weight"], 1);
 
+        // DiffusionGemma-only: enc_layer_output_scale [1]. Present only on the
+        // diffusion-gemma GGUF (TENSOR_NOT_REQUIRED on gemma4). When present the
+        // unified forward uses it as the per-layer scalar for the PROMPT region;
+        // when absent (autoregressive gemma4) every row uses LayerOutputScale.
+        float[]? encLayerOutScaleArr =
+            LoadOptionalNorm(dataBase, tensors, $"{prefix}.enc_layer_output_scale.weight", 1);
+
         var gemma4 = new Gemma4LayerWeights
         {
             PreFfwNorm2 = preFfwNorm2,
@@ -1182,6 +1206,7 @@ internal sealed class TransformerWeights : IDisposable
             RouterScale = routerScale,
             DownExpertScale = downExpertScale,
             LayerOutputScale = layerOutScaleArr[0],
+            EncLayerOutputScale = encLayerOutScaleArr is null ? (float?)null : encLayerOutScaleArr[0],
             VFromK = vFromK,
             GateUpExpsRowBytes = gateUpStride,
             DownExpsRowBytes = downStride,

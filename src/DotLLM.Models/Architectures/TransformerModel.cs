@@ -569,6 +569,30 @@ public sealed unsafe class TransformerModel : IModel
         // 1. EMBEDDING LOOKUP
         EmbeddingLookup(tokenIds, hidden, hiddenSize);
 
+        // 1b. DIFFUSION region embedding (diffusion-gemma only). The unified
+        // [prompt | canvas] forward splits at P = _currentMaskSpec.PrefixLength
+        // (the Hybrid prompt length / region split). Prompt rows [0, P) keep the
+        // scaled embedding; canvas rows [P, seqLen) get an EXTRA weight-less
+        // rms_norm(row, eps) (no scale) — the zero-self-conditioning path
+        // (diffusion-gemma.cpp:363-365,378-386). Gated on DiffusionConfig so the
+        // autoregressive gemma4 / every other architecture is byte-identical.
+        // TODO(self-conditioning): on denoise steps > 0 the canvas rms_noscale is
+        // applied to (embed + sc_signal); sc_signal is OFF on step 0, so the
+        // single-forward validation is exactly this zero-SC path.
+        if (Config.DiffusionConfig is not null)
+        {
+            int p = _currentMaskSpec.Mode == AttentionMaskMode.Hybrid
+                ? _currentMaskSpec.PrefixLength
+                : 0;
+            if (p < 0) p = 0;
+            if (p > seqLen) p = seqLen;
+            for (int t = p; t < seqLen; t++)
+            {
+                var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
+                RmsNorm.ExecuteUnit(row, eps, row);
+            }
+        }
+
         // 2. TRANSFORMER LAYERS
         var repackedLayers = _weights.RepackedLayers;
         int numLayers = DebugMaxLayers switch
@@ -1293,6 +1317,25 @@ public sealed unsafe class TransformerModel : IModel
         int numHeads = Config.NumAttentionHeads;
         var g4 = lw.Gemma4!;
 
+        // DIFFUSION region per-layer scalar split. On diffusion-gemma the LAST
+        // per-layer op uses enc_layer_output_scale for the PROMPT rows [0, P) and
+        // layer_output_scale for the CANVAS rows [P, seqLen) — same backbone
+        // weights, the encoder contributes ONLY the scalar (diffusion-gemma.cpp:
+        // 475-489). P is the Hybrid region split (prompt length). On autoregressive
+        // gemma4 (DiffusionConfig null) regionP == 0 so every row uses
+        // LayerOutputScale, byte-identical to the validated AR path.
+        bool diffusion = Config.DiffusionConfig is not null;
+        int regionP = 0;
+        if (diffusion && _currentMaskSpec.Mode == AttentionMaskMode.Hybrid)
+        {
+            regionP = _currentMaskSpec.PrefixLength;
+            if (regionP < 0) regionP = 0;
+            if (regionP > seqLen) regionP = seqLen;
+        }
+        float encScale = diffusion && g4.EncLayerOutputScale is float e
+            ? e
+            : g4.LayerOutputScale;
+
         // ── Attention ─────────────────────────────────────────────────────
         // normIn = rms(hidden) * attn_norm  (into normOut)
         for (int t = 0; t < seqLen; t++)
@@ -1411,7 +1454,10 @@ public sealed unsafe class TransformerModel : IModel
                     RmsNorm.Execute(
                         (ReadOnlySpan<float>)sumSpan, g4.PostFfwNorm, eps, sumSpan);
                     // cur = cur + attn_out, then * layer_output_scale (LAST op).
-                    float scale = g4.LayerOutputScale;
+                    // Diffusion: prompt rows [0,P) use enc_layer_output_scale,
+                    // canvas rows [P,seqLen) use layer_output_scale. Non-diffusion
+                    // gemma4 keeps layer_output_scale for ALL rows (regionP == 0).
+                    float scale = t < regionP ? encScale : g4.LayerOutputScale;
                     float* outT = hidden + t * hiddenSize;
                     float* aoT = attnOutP + t * hiddenSize;
                     float* sT = tmpP + t * hiddenSize;

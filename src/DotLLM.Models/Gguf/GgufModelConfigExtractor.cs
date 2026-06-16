@@ -652,18 +652,12 @@ public static class GgufModelConfigExtractor
         if (string.IsNullOrEmpty(chatTemplate)) chatTemplate = null;
 
         // DiffusionGemma: a non-null DiffusionConfig (canvas length + mask token).
-        // NOTE (PR #11 scope): the DiffusionGemma-specific graph pieces
-        // (self-conditioning, region-aware embed/scalar, enc_layer_output_scale,
-        // the diffusion canvas mask) are DEFERRED. The autoregressive gemma4 graph
-        // is implemented; loading a diffusion-gemma GGUF builds a valid config but
-        // the diffusion decode pieces are not wired yet — guard explicitly so a
-        // diffusion-gemma GGUF fails fast rather than silently running the AR graph.
-        if (architecture is Architecture.DiffusionGemma)
-            throw new NotSupportedException(
-                "diffusion-gemma GGUF: the DiffusionGemma-specific forward graph "
-                + "(self-conditioning, region-aware embed/scalar, enc_layer_output_scale, "
-                + "diffusion canvas mask) is not implemented yet (PR #11 covers the "
-                + "autoregressive gemma4 graph only). Tracked as follow-up.");
+        // The DiffusionGemma backbone is the EXACT gemma4 backbone; the diffusion
+        // graph adds three region-aware deltas (region embed rms_noscale on the
+        // canvas, region per-layer scalar enc_layer_output_scale/layer_output_scale,
+        // region-aware Hybrid(P) mask) wired in TransformerModel, gated on
+        // Config.DiffusionConfig. Self-conditioning + the PKV prefill/decode cache +
+        // the long-sequence sliding-mask clip remain DEFERRED optimizations.
         DiffusionConfig? diffusion = null;
         if (architecture is Architecture.DiffusionGemma)
         {

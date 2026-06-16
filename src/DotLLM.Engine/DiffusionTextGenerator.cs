@@ -330,7 +330,16 @@ public sealed class DiffusionTextGenerator
                 continue;
             int seqRow = prefixLen + i;
             var src = new ReadOnlySpan<float>(basePtr + (long)seqRow * vocabSize, vocabSize);
-            src.CopyTo(maskedLogits.AsSpan(rows * vocabSize, vocabSize));
+            Span<float> dst = maskedLogits.AsSpan(rows * vocabSize, vocabSize);
+            src.CopyTo(dst);
+            // Suppress the mask token from the candidate distribution: a denoise step must
+            // commit a REAL token, never the mask token. Models whose vocab contains the
+            // mask token and predict it as the argmax at still-masked positions (e.g.
+            // DiffusionGemma, mask id 4) would otherwise "unmask" a position back to the
+            // mask token — a no-op that stalls the canvas at all-masked. Harmless for
+            // absorbing-state models (LLaDA) that never rank the mask token highly.
+            if ((uint)maskTokenId < (uint)vocabSize)
+                dst[maskTokenId] = float.NegativeInfinity;
             maskedPositions[rows] = i;
             rows++;
         }

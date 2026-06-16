@@ -630,18 +630,48 @@ public class GgufModelConfigExtractorTests
     }
 
     [Fact]
-    public void Extract_DiffusionGemma_NotSupportedYet()
+    public void Extract_DiffusionGemma_BuildsDiffusionConfigOverGemma4Backbone()
     {
-        // PR #11 implements the autoregressive gemma4 graph only. The
-        // DiffusionGemma-specific pieces (self-conditioning, region-aware
-        // embed/scalar, enc_layer_output_scale, diffusion canvas mask) are
-        // deferred, so a diffusion-gemma GGUF fails fast rather than silently
-        // running the AR graph.
+        // DiffusionGemma reuses the EXACT gemma4 backbone config and ADDS a
+        // non-null DiffusionConfig (canvas length + mask token, Hybrid canvas
+        // mask). The region-aware forward deltas (region embed rms_noscale,
+        // enc_layer_output_scale per-layer scalar, Hybrid(P) mask) are wired in
+        // TransformerModel gated on DiffusionConfig; self-conditioning + PKV cache
+        // remain deferred.
         var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
         {
             d.AddUInt32("diffusion.canvas_length", 256);
             d.AddUInt32("tokenizer.ggml.mask_token_id", 4);
         });
-        Assert.Throws<NotSupportedException>(() => GgufModelConfigExtractor.Extract(metadata));
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        // Architecture maps to DiffusionGemma; backbone config is gemma4-identical.
+        Assert.Equal(Architecture.DiffusionGemma, config.Architecture);
+        Assert.True(config.IsGemmaArchitecture);
+        Assert.True(config.Gemma4DualFfn);
+        Assert.Equal(0.25f, config.PartialRotaryFactor);
+        Assert.Equal(1.0f, config.QueryPreAttnScalar);
+        Assert.NotNull(config.Moe);
+        Assert.Equal(128, config.Moe!.NumExperts);
+
+        // The diffusion delta: a non-null DiffusionConfig with the GGUF canvas
+        // length + mask token id, defaulting to the Hybrid region-aware mask.
+        Assert.NotNull(config.DiffusionConfig);
+        Assert.Equal(256, config.DiffusionConfig!.CanvasLength);
+        Assert.Equal(4, config.DiffusionConfig.MaskTokenId);
+        Assert.Equal(DotLLM.Core.Attention.AttentionMaskMode.Hybrid,
+            config.DiffusionConfig.CanvasAttentionMode);
+    }
+
+    [Fact]
+    public void Extract_DiffusionGemma_MissingMaskToken_Throws()
+    {
+        // A diffusion model cannot decode without a mask token id — loading must
+        // fail loudly when tokenizer.ggml.mask_token_id is absent.
+        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
+        {
+            d.AddUInt32("diffusion.canvas_length", 256);
+        });
+        Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
     }
 }
