@@ -1,0 +1,114 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q8_0 MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q8[m,k] * x[k]
+//
+// The activation x[] has been pre-quantized to Q8_1 (int8 qs + fp32 scale d_x
+// + fp32 sum, one block per 32 elements) by quantize_q8_1.comp. The Q8_0
+// weights are already int8 (fp16 scale d_w + 32 int8). For each 32-block the
+// raw integer dot product
+//   acc = sum_i  w_qs[i] * x_qs[i]            (int8 * int8 -> int32)
+// is accumulated with dotPacked4x8AccSatEXT (4 int8 MACs/instruction,
+// SPIR-V OpSDotAccSat, PackedVectorFormat4x8Bit), then scaled by d_w * d_x.
+// Q8_0 is symmetric (no min term) so the Q8_1 block-sum is unused here; it is
+// carried for the K-quant MMVQ kernels that follow.
+//
+// This is NOT bit-exact vs the F32-in GEMV: x is quantized to int8 first. The
+// per-32-block scaling keeps activation quant near-lossless for inference
+// (validated against the CPU F32 oracle with a tolerance + argmax-exact test).
+//
+// Weight layout (mirrors matmul_q8_0.comp / DotLLM.Cpu GemvQ8_0):
+//   Each 32 weights = one Q8_0 block of 34 bytes:
+//     bytes [0,1]   = fp16 scale d_w
+//     bytes [2..33] = 32 signed int8 qs
+//   Row stride = (K/32) * 34 bytes. The 34-byte block stride is 2 (mod 4) so
+//   the qs region (block+2) is alternately 0- or 2-aligned (mod 4) across
+//   blocks — same funnel trick as matmul_q8_0.comp to read aligned uints.
+//
+// Dispatch: one workgroup per output row, 128 threads, shared-mem reduction.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q8_0 blob, 4-byte indexable
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s_x)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // number of output rows
+    uint K;            // columns (multiple of 32)
+    uint blocksPerRow; // = K / 32
+    uint rowUints;     // per-row uint stride bound (rounded up; unused here)
+} pc;
+
+// Read fp16 weight scale at absolute byte offset (handles straddle), -> float.
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * 34u;
+    uint rowByteBase = m * rowByteStride;
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * 34u;
+        float dW = readHalf(blockByteBase);
+        float dX = xds[b].x;
+
+        // Funnel-read the 32 int8 weight qs as 8 aligned uints (4 int8 each),
+        // matching matmul_q8_0.comp. The activation qs are already packed 4/uint
+        // and naturally aligned (block start = 32*b, /4 => 8*b).
+        uint q = blockByteBase + 2u;
+        uint ubase = q >> 2u;
+        uint ph = q & 3u;             // 0 or 2
+        uint xqBase = b * 8u;         // 32 activations / 4 per uint = 8 uints
+
+        int dotI = 0;
+        uint prev = (ph == 0u) ? 0u : weight[ubase];
+        for (uint g = 0u; g < 8u; g++) {
+            uint wWord;
+            if (ph == 0u) {
+                wWord = weight[ubase + g];
+            } else {
+                uint nxt = weight[ubase + g + 1u];
+                wWord = (prev >> 16u) | (nxt << 16u);
+                prev = nxt;
+            }
+            uint xWord = xq[xqBase + g];
+            // 4 signed int8 lanes each; saturating int32 accumulate.
+            dotI = dotPacked4x8AccSatEXT(int(wWord), int(xWord), dotI);
+        }
+
+        acc += (dW * dX) * float(dotI);
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}

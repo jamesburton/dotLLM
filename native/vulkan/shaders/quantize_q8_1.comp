@@ -1,0 +1,78 @@
+#version 450
+// Activation quantization: FP32 x[K] -> Q8_1 (per-32-block int8 + fp32 scale + fp32 sum).
+//
+// This is the right-hand-operand quantization that turns the decode GEMV
+//   y[m] = sum_k W_q[m,k] * x[k]
+// into an integer dot product (dp4a / dotPacked4x8AccSatEXT) against the
+// already-int8 weights. Mirrors llama.cpp's `quantize_q8_1` Vulkan shader and
+// the CUDA `quantize_q8_1` used by mul_mat_vec_q.
+//
+// Q8_1 block (32 elements):
+//   d = amax / 127                       (fp32 scale; symmetric round-to-nearest)
+//   qs[i] = round(x[i] / d)  in [-127, 127]
+//   s = d * sum(qs[i])                   (fp32 block sum, == sum(x[i]) up to
+//                                         quantization; used by asymmetric
+//                                         weight formats' min term:
+//                                         y -= dmin * blockMin * sum_x)
+//
+// Output layout (two buffers, parallel arrays so the MMVQ inner loop streams
+// contiguous packed int8 and reads (d,s) separately):
+//   xq : uint[K/4]      — 4 signed int8 lanes per uint, little-endian byte order
+//   xds: vec2[K/32]     — (.x = d, .y = s) per 32-block
+//
+// Dispatch: ONE workgroup over all of K. local_size_x threads cooperate per
+// 32-block via shared-memory amax reduction. blocksPerThread handled by a
+// grid-stride over blocks. Decode path => K is small (<= ~16k), one workgroup
+// with a strided loop is plenty and avoids a cross-workgroup reduction.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { float x[]; };    // [K]
+layout(set = 0, binding = 1, std430) writeonly buffer BufXq  { uint  xq[]; };    // [K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufXds { vec2  xds[]; };   // [K/32]
+
+layout(push_constant) uniform PushConstants {
+    uint K;            // number of activation elements (multiple of 32)
+    uint blocksPerRow; // = K / 32
+} pc;
+
+const uint QK = 32u; // elements per Q8_1 block
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // One thread per block (grid-strided). 256 threads cover 256 blocks
+    // (= 8192 elements) per pass; larger K loops.
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint base = b * QK;
+
+        // Pass 1: amax over the 32 elements.
+        float amax = 0.0;
+        for (uint i = 0u; i < QK; i++) {
+            amax = max(amax, abs(x[base + i]));
+        }
+
+        float d = amax / 127.0;
+        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+        // Pass 2: quantize + pack 4 int8 lanes per uint, accumulate sum.
+        int sumI = 0;
+        uint qBase = base >> 2u; // 4 elements per uint
+        for (uint g = 0u; g < QK / 4u; g++) {
+            uint e = base + g * 4u;
+            int q0 = int(round(x[e + 0u] * id));
+            int q1 = int(round(x[e + 1u] * id));
+            int q2 = int(round(x[e + 2u] * id));
+            int q3 = int(round(x[e + 3u] * id));
+            sumI += q0 + q1 + q2 + q3;
+            uint packed = (uint(q0) & 0xFFu)
+                        | ((uint(q1) & 0xFFu) << 8u)
+                        | ((uint(q2) & 0xFFu) << 16u)
+                        | ((uint(q3) & 0xFFu) << 24u);
+            xq[qBase + g] = packed;
+        }
+
+        xds[b] = vec2(d, d * float(sumI));
+    }
+}
