@@ -561,7 +561,9 @@ public sealed class VulkanTransformerModel : IModel
         // (Q8_1Xq / Q8_1Xds) is only allocated when both kernels are live.
         QuantizeQ8_1Kernel? quantizeQ8_1 = null;
         MatMulQ8_0MmvqKernel? matmulQ8Mmvq = null;
-        if (!IsMmvqDisabled() && device.HasIntegerDotProduct)
+        // The MMVQ GEMV reduces per-row with subgroupAdd (one subgroup per row),
+        // so it needs subgroup arithmetic in addition to integer dot product.
+        if (!IsMmvqDisabled() && device.HasIntegerDotProduct && device.HasSubgroupArithmetic)
         {
             quantizeQ8_1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir);
             matmulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);

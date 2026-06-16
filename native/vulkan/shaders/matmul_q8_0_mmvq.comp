@@ -1,5 +1,7 @@
 #version 450
 #extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 // Q8_0 MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
 //
 //   y[m] = sum_k W_q8[m,k] * x[k]
@@ -26,7 +28,12 @@
 //   the qs region (block+2) is alternately 0- or 2-aligned (mod 4) across
 //   blocks — same funnel trick as matmul_q8_0.comp to read aligned uints.
 //
-// Dispatch: one workgroup per output row, 128 threads, shared-mem reduction.
+// Dispatch: ONE SUBGROUP per output row (rowsPerWg = local_size_x/subgroupSize
+// rows per workgroup). Each subgroup's lanes stride the row's blocks and reduce
+// with subgroupAdd — no shared memory, no barriers. This keeps every lane busy
+// even when blocksPerRow < local_size_x (e.g. K=2048 ⇒ 64 blocks: the old
+// one-workgroup-per-row/128-thread mapping left half the threads idle), and
+// packs rowsPerWg rows per workgroup for better memory-level parallelism.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -39,7 +46,7 @@ layout(push_constant) uniform PushConstants {
     uint M;            // number of output rows
     uint K;            // columns (multiple of 32)
     uint blocksPerRow; // = K / 32
-    uint rowUints;     // per-row uint stride bound (rounded up; unused here)
+    uint rowsPerWg;    // output rows per workgroup = local_size_x / subgroupSize
 } pc;
 
 // Read fp16 weight scale at absolute byte offset (handles straddle), -> float.
@@ -57,21 +64,21 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(half16).x;
 }
 
-shared float partials[128];
-
 void main() {
-    uint m = gl_WorkGroupID.x;
+    // One subgroup per row; rowsPerWg rows per workgroup.
+    if (gl_SubgroupID >= pc.rowsPerWg) return;
+    uint m = gl_WorkGroupID.x * pc.rowsPerWg + gl_SubgroupID;
     if (m >= pc.M) return;
 
-    uint tid = gl_LocalInvocationID.x;
-    uint threads = gl_WorkGroupSize.x;
+    uint lane  = gl_SubgroupInvocationID;
+    uint lanes = gl_SubgroupSize;
 
     uint rowByteStride = pc.blocksPerRow * 34u;
     uint rowByteBase = m * rowByteStride;
 
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    for (uint b = lane; b < pc.blocksPerRow; b += lanes) {
         uint blockByteBase = rowByteBase + b * 34u;
         float dW = readHalf(blockByteBase);
         float dX = xds[b].x;
@@ -103,12 +110,8 @@ void main() {
         acc += (dW * dX) * float(dotI);
     }
 
-    partials[tid] = acc;
-    barrier();
-    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
-        barrier();
-    }
-
-    if (tid == 0u) y[m] = partials[0];
+    // Subgroup-scope reduction — the subgroup IS the row, so one subgroupAdd
+    // yields the full dot product with no shared memory or barriers.
+    float rowSum = subgroupAdd(acc);
+    if (subgroupElect()) y[m] = rowSum;
 }

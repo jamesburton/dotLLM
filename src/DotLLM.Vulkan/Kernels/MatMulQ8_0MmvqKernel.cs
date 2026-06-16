@@ -1,3 +1,4 @@
+using System;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -38,7 +39,10 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
     /// <summary>Elements per Q8_0 block.</summary>
     public const int Q8_0GroupSize = 32;
 
-    private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowUints
+    /// <summary>Workgroup width — must match the shader's <c>local_size_x</c>.</summary>
+    private const int WorkgroupSize = 128;
+
+    private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, rowsPerWg
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -121,7 +125,6 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
 
         int blocksPerRow = k / Q8_0GroupSize;
         long rowBytes = (long)blocksPerRow * Q8_0BlockBytes;
-        int rowUints = (int)((rowBytes + 3) / 4);
 
         long weightsMin = (long)m * rowBytes;
         if (weightsQ8.Size < weightsMin)
@@ -142,9 +145,17 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
+        // One subgroup per output row → local_size_x / subgroupSize rows per
+        // workgroup. Falls back to 1 row/workgroup if the driver doesn't report
+        // a subgroup width (the MMVQ path is gated on subgroup arithmetic, so
+        // SubgroupSize is normally non-zero here).
+        uint subgroupSize = _device.SubgroupSize == 0 ? (uint)WorkgroupSize : _device.SubgroupSize;
+        uint rowsPerWg = Math.Max(1u, (uint)WorkgroupSize / subgroupSize);
+        uint numWorkgroups = ((uint)m + rowsPerWg - 1u) / rowsPerWg;
+
         Span<uint> pc = stackalloc uint[4]
         {
-            (uint)m, (uint)k, (uint)blocksPerRow, (uint)rowUints,
+            (uint)m, (uint)k, (uint)blocksPerRow, rowsPerWg,
         };
         fixed (uint* pcPtr = pc)
         {
@@ -153,7 +164,7 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        VulkanApi.vkCmdDispatch(cmdBuf, (uint)m, 1, 1);
+        VulkanApi.vkCmdDispatch(cmdBuf, numWorkgroups, 1, 1);
     }
 
     /// <inheritdoc/>
