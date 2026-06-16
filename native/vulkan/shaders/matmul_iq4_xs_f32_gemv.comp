@@ -101,19 +101,31 @@ void main() {
             int  ls   = int(low | (high << 4u)) - 32;
             float dl  = d * float(ls);
 
-            uint subQsBase = qsBase + ib * 16u;
+            // The sub-block's qs region is 16 bytes = 4 words, word-aligned
+            // (the 136-byte super-block puts qs at offset 8 and each 16-byte
+            // sub-block stride keeps it 4-aligned). Read each word ONCE and
+            // bitfield-extract the 8 nibbles instead of issuing 16 byte loads
+            // that reload each shared word 4 times. Codebook is a compile-time
+            // const float[16] (register/LDS), so the byte reads were the
+            // redundant weight traffic.
+            uint subQsUint = (qsBase + ib * 16u) >> 2u;   // 4-aligned
             uint subXBase  = xBase + ib * IQ4_XS_SUB_BLOCK_SIZE;
 
-            float subSum = 0.0;
-            for (uint j = 0u; j < 16u; j++) {
-                uint byteVal = readByte(subQsBase + j);
-                uint nLo = byteVal & 0xFu;
-                uint nHi = byteVal >> 4u;
-                float xLo = x[subXBase + j];
-                float xHi = x[subXBase + j + 16u];
-                subSum += xLo * KVALUES_IQ4NL[nLo] + xHi * KVALUES_IQ4NL[nHi];
+            float loSum = 0.0;
+            float hiSum = 0.0;
+            for (uint w = 0u; w < 4u; w++) {
+                uint cur = weight[subQsUint + w];
+                uint e = w * 4u;
+                loSum += x[subXBase + e + 0u] * KVALUES_IQ4NL[ cur        & 0xFu]
+                       + x[subXBase + e + 1u] * KVALUES_IQ4NL[(cur >>  8u) & 0xFu]
+                       + x[subXBase + e + 2u] * KVALUES_IQ4NL[(cur >> 16u) & 0xFu]
+                       + x[subXBase + e + 3u] * KVALUES_IQ4NL[(cur >> 24u) & 0xFu];
+                hiSum += x[subXBase + e + 16u] * KVALUES_IQ4NL[(cur >>  4u) & 0xFu]
+                       + x[subXBase + e + 17u] * KVALUES_IQ4NL[(cur >> 12u) & 0xFu]
+                       + x[subXBase + e + 18u] * KVALUES_IQ4NL[(cur >> 20u) & 0xFu]
+                       + x[subXBase + e + 19u] * KVALUES_IQ4NL[(cur >> 28u) & 0xFu];
             }
-            acc += dl * subSum;
+            acc += dl * (loSum + hiSum);
         }
     }
 
