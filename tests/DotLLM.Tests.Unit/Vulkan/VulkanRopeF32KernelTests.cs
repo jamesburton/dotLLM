@@ -141,6 +141,68 @@ public class VulkanRopeF32KernelTests
         AssertClose(kExpected, kActual, "K");
     }
 
+    [SkippableTheory]
+    // PARTIAL NeoX — rotate only the leading ropeDim dims, pairing each at the
+    // FULL head's half-dim (i, i + headDim/2), matching CPU
+    // RoPE.ExecutePartialNeoX. This is the Gemma-4 global-layer convention
+    // (partial_rotary_factor 0.25 over head_dim, e.g. headDim 64 → ropeDim 16).
+    // DISCRIMINATING: the pre-fix shader paired at ropeDim/2 (here 8, not 32),
+    // so it fails this test; the corrected full-head-half pairing passes.
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta)
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(4, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(256, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int rotatedPairs = ropeDim / 2;
+
+        var rng = new Random(0x5EED + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // Frequency table for the rotated span only: ropeDim/2 entries per
+        // position, exponent 2*pair/ropeDim (built by passing ropeDim as the
+        // "headDim" arg) — matches the kernel's per-thread freq reconstruction.
+        float[] cosTable = new float[seqLen * rotatedPairs];
+        float[] sinTable = new float[seqLen * rotatedPairs];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, ropeDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.ExecutePartialNeoX(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, rotatedPairs,
+            cosTable, sinTable);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.NeoX);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static float[] RandomFloats(Random rng, int count)

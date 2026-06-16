@@ -12,6 +12,14 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_rope = rope_dim / 2;
+    // NeoX pairing offset is the FULL head's half-dim, NOT rope_dim/2, so partial
+    // rope (rope_dim < head_dim, e.g. Gemma-4 global layers) pairs the leading
+    // rope_dim/2 dims with their full-head-half partners, matching CPU
+    // RoPE.ApplyRotationNeoXPartial + the Vulkan rope_f32 shader. For full rope
+    // (rope_dim == head_dim) this equals half_rope ⇒ byte-identical for every
+    // current NeoX model. NOTE: PTX must be regenerated on the CUDA box (no nvcc
+    // on the Strix Halo dev host) — no CUDA partial-NeoX model is enabled today.
+    int neox_pair_offset = head_dim / 2;
     int total_q_pairs = seq_len * num_heads * half_rope;
     int total_k_pairs = seq_len * num_kv_heads * half_rope;
 
@@ -28,7 +36,7 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
 
         int base_idx = t * num_heads * head_dim + head * head_dim;
         int i0 = (rope_type == 1) ? base_idx + pair : base_idx + 2 * pair;
-        int i1 = (rope_type == 1) ? base_idx + pair + half_rope : base_idx + 2 * pair + 1;
+        int i1 = (rope_type == 1) ? base_idx + pair + neox_pair_offset : base_idx + 2 * pair + 1;
 
         float v0 = q[i0], v1 = q[i1];
         q[i0] = v0 * cos_val - v1 * sin_val;
@@ -48,7 +56,7 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
 
         int base_idx = t * num_kv_heads * head_dim + head * head_dim;
         int i0 = (rope_type == 1) ? base_idx + pair : base_idx + 2 * pair;
-        int i1 = (rope_type == 1) ? base_idx + pair + half_rope : base_idx + 2 * pair + 1;
+        int i1 = (rope_type == 1) ? base_idx + pair + neox_pair_offset : base_idx + 2 * pair + 1;
 
         float v0 = k[i0], v1 = k[i1];
         k[i0] = v0 * cos_val - v1 * sin_val;

@@ -65,9 +65,15 @@ void main() {
         uint baseIdx = t * pc.numHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;
         if (pc.ropeType == 1u) {
-            // NeoX: pair (i, i + halfRope).
+            // NeoX: pair (i, i + headDim/2). The pairing offset is the FULL
+            // head's half-dim, NOT ropeDim/2 — so partial rope (ropeDim <
+            // headDim, e.g. Gemma-4 global layers, partial_rotary_factor 0.25)
+            // rotates the leading ropeDim/2 pairs straddling the head halves,
+            // matching CPU RoPE.ApplyRotationNeoXPartial. For full rope
+            // (ropeDim == headDim) this equals halfRope, so every existing
+            // NeoX model is byte-identical.
             i0 = baseIdx + pair;
-            i1 = baseIdx + pair + halfRope;
+            i1 = baseIdx + pair + (pc.headDim >> 1u);
         } else {
             // Norm / interleaved: pair (2i, 2i+1).
             i0 = baseIdx + 2u * pair;
@@ -96,8 +102,9 @@ void main() {
         uint baseIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;
         if (pc.ropeType == 1u) {
+            // NeoX: pair (i, i + headDim/2) — full-head half-dim offset (see Q branch).
             i0 = baseIdx + pair;
-            i1 = baseIdx + pair + halfRope;
+            i1 = baseIdx + pair + (pc.headDim >> 1u);
         } else {
             i0 = baseIdx + 2u * pair;
             i1 = baseIdx + 2u * pair + 1u;
