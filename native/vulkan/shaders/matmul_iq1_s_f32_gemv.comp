@@ -588,6 +588,19 @@ uint readU16(uint absByteOff) {
     return readByte(absByteOff) | (readByte(absByteOff + 1u) << 8u);
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when not 4-aligned (the 50-byte
+// super-block puts qs at offset 2 and qh at offset 34, both 2-mod-4). One
+// storage load replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 int sext8(uint b) {
     return int(b) - int((b & 0x80u) << 1u);
 }
@@ -614,16 +627,23 @@ void main() {
         uint xBase = b * IQ1_S_GROUP_SIZE;
 
         for (uint ib = 0u; ib < IQ1_S_NUM_SUB_BLOCKS; ib++) {
-            uint qhVal = readU16(qhBase + ib * 2u);
+            // qh[] holds 8 uint16; a funnelled word at qhBase + (ib>>1)*4 carries
+            // two of them (ib and ib+1). Read it ONCE and pick the half instead
+            // of two byte-wise reads per sub-block. The codebook is a
+            // compile-time const array (register/LDS), so these packed reads are
+            // the redundant weight traffic.
+            uint qhPair = read4Bytes(qhBase + (ib >> 1u) * 4u);
+            uint qhVal  = (qhPair >> ((ib & 1u) * 16u)) & 0xFFFFu;
             float dl    = d * float(2 * int((qhVal >> 12u) & 7u) + 1);
             float delta = ((qhVal & 0x8000u) != 0u) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-            uint subQsBase = qsBase + ib * 4u;
             uint subXBase  = xBase + ib * IQ1_S_SUB_BLOCK_SIZE;
+            // The sub-block's 4 qs index bytes are one funnelled word.
+            uint qsw = read4Bytes(qsBase + ib * 4u);
 
             float subSum = 0.0;
             for (uint l = 0u; l < 4u; l++) {
-                uint qsByte = readByte(subQsBase + l);
+                uint qsByte = (qsw >> (l * 8u)) & 0xFFu;
                 uint idx    = qsByte | (((qhVal >> (3u * l)) & 7u) << 8u);
                 uint gridLo = iq1s_grid_lo_hi[2u * idx];
                 uint gridHi = iq1s_grid_lo_hi[2u * idx + 1u];
