@@ -42,6 +42,18 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when not 4-aligned. One storage load
+// replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -84,23 +96,40 @@ void main() {
         uint scalesBase = blockByteBase + 2u + IQ3_S_GROUP_SIZE / 4u + IQ3_S_GROUP_SIZE / 32u + IQ3_S_GROUP_SIZE / 8u;
         uint xBase      = b * IQ3_S_GROUP_SIZE;
 
+        // scales[4] (4 bytes) and qh[8] (8 bytes) are contiguous; read them as
+        // funnelled words once per super-block instead of one readByte per
+        // sub-block.
+        uint scalesW = read4Bytes(scalesBase);
+        uint qh0     = read4Bytes(qhBase);
+        uint qh1     = read4Bytes(qhBase + 4u);
+
         for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
-            uint scaleByte = readByte(scalesBase + (ib32 >> 1u));
+            uint scaleByte = (scalesW >> ((ib32 >> 1u) * 8u)) & 0xFFu;
             uint subScale  = ((ib32 & 1u) == 0u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
             float db = d * float(1u + 2u * subScale);
-            uint qhByte    = readByte(qhBase + ib32);
+            uint qhByte    = ((ib32 < 4u) ? (qh0 >> (ib32 * 8u))
+                                          : (qh1 >> ((ib32 - 4u) * 8u))) & 0xFFu;
             uint qsSubBase = qsBase + ib32 * 8u;
             uint sgSubBase = signsBase + ib32 * 4u;
             uint xSubBase  = xBase + ib32 * 32u;
 
+            // The sub-block's 8 grid-index-low bytes are two funnelled words and
+            // its 4 sign bytes one funnelled word; read each ONCE instead of
+            // byte-wise per pair. The dot stays codebook-gather bound (gridByte).
+            uint qsw0  = read4Bytes(qsSubBase);        // lo for l=0,1
+            uint qsw1  = read4Bytes(qsSubBase + 4u);   // lo for l=2,3
+            uint signsW = read4Bytes(sgSubBase);
+
             for (uint l = 0u; l < 4u; l++) {
-                uint lo1 = readByte(qsSubBase + 2u * l + 0u);
-                uint lo2 = readByte(qsSubBase + 2u * l + 1u);
+                uint qsw = (l < 2u) ? qsw0 : qsw1;
+                uint sh  = (l & 1u) * 16u;
+                uint lo1 = (qsw >> sh) & 0xFFu;
+                uint lo2 = (qsw >> (sh + 8u)) & 0xFFu;
                 uint hi1 = (qhByte << (8u - 2u * l)) & 0x100u;
                 uint hi2 = (qhByte << (7u - 2u * l)) & 0x100u;
                 uint g1  = lo1 | hi1;
                 uint g2  = lo2 | hi2;
-                uint signs = readByte(sgSubBase + l);
+                uint signs = (signsW >> (l * 8u)) & 0xFFu;
                 uint xOff  = xSubBase + l * 8u;
                 uint gOff1 = g1 * 4u;
                 uint gOff2 = g2 * 4u;
