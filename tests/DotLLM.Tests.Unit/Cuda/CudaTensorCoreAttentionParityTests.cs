@@ -46,6 +46,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     [InlineData(256, 32, 8, 64)]
     [InlineData(512, 32, 8, 64)]
     [InlineData(1024, 32, 8, 64)]
+    [InlineData(2048, 32, 8, 64)]
     public void CublasSoftmaxPath_MatchesAttentionF16(int s, int numHeads, int numKvHeads, int headDim)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
