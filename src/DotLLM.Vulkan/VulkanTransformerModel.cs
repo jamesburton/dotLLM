@@ -1627,11 +1627,11 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // K/V projections — read the normalised hidden state written above.
-            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
-                lw.KOutputDim, lw.KInputDim, seqLen);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
-                lw.VOutputDim, lw.VInputDim, seqLen);
+            // Both contract over the same input (hidden), so under the DP4a
+            // decode path one shared activation quant feeds both GEMVs.
+            RecordSharedInputMatmulPair(cmdBuf, _state.NormOutput, lw.KInputDim, seqLen,
+                lw.K, lw.KDeviceQuantType, _state.K, lw.KOutputDim,
+                lw.V, lw.VDeviceQuantType, _state.V, lw.VOutputDim);
 
             // Optional QKV biases — kernel path keeps the whole forward in
             // one submit. Each bias add writes a different output buffer
@@ -2667,6 +2667,47 @@ public sealed class VulkanTransformerModel : IModel
         };
         VulkanApi.vkCmdCopyBuffer(cmdBuf, deltaSum.Handle, y.Handle, 1, region);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// Records two projections that read the <b>same</b> input activation
+    /// (<paramref name="input"/>, contraction dim <paramref name="inputDim"/>) —
+    /// e.g. K and V off the post-attn-norm hidden state. When the DP4a decode
+    /// path is active (seqLen==1, both Q8_0), the activation is quantized
+    /// <b>once</b> into the shared xq/dx scratch and both GEMVs read it, removing
+    /// the per-projection re-quantization. Otherwise it falls back to two
+    /// independent <see cref="RecordMatmul"/> calls (identical to dispatching
+    /// each projection on its own).
+    /// </summary>
+    /// <remarks>
+    /// The two GEMVs write distinct outputs and only read the shared (read-only)
+    /// scratch, so no barrier is needed between them. The caller must have made
+    /// <paramref name="input"/> visible (a compute→compute barrier after whatever
+    /// produced it) before this call, and must insert a barrier after it before
+    /// any consumer of <paramref name="outputA"/> / <paramref name="outputB"/>.
+    /// </remarks>
+    private void RecordSharedInputMatmulPair(
+        nint cmdBuf, VulkanDevice.Buffer input, int inputDim, int seqLen,
+        VulkanDevice.Buffer weightsA, QuantType qtA, VulkanDevice.Buffer outputA, int outputDimA,
+        VulkanDevice.Buffer weightsB, QuantType qtB, VulkanDevice.Buffer outputB, int outputDimB)
+    {
+        if (_dp4aEnabled && seqLen == 1
+            && qtA == QuantType.Q8_0 && qtB == QuantType.Q8_0)
+        {
+            // One activation quant shared by both projections.
+            _matmulQ8Dp4aPq!.RecordQuantizeActivation(cmdBuf, input, _state.Dp4aXq!, _state.Dp4aDx!, inputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _matmulQ8Dp4aPq.RecordGemvPrequant(cmdBuf, weightsA, _state.Dp4aXq!, _state.Dp4aDx!, outputA, outputDimA, inputDim);
+            _matmulQ8Dp4aPq.RecordGemvPrequant(cmdBuf, weightsB, _state.Dp4aXq!, _state.Dp4aDx!, outputB, outputDimB, inputDim);
+            return;
+        }
+
+        // Fallback: dispatch each projection independently. A barrier separates
+        // them only because RecordMatmul's DP4a single path may reuse the same
+        // shared scratch (WAR), and the scalar path is order-independent anyway.
+        RecordMatmul(cmdBuf, weightsA, qtA, input, outputA, outputDimA, inputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, weightsB, qtB, input, outputB, outputDimB, inputDim, seqLen);
     }
 
     private void RecordMatmul(

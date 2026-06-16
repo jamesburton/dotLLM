@@ -178,22 +178,43 @@ public sealed class MatMulQ8_0Dp4aPqKernel : IDisposable
         if ((k % Q8_0GroupSize) != 0)
             throw new ArgumentException($"k must be a multiple of {Q8_0GroupSize}, got {k}", nameof(k));
 
-        int blocksPerRow = k / Q8_0GroupSize;
-        long rowBytes = (long)blocksPerRow * Q8_0BlockBytes;
-        int rowUints = (int)((rowBytes + 3) / 4);
+        RecordQuantizeActivation(cmdBuf, x, xqScratch, dxScratch, k);
 
-        if (weightsQ8.Size < (long)m * rowBytes)
-            throw new ArgumentException("Weights buffer too small.", nameof(weightsQ8));
+        // xq/dx written by the quantize shader must be visible to the GEMV shader.
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        RecordGemvPrequant(cmdBuf, weightsQ8, xqScratch, dxScratch, y, m, k);
+    }
+
+    /// <summary>
+    /// Records only the activation pre-quantization pass (<c>quantize_q8_act</c>):
+    /// <c>x[K]</c> (FP32) → <c>xqScratch</c> (packed INT8) + <c>dxScratch</c>
+    /// (per-32-block FP32 scale). No barrier is recorded — the caller must insert
+    /// a compute→compute barrier before any <see cref="RecordGemvPrequant"/> that
+    /// reads the scratch. Split out so one activation quant can be shared across
+    /// several same-input projections (e.g. Q/K/V, gate/up) instead of being
+    /// re-run per projection.
+    /// </summary>
+    /// <param name="cmdBuf">Open command buffer.</param>
+    /// <param name="x">FP32 activation buffer of length <paramref name="k"/>.</param>
+    /// <param name="xqScratch">Scratch for packed INT8 activations; >= <see cref="XqScratchBytes"/>.</param>
+    /// <param name="dxScratch">Scratch for per-block FP32 scales; >= <see cref="DxScratchBytes"/>.</param>
+    /// <param name="k">Input dimension (must be a multiple of 32).</param>
+    public unsafe void RecordQuantizeActivation(
+        nint cmdBuf, VulkanDevice.Buffer x,
+        VulkanDevice.Buffer xqScratch, VulkanDevice.Buffer dxScratch, int k)
+    {
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if ((k % Q8_0GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q8_0GroupSize}, got {k}", nameof(k));
         if (x.Size < (long)k * sizeof(float))
             throw new ArgumentException("Input buffer too small.", nameof(x));
         if (xqScratch.Size < XqScratchBytes(k))
             throw new ArgumentException($"xq scratch too small: need >= {XqScratchBytes(k)} bytes.", nameof(xqScratch));
         if (dxScratch.Size < DxScratchBytes(k))
             throw new ArgumentException($"dx scratch too small: need >= {DxScratchBytes(k)} bytes.", nameof(dxScratch));
-        if (y.Size < (long)m * sizeof(float))
-            throw new ArgumentException("Output buffer too small.", nameof(y));
 
-        // ── Pass 1: quantize x → xq (packed int8) + dx (per-block scale) ──
+        int blocksPerRow = k / Q8_0GroupSize;
         Span<nint> quantBuffers = stackalloc nint[3] { x.Handle, xqScratch.Handle, dxScratch.Handle };
         nint quantSet = _quantCache.GetOrCreate(quantBuffers);
 
@@ -207,11 +228,48 @@ public sealed class MatMulQ8_0Dp4aPqKernel : IDisposable
                 cmdBuf, _quantPipeline.Layout, VkShaderStageFlags.Compute, 0, QuantPushConstantBytes, (nint)pcPtr);
         }
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)blocksPerRow, 1, 1);
+    }
 
-        // xq/dx written by the quantize shader must be visible to the GEMV shader.
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    /// <summary>
+    /// Records only the DP4a GEMV pass (<c>matmul_q8_0_dp4a_pq</c>) reading a
+    /// pre-quantized activation: <c>y[M] = W_q8[M,K] @ (xqScratch, dxScratch)</c>.
+    /// The caller is responsible for having recorded a
+    /// <see cref="RecordQuantizeActivation"/> for the same <c>k</c> plus a
+    /// compute→compute barrier beforehand. Multiple calls with the same scratch
+    /// and different (<paramref name="weightsQ8"/>, <paramref name="y"/>) share
+    /// one activation quant — they need no barrier between them (distinct outputs,
+    /// read-only scratch).
+    /// </summary>
+    /// <param name="cmdBuf">Open command buffer.</param>
+    /// <param name="weightsQ8">Raw Q8_0 blob of <c>M * (K/32) * 34</c> bytes.</param>
+    /// <param name="xqScratch">Packed INT8 activations from <see cref="RecordQuantizeActivation"/>.</param>
+    /// <param name="dxScratch">Per-block FP32 scales from <see cref="RecordQuantizeActivation"/>.</param>
+    /// <param name="y">FP32 output buffer of length <paramref name="m"/>.</param>
+    /// <param name="m">Output dimension.</param>
+    /// <param name="k">Input dimension (must be a multiple of 32).</param>
+    public unsafe void RecordGemvPrequant(
+        nint cmdBuf, VulkanDevice.Buffer weightsQ8,
+        VulkanDevice.Buffer xqScratch, VulkanDevice.Buffer dxScratch, VulkanDevice.Buffer y,
+        int m, int k)
+    {
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
+        if ((k % Q8_0GroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q8_0GroupSize}, got {k}", nameof(k));
 
-        // ── Pass 2: GEMV reading the shared xq/dx ──
+        int blocksPerRow = k / Q8_0GroupSize;
+        long rowBytes = (long)blocksPerRow * Q8_0BlockBytes;
+        int rowUints = (int)((rowBytes + 3) / 4);
+
+        if (weightsQ8.Size < (long)m * rowBytes)
+            throw new ArgumentException("Weights buffer too small.", nameof(weightsQ8));
+        if (xqScratch.Size < XqScratchBytes(k))
+            throw new ArgumentException($"xq scratch too small: need >= {XqScratchBytes(k)} bytes.", nameof(xqScratch));
+        if (dxScratch.Size < DxScratchBytes(k))
+            throw new ArgumentException($"dx scratch too small: need >= {DxScratchBytes(k)} bytes.", nameof(dxScratch));
+        if (y.Size < (long)m * sizeof(float))
+            throw new ArgumentException("Output buffer too small.", nameof(y));
+
         Span<nint> gemvBuffers = stackalloc nint[4] { weightsQ8.Handle, xqScratch.Handle, dxScratch.Handle, y.Handle };
         nint gemvSet = _gemvCache.GetOrCreate(gemvBuffers);
 
