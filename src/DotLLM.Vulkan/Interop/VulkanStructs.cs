@@ -15,6 +15,7 @@ internal static class VkStructureType
     internal const int MappedMemoryRange = 6;
     internal const int BindSparseInfo = 7;
     internal const int FenceCreateInfo = 8;
+    internal const int SemaphoreCreateInfo = 9;
     internal const int BufferCreateInfo = 12;
     internal const int ShaderModuleCreateInfo = 16;
     internal const int PipelineLayoutCreateInfo = 30;
@@ -54,6 +55,29 @@ internal static class VkStructureType
     // and the device-create enable. Drives the dp4a MMVQ decode path
     // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
     internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // VK_KHR_external_semaphore (core 1.1) — VkExportSemaphoreCreateInfo chains
+    // off VkSemaphoreCreateInfo.pNext to declare which handle type(s) the
+    // semaphore may be exported as. Drives the M3 Vulkan→CUDA async handoff.
+    internal const int ExportSemaphoreCreateInfo = 1000077000;
+    // VK_KHR_external_semaphore_win32 — VkSemaphoreGetWin32HandleInfoKHR is the
+    // argument to vkGetSemaphoreWin32HandleKHR; VkExportSemaphoreWin32HandleInfoKHR
+    // optionally chains security attrs/access onto the export create info.
+    internal const int SemaphoreGetWin32HandleInfoKhr = 1000078003;
+    internal const int ExportSemaphoreWin32HandleInfoKhr = 1000078001;
+}
+
+// VkExternalSemaphoreHandleTypeFlagBits — handle types a semaphore may be
+// exported/imported as (VK_KHR_external_semaphore). OpaqueWin32 is the same-stack
+// NT handle; D3D12Fence is the cross-vendor-portable Win32 fence handle that
+// both Intel Vulkan and NVIDIA CUDA understand.
+[Flags]
+internal enum VkExternalSemaphoreHandleTypeFlags : uint
+{
+    OpaqueFd = 0x00000001,
+    OpaqueWin32 = 0x00000002,
+    OpaqueWin32Kmt = 0x00000004,
+    D3D12Fence = 0x00000008,
+    SyncFd = 0x00000010,
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -495,6 +519,39 @@ internal struct VkFenceCreateInfo
     internal int sType;
     internal nint pNext;
     internal uint flags;
+}
+
+// VkSemaphoreCreateInfo — a binary semaphore by default. Chain a
+// VkExportSemaphoreCreateInfo on pNext to make it exportable (M3 handoff).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+}
+
+// VkExportSemaphoreCreateInfo (VK_KHR_external_semaphore, core 1.1). Chained
+// onto VkSemaphoreCreateInfo.pNext; handleTypes declares which external handle
+// types the created semaphore may later be exported as.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkExportSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleTypes; // VkExternalSemaphoreHandleTypeFlags
+}
+
+// VkSemaphoreGetWin32HandleInfoKHR (VK_KHR_external_semaphore_win32). Argument
+// to vkGetSemaphoreWin32HandleKHR — requests the Win32 HANDLE for an
+// already-created exportable semaphore.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreGetWin32HandleInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint semaphore;   // VkSemaphore
+    internal uint handleType;  // single VkExternalSemaphoreHandleTypeFlags bit
 }
 
 // VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
