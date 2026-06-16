@@ -38,6 +38,18 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when not 4-aligned. One storage load
+// replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -80,18 +92,34 @@ void main() {
         uint scalesBase = blockByteBase + 2u + 64u + 8u;
         uint xBase      = b * IQ2_S_GROUP_SIZE;
 
+        // scales[8] and qh[8] are 8 contiguous bytes each; read them as two
+        // funnelled words once per super-block instead of one readByte per
+        // sub-block.
+        uint scales0 = read4Bytes(scalesBase);
+        uint scales1 = read4Bytes(scalesBase + 4u);
+        uint qh0     = read4Bytes(qhBase);
+        uint qh1     = read4Bytes(qhBase + 4u);
+
         for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
-            uint scaleByte = readByte(scalesBase + ib32);
+            uint scaleByte = ((ib32 < 4u) ? (scales0 >> (ib32 * 8u))
+                                          : (scales1 >> ((ib32 - 4u) * 8u))) & 0xFFu;
             float db0 = d * (0.5 + float(scaleByte & 0xFu)) * 0.25;
             float db1 = d * (0.5 + float(scaleByte >> 4u)) * 0.25;
-            uint qhByte = readByte(qhBase + ib32);
+            uint qhByte = ((ib32 < 4u) ? (qh0 >> (ib32 * 8u))
+                                       : (qh1 >> ((ib32 - 4u) * 8u))) & 0xFFu;
             uint xSubBase = xBase + ib32 * 32u;
 
+            // The sub-block's 4 qsLow and 4 qsSign bytes are a single funnelled
+            // word each; read them ONCE instead of one readByte per pair. The
+            // dot itself stays codebook-gather bound (gridByte).
+            uint qsLowW  = read4Bytes(qsLowBase  + ib32 * 4u);
+            uint qsSignW = read4Bytes(qsSignBase + ib32 * 4u);
+
             for (uint l = 0u; l < 4u; l++) {
-                uint lo = readByte(qsLowBase + ib32 * 4u + l);
+                uint lo = (qsLowW >> (l * 8u)) & 0xFFu;
                 uint hi = (qhByte >> (2u * l)) & 0x3u;
                 uint gridIdx = lo | (hi << 8);
-                uint signs   = readByte(qsSignBase + ib32 * 4u + l);
+                uint signs   = (qsSignW >> (l * 8u)) & 0xFFu;
                 uint gridOff = gridIdx * 8u;
                 uint xOff = xSubBase + l * 8u;
                 float dl = (l < 2u) ? db0 : db1;
