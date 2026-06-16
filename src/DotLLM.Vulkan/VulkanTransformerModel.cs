@@ -146,6 +146,11 @@ public sealed class VulkanTransformerModel : IModel
     // or when the model's hidden size exceeds the shader's on-chip cap;
     // router falls back to the standalone (rmsnorm + matmul_q8_0) pair.
     private readonly RmsNormMatmulQ8_0FusedKernel? _rmsnormMatmulQ8Fused;
+    // dp4a MMVQ decode path (issue #46) — both null when the device lacks
+    // integer-dot-product support, the SPVs are missing, or the env-var
+    // opt-out is set; RecordMatmul then falls back to the F32-in Q8_0 GEMV.
+    private readonly QuantizeQ8_1Kernel? _quantizeQ8_1;
+    private readonly MatMulQ8_0MmvqKernel? _matmulQ8Mmvq;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -288,6 +293,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
+        QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, AddKernel add,
@@ -354,6 +360,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16 = matmulBf16;
         _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
+        _quantizeQ8_1 = quantizeQ8_1;
+        _matmulQ8Mmvq = matmulQ8Mmvq;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -544,6 +552,31 @@ public sealed class VulkanTransformerModel : IModel
             mlaRopeTheta = config.MlaConfig!.RopeTheta;
         }
 
+        // dp4a MMVQ decode path (issue #46). Quantize the F32 activation to
+        // Q8_1 on the device, then run an integer-dot (dotPacked4x8AccSatEXT)
+        // GEMV against the int8 Q8_0 weights. Created only when the device
+        // advertises VK_KHR_shader_integer_dot_product AND the SPVs are present
+        // AND the env-var opt-out is unset. Both null => the router falls back
+        // to the F32-in Q8_0 GEMV (MatMulQ8_0Kernel). The activation scratch
+        // (Q8_1Xq / Q8_1Xds) is only allocated when both kernels are live.
+        QuantizeQ8_1Kernel? quantizeQ8_1 = null;
+        MatMulQ8_0MmvqKernel? matmulQ8Mmvq = null;
+        if (!IsMmvqDisabled() && device.HasIntegerDotProduct)
+        {
+            quantizeQ8_1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir);
+            matmulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
+            // Both must exist for the path to be usable; if either SPV is
+            // missing, disable the whole path so we never half-wire it.
+            if (quantizeQ8_1 is null || matmulQ8Mmvq is null)
+            {
+                quantizeQ8_1?.Dispose();
+                matmulQ8Mmvq?.Dispose();
+                quantizeQ8_1 = null;
+                matmulQ8Mmvq = null;
+            }
+        }
+        bool mmvqEnabled = quantizeQ8_1 is not null && matmulQ8Mmvq is not null;
+
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize,
@@ -558,7 +591,8 @@ public sealed class VulkanTransformerModel : IModel
             moeTopK: moeTopK,
             moeIntermediateSize: moeIntermediate,
             moeSharedIntermediateSize: moeSharedIntermediate,
-            moeNumSharedExperts: moeNumSharedExperts);
+            moeNumSharedExperts: moeNumSharedExperts,
+            mmvqEnabled: mmvqEnabled);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -731,6 +765,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
+            quantizeQ8_1, matmulQ8Mmvq,
             rmsnorm, rope, attention, flashAttention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
@@ -755,6 +790,18 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsFlashAttentionDisabled() =>
         Environment.GetEnvironmentVariable(DisableFlashAttentionEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the dp4a MMVQ decode path (issue #46). Set
+    /// <c>DOTLLM_VULKAN_DISABLE_MMVQ=1</c> to force decode Q8_0 GEMV onto the
+    /// F32-in <see cref="MatMulQ8_0Kernel"/> (e.g. to A/B benchmark or to work
+    /// around a driver integer-dot bug). When unset, the path is used whenever
+    /// the device advertises integer-dot-product support and the SPVs exist.
+    /// </summary>
+    internal const string DisableMmvqEnvVar = "DOTLLM_VULKAN_DISABLE_MMVQ";
+
+    internal static bool IsMmvqDisabled() =>
+        Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
 
     /// <summary>
     /// Records the attention dispatch using Flash-Attention when the kernel
@@ -1782,6 +1829,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16.InvalidateDescriptorCache();
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
+        _quantizeQ8_1?.InvalidateDescriptorCache();
+        _matmulQ8Mmvq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -1846,6 +1895,16 @@ public sealed class VulkanTransformerModel : IModel
         int outputDim, int inputDim, int seqLen, float eps)
     {
         if (_rmsnormMatmulQ8Fused is null) return false;
+        // When the dp4a MMVQ decode path is wired, prefer it over the fused
+        // rmsnorm+Q8_0 GEMV: MMVQ's integer-dot inner loop is the optimized
+        // decode path we want on the hot projections (issue #46). Returning
+        // false here routes the (separate rmsnorm + RecordMatmul) pair, and
+        // RecordMatmul picks MMVQ for the Q8_0 GEMV. The fused F32-in GEMV only
+        // ever fires for models below its 1024-hidden cap; deferring keeps the
+        // decode quant path consistent across all Q8_0 projections.
+        if (seqLen == 1 && weightQt == QuantType.Q8_0
+            && _matmulQ8Mmvq is not null && _quantizeQ8_1 is not null)
+            return false;
         // Opt-out switch — default is fused-on. On RDNA3.5 the fused path
         // wins by ~3-5% in median paired-run min latency and is more
         // resilient to dispatch-time contention. Set the env var to "1"
@@ -2521,8 +2580,27 @@ public sealed class VulkanTransformerModel : IModel
         {
             if (seqLen == 1)
             {
-                _matmulQ8.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim);
+                // dp4a MMVQ decode path (issue #46): quantize the F32
+                // activation row to Q8_1, then run the integer-dot GEMV.
+                // Falls back to the F32-in GEMV when the path isn't wired
+                // (no integer-dot support / SPV missing / env opt-out) or the
+                // shapes don't qualify.
+                if (_matmulQ8Mmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % QuantizeQ8_1Kernel.GroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulQ8Mmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulQ8.Record(cmdBuf, weights, input, output,
+                        m: outputDim, k: inputDim);
+                }
             }
             else if (_matmulQ8GemmCoopmat is not null)
             {
@@ -2888,6 +2966,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ3K.Dispose();
         _matmulQ2KGemm.Dispose();
         _matmulQ2K.Dispose();
+        _matmulQ8Mmvq?.Dispose();
+        _quantizeQ8_1?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
         _matmulQ8.Dispose();

@@ -35,6 +35,9 @@ internal sealed class VulkanForwardState : IDisposable
     // MoE shared-expert dims — zero unless any MoE layer carries shared experts.
     private readonly int _moeSharedIntermediateSize;
     private readonly int _moeNumSharedExperts;
+    // True when the dp4a MMVQ decode path is wired — allocates the Q8_1
+    // activation-quantization scratch (Q8_1Xq / Q8_1Xds). Zero VRAM when off.
+    private readonly bool _mmvqEnabled;
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
@@ -141,6 +144,18 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MlaKPe { get; private set; }           // [seqLen, qkRope]
     public VulkanDevice.Buffer? MlaAttnOutput { get; private set; }    // [seqLen, numHeads * vHead]
 
+    // ── Q8_1 activation-quantization scratch (dp4a MMVQ decode path) ───
+    // Allocated only when the device supports integer dot product AND the
+    // MMVQ kernels were created (mmvqEnabled at construction). Sized for the
+    // single decode token (seqLen==1) over the largest matmul inputDim
+    // (max(hidden, intermediate)). The quantize kernel writes a packed-int8
+    // buffer (K/4 uints) and a (scale, sum) buffer (K/32 vec2); the MMVQ GEMV
+    // reads both. One pair is reused across all per-row quantizations in a
+    // forward — re-quantized per distinct activation row (NormOutput,
+    // AttnOutput, SiluOutput) since each is consumed by its own matmul(s).
+    public VulkanDevice.Buffer? Q8_1Xq { get; private set; }   // [maxK/4] packed int8
+    public VulkanDevice.Buffer? Q8_1Xds { get; private set; }  // [maxK/32] (d, s)
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 
@@ -175,9 +190,11 @@ internal sealed class VulkanForwardState : IDisposable
         int mlaNumHeads = 0, int mlaQkNopeHeadDim = 0, int mlaQkRopeHeadDim = 0,
         int mlaVHeadDim = 0, int mlaQLoraRank = 0, int mlaKvLoraRank = 0,
         int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0,
-        int moeSharedIntermediateSize = 0, int moeNumSharedExperts = 0)
+        int moeSharedIntermediateSize = 0, int moeNumSharedExperts = 0,
+        bool mmvqEnabled = false)
     {
         _device = device;
+        _mmvqEnabled = mmvqEnabled;
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
         _numKvHeads = numKvHeads;
@@ -202,6 +219,25 @@ internal sealed class VulkanForwardState : IDisposable
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));
+
+        // Q8_1 activation-quantization scratch — decode-only (one row), so its
+        // size is independent of seqLen capacity. Sized to the largest matmul
+        // inputDim (the down-projection's intermediate size, or hidden /
+        // moe-intermediate where larger). int8 quant is per-32-block, so K must
+        // be a multiple of 32 — round up defensively (any caller dispatches at
+        // the model's natural K which is already a 32-multiple for Q8_0).
+        if (_mmvqEnabled)
+        {
+            int maxK = Math.Max(hiddenSize, intermediateSize);
+            if (moeIntermediateSize > 0) maxK = Math.Max(maxK, moeIntermediateSize);
+            if (moeSharedIntermediateSize > 0) maxK = Math.Max(maxK, moeSharedIntermediateSize);
+            maxK = (maxK + 31) / 32 * 32;
+
+            // Packed int8: K/4 uints. Scales: K/32 vec2.
+            Q8_1Xq = device.AllocateDeviceLocal((long)(maxK / 4) * sizeof(uint));
+            Q8_1Xds = device.AllocateDeviceLocal((long)(maxK / 32) * 2 * sizeof(float));
+            AllocatedBytes += Q8_1Xq.Size + Q8_1Xds.Size;
+        }
     }
 
     /// <summary>
@@ -478,5 +514,7 @@ internal sealed class VulkanForwardState : IDisposable
         ReleaseLayerScratch();
         Logits?.Dispose();
         PositionsBuffer?.Dispose();
+        Q8_1Xq?.Dispose();
+        Q8_1Xds?.Dispose();
     }
 }
