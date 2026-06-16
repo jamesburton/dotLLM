@@ -287,6 +287,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _sigmoidMulF32Func;
     private readonly nint _dequantQ6_KF32Func;
 
+    // Causal softmax over the column-major [s x s] FP16 score buffer produced by the
+    // cuBLAS tensor-core prefill-attention path (QK GEMM -> THIS -> P*V GEMM).
+    // Optional — PTX may be absent on stale builds; HasAttentionSoftmaxCausal reports
+    // false and callers must keep the fused attention_f16 path. Required by a not-yet-
+    // built module would throw across the whole shared-CudaKernels GPU test suite.
+    private readonly CudaModule? _attentionSoftmaxCausalModule;
+    private readonly nint _attentionSoftmaxCausalFunc;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -617,7 +625,23 @@ public sealed unsafe class CudaKernels : IDisposable
             _siluF32Func = _elementwiseF32Module.TryGetFunction("silu_f32");
             _sigmoidMulF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_mul_f32");
         }
+
+        // Causal softmax for the cuBLAS tensor-core prefill-attention path (G3 prototype).
+        // Optional — PTX may be missing on stale builds.
+        string attentionSoftmaxCausalPath = Path.Combine(ptxDir, "attention_softmax_causal.ptx");
+        if (File.Exists(attentionSoftmaxCausalPath))
+        {
+            _attentionSoftmaxCausalModule = CudaModule.LoadFromFile(attentionSoftmaxCausalPath);
+            _attentionSoftmaxCausalFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_f16");
+        }
     }
+
+    /// <summary>
+    /// True when the causal-softmax kernel for the cuBLAS tensor-core prefill-attention
+    /// path is loaded (attention_softmax_causal.ptx present). When false, callers must
+    /// keep the fused <c>attention_f16</c> path.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausal => _attentionSoftmaxCausalFunc != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1325,6 +1349,32 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_softmaxFunc,
                 (uint)rows, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Causal softmax over the column-major <c>[s x s]</c> FP16 score buffer produced by
+    /// the cuBLAS tensor-core prefill-attention path. Operates in place: one plane per
+    /// query head (base <c>hq * s * s</c>), element <c>(tq, tk)</c> at <c>tq + tk * s</c>.
+    /// Each block softmaxes one query row (fixed <c>tq</c>) over the strided key axis,
+    /// applies the causal mask (<c>tk &gt; tq</c> → 0), and normalizes. The QK GEMM
+    /// already applied the <c>1/sqrt(headDim)</c> scale; it is not re-applied here.
+    /// One block per <c>(query head, query row)</c>; grid = <c>numHeads * s</c>.
+    /// </summary>
+    /// <param name="scores">Device pointer to the FP16 score buffer (<c>numHeads * s * s</c> elements), modified in place.</param>
+    /// <param name="s">Sequence length (rows and columns of each per-head score plane).</param>
+    /// <param name="numHeads">Number of query heads (score planes).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionSoftmaxCausal(nint scores, int s, int numHeads, nint stream)
+    {
+        nint scoresArg = scores;
+        int sArg = s, nhArg = numHeads;
+
+        void** args = stackalloc void*[] {&scoresArg, &sArg, &nhArg};
+
+        int numBlocks = numHeads * s;
+        CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalFunc,
+                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
