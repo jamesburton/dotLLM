@@ -1828,6 +1828,51 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
+    /// Downloads the post-transformer hidden state (all <paramref name="seqLen"/> rows)
+    /// from device-local memory to a freshly-allocated host CPU tensor. Must be called
+    /// immediately after <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
+    /// while the device buffers are still valid.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Used by the M1 Vulkan/CUDA hybrid model to extract the hidden state after the
+    /// Vulkan-resident layers complete and pass it to the CUDA backend for the
+    /// remaining layers. The <c>Forward</c> call on a model loaded with
+    /// <c>numVulkanLayers</c> (via <c>config with {{ NumLayers = numVulkanLayers }}</c>)
+    /// runs only those layers; the returned logits from <c>Forward</c> are discarded.
+    /// </para>
+    /// <para>
+    /// Two synchronous operations: <c>vkCmdCopyBuffer</c> DEVICE_LOCAL → HOST_VISIBLE
+    /// staging (one fence wait), then a host-side <c>MemoryCopy</c>. Both are off
+    /// the per-token hot path for the M1 proof-of-concept; async overlap is M3 scope.
+    /// </para>
+    /// </remarks>
+    /// <param name="seqLen">Number of tokens whose hidden states to download. Must match the last Forward call's seqLen.</param>
+    /// <returns>
+    /// A newly allocated CPU tensor [<paramref name="seqLen"/>, hiddenSize], FP32, deviceId=-1.
+    /// Caller owns disposal.
+    /// </returns>
+    public unsafe ITensor DownloadHiddenState(int seqLen)
+    {
+        if (seqLen <= 0)
+            throw new ArgumentOutOfRangeException(nameof(seqLen));
+
+        int hiddenSize = Config.HiddenSize;
+        long bytes = (long)seqLen * hiddenSize * sizeof(float);
+        var shape = new TensorShape(seqLen, hiddenSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+
+        // Copy DEVICE_LOCAL → HOST_VISIBLE staging via a separate synchronous command buffer.
+        // The caller's Forward call already did SubmitAndWait so the compute writes are visible.
+        using var staging = _device.Allocate(bytes);
+        _device.CopyBufferRangeSynchronous(_state.HiddenState, staging,
+            srcOffset: 0, dstOffset: 0, size: (ulong)bytes);
+        _device.Download(staging, new Span<float>((void*)result.DataPointer, seqLen * hiddenSize));
+
+        return result;
+    }
+
+    /// <summary>
     /// Host-side Gemma 2/3 final-logit soft-cap: <c>z' = cap * tanh(z / cap)</c>
     /// in-place. Uses <see cref="TensorPrimitives.Tanh"/> for the SIMD path.
     /// No-op when <see cref="ModelConfig.FinalLogitSoftcap"/> is null or
