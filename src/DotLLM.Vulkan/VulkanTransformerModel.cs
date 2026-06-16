@@ -151,6 +151,12 @@ public sealed class VulkanTransformerModel : IModel
     // opt-out is set; RecordMatmul then falls back to the F32-in Q8_0 GEMV.
     private readonly QuantizeQ8_1Kernel? _quantizeQ8_1;
     private readonly MatMulQ8_0MmvqKernel? _matmulQ8Mmvq;
+    // dp4a MMQ prefill path (issue #50) — both null when the device lacks
+    // integer-dot-product support, the SPVs are missing, or the MMQ env-var
+    // opt-out is set; RecordMatmul then falls back to the coopmat / scalar
+    // F32-in Q8_0 GEMM for seqLen>1.
+    private readonly QuantizeQ8_1RowsKernel? _quantizeQ8_1Rows;
+    private readonly MatMulQ8_0MmqKernel? _matmulQ8Mmq;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -294,6 +300,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
+        QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, AddKernel add,
@@ -362,6 +369,8 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
         _quantizeQ8_1 = quantizeQ8_1;
         _matmulQ8Mmvq = matmulQ8Mmvq;
+        _quantizeQ8_1Rows = quantizeQ8_1Rows;
+        _matmulQ8Mmq = matmulQ8Mmq;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -577,6 +586,31 @@ public sealed class VulkanTransformerModel : IModel
         }
         bool mmvqEnabled = quantizeQ8_1 is not null && matmulQ8Mmvq is not null;
 
+        // dp4a MMQ prefill path (issue #50). The compute-bound seqLen>1 analogue
+        // of MMVQ: quantize the F32 activation B-matrix to Q8_1 row-wise, then
+        // run an integer-dot (dotPacked4x8AccSatEXT) GEMM against the int8 Q8_0
+        // weights instead of the dequant→FP GEMM. Same gate as MMVQ (device
+        // integer-dot support + SPVs present) plus its own env-var opt-out. Both
+        // null => the router falls back to the coopmat / scalar Q8_0 GEMM.
+        QuantizeQ8_1RowsKernel? quantizeQ8_1Rows = null;
+        MatMulQ8_0MmqKernel? matmulQ8Mmq = null;
+        if (!IsMmqDisabled() && device.HasIntegerDotProduct)
+        {
+            quantizeQ8_1Rows = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
+            matmulQ8Mmq = MatMulQ8_0MmqKernel.TryCreate(device, spvDir);
+            if (quantizeQ8_1Rows is null || matmulQ8Mmq is null)
+            {
+                quantizeQ8_1Rows?.Dispose();
+                matmulQ8Mmq?.Dispose();
+                quantizeQ8_1Rows = null;
+                matmulQ8Mmq = null;
+            }
+        }
+        // The prefill MMQ activation scratch (Q8_1XqRows / Q8_1XdsRows) shares
+        // the mmvqEnabled allocation gate — both pairs need the same device
+        // integer-dot support. Enable the rows scratch when either path is live.
+        bool mmqEnabled = quantizeQ8_1Rows is not null && matmulQ8Mmq is not null;
+
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize,
@@ -592,7 +626,10 @@ public sealed class VulkanTransformerModel : IModel
             moeIntermediateSize: moeIntermediate,
             moeSharedIntermediateSize: moeSharedIntermediate,
             moeNumSharedExperts: moeNumSharedExperts,
-            mmvqEnabled: mmvqEnabled);
+            // The forward state's mmvqEnabled gate allocates BOTH the decode
+            // (Q8_1Xq/Xds) and prefill (Q8_1XqRows/XdsRows) activation scratch.
+            // Enable it when either the decode MMVQ or prefill MMQ path is live.
+            mmvqEnabled: mmvqEnabled || mmqEnabled);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -766,6 +803,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
+            quantizeQ8_1Rows, matmulQ8Mmq,
             rmsnorm, rope, attention, flashAttention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
@@ -802,6 +840,20 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmvqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the dp4a MMQ prefill path (issue #50). Set
+    /// <c>DOTLLM_VULKAN_DISABLE_MMQ=1</c> to force the seqLen&gt;1 Q8_0 GEMM onto
+    /// the dequant→FP GEMM (coopmat where available, else scalar
+    /// <see cref="MatMulQ8_0GemmKernel"/>) — e.g. to A/B benchmark MMQ vs the FP
+    /// GEMM or to work around a driver integer-dot bug. When unset, MMQ is used
+    /// for prefill Q8_0 whenever the device advertises integer-dot support and
+    /// the SPVs exist.
+    /// </summary>
+    internal const string DisableMmqEnvVar = "DOTLLM_VULKAN_DISABLE_MMQ";
+
+    internal static bool IsMmqDisabled() =>
+        Environment.GetEnvironmentVariable(DisableMmqEnvVar) == "1";
 
     /// <summary>
     /// Records the attention dispatch using Flash-Attention when the kernel
@@ -1831,6 +1883,8 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
         _quantizeQ8_1?.InvalidateDescriptorCache();
         _matmulQ8Mmvq?.InvalidateDescriptorCache();
+        _quantizeQ8_1Rows?.InvalidateDescriptorCache();
+        _matmulQ8Mmq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -2602,6 +2656,24 @@ public sealed class VulkanTransformerModel : IModel
                         m: outputDim, k: inputDim);
                 }
             }
+            else if (_matmulQ8Mmq is not null && _quantizeQ8_1Rows is not null
+                && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
+                && (inputDim % QuantizeQ8_1RowsKernel.GroupSize) == 0
+                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
+                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+            {
+                // dp4a MMQ prefill path (issue #50): quantize the F32 activation
+                // B-matrix to Q8_1 row-wise, then run the integer-dot GEMM. The
+                // compute-bound seqLen>1 analogue of the MMVQ decode GEMV; the
+                // integer-dot inner loop replaces the per-element dequant FMA of
+                // the FP GEMM. Falls through to coopmat / scalar when the path
+                // isn't wired or the activation scratch can't hold [N, K].
+                _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
+                    n: seqLen, k: inputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                _matmulQ8Mmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
             else if (_matmulQ8GemmCoopmat is not null)
             {
                 // Prefill path on coopmat-capable devices — ~3.8× over scalar
@@ -2966,6 +3038,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ3K.Dispose();
         _matmulQ2KGemm.Dispose();
         _matmulQ2K.Dispose();
+        _matmulQ8Mmq?.Dispose();
+        _quantizeQ8_1Rows?.Dispose();
         _matmulQ8Mmvq?.Dispose();
         _quantizeQ8_1?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();

@@ -38,6 +38,10 @@ internal sealed class VulkanForwardState : IDisposable
     // True when the dp4a MMVQ decode path is wired — allocates the Q8_1
     // activation-quantization scratch (Q8_1Xq / Q8_1Xds). Zero VRAM when off.
     private readonly bool _mmvqEnabled;
+    // Largest matmul inputDim (K) — drives the size of both the decode and the
+    // prefill Q8_1 activation scratch. Computed once at construction. Zero when
+    // mmvq is disabled.
+    private readonly int _q8_1MaxK;
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
@@ -156,6 +160,17 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? Q8_1Xq { get; private set; }   // [maxK/4] packed int8
     public VulkanDevice.Buffer? Q8_1Xds { get; private set; }  // [maxK/32] (d, s)
 
+    // ── Q8_1 multi-row activation-quantization scratch (dp4a MMQ prefill) ──
+    // Allocated only when mmvqEnabled (same gate as the decode scratch above:
+    // the device supports integer dot product). Unlike the decode pair, this is
+    // sized by seqLen × maxK (the whole [N, K] activation tile) and grows with
+    // EnsureCapacity. The multi-row quantizer (QuantizeQ8_1RowsKernel) writes a
+    // packed-int8 buffer (N*K/4 uints) and a (scale, sum) buffer (N*K/32 vec2);
+    // the MMQ GEMM (MatMulQ8_0MmqKernel) reads both.
+    public VulkanDevice.Buffer? Q8_1XqRows { get; private set; }   // [seqLen*maxK/4] packed int8
+    public VulkanDevice.Buffer? Q8_1XdsRows { get; private set; }  // [seqLen*maxK/32] (d, s)
+    private int _q8_1RowsMaxK; // per-row K the rows-scratch is currently sized for
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 
@@ -213,17 +228,9 @@ internal sealed class VulkanForwardState : IDisposable
         _moeSharedIntermediateSize = moeSharedIntermediateSize;
         _moeNumSharedExperts = moeNumSharedExperts;
 
-        // LM-head logits are always one token (last). Positions buffer sized for some reasonable
-        // default; grows with EnsureCapacity.
-        Logits = device.Allocate((long)vocabSize * sizeof(float));
-        PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
-
-        AllocateForCapacity(Math.Max(1, initialSeqLen));
-
-        // Q8_1 activation-quantization scratch — decode-only (one row), so its
-        // size is independent of seqLen capacity. Sized to the largest matmul
-        // inputDim (the down-projection's intermediate size, or hidden /
-        // moe-intermediate where larger). int8 quant is per-32-block, so K must
+        // Largest matmul inputDim (K) drives both Q8_1 activation scratches.
+        // Sized to the down-projection's intermediate size, or hidden /
+        // moe-intermediate where larger. int8 quant is per-32-block, so K must
         // be a multiple of 32 — round up defensively (any caller dispatches at
         // the model's natural K which is already a 32-multiple for Q8_0).
         if (_mmvqEnabled)
@@ -231,11 +238,26 @@ internal sealed class VulkanForwardState : IDisposable
             int maxK = Math.Max(hiddenSize, intermediateSize);
             if (moeIntermediateSize > 0) maxK = Math.Max(maxK, moeIntermediateSize);
             if (moeSharedIntermediateSize > 0) maxK = Math.Max(maxK, moeSharedIntermediateSize);
-            maxK = (maxK + 31) / 32 * 32;
+            _q8_1MaxK = (maxK + 31) / 32 * 32;
+        }
 
+        // LM-head logits are always one token (last). Positions buffer sized for some reasonable
+        // default; grows with EnsureCapacity.
+        Logits = device.Allocate((long)vocabSize * sizeof(float));
+        PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
+
+        // AllocateForCapacity allocates the per-seqLen prefill MMQ scratch
+        // (Q8_1XqRows / Q8_1XdsRows) sized by _q8_1MaxK, so it must run after
+        // _q8_1MaxK is set above.
+        AllocateForCapacity(Math.Max(1, initialSeqLen));
+
+        // Q8_1 activation-quantization scratch — decode-only (one row), so its
+        // size is independent of seqLen capacity.
+        if (_mmvqEnabled)
+        {
             // Packed int8: K/4 uints. Scales: K/32 vec2.
-            Q8_1Xq = device.AllocateDeviceLocal((long)(maxK / 4) * sizeof(uint));
-            Q8_1Xds = device.AllocateDeviceLocal((long)(maxK / 32) * 2 * sizeof(float));
+            Q8_1Xq = device.AllocateDeviceLocal((long)(_q8_1MaxK / 4) * sizeof(uint));
+            Q8_1Xds = device.AllocateDeviceLocal((long)(_q8_1MaxK / 32) * 2 * sizeof(float));
             AllocatedBytes += Q8_1Xq.Size + Q8_1Xds.Size;
         }
     }
@@ -342,11 +364,23 @@ internal sealed class VulkanForwardState : IDisposable
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
 
+        // Prefill MMQ activation scratch — [seqLen, maxK] packed int8 + scales.
+        // Only when the dp4a path is wired (mmvqEnabled). Released alongside the
+        // other layer scratch in ReleaseLayerScratch, re-allocated here.
+        long mmqRowsBytes = 0;
+        if (_mmvqEnabled && _q8_1MaxK > 0)
+        {
+            Q8_1XqRows = _device.AllocateDeviceLocal((long)seqLen * (_q8_1MaxK / 4) * sizeof(uint));
+            Q8_1XdsRows = _device.AllocateDeviceLocal((long)seqLen * (_q8_1MaxK / 32) * 2 * sizeof(float));
+            _q8_1RowsMaxK = _q8_1MaxK;
+            mmqRowsBytes = Q8_1XqRows.Size + Q8_1XdsRows.Size;
+        }
+
         _capacitySeqLen = seqLen;
 
         // hiddenBytes × 3: two hidden slots (HiddenState/AddScratch rotate) + NormOutput.
         AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
-                       + mlaBytes + moeBytes
+                       + mlaBytes + moeBytes + mmqRowsBytes
                        + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
     }
 
@@ -504,6 +538,13 @@ internal sealed class VulkanForwardState : IDisposable
         LoraDeltaSum?.Dispose(); LoraDeltaSum = null;
         _loraCapacityRank = 0;
         _loraCapacityOutputDim = 0;
+
+        // Prefill MMQ activation scratch — sized in seqLen × maxK, grows with
+        // EnsureCapacity, so it is released here and re-allocated in
+        // AllocateForCapacity at the new seqLen.
+        Q8_1XqRows?.Dispose(); Q8_1XqRows = null;
+        Q8_1XdsRows?.Dispose(); Q8_1XdsRows = null;
+        _q8_1RowsMaxK = 0;
     }
 
     public void Dispose()
