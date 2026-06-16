@@ -643,7 +643,13 @@ public sealed class VulkanTransformerModel : IModel
         MatMulQ8_0Dp4aPqKernel? matmulQ8Dp4aPq = null;
         if (device.HasIntegerDotProduct)
         {
-            try { matmulQ8Dp4aPq = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir); }
+            // Pool sized from the layer count: each layer contributes a handful of
+            // DP4a (weights,output) gemv sets + a few shared activation-quant sets;
+            // 16/layer is comfortable headroom (dense K/V/O/up/down + MoE router/
+            // shared), plus lm_head and overhead. Floor at the default so shallow
+            // models keep the prior capacity.
+            int dp4aMaxSets = Math.Max(1024, config.NumLayers * 16 + 128);
+            try { matmulQ8Dp4aPq = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir, dp4aMaxSets); }
             catch (FileNotFoundException) { /* DP4a SPV not built — keep scalar Q8_0. */ }
         }
         // Default-on for Intel/Arc, where the Q8_0 decode GEMV is ALU/dequant-bound

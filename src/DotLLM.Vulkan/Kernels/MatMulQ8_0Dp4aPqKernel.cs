@@ -64,11 +64,21 @@ public sealed class MatMulQ8_0Dp4aPqKernel : IDisposable
     /// </summary>
     /// <param name="device">Device; must report <see cref="VulkanDevice.HasIntegerDotProduct"/>.</param>
     /// <param name="spvDir">Directory containing the compiled SPIR-V blobs.</param>
+    /// <param name="maxDescriptorSets">
+    /// Descriptor-pool capacity (sets). One gemv set is minted per distinct
+    /// (weights, output) pair and one quant set per distinct activation buffer, so
+    /// a full model needs roughly <c>numLayers × (DP4a projections per layer)</c>
+    /// plus lm_head and any MoE router/shared-expert sets. The forward pass sizes
+    /// this from the layer count; the default covers shallow models / standalone
+    /// kernel use. Too small a pool surfaces as <c>VK_ERROR_OUT_OF_POOL_MEMORY</c>
+    /// on the first deep model.
+    /// </param>
     /// <returns>An initialized kernel.</returns>
     /// <exception cref="NotSupportedException">If the device lacks integer dot product support.</exception>
     /// <exception cref="FileNotFoundException">If a SPIR-V blob is missing.</exception>
-    public static MatMulQ8_0Dp4aPqKernel Create(VulkanDevice device, string spvDir)
+    public static MatMulQ8_0Dp4aPqKernel Create(VulkanDevice device, string spvDir, int maxDescriptorSets = 1024)
     {
+        if (maxDescriptorSets <= 0) throw new ArgumentOutOfRangeException(nameof(maxDescriptorSets));
         if (!device.HasIntegerDotProduct)
             throw new NotSupportedException(
                 "Device does not support VK_KHR_shader_integer_dot_product; use MatMulQ8_0Kernel instead.");
@@ -109,8 +119,9 @@ public sealed class MatMulQ8_0Dp4aPqKernel : IDisposable
             throw;
         }
 
-        // One pool sized for the wider (4-buffer) set covers both caches.
-        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+        // One pool sized for the wider (4-buffer) set covers both caches; capacity
+        // scales with the model so deep models don't exhaust it.
+        nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4, maxSets: (uint)maxDescriptorSets);
         return new MatMulQ8_0Dp4aPqKernel(device, quantModule, quantPipeline, gemvModule, gemvPipeline, pool);
     }
 
