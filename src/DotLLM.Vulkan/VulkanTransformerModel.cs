@@ -83,6 +83,10 @@ public sealed class VulkanTransformerModel : IModel
     // (device supports integer dot product AND the env opt-in is set). When
     // false, RecordMatmul keeps the FP32-activation _matmulQ8 path.
     private readonly bool _dp4aEnabled;
+    // When true (default with DP4a on), RecordSharedInputMatmulPair quantizes the
+    // shared input once for both projections; DOTLLM_VULKAN_DP4A_NO_SHARE=1 forces
+    // the per-matmul path for the share-vs-no-share equivalence test.
+    private readonly bool _dp4aShareActivation;
     // Q2_K + Q3_K matmul kernels — completes the K-quant family on Vulkan.
     // Always created; the dispatcher in RecordMatmul branches on the
     // device-side QuantizationType per call. No coopmat variants — follow-up
@@ -387,6 +391,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmq = matmulQ8Mmq;
         _matmulQ8Dp4aPq = matmulQ8Dp4aPq;
         _dp4aEnabled = dp4aEnabled;
+        // Shared-activation-quant across same-input projection groups (K/V) is on
+        // by default when DP4a is; DOTLLM_VULKAN_DP4A_NO_SHARE=1 forces the
+        // per-matmul fallback so a test can assert share == no-share bit-for-bit.
+        _dp4aShareActivation = dp4aEnabled
+            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE") != "1";
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -2691,7 +2700,7 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice.Buffer weightsA, QuantType qtA, VulkanDevice.Buffer outputA, int outputDimA,
         VulkanDevice.Buffer weightsB, QuantType qtB, VulkanDevice.Buffer outputB, int outputDimB)
     {
-        if (_dp4aEnabled && seqLen == 1
+        if (_dp4aEnabled && _dp4aShareActivation && seqLen == 1
             && qtA == QuantType.Q8_0 && qtB == QuantType.Q8_0)
         {
             // One activation quant shared by both projections.
