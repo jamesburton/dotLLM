@@ -131,7 +131,13 @@ public static unsafe partial class MatMul
     {
         int rowBytes = blockCount * Q8_0BlockBytes;
 
-        if (Avx512BW.IsSupported)
+        if (IsQ8_0VnniSupported)
+        {
+            // VNNI vpdpbusd fused integer dot: 1 instruction / 32-lane block vs the
+            // abs/sign + dual-madd AVX2/AVX-512 emulation. See MatMulVnni.cs.
+            ComputeRowsVnni(weightsQ8, xQ8, result, m, blockCount);
+        }
+        else if (Avx512BW.IsSupported)
         {
             int row = 0;
             // Process 4 rows at a time for cache efficiency.
