@@ -1,0 +1,183 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q8_0 MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_q8[M, K]^T
+//
+// Both operands are int8 here. The activation B[N, K] has been pre-quantized
+// to Q8_1 row-wise (quantize_q8_1_rows.comp) into a packed-int8 tile + per-32-
+// block fp32 (scale, sum). The Q8_0 weights are int8 (fp16 scale + 32 int8).
+// For each 32-block the raw integer dot product
+//   acc = sum_i  w_qs[i] * x_qs[i]            (int8 * int8 -> int32)
+// is accumulated with dotPacked4x8AccSatEXT (4 int8 MACs/instruction), then
+// scaled by d_w * d_x. Q8_0 is symmetric (no min term) so the Q8_1 block-sum
+// is unused; it is carried for the K-quant MMQ kernels that follow.
+//
+// This is the compute-bound prefill analogue of matmul_q8_0_mmvq.comp. It is
+// NOT bit-exact vs the F32-in GEMM: B is int8-quantized first. Per-32-block
+// scaling keeps the activation quant near-lossless (validated against the CPU
+// F32 oracle with a tolerance + argmax-exact test).
+//
+// Weight byte layout (identical to matmul_q8_0_gemm.comp):
+//   row stride = (K / 32) * 34 bytes; each 34-byte block = 2-byte fp16 scale
+//   + 32 signed int8 qs. Read as uint[] with explicit byte shifts.
+//
+// Activation layout (from quantize_q8_1_rows.comp):
+//   xq : uint[N * K/4]  — row r at r*(K/4); 4 int8 lanes/uint, naturally aligned.
+//   xds: vec2[N * K/32] — row r at r*(K/32); (.x = d_x, .y = s_x) per 32-block.
+//
+// Tiling: output tile = TILE_N rows × TILE_M cols of C = 16×16 = 256 cells, one
+// thread per cell (workgroup 16×16). Per K-block iteration:
+//   1. Cooperatively stage the 16×8-uint activation tile (sharedXq) + its 16
+//      fp32 d_x scales (sharedDx) into shared memory.
+//   2. Cooperatively stage the 16×8-uint weight tile (sharedWq) + its 16 fp32
+//      d_w scales (sharedDw) — the qs bytes are funnel-read from the 34-byte
+//      blocks into 8 aligned uints per row, dequant-free (kept as int8).
+//   3. Each thread runs dp4a over its (t_row, m_row) 8-uint pair, scales the
+//      int32 block dot by d_w * d_x, accumulates into an fp32 register.
+// Staging amortizes the weight funnel-read across 16 tokens and the activation
+// load across 16 weight rows.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N*K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N*K/32]
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };       // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output dim (weight rows)
+    uint K;            // contraction dim (multiple of 32)
+    uint N;            // batch size (input rows)
+    uint blocksPerRow; // = K / 32
+    uint rowUints;     // per-row uint stride bound (rounded up; unused here)
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint BLOCK = 32u;          // Q8_0 group size
+const uint BLOCK_BYTES = 34u;
+const uint UINTS_PER_BLOCK = 8u; // 32 int8 / 4 per uint
+
+// One K-block tile: 16 rows × 8 uints of packed int8 each, for B and W.
+shared uint  sharedXq[TILE_N * UINTS_PER_BLOCK]; // 128 uints
+shared uint  sharedWq[TILE_M * UINTS_PER_BLOCK]; // 128 uints
+shared float sharedDx[TILE_N];                   // per-token activation scale
+shared float sharedDw[TILE_M];                   // per-row weight scale
+
+// Read the fp16 scale at absolute byte offset (handles straddled uint words).
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x; // weight row / C col
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y; // token row / C row
+
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x; // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
+
+    float acc = 0.0;
+
+    for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
+        // ---- 1. Stage sharedXq[16][8] + sharedDx[16]. ----
+        // 256 threads, 128 uints -> first 128 threads load one uint each.
+        // Activation row r, block kBlock: uints at r*(K/4) + kBlock*8 + lane.
+        {
+            uint rLocal = tid >> 3u;        // 0..15 token within tile (128 threads)
+            uint lane   = tid & 7u;         // 0..7 uint within block
+            if (tid < TILE_N * UINTS_PER_BLOCK) {
+                uint tGlobal = tBase + rLocal;
+                uint v = 0u;
+                if (tGlobal < pc.N) {
+                    uint xqRowBase = tGlobal * (pc.K >> 2u);
+                    v = xq[xqRowBase + kBlock * UINTS_PER_BLOCK + lane];
+                }
+                sharedXq[rLocal * UINTS_PER_BLOCK + lane] = v;
+            }
+        }
+        // d_x scales: 16 values, first 16 threads.
+        if (tid < TILE_N) {
+            uint tGlobal = tBase + tid;
+            float dx = 0.0;
+            if (tGlobal < pc.N) {
+                dx = xds[tGlobal * pc.blocksPerRow + kBlock].x;
+            }
+            sharedDx[tid] = dx;
+        }
+
+        // ---- 2. Stage sharedWq[16][8] + sharedDw[16]. ----
+        // Funnel-read the 32 weight qs bytes of (weight row, kBlock) into 8
+        // aligned uints, matching matmul_q8_0_mmvq.comp's phase funnel. The
+        // 34-byte block stride makes the qs region (block+2) alternately 0- or
+        // 2-aligned (mod 4) across blocks.
+        {
+            uint rLocal = tid >> 3u;        // 0..15 weight row within tile
+            uint lane   = tid & 7u;         // 0..7 uint within block
+            if (tid < TILE_M * UINTS_PER_BLOCK) {
+                uint mGlobal = mBase + rLocal;
+                uint wWord = 0u;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kBlock * BLOCK_BYTES;
+                    uint q = blockByteBase + 2u;
+                    uint ubase = q >> 2u;
+                    uint ph = q & 3u;       // 0 or 2
+                    if (ph == 0u) {
+                        wWord = weight[ubase + lane];
+                    } else {
+                        uint lo = weight[ubase + lane];
+                        uint hi = weight[ubase + lane + 1u];
+                        wWord = (lo >> 16u) | (hi << 16u);
+                    }
+                }
+                sharedWq[rLocal * UINTS_PER_BLOCK + lane] = wWord;
+            }
+        }
+        // d_w scales: 16 values, first 16 threads.
+        if (tid < TILE_M) {
+            uint mGlobal = mBase + tid;
+            float dw = 0.0;
+            if (mGlobal < pc.M) {
+                uint blockByteBase = mGlobal * rowByteStride + kBlock * BLOCK_BYTES;
+                dw = readHalf(blockByteBase);
+            }
+            sharedDw[tid] = dw;
+        }
+
+        barrier();
+
+        // ---- 3. dp4a over this block for output cell (t, m). ----
+        {
+            uint xOff = gl_LocalInvocationID.y * UINTS_PER_BLOCK; // sharedXq row
+            uint wOff = gl_LocalInvocationID.x * UINTS_PER_BLOCK; // sharedWq row
+            int dotI = 0;
+            for (uint g = 0u; g < UINTS_PER_BLOCK; g++) {
+                dotI = dotPacked4x8AccSatEXT(
+                    int(sharedWq[wOff + g]), int(sharedXq[xOff + g]), dotI);
+            }
+            float scale = sharedDw[gl_LocalInvocationID.x] * sharedDx[gl_LocalInvocationID.y];
+            acc += scale * float(dotI);
+        }
+
+        barrier();
+    }
+
+    // ---- 4. Store output if within [N, M] bounds. ----
+    if (m < pc.M && t < pc.N) {
+        c[t * pc.M + m] = acc;
+    }
+}

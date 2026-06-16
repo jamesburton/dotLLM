@@ -1,0 +1,79 @@
+#version 450
+// Multi-row activation quantization: FP32 B[N, K] -> Q8_1 (per-32-block int8 +
+// fp32 scale + fp32 sum), one quantized row per input row.
+//
+// This is the prefill (seqLen>1) analogue of quantize_q8_1.comp: it feeds the
+// integer-dot MMQ GEMM (matmul_q8_0_mmq.comp). The decode quantizer handles a
+// single activation row in one workgroup; here each workgroup quantizes one of
+// the N rows so the activation B-matrix becomes a packed-int8 tile the dp4a
+// MMQ kernel can stream against the int8 Q8_0 weights.
+//
+// Q8_1 block (32 elements), identical math to quantize_q8_1.comp:
+//   d = amax / 127
+//   qs[i] = round(x[i] / d)  in [-127, 127]
+//   s = d * sum(qs[i])       (block sum; carried for asymmetric weight formats)
+//
+// Output layout (two parallel buffers, row-major over N):
+//   xq : uint[N * K/4]   — 4 signed int8 lanes per uint; row r at r*(K/4).
+//   xds: vec2[N * K/32]  — (.x = d, .y = s) per 32-block; row r at r*(K/32).
+//
+// Dispatch: gl_NumWorkGroups.x == N (one workgroup per row), local_size_x
+// threads grid-stride over the row's 32-blocks.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufX   { float x[]; };   // [N*K]
+layout(set = 0, binding = 1, std430) writeonly buffer BufXq  { uint  xq[]; };   // [N*K/4]
+layout(set = 0, binding = 2, std430) writeonly buffer BufXds { vec2  xds[]; };  // [N*K/32]
+
+layout(push_constant) uniform PushConstants {
+    uint K;            // activation length per row (multiple of 32)
+    uint blocksPerRow; // = K / 32
+    uint N;            // number of rows
+} pc;
+
+const uint QK = 32u; // elements per Q8_1 block
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint xRowBase  = row * pc.K;              // float index of this row's x
+    uint qRowBase  = row * (pc.K >> 2u);      // uint index of this row's xq
+    uint dsRowBase = row * pc.blocksPerRow;   // vec2 index of this row's xds
+
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint base = xRowBase + b * QK;
+
+        // Pass 1: amax over the 32 elements.
+        float amax = 0.0;
+        for (uint i = 0u; i < QK; i++) {
+            amax = max(amax, abs(x[base + i]));
+        }
+
+        float d = amax / 127.0;
+        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+        // Pass 2: quantize + pack 4 int8 lanes per uint, accumulate sum.
+        int sumI = 0;
+        uint qBase = qRowBase + (b * QK >> 2u); // 4 elements per uint
+        for (uint g = 0u; g < QK / 4u; g++) {
+            uint e = base + g * 4u;
+            int q0 = int(round(x[e + 0u] * id));
+            int q1 = int(round(x[e + 1u] * id));
+            int q2 = int(round(x[e + 2u] * id));
+            int q3 = int(round(x[e + 3u] * id));
+            sumI += q0 + q1 + q2 + q3;
+            uint packed = (uint(q0) & 0xFFu)
+                        | ((uint(q1) & 0xFFu) << 8u)
+                        | ((uint(q2) & 0xFFu) << 16u)
+                        | ((uint(q3) & 0xFFu) << 24u);
+            xq[qBase + g] = packed;
+        }
+
+        xds[dsRowBase + b] = vec2(d, d * float(sumI));
+    }
+}
