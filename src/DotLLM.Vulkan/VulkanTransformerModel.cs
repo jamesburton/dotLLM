@@ -832,6 +832,17 @@ public sealed class VulkanTransformerModel : IModel
         if (config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true })
             throw new NotSupportedException(
                 "MLA latent / hybrid KV-cache modes are not supported on the Vulkan backend yet; use the default expanded cache.");
+        // Gemma-4 / DiffusionGemma MoE is not yet wired into the Vulkan backend: it
+        // stores a FUSED gate_up expert bank + separate down bank + per-expert down-scale
+        // (not the standard per-expert gate/up/down slots), so weight upload would hit a
+        // null slot. Fail fast with a clear message rather than a NullReferenceException
+        // deep in UploadMoeLayer. See docs/diffusiongemma/GEMMA4-GPU-GAPS.md for the
+        // remaining work (fused-bank upload, dual-FFN graph, Q4_K/Q5_1 indexed MoE matmul).
+        if (config.Gemma4DualFfn)
+            throw new NotSupportedException(
+                "Gemma-4 MoE (gemma4 / DiffusionGemma) is not supported on the Vulkan backend yet "
+                + "(fused gate_up expert bank + dual-FFN graph + Q4_K/Q5_1 indexed MoE matmul not wired). "
+                + "See docs/diffusiongemma/GEMMA4-GPU-GAPS.md. Use the CPU backend.");
     }
 
     /// <inheritdoc/>
