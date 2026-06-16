@@ -21,6 +21,15 @@ public static class GgufModelConfigExtractor
         Architecture architecture = ParseArchitecture(archString);
         string arch = archString.ToLowerInvariant();
 
+        // Gemma 4 / DiffusionGemma have a fundamentally different per-layer shape
+        // (dual head_dim, dual KV-head count stored as a per-layer array, dual
+        // RoPE per attention type, MoE experts) that does not fit the generic
+        // scalar path below — in particular `attention.head_count_kv` is a
+        // per-layer Int32 ARRAY here, which the generic GetUInt32 path cannot
+        // read. Build it via the dedicated extractor.
+        if (architecture is Architecture.Gemma4 or Architecture.DiffusionGemma)
+            return BuildGemma4Config(metadata, arch, architecture);
+
         int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
         int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
         int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
@@ -508,8 +517,211 @@ public static class GgufModelConfigExtractor
             // V3 / V3-MoE — MLA + sigmoid-gated routing + group-norm experts.
             "deepseek3" => Architecture.DeepSeekV3,
             "nemotron_h" => Architecture.NemotronH,
+            // Gemma 4 MoE text tower (llama.cpp `gemma4` arch). Dual head-dim /
+            // dual KV-head / dual-RoPE-per-attention-type + MoE experts. See
+            // BuildGemma4Config for the full GGUF → ModelConfig mapping.
+            "gemma4" => Architecture.Gemma4,
+            // DiffusionGemma — the Gemma 4 MoE tower run as a masked-canvas block
+            // diffusion model. Same `gemma4` backbone; the `diffusion-gemma` GGUF
+            // adds `diffusion.canvas_length` + a `<mask>` token, which
+            // BuildGemma4Config turns into a non-null DiffusionConfig.
+            "diffusion-gemma" or "diffusion_gemma" => Architecture.DiffusionGemma,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
+    }
+
+    /// <summary>
+    /// Builds a Gemma-4 MoE <see cref="ModelConfig"/> from a llama.cpp
+    /// <c>gemma4</c> / <c>diffusion-gemma</c> GGUF. This is the GGUF counterpart
+    /// of <see cref="DotLLM.Models.SafeTensors.DiffusionGemmaConfigExtractor"/>
+    /// and produces an identically-shaped config (dual head dim, dual KV-head
+    /// count, dual RoPE per attention type, MoE experts, soft-cap, embedding
+    /// scale, per-layer sliding-window pattern).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Per-layer arrays.</b> Unlike Gemma 3, the gemma4 GGUF stores
+    /// <c>attention.head_count_kv</c> as a per-layer Int32 array (e.g.
+    /// <c>[8,8,8,8,8,2, …]</c>) and <c>attention.sliding_window_pattern</c> as a
+    /// per-layer 0/1 array (<c>1</c> = sliding/local layer, <c>0</c> = full/global
+    /// layer). The two arrays are correlated: sliding layers carry the larger KV
+    /// count (<c>num_key_value_heads</c>, e.g. 8) and the SWA head dim / local RoPE;
+    /// full layers carry the smaller KV count (<c>num_global_key_value_heads</c>,
+    /// e.g. 2) and the global head dim / global RoPE. The sliding values land on
+    /// <see cref="ModelConfig.NumKvHeads"/>/<see cref="ModelConfig.HeadDim"/>/
+    /// <see cref="ModelConfig.RoPEConfig"/>; the full values on
+    /// <see cref="ModelConfig.NumGlobalKvHeads"/>/<see cref="ModelConfig.GlobalHeadDim"/>/
+    /// <see cref="ModelConfig.GlobalRoPEConfig"/>.</para>
+    /// <para><b>Partial rotary.</b> llama.cpp bakes the partial-rotary factor into
+    /// <c>rope.dimension_count(_swa)</c> directly (it stores the actual rotated
+    /// dim, not a fraction). We therefore set the RoPE <c>DimensionCount</c> from
+    /// those keys and leave <see cref="ModelConfig.PartialRotaryFactor"/> null — the
+    /// forward path uses <c>DimensionCount</c> as the rotated span when the factor
+    /// is null, which is exactly the GGUF representation.</para>
+    /// <para><b>PLE / AltUp / Laurel.</b> The released
+    /// <c>unsloth/gemma-4-26B-A4B</c> and <c>diffusiongemma-26B</c> GGUFs report
+    /// <c>embedding_length_per_layer_input = 0</c> and carry no
+    /// <c>per_layer_*</c>/<c>altup</c>/<c>laurel</c> tensors — this conversion does
+    /// NOT use Gemma-3n-style per-layer embeddings / alternating updates / learned
+    /// augmented residuals, so none are wired here.</para>
+    /// </remarks>
+    private static ModelConfig BuildGemma4Config(GgufMetadata metadata, string arch, Architecture architecture)
+    {
+        int hiddenSize = (int)metadata.GetUInt32($"{arch}.embedding_length");
+        int numLayers = (int)metadata.GetUInt32($"{arch}.block_count");
+        int numAttentionHeads = (int)metadata.GetUInt32($"{arch}.attention.head_count");
+        int maxSeqLen = (int)metadata.GetUInt32OrDefault($"{arch}.context_length", 2048);
+        float normEps = metadata.GetFloat32OrDefault($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
+        int vocabSize = ResolveVocabSize(metadata, arch);
+
+        // Dense FFN width (the non-expert ffn_up/gate/down on every layer — Gemma 4
+        // keeps a dense MLP alongside the routed experts). Stored under
+        // feed_forward_length; expert width is separate (expert_feed_forward_length).
+        int intermediateSize = (int)metadata.GetUInt32OrDefault($"{arch}.feed_forward_length", 0);
+
+        // Sliding-window pattern: per-layer 1 (sliding/local) / 0 (full/global).
+        int slidingWindow = (int)metadata.GetUInt32OrDefault($"{arch}.attention.sliding_window", 1024);
+        if (slidingWindow <= 0) slidingWindow = 1024;
+        int[] swPattern = GetIntArrayOrEmpty(metadata, $"{arch}.attention.sliding_window_pattern");
+        var perLayerSliding = new int?[numLayers];
+        for (int i = 0; i < numLayers; i++)
+        {
+            bool isSliding = i < swPattern.Length ? swPattern[i] != 0 : false;
+            perLayerSliding[i] = isSliding ? slidingWindow : (int?)null;
+        }
+
+        // Per-layer KV-head array → (sliding count, full count). When a layer is
+        // sliding its entry is the local KV count; full layers carry the global
+        // KV count. Derive each by scanning for the first layer of each kind.
+        int[] kvArray = GetIntArrayOrEmpty(metadata, $"{arch}.attention.head_count_kv");
+        int slidingKv = numAttentionHeads, globalKv = numAttentionHeads;
+        bool sawSliding = false, sawGlobal = false;
+        for (int i = 0; i < numLayers && i < kvArray.Length; i++)
+        {
+            bool isSliding = perLayerSliding[i] is not null;
+            if (isSliding && !sawSliding) { slidingKv = kvArray[i]; sawSliding = true; }
+            if (!isSliding && !sawGlobal) { globalKv = kvArray[i]; sawGlobal = true; }
+        }
+        if (kvArray.Length == 0)
+            slidingKv = globalKv = (int)metadata.GetUInt32OrDefault($"{arch}.attention.head_count_kv", (uint)numAttentionHeads);
+        int? numGlobalKvHeads = sawGlobal && globalKv != slidingKv ? globalKv : null;
+
+        // Dual head dim: key_length_swa = sliding head dim, key_length = full head dim.
+        int slidingHeadDim = (int)metadata.GetUInt32OrDefault($"{arch}.attention.key_length_swa",
+            metadata.GetUInt32OrDefault($"{arch}.attention.key_length", (uint)(hiddenSize / numAttentionHeads)));
+        int globalHeadDim = (int)metadata.GetUInt32OrDefault($"{arch}.attention.key_length",
+            (uint)slidingHeadDim);
+        int? globalHeadDimNullable = globalHeadDim != slidingHeadDim ? globalHeadDim : null;
+
+        // Dual RoPE: *_swa keys are the sliding (local) schedule; the bare keys are
+        // the full (global) schedule. llama.cpp bakes the partial-rotary factor into
+        // rope.dimension_count(_swa) — we use those dims directly and leave
+        // PartialRotaryFactor null.
+        float slidingTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base_swa",
+            metadata.GetFloat32OrDefault($"{arch}.rope.freq_base", 10000.0f));
+        int slidingRopeDim = (int)metadata.GetUInt32OrDefault($"{arch}.rope.dimension_count_swa",
+            (uint)slidingHeadDim);
+        float globalTheta = metadata.GetFloat32OrDefault($"{arch}.rope.freq_base", 1_000_000.0f);
+        int globalRopeDim = (int)metadata.GetUInt32OrDefault($"{arch}.rope.dimension_count",
+            (uint)globalHeadDim);
+
+        var slidingRope = new RoPEConfig(Theta: slidingTheta, DimensionCount: slidingRopeDim, Type: RoPEType.NeoX);
+        var globalRope = new RoPEConfig(Theta: globalTheta, DimensionCount: globalRopeDim, Type: RoPEType.NeoX);
+
+        // MoE experts (expert_count / expert_used_count / expert_feed_forward_length).
+        MoeConfig? moe = null;
+        uint expertCount = metadata.GetUInt32OrDefault($"{arch}.expert_count", 0);
+        if (expertCount > 0)
+        {
+            moe = new MoeConfig
+            {
+                NumExperts = (int)expertCount,
+                NumExpertsPerTok = (int)metadata.GetUInt32($"{arch}.expert_used_count"),
+                MoeIntermediateSize = (int)metadata.GetUInt32($"{arch}.expert_feed_forward_length"),
+                NormTopKProb = true,
+            };
+        }
+
+        float? finalLogitSoftcap = null;
+        float fls = metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0f);
+        if (fls > 0f) finalLogitSoftcap = fls;
+        float? attnLogitSoftcap = null;
+        float als = metadata.GetFloat32OrDefault($"{arch}.attn_logit_softcapping", 0f);
+        if (als > 0f) attnLogitSoftcap = als;
+
+        string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
+        if (string.IsNullOrEmpty(chatTemplate)) chatTemplate = null;
+
+        // DiffusionGemma: a non-null DiffusionConfig (canvas length + mask token).
+        DiffusionConfig? diffusion = null;
+        if (architecture is Architecture.DiffusionGemma)
+        {
+            int canvas = (int)metadata.GetUInt32OrDefault("diffusion.canvas_length", 256);
+            int maskTokenId = (int)metadata.GetUInt32OrDefault("tokenizer.ggml.mask_token_id", uint.MaxValue);
+            if (maskTokenId == int.MaxValue || maskTokenId < 0)
+                throw new InvalidDataException(
+                    "diffusion-gemma GGUF is missing 'tokenizer.ggml.mask_token_id'; a diffusion model cannot decode without a mask token.");
+            diffusion = new DiffusionConfig
+            {
+                CanvasLength = canvas,
+                MaskTokenId = maskTokenId,
+                CanvasAttentionMode = DotLLM.Core.Attention.AttentionMaskMode.Hybrid,
+            };
+        }
+
+        return new ModelConfig
+        {
+            Architecture = architecture,
+            VocabSize = vocabSize,
+            HiddenSize = hiddenSize,
+            IntermediateSize = intermediateSize,
+            NumLayers = numLayers,
+            NumAttentionHeads = numAttentionHeads,
+            NumKvHeads = slidingKv,
+            HeadDim = slidingHeadDim,
+            MaxSequenceLength = maxSeqLen,
+            AttentionType = AttentionType.GQA,
+            PositionEncodingType = PositionEncodingType.RoPE,
+            RoPEConfig = slidingRope,
+            GlobalRoPEConfig = globalRope,
+            PartialRotaryFactor = null,
+            NumGlobalKvHeads = numGlobalKvHeads,
+            GlobalHeadDim = globalHeadDimNullable,
+            ActivationFunction = ActivationFunction.GELUTanh,
+            NormType = NormType.RMSNorm,
+            NormEpsilon = normEps,
+            // Gemma ties input/output embeddings.
+            TiedEmbeddings = true,
+            SlidingWindowSize = slidingWindow,
+            PerLayerSlidingWindow = perLayerSliding,
+            AttnLogitSoftcap = attnLogitSoftcap,
+            FinalLogitSoftcap = finalLogitSoftcap,
+            EmbeddingScale = MathF.Sqrt(hiddenSize),
+            Moe = moe,
+            ChatTemplate = chatTemplate,
+            DiffusionConfig = diffusion,
+        };
+    }
+
+    /// <summary>
+    /// Reads a GGUF metadata key as an Int32 array, tolerating the UInt32 array
+    /// encoding llama.cpp uses for unsigned per-layer values. Returns an empty
+    /// array when the key is absent or not an array.
+    /// </summary>
+    private static int[] GetIntArrayOrEmpty(GgufMetadata metadata, string key)
+    {
+        if (!metadata.TryGetValue(key, out var entry) || entry.Type != GgufValueType.Array)
+            return Array.Empty<int>();
+        // The element type can be Int32 or UInt32 depending on the writer; the
+        // underlying value object is int[] or uint[] respectively.
+        if (entry.Value is int[] ints)
+            return ints;
+        if (entry.Value is uint[] uints)
+        {
+            var r = new int[uints.Length];
+            for (int i = 0; i < uints.Length; i++) r[i] = (int)uints[i];
+            return r;
+        }
+        return Array.Empty<int>();
     }
 
     private static int ResolveVocabSize(GgufMetadata metadata, string arch)

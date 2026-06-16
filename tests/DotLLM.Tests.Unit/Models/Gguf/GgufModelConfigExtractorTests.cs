@@ -517,4 +517,137 @@ public class GgufModelConfigExtractorTests
         Assert.Equal(32.0f, config.RoPEConfig.Value.BetaFast);
         Assert.Equal(1.0f, config.RoPEConfig.Value.BetaSlow);
     }
+
+    // -------------------------------------------------------------------------
+    // Gemma 4 / DiffusionGemma. The synthetic metadata mirrors the real
+    // unsloth/gemma-4-26B-A4B-it GGUF shape: 30 layers, sliding pattern with a
+    // full layer every 6th (indices 5,11,17,23,29), dual KV head counts
+    // (8 sliding / 2 global), dual head dim (256 swa / 512 global), dual RoPE
+    // (theta 1e4 swa / 1e6 global, dim 256/512), MoE 128 experts / top-8,
+    // final-logit softcap 30.
+    // -------------------------------------------------------------------------
+    private static GgufMetadata BuildGemma4Metadata(string arch, Action<GgufTestData>? extra = null)
+    {
+        // sliding_window_pattern: 1 = sliding/local, 0 = full/global. Full every 6th (1-indexed).
+        int n = 30;
+        var pattern = new int[n];
+        var kv = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            bool isFull = ((i + 1) % 6) == 0;
+            pattern[i] = isFull ? 0 : 1;
+            kv[i] = isFull ? 2 : 8;
+        }
+
+        return BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", arch);
+            d.AddUInt32($"{arch}.embedding_length", 2816);
+            d.AddUInt32($"{arch}.block_count", (uint)n);
+            d.AddUInt32($"{arch}.attention.head_count", 16);
+            d.AddInt32Array($"{arch}.attention.head_count_kv", kv);
+            d.AddUInt32($"{arch}.feed_forward_length", 2112);
+            d.AddUInt32($"{arch}.context_length", 262144);
+            d.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
+            d.AddUInt32($"{arch}.attention.key_length", 512);
+            d.AddUInt32($"{arch}.attention.key_length_swa", 256);
+            d.AddUInt32($"{arch}.attention.sliding_window", 1024);
+            d.AddInt32Array($"{arch}.attention.sliding_window_pattern", pattern);
+            d.AddFloat32($"{arch}.rope.freq_base", 1_000_000.0f);
+            d.AddFloat32($"{arch}.rope.freq_base_swa", 10_000.0f);
+            d.AddUInt32($"{arch}.rope.dimension_count", 512);
+            d.AddUInt32($"{arch}.rope.dimension_count_swa", 256);
+            d.AddUInt32($"{arch}.expert_count", 128);
+            d.AddUInt32($"{arch}.expert_used_count", 8);
+            d.AddUInt32($"{arch}.expert_feed_forward_length", 704);
+            d.AddFloat32($"{arch}.final_logit_softcapping", 30.0f);
+            d.AddUInt32($"{arch}.vocab_size", 262144);
+            extra?.Invoke(d);
+        });
+    }
+
+    [Fact]
+    public void Extract_Gemma4_DualHeadDim_DualKv_DualRope_Moe()
+    {
+        var metadata = BuildGemma4Metadata("gemma4");
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(Architecture.Gemma4, config.Architecture);
+        Assert.True(config.IsGemmaArchitecture);
+        Assert.Equal(2816, config.HiddenSize);
+        Assert.Equal(30, config.NumLayers);
+        Assert.Equal(16, config.NumAttentionHeads);
+
+        // Sliding (local) values are the model-wide defaults.
+        Assert.Equal(8, config.NumKvHeads);
+        Assert.Equal(256, config.HeadDim);
+        // Full (global) values land on the *Global* overrides.
+        Assert.Equal(2, config.NumGlobalKvHeads);
+        Assert.Equal(512, config.GlobalHeadDim);
+
+        // Dual RoPE: sliding on RoPEConfig, global on GlobalRoPEConfig.
+        Assert.NotNull(config.RoPEConfig);
+        Assert.Equal(10_000.0f, config.RoPEConfig!.Value.Theta);
+        Assert.Equal(256, config.RoPEConfig.Value.DimensionCount);
+        Assert.NotNull(config.GlobalRoPEConfig);
+        Assert.Equal(1_000_000.0f, config.GlobalRoPEConfig!.Value.Theta);
+        Assert.Equal(512, config.GlobalRoPEConfig.Value.DimensionCount);
+        // llama.cpp bakes partial rotary into the dim count → factor stays null.
+        Assert.Null(config.PartialRotaryFactor);
+
+        // MoE.
+        Assert.NotNull(config.Moe);
+        Assert.Equal(128, config.Moe!.NumExperts);
+        Assert.Equal(8, config.Moe.NumExpertsPerTok);
+        Assert.Equal(704, config.Moe.MoeIntermediateSize);
+
+        // Gemma backbone markers.
+        Assert.Equal(ActivationFunction.GELUTanh, config.ActivationFunction);
+        Assert.True(config.TiedEmbeddings);
+        Assert.Equal(MathF.Sqrt(2816), config.EmbeddingScale);
+        Assert.Equal(30.0f, config.FinalLogitSoftcap);
+        Assert.Null(config.AttnLogitSoftcap);
+
+        // Per-layer attention type: layer 5 is full, layer 0 is sliding.
+        Assert.True(config.IsFullAttentionLayer(5));
+        Assert.False(config.IsFullAttentionLayer(0));
+        Assert.Equal(1024, config.PerLayerSlidingWindow![0]);
+        Assert.Null(config.PerLayerSlidingWindow[5]);
+
+        // Per-layer head dim resolves correctly (#36).
+        Assert.Equal(512, config.GetLayerHeadDim(5));   // full
+        Assert.Equal(256, config.GetLayerHeadDim(0));   // sliding
+
+        // AR Gemma 4 carries no diffusion config.
+        Assert.Null(config.DiffusionConfig);
+    }
+
+    [Fact]
+    public void Extract_DiffusionGemma_AttachesDiffusionConfig()
+    {
+        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
+        {
+            d.AddUInt32("diffusion.canvas_length", 256);
+            d.AddUInt32("tokenizer.ggml.mask_token_id", 4);
+        });
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(Architecture.DiffusionGemma, config.Architecture);
+        Assert.NotNull(config.DiffusionConfig);
+        Assert.Equal(256, config.DiffusionConfig!.CanvasLength);
+        Assert.Equal(4, config.DiffusionConfig.MaskTokenId);
+        Assert.Equal(DotLLM.Core.Attention.AttentionMaskMode.Hybrid, config.DiffusionConfig.CanvasAttentionMode);
+        // Diffusion shares the Gemma-4 backbone shape.
+        Assert.Equal(2, config.NumGlobalKvHeads);
+        Assert.Equal(512, config.GlobalHeadDim);
+        Assert.NotNull(config.Moe);
+    }
+
+    [Fact]
+    public void Extract_DiffusionGemma_MissingMaskToken_Throws()
+    {
+        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
+            d.AddUInt32("diffusion.canvas_length", 256));
+        Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
+    }
 }
