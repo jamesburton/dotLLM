@@ -181,6 +181,16 @@ public sealed class DiffusionTextGenerator
     }
 
     /// <summary>
+    /// The attention-mask spec for a canvas forward, per <see cref="DiffusionConfig.CanvasAttentionMode"/>:
+    /// fully <see cref="AttentionMaskSpec.Bidirectional"/> (LLaDA-style) or
+    /// <see cref="AttentionMaskSpec.Hybrid(int)"/> with a causal prompt prefix (DiffusionGemma block-AR).
+    /// </summary>
+    private AttentionMaskSpec CanvasMaskSpec(int prefixLen) =>
+        _diffusion.CanvasAttentionMode == AttentionMaskMode.Bidirectional
+            ? AttentionMaskSpec.Bidirectional
+            : AttentionMaskSpec.Hybrid(prefixLen);
+
+    /// <summary>
     /// Runs the denoising loop for a single canvas appended after the current causal context.
     /// </summary>
     private CanvasRun RunCanvas(
@@ -205,7 +215,10 @@ public sealed class DiffusionTextGenerator
         int[] maskedPositions = ArrayPool<int>.Shared.Rent(blockLen);
         float[] maskedLogits = ArrayPool<float>.Shared.Rent((int)logitElems);
 
-        AttentionMaskSpec hybrid = AttentionMaskSpec.Hybrid(prefixLen);
+        // Canvas attention pattern is model-specific: DiffusionGemma is block-AR (Hybrid —
+        // causal prompt prefix + bidirectional canvas); LLaDA is fully Bidirectional over
+        // [prompt | canvas] (Hybrid yields degenerate all-EOS output on LLaDA).
+        AttentionMaskSpec hybrid = CanvasMaskSpec(prefixLen);
 
         int step = 0;
         DenoiseStopResult stop = DenoiseStopResult.Continue;
@@ -342,7 +355,7 @@ public sealed class DiffusionTextGenerator
 
             using ITensor logits = _model.Forward(
                 seqTokens.AsSpan(0, seqLen), positions.AsSpan(0, seqLen),
-                deviceId: -1, kvCache: null, adapter: null, AttentionMaskSpec.Hybrid(prefixLen));
+                deviceId: -1, kvCache: null, adapter: null, CanvasMaskSpec(prefixLen));
 
             unsafe
             {

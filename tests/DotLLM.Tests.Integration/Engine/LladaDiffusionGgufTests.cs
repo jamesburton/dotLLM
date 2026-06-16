@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Core.Tensors;
 using DotLLM.Engine;
 using DotLLM.Models;
 using Xunit;
@@ -47,6 +49,69 @@ public sealed class LladaDiffusionGgufTests
         return path;
     }
 
+    /// <summary>
+    /// FAST diagnostic (~one forward per mask mode, seconds not minutes): build a short
+    /// [prompt | MASK x N] sequence and run a SINGLE forward under each attention-mask mode,
+    /// printing the argmax token decoded at each masked position. Tells us (a) the model
+    /// loads/dequantises coherently, (b) which mask mode LLaDA wants, (c) whether EOS is the
+    /// degenerate output. Gated on DOTLLM_LLADA_GGUF.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void Llada8B_Diagnostic_SingleForward_PerMaskMode()
+    {
+        string? path = TryResolveModelPath();
+        Skip.If(path is null, $"Set {ModelPathEnvVar} to a LLaDA-8B GGUF to run this diagnostic.");
+
+        var diffusion = new DiffusionConfig
+        {
+            CanvasLength = 8,
+            MaxDenoisingSteps = 4,
+            MaskTokenId = LladaMaskTokenId,
+        };
+        var (model, gguf, config, tokenizer) = ModelLoader.LoadGgufAsDiffusion(path!, diffusion);
+        using var _ = gguf;
+        using var __ = model;
+
+        int[] promptIds = tokenizer.Encode("The capital of France is");
+        _output.WriteLine($"vocab={config.VocabSize} eos={tokenizer.EosTokenId} mask={LladaMaskTokenId}");
+        _output.WriteLine($"prompt ids=[{string.Join(",", promptIds)}] decoded='{tokenizer.Decode(promptIds)}'");
+
+        const int nMask = 8;
+        int promptLen = promptIds.Length;
+        int seqLen = promptLen + nMask;
+        int[] seq = new int[seqLen];
+        Array.Copy(promptIds, seq, promptLen);
+        for (int i = promptLen; i < seqLen; i++) seq[i] = LladaMaskTokenId;
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        foreach (var (name, spec) in new (string, AttentionMaskSpec)[]
+        {
+            ("Bidirectional", AttentionMaskSpec.Bidirectional),
+            ("Hybrid(promptLen)", AttentionMaskSpec.Hybrid(promptLen)),
+        })
+        {
+            var sw = Stopwatch.StartNew();
+            using ITensor logits = model.Forward(seq, positions, deviceId: -1, kvCache: null, adapter: null, spec);
+            sw.Stop();
+            int vocab = logits.Shape[1];
+            var preds = new int[nMask];
+            float* p = (float*)logits.DataPointer;
+            for (int i = 0; i < nMask; i++)
+            {
+                int row = promptLen + i;
+                int best = 0; float bestV = float.NegativeInfinity;
+                for (int v = 0; v < vocab; v++) { float x = p[(long)row * vocab + v]; if (x > bestV) { bestV = x; best = v; } }
+                preds[i] = best;
+            }
+            _output.WriteLine($"[{name}] forward {sw.ElapsedMilliseconds}ms  argmax ids=[{string.Join(",", preds)}]");
+            _output.WriteLine($"[{name}] decoded='{tokenizer.Decode(preds)}'");
+            int eosCount = preds.Count(t => t == tokenizer.EosTokenId);
+            int maskCount = preds.Count(t => t == LladaMaskTokenId);
+            _output.WriteLine($"[{name}] eos@masked={eosCount}/{nMask} mask@masked={maskCount}/{nMask}");
+        }
+    }
+
     [SkippableFact]
     public void Llada8B_MaskedDiffusionDecode_ProducesNonDegenerateText()
     {
@@ -58,8 +123,11 @@ public sealed class LladaDiffusionGgufTests
         // steps / temperature bounds. Canvas kept modest (64) for a CPU smoke run.
         var diffusion = new DiffusionConfig
         {
-            CanvasLength = 64,
-            MaxDenoisingSteps = 48,
+            // LLaDA needs FULLY bidirectional attention over [prompt | canvas];
+            // Hybrid (causal prompt) yields degenerate all-EOS output on LLaDA.
+            CanvasAttentionMode = AttentionMaskMode.Bidirectional,
+            CanvasLength = 16,            // short answer; keeps the 8B CPU run tractable
+            MaxDenoisingSteps = 32,
             TemperatureMax = 0.8f,
             TemperatureMin = 0.4f,
             MaskTokenId = LladaMaskTokenId,

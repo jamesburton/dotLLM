@@ -484,6 +484,12 @@ public static class GgufModelConfigExtractor
         return archString.ToLowerInvariant() switch
         {
             "llama" => Architecture.Llama,
+            // LLaDA is a Llama-backbone masked-diffusion LLM (same transformer; the
+            // diffusion behaviour comes from the decode loop, not the weights). Its
+            // GGUFs declare general.architecture = "llada" and store hyperparameters
+            // under "llada.*" — read via the dynamic arch-prefix path, so mapping to
+            // the Llama transformer is sufficient.
+            "llada" => Architecture.Llama,
             "mistral" or "mistral3" => Architecture.Mistral,
             "phi" or "phi2" or "phi3" => Architecture.Phi,
             "qwen" or "qwen2" or "qwen3" => Architecture.Qwen,

@@ -1,3 +1,5 @@
+using DotLLM.Core.Attention;
+
 namespace DotLLM.Core.Models;
 
 /// <summary>
@@ -87,4 +89,18 @@ public sealed record DiffusionConfig
     /// Loading a diffusion model fails loudly when this cannot be resolved.
     /// </summary>
     public required int MaskTokenId { get; init; }
+
+    /// <summary>
+    /// Attention pattern used while denoising the canvas.
+    /// <list type="bullet">
+    /// <item><see cref="AttentionMaskMode.Hybrid"/> (default) — block-autoregressive: the prompt
+    /// prefix stays causal among itself and the canvas attends bidirectionally over the prefix +
+    /// canvas. This matches <b>DiffusionGemma</b>'s block-diffusion design.</item>
+    /// <item><see cref="AttentionMaskMode.Bidirectional"/> — fully bidirectional over the whole
+    /// [prompt | canvas] sequence (the prompt is a given, bidirectionally-attended context, not a
+    /// causal prefill). This matches <b>LLaDA</b>-style masked diffusion, where Hybrid produces
+    /// degenerate (all-EOS) output.</item>
+    /// </list>
+    /// </summary>
+    public AttentionMaskMode CanvasAttentionMode { get; init; } = AttentionMaskMode.Hybrid;
 }

@@ -24,6 +24,25 @@ Durable state log for the overnight build (survives context resets). Updated as 
 4. **DiffusionGemma**: swap LLaDA GGUF for the diffusiongemma Q4_K_M (disk), GGUF diffusion routing → real DiffusionGemma generation.
 5. **Vulkan competitive** (#35): Gemma four-norm/GeGLU/embed-scale Vulkan kernels + GPU forward + throughput vs CPU.
 
+## KEY FINDING — mask mode is model-specific (validated on real LLaDA-8B)
+A fast single-forward diagnostic on real LLaDA-8B Q4 (prompt "The capital of France is" + 8 mask
+positions) showed:
+- **Bidirectional** mask → first masked position argmax = **" Paris"** → `Paris.` then EOS padding. ✓ correct.
+- **Hybrid** (causal prompt) → all positions = EOS. ✗ degenerate (this caused the 0-token failure).
+
+So **LLaDA needs fully Bidirectional attention** over [prompt|canvas]; **DiffusionGemma is block-AR
+(Hybrid)**. Added `DiffusionConfig.CanvasAttentionMode` (default Hybrid; LLaDA sets Bidirectional);
+`DiffusionTextGenerator.CanvasMaskSpec` picks the spec. The diffusion decode machinery is **confirmed
+correct on real masked-diffusion weights**. (Perf: ~33 s / forward for 8B Q4 on CPU — recompute-per-step
+is the bottleneck → #37; GPU diffusion forward is future Vulkan work.)
+
+## ✅ LLaDA-8B REAL VALIDATION PASSED
+`The capital of France is` → **`Paris.`** (decoded `Paris.<|eot_id|>`), 16 adaptive denoise steps,
+CanvasAttentionMode=Bidirectional, canvas 16. Proves the full masked-diffusion decode (bidirectional
+attention + entropy-bound unmask + scheduler + GGUF Llama load) is correct on real weights.
+Perf: load 3.8 s; gen 1003 s (~16.7 min) — recompute-per-step 8B CPU is the bottleneck (~0.003 tok/s);
+GPU/Vulkan diffusion forward + KV-prefix reuse (#37) are required for usable throughput.
+
 ## Status log
 - [done] PR-1..PR-10 (issues #23-#34) implemented, CPU-validated, pushed (branches dg-pr1..dg-pr8). Synthetic end-to-end diffusion generation + server routing works.
 - [done] Follow-ups filed: #35 (Vulkan Gemma parity), #36 (per-layer head_dim), #37 (KV-prefix reuse).
