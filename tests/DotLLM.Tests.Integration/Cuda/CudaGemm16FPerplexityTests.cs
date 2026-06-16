@@ -143,6 +143,44 @@ public sealed class CudaGemm16FPerplexityTests
                 "16F-on prefill logits were BIT-IDENTICAL to 16F-off — the COMPUTE_16F toggle did not "
                 + "engage on the prefill GEMM. The measurement is VACUOUS; investigate before trusting any ratio.");
 
+            // ── Decode engagement probe ───────────────────────────────────────
+            // Use16FCompute also gates the decode GEMV (CudaGemm.GemvF16), but for
+            // a QUANTIZED model (Q8_0 here) the seqLen==1 decode projections route
+            // through the integer GEMV path (CudaTransformerModel.Project lines
+            // 1746/1748) and never reach GemvF16 — so COMPUTE_16F is prefill-only
+            // in practice for quant models. We confirm rather than assume.
+            //
+            // The probe MUST isolate the decode GEMV: prefill with 16F held OFF for
+            // BOTH runs (a 16F prefill would write a different K/V cache, and the
+            // decode step would then read different K/V via attention — a difference
+            // inherited from prefill, NOT from the decode GEMV engaging 16F). So we
+            // prefill 16F-off, then flip 16F only on the single seqLen==1 decode step.
+            // If decode logits are bit-identical, the decode GEMV is 16F-independent.
+            bool decodeDiffers;
+            {
+                int[] decPrefix = tokenIds[..probeLen];
+                int[] decPrefixPos = Positions(probeLen, 0);
+                int decodeToken = tokenIds[probeLen];
+                int[] decodePos = { probeLen };
+
+                float[] decOff = DecodeStepLogits(model, decPrefix, decPrefixPos, decodeToken, decodePos,
+                    config.VocabSize, prefill16F: false, decode16F: false);
+                float[] decOn = DecodeStepLogits(model, decPrefix, decPrefixPos, decodeToken, decodePos,
+                    config.VocabSize, prefill16F: false, decode16F: true);
+
+                float decMaxAbs = 0f;
+                decodeDiffers = false;
+                for (int i = 0; i < decOff.Length; i++)
+                {
+                    float d = MathF.Abs(decOff[i] - decOn[i]);
+                    if (d > 0f) decodeDiffers = true;
+                    if (d > decMaxAbs) decMaxAbs = d;
+                }
+                _output.WriteLine(
+                    $"decode engagement (seqLen=1, prefill held 16F-off): max|Δ|={decMaxAbs:E3} differ={decodeDiffers} "
+                    + $"→ {(decodeDiffers ? "16F engages decode GEMV" : "decode uses integer GEMV; COMPUTE_16F is PREFILL-ONLY for this quant model")}");
+            }
+
             // Growing-prefix prefill perplexity under each setting.
             CudaGemm.Use16FCompute = false;
             double pplOff = PrefillGrowingPrefixPerplexity(model, tokenIds, config.VocabSize);
@@ -153,6 +191,23 @@ public sealed class CudaGemm16FPerplexityTests
             _output.WriteLine(
                 $"prefill PPL: off={pplOff:F5} on={pplOn:F5} ratio(on/off)={ratio:F5} "
                 + $"({(ratio - 1) * 100:+0.000;-0.000}%)");
+
+            // Decode-mode (teacher-forced, one token at a time) perplexity. Every
+            // forward is seqLen==1, so NOTHING here touches the prefill GEMM — this
+            // measures purely the decode path under the 16F toggle. For a quant
+            // model the flat +0.000% IS the result: it confirms decode is integer
+            // and COMPUTE_16F is prefill-only. We always run it (its flatness is
+            // the measurement, not a reason to skip).
+            CudaGemm.Use16FCompute = false;
+            double decPplOff = DecodeModePerplexity(model, tokenIds, config.VocabSize);
+            CudaGemm.Use16FCompute = true;
+            double decPplOn = DecodeModePerplexity(model, tokenIds, config.VocabSize);
+            double decRatio = decPplOn / decPplOff;
+            _output.WriteLine(
+                $"decode PPL:  off={decPplOff:F5} on={decPplOn:F5} ratio(on/off)={decRatio:F5} "
+                + $"({(decRatio - 1) * 100:+0.000;-0.000}%)");
+            Assert.True(Math.Abs(decRatio - 1.0) < 0.01,
+                $"G1 (COMPUTE_16F) decode perplexity moved {(decRatio - 1) * 100:+0.00;-0.00}% — exceeds the 1% gate.");
 
             // Quality gate: a perplexity move under 1% on the worst-case (1B,
             // hidden 2048) is the threshold the sibling DP4a gate uses. A larger
@@ -189,6 +244,53 @@ public sealed class CudaGemm16FPerplexityTests
             float[] logits = LastRowLogits(model, prefix, positions, vocabSize);
 
             sumNll += -StableLogProb(logits, tokenIds[t + 1]);
+            scored++;
+        }
+        return Math.Exp(sumNll / scored);
+    }
+
+    /// <summary>
+    /// Prefills <paramref name="prefix"/> against a fresh KV cache, then runs one
+    /// seqLen==1 decode step for <paramref name="decodeToken"/> and returns its
+    /// last-row logits. <paramref name="prefill16F"/> and <paramref name="decode16F"/>
+    /// pin <see cref="CudaGemm.Use16FCompute"/> independently for the two phases so
+    /// the caller can isolate the decode GEMV from prefill-inherited K/V differences.
+    /// </summary>
+    private static unsafe float[] DecodeStepLogits(
+        CudaTransformerModel model, int[] prefix, int[] prefixPos,
+        int decodeToken, int[] decodePos, int vocabSize, bool prefill16F, bool decode16F)
+    {
+        using var cache = model.CreateKvCache(maxSeqLen: prefix.Length + 2);
+        CudaGemm.Use16FCompute = prefill16F;
+        using (ITensor _ = model.Forward(prefix, prefixPos, deviceId: 0, cache)) { }
+        CudaGemm.Use16FCompute = decode16F;
+        using ITensor logits = model.Forward([decodeToken], decodePos, deviceId: 0, cache);
+        var span = new ReadOnlySpan<float>((void*)logits.DataPointer, vocabSize);
+        return span.ToArray();
+    }
+
+    /// <summary>
+    /// Teacher-forced decode-mode perplexity: prefill the first token, then feed
+    /// each subsequent true token one at a time through the KV cache (every forward
+    /// after the first is seqLen==1 → decode path), scoring the NLL of the next
+    /// true token. Only meaningful when the decode path engages COMPUTE_16F.
+    /// </summary>
+    private static unsafe double DecodeModePerplexity(
+        CudaTransformerModel model, int[] tokenIds, int vocabSize)
+    {
+        using var cache = model.CreateKvCache(maxSeqLen: tokenIds.Length + 1);
+        // Prefill token[0] (seqLen==1 is acceptable here; the first forward seeds
+        // the cache and its target is token[1]).
+        double sumNll = 0;
+        int scored = 0;
+        for (int t = 0; t < tokenIds.Length - 1; t++)
+        {
+            int[] one = { tokenIds[t] };
+            int[] pos = { t };
+            using ITensor logits = model.Forward(one, pos, deviceId: 0, cache);
+            var span = new ReadOnlySpan<float>((void*)logits.DataPointer, vocabSize);
+            float[] row = span.ToArray();
+            sumNll += -StableLogProb(row, tokenIds[t + 1]);
             scored++;
         }
         return Math.Exp(sumNll / scored);
