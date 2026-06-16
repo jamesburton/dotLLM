@@ -1,5 +1,4 @@
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -55,11 +54,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     private readonly int _ropeDim;
     private readonly int _ropeType;
 
-    // ── Phase 2 transfer buffer: host FP32 hidden state ──
-    // Allocated once, grown on demand. Owns the allocation.
-    private nint _fp32TransferBuffer;    // host, aligned 64-byte
-    private int _fp32TransferCapacity;   // elements
-
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -90,11 +84,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         _ropeTheta = ropeTheta;
         _ropeDim = ropeDim;
         _ropeType = ropeType;
-
-        // Pre-allocate transfer buffer for single-token decode
-        _fp32TransferCapacity = config.HiddenSize;
-        _fp32TransferBuffer = (nint)NativeMemory.AlignedAlloc(
-            (nuint)(_fp32TransferCapacity * sizeof(float)), 64);
     }
 
     /// <summary>
@@ -472,16 +461,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         }
     }
 
-    private void EnsureTransferCapacity(int elements)
-    {
-        if (_fp32TransferCapacity >= elements) return;
-
-        NativeMemory.AlignedFree((void*)_fp32TransferBuffer);
-        _fp32TransferCapacity = elements;
-        _fp32TransferBuffer = (nint)NativeMemory.AlignedAlloc(
-            (nuint)(_fp32TransferCapacity * sizeof(float)), 64);
-    }
-
     /// <summary>Releases all Vulkan, CUDA, and host resources owned by this model.</summary>
     public void Dispose()
     {
@@ -491,10 +470,5 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         _stream.Dispose();
         _cublas.Dispose();
         _context.Dispose();
-        if (_fp32TransferBuffer != 0)
-        {
-            NativeMemory.AlignedFree((void*)_fp32TransferBuffer);
-            _fp32TransferBuffer = 0;
-        }
     }
 }
