@@ -344,6 +344,18 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
 
+        // G1: default the FP16-accumulate prefill GEMM on for GeForce Ampere with quantized weights —
+        // validated quality-safe (decode-mode perplexity ±0.000%, prefill −0.079% on Llama-3.2-1B Q8_0)
+        // and ~1.06–1.22× faster whole-prefill there. Off elsewhere: datacenter Ampere doesn't throttle
+        // FP32 accumulate (no win), and 16F decode-GEMV for non-quant weights is unvalidated (quant
+        // decode is integer, so 16F never touches it). DOTLLM_CUDA_GEMM_16F overrides ("1"/"0").
+        var device = CudaDevice.GetDevice(deviceId);
+        bool geForceAmpere = device.ComputeCapabilityMajor == 8
+            && device.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase);
+        bool quantizedWeights = weights.Layers.Length > 0
+            && weights.Layers[0].QQuantType is not (QuantizationType.F32 or QuantizationType.F16);
+        CudaGemm.ConfigureDefault(geForceAmpere && quantizedWeights);
+
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize);

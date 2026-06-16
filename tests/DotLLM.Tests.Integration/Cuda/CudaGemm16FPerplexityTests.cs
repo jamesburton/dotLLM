@@ -13,7 +13,10 @@ namespace DotLLM.Tests.Integration.Cuda;
 /// accumulate) to <c>CUBLAS_COMPUTE_16F</c> (FP16 accumulate), which runs at the
 /// full tensor-core rate on throttled GeForce Ampere but accumulates in FP16 and
 /// so carries an accuracy risk. It is measured at ~1.06x median / 1.22x best
-/// whole-prefill speedup and is OFF by default pending this quality check.
+/// whole-prefill speedup. This gate cleared the accuracy concern (decode-mode
+/// perplexity ±0.000%, prefill −0.079%), so it is now default-on for GeForce
+/// Ampere with quantized weights (CudaGemm.ConfigureDefault at model load);
+/// DOTLLM_CUDA_GEMM_16F overrides ("1"/"0").
 /// </summary>
 /// <remarks>
 /// <para>
@@ -322,6 +325,39 @@ public sealed class CudaGemm16FPerplexityTests
         for (int i = 0; i < positions.Length; i++)
             positions[i] = start + i;
         return positions;
+    }
+
+    /// <summary>
+    /// Verifies the G1 default-on flip: on GeForce Ampere with quantized weights and
+    /// <c>DOTLLM_CUDA_GEMM_16F</c> unset, loading the model enables
+    /// <see cref="CudaGemm.Use16FCompute"/> by default (via
+    /// <c>CudaGemm.ConfigureDefault</c>). Starts the field at <c>false</c> so a
+    /// <c>true</c> reading proves the load-time flip set it, not a stale value.
+    /// </summary>
+    [SkippableFact]
+    public void Gemm16F_DefaultsOn_ForGeForceAmpere_QuantModel()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_CUDA_GEMM_16F") is not null,
+            "DOTLLM_CUDA_GEMM_16F is set — it overrides the device-gated default this test checks.");
+        string? ggufPath = ResolveModelPath();
+        Skip.If(ggufPath is null, "Quantized GGUF not found for the default-gate check.");
+
+        var dev = CudaDevice.GetDevice(0);
+        Skip.IfNot(dev.ComputeCapabilityMajor == 8 && dev.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase),
+            $"Default-on gate is GeForce Ampere; device '{dev.Name}' (cc{dev.ComputeCapabilityMajor}) not eligible.");
+
+        bool prior = CudaGemm.Use16FCompute;
+        try
+        {
+            CudaGemm.Use16FCompute = false;
+            using var gguf = GgufFile.Open(ggufPath);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ResolvePtxDir());
+            Assert.True(CudaGemm.Use16FCompute,
+                "G1 default did not enable on GeForce Ampere + quantized weights after model load.");
+        }
+        finally { CudaGemm.Use16FCompute = prior; }
     }
 
     private static string? ResolveModelPath()
