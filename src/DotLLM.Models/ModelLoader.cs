@@ -24,18 +24,63 @@ public static class ModelLoader
     /// </summary>
     /// <param name="path">Path to the GGUF model file.</param>
     /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <param name="diffusionOverride">
+    /// Optional masked-diffusion decode configuration to attach to the loaded
+    /// <see cref="ModelConfig.DiffusionConfig"/>. GGUF carries no diffusion
+    /// metadata, so a diffusion model (e.g. LLaDA-8B, which is a Llama backbone
+    /// generating by masked diffusion) must have its mask token id + canvas /
+    /// step / temperature schedule injected explicitly here. When
+    /// <see langword="null"/> (the default) the GGUF load is unchanged — the
+    /// resulting <see cref="ModelConfig.DiffusionConfig"/> stays whatever the
+    /// extractor produced (always <see langword="null"/> for GGUF today), so the
+    /// model decodes autoregressively. When supplied, the returned model is a
+    /// normal <see cref="TransformerModel"/> that
+    /// <c>DiffusionTextGenerator</c> drives via the hybrid mask.
+    /// </param>
     /// <returns>The loaded model, GGUF file handle, and model configuration.</returns>
     public static (IModel Model, GgufFile Gguf, ModelConfig Config) LoadFromGguf(
-        string path, ThreadingConfig? threading = null)
+        string path, ThreadingConfig? threading = null, DiffusionConfig? diffusionOverride = null)
     {
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        if (diffusionOverride is not null)
+            config = config with { DiffusionConfig = diffusionOverride };
         IModel model = config.Architecture switch
         {
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config),
             _ => TransformerModel.LoadFromGguf(gguf, config, threading ?? ThreadingConfig.SingleThreaded),
         };
         return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Loads a GGUF model and attaches the supplied masked-diffusion decode
+    /// configuration, returning the loaded model together with the GGUF's
+    /// embedded tokenizer ready to hand to <c>DiffusionTextGenerator</c>.
+    /// </summary>
+    /// <remarks>
+    /// Convenience wrapper over <see cref="LoadFromGguf(string, ThreadingConfig?, DiffusionConfig?)"/>
+    /// for the diffusion case: a GGUF whose backbone is an autoregressive
+    /// architecture (LLaDA-8B is a Llama backbone) but which generates by masked
+    /// diffusion. The diffusion seam is not a model concern — the model exposes
+    /// the hybrid-mask canvas forward the generator drives, and the
+    /// <paramref name="diffusion"/> record (mask token + canvas / steps /
+    /// temperatures) supplies what GGUF metadata cannot.
+    /// </remarks>
+    /// <param name="path">Path to the GGUF model file.</param>
+    /// <param name="diffusion">Masked-diffusion decode configuration (required).</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model, GGUF file handle, model configuration (with
+    /// <see cref="ModelConfig.DiffusionConfig"/> set), and the embedded tokenizer.</returns>
+    public static (IModel Model, GgufFile Gguf, ModelConfig Config, BpeTokenizer Tokenizer) LoadGgufAsDiffusion(
+        string path, DiffusionConfig diffusion, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(diffusion);
+
+        var (model, gguf, config) = LoadFromGguf(path, threading, diffusion);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        return (model, gguf, config, tokenizer);
     }
 
     /// <summary>
