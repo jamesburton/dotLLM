@@ -395,6 +395,89 @@ public class HybridPrefillDecodeTests
         Assert.Equal(shared, noShare);
     }
 
+    /// <summary>
+    /// The default-on gate for DP4a: decode-mode (teacher-forced) perplexity off vs on.
+    /// Standard perplexity scores the prefill path (seqLen&gt;1) where DP4a never engages;
+    /// this instead feeds the corpus one token at a time through the KV cache (every
+    /// forward is seqLen==1 → DP4a runs on every projection of every step) and accumulates
+    /// the NLL of the true next token. That measures the actual quality impact of the INT8
+    /// activation quant on the decode path. Asserts the perplexity delta is small
+    /// (&lt;1%); a larger gap would justify keeping DP4a opt-in on quality grounds.
+    /// </summary>
+    [SkippableFact]
+    public void DecodePerplexity_Dp4aOnVsOff_RealModel_WithinTolerance()
+    {
+        SkipIfVulkanUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasIntegerDotProduct,
+                $"Device '{probe.DeviceName}' lacks VK_KHR_shader_integer_dot_product.");
+
+        using var gguf = GgufFile.Open(_fixture.FilePath);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        // A few hundred tokens of ordinary English; absolute PPL is secondary — the
+        // off-vs-on ratio on identical tokens is the signal.
+        const string corpus =
+            "The history of natural language processing began in the nineteen fifties, when researchers "
+            + "first attempted to translate text between human languages using simple rule based systems. "
+            + "Over the following decades, statistical methods gradually replaced handwritten rules, and the "
+            + "introduction of neural networks transformed the field once more. Today, large language models "
+            + "are trained on vast collections of text drawn from books, articles, and conversations, learning "
+            + "to predict the next word from everything that came before it. This deceptively simple objective "
+            + "turns out to capture a surprising amount of structure about grammar, facts, and reasoning.";
+        int[] tokenIds = tokenizer.Encode(corpus).ToArray();
+        Assert.True(tokenIds.Length >= 64, $"corpus too short ({tokenIds.Length} tokens).");
+        _output.WriteLine($"corpus: {tokenIds.Length} tokens");
+
+        double pplOff = DecodeModePerplexity(spvDir, tokenIds, enableDp4a: false);
+        double pplOn = DecodeModePerplexity(spvDir, tokenIds, enableDp4a: true);
+        double ratio = pplOn / pplOff;
+        _output.WriteLine($"decode-mode PPL: off={pplOff:F5} on={pplOn:F5} ratio(on/off)={ratio:F5} ({(ratio - 1) * 100:+0.000;-0.000}%)");
+
+        Assert.True(Math.Abs(ratio - 1.0) < 0.01,
+            $"DP4a decode perplexity moved {(ratio - 1) * 100:+0.00;-0.00}% (off={pplOff:F4} on={pplOn:F4}) — exceeds 1% gate.");
+    }
+
+    private double DecodeModePerplexity(string spvDir, int[] tokenIds, bool enableDp4a)
+    {
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        try
+        {
+            using var gguf = GgufFile.Open(_fixture.FilePath);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+            using var cache = model.CreateKvCache(maxSeqLen: tokenIds.Length + 1);
+
+            double sumNll = 0; int scored = 0;
+            // Teacher-forced decode: feed token[t] at position t (seqLen==1 → DP4a path),
+            // its last-token logits predict token[t+1]; accumulate NLL of that true target.
+            for (int t = 0; t < tokenIds.Length - 1; t++)
+            {
+                int[] one = { tokenIds[t] };
+                int[] pos = { t };
+                float[] logits = RunForwardVulkan(model, one, pos, cache);
+                sumNll += -StableLogProb(logits, tokenIds[t + 1]);
+                scored++;
+            }
+            return Math.Exp(sumNll / scored);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+        }
+    }
+
+    private static double StableLogProb(float[] logitsRow, int target)
+    {
+        float max = logitsRow[0];
+        for (int j = 1; j < logitsRow.Length; j++)
+            if (logitsRow[j] > max) max = logitsRow[j];
+        double sumExp = 0;
+        for (int j = 0; j < logitsRow.Length; j++)
+            sumExp += Math.Exp(logitsRow[j] - max);
+        return (logitsRow[target] - max) - Math.Log(sumExp);
+    }
+
     private (List<int> tokens, float[] firstDecodeLogits, double decodeMs) DecodeGreedy(
         string spvDir, int[] promptIds, int decodeSteps, bool enableDp4a, bool noShare = false)
     {
