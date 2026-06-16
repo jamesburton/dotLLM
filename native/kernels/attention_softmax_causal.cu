@@ -119,3 +119,55 @@ extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_f16(
     for (int tk = causal_len + threadIdx.x; tk < s; tk += blockDim.x)
         row[(size_t)tk * s] = __float2half(0.0f);
 }
+
+// Coalesced variant: ONE THREAD per softmax row (per query head, per query token).
+//
+// The one-block-per-row variant above reads row[tk*s] with consecutive threads in a
+// block striding by s along the key axis — fully uncoalesced (each 32-byte transaction
+// delivers 2 useful bytes), which caps the cuBLAS+softmax path well below the GEMM-only
+// floor. Here thread t owns global row = blockIdx.x*blockDim.x + threadIdx.x, decoded as
+// hq = row / s, tq = row % s. Consecutive threads own consecutive tq, whose row starts
+// (plane_base + tq) are CONSECUTIVE addresses, so each strided read across a warp lands
+// in one cache line — coalesced. No shuffles, no shared memory; the whole row reduction
+// is serial within the owning thread (s up to a few thousand is fine — memory-bound).
+extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_coalesced_f16(
+    half* __restrict__ scores,
+    const int s,
+    const int num_heads)
+{
+    int row_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row_id >= num_heads * s) return;
+
+    int hq = row_id / s;
+    int tq = row_id % s;
+
+    half* row = scores + (size_t)hq * s * s + tq;  // element (tq, tk) at row[tk * s]
+    int causal_len = tq + 1;
+
+    // Pass 1: max over the causal prefix.
+    float max_val = -FLT_MAX;
+    for (int tk = 0; tk < causal_len; tk++)
+    {
+        float v = __half2float(row[(size_t)tk * s]);
+        if (v > max_val) max_val = v;
+    }
+
+    // Pass 2: exp(x - max), store back, accumulate sum.
+    float sum_exp = 0.0f;
+    for (int tk = 0; tk < causal_len; tk++)
+    {
+        float e = expf(__half2float(row[(size_t)tk * s]) - max_val);
+        sum_exp += e;
+        row[(size_t)tk * s] = __float2half(e);
+    }
+
+    float sum_inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+
+    // Pass 3a: normalize the causal prefix.
+    for (int tk = 0; tk < causal_len; tk++)
+        row[(size_t)tk * s] = __float2half(__half2float(row[(size_t)tk * s]) * sum_inv);
+
+    // Pass 3b: zero the masked tail so P*V's full-key sum ignores it.
+    for (int tk = causal_len; tk < s; tk++)
+        row[(size_t)tk * s] = __float2half(0.0f);
+}

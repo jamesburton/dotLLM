@@ -294,6 +294,9 @@ public sealed unsafe class CudaKernels : IDisposable
     // built module would throw across the whole shared-CudaKernels GPU test suite.
     private readonly CudaModule? _attentionSoftmaxCausalModule;
     private readonly nint _attentionSoftmaxCausalFunc;
+    // Coalesced sibling: one thread per softmax row (consecutive threads → consecutive
+    // query rows → consecutive addresses), avoiding the per-block strided-read penalty.
+    private readonly nint _attentionSoftmaxCausalCoalescedFunc;
 
 
     /// <summary>
@@ -633,6 +636,7 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _attentionSoftmaxCausalModule = CudaModule.LoadFromFile(attentionSoftmaxCausalPath);
             _attentionSoftmaxCausalFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_f16");
+            _attentionSoftmaxCausalCoalescedFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f16");
         }
     }
 
@@ -642,6 +646,13 @@ public sealed unsafe class CudaKernels : IDisposable
     /// keep the fused <c>attention_f16</c> path.
     /// </summary>
     public bool HasAttentionSoftmaxCausal => _attentionSoftmaxCausalFunc != 0;
+
+    /// <summary>
+    /// True when the coalesced (one-thread-per-row) causal-softmax kernel is loaded.
+    /// This is the preferred variant — its global reads are coalesced, unlike the
+    /// one-block-per-row sibling whose strided reads cap throughput.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausalCoalesced => _attentionSoftmaxCausalCoalescedFunc != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1365,17 +1376,35 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <param name="s">Sequence length (rows and columns of each per-head score plane).</param>
     /// <param name="numHeads">Number of query heads (score planes).</param>
     /// <param name="stream">CUDA stream handle.</param>
-    public void LaunchAttentionSoftmaxCausal(nint scores, int s, int numHeads, nint stream)
+    /// <param name="coalesced">
+    /// When true (default), uses the one-thread-per-row variant whose global reads are
+    /// coalesced — the preferred path. When false, uses the one-block-per-row variant
+    /// (warp-reduced per row, but strided/uncoalesced reads) for A/B comparison.
+    /// </param>
+    public void LaunchAttentionSoftmaxCausal(nint scores, int s, int numHeads, nint stream, bool coalesced = true)
     {
         nint scoresArg = scores;
         int sArg = s, nhArg = numHeads;
 
         void** args = stackalloc void*[] {&scoresArg, &sArg, &nhArg};
 
-        int numBlocks = numHeads * s;
-        CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalFunc,
-                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+        if (coalesced)
+        {
+            // One thread per row; grid sized to cover numHeads*s rows.
+            int totalRows = numHeads * s;
+            uint gridDim = (uint)((totalRows + BlockSize - 1) / BlockSize);
+            CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalCoalescedFunc,
+                    gridDim, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
+        else
+        {
+            // One block per row.
+            int numBlocks = numHeads * s;
+            CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalFunc,
+                    (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
     }
 
     /// <summary>Embedding lookup with per-format dispatch.</summary>
