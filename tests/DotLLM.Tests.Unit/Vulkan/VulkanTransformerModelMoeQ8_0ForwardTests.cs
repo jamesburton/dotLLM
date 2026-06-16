@@ -117,6 +117,10 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
     // FP32-activation Q8_0 path. argmax stability is the failure L2 distance hides:
     // INT8 activation quant perturbs logits, and the only quality question that matters
     // for decode is whether that perturbation changes which token is sampled.
+    // The "off" arm forces the scalar FP32-activation GEMV (DP4a off AND MMVQ off);
+    // MMVQ (issue #46) is itself an INT8 integer-dot decode path whose output is
+    // bit-identical to DP4a-Pq here, so it must be disabled for the comparison to be
+    // INT8-vs-FP32 rather than INT8-vs-INT8 (see RunVulkanForwardWithDp4a).
     [SkippableFact]
     public void Forward_Q8_0_Dp4aOnVsOff_SingleToken_SameArgmax_LogitsDiffer()
     {
@@ -164,8 +168,20 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         // BuildFromPrebuiltWeights reads DOTLLM_VULKAN_ENABLE_DP4A once. The
         // VulkanKernels collection runs serially, so toggling the process env here is
         // safe as long as we restore it.
-        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
-        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        // Explicit "0"/"1" (not null) so the test pins DP4a regardless of the
+        // vendor-gated default (Intel/Arc defaults DP4a on when the env is unset).
+        // The "off" arm additionally disables the MMVQ decode GEMV (issue #46), which
+        // is itself an INT8 integer-dot path and produces output bit-identical to the
+        // DP4a-Pq path for these shapes — so without this the on/off comparison would
+        // be INT8-vs-INT8 and could not discriminate engagement. With MMVQ off, the
+        // "off" arm is the trusted FP32-activation scalar Q8_0 GEMV, the reference the
+        // DP4a perturbation is measured against.
+        string? priorDp4a = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        string? priorMmvq = Environment.GetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar);
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : "0");
+        Environment.SetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar, enableDp4a ? priorMmvq : "1");
         try
         {
             using var sf = SafetensorsFile.Open(path);
@@ -180,7 +196,9 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         }
         finally
         {
-            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", priorDp4a);
+            Environment.SetEnvironmentVariable(
+                VulkanTransformerModel.DisableMmvqEnvVar, priorMmvq);
         }
     }
 

@@ -396,6 +396,84 @@ public class HybridPrefillDecodeTests
     }
 
     /// <summary>
+    /// Verifies the vendor-gated default: on Intel/Arc, DP4a is ON by default (env
+    /// unset) — the default-decode trajectory must equal the env-forced-on
+    /// trajectory and differ from env-forced-off. Confirms the default flip
+    /// (DP4a on for Intel without requiring DOTLLM_VULKAN_ENABLE_DP4A=1) actually
+    /// takes effect, with the env var still overriding either way.
+    /// </summary>
+    [SkippableFact]
+    public void Decode_Dp4aDefault_IsOnForIntel_OffOverridable()
+    {
+        SkipIfVulkanUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+        {
+            Skip.IfNot(probe.HasIntegerDotProduct,
+                $"Device '{probe.DeviceName}' lacks VK_KHR_shader_integer_dot_product.");
+            Skip.IfNot(probe.VendorId == 0x8086,
+                $"Default-on gate is Intel-only; device vendor 0x{probe.VendorId:X4} is not Intel.");
+        }
+
+        using var gguf = GgufFile.Open(_fixture.FilePath);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] promptIds = tokenizer.Encode("The capital of France is").ToArray();
+        const int decodeSteps = 16;
+
+        List<int> def = DecodeTokensUnderEnv(spvDir, promptIds, decodeSteps, dp4aEnv: null);  // default
+        List<int> off = DecodeTokensUnderEnv(spvDir, promptIds, decodeSteps, dp4aEnv: "0");
+        List<int> on = DecodeTokensUnderEnv(spvDir, promptIds, decodeSteps, dp4aEnv: "1");
+
+        _output.WriteLine($"default: [{string.Join(',', def)}]");
+        _output.WriteLine($"off:     [{string.Join(',', off)}]");
+        _output.WriteLine($"on:      [{string.Join(',', on)}]");
+
+        Assert.Equal(on, def);          // Intel default == DP4a on
+        Assert.NotEqual(off, def);      // ...and that differs from forced-off (so default is not "off")
+    }
+
+    private List<int> DecodeTokensUnderEnv(string spvDir, int[] promptIds, int decodeSteps, string? dp4aEnv)
+    {
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        string? priorMmvq = Environment.GetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar);
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", dp4aEnv);
+        // When DP4a is explicitly forced off ("0"), also disable the MMVQ decode GEMV
+        // (issue #46) so the off-arm is the scalar FP32-activation reference rather than
+        // another INT8 integer-dot path (MMVQ output is bit-identical to DP4a-Pq). This
+        // makes "off differs from the DP4a default" a meaningful assertion. The default
+        // (null) and forced-on ("1") arms keep MMVQ at its prior state.
+        Environment.SetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar, dp4aEnv == "0" ? "1" : priorMmvq);
+        try
+        {
+            using var gguf = GgufFile.Open(_fixture.FilePath);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+            using var cache = model.CreateKvCache(maxSeqLen: promptIds.Length + decodeSteps + 1);
+
+            var tokens = new List<int>(decodeSteps);
+            float[] logits = RunForwardVulkan(model, promptIds, BuildPositions(promptIds.Length), cache);
+            int next = Argmax(logits);
+            tokens.Add(next);
+            for (int step = 0; step < decodeSteps - 1; step++)
+            {
+                int[] one = { next };
+                int[] pos = { promptIds.Length + step };
+                logits = RunForwardVulkan(model, one, pos, cache);
+                next = Argmax(logits);
+                tokens.Add(next);
+            }
+            return tokens;
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+            Environment.SetEnvironmentVariable(
+                VulkanTransformerModel.DisableMmvqEnvVar, priorMmvq);
+        }
+    }
+
+    /// <summary>
     /// The default-on gate for DP4a: decode-mode (teacher-forced) perplexity off vs on.
     /// Standard perplexity scores the prefill path (seqLen&gt;1) where DP4a never engages;
     /// this instead feeds the corpus one token at a time through the KV cache (every
@@ -439,8 +517,10 @@ public class HybridPrefillDecodeTests
 
     private double DecodeModePerplexity(string spvDir, int[] tokenIds, bool enableDp4a)
     {
+        // Explicit "0"/"1" (not null) so the test pins DP4a regardless of the
+        // vendor-gated default.
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
-        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : "0");
         try
         {
             using var gguf = GgufFile.Open(_fixture.FilePath);
@@ -483,8 +563,19 @@ public class HybridPrefillDecodeTests
     {
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
         string? priorShare = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE");
-        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        string? priorMmvq = Environment.GetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar);
+        // Explicit "0"/"1" (not null) so the test pins DP4a regardless of the
+        // vendor-gated default.
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : "0");
         Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE", noShare ? "1" : null);
+        // The off-arm also disables the MMVQ decode GEMV (issue #46): MMVQ is itself an
+        // INT8 integer-dot decode path whose output is bit-identical to the DP4a-Pq path,
+        // so without this the on/off comparison is INT8-vs-INT8 and cannot show DP4a
+        // engagement. With MMVQ off, the off-arm is the trusted scalar FP32-activation
+        // Q8_0 GEMV — the reference the INT8 DP4a perturbation is measured against.
+        Environment.SetEnvironmentVariable(
+            VulkanTransformerModel.DisableMmvqEnvVar, enableDp4a ? priorMmvq : "1");
         try
         {
             using var gguf = GgufFile.Open(_fixture.FilePath);
@@ -516,6 +607,8 @@ public class HybridPrefillDecodeTests
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE", priorShare);
+            Environment.SetEnvironmentVariable(
+                VulkanTransformerModel.DisableMmvqEnvVar, priorMmvq);
         }
     }
 

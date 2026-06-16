@@ -76,12 +76,14 @@ public sealed class VulkanTransformerModel : IModel
     // using dotPacked4x8AccSatEXT wins 1.18–3.39× over the FP32-activation
     // scalar kernel (lm_head 3.39×, deep-K 2.23×). Null on devices without
     // VK_KHR_shader_integer_dot_product. Gated additionally by _dp4aEnabled
-    // (env opt-in) because INT8 activation quant is lossy vs the FP32-activation
-    // _matmulQ8 path and must be validated per-model for token stability.
+    // (default-on for Intel/Arc; DOTLLM_VULKAN_ENABLE_DP4A overrides). INT8
+    // activation quant moves decode perplexity only +0.17% (validated), so the
+    // small near-tie argmax reordering it causes is not a quality regression.
     private readonly MatMulQ8_0Dp4aPqKernel? _matmulQ8Dp4aPq;
     // True when DP4a decode GEMV should be used for Q8_0 seqLen==1 matmuls
-    // (device supports integer dot product AND the env opt-in is set). When
-    // false, RecordMatmul keeps the FP32-activation _matmulQ8 path.
+    // (device supports integer dot product AND it is enabled — default-on for
+    // Intel/Arc, off elsewhere where the GEMV is memory-bound, env-overridable).
+    // When false, RecordMatmul keeps the FP32-activation _matmulQ8 path.
     private readonly bool _dp4aEnabled;
     // When true (default with DP4a on), RecordSharedInputMatmulPair quantizes the
     // shared input once for both projections; DOTLLM_VULKAN_DP4A_NO_SHARE=1 forces
@@ -638,17 +640,35 @@ public sealed class VulkanTransformerModel : IModel
         // Optional DP4a decode GEMV with shared activation pre-quantization.
         // Created when the device advertises integer dot product; the SPV may be
         // absent on older builds (FileNotFoundException → stay on scalar Q8_0).
-        // Gated on an env opt-in because INT8 activation quant is lossy vs the
-        // FP32-activation _matmulQ8 path and must be validated per-model for
-        // greedy-token stability before being made default-on.
         MatMulQ8_0Dp4aPqKernel? matmulQ8Dp4aPq = null;
         if (device.HasIntegerDotProduct)
         {
             try { matmulQ8Dp4aPq = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir); }
             catch (FileNotFoundException) { /* DP4a SPV not built — keep scalar Q8_0. */ }
         }
-        bool dp4aEnabled = matmulQ8Dp4aPq is not null
-            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A") == "1";
+        // Default-on for Intel/Arc, where the Q8_0 decode GEMV is ALU/dequant-bound
+        // and DP4a wins 1.18-3.39× per-kernel / ~1.6× end-to-end decode at +0.17%
+        // perplexity (see .docs/local-optimization-campaign.md V2/V5). Off by
+        // default elsewhere — on the memory-bound RTX 3060 it is ~1.0× (DP4a
+        // accelerates MACs, not the weight reads that bound it), so the extra
+        // prequant dispatch is not worth it. DOTLLM_VULKAN_ENABLE_DP4A overrides
+        // either way: "1" forces on (any vendor), "0" forces off.
+        const uint IntelVendorId = 0x8086;
+        bool dp4aEnabled;
+        if (matmulQ8Dp4aPq is null)
+        {
+            dp4aEnabled = false;
+        }
+        else
+        {
+            string? dp4aEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+            dp4aEnabled = dp4aEnv switch
+            {
+                "1" => true,
+                "0" => false,
+                _ => device.VendorId == IntelVendorId,
+            };
+        }
 
         // The shared activation-quant scratch is sized to the largest contraction
         // (input) dim any Q8_0 decode GEMV will use: hidden (Q/K/V/gate/up/lm_head/
