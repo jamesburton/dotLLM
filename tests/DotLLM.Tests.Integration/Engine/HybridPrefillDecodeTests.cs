@@ -289,6 +289,120 @@ public class HybridPrefillDecodeTests
             });
     }
 
+    /// <summary>
+    /// Real-model characterization of the DP4a decode path: greedy-decode the same
+    /// prompt on SmolLM-135M Q8_0 with DP4a off then on. Executes the dense
+    /// Q/K/V/O/gate/up/down + shared-K/V DP4a path on production shapes across every
+    /// layer — coverage the per-kernel and synthetic argmax tests cannot give.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Finding.</b> DP4a's per-block INT8 activation quantization perturbs the
+    /// decode logits by ~0.3% rms (max|Δ|≈0.3 on logits of magnitude ~23). That is
+    /// enough to flip a <i>near-tie</i> argmax — on this prompt the top two logits
+    /// differ by &lt;0.2 — which then diverges the greedy trajectory. So the
+    /// generated token IDs do <b>not</b> match off-vs-on, and DP4a stays
+    /// <b>opt-in</b> (<c>DOTLLM_VULKAN_ENABLE_DP4A=1</c>): flipping it default-on
+    /// would change model output. Quantifying whether that change is a quality
+    /// regression (perplexity off-vs-on) is the gate for any future default-on.
+    /// </para>
+    /// <para>
+    /// <b>What this test asserts</b> is that the wiring is correct, not that the
+    /// trajectory is identical: DP4a engages (first-decode logits differ), and the
+    /// ranking structure is preserved (top-10 set overlap ≥ 9/10, the new argmax
+    /// stays within the off top-3, perturbation bounded). A wiring bug — wrong dim,
+    /// clobbered shared K/V scratch, missing barrier — would destroy the top-10
+    /// overlap or blow up max|Δ|, which these bounds catch; a near-tie argmax flip
+    /// would not.
+    /// </para>
+    /// </remarks>
+    [SkippableFact]
+    public void Decode_Dp4aOnVsOff_RealModel_PreservesTopKRanking()
+    {
+        SkipIfVulkanUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasIntegerDotProduct,
+                $"Device '{probe.DeviceName}' lacks VK_KHR_shader_integer_dot_product — DP4a not testable here.");
+
+        using var gguf = GgufFile.Open(_fixture.FilePath);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] promptIds = tokenizer.Encode("The capital of France is").ToArray();
+        Assert.NotEmpty(promptIds);
+        const int decodeSteps = 16;
+
+        var (offTokens, offFirstDecode, offMs) = DecodeGreedy(spvDir, promptIds, decodeSteps, enableDp4a: false);
+        var (onTokens, onFirstDecode, onMs) = DecodeGreedy(spvDir, promptIds, decodeSteps, enableDp4a: true);
+
+        _output.WriteLine($"off tokens: [{string.Join(',', offTokens)}]  ({offMs:F1} ms / {decodeSteps} steps)");
+        _output.WriteLine($"on  tokens: [{string.Join(',', onTokens)}]  ({onMs:F1} ms / {decodeSteps} steps)");
+        _output.WriteLine($"decode wall time off/on: {offMs / onMs:F2}x  (DEBUG build, host-coherent mem — NOT a perf measurement; see release micro-bench)");
+        bool tokensMatch = offTokens.SequenceEqual(onTokens);
+        _output.WriteLine($"greedy trajectories identical: {tokensMatch} (divergence by near-tie argmax flip is expected — DP4a stays opt-in)");
+
+        float maxAbs = 0f; double sumSq = 0; bool anyDiffer = false;
+        for (int i = 0; i < offFirstDecode.Length; i++)
+        {
+            float d = MathF.Abs(offFirstDecode[i] - onFirstDecode[i]);
+            if (d > 0f) anyDiffer = true;
+            if (d > maxAbs) maxAbs = d;
+            sumSq += (double)d * d;
+        }
+        double rms = Math.Sqrt(sumSq / offFirstDecode.Length);
+        int onArg = Argmax(onFirstDecode);
+        int[] offTop10 = TopK(offFirstDecode, 10), onTop10 = TopK(onFirstDecode, 10);
+        int overlap = offTop10.Count(t => Array.IndexOf(onTop10, t) >= 0);
+        int[] offTop3 = TopK(offFirstDecode, 3);
+        _output.WriteLine($"first-decode: max|Δ|={maxAbs:E3} rms={rms:E3} top-10 overlap={overlap}/10 onArgmax={onArg} offTop3=[{string.Join(',', offTop3)}]");
+
+        // Engagement: DP4a actually ran on the dense decode path.
+        Assert.True(anyDiffer,
+            "DP4a-on first-decode logits were bit-identical to off — the DP4a decode path did not engage on the real model.");
+        // Wiring correctness (distinguishes quant drift from a bug): the ranking
+        // structure survives, the perturbation is small, and the flipped argmax is
+        // a near-tie within the off top-3.
+        Assert.True(overlap >= 9, $"first-decode top-10 overlap {overlap}/10 < 9 — ranking corrupted, likely a wiring bug not quant drift.");
+        Assert.True(maxAbs < 2.0f, $"first-decode max|Δ|={maxAbs:E3} too large for INT8 activation drift — likely a wiring bug.");
+        Assert.True(Array.IndexOf(offTop3, onArg) >= 0, $"DP4a argmax {onArg} not in off top-3 [{string.Join(',', offTop3)}] — not a near-tie flip.");
+    }
+
+    private (List<int> tokens, float[] firstDecodeLogits, double decodeMs) DecodeGreedy(
+        string spvDir, int[] promptIds, int decodeSteps, bool enableDp4a)
+    {
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        try
+        {
+            using var gguf = GgufFile.Open(_fixture.FilePath);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
+            using var cache = model.CreateKvCache(maxSeqLen: promptIds.Length + decodeSteps + 1);
+
+            var tokens = new List<int>(decodeSteps);
+            // Prefill (seqLen>1 → scalar path; DP4a does not engage here).
+            float[] logits = RunForwardVulkan(model, promptIds, BuildPositions(promptIds.Length), cache);
+            int next = Argmax(logits);
+            tokens.Add(next);
+
+            float[] firstDecodeLogits = Array.Empty<float>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int step = 0; step < decodeSteps - 1; step++)
+            {
+                int[] one = { next };
+                int[] pos = { promptIds.Length + step };
+                logits = RunForwardVulkan(model, one, pos, cache);   // seqLen==1 → DP4a path when enabled
+                if (step == 0) firstDecodeLogits = (float[])logits.Clone();
+                next = Argmax(logits);
+                tokens.Add(next);
+            }
+            sw.Stop();
+            return (tokens, firstDecodeLogits, sw.Elapsed.TotalMilliseconds);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+        }
+    }
+
     private static int[] BuildPositions(int n)
     {
         var pos = new int[n];
