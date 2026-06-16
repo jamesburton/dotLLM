@@ -141,7 +141,10 @@ internal static class AttentionTensorLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int headDim = config.HeadDim;
+        // Per-attention-type head dim (Gemma 4): full-attention layers may use a
+        // distinct GlobalHeadDim. Collapses to config.HeadDim for every other
+        // architecture, so the projection-shape validations below are unchanged.
+        int headDim = config.GetLayerHeadDim(layerIdx);
         int qOut = config.NumAttentionHeads * headDim;
         // Per-attention-type KV-head count (Gemma 4): full-attention layers use
         // NumGlobalKvHeads, sliding layers use NumKvHeads — so each layer's K/V

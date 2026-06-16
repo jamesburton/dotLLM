@@ -16,6 +16,14 @@ internal sealed unsafe class TransformerForwardState : IDisposable
     private readonly int _headDim;
     private readonly int _intermediateSize;
     private readonly int _vocabSize;
+    // Per-token element counts that drive the Q/AttnOutput and K/V scratch
+    // allocation. For a uniform head dim these are numHeads*headDim and
+    // numKvHeads*headDim respectively. For Gemma 4 with a distinct
+    // global_head_dim the full-attention layers project a wider per-head
+    // slice (and a different KV-head count), so these are sized to the LARGER
+    // per-layer block so a single allocation covers both layer types.
+    private readonly int _qBlockElems;   // max over layer types of numHeads   * layerHeadDim
+    private readonly int _kvBlockElems;  // max over layer types of kvHeads(L) * layerHeadDim
 
     private int _currentSeqLen;
 
@@ -29,8 +37,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
 
             long bytes = 0;
             bytes += s * _hiddenSize * 3;                    // HiddenState + Residual + NormOutput
-            bytes += s * _numHeads * _headDim * 2;           // Q + AttnOutput
-            bytes += s * _numKvHeads * _headDim * 2;         // K + V
+            bytes += s * _qBlockElems * 2;                   // Q + AttnOutput
+            bytes += s * _kvBlockElems * 2;                  // K + V
             bytes += s * _intermediateSize * 3;              // FfnGate + FfnUp + SiluOutput
             bytes += s * _vocabSize;                          // Logits (all positions for speculative verify)
             bytes *= sizeof(float);
@@ -103,7 +111,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         int hiddenSize, int numHeads, int numKvHeads, int headDim,
         int intermediateSize, int vocabSize, int maxSeqLen, int ropeDim,
         float ropeTheta,
-        int globalRopeDim = 0, float globalRopeTheta = 0f)
+        int globalRopeDim = 0, float globalRopeTheta = 0f,
+        int qBlockElems = 0, int kvBlockElems = 0)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -111,6 +120,11 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         _headDim = headDim;
         _intermediateSize = intermediateSize;
         _vocabSize = vocabSize;
+        // Default the per-token Q/KV block sizes to the uniform-head-dim layout
+        // when the caller does not pass explicit (per-layer max) sizes — keeps
+        // every existing caller byte-identical.
+        _qBlockElems = qBlockElems > 0 ? qBlockElems : numHeads * headDim;
+        _kvBlockElems = kvBlockElems > 0 ? kvBlockElems : numKvHeads * headDim;
 
         // Pre-compute RoPE frequency tables
         int halfDim = ropeDim / 2;
@@ -151,10 +165,10 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         HiddenState = AllocFloats(newCapacity * _hiddenSize);
         Residual = AllocFloats(newCapacity * _hiddenSize);
         NormOutput = AllocFloats(newCapacity * _hiddenSize);
-        Q = AllocFloats(newCapacity * _numHeads * _headDim);
-        K = AllocFloats(newCapacity * _numKvHeads * _headDim);
-        V = AllocFloats(newCapacity * _numKvHeads * _headDim);
-        AttnOutput = AllocFloats(newCapacity * _numHeads * _headDim);
+        Q = AllocFloats((long)newCapacity * _qBlockElems);
+        K = AllocFloats((long)newCapacity * _kvBlockElems);
+        V = AllocFloats((long)newCapacity * _kvBlockElems);
+        AttnOutput = AllocFloats((long)newCapacity * _qBlockElems);
         FfnGate = AllocFloats(newCapacity * _intermediateSize);
         FfnUp = AllocFloats(newCapacity * _intermediateSize);
         SiluOutput = AllocFloats(newCapacity * _intermediateSize);

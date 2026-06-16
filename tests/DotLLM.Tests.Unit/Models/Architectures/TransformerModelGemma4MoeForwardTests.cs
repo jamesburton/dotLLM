@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -260,6 +261,239 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
         var stats = ComputeStats(logits);
         Assert.Equal(stats.TotalCount, stats.FiniteCount);
         Assert.True(stats.StdDev > 0.0f, $"Logits degenerate: std={stats.StdDev}");
+    }
+
+    // ────────────── distinct per-layer head dim (issue #36) ──────────────
+    //
+    // The real DiffusionGemma / Gemma-4 26B uses head_dim=256 on the sliding
+    // layers and global_head_dim=512 on the full-attention layers. The tests
+    // below exercise the analogous CONFIGURATION on a tiny synthetic fixture:
+    // sliding layers project Q/K/V at SlidingHeadDim and full-attention layers
+    // at GlobalHeadDim (a DIFFERENT, larger per-head width), on the cacheless
+    // forward path.
+
+    // Distinct-head-dim geometry. NumHeads=4. Sliding head_dim=4 → Q stride 16
+    // (== HiddenSize). Full global_head_dim=8 → Q stride 32. KV: sliding
+    // NumKvHeads=2*4=8; full NumGlobalKvHeads=2*8=16. The two layer types carry
+    // DISTINCT Q/K/V/O projection shapes — the loader picks each up from the
+    // tensor shape; the forward dispatches the layer head dim per layer.
+    private const int DistinctSlidingHeadDim = 4;
+    private const int DistinctGlobalHeadDim = 8;
+    private const int DistinctNumKvHeads = 2;        // sliding KV-head count
+    private const int DistinctNumGlobalKvHeads = 2;  // full KV-head count
+
+    [Fact]
+    public void Forward_Gemma4_DistinctHeadDim_Cacheless_FiniteNonDegenerate()
+    {
+        // A Gemma-4 forward with GlobalHeadDim (8) != HeadDim (4) — full-attention
+        // layers project a wider per-head slice than the sliding layers — produces
+        // finite, non-degenerate [seq, vocab] logits on the cacheless path.
+        string path = Path.Combine(_scratch, "gemma4-distinct.safetensors");
+        WriteDistinctHeadDimFixture(path, seed: 55);
+
+        ModelConfig config = BuildDistinctHeadDimConfig();
+
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, config);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+        using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(tokenIds.Length, logits.Shape[0]);
+        Assert.Equal(VocabSize, logits.Shape[1]);
+
+        var stats = ComputeStats(logits);
+        Assert.Equal(stats.TotalCount, stats.FiniteCount);
+        Assert.True(stats.StdDev > 0.0f, $"Logits degenerate: std={stats.StdDev}");
+    }
+
+    [Fact]
+    public void Forward_Gemma4_DistinctHeadDim_DiffersFromUniformHeadDim()
+    {
+        // Discriminative: the distinct-head-dim config (full layers at
+        // GlobalHeadDim=8) must produce DIFFERENT logits than a uniform-head-dim
+        // config (full layers forced to HeadDim=4) — proving the full-attention
+        // layers actually rotate / attend at the wider per-head width rather than
+        // silently collapsing to the sliding head dim. The two runs use weight
+        // fixtures sized for their respective configs (the full-layer Q/K/V/O
+        // shapes differ), so we compare logit MAGNITUDE statistics rather than
+        // element-wise diff — a degenerate (uniform) forward over the wider
+        // fixture would mis-shape and fail to load at all.
+        string distinctPath = Path.Combine(_scratch, "gemma4-distinct-d.safetensors");
+        string uniformPath = Path.Combine(_scratch, "gemma4-distinct-u.safetensors");
+        WriteDistinctHeadDimFixture(distinctPath, seed: 77, globalHeadDim: DistinctGlobalHeadDim);
+        WriteDistinctHeadDimFixture(uniformPath, seed: 77, globalHeadDim: DistinctSlidingHeadDim);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        ModelConfig cfgDistinct = BuildDistinctHeadDimConfig(globalHeadDim: DistinctGlobalHeadDim);
+        ModelConfig cfgUniform = BuildDistinctHeadDimConfig(globalHeadDim: DistinctSlidingHeadDim);
+
+        float[] distinct = RunLogits(distinctPath, cfgDistinct, tokenIds, positions);
+        float[] uniform = RunLogits(uniformPath, cfgUniform, tokenIds, positions);
+
+        Assert.All(distinct, v => Assert.True(float.IsFinite(v)));
+        Assert.All(uniform, v => Assert.True(float.IsFinite(v)));
+
+        // Same seed + same sliding-layer weights, but the full-attention layers
+        // run at a different per-head width → the two logit vectors must diverge.
+        float maxDiff = MaxAbsDiff(distinct, uniform);
+        Assert.True(maxDiff > 1e-4f,
+            $"Distinct vs uniform head dim produced no measurable difference (maxDiff={maxDiff}).");
+    }
+
+    [Fact]
+    public void Forward_Gemma4_DistinctHeadDim_WithKvCache_Throws()
+    {
+        // A distinct per-layer head dim is supported on the cacheless path only.
+        // Combining it with a KV-cache must throw NotSupportedException (the
+        // single-stride KV cache cannot hold two distinct per-layer K/V block
+        // sizes). The cacheless forward in the test above proves the supported
+        // path works.
+        string path = Path.Combine(_scratch, "gemma4-distinct-kv.safetensors");
+        WriteDistinctHeadDimFixture(path, seed: 91);
+
+        ModelConfig config = BuildDistinctHeadDimConfig();
+
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, config);
+
+        // Sliding-layer K/V block size; the exact stride is irrelevant — the
+        // guard fires before the cache geometry is consulted.
+        using IKvCache kv = new DotLLM.Engine.KvCache.SimpleKvCache(
+            numLayers: NumLayers,
+            numKvHeads: DistinctNumKvHeads,
+            headDim: DistinctSlidingHeadDim,
+            maxSeqLen: 16);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+        var ex = Record.Exception(() =>
+        {
+            using ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache: kv);
+        });
+        Assert.IsType<NotSupportedException>(ex);
+    }
+
+    private static ModelConfig BuildDistinctHeadDimConfig(int globalHeadDim = DistinctGlobalHeadDim)
+    {
+        // Sliding RoPE rotates within the sliding head dim; the global RoPE
+        // rotates within the (wider) full-attention head dim.
+        var slidingRope = new RoPEConfig(
+            Theta: 10_000.0f,
+            DimensionCount: DistinctSlidingHeadDim,
+            Type: RoPEType.NeoX);
+
+        var globalRope = new RoPEConfig(
+            Theta: 1_000_000.0f,
+            DimensionCount: globalHeadDim,
+            Type: RoPEType.NeoX);
+
+        // Layers 0,2 sliding (window=2); layers 1,3 full attention.
+        var perLayer = new int?[NumLayers]
+        {
+            SlidingWindow, // layer 0 sliding
+            null,          // layer 1 full
+            SlidingWindow, // layer 2 sliding
+            null,          // layer 3 full
+        };
+
+        var moe = new MoeConfig
+        {
+            NumExperts = NumExperts,
+            NumExpertsPerTok = TopK,
+            MoeIntermediateSize = MoeIntermediateSize,
+            NormTopKProb = true,
+        };
+
+        return new ModelConfig
+        {
+            Architecture = Architecture.Gemma4,
+            VocabSize = VocabSize,
+            HiddenSize = HiddenSize,
+            IntermediateSize = MoeIntermediateSize,
+            NumLayers = NumLayers,
+            NumAttentionHeads = NumHeads,
+            NumKvHeads = DistinctNumKvHeads,
+            HeadDim = DistinctSlidingHeadDim,
+            MaxSequenceLength = 16,
+            AttentionType = AttentionType.GQA,
+            PositionEncodingType = PositionEncodingType.RoPE,
+            RoPEConfig = slidingRope,
+            GlobalRoPEConfig = globalRope,
+            // Full rotation on both tables — isolate the head-dim difference.
+            PartialRotaryFactor = 1.0f,
+            NumGlobalKvHeads = DistinctNumGlobalKvHeads,
+            GlobalHeadDim = globalHeadDim,
+            ActivationFunction = ActivationFunction.GELUTanh,
+            NormType = NormType.RMSNorm,
+            NormEpsilon = 1e-6f,
+            TiedEmbeddings = false,
+            SlidingWindowSize = SlidingWindow,
+            PerLayerSlidingWindow = perLayer,
+            FinalLogitSoftcap = 30.0f,
+            EmbeddingScale = MathF.Sqrt(HiddenSize),
+            Moe = moe,
+            ChatTemplate = null,
+        };
+    }
+
+    /// <summary>
+    /// Writes a synthetic Gemma-4 MoE fixture where the full-attention layers
+    /// (1,3) project Q/K/V/O at <paramref name="globalHeadDim"/> and the sliding
+    /// layers (0,2) at <see cref="DistinctSlidingHeadDim"/> — DISTINCT per-head
+    /// widths and KV-head counts per layer type, exactly as the real Gemma-4 26B
+    /// (head_dim 256 / global_head_dim 512) does. Setting
+    /// <paramref name="globalHeadDim"/> == <see cref="DistinctSlidingHeadDim"/>
+    /// emits a uniform-head-dim variant for the discriminative comparison.
+    /// </summary>
+    private static void WriteDistinctHeadDimFixture(string path, int seed,
+                                                    int globalHeadDim = DistinctGlobalHeadDim)
+    {
+        var b = new SafetensorsFixtureBuilder();
+
+        AddRand(b, "model.embed_tokens.weight", [VocabSize, HiddenSize], 0.1f, seed + 0);
+        AddRand(b, "model.norm.weight", [HiddenSize], amplitude: 0.05f, seed: seed + 1);
+        AddRand(b, "lm_head.weight", [VocabSize, HiddenSize], 0.1f, seed + 2);
+
+        for (int i = 0; i < NumLayers; i++)
+        {
+            int s = seed + 10 * (i + 1);
+            string prefix = $"model.layers.{i}";
+            bool isFull = (i % 2) == 1; // layers 1,3 full attention
+            int layerHeadDim = isFull ? globalHeadDim : DistinctSlidingHeadDim;
+            int layerKvHeads = isFull ? DistinctNumGlobalKvHeads : DistinctNumKvHeads;
+            int qStride = NumHeads * layerHeadDim;
+            int kvStride = layerKvHeads * layerHeadDim;
+
+            AddRand(b, $"{prefix}.input_layernorm.weight", [HiddenSize], amplitude: 0.05f, seed: s + 0);
+            AddRand(b, $"{prefix}.post_attention_layernorm.weight", [HiddenSize], amplitude: 0.10f, seed: s + 1);
+            AddRand(b, $"{prefix}.pre_feedforward_layernorm.weight", [HiddenSize], amplitude: 0.05f, seed: s + 9);
+            AddRand(b, $"{prefix}.post_feedforward_layernorm.weight", [HiddenSize], amplitude: 0.10f, seed: s + 10);
+
+            AddRand(b, $"{prefix}.self_attn.q_proj.weight", [qStride, HiddenSize], 0.1f, s + 2);
+            AddRand(b, $"{prefix}.self_attn.k_proj.weight", [kvStride, HiddenSize], 0.1f, s + 3);
+            AddRand(b, $"{prefix}.self_attn.v_proj.weight", [kvStride, HiddenSize], 0.1f, s + 4);
+            AddRand(b, $"{prefix}.self_attn.o_proj.weight", [HiddenSize, qStride], 0.1f, s + 5);
+
+            // Per-head QK-norm weights are sized by THIS layer's head dim.
+            AddRand(b, $"{prefix}.self_attn.q_norm.weight", [layerHeadDim], amplitude: 0.05f, seed: s + 11);
+            AddRand(b, $"{prefix}.self_attn.k_norm.weight", [layerHeadDim], amplitude: 0.05f, seed: s + 12);
+
+            AddRand(b, $"{prefix}.mlp.gate.weight", [NumExperts, HiddenSize], 0.2f, s + 6);
+            for (int e = 0; e < NumExperts; e++)
+            {
+                int es = s + 100 + 7 * e;
+                AddRand(b, $"{prefix}.mlp.experts.{e}.gate_proj.weight", [MoeIntermediateSize, HiddenSize], 0.10f, es + 0);
+                AddRand(b, $"{prefix}.mlp.experts.{e}.up_proj.weight", [MoeIntermediateSize, HiddenSize], 0.10f, es + 1);
+                AddRand(b, $"{prefix}.mlp.experts.{e}.down_proj.weight", [HiddenSize, MoeIntermediateSize], 0.05f, es + 2);
+            }
+        }
+
+        b.WriteTo(path);
     }
 
     // ───────────────────────── helpers ─────────────────────────

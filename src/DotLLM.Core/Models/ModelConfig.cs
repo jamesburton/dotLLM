@@ -224,15 +224,30 @@ public record ModelConfig
     /// Optional per-head dimension for the FULL-attention layers (Gemma 4
     /// <c>global_head_dim</c>, e.g. 512 vs the sliding <c>head_dim</c> 256). When
     /// non-null and different from <see cref="HeadDim"/>, the full-attention layers
-    /// would project Q/K/V at a different per-head width than the sliding layers.
-    /// The current CPU forward path uses a single uniform head_dim for its scratch
-    /// buffers and KV cache, so a config whose <see cref="GlobalHeadDim"/> differs
-    /// from <see cref="HeadDim"/> is not yet supported by the forward pass (it is
-    /// validated and rejected with a clear deferral message at model-build time).
-    /// Null, or equal to <see cref="HeadDim"/>, means a uniform head dimension —
-    /// the supported configuration.
+    /// project Q/K/V at a different per-head width than the sliding layers; the CPU
+    /// forward pass resolves the layer head dim per layer via
+    /// <see cref="GetLayerHeadDim(int)"/> and sizes its scratch buffers for the
+    /// larger of the two. Null, or equal to <see cref="HeadDim"/>, means a uniform
+    /// head dimension across all layer types — every non-Gemma-4 architecture
+    /// leaves this null and is unaffected.
     /// </summary>
     public int? GlobalHeadDim { get; init; }
+
+    /// <summary>
+    /// Returns the per-head dimension for <paramref name="layerIdx"/>. Full-attention
+    /// layers use <see cref="GlobalHeadDim"/> when set (Gemma 4 <c>global_head_dim</c>);
+    /// sliding-window layers and every other architecture use <see cref="HeadDim"/>.
+    /// Collapses to a uniform <see cref="HeadDim"/> when <see cref="GlobalHeadDim"/>
+    /// is null, so non-Gemma-4 forwards are unaffected.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public int GetLayerHeadDim(int layerIdx)
+    {
+        if (GlobalHeadDim is int g && IsFullAttentionLayer(layerIdx))
+            return g;
+        return HeadDim;
+    }
 
     /// <summary>
     /// Returns true when <paramref name="layerIdx"/> is a FULL-attention layer.

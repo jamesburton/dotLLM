@@ -222,18 +222,23 @@ public sealed unsafe class TransformerModel : IModel
         // layers may use a different base theta AND a partial-rotary factor than
         // the sliding-window layers. We build a secondary cos/sin table for the
         // full-attention layers and dispatch per layer in the forward pass.
-        // Until the shared forward-state / KV-cache plumbing supports a per-layer
-        // head_dim, we require GlobalHeadDim == HeadDim (the uniform-head-dim
-        // case). The dual-KV-head count (NumGlobalKvHeads != NumKvHeads) IS
-        // supported because it only changes the K/V projection width — buffers
-        // are sized for the max KV-head count.
+        // The full-attention layers may ALSO use a distinct per-head dimension
+        // (GlobalHeadDim != HeadDim): the cacheless forward resolves the layer
+        // head dim per layer and sizes its scratch for the larger of the two
+        // (handled below). A KV-cache combined with a distinct head dim is
+        // rejected at Forward time (the single-stride cache can't hold two
+        // per-layer K/V block sizes) — see GuardKvCacheHeadDim.
         int globalRopeDim = 0;
         float globalRopeTheta = 0f;
         RoPEType globalRopeType = ropeType;
         if (config.GlobalRoPEConfig is RoPEConfig gcfg && config.MlaConfig is null)
         {
-            ValidateGemma4UniformHeadDim(config);
-            int baseDim = gcfg.DimensionCount > 0 ? gcfg.DimensionCount : config.HeadDim;
+            // RoPE rotates pairs within each head's leading dims. For a partial
+            // rotary factor on the full-attention layers, the rotated span is a
+            // fraction of the FULL-attention head dim (GlobalHeadDim when set).
+            int baseDim = gcfg.DimensionCount > 0
+                ? gcfg.DimensionCount
+                : (config.GlobalHeadDim ?? config.HeadDim);
             // Partial-rotary factor (Gemma 4 full-attention layers): only the
             // leading round-down-to-even fraction of each head rotates.
             float prf = config.PartialRotaryFactor ?? 1.0f;
@@ -245,12 +250,27 @@ public sealed unsafe class TransformerModel : IModel
             globalRopeType = gcfg.Type;
         }
 
+        // Per-token Q/KV scratch block sizes. With a uniform head dim these are
+        // the standard numHeads*headDim and numKvHeads*headDim. With Gemma 4's
+        // distinct global_head_dim the full-attention layers project a wider
+        // per-head slice and a different KV-head count, so we size each block to
+        // the LARGER of the sliding and full layer types — a single allocation
+        // then covers both. The per-layer dispatch in the forward uses the
+        // layer's own head dim / KV-head count.
+        int slidingHeadDim = config.HeadDim;
+        int fullHeadDim = config.GlobalHeadDim ?? config.HeadDim;
+        int slidingKvHeads = config.NumKvHeads;
+        int fullKvHeads = config.NumGlobalKvHeads ?? config.NumKvHeads;
+        int qBlockElems = config.NumAttentionHeads * Math.Max(slidingHeadDim, fullHeadDim);
+        int kvBlockElems = Math.Max(slidingKvHeads * slidingHeadDim, fullKvHeads * fullHeadDim);
+
         var state = new TransformerForwardState(
             config.HiddenSize,
             config.NumAttentionHeads,
-            // Size the K/V scratch + KV cache for the LARGER of the two KV-head
-            // counts so both sliding (NumKvHeads) and full (NumGlobalKvHeads)
-            // layers fit. Per-layer dispatch uses the layer's own count.
+            // Size the K/V scratch for the LARGER of the two KV-head counts so
+            // both sliding (NumKvHeads) and full (NumGlobalKvHeads) layers fit.
+            // Per-layer dispatch uses the layer's own count. (kvBlockElems below
+            // supersedes this for the distinct-head-dim case.)
             Math.Max(config.NumKvHeads, config.NumGlobalKvHeads ?? config.NumKvHeads),
             config.HeadDim,
             config.IntermediateSize,
@@ -259,7 +279,9 @@ public sealed unsafe class TransformerModel : IModel
             ropeDim,
             ropeTheta,
             globalRopeDim,
-            globalRopeTheta);
+            globalRopeTheta,
+            qBlockElems,
+            kvBlockElems);
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
@@ -331,20 +353,36 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
-    /// Guards the unsupported Gemma 4 configuration where the full-attention
-    /// layers use a different per-head dimension (<c>global_head_dim</c>) than the
-    /// sliding-window layers (<c>head_dim</c>). The shared forward-state scratch
-    /// buffers and KV cache are sized for a single uniform head_dim; supporting a
-    /// per-layer head_dim is tracked separately. Throws a clear deferral message.
+    /// Returns true when this model has a distinct per-layer attention head
+    /// dimension (Gemma 4 <c>global_head_dim</c> != <c>head_dim</c>). The cacheless
+    /// forward path fully supports this (scratch buffers + the per-layer attention
+    /// dispatch are sized/threaded per layer); the KV-cached path does not — the
+    /// single-stride KV cache cannot hold two distinct per-layer K/V block sizes.
     /// </summary>
-    private static void ValidateGemma4UniformHeadDim(ModelConfig config)
+    private bool HasDistinctPerLayerHeadDim =>
+        Config.GlobalHeadDim is int ghd && ghd != Config.HeadDim;
+
+    /// <summary>
+    /// Rejects the combination of a distinct per-layer head dimension (Gemma 4
+    /// <c>global_head_dim</c> != <c>head_dim</c>) with a KV-cache. The
+    /// <c>SimpleKvCache</c> / paged KV caches allocate a single
+    /// <c>numKvHeads * headDim</c> stride per layer, but a distinct-head-dim model
+    /// has DIFFERENT per-layer K/V block sizes (full-attention layers:
+    /// <c>NumGlobalKvHeads * GlobalHeadDim</c>; sliding layers:
+    /// <c>NumKvHeads * HeadDim</c>). The cacheless forward (diffusion + the
+    /// synthetic forward) fully supports the distinct-head-dim case; per-layer
+    /// KV-cache strides are tracked as future work. Throws a clear message.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void GuardKvCacheHeadDim(IKvCache? kvCache)
     {
-        if (config.GlobalHeadDim is int ghd && ghd != config.HeadDim)
+        if (kvCache is not null && HasDistinctPerLayerHeadDim)
             throw new NotSupportedException(
-                $"Gemma 4 with distinct global_head_dim ({ghd}) and head_dim ({config.HeadDim}) "
-                + "is not yet supported by the CPU forward path — the shared forward-state and "
-                + "KV-cache buffers assume a uniform per-head dimension across layer types. "
-                + "Configure a uniform head_dim (per-layer head_dim support is tracked as issue #36).");
+                $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
+                + $"({Config.HeadDim}) is supported on the cacheless forward path only — the "
+                + "KV-cache allocates a single per-layer stride and cannot hold the two distinct "
+                + "per-layer K/V block sizes. Run this model without a KV-cache (the diffusion "
+                + "decode path is cacheless). Per-layer KV-cache strides are tracked as future work.");
     }
 
     /// <inheritdoc/>
@@ -517,6 +555,10 @@ public sealed unsafe class TransformerModel : IModel
     private unsafe void RunLayersAndFinalNormCore(
         ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, IKvCache? kvCache)
     {
+        // A distinct per-layer head dim (Gemma 4 global_head_dim) is supported on
+        // the cacheless path only — reject a KV-cache up front with a clear message.
+        GuardKvCacheHeadDim(kvCache);
+
         int maxSeq = Config.MaxSequenceLength;
         for (int i = 0; i < positions.Length; i++)
         {
@@ -528,7 +570,10 @@ public sealed unsafe class TransformerModel : IModel
         int seqLen = tokenIds.Length;
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
-        int headDim = Config.HeadDim;
+        // Note: the per-head dimension is resolved PER LAYER inside the loop
+        // (Config.GetLayerHeadDim) — Gemma 4 full-attention layers may use a
+        // distinct GlobalHeadDim. Every other architecture collapses to the
+        // uniform Config.HeadDim.
         int intermediateSize = Config.IntermediateSize;
         int vocabSize = Config.VocabSize;
         float eps = Config.NormEpsilon;
@@ -617,7 +662,13 @@ public sealed unsafe class TransformerModel : IModel
             // use NumGlobalKvHeads, sliding layers use NumKvHeads). Collapses to
             // the uniform Config.NumKvHeads for every other architecture.
             int numKvHeadsLayer = GetLayerKvHeads(layer);
-            int kvStrideLayer = numKvHeadsLayer * headDim;
+            // Per-attention-type head dim (Gemma 4: full-attention layers use
+            // GlobalHeadDim, sliding layers use HeadDim). Collapses to the uniform
+            // Config.HeadDim for every other architecture, so headDimLayer ==
+            // headDim and qStrideLayer == numHeads*headDim on the standard path.
+            int headDimLayer = Config.GetLayerHeadDim(layer);
+            int qStrideLayer = numHeads * headDimLayer;
+            int kvStrideLayer = numKvHeadsLayer * headDimLayer;
 
             // Declared once for the whole layer so both the GQA and MLA
             // paths share the same input-quantisation scratch region.
@@ -885,9 +936,9 @@ public sealed unsafe class TransformerModel : IModel
 
             // Optional QK-norms (Qwen3-style): per-head RMSNorm on Q/K after projection, before RoPE
             if (lw.QNormWeight is not null)
-                ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDim, seqLen, eps);
+                ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDimLayer, seqLen, eps);
             if (lw.KNormWeight is not null)
-                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDim, seqLen, eps);
+                ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
 
             // d. RoPE (in-place on Q and K for all tokens). SmolLM3 marks
             // selected layers as NoPE (skip RoPE entirely) via
@@ -899,10 +950,10 @@ public sealed unsafe class TransformerModel : IModel
             {
                 var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
                 RoPE.Execute(
-                    new Span<float>(q, seqLen * numHeads * headDim),
+                    new Span<float>(q, seqLen * qStrideLayer),
                     new Span<float>(k, seqLen * kvStrideLayer),
                     positions,
-                    numHeads, numKvHeadsLayer, headDim, ropeDimLayer,
+                    numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
                     ropeCos, ropeSin, ropeTypeLayer);
             }
 
@@ -916,11 +967,14 @@ public sealed unsafe class TransformerModel : IModel
             int? layerSlidingWindow = GetLayerSlidingWindow(layer);
             float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
                 ? 1.0f / MathF.Sqrt(qpas)
-                : 1.0f / MathF.Sqrt(headDim);
+                : 1.0f / MathF.Sqrt(headDimLayer);
             float attnSoftCap = Config.AttnLogitSoftcap ?? 0f;
 
             if (kvCache is not null)
             {
+                // KV-cache + distinct per-layer head dim is rejected at entry
+                // (GuardKvCacheHeadDim), so headDimLayer == headDim here and the
+                // single-stride cache geometry is consistent.
                 // Store new K/V in cache, then attend over full cached context (zero allocations)
                 var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
                 var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
@@ -933,7 +987,7 @@ public sealed unsafe class TransformerModel : IModel
                 {
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], _threadPool,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
                         layerSlidingWindow, attnSoftCap);
                 }
                 else
@@ -942,7 +996,7 @@ public sealed unsafe class TransformerModel : IModel
                     var cachedV = kvCache.GetValuesRef(layer);
 
                     Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
-                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDim, positions[0], attnScale,
+                        seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
                         _threadPool, layerSlidingWindow, attnSoftCap);
                 }
             }
@@ -953,13 +1007,14 @@ public sealed unsafe class TransformerModel : IModel
                 // it otherwise), so this call is byte-identical to the pre-bidirectional code
                 // on the causal path. Bidirectional / hybrid divert masking inside the kernel.
                 Attention.Execute(q, k, v, attnOut,
-                    seqLen, seqLen, numHeads, numKvHeadsLayer, headDim, 0, attnScale, _threadPool,
+                    seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
                     layerSlidingWindow, attnSoftCap,
                     _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
             }
 
-            // f. Batched O projection
-            byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, numHeads * headDim, seqLen, lw.OQuantType);
+            // f. Batched O projection. The O projection input width is the
+            // attention output stride (numHeads * headDimLayer == lw.OInputDim).
+            byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, qStrideLayer, seqLen, lw.OQuantType);
             var rwO = rl?.O ?? default;
             GemmInterleaved(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen,
                 preQuantAttn, in rwO);
@@ -1504,6 +1559,14 @@ public sealed unsafe class TransformerModel : IModel
         ReadOnlySpan<int> simpleIdxs,
         int simpleTotalTokens)
     {
+        // The batched path attends through per-request KV caches; a distinct
+        // per-layer head dim is cacheless-only (see GuardKvCacheHeadDim).
+        if (HasDistinctPerLayerHeadDim)
+            throw new NotSupportedException(
+                $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
+                + $"({Config.HeadDim}) is not supported on the batched (KV-cached) forward path. "
+                + "Use the cacheless single-sequence Forward path.");
+
         int maxSeq = Config.MaxSequenceLength;
         // Validate positions per-seq (mirrors the per-seq core).
         for (int s = 0; s < simpleIdxs.Length; s++)

@@ -823,6 +823,14 @@ internal sealed class TransformerWeights : IDisposable
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
+        // Per-attention-type head dim + KV-head count (Gemma 4): full-attention
+        // layers may use a distinct GlobalHeadDim / NumGlobalKvHeads. Collapses to
+        // the uniform config.HeadDim / config.NumKvHeads for every other
+        // architecture, so the fused-QKV split and q/k-norm lengths are unchanged.
+        int layerHeadDim = config.GetLayerHeadDim(layerIdx);
+        int layerKvHeads = config.NumGlobalKvHeads is int gkv && config.IsFullAttentionLayer(layerIdx)
+            ? gkv
+            : config.NumKvHeads;
 
         // Attention norm — dequantize to float[]
         var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
@@ -840,8 +848,8 @@ internal sealed class TransformerWeights : IDisposable
             int inputDim = qkvDesc.Shape[0]; // hidden_size
             long rowBytes = Dequantize.RowByteSize(inputDim, qkvDesc.QuantizationType);
 
-            int qDim = config.NumAttentionHeads * config.HeadDim;
-            int kvDim = config.NumKvHeads * config.HeadDim;
+            int qDim = config.NumAttentionHeads * layerHeadDim;
+            int kvDim = layerKvHeads * layerHeadDim;
 
             qPtr = qkvPtr; qQt = qkvDesc.QuantizationType; qM = qDim; qK = inputDim;
             kPtr = qkvPtr + (nint)(qDim * rowBytes); kQt = qkvDesc.QuantizationType; kM = kvDim; kK = inputDim;
@@ -863,8 +871,8 @@ internal sealed class TransformerWeights : IDisposable
         {
             // Fused QKV bias — split by element offset
             nint biasPtr = dataBase + (nint)qkvBiasDesc.DataOffset;
-            int qDim = config.NumAttentionHeads * config.HeadDim;
-            int kvDim = config.NumKvHeads * config.HeadDim;
+            int qDim = config.NumAttentionHeads * layerHeadDim;
+            int kvDim = layerKvHeads * layerHeadDim;
 
             qBias = new float[qDim];
             kBias = new float[kvDim];
@@ -883,8 +891,8 @@ internal sealed class TransformerWeights : IDisposable
         float[]? oBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.attn_output.bias");
 
         // Optional QK-norms (Qwen3-style): per-head RMSNorm applied to Q/K after projection, before RoPE
-        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", config.HeadDim);
-        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", config.HeadDim);
+        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", layerHeadDim);
+        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", layerHeadDim);
 
         // FFN norm
         var ffnNormDesc = tensors[$"{prefix}.ffn_norm.weight"];
