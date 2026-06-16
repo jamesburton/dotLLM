@@ -14,7 +14,7 @@ namespace DotLLM.Cuda;
 /// <see cref="VulkanCache"/> directly; CUDA layers via
 /// <see cref="CudaCache"/> using 0-based (per-cache) layer indices.
 /// </summary>
-public sealed class VulkanCudaKvCache : IKvCache
+public sealed class HybridVulkanCudaKvCache : IKvCache
 {
     private readonly int _numVulkanLayers;
 
@@ -47,7 +47,7 @@ public sealed class VulkanCudaKvCache : IKvCache
     /// <param name="vulkanCache">Vulkan cache for the first <paramref name="numVulkanLayers"/> layers.</param>
     /// <param name="cudaCache">CUDA cache for the remaining layers.</param>
     /// <param name="numVulkanLayers">Number of layers handled by the Vulkan cache.</param>
-    public VulkanCudaKvCache(VulkanKvCache vulkanCache, CudaKvCache cudaCache, int numVulkanLayers)
+    public HybridVulkanCudaKvCache(VulkanKvCache vulkanCache, CudaKvCache cudaCache, int numVulkanLayers)
     {
         ArgumentNullException.ThrowIfNull(vulkanCache);
         ArgumentNullException.ThrowIfNull(cudaCache);
@@ -73,7 +73,7 @@ public sealed class VulkanCudaKvCache : IKvCache
         // CudaKvCache.Update(ITensor) is the IKvCache host-copy path — not available
         // for device-side CudaKvCache; callers must use UpdateDevice. Surface a clear error.
         throw new NotSupportedException(
-            "Use CudaCache.UpdateDevice() for CUDA layers in a VulkanCudaKvCache.");
+            "Use CudaCache.UpdateDevice() for CUDA layers in a HybridVulkanCudaKvCache.");
     }
 
     /// <inheritdoc/>
@@ -84,7 +84,7 @@ public sealed class VulkanCudaKvCache : IKvCache
                 $"Layer {layerIndex} is a Vulkan layer — use VulkanCache directly.");
 
         throw new NotSupportedException(
-            "Use CudaCache.UpdateDevice() for CUDA layers in a VulkanCudaKvCache.");
+            "Use CudaCache.UpdateDevice() for CUDA layers in a HybridVulkanCudaKvCache.");
     }
 
     /// <inheritdoc/>
@@ -95,7 +95,7 @@ public sealed class VulkanCudaKvCache : IKvCache
                 $"Layer {layerIndex} is a Vulkan layer — use VulkanCache.GetKeys().");
 
         throw new NotSupportedException(
-            "Use CudaCache.GetKeysPtr() for CUDA layers in a VulkanCudaKvCache.");
+            "Use CudaCache.GetKeysPtr() for CUDA layers in a HybridVulkanCudaKvCache.");
     }
 
     /// <inheritdoc/>
@@ -106,7 +106,7 @@ public sealed class VulkanCudaKvCache : IKvCache
                 $"Layer {layerIndex} is a Vulkan layer — use VulkanCache.GetValues().");
 
         throw new NotSupportedException(
-            "Use CudaCache.GetValuesPtr() for CUDA layers in a VulkanCudaKvCache.");
+            "Use CudaCache.GetValuesPtr() for CUDA layers in a HybridVulkanCudaKvCache.");
     }
 
     /// <inheritdoc/>

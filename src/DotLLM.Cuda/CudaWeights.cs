@@ -155,14 +155,24 @@ internal sealed class CudaWeights : IDisposable
     /// <param name="numGpuLayers">Number of layers to upload. -1 = all layers.
     /// When less than total layers (hybrid mode), output norm and LM head are skipped
     /// since the CPU handles final projection.</param>
+    /// <param name="firstLayer">
+    /// First layer index (0-based) in <paramref name="cpuWeights"/> to upload.
+    /// Layers <c>firstLayer..(firstLayer+layerCount-1)</c> are uploaded.
+    /// The resulting <see cref="Layers"/> array is always 0-based regardless of
+    /// <paramref name="firstLayer"/>. Used by the Vulkan+CUDA split to avoid uploading
+    /// the Vulkan-resident layers to CUDA VRAM. Default 0 = upload from the beginning.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
-                                              int numGpuLayers = -1)
+                                              int numGpuLayers = -1, int firstLayer = 0)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         int layerCount = numGpuLayers < 0
-            ? config.NumLayers
-            : Math.Min(numGpuLayers, config.NumLayers);
-        bool isHybrid = layerCount < config.NumLayers;
+            ? config.NumLayers - firstLayer
+            : Math.Min(numGpuLayers, config.NumLayers - firstLayer);
+        // isHybrid: the CUDA upload covers only a contiguous slice of the full model,
+        // so it does NOT own the output norm + LM head (caller owns them separately).
+        bool isHybrid = (firstLayer + layerCount) < config.NumLayers;
 
         var allocs = new List<nint>();
 
@@ -229,7 +239,8 @@ internal sealed class CudaWeights : IDisposable
 
         for (int i = 0; i < layerCount; i++)
         {
-            ref readonly var lw = ref cpuWeights.Layers[i];
+            // cpuWeights.Layers is indexed globally; layers array is 0-based (local to this CUDA slice).
+            ref readonly var lw = ref cpuWeights.Layers[firstLayer + i];
 
             // MLA layers do NOT carry GQA Q/K/V tensors — those slots are zero on
             // the CPU side. Skip the GQA upload path entirely; CudaMlaWeightsLoader

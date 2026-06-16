@@ -21,14 +21,19 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// <remarks>
 /// <para>
 /// <b>Architecture.</b> A 4-layer synthetic dense GQA fixture (hidden=32,
-/// heads=2, KVheads=1, headDim=16, intermediate=32) is run three ways:
+/// heads=2, KVheads=1, headDim=16, intermediate=32) is parameterised over
+/// three split points:
 /// <list type="bullet">
-///   <item>Pure-CUDA (all 4 layers on CUDA) — the reference oracle.</item>
-///   <item>2-Vulkan + 2-CUDA (split at N=2) — exercises the handoff path.</item>
+///   <item>numVulkanLayers=1 (split at boundary 1/3) — catches off-by-one
+///   bugs where layer 0 ≡ global index ≡ local index, masking reindex errors.</item>
+///   <item>numVulkanLayers=2 (mid-stack) — original M1 split; exercises
+///   the two-independent-0-based-remap property (weights + KV cache).</item>
+///   <item>numVulkanLayers=3 (split at L-1) — only one CUDA layer; exercises
+///   the single-element edge case in the CUDA loop and firstLayer=3 offset
+///   in <see cref="CudaWeights.LoadFromGguf"/>.</item>
 /// </list>
-/// The split is at N=2 rather than N=1 so absolute layer-index versus
-/// cache-index bugs (which would only be hidden with N=1 where both
-/// coincide on the boundary layer) are discriminated cleanly.
+/// Both prefill and decode are run for each split so the three-way coverage
+/// catches both the activation handoff path and the KV-cache indexing path.
 /// </para>
 /// <para>
 /// <b>Tolerance band.</b> The hybrid path stacks two error sources on top of
@@ -40,13 +45,14 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// layer body.
 /// </para>
 /// <para>
-/// <b>What this test discriminates.</b>
-/// A wrong <c>cacheLayer = layer</c> (missing <c>- numVulkanLayers</c>
-/// offset) causes an out-of-bounds read in <see cref="CudaKvCache"/>
-/// (assert fails or silently reads stale data) — caught on decode step 2.
-/// A wrong positions upload (skipped) causes NaN/garbage logits — caught
-/// by the IsFinite assert. A wrong FP32→FP16 conversion direction
-/// (swapped src/dst) produces wildly off logits — caught by the tolerance.
+/// <b>What the split parameterisation discriminates.</b>
+/// Split=1: wrong <c>_cudaWeights.Layers[layer]</c> (missing firstLayer offset)
+/// reads layer 1 data for layer 0 — immediate OOB or silent garbage. Split=3:
+/// same bug surfaces on the first-CUDA-layer norm at local index 0 but global
+/// index 3. A wrong <c>cacheLayer = layer</c> (missing <c>- numVulkanLayers</c>
+/// offset) causes an out-of-bounds read in <see cref="HybridVulkanCudaKvCache"/>
+/// at decode step 2 — split=1 catches it because <c>cacheLayer=1</c> would
+/// read slot 1 from a 3-slot CUDA cache, while split=3 gives only 1 slot.
 /// </para>
 /// <para>
 /// <b>Skip behaviour.</b> Skips cleanly when either Vulkan or CUDA is
@@ -70,16 +76,20 @@ public sealed unsafe class HybridVulkanCudaParityTests
     private const int RopeDim = 16;
     private const int IntermediateSize = 32;
     private const int NumLayers = 4;
-    private const int NumVulkanLayers = 2; // First 2 of 4 layers on Vulkan (split at 2, not 1)
     private const int MaxSeqLen = 8;
+
+    // Three split points: 1 (min), 2 (mid), 3 (L-1 = max).
+    // Split at 1: numVulkanLayers=1, numCudaLayers=3, firstLayer=1
+    // Split at 2: numVulkanLayers=2, numCudaLayers=2, firstLayer=2  (original M1 point)
+    // Split at 3: numVulkanLayers=3, numCudaLayers=1, firstLayer=3
+    public static TheoryData<int> SplitPoints => new() { 1, 2, 3 };
 
     // Tolerance: Vulkan runs FP32 for layer bodies; CUDA runs FP16.
     // The FP32→FP16 conversion at the handoff introduces rounding at every
-    // hidden-state element. Over N=2 Vulkan layers + boundary + 2 CUDA
-    // layers this accumulates to ~1e-2 max|diff| on this tiny fixture.
-    // We use 5e-2 abs / 1e-1 rel — well above empirical noise but
-    // below the ~0.5 jump caused by a real boundary bug (mirroring the
-    // evidence in HybridTransformerModelSplitParityTests at ~600× gap).
+    // hidden-state element. Over N Vulkan layers + boundary + (L-N) CUDA
+    // layers this accumulates. We use 5e-2 abs / 1e-1 rel — well above
+    // empirical noise but below the ~0.5 jump caused by a real boundary bug
+    // (mirroring the evidence in HybridTransformerModelSplitParityTests at ~600×).
     private const float AbsTol = 5e-2f;
     private const float RelTol = 1e-1f;
 
@@ -132,12 +142,13 @@ public sealed unsafe class HybridVulkanCudaParityTests
     }
 
     /// <summary>
-    /// Prefill parity: 4-token sequence, NeoX RoPE.
-    /// Hybrid (2 Vulkan + 2 CUDA) logits must match pure-CUDA within the
-    /// tolerance band at the last-token position.
+    /// Prefill parity: 4-token sequence, NeoX RoPE, split point parameterised
+    /// over {1, 2, 3}. Hybrid logits must match pure-CUDA within the tolerance
+    /// band at the last-token position.
     /// </summary>
-    [SkippableFact]
-    public void HybridVulkanCuda_DenseNeoxRope_PrefillVsCuda_LastTokenLogitsMatch()
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void HybridVulkanCuda_DenseNeoxRope_PrefillVsCuda_LastTokenLogitsMatch(int numVulkanLayers)
     {
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
         string? ptxDir = FindPtxDir();
@@ -151,18 +162,21 @@ public sealed unsafe class HybridVulkanCudaParityTests
         using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
 
         float[] cudaLast = RunCudaLastRow(fixture, tokenIds, positions, ptxDir!);
-        float[] hybridLast = RunHybridLastRow(fixture, tokenIds, positions, ptxDir!, spvDir!);
+        float[] hybridLast = RunHybridLastRow(fixture, tokenIds, positions, numVulkanLayers, ptxDir!, spvDir!);
 
-        AssertLogitsMatch(cudaLast, hybridLast, "NeoX-prefill");
+        AssertLogitsMatch(cudaLast, hybridLast, $"NeoX-prefill/split={numVulkanLayers}");
     }
 
     /// <summary>
-    /// Single-token decode parity: NeoX RoPE decode step (positions=[4]).
-    /// Exercises the KV-cache path — specifically that the CUDA cache uses
-    /// 0-based (per-cache) layer indices, not global layer indices.
+    /// Single-token decode parity: NeoX RoPE decode step (positions=[4]),
+    /// split point parameterised over {1, 2, 3}.
+    /// Exercises the KV-cache path — specifically that both the weight array
+    /// and <see cref="HybridVulkanCudaKvCache"/> use independently-0-based
+    /// (local) layer indices, not global layer indices.
     /// </summary>
-    [SkippableFact]
-    public void HybridVulkanCuda_DenseNeoxRope_DecodeVsCuda_LastTokenLogitsMatch()
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void HybridVulkanCuda_DenseNeoxRope_DecodeVsCuda_LastTokenLogitsMatch(int numVulkanLayers)
     {
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
         string? ptxDir = FindPtxDir();
@@ -183,9 +197,9 @@ public sealed unsafe class HybridVulkanCudaParityTests
 
         // Run hybrid path with KV cache.
         float[] hybridLast = RunHybridDecodeLastRow(fixture, prefillIds, prefillPos, decodeIds, decodePos,
-            ptxDir!, spvDir!);
+            numVulkanLayers, ptxDir!, spvDir!);
 
-        AssertLogitsMatch(cudaLast, hybridLast, "NeoX-decode");
+        AssertLogitsMatch(cudaLast, hybridLast, $"NeoX-decode/split={numVulkanLayers}");
     }
 
     // ── Runner helpers ──────────────────────────────────────────────────────
@@ -203,11 +217,12 @@ public sealed unsafe class HybridVulkanCudaParityTests
     }
 
     private float[] RunHybridLastRow(
-        DenseFixture fixture, int[] tokenIds, int[] positions, string ptxDir, string spvDir)
+        DenseFixture fixture, int[] tokenIds, int[] positions,
+        int numVulkanLayers, string ptxDir, string spvDir)
     {
         using var device = VulkanDevice.Create();
         using var model = HybridVulkanCudaTransformerModel.BuildFromPrebuiltWeights(
-            fixture.Weights, fixture.Config, numVulkanLayers: NumVulkanLayers,
+            fixture.Weights, fixture.Config, numVulkanLayers: numVulkanLayers,
             vulkanDevice: device, cudaDeviceId: 0, spvDir: spvDir, ptxDir: ptxDir);
 
         using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
@@ -238,11 +253,11 @@ public sealed unsafe class HybridVulkanCudaParityTests
     private float[] RunHybridDecodeLastRow(
         DenseFixture fixture,
         int[] prefillIds, int[] prefillPos, int[] decodeIds, int[] decodePos,
-        string ptxDir, string spvDir)
+        int numVulkanLayers, string ptxDir, string spvDir)
     {
         using var device = VulkanDevice.Create();
         using var model = HybridVulkanCudaTransformerModel.BuildFromPrebuiltWeights(
-            fixture.Weights, fixture.Config, numVulkanLayers: NumVulkanLayers,
+            fixture.Weights, fixture.Config, numVulkanLayers: numVulkanLayers,
             vulkanDevice: device, cudaDeviceId: 0, spvDir: spvDir, ptxDir: ptxDir);
         using var kvCache = model.CreateKvCache(MaxSeqLen);
 

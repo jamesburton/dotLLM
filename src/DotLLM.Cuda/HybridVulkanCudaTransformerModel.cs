@@ -185,10 +185,12 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         var kernels = new CudaKernels(ptxDir);
 
-        // Upload full model weights to CUDA (norm + LM head required for Phase 3 final).
-        // numGpuLayers = -1 means all layers + output norm + LM head.
+        // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1
+        // are handled by Vulkan; no need to pay for them in CUDA VRAM.
+        // firstLayer skips the Vulkan slice; numGpuLayers = L-V covers the rest + output norm/LM head.
+        int numCudaOnlyLayers = config.NumLayers - numVulkanLayers;
         var cudaWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-            numGpuLayers: -1);
+            numGpuLayers: numCudaOnlyLayers, firstLayer: numVulkanLayers);
 
         // CUDA scratch activations (same sizing as CudaTransformerModel).
         var cudaState = new CudaForwardState(
@@ -208,16 +210,16 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     }
 
     /// <summary>
-    /// Creates a <see cref="VulkanCudaKvCache"/> sized for this model's layer split.
+    /// Creates a <see cref="HybridVulkanCudaKvCache"/> sized for this model's layer split.
     /// The Vulkan cache holds <see cref="NumVulkanLayers"/> FP32 per-layer KV tables;
     /// the CUDA cache holds <c>Config.NumLayers - NumVulkanLayers</c> FP16 tables.
     /// </summary>
     /// <param name="maxSeqLen">Maximum sequence length for both sub-caches.</param>
-    public VulkanCudaKvCache CreateKvCache(int maxSeqLen)
+    public HybridVulkanCudaKvCache CreateKvCache(int maxSeqLen)
     {
         _context.MakeCurrent();
         int numCudaLayers = Config.NumLayers - _numVulkanLayers;
-        return new VulkanCudaKvCache(
+        return new HybridVulkanCudaKvCache(
             _vulkanModel.CreateKvCache(maxSeqLen),
             new CudaKvCache(numCudaLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen),
             _numVulkanLayers);
@@ -247,7 +249,7 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
-        var vulkanCudaCache = kvCache as VulkanCudaKvCache;
+        var vulkanCudaCache = kvCache as HybridVulkanCudaKvCache;
 
         int seqLen = tokenIds.Length;
         int hiddenSize = Config.HiddenSize;
@@ -310,20 +312,22 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             CudaDriverApi.cuMemcpyHtoD_v2(_cudaState.PositionsDevice, (nint)posPtr,
                 (nuint)(seqLen * sizeof(int))).ThrowOnError();
 
-        // Layer 0 of CUDA phase (= global layer _numVulkanLayers):
+        // Layer 0 of CUDA phase (= global layer _numVulkanLayers, local CUDA index 0):
         // copy hidden→residual, then RmsNorm into NormOutput.
+        // _cudaWeights.Layers is 0-based (CUDA-local), so index 0 = global layer _numVulkanLayers.
         CudaDriverApi.cuMemcpyDtoDAsync_v2(_cudaState.Residual, _cudaState.HiddenState,
             (nuint)hiddenFp16Bytes, s).ThrowOnError();
-        _kernels.LaunchRmsNorm(_cudaState.HiddenState, _cudaWeights.Layers[_numVulkanLayers].AttnNormWeight,
+        _kernels.LaunchRmsNorm(_cudaState.HiddenState, _cudaWeights.Layers[0].AttnNormWeight,
             _cudaState.NormOutput, hiddenSize, eps, seqLen, s);
 
-        // CUDA layer loop — standard GQA forward for layers _numVulkanLayers..totalLayers-1.
-        // KV-cache: CudaCache uses 0-based indices (global layer - _numVulkanLayers).
+        // CUDA layer loop — standard GQA forward for global layers _numVulkanLayers..totalLayers-1.
+        // _cudaWeights.Layers and CudaCache are both 0-based (local CUDA indices).
         var cudaKvCache = vulkanCudaCache?.CudaCache;
         for (int layer = _numVulkanLayers; layer < totalLayers; layer++)
         {
-            ref readonly var lw = ref _cudaWeights.Layers[layer];
-            int cacheLayer = layer - _numVulkanLayers; // 0-based index for CudaCache
+            int localLayer = layer - _numVulkanLayers; // 0-based index for both CudaWeights and CudaCache
+            ref readonly var lw = ref _cudaWeights.Layers[localLayer];
+            int cacheLayer = localLayer; // 0-based index for CudaCache (same remapping)
 
             // ── ATTENTION BLOCK ──
             Project(lw.QQuant, lw.QQuantType, lw.Q, _cudaState.NormOutput, _cudaState.Q,
@@ -388,8 +392,9 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             // Fused FFN residual + next-layer setup
             if (layer < totalLayers - 1)
             {
-                // Not last layer: FusedAddRmsNorm pre-applies next layer's AttnNorm
-                ref readonly var nextLw = ref _cudaWeights.Layers[layer + 1];
+                // Not last layer: FusedAddRmsNorm pre-applies next layer's AttnNorm.
+                // Next local index = localLayer + 1 (both arrays are 0-based within the CUDA slice).
+                ref readonly var nextLw = ref _cudaWeights.Layers[localLayer + 1];
                 _kernels.LaunchFusedAddRmsNorm(_cudaState.Residual, _cudaState.NormOutput,
                     nextLw.AttnNormWeight, _cudaState.NormOutput, hiddenSize, eps, seqLen, s);
             }
