@@ -70,6 +70,19 @@ public sealed class VulkanTransformerModel : IModel
     // RDNA3.5 iGPU at Llama-3 4096² N=64 (790 vs 209 GFLOPS). Null on devices
     // without coopmat — the router falls back to _matmulQ8Gemm then.
     private readonly MatMulQ8_0GemmCoopmatKernel? _matmulQ8GemmCoopmat;
+    // Optional: DP4a (integer-dot-product) Q8_0 decode GEMV with a shared
+    // activation pre-quantization pass. On Intel Arc Xe-LPG the Q8_0 decode
+    // GEMV is ALU/dequant-bound, so quantizing the activation to INT8 once and
+    // using dotPacked4x8AccSatEXT wins 1.18–3.39× over the FP32-activation
+    // scalar kernel (lm_head 3.39×, deep-K 2.23×). Null on devices without
+    // VK_KHR_shader_integer_dot_product. Gated additionally by _dp4aEnabled
+    // (env opt-in) because INT8 activation quant is lossy vs the FP32-activation
+    // _matmulQ8 path and must be validated per-model for token stability.
+    private readonly MatMulQ8_0Dp4aPqKernel? _matmulQ8Dp4aPq;
+    // True when DP4a decode GEMV should be used for Q8_0 seqLen==1 matmuls
+    // (device supports integer dot product AND the env opt-in is set). When
+    // false, RecordMatmul keeps the FP32-activation _matmulQ8 path.
+    private readonly bool _dp4aEnabled;
     // Q2_K + Q3_K matmul kernels — completes the K-quant family on Vulkan.
     // Always created; the dispatcher in RecordMatmul branches on the
     // device-side QuantizationType per call. No coopmat variants — follow-up
@@ -301,6 +314,7 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
+        MatMulQ8_0Dp4aPqKernel? matmulQ8Dp4aPq, bool dp4aEnabled,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, AddKernel add,
@@ -371,6 +385,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmvq = matmulQ8Mmvq;
         _quantizeQ8_1Rows = quantizeQ8_1Rows;
         _matmulQ8Mmq = matmulQ8Mmq;
+        _matmulQ8Dp4aPq = matmulQ8Dp4aPq;
+        _dp4aEnabled = dp4aEnabled;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -610,11 +626,38 @@ public sealed class VulkanTransformerModel : IModel
         // the mmvqEnabled allocation gate — both pairs need the same device
         // integer-dot support. Enable the rows scratch when either path is live.
         bool mmqEnabled = quantizeQ8_1Rows is not null && matmulQ8Mmq is not null;
+        // Optional DP4a decode GEMV with shared activation pre-quantization.
+        // Created when the device advertises integer dot product; the SPV may be
+        // absent on older builds (FileNotFoundException → stay on scalar Q8_0).
+        // Gated on an env opt-in because INT8 activation quant is lossy vs the
+        // FP32-activation _matmulQ8 path and must be validated per-model for
+        // greedy-token stability before being made default-on.
+        MatMulQ8_0Dp4aPqKernel? matmulQ8Dp4aPq = null;
+        if (device.HasIntegerDotProduct)
+        {
+            try { matmulQ8Dp4aPq = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir); }
+            catch (FileNotFoundException) { /* DP4a SPV not built — keep scalar Q8_0. */ }
+        }
+        bool dp4aEnabled = matmulQ8Dp4aPq is not null
+            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A") == "1";
+
+        // The shared activation-quant scratch is sized to the largest contraction
+        // (input) dim any Q8_0 decode GEMV will use: hidden (Q/K/V/gate/up/lm_head/
+        // router), attnOutDim (o_proj), intermediate (down), and the MoE dims.
+        int dp4aMaxK = 0;
+        if (dp4aEnabled)
+        {
+            dp4aMaxK = Math.Max(config.HiddenSize, config.IntermediateSize);
+            dp4aMaxK = Math.Max(dp4aMaxK, config.NumAttentionHeads * config.HeadDim);
+            if (moeIntermediate > 0) dp4aMaxK = Math.Max(dp4aMaxK, moeIntermediate);
+            if (moeSharedIntermediate > 0) dp4aMaxK = Math.Max(dp4aMaxK, moeSharedIntermediate);
+        }
 
         var state = new VulkanForwardState(device,
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
             config.HeadDim, config.IntermediateSize, config.VocabSize,
             initialSeqLen: 1,
+            dp4aMaxK: dp4aMaxK,
             mlaNumHeads: mlaNumHeads,
             mlaQkNopeHeadDim: mlaQkNope,
             mlaQkRopeHeadDim: mlaQkRope,
@@ -804,6 +847,7 @@ public sealed class VulkanTransformerModel : IModel
             rmsnormMatmulQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
             quantizeQ8_1Rows, matmulQ8Mmq,
+            matmulQ8Dp4aPq, dp4aEnabled,
             rmsnorm, rope, attention, flashAttention, swiglu, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
@@ -1885,6 +1929,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ8Mmvq?.InvalidateDescriptorCache();
         _quantizeQ8_1Rows?.InvalidateDescriptorCache();
         _matmulQ8Mmq?.InvalidateDescriptorCache();
+        _matmulQ8Dp4aPq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -2634,12 +2679,27 @@ public sealed class VulkanTransformerModel : IModel
         {
             if (seqLen == 1)
             {
+                // DP4a decode GEMV with shared activation pre-quantization
+                // (shared-K/V prequant + Intel/Arc default-on). Takes priority
+                // over the MMVQ decode path when enabled: quantize the activation
+                // to INT8 once into the shared xq/dx scratch, then integer-dot
+                // against the Q8_0 weights. The forward pass inserts a
+                // compute→compute barrier between sequential matmuls, which also
+                // orders the prior GEMV's scratch read before this call's quantize
+                // overwrite. When DP4a is off, falls through to the MMVQ decode
+                // GEMV (issue #46), then to the F32-in scalar GEMV.
+                if (_dp4aEnabled)
+                {
+                    _matmulQ8Dp4aPq!.Record(cmdBuf, weights, input,
+                        _state.Dp4aXq!, _state.Dp4aDx!, output,
+                        m: outputDim, k: inputDim);
+                }
                 // dp4a MMVQ decode path (issue #46): quantize the F32
                 // activation row to Q8_1, then run the integer-dot GEMV.
                 // Falls back to the F32-in GEMV when the path isn't wired
                 // (no integer-dot support / SPV missing / env opt-out) or the
                 // shapes don't qualify.
-                if (_matmulQ8Mmvq is not null && _quantizeQ8_1 is not null
+                else if (_matmulQ8Mmvq is not null && _quantizeQ8_1 is not null
                     && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
                     && (inputDim % QuantizeQ8_1Kernel.GroupSize) == 0
                     && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
@@ -3005,6 +3065,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
+        _matmulQ8Dp4aPq?.Dispose();
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();
         _matmulF16GemmCoopmat?.Dispose();
