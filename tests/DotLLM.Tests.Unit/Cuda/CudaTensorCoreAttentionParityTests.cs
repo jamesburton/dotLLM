@@ -45,6 +45,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     [InlineData(128, 32, 8, 64)]
     [InlineData(256, 32, 8, 64)]
     [InlineData(512, 32, 8, 64)]
+    [InlineData(1024, 32, 8, 64)]
     public void CublasSoftmaxPath_MatchesAttentionF16(int s, int numHeads, int numKvHeads, int headDim)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
@@ -92,50 +93,54 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
             seqQ: s, seqKv: s, numHeads, numKvHeads, headDim,
             positionOffset: 0, slidingWindow: 0, stream.Handle);
 
-        // ── G3 path: QK GEMM → causal softmax → P·V GEMM (col-major output) ──
-        RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outCublas,
-            s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale);
-
-        stream.Synchronize();
-
         ushort[] refHost = Download(outRef.DataPointer, outElems);
-        ushort[] cublasHost = Download(outCublas.DataPointer, outElems);
 
-        // Reindex per the two output layouts and compare.
-        int mismatches = 0;
-        float maxAbs = 0f, maxRel = 0f;
-        int worstTq = -1, worstHq = -1, worstD = -1;
-        for (int hq = 0; hq < numHeads; hq++)
+        // ── G3 path: QK GEMM → causal softmax → P·V GEMM (col-major output) ──
+        // Verify both softmax variants (coalesced = shipping path, non-coalesced sibling).
+        foreach (bool coalesced in new[] { true, false })
         {
-            for (int tq = 0; tq < s; tq++)
+            RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outCublas,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, coalesced);
+            stream.Synchronize();
+
+            ushort[] cublasHost = Download(outCublas.DataPointer, outElems);
+
+            // Reindex per the two output layouts and compare.
+            int mismatches = 0;
+            float maxAbs = 0f, maxRel = 0f;
+            int worstTq = -1, worstHq = -1, worstD = -1;
+            for (int hq = 0; hq < numHeads; hq++)
             {
-                for (int d = 0; d < headDim; d++)
+                for (int tq = 0; tq < s; tq++)
                 {
-                    int refIdx = tq * numHeads * headDim + hq * headDim + d;          // row-major
-                    int cubIdx = hq * s * headDim + tq + d * s;                       // col-major per head
-                    float a = (float)BitConverter.UInt16BitsToHalf(refHost[refIdx]);
-                    float b = (float)BitConverter.UInt16BitsToHalf(cublasHost[cubIdx]);
-                    float absDiff = MathF.Abs(a - b);
-                    float relDiff = absDiff / (MathF.Abs(a) + 1e-6f);
-                    bool pass = absDiff <= AbsTol || relDiff <= RelTol;
-                    if (!pass)
+                    for (int d = 0; d < headDim; d++)
                     {
-                        mismatches++;
-                        if (absDiff > maxAbs) { maxAbs = absDiff; maxRel = relDiff; worstTq = tq; worstHq = hq; worstD = d; }
+                        int refIdx = tq * numHeads * headDim + hq * headDim + d;      // row-major
+                        int cubIdx = hq * s * headDim + tq + d * s;                   // col-major per head
+                        float a = (float)BitConverter.UInt16BitsToHalf(refHost[refIdx]);
+                        float b = (float)BitConverter.UInt16BitsToHalf(cublasHost[cubIdx]);
+                        float absDiff = MathF.Abs(a - b);
+                        float relDiff = absDiff / (MathF.Abs(a) + 1e-6f);
+                        bool pass = absDiff <= AbsTol || relDiff <= RelTol;
+                        if (!pass)
+                        {
+                            mismatches++;
+                            if (absDiff > maxAbs) { maxAbs = absDiff; maxRel = relDiff; worstTq = tq; worstHq = hq; worstD = d; }
+                        }
                     }
                 }
             }
+
+            _output.WriteLine($"s={s} heads={numHeads} kv={numKvHeads} hd={headDim} coalesced={coalesced}: "
+                + $"mismatches={mismatches}/{outElems} (tol abs {AbsTol} OR rel {RelTol})");
+            if (mismatches > 0)
+                _output.WriteLine($"worst @ (tq={worstTq},hq={worstHq},d={worstD}) absDiff={maxAbs} relDiff={maxRel}");
+
+            Assert.True(mismatches == 0,
+                $"cuBLAS+softmax (coalesced={coalesced}) vs attention_f16: {mismatches}/{outElems} elements "
+              + $"outside tolerance (abs {AbsTol} OR rel {RelTol}); worst abs {maxAbs} rel {maxRel} at "
+              + $"(tq={worstTq},hq={worstHq},d={worstD}).");
         }
-
-        _output.WriteLine($"s={s} heads={numHeads} kv={numKvHeads} hd={headDim}: "
-            + $"mismatches={mismatches}/{outElems} (tol abs {AbsTol} OR rel {RelTol})");
-        if (mismatches > 0)
-            _output.WriteLine($"worst @ (tq={worstTq},hq={worstHq},d={worstD}) absDiff={maxAbs} relDiff={maxRel}");
-
-        Assert.True(mismatches == 0,
-            $"cuBLAS+softmax vs attention_f16: {mismatches}/{outElems} elements outside tolerance "
-          + $"(abs {AbsTol} OR rel {RelTol}); worst abs {maxAbs} rel {maxRel} at "
-          + $"(tq={worstTq},hq={worstHq},d={worstD}).");
     }
 
     /// <summary>
@@ -170,8 +175,8 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
 
         _output.WriteLine("G3 complete cuBLAS+softmax path vs attention_f16 (full QK + softmax + PV)");
         _output.WriteLine($"heads={numHeads} kvHeads={numKvHeads} headDim={headDim} group={group}  reps={reps} (min ms, interleaved)");
-        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"cublas+sm",10} | {"speedup",10}");
-        _output.WriteLine(new string('-', 48));
+        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"cb+sm(uncoal)",14} | {"spd",6} | {"cb+sm(coal)",13} | {"spd",6}");
+        _output.WriteLine(new string('-', 70));
 
         foreach (int s in seqs)
         {
@@ -197,30 +202,33 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
                 q.DataPointer, k.DataPointer, v.DataPointer, outBuf.DataPointer,
                 seqQ: s, seqKv: s, numHeads, numKvHeads, headDim, 0, 0, stream.Handle);
 
-            void RunComplete() => RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outBuf,
-                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale);
+            void RunUncoal() => RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outBuf,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, coalesced: false);
+            void RunCoal() => RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outBuf,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, coalesced: true);
 
-            for (int w = 0; w < warmup; w++) { RunAttention(); RunComplete(); }
+            for (int w = 0; w < warmup; w++) { RunAttention(); RunUncoal(); RunCoal(); }
             stream.Synchronize();
 
-            double attnMin = double.MaxValue, completeMin = double.MaxValue;
+            double attnMin = double.MaxValue, uncoalMin = double.MaxValue, coalMin = double.MaxValue;
             for (int r = 0; r < reps; r++)
             {
                 attnMin = Math.Min(attnMin, TimeGpu(stream, RunAttention));
-                completeMin = Math.Min(completeMin, TimeGpu(stream, RunComplete));
+                uncoalMin = Math.Min(uncoalMin, TimeGpu(stream, RunUncoal));
+                coalMin = Math.Min(coalMin, TimeGpu(stream, RunCoal));
             }
 
-            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {completeMin,8:F3}ms | {attnMin / completeMin,8:F2}x");
+            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {uncoalMin,12:F3}ms | {attnMin / uncoalMin,5:F2}x | {coalMin,11:F3}ms | {attnMin / coalMin,5:F2}x");
         }
-        _output.WriteLine(new string('-', 48));
-        _output.WriteLine("speedup = attn_f16 / (cublas+softmax). >1 means the tensor-core path wins.");
+        _output.WriteLine(new string('-', 70));
+        _output.WriteLine("spd = attn_f16 / (cublas+softmax). coal = one-thread-per-row (coalesced reads).");
     }
 
     private static void RunCublasSoftmaxPath(
         CudaCublasHandle cublas, CudaKernels kernels, CudaStream stream,
         CudaTensor q, CudaTensor k, CudaTensor v, CudaTensor scores, CudaTensor outBuf,
         int s, int numHeads, int numKvHeads, int headDim, int group,
-        int qStride, int kvStride, float scale)
+        int qStride, int kvStride, float scale, bool coalesced)
     {
         float one = 1.0f, zero = 0.0f, sc = scale;
         for (int h = 0; h < numKvHeads; h++)
@@ -244,7 +252,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         }
 
         // Causal softmax over the whole scores buffer (all numHeads planes), in place.
-        kernels.LaunchAttentionSoftmaxCausal(scores.DataPointer, s, numHeads, stream.Handle);
+        kernels.LaunchAttentionSoftmaxCausal(scores.DataPointer, s, numHeads, stream.Handle, coalesced);
 
         for (int h = 0; h < numKvHeads; h++)
         {
