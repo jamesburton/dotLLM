@@ -49,6 +49,11 @@ internal static class VkStructureType
     internal const int ImportMemoryHostPointerInfoExt = 1000178000;
     internal const int MemoryHostPointerPropertiesExt = 1000178001;
     internal const int PhysicalDeviceExternalMemoryHostPropertiesExt = 1000178002;
+    // VK_KHR_shader_integer_dot_product (promoted to Vulkan 1.3 core). The
+    // features struct chains off VkPhysicalDeviceFeatures2 for both the probe
+    // and the device-create enable. Drives the dp4a MMVQ decode path
+    // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
+    internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -578,6 +583,20 @@ internal struct VkPhysicalDeviceCooperativeMatrixFeaturesKhr
     internal nint pNext;
     internal uint cooperativeMatrix;                // VkBool32
     internal uint cooperativeMatrixRobustBufferAccess; // VkBool32
+}
+
+// VkPhysicalDeviceShaderIntegerDotProductFeatures — feature bit from
+// VK_KHR_shader_integer_dot_product (Vulkan 1.3 core). Chained off
+// VkPhysicalDeviceFeatures2 via pNext for both the support probe and the
+// feature-enable at device creation. `shaderIntegerDotProduct` gates the
+// SPIR-V DotProductInput4x8BitPackedKHR capability used by the dp4a MMVQ
+// shaders (dotPacked4x8AccSatEXT).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint shaderIntegerDotProduct; // VkBool32
 }
 
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape

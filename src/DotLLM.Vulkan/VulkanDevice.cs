@@ -97,6 +97,17 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public ulong MinImportedHostPointerAlignment { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_KHR_shader_integer_dot_product</c>
+    /// (or Vulkan 1.3 core), the <c>shaderIntegerDotProduct</c> feature bit is
+    /// set, AND the device-create call enabled it. Prerequisite for the dp4a
+    /// MMVQ decode path (<c>MatMulQ8_0MmvqKernel</c>, which uses
+    /// <c>dotPacked4x8AccSatEXT</c> / SPIR-V <c>DotProductInput4x8BitPackedKHR</c>).
+    /// gfx1151 (Strix Halo, RDNA 3.5) reports this true. When <c>false</c> the
+    /// router falls back to the F32-in Q8_0 GEMV.
+    /// </summary>
+    public bool HasIntegerDotProduct { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -107,7 +118,8 @@ public sealed class VulkanDevice : IDisposable
         nint commandPool, string name, uint vendor, int type, uint queueFamily,
         uint subgroupSize, bool hasSubgroupArithmetic,
         bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes,
-        bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment)
+        bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment,
+        bool hasIntegerDotProduct)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -124,6 +136,7 @@ public sealed class VulkanDevice : IDisposable
         SupportedCooperativeMatrixProperties = coopmatShapes;
         HasExternalMemoryHost = hasExternalMemoryHost;
         MinImportedHostPointerAlignment = minImportedHostPointerAlignment;
+        HasIntegerDotProduct = hasIntegerDotProduct;
     }
 
     /// <summary>
@@ -208,7 +221,17 @@ public sealed class VulkanDevice : IDisposable
                 physical, apiVersion,
                 out bool hasExternalMemoryHost, out ulong minImportedHostPointerAlignment);
 
-            nint device = CreateLogicalDevice(physical, queueFamily, hasCoopmat, hasExternalMemoryHost);
+            // Probe VK_KHR_shader_integer_dot_product (Vulkan 1.3 core). Like
+            // coopmat, the extension + feature must be enabled at
+            // vkCreateDevice time before the dp4a MMVQ shader can run, so we
+            // decide support before creating the logical device. Skipped
+            // gracefully on Vulkan 1.0 — returns false.
+            ProbeIntegerDotProduct(
+                physical, apiVersion,
+                out bool hasIntegerDotProduct);
+
+            nint device = CreateLogicalDevice(
+                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -225,7 +248,8 @@ public sealed class VulkanDevice : IDisposable
             var result = new VulkanDevice(
                 instance, physical, device, queue, pool, name, vendor, type, queueFamily,
                 subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
-                hasExternalMemoryHost, minImportedHostPointerAlignment);
+                hasExternalMemoryHost, minImportedHostPointerAlignment,
+                hasIntegerDotProduct);
             instance = 0;
             return result;
         }
@@ -556,6 +580,57 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Probes <c>VK_KHR_shader_integer_dot_product</c> (Vulkan 1.3 core)
+    /// support. Chains a <c>VkPhysicalDeviceShaderIntegerDotProductFeatures</c>
+    /// off <c>vkGetPhysicalDeviceFeatures2</c> and checks the
+    /// <c>shaderIntegerDotProduct</c> bit. On a 1.3 driver the feature is core
+    /// (no extension string needed); on a 1.1/1.2 driver the extension must
+    /// also be advertised. We treat "extension present OR core 1.3" plus the
+    /// feature bit set as supported. The actual hardware acceleration (the
+    /// <c>integerDotProduct4x8BitPackedSignedAccelerated</c> property) is not
+    /// required for correctness — the shader works on any driver exposing the
+    /// feature; acceleration only affects throughput.
+    /// </summary>
+    private static unsafe void ProbeIntegerDotProduct(
+        nint physical, uint apiVersion, out bool hasIntegerDotProduct)
+    {
+        hasIntegerDotProduct = false;
+
+        // vkGetPhysicalDeviceFeatures2 is core in Vulkan 1.1.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            // On a Vulkan 1.2 driver the feature lives behind the extension;
+            // on 1.3 it is core. Accept either: a 1.3+ device, or a device
+            // that advertises the extension string.
+            bool core13 = VkApiMajor(apiVersion) > 1u
+                || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 3u);
+            if (!core13 && !HasDeviceExtension(physical, "VK_KHR_shader_integer_dot_product"u8))
+                return;
+
+            VkPhysicalDeviceShaderIntegerDotProductFeatures dotFeatures = default;
+            dotFeatures.sType = VkStructureType.PhysicalDeviceShaderIntegerDotProductFeatures;
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&dotFeatures);
+
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+
+            hasIntegerDotProduct = dotFeatures.shaderIntegerDotProduct != 0;
+        }
+        catch
+        {
+            // Loader/driver returned garbage — disable the feature; callers
+            // fall back to the F32-in Q8_0 GEMV. Mirrors the coopmat /
+            // external-memory probe's defensive posture.
+            hasIntegerDotProduct = false;
+        }
+    }
+
+    /// <summary>
     /// Returns <c>true</c> when <paramref name="physical"/> advertises the
     /// given device extension. <paramref name="name"/> must be the
     /// NUL-terminated UTF-8 extension name (e.g. <c>"VK_KHR_cooperative_matrix\0"u8</c>).
@@ -657,7 +732,7 @@ public sealed class VulkanDevice : IDisposable
 
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
-        bool enableCoopmat, bool enableExternalMemoryHost)
+        bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct)
     {
         float priority = 1.0f;
 
@@ -681,11 +756,15 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> coopmatName = "VK_KHR_cooperative_matrix\0"u8;
         ReadOnlySpan<byte> extMemHostName = "VK_EXT_external_memory_host\0"u8;
         ReadOnlySpan<byte> extMemName = "VK_KHR_external_memory\0"u8;
+        ReadOnlySpan<byte> intDotName = "VK_KHR_shader_integer_dot_product\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all three
-        // extensions are enabled at once.
-        byte* nameBytes = stackalloc byte[coopmatName.Length + extMemHostName.Length + extMemName.Length];
-        nint* namePtrs = stackalloc nint[3];
+        // Pack name bytes + pointer array onto the stack. Worst case all four
+        // extensions are enabled at once. (The integer-dot-product string is
+        // harmless to name even on a 1.3 driver where it is core — drivers
+        // ignore the duplicate, same as the external-memory names below.)
+        byte* nameBytes = stackalloc byte[
+            coopmatName.Length + extMemHostName.Length + extMemName.Length + intDotName.Length];
+        nint* namePtrs = stackalloc nint[4];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -713,17 +792,38 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += extMemHostName.Length;
         }
 
-        // VK_KHR_cooperative_matrix requires the feature bit `cooperativeMatrix=VK_TRUE`
-        // chained through pNext on top of the extension enable. No other feature
-        // bits need toggling for VK_EXT_external_memory_host.
+        if (enableIntegerDotProduct)
+        {
+            for (int i = 0; i < intDotName.Length; i++) nameBytes[nameOffset + i] = intDotName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += intDotName.Length;
+        }
+
+        // Feature structs chained through pNext on top of the extension enables:
+        //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
+        //  - VK_KHR_shader_integer_dot_product requires
+        //    `shaderIntegerDotProduct=VK_TRUE`.
+        // Both are chained when enabled (coopmat first, dot-product second).
+        // No feature bits are needed for VK_EXT_external_memory_host.
         VkPhysicalDeviceCooperativeMatrixFeaturesKhr coopmatFeatures = default;
+        VkPhysicalDeviceShaderIntegerDotProductFeatures dotFeatures = default;
+        nint featureChain = 0;
         if (enableCoopmat)
         {
             coopmatFeatures.sType = VkStructureType.PhysicalDeviceCooperativeMatrixFeaturesKhr;
             coopmatFeatures.cooperativeMatrix = 1; // VK_TRUE
             coopmatFeatures.cooperativeMatrixRobustBufferAccess = 0;
-            ci.pNext = (nint)(&coopmatFeatures);
+            coopmatFeatures.pNext = featureChain;
+            featureChain = (nint)(&coopmatFeatures);
         }
+        if (enableIntegerDotProduct)
+        {
+            dotFeatures.sType = VkStructureType.PhysicalDeviceShaderIntegerDotProductFeatures;
+            dotFeatures.shaderIntegerDotProduct = 1; // VK_TRUE
+            dotFeatures.pNext = featureChain;
+            featureChain = (nint)(&dotFeatures);
+        }
+        ci.pNext = featureChain;
 
         if (extCount > 0)
         {
