@@ -40,6 +40,19 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when the offset is not 4-aligned (the
+// 66-byte super-block puts the qs region at offset 2, i.e. 2-mod-4). One
+// storage load replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -85,15 +98,12 @@ void main() {
         uint xBase  = b * IQ2_XXS_GROUP_SIZE;
 
         for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
+            // a0 (4 grid-byte indices) and a1 (4×7-bit sign indices + sub-scale)
+            // are 8 contiguous bytes. Read each as ONE funnelled word instead of
+            // four byte-wise readByte calls that reloaded the same shared word.
             uint p = qsBase + 8u * ib32;
-            uint a0 = readByte(p)
-                    | (readByte(p + 1u) << 8)
-                    | (readByte(p + 2u) << 16)
-                    | (readByte(p + 3u) << 24);
-            uint a1 = readByte(p + 4u)
-                    | (readByte(p + 5u) << 8)
-                    | (readByte(p + 6u) << 16)
-                    | (readByte(p + 7u) << 24);
+            uint a0 = read4Bytes(p);
+            uint a1 = read4Bytes(p + 4u);
             float db = d * (0.5 + float(a1 >> 28)) * 0.25;
             uint xSubBase = xBase + ib32 * 32u;
 
