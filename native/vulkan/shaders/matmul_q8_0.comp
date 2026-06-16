@@ -96,12 +96,39 @@ void main() {
         uint blockByteBase = rowByteBase + b * 34u;
         float d = readHalf(blockByteBase);
 
-        // 32-element qs sum-of-products, convolved with the corresponding x slice.
+        // 32-element qs · x dot product. Read the 32 int8 values 4-at-a-time
+        // (one 32-bit word per 4 values) instead of byte-by-byte — the old
+        // path issued 32 storage loads per block, reloading the SAME word four
+        // times (4 bytes share a uint) and stalling on uncoalesced byte
+        // extraction. Here each word is fetched ONCE and bitfield-extracted into
+        // four sign-extended int8 lanes, then dotted against x as a vec4 — ~4×
+        // fewer weight loads on the decode-GEMV bandwidth-bound hot path.
+        //
+        // The qs region starts at blockByteBase+2 (always even); since the
+        // 34-byte block stride is 2 (mod 4), that start is either 0- or 2-aligned
+        // (mod 4), alternating per block. `ph` selects between a direct aligned
+        // word read and a funnel of two adjacent words.
         uint xBase = b * 32u;
+        uint q = blockByteBase + 2u;
+        uint ubase = q >> 2u;
+        uint ph = q & 3u;                 // 0 or 2
         float blockSum = 0.0;
-        for (uint j = 0u; j < 32u; j++) {
-            int qv = readQsByte(blockByteBase + 2u + j);
-            blockSum += float(qv) * x[xBase + j];
+        uint prev = (ph == 0u) ? 0u : weight[ubase];
+        for (uint g = 0u; g < 8u; g++) {
+            uint cur;
+            if (ph == 0u) {
+                cur = weight[ubase + g];
+            } else {
+                uint nxt = weight[ubase + g + 1u];
+                cur = (prev >> 16u) | (nxt << 16u);
+                prev = nxt;
+            }
+            int p = int(cur);
+            vec4 qv = vec4(bitfieldExtract(p,  0, 8), bitfieldExtract(p,  8, 8),
+                           bitfieldExtract(p, 16, 8), bitfieldExtract(p, 24, 8));
+            uint xb = xBase + g * 4u;
+            vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+            blockSum += dot(qv, xv);
         }
         acc += d * blockSum;
     }

@@ -99,6 +99,20 @@ int readSByte(uint absByteOff) {
     return int(b) - int((b & 0x80u) << 1);
 }
 
+// Read 4 consecutive bytes starting at `absByteOff` as a little-endian packed
+// uint, funnelling across the word boundary when the offset is not 4-aligned
+// (the 210-byte Q6_K super-block makes ql/qh bases 2-mod-4 on alternate blocks).
+// Lets the inner loop fetch four quant bytes in ONE storage load instead of
+// four — the byte-by-byte readByte path reloaded the same word up to 4×.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 // Read fp16 at `absByteOff` (2 bytes), handling straddled uint words.
 // Note: the per-row stride is `blocksPerRow * 210`, which is NOT a multiple
 // of 4 in general (210 % 4 == 2), so straddle handling is essential here —
@@ -158,32 +172,29 @@ void main() {
             uint qlLane  = (group & 1u) * 32u;     // group 0,2 → +0; group 1,3 → +32
 
             uint outBase = xBase + chunk * 32u;
+            uint qlChunkBase = qlBase + qlOff + qlLane;   // 32 consecutive ql bytes
+            uint qhChunkBase = qhBase + qhOff;            // 32 consecutive qh bytes
 
-            // Two half-chunks of 16 share a scale (isc=0 for first 16, isc=1 for next).
+            // Two half-chunks of 16 elements share a scale (isc=0 then isc=1).
+            float scF0 = d * float(readSByte(scalesBase + scOff + 0u + 2u * group));
+            float scF1 = d * float(readSByte(scalesBase + scOff + 1u + 2u * group));
+
+            // Process 4 elements per iteration: ONE ql word + ONE qh word fetched
+            // (via read4Bytes) instead of 8 byte-wise readByte calls. g<4 → first
+            // 16 elements (scF0); g>=4 → next 16 (scF1).
             float subSum = 0.0;
-            // First 16 elements (isc=0):
-            int sc0 = readSByte(scalesBase + scOff + 0u + 2u * group);
-            float scF0 = d * float(sc0);
-            for (uint i = 0u; i < 16u; i++) {
-                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
-                uint qhByte = readByte(qhBase + qhOff + i);
-                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
-                uint high2  = (qhByte >> shift) & 3u;
-                int q6 = int(nibble | (high2 << 4u)) - 32;
-                float xi = x[outBase + i];
-                subSum += xi * (scF0 * float(q6));
-            }
-            // Next 16 elements (isc=1):
-            int sc1 = readSByte(scalesBase + scOff + 1u + 2u * group);
-            float scF1 = d * float(sc1);
-            for (uint i = 16u; i < 32u; i++) {
-                uint qlByte = readByte(qlBase + qlOff + qlLane + i);
-                uint qhByte = readByte(qhBase + qhOff + i);
-                uint nibble = useHigh ? (qlByte >> 4u) : (qlByte & 0xFu);
-                uint high2  = (qhByte >> shift) & 3u;
-                int q6 = int(nibble | (high2 << 4u)) - 32;
-                float xi = x[outBase + i];
-                subSum += xi * (scF1 * float(q6));
+            for (uint g = 0u; g < 8u; g++) {
+                uint ql4 = read4Bytes(qlChunkBase + g * 4u);
+                uint qh4 = read4Bytes(qhChunkBase + g * 4u);
+                uvec4 nib = useHigh
+                    ? uvec4((ql4 >> 4u) & 0xFu, (ql4 >> 12u) & 0xFu, (ql4 >> 20u) & 0xFu, (ql4 >> 28u) & 0xFu)
+                    : uvec4( ql4        & 0xFu, (ql4 >>  8u) & 0xFu, (ql4 >> 16u) & 0xFu, (ql4 >> 24u) & 0xFu);
+                uvec4 high2 = uvec4((qh4 >> shift) & 3u, (qh4 >> (8u + shift)) & 3u,
+                                    (qh4 >> (16u + shift)) & 3u, (qh4 >> (24u + shift)) & 3u);
+                vec4 q6 = vec4(nib | (high2 << 4u)) - vec4(32.0);
+                uint xb = outBase + g * 4u;
+                vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                subSum += ((g < 4u) ? scF0 : scF1) * dot(xv, q6);
             }
             acc += subSum;
         }

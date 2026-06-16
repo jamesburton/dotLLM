@@ -54,6 +54,19 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes starting at `absByteOff` as a little-endian packed
+// uint, funnelling across the word boundary when the offset is not 4-aligned
+// (the 110-byte Q3_K super-block makes the qs/hmask bases 2-mod-4 on alternate
+// blocks). One storage load replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -109,18 +122,26 @@ void main() {
             int signedSc = unpackQ3Scale(scalesBase, sub);
             float scF = d * float(signedSc);
 
+            // The sub-block's 16 two-bit qs values pack into one funnelled word
+            // (value l at bit l*2); its 16 hmask high bits are the low 16 bits of
+            // the funnelled hmask word (byte t/8, bit t%8 ⇒ bit l). Fetch each
+            // ONCE and bitfield-extract into vec4 lanes — the old path issued a
+            // scalar word load per qs byte AND per hmask byte, 4× redundant.
+            uint qsw  = read4Bytes(qsBase + sub * 4u);
+            uint hm16 = read4Bytes(hmaskBase + sub * 2u) & 0xFFFFu;
             uint outBase = xBase + sub * 16u;
             float subSum = 0.0;
-            for (uint l = 0u; l < 16u; l++) {
-                uint t      = sub * 16u + l;
-                uint qByte  = readByte(qsBase + (t >> 2u));
-                uint bitOff = (t & 3u) << 1u;
-                uint qBits  = (qByte >> bitOff) & 0x3u;
-                uint hByte  = readByte(hmaskBase + (t >> 3u));
-                uint hBit   = (hByte >> (t & 7u)) & 0x1u;
-                int signed3 = int((hBit << 2u) | qBits) - 4;
-                float xi = x[outBase + l];
-                subSum  += xi * (scF * float(signed3));
+            for (uint g = 0u; g < 4u; g++) {
+                uint s2 = g * 8u;            // q2 bit base (l*2 for l=g*4)
+                uvec4 q2 = uvec4((qsw >> s2) & 3u, (qsw >> (s2 + 2u)) & 3u,
+                                 (qsw >> (s2 + 4u)) & 3u, (qsw >> (s2 + 6u)) & 3u);
+                uint lb = g * 4u;            // hmask bit base (l for l=g*4)
+                uvec4 hb = uvec4((hm16 >> lb) & 1u, (hm16 >> (lb + 1u)) & 1u,
+                                 (hm16 >> (lb + 2u)) & 1u, (hm16 >> (lb + 3u)) & 1u);
+                vec4 s3 = vec4((hb << 2u) | q2) - vec4(4.0);
+                uint xb = outBase + lb;
+                vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                subSum += scF * dot(xv, s3);
             }
             acc += subSum;
         }

@@ -133,27 +133,41 @@ void main() {
 
         uint xBase = b * Q4K_GROUP_SIZE;
 
-        // 8 sub-blocks of 32 elements. Each sub-block has its own (scale, min).
-        // Two sub-blocks share the same 32-byte qs slab (low / high nibble half).
-        for (uint j = 0u; j < 8u; j++) {
-            uvec2 sm = unpackScaleMin(scalesBase, j);
-            float sc = d * float(sm.x);
-            float mn = dmin * float(sm.y);
-
-            uint pairIdx    = j >> 1u;       // 0..3
-            uint nibbleHalf = j & 1u;        // 0 or 1
-            uint qsByteBase = qsBase + pairIdx * 32u;
-            uint outBase    = xBase + j * 32u;
-
-            float subSum = 0.0;
-            for (uint i = 0u; i < 32u; i++) {
-                uint byteVal = readByte(qsByteBase + i);
-                uint nibble  = (nibbleHalf == 0u) ? (byteVal & 0xFu) : (byteVal >> 4u);
-                // w_i = sc * nibble - mn (constant w.r.t. i over the sub-block)
-                float xi = x[outBase + i];
-                subSum += xi * (sc * float(nibble) - mn);
+        // 8 sub-blocks of 32 elements; 4 qs slabs of 32 bytes, each shared by a
+        // pair of sub-blocks (low nibble → even sub-block, high nibble → odd).
+        // Read each 32-byte slab ONCE as 8 words (4-byte aligned — the 144-byte
+        // super-block has no straddle), unpack both nibble halves per word into
+        // vec4 lanes, and dot against x. The old path re-read each slab twice
+        // (once per nibble half) AND issued a scalar word load per byte (4×
+        // redundant) — ~8× fewer qs loads on this bandwidth-bound hot path.
+        for (uint pairIdx = 0u; pairIdx < 4u; pairIdx++) {
+            uint j0 = pairIdx * 2u;          // low-nibble sub-block
+            uint j1 = j0 + 1u;               // high-nibble sub-block
+            uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+            uvec2 sm1 = unpackScaleMin(scalesBase, j1);
+            float sc0 = d * float(sm0.x);  float mn0 = dmin * float(sm0.y);
+            float sc1 = d * float(sm1.x);  float mn1 = dmin * float(sm1.y);
+            uint qsUintBase = (qsBase + pairIdx * 32u) >> 2u;   // word-aligned
+            uint out0 = xBase + j0 * 32u;
+            uint out1 = xBase + j1 * 32u;
+            float s0 = 0.0;
+            float s1 = 0.0;
+            for (uint g = 0u; g < 8u; g++) {
+                uint cur = weight[qsUintBase + g];
+                // Low nibbles of the 4 bytes → even sub-block elements.
+                vec4 lo = vec4( cur        & 0xFu, (cur >>  8u) & 0xFu,
+                               (cur >> 16u) & 0xFu, (cur >> 24u) & 0xFu);
+                // High nibbles → odd sub-block elements.
+                vec4 hi = vec4((cur >>  4u) & 0xFu, (cur >> 12u) & 0xFu,
+                               (cur >> 20u) & 0xFu, (cur >> 28u) & 0xFu);
+                uint xb0 = out0 + g * 4u;
+                vec4 xv0 = vec4(x[xb0], x[xb0 + 1u], x[xb0 + 2u], x[xb0 + 3u]);
+                s0 += dot(xv0, sc0 * lo - vec4(mn0));
+                uint xb1 = out1 + g * 4u;
+                vec4 xv1 = vec4(x[xb1], x[xb1 + 1u], x[xb1 + 2u], x[xb1 + 3u]);
+                s1 += dot(xv1, sc1 * hi - vec4(mn1));
             }
-            acc += subSum;
+            acc += s0 + s1;
         }
     }
 

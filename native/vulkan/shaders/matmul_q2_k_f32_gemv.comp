@@ -102,20 +102,26 @@ void main() {
 
         uint xBase = b * Q2K_GROUP_SIZE;
 
+        uint qsUintBase = qsBase >> 2u;   // 84-byte block ⇒ word-aligned
         for (uint sub = 0u; sub < 16u; sub++) {
             uint scByte = readByte(scalesBase + sub);
             float sc = d * float(scByte & 0xFu);
             float mn = dmin * float((scByte >> 4u) & 0xFu);
 
+            // All 16 two-bit values of a sub-block pack into ONE 32-bit word
+            // (4 bytes × 4 values); value l sits at bit l*2. Fetch it once and
+            // bitfield-extract into vec4 lanes — the old path read each of the
+            // 16 values with its own scalar word load (4× redundant).
+            uint qw = weight[qsUintBase + sub];
             uint outBase = xBase + sub * 16u;
             float subSum = 0.0;
-            for (uint l = 0u; l < 16u; l++) {
-                uint t      = sub * 16u + l;
-                uint qByte  = readByte(qsBase + (t >> 2u));
-                uint bitOff = (t & 3u) << 1u;
-                uint q2     = (qByte >> bitOff) & 0x3u;
-                float xi    = x[outBase + l];
-                subSum     += xi * (sc * float(q2) - mn);
+            for (uint g = 0u; g < 4u; g++) {
+                uint s = g * 8u;             // base bit for this group of 4 (l*2, l=g*4)
+                vec4 q2 = vec4((qw >> s) & 3u, (qw >> (s + 2u)) & 3u,
+                               (qw >> (s + 4u)) & 3u, (qw >> (s + 6u)) & 3u);
+                uint xb = outBase + g * 4u;
+                vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                subSum += dot(xv, sc * q2 - vec4(mn));
             }
             acc += subSum;
         }

@@ -144,31 +144,47 @@ void main() {
 
         uint xBase = b * Q5K_GROUP_SIZE;
 
-        // 8 sub-blocks of 32 elements. Each sub-block has its own (scale, min).
-        // Two sub-blocks share the same 32-byte qs slab (low / high nibble half).
-        // qh provides one extra bit per element: bit `j` of qh[i] is the 5th
-        // bit of element i within sub-block j.
-        for (uint j = 0u; j < 8u; j++) {
-            uvec2 sm = unpackScaleMin(scalesBase, j);
-            float sc = d * float(sm.x);
-            float mn = dmin * float(sm.y);
-
-            uint pairIdx    = j >> 1u;       // 0..3
-            uint nibbleHalf = j & 1u;        // 0 or 1
-            uint qsByteBase = qsBase + pairIdx * 32u;
-            uint outBase    = xBase + j * 32u;
-
-            float subSum = 0.0;
-            for (uint i = 0u; i < 32u; i++) {
-                uint qsByteVal = readByte(qsByteBase + i);
-                uint lo4 = (nibbleHalf == 0u) ? (qsByteVal & 0xFu) : (qsByteVal >> 4u);
-                uint qhByteVal = readByte(qhBase + i);
-                uint hi  = (qhByteVal >> j) & 1u;
-                uint q5  = lo4 | (hi << 4u);
-                float xi = x[outBase + i];
-                subSum += xi * (sc * float(q5) - mn);
+        // 8 sub-blocks of 32 elements; 4 qs slabs of 32 bytes, each shared by a
+        // pair (low nibble → even sub-block, high nibble → odd). qh[32] gives the
+        // 5th bit: bit j of qh[i] is the high bit of element i in sub-block j.
+        // Read each qs slab + the qh slab ONCE as words and unpack both halves —
+        // the old path re-read qs per nibble half and qh per sub-block, all
+        // byte-wise (scalar word reload per byte).
+        uint qhUintBase = qhBase >> 2u;   // 176-byte block ⇒ word-aligned
+        for (uint pairIdx = 0u; pairIdx < 4u; pairIdx++) {
+            uint j0 = pairIdx * 2u;          // low-nibble sub-block
+            uint j1 = j0 + 1u;               // high-nibble sub-block
+            uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+            uvec2 sm1 = unpackScaleMin(scalesBase, j1);
+            float sc0 = d * float(sm0.x);  float mn0 = dmin * float(sm0.y);
+            float sc1 = d * float(sm1.x);  float mn1 = dmin * float(sm1.y);
+            uint qsUintBase = (qsBase + pairIdx * 32u) >> 2u;   // word-aligned
+            uint out0 = xBase + j0 * 32u;
+            uint out1 = xBase + j1 * 32u;
+            float s0 = 0.0;
+            float s1 = 0.0;
+            for (uint g = 0u; g < 8u; g++) {
+                uint cur = weight[qsUintBase + g];
+                uint qh4 = weight[qhUintBase + g];               // 4 qh bytes for positions g*4..+3
+                vec4 lo = vec4( cur        & 0xFu, (cur >>  8u) & 0xFu,
+                               (cur >> 16u) & 0xFu, (cur >> 24u) & 0xFu);
+                vec4 hi = vec4((cur >>  4u) & 0xFu, (cur >> 12u) & 0xFu,
+                               (cur >> 20u) & 0xFu, (cur >> 28u) & 0xFu);
+                // 5th bit per element: bit j0 / j1 of each qh byte.
+                vec4 hb0 = vec4((qh4 >> j0) & 1u, (qh4 >> (8u + j0)) & 1u,
+                                (qh4 >> (16u + j0)) & 1u, (qh4 >> (24u + j0)) & 1u);
+                vec4 hb1 = vec4((qh4 >> j1) & 1u, (qh4 >> (8u + j1)) & 1u,
+                                (qh4 >> (16u + j1)) & 1u, (qh4 >> (24u + j1)) & 1u);
+                vec4 q5lo = lo + 16.0 * hb0;     // lo4 | (hi<<4)
+                vec4 q5hi = hi + 16.0 * hb1;
+                uint xb0 = out0 + g * 4u;
+                vec4 xv0 = vec4(x[xb0], x[xb0 + 1u], x[xb0 + 2u], x[xb0 + 3u]);
+                s0 += dot(xv0, sc0 * q5lo - vec4(mn0));
+                uint xb1 = out1 + g * 4u;
+                vec4 xv1 = vec4(x[xb1], x[xb1 + 1u], x[xb1 + 2u], x[xb1 + 3u]);
+                s1 += dot(xv1, sc1 * q5hi - vec4(mn1));
             }
-            acc += subSum;
+            acc += s0 + s1;
         }
     }
 
