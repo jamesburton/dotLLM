@@ -111,6 +111,87 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
     public void Forward_Q8_0_RouterAndGatedShared_Qwen15_SingleToken_MatchesCpuReference()
         => AssertSharedVulkanMatchesCpu(seqLen: 1, numSharedExperts: 1, seed: 71, gated: true);
 
+    // ── DP4a decode GEMV: off-vs-on discriminating test ─────────────────────────────
+    // Proves the DP4a path (a) actually engages — bit-identical logits would mean it
+    // silently fell back — and (b) does not flip the greedy token vs the trusted
+    // FP32-activation Q8_0 path. argmax stability is the failure L2 distance hides:
+    // INT8 activation quant perturbs logits, and the only quality question that matters
+    // for decode is whether that perturbation changes which token is sampled.
+    [SkippableFact]
+    public void Forward_Q8_0_Dp4aOnVsOff_SingleToken_SameArgmax_LogitsDiffer()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasIntegerDotProduct,
+                $"Device '{probe.DeviceName}' lacks VK_KHR_shader_integer_dot_product — DP4a not testable here.");
+
+        // Router + ungated shared experts: the seqLen==1 forward routes the gate and
+        // each shared W1/W2/W3 through RecordMatmul's Q8_0 decode path → multiple DP4a
+        // dispatches, so the engagement check is meaningful.
+        string path = Path.Combine(_scratch, "moe-q8-dp4a-onoff.safetensors");
+        WriteSharedFixture(path, seed: 909, numSharedExperts: 2, gated: false);
+        var config = BuildSharedConfig(numSharedExperts: 2, gated: false);
+
+        int[] tokenIds = [3 % VocabSize];   // single decode token
+        int[] positions = [0];
+
+        float[] off = RunVulkanForwardWithDp4a(path, config, tokenIds, positions, enableDp4a: false, spvDir);
+        float[] on = RunVulkanForwardWithDp4a(path, config, tokenIds, positions, enableDp4a: true, spvDir);
+
+        // Engagement: the INT8-activation DP4a path must perturb at least one logit.
+        // Bit-identical output means RecordMatmul never took the DP4a branch.
+        bool anyDiffer = false;
+        float maxAbs = 0f;
+        for (int c = 0; c < VocabSize; c++)
+        {
+            float d = MathF.Abs(off[c] - on[c]);
+            if (d > 0f) anyDiffer = true;
+            if (d > maxAbs) maxAbs = d;
+        }
+        Assert.True(anyDiffer,
+            "DP4a-on logits were bit-identical to DP4a-off — the DP4a decode path did not engage.");
+
+        // Token stability: the perturbation must not change the greedy argmax.
+        int argOff = ArgMax(off);
+        int argOn = ArgMax(on);
+        Assert.True(argOff == argOn,
+            $"DP4a flipped the greedy token: off→{argOff} (logit {off[argOff]:F6}), on→{argOn} (logit {on[argOn]:F6}); maxAbsΔ={maxAbs:E3}.");
+    }
+
+    private float[] RunVulkanForwardWithDp4a(
+        string path, ModelConfig config, int[] tokenIds, int[] positions, bool enableDp4a, string spvDir)
+    {
+        // BuildFromPrebuiltWeights reads DOTLLM_VULKAN_ENABLE_DP4A once. The
+        // VulkanKernels collection runs serially, so toggling the process env here is
+        // safe as long as we restore it.
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        try
+        {
+            using var sf = SafetensorsFile.Open(path);
+            var cpuWeights = TransformerWeightsSafetensorsLoader.Load(sf, config);
+            ApplyQ8OverlayInPlace(cpuWeights, expectShared: true, gated: false);
+            using var device = VulkanDevice.Create();
+            using var model = VulkanTransformerModel.BuildFromPrebuiltWeights(device, config, cpuWeights, spvDir);
+            using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);
+            Assert.Equal(1, logits.Shape[0]);
+            Assert.Equal(VocabSize, logits.Shape[1]);
+            return CopyLogits(logits);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+        }
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int best = 0;
+        for (int i = 1; i < v.Length; i++)
+            if (v[i] > v[best]) best = i;
+        return best;
+    }
+
     private void AssertMixtralVulkanMatchesCpu(int seqLen, int seed)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

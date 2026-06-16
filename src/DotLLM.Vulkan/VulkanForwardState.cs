@@ -1,3 +1,5 @@
+using DotLLM.Vulkan.Kernels;
+
 namespace DotLLM.Vulkan;
 
 /// <summary>
@@ -141,6 +143,21 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MlaKPe { get; private set; }           // [seqLen, qkRope]
     public VulkanDevice.Buffer? MlaAttnOutput { get; private set; }    // [seqLen, numHeads * vHead]
 
+    // ── DP4a decode activation-quant scratch ──────────────────────────
+    // Allocated once (when dp4aMaxK > 0) and shared across every Q8_0 decode
+    // GEMV: the quantize_q8_act pass writes the packed INT8 activation (Dp4aXq)
+    // and per-32-block FP32 scale (Dp4aDx), then matmul_q8_0_dp4a_pq reads them.
+    // Decode is seqLen==1 (x is length K), so these are independent of the
+    // seqLen capacity — sized once to the largest contraction dim and stable
+    // across forwards (so cached descriptor sets keep their handles).
+    private readonly int _dp4aMaxK;
+
+    /// <summary>Packed INT8 activation scratch for the DP4a decode GEMV; null when DP4a is disabled.</summary>
+    public VulkanDevice.Buffer? Dp4aXq { get; private set; }
+
+    /// <summary>Per-32-block FP32 activation scale scratch for the DP4a decode GEMV; null when DP4a is disabled.</summary>
+    public VulkanDevice.Buffer? Dp4aDx { get; private set; }
+
     // ── Logits (last token only) ──────────────────────────────────────
     public VulkanDevice.Buffer Logits { get; private set; }
 
@@ -172,6 +189,7 @@ internal sealed class VulkanForwardState : IDisposable
         VulkanDevice device,
         int hiddenSize, int numHeads, int numKvHeads, int headDim,
         int intermediateSize, int vocabSize, int initialSeqLen,
+        int dp4aMaxK = 0,
         int mlaNumHeads = 0, int mlaQkNopeHeadDim = 0, int mlaQkRopeHeadDim = 0,
         int mlaVHeadDim = 0, int mlaQLoraRank = 0, int mlaKvLoraRank = 0,
         int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0,
@@ -195,11 +213,22 @@ internal sealed class VulkanForwardState : IDisposable
         _moeIntermediateSize = moeIntermediateSize;
         _moeSharedIntermediateSize = moeSharedIntermediateSize;
         _moeNumSharedExperts = moeNumSharedExperts;
+        _dp4aMaxK = dp4aMaxK;
 
         // LM-head logits are always one token (last). Positions buffer sized for some reasonable
         // default; grows with EnsureCapacity.
         Logits = device.Allocate((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
+
+        // DP4a decode activation-quant scratch — sized once to the largest
+        // contraction dim (seqLen-independent; decode is always one token).
+        // Device-local: written by quantize_q8_act, read by the DP4a GEMV,
+        // never host-mapped.
+        if (_dp4aMaxK > 0)
+        {
+            Dp4aXq = device.AllocateDeviceLocal(MatMulQ8_0Dp4aPqKernel.XqScratchBytes(_dp4aMaxK));
+            Dp4aDx = device.AllocateDeviceLocal(MatMulQ8_0Dp4aPqKernel.DxScratchBytes(_dp4aMaxK));
+        }
 
         AllocateForCapacity(Math.Max(1, initialSeqLen));
     }
@@ -478,5 +507,7 @@ internal sealed class VulkanForwardState : IDisposable
         ReleaseLayerScratch();
         Logits?.Dispose();
         PositionsBuffer?.Dispose();
+        Dp4aXq?.Dispose();
+        Dp4aDx?.Dispose();
     }
 }
