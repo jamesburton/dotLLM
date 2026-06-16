@@ -335,7 +335,7 @@ public class HybridPrefillDecodeTests
 
         _output.WriteLine($"off tokens: [{string.Join(',', offTokens)}]  ({offMs:F1} ms / {decodeSteps} steps)");
         _output.WriteLine($"on  tokens: [{string.Join(',', onTokens)}]  ({onMs:F1} ms / {decodeSteps} steps)");
-        _output.WriteLine($"decode wall time off/on: {offMs / onMs:F2}x  (DEBUG build, host-coherent mem — NOT a perf measurement; see release micro-bench)");
+        _output.WriteLine($"decode wall time off/on: {offMs / onMs:F2}x  (single-run wall clock incl. first-step pipeline compile — indicative; rigorous per-kernel numbers are in the release micro-bench)");
         bool tokensMatch = offTokens.SequenceEqual(onTokens);
         _output.WriteLine($"greedy trajectories identical: {tokensMatch} (divergence by near-tie argmax flip is expected — DP4a stays opt-in)");
 
@@ -365,11 +365,43 @@ public class HybridPrefillDecodeTests
         Assert.True(Array.IndexOf(offTop3, onArg) >= 0, $"DP4a argmax {onArg} not in off top-3 [{string.Join(',', offTop3)}] — not a near-tie flip.");
     }
 
+    /// <summary>
+    /// Directly verifies the shared-activation K/V path is equivalent to the
+    /// per-matmul fallback: greedy-decodes with DP4a on and the K/V activation
+    /// quant shared (default) vs forced per-matmul (DOTLLM_VULKAN_DP4A_NO_SHARE=1).
+    /// The quantize pass is deterministic, so sharing it cannot change the result —
+    /// the token IDs must be bit-identical. A divergence means RecordSharedInputMatmulPair
+    /// is mis-wired (wrong buffer/dim, clobbered scratch); this is the direct check
+    /// the kernel-level SharedQuant test and the engagement test cannot give.
+    /// </summary>
+    [SkippableFact]
+    public void Decode_Dp4aShareVsNoShare_RealModel_BitIdentical()
+    {
+        SkipIfVulkanUnavailable(out string spvDir);
+        using (var probe = VulkanDevice.Create())
+            Skip.IfNot(probe.HasIntegerDotProduct,
+                $"Device '{probe.DeviceName}' lacks VK_KHR_shader_integer_dot_product.");
+
+        using var gguf = GgufFile.Open(_fixture.FilePath);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int[] promptIds = tokenizer.Encode("The capital of France is").ToArray();
+        const int decodeSteps = 16;
+
+        var (shared, _, _) = DecodeGreedy(spvDir, promptIds, decodeSteps, enableDp4a: true, noShare: false);
+        var (noShare, _, _) = DecodeGreedy(spvDir, promptIds, decodeSteps, enableDp4a: true, noShare: true);
+
+        _output.WriteLine($"shared:   [{string.Join(',', shared)}]");
+        _output.WriteLine($"no-share: [{string.Join(',', noShare)}]");
+        Assert.Equal(shared, noShare);
+    }
+
     private (List<int> tokens, float[] firstDecodeLogits, double decodeMs) DecodeGreedy(
-        string spvDir, int[] promptIds, int decodeSteps, bool enableDp4a)
+        string spvDir, int[] promptIds, int decodeSteps, bool enableDp4a, bool noShare = false)
     {
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
+        string? priorShare = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE");
         Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE", noShare ? "1" : null);
         try
         {
             using var gguf = GgufFile.Open(_fixture.FilePath);
@@ -400,6 +432,7 @@ public class HybridPrefillDecodeTests
         finally
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_NO_SHARE", priorShare);
         }
     }
 
