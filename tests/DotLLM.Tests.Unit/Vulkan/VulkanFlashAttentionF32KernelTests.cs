@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Vulkan;
@@ -102,10 +103,54 @@ public class VulkanFlashAttentionF32KernelTests
         RunOne(seqQ: 33, seqKv: 64, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0);
     }
 
+    // ── Non-causal mask modes (issue #41 item 2) ─────────────────
+    //
+    // DISCRIMINATING tests: early query rows must attend to future keys, which
+    // the causal mask (tkv > posQ) would zero. The CPU reference runs the same
+    // mode, so parity holds only if the FA shader honours maskMode/prefixLen.
+
+    [SkippableFact]
+    public void Launch_Bidirectional_Prefill()
+    {
+        // 16 queries × 16 keys, positionOffset=0. Query 0 attends to all 16 keys
+        // under Bidirectional (causal would give it only key 0).
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Bidirectional_MultiQTile_MultiKvTile()
+    {
+        // 128 queries × 128 keys: multiple Q-tiles (BR=16) and KV tiles (BC=64),
+        // fully bidirectional. Stresses the online-softmax rescale with no causal
+        // upper bound across tile boundaries.
+        RunOne(seqQ: 128, seqKv: 128, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixCausal_CanvasBidirectional()
+    {
+        // prefixLen=8: query rows 0..7 stay causal, rows 8..31 are bidirectional
+        // (attend to the full 32-key range). Spans two BR=16 Q-tiles so the
+        // prefix/canvas split crosses a tile boundary.
+        RunOne(seqQ: 32, seqKv: 32, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 8);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixLenZero_EqualsBidirectional()
+    {
+        // prefixLen=0 → every row is a canvas (bidirectional) query.
+        RunOne(seqQ: 16, seqKv: 16, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 0);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false)
+        int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -117,7 +162,7 @@ public class VulkanFlashAttentionF32KernelTests
 
         ComputeExpected(qh, kh, vh, expected,
             seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            slidingWindow, softCap, useAlibi);
+            slidingWindow, softCap, useAlibi, maskMode, prefixLen);
 
         using var device = VulkanDevice.Create();
         using var kernel = VulkanFlashAttentionF32Kernel.Create(device, spvDir);
@@ -134,7 +179,8 @@ public class VulkanFlashAttentionF32KernelTests
         kernel.Launch(bufQ, bufK, bufV, bufOut,
             seqQ, seqKv, numHeads, numKvHeads, headDim,
             positionOffset: positionOffset, slidingWindow: slidingWindow,
-            useAlibi: useAlibi, softCap: softCap);
+            useAlibi: useAlibi, softCap: softCap,
+            maskMode: maskMode, prefixLen: prefixLen);
 
         float[] actual = new float[expected.Length];
         device.Download(bufOut, actual);
@@ -152,18 +198,19 @@ public class VulkanFlashAttentionF32KernelTests
     private static void ComputeExpected(
         float[] q, float[] k, float[] v, float[] output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
-        int positionOffset, int slidingWindow, float softCap, bool useAlibi)
+        int positionOffset, int slidingWindow, float softCap, bool useAlibi,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (softCap <= 0f)
         {
             int? swArg = slidingWindow > 0 ? slidingWindow : null;
-            if (useAlibi)
-                Attention.ExecuteScalar(q, k, v, output,
-                    seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-                    AlibiPositionEncoding.CreateSlopes(numHeads), swArg);
-            else
-                Attention.ExecuteScalar(q, k, v, output,
-                    seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, swArg);
+            float scale = 1.0f / MathF.Sqrt(headDim);
+            ReadOnlySpan<float> slopes = useAlibi
+                ? AlibiPositionEncoding.CreateSlopes(numHeads)
+                : default;
+            Attention.ExecuteScalar(q, k, v, output,
+                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+                scale, slopes, swArg, softCap: 0f, maskMode, prefixLen);
             return;
         }
 
