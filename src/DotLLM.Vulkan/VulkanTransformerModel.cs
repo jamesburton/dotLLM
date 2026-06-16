@@ -257,8 +257,23 @@ public sealed class VulkanTransformerModel : IModel
     public long ComputeMemoryBytes => _state.AllocatedBytes + _weights.AllocatedBytes;
 
     /// <summary>Creates a <see cref="VulkanKvCache"/> sized for this model.</summary>
+    /// <remarks>
+    /// Gemma-4's sliding and global layers carry different KV-head counts AND head
+    /// dims, so its cache is built with an explicit per-layer row stride
+    /// (<c>GemmaLayerKvHeads(l) × GetLayerHeadDim(l)</c>); every other architecture
+    /// uses the uniform <c>NumKvHeads × HeadDim</c> stride.
+    /// </remarks>
     public VulkanKvCache CreateKvCache(int maxSeqLen)
-        => new(_device, Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+    {
+        if (Config.Gemma4DualFfn)
+        {
+            var strides = new int[Config.NumLayers];
+            for (int l = 0; l < strides.Length; l++)
+                strides[l] = GemmaLayerKvHeads(l) * Config.GetLayerHeadDim(l);
+            return new VulkanKvCache(_device, strides, maxSeqLen);
+        }
+        return new(_device, Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+    }
 
     /// <summary>
     /// Creates a per-layer MLA (DeepSeek-V2/V3) KV-cache sized for this
@@ -1557,10 +1572,13 @@ public sealed class VulkanTransformerModel : IModel
             else if (lw.Gemma4 is not null)
             {
                 // Gemma-4 attention (V-from-K, weight-less V-norm, per-layer dual
-                // head dim / rope, attn scale 1.0). Cacheless — the AR validation
-                // + diffusion paths are single-forward. Writes o_proj into
-                // NormOutput; the shared post-attn-norm + residual #1 follow.
-                RecordGemma4Attention(cmdBuf, layer, lw, seqLen, eps);
+                // head dim / rope, attn scale 1.0). Writes o_proj into NormOutput;
+                // the shared post-attn-norm + residual #1 follow. When a
+                // VulkanKvCache is supplied (autoregressive generation) the post-
+                // norm/post-RoPE K and weight-less-normed V are appended to the
+                // per-layer-strided cache and attention reads the full window;
+                // otherwise (diffusion / single-shot) it is cacheless.
+                RecordGemma4Attention(cmdBuf, layer, lw, seqLen, eps, positions, kvCache);
             }
             else
             {
@@ -2160,7 +2178,8 @@ public sealed class VulkanTransformerModel : IModel
     /// (<c>lw.PostAttnNormWeight</c>) + residual #1 in the layer loop then produce
     /// attn_out, exactly as for the Gemma-3 four-norm path.
     /// </summary>
-    private void RecordGemma4Attention(nint cmdBuf, int layer, in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
+    private void RecordGemma4Attention(nint cmdBuf, int layer, in VulkanWeights.LayerBuffers lw, int seqLen, float eps,
+        ReadOnlySpan<int> positions, IKvCache? kvCache)
     {
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
@@ -2212,11 +2231,37 @@ public sealed class VulkanTransformerModel : IModel
             variant: RopeF32Kernel.Variant.NeoX);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+        // Attention K/V source: either this forward's freshly-projected window
+        // (cacheless — diffusion / single-shot) or the per-layer-strided KV cache
+        // (autoregressive generation). The cache stores the FINAL K (post per-head
+        // norm + RoPE) and V (post weight-less norm; on V-from-K global layers this
+        // is the normed copy of the raw K projection) — exactly the buffers the
+        // attention kernel reads, so appending them here mirrors the GQA path.
+        VulkanDevice.Buffer kSrc, vSrc;
+        int seqKv;
+        int positionOffset;
+        if (kvCache is VulkanKvCache vkCache)
+        {
+            vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            kSrc = vkCache.GetKeysBuffer(layer);
+            vSrc = vkCache.GetValuesBuffer(layer);
+            seqKv = vkCache.CurrentLength;
+            positionOffset = positions[0];
+        }
+        else
+        {
+            kSrc = _state.K;
+            vSrc = _state.V;
+            seqKv = seqLen;
+            positionOffset = 0;
+        }
+
         // Attention: scale = 1/sqrt(QPAS) = 1.0 (q/k-norm make Q,K unit); no attn softcap.
-        RecordAttention(cmdBuf, _state.Q, _state.K, _state.V, _state.AttnOutput,
-            seqQ: seqLen, seqKv: seqLen,
+        RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+            seqQ: seqLen, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
-            positionOffset: 0, slidingWindow: GetLayerSlidingWindow(layer),
+            positionOffset: positionOffset, slidingWindow: GetLayerSlidingWindow(layer),
             softCap: 0.0f, scaleOverride: GetAttentionScaleOverride());
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
