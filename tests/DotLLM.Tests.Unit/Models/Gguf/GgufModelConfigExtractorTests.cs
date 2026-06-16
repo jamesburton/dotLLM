@@ -592,8 +592,15 @@ public class GgufModelConfigExtractorTests
         Assert.NotNull(config.GlobalRoPEConfig);
         Assert.Equal(1_000_000.0f, config.GlobalRoPEConfig!.Value.Theta);
         Assert.Equal(512, config.GlobalRoPEConfig.Value.DimensionCount);
-        // llama.cpp bakes partial rotary into the dim count → factor stays null.
-        Assert.Null(config.PartialRotaryFactor);
+        // gemma4 full-attention layers apply partial rope 0.25 over head_dim 512
+        // (rope.dimension_count 512 is the FULL head dim; factor selects the
+        // rotated span — first 64 pairs = 128 dims). See GEMMA4-GRAPH-SPEC.md.
+        Assert.Equal(0.25f, config.PartialRotaryFactor);
+
+        // Attention softmax scale 1.0 (q_norm/k_norm make Q,K unit) → QueryPreAttnScalar 1.0.
+        Assert.Equal(1.0f, config.QueryPreAttnScalar);
+        // Gemma 4 MoE dual-FFN graph flag.
+        Assert.True(config.Gemma4DualFfn);
 
         // MoE.
         Assert.NotNull(config.Moe);
@@ -623,31 +630,18 @@ public class GgufModelConfigExtractorTests
     }
 
     [Fact]
-    public void Extract_DiffusionGemma_AttachesDiffusionConfig()
+    public void Extract_DiffusionGemma_NotSupportedYet()
     {
+        // PR #11 implements the autoregressive gemma4 graph only. The
+        // DiffusionGemma-specific pieces (self-conditioning, region-aware
+        // embed/scalar, enc_layer_output_scale, diffusion canvas mask) are
+        // deferred, so a diffusion-gemma GGUF fails fast rather than silently
+        // running the AR graph.
         var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
         {
             d.AddUInt32("diffusion.canvas_length", 256);
             d.AddUInt32("tokenizer.ggml.mask_token_id", 4);
         });
-        var config = GgufModelConfigExtractor.Extract(metadata);
-
-        Assert.Equal(Architecture.DiffusionGemma, config.Architecture);
-        Assert.NotNull(config.DiffusionConfig);
-        Assert.Equal(256, config.DiffusionConfig!.CanvasLength);
-        Assert.Equal(4, config.DiffusionConfig.MaskTokenId);
-        Assert.Equal(DotLLM.Core.Attention.AttentionMaskMode.Hybrid, config.DiffusionConfig.CanvasAttentionMode);
-        // Diffusion shares the Gemma-4 backbone shape.
-        Assert.Equal(2, config.NumGlobalKvHeads);
-        Assert.Equal(512, config.GlobalHeadDim);
-        Assert.NotNull(config.Moe);
-    }
-
-    [Fact]
-    public void Extract_DiffusionGemma_MissingMaskToken_Throws()
-    {
-        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
-            d.AddUInt32("diffusion.canvas_length", 256));
-        Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
+        Assert.Throws<NotSupportedException>(() => GgufModelConfigExtractor.Extract(metadata));
     }
 }

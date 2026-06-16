@@ -221,6 +221,21 @@ public record ModelConfig
     public int? NumGlobalKvHeads { get; init; }
 
     /// <summary>
+    /// True for the Gemma-4 MoE backbone (and the DiffusionGemma tower that
+    /// reuses it), which the forward pass treats with the dedicated Gemma-4 graph:
+    /// V projected from the raw K projection on V-less (global) layers, a
+    /// weight-less RMSNorm on V, attention softmax scale 1.0, a dual <i>parallel</i>
+    /// FFN (a dense GeGLU MLP summed with a 128-expert MoE), a custom router
+    /// (<c>rms(attn_out)·1/sqrt(hidden)·ffn_gate_inp_s</c> then <c>ffn_gate_inp·…</c>),
+    /// a per-expert down-projection scale, and a per-layer <c>layer_output_scale</c>.
+    /// All other Gemma-family configs (Gemma 3) leave this false. Gated as a flag
+    /// (not derived from <see cref="Architecture"/>) so the dense-Gemma path stays
+    /// untouched and the seam is explicit. See
+    /// <c>docs/diffusiongemma/GEMMA4-GRAPH-SPEC.md</c>.
+    /// </summary>
+    public bool Gemma4DualFfn { get; init; }
+
+    /// <summary>
     /// Optional per-head dimension for the FULL-attention layers (Gemma 4
     /// <c>global_head_dim</c>, e.g. 512 vs the sliding <c>head_dim</c> 256). When
     /// non-null and different from <see cref="HeadDim"/>, the full-attention layers

@@ -112,7 +112,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         int intermediateSize, int vocabSize, int maxSeqLen, int ropeDim,
         float ropeTheta,
         int globalRopeDim = 0, float globalRopeTheta = 0f,
-        int qBlockElems = 0, int kvBlockElems = 0)
+        int qBlockElems = 0, int kvBlockElems = 0,
+        int globalFullHeadDim = 0)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -141,8 +142,17 @@ internal sealed unsafe class TransformerForwardState : IDisposable
             int globalHalfDim = globalRopeDim / 2;
             GlobalCosTable = new float[maxSeqLen * globalHalfDim];
             GlobalSinTable = new float[maxSeqLen * globalHalfDim];
-            DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(
-                maxSeqLen, globalRopeDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
+            // Partial rotary (Gemma 4 global layers): only globalRopeDim dims
+            // rotate, but the per-pair frequency denominator is the FULL head dim
+            // (globalFullHeadDim, e.g. 512) — NOT the rotated count. When
+            // globalFullHeadDim <= globalRopeDim (Gemma 3 / full rotation) the two
+            // coincide and the standard precompute is used.
+            if (globalFullHeadDim > globalRopeDim)
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTablePartial(
+                    maxSeqLen, globalRopeDim, globalFullHeadDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
+            else
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTable(
+                    maxSeqLen, globalRopeDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
         }
 
         // Initial allocation for 1 token (decode mode)

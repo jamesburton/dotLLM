@@ -119,46 +119,11 @@ public sealed unsafe class TransformerModel : IModel
     public static TransformerModel LoadFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig threading)
     {
         var weights = TransformerWeights.LoadFromGguf(gguf, config);
-        weights.RepackWeights();
-
-        int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
-        if (ropeDim == 0) ropeDim = config.HeadDim;
-        float ropeTheta = config.RoPEConfig?.Theta ?? 10000.0f;
-        RoPEType ropeType = config.RoPEConfig?.Type ?? RoPEType.Norm;
-
-        var state = new TransformerForwardState(
-            config.HiddenSize,
-            config.NumAttentionHeads,
-            config.NumKvHeads,
-            config.HeadDim,
-            config.IntermediateSize,
-            config.VocabSize,
-            config.MaxSequenceLength,
-            ropeDim,
-            ropeTheta);
-
-        ComputeThreadPool? pool = null;
-        if (threading.IsParallel)
-        {
-            int effectiveThreads = threading.EffectiveThreadCount;
-
-            if (threading.EnableNumaPinning || threading.EnablePCorePinning)
-            {
-                var topology = NumaTopology.Detect();
-
-                // If P-core pinning on hybrid, cap threads to P-core count
-                if (threading.EnablePCorePinning && topology.IsHybrid)
-                    effectiveThreads = Math.Min(effectiveThreads, topology.PerformanceCoreIds.Count);
-
-                pool = new ComputeThreadPool(effectiveThreads, topology, threading);
-            }
-            else
-            {
-                pool = new ComputeThreadPool(effectiveThreads, topology: null, threading);
-            }
-        }
-
-        return new TransformerModel(config, weights, state, gguf, ropeDim, ropeType, pool, ownsPool: pool is not null);
+        // Route through the shared state builder so the GGUF path gets the same
+        // per-attention-type RoPE tables, partial-rotary handling, and distinct
+        // per-layer head-dim scratch sizing as the safetensors path (Gemma 4 needs
+        // all three). The GGUF file is the mmap anchor.
+        return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: gguf);
     }
 
     /// <summary>
@@ -203,7 +168,7 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     private static TransformerModel BuildFromPrebuiltWeightsInternal(
-        TransformerWeights weights, ModelConfig config, ThreadingConfig threading, ISafetensorsTensorSource? anchorSource)
+        TransformerWeights weights, ModelConfig config, ThreadingConfig threading, object? anchorSource)
     {
         weights.RepackWeights();
 
@@ -281,7 +246,12 @@ public sealed unsafe class TransformerModel : IModel
             globalRopeDim,
             globalRopeTheta,
             qBlockElems,
-            kvBlockElems);
+            kvBlockElems,
+            // Full global head dim — the partial-rotary frequency denominator
+            // (Gemma 4 global layers: rotate globalRopeDim=128 dims but use freq
+            // base over the full head dim 512). Equals globalRopeDim when there is
+            // no partial rotary (Gemma 3), collapsing to the standard precompute.
+            globalFullHeadDim: config.GlobalHeadDim ?? config.HeadDim);
 
         // For MLA + YaRN (DeepSeek-V2/V3 long-context), rebuild cos/sin tables
         // using per-dim ramped inverse frequencies. Plain precompute above is a
@@ -676,6 +646,22 @@ public sealed unsafe class TransformerModel : IModel
 
             // a. Copy hiddenState → residual
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
+
+            // ── Gemma 4 MoE branch ───────────────────────────────────────
+            // The gemma4 graph is sufficiently distinct (V-from-K, weight-less
+            // V-norm, attn scale 1.0, dual-parallel FFN with a custom router,
+            // per-expert down scale, layer_output_scale) that it runs as a
+            // self-contained per-layer method rather than threading flags through
+            // the shared GQA/MoE/dense blocks. Cacheless single-forward only.
+            if (lw.Gemma4 is not null)
+            {
+                RunGemma4Layer(
+                    in lw, layer, seqLen,
+                    hidden, residual, normOut, q, k, v, attnOut,
+                    numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
+                    positions, eps);
+                continue;
+            }
 
             // ── MLA branch (DeepSeek-V2/V3) ──────────────────────────────
             // Routes through the standalone MlaAttention kernel: RMSNorm → Q
@@ -1277,6 +1263,383 @@ public sealed unsafe class TransformerModel : IModel
 
             new Span<float>(normOutT, hiddenSize).CopyTo(new Span<float>(hiddenT, hiddenSize));
         }
+    }
+
+    /// <summary>
+    /// Runs one Gemma-4 MoE transformer layer (cacheless, causal). Implements the
+    /// source-confirmed gemma4 graph (<c>docs/diffusiongemma/GEMMA4-GRAPH-SPEC.md</c>):
+    /// QK-normed attention with V-from-K on V-less layers + a weight-less V-norm and
+    /// softmax scale 1.0, then a dual <i>parallel</i> FFN (a dense GeGLU MLP summed
+    /// with a 128-expert MoE driven by a custom router), wrapped by the five FFN
+    /// norms, residual-added, and finally multiplied by <c>layer_output_scale</c>.
+    /// </summary>
+    /// <remarks>
+    /// On entry <paramref name="hidden"/> = <paramref name="residual"/> = the layer
+    /// input (the loop copied hidden→residual before this call). On exit
+    /// <paramref name="hidden"/> holds the layer output. Scratch buffers
+    /// <paramref name="normOut"/>/<paramref name="q"/>/<paramref name="k"/>/
+    /// <paramref name="v"/>/<paramref name="attnOut"/> are reused; hidden-sized
+    /// branch temporaries are rented from <see cref="ArrayPool{T}"/> (seqLen is
+    /// small on the single-forward path).
+    /// </remarks>
+    private unsafe void RunGemma4Layer(
+        in TransformerLayerWeights lw, int layer, int seqLen,
+        float* hidden, float* residual, float* normOut,
+        float* q, float* k, float* v, float* attnOut,
+        int numKvHeadsLayer, int headDimLayer, int qStrideLayer, int kvStrideLayer,
+        ReadOnlySpan<int> positions, float eps)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        var g4 = lw.Gemma4!;
+
+        // ── Attention ─────────────────────────────────────────────────────
+        // normIn = rms(hidden) * attn_norm  (into normOut)
+        for (int t = 0; t < seqLen; t++)
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
+                lw.AttnNormWeight, eps,
+                new Span<float>(normOut + t * hiddenSize, hiddenSize));
+
+        // Q = wq · normIn ; K = wk · normIn (raw projections, GEMM quantizes internally)
+        Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen);
+        Gemm(lw.KWeight, lw.KQuantType, normOut, k, lw.KOutputDim, lw.KInputDim, seqLen);
+
+        // V branch: off the RAW K projection when wv absent (global layers),
+        // else V = wv · normIn. K is captured BEFORE k-norm/rope, so when
+        // VFromK we copy k → v now (k still holds the raw projection).
+        if (g4.VFromK)
+            new Span<float>(k, seqLen * kvStrideLayer).CopyTo(new Span<float>(v, seqLen * kvStrideLayer));
+        else
+            Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
+
+        // Q-norm (rms * attn_q_norm per head), then K-norm (rms * attn_k_norm per
+        // kv head). V-norm is WEIGHT-LESS rms per kv head (no scale), all layers.
+        if (lw.QNormWeight is not null)
+            ApplyPerHeadNorm(lw.QNormWeight, q, numHeads, headDimLayer, seqLen, eps);
+        if (lw.KNormWeight is not null)
+            ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
+        ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
+
+        // RoPE on Q and K (V is NOT roped). Per-attention-type table/dim/pairing.
+        // Global (full-attention) layers use PARTIAL NeoX rope: only the leading
+        // GlobalRopeDim dims rotate, but the rotate_half pairing offset is the FULL
+        // head's half-dim (dims [0,64) ↔ [256,320)). Sliding layers use full rope.
+        var (ropeCos, ropeSin, ropeDimLayer, ropeTypeLayer) = GetLayerRope(layer);
+        var qSpan = new Span<float>(q, seqLen * qStrideLayer);
+        var kSpan = new Span<float>(k, seqLen * kvStrideLayer);
+        bool partialGlobal = Config.IsFullAttentionLayer(layer)
+            && Config.PartialRotaryFactor is float prf && prf > 0f && prf < 1f
+            && ropeDimLayer < headDimLayer;
+        if (partialGlobal)
+            RoPE.ExecutePartialNeoX(
+                qSpan, kSpan, positions,
+                numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer / 2,
+                ropeCos, ropeSin);
+        else
+            RoPE.Execute(
+                qSpan, kSpan, positions,
+                numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
+                ropeCos, ropeSin, ropeTypeLayer);
+
+        // Attention: softmax(Qᵀ·K * 1.0 + causal mask) · V, GQA broadcast. Scale is
+        // 1.0 (q_norm/k_norm make Q,K unit) — QueryPreAttnScalar=1.0 → 1/sqrt(1)=1.
+        float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
+            ? 1.0f / MathF.Sqrt(qpas)
+            : 1.0f / MathF.Sqrt(headDimLayer);
+        int? layerSlidingWindow = GetLayerSlidingWindow(layer);
+        Attention.Execute(q, k, v, attnOut,
+            seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+            layerSlidingWindow, softCap: 0f,
+            _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+
+        // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
+        Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
+
+        // post_attention_norm, then residual add: attn_out = rms(O)*post_attn + input.
+        for (int t = 0; t < seqLen; t++)
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                lw.PostAttnNormWeight!, eps,
+                new Span<float>(normOut + t * hiddenSize, hiddenSize));
+
+        long hElems = (long)seqLen * hiddenSize;
+        float[] attnOutBuf = ArrayPool<float>.Shared.Rent((int)hElems); // post-attn residual (input to both FFN branches)
+        float[] denseBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        float[] moeBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        float[] tmpNormBuf = ArrayPool<float>.Shared.Rent((int)hElems);
+        try
+        {
+            fixed (float* attnOutP = attnOutBuf)
+            fixed (float* denseP = denseBuf)
+            fixed (float* moeP = moeBuf)
+            fixed (float* tmpP = tmpNormBuf)
+            {
+                // attn_out = post_attn_norm(O) + residual(input)
+                for (int t = 0; t < seqLen; t++)
+                    Add.Execute(
+                        new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
+                        new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
+                        new Span<float>(attnOutP + t * hiddenSize, hiddenSize));
+
+                // ── Dense FFN branch (shared expert) ──────────────────────
+                // cur_mlp = down( geglu(gate·n) * (up·n) ), n = rms(attn_out)*ffn_norm
+                Gemma4DenseFfn(in lw, attnOutP, denseP, tmpP, normOut, seqLen, eps);
+                // cur_mlp = rms(cur_mlp) * post_ffw_norm_1
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize),
+                        g4.PostFfwNorm1, eps,
+                        new Span<float>(denseP + t * hiddenSize, hiddenSize));
+
+                // ── MoE branch ─────────────────────────────────────────────
+                Gemma4Moe(in lw, layer, attnOutP, moeP, tmpP, seqLen, eps);
+                // cur_moe = rms(cur_moe) * post_ffw_norm_2
+                for (int t = 0; t < seqLen; t++)
+                    RmsNorm.Execute(
+                        new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize),
+                        g4.PostFfwNorm2, eps,
+                        new Span<float>(moeP + t * hiddenSize, hiddenSize));
+
+                // ── Combine: cur = rms(cur_mlp + cur_moe)*post_ffw_norm + attn_out ──
+                for (int t = 0; t < seqLen; t++)
+                {
+                    var dSpan = new ReadOnlySpan<float>(denseP + t * hiddenSize, hiddenSize);
+                    var mSpan = new ReadOnlySpan<float>(moeP + t * hiddenSize, hiddenSize);
+                    var sumSpan = new Span<float>(tmpP + t * hiddenSize, hiddenSize);
+                    TensorPrimitives.Add(dSpan, mSpan, sumSpan);
+                    RmsNorm.Execute(
+                        (ReadOnlySpan<float>)sumSpan, g4.PostFfwNorm, eps, sumSpan);
+                    // cur = cur + attn_out, then * layer_output_scale (LAST op).
+                    float scale = g4.LayerOutputScale;
+                    float* outT = hidden + t * hiddenSize;
+                    float* aoT = attnOutP + t * hiddenSize;
+                    float* sT = tmpP + t * hiddenSize;
+                    for (int j = 0; j < hiddenSize; j++)
+                        outT[j] = (sT[j] + aoT[j]) * scale;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(attnOutBuf);
+            ArrayPool<float>.Shared.Return(denseBuf);
+            ArrayPool<float>.Shared.Return(moeBuf);
+            ArrayPool<float>.Shared.Return(tmpNormBuf);
+        }
+    }
+
+    /// <summary>
+    /// Gemma-4 dense FFN branch: <c>down( geglu(gate·n) * (up·n) )</c> where
+    /// <c>n = rms(attn_out) * ffn_norm</c>. Writes [seqLen × hidden] into
+    /// <paramref name="dense"/>. Uses the layer's dense gate/up/down slots and the
+    /// model-wide dense intermediate width.
+    /// </summary>
+    private unsafe void Gemma4DenseFfn(
+        in TransformerLayerWeights lw, float* attnOut, float* dense, float* normScratch,
+        float* hiddenScratch, int seqLen, float eps)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int interm = lw.GateOutputDim; // dense FFN width (2112)
+        float* ffnGate = (float*)_state.FfnGate;
+        float* ffnUp = (float*)_state.FfnUp;
+        float* siluOut = (float*)_state.SiluOutput;
+
+        // n = rms(attn_out) * ffn_norm
+        for (int t = 0; t < seqLen; t++)
+            RmsNorm.Execute(
+                new ReadOnlySpan<float>(attnOut + t * hiddenSize, hiddenSize),
+                lw.FfnNormWeight, eps,
+                new Span<float>(hiddenScratch + t * hiddenSize, hiddenSize));
+
+        Gemm(lw.GateWeight, lw.GateQuantType, hiddenScratch, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+        Gemm(lw.UpWeight, lw.UpQuantType, hiddenScratch, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            var gSpan = new ReadOnlySpan<float>(ffnGate + t * interm, interm);
+            var uSpan = new ReadOnlySpan<float>(ffnUp + t * interm, interm);
+            var oSpan = new Span<float>(siluOut + t * interm, interm);
+            FusedOps.GeGLUTanh(gSpan, uSpan, oSpan);
+        }
+
+        Gemm(lw.DownWeight, lw.DownQuantType, siluOut, dense, lw.DownOutputDim, lw.DownInputDim, seqLen);
+    }
+
+    /// <summary>
+    /// Gemma-4 MoE branch with the custom router and per-expert down scale.
+    /// Expert input <c>cur_moe = rms(attn_out) * pre_ffw_norm_2</c>; router logits
+    /// <c>= ffn_gate_inp · (rms(attn_out) * 1/sqrt(hidden) * ffn_gate_inp_s)</c>.
+    /// Routes (softmax → top-k → renorm with 6.1e-5 clamp), runs the GeGLU experts
+    /// over the fused gate_up bank (raw quant, split by row offset) + the down bank,
+    /// folds <c>ffn_down_exps.scale[e]</c> into each routing weight, and writes the
+    /// weighted sum [seqLen × hidden] into <paramref name="moe"/>.
+    /// </summary>
+    private unsafe void Gemma4Moe(
+        in TransformerLayerWeights lw, int layer, float* attnOut, float* moe, float* normScratch,
+        int seqLen, float eps)
+    {
+        int hiddenSize = Config.HiddenSize;
+        var g4 = lw.Gemma4!;
+        var moeW = lw.Moe!;
+        int numExperts = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int moeInterm = moeW.IntermediateSize;
+        float invSqrtH = 1.0f / MathF.Sqrt(hiddenSize);
+
+        long hElems = (long)seqLen * hiddenSize;
+        float[] expertInBuf = ArrayPool<float>.Shared.Rent((int)hElems);   // rms(attn_out)*pre_ffw_norm_2
+        float[] routerInBuf = ArrayPool<float>.Shared.Rent((int)hElems);   // rms(attn_out)*invSqrtH*router_scale
+        float[] rmsBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
+
+        int totalAssign = seqLen * topK;
+        int[] assignExpert = ArrayPool<int>.Shared.Rent(totalAssign);
+        float[] assignWeight = ArrayPool<float>.Shared.Rent(totalAssign);
+        int[] bucketCursors = ArrayPool<int>.Shared.Rent(numExperts + 1);
+        int[] bucketTokens = ArrayPool<int>.Shared.Rent(totalAssign);
+        int[] bucketSlots = ArrayPool<int>.Shared.Rent(totalAssign);
+        int[] uniqueExperts = ArrayPool<int>.Shared.Rent(Math.Min(numExperts, totalAssign));
+        float[] logitsBuf = ArrayPool<float>.Shared.Rent(numExperts);
+        float[] probsBuf = ArrayPool<float>.Shared.Rent(numExperts);
+        try
+        {
+            // Expert input + router input (both derived from rms(attn_out)).
+            for (int t = 0; t < seqLen; t++)
+            {
+                var rms = rmsBuf.AsSpan(0, hiddenSize);
+                RmsNorm.ExecuteUnit(
+                    new ReadOnlySpan<float>(attnOut + t * hiddenSize, hiddenSize), eps, rms);
+                // expert input = rms * pre_ffw_norm_2
+                TensorPrimitives.Multiply(rms, g4.PreFfwNorm2, expertInBuf.AsSpan(t * hiddenSize, hiddenSize));
+                // router input = rms * invSqrtH * router_scale
+                var rin = routerInBuf.AsSpan(t * hiddenSize, hiddenSize);
+                for (int j = 0; j < hiddenSize; j++)
+                    rin[j] = rms[j] * invSqrtH * g4.RouterScale[j];
+            }
+
+            // Custom routing: logits = ffn_gate_inp · routerInput, softmax over E,
+            // top-k, renorm (sum 1) with min-clamp 6.1e-5. Fill buckets.
+            bucketCursors.AsSpan(0, numExperts + 1).Clear();
+            Span<int> topkIdx = stackalloc int[topK];
+            Span<float> topkProb = stackalloc float[topK];
+            fixed (float* gatePtr = moeW.Gate)
+            fixed (float* routerInP = routerInBuf)
+            fixed (float* logitsP = logitsBuf)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    MatMul.GemvF32(gatePtr, routerInP + (long)t * hiddenSize, logitsP, numExperts, hiddenSize);
+
+                    Softmax.Execute(logitsBuf.AsSpan(0, numExperts), probsBuf.AsSpan(0, numExperts));
+                    MoeSwiGluMlp.SelectTopK(probsBuf.AsSpan(0, numExperts), topkIdx, topkProb);
+
+                    float sum = 0f;
+                    for (int i = 0; i < topK; i++) sum += topkProb[i];
+                    // Renorm to sum 1, clamping the denominator at 6.1e-5 to avoid
+                    // dividing by a vanishing top-k mass (gemma4.cpp).
+                    if (sum < 6.103515625e-05f) sum = 6.103515625e-05f;
+                    float invSum = 1.0f / sum;
+                    for (int i = 0; i < topK; i++)
+                    {
+                        float w = topkProb[i] * invSum;
+                        int e = topkIdx[i];
+                        int idx = t * topK + i;
+                        assignExpert[idx] = e;
+                        // Fold the per-expert down scale into the routing weight: the
+                        // final accumulation does sum_e w[e]*down_e, and the spec
+                        // scales down_e by ffn_down_exps.scale[e] — equivalent.
+                        assignWeight[idx] = w * g4.DownExpertScale[e];
+                        bucketCursors[e]++;
+                    }
+                }
+            }
+
+            // Exclusive prefix sum → bucket offsets.
+            int running = 0;
+            for (int e = 0; e <= numExperts; e++)
+            {
+                int c = bucketCursors[e];
+                bucketCursors[e] = running;
+                running += c;
+            }
+            // Fill buckets.
+            int[] cursor = ArrayPool<int>.Shared.Rent(numExperts);
+            try
+            {
+                for (int e = 0; e < numExperts; e++) cursor[e] = bucketCursors[e];
+                for (int t = 0; t < seqLen; t++)
+                    for (int slot = 0; slot < topK; slot++)
+                    {
+                        int e = assignExpert[t * topK + slot];
+                        int pos = cursor[e]++;
+                        bucketTokens[pos] = t;
+                        bucketSlots[pos] = slot;
+                    }
+            }
+            finally { ArrayPool<int>.Shared.Return(cursor); }
+
+            int uniqueCount = 0;
+            for (int e = 0; e < numExperts; e++)
+                if (bucketCursors[e + 1] - bucketCursors[e] > 0)
+                    uniqueExperts[uniqueCount++] = e;
+
+            // Per-expert GeGLU over the raw fused gate_up bank (gate offset 0, up
+            // offset Ie rows, both step the 2*Ie-row slab) + the down bank. The
+            // kernel applies assignWeight (which carries the per-expert down scale).
+            MoeSwiGluMlp.ExecuteRoutedFromAssignments(
+                expertInBuf.AsSpan(0, (int)hElems),
+                gateExpsRawBase: moeW.GateExpsRaw, moeW.GateExpsRawQt, g4.GateUpExpsRowBytes, ReadOnlySpan<nint>.Empty,
+                upExpsRawBase: moeW.UpExpsRaw, moeW.UpExpsRawQt, g4.GateUpExpsRowBytes, ReadOnlySpan<nint>.Empty,
+                downExpsRawBase: moeW.DownExpsRaw, moeW.DownExpsRawQt, g4.DownExpsRowBytes, ReadOnlySpan<nint>.Empty,
+                assignExpert.AsSpan(0, totalAssign),
+                assignWeight.AsSpan(0, totalAssign),
+                bucketCursors.AsSpan(0, numExperts + 1),
+                bucketTokens.AsSpan(0, totalAssign),
+                bucketSlots.AsSpan(0, totalAssign),
+                uniqueExperts.AsSpan(0, uniqueCount),
+                uniqueCount,
+                new Span<float>(moe, (int)hElems),
+                numExperts, topK, hiddenSize, moeInterm, seqLen,
+                ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty,
+                0, ReadOnlySpan<float>.Empty,
+                loraAdapter: null, loraLayer: -1,
+                threadPool: _threadPool,
+                useGeGLU: true);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(expertInBuf);
+            ArrayPool<float>.Shared.Return(routerInBuf);
+            ArrayPool<float>.Shared.Return(rmsBuf);
+            ArrayPool<int>.Shared.Return(assignExpert);
+            ArrayPool<float>.Shared.Return(assignWeight);
+            ArrayPool<int>.Shared.Return(bucketCursors);
+            ArrayPool<int>.Shared.Return(bucketTokens);
+            ArrayPool<int>.Shared.Return(bucketSlots);
+            ArrayPool<int>.Shared.Return(uniqueExperts);
+            ArrayPool<float>.Shared.Return(logitsBuf);
+            ArrayPool<float>.Shared.Return(probsBuf);
+        }
+    }
+
+    /// <summary>
+    /// Weight-less per-head RMSNorm (rms only, no learned scale) applied in place to
+    /// each of <paramref name="numKvHeads"/> head slices of width
+    /// <paramref name="headDim"/>. Gemma 4's V-norm: <c>Vcur = rms(Vcur)</c> with no
+    /// weight, on every layer, before attention (V is not roped).
+    /// </summary>
+    private static unsafe void ApplyPerHeadNormWeightless(
+        float* v, int numKvHeads, int headDim, int seqLen, float eps)
+    {
+        int stride = numKvHeads * headDim;
+        for (int t = 0; t < seqLen; t++)
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                float* head = v + t * stride + h * headDim;
+                RmsNorm.ExecuteUnit(
+                    new ReadOnlySpan<float>(head, headDim), eps,
+                    new Span<float>(head, headDim));
+            }
     }
 
     /// <summary>

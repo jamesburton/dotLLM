@@ -33,6 +33,20 @@ public static class RmsNorm
     }
 
     /// <summary>
+    /// Weight-less RMS normalization: <c>result[i] = input[i] / rms</c> (no learned
+    /// scale). Gemma 4 applies this to the attention V (and to the router /
+    /// expert-input <c>rms(attn_out)</c> before the per-channel scales). May alias
+    /// <paramref name="input"/> for in-place operation.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void ExecuteUnit(ReadOnlySpan<float> input, float epsilon, Span<float> result)
+    {
+        float sumSq = TensorPrimitives.SumOfSquares(input);
+        float rms = MathF.Sqrt(sumSq / input.Length + epsilon);
+        TensorPrimitives.Multiply(input, 1.0f / rms, result);
+    }
+
+    /// <summary>
     /// Scalar reference implementation for correctness verification.
     /// </summary>
     [SkipLocalsInit]

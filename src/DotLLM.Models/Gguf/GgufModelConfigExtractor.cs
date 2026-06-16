@@ -652,6 +652,18 @@ public static class GgufModelConfigExtractor
         if (string.IsNullOrEmpty(chatTemplate)) chatTemplate = null;
 
         // DiffusionGemma: a non-null DiffusionConfig (canvas length + mask token).
+        // NOTE (PR #11 scope): the DiffusionGemma-specific graph pieces
+        // (self-conditioning, region-aware embed/scalar, enc_layer_output_scale,
+        // the diffusion canvas mask) are DEFERRED. The autoregressive gemma4 graph
+        // is implemented; loading a diffusion-gemma GGUF builds a valid config but
+        // the diffusion decode pieces are not wired yet — guard explicitly so a
+        // diffusion-gemma GGUF fails fast rather than silently running the AR graph.
+        if (architecture is Architecture.DiffusionGemma)
+            throw new NotSupportedException(
+                "diffusion-gemma GGUF: the DiffusionGemma-specific forward graph "
+                + "(self-conditioning, region-aware embed/scalar, enc_layer_output_scale, "
+                + "diffusion canvas mask) is not implemented yet (PR #11 covers the "
+                + "autoregressive gemma4 graph only). Tracked as follow-up.");
         DiffusionConfig? diffusion = null;
         if (architecture is Architecture.DiffusionGemma)
         {
@@ -683,9 +695,22 @@ public static class GgufModelConfigExtractor
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = slidingRope,
             GlobalRoPEConfig = globalRope,
-            PartialRotaryFactor = null,
+            // Gemma 4 full-attention (global) layers apply RoPE to only the
+            // leading 0.25 fraction of the 512-dim head (first 64 pairs = 128
+            // dims; the GGUF rope.dimension_count is the FULL head dim, not the
+            // rotated span — partial_rotary_factor 0.25 selects the rotated dims).
+            // The forward path multiplies this factor by the global head dim and
+            // rounds down to even. Sliding layers keep full rotation (factor n/a).
+            PartialRotaryFactor = 0.25f,
             NumGlobalKvHeads = numGlobalKvHeads,
             GlobalHeadDim = globalHeadDimNullable,
+            // Gemma 4 q_norm/k_norm make Q,K unit so the attention softmax scale
+            // is exactly 1.0 (NOT 1/sqrt(head_dim)). QueryPreAttnScalar = 1.0
+            // routes the forward's scale computation to 1/sqrt(1.0) == 1.0.
+            QueryPreAttnScalar = 1.0f,
+            // Gemma 4 MoE dual-FFN graph (V-from-K, weight-less V-norm, dense+MoE
+            // parallel FFN, custom router, per-expert down scale, layer_output_scale).
+            Gemma4DualFfn = true,
             ActivationFunction = ActivationFunction.GELUTanh,
             NormType = NormType.RMSNorm,
             NormEpsilon = normEps,
@@ -711,14 +736,22 @@ public static class GgufModelConfigExtractor
     {
         if (!metadata.TryGetValue(key, out var entry) || entry.Type != GgufValueType.Array)
             return Array.Empty<int>();
-        // The element type can be Int32 or UInt32 depending on the writer; the
-        // underlying value object is int[] or uint[] respectively.
+        // The element type can be Int32, UInt32, or Bool depending on the writer.
+        // gemma4 stores attention.sliding_window_pattern as a Bool array
+        // ([True,True,…,False] — true = sliding/local layer) and
+        // attention.head_count_kv as a (U)Int32 array. Map each to int[].
         if (entry.Value is int[] ints)
             return ints;
         if (entry.Value is uint[] uints)
         {
             var r = new int[uints.Length];
             for (int i = 0; i < uints.Length; i++) r[i] = (int)uints[i];
+            return r;
+        }
+        if (entry.Value is bool[] bools)
+        {
+            var r = new int[bools.Length];
+            for (int i = 0; i < bools.Length; i++) r[i] = bools[i] ? 1 : 0;
             return r;
         }
         return Array.Empty<int>();
