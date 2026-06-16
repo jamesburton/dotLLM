@@ -49,6 +49,23 @@ GPU/Vulkan diffusion forward + KV-prefix reuse (#37) are required for usable thr
 - [in progress] LLaDA-8B Q4_K_M download → C:\models\llada\.
 - [in progress] GGUF→diffusion wiring on branch `dg-pr9-llada-validation`.
 
+## DiffusionGemma-26B — bounded remaining work (NOT a correct run tonight)
+The DiffusionGemma GGUF (`general.architecture = diffusion-gemma`) carries everything the loader
+needs (dual `key_length`/`key_length_swa`, per-attn `rope.dimension_count`/`_swa`, MoE, `diffusion.canvas_length`)
+**but also `gemma4.embedding_length_per_layer_input`** → the 26B-A4B uses **Gemma-4/3n per-layer
+embeddings (PLE)** + (likely) AltUp/Laurel, which the backbone doesn't implement. A correct 26B forward
+needs that architecture work + GGUF gemma4/diffusion-gemma loading (→ **issue #40**). 26B on CPU is also
+~minutes/forward — impractical without GPU. So DiffusionGemma-26B real generation is deferred with a
+precise plan, not attempted blind.
+
+## Final overnight outcome
+- ✅ **Headline: masked-diffusion decode validated on REAL weights** (LLaDA-8B → "Paris.").
+- ✅ Full diffusion stack PR-1..PR-10 + #36, all CPU-validated and pushed (branches dg-pr1..dg-pr10).
+- ✅ Mask-mode bug root-caused + fixed (Bidirectional vs Hybrid).
+- ⏭️ DiffusionGemma-26B → **#40** (Gemma-4/3n PLE/AltUp + GGUF loading). Vulkan/throughput → **#41** + #37.
+- Models on disk: LLaDA-8B Q4 (4.93G), DiffusionGemma-26B Q4 (16.81G), gemma-4-26B Q4 (15.78G). Freed
+  18.7G by removing unused RyzenAI NPU/ONNX models.
+
 ## Branch stack
 dev-diffusiongemma → dg-pr1-gemma-backbone → dg-pr2-gemma4-moe → dg-pr3-bidirectional-attn →
 dg-pr4-diffusion-config → dg-pr5-denoise-scheduler-sampler → dg-pr6-diffusion-text-generator →
