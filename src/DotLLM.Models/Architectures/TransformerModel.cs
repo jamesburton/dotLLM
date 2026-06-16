@@ -59,6 +59,19 @@ public sealed unsafe class TransformerModel : IModel
     private float[]? _scPrevLogits;
     private int _scCanvasLen;
     private float _scUse;
+    // ── DiffusionGemma prompt-KV (PKV) phase state ──────────────────────────
+    // Drives the two-phase PKV optimisation inside RunGemma4Layer. None: normal
+    // cacheless forward (DEFAULT — every other path unchanged). Prefill: capture
+    // each layer's prompt K/V into _pkvStore. Decode: read cached prompt K/V and
+    // attend [prompt K/V | fresh canvas K/V] under a rectangular bidirectional mask.
+    // _pkvPromptLen is the prompt length P (the cached prefix); the canvas RoPE
+    // positions on a decode forward start at P. Single-threaded per generation,
+    // like _currentMaskSpec / _scUse.
+    private DiffusionKvPhase _pkvPhase = DiffusionKvPhase.None;
+    private DiffusionPromptKvStore? _pkvStore;
+    private int _pkvPromptLen;
+
+    private enum DiffusionKvPhase { None, Prefill, Decode }
     // Lifetime anchor for the underlying mmap-backed weight file. Holds a
     // strong reference so the GC cannot collect the GgufFile / SafetensorsFile
     // while weight pointers are still in use. Not null for any loaded model.
@@ -479,6 +492,99 @@ public sealed unsafe class TransformerModel : IModel
         {
             _scCanvasLen = 0;
             _scUse = 0f;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Supported only on the diffusion-gemma backbone (the Gemma-4 tower with a non-null
+    /// <see cref="ModelConfig.DiffusionConfig"/>). PKV reuses the per-layer prompt K/V across
+    /// denoise steps; the cacheless unified forward remains the default and is unaffected.
+    /// </remarks>
+    public bool SupportsDiffusionPromptKv =>
+        Config.DiffusionConfig is not null && _weights.Layers.Length > 0
+        && _weights.Layers[0].Gemma4 is not null;
+
+    /// <inheritdoc/>
+    public void DiffusionPrefillPromptKv(
+        ReadOnlySpan<int> promptTokens, ReadOnlySpan<int> positions, DiffusionPromptKvStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        if (!SupportsDiffusionPromptKv)
+            throw new NotSupportedException(
+                "DiffusionPrefillPromptKv requires a diffusion-gemma (Gemma-4) model.");
+        if (promptTokens.Length == 0)
+            throw new ArgumentException("Prompt must be non-empty for PKV prefill.", nameof(promptTokens));
+        if (promptTokens.Length != positions.Length)
+            throw new ArgumentException("promptTokens and positions length mismatch.", nameof(positions));
+
+        int p = promptTokens.Length;
+        int numLayers = Config.NumLayers;
+        // Per-layer KV block width (nKvHead*headDim) — differs for sliding vs global layers.
+        Span<int> kvBlockElems = numLayers <= 256 ? stackalloc int[numLayers] : new int[numLayers];
+        for (int l = 0; l < numLayers; l++)
+            kvBlockElems[l] = GetLayerKvHeads(l) * Config.GetLayerHeadDim(l);
+        store.BeginPrefill(p, kvBlockElems);
+
+        // Run a prompt-only causal forward (Hybrid(P) with P == seqLen ⇒ every row is in the
+        // causal prefix, so the region-embed and region scalar deltas are inert exactly as the
+        // unified path's prompt rows). RunGemma4Layer captures K/V per layer while _pkvPhase is
+        // Prefill. No SC on the prompt (the generator clears SC before prefill). No KV-cache.
+        _pkvStore = store;
+        _pkvPromptLen = p;
+        _pkvPhase = DiffusionKvPhase.Prefill;
+        _currentMaskSpec = AttentionMaskSpec.Hybrid(p);
+        try
+        {
+            RunLayersAndFinalNormCore(promptTokens, positions, kvCache: null);
+            // No LM head needed for prefill — we only want the captured K/V. (Running the head
+            // would be wasted work; the store now holds every layer's prompt K/V.)
+        }
+        finally
+        {
+            _pkvPhase = DiffusionKvPhase.None;
+            _pkvStore = null;
+            _pkvPromptLen = 0;
+            _currentMaskSpec = AttentionMaskSpec.Causal;
+        }
+    }
+
+    /// <inheritdoc/>
+    public ITensor DiffusionDecodeWithPromptKv(
+        ReadOnlySpan<int> canvasTokens, ReadOnlySpan<int> positions, int deviceId,
+        DiffusionPromptKvStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        if (!SupportsDiffusionPromptKv)
+            throw new NotSupportedException(
+                "DiffusionDecodeWithPromptKv requires a diffusion-gemma (Gemma-4) model.");
+        if (store.PromptLen <= 0)
+            throw new InvalidOperationException("PKV store is empty — run DiffusionPrefillPromptKv first.");
+        if (canvasTokens.Length == 0)
+            throw new ArgumentException("Canvas must be non-empty for PKV decode.", nameof(canvasTokens));
+        if (canvasTokens.Length != positions.Length)
+            throw new ArgumentException("canvasTokens and positions length mismatch.", nameof(positions));
+
+        _pkvStore = store;
+        _pkvPromptLen = store.PromptLen;
+        _pkvPhase = DiffusionKvPhase.Decode;
+        // Bidirectional mask spec so the region-embed (p == 0 ⇒ all C rows are canvas) and the
+        // region per-layer scalar (regionP == 0 ⇒ all C rows use layer_output_scale) treat every
+        // decode row as a canvas row. The actual canvas↔[prompt|canvas] attention is built inside
+        // RunGemma4Layer from the cached prompt K/V (the mask spec's attention mode is overridden
+        // there for the Decode phase).
+        _currentMaskSpec = AttentionMaskSpec.Bidirectional;
+        try
+        {
+            RunLayersAndFinalNormCore(canvasTokens, positions, kvCache: null);
+            return RunLmHead(canvasTokens.Length, deviceId);
+        }
+        finally
+        {
+            _pkvPhase = DiffusionKvPhase.None;
+            _pkvStore = null;
+            _pkvPromptLen = 0;
+            _currentMaskSpec = AttentionMaskSpec.Causal;
         }
     }
 
@@ -1443,10 +1549,75 @@ public sealed unsafe class TransformerModel : IModel
             ? 1.0f / MathF.Sqrt(qpas)
             : 1.0f / MathF.Sqrt(headDimLayer);
         int? layerSlidingWindow = GetLayerSlidingWindow(layer);
-        Attention.Execute(q, k, v, attnOut,
-            seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
-            layerSlidingWindow, softCap: 0f,
-            _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+
+        // ── PKV phase split ─────────────────────────────────────────────────
+        // Prefill: capture this layer's post-rope K (and post-vnorm V) for reuse
+        //   across denoise steps, then run the normal causal prompt attention.
+        // Decode: attend the C canvas queries over [cached prompt K/V | fresh canvas
+        //   K/V] (length P+C) under a RECTANGULAR bidirectional mask — a canvas query
+        //   (RoPE position P+i) attends every prompt key + every canvas key, clipped by
+        //   the per-layer sliding window. positionOffset = P maps the canvas query to
+        //   logical position P+i so the sliding-window lower bound matches the unified
+        //   Hybrid path exactly.
+        // None (default): the verbatim unified cacheless attention — byte-identical.
+        if (_pkvPhase == DiffusionKvPhase.Prefill)
+        {
+            // K/V are row-major [seqLen × kvStrideLayer]; store them whole (seqLen == P).
+            var store = _pkvStore!;
+            int kvElems = seqLen * kvStrideLayer;
+            new Span<float>(k, kvElems).CopyTo(new Span<float>(store.Keys(layer), kvElems));
+            new Span<float>(v, kvElems).CopyTo(new Span<float>(store.Values(layer), kvElems));
+
+            Attention.Execute(q, k, v, attnOut,
+                seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+                layerSlidingWindow, softCap: 0f,
+                _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+        }
+        else if (_pkvPhase == DiffusionKvPhase.Decode)
+        {
+            int p = _pkvPromptLen;            // cached prompt length
+            int c = seqLen;                   // canvas length (this forward's row count)
+            int kvCtx = p + c;                // concat key/value rows
+            var store = _pkvStore!;
+            long concatElems = (long)kvCtx * kvStrideLayer;
+            float[] kCat = ArrayPool<float>.Shared.Rent((int)concatElems);
+            float[] vCat = ArrayPool<float>.Shared.Rent((int)concatElems);
+            try
+            {
+                fixed (float* kCatP = kCat)
+                fixed (float* vCatP = vCat)
+                {
+                    // [0, P) = cached prompt K/V (post-norm/post-rope, V-from-K on global
+                    // layers exactly as captured); [P, P+C) = fresh canvas K/V.
+                    int promptKvElems = p * kvStrideLayer;
+                    int canvasKvElems = c * kvStrideLayer;
+                    new Span<float>(store.Keys(layer), promptKvElems).CopyTo(new Span<float>(kCatP, promptKvElems));
+                    new Span<float>(store.Values(layer), promptKvElems).CopyTo(new Span<float>(vCatP, promptKvElems));
+                    new Span<float>(k, canvasKvElems).CopyTo(new Span<float>(kCatP + promptKvElems, canvasKvElems));
+                    new Span<float>(v, canvasKvElems).CopyTo(new Span<float>(vCatP + promptKvElems, canvasKvElems));
+
+                    // seqQ = C canvas queries, seqKv = P+C keys, positionOffset = P (canvas
+                    // query i has logical position P+i). Bidirectional: every canvas query
+                    // attends all P+C keys, with the sliding-window lower bound applied.
+                    Attention.Execute(q, kCatP, vCatP, attnOut,
+                        c, kvCtx, numHeads, numKvHeadsLayer, headDimLayer, p, attnScale, _threadPool,
+                        layerSlidingWindow, softCap: 0f,
+                        AttentionMaskMode.Bidirectional, 0);
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(kCat);
+                ArrayPool<float>.Shared.Return(vCat);
+            }
+        }
+        else
+        {
+            Attention.Execute(q, k, v, attnOut,
+                seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
+                layerSlidingWindow, softCap: 0f,
+                _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+        }
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);

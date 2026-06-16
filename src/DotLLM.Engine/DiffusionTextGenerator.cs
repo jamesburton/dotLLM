@@ -46,6 +46,12 @@ public sealed class DiffusionTextGenerator
     private readonly DiffusionConfig _diffusion;
     private readonly IDiffusionUnmaskSampler _sampler;
     private readonly float _logitSoftCap;
+    // Opt-in prompt-KV (PKV) prefill/decode optimisation. When true AND the model
+    // implements it AND the canvas uses the Hybrid (block-AR) mask (DiffusionGemma),
+    // each canvas block prefills the prompt prefix once and runs the per-step canvas
+    // forward over the cached prompt K/V instead of recomputing the prompt every step.
+    // Default false ⇒ the cacheless unified path runs verbatim (byte-identical).
+    private readonly bool _enablePromptKv;
 
     /// <summary>
     /// Creates a diffusion text generator.
@@ -58,11 +64,17 @@ public sealed class DiffusionTextGenerator
     /// <param name="diffusionConfig">Diffusion decode config. Null falls back to the model's
     /// <see cref="ModelConfig.DiffusionConfig"/>; if that is also null an exception is thrown.</param>
     /// <exception cref="ArgumentException">The model has no diffusion configuration and none was supplied.</exception>
+    /// <param name="enablePromptKv">Opt-in prompt-KV (PKV) prefill/decode optimisation. When true and
+    /// the model supports it (DiffusionGemma) under the Hybrid block-AR canvas mask, the prompt prefix
+    /// is prefilled once per canvas and reused across denoise steps. Default false ⇒ the cacheless
+    /// unified forward (byte-identical to the pre-PKV path). PKV decode produces identical canvas
+    /// logits — it is a pure throughput optimisation.</param>
     public DiffusionTextGenerator(
         IModel model,
         ITokenizer tokenizer,
         IDiffusionUnmaskSampler? sampler = null,
-        DiffusionConfig? diffusionConfig = null)
+        DiffusionConfig? diffusionConfig = null,
+        bool enablePromptKv = false)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(tokenizer);
@@ -76,6 +88,12 @@ public sealed class DiffusionTextGenerator
                 nameof(diffusionConfig));
         _sampler = sampler ?? new EntropyBoundSampler();
         _logitSoftCap = model.Config.FinalLogitSoftcap ?? 0f;
+        // PKV is only sound for the Hybrid (block-AR) canvas mask — it caches a CAUSAL prompt
+        // prefix. LLaDA's fully-bidirectional prompt is NOT a causal prefix, so PKV is disabled
+        // for Bidirectional canvases (the unified path runs instead).
+        _enablePromptKv = enablePromptKv
+            && model.SupportsDiffusionPromptKv
+            && _diffusion.CanvasAttentionMode == AttentionMaskMode.Hybrid;
     }
 
     /// <summary>
@@ -228,6 +246,17 @@ public sealed class DiffusionTextGenerator
         // [prompt | canvas] (Hybrid yields degenerate all-EOS output on LLaDA).
         AttentionMaskSpec hybrid = CanvasMaskSpec(prefixLen);
 
+        // PKV opt-in: prefill the prompt prefix ONCE per canvas block, then run the per-step
+        // canvas-only decode over the cached prompt K/V. Produces canvas logits identical to
+        // the unified path — a pure throughput optimisation. usePkv is gated on the model
+        // supporting it AND a non-empty prefix (nothing to cache for an empty prompt).
+        bool usePkv = _enablePromptKv && prefixLen > 0;
+        DiffusionPromptKvStore? pkvStore = null;
+        // The forward's logit tensor has its canvas rows starting at `logitsRowOffset`: the
+        // unified [prompt|canvas] forward puts them at `prefixLen`; the PKV canvas-only decode
+        // returns a [blockLen × vocab] tensor whose canvas rows start at 0.
+        int logitsRowOffset = usePkv ? 0 : prefixLen;
+
         int step = 0;
         DenoiseStopResult stop = DenoiseStopResult.Continue;
 
@@ -239,6 +268,16 @@ public sealed class DiffusionTextGenerator
                 positions[prefixLen + i] = prefixLen + i;
             for (int i = 0; i < prefixLen; i++)
                 seqTokens[i] = context[i];
+
+            if (usePkv)
+            {
+                // Capture the prompt's per-layer K/V once. Clear SC first so the prompt-only
+                // prefill is the zero-SC causal path (SC only modifies canvas rows anyway).
+                pkvStore = new DiffusionPromptKvStore(_model.Config.NumLayers);
+                _model.SetDiffusionSelfCond(ReadOnlySpan<float>.Empty, 0, scUse: 0f);
+                _model.DiffusionPrefillPromptKv(
+                    seqTokens.AsSpan(0, prefixLen), positions.AsSpan(0, prefixLen), pkvStore);
+            }
 
             for (step = 0; step < _diffusion.MaxDenoisingSteps; step++)
             {
@@ -256,24 +295,32 @@ public sealed class DiffusionTextGenerator
                 else
                     _model.SetDiffusionSelfCond(ReadOnlySpan<float>.Empty, 0, scUse: 0f);
 
-                // ── Cacheless hybrid forward. NEVER pass a KV-cache here: PR-3 throws for a
-                //    non-causal mask + non-null cache. Recompute the whole prompt+canvas each step.
+                // ── Forward. PKV decode: canvas-only forward over cached prompt K/V (positions
+                //    prefixLen..prefixLen+blockLen). Unified: cacheless [prompt|canvas] forward
+                //    under the Hybrid mask. NEVER a KV-cache (PR-3 throws for non-causal + cache);
+                //    the PKV store is a bespoke diffusion prompt-KV buffer, not the general cache.
                 int beforeMasked = maskedCount;
                 UnmaskDecision decision;
-                using (ITensor logits = _model.Forward(
-                           seqTokens.AsSpan(0, seqLen),
-                           positions.AsSpan(0, seqLen),
-                           deviceId: -1, kvCache: null, adapter: null, hybrid))
+                ITensor logits = usePkv
+                    ? _model.DiffusionDecodeWithPromptKv(
+                        seqTokens.AsSpan(prefixLen, blockLen),
+                        positions.AsSpan(prefixLen, blockLen),
+                        deviceId: -1, pkvStore!)
+                    : _model.Forward(
+                        seqTokens.AsSpan(0, seqLen),
+                        positions.AsSpan(0, seqLen),
+                        deviceId: -1, kvCache: null, adapter: null, hybrid);
+                using (logits)
                 {
-                    // Capture the FULL canvas-region logits ([blockLen × vocab], rows
-                    // prefixLen..prefixLen+blockLen) for the NEXT step's self-conditioning.
-                    // These are post-softcap and NOT mask-suppressed (SC uses the full
-                    // distribution; mask-suppression is only for the unmask COMMIT below).
-                    CaptureCanvasLogits(logits, prefixLen, blockLen, vocabSize, scPrevCanvasLogits);
+                    // Capture the FULL canvas-region logits ([blockLen × vocab]) for the NEXT
+                    // step's self-conditioning. Canvas rows start at logitsRowOffset (prefixLen
+                    // unified / 0 PKV-decode). Post-softcap, NOT mask-suppressed (SC uses the
+                    // full distribution; mask-suppression is only for the unmask COMMIT below).
+                    CaptureCanvasLogits(logits, logitsRowOffset, blockLen, vocabSize, scPrevCanvasLogits);
                     scValid = true;
 
                     // Gather logit rows for the still-masked canvas positions only.
-                    int rows = GatherMaskedRows(canvas, maskTokenId, prefixLen, vocabSize, logits,
+                    int rows = GatherMaskedRows(canvas, maskTokenId, logitsRowOffset, vocabSize, logits,
                         maskedPositions, maskedLogits);
 
                     var ctx = scheduler.CreateStepContext(step, rows, _logitSoftCap);
@@ -334,6 +381,8 @@ public sealed class DiffusionTextGenerator
             ArrayPool<int>.Shared.Return(maskedPositions);
             ArrayPool<float>.Shared.Return(maskedLogits);
             ArrayPool<float>.Shared.Return(scPrevCanvasLogits);
+            // Free this canvas block's prompt-KV store (unmanaged buffers).
+            pkvStore?.Dispose();
             // Clear the model's SC state so a later non-diffusion / next-canvas forward
             // starts clean (the next RunCanvas re-primes step 0 with scUse=0 anyway).
             _model.SetDiffusionSelfCond(ReadOnlySpan<float>.Empty, 0, scUse: 0f);

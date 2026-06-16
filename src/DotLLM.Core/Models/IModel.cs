@@ -107,6 +107,61 @@ public interface IModel : IDisposable
     void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse) { }
 
     /// <summary>
+    /// True when this model implements the DiffusionGemma prompt-KV (PKV) prefill/decode
+    /// cache — the throughput optimisation that captures the prompt's per-layer K/V once
+    /// (<see cref="DiffusionPrefillPromptKv"/>) and reuses them on every denoise step
+    /// (<see cref="DiffusionDecodeWithPromptKv"/>) instead of recomputing the prompt prefix.
+    /// Default false: callers fall back to the cacheless unified <c>[prompt | canvas]</c> forward.
+    /// </summary>
+    bool SupportsDiffusionPromptKv => false;
+
+    /// <summary>
+    /// PKV <b>prefill</b>: runs a prompt-only causal forward (over the <paramref name="promptTokens"/>)
+    /// and captures each transformer layer's post-norm/post-rope prompt <c>K</c> and weight-less-normed
+    /// prompt <c>V</c> into <paramref name="store"/> for reuse by <see cref="DiffusionDecodeWithPromptKv"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The captured K/V are byte-equivalent to the prompt rows the cacheless unified forward would
+    /// compute (the prompt embedding is fixed across denoise steps, and K/V projections do not depend on
+    /// the attention mask). On V-less global layers <c>V</c> is the raw <c>K</c> projection, exactly as
+    /// the unified path. The default implementation throws — only models reporting
+    /// <see cref="SupportsDiffusionPromptKv"/> implement it.</para>
+    /// </remarks>
+    /// <param name="promptTokens">Prompt token ids (the causal prefix to cache).</param>
+    /// <param name="positions">Position indices for the prompt tokens (typically <c>0..P-1</c>).</param>
+    /// <param name="store">Destination prompt-KV store; resized and filled for the current prompt.</param>
+    void DiffusionPrefillPromptKv(
+        ReadOnlySpan<int> promptTokens, ReadOnlySpan<int> positions, DiffusionPromptKvStore store)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support DiffusionGemma prompt-KV prefill.");
+
+    /// <summary>
+    /// PKV <b>decode</b>: runs a canvas-only forward (over the <paramref name="canvasTokens"/>, length C)
+    /// that, for each layer, computes fresh canvas Q/K/V and attends over the concatenation
+    /// <c>[cached prompt K/V | fresh canvas K/V]</c> under a rectangular bidirectional mask
+    /// (a canvas query attends all prompt keys + all canvas keys, clipped by the per-layer sliding
+    /// window). The canvas region embedding (weight-less rms + self-conditioning) and the canvas
+    /// <c>layer_output_scale</c> apply to all C rows exactly as the unified forward.
+    /// </summary>
+    /// <remarks>
+    /// <para>Produces canvas logits byte-equivalent to the cacheless unified forward's canvas rows — a
+    /// pure optimisation. The canvas RoPE positions are <c>promptLen + 0 .. promptLen + C - 1</c>
+    /// (supplied via <paramref name="positions"/>). Self-conditioning is supplied beforehand via
+    /// <see cref="SetDiffusionSelfCond"/>, identical to the unified path. The default implementation
+    /// throws — only models reporting <see cref="SupportsDiffusionPromptKv"/> implement it.</para>
+    /// </remarks>
+    /// <param name="canvasTokens">Canvas token ids for this step (length C).</param>
+    /// <param name="positions">Canvas RoPE positions (<c>promptLen .. promptLen+C-1</c>).</param>
+    /// <param name="deviceId">Target device for computation.</param>
+    /// <param name="store">Prompt-KV store filled by a prior <see cref="DiffusionPrefillPromptKv"/>.</param>
+    /// <returns>Logits tensor of shape <c>[C, vocabSize]</c> for the canvas positions.</returns>
+    ITensor DiffusionDecodeWithPromptKv(
+        ReadOnlySpan<int> canvasTokens, ReadOnlySpan<int> positions, int deviceId,
+        DiffusionPromptKvStore store)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support DiffusionGemma prompt-KV decode.");
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>
