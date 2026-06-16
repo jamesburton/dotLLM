@@ -58,12 +58,16 @@ float readHalf(uint absByteOff) {
     return unpackHalf2x16(half16).x;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when not 4-aligned. One storage load
+// replaces four byte-wise readByte calls.
 uint readU32(uint absByteOff) {
-    uint b0 = readByte(absByteOff);
-    uint b1 = readByte(absByteOff + 1u);
-    uint b2 = readByte(absByteOff + 2u);
-    uint b3 = readByte(absByteOff + 3u);
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
 }
 
 uint gridByte(uint absIdx) {
@@ -102,9 +106,18 @@ void main() {
             float db = d * (0.5 + float(aux32 >> 28)) * 0.5;
             uint xSubBase = xBase + ib32 * 32u;
 
+            // The sub-block's 8 grid-index bytes (g1,g2 for l=0..3) are two
+            // funnelled words; read each ONCE and extract the bytes instead of
+            // eight byte-wise readByte calls reloading the shared words. The dot
+            // itself remains codebook-gather bound (gridByte).
+            uint qsw0 = readU32(qsBase + ib32 * 8u);        // bytes 0..3 (l=0,1)
+            uint qsw1 = readU32(qsBase + ib32 * 8u + 4u);   // bytes 4..7 (l=2,3)
+
             for (uint l = 0u; l < 4u; l++) {
-                uint g1 = readByte(qsBase + ib32 * 8u + 2u * l + 0u);
-                uint g2 = readByte(qsBase + ib32 * 8u + 2u * l + 1u);
+                uint qsw = (l < 2u) ? qsw0 : qsw1;
+                uint sh  = (l & 1u) * 16u;                  // byte pair within word
+                uint g1 = (qsw >> sh) & 0xFFu;
+                uint g2 = (qsw >> (sh + 8u)) & 0xFFu;
                 uint signsIdx = (aux32 >> (7u * l)) & 0x7Fu;
                 uint signs    = ksignByte(signsIdx);
                 uint xOff = xSubBase + l * 8u;
