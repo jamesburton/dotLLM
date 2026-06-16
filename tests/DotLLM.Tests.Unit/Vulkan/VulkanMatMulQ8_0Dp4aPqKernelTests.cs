@@ -74,6 +74,78 @@ public class VulkanMatMulQ8_0Dp4aPqKernelTests
         AssertClose(expected, actual, m, k);
     }
 
+    /// <summary>
+    /// Validates the split API used by the forward-pass shared-activation path:
+    /// one <see cref="MatMulQ8_0Dp4aPqKernel.RecordQuantizeActivation"/> feeding
+    /// two <see cref="MatMulQ8_0Dp4aPqKernel.RecordGemvPrequant"/> calls (K/V-shaped:
+    /// same input, different output dims) must produce <b>bit-identical</b> results
+    /// to two independent full <see cref="MatMulQ8_0Dp4aPqKernel.Launch"/> calls.
+    /// The quantize pass is deterministic, so sharing it cannot change the output —
+    /// this guards the refactor that split <c>Record</c> into the two passes.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void SharedQuant_TwoGemvs_MatchPerMatmulLaunch()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct,
+            $"Device '{device.DeviceName}' does not support VK_KHR_shader_integer_dot_product.");
+
+        const int k = 576;          // shared contraction dim (K/V both contract over hidden)
+        const int mA = 1536;        // K-like output dim
+        const int mB = 512;         // V-like output dim (distinct, to catch dim mix-ups)
+
+        var rng = new Random(0x5A5A + k);
+        byte[] wqA = QuantizeRows(RandomFloats(rng, mA * k, range: 0.1f), mA, k);
+        byte[] wqB = QuantizeRows(RandomFloats(rng, mB * k, range: 0.1f), mB, k);
+        float[] x = RandomFloats(rng, k, range: 1.0f);
+
+        using var kernel = MatMulQ8_0Dp4aPqKernel.Create(device, spvDir);
+
+        using var bufWA = device.Allocate((wqA.LongLength + 3) & ~3L);
+        using var bufWB = device.Allocate((wqB.LongLength + 3) & ~3L);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufXq = device.Allocate(MatMulQ8_0Dp4aPqKernel.XqScratchBytes(k));
+        using var bufDx = device.Allocate(MatMulQ8_0Dp4aPqKernel.DxScratchBytes(k));
+        using var bufYa = device.Allocate((long)mA * sizeof(float));
+        using var bufYb = device.Allocate((long)mB * sizeof(float));
+
+        device.Upload(new ReadOnlySpan<byte>(wqA), bufWA);
+        device.Upload(new ReadOnlySpan<byte>(wqB), bufWB);
+        device.Upload(x, bufX);
+
+        // Reference: two independent full Launch calls (each re-quantizes x).
+        kernel.Launch(bufWA, bufX, bufXq, bufDx, bufYa, mA, k);
+        float[] refA = new float[mA];
+        device.Download(bufYa, refA);
+        kernel.Launch(bufWB, bufX, bufXq, bufDx, bufYb, mB, k);
+        float[] refB = new float[mB];
+        device.Download(bufYb, refB);
+
+        // Shared: one quantize, a barrier, then both GEMVs read the shared scratch.
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            kernel.RecordQuantizeActivation(ctx.CommandBuffer, bufX, bufXq, bufDx, k);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            kernel.RecordGemvPrequant(ctx.CommandBuffer, bufWA, bufXq, bufDx, bufYa, mA, k);
+            kernel.RecordGemvPrequant(ctx.CommandBuffer, bufWB, bufXq, bufDx, bufYb, mB, k);
+            ctx.SubmitAndWait();
+        }
+        float[] sharedA = new float[mA];
+        float[] sharedB = new float[mB];
+        device.Download(bufYa, sharedA);
+        device.Download(bufYb, sharedB);
+
+        for (int i = 0; i < mA; i++)
+            Assert.True(refA[i] == sharedA[i],
+                $"Shared-quant A row {i} differs: per-matmul={refA[i]:G9} vs shared={sharedA[i]:G9}");
+        for (int i = 0; i < mB; i++)
+            Assert.True(refB[i] == sharedB[i],
+                $"Shared-quant B row {i} differs: per-matmul={refB[i]:G9} vs shared={sharedB[i]:G9}");
+    }
+
     private static float[] RandomFloats(Random rng, int count, float range)
     {
         var arr = new float[count];
