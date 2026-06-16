@@ -175,6 +175,40 @@ When a long-lived experimental branch (e.g. `feature/mamba-3`, `feature/qwen3.6`
 4. **Work one source branch to completion before moving to the next.** When `feature/<name>` is fully covered by extracted PRs, move on to the branch that built on top of it (e.g. `feature/qwen3.6` after `feature/mamba-3`).
 5. **Do not push direct commits to `dev`.** Only merge from extracted PR branches — that keeps `dev`'s history reflecting the actual upstream-ready chunks, and the diff against `feature/<name>` continues to mean "what's left to extract".
 
+### Preview / unmerged-runtime optimizations (the `dev-dotnet11` track)
+
+Some optimizations depend on **.NET runtime intrinsics that we have PR'd but that are not yet in a
+shipping (RC/final) mainstream .NET release** — currently the AVX-512 work in `C:\dotnet-runtime`:
+`feature/avxvnni.v512` (**`AvxVnni.V512`** / VPDPBUSD-512) and `feature/avx512bf16`
+(**`Avx512Bf16`** / VDPBF16PS). These can be the key to topping the performance stakes, but **we
+cannot assume they are available to everyone until they reach RC/final**. So we keep two parallel
+tracks:
+
+- **`main` / `dev` (the default):** optimize for **currently-shipping intrinsics only** — APIs
+  present in the pinned mainstream SDK (`global.json` = .NET 10). Anything that builds and runs for
+  every user. This is where normal development happens; **this is the priority track.** (E.g. the
+  mainstream `Avx512Vnni` / VPDPBUSD path lives here.)
+- **`dev-dotnet11` (preview track):** the integration base for optimizations that **require the
+  preview-runtime APIs**. Built/tested against the dogfood SDK in `C:\dotnet-runtime` (use
+  `C:\dotnet-runtime\dotnet.cmd`, or point `DOTNET_ROOT` at its built
+  `artifacts\bin\testhost\net11.0-windows-Release-x64`). Existing preview work to integrate here:
+  `issue/322-q8-avx512-vnni-net11`, `issue/321-q8-vnni-outer-product`, `issue/q8-bf16-prefill-e2e`,
+  and the Vulkan f16/bf16 issues (#233/#235/#238). A dedicated agent can "fill operator gaps" on
+  this track using the PR'd intrinsics.
+
+**Merge direction is ONE-WAY:**
+- Mainstream → preview: regularly merge `dev` **into** `dev-dotnet11` to keep it current.
+- Preview → mainstream: **do NOT merge `dev-dotnet11`'s preview-dependent changes back into
+  `dev`/`main` until the runtime APIs they use ship in a mainstream RC/final release.** When an API
+  ships, retarget that optimization to the mainstream API (or `#if`/`IsSupported`-gate it with a
+  mainstream fallback) and only then extract it as a normal PR onto `dev`/`main`.
+- Prefer writing preview-track kernels so they **degrade gracefully**: gate on `*.IsSupported` with a
+  mainstream-supported fallback, so the same code path can move to `dev` unchanged once the API lands.
+
+Do not block a mainstream optimization on a preview one: if both a current-support and a
+preview-only implementation exist, ship the current-support version on `dev` and keep the faster
+preview variant parallel on `dev-dotnet11`.
+
 ### Pinging idle upstream PRs
 
 If a PR to upstream sits without maintainer activity for **two weeks**, post a polite re-ping summarising current status (CI state, threads resolved, anything still pending). Fortnightly cadence — not weekly.
