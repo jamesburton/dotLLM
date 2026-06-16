@@ -37,6 +37,18 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when not 4-aligned. One storage load
+// replaces four byte-wise readByte calls.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -82,15 +94,27 @@ void main() {
         uint scalesBase = blockByteBase + 66u;
         uint xBase      = b * IQ2_XS_GROUP_SIZE;
 
+        // scales[8] are 8 contiguous bytes; read them as two funnelled words
+        // once per super-block instead of one readByte per sub-block.
+        uint scales0 = read4Bytes(scalesBase);        // scales[0..3]
+        uint scales1 = read4Bytes(scalesBase + 4u);   // scales[4..7]
+
         for (uint ib32 = 0u; ib32 < NUM_SUBBLOCKS; ib32++) {
-            uint scaleByte = readByte(scalesBase + ib32);
+            uint scaleByte = ((ib32 < 4u) ? (scales0 >> (ib32 * 8u))
+                                          : (scales1 >> ((ib32 - 4u) * 8u))) & 0xFFu;
             float db0 = d * (0.5 + float(scaleByte & 0xFu)) * 0.25;
             float db1 = d * (0.5 + float(scaleByte >> 4u)) * 0.25;
             uint xSubBase = xBase + ib32 * 32u;
 
+            // The sub-block's 4 qs uint16 values are 8 contiguous bytes = two
+            // funnelled words; read them ONCE instead of 8 byte-wise reads. The
+            // dot itself stays codebook-gather bound (gridByte).
+            uint qsw0 = read4Bytes(qsBase + ib32 * 8u);        // q for l=0,1
+            uint qsw1 = read4Bytes(qsBase + ib32 * 8u + 4u);   // q for l=2,3
+
             for (uint l = 0u; l < 4u; l++) {
-                uint q16Off = qsBase + (ib32 * 4u + l) * 2u;
-                uint q = readByte(q16Off) | (readByte(q16Off + 1u) << 8);
+                uint qsw = (l < 2u) ? qsw0 : qsw1;
+                uint q = (qsw >> ((l & 1u) * 16u)) & 0xFFFFu;
                 uint gridIdx  = q & 0x1FFu;
                 uint signsIdx = q >> 9u;
                 uint signs = ksignByte(signsIdx);
