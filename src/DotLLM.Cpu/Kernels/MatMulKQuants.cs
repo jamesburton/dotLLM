@@ -757,6 +757,136 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// GFNI 4-row Q4_K × Q8_K. Identical to <see cref="VecDotQ4_K_Q8_K_4Rows_Avx2"/> except the
+    /// high-nibble extract uses a single <c>VGF2P8AFFINEQB</c> (<see cref="GfniHighNibbleMatrix"/>)
+    /// in place of <c>vpsrlw + vpand</c>. The low nibble stays a plain <c>vpand</c> (already one op;
+    /// GFNI gives no win there). Produces bit-identical results to the AVX2 path.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void VecDotQ4_K_Q8_K_4Rows_Gfni(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* q8k, int superBlockCount, float* results)
+    {
+        Vector256<float> acc0 = Vector256<float>.Zero, acc1 = Vector256<float>.Zero;
+        Vector256<float> acc2 = Vector256<float>.Zero, acc3 = Vector256<float>.Zero;
+        Vector256<byte> mask0F = Vector256.Create((byte)0x0F);
+        Vector256<byte> hiMat = Vector256.Create(GfniHighNibbleMatrix).AsByte();
+        float sumMin0 = 0, sumMin1 = 0, sumMin2 = 0, sumMin3 = 0;
+
+        byte* sc0 = stackalloc byte[8]; byte* mn0 = stackalloc byte[8];
+        byte* sc1 = stackalloc byte[8]; byte* mn1 = stackalloc byte[8];
+        byte* sc2 = stackalloc byte[8]; byte* mn2 = stackalloc byte[8];
+        byte* sc3 = stackalloc byte[8]; byte* mn3 = stackalloc byte[8];
+
+        for (int sb = 0; sb < superBlockCount; sb++)
+        {
+            float d8 = Unsafe.ReadUnaligned<float>(q8k);
+            sbyte* q8qs = (sbyte*)(q8k + 4);
+            short* bsums = (short*)(q8k + 260);
+
+            float d4_0 = (float)Unsafe.ReadUnaligned<Half>(w0);
+            float dm0 = (float)Unsafe.ReadUnaligned<Half>(w0 + 2);
+            Dequantize.UnpackQ4Q5Scales(w0 + 4, sc0, mn0);
+            float d4_1 = (float)Unsafe.ReadUnaligned<Half>(w1);
+            float dm1 = (float)Unsafe.ReadUnaligned<Half>(w1 + 2);
+            Dequantize.UnpackQ4Q5Scales(w1 + 4, sc1, mn1);
+            float d4_2 = (float)Unsafe.ReadUnaligned<Half>(w2);
+            float dm2 = (float)Unsafe.ReadUnaligned<Half>(w2 + 2);
+            Dequantize.UnpackQ4Q5Scales(w2 + 4, sc2, mn2);
+            float d4_3 = (float)Unsafe.ReadUnaligned<Half>(w3);
+            float dm3 = (float)Unsafe.ReadUnaligned<Half>(w3 + 2);
+            Dequantize.UnpackQ4Q5Scales(w3 + 4, sc3, mn3);
+
+            int mc0 = 0, mc1 = 0, mc2 = 0, mc3 = 0;
+            for (int j = 0; j < 8; j++)
+            {
+                int q8s = bsums[j * 2] + bsums[j * 2 + 1];
+                mc0 += mn0[j] * q8s; mc1 += mn1[j] * q8s;
+                mc2 += mn2[j] * q8s; mc3 += mn3[j] * q8s;
+            }
+            sumMin0 += dm0 * d8 * mc0; sumMin1 += dm1 * d8 * mc1;
+            sumMin2 += dm2 * d8 * mc2; sumMin3 += dm3 * d8 * mc3;
+
+            byte* qs0p = w0 + 16; byte* qs1p = w1 + 16;
+            byte* qs2p = w2 + 16; byte* qs3p = w3 + 16;
+
+            Vector256<int> sumi0 = Vector256<int>.Zero, sumi1 = Vector256<int>.Zero;
+            Vector256<int> sumi2 = Vector256<int>.Zero, sumi3 = Vector256<int>.Zero;
+
+            for (int j = 0; j < 4; j++)
+            {
+                Vector256<sbyte> q8Lo = Unsafe.ReadUnaligned<Vector256<sbyte>>(q8qs + j * 64);
+                Vector256<sbyte> q8Hi = Unsafe.ReadUnaligned<Vector256<sbyte>>(q8qs + j * 64 + 32);
+
+                // Row 0
+                {
+                    Vector256<byte> raw = Unsafe.ReadUnaligned<Vector256<byte>>(qs0p + j * 32);
+                    Vector256<short> pLo = Avx2.MultiplyAddAdjacent(Avx2.And(raw, mask0F), q8Lo);
+                    Vector256<short> pHi = Avx2.MultiplyAddAdjacent(
+                        Gfni.V256.GaloisFieldAffineTransform(raw, hiMat, 0), q8Hi);
+                    sumi0 = Avx2.Add(sumi0, Avx2.Add(
+                        Avx2.MultiplyAddAdjacent(pLo, Vector256.Create((short)sc0[j * 2])),
+                        Avx2.MultiplyAddAdjacent(pHi, Vector256.Create((short)sc0[j * 2 + 1]))));
+                }
+                // Row 1
+                {
+                    Vector256<byte> raw = Unsafe.ReadUnaligned<Vector256<byte>>(qs1p + j * 32);
+                    Vector256<short> pLo = Avx2.MultiplyAddAdjacent(Avx2.And(raw, mask0F), q8Lo);
+                    Vector256<short> pHi = Avx2.MultiplyAddAdjacent(
+                        Gfni.V256.GaloisFieldAffineTransform(raw, hiMat, 0), q8Hi);
+                    sumi1 = Avx2.Add(sumi1, Avx2.Add(
+                        Avx2.MultiplyAddAdjacent(pLo, Vector256.Create((short)sc1[j * 2])),
+                        Avx2.MultiplyAddAdjacent(pHi, Vector256.Create((short)sc1[j * 2 + 1]))));
+                }
+                // Row 2
+                {
+                    Vector256<byte> raw = Unsafe.ReadUnaligned<Vector256<byte>>(qs2p + j * 32);
+                    Vector256<short> pLo = Avx2.MultiplyAddAdjacent(Avx2.And(raw, mask0F), q8Lo);
+                    Vector256<short> pHi = Avx2.MultiplyAddAdjacent(
+                        Gfni.V256.GaloisFieldAffineTransform(raw, hiMat, 0), q8Hi);
+                    sumi2 = Avx2.Add(sumi2, Avx2.Add(
+                        Avx2.MultiplyAddAdjacent(pLo, Vector256.Create((short)sc2[j * 2])),
+                        Avx2.MultiplyAddAdjacent(pHi, Vector256.Create((short)sc2[j * 2 + 1]))));
+                }
+                // Row 3
+                {
+                    Vector256<byte> raw = Unsafe.ReadUnaligned<Vector256<byte>>(qs3p + j * 32);
+                    Vector256<short> pLo = Avx2.MultiplyAddAdjacent(Avx2.And(raw, mask0F), q8Lo);
+                    Vector256<short> pHi = Avx2.MultiplyAddAdjacent(
+                        Gfni.V256.GaloisFieldAffineTransform(raw, hiMat, 0), q8Hi);
+                    sumi3 = Avx2.Add(sumi3, Avx2.Add(
+                        Avx2.MultiplyAddAdjacent(pLo, Vector256.Create((short)sc3[j * 2])),
+                        Avx2.MultiplyAddAdjacent(pHi, Vector256.Create((short)sc3[j * 2 + 1]))));
+                }
+            }
+
+            if (Fma.IsSupported)
+            {
+                acc0 = Fma.MultiplyAdd(Vector256.Create(d4_0 * d8), Avx.ConvertToVector256Single(sumi0), acc0);
+                acc1 = Fma.MultiplyAdd(Vector256.Create(d4_1 * d8), Avx.ConvertToVector256Single(sumi1), acc1);
+                acc2 = Fma.MultiplyAdd(Vector256.Create(d4_2 * d8), Avx.ConvertToVector256Single(sumi2), acc2);
+                acc3 = Fma.MultiplyAdd(Vector256.Create(d4_3 * d8), Avx.ConvertToVector256Single(sumi3), acc3);
+            }
+            else
+            {
+                acc0 = Avx.Add(acc0, Avx.Multiply(Vector256.Create(d4_0 * d8), Avx.ConvertToVector256Single(sumi0)));
+                acc1 = Avx.Add(acc1, Avx.Multiply(Vector256.Create(d4_1 * d8), Avx.ConvertToVector256Single(sumi1)));
+                acc2 = Avx.Add(acc2, Avx.Multiply(Vector256.Create(d4_2 * d8), Avx.ConvertToVector256Single(sumi2)));
+                acc3 = Avx.Add(acc3, Avx.Multiply(Vector256.Create(d4_3 * d8), Avx.ConvertToVector256Single(sumi3)));
+            }
+
+            w0 += Q4_K_BlockBytes; w1 += Q4_K_BlockBytes;
+            w2 += Q4_K_BlockBytes; w3 += Q4_K_BlockBytes;
+            q8k += Q8_K_BlockBytes;
+        }
+
+        results[0] = HorizontalSumAvx2Float(acc0) - sumMin0;
+        results[1] = HorizontalSumAvx2Float(acc1) - sumMin1;
+        results[2] = HorizontalSumAvx2Float(acc2) - sumMin2;
+        results[3] = HorizontalSumAvx2Float(acc3) - sumMin3;
+    }
+
+    /// <summary>
     /// True 4-row Q5_K × Q8_K: integer accumulation, scale-in-madd, bsums min correction.
     /// </summary>
     [SkipLocalsInit]

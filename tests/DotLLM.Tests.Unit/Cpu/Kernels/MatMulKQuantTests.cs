@@ -477,6 +477,169 @@ public sealed unsafe class MatMulKQuantTests
         }
     }
 
+    /// <summary>
+    /// GFNI high-nibble-extract variant of the Q4_K 4-row vec_dot must produce results that are
+    /// BIT-IDENTICAL to the AVX2 shift/mask path. The high nibble bytes are integer-identical
+    /// either way, so the integer accumulator and the final floats must match exactly — hence the
+    /// assertion is strict equality, not an epsilon (an epsilon would mask a lane-ordering or a
+    /// transposed-matrix bug). Weight bytes are full-range random (distinct high/low nibbles), so a
+    /// wrong affine matrix fails loudly. Runs across several super-block counts and RNG seeds.
+    /// </summary>
+    [Fact]
+    public void VecDotQ4_K_4Row_GfniMatchesAvx2_BitExact()
+    {
+        if (!Gfni.V256.IsSupported || !Avx2.IsSupported)
+            return;
+
+        foreach (int superBlockCount in new[] { 1, 2, 5 })
+        foreach (int seed in new[] { 1, 42, 12345, 0x5A3C })
+        {
+            var rng = new Random(seed);
+            nint w0 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+            nint w1 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+            nint w2 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+            nint w3 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+            nint q8k = AllocRandomQ8_KBlocks(superBlockCount, rng);
+            try
+            {
+                float* avx2 = stackalloc float[4];
+                float* gfni = stackalloc float[4];
+
+                MatMul.VecDotQ4_K_Q8_K_4Rows_Avx2((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
+                    (byte*)q8k, superBlockCount, avx2);
+                MatMul.VecDotQ4_K_Q8_K_4Rows_Gfni((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
+                    (byte*)q8k, superBlockCount, gfni);
+
+                for (int r = 0; r < 4; r++)
+                {
+                    Assert.Equal(
+                        BitConverter.SingleToInt32Bits(avx2[r]),
+                        BitConverter.SingleToInt32Bits(gfni[r]));
+                }
+            }
+            finally
+            {
+                NativeMemory.AlignedFree((void*)w0);
+                NativeMemory.AlignedFree((void*)w1);
+                NativeMemory.AlignedFree((void*)w2);
+                NativeMemory.AlignedFree((void*)w3);
+                NativeMemory.AlignedFree((void*)q8k);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Paired-median microbench: AVX2 vs GFNI 4-row Q4_K vec_dot, back-to-back per round.
+    /// Skipped unless DOTLLM_BENCH_GFNI=1 (it is not a correctness gate). Pins to a single P-core,
+    /// warms up to steady-state tier-1, sizes the working set L2-resident (compute-bound), and
+    /// records the median of per-round GFNI/AVX2 ratios. Writes results to the temp file named by
+    /// DOTLLM_BENCH_OUT. Never divides two separately-measured minimums (project methodology rule).
+    /// </summary>
+    [Fact]
+    public void Bench_VecDotQ4_K_4Row_Gfni_vs_Avx2_PairedMedian()
+    {
+        if (Environment.GetEnvironmentVariable("DOTLLM_BENCH_GFNI") != "1")
+            return;
+        if (!Gfni.V256.IsSupported || !Avx2.IsSupported)
+            return;
+
+        // Pin to a single core. Mask provided via DOTLLM_BENCH_CORE (logical core index).
+        int coreIdx = int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_BENCH_CORE"), out int c) ? c : 9;
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        {
+            try
+            {
+                System.Diagnostics.Process.GetCurrentProcess().ProcessorAffinity = (nint)(1L << coreIdx);
+                System.Threading.Thread.BeginThreadAffinity();
+            }
+            catch { /* affinity best-effort */ }
+        }
+
+        // L2-resident working set: 4 weight rows + activations stay compute-bound, not memory-bound.
+        const int superBlockCount = 32;          // 4*144*32 ≈ 18 KB weights, 292*32 ≈ 9 KB q8k
+        const int innerReps = 4000;              // repeats per timed sample over the same buffers
+        const int warmupRounds = 30;
+        const int timedRounds = 15;
+
+        var rng = new Random(20240601);
+        nint w0 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+        nint w1 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+        nint w2 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+        nint w3 = AllocRandomKQuantBlocks(Q4_K_BlockBytes, superBlockCount, rng);
+        nint q8k = AllocRandomQ8_KBlocks(superBlockCount, rng);
+
+        float* res = stackalloc float[4];
+        float sink = 0;
+
+        void RunAvx2()
+        {
+            for (int i = 0; i < innerReps; i++)
+            {
+                MatMul.VecDotQ4_K_Q8_K_4Rows_Avx2((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
+                    (byte*)q8k, superBlockCount, res);
+                sink += res[0] + res[1] + res[2] + res[3];
+            }
+        }
+        void RunGfni()
+        {
+            for (int i = 0; i < innerReps; i++)
+            {
+                MatMul.VecDotQ4_K_Q8_K_4Rows_Gfni((byte*)w0, (byte*)w1, (byte*)w2, (byte*)w3,
+                    (byte*)q8k, superBlockCount, res);
+                sink += res[0] + res[1] + res[2] + res[3];
+            }
+        }
+
+        try
+        {
+            // Warm up both forks to steady-state (drive tier-1 JIT).
+            for (int r = 0; r < warmupRounds; r++) { RunAvx2(); RunGfni(); }
+
+            var sw = new System.Diagnostics.Stopwatch();
+            var ratios = new List<double>(timedRounds);
+            var avx2Ms = new List<double>(timedRounds);
+            var gfniMs = new List<double>(timedRounds);
+
+            for (int r = 0; r < timedRounds; r++)
+            {
+                sw.Restart(); RunAvx2(); sw.Stop();
+                double ta = sw.Elapsed.TotalMilliseconds;
+
+                sw.Restart(); RunGfni(); sw.Stop();
+                double tg = sw.Elapsed.TotalMilliseconds;
+
+                avx2Ms.Add(ta); gfniMs.Add(tg);
+                ratios.Add(tg / ta); // >1 means GFNI slower
+            }
+
+            ratios.Sort();
+            double medianRatio = ratios[ratios.Count / 2];
+            avx2Ms.Sort(); gfniMs.Sort();
+
+            var lines = new List<string>
+            {
+                $"core={coreIdx} superBlockCount={superBlockCount} innerReps={innerReps} rounds={timedRounds}",
+                $"per-round GFNI/AVX2 ratios: {string.Join(", ", ratios.ConvertAll(x => x.ToString("F4")))}",
+                $"MEDIAN GFNI/AVX2 ratio = {medianRatio:F4}  (>1.0 => GFNI slower, <1.0 => GFNI faster)",
+                $"median AVX2 ms/round = {avx2Ms[avx2Ms.Count / 2]:F3}",
+                $"median GFNI ms/round = {gfniMs[gfniMs.Count / 2]:F3}",
+                $"sink={sink}",
+            };
+            string outFile = Environment.GetEnvironmentVariable("DOTLLM_BENCH_OUT")
+                ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "gfni_bench.txt");
+            System.IO.File.WriteAllLines(outFile, lines);
+        }
+        finally
+        {
+            try { System.Threading.Thread.EndThreadAffinity(); } catch { }
+            NativeMemory.AlignedFree((void*)w0);
+            NativeMemory.AlignedFree((void*)w1);
+            NativeMemory.AlignedFree((void*)w2);
+            NativeMemory.AlignedFree((void*)w3);
+            NativeMemory.AlignedFree((void*)q8k);
+        }
+    }
+
     [Fact]
     public void VecDotQ6_K_4Row_MatchesSingleRow()
     {
