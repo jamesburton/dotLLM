@@ -14,14 +14,35 @@ public static class CudaGemm
     private static readonly float FloatOne = 1.0f;
     private static readonly float FloatZero = 0.0f;
 
-    // G1 experiment toggle: DOTLLM_CUDA_GEMM_16F=1 switches the prefill GEMM compute type from
-    // CUBLAS_COMPUTE_32F (FP16 inputs, FP32 accumulate — throttled to ~half rate on GeForce Ampere)
-    // to CUBLAS_COMPUTE_16F (FP16 accumulate — full tensor-core rate, lower precision). Compute-16F
-    // requires half-typed alpha/beta, so the scalar constants differ per path.
-    // Mutable so a benchmark can interleave 32F/16F reps within one warmed process (consumer GPUs
-    // drift clocks across consecutive runs, so a fresh-process A/B is confounded by thermal state).
-    internal static bool Use16FCompute =
-        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GEMM_16F") == "1";
+    // G1 toggle: switches the prefill GEMM compute type from CUBLAS_COMPUTE_32F (FP16 inputs, FP32
+    // accumulate — throttled to ~half rate on GeForce Ampere) to CUBLAS_COMPUTE_16F (FP16 accumulate —
+    // full tensor-core rate). Compute-16F requires half-typed alpha/beta, so the scalar constants differ.
+    //
+    // DOTLLM_CUDA_GEMM_16F overrides the device-gated default: "1" forces on (any device), "0" forces
+    // off. When unset, ConfigureDefault (called at model load) enables it on eligible devices.
+    private static readonly string? Gemm16FEnv =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GEMM_16F");
+
+    // Effective flag. Honours an explicit env override immediately; otherwise stays off until
+    // ConfigureDefault sets the device-gated default at model load. Mutable so a benchmark can
+    // interleave 32F/16F reps within one warmed process (consumer GPUs drift clocks across runs).
+    internal static bool Use16FCompute = Gemm16FEnv == "1";
+
+    /// <summary>
+    /// Sets the COMPUTE_16F prefill-GEMM default from device eligibility, unless
+    /// <c>DOTLLM_CUDA_GEMM_16F</c> overrides it ("1" force on, "0" force off). G1 validated FP16
+    /// accumulate as quality-safe (decode-mode perplexity ±0.000%, prefill −0.079% on Llama-3.2-1B
+    /// Q8_0) and ~1.06–1.22× faster whole-prefill on GeForce Ampere; left off elsewhere (datacenter
+    /// Ampere doesn't throttle FP32 accumulate, so there is no win to capture).
+    /// </summary>
+    /// <param name="deviceEligible">True when the device benefits — GeForce Ampere with quantized weights.</param>
+    internal static void ConfigureDefault(bool deviceEligible) =>
+        Use16FCompute = Gemm16FEnv switch
+        {
+            "1" => true,
+            "0" => false,
+            _ => deviceEligible,
+        };
 
     /// <summary>
     /// Linear projection: Y_f16[m, n] = X_f16[m, k] × W_f16^T.

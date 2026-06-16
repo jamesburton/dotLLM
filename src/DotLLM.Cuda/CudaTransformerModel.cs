@@ -424,6 +424,23 @@ public sealed unsafe class CudaTransformerModel : IModel
         // BitNet's residual stream exceeds FP16 range in deep layers, so it carries the
         // residual in FP32 (overflow→NaN otherwise).
         bool useFp32Residual = config.Architecture == Architecture.BitNet;
+
+        // G1: default the FP16-accumulate prefill GEMM on for GeForce Ampere with quantized weights —
+        // validated quality-safe (decode-mode perplexity ±0.000%, prefill −0.079% on Llama-3.2-1B Q8_0)
+        // and ~1.06–1.22× faster whole-prefill there. Off elsewhere: datacenter Ampere doesn't throttle
+        // FP32 accumulate (no win), and 16F decode-GEMV for non-quant weights is unvalidated (quant
+        // decode is integer, so 16F never touches it). DOTLLM_CUDA_GEMM_16F overrides ("1"/"0").
+        // BitNet excluded: its prefill dequantizes I2_S → F16 and routes through CudaGemm.LinearF16,
+        // but its activations/residual exceed FP16 range (the model carries the residual in FP32 for
+        // exactly this reason), so FP16-accumulate prefill GEMM is unvalidated and risks overflow.
+        var device = CudaDevice.GetDevice(deviceId);
+        bool geForceAmpere = device.ComputeCapabilityMajor == 8
+            && device.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase);
+        bool quantizedWeights = weights.Layers.Length > 0
+            && weights.Layers[0].QQuantType is not (QuantizationType.F32 or QuantizationType.F16);
+        CudaGemm.ConfigureDefault(
+            geForceAmpere && quantizedWeights && config.Architecture != Architecture.BitNet);
+
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
             stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
