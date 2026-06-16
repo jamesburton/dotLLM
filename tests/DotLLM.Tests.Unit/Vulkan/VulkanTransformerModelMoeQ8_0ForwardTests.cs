@@ -164,8 +164,10 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         // BuildFromPrebuiltWeights reads DOTLLM_VULKAN_ENABLE_DP4A once. The
         // VulkanKernels collection runs serially, so toggling the process env here is
         // safe as long as we restore it.
+        // Explicit "0"/"1" (not null) so the test pins DP4a regardless of the
+        // vendor-gated default (Intel/Arc defaults DP4a on when the env is unset).
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
-        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : null);
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : "0");
         try
         {
             using var sf = SafetensorsFile.Open(path);
