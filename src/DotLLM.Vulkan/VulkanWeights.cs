@@ -297,6 +297,13 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? QBias, KBias, VBias, OBias;
 
         /// <summary>
+        /// Per-head Q/K RMSNorm weights [headDim] (Gemma-4, Qwen3). Applied per
+        /// head as <c>rmsnorm(rowCount = seqLen*numHeads, n = headDim)</c> before
+        /// RoPE. Null when the architecture has no QK-norm.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? QNormWeight, KNormWeight;
+
+        /// <summary>
         /// Gemma four-norm layout: optional post-attention RMSNorm applied to
         /// the attention sublayer output BEFORE the residual add. Null on
         /// non-Gemma architectures (standard two-norm layout).
@@ -363,9 +370,13 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer? postFfnNorm = null,
             MlaLayerBuffers? mla = null,
             MoeLayerBuffers? moe = null,
-            Gemma4LayerBuffers? gemma4 = null)
+            Gemma4LayerBuffers? gemma4 = null,
+            VulkanDevice.Buffer? qNorm = null,
+            VulkanDevice.Buffer? kNorm = null)
         {
             AttnNormWeight = attnNorm;
+            QNormWeight = qNorm;
+            KNormWeight = kNorm;
             PostAttnNormWeight = postAttnNorm;
             PostFfnNormWeight = postFfnNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
@@ -388,6 +399,7 @@ internal sealed class VulkanWeights : IDisposable
             AttnNormWeight.Dispose();
             Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
             QBias?.Dispose(); KBias?.Dispose(); VBias?.Dispose(); OBias?.Dispose();
+            QNormWeight?.Dispose(); KNormWeight?.Dispose();
             PostAttnNormWeight?.Dispose();
             PostFfnNormWeight?.Dispose();
             FfnNormWeight.Dispose();
@@ -498,6 +510,13 @@ internal sealed class VulkanWeights : IDisposable
             var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
 
+            // Per-head Q/K RMSNorm weights [headDim] (Gemma-4, Qwen3). Null when
+            // the architecture has no QK-norm (UploadOptionalVec returns null).
+            var qNorm = UploadOptionalVec(device, staging, lw.QNormWeight);
+            var kNorm = UploadOptionalVec(device, staging, lw.KNormWeight);
+            if (lw.QNormWeight is not null) totalBytes += (long)lw.QNormWeight.Length * sizeof(float);
+            if (lw.KNormWeight is not null) totalBytes += (long)lw.KNormWeight.Length * sizeof(float);
+
             // Gemma four-norm layout: optional post-attention RMSNorm weight
             // applied to the attention output before the residual add. Null on
             // non-Gemma architectures (UploadOptionalVec returns null).
@@ -561,8 +580,11 @@ internal sealed class VulkanWeights : IDisposable
 
             // Gemma four-norm layout: optional post-FFN RMSNorm weight applied
             // to the FFN output before the residual add. Null on non-Gemma.
-            var postFfnNorm = UploadOptionalVec(device, staging, lw.PostFfnNormWeight);
-            if (lw.PostFfnNormWeight is not null)
+            // For Gemma-4 this is forced null — the combined post_ffw_norm is
+            // applied INSIDE RecordGemma4Ffn (g4.PostFfwNorm), so the shared
+            // residual-#2 post-FFN norm must NOT also fire (double-norm).
+            var postFfnNorm = isGemma4 ? null : UploadOptionalVec(device, staging, lw.PostFfnNormWeight);
+            if (!isGemma4 && lw.PostFfnNormWeight is not null)
                 totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
 
             // MoE layers replace the dense Gate/Up/Down with per-expert
@@ -610,12 +632,20 @@ internal sealed class VulkanWeights : IDisposable
                     totalBytes += moeBytes;
 
                     var g4 = lw.Gemma4!;
+                    // Pre-fold 1/sqrt(hidden) into the router channel scale so the
+                    // custom-router input is a plain rmsnorm(attn_out, RouterScale·invSqrtH)
+                    // dispatch on device (CPU does rms·(1/√H)·ffn_gate_inp_s).
+                    float invSqrtH = 1.0f / MathF.Sqrt(weights.HiddenSize);
+                    float[] routerScaleScaled = new float[g4.RouterScale.Length];
+                    for (int j = 0; j < routerScaleScaled.Length; j++)
+                        routerScaleScaled[j] = g4.RouterScale[j] * invSqrtH;
+
                     gemma4 = new Gemma4LayerBuffers(
                         UploadNormVec(device, staging, g4.PreFfwNorm2),
                         UploadNormVec(device, staging, g4.PostFfwNorm1),
                         UploadNormVec(device, staging, g4.PostFfwNorm2),
                         UploadNormVec(device, staging, g4.PostFfwNorm),
-                        UploadNormVec(device, staging, g4.RouterScale),
+                        UploadNormVec(device, staging, routerScaleScaled),
                         g4.LayerOutputScale,
                         g4.VFromK);
                     totalBytes += (long)(g4.PreFfwNorm2.Length + g4.PostFfwNorm1.Length
@@ -641,7 +671,8 @@ internal sealed class VulkanWeights : IDisposable
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
                 gateBias, upBias, downBias,
                 postAttnNorm, postFfnNorm,
-                mla, moe, gemma4);
+                mla, moe, gemma4,
+                qNorm, kNorm);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes
                 + gateBytes + upBytes + downBytes;

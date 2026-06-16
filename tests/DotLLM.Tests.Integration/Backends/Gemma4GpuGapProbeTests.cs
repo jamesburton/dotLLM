@@ -1,4 +1,8 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Configuration;
+using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
+using DotLLM.Models;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
@@ -32,8 +36,18 @@ public sealed class Gemma4GpuGapProbeTests
         return SyntheticGemma4Gguf.WriteGemma4(path, SyntheticGemma4Gguf.Tiny);
     }
 
+    /// <summary>
+    /// CPU↔Vulkan parity for the autoregressive gemma4 forward (cacheless single
+    /// forward over the tiny synthetic fixture: dual head dim, V-from-K global
+    /// layer, dual-FFN dense+MoE, custom router, GeGLU experts, layer scale, final
+    /// softcap). Asserts last-token logits agree within the standard Vulkan
+    /// reduction-order envelope. (The fixture's experts are Q4_K/Q5_1 — host-
+    /// dequantised on the Vulkan side, in-kernel-dequantised on CPU — so the
+    /// expert weights are bit-identical and only GPU-vs-CPU accumulation order
+    /// consumes tolerance.)
+    /// </summary>
     [SkippableFact]
-    public void Vulkan_Gemma4_Fixture_FailsWithCapturedGap()
+    public void Vulkan_Gemma4_MatchesCpuReference()
     {
         Skip.If(
             Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
@@ -46,35 +60,87 @@ public sealed class Gemma4GpuGapProbeTests
         string path = WriteFixture();
         try
         {
-            using var gguf = GgufFile.Open(path);
-            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            int[] ids = { 2, 7, 8, 9, 5, 6 }; // synthetic fixture BOS = 2
+            int[] pos = { 0, 1, 2, 3, 4, 5 };
 
-            // Sanity: the GGUF parses and config-extracts as gemma4 (the CPU-side metadata
-            // mapping is wired). The gap is purely in the GPU forward path.
-            Assert.Equal(DotLLM.Core.Configuration.Architecture.Gemma4, config.Architecture);
-            _output.WriteLine(
-                $"gemma4 config extracted: layers={config.NumLayers} hidden={config.HiddenSize} " +
-                $"gemma4DualFfn={config.Gemma4DualFfn} moe={(config.Moe is not null)}");
-
-            // Attempt to load + run gemma4 on Vulkan. Capture wherever it fails.
-            var ex = Record.Exception(() =>
+            // ── CPU oracle ────────────────────────────────────────────
+            float[] cpuLast;
+            int vocab;
             {
-                using var model = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir);
-                int[] ids = { 2, 7, 8, 9 }; // synthetic fixture BOS = 2
-                int[] pos = { 0, 1, 2, 3 };
-                using var _ = model.Forward(ids, pos, -1, kvCache: null);
-            });
+                var (model, gguf, cfg) = ModelLoader.LoadFromGguf(path, ThreadingConfig.SingleThreaded);
+                using (gguf)
+                using (model)
+                {
+                    vocab = cfg.VocabSize;
+                    using ITensor logits = model.Forward(ids, pos, -1, null, null, AttentionMaskSpec.Causal);
+                    cpuLast = LastRow(logits, vocab);
+                }
+            }
 
-            Assert.NotNull(ex);
-            _output.WriteLine($"VULKAN gemma4 GAP: {ex!.GetType().FullName}");
-            _output.WriteLine($"VULKAN gemma4 GAP message: {ex.Message}");
-            if (ex.StackTrace is not null)
-                _output.WriteLine($"VULKAN gemma4 GAP frames:\n{DotLlmFrames(ex.StackTrace)}");
+            // ── Vulkan under test ─────────────────────────────────────
+            float[] vkLast;
+            {
+                using var gguf = GgufFile.Open(path);
+                var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
+                Assert.Equal(DotLLM.Core.Configuration.Architecture.Gemma4, cfg.Architecture);
+                using var model = VulkanTransformerModel.LoadFromGguf(gguf, cfg, spvDir);
+                using ITensor logits = model.Forward(ids, pos, -1, kvCache: null);
+                vkLast = LastRow(logits, vocab);
+            }
+
+            // Structural guard: the greedy next-token (argmax) must agree — this
+            // is independent of the small-logit reduction-order drift below and
+            // catches any real graph divergence (a broken op flips the argmax).
+            int cpuArg = ArgMax(cpuLast), vkArg = ArgMax(vkLast);
+            Assert.Equal(cpuArg, vkArg);
+
+            // Per-logit envelope. gemma4's dual-FFN + per-head norms + partial rope
+            // accumulate more per-layer F32 reduction-order drift than the Gemma-3
+            // backbone (2.5e-2), and the final softcap pushes logits near zero where
+            // relative error amplifies — so the bar is a touch wider. Still ~3× tighter
+            // than any structural bug (which flips logits by >0.1) and the argmax guard
+            // above is exact.
+            const float absTol = 6.0e-2f, relTol = 5.0e-3f;
+            int worst = -1; float worstDiff = 0;
+            for (int c = 0; c < vocab; c++)
+            {
+                float diff = MathF.Abs(cpuLast[c] - vkLast[c]);
+                if (diff > worstDiff) { worstDiff = diff; worst = c; }
+            }
+            for (int c = 0; c < vocab; c++)
+            {
+                float cpu = cpuLast[c], vk = vkLast[c];
+                float bar = absTol + relTol * MathF.Abs(cpu);
+                Assert.True(MathF.Abs(cpu - vk) <= bar,
+                    $"col {c}: cpu={cpu:F6} vs vulkan={vk:F6} (|diff|={MathF.Abs(cpu - vk):E3} > {bar:E3}); "
+                    + $"argmax cpu={cpuArg} vk={vkArg}; worst |diff|={worstDiff:E3} @ col {worst}");
+            }
+            _output.WriteLine($"gemma4 CPU↔Vulkan parity OK: argmax={cpuArg}, worst |diff|={worstDiff:E3} @ col {worst} over {vocab} logits.");
         }
         finally
         {
             try { File.Delete(path); } catch { /* best-effort */ }
         }
+    }
+
+    private static int ArgMax(float[] v)
+    {
+        int best = 0;
+        for (int i = 1; i < v.Length; i++) if (v[i] > v[best]) best = i;
+        return best;
+    }
+
+    private static unsafe float[] LastRow(ITensor logits, int vocab)
+    {
+        int total = 1;
+        for (int i = 0; i < logits.Shape.Rank; i++) total *= logits.Shape[i];
+        var all = new float[total];
+        new ReadOnlySpan<float>((void*)logits.DataPointer, total).CopyTo(all);
+        // CPU returns [seqLen, vocab]; Vulkan returns [1, vocab]. Either way the
+        // last `vocab` elements are the final token's logits (the sampler input).
+        var row = new float[vocab];
+        Array.Copy(all, total - vocab, row, 0, vocab);
+        return row;
     }
 
     [SkippableFact]

@@ -162,8 +162,12 @@ public sealed class VulkanTransformerModel : IModel
     // every SwiGLU architecture so the standard path is byte-identical.
     private readonly GeGluTanhF32Kernel? _geglu;
     // In-place scalar multiply for the Gemma sqrt(hidden) embedding scale —
-    // created only when Config.EmbeddingScale is set. Null otherwise.
+    // created only when Config.EmbeddingScale is set. Null otherwise. Also
+    // reused for the Gemma-4 per-layer output scale (layer_output_scale).
     private readonly ScaleInplaceF32Kernel? _embedScale;
+    // Unit-gamma (all-ones) [maxHeadDim] vector for Gemma-4's weight-less V-norm
+    // (per-kv-head RMSNorm with no scale). Lazily allocated on first use.
+    private VulkanDevice.Buffer? _gemma4OnesVec;
     private readonly AddKernel _add;
     // Per-feature bias add. Replaces the host-mapped fallback that used to
     // split the forward into multiple submits whenever Phi-3 / Qwen3 /
@@ -553,9 +557,17 @@ public sealed class VulkanTransformerModel : IModel
             mlaRopeTheta = config.MlaConfig!.RopeTheta;
         }
 
+        // Gemma-4 has a dual head dim (sliding 256 / global 512) and dual KV-head
+        // count (sliding 8 / global 2). Size the Q/K/V/AttnOutput scratch for the
+        // MAX over the two so global layers fit; the matmul writes each layer's
+        // actual (smaller-or-equal) packed dims and the attention/rope kernels
+        // use the per-layer dims. No-op for non-Gemma-4 (global dims null → max
+        // with 0 = the base dim).
+        int stateHeadDim = Math.Max(config.HeadDim, config.GlobalHeadDim ?? 0);
+        int stateKvHeads = Math.Max(config.NumKvHeads, config.NumGlobalKvHeads ?? 0);
         var state = new VulkanForwardState(device,
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize,
+            config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
+            stateHeadDim, config.IntermediateSize, config.VocabSize,
             initialSeqLen: 1,
             mlaNumHeads: mlaNumHeads,
             mlaQkNopeHeadDim: mlaQkNope,
@@ -567,7 +579,8 @@ public sealed class VulkanTransformerModel : IModel
             moeTopK: moeTopK,
             moeIntermediateSize: moeIntermediate,
             moeSharedIntermediateSize: moeSharedIntermediate,
-            moeNumSharedExperts: moeNumSharedExperts);
+            moeNumSharedExperts: moeNumSharedExperts,
+            gemma4DualFfn: config.Gemma4DualFfn);
 
         var matmul = MatMulF32Kernel.Create(device, spvDir);
         var matmulQ8 = MatMulQ8_0Kernel.Create(device, spvDir);
@@ -841,6 +854,50 @@ public sealed class VulkanTransformerModel : IModel
             : 0.0f;
     }
 
+    /// <summary>Gemma-4 per-layer KV-head count (full layers use <see cref="ModelConfig.NumGlobalKvHeads"/>). Mirrors the CPU <c>GetLayerKvHeads</c>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GemmaLayerKvHeads(int layer) =>
+        Config.NumGlobalKvHeads is int g && Config.IsFullAttentionLayer(layer) ? g : Config.NumKvHeads;
+
+    /// <summary>
+    /// Gemma-4 per-layer RoPE (theta, rotated-dim count). Full-attention layers use the
+    /// global table with a partial-rotary factor applied to the full head; sliding layers
+    /// use the local table at full rotation. Mirrors the CPU <c>GetLayerRope</c> /
+    /// global-rope-dim derivation exactly.
+    /// </summary>
+    private (float Theta, int RopeDim) GemmaLayerRope(int layer)
+    {
+        if (Config.GlobalRoPEConfig is RoPEConfig gcfg && Config.IsFullAttentionLayer(layer))
+        {
+            int baseDim = gcfg.DimensionCount > 0 ? gcfg.DimensionCount : (Config.GlobalHeadDim ?? Config.HeadDim);
+            float prf = Config.PartialRotaryFactor ?? 1.0f;
+            int rotated = (int)MathF.Floor(prf * baseDim) & ~1; // round down to even
+            if (rotated < 2) rotated = 2;
+            return (gcfg.Theta, Math.Min(rotated, baseDim));
+        }
+        var s = Config.RoPEConfig!.Value;
+        return (s.Theta, s.DimensionCount > 0 ? s.DimensionCount : Config.HeadDim);
+    }
+
+    /// <summary>
+    /// Lazily-allocated unit-gamma (all-ones) [maxHeadDim] vector for Gemma-4's
+    /// weight-less V-norm (per-kv-head RMSNorm with no learned scale). Host-visible
+    /// so the single tiny upload is trivial; read-only thereafter.
+    /// </summary>
+    private VulkanDevice.Buffer Gemma4OnesVec()
+    {
+        if (_gemma4OnesVec is null)
+        {
+            int len = Math.Max(Config.HeadDim, Config.GlobalHeadDim ?? 0);
+            var ones = new float[len];
+            Array.Fill(ones, 1.0f);
+            var buf = _device.Allocate((long)len * sizeof(float));
+            _device.Upload(ones.AsSpan(), buf);
+            _gemma4OnesVec = buf;
+        }
+        return _gemma4OnesVec;
+    }
+
     private static void RejectUnsupportedArchitecture(ModelConfig config)
     {
         if (config.HybridLayout is not null || config.SsmConfig is not null || config.Mamba3Config is not null)
@@ -852,17 +909,11 @@ public sealed class VulkanTransformerModel : IModel
         if (config.MlaConfig is { UseLatentCache: true } or { UseHybridMlaCache: true })
             throw new NotSupportedException(
                 "MLA latent / hybrid KV-cache modes are not supported on the Vulkan backend yet; use the default expanded cache.");
-        // Gemma-4 / DiffusionGemma MoE is not yet wired into the Vulkan backend: it
-        // stores a FUSED gate_up expert bank + separate down bank + per-expert down-scale
-        // (not the standard per-expert gate/up/down slots), so weight upload would hit a
-        // null slot. Fail fast with a clear message rather than a NullReferenceException
-        // deep in UploadMoeLayer. See docs/diffusiongemma/GEMMA4-GPU-GAPS.md for the
-        // remaining work (fused-bank upload, dual-FFN graph, Q4_K/Q5_1 indexed MoE matmul).
-        if (config.Gemma4DualFfn)
-            throw new NotSupportedException(
-                "Gemma-4 MoE (gemma4 / DiffusionGemma) is not supported on the Vulkan backend yet "
-                + "(fused gate_up expert bank + dual-FFN graph + Q4_K/Q5_1 indexed MoE matmul not wired). "
-                + "See docs/diffusiongemma/GEMMA4-GPU-GAPS.md. Use the CPU backend.");
+        // Gemma-4 MoE autoregressive forward (gemma4) IS now supported on the
+        // Vulkan backend (RecordGemma4Attention + RecordGemma4Ffn; experts
+        // host-dequantised to F32 at load). DiffusionGemma generation additionally
+        // needs the non-causal canvas attention + region-aware embed / self-cond,
+        // which are not wired here yet — but the cacheless gemma4 backbone runs.
     }
 
     /// <inheritdoc/>
@@ -1503,6 +1554,14 @@ public sealed class VulkanTransformerModel : IModel
                 RecordMlaLayer(cmdBuf, layer, mlaW, lw, seqLen, eps,
                     positions, kvCache);
             }
+            else if (lw.Gemma4 is not null)
+            {
+                // Gemma-4 attention (V-from-K, weight-less V-norm, per-layer dual
+                // head dim / rope, attn scale 1.0). Cacheless — the AR validation
+                // + diffusion paths are single-forward. Writes o_proj into
+                // NormOutput; the shared post-attn-norm + residual #1 follow.
+                RecordGemma4Attention(cmdBuf, layer, lw, seqLen, eps);
+            }
             else
             {
 
@@ -1655,11 +1714,22 @@ public sealed class VulkanTransformerModel : IModel
 
             if (lw.Moe is { } moeW)
             {
-                // MoE FFN replaces the dense Gate/Up/Down with a sparse
-                // top-k expert dispatch. Writes the post-MoE result into
-                // _state.NormOutput so the shared residual-add below
-                // works unchanged.
-                RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
+                if (lw.Gemma4 is not null)
+                {
+                    // Gemma-4 dual parallel dense + MoE FFN. Writes the combined
+                    // post_ffw_norm'd result into NormOutput so the shared
+                    // residual-add below works unchanged; the per-layer output
+                    // scale is applied after that add.
+                    RecordGemma4Ffn(cmdBuf, layer, moeW, lw, seqLen, eps);
+                }
+                else
+                {
+                    // MoE FFN replaces the dense Gate/Up/Down with a sparse
+                    // top-k expert dispatch. Writes the post-MoE result into
+                    // _state.NormOutput so the shared residual-add below
+                    // works unchanged.
+                    RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
+                }
             }
             else
             {
@@ -1746,6 +1816,16 @@ public sealed class VulkanTransformerModel : IModel
             // needed.
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
+
+            // Gemma-4 per-layer output scale (layer_output_scale) — the LAST
+            // per-layer op, an in-place scalar multiply on the post-residual
+            // hidden state. Reuses the embedding-scale kernel (a generic scalar
+            // multiply). No-op on every other architecture (lw.Gemma4 null).
+            if (lw.Gemma4 is { } g4scale)
+            {
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                _embedScale!.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, g4scale.LayerOutputScale);
+            }
 
             // COMPUTE→COMPUTE between layers — next iteration's first op is
             // the attention RMSNorm, which reads the freshly-rotated
@@ -2068,6 +2148,168 @@ public sealed class VulkanTransformerModel : IModel
         }
         MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.MlaAttnOutput!, _state.NormOutput,
             seqLen, lw.OInputDim, lw.OOutputDim);
+    }
+
+    /// <summary>
+    /// Records the Gemma-4 attention block for one layer (cacheless / single
+    /// forward — the AR validation + diffusion paths are cacheless). Mirrors the
+    /// CPU <c>RunGemma4Layer</c> attention: attn_norm → Q/K(/V) proj (V branches
+    /// off the RAW K projection on V-less global layers) → per-head Q/K-norm +
+    /// WEIGHT-LESS V-norm → partial/dual RoPE → softmax(QᵀK·1.0)·V → o_proj.
+    /// Writes o_proj into <c>NormOutput</c>; the shared post-attn-norm
+    /// (<c>lw.PostAttnNormWeight</c>) + residual #1 in the layer loop then produce
+    /// attn_out, exactly as for the Gemma-3 four-norm path.
+    /// </summary>
+    private void RecordGemma4Attention(nint cmdBuf, int layer, in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int headDim = Config.GetLayerHeadDim(layer);
+        int numKvHeads = GemmaLayerKvHeads(layer);
+        var g4 = lw.Gemma4!.Value;
+        var (ropeTheta, ropeDim) = GemmaLayerRope(layer);
+
+        // attn_norm → NormOutput
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Q, K projections (raw — K is captured before k-norm/rope for V-from-K).
+        RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
+            lw.QOutputDim, lw.QInputDim, seqLen);
+        RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+            lw.KOutputDim, lw.KInputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        if (g4.VFromK)
+        {
+            // V-less global layer: V = raw K projection (no attn_v weight).
+            long kvBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.K, _state.V, 0, 0, (ulong)kvBytes);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
+        else
+        {
+            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                lw.VOutputDim, lw.VInputDim, seqLen);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
+        // Per-head Q/K RMSNorm (× learned weight); weight-less V RMSNorm (unit gamma).
+        _rmsnorm.Record(cmdBuf, _state.Q, lw.QNormWeight!, _state.Q,
+            rowCount: seqLen * numHeads, n: headDim, eps: eps);
+        _rmsnorm.Record(cmdBuf, _state.K, lw.KNormWeight!, _state.K,
+            rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
+        _rmsnorm.Record(cmdBuf, _state.V, Gemma4OnesVec(), _state.V,
+            rowCount: seqLen * numKvHeads, n: headDim, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // RoPE(Q, K) — per-layer theta / rotated dims, NeoX. V is NOT roped.
+        _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+            seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+            headDim: headDim, ropeDim: ropeDim, theta: ropeTheta,
+            variant: RopeF32Kernel.Variant.NeoX);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Attention: scale = 1/sqrt(QPAS) = 1.0 (q/k-norm make Q,K unit); no attn softcap.
+        RecordAttention(cmdBuf, _state.Q, _state.K, _state.V, _state.AttnOutput,
+            seqQ: seqLen, seqKv: seqLen,
+            numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+            positionOffset: 0, slidingWindow: GetLayerSlidingWindow(layer),
+            softCap: 0.0f, scaleOverride: GetAttentionScaleOverride());
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // o_proj → NormOutput. Shared post-attn-norm + residual #1 follow.
+        RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
+            lw.OOutputDim, lw.OInputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// Records the Gemma-4 dual parallel FFN for one layer. Reads attn_out
+    /// (<c>HiddenState</c>, after residual #1), runs a dense GeGLU MLP and a
+    /// 128-expert routed GeGLU MoE IN PARALLEL (each over its own pre-norm of
+    /// attn_out), post-norms each branch, sums them, applies the combined
+    /// post_ffw_norm, and writes the result into <c>NormOutput</c> — so the
+    /// shared residual #2 adds attn_out and the per-layer output scale applies
+    /// after. Mirrors CPU <c>Gemma4DenseFfn</c> + <c>Gemma4Moe</c>. The custom
+    /// router input is <c>rms(attn_out)·(ffn_gate_inp.scale·1/√hidden)</c> (the
+    /// 1/√hidden is pre-folded into RouterScale at upload); the per-expert down
+    /// scale is pre-folded into the W2 bank.
+    /// </summary>
+    private unsafe void RecordGemma4Ffn(
+        nint cmdBuf, int layer, VulkanWeights.MoeLayerBuffers moeW,
+        in VulkanWeights.LayerBuffers lw, int seqLen, float eps)
+    {
+        int hidden = Config.HiddenSize;
+        int interm = moeW.IntermediateSize;        // expert FF width (Ie)
+        int denseInterm = lw.GateOutputDim;        // dense ("shared expert") FF width
+        int numE = moeW.NumExperts;
+        int topK = moeW.NumExpertsPerTok;
+        int expandedRows = seqLen * topK;
+        var g4 = lw.Gemma4!.Value;
+
+        // ── Dense ("shared expert") branch: cur_mlp = rms(rms(attn_out)*ffn_norm GeGLU) * post_ffw_norm_1 ──
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
+            lw.GateOutputDim, lw.GateInputDim, seqLen);
+        RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
+            lw.UpOutputDim, lw.UpInputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _geglu!.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * denseInterm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.Gemma4DenseResult!,
+            lw.DownOutputDim, lw.DownInputDim, seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _rmsnorm.Record(cmdBuf, _state.Gemma4DenseResult!, g4.PostFfwNorm1, _state.Gemma4DenseResult!,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── MoE branch ──
+        // Custom router: logits = ffn_gate_inp · (rms(attn_out) · RouterScale·1/√H).
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.RouterScale, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, moeW.Gate, moeW.GateDeviceQuantType, _state.NormOutput, _state.MoeRouterLogits!,
+            outputDim: numE, inputDim: hidden, seqLen: seqLen);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _moeTopkSoftmax!.Record(cmdBuf, _state.MoeRouterLogits!, _state.MoeTopkIndices!, _state.MoeTopkWeights!,
+            seqLen: seqLen, numExperts: numE, k: topK, normTopKProb: moeW.NormTopKProb);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // Expert input = rms(attn_out) * pre_ffw_norm_2 (overwrites the router-input temp).
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, g4.PreFfwNorm2, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!,
+            seqLen: seqLen, topK: topK, hidden: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMoeIndexedMatmul(cmdBuf, moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+            moeW.W1DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        RecordMoeIndexedMatmul(cmdBuf, moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+            moeW.W3DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _geglu!.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMoeIndexedMatmul(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+            moeW.W2DeviceQuantType, m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // Weighted scatter (routing weights; per-expert down scale pre-folded into W2) → Gemma4MoeResult.
+        _moeWeightedScatter!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.Gemma4MoeResult!,
+            seqLen: seqLen, topK: topK, hiddenSize: hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _rmsnorm.Record(cmdBuf, _state.Gemma4MoeResult!, g4.PostFfwNorm2, _state.Gemma4MoeResult!,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // ── Combine: cur = rms(dense + moe) * post_ffw_norm → NormOutput ──
+        _add.Record(cmdBuf, _state.Gemma4DenseResult!, _state.Gemma4MoeResult!, _state.NormOutput, seqLen * hidden);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        _rmsnorm.Record(cmdBuf, _state.NormOutput, g4.PostFfwNorm, _state.NormOutput,
+            rowCount: seqLen, n: hidden, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
     }
 
     /// <summary>
@@ -2922,6 +3164,7 @@ public sealed class VulkanTransformerModel : IModel
         _swiglu.Dispose();
         _geglu?.Dispose();
         _embedScale?.Dispose();
+        _gemma4OnesVec?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
