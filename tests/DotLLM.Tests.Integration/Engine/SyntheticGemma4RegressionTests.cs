@@ -81,6 +81,42 @@ public sealed class SyntheticGemma4RegressionTests
     }
 
     /// <summary>
+    /// Q4_K MULTI-super-block coverage. The Tiny fixture's hidden is 256 = exactly ONE Q4_K
+    /// super-block per fused-expert (<c>ffn_gate_up_exps</c>) row, so it cannot catch a super-block
+    /// stride/iteration bug. This builds a fixture with hidden=512 so each Q4_K expert row spans
+    /// TWO super-blocks, exercising the Q4_K quantizer + dequantizer + MoE expert matmul over
+    /// multiple super-blocks end-to-end in the real forward, and asserts the result is deterministic
+    /// run-to-run. (The quantizer unit round-trip already covers 256*3 super-blocks; this is the
+    /// MODEL-path counterpart the design notes call for.)
+    /// </summary>
+    [Fact]
+    public void Gemma4_Q4K_MultiSuperBlock_Hidden512_DeterministicForward()
+    {
+        var dims = SyntheticGemma4Gguf.Tiny with { HiddenSize = 512 };
+        Assert.Equal(QuantizationType.Q4_K, dims.ExpertGateUpQuant);
+        string path = Path.Combine(Path.GetTempPath(), $"syn_gemma4_q4k512_{Guid.NewGuid():N}.gguf");
+        SyntheticGemma4Gguf.WriteGemma4(path, dims);
+        try
+        {
+            using (var gguf = GgufFile.Open(path))
+            {
+                var gateUp = gguf.TensorsByName["blk.0.ffn_gate_up_exps.weight"];
+                Assert.Equal(QuantizationType.Q4_K, gateUp.QuantizationType);
+                Assert.Equal(512, gateUp.Shape[0]);          // K = hidden = 512
+                Assert.Equal(0, gateUp.Shape[0] % 256);      // whole multiple of the Q4_K super-block
+                Assert.True(gateUp.Shape[0] / 256 >= 2,
+                    "Q4_K expert row must span >= 2 super-blocks to exercise the super-block stride.");
+            }
+            var (c1, a1, _) = RunGemma4Forward(path);
+            var (c2, a2, _) = RunGemma4Forward(path);
+            Assert.Equal(c1, c2);   // deterministic across two independent loads
+            Assert.Equal(a1, a2);
+            _out.WriteLine($"[gemma4 hidden=512 Q4_K 2-superblock] argmax={a1} checksum=0x{c1:X16}");
+        }
+        finally { if (File.Exists(path)) File.Delete(path); }
+    }
+
+    /// <summary>
     /// THE GATE: generate the tiny gemma4 fixture, load it, assert all Gemma-4 features are present,
     /// run a deterministic causal forward, and assert the last-row checksum + argmax match the golden
     /// AND are byte-identical across two independent loads (run-to-run stability).
@@ -226,6 +262,11 @@ public sealed class SyntheticGemma4RegressionTests
             // (see DiffusionGemmaGgufForwardTests). The synthetic gate is determinism + signal.
             Assert.True(distinct > 1, $"Denoise output degenerate (distinct {distinct}); ids=[{string.Join(",", gen1)}].");
             Assert.Contains(gen1, id => id != dims.MaskTokenId);
+            // A finished canvas must contain NO surviving mask tokens — even the step-limit
+            // fallback (FillRemainingMasked) commits a real (non-mask) token. With an untrained
+            // synthetic model the raw argmax at low-confidence positions can be the mask token,
+            // so this discriminates the mask-suppressed fallback from a plain argmax.
+            Assert.DoesNotContain(dims.MaskTokenId, gen1);
         }
         finally { File.Delete(path); }
     }

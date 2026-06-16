@@ -417,7 +417,22 @@ public sealed class DiffusionTextGenerator
                     if (canvas[i] != maskTokenId)
                         continue;
                     var row = new ReadOnlySpan<float>(basePtr + (long)(prefixLen + i) * vocabSize, vocabSize);
-                    canvas[i] = System.Numerics.Tensors.TensorPrimitives.IndexOfMax(row);
+                    // Never commit the mask token — a finished canvas must contain only real
+                    // tokens (consistent with the unmask path in GatherMaskedRows, which
+                    // suppresses the mask token before sampling). Pick the best NON-mask token;
+                    // models whose vocab contains the mask token (DiffusionGemma, id 4) can rank
+                    // it as the raw argmax at low-confidence positions, so a plain IndexOfMax
+                    // would leave the position masked. Fall back to the unrestricted argmax only
+                    // in the degenerate case where every non-mask logit is -inf.
+                    int best = -1;
+                    float bestV = float.NegativeInfinity;
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        if (v == maskTokenId) continue;
+                        float x = row[v];
+                        if (x > bestV) { bestV = x; best = v; }
+                    }
+                    canvas[i] = best >= 0 ? best : System.Numerics.Tensors.TensorPrimitives.IndexOfMax(row);
                     maskedCount--;
                 }
             }
