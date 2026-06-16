@@ -55,6 +55,21 @@ uint readByte(uint absByteOff) {
     return (u >> shift) & 0xFFu;
 }
 
+// Read 4 consecutive bytes at `absByteOff` as a little-endian packed uint,
+// funnelling across the word boundary when the offset is not 4-aligned (the
+// 18-byte IQ4_NL block puts the qs region at offset 2, which is 0- or 2-mod-4
+// on alternate blocks). One storage load replaces four byte-wise readByte
+// calls — the qs region was previously read 16 bytes/block, reloading each
+// shared word four times.
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
 float readHalf(uint absByteOff) {
     uint alignedIdx = absByteOff >> 2u;
     uint byteInWord = absByteOff & 3u;
@@ -90,16 +105,27 @@ void main() {
 
         uint xBase = b * IQ4_NL_GROUP_SIZE;
 
-        float subSum = 0.0;
-        for (uint j = 0u; j < 16u; j++) {
-            uint byteVal = readByte(qsBase + j);
-            uint nLo = byteVal & 0xFu;
-            uint nHi = byteVal >> 4u;
-            float xLo = x[xBase + j];
-            float xHi = x[xBase + j + 16u];
-            subSum += xLo * KVALUES_IQ4NL[nLo] + xHi * KVALUES_IQ4NL[nHi];
+        // 16 qs bytes (32 nibbles) read 4-at-a-time as 4 words instead of
+        // byte-by-byte. Word w holds bytes [4w..4w+3]; each byte's low nibble
+        // produces element 4w+i, its high nibble element 4w+i+16. Fetch each
+        // word ONCE and bitfield-extract the nibbles — the codebook lookups are
+        // a compile-time const array (register/LDS), so the byte reads were the
+        // redundant weight traffic (4 reloads/word).
+        float loSum = 0.0;
+        float hiSum = 0.0;
+        for (uint w = 0u; w < 4u; w++) {
+            uint cur = read4Bytes(qsBase + w * 4u);
+            uint e = w * 4u;
+            loSum += x[xBase + e + 0u] * KVALUES_IQ4NL[ cur        & 0xFu]
+                   + x[xBase + e + 1u] * KVALUES_IQ4NL[(cur >>  8u) & 0xFu]
+                   + x[xBase + e + 2u] * KVALUES_IQ4NL[(cur >> 16u) & 0xFu]
+                   + x[xBase + e + 3u] * KVALUES_IQ4NL[(cur >> 24u) & 0xFu];
+            hiSum += x[xBase + e + 16u] * KVALUES_IQ4NL[(cur >>  4u) & 0xFu]
+                   + x[xBase + e + 17u] * KVALUES_IQ4NL[(cur >> 12u) & 0xFu]
+                   + x[xBase + e + 18u] * KVALUES_IQ4NL[(cur >> 20u) & 0xFu]
+                   + x[xBase + e + 19u] * KVALUES_IQ4NL[(cur >> 28u) & 0xFu];
         }
-        acc += d * subSum;
+        acc += d * (loSum + hiSum);
     }
 
     partials[tid] = acc;
