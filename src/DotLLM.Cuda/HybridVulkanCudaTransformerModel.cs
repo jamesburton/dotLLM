@@ -54,6 +54,14 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     private readonly int _ropeDim;
     private readonly int _ropeType;
 
+    // Persistent device FP32 staging buffer for the Vulkan→CUDA boundary upload.
+    // Grown on demand (power-of-2) and reused across forwards to avoid a per-call
+    // cuMemAlloc/cuMemFree on the hot path. Required by the pipelined path: the
+    // synchronous H2D fills it before each EnqueueCudaPhase returns, so a single
+    // buffer is safe (CUDA(i-1) is synced before CUDA(i) reuses it).
+    private nint _tempF32Device;
+    private long _tempF32Capacity; // in bytes
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -250,8 +258,135 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
                            int deviceId, IKvCache? kvCache)
     {
         var vulkanCudaCache = kvCache as HybridVulkanCudaKvCache;
-
         int seqLen = tokenIds.Length;
+
+        // ── PHASE 1: Vulkan (embedding + layers 0..V-1), host download ──
+        using var vulkanHiddenTensor = RunVulkanPhase(tokenIds, positions, vulkanCudaCache);
+
+        // ── PHASE 2+3: CUDA enqueue (async on the stream), then finish (sync + DtoH) ──
+        EnqueueCudaPhase(vulkanHiddenTensor.DataPointer, positions, seqLen, vulkanCudaCache);
+        return FinishCudaPhase();
+    }
+
+    /// <summary>
+    /// Pipelined batched forward over <paramref name="requests"/> independent
+    /// streams (sequences). Overlaps the Vulkan stage of stream <c>i</c> with the
+    /// in-flight CUDA stage of stream <c>i-1</c>: while the CUDA eGPU consumes
+    /// stream <c>i-1</c>'s activations, the Vulkan iGPU computes stream <c>i</c>'s
+    /// early layers. This fills the pipeline bubble inherent to a 2-device
+    /// layer split and is the M3 throughput win for the batched / multi-stream /
+    /// multi-turn serving path.
+    /// </summary>
+    /// <param name="requests">
+    /// Per-stream inputs: token ids, positions, and the stream's own KV cache.
+    /// Each request is decoded independently (one forward each); the KV caches
+    /// must be distinct per stream.
+    /// </param>
+    /// <returns>
+    /// One logits tensor (<c>[1, vocabSize]</c>, host FP32) per request, in input
+    /// order. Caller owns disposal of each.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// The overlap is cross-device: the two GPUs touch disjoint scratch
+    /// (<c>_cudaState</c> is CUDA-only, the Vulkan model's scratch is Vulkan-only)
+    /// and per-stream KV caches, so the shared single scratch on each device is
+    /// safe. CUDA work is stream-ordered on one stream, so CUDA(i) is enqueued
+    /// only after CUDA(i-1) has been synced — making the persistent staging
+    /// buffers safe to reuse without a double-buffer ring.
+    /// </para>
+    /// <para>
+    /// The Vulkan→CUDA handoff routes through host RAM (the synchronous
+    /// <c>cuMemcpyHtoD</c> fully consumes the host hidden buffer before
+    /// <see cref="EnqueueCudaPhase"/> returns). The original M3 plan gated the
+    /// CUDA stage with an imported Vulkan semaphore
+    /// (<c>cuWaitExternalSemaphoresAsync</c>); on this Intel-Arc-iGPU +
+    /// NVIDIA-3060-eGPU box that cross-API import is blocked by CUDA's
+    /// same-adapter (UUID/LUID) requirement (see the M3 interop smoke tests).
+    /// Host-pipelining delivers the same overlap because, per
+    /// <c>offload-partitioning-strategy.md</c>, the cross-API wait would only
+    /// have hidden the &lt;1%-of-compute handoff term; the dominant win is
+    /// serial→pipelined, captured here without it.
+    /// </para>
+    /// <para>
+    /// <c>requests.Count == 1</c> degenerates to the synchronous serial path
+    /// (Vulkan → enqueue → finish), so single-stream batch=1 decode is neutral.
+    /// </para>
+    /// </remarks>
+    public ITensor[] ForwardBatchedPipelined(IReadOnlyList<PipelinedRequest> requests)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        int n = requests.Count;
+        if (n == 0) return [];
+
+        var results = new ITensor[n];
+
+        // Software pipeline, depth 1: Vulkan(i) ∥ CUDA(i-1).
+        //
+        //   Vulkan(0) ; Enqueue(0)
+        //   for i in 1..n-1:  Vulkan(i)  [overlaps in-flight CUDA(i-1)]
+        //                     Finish(i-1) ; Enqueue(i)
+        //   Finish(n-1)
+        //
+        // The host blocks inside Vulkan(i) on the iGPU fence while the eGPU runs
+        // CUDA(i-1) — that wait is the overlap window.
+
+        var first = requests[0];
+        var hiddenCurrent = RunVulkanPhase(first.TokenIds, first.Positions, AsHybridCache(first.KvCache));
+        EnqueueCudaPhase(hiddenCurrent.DataPointer, first.Positions, first.TokenIds.Length,
+            AsHybridCache(first.KvCache));
+
+        for (int i = 1; i < n; i++)
+        {
+            var req = requests[i];
+            // Vulkan stage for stream i — runs on the iGPU while CUDA(i-1) is in flight on the eGPU.
+            var hiddenNext = RunVulkanPhase(req.TokenIds, req.Positions, AsHybridCache(req.KvCache));
+
+            // Drain CUDA(i-1): sync + read its logits. Its scratch/staging are now free.
+            results[i - 1] = FinishCudaPhase();
+            hiddenCurrent.Dispose();
+            hiddenCurrent = hiddenNext;
+
+            // Enqueue CUDA(i) (synchronous H2D consumes hiddenCurrent, then async kernels).
+            EnqueueCudaPhase(hiddenCurrent.DataPointer, req.Positions, req.TokenIds.Length,
+                AsHybridCache(req.KvCache));
+        }
+
+        results[n - 1] = FinishCudaPhase();
+        hiddenCurrent.Dispose();
+        return results;
+    }
+
+    private static HybridVulkanCudaKvCache? AsHybridCache(IKvCache? kvCache)
+        => kvCache as HybridVulkanCudaKvCache;
+
+    // ── Phase helpers (shared by serial Forward and pipelined batched forward) ──
+
+    /// <summary>
+    /// Runs the Vulkan stage (embedding + layers 0..V-1) for one sequence and
+    /// downloads the boundary hidden state to host FP32. Blocks the host on the
+    /// Vulkan fence — that host wait is what overlaps in-flight CUDA work in the
+    /// pipelined path.
+    /// </summary>
+    private ITensor RunVulkanPhase(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                                   HybridVulkanCudaKvCache? vulkanCudaCache)
+    {
+        using var vulkanLogits = _vulkanModel.Forward(tokenIds, positions, deviceId: -1,
+            kvCache: vulkanCudaCache?.VulkanCache);
+        return _vulkanModel.DownloadHiddenState(tokenIds.Length);
+    }
+
+    /// <summary>
+    /// Enqueues the CUDA stage (boundary upload + layers V..L-1 + final norm + LM
+    /// head) on the CUDA stream <b>without synchronising</b>. The host FP32
+    /// hidden state at <paramref name="hostHiddenPtr"/> is fully consumed by the
+    /// synchronous H2D before this returns, so the caller may overwrite it
+    /// (e.g. dispose the Vulkan tensor) once this method returns. The CUDA
+    /// kernels run asynchronously; call <see cref="FinishCudaPhase"/> to drain.
+    /// </summary>
+    private void EnqueueCudaPhase(nint hostHiddenPtr, ReadOnlySpan<int> positions, int seqLen,
+                                  HybridVulkanCudaKvCache? vulkanCudaCache)
+    {
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
@@ -261,23 +396,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         float eps = Config.NormEpsilon;
         int slidingWindow = Config.SlidingWindowSize ?? 0;
         int h = sizeof(ushort); // FP16 element size
-
-        // ════════════════════════════════════════════════════════
-        //  PHASE 1: Vulkan — Embedding + Layers 0.._numVulkanLayers-1
-        // ════════════════════════════════════════════════════════
-
-        // Run the Vulkan forward pass for the first N layers.
-        // Logits returned here are discarded — only the hidden state matters.
-        using var vulkanLogits = _vulkanModel.Forward(tokenIds, positions, deviceId: -1,
-            kvCache: vulkanCudaCache?.VulkanCache);
-
-        // Download the post-layer-N hidden state from Vulkan device memory.
-        // DownloadHiddenState uses a Vulkan staging buffer internally; result is host FP32.
-        using var vulkanHiddenTensor = _vulkanModel.DownloadHiddenState(seqLen);
-
-        // ════════════════════════════════════════════════════════
-        //  PHASE 2: Boundary Transfer (Vulkan host FP32 → CUDA FP16)
-        // ════════════════════════════════════════════════════════
 
         _context.MakeCurrent();
         _cudaState.EnsureCapacity(seqLen);
@@ -290,44 +408,32 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         long hiddenFp16Bytes = (long)transferElems * h;
         int totalLayers = Config.NumLayers;
 
-        // Allocate a temporary device FP32 buffer, upload host FP32 from the Vulkan
-        // tensor, then convert FP32→FP16 on-device into _cudaState.HiddenState.
-        // The buffer is freed AFTER stream sync (it is read asynchronously).
-        nint tempF32Device;
-        CudaDriverApi.cuMemAlloc_v2(out tempF32Device, (nuint)fp32Bytes).ThrowOnError();
+        EnsureTempF32Capacity(fp32Bytes);
 
-        // Synchronous H2D upload (blocking until data is queued; the convert kernel runs async).
-        CudaDriverApi.cuMemcpyHtoD_v2(tempF32Device, vulkanHiddenTensor.DataPointer,
-            (nuint)fp32Bytes).ThrowOnError();
+        // Synchronous H2D upload — fully drains hostHiddenPtr into device memory,
+        // so the caller may free/overwrite the host buffer once this returns.
+        CudaDriverApi.cuMemcpyHtoD_v2(_tempF32Device, hostHiddenPtr, (nuint)fp32Bytes).ThrowOnError();
 
         // Device FP32 → FP16 (async, on the CUDA stream).
-        _kernels.LaunchConvertF32ToF16(tempF32Device, _cudaState.HiddenState, transferElems, s);
-
-        // ════════════════════════════════════════════════════════
-        //  PHASE 3: CUDA — Layers _numVulkanLayers..N-1 + Final Norm + LM Head
-        // ════════════════════════════════════════════════════════
+        _kernels.LaunchConvertF32ToF16(_tempF32Device, _cudaState.HiddenState, transferElems, s);
 
         // Upload positions to device (required by LaunchRoPE in the layer loop below).
         fixed (int* posPtr = positions)
             CudaDriverApi.cuMemcpyHtoD_v2(_cudaState.PositionsDevice, (nint)posPtr,
                 (nuint)(seqLen * sizeof(int))).ThrowOnError();
 
-        // Layer 0 of CUDA phase (= global layer _numVulkanLayers, local CUDA index 0):
-        // copy hidden→residual, then RmsNorm into NormOutput.
-        // _cudaWeights.Layers is 0-based (CUDA-local), so index 0 = global layer _numVulkanLayers.
+        // Layer 0 of CUDA phase (= global layer _numVulkanLayers, local CUDA index 0).
         CudaDriverApi.cuMemcpyDtoDAsync_v2(_cudaState.Residual, _cudaState.HiddenState,
             (nuint)hiddenFp16Bytes, s).ThrowOnError();
         _kernels.LaunchRmsNorm(_cudaState.HiddenState, _cudaWeights.Layers[0].AttnNormWeight,
             _cudaState.NormOutput, hiddenSize, eps, seqLen, s);
 
-        // CUDA layer loop — standard GQA forward for global layers _numVulkanLayers..totalLayers-1.
-        // _cudaWeights.Layers and CudaCache are both 0-based (local CUDA indices).
         var cudaKvCache = vulkanCudaCache?.CudaCache;
         for (int layer = _numVulkanLayers; layer < totalLayers; layer++)
         {
-            int localLayer = layer - _numVulkanLayers; // 0-based index for both CudaWeights and CudaCache
+            int localLayer = layer - _numVulkanLayers; // 0-based for both CudaWeights and CudaCache
             ref readonly var lw = ref _cudaWeights.Layers[localLayer];
-            int cacheLayer = localLayer; // 0-based index for CudaCache (same remapping)
+            int cacheLayer = localLayer;
 
             // ── ATTENTION BLOCK ──
             Project(lw.QQuant, lw.QQuantType, lw.Q, _cudaState.NormOutput, _cudaState.Q,
@@ -349,7 +455,6 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             _kernels.LaunchRoPE(_cudaState.Q, _cudaState.K, _cudaState.PositionsDevice,
                 seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, _ropeType, s);
 
-            // KV-cache update (uses cacheLayer for 0-based CUDA cache indexing)
             if (cudaKvCache is not null)
             {
                 cudaKvCache.UpdateDevice(_cudaState.K, _cudaState.V, positions, seqLen, cacheLayer, s);
@@ -364,12 +469,10 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
                     seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
             }
 
-            // O projection → NormOutput
             Project(lw.OQuant, lw.OQuantType, lw.O, _cudaState.AttnOutput, _cudaState.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen, s, cublasH);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_cudaState.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
-            // Fused attention residual + FFN norm
             _kernels.LaunchFusedAddRmsNorm(_cudaState.Residual, _cudaState.NormOutput,
                 lw.FfnNormWeight, _cudaState.NormOutput, hiddenSize, eps, seqLen, s);
 
@@ -389,18 +492,14 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
                 lw.DownOutputDim, lw.DownInputDim, seqLen, s, cublasH);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_cudaState.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
 
-            // Fused FFN residual + next-layer setup
             if (layer < totalLayers - 1)
             {
-                // Not last layer: FusedAddRmsNorm pre-applies next layer's AttnNorm.
-                // Next local index = localLayer + 1 (both arrays are 0-based within the CUDA slice).
                 ref readonly var nextLw = ref _cudaWeights.Layers[localLayer + 1];
                 _kernels.LaunchFusedAddRmsNorm(_cudaState.Residual, _cudaState.NormOutput,
                     nextLw.AttnNormWeight, _cudaState.NormOutput, hiddenSize, eps, seqLen, s);
             }
             else
             {
-                // Last layer: plain add → HiddenState for final norm
                 _kernels.LaunchAdd(_cudaState.Residual, _cudaState.NormOutput, _cudaState.HiddenState,
                     seqLen * hiddenSize, s);
             }
@@ -416,19 +515,41 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
             _cudaWeights.OutputOutputDim, _cudaWeights.OutputInputDim, 1, s, cublasH);
 
         _kernels.LaunchConvertF16ToF32(_cudaState.LogitsF16, _cudaState.LogitsF32, vocabSize, s);
+    }
 
-        // Single sync for all CUDA kernel submissions.
-        // tempF32Device is freed after sync — safe because all async reads are done.
+    /// <summary>
+    /// Drains the CUDA stream from a prior <see cref="EnqueueCudaPhase"/>: blocks
+    /// until all enqueued work completes, then copies the FP32 logits back to a
+    /// freshly-allocated host tensor. After this returns the CUDA scratch and the
+    /// persistent staging buffer are free for the next enqueue.
+    /// </summary>
+    private ITensor FinishCudaPhase()
+    {
+        int vocabSize = Config.VocabSize;
         _stream.Synchronize();
-        CudaDriverApi.cuMemFree_v2(tempF32Device).ThrowOnError();
 
-        // D2H: FP32 logits → host UnmanagedTensor.
         var shape = new TensorShape(1, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _cudaState.LogitsF32,
             (nuint)(vocabSize * sizeof(float))).ThrowOnError();
-
         return result;
+    }
+
+    /// <summary>
+    /// Ensures <see cref="_tempF32Device"/> holds at least <paramref name="bytes"/>,
+    /// growing it (power-of-2) and freeing the old allocation when necessary.
+    /// </summary>
+    private void EnsureTempF32Capacity(long bytes)
+    {
+        if (bytes <= _tempF32Capacity) return;
+
+        long newCapacity = 1;
+        while (newCapacity < bytes) newCapacity <<= 1;
+
+        if (_tempF32Device != 0)
+            CudaDriverApi.cuMemFree_v2(_tempF32Device).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _tempF32Device, (nuint)newCapacity).ThrowOnError();
+        _tempF32Capacity = newCapacity;
     }
 
     // ── Private helpers ──
@@ -469,6 +590,11 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
     /// <summary>Releases all Vulkan, CUDA, and host resources owned by this model.</summary>
     public void Dispose()
     {
+        if (_tempF32Device != 0)
+        {
+            CudaDriverApi.cuMemFree_v2(_tempF32Device);
+            _tempF32Device = 0;
+        }
         _vulkanModel.Dispose();
         _cudaWeights.Dispose();
         _cudaState.Dispose();
@@ -476,4 +602,25 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         _cublas.Dispose();
         _context.Dispose();
     }
+}
+
+/// <summary>
+/// One stream's inputs for <see cref="HybridVulkanCudaTransformerModel.ForwardBatchedPipelined"/>.
+/// Each request is decoded independently with its own KV cache; the pipelined
+/// scheduler overlaps the Vulkan stage of one request with the CUDA stage of the
+/// previous one.
+/// </summary>
+public sealed class PipelinedRequest
+{
+    /// <summary>Token ids for this forward pass (decode: a single token).</summary>
+    public required int[] TokenIds { get; init; }
+
+    /// <summary>Absolute positions matching <see cref="TokenIds"/>.</summary>
+    public required int[] Positions { get; init; }
+
+    /// <summary>
+    /// This stream's own KV cache (a <see cref="HybridVulkanCudaKvCache"/>), or
+    /// <c>null</c> for a stateless (no-cache) forward. Must be distinct per stream.
+    /// </summary>
+    public IKvCache? KvCache { get; init; }
 }
