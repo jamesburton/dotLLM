@@ -20,6 +20,17 @@ public static unsafe partial class MatMul
     /// <summary>Number of elements per Q8_0 block.</summary>
     private const int Q8_0GroupSize = 32;
 
+#if NET11_0_OR_GREATER
+    /// <summary>
+    /// Opt-in switch for the AVX512-BF16 (VDPBF16PS) Q8_0 outer-product microkernel
+    /// (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>). Default <c>false</c>: the Q8_0 GEMM uses the
+    /// exact maddubs path so existing exact-parity tests hold. The BF16 kernel is an <i>approximation</i>
+    /// (bf16 rounds each scaled value), so it is enabled explicitly for accuracy/throughput evaluation.
+    /// Has no effect unless <see cref="Avx512Bf16.IsSupported"/>. (preview-runtime / dev-dotnet11 track.)
+    /// </summary>
+    internal static bool UseAvx512Bf16Q8_0 = false;
+#endif
+
     /// <summary>Q8_1 block size in bytes: 2 (Half d) + 2 (Half s) + 32 (sbyte quantized values).</summary>
     public const int Q8_1BlockBytes = 36;
 
@@ -1598,6 +1609,207 @@ public static unsafe partial class MatMul
         }
     }
 
+#if NET11_0_OR_GREATER
+    /// <summary>
+    /// Dequantizes one Q8_0 block (32 int8 values + an fp16 scale already widened to <paramref name="d"/>)
+    /// to a single 64-byte <c>Vector512&lt;ushort&gt;</c> with the scale folded into each value —
+    /// the foundation of the BF16 dequant-and-accumulate Q8_0 kernel
+    /// (<see cref="OuterProductQ8_0Avx512Bf16_4x6"/>).
+    /// </summary>
+    /// <remarks>
+    /// The bf16 values are carried in <c>ushort</c> lanes (raw bf16 bit-patterns): the
+    /// <c>Avx512Bf16</c> intrinsics ship their initial signatures over <c>Vector512&lt;ushort&gt;</c>.
+    /// <c>VCVTNE2PS2BF16</c> / <c>VDPBF16PS</c> are bit-pattern operations, so <c>ushort</c> is exact.
+    /// Folding the per-block scale into the value means downstream accumulation is a plain
+    /// <c>VDPBF16PS</c> chain into one fp32 accumulator with no per-block reduction, dual-scale fold,
+    /// or compensation. This rounds: each scaled value is rounded to bf16 (8-bit mantissa), so the
+    /// kernel approximates the exact int8-dot×scale the maddubs kernel computes.
+    /// </remarks>
+    /// <param name="qBlock">Pointer to the 32 raw int8 values (the block record's bytes 2..33).</param>
+    /// <param name="d">The block's fp16 scale, already widened to float.</param>
+    /// <returns>32 bf16 values <c>= (float)q[i] · d</c> (rounded), packed into ushort lanes.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<ushort> DequantBlockToBf16(byte* qBlock, float d)
+    {
+        // Load 32 signed int8 (one Q8_0 block).
+        Vector256<sbyte> q = Unsafe.ReadUnaligned<Vector256<sbyte>>(qBlock);
+
+        // Sign-extend each 16-byte half int8 → int32 (VPMOVSXBD), then int32 → float.
+        Vector512<int> lo32 = Avx512F.ConvertToVector512Int32(q.GetLower());
+        Vector512<int> hi32 = Avx512F.ConvertToVector512Int32(q.GetUpper());
+        Vector512<float> scale = Vector512.Create(d);
+        Vector512<float> loF = Avx512F.ConvertToVector512Single(lo32) * scale;
+        Vector512<float> hiF = Avx512F.ConvertToVector512Single(hi32) * scale;
+
+        // Pack 2×16 fp32 → 32 bf16 (VCVTNE2PS2BF16): low 16 lanes = loF, high 16 = hiF.
+        return Avx512Bf16.ConvertToBFloat16(loF, hiF);
+    }
+
+    /// <summary>
+    /// Per-token hoist for <see cref="OuterProductQ8_0Avx512Bf16_4x6"/>: dequantizes a dual-block
+    /// activation token to two scale-folded <c>Vector512&lt;ushort&gt;</c>, reused across all 4 weight rows.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockTokenBf16(byte* x, int block,
+        out Vector512<ushort> xb0, out Vector512<ushort> xb1)
+    {
+        byte* b0 = x + block * Q8_0BlockBytes;
+        byte* b1 = x + (block + 1) * Q8_0BlockBytes;
+        xb0 = DequantBlockToBf16(b0 + 2, HalfBitsToFloat(b0));
+        xb1 = DequantBlockToBf16(b1 + 2, HalfBitsToFloat(b1));
+    }
+
+    /// <summary>
+    /// Per-row hoist for <see cref="OuterProductQ8_0Avx512Bf16_4x6"/>: dequantizes a dual-block weight
+    /// row to two scale-folded <c>Vector512&lt;ushort&gt;</c>, reused across all 6 tokens.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LoadDualBlockRowBf16(byte* wb0, byte* wb1,
+        out Vector512<ushort> wbf0, out Vector512<ushort> wbf1)
+    {
+        wbf0 = DequantBlockToBf16(wb0 + 2, HalfBitsToFloat(wb0));
+        wbf1 = DequantBlockToBf16(wb1 + 2, HalfBitsToFloat(wb1));
+    }
+
+    /// <summary>
+    /// BF16 dual-block multiply-accumulate: two <c>VDPBF16PS</c> into one fp32 accumulator. The per-block
+    /// scale is already folded into the bf16 values, so there is no dual-scale fold and the accumulator
+    /// is reduced in full at the end.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Avx512DualBlockBf16Mac(
+        Vector512<ushort> wbf0, Vector512<ushort> wbf1,
+        Vector512<ushort> xbf0, Vector512<ushort> xbf1,
+        ref Vector512<float> acc)
+    {
+        // VDPBF16PS: acc[i] += x[2i]·w[2i] + x[2i+1]·w[2i+1]. One call per block of the pair.
+        acc = Avx512Bf16.MultiplyWideningAndAdd(acc, xbf0, wbf0);
+        acc = Avx512Bf16.MultiplyWideningAndAdd(acc, xbf1, wbf1);
+    }
+
+    /// <summary>
+    /// BF16 dequant-and-accumulate outer-product microkernel for Q8_0 R4 layout — an alternative AVX-512
+    /// variant alongside <see cref="OuterProductQ8_0Avx512_4x6"/> (maddubs). Same 4 weight rows × 6 tokens,
+    /// 24 ZMM accumulators, dual-block-per-iteration scheme, and shared AVX2 odd-trailing-block tail.
+    /// Each Q8_0 block is dequantized to bf16 with its scale folded in (<see cref="DequantBlockToBf16"/>),
+    /// then accumulated via <c>VDPBF16PS</c> into a single fp32 accumulator per cell — no per-block integer
+    /// reduction, dual-scale fold, or compensation term. Weights dequant'd once per row (reused across 6
+    /// tokens), activations once per token (reused across 4 rows). Requires AVX512-BF16
+    /// (<see cref="Avx512Bf16.IsSupported"/>); an approximation (bf16 rounding).
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void OuterProductQ8_0Avx512Bf16_4x6(
+        byte* groupBase, byte* x0, byte* x1, byte* x2, byte* x3, byte* x4, byte* x5,
+        float* c, int blockCount, int cStride)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+
+        Vector512<float> a0t0 = Vector512<float>.Zero, a0t1 = Vector512<float>.Zero, a0t2 = Vector512<float>.Zero;
+        Vector512<float> a0t3 = Vector512<float>.Zero, a0t4 = Vector512<float>.Zero, a0t5 = Vector512<float>.Zero;
+        Vector512<float> a1t0 = Vector512<float>.Zero, a1t1 = Vector512<float>.Zero, a1t2 = Vector512<float>.Zero;
+        Vector512<float> a1t3 = Vector512<float>.Zero, a1t4 = Vector512<float>.Zero, a1t5 = Vector512<float>.Zero;
+        Vector512<float> a2t0 = Vector512<float>.Zero, a2t1 = Vector512<float>.Zero, a2t2 = Vector512<float>.Zero;
+        Vector512<float> a2t3 = Vector512<float>.Zero, a2t4 = Vector512<float>.Zero, a2t5 = Vector512<float>.Zero;
+        Vector512<float> a3t0 = Vector512<float>.Zero, a3t1 = Vector512<float>.Zero, a3t2 = Vector512<float>.Zero;
+        Vector512<float> a3t3 = Vector512<float>.Zero, a3t4 = Vector512<float>.Zero, a3t5 = Vector512<float>.Zero;
+
+        int block = 0;
+
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* blockBase0 = groupBase + block * wStride;
+            byte* blockBase1 = groupBase + (block + 1) * wStride;
+
+            LoadDualBlockTokenBf16(x0, block, out var x0b0, out var x0b1);
+            LoadDualBlockTokenBf16(x1, block, out var x1b0, out var x1b1);
+            LoadDualBlockTokenBf16(x2, block, out var x2b0, out var x2b1);
+            LoadDualBlockTokenBf16(x3, block, out var x3b0, out var x3b1);
+            LoadDualBlockTokenBf16(x4, block, out var x4b0, out var x4b1);
+            LoadDualBlockTokenBf16(x5, block, out var x5b0, out var x5b1);
+
+            {
+                LoadDualBlockRowBf16(blockBase0, blockBase1, out var w0, out var w1);
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a0t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a0t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a0t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a0t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a0t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a0t5);
+            }
+            {
+                LoadDualBlockRowBf16(blockBase0 + Q8_0BlockBytes, blockBase1 + Q8_0BlockBytes,
+                    out var w0, out var w1);
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a1t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a1t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a1t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a1t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a1t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a1t5);
+            }
+            {
+                LoadDualBlockRowBf16(blockBase0 + 2 * Q8_0BlockBytes, blockBase1 + 2 * Q8_0BlockBytes,
+                    out var w0, out var w1);
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a2t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a2t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a2t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a2t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a2t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a2t5);
+            }
+            {
+                LoadDualBlockRowBf16(blockBase0 + 3 * Q8_0BlockBytes, blockBase1 + 3 * Q8_0BlockBytes,
+                    out var w0, out var w1);
+                Avx512DualBlockBf16Mac(w0, w1, x0b0, x0b1, ref a3t0);
+                Avx512DualBlockBf16Mac(w0, w1, x1b0, x1b1, ref a3t1);
+                Avx512DualBlockBf16Mac(w0, w1, x2b0, x2b1, ref a3t2);
+                Avx512DualBlockBf16Mac(w0, w1, x3b0, x3b1, ref a3t3);
+                Avx512DualBlockBf16Mac(w0, w1, x4b0, x4b1, ref a3t4);
+                Avx512DualBlockBf16Mac(w0, w1, x5b0, x5b1, ref a3t5);
+            }
+        }
+
+        c[0 * cStride + 0] = HorizontalSumAvx512Float(a0t0);
+        c[0 * cStride + 1] = HorizontalSumAvx512Float(a1t0);
+        c[0 * cStride + 2] = HorizontalSumAvx512Float(a2t0);
+        c[0 * cStride + 3] = HorizontalSumAvx512Float(a3t0);
+        c[1 * cStride + 0] = HorizontalSumAvx512Float(a0t1);
+        c[1 * cStride + 1] = HorizontalSumAvx512Float(a1t1);
+        c[1 * cStride + 2] = HorizontalSumAvx512Float(a2t1);
+        c[1 * cStride + 3] = HorizontalSumAvx512Float(a3t1);
+        c[2 * cStride + 0] = HorizontalSumAvx512Float(a0t2);
+        c[2 * cStride + 1] = HorizontalSumAvx512Float(a1t2);
+        c[2 * cStride + 2] = HorizontalSumAvx512Float(a2t2);
+        c[2 * cStride + 3] = HorizontalSumAvx512Float(a3t2);
+        c[3 * cStride + 0] = HorizontalSumAvx512Float(a0t3);
+        c[3 * cStride + 1] = HorizontalSumAvx512Float(a1t3);
+        c[3 * cStride + 2] = HorizontalSumAvx512Float(a2t3);
+        c[3 * cStride + 3] = HorizontalSumAvx512Float(a3t3);
+        c[4 * cStride + 0] = HorizontalSumAvx512Float(a0t4);
+        c[4 * cStride + 1] = HorizontalSumAvx512Float(a1t4);
+        c[4 * cStride + 2] = HorizontalSumAvx512Float(a2t4);
+        c[4 * cStride + 3] = HorizontalSumAvx512Float(a3t4);
+        c[5 * cStride + 0] = HorizontalSumAvx512Float(a0t5);
+        c[5 * cStride + 1] = HorizontalSumAvx512Float(a1t5);
+        c[5 * cStride + 2] = HorizontalSumAvx512Float(a2t5);
+        c[5 * cStride + 3] = HorizontalSumAvx512Float(a3t5);
+
+        // Odd trailing block via the shared exact AVX2 path (no bf16 rounding for the tail).
+        if (block < blockCount)
+        {
+            byte* blockBase = groupBase + block * wStride;
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            ProcessAvx512TailBlock(blockBase, x0, block, ones, c, cStride, 0);
+            ProcessAvx512TailBlock(blockBase, x1, block, ones, c, cStride, 1);
+            ProcessAvx512TailBlock(blockBase, x2, block, ones, c, cStride, 2);
+            ProcessAvx512TailBlock(blockBase, x3, block, ones, c, cStride, 3);
+            ProcessAvx512TailBlock(blockBase, x4, block, ones, c, cStride, 4);
+            ProcessAvx512TailBlock(blockBase, x5, block, ones, c, cStride, 5);
+        }
+    }
+#endif
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void LoadDualBlockToken(byte* x, int block,
         out float dx0, out float dx1,
@@ -1700,6 +1912,21 @@ public static unsafe partial class MatMul
                 int nFull6 = (n / 6) * 6;
                 for (; t < nFull6; t += 6)
                 {
+#if NET11_0_OR_GREATER
+                    if (UseAvx512Bf16Q8_0 && Avx512Bf16.IsSupported)
+                    {
+                        OuterProductQ8_0Avx512Bf16_4x6(
+                            groupBase,
+                            inputQ8 + (long)t * q8RowBytes,
+                            inputQ8 + (long)(t + 1) * q8RowBytes,
+                            inputQ8 + (long)(t + 2) * q8RowBytes,
+                            inputQ8 + (long)(t + 3) * q8RowBytes,
+                            inputQ8 + (long)(t + 4) * q8RowBytes,
+                            inputQ8 + (long)(t + 5) * q8RowBytes,
+                            c + (long)t * m + baseRow, blockCount, m);
+                        continue;
+                    }
+#endif
                     OuterProductQ8_0Avx512_4x6(
                         groupBase,
                         inputQ8 + (long)t * q8RowBytes,
@@ -1855,6 +2082,21 @@ public static unsafe partial class MatMul
                     int nFull6 = (ctx.N / 6) * 6;
                     for (; t < nFull6; t += 6)
                     {
+#if NET11_0_OR_GREATER
+                        if (UseAvx512Bf16Q8_0 && Avx512Bf16.IsSupported)
+                        {
+                            OuterProductQ8_0Avx512Bf16_4x6(
+                                groupBase,
+                                ctx.InputQ8 + (long)t * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 1) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 2) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 3) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 4) * q8RowBytes,
+                                ctx.InputQ8 + (long)(t + 5) * q8RowBytes,
+                                ctx.C + (long)t * ctx.M + baseRow, ctx.BlockCount, ctx.M);
+                            continue;
+                        }
+#endif
                         OuterProductQ8_0Avx512_4x6(
                             groupBase,
                             ctx.InputQ8 + (long)t * q8RowBytes,

@@ -144,6 +144,80 @@ public sealed unsafe class OuterProductGemmTests
         }
     }
 
+#if NET11_0_OR_GREATER
+    // ──────────────────── AVX-512 BF16 microkernel (VDPBF16PS) ────────────────────
+
+    [Theory]
+    [InlineData(1)]    // single block: runs entirely through the exact AVX2 tail (≈0 bf16 error)
+    [InlineData(2)]
+    [InlineData(3)]    // even pair + odd tail
+    [InlineData(8)]
+    [InlineData(17)]   // odd block count -> exercises tail
+    [InlineData(18)]   // SmolLM-135M: 576/32
+    [InlineData(48)]   // 1536/32
+    [InlineData(128)]  // 4096/32
+    public void OuterProductAvx512Bf16_4x6_MatchesScalar(int blockCount)
+    {
+        if (!Avx512Bf16.IsSupported)
+            return;
+
+        var rng = new Random(42);
+        int m = 4;
+        int n = 6;
+        int rowBytes = blockCount * Q8_0BlockBytes;
+
+        byte* weights = AllocAndFillR4Weights(4, blockCount, rng);
+        byte*[] xPtrs = new byte*[n];
+        for (int t = 0; t < n; t++)
+        {
+            xPtrs[t] = (byte*)NativeMemory.AlignedAlloc((nuint)rowBytes, 64);
+            FillRandomQ8_0Blocks(xPtrs[t], blockCount, rng);
+        }
+
+        float* cScalar = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+        float* cBf16 = (float*)NativeMemory.AlignedAlloc((nuint)(n * m * sizeof(float)), 64);
+
+        try
+        {
+            // Exact scalar reference (int8 dot × scale, per row per token).
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                    cScalar[t * m + r] = MatMul.VecDotQ8_0ScalarR4(weights, r, xPtrs[t], blockCount);
+
+            MatMul.OuterProductQ8_0Avx512Bf16_4x6(
+                weights, xPtrs[0], xPtrs[1], xPtrs[2], xPtrs[3], xPtrs[4], xPtrs[5],
+                cBf16, blockCount, m);
+
+            // bf16 rounds each scaled value q·d to an 8-bit mantissa (per-term rel error ~2^-8).
+            // With sign cancellation the result-relative error blows up on small sums, so the correct
+            // bound is proportional to the sum of *absolute* term magnitudes (cancellation-aware).
+            float maxRel = 0f;
+            for (int t = 0; t < n; t++)
+                for (int r = 0; r < m; r++)
+                {
+                    float exp = cScalar[t * m + r];
+                    float got = cBf16[t * m + r];
+                    float sumAbs = SumAbsTermMagnitudes(weights, r, xPtrs[t], blockCount);
+                    // 2^-8 ≈ 3.9e-3 per term, doubled for both operands rounded + slack.
+                    float tol = 1.2e-2f * sumAbs + 1e-3f;
+                    float rel = MathF.Abs(got - exp) / (sumAbs + 1e-3f);
+                    if (rel > maxRel) maxRel = rel;
+                    Assert.True(MathF.Abs(got - exp) <= tol,
+                        $"bf16 parity failed t={t} r={r}: exp={exp} got={got} sumAbs={sumAbs} tol={tol}");
+                }
+            Assert.True(maxRel >= 0f); // expose max relative error to the runner.
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(weights);
+            for (int t = 0; t < n; t++)
+                NativeMemory.AlignedFree(xPtrs[t]);
+            NativeMemory.AlignedFree(cScalar);
+            NativeMemory.AlignedFree(cBf16);
+        }
+    }
+#endif
+
     // ──────────────────── Full GEMM tests ────────────────────
 
     [Theory]
@@ -411,5 +485,25 @@ public sealed unsafe class OuterProductGemmTests
             for (int i = 0; i < Q8_0GroupSize; i++)
                 ((sbyte*)(block + 2))[i] = (sbyte)rng.Next(-127, 128);
         }
+    }
+
+    // Sum of absolute scaled-term magnitudes Σ|qw·dw · qx·dx| for one (row, token) cell — the
+    // cancellation-aware scale for a bf16 per-term rounding error bound.
+    private static float SumAbsTermMagnitudes(byte* groupBase, int rowInGroup, byte* xQ8, int blockCount)
+    {
+        const int wStride = 4 * Q8_0BlockBytes;
+        float acc = 0f;
+        for (int block = 0; block < blockCount; block++)
+        {
+            byte* wBlock = groupBase + block * wStride + rowInGroup * Q8_0BlockBytes;
+            byte* xBlock = xQ8 + block * Q8_0BlockBytes;
+            float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
+            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            sbyte* qw = (sbyte*)(wBlock + 2);
+            sbyte* qx = (sbyte*)(xBlock + 2);
+            for (int i = 0; i < Q8_0GroupSize; i++)
+                acc += MathF.Abs(qw[i] * dw) * MathF.Abs(qx[i] * dx);
+        }
+        return acc;
     }
 }
