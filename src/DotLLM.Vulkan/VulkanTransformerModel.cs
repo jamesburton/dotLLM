@@ -156,6 +156,19 @@ public sealed class VulkanTransformerModel : IModel
     // conditions as _matmulQ8Mmvq; reuses _quantizeQ8_1 + the Q8_1Xq/Xds
     // activation scratch. RecordMatmul falls back to the F32-in Q4_K GEMV.
     private readonly MatMulQ4KMmvqKernel? _matmulQ4KMmvq;
+    // When true (default whenever the MMVQ decode path is wired),
+    // RecordSharedInputMmvqGroup quantizes the shared activation once for a group
+    // of same-input Q8_0 projections (Q/K/V share the post-attn-norm input;
+    // gate/up share the post-ffn-norm input) instead of re-running quantize_q8_1
+    // per projection. DOTLLM_VULKAN_MMVQ_NO_SHARE=1 forces the per-projection
+    // path (used by the share-vs-no-share bit-identical parity test).
+    private readonly bool _mmvqShareActivation = !IsMmvqShareDisabled();
+    // Reusable scratch for RecordSharedInputMmvqGroup's projection list — sized
+    // for the largest same-input group (Q/K/V = 3). Reused across layers and
+    // decode steps to keep command-buffer recording allocation-free (the element
+    // type holds a managed VulkanDevice.Buffer, so a Span collection-expression
+    // would heap-allocate per call). Recording is single-threaded per model.
+    private readonly MmvqGroupProjection[] _mmvqGroupScratch = new MmvqGroupProjection[3];
     // dp4a MMQ prefill path (issue #50) — both null when the device lacks
     // integer-dot-product support, the SPVs are missing, or the MMQ env-var
     // opt-out is set; RecordMatmul then falls back to the coopmat / scalar
@@ -974,6 +987,19 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmvqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the shared-activation-quant optimisation on the MMVQ
+    /// decode path. Set <c>DOTLLM_VULKAN_MMVQ_NO_SHARE=1</c> to quantize the
+    /// activation per projection (the original per-call behaviour) instead of
+    /// once per same-input group (Q/K/V, gate/up). Used by the share-vs-no-share
+    /// bit-identical parity test and for A/B benchmarking. When unset, sharing is
+    /// on whenever the MMVQ decode path is wired.
+    /// </summary>
+    internal const string MmvqNoShareEnvVar = "DOTLLM_VULKAN_MMVQ_NO_SHARE";
+
+    internal static bool IsMmvqShareDisabled() =>
+        Environment.GetEnvironmentVariable(MmvqNoShareEnvVar) == "1";
 
     /// <summary>
     /// Env-var opt-out for the dp4a MMQ prefill path (issue #50). Set
@@ -2003,26 +2029,36 @@ public sealed class VulkanTransformerModel : IModel
             // shader writes BOTH the normalised hidden state (for K/V to
             // read) AND the Q matmul output. Falls back to the standalone
             // pair on prefill, non-Q8_0 weights, or oversized hidden.
-            if (!TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.AttnNormWeight,
                     lw.Q, lw.QDeviceQuantType,
                     _state.NormOutput, _state.Q,
                     lw.QOutputDim, lw.QInputDim, seqLen, eps))
             {
+                // Fused path wrote NormOutput + Q; K/V follow over the same input.
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                    lw.KOutputDim, lw.KInputDim, seqLen);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                    lw.VOutputDim, lw.VInputDim, seqLen);
+            }
+            else
+            {
                 _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
-                RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
-                    lw.QOutputDim, lw.QInputDim, seqLen);
-            }
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // K/V projections — read the normalised hidden state written above.
-            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
-                lw.KOutputDim, lw.KInputDim, seqLen);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
-                lw.VOutputDim, lw.VInputDim, seqLen);
+                // Q/K/V all read the post-attn-norm hidden state. On the MMVQ
+                // decode path this shares one Q8_1 activation-quant across the
+                // three GEMVs (issue #46 follow-up). Non-qualifying groups fall
+                // back to per-projection RecordMatmul with the same barriers.
+                _mmvqGroupScratch[0] = new(lw.Q, lw.QDeviceQuantType, _state.Q, lw.QOutputDim);
+                _mmvqGroupScratch[1] = new(lw.K, lw.KDeviceQuantType, _state.K, lw.KOutputDim);
+                _mmvqGroupScratch[2] = new(lw.V, lw.VDeviceQuantType, _state.V, lw.VOutputDim);
+                RecordSharedInputMmvqGroup(cmdBuf, _state.NormOutput, lw.QInputDim, seqLen,
+                    _mmvqGroupScratch.AsSpan(0, 3));
+            }
 
             // Optional QKV biases — kernel path keeps the whole forward in
             // one submit. Each bias add writes a different output buffer
@@ -2187,23 +2223,32 @@ public sealed class VulkanTransformerModel : IModel
             // FFN RMSNorm + Gate projection — fused when available
             // (mirrors the attn-norm + Q fusion above). Up reads the
             // normalised hidden state written by the fused dispatch.
-            if (!TryRecordFusedRmsNormMatmul(cmdBuf,
+            if (TryRecordFusedRmsNormMatmul(cmdBuf,
                     _state.HiddenState, lw.FfnNormWeight,
                     lw.Gate, lw.GateDeviceQuantType,
                     _state.NormOutput, _state.FfnGate,
                     lw.GateOutputDim, lw.GateInputDim, seqLen, eps))
             {
+                // Fused path wrote NormOutput + Gate; Up follows over the same input.
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
+                    lw.UpOutputDim, lw.UpInputDim, seqLen);
+            }
+            else
+            {
                 _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
                     rowCount: seqLen, n: hiddenSize, eps: eps);
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
-                RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
-                    lw.GateOutputDim, lw.GateInputDim, seqLen);
-            }
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            // Up projection — reads the normalised hidden state.
-            RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
-                lw.UpOutputDim, lw.UpInputDim, seqLen);
+                // Gate/Up both read the post-ffn-norm hidden state. On the MMVQ
+                // decode path this shares one Q8_1 activation-quant across the two
+                // GEMVs. Non-qualifying groups fall back to per-projection
+                // RecordMatmul with the same barriers.
+                _mmvqGroupScratch[0] = new(lw.Gate, lw.GateDeviceQuantType, _state.FfnGate, lw.GateOutputDim);
+                _mmvqGroupScratch[1] = new(lw.Up, lw.UpDeviceQuantType, _state.FfnUp, lw.UpOutputDim);
+                RecordSharedInputMmvqGroup(cmdBuf, _state.NormOutput, lw.GateInputDim, seqLen,
+                    _mmvqGroupScratch.AsSpan(0, 2));
+            }
 
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             if (lw.GateBias is not null) _biasAdd.Record(cmdBuf, _state.FfnGate, lw.GateBias, seqLen, lw.GateOutputDim);
@@ -3869,6 +3914,105 @@ public sealed class VulkanTransformerModel : IModel
         };
         VulkanApi.vkCmdCopyBuffer(cmdBuf, deltaSum.Handle, y.Handle, 1, region);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// One projection in a same-input MMVQ group: the Q8_0 weight blob, its
+    /// device-side quant type, the output buffer, and the output dimension.
+    /// </summary>
+    private readonly record struct MmvqGroupProjection(
+        VulkanDevice.Buffer Weights, QuantType WeightQt,
+        VulkanDevice.Buffer Output, int OutputDim);
+
+    /// <summary>
+    /// Records a group of decode (<c>seqLen==1</c>) projections that all read the
+    /// same activation <paramref name="input"/> (e.g. Q/K/V over the post-attn-norm
+    /// hidden state, or gate/up over the post-ffn-norm hidden state), sharing one
+    /// Q8_1 activation-quant across the group's MMVQ GEMVs.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When the MMVQ decode path is wired, sharing is enabled
+    /// (<see cref="_mmvqShareActivation"/>), and every projection is Q8_0 with a
+    /// qualifying shape, the activation is quantized to Q8_1 once into the shared
+    /// <c>_state.Q8_1Xq</c>/<c>_state.Q8_1Xds</c> scratch, then each projection's
+    /// integer-dot GEMV runs against that one quantized copy. Recording is:
+    /// <c>quantize → barrier → GEMV_0, GEMV_1, …</c> with NO barrier between the
+    /// GEMVs (they only read the shared scratch; their outputs are disjoint). The
+    /// caller is responsible for the barrier that precedes the next dispatch which
+    /// WRITES the shared scratch (e.g. the o-proj / down-proj quantize), exactly
+    /// as for a standalone <see cref="RecordMatmul"/>.
+    /// </para>
+    /// <para>
+    /// Results are bit-identical to the per-projection path
+    /// (<c>DOTLLM_VULKAN_MMVQ_NO_SHARE=1</c>): the same quantized activation feeds
+    /// every GEMV, so sharing only removes redundant quantize dispatches. When the
+    /// group does not qualify (sharing off, a non-Q8_0 member, an unsupported
+    /// shape, or scratch too small) each projection falls back to a standalone
+    /// <see cref="RecordMatmul"/> with a separating barrier — identical semantics
+    /// to recording them individually.
+    /// </para>
+    /// </remarks>
+    private void RecordSharedInputMmvqGroup(
+        nint cmdBuf, VulkanDevice.Buffer input, int inputDim, int seqLen,
+        ReadOnlySpan<MmvqGroupProjection> projections)
+    {
+        if (CanShareMmvqQuant(inputDim, seqLen, projections))
+        {
+            // One activation quant shared by every projection in the group.
+            _quantizeQ8_1!.Record(cmdBuf, input, _state.Q8_1Xq!, _state.Q8_1Xds!, inputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            foreach (var p in projections)
+            {
+                // No inter-GEMV barrier: all GEMVs only read the shared scratch
+                // and write disjoint outputs (read-after-write on the scratch is
+                // ordered by the single barrier above).
+                _matmulQ8Mmvq!.Record(cmdBuf, p.Weights, _state.Q8_1Xq!, _state.Q8_1Xds!, p.Output,
+                    m: p.OutputDim, k: inputDim);
+            }
+            return;
+        }
+
+        // Fallback: dispatch each projection independently, with a barrier between
+        // them, at the caller's real seqLen. RecordMatmul routes each to the
+        // appropriate kernel (decode MMVQ / prefill MMQ / coopmat / scalar). The
+        // barrier orders each projection's activation-quant after the prior GEMV's
+        // shared-scratch read (WAR on _state.Q8_1Xq); non-shared paths are
+        // order-independent anyway.
+        for (int i = 0; i < projections.Length; i++)
+        {
+            if (i > 0) KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            var p = projections[i];
+            RecordMatmul(cmdBuf, p.Weights, p.WeightQt, input, p.Output,
+                p.OutputDim, inputDim, seqLen);
+        }
+    }
+
+    /// <summary>
+    /// Returns true when every projection in <paramref name="projections"/>
+    /// qualifies for the shared MMVQ activation-quant: decode step
+    /// (<paramref name="seqLen"/>==1), sharing enabled, the MMVQ decode path
+    /// wired, the shared scratch present and large enough for
+    /// <paramref name="inputDim"/>, and every member is Q8_0 with a 32-aligned
+    /// input. The group's input dim is identical for all members (they read the
+    /// same buffer) — asserted via the shared-scratch size check on
+    /// <paramref name="inputDim"/>. Prefill (seqLen&gt;1) never shares: the
+    /// quantize_q8_1 / MMVQ kernels are single-row decode kernels, so each
+    /// projection must fall back to the row-wise MMQ / GEMM path.
+    /// </summary>
+    private bool CanShareMmvqQuant(int inputDim, int seqLen, ReadOnlySpan<MmvqGroupProjection> projections)
+    {
+        if (seqLen != 1) return false;
+        if (!_mmvqShareActivation || projections.Length < 2) return false;
+        if (_matmulQ8Mmvq is null || _quantizeQ8_1 is null
+            || _state.Q8_1Xq is null || _state.Q8_1Xds is null)
+            return false;
+        if ((inputDim % QuantizeQ8_1Kernel.GroupSize) != 0) return false;
+        if (QuantizeQ8_1Kernel.PackedBytes(inputDim) > _state.Q8_1Xq.Size) return false;
+        if (QuantizeQ8_1Kernel.ScaleBytes(inputDim) > _state.Q8_1Xds.Size) return false;
+        foreach (var p in projections)
+            if (p.WeightQt != QuantType.Q8_0) return false;
+        return true;
     }
 
     private void RecordMatmul(
