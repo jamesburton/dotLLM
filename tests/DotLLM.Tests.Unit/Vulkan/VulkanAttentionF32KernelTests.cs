@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Vulkan;
@@ -60,6 +61,23 @@ public class VulkanAttentionF32KernelTests
     }
 
     [SkippableFact]
+    public void Launch_Gemma4Global_HeadDim512_Gqa8()
+    {
+        // Real gemma-4 26B GLOBAL-layer attention shape: head_dim 512 (over the old
+        // MAX_HEAD_DIM 256 bound, now 512), 16 Q / 2 KV heads (GQA group 8), prefill
+        // seqQ = seqKv = 6. This is the FIRST coverage of head_dim > 128 on the naive
+        // (non-flash) attention kernel — the path the real 26B uses (flash caps at 128).
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 2, headDim: 512, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gemma4Sliding_HeadDim256_Gqa2()
+    {
+        // Real gemma-4 26B SLIDING-layer attention shape: head_dim 256, 16 Q / 8 KV.
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 8, headDim: 256, positionOffset: 0);
+    }
+
+    [SkippableFact]
     public void Launch_MultiTile_TripleTile()
     {
         // Exercises the online-softmax tile loop: seq_kv > TILE_KV (256).
@@ -91,10 +109,66 @@ public class VulkanAttentionF32KernelTests
             slidingWindow: 128);
     }
 
+    // ── Non-causal mask modes (issue #41 item 2) ─────────────────
+    //
+    // These DISCRIMINATE against the causal path: a query at an early position
+    // must attend to FUTURE keys, which the causal mask (tkv > posQ) would zero
+    // out. The CPU reference is invoked in the same mask mode, so parity holds
+    // only if the Vulkan shader honours maskMode/prefixLen identically.
+
+    [SkippableFact]
+    public void Launch_Bidirectional_AttendsFutureKeys()
+    {
+        // 4 queries × 4 keys, positionOffset=0. Under Causal, query 0 sees only
+        // key 0; under Bidirectional it sees all 4 keys. The CPU reference runs
+        // the same Bidirectional mode, so a shader that ignored maskMode (still
+        // causal) would diverge for the early query rows.
+        RunOne(seqQ: 4, seqKv: 4, numHeads: 2, numKvHeads: 1, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Bidirectional_Gqa_Decode()
+    {
+        // Single bidirectional query over a 128-key canvas at positionOffset=0:
+        // it must attend to ALL 128 keys (a causal mask would leave only key 0).
+        RunOne(seqQ: 1, seqKv: 128, numHeads: 9, numKvHeads: 3, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Bidirectional_MultiTile()
+    {
+        // seqKv > TILE_KV (256): exercises the online-softmax tile loop with no
+        // causal upper bound. positionOffset=0 so every key is in-window.
+        RunOne(seqQ: 1, seqKv: 400, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Bidirectional);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixCausal_CanvasBidirectional()
+    {
+        // prefixLen=3: query positions 0..2 stay causal (mask future keys),
+        // positions 3..7 are bidirectional (attend to the full 8-key range).
+        // Distinct from both pure-causal and pure-bidirectional outputs.
+        RunOne(seqQ: 8, seqKv: 8, numHeads: 2, numKvHeads: 1, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 3);
+    }
+
+    [SkippableFact]
+    public void Launch_Hybrid_PrefixLenZero_EqualsBidirectional()
+    {
+        // prefixLen=0 means no causal prefix → every query is a canvas query →
+        // identical to Bidirectional. Validates the boundary of the hybrid rule.
+        RunOne(seqQ: 4, seqKv: 4, numHeads: 2, numKvHeads: 2, headDim: 64, positionOffset: 0,
+            maskMode: AttentionMaskMode.Hybrid, prefixLen: 0);
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim, int positionOffset,
-        bool useAlibi = false, int slidingWindow = 0)
+        bool useAlibi = false, int slidingWindow = 0,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -105,17 +179,13 @@ public class VulkanAttentionF32KernelTests
         float[] expected = new float[seqQ * numHeads * headDim];
 
         int? sw = slidingWindow > 0 ? slidingWindow : null;
-        if (useAlibi)
-        {
-            Attention.ExecuteScalar(qh, kh, vh, expected,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-                AlibiPositionEncoding.CreateSlopes(numHeads), sw);
-        }
-        else
-        {
-            Attention.ExecuteScalar(qh, kh, vh, expected,
-                seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset, sw);
-        }
+        float scale = 1.0f / MathF.Sqrt(headDim);
+        ReadOnlySpan<float> slopes = useAlibi
+            ? AlibiPositionEncoding.CreateSlopes(numHeads)
+            : default;
+        Attention.ExecuteScalar(qh, kh, vh, expected,
+            seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
+            scale, slopes, sw, softCap: 0f, maskMode, prefixLen);
 
         // GPU path.
         using var device = VulkanDevice.Create();
@@ -132,7 +202,8 @@ public class VulkanAttentionF32KernelTests
 
         kernel.Launch(bufQ, bufK, bufV, bufOut,
             seqQ, seqKv, numHeads, numKvHeads, headDim, positionOffset,
-            slidingWindow: slidingWindow, useAlibi: useAlibi);
+            slidingWindow: slidingWindow, useAlibi: useAlibi,
+            maskMode: maskMode, prefixLen: prefixLen);
 
         float[] actual = new float[expected.Length];
         device.Download(bufOut, actual);

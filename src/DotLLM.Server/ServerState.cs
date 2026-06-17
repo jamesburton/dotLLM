@@ -64,6 +64,15 @@ public sealed class ServerState : IDisposable
     public TextGenerator? Generator { get; set; }
 
     /// <summary>
+    /// Masked text-diffusion generator wired to the current model. Non-null
+    /// <b>only</b> when the loaded model is a diffusion model
+    /// (<see cref="ModelConfig.DiffusionConfig"/> is non-null). When set, chat
+    /// completions route through this generator instead of <see cref="Generator"/>;
+    /// the autoregressive path (this being null) is unchanged.
+    /// </summary>
+    public DiffusionTextGenerator? DiffusionGenerator { get; set; }
+
+    /// <summary>
     /// Async continuous-batch scheduler. When non-null, endpoint handlers route concurrent
     /// requests through <see cref="ContinuousBatchSchedulerService.EnqueueAsync"/> instead of
     /// serialising through <see cref="ExecuteAsync"/>. Falls back to the direct-generator path

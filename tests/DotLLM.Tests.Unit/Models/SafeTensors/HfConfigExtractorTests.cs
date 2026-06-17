@@ -674,6 +674,10 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(256f, cfg.QueryPreAttnScalar);
         Assert.True(cfg.TiedEmbeddings, "Gemma 3 default ties word embeddings.");
 
+        // Gemma scales input embeddings by sqrt(hidden_size).
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Equal(MathF.Sqrt(64), cfg.EmbeddingScale!.Value, precision: 5);
+
         // Per-layer attention pattern with sliding_window_pattern=3 on 6 layers:
         // (i+1) % 3 == 0 ⇒ full, else sliding.
         Assert.NotNull(cfg.PerLayerSlidingWindow);

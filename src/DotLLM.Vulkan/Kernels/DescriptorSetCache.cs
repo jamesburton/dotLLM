@@ -34,8 +34,17 @@ namespace DotLLM.Vulkan.Kernels;
 /// </remarks>
 internal sealed class DescriptorSetCache
 {
-    /// <summary>Fixed cache slot count. Must be &gt;= the expected number of distinct buffer tuples per forward.</summary>
-    internal const int Capacity = 256;
+    /// <summary>
+    /// Fixed cache slot count. MUST equal the pool's <see cref="KernelSupport.DefaultMaxSetsPerPool"/>
+    /// so the cache can hold every set the pool can allocate. Previously 256 while the pool held
+    /// 1024 — a model with &gt;256 distinct buffer tuples for one kernel (e.g. gemma4-26B: 30 layers ×
+    /// many projections) overflowed the cache MID-COMMAND-BUFFER, triggering <see cref="Reset"/>
+    /// (vkResetDescriptorPool) which freed descriptor sets still referenced by already-recorded
+    /// dispatches — silent cross-layer corruption that a pipeline barrier could not fix (only a full
+    /// submit between layers, which drains the queue). Keeping the two equal makes overflow unreachable
+    /// until a model genuinely needs more sets than the pool holds, at which point GetOrCreate fails loudly.
+    /// </summary>
+    internal const int Capacity = (int)KernelSupport.DefaultMaxSetsPerPool;
 
     /// <summary>Hard upper bound on buffers per descriptor set — matches the widest kernel (mamba3 canonical SSD MIMO scan, 13 bindings: state, v, qRoped, kRoped, qkPreDotSum, scale, gamma, adt, d, z, mimoZ, mimoO, y).</summary>
     private const int MaxBuffersPerSet = 13;
@@ -84,12 +93,18 @@ internal sealed class DescriptorSetCache
                 return _sets[i];
         }
 
-        // Miss — allocate + write + insert.
+        // Miss — allocate + write + insert. Overflow is NOT recoverable mid-pass:
+        // resetting the pool here would free sets still referenced by dispatches
+        // already recorded in the open command buffer (silent corruption). Since
+        // Capacity == the pool's maxSets, reaching here means the model needs more
+        // concurrent descriptor sets than the pool holds — fail loudly so the pool
+        // size can be raised, rather than corrupting the forward.
         if (_count >= Capacity)
         {
-            // Cache full. Reset the entire pool and drop all entries.
-            // The caller's kernel code is then free to allocate fresh.
-            Reset();
+            throw new InvalidOperationException(
+                $"DescriptorSetCache overflow: more than Capacity={Capacity} distinct buffer tuples " +
+                $"(buffersPerSet={_buffersPerSet}) for one kernel in a single forward. Increase " +
+                $"{nameof(KernelSupport)}.{nameof(KernelSupport.DefaultMaxSetsPerPool)} (and this Capacity, kept equal to it).");
         }
 
         nint set = KernelSupport.AllocateDescriptorSet(_device, _pool, _setLayout);

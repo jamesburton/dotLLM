@@ -109,15 +109,46 @@ internal static class TransformerWeightsSafetensorsLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
+        bool isGemma = config.IsGemmaArchitecture;
 
         // Pre-attention RMSNorm + all attention projections (Llama-style GQA
         // or Phi-3 fused-QKV, auto-selected by tensor presence; optional
-        // Qwen2 biases; optional Qwen3 QK-norms).
+        // Qwen2 biases; optional Qwen3 / Gemma QK-norms).
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
         var attn = AttentionTensorLoader.Load(AttentionVariant.Gqa, file, config, layerIdx, owned);
 
-        // Post-attention (pre-FFN) RMSNorm
-        float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+        // Per-layer norm weights:
+        //  - Standard (Llama/…): `post_attention_layernorm` is the PRE-FFN norm
+        //    and there is no post-attn / post-ffn sublayer norm (two-norm layout).
+        //  - Gemma (four-norm layout): `post_attention_layernorm` runs on the
+        //    attention sublayer output before the residual add, `pre_feedforward_layernorm`
+        //    is the pre-FFN norm, and `post_feedforward_layernorm` runs on the FFN
+        //    sublayer output before its residual add. Gemma also stores every RMSNorm
+        //    weight as an offset from 1.0, absorbed here by adding 1.0 at load.
+        float[] ffnNorm;
+        float[]? postAttnNorm = null;
+        float[]? postFfnNorm = null;
+        if (isGemma)
+        {
+            postAttnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+            ffnNorm = ResolveNorm(file, $"{prefix}.pre_feedforward_layernorm.weight", hiddenSize);
+            postFfnNorm = ResolveNorm(file, $"{prefix}.post_feedforward_layernorm.weight", hiddenSize);
+
+            // (1 + w) RMSNorm absorption — applied to EVERY Gemma RMSNorm weight
+            // (input, post-attn, pre-ffn, post-ffn, and the per-head Q/K norms)
+            // so the existing RMSNorm kernel runs unchanged.
+            GemmaAbsorbOnePlusWeight(attnNorm);
+            GemmaAbsorbOnePlusWeight(postAttnNorm);
+            GemmaAbsorbOnePlusWeight(ffnNorm);
+            GemmaAbsorbOnePlusWeight(postFfnNorm);
+            GemmaAbsorbOnePlusWeight(attn.QNormWeight);
+            GemmaAbsorbOnePlusWeight(attn.KNormWeight);
+        }
+        else
+        {
+            // Post-attention (pre-FFN) RMSNorm — standard two-norm layout.
+            ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+        }
 
         // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
         // Qwen-MoE-convention MoE (possibly interleaved with dense layers via
@@ -134,6 +165,14 @@ internal static class TransformerWeightsSafetensorsLoader
                 // standard Llama-style mlp.{gate,up,down}_proj names — fall
                 // through to the dense path below.
                 DotLLM.Core.Configuration.Architecture.QwenMoe => config.Moe.IsMoeLayer(layerIdx),
+                // Gemma 4 MoE: every layer is MoE (no dense/MoE interleaving in
+                // the DiffusionGemma text tower). Uses the Qwen-MoE tensor names
+                // (mlp.gate + mlp.experts.{j}.{gate,up,down}_proj).
+                DotLLM.Core.Configuration.Architecture.Gemma4 => config.Moe.IsMoeLayer(layerIdx),
+                // DiffusionGemma: identical Gemma-4 MoE text tower (same Qwen-MoE
+                // expert tensor names); the diffusion decode seam is independent of
+                // weight loading.
+                DotLLM.Core.Configuration.Architecture.DiffusionGemma => config.Moe.IsMoeLayer(layerIdx),
                 _ => true,
             };
 
@@ -142,6 +181,8 @@ internal static class TransformerWeightsSafetensorsLoader
                 moe = config.Architecture switch
                 {
                     DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.Gemma4 => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.DiffusionGemma => LoadQwenMoeLayer(layerIdx, file, config, owned),
                     DotLLM.Core.Configuration.Architecture.GraniteMoe => LoadGraniteMoeLayer(layerIdx, file, config, owned),
                     _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
                 };
@@ -158,7 +199,9 @@ internal static class TransformerWeightsSafetensorsLoader
                     attn.QBias, attn.KBias, attn.VBias, attn.OBias,
                     gateBias: null, upBias: null, downBias: null,
                     qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
-                    moe: moe);
+                    moe: moe,
+                    mla: null,
+                    postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm);
             }
             // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
             // the Llama-style dense SwiGLU resolution below.
@@ -207,7 +250,23 @@ internal static class TransformerWeightsSafetensorsLoader
             downPtr, downQt, downM, downK,
             attn.QBias, attn.KBias, attn.VBias, attn.OBias,
             gateBias: null, upBias: null, downBias: null,
-            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight);
+            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
+            moe: null,
+            mla: null,
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm);
+    }
+
+    /// <summary>
+    /// Applies Gemma's <c>(1 + w)</c> RMSNorm-weight convention in place: adds
+    /// 1.0 to every element so the standard RMSNorm kernel (which multiplies by
+    /// <c>w</c>) reproduces Gemma's <c>(1 + w)</c> scaling without a special-case
+    /// kernel. No-op when <paramref name="weights"/> is null (absent QK-norm).
+    /// </summary>
+    private static void GemmaAbsorbOnePlusWeight(float[]? weights)
+    {
+        if (weights is null) return;
+        for (int i = 0; i < weights.Length; i++)
+            weights[i] += 1.0f;
     }
 
     /// <summary>

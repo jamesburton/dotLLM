@@ -249,6 +249,12 @@ public static class HfConfigExtractor
             AttnLogitSoftcap = attnLogitSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             QueryPreAttnScalar = queryPreAttnScalar,
+            // Gemma scales input embeddings by sqrt(hidden_size) (HF
+            // Gemma3TextScaledWordEmbedding). Null for every other architecture
+            // so the forward-path multiply is a no-op there.
+            EmbeddingScale = architecture == Architecture.Gemma3
+                ? MathF.Sqrt(hiddenSize)
+                : null,
             MlaConfig = mla,
             Moe = moe,
             ChatTemplate = null,
@@ -643,6 +649,15 @@ public static class HfConfigExtractor
             (var a, _) when a is not null
                 && (a.Contains("gemma3") || a.Contains("gemma_3")) => Architecture.Gemma3,
             (_, "gemma3" or "gemma3_text" or "gemma_3" or "gemma_3_text") => Architecture.Gemma3,
+            // Gemma 4 — the text tower behind DiffusionGemma. Same backbone
+            // shape as Gemma 3 (handled by the same transformer path) plus a
+            // sparse MoE FFN, per-attention-type RoPE, and dual KV-head counts.
+            // Checked before the generic "gemma" fall-through. (The diffusion
+            // wrapper model_type=diffusion_gemma is intercepted earlier in
+            // ModelLoader and routed to issue #29.)
+            (var a, _) when a is not null
+                && (a.Contains("gemma4") || a.Contains("gemma_4")) => Architecture.Gemma4,
+            (_, "gemma4" or "gemma4_text" or "gemma_4" or "gemma_4_text") => Architecture.Gemma4,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,
@@ -667,6 +682,7 @@ public static class HfConfigExtractor
     {
         Architecture.Phi => true,
         Architecture.Gemma3 => true,
+        Architecture.Gemma4 => true,
         _ => false,
     };
 

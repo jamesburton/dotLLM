@@ -42,6 +42,7 @@ internal sealed class VulkanForwardState : IDisposable
     // prefill Q8_1 activation scratch. Computed once at construction. Zero when
     // mmvq is disabled.
     private readonly int _q8_1MaxK;
+    private readonly bool _gemma4DualFfn;
     private int _capacitySeqLen;
 
     // ── Transformer layer scratch (all FP32) ──────────────────────────
@@ -118,6 +119,14 @@ internal sealed class VulkanForwardState : IDisposable
     public VulkanDevice.Buffer? MoeGroupedHidden { get; private set; }  // [seqLen * topK, hidden]
     public VulkanDevice.Buffer? MoeGroupedGateInter { get; private set; } // [seqLen * topK, intermediate]
     public VulkanDevice.Buffer? MoeGroupedUpInter { get; private set; } // [seqLen * topK, intermediate]
+
+    // ── Gemma-4 dual-FFN scratch ──────────────────────────────────────
+    // Allocated only for Gemma-4 (gemma4DualFfn). The dense ("shared") FFN
+    // and the routed MoE both read attn_out (HiddenState) and produce a
+    // [seqLen, hidden] result; these hold each branch's post-norm output
+    // while the other branch computes, then they are summed into NormOutput.
+    public VulkanDevice.Buffer? Gemma4DenseResult { get; private set; }  // [seqLen, hidden]
+    public VulkanDevice.Buffer? Gemma4MoeResult { get; private set; }    // [seqLen, hidden]
 
     // ── MoE shared-expert scratch (DeepSeek-V2/V3) ────────────────────
     // Allocated only when the model carries an MoE layer with shared
@@ -206,10 +215,12 @@ internal sealed class VulkanForwardState : IDisposable
         int mlaVHeadDim = 0, int mlaQLoraRank = 0, int mlaKvLoraRank = 0,
         int moeNumExperts = 0, int moeTopK = 0, int moeIntermediateSize = 0,
         int moeSharedIntermediateSize = 0, int moeNumSharedExperts = 0,
-        bool mmvqEnabled = false)
+        bool mmvqEnabled = false,
+        bool gemma4DualFfn = false)
     {
         _device = device;
         _mmvqEnabled = mmvqEnabled;
+        _gemma4DualFfn = gemma4DualFfn;
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
         _numKvHeads = numKvHeads;
@@ -360,6 +371,14 @@ internal sealed class VulkanForwardState : IDisposable
         long mlaBytes = AllocateMlaScratch(seqLen);
         long moeBytes = AllocateMoeScratch(seqLen);
 
+        long gemma4Bytes = 0;
+        if (_gemma4DualFfn)
+        {
+            Gemma4DenseResult = _device.AllocateDeviceLocal(hiddenBytes);
+            Gemma4MoeResult = _device.AllocateDeviceLocal(hiddenBytes);
+            gemma4Bytes = hiddenBytes * 2;
+        }
+
         // Resize positions buffer — host writes positions per forward.
         PositionsBuffer.Dispose();
         PositionsBuffer = _device.Allocate((long)seqLen * sizeof(int));
@@ -380,7 +399,7 @@ internal sealed class VulkanForwardState : IDisposable
 
         // hiddenBytes × 3: two hidden slots (HiddenState/AddScratch rotate) + NormOutput.
         AllocatedBytes = hiddenBytes * 3 + qBytes * 2 + kvBytes * 2 + ffnBytes * 3
-                       + mlaBytes + moeBytes + mmqRowsBytes
+                       + mlaBytes + moeBytes + mmqRowsBytes + gemma4Bytes
                        + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int);
     }
 
@@ -519,6 +538,9 @@ internal sealed class VulkanForwardState : IDisposable
         MoeGroupedHidden?.Dispose(); MoeGroupedHidden = null;
         MoeGroupedGateInter?.Dispose(); MoeGroupedGateInter = null;
         MoeGroupedUpInter?.Dispose(); MoeGroupedUpInter = null;
+
+        Gemma4DenseResult?.Dispose(); Gemma4DenseResult = null;
+        Gemma4MoeResult?.Dispose(); Gemma4MoeResult = null;
 
         MoeSharedInput?.Dispose(); MoeSharedInput = null;
         MoeSharedGate?.Dispose(); MoeSharedGate = null;

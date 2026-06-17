@@ -141,9 +141,19 @@ internal static class AttentionTensorLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int headDim = config.HeadDim;
+        // Per-attention-type head dim (Gemma 4): full-attention layers may use a
+        // distinct GlobalHeadDim. Collapses to config.HeadDim for every other
+        // architecture, so the projection-shape validations below are unchanged.
+        int headDim = config.GetLayerHeadDim(layerIdx);
         int qOut = config.NumAttentionHeads * headDim;
-        int kvOut = config.NumKvHeads * headDim;
+        // Per-attention-type KV-head count (Gemma 4): full-attention layers use
+        // NumGlobalKvHeads, sliding layers use NumKvHeads — so each layer's K/V
+        // projection has a different output dim. Collapses to NumKvHeads for
+        // every other architecture (NumGlobalKvHeads null).
+        int layerKvHeads = config.NumGlobalKvHeads is int g && config.IsFullAttentionLayer(layerIdx)
+            ? g
+            : config.NumKvHeads;
+        int kvOut = layerKvHeads * headDim;
 
         // Q / K / V projections. Phi-3 convention fuses QKV into a single
         // `self_attn.qkv_proj.weight` of shape [qOut + 2*kvOut, hidden]

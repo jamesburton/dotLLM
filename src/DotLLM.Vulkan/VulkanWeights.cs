@@ -224,6 +224,67 @@ internal sealed class VulkanWeights : IDisposable
         }
     }
 
+    /// <summary>
+    /// Per-layer Gemma-4 MoE extras: the dual-parallel-FFN norms, custom-router
+    /// channel scale, per-layer output scale, and the V-from-K flag. Mirrors the
+    /// CPU <c>Gemma4LayerWeights</c>. Non-null only on Gemma-4 (<c>gemma4</c> /
+    /// DiffusionGemma) layers; null on every other architecture, where the
+    /// standard dense/MoE FFN graph runs. The dense FFN (Gate/Up/Down on
+    /// <see cref="LayerBuffers"/>) and the routed experts (<see cref="LayerBuffers.Moe"/>)
+    /// both run in parallel on a Gemma-4 layer — neither stubs the other.
+    /// </summary>
+    internal readonly struct Gemma4LayerBuffers
+    {
+        /// <summary>MoE branch pre-norm <c>pre_ffw_norm_2</c> [hidden] — RMSNorm'd attn_out fed to the experts.</summary>
+        public readonly VulkanDevice.Buffer PreFfwNorm2;
+        /// <summary>Dense branch post-norm <c>post_ffw_norm_1</c> [hidden] — applied to the dense MLP output.</summary>
+        public readonly VulkanDevice.Buffer PostFfwNorm1;
+        /// <summary>MoE branch post-norm <c>post_ffw_norm_2</c> [hidden] — applied to the MoE output.</summary>
+        public readonly VulkanDevice.Buffer PostFfwNorm2;
+        /// <summary>Combined post-norm <c>post_ffw_norm</c> [hidden] — wraps (dense + MoE) before the residual add.</summary>
+        public readonly VulkanDevice.Buffer PostFfwNorm;
+        /// <summary>Custom-router channel scale <c>ffn_gate_inp.scale</c> [hidden] — multiplies the scaled-RMS router input.</summary>
+        public readonly VulkanDevice.Buffer RouterScale;
+        /// <summary>Per-layer output scale <c>layer_output_scale</c> — single scalar applied as the LAST per-layer op.</summary>
+        public readonly float LayerOutputScale;
+        /// <summary>True on a V-less (global/full-attention) layer where V branches off the RAW K projection — the forward copies K→V and the V projection slot is unused.</summary>
+        public readonly bool VFromK;
+        /// <summary>
+        /// Per-expert down-projection scale <c>ffn_down_exps.scale</c> [numExperts] as an
+        /// F32 device buffer. Non-null ONLY on the QUANTIZED expert path, where the down
+        /// (Q5_1) indexed-matmul shader folds the scale into its output (op #14). On the
+        /// F32 host-dequant path the scale is pre-folded into the W2 weight at upload, so
+        /// this is null and the weighted-scatter carries no per-expert scale.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? DownExpertScale;
+
+        public Gemma4LayerBuffers(
+            VulkanDevice.Buffer preFfwNorm2, VulkanDevice.Buffer postFfwNorm1,
+            VulkanDevice.Buffer postFfwNorm2, VulkanDevice.Buffer postFfwNorm,
+            VulkanDevice.Buffer routerScale, float layerOutputScale, bool vFromK,
+            VulkanDevice.Buffer? downExpertScale = null)
+        {
+            PreFfwNorm2 = preFfwNorm2;
+            PostFfwNorm1 = postFfwNorm1;
+            PostFfwNorm2 = postFfwNorm2;
+            PostFfwNorm = postFfwNorm;
+            RouterScale = routerScale;
+            LayerOutputScale = layerOutputScale;
+            VFromK = vFromK;
+            DownExpertScale = downExpertScale;
+        }
+
+        public void Dispose()
+        {
+            PreFfwNorm2.Dispose();
+            PostFfwNorm1.Dispose();
+            PostFfwNorm2.Dispose();
+            PostFfwNorm.Dispose();
+            RouterScale.Dispose();
+            DownExpertScale?.Dispose();
+        }
+    }
+
     internal readonly struct LayerBuffers
     {
         public readonly VulkanDevice.Buffer AttnNormWeight;
@@ -247,6 +308,27 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? QBias, KBias, VBias, OBias;
 
         /// <summary>
+        /// Per-head Q/K RMSNorm weights [headDim] (Gemma-4, Qwen3). Applied per
+        /// head as <c>rmsnorm(rowCount = seqLen*numHeads, n = headDim)</c> before
+        /// RoPE. Null when the architecture has no QK-norm.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? QNormWeight, KNormWeight;
+
+        /// <summary>
+        /// Gemma four-norm layout: optional post-attention RMSNorm applied to
+        /// the attention sublayer output BEFORE the residual add. Null on
+        /// non-Gemma architectures (standard two-norm layout).
+        /// </summary>
+        public readonly VulkanDevice.Buffer? PostAttnNormWeight;
+
+        /// <summary>
+        /// Gemma four-norm layout: optional post-FFN RMSNorm applied to the
+        /// FFN sublayer output BEFORE the residual add. Null on non-Gemma
+        /// architectures.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? PostFfnNormWeight;
+
+        /// <summary>
         /// Non-null when the layer uses MLA attention (DeepSeek-V2/V3).
         /// Forward routes through <c>RecordMlaLayer</c> and the Q/K/V slots
         /// above are unused (zero buffers).
@@ -259,6 +341,15 @@ internal sealed class VulkanWeights : IDisposable
         /// dense Gate/Up/Down slots above are unused (zero buffers).
         /// </summary>
         public readonly MoeLayerBuffers? Moe;
+
+        /// <summary>
+        /// Non-null when the layer is a Gemma-4 MoE dual-FFN layer. Carries the
+        /// extra FFN norms, custom-router scale, layer-output scale and V-from-K
+        /// flag (see <see cref="Gemma4LayerBuffers"/>). On a Gemma-4 layer BOTH
+        /// the dense Gate/Up/Down slots AND <see cref="Moe"/> are populated and
+        /// run in parallel — the forward routes through <c>RecordGemma4Layer</c>.
+        /// </summary>
+        public readonly Gemma4LayerBuffers? Gemma4;
 
         public readonly VulkanDevice.Buffer FfnNormWeight;
 
@@ -286,10 +377,19 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer up, QuantizationType upQt, int upM, int upK,
             VulkanDevice.Buffer down, QuantizationType downQt, int downM, int downK,
             VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias,
+            VulkanDevice.Buffer? postAttnNorm = null,
+            VulkanDevice.Buffer? postFfnNorm = null,
             MlaLayerBuffers? mla = null,
-            MoeLayerBuffers? moe = null)
+            MoeLayerBuffers? moe = null,
+            Gemma4LayerBuffers? gemma4 = null,
+            VulkanDevice.Buffer? qNorm = null,
+            VulkanDevice.Buffer? kNorm = null)
         {
             AttnNormWeight = attnNorm;
+            QNormWeight = qNorm;
+            KNormWeight = kNorm;
+            PostAttnNormWeight = postAttnNorm;
+            PostFfnNormWeight = postFfnNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
             K = k; KDeviceQuantType = kQt; KOutputDim = kM; KInputDim = kK;
             V = v; VDeviceQuantType = vQt; VOutputDim = vM; VInputDim = vK;
@@ -302,6 +402,7 @@ internal sealed class VulkanWeights : IDisposable
             GateBias = gateBias; UpBias = upBias; DownBias = downBias;
             Mla = mla;
             Moe = moe;
+            Gemma4 = gemma4;
         }
 
         public void Dispose()
@@ -309,11 +410,15 @@ internal sealed class VulkanWeights : IDisposable
             AttnNormWeight.Dispose();
             Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
             QBias?.Dispose(); KBias?.Dispose(); VBias?.Dispose(); OBias?.Dispose();
+            QNormWeight?.Dispose(); KNormWeight?.Dispose();
+            PostAttnNormWeight?.Dispose();
+            PostFfnNormWeight?.Dispose();
             FfnNormWeight.Dispose();
             Gate.Dispose(); Up.Dispose(); Down.Dispose();
             GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
             Mla?.Dispose();
             Moe?.Dispose();
+            Gemma4?.Dispose();
         }
     }
 
@@ -406,8 +511,29 @@ internal sealed class VulkanWeights : IDisposable
         {
             ref readonly var lw = ref weights.Layers[i];
 
+            // Gemma-4 MoE dual-FFN layer: both the dense Gate/Up/Down AND the
+            // routed experts run in parallel, V branches off the raw K projection
+            // on V-less (global) layers, and four extra FFN norms + a per-layer
+            // output scale apply. Detected by the loader-resolved Gemma4 extras.
+            bool isGemma4 = lw.Gemma4 is not null;
+            bool vFromK = lw.Gemma4?.VFromK ?? false;
+
             var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
+
+            // Per-head Q/K RMSNorm weights [headDim] (Gemma-4, Qwen3). Null when
+            // the architecture has no QK-norm (UploadOptionalVec returns null).
+            var qNorm = UploadOptionalVec(device, staging, lw.QNormWeight);
+            var kNorm = UploadOptionalVec(device, staging, lw.KNormWeight);
+            if (lw.QNormWeight is not null) totalBytes += (long)lw.QNormWeight.Length * sizeof(float);
+            if (lw.KNormWeight is not null) totalBytes += (long)lw.KNormWeight.Length * sizeof(float);
+
+            // Gemma four-norm layout: optional post-attention RMSNorm weight
+            // applied to the attention output before the residual add. Null on
+            // non-Gemma architectures (UploadOptionalVec returns null).
+            var postAttnNorm = UploadOptionalVec(device, staging, lw.PostAttnNormWeight);
+            if (lw.PostAttnNormWeight is not null)
+                totalBytes += (long)lw.PostAttnNormWeight.Length * sizeof(float);
 
             // MLA layers carry their projections in lw.Mla; the standard
             // Q/K/V slots are zeroed by the loader. Replace each with a
@@ -432,8 +558,19 @@ internal sealed class VulkanWeights : IDisposable
                     dequantToFp32, out qDeviceQt, out qBytes);
                 k = UploadMatrix(device, staging, lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim,
                     dequantToFp32, out kDeviceQt, out kBytes);
-                v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
-                    dequantToFp32, out vDeviceQt, out vBytes);
+                if (vFromK)
+                {
+                    // V-less global layer: no attn_v weight; the forward copies
+                    // the raw K projection into V. Stub the slot (never matmul'd).
+                    v = device.AllocateDeviceLocal(64);
+                    vDeviceQt = QuantizationType.F32;
+                    vBytes = 0;
+                }
+                else
+                {
+                    v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
+                        dequantToFp32, out vDeviceQt, out vBytes);
+                }
                 qBias = UploadOptionalVec(device, staging, lw.QBias);
                 kBias = UploadOptionalVec(device, staging, lw.KBias);
                 vBias = UploadOptionalVec(device, staging, lw.VBias);
@@ -452,6 +589,15 @@ internal sealed class VulkanWeights : IDisposable
             var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
             totalBytes += (long)lw.FfnNormWeight.Length * sizeof(float);
 
+            // Gemma four-norm layout: optional post-FFN RMSNorm weight applied
+            // to the FFN output before the residual add. Null on non-Gemma.
+            // For Gemma-4 this is forced null — the combined post_ffw_norm is
+            // applied INSIDE RecordGemma4Ffn (g4.PostFfwNorm), so the shared
+            // residual-#2 post-FFN norm must NOT also fire (double-norm).
+            var postFfnNorm = isGemma4 ? null : UploadOptionalVec(device, staging, lw.PostFfnNormWeight);
+            if (!isGemma4 && lw.PostFfnNormWeight is not null)
+                totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
+
             // MoE layers replace the dense Gate/Up/Down with per-expert
             // banks (lw.Moe). Stub the dense slots with 64-byte buffers so
             // the LayerBuffers contract still holds — the forward pass
@@ -460,7 +606,7 @@ internal sealed class VulkanWeights : IDisposable
             QuantizationType gateDeviceQt, upDeviceQt, downDeviceQt;
             long gateBytes, upBytes, downBytes;
             VulkanDevice.Buffer? gateBias, upBias, downBias;
-            if (lw.Moe is not null)
+            if (lw.Moe is not null && !isGemma4)
             {
                 gate = device.AllocateDeviceLocal(64);
                 up = device.AllocateDeviceLocal(64);
@@ -483,10 +629,57 @@ internal sealed class VulkanWeights : IDisposable
             }
 
             MoeLayerBuffers? moe = null;
+            Gemma4LayerBuffers? gemma4 = null;
             if (lw.Moe is not null)
             {
-                moe = UploadMoeLayer(device, lw.Moe, out long moeBytes);
-                totalBytes += moeBytes;
+                if (isGemma4)
+                {
+                    // Gemma-4 experts. PREFERRED: keep the fused gate_up (Q4_K) and
+                    // down (Q5_1) banks QUANTIZED on device — repacked into contiguous
+                    // gate/up/down banks the Q4_K / Q5_1 indexed-MoE matmul shaders
+                    // dequant per-row (memory-viable for the real 26B, whose F32
+                    // experts are tens of GB). FALLBACK: host-dequant to F32 banks
+                    // (the existing path) when the quant mix is unsupported.
+                    VulkanDevice.Buffer? downScaleBuf = null;
+                    if (Gemma4ExpertsKeepQuantized(lw.Moe))
+                    {
+                        moe = UploadGemma4MoeLayerQuantized(device, lw.Moe, lw.Gemma4!,
+                            out var dsBuf, out long moeBytes);
+                        downScaleBuf = dsBuf;
+                        totalBytes += moeBytes;
+                    }
+                    else
+                    {
+                        moe = UploadGemma4MoeLayer(device, lw.Moe, lw.Gemma4!, out long moeBytes);
+                        totalBytes += moeBytes;
+                    }
+
+                    var g4 = lw.Gemma4!;
+                    // Pre-fold 1/sqrt(hidden) into the router channel scale so the
+                    // custom-router input is a plain rmsnorm(attn_out, RouterScale·invSqrtH)
+                    // dispatch on device (CPU does rms·(1/√H)·ffn_gate_inp_s).
+                    float invSqrtH = 1.0f / MathF.Sqrt(weights.HiddenSize);
+                    float[] routerScaleScaled = new float[g4.RouterScale.Length];
+                    for (int j = 0; j < routerScaleScaled.Length; j++)
+                        routerScaleScaled[j] = g4.RouterScale[j] * invSqrtH;
+
+                    gemma4 = new Gemma4LayerBuffers(
+                        UploadNormVec(device, staging, g4.PreFfwNorm2),
+                        UploadNormVec(device, staging, g4.PostFfwNorm1),
+                        UploadNormVec(device, staging, g4.PostFfwNorm2),
+                        UploadNormVec(device, staging, g4.PostFfwNorm),
+                        UploadNormVec(device, staging, routerScaleScaled),
+                        g4.LayerOutputScale,
+                        g4.VFromK,
+                        downScaleBuf);
+                    totalBytes += (long)(g4.PreFfwNorm2.Length + g4.PostFfwNorm1.Length
+                        + g4.PostFfwNorm2.Length + g4.PostFfwNorm.Length + g4.RouterScale.Length) * sizeof(float);
+                }
+                else
+                {
+                    moe = UploadMoeLayer(device, lw.Moe, out long moeBytes);
+                    totalBytes += moeBytes;
+                }
             }
 
             layerBuffers[i] = new LayerBuffers(
@@ -501,7 +694,9 @@ internal sealed class VulkanWeights : IDisposable
                 up, upDeviceQt, lw.UpOutputDim, lw.UpInputDim,
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
                 gateBias, upBias, downBias,
-                mla, moe);
+                postAttnNorm, postFfnNorm,
+                mla, moe, gemma4,
+                qNorm, kNorm);
 
             totalBytes += qBytes + kBytes + vBytes + oBytes
                 + gateBytes + upBytes + downBytes;
@@ -1234,6 +1429,221 @@ internal sealed class VulkanWeights : IDisposable
             numSharedExperts: hasShared ? numShared : 0,
             sharedExpertGate: sharedExpertGate,
             sharedExpertGateDeviceQt: sharedExpertGateDeviceQt);
+    }
+
+    /// <summary>
+    /// Uploads a Gemma-4 MoE layer's experts by HOST-dequantising the fused
+    /// <c>gate_up</c> bank (Q4_K) into two F32 banks (gate → W1, up → W3) and the
+    /// <c>down</c> bank (Q5_1) into an F32 W2 bank PRE-SCALED per expert by
+    /// <c>ffn_down_exps.scale[e]</c> (folds Gemma-4 op #14 into the weight, so the
+    /// downstream weighted-scatter need not carry the per-expert scale). The
+    /// router gate stays F32. Result is a standard F32 <see cref="MoeLayerBuffers"/>
+    /// the existing <c>moe_indexed_matmul_f32</c> kernel runs unchanged.
+    ///
+    /// <para>The fused tensor stores, per expert, a <c>[2*Ie, hidden]</c> slab:
+    /// rows <c>[0, Ie)</c> = gate, rows <c>[Ie, 2*Ie)</c> = up, with a per-expert
+    /// stride of <see cref="Gemma4LayerWeights.GateUpExpsRowBytes"/>. The CPU loader
+    /// pre-offsets <see cref="MoeLayerWeights.UpExpsRaw"/> to the up rows, so gate
+    /// and up share the same per-expert stride from their respective bases.</para>
+    ///
+    /// <para><b>Memory:</b> F32 dequant-on-load is the correctness / synthetic-fixture
+    /// path. The real 26B (128 experts × Ie × hidden F32 per layer) is impractical
+    /// this way — that is what the deferred Q4_K + Q5_1 indexed-MoE matmul shaders
+    /// (keep experts quantized on device) are for.</para>
+    /// </summary>
+    private static unsafe MoeLayerBuffers UploadGemma4MoeLayer(
+        VulkanDevice device, MoeLayerWeights moe, Gemma4LayerWeights g4, out long uploadedBytes)
+    {
+        uploadedBytes = 0;
+        int hidden = moe.HiddenSize;
+        int interm = moe.IntermediateSize;
+        int numE = moe.NumExperts;
+
+        long perGateUpElems = (long)interm * hidden;   // W1 (gate) / W3 (up) per expert
+        long perDownElems = (long)hidden * interm;     // W2 (down) per expert
+        long perGateUpBytes = perGateUpElems * sizeof(float);
+        long perDownBytes = perDownElems * sizeof(float);
+        long gateRouterBytes = (long)numE * hidden * sizeof(float);
+
+        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownBytes));
+        using var stage = device.Allocate(stageBytes);
+
+        // ── Router gate (F32 [numExperts, hidden]) ───────────────────
+        var gate = device.AllocateDeviceLocal(gateRouterBytes);
+        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateRouterBytes, 0, out nint gateMapped)
+            .ThrowOnError("vkMapMemory UploadGemma4MoeLayer gate");
+        try
+        {
+            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
+        }
+        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
+        device.CopyBufferSynchronous(stage, gate, (ulong)gateRouterBytes);
+        uploadedBytes += gateRouterBytes;
+
+        // ── Expert banks (F32), one expert slice at a time ───────────
+        var w1Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // gate
+        var w3Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // up
+        var w2Bank = device.AllocateDeviceLocal(perDownBytes * numE);     // down (pre-scaled)
+
+        for (int e = 0; e < numE; e++)
+        {
+            nint gateSrc = moe.GateExpsRaw + (nint)(e * g4.GateUpExpsRowBytes);
+            nint upSrc = moe.UpExpsRaw + (nint)(e * g4.GateUpExpsRowBytes);
+            nint downSrc = moe.DownExpsRaw + (nint)(e * g4.DownExpsRowBytes);
+
+            DequantAndUploadSlot(device, stage, gateSrc, perGateUpElems, moe.GateExpsRawQt,
+                scale: 1.0f, w1Bank, (long)e * perGateUpBytes);
+            DequantAndUploadSlot(device, stage, upSrc, perGateUpElems, moe.UpExpsRawQt,
+                scale: 1.0f, w3Bank, (long)e * perGateUpBytes);
+            // Fold the per-expert down scale into the weight (op #14).
+            DequantAndUploadSlot(device, stage, downSrc, perDownElems, moe.DownExpsRawQt,
+                scale: g4.DownExpertScale[e], w2Bank, (long)e * perDownBytes);
+        }
+        uploadedBytes += (perGateUpBytes * 2 + perDownBytes) * numE;
+
+        return new MoeLayerBuffers(gate, QuantizationType.F32, w1Bank, w2Bank, w3Bank,
+            QuantizationType.F32, QuantizationType.F32, QuantizationType.F32,
+            moe.NumExperts, moe.NumExpertsPerTok,
+            moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
+            sharedW1: null, sharedW2: null, sharedW3: null,
+            QuantizationType.F32, QuantizationType.F32, QuantizationType.F32,
+            sharedIntermediateSize: 0, numSharedExperts: 0,
+            sharedExpertGate: null, sharedExpertGateDeviceQt: QuantizationType.F32);
+    }
+
+    /// <summary>
+    /// True when a Gemma-4 MoE layer's experts can stay QUANTIZED on device: the
+    /// fused <c>gate_up</c> raw bank is Q4_K (and the contraction axis <c>hidden</c>
+    /// is a multiple of 256) and the <c>down</c> raw bank is Q5_1 (and the expert FF
+    /// width is a multiple of 32). When false the caller falls back to the F32
+    /// host-dequant path (<see cref="UploadGemma4MoeLayer"/>).
+    /// </summary>
+    private static bool Gemma4ExpertsKeepQuantized(MoeLayerWeights moe)
+        => moe.GateExpsRaw != 0 && moe.UpExpsRaw != 0 && moe.DownExpsRaw != 0
+        && moe.GateExpsRawQt == QuantizationType.Q4_K
+        && moe.UpExpsRawQt == QuantizationType.Q4_K
+        && moe.DownExpsRawQt == QuantizationType.Q5_1
+        && (moe.HiddenSize % 256) == 0
+        && (moe.IntermediateSize % 32) == 0;
+
+    /// <summary>
+    /// Uploads a Gemma-4 MoE layer's experts KEPT QUANTIZED on device. The fused
+    /// <c>gate_up</c> Q4_K bank is REPACKED into two contiguous Q4_K banks — W1 (gate,
+    /// rows <c>[0, Ie)</c> of each expert slab) and W3 (up, rows <c>[Ie, 2*Ie)</c>) —
+    /// and the <c>down</c> Q5_1 bank is copied contiguously into W2. The per-expert
+    /// down scale <c>ffn_down_exps.scale[e]</c> is uploaded as an F32 [numExperts]
+    /// buffer and folded by the Q5_1 indexed-matmul shader (NOT pre-multiplied into
+    /// the weight, since the bank stays quantized). The router gate stays F32.
+    ///
+    /// <para>This is the memory-viable path for the real 26B: experts occupy their
+    /// GGUF-quantized footprint (~Q4_K + Q5_1) instead of being dequantised to F32
+    /// at load (tens of GB). The matching <c>moe_indexed_matmul_q4_k_f32</c> /
+    /// <c>moe_indexed_matmul_q5_1_f32</c> shaders dequant per-row in the inner loop.</para>
+    ///
+    /// <para>The fused tensor stores, per expert, a <c>[2*Ie, hidden]</c> Q4_K slab at
+    /// per-expert stride <see cref="Gemma4LayerWeights.GateUpExpsRowBytes"/>; gate is the
+    /// first <c>Ie</c> rows (<see cref="MoeLayerWeights.GateExpsRaw"/>), up the next
+    /// <c>Ie</c> rows (<see cref="MoeLayerWeights.UpExpsRaw"/>, pre-offset by the loader).
+    /// Each contiguous bank uses a per-expert stride of <c>Ie * rowBytes</c>.</para>
+    /// </summary>
+    private static unsafe MoeLayerBuffers UploadGemma4MoeLayerQuantized(
+        VulkanDevice device, MoeLayerWeights moe, Gemma4LayerWeights g4,
+        out VulkanDevice.Buffer downScaleBuffer, out long uploadedBytes)
+    {
+        uploadedBytes = 0;
+        int hidden = moe.HiddenSize;
+        int interm = moe.IntermediateSize;   // Ie
+        int numE = moe.NumExperts;
+
+        // Per-expert quantized slab byte sizes (one projection each):
+        //   gate/up: Ie rows of hidden Q4_K  → Ie * rowBytes(Q4_K, hidden)
+        //   down:    hidden rows of Ie Q5_1   → hidden * rowBytes(Q5_1, Ie)
+        long gateUpRowBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q4_K);
+        long perGateUpBytes = (long)interm * gateUpRowBytes;
+        long downRowBytes = Dequantize.RowByteSize(interm, QuantizationType.Q5_1);
+        long perDownBytes = (long)hidden * downRowBytes;
+        long gateRouterBytes = (long)numE * hidden * sizeof(float);
+
+        // The fused gate_up per-expert stride must equal 2 * gate (gate + up halves).
+        if (g4.GateUpExpsRowBytes != perGateUpBytes * 2)
+            throw new InvalidOperationException(
+                $"Gemma-4 fused gate_up stride mismatch: GateUpExpsRowBytes={g4.GateUpExpsRowBytes} "
+                + $"!= 2*{perGateUpBytes} (Ie={interm}, hidden={hidden}, rowBytes={gateUpRowBytes}).");
+        if (g4.DownExpsRowBytes != perDownBytes)
+            throw new InvalidOperationException(
+                $"Gemma-4 down stride mismatch: DownExpsRowBytes={g4.DownExpsRowBytes} != {perDownBytes} "
+                + $"(hidden={hidden}, Ie={interm}, rowBytes={downRowBytes}).");
+
+        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownBytes));
+        using var stage = device.Allocate(stageBytes);
+
+        // ── Router gate (F32 [numExperts, hidden]) ───────────────────
+        var gate = device.AllocateDeviceLocal(gateRouterBytes);
+        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateRouterBytes, 0, out nint gateMapped)
+            .ThrowOnError("vkMapMemory UploadGemma4MoeLayerQuantized gate");
+        try
+        {
+            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
+        }
+        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
+        device.CopyBufferSynchronous(stage, gate, (ulong)gateRouterBytes);
+        uploadedBytes += gateRouterBytes;
+
+        // ── Quantized expert banks (Q4_K gate/up, Q5_1 down) ─────────
+        var w1Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // gate Q4_K
+        var w3Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // up   Q4_K
+        var w2Bank = device.AllocateDeviceLocal(perDownBytes * numE);     // down Q5_1
+
+        for (int e = 0; e < numE; e++)
+        {
+            nint gateSrc = moe.GateExpsRaw + (nint)(e * g4.GateUpExpsRowBytes);
+            nint upSrc = moe.UpExpsRaw + (nint)(e * g4.GateUpExpsRowBytes);
+            nint downSrc = moe.DownExpsRaw + (nint)(e * g4.DownExpsRowBytes);
+
+            UploadRawBankSlot(device, stage, gateSrc, perGateUpBytes, w1Bank, (long)e * perGateUpBytes);
+            UploadRawBankSlot(device, stage, upSrc, perGateUpBytes, w3Bank, (long)e * perGateUpBytes);
+            UploadRawBankSlot(device, stage, downSrc, perDownBytes, w2Bank, (long)e * perDownBytes);
+        }
+        uploadedBytes += (perGateUpBytes * 2 + perDownBytes) * numE;
+
+        // ── Per-expert down scale (folded by the Q5_1 down shader, op #14) ──
+        downScaleBuffer = UploadNormVec(device, stage, g4.DownExpertScale);
+        uploadedBytes += (long)numE * sizeof(float);
+
+        return new MoeLayerBuffers(gate, QuantizationType.F32, w1Bank, w2Bank, w3Bank,
+            QuantizationType.Q4_K, QuantizationType.Q5_1, QuantizationType.Q4_K,
+            moe.NumExperts, moe.NumExpertsPerTok,
+            moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
+            sharedW1: null, sharedW2: null, sharedW3: null,
+            QuantizationType.F32, QuantizationType.F32, QuantizationType.F32,
+            sharedIntermediateSize: 0, numSharedExperts: 0,
+            sharedExpertGate: null, sharedExpertGateDeviceQt: QuantizationType.F32);
+    }
+
+    /// <summary>
+    /// Dequantises <paramref name="elems"/> contiguous elements at
+    /// <paramref name="src"/> (format <paramref name="qt"/>) to F32 directly into
+    /// the staging buffer, optionally multiplying every element by
+    /// <paramref name="scale"/>, then copies the slice into <paramref name="bank"/>
+    /// at <paramref name="dstOffsetBytes"/>. Used by the Gemma-4 F32 expert upload.
+    /// </summary>
+    private static unsafe void DequantAndUploadSlot(
+        VulkanDevice device, VulkanDevice.Buffer stage,
+        nint src, long elems, QuantizationType qt, float scale,
+        VulkanDevice.Buffer bank, long dstOffsetBytes)
+    {
+        long bytes = elems * sizeof(float);
+        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory VulkanWeights.DequantAndUploadSlot");
+        try
+        {
+            var dst = new Span<float>((void*)mapped, checked((int)elems));
+            Dequantize.ToFloat32(src, elems, qt, dst);
+            if (scale != 1.0f)
+                for (int i = 0; i < dst.Length; i++) dst[i] *= scale;
+        }
+        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
+        device.CopyBufferRangeSynchronous(stage, bank, srcOffset: 0, dstOffset: (ulong)dstOffsetBytes, size: (ulong)bytes);
     }
 
     /// <summary>True iff a Q8_0 MoE overlay can be kept on device as raw Q8_0 blocks —

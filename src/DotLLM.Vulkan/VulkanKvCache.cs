@@ -38,10 +38,12 @@ public sealed class VulkanKvCache : IKvCache
     private readonly VulkanDevice.Buffer[] _keys;
     private readonly VulkanDevice.Buffer[] _values;
     private readonly int _numLayers;
-    private readonly int _numKvHeads;
-    private readonly int _headDim;
     private readonly int _maxSeqLen;
-    private readonly int _kvStride;
+    // Per-layer row stride (numKvHeads × headDim, FP32 elements). Uniform across
+    // layers for every dense/GQA/MoE model; PER-LAYER for Gemma-4, whose sliding
+    // and global layers carry different KV-head counts AND head dims (e.g. sliding
+    // 8×256 vs global 2×512) — so each layer's cached K/V row is a different width.
+    private readonly int[] _kvStride;
     private int _currentLength;
     private bool _disposed;
 
@@ -51,31 +53,56 @@ public sealed class VulkanKvCache : IKvCache
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
 
-    /// <summary>Creates the per-layer K/V buffers. Memory is not zeroed — the forward pass only reads positions it has written.</summary>
+    /// <summary>
+    /// Creates the per-layer K/V buffers with a UNIFORM <c>numKvHeads × headDim</c>
+    /// row stride (every layer the same width — the dense / GQA / MoE case).
+    /// Memory is not zeroed — the forward pass only reads positions it has written.
+    /// </summary>
     public VulkanKvCache(VulkanDevice device, int numLayers, int numKvHeads, int headDim, int maxSeqLen)
+        : this(device, BuildUniformStrides(numLayers, numKvHeads, headDim), maxSeqLen)
+    {
+    }
+
+    /// <summary>
+    /// Creates the per-layer K/V buffers from an explicit PER-LAYER row stride
+    /// (FP32 elements per token position, i.e. <c>numKvHeads × headDim</c> for that
+    /// layer). Used by Gemma-4, whose sliding and global layers have different
+    /// KV-head counts and head dims, so each layer's cached row is a different width.
+    /// </summary>
+    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen)
     {
         ArgumentNullException.ThrowIfNull(device);
-        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
-        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
-        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        ArgumentNullException.ThrowIfNull(kvStridePerLayer);
+        if (kvStridePerLayer.Length == 0) throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
 
         _device = device;
-        _numLayers = numLayers;
-        _numKvHeads = numKvHeads;
-        _headDim = headDim;
+        _numLayers = kvStridePerLayer.Length;
         _maxSeqLen = maxSeqLen;
-        _kvStride = numKvHeads * headDim;
+        _kvStride = (int[])kvStridePerLayer.Clone();
 
-        _keys = new VulkanDevice.Buffer[numLayers];
-        _values = new VulkanDevice.Buffer[numLayers];
+        _keys = new VulkanDevice.Buffer[_numLayers];
+        _values = new VulkanDevice.Buffer[_numLayers];
 
-        long bytesPerLayer = (long)maxSeqLen * _kvStride * sizeof(float);
-        for (int i = 0; i < numLayers; i++)
+        for (int i = 0; i < _numLayers; i++)
         {
+            if (_kvStride[i] <= 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer),
+                    $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
+            long bytesPerLayer = (long)maxSeqLen * _kvStride[i] * sizeof(float);
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
         }
+    }
+
+    private static int[] BuildUniformStrides(int numLayers, int numKvHeads, int headDim)
+    {
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        var strides = new int[numLayers];
+        Array.Fill(strides, numKvHeads * headDim);
+        return strides;
     }
 
     /// <summary>Returns the device buffer holding cached keys for the given layer.</summary>
@@ -99,7 +126,7 @@ public sealed class VulkanKvCache : IKvCache
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
 
-        int rowBytes = _kvStride * sizeof(float);
+        int rowBytes = _kvStride[layerIndex] * sizeof(float);
 
         // Single contiguous range if positions are consecutive — one copy call
         // covers the whole seqLen. Otherwise fall back to per-row copies.
@@ -151,7 +178,7 @@ public sealed class VulkanKvCache : IKvCache
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
 
-        int rowBytes = _kvStride * sizeof(float);
+        int rowBytes = _kvStride[layerIndex] * sizeof(float);
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
 
@@ -255,9 +282,14 @@ public sealed class VulkanKvCache : IKvCache
     public int LayerCount => _numLayers;
 
     /// <summary>
-    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements).
+    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements) of layer 0.
+    /// For uniform caches this is the model-wide stride; for Gemma-4 (per-layer
+    /// strides) use <see cref="KvStrideOf"/> to get a specific layer's width.
     /// </summary>
-    public int KvStride => _kvStride;
+    public int KvStride => _kvStride[0];
+
+    /// <summary>Per-row stride (FP32 elements) for the given layer.</summary>
+    public int KvStrideOf(int layerIndex) => _kvStride[layerIndex];
 
     /// <summary>
     /// Ingests host-resident K/V rows (FP32, layout <c>[length, kvStride]</c>)
@@ -292,7 +324,7 @@ public sealed class VulkanKvCache : IKvCache
         if (length > _maxSeqLen)
             throw new ArgumentOutOfRangeException(nameof(length),
                 $"length {length} exceeds cache MaxLength {_maxSeqLen}.");
-        long expectedFloats = (long)length * _kvStride;
+        long expectedFloats = (long)length * _kvStride[layerIndex];
         if (keys.Length != expectedFloats || values.Length != expectedFloats)
             throw new ArgumentException(
                 $"keys/values must contain exactly length × kvStride = {expectedFloats} floats; "

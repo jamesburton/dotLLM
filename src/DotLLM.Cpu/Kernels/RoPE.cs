@@ -65,6 +65,41 @@ public static class RoPE
         }
     }
 
+    /// <summary>
+    /// Precomputes a PARTIAL-rotary cos/sin table: only the leading
+    /// <paramref name="rotatedDim"/> dimensions of each head rotate, but the
+    /// per-pair frequency uses the FULL head dimension
+    /// (<paramref name="fullHeadDim"/>) as the denominator —
+    /// <c>θ_i = theta^(-2i / fullHeadDim)</c> for <c>i ∈ [0, rotatedDim/2)</c>.
+    /// This matches llama.cpp's Gemma-4 global-attention partial rope (n_rot is
+    /// the full head dim 512; the first 64 pairs rotate with freq_factor 1.0, the
+    /// rest are identity). The tables are sized for <c>rotatedDim/2</c> pairs and
+    /// consumed by the partial-rotary <see cref="Execute(Span{float}, Span{float}, ReadOnlySpan{int}, int, int, int, int, ReadOnlySpan{float}, ReadOnlySpan{float}, RoPEType)"/>
+    /// overload with <c>ropeDim = rotatedDim</c>.
+    /// </summary>
+    public static void PrecomputeFrequencyTablePartial(
+        int maxSeqLen, int rotatedDim, int fullHeadDim, float theta,
+        Span<float> cosTable, Span<float> sinTable)
+    {
+        if (rotatedDim <= 0 || rotatedDim % 2 != 0)
+            throw new ArgumentException($"rotatedDim must be a positive even number, got {rotatedDim}", nameof(rotatedDim));
+        if (fullHeadDim < rotatedDim || fullHeadDim % 2 != 0)
+            throw new ArgumentException($"fullHeadDim ({fullHeadDim}) must be even and >= rotatedDim ({rotatedDim}).", nameof(fullHeadDim));
+
+        int halfDim = rotatedDim / 2;
+        if (halfDim * sizeof(float) <= StackAllocThreshold)
+        {
+            Span<float> freqs = stackalloc float[halfDim];
+            FillTables(maxSeqLen, fullHeadDim, theta, cosTable, sinTable, freqs);
+        }
+        else
+        {
+            float[] rented = ArrayPool<float>.Shared.Rent(halfDim);
+            FillTables(maxSeqLen, fullHeadDim, theta, cosTable, sinTable, rented.AsSpan(0, halfDim));
+            ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void FillTables(int maxSeqLen, int headDim, float theta,
                                     Span<float> cosTable, Span<float> sinTable, Span<float> freqs)
@@ -449,6 +484,64 @@ public static class RoPE
                 else
                     ApplyRotation(headSlice, cos, sin, ropeDim);
             }
+        }
+    }
+
+    /// <summary>
+    /// PARTIAL NeoX RoPE: rotates only the leading <paramref name="rotatedPairs"/>
+    /// dimension PAIRS of each head, where pair <c>i</c> couples
+    /// <c>(vec[i], vec[i + headDim/2])</c> — the HuggingFace/llama.cpp "rotate_half"
+    /// convention with the pairing offset over the FULL head dim. This matches
+    /// llama.cpp's Gemma-4 global-attention rope (n_rot = full head dim 512, but
+    /// freq_factors freeze pairs ≥ 64, so only the first 64 pairs — dims [0,64) ↔
+    /// [256,320) — actually rotate). Cos/sin tables hold <paramref name="rotatedPairs"/>
+    /// entries per position (built via <see cref="PrecomputeFrequencyTablePartial"/>).
+    /// NeoX-only (Gemma uses NeoX pairing).
+    /// </summary>
+    [SkipLocalsInit]
+    public static void ExecutePartialNeoX(
+        Span<float> q, Span<float> k, ReadOnlySpan<int> positions,
+        int numHeads, int numKvHeads, int headDim, int rotatedPairs,
+        ReadOnlySpan<float> cosTable, ReadOnlySpan<float> sinTable)
+    {
+        int halfDim = headDim / 2;
+        int qStride = numHeads * headDim;
+        int kStride = numKvHeads * headDim;
+        int seqLen = positions.Length;
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            int pos = positions[t];
+            var cos = cosTable.Slice(pos * rotatedPairs, rotatedPairs);
+            var sin = sinTable.Slice(pos * rotatedPairs, rotatedPairs);
+
+            for (int h = 0; h < numHeads; h++)
+                ApplyRotationNeoXPartial(
+                    q.Slice(t * qStride + h * headDim, headDim), cos, sin, halfDim, rotatedPairs);
+            for (int h = 0; h < numKvHeads; h++)
+                ApplyRotationNeoXPartial(
+                    k.Slice(t * kStride + h * headDim, headDim), cos, sin, halfDim, rotatedPairs);
+        }
+    }
+
+    /// <summary>
+    /// Partial NeoX rotation on one head vector: rotates pairs
+    /// <c>(vec[i], vec[i + halfDim])</c> for <c>i ∈ [0, rotatedPairs)</c>; the
+    /// remaining dims pass through unchanged. <paramref name="halfDim"/> is the FULL
+    /// head's half-dim (the pairing offset), <paramref name="rotatedPairs"/> ≤
+    /// <paramref name="halfDim"/> is how many leading pairs rotate.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ApplyRotationNeoXPartial(
+        Span<float> vec, ReadOnlySpan<float> cos, ReadOnlySpan<float> sin,
+        int halfDim, int rotatedPairs)
+    {
+        for (int i = 0; i < rotatedPairs; i++)
+        {
+            float e = vec[i];
+            float o = vec[i + halfDim];
+            vec[i] = e * cos[i] - o * sin[i];
+            vec[i + halfDim] = e * sin[i] + o * cos[i];
         }
     }
 

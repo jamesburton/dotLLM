@@ -205,8 +205,19 @@ public static class ServerStartup
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
             prefixTrieManager: prefixTrieManager);
 
-        // Warm-up: JIT pre-compilation + CUDA kernel loading
-        WarmupRunner.Run(generator, tokenizer, options.Warmup);
+        // Diffusion models (DiffusionGemma) route chat completions through a masked-canvas
+        // diffusion generator instead of the autoregressive TextGenerator. Built only when the
+        // checkpoint carries a DiffusionConfig; null for every AR architecture (path unchanged).
+        DiffusionTextGenerator? diffusionGenerator = config.DiffusionConfig is not null
+            ? new DiffusionTextGenerator(model, tokenizer, sampler: null, config.DiffusionConfig)
+            : null;
+
+        // Warm-up: JIT pre-compilation + CUDA kernel loading. Diffusion models exercise the
+        // cacheless hybrid forward + denoise loop; AR models exercise prefill/decode.
+        if (diffusionGenerator is not null)
+            WarmupRunner.RunDiffusion(diffusionGenerator, tokenizer, options.Warmup);
+        else
+            WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
 
         // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
@@ -240,6 +251,7 @@ public static class ServerStartup
             Tokenizer = tokenizer,
             ChatTemplate = chatTemplate,
             Generator = generator,
+            DiffusionGenerator = diffusionGenerator,
             Scheduler = scheduler,
             LoadedModelPath = resolvedPath,
             CurrentGguf = gguf,

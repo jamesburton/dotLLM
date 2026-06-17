@@ -191,5 +191,89 @@ public enum Architecture
     /// the upgrade path when Gemma 4 lands.
     /// </para>
     /// </summary>
-    Gemma3
+    Gemma3,
+
+    /// <summary>
+    /// Google Gemma 4 family — the text tower powering DiffusionGemma. Retains the
+    /// Gemma 2/3 backbone shape (four RMSNorms per layer, <c>(1 + weight)</c> RMSNorm
+    /// convention, GeGLU activation, <c>sqrt(hidden)</c> embedding scaling, per-head
+    /// Q/K RMSNorms, interleaved local/global attention, final-logit soft-capping)
+    /// and is therefore handled by the same <c>DotLLM.Models</c> transformer
+    /// path as <see cref="Gemma3"/> (see
+    /// <see cref="DotLLM.Core.Models.ModelConfig.IsGemmaArchitecture"/>).
+    /// <para>
+    /// <b>Deltas vs <see cref="Gemma3"/>:</b>
+    /// <list type="bullet">
+    ///   <item><b>Sparse MoE FFN</b> — the dense GeGLU MLP is replaced by a top-k
+    ///     dense-routing Mixture-of-Experts block (<c>num_experts</c> experts,
+    ///     <c>top_k_experts</c> active per token, per-expert width
+    ///     <c>moe_intermediate_size</c>). The MoE variant is identified by
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.Moe"/> being non-null. The
+    ///     experts are GeGLU (not SwiGLU), honouring
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.ActivationFunction"/> exactly as
+    ///     the dense Gemma FFN does. Tensor naming follows the Qwen-MoE convention
+    ///     (<c>mlp.gate</c> router + <c>mlp.experts.{j}.{gate,up,down}_proj</c>).</item>
+    ///   <item><b>Per-attention-type RoPE</b> — full-attention layers and
+    ///     sliding-window layers use different RoPE configurations (different
+    ///     <c>rope_theta</c>, and the full-attention layers additionally apply a
+    ///     <c>partial_rotary_factor</c> so only the leading fraction of each head
+    ///     is rotated). Surfaced via
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.GlobalRoPEConfig"/> +
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.PartialRotaryFactor"/>; the
+    ///     sliding layers keep the standard
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.RoPEConfig"/>.</item>
+    ///   <item><b>Dual KV-head counts / head dims</b> — sliding-window layers use
+    ///     <c>num_key_value_heads</c> KV heads at <c>head_dim</c>; full-attention
+    ///     layers use <c>num_global_key_value_heads</c> KV heads at
+    ///     <c>global_head_dim</c>. Surfaced via
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.NumGlobalKvHeads"/> +
+    ///     <see cref="DotLLM.Core.Models.ModelConfig.GlobalHeadDim"/>. The current
+    ///     CPU forward path supports a uniform head_dim across layer types; a
+    ///     checkpoint whose full-attention head_dim differs from its sliding
+    ///     head_dim is rejected with a clear deferral message until the shared
+    ///     forward-state / KV-cache plumbing is generalised.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// HF discriminators: <c>architectures[0]=Gemma4ForCausalLM</c> /
+    /// <c>Gemma4TextForCausalLM</c>, <c>model_type=gemma4</c> / <c>gemma4_text</c>.
+    /// The DiffusionGemma wrapper (<c>model_type=diffusion_gemma</c> /
+    /// <c>diffusion_gemma_text</c>) embeds a Gemma-4 text tower; loading the
+    /// diffusion wrapper itself is <see cref="DiffusionGemma"/> (issue #29).
+    /// </para>
+    /// </summary>
+    Gemma4,
+
+    /// <summary>
+    /// Google DiffusionGemma — a <b>block masked-diffusion</b> text model built on the
+    /// Gemma-4 MoE backbone. HF discriminators: <c>model_type=diffusion_gemma</c>
+    /// (text-tower-only checkpoints carry <c>model_type=diffusion_gemma_text</c>),
+    /// <c>architectures=["DiffusionGemmaForBlockDiffusion"]</c>.
+    /// <para>
+    /// <b>Backbone.</b> The transformer tower is byte-identical in shape to
+    /// <see cref="Gemma4"/> — four RMSNorms per layer, the <c>(1 + weight)</c>
+    /// RMSNorm convention, GeGLU sparse MoE experts, <c>sqrt(hidden)</c> embedding
+    /// scaling, per-head Q/K RMSNorms, interleaved local/global attention with
+    /// per-attention-type RoPE (full layers <c>rope_theta = 1e6</c> +
+    /// <c>partial_rotary_factor = 0.25</c>; sliding layers <c>rope_theta = 1e4</c>),
+    /// dual KV-head counts, and final-logit soft-capping. It is therefore handled by
+    /// the same <c>DotLLM.Models</c> transformer forward path as <see cref="Gemma4"/>
+    /// (<see cref="DotLLM.Core.Models.ModelConfig.IsGemmaArchitecture"/> includes both).
+    /// The real 26B-A4B SKU: hidden 2816, 30 layers, 16 heads, 8 sliding-KV / 2
+    /// global-KV heads, head_dim 256 (global_head_dim 512), 128 experts top-8,
+    /// vocab 262144.
+    /// </para>
+    /// <para>
+    /// <b>Diffusion delta.</b> Instead of autoregressive next-token decoding, the
+    /// model refines a fixed-length <c>canvas_length</c> (default 256) canvas of
+    /// masked positions over a denoising schedule, attending bidirectionally over the
+    /// canvas while cross-attending the causal prompt prefix (the hybrid attention
+    /// mask). The diffusion decode parameters (canvas length, denoise schedule,
+    /// tokenizer-resolved mask token id) are carried on
+    /// <see cref="DotLLM.Core.Models.ModelConfig.DiffusionConfig"/> and consumed by
+    /// <c>DiffusionTextGenerator</c>; the backbone weights load through the standard
+    /// Gemma-4 MoE safetensors path.
+    /// </para>
+    /// </summary>
+    DiffusionGemma
 }
