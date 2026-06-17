@@ -54,6 +54,18 @@ internal static class VkStructureType
     // and the device-create enable. Drives the dp4a MMVQ decode path
     // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
     internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // VK_EXT_subgroup_size_control (promoted to Vulkan 1.3 core). The Properties
+    // struct (chained off VkPhysicalDeviceProperties2) reports min/max subgroup
+    // size and which shader stages accept a required size; the Features struct
+    // (chained off VkPhysicalDeviceFeatures2 at device create) carries the
+    // subgroupSizeControl + computeFullSubgroups enables. The
+    // RequiredSubgroupSizeCreateInfo struct chains off
+    // VkPipelineShaderStageCreateInfo.pNext to pin a single compute pipeline to
+    // a specific wave width (e.g. 32 for the K-quant decode GEMV on RDNA3.5,
+    // whose driver defaults compute to wave64).
+    internal const int PhysicalDeviceSubgroupSizeControlProperties = 1000225000;
+    internal const int PhysicalDeviceSubgroupSizeControlFeatures = 1000225001;
+    internal const int PipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225002;
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -151,6 +163,16 @@ internal static class VkDescriptorType
 internal static class VkShaderStageFlags
 {
     internal const uint Compute = 0x00000020;
+}
+
+// VkPipelineShaderStageCreateFlagBits — flags on VkPipelineShaderStageCreateInfo.
+// REQUIRE_FULL_SUBGROUPS_BIT (VK_EXT_subgroup_size_control / Vulkan 1.3 core)
+// asserts the local workgroup size is a multiple of the (required) subgroup
+// size so every subgroup is fully populated — paired with
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo when pinning a wave width.
+internal static class VkPipelineShaderStageCreateFlags
+{
+    internal const uint RequireFullSubgroups = 0x00000002;
 }
 
 internal static class VkCommandPoolCreateFlags
@@ -597,6 +619,51 @@ internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
     internal int sType;
     internal nint pNext;
     internal uint shaderIntegerDotProduct; // VkBool32
+}
+
+// VkPhysicalDeviceSubgroupSizeControlProperties — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceProperties2.pNext.
+// `minSubgroupSize`/`maxSubgroupSize` bracket the legal required-size range
+// (gfx1151 reports 32/64). `requiredSubgroupSizeStages` is the VkShaderStageFlags
+// bitmask of stages that accept a VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+// — we require the COMPUTE bit before pinning a compute pipeline's wave width.
+// `maxComputeWorkgroupSubgroups` is read for completeness.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint minSubgroupSize;
+    internal uint maxSubgroupSize;
+    internal uint maxComputeWorkgroupSubgroups;
+    internal uint requiredSubgroupSizeStages; // VkShaderStageFlags bitmask
+}
+
+// VkPhysicalDeviceSubgroupSizeControlFeatures — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceFeatures2.pNext at device
+// creation. `subgroupSizeControl` enables pinning a pipeline's subgroup size;
+// `computeFullSubgroups` enables the REQUIRE_FULL_SUBGROUPS stage flag.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSizeControl;  // VkBool32
+    internal uint computeFullSubgroups; // VkBool32
+}
+
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPipelineShaderStageCreateInfo.pNext to pin
+// the stage to a specific wave width. `requiredSubgroupSize` must be a power of
+// two within [minSubgroupSize, maxSubgroupSize] and the stage must be in
+// `requiredSubgroupSizeStages`. Used to force the K-quant decode GEMV onto
+// wave32 on RDNA3.5 (whose driver otherwise defaults compute to wave64).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint requiredSubgroupSize;
 }
 
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape

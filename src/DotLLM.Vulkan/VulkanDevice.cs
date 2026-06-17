@@ -108,6 +108,66 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasIntegerDotProduct { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_EXT_subgroup_size_control</c>
+    /// (or Vulkan 1.3 core), reports a valid <c>minSubgroupSize</c>..<c>maxSubgroupSize</c>
+    /// range with the compute stage in <c>requiredSubgroupSizeStages</c>, AND the
+    /// device-create call enabled the <c>subgroupSizeControl</c> +
+    /// <c>computeFullSubgroups</c> features. Prerequisite for pinning a single
+    /// compute pipeline to a specific wave width via
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>. On RDNA3.5
+    /// (gfx1151) this lets the K-quant decode GEMV run wave32 while the driver's
+    /// global compute default stays wave64 — see <see cref="SupportsRequiredSubgroupSize"/>.
+    /// </summary>
+    /// <remarks>
+    /// Support is keyed off the <c>VkPhysicalDeviceSubgroupSizeControlProperties</c>
+    /// query (min/max + requiredSubgroupSizeStages), not the
+    /// <c>VkPhysicalDeviceSubgroupSizeControlFeatures</c> bits: when the feature
+    /// was promoted to Vulkan 1.3 core, some loader/driver combinations only
+    /// populate the promoted feature struct for an instance created at
+    /// apiVersion ≥ 1.3 (this backend's instance requests 1.2), whereas the
+    /// EXT-keyed properties struct is populated reliably. The features are still
+    /// enabled at device-create time; <c>vkCreateDevice</c> would fail if the
+    /// driver could not honour them.
+    /// </remarks>
+    public bool HasSubgroupSizeControl { get; }
+
+    /// <summary>
+    /// Minimum subgroup width the device will accept as a required size
+    /// (<c>minSubgroupSize</c> from <c>VkPhysicalDeviceSubgroupSizeControlProperties</c>).
+    /// Zero when <see cref="HasSubgroupSizeControl"/> is <c>false</c>. gfx1151
+    /// reports 32.
+    /// </summary>
+    public uint MinSubgroupSize { get; }
+
+    /// <summary>
+    /// Maximum subgroup width the device will accept as a required size
+    /// (<c>maxSubgroupSize</c>). Zero when <see cref="HasSubgroupSizeControl"/>
+    /// is <c>false</c>. gfx1151 reports 64.
+    /// </summary>
+    public uint MaxSubgroupSize { get; }
+
+    // VkShaderStageFlags bitmask of stages that accept a required subgroup size
+    // (requiredSubgroupSizeStages). Checked by SupportsRequiredSubgroupSize.
+    private readonly uint _requiredSubgroupSizeStages;
+
+    /// <summary>
+    /// Returns <c>true</c> when the device can pin a pipeline of the given
+    /// <paramref name="stage"/> to the exact wave width <paramref name="size"/>:
+    /// the <c>subgroupSizeControl</c> feature is enabled, <paramref name="size"/>
+    /// lies within <see cref="MinSubgroupSize"/>..<see cref="MaxSubgroupSize"/>,
+    /// and <paramref name="stage"/> is in the driver's
+    /// <c>requiredSubgroupSizeStages</c>. Pass <c>VkShaderStageFlags.Compute</c>
+    /// (0x20) for the MMVQ decode kernels. Falls back to <c>false</c> (callers
+    /// then use the unset/default subgroup size) on any device lacking the feature.
+    /// </summary>
+    public bool SupportsRequiredSubgroupSize(uint size, uint stage)
+    {
+        if (!HasSubgroupSizeControl) return false;
+        if (size < MinSubgroupSize || size > MaxSubgroupSize) return false;
+        return (_requiredSubgroupSizeStages & stage) != 0;
+    }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -119,7 +179,9 @@ public sealed class VulkanDevice : IDisposable
         uint subgroupSize, bool hasSubgroupArithmetic,
         bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes,
         bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment,
-        bool hasIntegerDotProduct)
+        bool hasIntegerDotProduct,
+        bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
+        uint requiredSubgroupSizeStages)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -137,6 +199,10 @@ public sealed class VulkanDevice : IDisposable
         HasExternalMemoryHost = hasExternalMemoryHost;
         MinImportedHostPointerAlignment = minImportedHostPointerAlignment;
         HasIntegerDotProduct = hasIntegerDotProduct;
+        HasSubgroupSizeControl = hasSubgroupSizeControl;
+        MinSubgroupSize = minSubgroupSize;
+        MaxSubgroupSize = maxSubgroupSize;
+        _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
     }
 
     /// <summary>
@@ -230,8 +296,19 @@ public sealed class VulkanDevice : IDisposable
                 physical, apiVersion,
                 out bool hasIntegerDotProduct);
 
+            // Probe VK_EXT_subgroup_size_control (Vulkan 1.3 core). Like the
+            // others, the feature must be enabled at vkCreateDevice time before
+            // a pipeline may pin its subgroup size, so we decide support before
+            // creating the logical device. Skipped gracefully on < 1.3 / missing
+            // extension — returns false + zero sizes.
+            ProbeSubgroupSizeControl(
+                physical, apiVersion,
+                out bool hasSubgroupSizeControl, out uint minSubgroupSize,
+                out uint maxSubgroupSize, out uint requiredSubgroupSizeStages);
+
             nint device = CreateLogicalDevice(
-                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct);
+                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
+                hasSubgroupSizeControl);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -249,7 +326,9 @@ public sealed class VulkanDevice : IDisposable
                 instance, physical, device, queue, pool, name, vendor, type, queueFamily,
                 subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
-                hasIntegerDotProduct);
+                hasIntegerDotProduct,
+                hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
+                requiredSubgroupSizeStages);
             instance = 0;
             return result;
         }
@@ -631,6 +710,103 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Probes <c>VK_EXT_subgroup_size_control</c> (Vulkan 1.3 core). Reads
+    /// <c>VkPhysicalDeviceSubgroupSizeControlProperties</c> (min/max subgroup
+    /// size + the stages that accept a required size) via
+    /// <c>vkGetPhysicalDeviceProperties2</c> and the
+    /// <c>subgroupSizeControl</c>/<c>computeFullSubgroups</c> feature bits via
+    /// <c>vkGetPhysicalDeviceFeatures2</c>. Support is declared when the device
+    /// reports a valid subgroup-size range AND the compute stage accepts a
+    /// required size — that is exactly what a per-kernel wave32 pin (with
+    /// REQUIRE_FULL_SUBGROUPS) needs, and what llama.cpp keys off. The feature
+    /// bits are read for completeness but are NOT part of the gate (they are
+    /// unreliable on a 1.3-core feature under a 1.2 instance — see the remarks on
+    /// <see cref="HasSubgroupSizeControl"/>); the features are still enabled at
+    /// device create. Like the integer-dot probe, accepts a 1.3+ core device or
+    /// one that advertises the extension string. Safe on older drivers: returns
+    /// <c>false</c> + zero sizes without throwing.
+    /// </summary>
+    private static unsafe void ProbeSubgroupSizeControl(
+        nint physical, uint apiVersion,
+        out bool hasSubgroupSizeControl, out uint minSubgroupSize,
+        out uint maxSubgroupSize, out uint requiredSubgroupSizeStages)
+    {
+        hasSubgroupSizeControl = false;
+        minSubgroupSize = 0;
+        maxSubgroupSize = 0;
+        requiredSubgroupSizeStages = 0;
+
+        // vkGetPhysicalDeviceProperties2 / Features2 are core in Vulkan 1.1.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            // Core in Vulkan 1.3; on 1.1/1.2 the extension must be advertised.
+            bool core13 = VkApiMajor(apiVersion) > 1u
+                || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 3u);
+            bool hasExt = HasDeviceExtension(physical, "VK_EXT_subgroup_size_control"u8);
+            if (!core13 && !hasExt)
+                return;
+
+            // Read the feature bits for completeness. NOTE: these are advisory —
+            // when the feature was promoted to Vulkan 1.3 core, some loader/driver
+            // combinations only populate the promoted *feature* struct when the
+            // INSTANCE was created at apiVersion >= 1.3 (our instance requests
+            // 1.2). The *properties* struct (below) is keyed off the EXT and is
+            // populated reliably. We therefore gate support on the properties +
+            // the compute stage being in requiredSubgroupSizeStages, which is
+            // exactly what enabling a per-pipeline required size needs, and what
+            // llama.cpp keys off. The features are still enabled at device
+            // create; vkCreateDevice would fail if the driver could not honour
+            // them (it does not on gfx1151).
+            VkPhysicalDeviceSubgroupSizeControlFeatures sscFeatures = default;
+            sscFeatures.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlFeatures;
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&sscFeatures);
+
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+
+            // Properties — min/max size and which stages accept a required size.
+            VkPhysicalDeviceSubgroupSizeControlProperties sscProps = default;
+            sscProps.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlProperties;
+
+            VkPhysicalDeviceProperties2 props2 = default;
+            props2.sType = VkStructureType.PhysicalDeviceProperties2;
+            props2.pNext = (nint)(&sscProps);
+
+            VulkanApi.vkGetPhysicalDeviceProperties2(physical, ref props2);
+
+            // Defensive: a driver reporting a degenerate range is unusable.
+            if (sscProps.minSubgroupSize == 0 || sscProps.maxSubgroupSize == 0
+                || sscProps.minSubgroupSize > sscProps.maxSubgroupSize)
+                return;
+
+            // Require the COMPUTE stage to accept a required subgroup size — the
+            // MMVQ decode pipelines are compute. Without this bit a per-pipeline
+            // pin is illegal and vkCreateComputePipelines would fail.
+            if ((sscProps.requiredSubgroupSizeStages & VkShaderStageFlags.Compute) == 0)
+                return;
+
+            minSubgroupSize = sscProps.minSubgroupSize;
+            maxSubgroupSize = sscProps.maxSubgroupSize;
+            requiredSubgroupSizeStages = sscProps.requiredSubgroupSizeStages;
+            hasSubgroupSizeControl = true;
+        }
+        catch
+        {
+            // Loader/driver returned garbage — disable; callers fall back to the
+            // default (unset) subgroup size. Mirrors the other probes' posture.
+            hasSubgroupSizeControl = false;
+            minSubgroupSize = 0;
+            maxSubgroupSize = 0;
+            requiredSubgroupSizeStages = 0;
+        }
+    }
+
+    /// <summary>
     /// Returns <c>true</c> when <paramref name="physical"/> advertises the
     /// given device extension. <paramref name="name"/> must be the
     /// NUL-terminated UTF-8 extension name (e.g. <c>"VK_KHR_cooperative_matrix\0"u8</c>).
@@ -732,7 +908,8 @@ public sealed class VulkanDevice : IDisposable
 
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
-        bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct)
+        bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
+        bool enableSubgroupSizeControl)
     {
         float priority = 1.0f;
 
@@ -757,14 +934,17 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extMemHostName = "VK_EXT_external_memory_host\0"u8;
         ReadOnlySpan<byte> extMemName = "VK_KHR_external_memory\0"u8;
         ReadOnlySpan<byte> intDotName = "VK_KHR_shader_integer_dot_product\0"u8;
+        ReadOnlySpan<byte> sscName = "VK_EXT_subgroup_size_control\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all four
-        // extensions are enabled at once. (The integer-dot-product string is
-        // harmless to name even on a 1.3 driver where it is core — drivers
-        // ignore the duplicate, same as the external-memory names below.)
+        // Pack name bytes + pointer array onto the stack. Worst case all five
+        // extensions are enabled at once. (The integer-dot-product and
+        // subgroup-size-control strings are harmless to name even on a 1.3
+        // driver where they are core — drivers ignore the duplicate, same as the
+        // external-memory names below.)
         byte* nameBytes = stackalloc byte[
-            coopmatName.Length + extMemHostName.Length + extMemName.Length + intDotName.Length];
-        nint* namePtrs = stackalloc nint[4];
+            coopmatName.Length + extMemHostName.Length + extMemName.Length
+            + intDotName.Length + sscName.Length];
+        nint* namePtrs = stackalloc nint[5];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -799,6 +979,13 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += intDotName.Length;
         }
 
+        if (enableSubgroupSizeControl)
+        {
+            for (int i = 0; i < sscName.Length; i++) nameBytes[nameOffset + i] = sscName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += sscName.Length;
+        }
+
         // Feature structs chained through pNext on top of the extension enables:
         //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
         //  - VK_KHR_shader_integer_dot_product requires
@@ -807,6 +994,7 @@ public sealed class VulkanDevice : IDisposable
         // No feature bits are needed for VK_EXT_external_memory_host.
         VkPhysicalDeviceCooperativeMatrixFeaturesKhr coopmatFeatures = default;
         VkPhysicalDeviceShaderIntegerDotProductFeatures dotFeatures = default;
+        VkPhysicalDeviceSubgroupSizeControlFeatures sscFeatures = default;
         nint featureChain = 0;
         if (enableCoopmat)
         {
@@ -822,6 +1010,17 @@ public sealed class VulkanDevice : IDisposable
             dotFeatures.shaderIntegerDotProduct = 1; // VK_TRUE
             dotFeatures.pNext = featureChain;
             featureChain = (nint)(&dotFeatures);
+        }
+        if (enableSubgroupSizeControl)
+        {
+            // Enable both bits: subgroupSizeControl lets a pipeline pin its
+            // subgroup size; computeFullSubgroups lets us set the
+            // REQUIRE_FULL_SUBGROUPS stage flag that pairs with the pin.
+            sscFeatures.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlFeatures;
+            sscFeatures.subgroupSizeControl = 1;  // VK_TRUE
+            sscFeatures.computeFullSubgroups = 1; // VK_TRUE
+            sscFeatures.pNext = featureChain;
+            featureChain = (nint)(&sscFeatures);
         }
         ci.pNext = featureChain;
 
