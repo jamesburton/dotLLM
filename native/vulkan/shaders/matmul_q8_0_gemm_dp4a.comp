@@ -1,0 +1,203 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q8_0 batched GEMM, DP4a (integer dot product) variant — Intel Arc prefill probe.
+//
+//   C[N, M] = B[N, K] @ W_q8[M, K]^T        with both operands kept in INT8.
+//
+// This is the tiled-GEMM analogue of matmul_q8_0_dp4a_pq.comp (decode GEMV). It
+// targets compute-bound prefill (seqLen = N > 1) on devices that accelerate
+// `dotPacked4x8AccSatEXT` (VK_KHR_shader_integer_dot_product with
+// integerDotProduct4x8BitPackedSignedAccelerated) but DO NOT expose
+// VK_KHR_cooperative_matrix — e.g. Intel Arc Xe-LPG (driver 101.7026).
+//
+// Semantic parity target: DotLLM.Cpu.Kernels.MatMul.GemmQ8_0 / the scalar
+// matmul_q8_0_gemm.comp, to coopmat-grade tolerance (the activation is
+// re-quantized to INT8 per 32-block, so the result carries the activation's
+// own per-block Q8 rounding on top of the weight's stored Q8 rounding).
+//
+// Weight byte layout (identical to matmul_q8_0_gemm.comp):
+//   row stride = (K/32) * 34 bytes; each 34-byte block = fp16 scale + 32 int8.
+// B is row-major [N, K] FP32; C is row-major [N, M] FP32.
+//
+// Tiling (mirrors the scalar GEMM so the perf comparison is apples-to-apples):
+//   Output tile  = TILE_N (16) tokens × TILE_M (16) weight rows = 256 cells.
+//   Workgroup    = (16, 16, 1) = 256 threads, one thread per output cell.
+//   K-chunk      = 32 elements (exactly one Q8_0 block).
+//
+//   Per K-chunk:
+//     1. Quantize the 16×32 B tile to INT8 once into shared memory (sharedBq
+//        packed 4x8, sharedBd per-token-row scale). Reused by all 16 W rows.
+//     2. Load the 16×32 W tile's int8 (already quantized) into shared memory
+//        (sharedWq packed 4x8, sharedWd per-weight-row fp16 scale). Reused by
+//        all 16 B rows.
+//     3. Each thread does 8 dotPacked4x8AccSatEXT over its (token, weight) rows
+//        and accumulates  sharedBd[t] * sharedWd[m] * dot  into a register.
+//
+// Probe scope: perfect-multiple shapes only (M % 16 == 0, N % 16 == 0,
+// K % 32 == 0). Edge handling is intentionally omitted — this shader exists to
+// measure the DP4a-GEMM compute ceiling vs the scalar GEMM, not to ship. The
+// shipping kernel (if the ceiling clears the bar) adds bounds guards + parity.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // Q8_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 32)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 32
+    uint rowUints;      // per-row uint stride (unused here; kept for binding/PC parity)
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint BLOCK = 32u;        // Q8_0 group size
+const uint BLOCK_BYTES = 34u;
+const uint PACKS = 8u;         // 32 int8 / 4 per pack
+
+// Quantized B tile: 16 token rows × 8 packed-4x8 uints, plus per-row scale.
+shared uint  sharedBq[TILE_N * PACKS];
+shared float sharedBd[TILE_N];
+
+// Quantized W tile: 16 weight rows × 8 packed-4x8 uints, plus per-row fp16 scale.
+shared uint  sharedWq[TILE_M * PACKS];
+shared float sharedWd[TILE_M];
+
+// Per-row activation amax scratch (16 rows × 16 lanes). After the row
+// reduction, slot [row*16] is repurposed to hold the row's invScale.
+shared float sharedAmax[TILE_N * 16u];
+
+// Read 4 weight bytes at absByteOff as a little-endian uint (straddle-safe).
+uint readU32(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint sh = (absByteOff & 3u) * 8u;
+    if (sh == 0u) return weight[idx];
+    uint lo = weight[idx] >> sh;
+    uint hi = weight[idx + 1u] << (32u - sh);
+    return lo | hi;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Quantize 4 FP32 activation values to a packed-4x8 int8 word given the inverse
+// scale (127 / amax). Round-to-nearest, clamp to [-127, 127] (symmetric Q8_0).
+uint packQuant4(float v0, float v1, float v2, float v3, float invScale) {
+    int q0 = clamp(int(round(v0 * invScale)), -127, 127);
+    int q1 = clamp(int(round(v1 * invScale)), -127, 127);
+    int q2 = clamp(int(round(v2 * invScale)), -127, 127);
+    int q3 = clamp(int(round(v3 * invScale)), -127, 127);
+    return (uint(q0) & 0xFFu)
+         | ((uint(q1) & 0xFFu) << 8)
+         | ((uint(q2) & 0xFFu) << 16)
+         | ((uint(q3) & 0xFFu) << 24);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x; // weight row / col of C
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y; // token row / row of C
+
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x; // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * BLOCK_BYTES;
+
+    // The per-block scales (d_w * d_x) differ, so the INT8 dot cannot be
+    // accumulated across blocks — fold each block's int dot into a float acc.
+    float accF = 0.0;
+
+    for (uint kBlock = 0u; kBlock < pc.blocksPerRow; kBlock++) {
+        uint kBase = kBlock * BLOCK;
+
+        // ---- 1. Quantize the 16×32 B tile -> sharedBq / sharedBd. ----
+        // 16 token rows, one row per local-y; the 16 local-x threads of that
+        // row cooperate. Thread (x,y): x in [0,15] handles K columns [2x, 2x+1]
+        // for the amax pass, then thread x in [0,7] writes pack x.
+        {
+            // Each token row uses its 16 x-lanes; lane reads 2 of the 32 cols.
+            uint rowTok = tBase + gl_LocalInvocationID.y;
+            uint lane   = gl_LocalInvocationID.x;     // 0..15
+            uint col0   = lane * 2u;
+            uint col1   = col0 + 1u;
+            float v0 = b[rowTok * pc.K + kBase + col0];
+            float v1 = b[rowTok * pc.K + kBase + col1];
+
+            // Row amax via a shared reduction over the 16 lanes: each lane
+            // stages its abs-max candidate, then lane 0 reduces (below).
+            sharedAmax[gl_LocalInvocationID.y * 16u + lane] = max(abs(v0), abs(v1));
+        }
+        barrier();
+        {
+            // Lane 0 of each row reduces 16 candidates -> scale, writes sharedBd.
+            if (gl_LocalInvocationID.x == 0u) {
+                float amax = 0.0;
+                uint base = gl_LocalInvocationID.y * 16u;
+                for (uint i = 0u; i < 16u; i++) amax = max(amax, sharedAmax[base + i]);
+                float scale = amax / 127.0;
+                sharedBd[gl_LocalInvocationID.y] = scale;
+                sharedAmax[base] = (scale > 0.0) ? (127.0 / amax) : 0.0; // stash invScale
+            }
+        }
+        barrier();
+        {
+            // Now pack: 16 rows × 8 packs = 128 packs. Threads tid 0..127 each
+            // write one pack. tid -> (row = tid/8, pack = tid%8).
+            if (tid < TILE_N * PACKS) {
+                uint row = tid / PACKS;
+                uint pack = tid - row * PACKS;
+                float invScale = sharedAmax[row * 16u];
+                uint tok = tBase + row;
+                uint cb = kBase + pack * 4u;
+                uint o = tok * pc.K + cb;
+                sharedBq[row * PACKS + pack] = packQuant4(b[o], b[o + 1u], b[o + 2u], b[o + 3u], invScale);
+            }
+        }
+
+        // ---- 2. Load the 16×32 W tile int8 -> sharedWq / sharedWd. ----
+        {
+            // 16 rows × 8 packs = 128 packs; threads tid 0..127.
+            if (tid < TILE_M * PACKS) {
+                uint row = tid / PACKS;
+                uint pack = tid - row * PACKS;
+                uint mGlobal = mBase + row;
+                uint blockBase = mGlobal * rowByteStride + kBlock * BLOCK_BYTES;
+                if (pack == 0u) sharedWd[row] = readHalf(blockBase);
+                // qs bytes start at +2; pack p covers qs[4p .. 4p+3].
+                sharedWq[row * PACKS + pack] = readU32(blockBase + 2u + pack * 4u);
+            }
+        }
+
+        barrier();
+
+        // ---- 3. INT8 dot for this thread's (t, m) cell. ----
+        {
+            uint bRow = gl_LocalInvocationID.y * PACKS;
+            uint wRow = gl_LocalInvocationID.x * PACKS;
+            int dot = 0;
+            for (uint p = 0u; p < PACKS; p++) {
+                dot = dotPacked4x8AccSatEXT(int(sharedWq[wRow + p]), int(sharedBq[bRow + p]), dot);
+            }
+            accF += sharedBd[gl_LocalInvocationID.y] * sharedWd[gl_LocalInvocationID.x] * float(dot);
+        }
+
+        barrier();
+    }
+
+    c[t * pc.M + m] = accF;
+}
