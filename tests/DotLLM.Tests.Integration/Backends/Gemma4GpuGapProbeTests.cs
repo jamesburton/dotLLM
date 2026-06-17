@@ -29,10 +29,7 @@ public sealed class Gemma4GpuGapProbeTests
     private static string WriteFixture()
     {
         string path = Path.Combine(Path.GetTempPath(), $"syn_gemma4_gpuprobe_{Guid.NewGuid():N}.gguf");
-        var cfg = Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_F32FIXTURE") == "1"
-            ? SyntheticGemma4Gguf.Tiny.AllF32()
-            : SyntheticGemma4Gguf.Tiny;
-        return SyntheticGemma4Gguf.WriteGemma4(path, cfg);
+        return SyntheticGemma4Gguf.WriteGemma4(path, SyntheticGemma4Gguf.Tiny);
     }
 
     [SkippableFact]
@@ -159,12 +156,9 @@ public sealed class Gemma4GpuGapProbeTests
                 Assert.True(diff <= tol,
                     $"logit[{i}] diverged: cpu={cpuLogits[i]:F5} cuda={cudaLogits[i]:F5} diff={diff:F5} tol={tol:F5}");
             }
-            // Also report the raw worst-case absolute logit diff (informational).
             float rawMax = 0f;
             for (int i = 0; i < n; i++) rawMax = MathF.Max(rawMax, MathF.Abs(cpuLogits[i] - cudaLogits[i]));
             _output.WriteLine($"max (diff - tol) over {n} logits = {maxAbs:E3} (<=0 ⇒ all within tolerance); raw max|diff|={rawMax:E3}");
-            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "g4margin.txt"),
-                $"argmax cpu={cpuArgmax} cuda={cudaArgmax}; maxAbs(diff-tol)={maxAbs:E3} rawMax|diff|={rawMax:E3}"); } catch { }
         }
         finally
         {

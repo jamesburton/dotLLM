@@ -18,47 +18,6 @@
 // and the CPU reference TransformerModel.RunGemma4Layer / RoPE.ExecutePartialNeoX.
 
 #include <math.h>
-#include <cuda_fp16.h>
-
-// ── Activation Q8_0 round-trip (FP32 in/out) ──
-// Reproduces the CPU oracle's on-the-fly ACTIVATION quantization for Q8_0-weight
-// GEMMs (MatMul.GemmQ8_0 quantizes the F32 activation to Q8_0 before the int8
-// dot). The CUDA gemma4 forward runs F32 cuBLAS on a dequantized weight, which
-// keeps the activation in full F32 — so without this round-trip the two backends
-// do DIFFERENT math and drift (~1.7e-3/op, compounding to a wrong argmax).
-//
-// Per 32-element block: scale = (half)(maxabs / 127); q = round_nearest_even(x/scale)
-// clamped to ±127; x_out = q * (float)scale. The scale is stored/consumed as FP16
-// exactly like the CPU's Q8_0 block scale (Half). One block per CUDA block; the
-// last partial group (k % 32 != 0) is passed through unchanged (matches the CPU,
-// which only quantizes whole 32-blocks; gemma4 K dims are always %32).
-extern "C" __global__ void __launch_bounds__(32) quantize_activation_q8_0_roundtrip_f32(
-    float* __restrict__ x, const int k, const int rows)
-{
-    int nb = k / 32;
-    long total = (long)rows * nb;
-    int gid = blockIdx.x;                 // one warp per 32-block
-    if (gid >= total) return;
-
-    int row = gid / nb;
-    int blk = gid % nb;
-    float* base = x + (size_t)row * k + (size_t)blk * 32;
-    int lane = threadIdx.x;               // 0..31
-
-    float v = base[lane];
-    float a = fabsf(v);
-    // Warp max-abs reduction.
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, off));
-    // a is now the block max-abs on every lane.
-    float scale_f = __half2float(__float2half(a / 127.0f));   // FP16 scale, like CPU
-    if (scale_f == 0.0f) { base[lane] = 0.0f; return; }
-    float inv = 1.0f / scale_f;
-    int q = __float2int_rn(v * inv);      // round-nearest-even, matches CPU
-    q = max(-127, min(127, q));
-    base[lane] = (float)q * scale_f;
-}
 
 // ── tanh-approx GELU GeGLU: output = gelu_tanh(gate) * up ──
 // gelu_tanh(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) ))

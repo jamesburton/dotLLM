@@ -1475,8 +1475,6 @@ public sealed unsafe class TransformerModel : IModel
         int numHeads = Config.NumAttentionHeads;
         var g4 = lw.Gemma4!;
 
-        if (layer == 0) Gemma4DumpCpu("embed", hidden, seqLen * hiddenSize);
-
         // DIFFUSION region per-layer scalar split. On diffusion-gemma the LAST
         // per-layer op uses enc_layer_output_scale for the PROMPT rows [0, P) and
         // layer_output_scale for the CANVAS rows [P, seqLen) — same backbone
@@ -1503,7 +1501,6 @@ public sealed unsafe class TransformerModel : IModel
                 new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                 lw.AttnNormWeight, eps,
                 new Span<float>(normOut + t * hiddenSize, hiddenSize));
-        Gemma4DumpCpu($"A{layer}_normin", normOut, seqLen * hiddenSize);
 
         // Q = wq · normIn ; K = wk · normIn (raw projections, GEMM quantizes internally)
         Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen);
@@ -1517,9 +1514,6 @@ public sealed unsafe class TransformerModel : IModel
         else
             Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
 
-        Gemma4DumpCpu($"A{layer}_qraw", q, seqLen * qStrideLayer);
-        Gemma4DumpCpu($"A{layer}_kraw", k, seqLen * kvStrideLayer);
-
         // Q-norm (rms * attn_q_norm per head), then K-norm (rms * attn_k_norm per
         // kv head). V-norm is WEIGHT-LESS rms per kv head (no scale), all layers.
         if (lw.QNormWeight is not null)
@@ -1527,9 +1521,6 @@ public sealed unsafe class TransformerModel : IModel
         if (lw.KNormWeight is not null)
             ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
         ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
-        Gemma4DumpCpu($"A{layer}_qnorm", q, seqLen * qStrideLayer);
-        Gemma4DumpCpu($"A{layer}_knorm", k, seqLen * kvStrideLayer);
-        Gemma4DumpCpu($"A{layer}_vnorm", v, seqLen * kvStrideLayer);
 
         // RoPE on Q and K (V is NOT roped). Per-attention-type table/dim/pairing.
         // Global (full-attention) layers use PARTIAL NeoX rope: only the leading
@@ -1551,8 +1542,6 @@ public sealed unsafe class TransformerModel : IModel
                 qSpan, kSpan, positions,
                 numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
                 ropeCos, ropeSin, ropeTypeLayer);
-        Gemma4DumpCpu($"A{layer}_qrope", q, seqLen * qStrideLayer);
-        Gemma4DumpCpu($"A{layer}_krope", k, seqLen * kvStrideLayer);
 
         // Attention: softmax(Qᵀ·K * 1.0 + causal mask) · V, GQA broadcast. Scale is
         // 1.0 (q_norm/k_norm make Q,K unit) — QueryPreAttnScalar=1.0 → 1/sqrt(1)=1.
@@ -1629,11 +1618,9 @@ public sealed unsafe class TransformerModel : IModel
                 layerSlidingWindow, softCap: 0f,
                 _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
         }
-        Gemma4DumpCpu($"A{layer}_attn", attnOut, seqLen * qStrideLayer);
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
-        Gemma4DumpCpu($"L{layer}_oproj", normOut, seqLen * hiddenSize);
 
         // post_attention_norm, then residual add: attn_out = rms(O)*post_attn + input.
         for (int t = 0; t < seqLen; t++)
@@ -1660,7 +1647,6 @@ public sealed unsafe class TransformerModel : IModel
                         new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
                         new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                         new Span<float>(attnOutP + t * hiddenSize, hiddenSize));
-                Gemma4DumpCpu($"L{layer}_attnout", attnOutP, seqLen * hiddenSize);
 
                 // ── Dense FFN branch (shared expert) ──────────────────────
                 // cur_mlp = down( geglu(gate·n) * (up·n) ), n = rms(attn_out)*ffn_norm
@@ -1710,23 +1696,6 @@ public sealed unsafe class TransformerModel : IModel
             ArrayPool<float>.Shared.Return(moeBuf);
             ArrayPool<float>.Shared.Return(tmpNormBuf);
         }
-
-        Gemma4DumpCpu($"L{layer}_out", hidden, seqLen * hiddenSize);
-    }
-
-    // Debug op-by-op dump for gemma4 CPU-vs-CUDA bisection. Gated on the
-    // DOTLLM_GEMMA4_DUMP env var (= a directory). Writes "<tag>.cpu.bin" raw F32.
-    private static readonly string? _gemma4DumpDir =
-        Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_DUMP");
-
-    private static unsafe void Gemma4DumpCpu(string tag, float* data, int count)
-    {
-        if (_gemma4DumpDir is null) return;
-        System.IO.Directory.CreateDirectory(_gemma4DumpDir);
-        var bytes = new byte[count * sizeof(float)];
-        fixed (byte* bp = bytes)
-            Buffer.MemoryCopy(data, bp, bytes.Length, (long)count * sizeof(float));
-        System.IO.File.WriteAllBytes(System.IO.Path.Combine(_gemma4DumpDir, $"{tag}.cpu.bin"), bytes);
     }
 
     /// <summary>

@@ -303,7 +303,6 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _rmsnormWeightlessF32Func;
     private readonly nint _softcapInplaceF32Func;
     private readonly nint _moeRenormTopkClampedF32Func;
-    private readonly nint _quantizeActQ8_0RoundtripF32Func;
 
 
     /// <summary>
@@ -650,7 +649,6 @@ public sealed unsafe class CudaKernels : IDisposable
             _rmsnormWeightlessF32Func = _gemma4F32Module.TryGetFunction("rmsnorm_weightless_f32");
             _softcapInplaceF32Func = _gemma4F32Module.TryGetFunction("softcap_inplace_f32");
             _moeRenormTopkClampedF32Func = _gemma4F32Module.TryGetFunction("moe_renorm_topk_clamped_f32");
-            _quantizeActQ8_0RoundtripF32Func = _gemma4F32Module.TryGetFunction("quantize_activation_q8_0_roundtrip_f32");
         }
     }
 
@@ -663,8 +661,7 @@ public sealed unsafe class CudaKernels : IDisposable
     public bool HasGemma4Kernels =>
         _gegluTanhF32Func != 0 && _ropeF32PartialNeoxFunc != 0
         && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
-        && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
-        && _quantizeActQ8_0RoundtripF32Func != 0;
+        && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1052,25 +1049,6 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     // ── Gemma-4 (DiffusionGemma AR) F32 launchers ────────────────────────────
-
-    /// <summary>
-    /// In-place Q8_0 round-trip of an F32 activation buffer <c>[rows, k]</c>:
-    /// per 32-block, quantize to Q8_0 (FP16 block scale, round-nearest-even,
-    /// clamp ±127) then dequantize back to F32. Reproduces the CPU oracle's
-    /// on-the-fly activation quantization for Q8_0-weight GEMMs so the gemma4
-    /// F32 forward matches <c>MatMul.GemmQ8_0</c>. Requires <c>k % 32 == 0</c>.
-    /// </summary>
-    public void LaunchQuantizeActivationQ8_0RoundtripF32(nint xF32, int k, int rows, nint stream)
-    {
-        if ((k & 31) != 0) return; // gemma4 K dims are %32; skip otherwise (CPU only quantizes whole blocks)
-        nint xArg = xF32;
-        int kArg = k, rowsArg = rows;
-        void** args = stackalloc void*[] {&xArg, &kArg, &rowsArg};
-        long nb = (long)rows * (k / 32);
-        CudaDriverApi.cuLaunchKernel(_quantizeActQ8_0RoundtripF32Func,
-                (uint)nb, 1, 1, 32, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
-    }
 
     /// <summary>FP32 GeGLU (tanh-approx GELU): out = gelu_tanh(gate) * up.</summary>
     public void LaunchGeGLUTanhF32(nint gate, nint up, nint output,
