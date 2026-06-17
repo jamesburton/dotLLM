@@ -38,6 +38,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     // confirms a pure square-causal global-attention prefill. Otherwise attention_f16.
     private readonly CudaG3Attention _g3Attention;
 
+    // G-flash long-context prefill-attention path (hand-fused mma.sync flash kernel). Used
+    // ahead of G3 when CudaFlashAttention.CanUse(...) confirms a long-enough (s >= crossover)
+    // pure square-causal global prefill at the prototype head shape (headDim 64). Otherwise
+    // the dispatch falls through to G3, then attention_f16.
+    private readonly CudaFlashAttention _flashAttention;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -204,6 +210,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         VramWarning = vramWarning;
         _ropeType = ropeType;
         _g3Attention = new CudaG3Attention(kernels);
+        _flashAttention = new CudaFlashAttention(kernels);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
         if (_useHighPrecisionForward)
         {
@@ -370,6 +377,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         bool geForceAmpere = device.ComputeCapabilityMajor == 8
             && device.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase);
         CudaG3Attention.ConfigureDefault(geForceAmpere);
+
+        // G-flash: default the hand-fused mma.sync long-context prefill kernel on for the
+        // same GeForce Ampere parts (it emits Ampere-only mma.sync PTX). It is dispatched
+        // ahead of G3 only for long-context prefill at the prototype head shape; shorter
+        // sequences keep G3. DOTLLM_CUDA_FLASH_ATTN overrides ("1"/"0"); the crossover is
+        // DOTLLM_CUDA_FLASH_ATTN_MINSEQ. Per-call gating in CudaFlashAttention.CanUse.
+        CudaFlashAttention.ConfigureDefault(geForceAmpere);
 
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
@@ -758,7 +772,15 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // same row-major [seq, heads, headDim] output either way.
                 void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset)
                 {
-                    if (_g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                    // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
+                    // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
+                    // softmax). Everything else (decode, prefix reuse, sliding window, non-64
+                    // headDim, non-Ampere) → attention_f16.
+                    if (_flashAttention.CanUse(seqLen, seqKv, positionOffset, slidingWindow,
+                            numHeads, numKvHeads, headDim))
+                        _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, numHeads, numKvHeads, headDim, s);
+                    else if (_g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
                         _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
                             seqLen, numHeads, numKvHeads, headDim, s);
                     else
