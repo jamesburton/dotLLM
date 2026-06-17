@@ -15,7 +15,7 @@
 // match the reference shader exactly.
 
 #define TILE_KV         256
-#define MAX_HEAD_DIM    256
+#define MAX_HEAD_DIM    512
 #define WG_SIZE         256
 #define NEG_INF         (-3.4e38)
 

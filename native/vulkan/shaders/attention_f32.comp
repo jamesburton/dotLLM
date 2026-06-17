@@ -19,10 +19,11 @@
 //   local_size_x    = 256
 //   groupCount.x    = seq_q * num_heads
 // Shared memory:    headDim*2 + TILE_KV + workgroup_size (floats)
-//   (MAX_HEAD_DIM = 256 gives headroom for Llama/DeepSeek 128, SmolLM 64.)
+//   (MAX_HEAD_DIM = 512 covers gemma4 global layers (512); Llama/DeepSeek 128,
+//    SmolLM 64. qShared+outAccum = 2*512*4 = 4 KB — well under the LDS limit.)
 
 #define TILE_KV         256
-#define MAX_HEAD_DIM    256
+#define MAX_HEAD_DIM    512
 #define WG_SIZE         256
 #define NEG_INF         (-3.4e38)
 

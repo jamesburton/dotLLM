@@ -45,7 +45,16 @@ namespace DotLLM.Vulkan.Kernels;
 public sealed class AttentionF32Kernel : IDisposable
 {
     /// <summary>Fixed compile-time upper bound on head_dim in the shader.</summary>
-    public const int MaxHeadDim = 256;
+    public const int MaxHeadDim = 512;
+
+    /// <summary>
+    /// The coopmat variant's f16 Q/K/V/O tiles are sized to this bound; at 512
+    /// they would need ~80 KB of shared memory (over the 64 KB LDS limit), so
+    /// coopmat stays capped at 256. A dispatch whose <c>headDim</c> exceeds this
+    /// falls back to the shared-memory pipeline (always present), so gemma4's
+    /// 512-wide global layers never land on coopmat even when it is force-enabled.
+    /// </summary>
+    private const int CoopmatMaxHeadDim = 256;
 
     private const int WorkgroupSize = 256;
     // 8 uints + 2 floats (softCap, scaleOverride) + 2 uints (maskMode, prefixLen) = 12 * 4 = 48 bytes.
@@ -335,7 +344,13 @@ public sealed class AttentionF32Kernel : IDisposable
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
-        ComputePipeline pipeline = _mode switch
+        // Coopmat's tiles cap at CoopmatMaxHeadDim; a wider head (gemma4 global,
+        // 512) falls back to the shared-memory pipeline, which is always present.
+        DispatchMode mode = (_mode == DispatchMode.Coopmat && headDim > CoopmatMaxHeadDim)
+            ? DispatchMode.SharedMem
+            : _mode;
+
+        ComputePipeline pipeline = mode switch
         {
             DispatchMode.Coopmat  => _coopmatPipeline!,
             DispatchMode.Subgroup => _subgroupPipeline!,
@@ -379,7 +394,7 @@ public sealed class AttentionF32Kernel : IDisposable
         //   coopmat: one WG per (query-tile-of-16-rows, query-head)
         //   shared / subgroup: one WG per (query-token, query-head)
         uint groups;
-        if (_mode == DispatchMode.Coopmat)
+        if (mode == DispatchMode.Coopmat)
         {
             const int Br = 16;
             uint qTiles = ((uint)seqQ + (uint)Br - 1u) / (uint)Br;
