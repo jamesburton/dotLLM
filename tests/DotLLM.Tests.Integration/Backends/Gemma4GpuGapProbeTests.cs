@@ -159,7 +159,10 @@ public sealed class Gemma4GpuGapProbeTests
                 Assert.True(diff <= tol,
                     $"logit[{i}] diverged: cpu={cpuLogits[i]:F5} cuda={cudaLogits[i]:F5} diff={diff:F5} tol={tol:F5}");
             }
-            _output.WriteLine($"max (diff - tol) over {n} logits = {maxAbs:E3} (<=0 ⇒ all within tolerance)");
+            // Also report the raw worst-case absolute logit diff (informational).
+            float rawMax = 0f;
+            for (int i = 0; i < n; i++) rawMax = MathF.Max(rawMax, MathF.Abs(cpuLogits[i] - cudaLogits[i]));
+            _output.WriteLine($"max (diff - tol) over {n} logits = {maxAbs:E3} (<=0 ⇒ all within tolerance); raw max|diff|={rawMax:E3}");
         }
         finally
         {

@@ -2101,7 +2101,8 @@ public sealed unsafe class CudaTransformerModel : IModel
     private void ProjectF32Gemma4(nint quantWeight, QuantizationType qt, nint fp16Weight,
                                    nint inputF32, nint outputF32, int outputDim, int inputDim, int seqLen)
     {
-        if (qt == QuantizationType.Q8_0 && (inputDim & 31) == 0)
+        if (qt == QuantizationType.Q8_0 && (inputDim & 31) == 0
+            && Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_NO_ACTQUANT") != "1")
         {
             nint s = _stream.Handle;
             int elems = seqLen * inputDim;
