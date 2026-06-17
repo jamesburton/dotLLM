@@ -64,6 +64,23 @@ internal static class VkStructureType
     // optionally chains security attrs/access onto the export create info.
     internal const int SemaphoreGetWin32HandleInfoKhr = 1000078003;
     internal const int ExportSemaphoreWin32HandleInfoKhr = 1000078001;
+    // VK_KHR_timeline_semaphore (core 1.2) — VkSemaphoreTypeCreateInfo chains off
+    // VkSemaphoreCreateInfo.pNext to request a TIMELINE semaphore. Required for the
+    // D3D12_FENCE export type CUDA imports cross-vendor (Intel Vulkan → NVIDIA CUDA);
+    // the OPAQUE_WIN32 binary form fails import on that pairing (CUresult 999).
+    internal const int SemaphoreTypeCreateInfo = 1000207002;
+    // VkTimelineSemaphoreSubmitInfo chains off VkSubmitInfo.pNext to carry the
+    // per-semaphore signal/wait counter values for a timeline submit.
+    internal const int TimelineSemaphoreSubmitInfo = 1000207003;
+    // Feature struct enabling the timelineSemaphore capability at device create.
+    internal const int PhysicalDeviceTimelineSemaphoreFeatures = 1000207000;
+}
+
+// VkSemaphoreType — binary (default) vs timeline (monotonic counter).
+internal static class VkSemaphoreType
+{
+    internal const int Binary = 0;
+    internal const int Timeline = 1;
 }
 
 // VkExternalSemaphoreHandleTypeFlagBits — handle types a semaphore may be
@@ -567,6 +584,42 @@ internal struct VkSemaphoreGetWin32HandleInfoKhr
     internal nint pNext;
     internal nint semaphore;   // VkSemaphore
     internal uint handleType;  // single VkExternalSemaphoreHandleTypeFlags bit
+}
+
+// VkSemaphoreTypeCreateInfo (VK_KHR_timeline_semaphore, core 1.2). Chains onto
+// VkSemaphoreCreateInfo.pNext (before VkExportSemaphoreCreateInfo) to request a
+// timeline semaphore with an initial counter value.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreTypeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal int semaphoreType; // VkSemaphoreType
+    internal ulong initialValue;
+}
+
+// VkTimelineSemaphoreSubmitInfo (core 1.2). Chains onto VkSubmitInfo.pNext to
+// carry the per-semaphore counter values for timeline wait/signal. The array
+// lengths must match VkSubmitInfo's wait/signal semaphore counts.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkTimelineSemaphoreSubmitInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint waitSemaphoreValueCount;
+    internal nint pWaitSemaphoreValues;   // const uint64_t*
+    internal uint signalSemaphoreValueCount;
+    internal nint pSignalSemaphoreValues; // const uint64_t*
+}
+
+// VkPhysicalDeviceTimelineSemaphoreFeatures — chains off
+// VkPhysicalDeviceFeatures2.pNext to enable timelineSemaphore at device create.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceTimelineSemaphoreFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint timelineSemaphore; // VkBool32
 }
 
 // VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
