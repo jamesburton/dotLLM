@@ -275,5 +275,8 @@ public enum Architecture
     /// Gemma-4 MoE safetensors path.
     /// </para>
     /// </summary>
-    DiffusionGemma
+    DiffusionGemma,
+
+    /// <summary>Microsoft BitNet b1.58 family (ternary-weight, I2_S quantization).</summary>
+    BitNet
 }

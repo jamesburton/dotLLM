@@ -15,6 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Compares CPU vs GPU logits token by token to diagnose divergence.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaLogitComparisonTest
 {
     private readonly ITestOutputHelper _out;

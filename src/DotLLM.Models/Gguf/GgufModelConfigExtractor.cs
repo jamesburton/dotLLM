@@ -135,7 +135,7 @@ public static class GgufModelConfigExtractor
             MaxSequenceLength = maxSeqLen,
             NormEpsilon = normEps,
             AttentionType = attentionType,
-            ActivationFunction = architecture == Architecture.NemotronH
+            ActivationFunction = architecture is Architecture.NemotronH or Architecture.BitNet
                 ? ActivationFunction.ReluSquared
                 : ActivationFunction.SiLU,
             RoPEConfig = ropeConfig,
@@ -526,6 +526,7 @@ public static class GgufModelConfigExtractor
             // adds `diffusion.canvas_length` + a `<mask>` token, which
             // BuildGemma4Config turns into a non-null DiffusionConfig.
             "diffusion-gemma" or "diffusion_gemma" => Architecture.DiffusionGemma,
+            "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }

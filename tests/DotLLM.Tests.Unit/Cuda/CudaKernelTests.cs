@@ -10,6 +10,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Tests individual CUDA kernels against CPU reference implementations.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaKernelTests : IDisposable
 {
     private readonly CudaContext? _ctx;

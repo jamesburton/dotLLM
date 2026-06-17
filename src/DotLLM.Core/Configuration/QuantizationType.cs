@@ -121,5 +121,12 @@ public enum QuantizationType
     /// <c>scales[ib32/2]</c> byte (low nibble = first sub, high = second);
     /// per-pair scale is <c>db = d * (1 + 2 * sub_scale)</c>.
     /// </summary>
-    IQ3_S = 21
+    IQ3_S = 21,
+
+    /// <summary>
+    /// BitNet b1.58 ternary weights. 4 codes packed per byte (2 bits each), block size 128;
+    /// codes 0→-1, 1→0, 2→+1; a single per-tensor float32 scale follows the packed data.
+    /// This is bitnet.cpp's <c>GGML_TYPE_I2_S</c> (id 36, not a mainline ggml type).
+    /// </summary>
+    I2_S = 36
 }

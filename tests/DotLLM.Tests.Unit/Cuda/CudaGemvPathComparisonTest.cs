@@ -23,6 +23,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// If |B-C| >> |A-C|, there's a GPU kernel bug.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaGemvPathComparisonTest
 {
     private readonly ITestOutputHelper _out;

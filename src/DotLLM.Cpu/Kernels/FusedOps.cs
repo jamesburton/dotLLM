@@ -214,6 +214,64 @@ public static unsafe class FusedOps
         }
     }
 
+    // ──────────────────── ReLU² GLU Fusion ────────────────────
+    // Fuses relu(gate)² + Multiply(reluSq, up) into a tiled operation:
+    //   result[i] = max(0, gate[i])² * up[i]
+    // This is the squared-ReLU ("relu2") gating used by BitNet b1.58 in place of SwiGLU.
+    // Tiles of 256 floats (1KB) keep the relu intermediate in L1 cache.
+
+    /// <summary>
+    /// Fused squared-ReLU GLU activation: <c>result[i] = max(0, gate[i])² * up[i]</c>.
+    /// Uses tiled <see cref="TensorPrimitives"/> with the relu intermediate staying in L1
+    /// via a small stack buffer. This is BitNet's FFN gating (in place of SwiGLU).
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void ReLU2GLU(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        int length = gate.Length;
+        Span<float> reluBuf = stackalloc float[SwiGLUTileSize];
+
+        int i = 0;
+        for (; i + SwiGLUTileSize <= length; i += SwiGLUTileSize)
+        {
+            var gTile = gate.Slice(i, SwiGLUTileSize);
+            var uTile = up.Slice(i, SwiGLUTileSize);
+            var rTile = result.Slice(i, SwiGLUTileSize);
+
+            TensorPrimitives.Max(gTile, 0f, reluBuf);                       // relu(gate)
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluBuf, reluBuf, reluBuf); // squared
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluBuf, uTile, rTile);     // * up
+        }
+
+        // Tail
+        if (i < length)
+        {
+            int remaining = length - i;
+            var gTile = gate.Slice(i, remaining);
+            var uTile = up.Slice(i, remaining);
+            var rTile = result.Slice(i, remaining);
+            var reluTail = reluBuf.Slice(0, remaining);
+
+            TensorPrimitives.Max(gTile, 0f, reluTail);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluTail, reluTail, reluTail);
+            TensorPrimitives.Multiply((ReadOnlySpan<float>)reluTail, uTile, rTile);
+        }
+    }
+
+    /// <summary>
+    /// Scalar ReLU² GLU reference implementation for correctness verification.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void ReLU2GLUScalar(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
+    {
+        for (int i = 0; i < gate.Length; i++)
+        {
+            float r = MathF.Max(0f, gate[i]);
+            result[i] = r * r * up[i];
+        }
+    }
+
     // ──────────────────── RMSNorm + Quantize Fusion ────────────────────
     // Fuses RmsNorm(hidden → normOut) + Quantize(normOut → Q8 scratch) into one kernel
     // that reads hidden once and writes quantized output directly — skipping normOut.

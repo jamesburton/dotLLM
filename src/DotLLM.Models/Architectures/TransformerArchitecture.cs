@@ -32,7 +32,8 @@ public sealed class TransformerArchitecture : IModelArchitecture
          // embed-scale, QK-norm, per-attention-type RoPE, dual KV-head/head-dim,
          // sparse MoE, soft-cap). DiffusionGemma adds only a DiffusionConfig the
          // generator consumes — the tower itself is the Gemma-4 MoE backbone.
-         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma];
+         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma,
+         Architecture.BitNet];
 
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
@@ -52,7 +53,8 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
                                     or Architecture.Phi or Architecture.Qwen
-                                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3))
+                                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                                    or Architecture.BitNet))
             throw new ArgumentException(
                 $"TransformerArchitecture does not support {config.Architecture}.", nameof(config));
 

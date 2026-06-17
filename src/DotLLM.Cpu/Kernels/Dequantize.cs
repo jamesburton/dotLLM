@@ -35,6 +35,9 @@ public static unsafe partial class Dequantize
     /// <summary>Q5_1 block size in bytes: 2 (Half d) + 2 (Half m) + 4 (qh) + 16 (qs) = 24.</summary>
     private const int Q5_1BlockBytes = 24;
 
+    /// <summary>Number of elements per I2_S block (x86 packing). 128 codes → 32 bytes.</summary>
+    internal const int I2SBlockSize = 128;
+
     /// <summary>
     /// Returns the byte size of one row of <paramref name="elementCount"/> elements in the given quantization format.
     /// Useful for computing row strides when iterating weight matrices.
@@ -62,6 +65,8 @@ public static unsafe partial class Dequantize
         QuantizationType.IQ1_S => elementCount / KQuantGroupSize * IQ1_S_BlockBytes,
         QuantizationType.IQ3_XXS => elementCount / KQuantGroupSize * IQ3_XXS_BlockBytes,
         QuantizationType.IQ3_S => elementCount / KQuantGroupSize * IQ3_S_BlockBytes,
+        // I2_S: packed 2-bit row stride only (k/4). The per-tensor scale lives at the tensor tail.
+        QuantizationType.I2_S => elementCount / 4,
         _ => throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
             $"Unknown quantization type: {quantType}")
     };
@@ -142,6 +147,9 @@ public static unsafe partial class Dequantize
                 break;
             case QuantizationType.IQ3_S:
                 DequantizeIQ3_S(src, elementCount, dest);
+                break;
+            case QuantizationType.I2_S:
+                DequantizeI2_S(src, elementCount, dest);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(quantType), quantType,
@@ -348,6 +356,42 @@ public static unsafe partial class Dequantize
 
             outIdx += Q5_0GroupSize;
             blockBase += Q5_0BlockBytes;
+        }
+    }
+
+    // ──────────────────── I2_S (BitNet ternary) ────────────────────
+
+    /// <summary>
+    /// Scalar I2_S dequantization (BitNet b1.58 ternary). Block layout: 128 codes → 32 bytes,
+    /// 4 codes per byte. Within a block, byte at <c>group_pos</c> (0..31) holds the codes for
+    /// elements {group_pos, +32, +64, +96} at bit offsets {6,4,2,0}. Codes map 0→-1, 1→0, 2→+1.
+    /// A single per-tensor float32 scale is stored immediately after the packed data (offset n/4).
+    /// Formula: <c>value = (code - 1) * scale</c>.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void DequantizeI2_S(nint src, long elementCount, Span<float> dest)
+    {
+        if (elementCount % I2SBlockSize != 0)
+            throw new ArgumentException(
+                $"I2_S element count must be a multiple of {I2SBlockSize}, got {elementCount}",
+                nameof(elementCount));
+
+        byte* data = (byte*)src;
+        float scale = Unsafe.ReadUnaligned<float>(data + elementCount / 4);
+        long blockCount = elementCount / I2SBlockSize;
+
+        for (long b = 0; b < blockCount; b++)
+        {
+            byte* blockBase = data + b * 32;
+            int outBase = (int)(b * I2SBlockSize);
+            for (int gp = 0; gp < 32; gp++)
+            {
+                byte packed = blockBase[gp];
+                dest[outBase + gp] = (((packed >> 6) & 0x3) - 1) * scale;
+                dest[outBase + gp + 32] = (((packed >> 4) & 0x3) - 1) * scale;
+                dest[outBase + gp + 64] = (((packed >> 2) & 0x3) - 1) * scale;
+                dest[outBase + gp + 96] = ((packed & 0x3) - 1) * scale;
+            }
         }
     }
 
