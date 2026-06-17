@@ -356,6 +356,79 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
         }
     }
 
+    /// <summary>
+    /// CONTROL for the D3D12_FENCE path: same-adapter (3060 on both sides) timeline
+    /// import. Disambiguates the cross-vendor D3D12_FENCE failure (CUresult 1,
+    /// INVALID_VALUE): if this SAME-adapter import succeeds, the cross-vendor
+    /// failure is the adapter (LUID) mismatch — symmetric with the OPAQUE_WIN32
+    /// result. If it also fails INVALID_VALUE, the D3D12_FENCE export likely needs
+    /// the DXGI access-rights path (VkExportSemaphoreWin32HandleInfoKHR), separate
+    /// from the adapter constraint. Either way the cross-vendor verdict is
+    /// unchanged (both handle types fail Arc→3060); this only sharpens the D3D12
+    /// root-cause attribution.
+    /// </summary>
+    [SkippableFact]
+    public void M3_Smoke_Control_NvidiaD3D12FenceTimeline_SameNvidiaCudaImports()
+    {
+        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+            "VK_KHR_external_semaphore_win32 is Windows-only.");
+        Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
+
+        string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR");
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR", "0x10DE");
+        try
+        {
+            using var device = VulkanDevice.Create();
+            _out.WriteLine($"Vulkan device: {device.DeviceName} (vendor=0x{device.VendorId:X4})");
+            Skip.If(device.VendorId != 0x10DE,
+                $"No NVIDIA Vulkan device present (got vendor 0x{device.VendorId:X4}); control needs the 3060 on both sides.");
+            Skip.IfNot(device.HasExternalSemaphoreWin32,
+                "NVIDIA device does not expose VK_KHR_external_semaphore_win32.");
+
+            using var ctx = CudaContext.Create(0);
+            ctx.MakeCurrent();
+
+            nint vkSem = device.CreateExportableTimelineSemaphore(
+                ExternalSemaphoreHandleType.D3D12Fence, initialValue: 0);
+            nint win32Handle = 0;
+            nint cudaExtSem = 0;
+            try
+            {
+                win32Handle = device.GetSemaphoreWin32Handle(vkSem, ExternalSemaphoreHandleType.D3D12Fence);
+                var desc = new CudaExternalSemaphoreHandleDesc
+                {
+                    Type = CudaDriverApi.CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE,
+                    Handle = win32Handle,
+                    Name = 0,
+                    Flags = 0,
+                };
+                int importResult = CudaDriverApi.cuImportExternalSemaphore(out cudaExtSem, desc);
+                _out.WriteLine($"cuImportExternalSemaphore(D3D12_FENCE, same-adapter) -> {importResult} " +
+                    $"({(importResult == 0 ? "SUCCESS" : DescribeCuResult(importResult))})");
+
+                _out.WriteLine("");
+                if (importResult == 0)
+                    _out.WriteLine("VERDICT: same-adapter D3D12_FENCE import WORKS -> cross-vendor " +
+                        "D3D12_FENCE failure is the LUID/adapter mismatch (symmetric with OPAQUE_WIN32).");
+                else
+                    _out.WriteLine($"VERDICT: same-adapter D3D12_FENCE ALSO fails ({DescribeCuResult(importResult)}) " +
+                        "-> the D3D12_FENCE export likely needs the DXGI access-rights path, not (only) the adapter.");
+                // Diagnostic, not a hard gate — records the attribution either way.
+                Assert.True(importResult == 0 || importResult != 0);
+            }
+            finally
+            {
+                if (cudaExtSem != 0) CudaDriverApi.cuDestroyExternalSemaphore(cudaExtSem);
+                if (win32Handle != 0) CloseHandle(win32Handle);
+                device.DestroySemaphore(vkSem);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR", prior);
+        }
+    }
+
     private static string DescribeCuResult(int code) => code switch
     {
         1 => "CUDA_ERROR_INVALID_VALUE",
