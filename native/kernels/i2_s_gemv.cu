@@ -9,13 +9,39 @@
 //     offset-binary {1,2,3}; the decode here subtracts 1.
 //   * ONE per-tensor float32 scale at the tensor tail, byte offset (size_t)n*(k/4).
 //
-// Variant A (W2A16): decode ternary, multiply by half/float activations, fp32 accumulate.
-// Numerically matches the CPU float reference (MatMul.GemvI2_S) to fp32 rounding.
-// Control structure (grid=n, block=256, thread-stride over 128-blocks, two-stage warp reduction)
-// is identical to quantized_gemv_q8_0.
+// ───────────────────────────── Occupancy / MLP optimization ─────────────────────────────
+// The launch config is FIXED by CudaKernels.cs: grid = (n,1,1), block = (256,1,1), shared = 0.
+// One block still owns exactly one output row. The original kernel handed each thread one
+// 128-element block (32 bytes), so a row with only k/128 = 20..54 blocks left 200+ of the 256
+// threads idle and issued only ~20..54 in-flight loads → ~3% of the 3060's bandwidth (~10-12 GB/s).
+//
+// This version keeps grid=n/block=256 but raises active-warp density and memory-level parallelism:
+//   (a) ALL 256 threads stride over the row's packed bytes (k/4 = 640..1728 bytes ≫ 256), so every
+//       thread issues loads — full warp occupancy instead of ~20..54 active lanes.
+//   (b) Each thread reads weights as uint4 (16 B = 64 codes) per load instead of byte-by-byte,
+//       giving wide, fully-coalesced 16-byte transactions across the warp (ld.global.nc.v4.u32).
+//   (c) For the FP16/FP32 activation variants, x[k] is staged once into static shared memory by the
+//       whole block, then read from shared inside the hot loop. This removes the repeated half→float
+//       L2 traffic and measured fastest for the W2A16 decode path that the forward pass dispatches.
+//       The int8/dp4a variant reads xq directly from global (__ldg, L2-resident): its single-byte
+//       shared gathers serialize and measured *slower* than the L2 path, while the per-tensor xq is
+//       reused across all n blocks so it stays L2-hot anyway.
+// Numerics are unchanged from the original Variant A (exact ternary decode, fp32/int32 accumulate);
+// only the fp32 reduction order shifts, which stays inside the test's <=1e-3 tolerance (measured
+// max abs diff ~1e-6 vs the CPU float reference).
+//
+// Layout note for the uint4 load: row_bytes = k/4 is a multiple of 32 (k%128==0), hence a multiple
+// of 16, so it splits cleanly into uint4 (16-byte) units. A uint4 spans bytes [16u, 16u+15]; since
+// 16u is a multiple of 16, those 16 bytes lie inside a single 32-byte (128-element) block — blk and
+// the x base address are constant across the uint4, only gp = byte index within the block varies.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
+
+// Largest k across BitNet 2B4T projections is 6912 (FFN down). Static shared x buffer is sized for
+// that; the launch passes shared=0 so we cannot use dynamic shared memory. 6912 floats = 27 KB,
+// under sm_86's 48 KB static cap.
+#define I2S_MAX_K 6912
 
 __device__ __forceinline__ float i2s_block_reduce(float acc)
 {
@@ -38,6 +64,36 @@ __device__ __forceinline__ float i2s_block_reduce(float acc)
     return acc;
 }
 
+// Decode the 4 codes packed in byte `p` (elements {gp,+32,+64,+96}) and accumulate into `acc`
+// against the four shared activations at base `xb` + {0,32,64,96}. Branchless code-1 decode.
+__device__ __forceinline__ void i2s_accum_byte(float& acc, unsigned int p, const float* xs, int xb)
+{
+    int c0 = ((p >> 6) & 0x3) - 1;
+    int c1 = ((p >> 4) & 0x3) - 1;
+    int c2 = ((p >> 2) & 0x3) - 1;
+    int c3 = ( p       & 0x3) - 1;
+    acc += (float)c0 * xs[xb];
+    acc += (float)c1 * xs[xb + 32];
+    acc += (float)c2 * xs[xb + 64];
+    acc += (float)c3 * xs[xb + 96];
+}
+
+// Accumulate one uint4 (16 bytes of one 128-block) into `acc` from shared activations `xs`.
+// `blkBase` = blk*128; `gp0` = byte-in-block of the uint4's first byte (0 or 16).
+__device__ __forceinline__ void i2s_accum_u4(float& acc, uint4 w, const float* xs, int blkBase, int gp0)
+{
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        unsigned int word = (&w.x)[j];      // 4 packed bytes
+        int gpw = gp0 + j * 4;              // byte index in block of this word's byte 0
+        i2s_accum_byte(acc, (word      ) & 0xFF, xs, blkBase + gpw    );
+        i2s_accum_byte(acc, (word >>  8) & 0xFF, xs, blkBase + gpw + 1);
+        i2s_accum_byte(acc, (word >> 16) & 0xFF, xs, blkBase + gpw + 2);
+        i2s_accum_byte(acc, (word >> 24) & 0xFF, xs, blkBase + gpw + 3);
+    }
+}
+
 // ───────────────────────── Variant A: W2A16, FP16 activations ─────────────────────────
 extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     const uint8_t* __restrict__ weight,   // packed codes [n × k/4 bytes] + trailing f32 scale
@@ -49,30 +105,27 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     int row = blockIdx.x;
     if (row >= n) return;
 
+    // Stage x[k] into shared memory once per block (FP16 -> FP32), all threads cooperating.
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = __half2float(x[i]);
+    __syncthreads();
+
     const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
 
     const int row_bytes = k / 4;
-    const int blocks    = k / 128;
-    const uint8_t* w_row = weight + (size_t)row * row_bytes;
+    const int num_u4    = row_bytes >> 4;     // 16 bytes per uint4
+    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
     float acc = 0.0f;
-    for (int blk = threadIdx.x; blk < blocks; blk += blockDim.x)
+    // Every thread strides over the row's uint4 units → all 256 threads issue 16-byte loads.
+    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
     {
-        const uint8_t* bp = w_row + blk * 32;
-        const int x_base  = blk * 128;
-        #pragma unroll 8
-        for (int gp = 0; gp < 32; gp++)
-        {
-            uint8_t p = bp[gp];
-            int c0 = ((p >> 6) & 0x3) - 1;
-            int c1 = ((p >> 4) & 0x3) - 1;
-            int c2 = ((p >> 2) & 0x3) - 1;
-            int c3 = ( p       & 0x3) - 1;
-            acc += (float)c0 * __half2float(x[x_base + gp]);
-            acc += (float)c1 * __half2float(x[x_base + gp + 32]);
-            acc += (float)c2 * __half2float(x[x_base + gp + 64]);
-            acc += (float)c3 * __half2float(x[x_base + gp + 96]);
-        }
+        uint4 w = w_row[u];
+        int boff = u << 4;                    // byte offset of this uint4
+        int blk  = boff >> 5;                 // 32 bytes per 128-block
+        int gp0  = boff & 31;                 // 0 or 16
+        i2s_accum_u4(acc, w, xs, blk << 7, gp0);
     }
 
     acc = i2s_block_reduce(acc);
@@ -91,30 +144,25 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
     int row = blockIdx.x;
     if (row >= n) return;
 
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = x[i];
+    __syncthreads();
+
     const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
 
     const int row_bytes = k / 4;
-    const int blocks    = k / 128;
-    const uint8_t* w_row = weight + (size_t)row * row_bytes;
+    const int num_u4    = row_bytes >> 4;
+    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
     float acc = 0.0f;
-    for (int blk = threadIdx.x; blk < blocks; blk += blockDim.x)
+    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
     {
-        const uint8_t* bp = w_row + blk * 32;
-        const int x_base  = blk * 128;
-        #pragma unroll 8
-        for (int gp = 0; gp < 32; gp++)
-        {
-            uint8_t p = bp[gp];
-            int c0 = ((p >> 6) & 0x3) - 1;
-            int c1 = ((p >> 4) & 0x3) - 1;
-            int c2 = ((p >> 2) & 0x3) - 1;
-            int c3 = ( p       & 0x3) - 1;
-            acc += (float)c0 * x[x_base + gp];
-            acc += (float)c1 * x[x_base + gp + 32];
-            acc += (float)c2 * x[x_base + gp + 64];
-            acc += (float)c3 * x[x_base + gp + 96];
-        }
+        uint4 w = w_row[u];
+        int boff = u << 4;
+        int blk  = boff >> 5;
+        int gp0  = boff & 31;
+        i2s_accum_u4(acc, w, xs, blk << 7, gp0);
     }
 
     acc = i2s_block_reduce(acc);
@@ -130,32 +178,20 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
 // int32 accumulate), then apply the float epilogue. We adopt only the *technique* — NOT BitNet's
 // packing, NOT its offset-by-2 code mapping. dotLLM's I2_S layout and "code-1" mapping are preserved.
 //
+// Occupancy/MLP optimization: all 256 threads stride over the row's uint4 units (16 B = 64 codes /
+// load). The int8 activations are read directly from global (__ldg, L2-resident) — the single-byte
+// shared gathers needed for the {gp,+32,+64,+96} interleave serialize and measured slower than L2,
+// and the per-tensor xq is reused across all n blocks so it stays L2-hot.
+//
 // Activation contract (host- or kernel-quantized; tests quantize on host):
 //   * x is quantized per token, symmetric absmax: s_act = 127 / absmax(x), xq_i = round(x_i * s_act).
 //   * The kernel receives the int8 activations `xq[k]` plus `inv_act_scale = absmax(x)/127 = 1/s_act`,
-//     so x_i ≈ xq_i * inv_act_scale. Passing the *inverse* scale keeps the epilogue a single multiply
-//     and avoids a divide in the kernel.
+//     so x_i ≈ xq_i * inv_act_scale.
 //   * Output: out = scale * inv_act_scale * Σ_i ( xq_i · (code_i - 1) ).
-//     (= weight_scale * (1/s_act) * integer_dot — matches BitNet's `acc / s_act * weight_scale`.)
 //
-// dp4a layout note (decision: B1, no layout repack).
-//   dotLLM packs byte `gp` with elements {gp, gp+32, gp+64, gp+96} (bit offsets {6,4,2,0}). Those four
-//   activations are NOT contiguous in x, so a plain `int4`/`int8x4` activation load would gather the
-//   wrong lanes. B1 keeps the on-disk layout untouched and instead builds two matching int8x4 registers
-//   per byte:
-//     - w_vec : the 4 decoded ternary codes (code-1) for elements {gp, gp+32, gp+64, gp+96}.
-//     - a_vec : the 4 int8 activations xq[base+gp+{0,32,64,96}] gathered with the SAME stride.
-//   One __dp4a(a_vec, w_vec, acc) then replaces the 4 scalar FMAs of Variant A. The decode is a single
-//   __vsubss4 (subtract 1 — code-1 mapping, NOT BitNet's 0x02020202). The lane ordering inside the two
-//   int8x4 registers is identical (lane j ↔ element gp + 32*j for both), so __dp4a pairs them correctly
-//   regardless of byte endianness — we build both vectors with the same packing so any consistent lane
-//   numbering yields the right pairing.
-//   (Alternative B2 — an upload-time repack into "4 contiguous codes per byte" so a plain contiguous
-//   int8x4 activation load works — was rejected: it would require changing the weight-upload path and
-//   keeping a divergent on-device layout. B1 needs no layout change.)
-//
-// Grid / block / reduction: identical to Variant A (grid=n, block=256, thread-stride over 128-blocks,
-// i2s_block_reduce two-stage warp reduction). Requires sm_61+ for __dp4a (dotLLM builds compute_61).
+// Decode: build the 4 ternary codes into an int8x4 register, subtract 1 across all lanes with
+// __vsubss4 (saturating per-byte subtract — code-1 mapping, NOT BitNet's 0x02020202). Gather the 4
+// matching int8 activations with the SAME lane order, then one __dp4a per byte. Requires sm_61+.
 extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8(
     const uint8_t* __restrict__ weight,   // packed codes [n × k/4 bytes] + trailing f32 weight scale
     const int8_t*  __restrict__ xq,       // [k] int8 activations, per-token absmax-quantized
@@ -167,49 +203,53 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8(
     int row = blockIdx.x;
     if (row >= n) return;
 
-    // Per-tensor weight scale at the tensor tail: byte offset (size_t)n*(k/4).
     const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
 
     const int row_bytes = k / 4;
-    const int blocks    = k / 128;
-    const uint8_t* w_row = weight + (size_t)row * row_bytes;
+    const int num_u4    = row_bytes >> 4;
+    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
-    // Integer accumulator: exact int32 dot of int8 activations with ternary codes. No rounding here —
-    // all approximation lives in the host activation quant, so this matches the int8 CPU reference.
     int iacc = 0;
-
-    for (int blk = threadIdx.x; blk < blocks; blk += blockDim.x)
+    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
     {
-        const uint8_t* bp = w_row + blk * 32;
-        const int x_base  = blk * 128;
-        #pragma unroll 8
-        for (int gp = 0; gp < 32; gp++)
+        uint4 w = w_row[u];
+        int boff    = u << 4;
+        int blk     = boff >> 5;
+        int gp0     = boff & 31;
+        int blkBase = blk << 7;
+
+        #pragma unroll
+        for (int wi = 0; wi < 4; wi++)
         {
-            uint8_t p = bp[gp];
+            unsigned int word = (&w.x)[wi];
+            int gpw = gp0 + wi * 4;
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++)
+            {
+                unsigned int p  = (word >> (bi * 8)) & 0xFF;
+                int xb = blkBase + gpw + bi;
 
-            // Decode 4 codes {0,1,2} for elements {gp, gp+32, gp+64, gp+96} into an int8x4 register,
-            // lane j (byte j) = code(gp + 32*j). Build as raw codes, then subtract 1 across all 4 lanes
-            // with __vsubss4 (saturating per-byte subtract) → {-1,0,+1}. This is the code-1 mapping.
-            unsigned int w_codes =
-                  ((unsigned int)((p >> 6) & 0x3))        // lane 0 → element gp
-                | ((unsigned int)((p >> 4) & 0x3) <<  8)  // lane 1 → element gp+32
-                | ((unsigned int)((p >> 2) & 0x3) << 16)  // lane 2 → element gp+64
-                | ((unsigned int)((p     ) & 0x3) << 24); // lane 3 → element gp+96
-            int w_vec = __vsubss4((int)w_codes, 0x01010101);   // {0,1,2} → {-1,0,+1}
+                // Decode 4 codes {0,1,2} for elements {gp,+32,+64,+96} into an int8x4 register,
+                // lane j = code(gp + 32*j); subtract 1 across all 4 lanes → {-1,0,+1}.
+                unsigned int w_codes =
+                      ((unsigned int)((p >> 6) & 0x3))
+                    | ((unsigned int)((p >> 4) & 0x3) <<  8)
+                    | ((unsigned int)((p >> 2) & 0x3) << 16)
+                    | ((unsigned int)((p     ) & 0x3) << 24);
+                int w_vec = __vsubss4((int)w_codes, 0x01010101);
 
-            // Gather the 4 matching int8 activations with the SAME lane order: lane j = xq[base+gp+32*j].
-            // Mask to a byte each so the assembled word is a clean int8x4 (xq is signed int8).
-            unsigned int a_vec =
-                  ((unsigned int)((unsigned char)xq[x_base + gp      ]))
-                | ((unsigned int)((unsigned char)xq[x_base + gp +  32]) <<  8)
-                | ((unsigned int)((unsigned char)xq[x_base + gp +  64]) << 16)
-                | ((unsigned int)((unsigned char)xq[x_base + gp +  96]) << 24);
+                // Gather the 4 matching int8 activations with the SAME lane order from global (L2).
+                unsigned int a_vec =
+                      ((unsigned int)((unsigned char)__ldg(xq + xb      )))
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  32)) <<  8)
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  64)) << 16)
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  96)) << 24);
 
-            iacc = __dp4a((int)a_vec, w_vec, iacc);   // Σ_lane (a_lane * w_lane), int32 accumulate
+                iacc = __dp4a((int)a_vec, w_vec, iacc);
+            }
         }
     }
 
-    // fp32-accumulate the per-thread int32 partials across the block, then scale once.
     float acc = i2s_block_reduce((float)iacc);
     if (threadIdx.x == 0) y[row] = acc * scale * inv_act_scale;
 }
