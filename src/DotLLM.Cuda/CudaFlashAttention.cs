@@ -10,12 +10,14 @@ namespace DotLLM.Cuda;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Where it sits in the dispatch.</b> The flash kernel wins over G3 only once the
-/// score round-trip dominates — measured on an RTX 3060 (CC 8.6) the win is 1.3–1.69×
-/// at <c>s ≥ 1024</c>. Below the crossover the launch/occupancy overhead of the untuned
-/// kernel makes G3 (or <c>attention_f16</c>) the better choice, so the model dispatches
-/// flash only for long-context prefill and keeps G3 for shorter sequences. See
-/// <see cref="CrossoverSeqLen"/> for the threshold and its override.
+/// <b>Where it sits in the dispatch.</b> The tuned kernel (GQA-group K/V sharing, one warp
+/// per query head, <c>group</c> warps/block) beats G3 across the whole measured range on an
+/// RTX 3060 (CC 8.6): end-to-end attention-category G3/flash 2.14× @ s=512, 1.83× @ 1024,
+/// 1.81× @ 2048, and kernel-level 1.94× @ 4096 — combining the causal-triangle FLOP halving
+/// with score fusion (no <c>numHeads · s²</c> HBM round-trip). The crossover is set to 512,
+/// the lowest length with a clean measurement; below that, per-block launch overhead may
+/// favour G3, so shorter prefills keep G3. See <see cref="CrossoverSeqLen"/> for the
+/// threshold and its override.
 /// </para>
 /// <para>
 /// <b>Eligibility (see <see cref="CanUse"/>).</b> The kernel is a prototype for the
@@ -34,18 +36,29 @@ internal sealed class CudaFlashAttention
 
     /// <summary>
     /// Max GQA group (query heads per kv head) the tuned kernel supports: it launches
-    /// <c>group</c> warps per block and statically sizes per-warp shared memory for this
-    /// many warps (<c>MAX_GROUP_WARPS</c> in the kernel). Larger groups fall through to G3.
-    /// Llama-3.2-1B is group 4.
+    /// <c>group</c> warps per block (<c>group · 32</c> threads) and statically sizes per-warp
+    /// shared memory for this many warps. Larger groups fall through to G3. Llama-3.2-1B is
+    /// group 4.
+    /// <para>
+    /// <b>MUST equal <c>MAX_GROUP_WARPS</c> in <c>native/kernels/attention_flash_mma.cu</c>.</b>
+    /// The kernel is compiled <c>__launch_bounds__(MAX_GROUP_WARPS · 32)</c> and indexes its
+    /// per-warp shared arrays by warp id; if this cap exceeds the kernel's, an admitted
+    /// large-group call launches more threads than launch-bounds allows and indexes shared
+    /// memory out of bounds. Keep the two constants in lockstep.
+    /// </para>
     /// </summary>
-    private const int MaxGroupWarps = 8;
+    private const int MaxGroupWarps = 4;
 
     /// <summary>
-    /// Default sequence-length crossover at/above which flash beats G3 (measured 1.3–1.69×
-    /// at s ≥ 1024 on a 3060; below that G3 is kept). Overridable via
+    /// Default sequence-length crossover at/above which flash is dispatched ahead of G3.
+    /// The tuned kernel (GQA-group K/V sharing, <c>group</c> warps/block) beats G3 across the
+    /// whole measured range on a 3060 — end-to-end attention-category G3/flash 2.14× @ s=512,
+    /// 1.83× @ 1024, 1.81× @ 2048; kernel-level 1.94× @ 4096 — so the crossover is the lowest
+    /// length with a clean measurement (512). Below 512 there is no data and per-block launch
+    /// overhead may favour G3, so 512 is kept as a conservative floor. Overridable via
     /// <c>DOTLLM_CUDA_FLASH_ATTN_MINSEQ</c>.
     /// </summary>
-    private const int DefaultCrossoverSeqLen = 1024;
+    private const int DefaultCrossoverSeqLen = 512;
 
     private static readonly string? FlashAttnEnv =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_ATTN");

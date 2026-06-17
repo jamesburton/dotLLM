@@ -238,6 +238,38 @@ public sealed class CudaFlashPrefillForwardHarness
         model.ProfilingEnabled = false;
     }
 
+    /// <summary>
+    /// Verifies the flash default-on flip: on GeForce Ampere with <c>DOTLLM_CUDA_FLASH_ATTN</c>
+    /// unset, loading the model enables <see cref="CudaFlashAttention.Enabled"/> by default (via
+    /// <c>CudaFlashAttention.ConfigureDefault</c>). Starts the field at <c>false</c> so a
+    /// <c>true</c> reading proves the load-time flip set it, not a stale value. Mirrors
+    /// <see cref="CudaG3PrefillForwardHarness.G3Attn_DefaultsOn_ForGeForceAmpere"/>.
+    /// </summary>
+    [SkippableFact]
+    public void FlashAttn_DefaultsOn_ForGeForceAmpere()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_ATTN") is not null,
+            "DOTLLM_CUDA_FLASH_ATTN is set — it overrides the device-gated default this test checks.");
+        string? modelPath = ResolveModelPath();
+        Skip.If(modelPath is null, "No model for the default-gate check.");
+
+        var dev = CudaDevice.GetDevice(0);
+        Skip.IfNot(dev.ComputeCapabilityMajor == 8 && dev.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase),
+            $"Default-on gate is GeForce Ampere; device '{dev.Name}' (cc{dev.ComputeCapabilityMajor}) not eligible.");
+
+        bool prior = CudaFlashAttention.Enabled;
+        try
+        {
+            CudaFlashAttention.Enabled = false;
+            using var gguf = GgufFile.Open(modelPath!);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ResolvePtxDir());
+            Assert.True(CudaFlashAttention.Enabled, "Flash default did not enable on GeForce Ampere after model load.");
+        }
+        finally { CudaFlashAttention.Enabled = prior; }
+    }
+
     private static ushort[] CaptureLayer0AttnOutput(CudaTransformerModel model, ModelConfig config, int len, bool flashOn)
     {
         SetDispatch(flashOn);
