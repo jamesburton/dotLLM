@@ -21,6 +21,11 @@ internal readonly struct TransformerLayerWeights
     /// <summary>Optional QK-norm weight [headDim]. Applied per-head to K after projection, before RoPE. Null when absent.</summary>
     public readonly float[]? KNormWeight;
 
+    /// <summary>Optional attention sub-norm weight [hiddenSize]. Applied to the attention output before the output projection (BitNet Sub-LN). Null when absent.</summary>
+    public readonly float[]? AttnSubNormWeight;
+    /// <summary>Optional FFN sub-norm weight [intermediateSize]. Applied to the gated FFN intermediate before the down projection (BitNet Sub-LN). Null when absent.</summary>
+    public readonly float[]? FfnSubNormWeight;
+
     /// <summary>Q projection pointer, quantType, output dim, input dim.</summary>
     public readonly nint QWeight;
     public readonly QuantizationType QQuantType;
@@ -92,11 +97,14 @@ internal readonly struct TransformerLayerWeights
         nint downWeight, QuantizationType downQuantType, int downOutputDim, int downInputDim,
         float[]? qBias = null, float[]? kBias = null, float[]? vBias = null, float[]? oBias = null,
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
-        float[]? qNormWeight = null, float[]? kNormWeight = null)
+        float[]? qNormWeight = null, float[]? kNormWeight = null,
+        float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
         KNormWeight = kNormWeight;
+        AttnSubNormWeight = attnSubNormWeight;
+        FfnSubNormWeight = ffnSubNormWeight;
         QWeight = qWeight; QQuantType = qQuantType; QOutputDim = qOutputDim; QInputDim = qInputDim; QBias = qBias;
         KWeight = kWeight; KQuantType = kQuantType; KOutputDim = kOutputDim; KInputDim = kInputDim; KBias = kBias;
         VWeight = vWeight; VQuantType = vQuantType; VOutputDim = vOutputDim; VInputDim = vInputDim; VBias = vBias;
@@ -345,9 +353,15 @@ internal sealed class TransformerWeights : IDisposable
         float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", config.HeadDim);
         float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", config.HeadDim);
 
+        // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output [hiddenSize] before o_proj.
+        float[]? attnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_sub_norm.weight", hiddenSize);
+
         // FFN norm
         var ffnNormDesc = tensors[$"{prefix}.ffn_norm.weight"];
         float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
+
+        // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
+        float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
 
         // FFN projections — check for fused gate+up (Phi-3 style: ffn_up.weight has 2x intermediate rows)
         nint gatePtr, upPtr, downPtr;
@@ -408,7 +422,8 @@ internal sealed class TransformerWeights : IDisposable
             downPtr, downQt, downM, downK,
             qBias, kBias, vBias, oBias,
             gateBias, upBias, downBias,
-            qNormWeight, kNormWeight);
+            qNormWeight, kNormWeight,
+            attnSubNormWeight, ffnSubNormWeight);
     }
 
     private static (nint ptr, QuantizationType qt, int outputDim, int inputDim) LoadLinear(

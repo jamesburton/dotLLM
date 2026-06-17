@@ -23,6 +23,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.Q4_K => elementCount / 256 * 144,
         QuantizationType.Q5_K => elementCount / 256 * 176,
         QuantizationType.Q6_K => elementCount / 256 * 210,
+        // I2_S: n/4 packed bytes (4 ternary codes/byte) + one trailing per-tensor float32 scale.
+        QuantizationType.I2_S => elementCount / 4 + 4,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

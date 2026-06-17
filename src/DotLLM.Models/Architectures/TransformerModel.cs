@@ -193,7 +193,9 @@ public sealed unsafe class TransformerModel : IModel
             // b. RMSNorm + Pre-quantize + Q/K/V projections
             byte* inputQ8Scratch = (byte*)_state.InputQ8Scratch;
 
-            if (seqLen == 1 && _threadPool != null)
+            // The fused decode kernels don't support I2_S; route ternary weights through the
+            // standard (unfused) projection path, which dispatches to the I2_S GEMV.
+            if (seqLen == 1 && _threadPool != null && lw.QQuantType != QuantizationType.I2_S)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -294,6 +296,18 @@ public sealed unsafe class TransformerModel : IModel
                     _slidingWindowSize);
             }
 
+            // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output
+            // before the output projection. In-place per token. No-op for non-BitNet models.
+            if (lw.AttnSubNormWeight is not null)
+            {
+                int attnDim = numHeads * headDim;
+                for (int t = 0; t < seqLen; t++)
+                {
+                    var s = new Span<float>(attnOut + t * attnDim, attnDim);
+                    RmsNorm.Execute(s, lw.AttnSubNormWeight, eps, s);
+                }
+            }
+
             // f. Batched O projection
             byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, numHeads * headDim, seqLen, lw.OQuantType);
             var rwO = rl?.O ?? default;
@@ -314,7 +328,8 @@ public sealed unsafe class TransformerModel : IModel
             new Span<float>(hidden, seqLen * hiddenSize).CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
             // i. FFN RMSNorm + Pre-quantize + Gate/Up projections
-            if (seqLen == 1 && _threadPool != null)
+            // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused path.
+            if (seqLen == 1 && _threadPool != null && lw.GateQuantType != QuantizationType.I2_S)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
@@ -359,17 +374,35 @@ public sealed unsafe class TransformerModel : IModel
             AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
             AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
-            // Fused SwiGLU: SiLU(gate) * up in a single tiled pass (per token)
+            // Fused gated activation in a single tiled pass (per token).
+            // Activation nonlinearity is config-driven: SiLU → SwiGLU (Llama/Mistral/Qwen/Phi),
+            // ReLU2 → squared-ReLU GLU (BitNet b1.58).
+            bool useReLU2 = Config.ActivationFunction == ActivationFunction.ReLU2;
             for (int t = 0; t < seqLen; t++)
             {
                 float* gateT = ffnGate + t * intermediateSize;
                 float* upT = ffnUp + t * intermediateSize;
                 float* siluT = siluOut + t * intermediateSize;
 
-                FusedOps.SwiGLU(
-                    new ReadOnlySpan<float>(gateT, intermediateSize),
-                    new ReadOnlySpan<float>(upT, intermediateSize),
-                    new Span<float>(siluT, intermediateSize));
+                var gateSpan = new ReadOnlySpan<float>(gateT, intermediateSize);
+                var upSpan = new ReadOnlySpan<float>(upT, intermediateSize);
+                var outSpan = new Span<float>(siluT, intermediateSize);
+
+                if (useReLU2)
+                    FusedOps.ReLU2GLU(gateSpan, upSpan, outSpan);
+                else
+                    FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
+            }
+
+            // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate
+            // before the down projection. In-place per token. No-op for non-BitNet models.
+            if (lw.FfnSubNormWeight is not null)
+            {
+                for (int t = 0; t < seqLen; t++)
+                {
+                    var s = new Span<float>(siluOut + t * intermediateSize, intermediateSize);
+                    RmsNorm.Execute(s, lw.FfnSubNormWeight, eps, s);
+                }
             }
 
             // Pre-quantize siluOutput for Down projection (different input dim = intermediateSize)
@@ -482,6 +515,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else
             GemvDequantFallback(weights, qt, x, y, m, k);
     }
@@ -533,6 +568,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else
             GemmDequantFallback(weights, qt, b, c, m, k, n);
     }

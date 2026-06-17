@@ -18,5 +18,8 @@ public enum Architecture
     Qwen,
 
     /// <summary>DeepSeek family.</summary>
-    DeepSeek
+    DeepSeek,
+
+    /// <summary>Microsoft BitNet b1.58 family (ternary-weight, I2_S quantization).</summary>
+    BitNet
 }

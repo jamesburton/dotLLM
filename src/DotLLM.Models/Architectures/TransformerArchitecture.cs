@@ -24,7 +24,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
     /// <inheritdoc/>
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
-        [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen];
+        [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen, Architecture.BitNet];
 
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
@@ -35,7 +35,7 @@ public sealed class TransformerArchitecture : IModelArchitecture
                 "See roadmap Step 48.");
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
-                                    or Architecture.Phi or Architecture.Qwen))
+                                    or Architecture.Phi or Architecture.Qwen or Architecture.BitNet))
             throw new ArgumentException(
                 $"TransformerArchitecture does not support {config.Architecture}.", nameof(config));
 

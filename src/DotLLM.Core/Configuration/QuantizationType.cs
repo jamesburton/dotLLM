@@ -33,5 +33,12 @@ public enum QuantizationType
     Q5_K = 13,
 
     /// <summary>6-bit K-quant, super-block of 256.</summary>
-    Q6_K = 14
+    Q6_K = 14,
+
+    /// <summary>
+    /// BitNet b1.58 ternary weights. 4 codes packed per byte (2 bits each), block size 128;
+    /// codes 0→-1, 1→0, 2→+1; a single per-tensor float32 scale follows the packed data.
+    /// This is bitnet.cpp's <c>GGML_TYPE_I2_S</c> (id 36, not a mainline ggml type).
+    /// </summary>
+    I2_S = 36
 }

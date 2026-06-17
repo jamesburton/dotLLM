@@ -48,9 +48,15 @@ public static class GgufModelConfigExtractor
 
         RoPEConfig? ropeConfig = ExtractRoPEConfig(metadata, arch, headDim, architecture);
 
+        // BitNet b1.58 uses squared-ReLU (relu2) gated FFN; all other supported families use SiLU/SwiGLU.
+        ActivationFunction activation = architecture == Architecture.BitNet
+            ? ActivationFunction.ReLU2
+            : ActivationFunction.SiLU;
+
         return new ModelConfig
         {
             Architecture = architecture,
+            ActivationFunction = activation,
             VocabSize = vocabSize,
             HiddenSize = hiddenSize,
             IntermediateSize = intermediateSize,
@@ -76,6 +82,7 @@ public static class GgufModelConfigExtractor
             "phi" or "phi2" or "phi3" => Architecture.Phi,
             "qwen" or "qwen2" or "qwen3" => Architecture.Qwen,
             "deepseek" or "deepseek2" => Architecture.DeepSeek,
+            "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }
