@@ -330,6 +330,11 @@ public sealed unsafe class HybridTransformerModel : IModel
                     seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
             }
 
+            // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.
+            if (lw.AttnSubNormWeight != 0)
+                _kernels.LaunchRmsNorm(_gpuState.AttnOutput, lw.AttnSubNormWeight, _gpuState.AttnOutput,
+                    numHeads * headDim, eps, seqLen, s);
+
             // O projection → NormOutput
             ProjectGpu(lw.OQuant, lw.OQuantType, lw.O, _gpuState.AttnOutput, _gpuState.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
@@ -348,8 +353,26 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-            _kernels.LaunchSwiGLU(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
-                intermediateSize, seqLen, s);
+            // BitNet's relu(gate)²·up intermediate overflows FP16; fuse activation + Sub-LN RMSNorm
+            // (kept in FP32) when the Sub-LN weight is present. See CudaTransformerModel for rationale.
+            if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+            {
+                _kernels.LaunchReLU2GluRmsNorm(_gpuState.FfnGate, _gpuState.FfnUp, lw.FfnSubNormWeight,
+                    _gpuState.SiluOutput, intermediateSize, eps, seqLen, s);
+            }
+            else
+            {
+                if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+                    _kernels.LaunchReLU2(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
+                        intermediateSize, seqLen, s);
+                else
+                    _kernels.LaunchSwiGLU(_gpuState.FfnGate, _gpuState.FfnUp, _gpuState.SiluOutput,
+                        intermediateSize, seqLen, s);
+
+                if (lw.FfnSubNormWeight != 0)
+                    _kernels.LaunchRmsNorm(_gpuState.SiluOutput, lw.FfnSubNormWeight, _gpuState.SiluOutput,
+                        intermediateSize, eps, seqLen, s);
+            }
 
             ProjectGpu(lw.DownQuant, lw.DownQuantType, lw.Down, _gpuState.SiluOutput, _gpuState.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
@@ -521,6 +544,17 @@ public sealed unsafe class HybridTransformerModel : IModel
                         _slidingWindowSize);
                 }
 
+                // Optional attention Sub-LN (BitNet): RMSNorm over the attention output before o_proj.
+                if (lw.AttnSubNormWeight is not null)
+                {
+                    int attnDim = numHeads * headDim;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var sp = new Span<float>(attnOut + t * attnDim, attnDim);
+                        RmsNorm.Execute(sp, lw.AttnSubNormWeight, eps, sp);
+                    }
+                }
+
                 // O projection
                 byte* preQuantAttn = QuantizeInput(attnOut, inputQ8Scratch, numHeads * headDim, seqLen, lw.OQuantType);
                 var rwO = rl?.O ?? default;
@@ -584,13 +618,27 @@ public sealed unsafe class HybridTransformerModel : IModel
                 AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
                 AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
-                // Fused SwiGLU
+                // Gated activation: SwiGLU (default) or squared-ReLU GLU (BitNet b1.58).
+                bool useReluSquared = Config.ActivationFunction == ActivationFunction.ReluSquared;
                 for (int t = 0; t < seqLen; t++)
                 {
-                    FusedOps.SwiGLU(
-                        new ReadOnlySpan<float>(ffnGate + t * intermediateSize, intermediateSize),
-                        new ReadOnlySpan<float>(ffnUp + t * intermediateSize, intermediateSize),
-                        new Span<float>(siluOut + t * intermediateSize, intermediateSize));
+                    var gateSpan = new ReadOnlySpan<float>(ffnGate + t * intermediateSize, intermediateSize);
+                    var upSpan = new ReadOnlySpan<float>(ffnUp + t * intermediateSize, intermediateSize);
+                    var outSpan = new Span<float>(siluOut + t * intermediateSize, intermediateSize);
+                    if (useReluSquared)
+                        FusedOps.ReLU2GLU(gateSpan, upSpan, outSpan);
+                    else
+                        FusedOps.SwiGLU(gateSpan, upSpan, outSpan);
+                }
+
+                // Optional FFN Sub-LN (BitNet): RMSNorm over the gated intermediate before ffn_down.
+                if (lw.FfnSubNormWeight is not null)
+                {
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        var sp = new Span<float>(siluOut + t * intermediateSize, intermediateSize);
+                        RmsNorm.Execute(sp, lw.FfnSubNormWeight, eps, sp);
+                    }
                 }
 
                 // Down projection
@@ -664,11 +712,18 @@ public sealed unsafe class HybridTransformerModel : IModel
             nint w = fp16Weight;
             if (w == 0)
             {
-                _kernels.LaunchDequantToF16(quantWeight, qt, _gpuState.DequantScratch,
-                    outputDim * inputDim, s);
+                if (qt == QuantizationType.I2_S)
+                    _kernels.LaunchDequantI2_SToF16(quantWeight, _gpuState.DequantScratch, outputDim, inputDim, s);
+                else
+                    _kernels.LaunchDequantToF16(quantWeight, qt, _gpuState.DequantScratch,
+                        outputDim * inputDim, s);
                 w = _gpuState.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S)
+        {
+            _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt))
         {
