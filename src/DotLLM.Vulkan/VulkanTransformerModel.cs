@@ -839,6 +839,14 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
+    /// DIAGNOSTIC (spike/decode-barrier): when DOTLLM_VULKAN_TIMING=1, the decode
+    /// Forward prints the CPU split between command-buffer RECORDING and the
+    /// blocking SubmitAndWait (≈ GPU execution). Decides GPU-bound vs CPU-bound.
+    /// </summary>
+    private static readonly bool _decodeTimingEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_TIMING") == "1";
+
+    /// <summary>
     /// Env-var opt-out for the Flash-Attention prefill path. Set
     /// <c>DOTLLM_VULKAN_DISABLE_FLASH_ATTENTION=1</c> to force every dispatch
     /// onto the legacy per-token <see cref="AttentionF32Kernel"/>.
@@ -1541,6 +1549,7 @@ public sealed class VulkanTransformerModel : IModel
         //    whole transformer. Bias-add host steps split the forward into
         //    multiple submits (one per distinct set of biases we need to
         //    pause for); everything else stays inside the pipelined path.
+        var _recSw = _decodeTimingEnabled ? System.Diagnostics.Stopwatch.StartNew() : null;
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
@@ -1827,7 +1836,24 @@ public sealed class VulkanTransformerModel : IModel
 
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
         KernelSupport.ComputeToHostBarrier(cmdBuf);
-        _submit.SubmitAndWait();
+        if (_recSw is not null)
+        {
+            _recSw.Stop();
+            var _waitSw = System.Diagnostics.Stopwatch.StartNew();
+            _submit.SubmitAndWait();
+            _waitSw.Stop();
+            try
+            {
+                System.IO.File.AppendAllText(
+                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "dotllm_decode_timing.log"),
+                    $"record_ms={_recSw.Elapsed.TotalMilliseconds:F2} submit_wait_ms={_waitSw.Elapsed.TotalMilliseconds:F2}\n");
+            }
+            catch { /* diagnostic only */ }
+        }
+        else
+        {
+            _submit.SubmitAndWait();
+        }
 
         // 5. Return logits as a host-resident UnmanagedTensor [1, vocabSize].
         var shape = new TensorShape(1, vocabSize);

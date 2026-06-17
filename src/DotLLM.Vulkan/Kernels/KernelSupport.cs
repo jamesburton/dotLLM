@@ -18,6 +18,17 @@ namespace DotLLM.Vulkan.Kernels;
 internal static class KernelSupport
 {
     /// <summary>
+    /// DIAGNOSTIC ONLY (spike/decode-barrier): when DOTLLM_VULKAN_NO_BARRIERS=1,
+    /// the intra-compute <see cref="ComputeToComputeBarrier"/> is skipped. This
+    /// produces INCORRECT results (RAW hazards on shared buffers) and exists
+    /// solely to measure the wall-time cost of the ~320 global memory barriers
+    /// emitted per decode token — i.e. the ceiling on what dependency-scoped
+    /// barriers could recover. Never set this in a correctness run.
+    /// </summary>
+    internal static readonly bool BarriersDisabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_NO_BARRIERS") == "1";
+
+    /// <summary>
     /// Default upper bound on concurrent descriptor sets allocated from a
     /// single kernel pool across one forward pass. Sized to cover the
     /// matmul kernel's ~211 dispatches on SmolLM-135M (7 per layer × 30
@@ -122,6 +133,7 @@ internal static class KernelSupport
     /// </summary>
     internal static unsafe void ComputeToComputeBarrier(nint cmdBuf)
     {
+        if (BarriersDisabled) return; // DIAGNOSTIC ceiling probe — see BarriersDisabled.
         var barrier = new VkMemoryBarrier
         {
             sType = VkStructureType.MemoryBarrier,
