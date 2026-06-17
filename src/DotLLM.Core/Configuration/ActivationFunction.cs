@@ -14,6 +14,6 @@ public enum ActivationFunction
     /// <summary>GELU with tanh approximation.</summary>
     GELUTanh,
 
-    /// <summary>Squared ReLU: <c>relu(x)²</c>. Used as the gated-FFN nonlinearity in BitNet b1.58.</summary>
-    ReLU2
+    /// <summary>Squared ReLU: <c>relu(x)²</c>. Used (gated, as <c>relu(gate)²·up</c>) by BitNet b1.58.</summary>
+    ReluSquared
 }

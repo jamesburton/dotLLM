@@ -34,14 +34,14 @@ public class BitNetForwardPassTests
     }
 
     [Fact]
-    public void Config_IsBitNet_WithReLU2()
+    public void Config_IsBitNet_WithReluSquared()
     {
         var gguf = GgufFile.Open(_fixture.FilePath);
         using var _ = gguf;
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
         Assert.Equal(Architecture.BitNet, config.Architecture);
-        Assert.Equal(ActivationFunction.ReLU2, config.ActivationFunction);
+        Assert.Equal(ActivationFunction.ReluSquared, config.ActivationFunction);
         Assert.Equal(2560, config.HiddenSize);
         Assert.Equal(30, config.NumLayers);
         Assert.Equal(128256, config.VocabSize);

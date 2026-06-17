@@ -376,8 +376,8 @@ public sealed unsafe class TransformerModel : IModel
 
             // Fused gated activation in a single tiled pass (per token).
             // Activation nonlinearity is config-driven: SiLU → SwiGLU (Llama/Mistral/Qwen/Phi),
-            // ReLU2 → squared-ReLU GLU (BitNet b1.58).
-            bool useReLU2 = Config.ActivationFunction == ActivationFunction.ReLU2;
+            // ReluSquared → squared-ReLU GLU (BitNet b1.58).
+            bool useReluSquared = Config.ActivationFunction == ActivationFunction.ReluSquared;
             for (int t = 0; t < seqLen; t++)
             {
                 float* gateT = ffnGate + t * intermediateSize;
@@ -388,7 +388,7 @@ public sealed unsafe class TransformerModel : IModel
                 var upSpan = new ReadOnlySpan<float>(upT, intermediateSize);
                 var outSpan = new Span<float>(siluT, intermediateSize);
 
-                if (useReLU2)
+                if (useReluSquared)
                     FusedOps.ReLU2GLU(gateSpan, upSpan, outSpan);
                 else
                     FusedOps.SwiGLU(gateSpan, upSpan, outSpan);

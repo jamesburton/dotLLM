@@ -50,7 +50,7 @@ public static class GgufModelConfigExtractor
 
         // BitNet b1.58 uses squared-ReLU (relu2) gated FFN; all other supported families use SiLU/SwiGLU.
         ActivationFunction activation = architecture == Architecture.BitNet
-            ? ActivationFunction.ReLU2
+            ? ActivationFunction.ReluSquared
             : ActivationFunction.SiLU;
 
         return new ModelConfig
