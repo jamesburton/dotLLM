@@ -139,16 +139,12 @@ public sealed class Gemma4GgufForwardTests
     /// in-shader dequant make the real model runnable on the GPU.
     /// </summary>
     /// <remarks>
-    /// <para>Gated on <c>DOTLLM_GEMMA4_GGUF</c> + a Vulkan device. CPU-free run.</para>
-    /// <para><b>Known gap (NOT this change):</b> the real 26B's global (full-attention)
-    /// layers use <c>head_dim = 512</c>, but the standard Vulkan attention shaders
-    /// (<c>attention_f32.comp</c> / <c>_sg</c>) cap <c>MAX_HEAD_DIM = 256</c>, so the
-    /// forward currently throws an <see cref="ArgumentException"/> in
-    /// <c>AttentionF32Kernel.Record</c> for these layers. That is an attention-shader
-    /// limitation orthogonal to the MoE-quant path delivered here — the quantized
-    /// expert LOAD (the thing this test gates) succeeds. The forward is wrapped so the
-    /// test asserts the load + quantized-expert path and reports the attention gap
-    /// rather than masking a genuine MoE regression as a pass.</para>
+    /// <para>Gated on <c>DOTLLM_GEMMA4_GGUF</c> + a Vulkan device. CPU-free run. The full
+    /// AR forward now runs end-to-end and must predict " Paris" — this gates the whole
+    /// Vulkan gemma4 path: quantized-expert load + in-shader dequant, the 512-head-dim
+    /// attention bound, the partial-NeoX RoPE freq denominator, and the descriptor-set
+    /// cache lifetime fix (the cache capacity must equal the pool size or a &gt;256-tuple
+    /// model resets the pool mid-command-buffer and silently corrupts the output).</para>
     /// </remarks>
     [SkippableFact]
     public unsafe void Gemma4_26B_Vulkan_QuantizedExperts_LoadsAndForwards()
@@ -181,30 +177,12 @@ public sealed class Gemma4GgufForwardTests
         int[] positions = new int[promptLen];
         for (int i = 0; i < promptLen; i++) positions[i] = i;
 
-        ITensor? logits = null;
-        ArgumentException? attnGap = null;
-        try
-        {
-            var fwdSw = Stopwatch.StartNew();
-            logits = model.Forward(promptIds, positions, deviceId: -1, kvCache: null);
-            fwdSw.Stop();
-            _output.WriteLine($"  forward wall : {fwdSw.Elapsed.TotalSeconds:F2} s");
-        }
-        catch (ArgumentException ex) when (ex.Message.Contains("MAX_HEAD_DIM", StringComparison.Ordinal))
-        {
-            // Known attention-shader head-dim gap (512 > 256), separate from MoE-quant.
-            attnGap = ex;
-        }
+        var fwdSw = Stopwatch.StartNew();
+        using ITensor logits = model.Forward(promptIds, positions, deviceId: -1, kvCache: null);
+        fwdSw.Stop();
+        _output.WriteLine($"  forward wall : {fwdSw.Elapsed.TotalSeconds:F2} s");
 
-        if (attnGap is not null)
-        {
-            _output.WriteLine($"  forward GAP  : {attnGap.Message}");
-            _output.WriteLine("  → quantized-expert load OK; AR forward blocked by the 512-head-dim attention shader bound (separate gap).");
-            return; // The MoE-quant deliverable (quantized load) is validated; attention bound is out of scope.
-        }
-
-        using var _ = logits!;
-        int vocab = logits!.Shape[logits.Shape.Rank - 1];
+        int vocab = logits.Shape[logits.Shape.Rank - 1];
         Assert.Equal(config.VocabSize, vocab);
         float* p = (float*)logits.DataPointer;
         int best = 0; float bestV = float.NegativeInfinity;
