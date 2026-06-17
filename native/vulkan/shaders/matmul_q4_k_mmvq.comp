@@ -24,6 +24,13 @@
 //                      no straddle; qs is word-aligned.
 //
 // Dispatch: one workgroup per output row, 128 threads, shared-mem reduction.
+//
+// Occupancy (#329): threads are mapped to SUB-BLOCK (32-element) granularity, not
+// super-block (256-element). Each Q4_K super-block has 8 sub-blocks, so the total
+// work items per row = blocksPerRow*8 = K/32. For K=4096 that is 128 sub-blocks →
+// all 128 lanes active; K=2048 → 64 lanes; K=14336 (FFN down) → 448 → grid-stride.
+// The previous super-block mapping left K/256 active lanes (only 16 for K=4096),
+// so most of the 128-wide workgroup idled and memory could not be saturated.
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -90,48 +97,49 @@ void main() {
     uint rowByteBase = m * pc.blocksPerRow * Q4K_BLOCK_BYTES;
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    // Sub-block granularity: flatten t over [0, blocksPerRow*8). Grid-stride by
+    // 128 keeps all lanes busy for K>=4096 and covers long K (e.g. K=14336).
+    uint subBlocksPerRow = pc.blocksPerRow * 8u;
+    for (uint t = tid; t < subBlocksPerRow; t += threads) {
+        uint b = t >> 3u;          // super-block index = t / 8
+        uint j = t & 7u;           // sub-block index within super-block = t % 8
+
         uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
         float d    = readHalf(blockByteBase);
         float dmin = readHalf(blockByteBase + 2u);
         uint scalesBase = blockByteBase + 4u;
         uint qsUintRow  = (blockByteBase + 16u) >> 2u;   // word-aligned
-        uint xqBlockBase = b * 64u;   // (b*256)/4 = first activation uint of this super-block
-        uint xdsBase     = b * 8u;    // first Q8_1 block of this super-block
 
-        // 8 sub-blocks of 32 elements; pairs share a 32-byte qs slab.
-        for (uint pairIdx = 0u; pairIdx < 4u; pairIdx++) {
-            uint j0 = pairIdx * 2u;          // low-nibble sub-block
-            uint j1 = j0 + 1u;               // high-nibble sub-block
-            uvec2 sm0 = unpackScaleMin(scalesBase, j0);
-            uvec2 sm1 = unpackScaleMin(scalesBase, j1);
-            uint qsBase = qsUintRow + pairIdx * 8u;   // 8 words = 32 bytes for this pair
-            uint xq0 = xqBlockBase + j0 * 8u;         // 8 activation uints for sub-block j0
-            uint xq1 = xqBlockBase + j1 * 8u;
-            vec2 ds0 = xds[xdsBase + j0];             // (d_x, s) for sub-block j0
-            vec2 ds1 = xds[xdsBase + j1];
+        uvec2 sm = unpackScaleMin(scalesBase, j);
+        // Pairs (j even = low nibble, j odd = high nibble) share a 32-byte qs
+        // slab: slab index = j/2, each slab is 8 words (32 bytes).
+        uint qsBase = qsUintRow + (j >> 1u) * 8u;
+        bool highNibble = (j & 1u) != 0u;
 
-            int dot0 = 0;
-            int dot1 = 0;
-            for (uint g = 0u; g < 8u; g++) {
-                uint cur = weight[qsBase + g];
-                // Low nibbles (even sub-block), high nibbles (odd sub-block),
-                // packed as 4 int8 lanes per uint for dp4a.
-                uint lo = ( cur        & 0x0Fu)
-                        | ((cur >>  8u) & 0x0Fu) << 8u
-                        | ((cur >> 16u) & 0x0Fu) << 16u
-                        | ((cur >> 24u) & 0x0Fu) << 24u;
-                uint hi = ((cur >>  4u) & 0x0Fu)
-                        | ((cur >> 12u) & 0x0Fu) << 8u
-                        | ((cur >> 20u) & 0x0Fu) << 16u
-                        | ((cur >> 28u) & 0x0Fu) << 24u;
-                dot0 = dotPacked4x8AccSatEXT(int(lo), int(xq[xq0 + g]), dot0);
-                dot1 = dotPacked4x8AccSatEXT(int(hi), int(xq[xq1 + g]), dot1);
+        uint xqSub = b * 64u + j * 8u;   // 8 activation uints for this sub-block
+        vec2 ds    = xds[b * 8u + j];    // (d_x, s) for this sub-block
+
+        int dot = 0;
+        for (uint g = 0u; g < 8u; g++) {
+            uint cur = weight[qsBase + g];
+            // Select this sub-block's nibble (low/high) and pack 4 int8 lanes
+            // per uint for dp4a.
+            uint packed;
+            if (highNibble) {
+                packed = ((cur >>  4u) & 0x0Fu)
+                       | ((cur >> 12u) & 0x0Fu) << 8u
+                       | ((cur >> 20u) & 0x0Fu) << 16u
+                       | ((cur >> 28u) & 0x0Fu) << 24u;
+            } else {
+                packed = ( cur        & 0x0Fu)
+                       | ((cur >>  8u) & 0x0Fu) << 8u
+                       | ((cur >> 16u) & 0x0Fu) << 16u
+                       | ((cur >> 24u) & 0x0Fu) << 24u;
             }
-            // contribution = d·sc·(d_x·dot) - dmin·mn·s
-            acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y;
-            acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y;
+            dot = dotPacked4x8AccSatEXT(int(packed), int(xq[xqSub + g]), dot);
         }
+        // contribution = d·sc·(d_x·dot) - dmin·mn·s
+        acc += (d * float(sm.x)) * (ds.x * float(dot)) - (dmin * float(sm.y)) * ds.y;
     }
 
     partials[tid] = acc;
