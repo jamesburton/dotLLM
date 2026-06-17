@@ -161,40 +161,110 @@ public sealed class Gemma4GpuGapProbeTests
         return row;
     }
 
+    /// <summary>
+    /// CUDA gemma4 AR parity: load the synthetic gemma4 fixture on CUDA, run the
+    /// forward, and compare against the CPU reference (EXACT argmax + logits within
+    /// tolerance — CUDA's F32 reduction order differs from the CPU, so a checksum is
+    /// NOT valid; tolerance is the cross-backend golden). Skips cleanly on this AMD
+    /// dev box (no NVIDIA GPU) — runs on the T5500. Requires the regenerated
+    /// gemma4_f32.ptx (native/build.{sh,ps1} with nvcc).
+    /// </summary>
     [SkippableFact]
-    public void Cuda_Gemma4_Fixture_FailsWithCapturedGap()
+    public void Cuda_Gemma4_MatchesCpuReference()
     {
-        // CUDA cannot RUN on this host (no NVIDIA GPU); this probe only executes on a CUDA box
-        // (e.g. the T5500). Build-verify of the managed CUDA path is covered by the solution build.
         Skip.IfNot(
             CudaDevice.IsAvailable(),
             "No CUDA device/driver on this host (CUDA is build-verify-only here).");
 
         string path = WriteFixture();
+        int[] ids = { 2, 7, 8, 9 }; // synthetic fixture BOS = 2
+        int[] pos = { 0, 1, 2, 3 };
         try
         {
-            var ex = Record.Exception(() =>
+            // CPU reference logits. The CPU IModel.Forward returns logits for ALL
+            // seqLen positions ([seqLen, vocab]); the CUDA gemma4 forward (like every
+            // CUDA forward) applies the final norm + LM head to the LAST token only
+            // ([1, vocab]). Compare the LAST-position row of both so the two are
+            // shape-compatible — an autoregressive next-token prediction.
+            float[] cpuLogits;
+            {
+                var (cpuModel, cpuGguf, _) = DotLLM.Models.ModelLoader.LoadFromGguf(
+                    path, DotLLM.Core.Configuration.ThreadingConfig.SingleThreaded);
+                using (cpuGguf)
+                using (cpuModel)
+                using (var logits = cpuModel.Forward(ids, pos, -1, kvCache: null))
+                {
+                    cpuLogits = ToFloatArray(logits);
+                }
+            }
+
+            // CUDA logits (last token only).
+            float[] cudaLogits;
             {
                 var (model, gguf, _) = CudaModelLoader.LoadFromGguf(path, deviceId: 0);
                 using (gguf)
                 using (model)
+                using (var logits = model.Forward(ids, pos, -1, kvCache: null))
                 {
-                    int[] ids = { 2, 7, 8, 9 };
-                    int[] pos = { 0, 1, 2, 3 };
-                    using var _ = model.Forward(ids, pos, -1, kvCache: null);
+                    cudaLogits = ToFloatArray(logits);
                 }
-            });
+            }
 
-            Assert.NotNull(ex);
-            _output.WriteLine($"CUDA gemma4 GAP: {ex!.GetType().FullName}");
-            _output.WriteLine($"CUDA gemma4 GAP message: {ex.Message}");
-            if (ex.StackTrace is not null)
-                _output.WriteLine($"CUDA gemma4 GAP frames:\n{DotLlmFrames(ex.StackTrace)}");
+            // Slice the CPU logits to the last position's vocab row so both vectors
+            // describe the same (final) token's distribution. vocab == CUDA length.
+            int vocab = cudaLogits.Length;
+            Assert.True(cpuLogits.Length % vocab == 0,
+                $"CPU logit length {cpuLogits.Length} not a multiple of CUDA vocab {vocab}.");
+            int lastRow = cpuLogits.Length - vocab;
+            var cpuLast = new float[vocab];
+            Array.Copy(cpuLogits, lastRow, cpuLast, 0, vocab);
+            cpuLogits = cpuLast;
+
+            int cpuArgmax = Argmax(cpuLogits);
+            int cudaArgmax = Argmax(cudaLogits);
+
+            _output.WriteLine($"CPU argmax={cpuArgmax} logit={cpuLogits[cpuArgmax]:F4}; "
+                + $"CUDA argmax={cudaArgmax} logit={cudaLogits[cudaArgmax]:F4}");
+
+            Assert.Equal(cpuArgmax, cudaArgmax);
+
+            // Logits within tolerance (abs 6e-2 / rel 5e-3) — same envelope as the
+            // Vulkan parity test. CUDA F32 reduction order differs from the CPU.
+            int n = Math.Min(cpuLogits.Length, cudaLogits.Length);
+            float maxAbs = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                float diff = MathF.Abs(cpuLogits[i] - cudaLogits[i]);
+                float tol = 6e-2f + 5e-3f * MathF.Abs(cpuLogits[i]);
+                maxAbs = MathF.Max(maxAbs, diff - tol);
+                Assert.True(diff <= tol,
+                    $"logit[{i}] diverged: cpu={cpuLogits[i]:F5} cuda={cudaLogits[i]:F5} diff={diff:F5} tol={tol:F5}");
+            }
+            float rawMax = 0f;
+            for (int i = 0; i < n; i++) rawMax = MathF.Max(rawMax, MathF.Abs(cpuLogits[i] - cudaLogits[i]));
+            _output.WriteLine($"max (diff - tol) over {n} logits = {maxAbs:E3} (<=0 ⇒ all within tolerance); raw max|diff|={rawMax:E3}");
         }
         finally
         {
             try { File.Delete(path); } catch { /* best-effort */ }
         }
+    }
+
+    private static unsafe float[] ToFloatArray(DotLLM.Core.Tensors.ITensor t)
+    {
+        int n = (int)t.Shape.ElementCount;
+        var arr = new float[n];
+        float* p = (float*)t.DataPointer;
+        for (int i = 0; i < n; i++) arr[i] = p[i];
+        return arr;
+    }
+
+    private static int Argmax(float[] v)
+    {
+        int best = 0;
+        for (int i = 1; i < v.Length; i++)
+            if (v[i] > v[best]) best = i;
+        return best;
     }
 
     // The throw site is often a Memmove deep in a copy; the meaningful gap signal is the

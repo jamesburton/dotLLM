@@ -112,6 +112,17 @@ internal sealed class CudaWeights : IDisposable
     /// </summary>
     public CudaMoeLayerWeights?[]? MoeLayers { get; }
 
+    /// <summary>
+    /// Per-layer Gemma-4 (DiffusionGemma AR) extras. Non-null iff
+    /// <c>config.Gemma4DualFfn</c>; one entry per layer (all gemma4 layers are
+    /// MoE layers). When non-null the forward routes through the gemma4 F32 path
+    /// (V-from-K, weight-less V-norm, partial rope, dual dense+MoE GeGLU FFN, the
+    /// five norms, custom router, per-expert down scale, layer_output_scale).
+    /// The companion experts live in <see cref="MoeLayers"/>; the dense
+    /// gate/up/down + norms live in the matching <see cref="Layers"/> entry.
+    /// </summary>
+    public CudaGemma4LayerWeights?[]? Gemma4Layers { get; }
+
     public nint TokenEmbedDevice { get; }
     public QuantizationType TokenEmbedQuantType { get; }
     public nint OutputNormWeight { get; }
@@ -128,7 +139,8 @@ internal sealed class CudaWeights : IDisposable
                           nint outputWeightQuant, QuantizationType outputQt,
                           List<nint> allocs,
                           CudaMlaLayerWeights[]? mlaLayers,
-                          CudaMoeLayerWeights?[]? moeLayers)
+                          CudaMoeLayerWeights?[]? moeLayers,
+                          CudaGemma4LayerWeights?[]? gemma4Layers)
     {
         Layers = layers;
         TokenEmbedDevice = tokenEmbed;
@@ -142,6 +154,7 @@ internal sealed class CudaWeights : IDisposable
         _allAllocations = allocs;
         MlaLayers = mlaLayers;
         MoeLayers = moeLayers;
+        Gemma4Layers = gemma4Layers;
     }
 
     /// <summary>
@@ -224,8 +237,14 @@ internal sealed class CudaWeights : IDisposable
         // bundle (Qwen3-MoE-style alternating layouts leave non-MoE layers null).
         bool hasMla = config.MlaConfig is not null;
         bool hasMoe = config.Moe is not null;
+        // Gemma-4 is a dual-FFN MoE: every layer carries BOTH a dense gate/up/down
+        // (the "shared expert") AND a 128-expert MoE. The dense slots must still be
+        // uploaded (unlike pure-MoE Qwen/DeepSeek layers, which zero them), so the
+        // dense-FFN upload is gated on `isMoeLayer && !isGemma4` below.
+        bool hasGemma4 = config.Gemma4DualFfn;
         var mlaLayers = hasMla ? new CudaMlaLayerWeights[layerCount] : null;
         var moeLayers = hasMoe ? new CudaMoeLayerWeights?[layerCount] : null;
+        var gemma4Layers = hasGemma4 ? new CudaGemma4LayerWeights?[layerCount] : null;
 
         for (int i = 0; i < layerCount; i++)
         {
@@ -241,6 +260,12 @@ internal sealed class CudaWeights : IDisposable
             // zero on the CPU side. The MoE loader uploads per-expert projections
             // into separate device allocations.
             bool isMoeLayer = lw.Moe is not null;
+            // Gemma-4 layers ARE MoE layers but ALSO carry a dense gate/up/down
+            // ("shared expert") that must be uploaded into the standard dense slots.
+            bool isGemma4Layer = lw.Gemma4 is not null;
+            // V-from-K (gemma4 global layers): no attn_v.weight — the V slot is 0
+            // on the CPU side and the forward copies the raw K projection into V.
+            bool vFromK = isGemma4Layer && lw.Gemma4!.VFromK;
 
             nint q = 0, k = 0, v = 0, o = 0;
             nint qQuant = 0, kQuant = 0, vQuant = 0, oQuant = 0;
@@ -251,7 +276,9 @@ internal sealed class CudaWeights : IDisposable
             {
                 q = SkipFp16(lw.QQuantType, kernels) ? 0 : UploadAndDequant(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs, kernels, stream);
                 k = SkipFp16(lw.KQuantType, kernels) ? 0 : UploadAndDequant(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs, kernels, stream);
-                v = SkipFp16(lw.VQuantType, kernels) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
+                // V-from-K (gemma4 global layers): no attn_v.weight — leave V slots 0;
+                // the gemma4 forward copies the raw K projection into V.
+                v = (vFromK || SkipFp16(lw.VQuantType, kernels)) ? 0 : UploadAndDequant(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs, kernels, stream);
                 o = SkipFp16(lw.OQuantType, kernels) ? 0 : UploadAndDequant(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs, kernels, stream);
 
                 // ── Upload raw quantized Q/K/V weights ──
@@ -263,7 +290,8 @@ internal sealed class CudaWeights : IDisposable
                 // work unchanged because they only read `outputDim` rows starting at the
                 // given pointer. Saves ~`(qOut+kOut+vOut)*rowBytes` per layer of VRAM that
                 // was previously double-stored. Only the packed allocation is in `allocs`.
-                if (!CudaKernels.DisablePackedQkv)
+                // Skip packing on V-from-K layers — there is no V tensor to pack.
+                if (!CudaKernels.DisablePackedQkv && !vFromK)
                 {
                     (qkvPacked, qkvPackedQt, qkvPackedOut,
                      qQuant, kQuant, vQuant) = TryUploadPackedThree(
@@ -277,7 +305,7 @@ internal sealed class CudaWeights : IDisposable
                     // Fusion not possible — fall back to per-tensor uploads (separate allocations).
                     qQuant = UploadQuantized(lw.QWeight, lw.QQuantType, lw.QOutputDim, lw.QInputDim, allocs);
                     kQuant = UploadQuantized(lw.KWeight, lw.KQuantType, lw.KOutputDim, lw.KInputDim, allocs);
-                    vQuant = UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
+                    vQuant = vFromK ? 0 : UploadQuantized(lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim, allocs);
                 }
 
                 oQuant = UploadQuantized(lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim, allocs);
@@ -294,7 +322,10 @@ internal sealed class CudaWeights : IDisposable
             nint gateQuant = 0, upQuant = 0, downQuant = 0;
             nint gateUpPacked = 0; QuantizationType gateUpPackedQt = QuantizationType.F16; int gateUpPackedOut = 0;
             nint gateBias = 0, upBias = 0, downBias = 0;
-            if (!isMoeLayer)
+            // Gemma-4 layers ARE MoE layers but carry a dense gate/up/down ("shared
+            // expert") that must be uploaded into the standard dense slots. Run the
+            // dense upload for non-MoE layers AND for gemma4 layers.
+            if (!isMoeLayer || isGemma4Layer)
             {
                 gate = SkipFp16(lw.GateQuantType, kernels) ? 0 : UploadAndDequant(lw.GateWeight, lw.GateQuantType, lw.GateOutputDim, lw.GateInputDim, allocs, kernels, stream);
                 up = SkipFp16(lw.UpQuantType, kernels) ? 0 : UploadAndDequant(lw.UpWeight, lw.UpQuantType, lw.UpOutputDim, lw.UpInputDim, allocs, kernels, stream);
@@ -348,7 +379,19 @@ internal sealed class CudaWeights : IDisposable
                     ? CudaMlaWeightsLoader.LoadLayerQuant(lw, config.HiddenSize, lw.OQuantType, allocs)
                     : CudaMlaWeightsLoader.LoadLayerF16(lw, config.HiddenSize, allocs);
             }
-            if (isMoeLayer)
+            if (isGemma4Layer)
+            {
+                // Gemma-4 dual-FFN MoE: host-dequant the fused gate_up bank into
+                // separate F32 gate/up per-expert banks + the down bank with the
+                // per-expert down scale folded in, plus the gemma4 per-layer extras
+                // (five F32 norms, router scale with 1/√H folded, layer_output_scale,
+                // V-from-K flag). The experts reuse the F32 CudaMoeFfn routed path
+                // (GeGLU substituted for SwiGLU by the gemma4 FFN helper).
+                var (extras, g4Moe) = CudaGemma4WeightsLoader.LoadLayer(lw, config, allocs);
+                gemma4Layers![i] = extras;
+                moeLayers![i] = g4Moe;
+            }
+            else if (isMoeLayer)
             {
                 // GGUF source with raw quant view → upload Q4_K bytes per expert
                 // (~26 GB at full V2-Lite Q4_K_M scale; the next perf milestone
@@ -372,7 +415,7 @@ internal sealed class CudaWeights : IDisposable
         return new CudaWeights(layers, tokenEmbed, tokenEmbedQt,
             outputNorm, outputWeight, cpuWeights.OutputOutputDim, cpuWeights.OutputInputDim,
             outputWeightQuant, cpuWeights.OutputQuantType, allocs,
-            mlaLayers, moeLayers);
+            mlaLayers, moeLayers, gemma4Layers);
     }
 
     /// <summary>Upload raw quantized weight bytes to GPU (no dequant). For decode quantized GEMV.</summary>

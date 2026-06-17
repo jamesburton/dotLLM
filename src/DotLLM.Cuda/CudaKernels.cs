@@ -287,6 +287,24 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _sigmoidMulF32Func;
     private readonly nint _dequantQ6_KF32Func;
 
+    // ── Gemma-4 (DiffusionGemma AR) F32 helper kernels ───────────────────────
+    // Cover the gemma4 MoE forward ops absent from the generic F32 catalog:
+    //   • geglu_tanh_f32         — tanh-approx GELU GeGLU (dense + experts)
+    //   • rope_f32_partial_neox  — partial NeoX rope (pair (i, i+head_dim/2), full-head freq base)
+    //   • scale_inplace_f32      — in-place scalar multiply (layer_output_scale)
+    //   • rmsnorm_weightless_f32 — per-row RMSNorm with unit gamma (weight-less V-norm)
+    //   • softcap_inplace_f32    — final-logit soft-capping c*tanh(x/c)
+    // Optional — PTX may be absent on stale builds; HasGemma4Kernels reports false
+    // and the gemma4 forward path surfaces a clear error instead of an NRE.
+    private readonly CudaModule? _gemma4F32Module;
+    private readonly nint _gegluTanhF32Func;
+    private readonly nint _ropeF32PartialNeoxFunc;
+    private readonly nint _scaleInplaceF32Func;
+    private readonly nint _rmsnormWeightlessF32Func;
+    private readonly nint _softcapInplaceF32Func;
+    private readonly nint _moeRenormTopkClampedF32Func;
+    private readonly nint _quantizeActQ8_0RoundtripF32Func;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -617,7 +635,36 @@ public sealed unsafe class CudaKernels : IDisposable
             _siluF32Func = _elementwiseF32Module.TryGetFunction("silu_f32");
             _sigmoidMulF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_mul_f32");
         }
+
+        // Gemma-4 (DiffusionGemma AR) F32 helper kernels — optional PTX. Absent on
+        // stale builds until native/build.{sh,ps1} regenerates it (no nvcc here on
+        // the AMD dev box; regenerated on the CUDA box). HasGemma4Kernels gates the
+        // gemma4 forward path so a stale PTX surfaces a clear error, not an NRE.
+        string gemma4F32Path = Path.Combine(ptxDir, "gemma4_f32.ptx");
+        if (File.Exists(gemma4F32Path))
+        {
+            _gemma4F32Module = CudaModule.LoadFromFile(gemma4F32Path);
+            _gegluTanhF32Func = _gemma4F32Module.TryGetFunction("geglu_tanh_f32");
+            _ropeF32PartialNeoxFunc = _gemma4F32Module.TryGetFunction("rope_f32_partial_neox");
+            _scaleInplaceF32Func = _gemma4F32Module.TryGetFunction("scale_inplace_f32");
+            _rmsnormWeightlessF32Func = _gemma4F32Module.TryGetFunction("rmsnorm_weightless_f32");
+            _softcapInplaceF32Func = _gemma4F32Module.TryGetFunction("softcap_inplace_f32");
+            _moeRenormTopkClampedF32Func = _gemma4F32Module.TryGetFunction("moe_renorm_topk_clamped_f32");
+            _quantizeActQ8_0RoundtripF32Func = _gemma4F32Module.TryGetFunction("quantize_activation_q8_0_roundtrip_f32");
+        }
     }
+
+    /// <summary>
+    /// True when all Gemma-4 F32 helper kernels (GeGLU-tanh, partial-NeoX RoPE,
+    /// scalar scale, weight-less RMSNorm, softcap, clamped top-k renorm) are
+    /// available. Required by the gemma4 AR forward path
+    /// (<see cref="CudaTransformerModel"/>).
+    /// </summary>
+    public bool HasGemma4Kernels =>
+        _gegluTanhF32Func != 0 && _ropeF32PartialNeoxFunc != 0
+        && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
+        && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
+        && _quantizeActQ8_0RoundtripF32Func != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1013,6 +1060,132 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_perHeadRmsNormF32Func,
                 (uint)(seqLen * numHeads), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    // ── Gemma-4 (DiffusionGemma AR) F32 launchers ────────────────────────────
+
+    /// <summary>
+    /// In-place Q8_0 round-trip of an F32 activation buffer <c>[rows, k]</c>:
+    /// per 32-block, quantize to Q8_0 (FP16 block scale, round-nearest-even,
+    /// clamp ±127) then dequantize back to F32. Reproduces the CPU oracle's
+    /// on-the-fly activation quantization for Q8_0-weight GEMMs so the gemma4
+    /// F32 forward stays within parity tolerance of <c>MatMul.GemmQ8_0</c>.
+    /// Requires <c>k % 32 == 0</c> (gemma4 K dims always satisfy this).
+    /// </summary>
+    public void LaunchQuantizeActivationQ8_0RoundtripF32(nint xF32, int k, int rows, nint stream)
+    {
+        if ((k & 31) != 0) return; // CPU only quantizes whole 32-blocks
+        nint xArg = xF32;
+        int kArg = k, rowsArg = rows;
+        void** args = stackalloc void*[] {&xArg, &kArg, &rowsArg};
+        long nb = (long)rows * (k / 32);
+        CudaDriverApi.cuLaunchKernel(_quantizeActQ8_0RoundtripF32Func,
+                (uint)nb, 1, 1, 32, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>FP32 GeGLU (tanh-approx GELU): out = gelu_tanh(gate) * up.</summary>
+    public void LaunchGeGLUTanhF32(nint gate, nint up, nint output,
+                                     int n, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
+        uint gridDim = (uint)(((long)n * seqLen + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_gegluTanhF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Partial NeoX RoPE (FP32, in place on Q and K). Rotates the leading
+    /// <paramref name="rotatedPairs"/> pairs of each head, coupling
+    /// <c>(vec[i], vec[i + headDim/2])</c>; freq base over the full
+    /// <paramref name="headDim"/>. Mirrors <c>RoPE.ExecutePartialNeoX</c>.
+    /// </summary>
+    public void LaunchRoPEF32PartialNeoX(nint q, nint k, nint positions,
+                                           int seqLen, int numHeads, int numKvHeads,
+                                           int headDim, int rotatedPairs, float theta, nint stream)
+    {
+        nint qArg = q, kArg = k, posArg = positions;
+        int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
+        int hdArg = headDim, rpArg = rotatedPairs;
+        float thetaArg = theta;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
+                        &hdArg, &rpArg, &thetaArg};
+
+        int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * rotatedPairs;
+        uint gridDim = (uint)((totalPairs + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_ropeF32PartialNeoxFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>In-place FP32 scalar multiply: x[i] *= scale (layer_output_scale).</summary>
+    public void LaunchScaleInplaceF32(nint x, int n, float scale, nint stream)
+    {
+        nint xArg = x;
+        int nArg = n;
+        float scaleArg = scale;
+
+        void** args = stackalloc void*[] {&xArg, &nArg, &scaleArg};
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_scaleInplaceF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP32 weight-less per-row RMSNorm (unit gamma). One block per row;
+    /// <paramref name="rows"/> rows of width <paramref name="n"/>. Used for the
+    /// gemma4 weight-less V-norm with one row per (token, kv-head).
+    /// </summary>
+    public void LaunchRmsNormWeightlessF32(nint input, nint output,
+                                             int n, float eps, int rows, nint stream)
+    {
+        nint inputArg = input, outputArg = output;
+        int nArg = n;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&inputArg, &outputArg, &nArg, &epsArg};
+        CudaDriverApi.cuLaunchKernel(_rmsnormWeightlessF32Func,
+                (uint)rows, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>In-place FP32 final-logit soft-capping: x[i] = cap * tanh(x[i] / cap).</summary>
+    public void LaunchSoftcapInplaceF32(nint x, int n, float cap, nint stream)
+    {
+        nint xArg = x;
+        int nArg = n;
+        float capArg = cap;
+
+        void** args = stackalloc void*[] {&xArg, &nArg, &capArg};
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_softcapInplaceF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gemma-4 top-k renorm with the 6.1e-5 denominator clamp:
+    /// <c>w[i] *= 1 / max(Σ w, 2^-14)</c>. One block per token.
+    /// </summary>
+    public void LaunchMoeRenormTopkClampedF32(nint topkWeight, int seqLen, int topK, nint stream)
+    {
+        nint wArg = topkWeight;
+        int slArg = seqLen, kArg = topK;
+
+        void** args = stackalloc void*[] {&wArg, &slArg, &kArg};
+        CudaDriverApi.cuLaunchKernel(_moeRenormTopkClampedF32Func,
+                (uint)seqLen, 1, 1, 32, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -3292,5 +3465,6 @@ public sealed unsafe class CudaKernels : IDisposable
         _conv1dCausalF32Module?.Dispose();
         _gdnScanF32Module?.Dispose();
         _elementwiseF32Module?.Dispose();
+        _gemma4F32Module?.Dispose();
     }
 }
