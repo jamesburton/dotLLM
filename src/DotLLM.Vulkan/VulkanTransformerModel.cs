@@ -57,6 +57,35 @@ namespace DotLLM.Vulkan;
 /// </remarks>
 public sealed class VulkanTransformerModel : IModel
 {
+    // ── Decode launch-overhead instrumentation (opt-in via DOTLLM_VULKAN_PROFILE_SUBMIT=1) ──
+    // Splits single-token Forward into the CPU command-buffer record region
+    // (Begin → last Record*) vs the SubmitAndWait region (GPU exec + fence
+    // wait + logits D2H). Used to decide whether record-once/replay is worth
+    // building. Zero-cost when the env var is unset.
+    private static readonly bool s_profileSubmit =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PROFILE_SUBMIT") == "1";
+
+    /// <summary>Accumulated ticks spent recording the per-token command buffer (CPU side).</summary>
+    public static long ProfileRecordTicks;
+
+    /// <summary>Accumulated ticks spent in SubmitAndWait + logits download (GPU + fence wait).</summary>
+    public static long ProfileSubmitTicks;
+
+    /// <summary>Accumulated ticks spent in SubmitAndWait only (queue submit + fence wait = GPU exec).</summary>
+    public static long ProfileSubmitWaitTicks;
+
+    /// <summary>Number of single-token forwards profiled.</summary>
+    public static long ProfileForwardCount;
+
+    /// <summary>Resets the decode profiling accumulators.</summary>
+    public static void ResetProfile()
+    {
+        ProfileRecordTicks = 0;
+        ProfileSubmitTicks = 0;
+        ProfileSubmitWaitTicks = 0;
+        ProfileForwardCount = 0;
+    }
+
     private readonly VulkanDevice _device;
     private readonly VulkanWeights _weights;
     private readonly VulkanForwardState _state;
@@ -1503,6 +1532,7 @@ public sealed class VulkanTransformerModel : IModel
         //    whole transformer. Bias-add host steps split the forward into
         //    multiple submits (one per distinct set of biases we need to
         //    pause for); everything else stays inside the pipelined path.
+        long _profRecordStart = s_profileSubmit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
@@ -1789,7 +1819,15 @@ public sealed class VulkanTransformerModel : IModel
 
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        long _profSubmitStart = 0L;
+        if (s_profileSubmit)
+        {
+            _profSubmitStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            ProfileRecordTicks += _profSubmitStart - _profRecordStart;
+        }
         _submit.SubmitAndWait();
+        if (s_profileSubmit && seqLen == 1)
+            ProfileSubmitWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _profSubmitStart;
 
         // 5. Return logits as a host-resident UnmanagedTensor [1, vocabSize].
         var shape = new TensorShape(1, vocabSize);
@@ -1804,6 +1842,11 @@ public sealed class VulkanTransformerModel : IModel
             // Mirrors the CPU TransformerModel.ApplyFinalLogitSoftcap; no-op
             // when Config.FinalLogitSoftcap is null or non-positive.
             ApplyFinalLogitSoftcapHost(dest);
+        }
+        if (s_profileSubmit && seqLen == 1)
+        {
+            ProfileSubmitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - _profSubmitStart;
+            ProfileForwardCount++;
         }
         return result;
     }

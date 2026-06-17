@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>DecodeBench</AssemblyName>
+    <RootNamespace>DecodeBench</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotLLM.Core\DotLLM.Core.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Models\DotLLM.Models.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Tokenizers\DotLLM.Tokenizers.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cpu\DotLLM.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Cuda\DotLLM.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Vulkan\DotLLM.Vulkan.csproj" />
+    <ProjectReference Include="..\..\src\DotLLM.Engine\DotLLM.Engine.csproj" />
+  </ItemGroup>
+
+</Project>
