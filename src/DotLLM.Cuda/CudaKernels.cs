@@ -649,12 +649,29 @@ public sealed unsafe class CudaKernels : IDisposable
             _attentionSoftmaxCausalCoalescedF32InFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f32in_f16out");
         }
 
-        // Hand-fused mma.sync flash-attention prefill kernel (G-flash prototype). Optional.
+        // Hand-fused mma.sync flash-attention prefill kernel (G-flash). Optional, and the
+        // ONLY module compiled to compute_86 (mma.sync.m16n8k16 is sm_80+). On a pre-Ampere
+        // GPU (e.g. Turing sm_75) the driver cannot JIT this PTX: cuModuleLoadData JITs
+        // eagerly and would throw, taking down model construction on hardware that should
+        // simply fall back to G3/attention_f16. So the load is best-effort — a failure
+        // leaves HasAttentionFlashMma false and the dispatch never selects it (it is also
+        // arch-gated off in CudaFlashAttention.ConfigureDefault). This keeps non-Ampere
+        // devices unregressed even though the sm_86 PTX ships in every package.
         string attentionFlashMmaPath = Path.Combine(ptxDir, "attention_flash_mma.ptx");
         if (File.Exists(attentionFlashMmaPath))
         {
-            _attentionFlashMmaModule = CudaModule.LoadFromFile(attentionFlashMmaPath);
-            _attentionFlashMmaFunc = _attentionFlashMmaModule.TryGetFunction("attention_flash_mma_f16");
+            try
+            {
+                var flashModule = CudaModule.LoadFromFile(attentionFlashMmaPath);
+                _attentionFlashMmaFunc = flashModule.TryGetFunction("attention_flash_mma_f16");
+                _attentionFlashMmaModule = flashModule;
+            }
+            catch (CudaException)
+            {
+                // Pre-Ampere driver rejected the sm_86 module — leave flash disabled.
+                _attentionFlashMmaModule = null;
+                _attentionFlashMmaFunc = 0;
+            }
         }
     }
 
