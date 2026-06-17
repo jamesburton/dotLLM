@@ -1,0 +1,38 @@
+Device      : Intel(R) Arc(TM) Graphics (vendor 0x8086)
+Subgroup    : size=32, arithmetic=True
+IntDotProd  : True
+Per-vendor default (baseline): dp4a-pq
+Schedule    : 4 warmup + up to 21 timed rounds (adaptive: fewer for latency-bound large-M shapes), 6 batches × (M-bounded batchSize, budget 1048576 rows/submit) per (round,shape,variant), min-of-batch, median-of-round-ratios
+
+════ SmolLM2-135M (30 layers) ════
+shape            M      K        wg64 us     wg128 us     wg256 us        sg us   dp4a-pq us   best  vs[dp4a-pq]
+--------------------------------------------------------------------------------------------------------------------
+attn_q         576    576           34.6         37.7         48.6         33.0         20.4   dp4a-pq  1.00x  (bs=256,r=21)
+attn_kv        192    576           13.8         14.9         19.1         13.3          8.3   dp4a-pq  1.00x  (bs=256,r=21)
+attn_o         576    576           27.3         29.6         40.6         27.6         16.2   dp4a-pq  1.00x  (bs=256,r=21)
+ffn_gateup    1536    576           80.8         84.6        121.4         87.1         53.6   dp4a-pq  1.00x  (bs=256,r=13)
+ffn_down       576   1536           66.5         64.8         78.9         65.3         30.0   dp4a-pq  1.00x  (bs=256,r=21)
+lm_head      49152    576         1995.0       2318.8       2942.0       1975.4       1189.0   dp4a-pq  1.00x  (bs=21,r=5)
+
+Decode-weighted Q8_0 GEMV cost per step (us, ×layers for per-layer shapes):
+variant              wg64        wg128        wg256           sg      dp4a-pq    per-shape
+us/step           11522.3      12254.4      16414.8      11775.8       6901.4       6901.4
+vs default         0.599x       0.563x       0.420x       0.586x       1.000x       1.000x
+
+
+════ Llama-3.2-1B (16 layers) ════
+shape            M      K        wg64 us     wg128 us     wg256 us        sg us   dp4a-pq us   best  vs[dp4a-pq]
+--------------------------------------------------------------------------------------------------------------------
+attn_q        2048   2048          258.4        255.0        287.1        235.9        113.4   dp4a-pq  1.00x  (bs=256,r=9)
+attn_kv        512   2048           67.7         71.9         72.7         64.7         29.5   dp4a-pq  1.00x  (bs=256,r=21)
+attn_o        2048   2048          237.6        260.2        291.1        248.4        115.3   dp4a-pq  1.00x  (bs=256,r=9)
+ffn_gateup    8192   2048         1138.4       1101.2       1188.1       1030.1        533.8   dp4a-pq  1.00x  (bs=128,r=5)
+ffn_down      2048   8192         1188.8       1032.8        978.3       1007.2        469.5   dp4a-pq  1.00x  (bs=256,r=9)
+lm_head     128256   2048        17277.1      16799.9      18545.6      16009.4       8687.4   dp4a-pq  1.00x  (bs=8,r=5)
+
+Decode-weighted Q8_0 GEMV cost per step (us, ×layers for per-layer shapes):
+variant              wg64        wg128        wg256           sg      dp4a-pq    per-shape
+us/step           82828.6      79106.6      83794.1      74906.2      37883.1      37883.1
+vs default         0.457x       0.479x       0.452x       0.506x       1.000x       1.000x
+
+
