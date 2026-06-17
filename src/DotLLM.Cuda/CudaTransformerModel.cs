@@ -163,6 +163,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     private nint _gemma4RouterInF32;
     private int _gemma4ScratchCapacityElems;
 
+    // Scratch for the per-projection activation Q8_0 round-trip (matches the CPU
+    // oracle's on-the-fly activation quantization). Sized to the largest projection
+    // input the gemma4 forward feeds (max of hidden and the attn-output width).
+    private nint _gemma4ActScratchF32;
+    private int _gemma4ActScratchElems;
+
     // ── per-category profiling state (only allocated when ProfilingEnabled is set) ──
     internal const int ProfileCategoryCount = 12;
     private nint[]? _profEvents;        // event pool, allocated lazily
@@ -1896,9 +1902,9 @@ public sealed unsafe class CudaTransformerModel : IModel
         Gemma4Dump($"A{layer}_normin", _state.NormOutputF32, seqLen * hiddenSize, s);
 
         // Q, K projections (raw — K captured before k-norm/rope for V-from-K).
-        ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
+        ProjectF32Gemma4(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
             lw.QOutputDim, lw.QInputDim, seqLen);
-        ProjectF32(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
+        ProjectF32Gemma4(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
             lw.KOutputDim, lw.KInputDim, seqLen);
 
         // V branch: V-from-K (global, V-less) copies the raw K projection into V;
@@ -1910,7 +1916,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
         else
         {
-            ProjectF32(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
+            ProjectF32Gemma4(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
                 lw.VOutputDim, lw.VInputDim, seqLen);
         }
 
@@ -1956,7 +1962,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         Gemma4Dump($"A{layer}_attn", _state.AttnOutputF32, seqLen * numHeads * headDim, s);
 
         // o_proj → NormOutputF32.
-        ProjectF32(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
+        ProjectF32Gemma4(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
             lw.OOutputDim, lw.OInputDim, seqLen);
     }
 
@@ -1976,13 +1982,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         // cur_mlp = rms(attn_out)*ffn_norm ; geglu(gate, up) ; down ; rms*post_ffw_norm_1
         _kernels.LaunchRmsNormF32(_state.HiddenStateF32, g4.FfnNorm, _state.NormOutputF32,
             hiddenSize, eps, seqLen, s);
-        ProjectF32(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
+        ProjectF32Gemma4(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
             lw.GateOutputDim, lw.GateInputDim, seqLen);
-        ProjectF32(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
+        ProjectF32Gemma4(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
             lw.UpOutputDim, lw.UpInputDim, seqLen);
         _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
             denseInterm, seqLen, s);
-        ProjectF32(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _gemma4DenseF32,
+        ProjectF32Gemma4(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _gemma4DenseF32,
             lw.DownOutputDim, lw.DownInputDim, seqLen);
         _kernels.LaunchRmsNormF32(_gemma4DenseF32, g4.PostFfwNorm1, _gemma4DenseF32,
             hiddenSize, eps, seqLen, s);
@@ -2068,6 +2074,45 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
         _kernels.LaunchRmsNormF32(inputF32, _state.DequantScratchF32, outputF32,
             hiddenSize, eps, rows, stream);
+    }
+
+    /// <summary>
+    /// Ensures the gemma4 activation round-trip scratch holds at least
+    /// <paramref name="elems"/> F32 values.
+    /// </summary>
+    private void EnsureGemma4ActScratch(int elems)
+    {
+        if (_gemma4ActScratchElems >= elems) return;
+        if (_gemma4ActScratchF32 != 0) CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32);
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4ActScratchF32, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+        _gemma4ActScratchElems = elems;
+    }
+
+    /// <summary>
+    /// Gemma4 projection that reproduces the CPU oracle's per-projection ACTIVATION
+    /// quantization. The CPU <c>TransformerModel.Gemm</c> for Q8_0 weights
+    /// quantizes the F32 activation to Q8_0 before the int8 dot; the F32 cuBLAS path
+    /// here would otherwise keep the activation in full precision and drift. For Q8_0
+    /// weights we copy the input to scratch, round-trip it through Q8_0 (FP16 scale,
+    /// round-nearest-even), then GEMM — bit-equivalent to the CPU within reduction
+    /// order. Other quant types fall through to the plain F32 projection (their CPU
+    /// activation-quant round-trips are added as needed).
+    /// </summary>
+    private void ProjectF32Gemma4(nint quantWeight, QuantizationType qt, nint fp16Weight,
+                                   nint inputF32, nint outputF32, int outputDim, int inputDim, int seqLen)
+    {
+        if (qt == QuantizationType.Q8_0 && (inputDim & 31) == 0)
+        {
+            nint s = _stream.Handle;
+            int elems = seqLen * inputDim;
+            EnsureGemma4ActScratch(elems);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gemma4ActScratchF32, inputF32,
+                (nuint)((long)elems * sizeof(float)), s).ThrowOnError();
+            _kernels.LaunchQuantizeActivationQ8_0RoundtripF32(_gemma4ActScratchF32, inputDim, seqLen, s);
+            ProjectF32(quantWeight, qt, fp16Weight, _gemma4ActScratchF32, outputF32, outputDim, inputDim, seqLen);
+            return;
+        }
+        ProjectF32(quantWeight, qt, fp16Weight, inputF32, outputF32, outputDim, inputDim, seqLen);
     }
 
     private void ProjectF32(nint quantWeight, QuantizationType qt, nint fp16Weight,
@@ -2194,6 +2239,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_gemma4DenseF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4DenseF32); _gemma4DenseF32 = 0; }
         if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }
         if (_gemma4RouterInF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32); _gemma4RouterInF32 = 0; }
+        if (_gemma4ActScratchF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32); _gemma4ActScratchF32 = 0; }
         _mlaScratchF16?.Dispose();
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
