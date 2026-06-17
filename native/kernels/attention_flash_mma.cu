@@ -5,6 +5,21 @@
 // round-trips numHeads * s^2 FP16 through HBM). One warp per (query head, 16-query
 // tile); the KV axis is streamed in tiles of 16 keys with online softmax.
 //
+// WHERE THE MEASURED WIN COMES FROM (important — it is NOT just the round-trip):
+//   This kernel sweeps KV tiles only up to a query tile's own diagonal
+//   (kv_end = min(seq, q0+Q_TILE)), so over all query tiles it does ~HALF the
+//   matmul FLOPs — only the causal triangle. The G3 cuBLAS path and the
+//   "GEMM-only floor" both run a DENSE full s x s QK GEMM and zero the upper
+//   triangle afterwards in softmax. So the GEMM-only floor is NOT a true lower
+//   bound for this kernel (flash computes fewer FLOPs than the floor). On the
+//   3060 at s=4096: floor(full square)=14.5ms => a causal-triangle GEMM at cuBLAS
+//   efficiency would be ~7ms, yet flash is ~22.7ms — i.e. this untuned 1-warp/
+//   block kernel's per-FLOP MMA throughput is ~3x worse than cuBLAS. Flash still
+//   beats shipped-G3 (1.3-1.69x) by COMBINING causal work-reduction with score
+//   fusion, DESPITE poor MMA utilisation. A tuned kernel (more warps/block,
+//   double-buffered K/V loads) has substantial further headroom. NB a causal-aware
+//   G3 (block-triangular GEMMs) would capture part of this win without hand-MMA.
+//
 // SCOPE (prototype, Llama-3.2-1B head shape):
 //   headDim == 64 (4 k-steps of k16), causal, position_offset == 0, FP16 in/out.
 //   GQA handled by the caller's grid (query head hq -> kv head hq / group). Output
