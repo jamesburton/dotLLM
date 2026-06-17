@@ -2599,10 +2599,18 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // RoPE(Q, K) — per-layer theta / rotated dims, NeoX. V is NOT roped.
+        // Gemma-4 global (full-attention) layers use PARTIAL-rotary NeoX whose
+        // rotate-half pairing offset is the FULL head's half-dim (matches CPU
+        // RoPE.ExecutePartialNeoX → ApplyRotationNeoXPartial, e.g. dims [0,64) ↔
+        // [256,320)). Sliding / full-rope layers use the standard ropeDim/2 offset.
+        bool partialGlobal = Config.IsFullAttentionLayer(layer)
+            && Config.PartialRotaryFactor is float prf && prf > 0f && prf < 1f
+            && ropeDim < headDim;
+        int? neoxPairOffset = partialGlobal ? headDim / 2 : null;
         _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
             seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
             headDim: headDim, ropeDim: ropeDim, theta: ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+            variant: RopeF32Kernel.Variant.NeoX, neoxPairOffset: neoxPairOffset);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Attention K/V source: either this forward's freshly-projected window

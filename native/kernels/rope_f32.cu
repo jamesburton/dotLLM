@@ -12,14 +12,19 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_rope = rope_dim / 2;
-    // NeoX pairing offset is the FULL head's half-dim, NOT rope_dim/2, so partial
-    // rope (rope_dim < head_dim, e.g. Gemma-4 global layers) pairs the leading
-    // rope_dim/2 dims with their full-head-half partners, matching CPU
-    // RoPE.ApplyRotationNeoXPartial + the Vulkan rope_f32 shader. For full rope
-    // (rope_dim == head_dim) this equals half_rope ⇒ byte-identical for every
-    // current NeoX model. NOTE: PTX must be regenerated on the CUDA box (no nvcc
-    // on the Strix Halo dev host) — no CUDA partial-NeoX model is enabled today.
-    int neox_pair_offset = head_dim / 2;
+    // NeoX pairing offset is rope_dim/2 — the STANDARD partial-rotary convention
+    // (Qwen3 / NemotronH / Llama-family; matches CPU RoPE.Execute → ApplyRotationNeoX
+    // and native rope.cu / fused_rope_kv_write.cu, which both pair at half_rope).
+    // A prior change set this to head_dim/2 for Gemma-4 partial-rotary global layers,
+    // but that silently broke EVERY other partial-rotary NeoX model on this kernel
+    // (rope_dim < head_dim → wrong pairing); the Vulkan/CPU surfaced this via the
+    // Qwen3MoeHybrid IQ3 forward parity failure. For full rope (rope_dim == head_dim)
+    // both offsets coincide, so all currently-enabled CUDA models are byte-identical.
+    // Gemma-4 partial rope on CUDA (not enabled today) must be re-introduced as a
+    // caller-supplied offset push-arg mirroring the Vulkan rope_f32 kernel's
+    // neoxPairOffset, NOT by hardcoding head_dim/2 here.
+    // NOTE: PTX must be regenerated on the CUDA box (no nvcc on the Strix Halo dev host).
+    int neox_pair_offset = half_rope;
     int total_q_pairs = seq_len * num_heads * half_rope;
     int total_k_pairs = seq_len * num_kv_heads * half_rope;
 
