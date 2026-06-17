@@ -104,6 +104,20 @@ public sealed unsafe class TransformerModel : IModel
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
+    /// <summary>
+    /// Diagnostic hybrid hook (bug-#2 bisection). When set, Gemma-4 layers
+    /// selected by <see cref="Gemma4LayerOverrideSelector"/> are computed by this
+    /// delegate (e.g. a Vulkan single-layer) instead of the in-process
+    /// <c>RunGemma4Layer</c> — letting a working CPU forward swap layers to
+    /// another backend one at a time and re-test. The delegate must overwrite the
+    /// <c>[seqLen × hiddenSize]</c> residual stream in place. NOT a production path.
+    /// </summary>
+    internal unsafe delegate void Gemma4LayerOverrideFn(float* hidden, int layer, int seqLen);
+    /// <summary>Diagnostic override for selected Gemma-4 layers. See <see cref="Gemma4LayerOverrideFn"/>.</summary>
+    internal Gemma4LayerOverrideFn? Gemma4LayerOverride { get; set; }
+    /// <summary>Predicate selecting which layers the override applies to. Null ⇒ all gemma4 layers when an override is set.</summary>
+    internal Func<int, bool>? Gemma4LayerOverrideSelector { get; set; }
+
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
                        ComputeThreadPool? threadPool, bool ownsPool, RoPEType globalRopeType = RoPEType.Norm)
@@ -837,11 +851,22 @@ public sealed unsafe class TransformerModel : IModel
             // the shared GQA/MoE/dense blocks. Cacheless single-forward only.
             if (lw.Gemma4 is not null)
             {
-                RunGemma4Layer(
-                    in lw, layer, seqLen,
-                    hidden, residual, normOut, q, k, v, attnOut,
-                    numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
-                    positions, eps);
+                // Diagnostic hybrid bisection: a selected layer is computed by the
+                // override backend (e.g. Vulkan) instead of in-process. No-op on
+                // the normal path (Gemma4LayerOverride null).
+                if (Gemma4LayerOverride is { } over
+                    && (Gemma4LayerOverrideSelector is null || Gemma4LayerOverrideSelector(layer)))
+                {
+                    over(hidden, layer, seqLen);
+                }
+                else
+                {
+                    RunGemma4Layer(
+                        in lw, layer, seqLen,
+                        hidden, residual, normOut, q, k, v, attnOut,
+                        numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
+                        positions, eps);
+                }
                 continue;
             }
 

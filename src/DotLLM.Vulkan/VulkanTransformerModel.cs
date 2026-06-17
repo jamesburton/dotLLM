@@ -2542,6 +2542,106 @@ public sealed class VulkanTransformerModel : IModel
             seqLen, lw.OInputDim, lw.OOutputDim);
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // DIAGNOSTIC HARNESS (bug-#2 bisection). Run ONE Gemma-4 layer on the GPU
+    // against a host-supplied residual stream so a working CPU forward can swap
+    // individual layers to Vulkan one at a time and re-test ("still Paris?").
+    // NOT a production path (one submit per call). RecordGemma4LayerBody mirrors
+    // the Forward loop's gemma4 path verbatim so the swap is numerically faithful.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Diagnostic: compute one Gemma-4 layer on the GPU given a host residual
+    /// stream <paramref name="hidden"/> (<c>[seqLen × hiddenSize]</c>, row-major
+    /// F32 — the same layout as the CPU forward), overwriting it in place with
+    /// the post-layer residual stream. Cacheless / AR. For the hybrid CPU↔Vulkan
+    /// bisection harness only; do not use on the hot path.
+    /// </summary>
+    public unsafe void RunGemma4LayerOnHost(Span<float> hidden, int layer, int seqLen, ReadOnlySpan<int> positions)
+    {
+        int hiddenSize = Config.HiddenSize;
+        float eps = Config.NormEpsilon;
+        if (hidden.Length != (long)seqLen * hiddenSize)
+            throw new ArgumentException(
+                $"hidden length {hidden.Length} != seqLen*hidden {(long)seqLen * hiddenSize}.", nameof(hidden));
+        if ((uint)layer >= (uint)Config.NumLayers) throw new ArgumentOutOfRangeException(nameof(layer));
+        if (_weights.Layers[layer].Gemma4 is null)
+            throw new InvalidOperationException($"Layer {layer} is not a Gemma-4 layer.");
+
+        bool resized = _state.EnsureCapacity(seqLen);
+        if (resized) InvalidateKernelCaches();
+        UploadPositions(positions);
+
+        // HiddenState is device-local (not host-mappable on this UMA path), so
+        // bridge host↔device through a host-visible staging buffer + synchronous
+        // copy. The buffer is tiny (seqLen*hidden*4) and diagnostic-only.
+        long bytes = (long)hidden.Length * sizeof(float);
+        using var staging = _device.Allocate(bytes);
+
+        // Canonicalise the hidden slot (label op), then stage the host residual
+        // stream into HiddenState before recording begins.
+        _state.ResetHiddenSlot();
+        _device.Upload(hidden, staging);
+        _device.CopyBufferSynchronous(staging, _state.HiddenState, (ulong)bytes);
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+        RecordGemma4LayerBody(cmdBuf, layer, seqLen, eps, positions);
+        _submit.SubmitAndWait();
+
+        _device.CopyBufferSynchronous(_state.HiddenState, staging, (ulong)bytes);
+        _device.Download(staging, hidden);
+    }
+
+    /// <summary>
+    /// Records exactly the per-layer op sequence the Forward loop runs for a
+    /// Gemma-4 layer (attention → post-attn-norm → residual → dual FFN →
+    /// residual → layer_output_scale), so the diagnostic single-layer path stays
+    /// numerically faithful to the full forward. AR / cacheless only (regionP 0).
+    /// </summary>
+    private void RecordGemma4LayerBody(nint cmdBuf, int layer, int seqLen, float eps, ReadOnlySpan<int> positions)
+    {
+        ref readonly var lw = ref _weights.Layers[layer];
+        int hiddenSize = Config.HiddenSize;
+
+        // Attention → o_proj into NormOutput.
+        RecordGemma4Attention(cmdBuf, layer, lw, seqLen, eps, positions, kvCache: null);
+
+        // Post-attention RMSNorm (Gemma four-norm) on NormOutput, then residual #1.
+        if (lw.PostAttnNormWeight is { } postAttnNorm1)
+        {
+            _rmsnorm.Record(cmdBuf, _state.NormOutput, postAttnNorm1, _state.NormOutput,
+                rowCount: seqLen, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+        _state.RotateHiddenSlot();
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Dual parallel dense + MoE FFN → combined post_ffw_norm'd result in NormOutput.
+        var moeW = lw.Moe!.Value;
+        RecordGemma4Ffn(cmdBuf, layer, moeW, lw, seqLen, eps);
+
+        // Post-FFN RMSNorm is null for gemma4 (its post_ffw_norm lives inside the
+        // FFN); mirror the loop's guarded check for fidelity anyway.
+        if (lw.PostFfnNormWeight is { } postFfnNorm1)
+        {
+            _rmsnorm.Record(cmdBuf, _state.NormOutput, postFfnNorm1, _state.NormOutput,
+                rowCount: seqLen, n: hiddenSize, eps: eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+        _state.RotateHiddenSlot();
+
+        // layer_output_scale (AR: all rows; regionP 0 so no enc correction).
+        if (lw.Gemma4 is { } g4scale)
+        {
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _embedScale!.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, g4scale.LayerOutputScale);
+        }
+    }
+
     /// <summary>
     /// Records the Gemma-4 attention block for one layer (cacheless / single
     /// forward — the AR validation + diffusion paths are cacheless). Mirrors the

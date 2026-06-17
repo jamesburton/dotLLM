@@ -4,6 +4,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models;
+using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using Xunit;
@@ -212,6 +213,96 @@ public sealed class Gemma4GgufForwardTests
         Assert.True(float.IsFinite(bestV), "Top logit must be finite (no NaN/Inf from quantized dequant or softcap).");
         string decoded = tokenizer.Decode(new[] { best });
         Assert.Contains("Paris", decoded, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// HYBRID BISECTION HARNESS (bug #2). Runs the KNOWN-GOOD CPU 26B forward
+    /// (predicts " Paris") but routes the Gemma-4 layers selected by
+    /// <c>DOTLLM_HYBRID_VK_LAYERS</c> through the Vulkan single-layer path, so we
+    /// can swap layers/sections to Vulkan one at a time and see whether " Paris"
+    /// survives. The first swap that breaks it names the culprit.
+    /// <para>Specs: <c>none</c> (pure-CPU baseline — must be Paris), <c>all</c>
+    /// (full Vulkan via the host-roundtrip seam — must reproduce the bug),
+    /// <c>global</c> / <c>sliding</c> (by attention type), a range <c>a-b</c>, or
+    /// a CSV <c>1,7,12</c>.</para>
+    /// Gated on <c>DOTLLM_GEMMA4_GGUF</c> + a Vulkan device. Always asserts
+    /// " Paris" so green = correct, red = broken for that swap set.
+    /// </summary>
+    [SkippableFact]
+    public unsafe void Gemma4_26B_HybridLayerSwap_Bisect()
+    {
+        string? path = TryResolveModelPath();
+        Skip.If(path is null, $"Set {ModelPathEnvVar} to a gemma4 GGUF to run this validation.");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
+        string spec = (Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VK_LAYERS") ?? "none").Trim();
+        string spvDir = ResolveSpvDir();
+
+        // CPU model is the driver (embedding + per-layer + final norm + lm_head);
+        // the Vulkan model supplies single-layer compute for the selected layers.
+        var (model, gguf, config) = ModelLoader.LoadFromGguf(path!);
+        using var _g = gguf;
+        using var _m = model;
+        var cpu = (TransformerModel)model;
+        int numLayers = config.NumLayers, hiddenSize = config.HiddenSize;
+
+        using var vkGguf = GgufFile.Open(path!);
+        var vkConfig = GgufModelConfigExtractor.Extract(vkGguf.Metadata);
+        using var vk = VulkanTransformerModel.LoadFromGguf(vkGguf, vkConfig, spvDir);
+
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        const string prompt = "The Eiffel Tower is located in";
+        int[] enc = tokenizer.Encode(prompt);
+        int[] promptIds = new int[enc.Length + 1];
+        promptIds[0] = tokenizer.BosTokenId;
+        Array.Copy(enc, 0, promptIds, 1, enc.Length);
+        int seqLen = promptIds.Length;
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // Resolve which layers run on Vulkan.
+        var vkLayers = new HashSet<int>();
+        switch (spec.ToLowerInvariant())
+        {
+            case "none": break;
+            case "all": for (int l = 0; l < numLayers; l++) vkLayers.Add(l); break;
+            case "global": for (int l = 0; l < numLayers; l++) if (config.IsFullAttentionLayer(l)) vkLayers.Add(l); break;
+            case "sliding": for (int l = 0; l < numLayers; l++) if (!config.IsFullAttentionLayer(l)) vkLayers.Add(l); break;
+            default:
+                if (spec.Contains('-') && !spec.Contains(','))
+                {
+                    var parts = spec.Split('-');
+                    int a = int.Parse(parts[0]), b = int.Parse(parts[1]);
+                    for (int l = a; l <= b && l < numLayers; l++) vkLayers.Add(l);
+                }
+                else
+                {
+                    foreach (var s in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        vkLayers.Add(int.Parse(s));
+                }
+                break;
+        }
+
+        _output.WriteLine($"[hybrid bisect] spec='{spec}' → {vkLayers.Count} VK layers: [{string.Join(",", vkLayers.OrderBy(x => x))}]");
+
+        if (vkLayers.Count > 0)
+        {
+            cpu.Gemma4LayerOverrideSelector = layer => vkLayers.Contains(layer);
+            cpu.Gemma4LayerOverride = (hidden, layer, sl) =>
+                vk.RunGemma4LayerOnHost(new Span<float>(hidden, sl * hiddenSize), layer, sl, positions);
+        }
+
+        using ITensor logits = cpu.Forward(promptIds, positions, deviceId: -1, kvCache: null,
+            adapter: null, AttentionMaskSpec.Causal);
+        int vocab = logits.Shape[logits.Shape.Rank - 1];
+        float* p = (float*)logits.DataPointer;
+        long lastRow = (long)(seqLen - 1) * vocab;          // CPU returns [seqLen, vocab]
+        int best = 0; float bestV = float.NegativeInfinity;
+        for (int v = 0; v < vocab; v++) { float x = p[lastRow + v]; if (x > bestV) { bestV = x; best = v; } }
+        string decoded = tokenizer.Decode(new[] { best });
+        bool isParis = decoded.Contains("Paris", StringComparison.OrdinalIgnoreCase);
+        _output.WriteLine($"  next token : id={best} '{decoded}' logit={bestV:F3}  PARIS={(isParis ? "YES" : "no")}");
+
+        Assert.True(isParis, $"spec='{spec}': expected 'Paris', got '{decoded}' (id={best}, logit={bestV:F3}).");
     }
 
     private static string ResolveSpvDir()
