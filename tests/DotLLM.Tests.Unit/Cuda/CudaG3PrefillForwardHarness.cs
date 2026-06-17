@@ -167,6 +167,37 @@ public sealed class CudaG3PrefillForwardHarness
         model.ProfilingEnabled = false;
     }
 
+    /// <summary>
+    /// Verifies the G3 default-on flip: on GeForce Ampere with <c>DOTLLM_CUDA_G3_ATTN</c>
+    /// unset, loading the model enables <see cref="CudaG3Attention.Enabled"/> by default
+    /// (via <c>CudaG3Attention.ConfigureDefault</c>). Starts the field at <c>false</c> so a
+    /// <c>true</c> reading proves the load-time flip set it, not a stale value.
+    /// </summary>
+    [SkippableFact]
+    public void G3Attn_DefaultsOn_ForGeForceAmpere()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_CUDA_G3_ATTN") is not null,
+            "DOTLLM_CUDA_G3_ATTN is set — it overrides the device-gated default this test checks.");
+        string? modelPath = ResolveModelPath();
+        Skip.If(modelPath is null, "No model for the default-gate check.");
+
+        var dev = CudaDevice.GetDevice(0);
+        Skip.IfNot(dev.ComputeCapabilityMajor == 8 && dev.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase),
+            $"Default-on gate is GeForce Ampere; device '{dev.Name}' (cc{dev.ComputeCapabilityMajor}) not eligible.");
+
+        bool prior = CudaG3Attention.Enabled;
+        try
+        {
+            CudaG3Attention.Enabled = false;
+            using var gguf = GgufFile.Open(modelPath!);
+            var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ResolvePtxDir());
+            Assert.True(CudaG3Attention.Enabled, "G3 default did not enable on GeForce Ampere after model load.");
+        }
+        finally { CudaG3Attention.Enabled = prior; }
+    }
+
     private static ushort[] CaptureLayer0AttnOutput(CudaTransformerModel model, ModelConfig config, int len, bool g3On)
     {
         CudaG3Attention.Enabled = g3On;
