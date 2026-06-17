@@ -7,6 +7,18 @@ REM
 REM compute_75 = Turing, the CUDA 13 floor. PTX is forward-compatible so this
 REM runs on any Turing (SM 7.5), Ampere (8.0/8.6), Ada (8.9), Hopper (9.0),
 REM or Blackwell (10.0/12.0) GPU. CUDA 13 dropped Pascal/Volta (SM 6.x/7.0).
+REM
+REM ARCH POLICY: keep the default at compute_75. The driver JITs PTX to the
+REM actual SM at module load, so compute_75 PTX already runs as native sm_86 on
+REM (e.g.) an RTX 3060 with NO perf penalty. Raising the GLOBAL default does not
+REM make anything faster; it only drops portability to Turing. The ONLY reason
+REM to use compute_86+ is a kernel that emits Ampere-only PTX (mma.sync /
+REM cp.async). For those: build that ONE kernel at the higher arch AND
+REM dispatch-gate it to capable GPUs in C# (e.g. the G3 attention path is
+REM GeForce-Ampere-gated, so its PTX never loads on Turing). This script is
+REM global-arch today; add per-kernel arch metadata when the first Ampere-only
+REM kernel ships (issue #70 — fused mma.sync flash attention). Keep the
+REM committed native/ptx tree uniform sm_75 except such gated kernels.
 setlocal EnableDelayedExpansion
 
 set ARCH=%1
