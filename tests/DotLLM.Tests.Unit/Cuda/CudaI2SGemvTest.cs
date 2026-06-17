@@ -222,6 +222,83 @@ public class CudaI2SGemvTest
         Assert.True(meanDiff <= 1e-5f, $"mean abs diff {meanDiff} exceeds 1e-5");
     }
 
+    /// <summary>
+    /// Microbenchmark: Variant A (W2A16, FP16 activations) vs Variant B (W2A8, dp4a int8 activations)
+    /// at the GEMV level on the real BitNet projection shapes. Informational — always passes; run with
+    /// <c>--logger "console;verbosity=detailed"</c> to see the timings. Decides which variant the
+    /// forward integration should dispatch.
+    /// </summary>
+    [SkippableFact]
+    public void Benchmark_I2SGemv_AvsB()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        Bench(kernels, stream, 2560, 2560);
+        Bench(kernels, stream, 2560, 6912);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void Bench(CudaKernels kernels, CudaStream stream, int n, int k)
+    {
+        const int Iters = 500, Warmup = 30;
+        var rng = new Random(7);
+        int rowBytes = k / 4;
+        long packedLen = (long)n * rowBytes + 4;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        byte[] packed = Pack(ternary, n, k, 0.03f);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+        Half[] xh = new Half[k];
+        for (int i = 0; i < k; i++) xh[i] = (Half)x[i];
+        float absmax = 0f; for (int i = 0; i < k; i++) absmax = MathF.Max(absmax, MathF.Abs(x[i]));
+        float invAct = absmax / 127f;
+        sbyte[] xq = new sbyte[k];
+        for (int i = 0; i < k; i++) xq[i] = (sbyte)Math.Clamp((int)MathF.Round(x[i] * 127f / absmax), -127, 127);
+
+        nint s = stream.Handle;
+        CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devXh, (nuint)((long)k * 2)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devXq, (nuint)k).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devYh, (nuint)((long)n * 2)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devYf, (nuint)((long)n * 4)).ThrowOnError();
+        try
+        {
+            fixed (byte* w = packed) CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+            fixed (Half* p = xh) CudaDriverApi.cuMemcpyHtoD_v2(devXh, (nint)p, (nuint)((long)k * 2)).ThrowOnError();
+            fixed (sbyte* p = xq) CudaDriverApi.cuMemcpyHtoD_v2(devXq, (nint)p, (nuint)k).ThrowOnError();
+
+            for (int i = 0; i < Warmup; i++) kernels.LaunchI2_SGemvF16In(devW, devXh, devYh, n, k, s);
+            stream.Synchronize();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < Iters; i++) kernels.LaunchI2_SGemvF16In(devW, devXh, devYh, n, k, s);
+            stream.Synchronize(); sw.Stop();
+            double aUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
+
+            for (int i = 0; i < Warmup; i++) kernels.LaunchI2_SGemvA8(devW, devXq, devYf, n, k, invAct, s);
+            stream.Synchronize();
+            sw.Restart();
+            for (int i = 0; i < Iters; i++) kernels.LaunchI2_SGemvA8(devW, devXq, devYf, n, k, invAct, s);
+            stream.Synchronize(); sw.Stop();
+            double bUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
+
+            double wBytes = (double)n * rowBytes; // packed weight bytes read per GEMV
+            _out.WriteLine($"I2_S GEMV {n}x{k}:  A(W2A16)={aUs:F1}us {wBytes / aUs / 1e3:F1}GB/s   " +
+                           $"B(dp4a)={bUs:F1}us {wBytes / bUs / 1e3:F1}GB/s   B/A={bUs / aUs:F2}x");
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devW); CudaDriverApi.cuMemFree_v2(devXh); CudaDriverApi.cuMemFree_v2(devXq);
+            CudaDriverApi.cuMemFree_v2(devYh); CudaDriverApi.cuMemFree_v2(devYf);
+        }
+    }
+
     /// <summary>Packs ternary {-1,0,+1} into dotLLM I2_S layout + trailing per-tensor float32 scale.</summary>
     private static byte[] Pack(sbyte[] ternary, int n, int k, float scale)
     {
