@@ -12,6 +12,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private const int BlockSize = 256;
 
     /// <summary>
+    /// I2_S GEMV output rows processed per block (warp-per-row scheme): the block's
+    /// <see cref="BlockSize"/>/32 = 8 warps each own <c>I2S_ROWS_PER_WARP</c> rows. Grid is sized
+    /// ceil(n / this). Must stay in sync with <c>I2S_ROWS_PER_BLOCK</c> (= 8 × I2S_ROWS_PER_WARP)
+    /// in native/kernels/i2_s_gemv.cu.
+    /// </summary>
+    private const int I2sRowsPerBlock = 16;
+
+    /// <summary>
     /// Max CUDA blocks for dequant kernel launches. Kernels use grid-stride loops,
     /// so capping grid size amortizes block launch overhead on GPUs with many SMs
     /// (e.g. RTX 3050 has 20 SMs; launching 65K+ blocks per dequant overwhelms the
@@ -264,8 +272,9 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF16, yArg = yF16;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // v2 warp-per-row: I2sRowsPerBlock output rows per 256-thread block → ceil(n / rows) blocks.
         CudaDriverApi.cuLaunchKernel(_i2sGemvF16InFunc,
-                (uint)n, 1, 1, BlockSize, 1, 1,
+                (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -276,7 +285,7 @@ public sealed unsafe class CudaKernels : IDisposable
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
-                (uint)n, 1, 1, BlockSize, 1, 1,
+                (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -298,7 +307,7 @@ public sealed unsafe class CudaKernels : IDisposable
         float sArg = invActScale;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg, &sArg};
         CudaDriverApi.cuLaunchKernel(_i2sGemvA8Func,
-                (uint)n, 1, 1, BlockSize, 1, 1,
+                (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 

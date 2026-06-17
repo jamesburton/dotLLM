@@ -9,31 +9,48 @@
 //     offset-binary {1,2,3}; the decode here subtracts 1.
 //   * ONE per-tensor float32 scale at the tensor tail, byte offset (size_t)n*(k/4).
 //
-// ───────────────────────────── Occupancy / MLP optimization ─────────────────────────────
-// The launch config is FIXED by CudaKernels.cs: grid = (n,1,1), block = (256,1,1), shared = 0.
-// One block still owns exactly one output row. The original kernel handed each thread one
-// 128-element block (32 bytes), so a row with only k/128 = 20..54 blocks left 200+ of the 256
-// threads idle and issued only ~20..54 in-flight loads → ~3% of the 3060's bandwidth (~10-12 GB/s).
+// ───────────────────────── Occupancy / MLP optimization (v2: warp-per-row) ─────────────────────────
+// HISTORY. v1 used grid=(n,1,1)/block=(256,1,1) with ONE block per output row, each thread striding the
+// row's uint4 units. But a row is only k/4 bytes = k/64 uint4 units = 40 (k=2560) .. 108 (k=6912) units,
+// so only 40..108 of the block's 256 threads ever issued a load — 6 of the 8 warps sat idle, the block
+// reduce summed mostly-empty warps, and we launched n=2560 such half-empty blocks. Measured 22 GB/s
+// (k=2560) .. 29 GB/s (k=6912), ~6-8% of the 3060's 360 GB/s peak.
 //
-// This version keeps grid=n/block=256 but raises active-warp density and memory-level parallelism:
-//   (a) ALL 256 threads stride over the row's packed bytes (k/4 = 640..1728 bytes ≫ 256), so every
-//       thread issues loads — full warp occupancy instead of ~20..54 active lanes.
-//   (b) Each thread reads weights as uint4 (16 B = 64 codes) per load instead of byte-by-byte,
-//       giving wide, fully-coalesced 16-byte transactions across the warp (ld.global.nc.v4.u32).
-//   (c) For the FP16/FP32 activation variants, x[k] is staged once into static shared memory by the
-//       whole block, then read from shared inside the hot loop. This removes the repeated half→float
-//       L2 traffic and measured fastest for the W2A16 decode path that the forward pass dispatches.
-//       The int8/dp4a variant reads xq directly from global (__ldg, L2-resident): its single-byte
-//       shared gathers serialize and measured *slower* than the L2 path, while the per-tensor xq is
-//       reused across all n blocks so it stays L2-hot anyway.
-// Numerics are unchanged from the original Variant A (exact ternary decode, fp32/int32 accumulate);
-// only the fp32 reduction order shifts, which stays inside the test's <=1e-3 tolerance (measured
-// max abs diff ~1e-6 vs the CPU float reference).
+// v2 packs MULTIPLE rows per block (à la Microsoft BitNet's 16-rows/block GPU kernel) so every warp does
+// real work and the shared-loaded x is reused across all rows in the block:
+//   * block = 256 threads = 8 warps; ROWS_PER_BLOCK = 8 → ONE WARP OWNS ONE OUTPUT ROW.
+//   * grid.x = ceil(n / 8). Block b covers rows [8b, 8b+8). Warp wid (=threadIdx.x/32) owns row 8b+wid.
+//   * x[k] is staged into shared ONCE by all 256 threads, then read by all 8 rows' warps → the shared
+//     stage cost (and the half→float x traffic) is amortized 8× vs one-row-per-block.
+//   * Each warp's 32 lanes stride over the row's 40..108 uint4 units (1..4 units/lane) → the warp is
+//     fully populated and issues 32 in-flight 16-byte loads (ld.global.nc.v4.u32) at a time. Across the
+//     8 warps that is up to 256 independent weight loads in flight per block — far higher memory-level
+//     parallelism than v1, and the weight matrix (the bandwidth-bound operand) is still read exactly once.
+//   * Reduction is a single intra-warp __shfl_down (no __syncthreads, no shared warp_sums, no idle-warp
+//     summing) — lane 0 of each warp writes its row.
 //
-// Layout note for the uint4 load: row_bytes = k/4 is a multiple of 32 (k%128==0), hence a multiple
-// of 16, so it splits cleanly into uint4 (16-byte) units. A uint4 spans bytes [16u, 16u+15]; since
-// 16u is a multiple of 16, those 16 bytes lie inside a single 32-byte (128-element) block — blk and
-// the x base address are constant across the uint4, only gp = byte index within the block varies.
+// Each warp reads weights as uint4 (16 B = 64 codes) per load — wide, fully-coalesced transactions. For
+// FP16/FP32 activations x is shared-resident; the int8/dp4a variant reads xq from global (__ldg,
+// L2-resident) because its {gp,+32,+64,+96} single-byte gathers serialize through shared (measured
+// slower) while the per-token xq stays L2-hot across all blocks anyway.
+//
+// Numerics are unchanged (exact ternary decode, fp32/int32 accumulate). Only the reduction is now a pure
+// 32-lane warp reduce; the fp32 sum order stays within the test's <=1e-3 tolerance (measured max abs diff
+// ~1e-6 vs the CPU float reference).
+//
+// Layout note for the uint4 load: row_bytes = k/4 is a multiple of 32 (k%128==0), hence a multiple of 16,
+// so it splits cleanly into uint4 (16-byte) units. A uint4 spans bytes [16u, 16u+15]; since 16u is a
+// multiple of 16, those 16 bytes lie inside a single 32-byte (128-element) block — blk and the x base
+// address are constant across the uint4, only gp = byte index within the block varies.
+//
+// Launch contract (set in CudaKernels.cs): block = (256,1,1); grid = (ceil(n/ROWS_PER_BLOCK),1,1); shared=0.
+//
+// Tunables. WARPS_PER_BLOCK is fixed at 8 (256/32). I2S_ROWS_PER_WARP rows are handled per warp; the
+// block therefore covers I2S_ROWS_PER_BLOCK = 8 * I2S_ROWS_PER_WARP rows and stages x ONCE for all of
+// them. Measured on the 3060 (sm_86): ROWS_PER_WARP=2 amortizes the half→float x stage over 16 rows and
+// beats ROWS_PER_WARP=1 on the small-k attention shape (k=2560) while matching it on FFN (k=6912).
+#define I2S_ROWS_PER_WARP  2
+#define I2S_ROWS_PER_BLOCK (8 * I2S_ROWS_PER_WARP)   // 8 warps/block × rows-per-warp
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -43,24 +60,13 @@
 // under sm_86's 48 KB static cap.
 #define I2S_MAX_K 6912
 
-__device__ __forceinline__ float i2s_block_reduce(float acc)
+// Intra-warp sum reduce (v2 warp-per-row path): the 32 lanes of one warp hold partial sums for a single
+// output row; lane 0 ends with the total. No shared memory, no __syncthreads.
+__device__ __forceinline__ float i2s_warp_reduce(float acc)
 {
+    #pragma unroll
     for (int off = warpSize / 2; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xFFFFFFFF, acc, off);
-
-    __shared__ float warp_sums[32];
-    int lane = threadIdx.x % warpSize;
-    int wid  = threadIdx.x / warpSize;
-    if (lane == 0) warp_sums[wid] = acc;
-    __syncthreads();
-
-    if (wid == 0)
-    {
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-        acc = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        for (int off = warpSize / 2; off > 0; off >>= 1)
-            acc += __shfl_down_sync(0xFFFFFFFF, acc, off);
-    }
     return acc;
 }
 
@@ -102,34 +108,42 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     const int n,
     const int k)
 {
-    int row = blockIdx.x;
-    if (row >= n) return;
-
-    // Stage x[k] into shared memory once per block (FP16 -> FP32), all threads cooperating.
+    // Stage x[k] into shared memory once per block (FP16 -> FP32), all 256 threads cooperating.
+    // Reused by all I2S_ROWS_PER_BLOCK warps in this block.
     __shared__ float xs[I2S_MAX_K];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = __half2float(x[i]);
     __syncthreads();
 
-    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const int wid  = threadIdx.x >> 5;        // warp id within block (0..7)
+    const int lane = threadIdx.x & 31;        // lane within warp
 
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
     const int row_bytes = k / 4;
     const int num_u4    = row_bytes >> 4;     // 16 bytes per uint4
-    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
-    float acc = 0.0f;
-    // Every thread strides over the row's uint4 units → all 256 threads issue 16-byte loads.
-    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
+    // Each warp owns I2S_ROWS_PER_WARP consecutive-in-block rows. Staging x once and reusing it across
+    // (warps × rows-per-warp) = I2S_ROWS_PER_BLOCK rows amortizes the half→float x stage further.
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
     {
-        uint4 w = w_row[u];
-        int boff = u << 4;                    // byte offset of this uint4
-        int blk  = boff >> 5;                 // 32 bytes per 128-block
-        int gp0  = boff & 31;                 // 0 or 16
-        i2s_accum_u4(acc, w, xs, blk << 7, gp0);
-    }
+        const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
+        if (row >= n) return;                 // rows ascend; once past n the rest are too
 
-    acc = i2s_block_reduce(acc);
-    if (threadIdx.x == 0) y[row] = __float2half(acc * scale);
+        const uint4* w_row = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
+        float acc = 0.0f;
+        // The warp's 32 lanes stride over this row's uint4 units → 32 coalesced 16-byte loads in flight.
+        for (int u = lane; u < num_u4; u += warpSize)
+        {
+            uint4 w = w_row[u];
+            int boff = u << 4;                // byte offset of this uint4
+            int blk  = boff >> 5;             // 32 bytes per 128-block
+            int gp0  = boff & 31;             // 0 or 16
+            i2s_accum_u4(acc, w, xs, blk << 7, gp0);
+        }
+        acc = i2s_warp_reduce(acc);
+        if (lane == 0) y[row] = __float2half(acc * scale);
+    }
 }
 
 // ───────────────────────── Variant A twin: FP32 activations ─────────────────────────
@@ -141,32 +155,37 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
     const int n,
     const int k)
 {
-    int row = blockIdx.x;
-    if (row >= n) return;
-
     __shared__ float xs[I2S_MAX_K];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = x[i];
     __syncthreads();
 
-    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
 
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
     const int row_bytes = k / 4;
     const int num_u4    = row_bytes >> 4;
-    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
-    float acc = 0.0f;
-    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
     {
-        uint4 w = w_row[u];
-        int boff = u << 4;
-        int blk  = boff >> 5;
-        int gp0  = boff & 31;
-        i2s_accum_u4(acc, w, xs, blk << 7, gp0);
-    }
+        const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
+        if (row >= n) return;
 
-    acc = i2s_block_reduce(acc);
-    if (threadIdx.x == 0) y[row] = acc * scale;
+        const uint4* w_row = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
+        float acc = 0.0f;
+        for (int u = lane; u < num_u4; u += warpSize)
+        {
+            uint4 w = w_row[u];
+            int boff = u << 4;
+            int blk  = boff >> 5;
+            int gp0  = boff & 31;
+            i2s_accum_u4(acc, w, xs, blk << 7, gp0);
+        }
+        acc = i2s_warp_reduce(acc);
+        if (lane == 0) y[row] = acc * scale;
+    }
 }
 
 // ───────────────────────── Variant B: W2A8 (int8 activations, __dp4a) ─────────────────────────
@@ -200,17 +219,23 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8(
     const int   k,
     const float inv_act_scale)            // = absmax(x)/127 = 1/s_act ; x_i ≈ xq_i * inv_act_scale
 {
-    int row = blockIdx.x;
-    if (row >= n) return;
+    const int wid  = threadIdx.x >> 5;        // warp id (0..7)
+    const int lane = threadIdx.x & 31;
 
     const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
-
     const int row_bytes = k / 4;
     const int num_u4    = row_bytes >> 4;
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+    const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
+    if (row >= n) return;
+
     const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
 
     int iacc = 0;
-    for (int u = threadIdx.x; u < num_u4; u += blockDim.x)
+    for (int u = lane; u < num_u4; u += warpSize)
     {
         uint4 w = w_row[u];
         int boff    = u << 4;
@@ -250,6 +275,7 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8(
         }
     }
 
-    float acc = i2s_block_reduce((float)iacc);
-    if (threadIdx.x == 0) y[row] = acc * scale * inv_act_scale;
+    float acc = i2s_warp_reduce((float)iacc);
+    if (lane == 0) y[row] = acc * scale * inv_act_scale;
+    }
 }
