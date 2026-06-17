@@ -42,11 +42,19 @@ namespace DotLLM.Cuda;
 /// </para>
 /// <para>
 /// The dense-square QK/PV process the full <c>s × s</c> even though prefill is causal
-/// (~half the entries are masked). Block-triangular / causal-aware GEMM is a documented
-/// follow-up: it fights the strided-batched-cuBLAS model (fragmenting into many small
-/// per-diagonal GEMMs would destroy throughput) and is out of scope for a clean
-/// prefill-only wire. The softmax already zeroes the upper triangle, so the dense path
-/// is numerically correct today.
+/// (~half the entries are masked). Block-triangular / causal-aware GEMM was investigated
+/// as a follow-up (issue #72) and is a measured <b>NO-GO</b> for this cuBLAS path: a
+/// triangular GEMM-floor probe on the production head shape (RTX 3060, Llama-3.2-1B
+/// 32/8/64, interleaved min-of-N) showed per-query-block GEMMs give near-zero GEMM-half
+/// saving despite ~half the FLOPs — per-block cuBLAS efficiency loss + launch overhead
+/// from the smaller growing-K GEMMs swamp the cut (tri/dense GEMM-half ratio 0.92–1.14×
+/// at the best block size; worse for smaller blocks). And block-triangular cannot touch
+/// the other half of the G3 cost — the full <c>numHeads·s²</c> score round-trip through
+/// global memory — so the projected end-to-end attention speedup is ≈0.96× at s=512/1024
+/// and only ≈1.06× at s=2048, below the bar. The fused <c>mma.sync</c> flash kernel
+/// (issue #70) is the right vehicle for causal-FLOP savings: it cuts both the GEMM half
+/// AND the score round-trip by keeping scores in shared/registers. The softmax already
+/// zeroes the upper triangle, so the dense path is numerically correct today.
 /// </para>
 /// </remarks>
 internal sealed class CudaG3Attention : IDisposable
