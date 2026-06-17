@@ -945,6 +945,20 @@ public sealed class VulkanDevice : IDisposable
             dotFeatures.pNext = featureChain;
             featureChain = (nint)(&dotFeatures);
         }
+        // Timeline semaphores (core 1.2) require `timelineSemaphore=VK_TRUE` enabled
+        // at device create. We need them for the D3D12_FENCE export type CUDA imports
+        // cross-vendor (Intel Vulkan → NVIDIA CUDA) — the OPAQUE_WIN32 binary form
+        // fails import on that pairing. Enable alongside the external-semaphore-win32
+        // path so the M3 handoff can create exportable timeline semaphores.
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = default;
+        if (enableExternalSemaphoreWin32)
+        {
+            timelineFeatures.sType = VkStructureType.PhysicalDeviceTimelineSemaphoreFeatures;
+            timelineFeatures.timelineSemaphore = 1; // VK_TRUE
+            timelineFeatures.pNext = featureChain;
+            featureChain = (nint)(&timelineFeatures);
+        }
+
         ci.pNext = featureChain;
 
         if (extCount > 0)
@@ -1490,6 +1504,54 @@ public sealed class VulkanDevice : IDisposable
         return handle;
     }
 
+    /// <summary>
+    /// Creates an exportable <b>timeline</b> <c>VkSemaphore</c> for the
+    /// cross-vendor M3 handoff. A timeline semaphore is required for the
+    /// <see cref="ExternalSemaphoreHandleType.D3D12Fence"/> handle type, which is
+    /// the form CUDA can import from an Intel-Arc Vulkan device (the
+    /// <see cref="ExternalSemaphoreHandleType.OpaqueWin32"/> binary form fails
+    /// <c>cuImportExternalSemaphore</c> on the Arc→NVIDIA pairing). The semaphore
+    /// starts at counter value <paramref name="initialValue"/> and is advanced by
+    /// each <see cref="SubmitContext.SubmitAndSignalTimeline"/> call.
+    /// </summary>
+    /// <param name="handleType">External handle type — D3D12_FENCE for the working cross-vendor path.</param>
+    /// <param name="initialValue">Initial timeline counter value (typically 0).</param>
+    /// <returns>The created timeline <c>VkSemaphore</c> handle.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the external-semaphore-win32 extension.</exception>
+    public unsafe nint CreateExportableTimelineSemaphore(
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.D3D12Fence,
+        ulong initialValue = 0)
+    {
+        if (!HasExternalSemaphoreWin32)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_external_semaphore_win32 — cannot export a semaphore to CUDA.");
+
+        // pNext chain: VkSemaphoreCreateInfo -> VkExportSemaphoreCreateInfo -> VkSemaphoreTypeCreateInfo.
+        var typeInfo = new VkSemaphoreTypeCreateInfo
+        {
+            sType = VkStructureType.SemaphoreTypeCreateInfo,
+            semaphoreType = VkSemaphoreType.Timeline,
+            initialValue = initialValue,
+        };
+
+        var exportInfo = new VkExportSemaphoreCreateInfo
+        {
+            sType = VkStructureType.ExportSemaphoreCreateInfo,
+            pNext = (nint)(&typeInfo),
+            handleTypes = (uint)ToVkHandleType(handleType),
+        };
+
+        var ci = new VkSemaphoreCreateInfo
+        {
+            sType = VkStructureType.SemaphoreCreateInfo,
+            pNext = (nint)(&exportInfo),
+        };
+
+        VulkanApi.vkCreateSemaphore(_device, ci, 0, out nint semaphore)
+            .ThrowOnError("vkCreateSemaphore (exportable timeline)");
+        return semaphore;
+    }
+
     /// <summary>Destroys a semaphore previously created by <see cref="CreateExportableSemaphore"/>.</summary>
     /// <param name="semaphore">The semaphore handle; no-op when zero.</param>
     public void DestroySemaphore(nint semaphore)
@@ -1606,6 +1668,51 @@ public sealed class VulkanDevice : IDisposable
             };
             VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
                 .ThrowOnError("vkQueueSubmit SubmitAndSignal");
+        }
+
+        /// <summary>
+        /// Ends the command buffer and submits it with a <b>timeline</b> signal:
+        /// <paramref name="signalSemaphore"/> is advanced to
+        /// <paramref name="signalValue"/> once the GPU finishes this submission.
+        /// CUDA gates on the same (semaphore, value) pair via
+        /// <c>cuWaitExternalSemaphoresAsync</c>. Does NOT host-wait on the fence —
+        /// this is the M3 async-handoff submit for the cross-vendor D3D12_FENCE path.
+        /// </summary>
+        /// <param name="signalSemaphore">An exportable timeline semaphore.</param>
+        /// <param name="signalValue">The counter value to signal on GPU completion (must exceed the prior signalled value).</param>
+        /// <remarks>
+        /// The fence is still passed so the host can reclaim the command buffer on
+        /// the next <see cref="Begin"/>. Overlapping in-flight submissions require a
+        /// double-buffered <see cref="SubmitContext"/> ring — one command buffer +
+        /// fence cannot host two simultaneous submissions even with a timeline
+        /// semaphore (the fence and command buffer are still single-use-at-a-time).
+        /// </remarks>
+        public unsafe void SubmitAndSignalTimeline(nint signalSemaphore, ulong signalValue)
+        {
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignalTimeline");
+
+            nint cmdBufLocal = _cmdBuf;
+            nint semLocal = signalSemaphore;
+            ulong signalValueLocal = signalValue;
+
+            var timelineInfo = new VkTimelineSemaphoreSubmitInfo
+            {
+                sType = VkStructureType.TimelineSemaphoreSubmitInfo,
+                signalSemaphoreValueCount = 1,
+                pSignalSemaphoreValues = (nint)(&signalValueLocal),
+            };
+
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                pNext = (nint)(&timelineInfo),
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = (nint)(&semLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
+                .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
         }
 
         /// <summary>
