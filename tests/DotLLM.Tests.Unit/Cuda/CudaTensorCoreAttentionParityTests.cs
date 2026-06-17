@@ -214,6 +214,80 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     }
 
     /// <summary>
+    /// Numeric parity of the hand-fused mma.sync flash kernel against attention_f16.
+    /// The fused kernel writes the SAME row-major [seq, heads, headDim] layout, so the
+    /// compare is a direct linear walk. Same 5e-3 abs OR rel tolerance (FP16 coopmat
+    /// precedent). Prototype: Llama-3.2-1B head shape (heads=32, kv=8, headDim=64).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(512, 32, 8, 64)]
+    [InlineData(1024, 32, 8, 64)]
+    [InlineData(2048, 32, 8, 64)]
+    public void FlashMmaPath_MatchesAttentionF16(int s, int numHeads, int numKvHeads, int headDim)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string ptxDir = ResolvePtxDir();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "attention_flash_mma.ptx")), "attention_flash_mma.ptx not built.");
+
+        using var ctx = CudaContext.Create(0);
+        ctx.MakeCurrent();
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir);
+        Skip.IfNot(kernels.HasAttentionFlashMma, "Flash mma kernel not loaded.");
+
+        float scale = 1.0f / MathF.Sqrt(headDim);
+        int qElems = s * numHeads * headDim;
+        int kvElems = s * numKvHeads * headDim;
+        int outElems = s * numHeads * headDim;
+
+        using var q = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+        using var k = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var v = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var outFlash = CudaTensor.Allocate(new TensorShape(outElems), DType.Float16, 0);
+        using var outRef = CudaTensor.Allocate(new TensorShape(outElems), DType.Float16, 0);
+
+        Upload(q.DataPointer, RandomHalf(qElems, 1));
+        Upload(k.DataPointer, RandomHalf(kvElems, 2));
+        Upload(v.DataPointer, RandomHalf(kvElems, 3));
+
+        kernels.LaunchAttention(q.DataPointer, k.DataPointer, v.DataPointer, outRef.DataPointer,
+            seqQ: s, seqKv: s, numHeads, numKvHeads, headDim, 0, 0, stream.Handle);
+        ushort[] refHost = Download(outRef.DataPointer, outElems);
+
+        kernels.LaunchAttentionFlashMma(q.DataPointer, k.DataPointer, v.DataPointer, outFlash.DataPointer,
+            s, numHeads, numKvHeads, headDim, scale, stream.Handle);
+        stream.Synchronize();
+        ushort[] flashHost = Download(outFlash.DataPointer, outElems);
+
+        int mismatches = 0;
+        float maxAbs = 0f, maxRel = 0f;
+        int worst = -1;
+        for (int i = 0; i < outElems; i++)
+        {
+            float a = (float)BitConverter.UInt16BitsToHalf(refHost[i]);
+            float b = (float)BitConverter.UInt16BitsToHalf(flashHost[i]);
+            float absDiff = MathF.Abs(a - b);
+            float relDiff = absDiff / (MathF.Abs(a) + 1e-6f);
+            if (!(absDiff <= AbsTol || relDiff <= RelTol))
+            {
+                mismatches++;
+                if (absDiff > maxAbs) { maxAbs = absDiff; maxRel = relDiff; worst = i; }
+            }
+        }
+
+        _output.WriteLine($"flash-mma s={s} heads={numHeads} kv={numKvHeads} hd={headDim}: "
+            + $"mismatches={mismatches}/{outElems} (tol abs {AbsTol} OR rel {RelTol})");
+        if (mismatches > 0)
+        {
+            int d = worst % headDim, hq = (worst / headDim) % numHeads, tq = worst / (headDim * numHeads);
+            _output.WriteLine($"worst linear idx {worst} -> (tq={tq},hq={hq},d={d}) absDiff={maxAbs} relDiff={maxRel}");
+        }
+
+        Assert.True(mismatches == 0,
+            $"flash-mma vs attention_f16: {mismatches}/{outElems} outside tolerance; worst abs {maxAbs} rel {maxRel}.");
+    }
+
+    /// <summary>
     /// Complete-path timing vs <c>attention_f16</c>: QK GEMM → causal softmax → P·V GEMM.
     /// CUDA events, interleaved, min over reps (the 3060 clocks drift ~2× across heavy
     /// runs — interleave + min, never divide separate fresh-process mins). Opt-in via
@@ -249,8 +323,10 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         _output.WriteLine("floor = the two cuBLAS GEMMs with NO softmax/round-trip (hard lower bound).");
         _output.WriteLine("G3/floor = ceiling on any fused kernel's speedup over G3 (fused can't beat the floor).");
         _output.WriteLine($"heads={numHeads} kvHeads={numKvHeads} headDim={headDim} group={group}  reps={reps} (min ms, interleaved)");
-        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"G3coal",10} | {"G3uncoal",10} | {"floor",10} | {"G3/floor",9} | {"attn/G3",8}");
-        _output.WriteLine(new string('-', 84));
+        bool hasFlash = kernels.HasAttentionFlashMma;
+        _output.WriteLine($"flash-mma kernel loaded: {hasFlash}");
+        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"G3coal",10} | {"G3uncoal",10} | {"floor",10} | {"flashMMA",10} | {"G3/floor",9} | {"attn/G3",8} | {"G3/flash",9}");
+        _output.WriteLine(new string('-', 110));
 
         foreach (int s in seqs)
         {
@@ -285,24 +361,31 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
             // hard lower bound a fused kernel can approach but never beat.
             void RunGemmOnly() => RunGemmOnlyPath(cublas, stream, q, k, v, scores, outBuf,
                 s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale);
+            void RunFlash() => kernels.LaunchAttentionFlashMma(
+                q.DataPointer, k.DataPointer, v.DataPointer, outBuf.DataPointer,
+                s, numHeads, numKvHeads, headDim, scale, stream.Handle);
 
-            for (int w = 0; w < warmup; w++) { RunAttention(); RunCoal(); RunUncoal(); RunGemmOnly(); }
+            for (int w = 0; w < warmup; w++) { RunAttention(); RunCoal(); RunUncoal(); RunGemmOnly(); if (hasFlash) RunFlash(); }
             stream.Synchronize();
 
-            double attnMin = double.MaxValue, uncoalMin = double.MaxValue, coalMin = double.MaxValue, floorMin = double.MaxValue;
+            double attnMin = double.MaxValue, uncoalMin = double.MaxValue, coalMin = double.MaxValue, floorMin = double.MaxValue, flashMin = double.MaxValue;
             for (int r = 0; r < reps; r++)
             {
                 attnMin = Math.Min(attnMin, TimeGpu(stream, RunAttention));
                 coalMin = Math.Min(coalMin, TimeGpu(stream, RunCoal));
                 uncoalMin = Math.Min(uncoalMin, TimeGpu(stream, RunUncoal));
                 floorMin = Math.Min(floorMin, TimeGpu(stream, RunGemmOnly));
+                if (hasFlash) flashMin = Math.Min(flashMin, TimeGpu(stream, RunFlash));
             }
 
-            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {coalMin,8:F3}ms | {uncoalMin,8:F3}ms | {floorMin,8:F3}ms | {coalMin / floorMin,8:F2}x | {attnMin / coalMin,6:F2}x");
+            string flashCol = hasFlash ? $"{flashMin,8:F3}ms" : $"{"n/a",10}";
+            string g3OverFlash = hasFlash ? $"{coalMin / flashMin,8:F2}x" : $"{"n/a",9}";
+            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {coalMin,8:F3}ms | {uncoalMin,8:F3}ms | {floorMin,8:F3}ms | {flashCol} | {coalMin / floorMin,8:F2}x | {attnMin / coalMin,6:F2}x | {g3OverFlash}");
         }
-        _output.WriteLine(new string('-', 84));
+        _output.WriteLine(new string('-', 110));
         _output.WriteLine("G3coal = shipping path (one-thread-per-row coalesced softmax). G3/floor uses G3coal.");
         _output.WriteLine("Fused-kernel headroom over G3 = G3coal - floor (the score round-trip). Ceiling = G3/floor.");
+        _output.WriteLine("flashMMA = hand-fused mma.sync flash kernel. G3/flash = measured fused speedup over G3 (>1 = win).");
     }
 
     private static void RunCublasSoftmaxPath(
