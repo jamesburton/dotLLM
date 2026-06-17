@@ -131,9 +131,12 @@ public sealed class Gemma4GpuGapProbeTests
 
             _output.WriteLine($"CPU argmax={cpuArgmax} logit={cpuLogits[cpuArgmax]:F4}; "
                 + $"CUDA argmax={cudaArgmax} logit={cudaLogits[cudaArgmax]:F4}");
+            _output.WriteLine($"DIAG lengths: cpu={cpuLogits.Length} cuda={cudaLogits.Length}");
             // Diagnostic: compare both backends at BOTH argmax indices + global max diff.
             {
                 int a = cpuArgmax, b = cudaArgmax;
+                int nn = Math.Min(cpuLogits.Length, cudaLogits.Length);
+                if (a >= nn) a = 0; if (b >= nn) b = 0;
                 float maxd = 0f; int maxi = 0;
                 for (int i = 0; i < Math.Min(cpuLogits.Length, cudaLogits.Length); i++)
                 { float dd = MathF.Abs(cpuLogits[i] - cudaLogits[i]); if (dd > maxd) { maxd = dd; maxi = i; } }
