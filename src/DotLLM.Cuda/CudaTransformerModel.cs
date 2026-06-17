@@ -1893,6 +1893,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // attn_norm(input) → NormOutputF32
         _kernels.LaunchRmsNormF32(_state.ResidualF32, g4.AttnNorm, _state.NormOutputF32,
             hiddenSize, eps, seqLen, s);
+        Gemma4Dump($"A{layer}_normin", _state.NormOutputF32, seqLen * hiddenSize, s);
 
         // Q, K projections (raw — K captured before k-norm/rope for V-from-K).
         ProjectF32(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,

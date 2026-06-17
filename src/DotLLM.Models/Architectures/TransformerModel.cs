@@ -1503,6 +1503,7 @@ public sealed unsafe class TransformerModel : IModel
                 new ReadOnlySpan<float>(hidden + t * hiddenSize, hiddenSize),
                 lw.AttnNormWeight, eps,
                 new Span<float>(normOut + t * hiddenSize, hiddenSize));
+        Gemma4DumpCpu($"A{layer}_normin", normOut, seqLen * hiddenSize);
 
         // Q = wq · normIn ; K = wk · normIn (raw projections, GEMM quantizes internally)
         Gemm(lw.QWeight, lw.QQuantType, normOut, q, lw.QOutputDim, lw.QInputDim, seqLen);
