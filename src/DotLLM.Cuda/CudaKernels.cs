@@ -1487,10 +1487,14 @@ public sealed unsafe class CudaKernels : IDisposable
 
         void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &seqArg, &nhArg, &nkvArg, &scArg };
 
-        uint gridX = (uint)numHeads;
+        // TUNED layout: one block per (kv head, 16-query tile); `group` warps per block,
+        // one warp per query head sharing that kv head (K/V loaded once, reused group×).
+        int group = numHeads / numKvHeads;
+        uint gridX = (uint)numKvHeads;
         uint gridY = (uint)((seq + 15) / 16);   // 16-query tiles
+        uint blockX = (uint)(group * 32);       // group warps per block
         CudaDriverApi.cuLaunchKernel(_attentionFlashMmaFunc,
-                gridX, gridY, 1, 32, 1, 1,
+                gridX, gridY, 1, blockX, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 

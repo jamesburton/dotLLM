@@ -85,9 +85,24 @@ __device__ __forceinline__ void mma_m16n8k16(
           "r"(b[0]), "r"(b[1]));
 }
 
-// One WARP per (query head, 16-query tile).
-//   gridDim.x = numHeads, gridDim.y = ceil(seq / 16), blockDim.x = 32.
-extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
+// Max query heads per kv head we statically size the block's shared arrays for. The
+// kernel launches `group` warps per block; if a model's GQA group exceeds this the caller
+// falls back to G3 (CanUse caps group). Llama-3.2-1B: group=4. Kept tight (==4) so the
+// per-warp shared arrays (sQ dominates at 2KB/warp) don't bloat past what occupancy can
+// afford on sm_86 — oversizing to 8 left half the shared block dead and capped blocks/SM.
+#define MAX_GROUP_WARPS 4
+
+// TUNED: one BLOCK per (kv head, 16-query tile); `group` WARPS per block, one warp per
+// query head sharing that kv head. All warps in the block process the SAME q-tile and the
+// SAME kv head, so they stream the SAME K/V tiles with the SAME causal extent (kv_end
+// depends only on q_tile, not head) — K/V is loaded ONCE per block into shared and reused
+// across all `group` warps (group× fewer K/V global loads), and the extra warps give the
+// Ampere MMA pipeline the latency hiding the 1-warp/block prototype lacked.
+//   gridDim.x = numKvHeads, gridDim.y = ceil(seq / 16), blockDim.x = group * 32.
+//   K/V load → compute barrier is __syncthreads() (cross-warp); QK / softmax / PV stay
+//   per-warp under __syncwarp(). Per-warp state (sQ/sScore/sP/sM/sL/sCorr/O_frag) is
+//   warp-indexed; sK/sVt are block-shared.
+extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_flash_mma_f16(
     const half* __restrict__ q,   // [seq, numHeads,   headDim] row-major
     const half* __restrict__ k,   // [seq, numKvHeads, headDim] row-major
     const half* __restrict__ v,   // [seq, numKvHeads, headDim] row-major
@@ -97,34 +112,43 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
     const int num_kv_heads,
     const float scale)
 {
-    const int lane = threadIdx.x;            // 0..31
-    const int hq = blockIdx.x;               // query head
+    const int lane = threadIdx.x & 31;       // 0..31 within warp
+    const int warp = threadIdx.x >> 5;       // 0..group-1 (which query head in the group)
+    const int group = num_heads / num_kv_heads;
+
+    const int hk = blockIdx.x;               // kv head (shared by this block's warps)
+    const int hq = hk * group + warp;        // this warp's query head
     const int q_tile = blockIdx.y;           // which 16-query tile
     const int q0 = q_tile * Q_TILE;          // first query row of this tile
     if (q0 >= seq) return;
 
-    const int group = num_heads / num_kv_heads;
-    const int hk = hq / group;               // kv head feeding this query head
-
     const int q_stride = num_heads * HEAD_DIM;
     const int kv_stride = num_kv_heads * HEAD_DIM;
 
-    // Shared tiles. Q persists for the whole key loop; K/V refilled per KV tile.
-    __shared__ half sQ[Q_TILE * HEAD_DIM];        // [q][d]
-    __shared__ half sK[KV_TILE * HEAD_DIM];       // [key][d]
-    __shared__ half sVt[HEAD_DIM * KV_TILE];      // V transposed: [d][key]
-    __shared__ half sP[Q_TILE * KV_TILE];         // normalised P: [q][key]
-    __shared__ float sScore[Q_TILE * KV_TILE];    // raw S spilled from accumulator
-    __shared__ float sM[Q_TILE];                  // running row max
-    __shared__ float sL[Q_TILE];                  // running row denom (sum exp)
-    __shared__ float sCorr[Q_TILE];               // per-row O rescale for this KV tile
+    // Block-shared K/V tiles (loaded once, reused by all `group` warps).
+    __shared__ half sK[KV_TILE * HEAD_DIM];        // [key][d]
+    __shared__ half sVt[HEAD_DIM * KV_TILE];       // V transposed: [d][key]
+    // Per-warp state (warp-indexed slices).
+    __shared__ half sQ[MAX_GROUP_WARPS][Q_TILE * HEAD_DIM];     // [warp][q][d]
+    __shared__ half sP[MAX_GROUP_WARPS][Q_TILE * KV_TILE];      // [warp] normalised P: [q][key]
+    __shared__ float sScore[MAX_GROUP_WARPS][Q_TILE * KV_TILE]; // [warp] raw S spilled
+    __shared__ float sM[MAX_GROUP_WARPS][Q_TILE];              // [warp] running row max
+    __shared__ float sL[MAX_GROUP_WARPS][Q_TILE];              // [warp] running row denom
+    __shared__ float sCorr[MAX_GROUP_WARPS][Q_TILE];          // [warp] per-row O rescale
 
-    // Load Q tile into shared (row-major [q][d]). 16*64 = 1024 halves / 32 lanes = 32 each.
+    half* wQ = sQ[warp];
+    half* wP = sP[warp];
+    float* wScore = sScore[warp];
+    float* wM = sM[warp];
+    float* wL = sL[warp];
+    float* wCorr = sCorr[warp];
+
+    // Load this warp's Q tile (row-major [q][d]). 16*64 = 1024 halves / 32 lanes = 32 each.
     for (int i = lane; i < Q_TILE * HEAD_DIM; i += 32)
     {
         int qr = i / HEAD_DIM, d = i % HEAD_DIM;
         int gq = q0 + qr;
-        sQ[i] = (gq < seq) ? q[(size_t)gq * q_stride + hq * HEAD_DIM + d] : __float2half(0.0f);
+        wQ[i] = (gq < seq) ? q[(size_t)gq * q_stride + hq * HEAD_DIM + d] : __float2half(0.0f);
     }
 
     // O accumulator: 16 queries x 64 headDim = 8 n-subtiles, each a {f32 x4} frag.
@@ -135,8 +159,7 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
     for (int n = 0; n < HEAD_DIM / 8; n++)
         O_frag[n][0] = O_frag[n][1] = O_frag[n][2] = O_frag[n][3] = 0.0f;
 
-    if (lane < Q_TILE) { sM[lane] = -FLT_MAX; sL[lane] = 0.0f; }
-    __syncwarp();
+    if (lane < Q_TILE) { wM[lane] = -FLT_MAX; wL[lane] = 0.0f; }
 
     // This lane owns C/D rows r0 and r0+8, and within an 8-wide n-subtile the two
     // columns col_lo, col_hi.
@@ -144,12 +167,15 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
     const int col_lo = (lane & 3) * 2;
     const int col_hi = col_lo + 1;
 
-    // Stream the key axis. Causal: keys only up to the last query in this tile.
+    // Stream the key axis. Causal: keys only up to the last query in this tile. kv_end is
+    // identical for every warp in the block (depends on q_tile, not head), so the shared
+    // K/V load and __syncthreads() barriers below never diverge across warps.
     const int kv_end = min(seq, q0 + Q_TILE);
     for (int k0 = 0; k0 < kv_end; k0 += KV_TILE)
     {
-        // Load K tile [key][d] and V transposed [d][key].
-        for (int i = lane; i < KV_TILE * HEAD_DIM; i += 32)
+        // Cooperative block-wide K/V load: all `group*32` threads fill the shared tile once.
+        // [key][d] for K, transposed [d][key] for V.
+        for (int i = threadIdx.x; i < KV_TILE * HEAD_DIM; i += blockDim.x)
         {
             int kr = i / HEAD_DIM, d = i % HEAD_DIM;
             int gk = k0 + kr;
@@ -158,7 +184,7 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
             half vv = (gk < seq) ? v[(size_t)gk * kv_stride + hk * HEAD_DIM + d] : __float2half(0.0f);
             sVt[(size_t)d * KV_TILE + kr] = vv;   // transpose into [d][key]
         }
-        __syncwarp();
+        __syncthreads();   // block-wide: K/V visible to every warp before any warp reads
 
         // ---- QK: S[16x16] = Q . K^T, two n-subtiles (keys 0..7, 8..15) ----
         float S_frag[2][4];
@@ -173,7 +199,7 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
             unsigned a[4];
             // Each lane points at row (lane%16), the half-tile selected by lane/16
             // gives the 8-col offset; ldmatrix gathers the full 16x16.
-            const half* aptr = &sQ[(lane & 15) * HEAD_DIM + ks * 16 + (lane >> 4) * 8];
+            const half* aptr = &wQ[(lane & 15) * HEAD_DIM + ks * 16 + (lane >> 4) * 8];
             ldmatrix_x4(a, aptr);
 
             #pragma unroll
@@ -187,15 +213,15 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
             }
         }
 
-        // Spill S to shared [q][key] via the C/D map, applying the QK scale.
+        // Spill S to this warp's shared [q][key] via the C/D map, applying the QK scale.
         #pragma unroll
         for (int ns = 0; ns < 2; ns++)
         {
             int kcol = ns * 8 + col_lo;
-            sScore[r0 * KV_TILE + kcol]       = S_frag[ns][0] * scale;
-            sScore[r0 * KV_TILE + ns * 8 + col_hi] = S_frag[ns][1] * scale;
-            sScore[(r0 + 8) * KV_TILE + kcol] = S_frag[ns][2] * scale;
-            sScore[(r0 + 8) * KV_TILE + ns * 8 + col_hi] = S_frag[ns][3] * scale;
+            wScore[r0 * KV_TILE + kcol]       = S_frag[ns][0] * scale;
+            wScore[r0 * KV_TILE + ns * 8 + col_hi] = S_frag[ns][1] * scale;
+            wScore[(r0 + 8) * KV_TILE + kcol] = S_frag[ns][2] * scale;
+            wScore[(r0 + 8) * KV_TILE + ns * 8 + col_hi] = S_frag[ns][3] * scale;
         }
         __syncwarp();
 
@@ -204,8 +230,8 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
         {
             int gq = q0 + lane;
             int causal_last = gq;            // query gq attends keys 0..gq
-            float m_prev = sM[lane];
-            float l_prev = sL[lane];
+            float m_prev = wM[lane];
+            float l_prev = wL[lane];
 
             // tile-local max over valid (causal, in-range) keys
             float m_cur = m_prev;
@@ -214,7 +240,7 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
                 int gk = k0 + j;
                 if (gk < seq && gk <= causal_last)
                 {
-                    float s = sScore[lane * KV_TILE + j];
+                    float s = wScore[lane * KV_TILE + j];
                     if (s > m_cur) m_cur = s;
                 }
             }
@@ -231,22 +257,22 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
                 float p = 0.0f;
                 if (gk < seq && gk <= causal_last)
                 {
-                    p = __expf(sScore[lane * KV_TILE + j] - m_cur);
+                    p = __expf(wScore[lane * KV_TILE + j] - m_cur);
                     l_cur += p;
                 }
-                sP[lane * KV_TILE + j] = __float2half(p);
+                wP[lane * KV_TILE + j] = __float2half(p);
             }
 
-            sM[lane] = m_cur;
-            sL[lane] = l_cur;
-            sCorr[lane] = correction;
+            wM[lane] = m_cur;
+            wL[lane] = l_cur;
+            wCorr[lane] = correction;
         }
         __syncwarp();
 
         // Rescale O accumulator by this tile's correction, then add P.V.
         // correction for the two rows this lane owns:
-        float corr0 = sCorr[r0];
-        float corr1 = sCorr[r0 + 8];
+        float corr0 = wCorr[r0];
+        float corr1 = wCorr[r0 + 8];
         #pragma unroll
         for (int n = 0; n < HEAD_DIM / 8; n++)
         {
@@ -255,9 +281,9 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
         }
 
         // ---- PV: O[16 x 64] += P[16 x 16] . V[16 x 64], 8 n-subtiles, 1 k-step ----
-        // A = P[16x16] from sP via ldmatrix.x4.
+        // A = P[16x16] from this warp's sP via ldmatrix.x4.
         unsigned pa[4];
-        const half* pptr = &sP[(lane & 15) * KV_TILE + (lane >> 4) * 8];
+        const half* pptr = &wP[(lane & 15) * KV_TILE + (lane >> 4) * 8];
         ldmatrix_x4(pa, pptr);
 
         #pragma unroll
@@ -269,7 +295,9 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
             ldmatrix_x2(vb, vptr);
             mma_m16n8k16(O_frag[n], pa, vb);
         }
-        __syncwarp();
+        // Block-wide barrier before the next tile overwrites the shared K/V — every warp
+        // must have finished consuming sK/sVt (PV reads sVt) before the reload.
+        __syncthreads();
     }
 
     // Final normalisation by the row denom and write row-major [seq, heads, headDim].
@@ -278,8 +306,8 @@ extern "C" __global__ void __launch_bounds__(32) attention_flash_mma_f16(
     {
         int gr0 = q0 + r0;
         int gr1 = q0 + r0 + 8;
-        float inv0 = (sL[r0] > 0.0f) ? 1.0f / sL[r0] : 0.0f;
-        float inv1 = (sL[r0 + 8] > 0.0f) ? 1.0f / sL[r0 + 8] : 0.0f;
+        float inv0 = (wL[r0] > 0.0f) ? 1.0f / wL[r0] : 0.0f;
+        float inv1 = (wL[r0 + 8] > 0.0f) ? 1.0f / wL[r0 + 8] : 0.0f;
         int d_lo = n * 8 + col_lo;
         int d_hi = n * 8 + col_hi;
         if (gr0 < seq)

@@ -33,6 +33,14 @@ internal sealed class CudaFlashAttention
     private const int SupportedHeadDim = 64;
 
     /// <summary>
+    /// Max GQA group (query heads per kv head) the tuned kernel supports: it launches
+    /// <c>group</c> warps per block and statically sizes per-warp shared memory for this
+    /// many warps (<c>MAX_GROUP_WARPS</c> in the kernel). Larger groups fall through to G3.
+    /// Llama-3.2-1B is group 4.
+    /// </summary>
+    private const int MaxGroupWarps = 8;
+
+    /// <summary>
     /// Default sequence-length crossover at/above which flash beats G3 (measured 1.3–1.69×
     /// at s ≥ 1024 on a 3060; below that G3 is kept). Overridable via
     /// <c>DOTLLM_CUDA_FLASH_ATTN_MINSEQ</c>.
@@ -104,7 +112,8 @@ internal sealed class CudaFlashAttention
         && positionOffset == 0
         && slidingWindow <= 0
         && numKvHeads > 0
-        && (numHeads % numKvHeads) == 0;
+        && (numHeads % numKvHeads) == 0
+        && (numHeads / numKvHeads) <= MaxGroupWarps;
 
     /// <summary>
     /// Runs the G-flash kernel for one prefill attention call, writing the result into
