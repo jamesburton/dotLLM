@@ -60,6 +60,14 @@ internal sealed class CudaFlashAttention
             ? v
             : DefaultCrossoverSeqLen;
 
+    /// <summary>
+    /// Count of flash-kernel launches since process start (one per eligible attention call,
+    /// i.e. per layer per forward). Lets a test prove the flash branch actually fired in the
+    /// wired <c>Forward</c> path — without it an end-to-end "parity" pass is vacuous if
+    /// <see cref="CanUse"/> silently fell through to G3 on both arms. Diagnostics only.
+    /// </summary>
+    internal static long DispatchCount;
+
     private readonly CudaKernels _kernels;
 
     internal CudaFlashAttention(CudaKernels kernels) => _kernels = kernels;
@@ -108,6 +116,7 @@ internal sealed class CudaFlashAttention
                       int seqLen, int numHeads, int numKvHeads, int headDim, nint stream)
     {
         float scale = 1.0f / MathF.Sqrt(headDim);
+        DispatchCount++;
         _kernels.LaunchAttentionFlashMma(q, k, v, output,
             seqLen, numHeads, numKvHeads, headDim, scale, stream);
     }
