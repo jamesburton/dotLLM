@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -220,6 +221,31 @@ public sealed class VulkanTransformerModel : IModel
 
     private readonly TransformerWeights _cpuWeights; // retained for embedding lookup
     private readonly GgufFile? _gguf;
+
+    // ── DiffusionGemma per-forward state ────────────────────────────────────
+    // Mirrors the CPU TransformerModel diffusion seam. _diffusionMaskMode /
+    // _diffusionPrefixLen carry the region split (Hybrid prefix = prompt length P);
+    // the canvas region is rows [P, seqLen). Default Causal/0 ⇒ the AR gemma4 path
+    // and every non-diffusion forward are byte-identical (region deltas inert).
+    // Single-threaded per generation, like _currentLora.
+    private AttentionMaskMode _diffusionMaskMode = AttentionMaskMode.Causal;
+    private int _diffusionPrefixLen;
+    // Self-conditioning (set by the diffusion generator each denoise step). _scUse
+    // is the gate (0 on step 0 ⇒ zero-SC; 1 thereafter); _scPrevLogits holds the
+    // previous step's canvas-region logits [_scCanvasLen × vocab] (post-softcap).
+    private float[]? _scPrevLogits;
+    private int _scCanvasLen;
+    private float _scUse;
+    // Lazily-allocated all-position logits buffer [maxSeqLen × vocab] for the
+    // diffusion forward (the AR Forward returns only the last row; diffusion needs
+    // every canvas row). Grows monotonically; null until the first diffusion forward.
+    private VulkanDevice.Buffer? _diffusionLogits;
+    private int _diffusionLogitsCapacityRows;
+    // Host-visible scratch holding the host-computed self-conditioning signal
+    // [canvasLen × hidden] (uploaded then device-added into the canvas embedding).
+    // Lazy; grows monotonically; null until the first SC step.
+    private VulkanDevice.Buffer? _diffusionScSig;
+    private int _diffusionScSigCapacityElems;
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly RopeF32Kernel.Variant _ropeVariant;
@@ -820,7 +846,8 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow,
-        float softCap = 0.0f, float scaleOverride = 0.0f)
+        float softCap = 0.0f, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
@@ -828,14 +855,16 @@ public sealed class VulkanTransformerModel : IModel
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
-                softCap: softCap, scaleOverride: scaleOverride);
+                softCap: softCap, scaleOverride: scaleOverride,
+                maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
         _attention.Record(cmdBuf, q, k, v, output,
             seqQ: seqQ, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
             positionOffset: positionOffset, slidingWindow: slidingWindow,
-            softCap: softCap, scaleOverride: scaleOverride);
+            softCap: softCap, scaleOverride: scaleOverride,
+            maskMode: maskMode, prefixLen: prefixLen);
     }
 
     /// <summary>
@@ -903,7 +932,9 @@ public sealed class VulkanTransformerModel : IModel
     {
         if (_gemma4OnesVec is null)
         {
-            int len = Math.Max(Config.HeadDim, Config.GlobalHeadDim ?? 0);
+            // Sized for the widest unit-gamma RMSNorm consumer: the per-kv-head V-norm
+            // (n = headDim) AND the DiffusionGemma canvas weight-less rms_noscale (n = hidden).
+            int len = Math.Max(Math.Max(Config.HeadDim, Config.GlobalHeadDim ?? 0), Config.HiddenSize);
             var ones = new float[len];
             Array.Fill(ones, 1.0f);
             var buf = _device.Allocate((long)len * sizeof(float));
@@ -911,6 +942,23 @@ public sealed class VulkanTransformerModel : IModel
             _gemma4OnesVec = buf;
         }
         return _gemma4OnesVec;
+    }
+
+    /// <summary>
+    /// DiffusionGemma region split P (prompt length) for the current forward: the
+    /// Hybrid prefix length clamped to [0, seqLen]. Canvas rows are [P, seqLen).
+    /// Returns 0 when not a diffusion-region forward (AR gemma4 / Causal / Bidirectional)
+    /// — so every region delta is inert and the AR path is byte-identical.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int DiffusionRegionPrefix(int seqLen)
+    {
+        if (Config.DiffusionConfig is null) return 0;
+        if (_diffusionMaskMode != AttentionMaskMode.Hybrid) return 0;
+        int p = _diffusionPrefixLen;
+        if (p < 0) p = 0;
+        if (p > seqLen) p = seqLen;
+        return p;
     }
 
     private static void RejectUnsupportedArchitecture(ModelConfig config)
@@ -934,6 +982,68 @@ public sealed class VulkanTransformerModel : IModel
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Causal (the default) routes to the byte-identical autoregressive forward. The non-causal
+    /// modes (Bidirectional / Hybrid) are supported ONLY for DiffusionGemma (a gemma4 backbone with
+    /// a non-null <see cref="ModelConfig.DiffusionConfig"/>): the canvas region attends bidirectionally
+    /// (Hybrid keeps the prompt prefix causal), the canvas embedding gets the region-aware
+    /// rms_noscale (+ self-conditioning), and the LM head runs over every position — returning
+    /// <c>[seqLen, vocab]</c> for the denoise generator. A non-null KV-cache with a non-causal mask
+    /// is rejected (PR-3): the diffusion forward is cacheless (the PKV seam carries its own cache).
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId,
+        IKvCache? kvCache, ILoraAdapter? adapter, AttentionMaskSpec maskSpec)
+    {
+        if (maskSpec.IsCausal)
+            return Forward(tokenIds, positions, deviceId, kvCache, adapter);
+
+        if (Config.DiffusionConfig is null || !Config.Gemma4DualFfn)
+            throw new NotSupportedException(
+                $"{nameof(VulkanTransformerModel)} supports non-causal attention only for DiffusionGemma "
+                + $"(gemma4 backbone with a diffusion config); mask mode {maskSpec.Mode}.");
+        if (kvCache is not null)
+            throw new NotSupportedException(
+                "A non-null KV-cache with a non-causal mask is not supported (the diffusion forward is cacheless).");
+        if (adapter is not null)
+            throw new NotSupportedException("LoRA adapters are not supported on the DiffusionGemma forward.");
+
+        _diffusionMaskMode = maskSpec.Mode;
+        _diffusionPrefixLen = maskSpec.Mode == AttentionMaskMode.Hybrid ? maskSpec.PrefixLength : 0;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache: null);
+        }
+        finally
+        {
+            _diffusionMaskMode = AttentionMaskMode.Causal;
+            _diffusionPrefixLen = 0;
+        }
+    }
+
+    /// <inheritdoc/>
+    public void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse)
+    {
+        if (scUse > 0f && !prevCanvasLogits.IsEmpty && canvasLen > 0)
+        {
+            int need = canvasLen * Config.VocabSize;
+            if (prevCanvasLogits.Length < need)
+                throw new ArgumentException(
+                    $"prevCanvasLogits length {prevCanvasLogits.Length} < canvasLen*vocab {need}.",
+                    nameof(prevCanvasLogits));
+            if (_scPrevLogits is null || _scPrevLogits.Length < need)
+                _scPrevLogits = new float[need];
+            prevCanvasLogits[..need].CopyTo(_scPrevLogits);
+            _scCanvasLen = canvasLen;
+            _scUse = scUse;
+        }
+        else
+        {
+            _scCanvasLen = 0;
+            _scUse = 0f;
+        }
+    }
 
     /// <summary>
     /// LoRA-aware forward. When <paramref name="adapter"/> is non-null, each
@@ -1508,6 +1618,22 @@ public sealed class VulkanTransformerModel : IModel
         if (scratchResized)
             InvalidateKernelCaches();
 
+        // Diffusion forward: pre-allocate the all-position logits buffer and (when
+        // self-conditioning is active this step) the SC-signal buffer BEFORE recording
+        // begins — both may grow and invalidate descriptor caches, which is only safe
+        // outside an open command buffer. No-op on the AR / Causal path.
+        bool diffusionForward = _diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null;
+        if (diffusionForward)
+        {
+            EnsureDiffusionLogits(seqLen, vocabSize);
+            int regionP0 = DiffusionRegionPrefix(seqLen);
+            int canvasLen0 = seqLen - regionP0;
+            bool scThisStep = _scUse > 0f && _cpuWeights.SelfCond is not null
+                && _scPrevLogits is not null && _scCanvasLen == canvasLen0 && canvasLen0 > 0;
+            if (scThisStep)
+                EnsureScSigBuffer(canvasLen0 * hiddenSize);
+        }
+
         // 1. Validate token IDs (done host-side; cheap), then upload only
         //    positions host→device. The embedding table is device-local and
         //    populated once at construction; per-token rows are gathered into
@@ -1546,6 +1672,22 @@ public sealed class VulkanTransformerModel : IModel
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize,
                 Config.EmbeddingScale!.Value);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
+        // DiffusionGemma region embedding: the canvas rows [P, seqLen) get an
+        // EXTRA weight-less rms_norm (no scale) — the zero-self-conditioning path
+        // (diffusion-gemma.cpp dg_canvas_embed). With self-conditioning ON (step > 0)
+        // the canvas rows first receive sc_sig before the rms_noscale. Gated on a
+        // diffusion-region forward (Hybrid) ⇒ AR gemma4 / non-diffusion are
+        // byte-identical (regionP == 0 ⇒ no-op). Implemented host-light: the
+        // contiguous canvas tail is copied into NormOutput[0..], normed there with
+        // a unit-gamma weight, and copied back — reuses the shared kernels with no
+        // offset-binding or new shader.
+        {
+            int regionP = DiffusionRegionPrefix(seqLen);
+            int canvasLen = seqLen - regionP;
+            if (regionP > 0 && canvasLen > 0)
+                RecordDiffusionCanvasEmbed(cmdBuf, regionP, canvasLen, hiddenSize, eps);
         }
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -1842,7 +1984,23 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.Gemma4 is { } g4scale)
             {
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                // AR gemma4: every row uses layer_output_scale. DiffusionGemma: the
+                // canvas rows [P, seqLen) use layer_output_scale, the PROMPT rows
+                // [0, P) use enc_layer_output_scale (same backbone weights — the
+                // encoder contributes ONLY the scalar). layer_output_scale is applied
+                // to ALL rows first (the canvas-correct value); then the contiguous
+                // HEAD prompt rows [0, P) are corrected by the enc/layer ratio. Prompt
+                // rows start at offset 0, so the whole-buffer kernel (which processes
+                // P*hidden elements from the start) hits exactly them — no offset binding.
                 _embedScale!.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, g4scale.LayerOutputScale);
+                int regionP = DiffusionRegionPrefix(seqLen);
+                float? encScale = _cpuWeights.Layers[layer].Gemma4?.EncLayerOutputScale;
+                if (regionP > 0 && encScale is float enc && g4scale.LayerOutputScale != 0f)
+                {
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    float ratio = enc / g4scale.LayerOutputScale;
+                    _embedScale!.Record(cmdBuf, _state.HiddenState, regionP * hiddenSize, ratio);
+                }
             }
 
             // COMPUTE→COMPUTE between layers — next iteration's first op is
@@ -1851,6 +2009,12 @@ public sealed class VulkanTransformerModel : IModel
             if (layer < Config.NumLayers - 1)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
         }
+
+        // 3b. DiffusionGemma: final RMSNorm + LM head over ALL positions (the
+        //     diffusion generator gathers logit rows for the masked canvas
+        //     positions, not just the last token). Returns [seqLen, vocab].
+        if (_diffusionMaskMode != AttentionMaskMode.Causal && Config.DiffusionConfig is not null)
+            return FinishDiffusionForward(cmdBuf, seqLen, hiddenSize, vocabSize, eps, deviceId);
 
         // 3. Final RMSNorm on the last token only, then LM head.
         //    The last hidden state was just written by the final layer's
@@ -1892,6 +2056,55 @@ public sealed class VulkanTransformerModel : IModel
             ApplyFinalLogitSoftcapHost(dest);
         }
         return result;
+    }
+
+    /// <summary>
+    /// DiffusionGemma forward tail: final RMSNorm + LM head over ALL <paramref name="seqLen"/>
+    /// positions (vs the AR path's last-token-only head), returning a host-resident
+    /// <c>[seqLen, vocab]</c> logits tensor (per-row final soft-cap applied). Used only by the
+    /// diffusion forward — the canvas generator gathers the masked-position rows.
+    /// </summary>
+    private ITensor FinishDiffusionForward(nint cmdBuf, int seqLen, int hiddenSize, int vocabSize, float eps, int deviceId)
+    {
+        // Final RMSNorm over every row, in place on HiddenState → NormOutput.
+        _rmsnorm.Record(cmdBuf, _state.HiddenState, _weights.OutputNormWeight, _state.NormOutput,
+            rowCount: seqLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        VulkanDevice.Buffer logitsBuf = EnsureDiffusionLogits(seqLen, vocabSize);
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, logitsBuf,
+            _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: seqLen);
+
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var shape = new TensorShape(seqLen, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        unsafe
+        {
+            var dest = new Span<float>((void*)result.DataPointer, seqLen * vocabSize);
+            _device.Download(logitsBuf, dest);
+            // Per-row Gemma final-logit soft-cap (no-op when FinalLogitSoftcap is null).
+            if (Config.FinalLogitSoftcap is float cap && cap > 0f)
+                for (int r = 0; r < seqLen; r++)
+                    ApplyFinalLogitSoftcapHost(dest.Slice(r * vocabSize, vocabSize));
+        }
+        return result;
+    }
+
+    /// <summary>Lazily (re)allocates the all-position diffusion logits buffer for <paramref name="rows"/> × <paramref name="vocab"/>.</summary>
+    private VulkanDevice.Buffer EnsureDiffusionLogits(int rows, int vocab)
+    {
+        if (_diffusionLogits is null || _diffusionLogitsCapacityRows < rows)
+        {
+            _diffusionLogits?.Dispose();
+            _diffusionLogits = _device.Allocate((long)rows * vocab * sizeof(float));
+            _diffusionLogitsCapacityRows = rows;
+            // The new handle invalidates any cached lm-head matmul descriptor set.
+            InvalidateKernelCaches();
+        }
+        return _diffusionLogits;
     }
 
     /// <summary>
@@ -2258,11 +2471,17 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         // Attention: scale = 1/sqrt(QPAS) = 1.0 (q/k-norm make Q,K unit); no attn softcap.
+        // Diffusion: the cacheless canvas forward uses the region-aware mask
+        // (Hybrid(P): prompt prefix causal, canvas bidirectional). On the AR /
+        // KV-cached path _diffusionMaskMode is Causal/0 ⇒ byte-identical.
+        AttentionMaskMode maskMode = kvCache is VulkanKvCache ? AttentionMaskMode.Causal : _diffusionMaskMode;
+        int prefixLen = kvCache is VulkanKvCache ? 0 : _diffusionPrefixLen;
         RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
             seqQ: seqLen, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
             positionOffset: positionOffset, slidingWindow: GetLayerSlidingWindow(layer),
-            softCap: 0.0f, scaleOverride: GetAttentionScaleOverride());
+            softCap: 0.0f, scaleOverride: GetAttentionScaleOverride(),
+            maskMode: maskMode, prefixLen: prefixLen);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // o_proj → NormOutput. Shared post-attn-norm + residual #1 follow.
@@ -2355,6 +2574,184 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnorm.Record(cmdBuf, _state.NormOutput, g4.PostFfwNorm, _state.NormOutput,
             rowCount: seqLen, n: hidden, eps: eps);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// Records the DiffusionGemma canvas region embedding for the contiguous canvas
+    /// tail rows <c>[regionP, regionP+canvasLen)</c> of <see cref="VulkanForwardState.HiddenState"/>:
+    /// (optionally) adds the self-conditioning signal, then applies the weight-less
+    /// (unit-gamma) <c>rms_norm</c> — mirroring CPU <c>TransformerModel</c>'s region-embed
+    /// block (diffusion-gemma.cpp <c>dg_canvas_embed</c>). The canvas rows are a contiguous
+    /// tail, so the work is done in <see cref="VulkanForwardState.NormOutput"/> (a device
+    /// scratch, free before the layer loop) and copied back — reusing the shared rmsnorm/add
+    /// kernels with no offset binding or new shader.
+    /// </summary>
+    private void RecordDiffusionCanvasEmbed(nint cmdBuf, int regionP, int canvasLen, int hiddenSize, float eps)
+    {
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        ulong canvasOffset = (ulong)((long)regionP * rowBytes);
+        ulong canvasBytes = (ulong)((long)canvasLen * rowBytes);
+
+        // Copy the canvas tail of HiddenState into NormOutput[0..] (device scratch).
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+            srcOffset: canvasOffset, dstOffset: 0, size: canvasBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        // Self-conditioning (steps > 0): add the host-computed sc_sig to the canvas
+        // embedding BEFORE the weight-less rms_norm. sc_sig is computed entirely from
+        // the previous step's canvas logits (already on host) — independent of device
+        // state — so it is uploaded into a host-visible buffer and device-added here.
+        bool applySc = _scUse > 0f
+            && _cpuWeights.SelfCond is not null
+            && _scPrevLogits is not null
+            && _scCanvasLen == canvasLen
+            && canvasLen > 0;
+        if (applySc)
+        {
+            VulkanDevice.Buffer scSig = EnsureScSigBuffer(canvasLen * hiddenSize);
+            ComputeSelfConditioningSignalHost(canvasLen, hiddenSize, eps, scSig);
+            _add.Record(cmdBuf, _state.NormOutput, scSig, _state.NormOutput, canvasLen * hiddenSize);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
+        // Weight-less rms_norm (unit gamma) over the canvasLen rows in place.
+        _rmsnorm.Record(cmdBuf, _state.NormOutput, Gemma4OnesVec(), _state.NormOutput,
+            rowCount: canvasLen, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+
+        // Copy the normalised canvas rows back into HiddenState's canvas tail.
+        RecordCopyBufferRange(cmdBuf, _state.NormOutput, _state.HiddenState,
+            srcOffset: 0, dstOffset: canvasOffset, size: canvasBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>Lazily (re)allocates the host-visible self-conditioning signal buffer to hold <paramref name="elems"/> floats.</summary>
+    private VulkanDevice.Buffer EnsureScSigBuffer(int elems)
+    {
+        if (_diffusionScSig is null || _diffusionScSigCapacityElems < elems)
+        {
+            _diffusionScSig?.Dispose();
+            _diffusionScSig = _device.Allocate((long)elems * sizeof(float));
+            _diffusionScSigCapacityElems = elems;
+            // The new handle invalidates any cached add-kernel descriptor set.
+            InvalidateKernelCaches();
+        }
+        return _diffusionScSig;
+    }
+
+    /// <summary>
+    /// Computes the DiffusionGemma self-conditioning signal <c>sc_sig[canvasLen × hidden]</c>
+    /// entirely on the host (mirrors CPU <c>TransformerModel.ApplySelfConditioning</c>) and
+    /// uploads it into <paramref name="dst"/>. SC feeds the previous step's canvas logits back
+    /// via a gated GeGLU MLP over a soft token-embedding:
+    /// <code>
+    /// soft[c]   = sqrt(n_embd) * Σ_v softmax(prev_logits[c])[v] * tok_embd[v]
+    /// normed[c] = rms_norm(soft[c]) * self_cond_pre_norm
+    /// sc_sig[c] = self_cond_down( gelu_tanh(self_cond_gate·normed) * (self_cond_up·normed) )
+    /// </code>
+    /// Source-confirmed against diffusion-gemma.cpp; runs only on the (small) canvas region,
+    /// once per denoise step. The soft-embed sweeps the tied token-embedding table once.
+    /// </summary>
+    private unsafe void ComputeSelfConditioningSignalHost(int canvasLen, int hiddenSize, float eps, VulkanDevice.Buffer dst)
+    {
+        var sc = _cpuWeights.SelfCond!;
+        int vocab = Config.VocabSize;
+        int ff = sc.GateOut;
+        float embScale = Config.EmbeddingScale ?? 1.0f;
+        float[] prev = _scPrevLogits!;
+
+        var soft = new float[canvasLen * hiddenSize];
+        var probs = new float[vocab];
+        var row = new float[hiddenSize];
+        var normed = new float[canvasLen * hiddenSize];
+        var gate = new float[canvasLen * ff];
+        var up = new float[canvasLen * ff];
+        var gelu = new float[canvasLen * ff];
+        var sig = new float[canvasLen * hiddenSize];
+
+        // soft[c] = Σ_v softmax(prev_logits[c])[v] * tok_embd[v]. Single vocab sweep:
+        // each embedding row is dequantized once and scatter-accumulated into every
+        // canvas soft-vector weighted by that token's probability.
+        // (Compute per-column probs lazily to avoid a [canvasLen × vocab] buffer.)
+        var allProbs = new float[canvasLen * vocab];
+        for (int c = 0; c < canvasLen; c++)
+            Softmax.Execute(prev.AsSpan(c * vocab, vocab), allProbs.AsSpan(c * vocab, vocab));
+        for (int v = 0; v < vocab; v++)
+        {
+            DequantTokenEmbedRow(v, row, hiddenSize);
+            for (int c = 0; c < canvasLen; c++)
+            {
+                float w = allProbs[c * vocab + v];
+                if (w == 0f) continue;
+                TensorPrimitives.MultiplyAdd(row, w, soft.AsSpan(c * hiddenSize, hiddenSize),
+                    soft.AsSpan(c * hiddenSize, hiddenSize));
+            }
+        }
+        _ = probs;
+
+        // soft *= sqrt(n_embd); normed = rms_norm(soft) * self_cond_pre_norm.
+        for (int c = 0; c < canvasLen; c++)
+        {
+            var softC = soft.AsSpan(c * hiddenSize, hiddenSize);
+            if (embScale != 1.0f) TensorPrimitives.Multiply(softC, embScale, softC);
+            RmsNorm.Execute(softC, sc.PreNorm, eps, normed.AsSpan(c * hiddenSize, hiddenSize));
+        }
+
+        // g = gate·normed ; u = up·normed (batched). gelu = gelu_tanh(g) * u.
+        HostGemm(sc.GatePtr, sc.GateQt, normed, gate, sc.GateOut, sc.GateIn, canvasLen);
+        HostGemm(sc.UpPtr, sc.UpQt, normed, up, sc.UpOut, sc.UpIn, canvasLen);
+        for (int c = 0; c < canvasLen; c++)
+            FusedOps.GeGLUTanh(gate.AsSpan(c * ff, ff), up.AsSpan(c * ff, ff), gelu.AsSpan(c * ff, ff));
+
+        // sc_sig = down·(gelu*u).
+        HostGemm(sc.DownPtr, sc.DownQt, gelu, sig, sc.DownOut, sc.DownIn, canvasLen);
+
+        _device.Upload(sig.AsSpan(0, canvasLen * hiddenSize), dst);
+    }
+
+    /// <summary>
+    /// Host F32 GEMM mirroring the CPU model's row-major projection contract:
+    /// <c>out[r*M + m] = Σ_k W[m,k] * in[r*K + k]</c>, dequantizing each weight row of
+    /// <paramref name="weightPtr"/> (quant <paramref name="qt"/>) on the fly. Used only for
+    /// the small self-conditioning gate/up/down projections.
+    /// </summary>
+    private static unsafe void HostGemm(
+        nint weightPtr, QuantizationType qt, ReadOnlySpan<float> input, Span<float> output,
+        int m, int k, int rows)
+    {
+        long rowBytes = qt == QuantizationType.F32 ? (long)k * sizeof(float)
+            : qt == QuantizationType.F16 ? (long)k * sizeof(Half)
+            : Dequantize.RowByteSize(k, qt);
+        Span<float> wRow = k <= 4096 ? stackalloc float[k] : new float[k];
+        for (int mi = 0; mi < m; mi++)
+        {
+            nint rp = weightPtr + (nint)((long)mi * rowBytes);
+            if (qt == QuantizationType.F32)
+                new ReadOnlySpan<float>((float*)rp, k).CopyTo(wRow);
+            else if (qt == QuantizationType.F16)
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>((Half*)rp, k), wRow);
+            else
+                Dequantize.ToFloat32(rp, k, qt, wRow);
+            for (int r = 0; r < rows; r++)
+                output[r * m + mi] = TensorPrimitives.Dot(wRow, input.Slice(r * k, k));
+        }
+    }
+
+    /// <summary>Dequantizes one token-embedding row (raw, no embedding scale) into <paramref name="dest"/> [hidden].</summary>
+    private unsafe void DequantTokenEmbedRow(int tokenId, Span<float> dest, int hiddenSize)
+    {
+        nint embPtr = _cpuWeights.TokenEmbedWeight;
+        var qt = _cpuWeights.TokenEmbedQuantType;
+        if (qt == QuantizationType.F32)
+            new ReadOnlySpan<float>((float*)embPtr + (long)tokenId * hiddenSize, hiddenSize).CopyTo(dest);
+        else if (qt == QuantizationType.F16)
+            TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>((Half*)embPtr + (long)tokenId * hiddenSize, hiddenSize), dest);
+        else
+        {
+            long rowBytes = Dequantize.RowByteSize(hiddenSize, qt);
+            Dequantize.ToFloat32(embPtr + (nint)((long)tokenId * rowBytes), hiddenSize, qt, dest);
+        }
     }
 
     /// <summary>
@@ -3183,6 +3580,9 @@ public sealed class VulkanTransformerModel : IModel
 
         // ForwardBatch scratch — null when batched path was never invoked.
         _batchScratch?.Dispose();
+
+        _diffusionLogits?.Dispose();
+        _diffusionScSig?.Dispose();
 
         _submit.Dispose();
         _state.Dispose();
