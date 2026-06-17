@@ -294,6 +294,232 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         _output.WriteLine("spd = attn_f16 / (cublas+softmax). coal = one-thread-per-row (coalesced reads).");
     }
 
+    /// <summary>
+    /// Feasibility probe for issue #72 (causal-aware / block-triangular G3). The cheapest
+    /// discriminating experiment: time the GEMM half of the G3 path three ways, interleaved
+    /// in one warmed process, min-of-N — (1) dense full-square QK+PV (the current G3 GEMM
+    /// floor), (2) <b>block-triangular</b> QK+PV that dispatches per query-block GEMMs over
+    /// only key-blocks <c>[0..i]</c> (the causal-FLOP-halved candidate), and (3) the full
+    /// dense G3 (with softmax) as the production reference. No softmax/scratch changes: the
+    /// shipping causal-softmax already masks by position, so stale upper-triangle scratch
+    /// from the skipped blocks is harmless for a <i>timing</i> probe — and a separate parity
+    /// run would be needed only if this clears the bar.
+    /// </summary>
+    /// <remarks>
+    /// Reads out the two levers the G3 author flagged: per-block cuBLAS efficiency loss and
+    /// launch overhead from N smaller GEMMs, versus the ~2× FLOP saving. Block size via
+    /// <c>DOTLLM_CUDA_TRI_BLOCK</c> (default 128). Opt-in via <c>DOTLLM_CUDA_TRI_BENCH=1</c>.
+    /// </remarks>
+    [SkippableFact]
+    public void TriangularGemmFloorProbe()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_CUDA_TRI_BENCH") == "1", "DOTLLM_CUDA_TRI_BENCH=1 not set.");
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string ptxDir = ResolvePtxDir();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "attention_softmax_causal.ptx")), "attention_softmax_causal.ptx not built.");
+
+        int numHeads = EnvInt("DOTLLM_CUDA_ATTN_HEADS", 32);
+        int numKvHeads = EnvInt("DOTLLM_CUDA_ATTN_KVHEADS", 8);
+        int headDim = EnvInt("DOTLLM_CUDA_ATTN_HEADDIM", 64);
+        int group = numHeads / numKvHeads;
+        int block = EnvInt("DOTLLM_CUDA_TRI_BLOCK", 128);
+        int[] seqs = ParseSeqList(Environment.GetEnvironmentVariable("DOTLLM_CUDA_TRI_SEQS")) ?? new[] { 256, 512, 1024, 2048 };
+        int reps = EnvInt("DOTLLM_CUDA_TRI_REPS", 30), warmup = 6;
+        float scale = 1.0f / MathF.Sqrt(headDim);
+
+        using var ctx = CudaContext.Create(0);
+        ctx.MakeCurrent();
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir);
+        using var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+        Skip.IfNot(kernels.HasAttentionSoftmaxCausalCoalescedF32In, "F32-scores causal-softmax kernel not loaded.");
+
+        _output.WriteLine($"Triangular GEMM-floor probe (issue #72). heads={numHeads} kv={numKvHeads} hd={headDim} block={block} reps={reps}");
+        _output.WriteLine($"{"seq",6} | {"dense floor",12} | {"tri floor",12} | {"tri/dense GEMM",14} | {"full G3",10} | {"#GEMM dense",11} | {"#GEMM tri",10}");
+        _output.WriteLine(new string('-', 92));
+
+        foreach (int s in seqs)
+        {
+            int qElems = s * numHeads * headDim;
+            int kvElems = s * numKvHeads * headDim;
+            int scoreElems = numHeads * s * s;
+            int outElems = s * numHeads * headDim;
+
+            using var q = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+            using var k = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+            using var v = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+            using var scoresF32 = CudaTensor.Allocate(new TensorShape(scoreElems), DType.Float32, 0);
+            using var probsF16 = CudaTensor.Allocate(new TensorShape(scoreElems), DType.Float16, 0);
+            using var outBuf = CudaTensor.Allocate(new TensorShape(outElems), DType.Float16, 0);
+
+            Upload(q.DataPointer, RandomHalf(qElems, 1));
+            Upload(k.DataPointer, RandomHalf(kvElems, 2));
+            Upload(v.DataPointer, RandomHalf(kvElems, 3));
+
+            int qStride = numHeads * headDim;
+            int kvStride = numKvHeads * headDim;
+
+            int denseGemms = 2 * numKvHeads;
+            int nBlocks = (s + block - 1) / block;
+            int triGemms = 2 * numKvHeads * nBlocks;
+
+            void DenseFloor() => RunDenseGemmFloor(cublas, q, k, v, scoresF32, probsF16, outBuf,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale);
+            void TriFloor() => RunTriangularGemmFloor(cublas, q, k, v, scoresF32, probsF16, outBuf,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, block);
+            void FullG3()
+            {
+                RunDenseGemmFloor(cublas, q, k, v, scoresF32, probsF16, outBuf,
+                    s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, qkOnly: true);
+                kernels.LaunchAttentionSoftmaxCausalF32In(scoresF32.DataPointer, probsF16.DataPointer, s, numHeads, stream.Handle);
+                RunDenseGemmFloor(cublas, q, k, v, scoresF32, probsF16, outBuf,
+                    s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, pvOnly: true);
+            }
+
+            for (int w = 0; w < warmup; w++) { DenseFloor(); TriFloor(); FullG3(); }
+            stream.Synchronize();
+
+            double denseMin = double.MaxValue, triMin = double.MaxValue, g3Min = double.MaxValue;
+            for (int r = 0; r < reps; r++)
+            {
+                denseMin = Math.Min(denseMin, TimeGpu(stream, DenseFloor));
+                triMin = Math.Min(triMin, TimeGpu(stream, TriFloor));
+                g3Min = Math.Min(g3Min, TimeGpu(stream, FullG3));
+            }
+
+            _output.WriteLine($"{s,6} | {denseMin,10:F3}ms | {triMin,10:F3}ms | {denseMin / triMin,12:F2}x | "
+                + $"{g3Min,8:F3}ms | {denseGemms,11} | {triGemms,10}");
+        }
+        _output.WriteLine(new string('-', 92));
+        _output.WriteLine("dense/tri floor = QK+PV GEMMs only (no softmax). tri/dense = GEMM-half speedup ceiling.");
+        _output.WriteLine("full G3 = QK + causal softmax + PV (production). Compare tri-savings against the softmax-half it CANNOT cut.");
+    }
+
+    // Dense full-square QK+PV GEMM floor (no softmax) — the GEMM half of the G3 path.
+    // qkOnly/pvOnly let the full-G3 reference interleave the real softmax between halves.
+    private static void RunDenseGemmFloor(
+        CudaCublasHandle cublas, CudaTensor q, CudaTensor k, CudaTensor v,
+        CudaTensor scoresF32, CudaTensor probsF16, CudaTensor outBuf,
+        int s, int numHeads, int numKvHeads, int headDim, int group,
+        int qStride, int kvStride, float scale, bool qkOnly = false, bool pvOnly = false)
+    {
+        float one = 1.0f, zero = 0.0f, sc = scale;
+        if (!pvOnly)
+        {
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                nint qBase = q.DataPointer + (nint)((long)h * group * headDim * 2);
+                nint kBase = k.DataPointer + (nint)((long)h * headDim * 2);
+                nint scBase = scoresF32.DataPointer + (nint)((long)h * group * s * s * 4);
+
+                CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                    CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                    s, s, headDim,
+                    (nint)(&sc),
+                    qBase, CublasApi.CUDA_R_16F, qStride, headDim,
+                    kBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                    (nint)(&zero),
+                    scBase, CublasApi.CUDA_R_32F, s, (long)s * s,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
+        }
+        if (!qkOnly)
+        {
+            for (int h = 0; h < numKvHeads; h++)
+            {
+                nint vBase = v.DataPointer + (nint)((long)h * headDim * 2);
+                nint pBase = probsF16.DataPointer + (nint)((long)h * group * s * s * 2);
+                nint oBase = outBuf.DataPointer + (nint)((long)h * group * headDim * 2);
+
+                CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                    CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+                    headDim, s, s,
+                    (nint)(&one),
+                    vBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                    pBase, CublasApi.CUDA_R_16F, s, (long)s * s,
+                    (nint)(&zero),
+                    oBase, CublasApi.CUDA_R_16F, numHeads * headDim, headDim,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
+        }
+    }
+
+    // Block-triangular QK+PV: per query-block i (rows [i*B, i*B+Bq)), only key-blocks
+    // [0, i*B+Bq) are computed (lower-triangular + diagonal). Same col-major scores layout
+    // as dense (ldc=s), so the existing causal softmax + PV indexing apply unchanged. This
+    // measures the GEMM-half ceiling: ~half the FLOPs at the cost of nBlocks× the GEMM
+    // launches per head. (QK: m=Bq queries, n=keysUpTo, k=headDim. PV: m=headDim, n=Bq,
+    // k=keysUpTo, accumulating only the needed key range per query block.)
+    private static void RunTriangularGemmFloor(
+        CudaCublasHandle cublas, CudaTensor q, CudaTensor k, CudaTensor v,
+        CudaTensor scoresF32, CudaTensor probsF16, CudaTensor outBuf,
+        int s, int numHeads, int numKvHeads, int headDim, int group,
+        int qStride, int kvStride, float scale, int block)
+    {
+        float one = 1.0f, zero = 0.0f, sc = scale;
+
+        // QK^T per query-block, growing key extent.
+        for (int h = 0; h < numKvHeads; h++)
+        {
+            nint qHead = q.DataPointer + (nint)((long)h * group * headDim * 2);
+            nint kHead = k.DataPointer + (nint)((long)h * headDim * 2);
+            nint scHead = scoresF32.DataPointer + (nint)((long)h * group * s * s * 4);
+            for (int q0 = 0; q0 < s; q0 += block)
+            {
+                int bq = Math.Min(block, s - q0);
+                int keysUpTo = q0 + bq;  // causal: queries in this block see keys [0, q0+bq)
+                // C[i,j] = Q[q0+i,:]·K[j,:] : m=bq queries, n=keysUpTo keys, k=headDim.
+                // Q rows offset by q0 (within the head's [s, headDim] block); scores col j*s + (q0+i).
+                nint qBase = qHead + (nint)((long)q0 * qStride * 2);
+                nint scBase = scHead + (nint)((long)q0 * 4);  // row offset q0 in col-major ldc=s
+                CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                    CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                    bq, keysUpTo, headDim,
+                    (nint)(&sc),
+                    qBase, CublasApi.CUDA_R_16F, qStride, headDim,
+                    kHead, CublasApi.CUDA_R_16F, kvStride, 0,
+                    (nint)(&zero),
+                    scBase, CublasApi.CUDA_R_32F, s, (long)s * s,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
+        }
+
+        // PV per query-block, accumulating only the needed key range.
+        for (int h = 0; h < numKvHeads; h++)
+        {
+            nint vHead = v.DataPointer + (nint)((long)h * headDim * 2);
+            nint pHead = probsF16.DataPointer + (nint)((long)h * group * s * s * 2);
+            nint oHead = outBuf.DataPointer + (nint)((long)h * group * headDim * 2);
+            for (int q0 = 0; q0 < s; q0 += block)
+            {
+                int bq = Math.Min(block, s - q0);
+                int keysUpTo = q0 + bq;
+                // out^T[d, tq] = Σ_{tk<keysUpTo} V[tk,d]·P[tq,tk]; m=headDim, n=bq, k=keysUpTo.
+                nint pBase = pHead + (nint)((long)q0 * 2);   // probs query-row offset q0 (col-major, query=row, ldp=s)
+                nint oBase = oHead + (nint)((long)q0 * numHeads * headDim * 2);  // output row tq=q0+i
+                CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                    CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+                    headDim, bq, keysUpTo,
+                    (nint)(&one),
+                    vHead, CublasApi.CUDA_R_16F, kvStride, 0,
+                    pBase, CublasApi.CUDA_R_16F, s, (long)s * s,
+                    (nint)(&zero),
+                    oBase, CublasApi.CUDA_R_16F, numHeads * headDim, headDim,
+                    group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+            }
+        }
+    }
+
+    private static int[]? ParseSeqList(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv)) return null;
+        var list = new List<int>();
+        foreach (var p in csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            if (int.TryParse(p, out int v) && v > 1) list.Add(v);
+        return list.Count > 0 ? list.ToArray() : null;
+    }
+
     private static void RunCublasSoftmaxPath(
         CudaCublasHandle cublas, CudaKernels kernels, CudaStream stream,
         CudaTensor q, CudaTensor k, CudaTensor v, CudaTensor scores, CudaTensor outBuf,
