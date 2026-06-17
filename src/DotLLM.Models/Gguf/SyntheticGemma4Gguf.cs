@@ -35,6 +35,40 @@ public static class SyntheticGemma4Gguf
     public static SyntheticGemma4Config Tiny => new();
 
     /// <summary>
+    /// Real-26B-like preset for catching head-dim-&gt;256 / partial-rope divergence WITHOUT the
+    /// 26B. Mirrors the real model's distinguishing attention config that the Tiny/Bench presets
+    /// do NOT exercise: <b>GlobalHeadDim = 512</b> (over the Vulkan attention shader's old 256
+    /// bound) and a <b>full-head-dim rope.dimension_count</b> so the 0.25 partial-rotary factor
+    /// actually fires (rotate 128 of 512 dims, freq denominator = 512). Sliding layers use
+    /// head_dim 256 / 8 kv-heads, global layers head_dim 512 / 2 kv-heads + V-from-K — exactly
+    /// the 26B's dual schedule, only with a tiny hidden/vocab/expert count so a single forward is
+    /// milliseconds. The 16-head Q matches the 26B. Stays well under any memory budget.
+    /// </summary>
+    /// <remarks>
+    /// Because <see cref="SyntheticGemma4Config.GlobalHeadDim"/> (512) differs from the
+    /// <c>rope.dimension_count</c> the fixture emits, the partial-rope path is driven by the
+    /// config extractor's hardcoded 0.25 factor over the full 512-dim head — the SAME code path
+    /// as the real 26B. This is the fixture the CPU↔Vulkan partial-rope-denominator parity test
+    /// runs on.
+    /// </remarks>
+    public static SyntheticGemma4Config Real26BLike => new()
+    {
+        BlockCount = 6,            // layers 0-4 sliding, layer 5 global (matches GlobalLayerStride 6)
+        HiddenSize = 256,          // Q4_K gate_up rows need K = hidden % 256 == 0
+        HeadCount = 16,            // 26B has 16 Q heads
+        SlidingHeadDim = 256,      // 26B sliding head_dim
+        GlobalHeadDim = 512,       // 26B global head_dim — EXERCISES head_dim > 256
+        SlidingKvHeads = 8,        // 26B sliding kv-heads
+        GlobalKvHeads = 2,         // 26B global kv-heads
+        DenseFeedForward = 64,
+        ExpertFeedForward = 32,
+        ExpertCount = 8,
+        ExpertUsedCount = 2,
+        VocabSize = 256,
+        ContextLength = 512,
+    };
+
+    /// <summary>
     /// Larger "bench" preset — compute-bound enough for cross-backend timing while staying
     /// far under 12 GB. Still block-valid (hidden 1024, expert_ff 128, dense ff 512).
     /// </summary>

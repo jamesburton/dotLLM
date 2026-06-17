@@ -29,6 +29,14 @@ public class VulkanFlashAttentionF32KernelTests
     }
 
     [SkippableFact]
+    public void Launch_Gqa8_SmallHead_Debug()
+    {
+        // EXACT shape of the diverging gemma4 global/grp8 case: 16 Q heads / 2 KV
+        // heads (groupSize 8), tiny head_dim 16, short prefill (seq 6).
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 2, headDim: 16, positionOffset: 0);
+    }
+
+    [SkippableFact]
     public void Launch_Mha_HeadDim128()
     {
         // Llama-style head dim 128 — exercises the wider qTile / outAccum

@@ -45,6 +45,7 @@ public sealed class VulkanMoeIndexedMatmulQ5_1F32KernelTests
     [InlineData(8, 8, 32, 96, 4)]    // 3 blocks per row
     [InlineData(5, 16, 48, 32, 8)]   // wider expert bank, indices spanning more experts
     [InlineData(6, 8, 24, 704, 5)]   // real-26B expert FF width (704 = 22 blocks/row)
+    [InlineData(8, 16, 2816, 704, 8)] // real-26B down shape: M=hidden 2816, K=Ie 704
     public void Launch_MatchesDequantizedCpuReference(int n, int numExperts, int m, int k, int activeExperts)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

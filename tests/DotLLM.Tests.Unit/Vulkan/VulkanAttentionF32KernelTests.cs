@@ -61,6 +61,23 @@ public class VulkanAttentionF32KernelTests
     }
 
     [SkippableFact]
+    public void Launch_Gemma4Global_HeadDim512_Gqa8()
+    {
+        // Real gemma-4 26B GLOBAL-layer attention shape: head_dim 512 (over the old
+        // MAX_HEAD_DIM 256 bound, now 512), 16 Q / 2 KV heads (GQA group 8), prefill
+        // seqQ = seqKv = 6. This is the FIRST coverage of head_dim > 128 on the naive
+        // (non-flash) attention kernel — the path the real 26B uses (flash caps at 128).
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 2, headDim: 512, positionOffset: 0);
+    }
+
+    [SkippableFact]
+    public void Launch_Gemma4Sliding_HeadDim256_Gqa2()
+    {
+        // Real gemma-4 26B SLIDING-layer attention shape: head_dim 256, 16 Q / 8 KV.
+        RunOne(seqQ: 6, seqKv: 6, numHeads: 16, numKvHeads: 8, headDim: 256, positionOffset: 0);
+    }
+
+    [SkippableFact]
     public void Launch_MultiTile_TripleTile()
     {
         // Exercises the online-softmax tile loop: seq_kv > TILE_KV (256).

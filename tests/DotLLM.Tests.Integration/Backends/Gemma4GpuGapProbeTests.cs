@@ -30,10 +30,12 @@ public sealed class Gemma4GpuGapProbeTests
 
     public Gemma4GpuGapProbeTests(ITestOutputHelper output) => _output = output;
 
-    private static string WriteFixture()
+    private static string WriteFixture() => WriteFixture(SyntheticGemma4Gguf.Tiny);
+
+    private static string WriteFixture(SyntheticGemma4Config cfg)
     {
         string path = Path.Combine(Path.GetTempPath(), $"syn_gemma4_gpuprobe_{Guid.NewGuid():N}.gguf");
-        return SyntheticGemma4Gguf.WriteGemma4(path, SyntheticGemma4Gguf.Tiny);
+        return SyntheticGemma4Gguf.WriteGemma4(path, cfg);
     }
 
     /// <summary>
@@ -48,6 +50,24 @@ public sealed class Gemma4GpuGapProbeTests
     /// </summary>
     [SkippableFact]
     public void Vulkan_Gemma4_MatchesCpuReference()
+        => RunVulkanParity(SyntheticGemma4Gguf.Tiny);
+
+    /// <summary>
+    /// CPU↔Vulkan parity on the <see cref="SyntheticGemma4Gguf.Real26BLike"/> fixture, which
+    /// (unlike Tiny/Bench) sets <b>GlobalHeadDim = 512</b> and a full-head <c>rope.dimension_count</c>
+    /// so the global (full-attention) layers run PARTIAL NeoX rope at the real 26B's head dim
+    /// (rotate 128 of 512 dims, freq denominator = the full 512 head dim) AND the real dual schedule
+    /// (sliding 256/8, global 512/2, V-from-K). This exercises the partial-rope
+    /// frequency-denominator path the Tiny fixture (GlobalHeadDim 32) cannot — the bug that flipped
+    /// the real-26B next token. The greedy argmax must agree (structural correctness); the per-logit
+    /// envelope is WIDER than Tiny because the head_dim-512 dot products + dual-FFN + final softcap
+    /// near zero accumulate more F32 reduction-order drift over the alternating-stride layers.
+    /// </summary>
+    [SkippableFact]
+    public void Vulkan_Gemma4_Real26BLike_MatchesCpuReference()
+        => RunVulkanParity(SyntheticGemma4Gguf.Real26BLike, absTol: 1.0f, relTol: 5.0e-3f);
+
+    private void RunVulkanParity(SyntheticGemma4Config fixtureCfg, float absTol = 6.0e-2f, float relTol = 5.0e-3f)
     {
         Skip.If(
             Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
@@ -57,7 +77,7 @@ public sealed class Gemma4GpuGapProbeTests
             "No Vulkan loader or physical device available on this host.");
 
         string spvDir = ResolveSpvDir();
-        string path = WriteFixture();
+        string path = WriteFixture(fixtureCfg);
         try
         {
             int[] ids = { 2, 7, 8, 9, 5, 6 }; // synthetic fixture BOS = 2
@@ -94,13 +114,11 @@ public sealed class Gemma4GpuGapProbeTests
             int cpuArg = ArgMax(cpuLast), vkArg = ArgMax(vkLast);
             Assert.Equal(cpuArg, vkArg);
 
-            // Per-logit envelope. gemma4's dual-FFN + per-head norms + partial rope
-            // accumulate more per-layer F32 reduction-order drift than the Gemma-3
-            // backbone (2.5e-2), and the final softcap pushes logits near zero where
-            // relative error amplifies — so the bar is a touch wider. Still ~3× tighter
-            // than any structural bug (which flips logits by >0.1) and the argmax guard
-            // above is exact.
-            const float absTol = 6.0e-2f, relTol = 5.0e-3f;
+            // Per-logit envelope (absTol/relTol passed by the caller). gemma4's dual-FFN
+            // + per-head norms + partial rope accumulate per-layer F32 reduction-order drift,
+            // and the final softcap pushes logits near zero where relative error amplifies.
+            // The argmax guard above is the exact structural check; this bar catches gross
+            // per-op divergence without flagging benign reduction-order drift.
             int worst = -1; float worstDiff = 0;
             for (int c = 0; c < vocab; c++)
             {
