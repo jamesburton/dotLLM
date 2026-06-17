@@ -7,7 +7,7 @@
 //
 
 .version 9.1
-.target sm_86
+.target sm_75
 .address_size 64
 
 	// .globl	attention_softmax_causal_f16
