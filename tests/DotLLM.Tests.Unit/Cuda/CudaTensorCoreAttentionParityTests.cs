@@ -162,7 +162,9 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         int numKvHeads = EnvInt("DOTLLM_CUDA_ATTN_KVHEADS", 8);
         int headDim = EnvInt("DOTLLM_CUDA_ATTN_HEADDIM", 64);
         int group = numHeads / numKvHeads;
-        int[] seqs = { 256, 512, 1024, 2048 };
+        // Long-context focus for the fused-kernel go/no-go: the score round-trip only
+        // dominates at s >= 1024. Override via DOTLLM_CUDA_ATTN_SEQS (comma-separated).
+        int[] seqs = EnvSeqs("DOTLLM_CUDA_ATTN_SEQS", new[] { 1024, 2048, 4096 });
         int reps = 30, warmup = 6;
         float scale = 1.0f / MathF.Sqrt(headDim);
 
@@ -174,10 +176,12 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         cublas.SetStream(stream);
         Skip.IfNot(kernels.HasAttentionSoftmaxCausal, "Causal-softmax kernel not loaded.");
 
-        _output.WriteLine("G3 complete cuBLAS+softmax path vs attention_f16 (full QK + softmax + PV)");
+        _output.WriteLine("Four-way interleaved: attention_f16 vs G3 (cuBLAS+softmax) vs GEMM-only floor.");
+        _output.WriteLine("floor = the two cuBLAS GEMMs with NO softmax/round-trip (hard lower bound).");
+        _output.WriteLine("G3/floor = ceiling on any fused kernel's speedup over G3 (fused can't beat the floor).");
         _output.WriteLine($"heads={numHeads} kvHeads={numKvHeads} headDim={headDim} group={group}  reps={reps} (min ms, interleaved)");
-        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"cb+sm(uncoal)",14} | {"spd",6} | {"cb+sm(coal)",13} | {"spd",6}");
-        _output.WriteLine(new string('-', 70));
+        _output.WriteLine($"{"seq",6} | {"attn_f16",10} | {"G3coal",10} | {"G3uncoal",10} | {"floor",10} | {"G3/floor",9} | {"attn/G3",8}");
+        _output.WriteLine(new string('-', 84));
 
         foreach (int s in seqs)
         {
@@ -207,22 +211,29 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
                 s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, coalesced: false);
             void RunCoal() => RunCublasSoftmaxPath(cublas, kernels, stream, q, k, v, scores, outBuf,
                 s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale, coalesced: true);
+            // GEMM-only floor: the same two cuBLAS GEMMs as G3 but with NO softmax
+            // launch — so the score buffer never gets read back/normalised. This is the
+            // hard lower bound a fused kernel can approach but never beat.
+            void RunGemmOnly() => RunGemmOnlyPath(cublas, stream, q, k, v, scores, outBuf,
+                s, numHeads, numKvHeads, headDim, group, qStride, kvStride, scale);
 
-            for (int w = 0; w < warmup; w++) { RunAttention(); RunUncoal(); RunCoal(); }
+            for (int w = 0; w < warmup; w++) { RunAttention(); RunCoal(); RunUncoal(); RunGemmOnly(); }
             stream.Synchronize();
 
-            double attnMin = double.MaxValue, uncoalMin = double.MaxValue, coalMin = double.MaxValue;
+            double attnMin = double.MaxValue, uncoalMin = double.MaxValue, coalMin = double.MaxValue, floorMin = double.MaxValue;
             for (int r = 0; r < reps; r++)
             {
                 attnMin = Math.Min(attnMin, TimeGpu(stream, RunAttention));
-                uncoalMin = Math.Min(uncoalMin, TimeGpu(stream, RunUncoal));
                 coalMin = Math.Min(coalMin, TimeGpu(stream, RunCoal));
+                uncoalMin = Math.Min(uncoalMin, TimeGpu(stream, RunUncoal));
+                floorMin = Math.Min(floorMin, TimeGpu(stream, RunGemmOnly));
             }
 
-            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {uncoalMin,12:F3}ms | {attnMin / uncoalMin,5:F2}x | {coalMin,11:F3}ms | {attnMin / coalMin,5:F2}x");
+            _output.WriteLine($"{s,6} | {attnMin,8:F3}ms | {coalMin,8:F3}ms | {uncoalMin,8:F3}ms | {floorMin,8:F3}ms | {coalMin / floorMin,8:F2}x | {attnMin / coalMin,6:F2}x");
         }
-        _output.WriteLine(new string('-', 70));
-        _output.WriteLine("spd = attn_f16 / (cublas+softmax). coal = one-thread-per-row (coalesced reads).");
+        _output.WriteLine(new string('-', 84));
+        _output.WriteLine("G3coal = shipping path (one-thread-per-row coalesced softmax). G3/floor uses G3coal.");
+        _output.WriteLine("Fused-kernel headroom over G3 = G3coal - floor (the score round-trip). Ceiling = G3/floor.");
     }
 
     private static void RunCublasSoftmaxPath(
@@ -262,6 +273,48 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
             nint oBase = outBuf.DataPointer + (nint)((long)h * group * s * headDim * 2);
 
             // P·V: out[tq,d] = Σ_tk scores[tq,tk]·V[tk,d]  (col-major [s × headDim], ldc=s)
+            CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+                s, headDim, s,
+                (nint)(&one),
+                scBase, CublasApi.CUDA_R_16F, s, (long)s * s,
+                vBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                (nint)(&zero),
+                oBase, CublasApi.CUDA_R_16F, s, (long)s * headDim,
+                group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+        }
+    }
+
+    /// <summary>
+    /// GEMM-only floor: the two cuBLAS strided-batched GEMMs from the G3 path with the
+    /// causal-softmax launch removed. No numeric correctness (scores are never normalised),
+    /// only the matmul cost — the hard lower bound a fused kernel can approach but not beat.
+    /// </summary>
+    private static void RunGemmOnlyPath(
+        CudaCublasHandle cublas, CudaStream stream,
+        CudaTensor q, CudaTensor k, CudaTensor v, CudaTensor scores, CudaTensor outBuf,
+        int s, int numHeads, int numKvHeads, int headDim, int group,
+        int qStride, int kvStride, float scale)
+    {
+        float one = 1.0f, zero = 0.0f, sc = scale;
+        for (int h = 0; h < numKvHeads; h++)
+        {
+            nint qBase = q.DataPointer + (nint)((long)h * group * headDim * 2);
+            nint kBase = k.DataPointer + (nint)((long)h * headDim * 2);
+            nint vBase = v.DataPointer + (nint)((long)h * headDim * 2);
+            nint scBase = scores.DataPointer + (nint)((long)h * group * s * s * 2);
+            nint oBase = outBuf.DataPointer + (nint)((long)h * group * s * headDim * 2);
+
+            CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                s, s, headDim,
+                (nint)(&sc),
+                qBase, CublasApi.CUDA_R_16F, qStride, headDim,
+                kBase, CublasApi.CUDA_R_16F, kvStride, 0,
+                (nint)(&zero),
+                scBase, CublasApi.CUDA_R_16F, s, (long)s * s,
+                group, CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT).ThrowOnCublasError();
+
             CublasApi.cublasGemmStridedBatchedEx(cublas.Handle,
                 CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
                 s, headDim, s,
@@ -319,6 +372,17 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
 
     private static int EnvInt(string name, int dflt)
         => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : dflt;
+
+    private static int[] EnvSeqs(string name, int[] dflt)
+    {
+        string? raw = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(raw)) return dflt;
+        var parsed = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(p => int.TryParse(p, out int v) ? v : 0)
+            .Where(v => v > 0)
+            .ToArray();
+        return parsed.Length > 0 ? parsed : dflt;
+    }
 
     private static string ResolvePtxDir()
     {
