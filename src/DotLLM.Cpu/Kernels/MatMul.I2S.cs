@@ -12,24 +12,43 @@ namespace DotLLM.Cpu.Kernels;
 ///
 /// Correctness-first implementation: each weight row is unpacked to float {-1,0,+1} and dotted
 /// against the (full-precision) activation via <see cref="TensorPrimitives.Dot"/>, then scaled by
-/// the per-tensor weight scale. Using full-precision activations is at least as accurate as the
-/// W2A8 reference. Phase 2 will add a parallel, int8-activation SIMD ternary kernel.
+/// the per-tensor weight scale. Work is partitioned across output rows over the compute thread
+/// pool. Phase 2 will replace the float unpack with an int8-activation (W2A8) VNNI/maddubs kernel
+/// that consumes the packed 2-bit weights directly.
 /// </summary>
 public static unsafe partial class MatMul
 {
     private const int I2SBlockSize = 128;
 
+    // ── Context structs ──
+
+    private struct GemvI2SCtx
+    {
+        public byte* Weights;
+        public float* X;
+        public float* Result;
+        public int M;
+        public int K;
+        public float Scale;
+    }
+
+    private struct GemmI2SCtx
+    {
+        public byte* Weights;
+        public float* B;
+        public float* C;
+        public int M;
+        public int K;
+        public int N;
+        public float Scale;
+    }
+
     /// <summary>
     /// I2_S ternary GEMV: <c>result[r] = scale · dot(ternary(A[r,:]), x)</c>.
     /// A is [M,K] packed I2_S (row-major, K a multiple of 128); x is f32 [K]; result is f32 [M].
-    /// The per-tensor scale is read from the tail of <paramref name="weights"/>.
+    /// The per-tensor scale is read from the tail of <paramref name="weights"/>. Output rows are
+    /// partitioned across <paramref name="threadPool"/> workers when present.
     /// </summary>
-    /// <param name="weights">Pointer to the I2_S tensor base (packed data + trailing float32 scale).</param>
-    /// <param name="x">Pointer to f32 input vector [K].</param>
-    /// <param name="result">Pointer to f32 output vector [M].</param>
-    /// <param name="m">Number of weight rows (output dimension).</param>
-    /// <param name="k">Number of columns (input dimension). Must be a multiple of 128.</param>
-    /// <param name="threadPool">Compute thread pool (currently unused; reserved for the Phase 2 parallel kernel).</param>
     [SkipLocalsInit]
     public static void GemvI2_S(byte* weights, float* x, float* result, int m, int k,
                                 ComputeThreadPool? threadPool)
@@ -38,6 +57,32 @@ public static unsafe partial class MatMul
             throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
 
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemvI2_SRows(weights, x, result, 0, m, k, scale);
+            return;
+        }
+
+        var ctx = new GemvI2SCtx { Weights = weights, X = x, Result = result, M = m, K = k, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemvI2_SWorker);
+    }
+
+    [SkipLocalsInit]
+    private static void GemvI2_SWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<GemvI2SCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        GemvI2_SRows(ctx.Weights, ctx.X, ctx.Result, start, count, ctx.K, ctx.Scale);
+    }
+
+    /// <summary>Computes <paramref name="rowCount"/> output rows starting at <paramref name="startRow"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemvI2_SRows(byte* weights, float* x, float* result,
+                                     int startRow, int rowCount, int k, float scale)
+    {
         int rowBytes = k / 4;
         var xSpan = new ReadOnlySpan<float>(x, k);
 
@@ -45,7 +90,7 @@ public static unsafe partial class MatMul
         try
         {
             var rowSpan = rowBuf.AsSpan(0, k);
-            for (int r = 0; r < m; r++)
+            for (int r = startRow; r < startRow + rowCount; r++)
             {
                 UnpackRow(weights + (long)r * rowBytes, rowSpan, k);
                 result[r] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan) * scale;
@@ -59,15 +104,9 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// I2_S ternary GEMM: <c>C[N,M] = (B[N,K] × ternary(A[M,K])^T) · scale</c>.
-    /// Each weight row is unpacked once and dotted against all N input rows.
+    /// Each weight row is unpacked once and dotted against all N input rows. Output rows are
+    /// partitioned across <paramref name="threadPool"/> workers when present.
     /// </summary>
-    /// <param name="weights">I2_S weight matrix [M,K] (packed + trailing float32 scale).</param>
-    /// <param name="b">f32 input matrix [N,K], row-major.</param>
-    /// <param name="c">f32 output matrix [N,M], row-major.</param>
-    /// <param name="m">Number of weight rows (output dimension).</param>
-    /// <param name="k">Number of columns (input dimension). Must be a multiple of 128.</param>
-    /// <param name="n">Number of input tokens (batch size).</param>
-    /// <param name="threadPool">Compute thread pool (currently unused; reserved for the Phase 2 parallel kernel).</param>
     [SkipLocalsInit]
     public static void GemmI2_S(byte* weights, float* b, float* c, int m, int k, int n,
                                 ComputeThreadPool? threadPool)
@@ -82,13 +121,39 @@ public static unsafe partial class MatMul
             throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
 
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemmI2_SRows(weights, b, c, m, 0, m, k, n, scale);
+            return;
+        }
+
+        var ctx = new GemmI2SCtx { Weights = weights, B = b, C = c, M = m, K = k, N = n, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemmI2_SWorker);
+    }
+
+    [SkipLocalsInit]
+    private static void GemmI2_SWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<GemmI2SCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        GemmI2_SRows(ctx.Weights, ctx.B, ctx.C, ctx.M, start, count, ctx.K, ctx.N, ctx.Scale);
+    }
+
+    /// <summary>Computes <paramref name="rowCount"/> weight rows (over all N tokens) starting at <paramref name="startRow"/>.</summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemmI2_SRows(byte* weights, float* b, float* c, int m,
+                                     int startRow, int rowCount, int k, int n, float scale)
+    {
         int rowBytes = k / 4;
 
         float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
         try
         {
             var rowSpan = rowBuf.AsSpan(0, k);
-            for (int r = 0; r < m; r++)
+            for (int r = startRow; r < startRow + rowCount; r++)
             {
                 UnpackRow(weights + (long)r * rowBytes, rowSpan, k);
                 for (int t = 0; t < n; t++)
