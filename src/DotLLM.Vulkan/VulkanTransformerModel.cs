@@ -193,6 +193,12 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MoeTopKSoftmaxF32Kernel? _moeTopkSoftmax;
     private readonly MoeIndexedMatmulF32Kernel? _moeIndexedMatmul;
     private readonly MoeIndexedMatmulQ8_0F32Kernel? _moeIndexedMatmulQ8;
+    // Gemma-4 quantized experts: Q4_K (fused gate_up → split W1/W3) and Q5_1
+    // (down, with the per-expert ffn_down_exps.scale folded in-shader). Keep the
+    // real 26B's experts quantized on device. Null when the model has no gemma4
+    // quantized-MoE layer.
+    private readonly MoeIndexedMatmulQ4_KF32Kernel? _moeIndexedMatmulQ4K;
+    private readonly MoeIndexedMatmulQ5_1F32Kernel? _moeIndexedMatmulQ5_1;
     // Tiled (shared-memory) variant of the indexed matmul. Wins on prefill at
     // large N (seqLen * topK ≥ 32) by amortising the x-row load across a
     // TILE_M-wide output tile; the scalar variant remains for decode (small N)
@@ -321,6 +327,8 @@ public sealed class VulkanTransformerModel : IModel
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8,
+        MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K,
+        MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1,
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled,
         MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta,
         MoeExpertOffsetsKernel? moeExpertOffsets,
@@ -395,6 +403,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax = moeTopkSoftmax;
         _moeIndexedMatmul = moeIndexedMatmul;
         _moeIndexedMatmulQ8 = moeIndexedMatmulQ8;
+        _moeIndexedMatmulQ4K = moeIndexedMatmulQ4K;
+        _moeIndexedMatmulQ5_1 = moeIndexedMatmulQ5_1;
         _moeIndexedMatmulTiled = moeIndexedMatmulTiled;
         _moeIndexedLoraDelta = moeIndexedLoraDelta;
         _moeExpertOffsets = moeExpertOffsets;
@@ -711,6 +721,8 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax = null;
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8 = null;
+        MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K = null;
+        MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1 = null;
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled = null;
         MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta = null;
         MoeExpertOffsetsKernel? moeExpertOffsets = null;
@@ -725,6 +737,13 @@ public sealed class VulkanTransformerModel : IModel
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
             moeIndexedMatmulQ8 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir);
+            if (config.Gemma4DualFfn)
+            {
+                // Gemma-4 quantized experts: fused gate_up Q4_K + down Q5_1 stay
+                // quantized on device (the real 26B's F32 experts are tens of GB).
+                moeIndexedMatmulQ4K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir);
+                moeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
+            }
             moeIndexedMatmulTiled = MoeIndexedMatmulTiledF32Kernel.Create(device, spvDir);
             moeIndexedLoraDelta = MoeIndexedLoraDeltaF32Kernel.Create(device, spvDir);
             moeExpertOffsets = MoeExpertOffsetsKernel.Create(device, spvDir);
@@ -782,7 +801,9 @@ public sealed class VulkanTransformerModel : IModel
             rmsnorm, rope, attention, flashAttention, swiglu, geglu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
-            moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8, moeIndexedMatmulTiled, moeIndexedLoraDelta,
+            moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
+            moeIndexedMatmulQ4K, moeIndexedMatmulQ5_1,
+            moeIndexedMatmulTiled, moeIndexedLoraDelta,
             moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
             moeWeightedScatter, moeBroadcast,
             moeSigmoidGatedAdd,
@@ -1963,6 +1984,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeTopkSoftmax?.InvalidateDescriptorCache();
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
         _moeIndexedMatmulTiled?.InvalidateDescriptorCache();
         _moeExpertOffsets?.InvalidateDescriptorCache();
         _moeExpandGroupByExpert?.InvalidateDescriptorCache();
@@ -2338,10 +2361,25 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         _geglu!.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        RecordMoeIndexedMatmul(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
-            moeW.W2DeviceQuantType, m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        if (moeW.W2DeviceQuantType == QuantType.Q5_1)
+        {
+            // Quantized down path: the Q5_1 indexed-matmul shader folds the per-expert
+            // ffn_down_exps.scale (op #14) into its output, so the weighted-scatter below
+            // carries only the routing weight — exactly matching the CPU fold order.
+            if (_moeIndexedMatmulQ5_1 is null)
+                throw new InvalidOperationException("Q5_1 MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ5_1.Record(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!,
+                _state.MoeDownRows!, g4.DownExpertScale!, m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            // F32 host-dequant path: per-expert down scale was pre-folded into W2 at upload.
+            RecordMoeIndexedMatmul(cmdBuf, moeW.W2Bank, _state.MoeSiluInter!, _state.MoeTopkIndices!, _state.MoeDownRows!,
+                moeW.W2DeviceQuantType, m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        // Weighted scatter (routing weights; per-expert down scale pre-folded into W2) → Gemma4MoeResult.
+        // Weighted scatter (routing weights; per-expert down scale folded by the Q5_1 shader
+        // or pre-folded into the F32 W2) → Gemma4MoeResult.
         _moeWeightedScatter!.Record(cmdBuf, _state.MoeDownRows!, _state.MoeTopkWeights!, _state.Gemma4MoeResult!,
             seqLen: seqLen, topK: topK, hiddenSize: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -2728,6 +2766,16 @@ public sealed class VulkanTransformerModel : IModel
             if (_moeIndexedMatmulQ8 is null)
                 throw new InvalidOperationException("Q8_0 MoE indexed matmul kernel was not created.");
             _moeIndexedMatmulQ8.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt == QuantizationType.Q4_K)
+        {
+            if (_moeIndexedMatmulQ4K is null)
+                throw new InvalidOperationException("Q4_K MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ4K.Record(cmdBuf,
                 bank, x, indices, y,
                 m: m, k: k, n: n, numExperts: numExperts);
             return;
@@ -3198,6 +3246,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeExpertOffsets?.Dispose();
         _moeIndexedLoraDelta?.Dispose();
         _moeIndexedMatmulTiled?.Dispose();
+        _moeIndexedMatmulQ5_1?.Dispose();
+        _moeIndexedMatmulQ4K?.Dispose();
         _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
         _moeTopkSoftmax?.Dispose();
