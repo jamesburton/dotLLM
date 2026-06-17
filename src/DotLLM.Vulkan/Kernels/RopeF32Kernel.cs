@@ -35,7 +35,7 @@ public sealed class RopeF32Kernel : IDisposable
     }
 
     private const int WorkgroupSize = 256;
-    private const int PushConstantBytes = 7 * sizeof(uint) + sizeof(float); // seqLen, numHeads, numKvHeads, headDim, ropeDim, ropeType, theta, freqDim
+    private const int PushConstantBytes = 8 * sizeof(uint) + sizeof(float); // seqLen, numHeads, numKvHeads, headDim, ropeDim, ropeType, theta, freqDim, neoxPairOffset
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
@@ -103,19 +103,26 @@ public sealed class RopeF32Kernel : IDisposable
     /// <param name="variant">Pair-layout variant.</param>
     /// <param name="freqDim">
     /// Frequency-denominator dim for the exponent <c>2*pair/freqDim</c>. Pass 0 (default)
-    /// to use <paramref name="ropeDim"/> — correct for full rotation. For partial NeoX rope
-    /// (<paramref name="ropeDim"/> &lt; <paramref name="headDim"/>, e.g. Gemma-4 global
-    /// layers) pass the FULL head dim so the exponent matches the CPU oracle's partial freq
-    /// table (<c>RoPE.PrecomputeFrequencyTablePartial</c>, denom = fullHeadDim).
+    /// to use <paramref name="ropeDim"/> — correct for full rotation AND for standard
+    /// partial-rotary NeoX (Qwen3 / NemotronH / Llama). For Gemma-4 partial global layers
+    /// pass the FULL head dim so the exponent matches the CPU oracle's partial freq table
+    /// (<c>RoPE.PrecomputeFrequencyTablePartial</c>, denom = fullHeadDim).
+    /// </param>
+    /// <param name="neoxPairOffset">
+    /// NeoX rotate-half pairing offset (<c>i1 = i0 + offset</c>). Pass <c>null</c> (default)
+    /// for the standard partial-rotary convention <c>ropeDim/2</c> (Qwen3 / NemotronH /
+    /// Llama-family — matches CPU <c>RoPE.Execute</c> → <c>ApplyRotationNeoX</c>); pass
+    /// <c>headDim/2</c> for Gemma-4 partial global layers (matches CPU
+    /// <c>RoPE.ApplyRotationNeoXPartial</c>). Ignored for <see cref="Variant.Norm"/>.
     /// </param>
     public void Launch(
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
         int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta,
-        Variant variant = Variant.Norm, int freqDim = 0)
+        Variant variant = Variant.Norm, int freqDim = 0, int? neoxPairOffset = null)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
-        Record(ctx.CommandBuffer, q, k, positions, seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, variant, freqDim);
+        Record(ctx.CommandBuffer, q, k, positions, seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, variant, freqDim, neoxPairOffset);
         ctx.SubmitAndWait();
     }
 
@@ -124,7 +131,7 @@ public sealed class RopeF32Kernel : IDisposable
         nint cmdBuf,
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer positions,
         int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta,
-        Variant variant = Variant.Norm, int freqDim = 0)
+        Variant variant = Variant.Norm, int freqDim = 0, int? neoxPairOffset = null)
     {
         if (seqLen <= 0) throw new ArgumentOutOfRangeException(nameof(seqLen));
         if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
@@ -132,10 +139,20 @@ public sealed class RopeF32Kernel : IDisposable
         if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
         if (ropeDim <= 0 || (ropeDim & 1) != 0) throw new ArgumentException($"ropeDim must be a positive even integer, got {ropeDim}", nameof(ropeDim));
         if (ropeDim > headDim) throw new ArgumentException($"ropeDim ({ropeDim}) must be <= headDim ({headDim})", nameof(ropeDim));
-        // Default the frequency denominator to ropeDim (full-rotation convention).
-        // Partial NeoX rope (Gemma-4 global) passes headDim so the exponent matches
-        // the CPU oracle's partial freq table.
+        // Default the frequency denominator to ropeDim (full-rotation + standard partial).
+        // Gemma-4 partial global passes headDim so the exponent matches the CPU oracle.
         if (freqDim <= 0) freqDim = ropeDim;
+        // Default NeoX pairing offset is ropeDim/2 (standard partial-rotary; equals
+        // headDim/2 for full rope). Gemma-4 global partial rope overrides with headDim/2.
+        int pairOffset = neoxPairOffset ?? (ropeDim / 2);
+        if (variant == Variant.NeoX)
+        {
+            if (pairOffset <= 0) throw new ArgumentException($"neoxPairOffset must be positive, got {pairOffset}", nameof(neoxPairOffset));
+            if (pairOffset + ropeDim / 2 > headDim)
+                throw new ArgumentException(
+                    $"neoxPairOffset ({pairOffset}) + ropeDim/2 ({ropeDim / 2}) must be <= headDim ({headDim}) "
+                    + "or the high pair index runs past the head.", nameof(neoxPairOffset));
+        }
 
         long qBytes = (long)seqLen * numHeads * headDim * sizeof(float);
         long kBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
@@ -157,7 +174,7 @@ public sealed class RopeF32Kernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        // Push constants: 7 uint + 1 float = 32 bytes.
+        // Push constants: 8 uint + 1 float = 36 bytes.
         Span<byte> pcBytes = stackalloc byte[PushConstantBytes];
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[0..],  (uint)seqLen);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[4..],  (uint)numHeads);
@@ -167,6 +184,7 @@ public sealed class RopeF32Kernel : IDisposable
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[20..], (uint)variant);
         System.Buffers.Binary.BinaryPrimitives.WriteSingleLittleEndian(pcBytes[24..], theta);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[28..], (uint)freqDim);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(pcBytes[32..], (uint)pairOffset);
         fixed (byte* pcPtr = pcBytes)
         {
             VulkanApi.vkCmdPushConstants(

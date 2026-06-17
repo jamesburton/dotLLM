@@ -9,21 +9,24 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
     const int* __restrict__ positions,
     const int seq_len, const int num_heads, const int num_kv_heads,
     const int head_dim, const int rope_dim, const float theta, const int rope_type,
-    const int freq_dim)
+    const int freq_dim, const int neox_pair_offset_arg)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_rope = rope_dim / 2;
-    // NeoX pairing offset is the FULL head's half-dim, NOT rope_dim/2, so partial
-    // rope (rope_dim < head_dim, e.g. Gemma-4 global layers) pairs the leading
-    // rope_dim/2 dims with their full-head-half partners, matching CPU
-    // RoPE.ApplyRotationNeoXPartial + the Vulkan rope_f32 shader. For full rope
-    // (rope_dim == head_dim) this equals half_rope ⇒ byte-identical for every
-    // current NeoX model. NOTE: PTX must be regenerated on the CUDA box (no nvcc
-    // on the Strix Halo dev host) — no CUDA partial-NeoX model is enabled today.
-    int neox_pair_offset = head_dim / 2;
+    // NeoX rotate-half pairing offset. STANDARD partial-rotary (Qwen3 / NemotronH /
+    // Llama-family) pairs WITHIN the rotated block → rope_dim/2 (matches CPU
+    // RoPE.Execute → ApplyRotationNeoX and native rope.cu / fused_rope_kv_write.cu).
+    // Gemma-4 partial-rotary global layers pair ACROSS the full-head halves →
+    // head_dim/2 (matches CPU RoPE.ApplyRotationNeoXPartial); the caller supplies that
+    // via neox_pair_offset_arg. A prior change hardcoded head_dim/2 here, which
+    // silently broke every other partial-rotary NeoX model (surfaced on Vulkan/CPU via
+    // the Qwen3MoeHybrid IQ3 forward parity failure). For full rope both coincide.
+    // Callers pass 0 to mean the standard rope_dim/2. NOTE: PTX must be regenerated on
+    // the CUDA box (no nvcc on the Strix Halo dev host).
+    int neox_pair_offset = neox_pair_offset_arg > 0 ? neox_pair_offset_arg : half_rope;
     // Frequency-denominator dim for the exponent 2*pair/freq_dim. Equals rope_dim for
-    // full rotation; for partial NeoX rope (Gemma-4 global) freq_dim is the FULL head
-    // dim, matching the CPU oracle's partial freq table. Callers pass 0 to mean rope_dim.
+    // full rotation AND standard partial NeoX; for Gemma-4 partial global freq_dim is
+    // the FULL head dim, matching the CPU oracle's partial freq table. 0 ⇒ rope_dim.
     int fd = freq_dim > 0 ? freq_dim : rope_dim;
     int total_q_pairs = seq_len * num_heads * half_rope;
     int total_k_pairs = seq_len * num_kv_heads * half_rope;

@@ -142,18 +142,18 @@ public class VulkanRopeF32KernelTests
     }
 
     [SkippableTheory]
-    // PARTIAL NeoX — rotate only the leading ropeDim dims, pairing each at the
-    // FULL head's half-dim (i, i + headDim/2), matching CPU
+    // PARTIAL NeoX, GEMMA-4 convention — rotate only the leading ropeDim dims,
+    // pairing each at the FULL head's half-dim (i, i + headDim/2), matching CPU
     // RoPE.ExecutePartialNeoX. This is the Gemma-4 global-layer convention
     // (partial_rotary_factor 0.25 over head_dim, e.g. headDim 64 → ropeDim 16).
-    // DISCRIMINATING: the pre-fix shader paired at ropeDim/2 (here 8, not 32),
-    // so it fails this test; the corrected full-head-half pairing passes.
+    // The caller MUST request this pairing explicitly via neoxPairOffset:headDim/2
+    // (the kernel default is the STANDARD ropeDim/2 — see _StandardRopeDimHalf below).
     // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta)
     [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
     [InlineData(4, 4, 1, 64, 16, 1_000_000f)]
     [InlineData(256, 4, 1, 64, 16, 1_000_000f)]
     [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
-    public void Launch_MatchesCpuReference_PartialNeoX(
+    public void Launch_MatchesCpuReference_PartialNeoX_GemmaFullHeadHalf(
         int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -191,6 +191,78 @@ public class VulkanRopeF32KernelTests
         device.Upload(k.AsSpan(), bufK);
         device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
 
+        // Gemma-4 partial global rope: pair across the full-head halves (headDim/2).
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta,
+            RopeF32Kernel.Variant.NeoX, neoxPairOffset: headDim / 2);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
+    [SkippableTheory]
+    // PARTIAL NeoX, STANDARD convention — rotate only the leading ropeDim dims,
+    // pairing each WITHIN the rotated block (i, i + ropeDim/2), matching CPU
+    // RoPE.Execute → ApplyRotationNeoX (a ropeDim-length head slice). This is the
+    // Qwen3 / NemotronH / Llama-family partial-rotary convention and the kernel
+    // DEFAULT (neoxPairOffset == null → ropeDim/2).
+    //
+    // DISCRIMINATING / regression guard: a prior change hardcoded the NeoX pairing
+    // offset to headDim/2, which silently mis-paired every partial-rotary model
+    // where ropeDim < headDim (surfaced as the Qwen3MoeHybrid IQ3 forward parity
+    // failure). With ropeDim < headDim and headDim/2 != ropeDim/2 these shapes are
+    // grossly wrong under the headDim/2 offset and bit-exact under the standard
+    // ropeDim/2 default — RED before, GREEN after.
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta)
+    [InlineData(4, 4, 2, 64, 32, 10000f)]    // Qwen3MoeHybrid IQ3 fixture shape (headDim 64, ropeDim 32)
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(256, 4, 1, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX_StandardRopeDimHalf(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int halfRope = ropeDim / 2;
+
+        var rng = new Random(0x515D + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // ropeDim/2 freq entries per position, exponent 2*pair/ropeDim — matches the
+        // kernel's per-thread freq reconstruction AND the CPU RoPE.Execute partial-
+        // rotary path (which slices each head to length ropeDim).
+        float[] cosTable = new float[seqLen * halfRope];
+        float[] sinTable = new float[seqLen * halfRope];
+        RoPE.PrecomputeFrequencyTableScalar(seqLen, ropeDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.Execute(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable,
+            DotLLM.Core.Configuration.RoPEType.NeoX);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        // No neoxPairOffset → kernel default ropeDim/2 (the standard convention).
         kernel.Launch(bufQ, bufK, bufPos,
             seqLen, numHeads, numKvHeads, headDim, ropeDim, theta, RopeF32Kernel.Variant.NeoX);
 
@@ -256,10 +328,12 @@ public class VulkanRopeF32KernelTests
         device.Upload(k.AsSpan(), bufK);
         device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
 
-        // freqDim = headDim is the fix: drive the per-pair frequency denominator with the full head.
+        // Gemma-4 partial global rope: BOTH overrides — freqDim = headDim (freq denominator
+        // over the full head) AND neoxPairOffset = headDim/2 (pairing across the full-head
+        // halves) — together matching CPU PrecomputeFrequencyTablePartial + ExecutePartialNeoX.
         kernel.Launch(bufQ, bufK, bufPos,
             seqLen, numHeads, numKvHeads, headDim, ropeDim, theta,
-            RopeF32Kernel.Variant.NeoX, freqDim: headDim);
+            RopeF32Kernel.Variant.NeoX, freqDim: headDim, neoxPairOffset: headDim / 2);
 
         float[] qActual = new float[q.Length];
         float[] kActual = new float[k.Length];

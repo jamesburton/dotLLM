@@ -37,10 +37,18 @@ layout(push_constant) uniform PushConstants {
     uint  ropeType;    // 0 = Norm (interleaved), 1 = NeoX (rotate-half)
     float theta;
     uint  freqDim;     // frequency-denominator dim for the exponent 2*pair/freqDim.
-                       // Equals ropeDim for full rotation; for partial NeoX rope
-                       // (ropeDim < headDim, e.g. Gemma-4 global layers) this is the
-                       // FULL head dim — matching the CPU oracle's partial freq table
-                       // (RoPE.PrecomputeFrequencyTablePartial, denom = fullHeadDim).
+                       // Equals ropeDim for full rotation AND for standard partial-
+                       // rotary NeoX (Qwen3 / NemotronH / Llama-family); for Gemma-4
+                       // partial global layers this is the FULL head dim — matching
+                       // the CPU oracle (RoPE.PrecomputeFrequencyTablePartial denom =
+                       // fullHeadDim vs RoPE.Execute denom = ropeDim).
+    uint  neoxPairOffset; // NeoX rotate-half pairing offset: i1 = i0 + neoxPairOffset.
+                       // Standard partial-rotary NeoX (Qwen3 / NemotronH / Llama)
+                       // pairs WITHIN the rotated block → ropeDim/2 (matches CPU
+                       // RoPE.Execute → ApplyRotationNeoX). Gemma-4 partial global
+                       // layers pair ACROSS the full-head halves → headDim/2 (matches
+                       // CPU RoPE.ApplyRotationNeoXPartial). For full rope both coincide.
+                       // Ignored for Norm (interleaved) rope.
 } pc;
 
 void main() {
@@ -70,15 +78,14 @@ void main() {
         uint baseIdx = t * pc.numHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;
         if (pc.ropeType == 1u) {
-            // NeoX: pair (i, i + headDim/2). The pairing offset is the FULL
-            // head's half-dim, NOT ropeDim/2 — so partial rope (ropeDim <
-            // headDim, e.g. Gemma-4 global layers, partial_rotary_factor 0.25)
-            // rotates the leading ropeDim/2 pairs straddling the head halves,
-            // matching CPU RoPE.ApplyRotationNeoXPartial. For full rope
-            // (ropeDim == headDim) this equals halfRope, so every existing
-            // NeoX model is byte-identical.
+            // NeoX: pair (i, i + neoxPairOffset). The offset is caller-supplied so
+            // both partial-rotary conventions are exact: standard (Qwen3 / NemotronH
+            // / Llama) pass ropeDim/2 — pairs stay inside the rotated block, matching
+            // CPU RoPE.Execute → ApplyRotationNeoX; Gemma-4 partial global layers pass
+            // headDim/2 — pairs straddle the full-head halves, matching CPU
+            // RoPE.ApplyRotationNeoXPartial. For full rope both equal halfRope.
             i0 = baseIdx + pair;
-            i1 = baseIdx + pair + (pc.headDim >> 1u);
+            i1 = baseIdx + pair + pc.neoxPairOffset;
         } else {
             // Norm / interleaved: pair (2i, 2i+1).
             i0 = baseIdx + 2u * pair;
@@ -107,9 +114,9 @@ void main() {
         uint baseIdx = t * pc.numKvHeads * pc.headDim + head * pc.headDim;
         uint i0, i1;
         if (pc.ropeType == 1u) {
-            // NeoX: pair (i, i + headDim/2) — full-head half-dim offset (see Q branch).
+            // NeoX: pair (i, i + neoxPairOffset) — caller-supplied offset (see Q branch).
             i0 = baseIdx + pair;
-            i1 = baseIdx + pair + (pc.headDim >> 1u);
+            i1 = baseIdx + pair + pc.neoxPairOffset;
         } else {
             i0 = baseIdx + 2u * pair;
             i1 = baseIdx + 2u * pair + 1u;

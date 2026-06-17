@@ -916,23 +916,27 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <summary>
     /// FP32 RoPE: in-place rotation on FP32 Q and K. <paramref name="freqDim"/> is the
     /// frequency-denominator dim for the exponent <c>2*pair/freqDim</c>: pass 0 (default) to use
-    /// <paramref name="ropeDim"/> (full rotation); for partial NeoX rope (Gemma-4 global layers,
-    /// <paramref name="ropeDim"/> &lt; <paramref name="headDim"/>) pass the FULL head dim so the
-    /// exponent matches the CPU/Vulkan oracle.
+    /// <paramref name="ropeDim"/> (full rotation + standard partial NeoX); for Gemma-4 partial
+    /// global layers pass the FULL head dim so the exponent matches the CPU/Vulkan oracle.
+    /// <paramref name="neoxPairOffset"/> is the NeoX rotate-half pairing offset: pass 0 (default)
+    /// for the standard <c>ropeDim/2</c> (Qwen3 / NemotronH / Llama — matches CPU
+    /// <c>RoPE.Execute</c>); pass <c>headDim/2</c> for Gemma-4 partial global layers (matches CPU
+    /// <c>RoPE.ApplyRotationNeoXPartial</c>).
     /// </summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
                                 int ropeDim, float theta, int ropeType, nint stream,
-                                int freqDim = 0)
+                                int freqDim = 0, int neoxPairOffset = 0)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
         int hdArg = headDim, rdArg = ropeDim, rtArg = ropeType;
         int fdArg = freqDim; // 0 ⇒ kernel falls back to rope_dim
+        int npoArg = neoxPairOffset; // 0 ⇒ kernel falls back to rope_dim/2 (standard)
         float thetaArg = theta;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg, &npoArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;

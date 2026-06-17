@@ -2599,19 +2599,26 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // RoPE(Q, K) — per-layer theta / rotated dims, NeoX. V is NOT roped.
-        // Gemma-4 global layers use PARTIAL NeoX rope: only the leading `ropeDim`
-        // dims rotate (ropeDim < headDim), pairing dim i with i+headDim/2, but the
-        // per-pair frequency denominator is the FULL head dim — NOT ropeDim. The CPU
-        // oracle builds its partial freq table over fullHeadDim
-        // (RoPE.PrecomputeFrequencyTablePartial), so we pass freqDim = headDim here.
-        // For sliding (full-rotation) layers ropeDim == headDim ⇒ freqDim == ropeDim,
-        // byte-identical to the default. Without this the global-layer angles were
-        // computed with denominator ropeDim (128) vs the CPU's 512 — a silent
-        // divergence that only surfaced at the real 26B scale (head_dim 512).
+        // Gemma-4 global (full-attention) layers use a NON-STANDARD partial-rotary
+        // NeoX (matches CPU RoPE.ExecutePartialNeoX → ApplyRotationNeoXPartial): only
+        // the leading `ropeDim` dims rotate, but BOTH (a) the per-pair frequency
+        // denominator AND (b) the rotate-half pairing offset are over the FULL head
+        // dim (freqDim = headDim, neoxPairOffset = headDim/2) — e.g. dims [0,64) ↔
+        // [256,320). Sliding / full-rope layers keep the standard convention
+        // (freqDim = ropeDim, pairing = ropeDim/2 — kernel defaults), which for those
+        // layers (ropeDim == headDim) coincides anyway. This differs from EVERY OTHER
+        // partial-rotary NeoX model (Qwen3 / NemotronH / Llama) which pairs and scales
+        // within the rotated block (CPU RoPE.Execute → ApplyRotationNeoX) — those must
+        // NOT receive the Gemma overrides.
+        bool partialGlobal = Config.IsFullAttentionLayer(layer)
+            && Config.PartialRotaryFactor is float prf && prf > 0f && prf < 1f
+            && ropeDim < headDim;
         _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
             seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
             headDim: headDim, ropeDim: ropeDim, theta: ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX, freqDim: headDim);
+            variant: RopeF32Kernel.Variant.NeoX,
+            freqDim: partialGlobal ? headDim : 0,
+            neoxPairOffset: partialGlobal ? headDim / 2 : (int?)null);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Attention K/V source: either this forward's freshly-projected window
