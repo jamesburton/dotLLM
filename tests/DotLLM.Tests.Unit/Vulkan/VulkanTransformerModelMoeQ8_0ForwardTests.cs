@@ -168,6 +168,12 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         // vendor-gated default (Intel/Arc defaults DP4a on when the env is unset).
         string? prior = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A");
         Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", enableDp4a ? "1" : "0");
+        // Pin the per-shape DP4a threshold to 0 so Q8DecodeGemvPolicy does not veto
+        // the DP4a path at this fixture's tiny K (HiddenSize=32). On NVIDIA the
+        // policy otherwise prefers the workgroup kernel below K=2048, which would
+        // make DP4a-on bit-identical to DP4a-off and defeat the engagement check.
+        string? priorMinK = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DP4A_MIN_K");
+        Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_MIN_K", "0");
         try
         {
             using var sf = SafetensorsFile.Open(path);
@@ -183,6 +189,7 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         finally
         {
             Environment.SetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_DP4A", prior);
+            Environment.SetEnvironmentVariable("DOTLLM_VULKAN_DP4A_MIN_K", priorMinK);
         }
     }
 

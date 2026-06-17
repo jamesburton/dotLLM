@@ -2615,8 +2615,11 @@ public sealed class VulkanTransformerModel : IModel
         VulkanDevice.Buffer weightsB, QuantType qtB, VulkanDevice.Buffer outputB, int outputDimB)
     {
         if (_dp4aEnabled && _dp4aShareActivation && seqLen == 1
-            && qtA == QuantType.Q8_0 && qtB == QuantType.Q8_0)
+            && qtA == QuantType.Q8_0 && qtB == QuantType.Q8_0
+            && Q8DecodeGemvPolicy.UseDp4a(_device.VendorId, inputDim))
         {
+            // Per-shape veto (Q8DecodeGemvPolicy): both projections share one
+            // contraction dim, so the DP4a-vs-workgroup decision is uniform.
             // One activation quant shared by both projections.
             _matmulQ8Dp4aPq!.RecordQuantizeActivation(cmdBuf, input, _state.Dp4aXq!, _state.Dp4aDx!, inputDim);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -2643,7 +2646,14 @@ public sealed class VulkanTransformerModel : IModel
         {
             if (seqLen == 1)
             {
-                if (_dp4aEnabled)
+                // Per-shape dispatch along the DP4a-vs-workgroup axis. DP4a is
+                // available + enabled (Arc by default, any vendor via env), but
+                // it only wins for long contractions on some vendors — on NVIDIA
+                // it beats wg64 at K>=2048 yet loses at the short SmolLM K's.
+                // Q8DecodeGemvPolicy encodes the measured per-vendor K crossover
+                // so the enabled-DP4a path stops regressing short-K shapes.
+                if (_dp4aEnabled
+                    && Q8DecodeGemvPolicy.UseDp4a(_device.VendorId, inputDim))
                 {
                     // DP4a decode GEMV: quantize the activation to INT8 once,
                     // then integer-dot against the Q8_0 weights. The xq/dx
