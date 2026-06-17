@@ -241,5 +241,30 @@ the probe asserts the clean message (not an NRE); no regression. Commits `ee946a
 
 ## 5. Staged local branches
 
-See `git branch --list 'issue/G*'` in this worktree. Staging status is recorded below by the agent
-that produced this plan. **Nothing was pushed; no PR/issue was opened.**
+All six branches were staged locally (LOCAL ONLY — nothing pushed, no PR/issue opened). They were
+cherry-picked onto **`bd7a60c`** (the actual parent of the dg-pr11 stack), NOT onto
+`dev-diffusiongemma`. Reason: `dev-diffusiongemma` does **not** contain the intermediate base chain
+(`bd7a60c..70e859a`: the GGUF arch-mapping WIP #40, per-layer head_dim #36, GGUF-as-diffusion #32)
+that `f6b3e68` builds on — a direct cherry-pick onto `dev-diffusiongemma` conflicts immediately on
+`ModelConfig.cs` / `TransformerModel.cs` / `GgufModelConfigExtractor.cs` (verified). So the realistic
+base for upstreaming these PRs is **the `bd7a60c` lineage being landed first** (i.e. the prior #40
+WIP must reach `dev`/`dev-diffusiongemma` before these six can rebase cleanly onto it). This makes
+the §0 caveat concrete.
+
+| Branch | Base | Commit(s) cherry-picked | Tip |
+|--------|------|--------------------------|-----|
+| `issue/G1-gemma4-moe-gguf-ar-forward` | `bd7a60c` | `f6b3e68` | `1772f36` |
+| `issue/G2-diffusiongemma-gguf-forward` | G1 | `5906e1b` | `ae056c3` |
+| `issue/G3-diffusiongemma-self-cond` | G2 | `6076ee7` | `6974ffd` |
+| `issue/G4-synthetic-gguf-fixture` | G3 | `8fc653c`, `478a47c` (whole) | `ef8484b` |
+| `issue/G5-diffusion-pkv-cache` | G4 | `4e5a44e` | `292c992` |
+| `issue/G6-cross-backend-harness` | G5 | `ee946ae`, `9686e24` | `970525f` |
+
+**Lossless check:** the tip of the stack (`issue/G6` @ `970525f`) has a tree **byte-identical** to
+`dg-pr11-gemma4-arch` @ `9686e24` (`git diff --quiet` clean). The only reordering vs the original
+history is `478a47c` moving from between D and E to immediately after `8fc653c` inside PR-D — this
+does not change the final tree. (Staging note: PR-D holds `478a47c` **whole** — the §2 simplest-clean
+option. If the reviewer prefers the hunk split, move the `DiffusionTextGenerator.cs` hunk to PR-B;
+the fixture-test hunk stays in PR-D.)
+
+**Nothing was pushed; no PR/issue was opened/commented; no merge into `dev`/`dev-diffusiongemma`.**
