@@ -29,7 +29,10 @@ public sealed class Gemma4GpuGapProbeTests
     private static string WriteFixture()
     {
         string path = Path.Combine(Path.GetTempPath(), $"syn_gemma4_gpuprobe_{Guid.NewGuid():N}.gguf");
-        return SyntheticGemma4Gguf.WriteGemma4(path, SyntheticGemma4Gguf.Tiny);
+        var cfg = Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_F32FIXTURE") == "1"
+            ? SyntheticGemma4Gguf.Tiny.AllF32()
+            : SyntheticGemma4Gguf.Tiny;
+        return SyntheticGemma4Gguf.WriteGemma4(path, cfg);
     }
 
     [SkippableFact]
