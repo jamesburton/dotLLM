@@ -31,6 +31,10 @@
     <CudaKernelDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'kernels'))</CudaKernelDir>
     <PtxOutputDir>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '..', '..', 'native', 'ptx'))</PtxOutputDir>
     <CudaArch>compute_61</CudaArch>
+    <!-- CUDA only whitelists host compilers up to VS2022; newer MSVC (e.g. VS18 / MSVC 14.50) trips
+         host_config.h's version check. nvcc compiles + runs fine with -allow-unsupported-compiler.
+         Opt in by setting the DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER=1 environment variable. -->
+    <CudaAllowUnsupportedCompiler Condition="'$(DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER)' == '1'">-allow-unsupported-compiler</CudaAllowUnsupportedCompiler>
   </PropertyGroup>
 
   <!-- All .cu kernel files, default to precise math -->
@@ -76,7 +80,7 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 
