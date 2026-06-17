@@ -163,6 +163,8 @@ public sealed class Gemma4GpuGapProbeTests
             float rawMax = 0f;
             for (int i = 0; i < n; i++) rawMax = MathF.Max(rawMax, MathF.Abs(cpuLogits[i] - cudaLogits[i]));
             _output.WriteLine($"max (diff - tol) over {n} logits = {maxAbs:E3} (<=0 ⇒ all within tolerance); raw max|diff|={rawMax:E3}");
+            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "g4margin.txt"),
+                $"argmax cpu={cpuArgmax} cuda={cudaArgmax}; maxAbs(diff-tol)={maxAbs:E3} rawMax|diff|={rawMax:E3}"); } catch { }
         }
         finally
         {
