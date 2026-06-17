@@ -114,10 +114,12 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Upload weights to GPU
         var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
 
-        // Create scratch buffers
+        // Create scratch buffers. BitNet's residual stream exceeds FP16 range in deep layers,
+        // so it carries the residual in FP32 (overflow→NaN otherwise).
+        bool useFp32Residual = config.Architecture == Architecture.BitNet;
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
+            config.HeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
@@ -167,9 +169,15 @@ public sealed unsafe class CudaTransformerModel : IModel
             _state.TokenIdsDevice, _state.HiddenState,
             seqLen, hiddenSize, s);
 
-        // 3. Layer 0 setup: copy hidden→residual, RmsNorm→NormOutput
+        // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
+        bool fp32Res = _state.ResidualF32 != 0;
+
+        // 3. Layer 0 setup: seed residual from embedding, RmsNorm→NormOutput
         long hiddenBytes = (long)seqLen * hiddenSize * h;
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
+        if (fp32Res)
+            _kernels.LaunchCopyF16ToF32(_state.HiddenState, _state.ResidualF32, seqLen * hiddenSize, s);
+        else
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
         _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
             hiddenSize, eps, seqLen, s);
 
@@ -182,8 +190,10 @@ public sealed unsafe class CudaTransformerModel : IModel
             _ => Math.Min(DebugMaxLayers, Config.NumLayers)
         };
 
-        // When skipping all layers, treat embedding output as final hidden state
-        if (numLayers == 0)
+        // When skipping all layers, treat embedding output as final hidden state.
+        // (HiddenState already holds the embedding; with FP16 residual we restore from the
+        // residual copy, with FP32 residual HiddenState is already correct so nothing to do.)
+        if (numLayers == 0 && !fp32Res)
         {
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
         }
@@ -245,14 +255,24 @@ public sealed unsafe class CudaTransformerModel : IModel
                     0, slidingWindow, s);
             }
 
+            // Optional attention Sub-LN (BitNet): RMSNorm over the attention output [numHeads·headDim]
+            // before the output projection. No-op for non-BitNet models (weight == 0).
+            if (lw.AttnSubNormWeight != 0)
+                _kernels.LaunchRmsNorm(_state.AttnOutput, lw.AttnSubNormWeight, _state.AttnOutput,
+                    numHeads * headDim, eps, seqLen, s);
+
             // O projection → NormOutput
             Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
             // ── FUSED: attention residual + FFN norm ──
-            // residual = residual + NormOutput (via FP32), NormOutput = rmsnorm(new_residual, ffnNormWeight)
-            _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
-                hiddenSize, eps, seqLen, s);
+            // residual = residual + NormOutput, NormOutput = rmsnorm(new_residual, ffnNormWeight)
+            if (fp32Res)
+                _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                    hiddenSize, eps, seqLen, s);
+            else
+                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                    hiddenSize, eps, seqLen, s);
 
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
@@ -263,9 +283,29 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-            // SwiGLU (FP16)
-            _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput,
-                intermediateSize, seqLen, s);
+            // Gated activation (FP16). BitNet b1.58 uses squared-ReLU GLU followed by a Sub-LN
+            // RMSNorm; the un-normalized relu(gate)²·up intermediate overflows FP16, so when the
+            // Sub-LN weight is present we fuse activation + RMSNorm (large value kept in FP32,
+            // only the normalized O(1) result hits FP16). Otherwise dispatch the plain activation.
+            if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+            {
+                _kernels.LaunchReLU2GluRmsNorm(_state.FfnGate, _state.FfnUp, lw.FfnSubNormWeight,
+                    _state.SiluOutput, intermediateSize, eps, seqLen, s);
+            }
+            else
+            {
+                if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+                    _kernels.LaunchReLU2(_state.FfnGate, _state.FfnUp, _state.SiluOutput,
+                        intermediateSize, seqLen, s);
+                else
+                    _kernels.LaunchSwiGLU(_state.FfnGate, _state.FfnUp, _state.SiluOutput,
+                        intermediateSize, seqLen, s);
+
+                // Optional FFN Sub-LN (BitNet) for the non-fused fallback. No-op when weight == 0.
+                if (lw.FfnSubNormWeight != 0)
+                    _kernels.LaunchRmsNorm(_state.SiluOutput, lw.FfnSubNormWeight, _state.SiluOutput,
+                        intermediateSize, eps, seqLen, s);
+            }
 
             // Down projection → NormOutput
             Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
@@ -275,21 +315,41 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (layer < numLayers - 1)
             {
                 ref readonly var nextLw = ref _weights.Layers[layer + 1];
-                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
-                    hiddenSize, eps, seqLen, s);
+                if (fp32Res)
+                    _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
             }
             else
             {
-                // Last processed layer: plain add → HiddenState for final norm
-                _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
-                    seqLen * hiddenSize, s);
+                // Last processed layer: add residual + FFN output for the final norm.
+                if (fp32Res)
+                    // Accumulate into the FP32 residual (the final norm reads it directly, avoiding an
+                    // FP16 truncation that would overflow for BitNet's large final residual).
+                    _kernels.LaunchAddF32F16(_state.ResidualF32, _state.NormOutput, _state.ResidualF32,
+                        seqLen * hiddenSize, s);
+                else
+                    _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
+                        seqLen * hiddenSize, s);
             }
         }
 
-        // 5. Final RmsNorm (last token only)
-        nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
-        _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-            hiddenSize, eps, 1, s);
+        // 5. Final RmsNorm (last token only). For BitNet, read the FP32 residual directly so the
+        // large final residual is never truncated to FP16.
+        if (fp32Res && numLayers > 0)
+        {
+            nint lastResF32 = _state.ResidualF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+            _kernels.LaunchRmsNormF32InF16W(lastResF32, _weights.OutputNormWeight, _state.NormOutput,
+                hiddenSize, eps, 1, s);
+        }
+        else
+        {
+            nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
+            _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
+                hiddenSize, eps, 1, s);
+        }
 
         // 6. LM head (last token only) → FP16 logits, then convert to FP32
         Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
@@ -325,11 +385,18 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (w == 0)
             {
                 // Quantized: dequant into scratch, then GEMM
-                _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
-                    outputDim * inputDim, s);
+                if (qt == QuantizationType.I2_S)
+                    _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                else
+                    _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
+                        outputDim * inputDim, s);
                 w = _state.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S) // Decode: I2_S ternary GEMV
+        {
+            _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && CudaKernels.HasQuantizedGemv(qt)) // Decode: quantized GEMV
         {

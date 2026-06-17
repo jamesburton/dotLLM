@@ -25,6 +25,9 @@ internal sealed class CudaForwardState : IDisposable
     // All activation pointers are cuMemAlloc'd device memory, FP16 (sizeof(ushort) = 2 bytes)
     public nint HiddenState;    // [seqLen, hiddenSize]
     public nint Residual;       // [seqLen, hiddenSize]
+    /// <summary>FP32 residual stream [seqLen, hiddenSize]. Used by BitNet, whose residual magnitude
+    /// can exceed FP16's ~65504 ceiling. Null/0 unless the model requests it.</summary>
+    public nint ResidualF32;
     public nint NormOutput;     // [seqLen, hiddenSize]
     public nint Q;              // [seqLen, numHeads * headDim]
     public nint K;              // [seqLen, numKvHeads * headDim]
@@ -50,9 +53,12 @@ internal sealed class CudaForwardState : IDisposable
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
 
+    private readonly bool _useFp32Residual;
+
     public CudaForwardState(int hiddenSize, int numHeads, int numKvHeads, int headDim,
-                              int intermediateSize, int vocabSize)
+                              int intermediateSize, int vocabSize, bool useFp32Residual = false)
     {
+        _useFp32Residual = useFp32Residual;
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
         _numKvHeads = numKvHeads;
@@ -94,6 +100,8 @@ internal sealed class CudaForwardState : IDisposable
         // Only LogitsF32 (output to host) stays FP32.
         HiddenState = AllocDevice((long)newCapacity * _hiddenSize * half);
         Residual = AllocDevice((long)newCapacity * _hiddenSize * half);
+        if (_useFp32Residual)
+            ResidualF32 = AllocDevice((long)newCapacity * _hiddenSize * sizeof(float));
         NormOutput = AllocDevice((long)newCapacity * _hiddenSize * half);
         Q = AllocDevice((long)newCapacity * _numHeads * _headDim * half);
         K = AllocDevice((long)newCapacity * _numKvHeads * _headDim * half);
@@ -132,6 +140,7 @@ internal sealed class CudaForwardState : IDisposable
     {
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
+        FreeIfNonZero(ref ResidualF32);
         FreeIfNonZero(ref NormOutput);
         FreeIfNonZero(ref Q);
         FreeIfNonZero(ref K);

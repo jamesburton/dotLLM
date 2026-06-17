@@ -43,6 +43,11 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _rmsnormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
     private readonly CudaModule _i2sGemvModule;
+    private readonly CudaModule _dequantI2sModule;
+    private readonly CudaModule _relu2Module;
+    private readonly CudaModule _relu2F32Module;
+    private readonly CudaModule _relu2GluRmsNormModule;
+    private readonly CudaModule _fusedAddRmsNormF32ResModule;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -79,6 +84,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemvF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
     private readonly nint _i2sGemvA8Func;
+    private readonly nint _dequantI2sF16Func;
+    private readonly nint _relu2Func;
+    private readonly nint _relu2F32Func;
+    private readonly nint _relu2GluRmsNormFunc;
+    private readonly nint _fusedAddRmsNormF32ResFunc;
+    private readonly nint _copyF16ToF32Func;
+    private readonly nint _addF32ResF16Func;
+    private readonly nint _rmsNormF32InF16WFunc;
     private readonly nint _dequantQ8_0Func;
     private readonly nint _dequantQ4_0Func;
     private readonly nint _dequantQ5_0Func;
@@ -120,6 +133,11 @@ public sealed unsafe class CudaKernels : IDisposable
         _rmsnormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm_f32.ptx"));
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
         _i2sGemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "i2_s_gemv.ptx"));
+        _dequantI2sModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_i2_s.ptx"));
+        _relu2Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2.ptx"));
+        _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
+        _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
+        _fusedAddRmsNormF32ResModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "fused_add_rmsnorm_f32res.ptx"));
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
         _rmsnormF32Func = _rmsnormF32Module.GetFunction("rmsnorm_f32");
@@ -156,6 +174,14 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
+        _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
+        _relu2Func = _relu2Module.GetFunction("relu2_f16");
+        _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
+        _relu2GluRmsNormFunc = _relu2GluRmsNormModule.GetFunction("relu2_glu_rmsnorm_f16");
+        _fusedAddRmsNormF32ResFunc = _fusedAddRmsNormF32ResModule.GetFunction("fused_add_rmsnorm_f32res");
+        _copyF16ToF32Func = _fusedAddRmsNormF32ResModule.GetFunction("copy_f16_to_f32");
+        _addF32ResF16Func = _fusedAddRmsNormF32ResModule.GetFunction("add_f32res_f16");
+        _rmsNormF32InF16WFunc = _fusedAddRmsNormF32ResModule.GetFunction("rmsnorm_f32in_f16w");
         _dequantQ8_0Func = _dequantModule.GetFunction("dequant_q8_0_f16");
         _dequantQ4_0Func = _dequantModule.GetFunction("dequant_q4_0_f16");
         _dequantQ5_0Func = _dequantModule.GetFunction("dequant_q5_0_f16");
@@ -273,6 +299,129 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg, &sArg};
         CudaDriverApi.cuLaunchKernel(_i2sGemvA8Func,
                 (uint)n, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Dequantizes an I2_S (BitNet ternary) weight matrix to dense FP16 on the GPU for prefill GEMM.
+    /// <c>dst[row·k + col] = (code(W[row,col]) - 1) · scale</c>. Unlike the generic
+    /// <see cref="LaunchDequantToF16"/> (keyed on total element count), this needs <paramref name="n"/>
+    /// and <paramref name="k"/> to locate the per-tensor float32 scale at the tensor tail (offset n·k/4).
+    /// <paramref name="src"/> must point at the full I2_S tensor including the trailing scale.
+    /// </summary>
+    public void LaunchDequantI2_SToF16(nint src, nint dst, int n, int k, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
+
+        long totalBlocks = (long)n * (k / 128);
+        uint gridDim = (uint)Math.Min((totalBlocks + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_dequantI2sF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Fused squared-ReLU GLU (BitNet): <c>out = relu(gate)² · up</c>. FP16, half2 vectorized.</summary>
+    public void LaunchReLU2(nint gate, nint up, nint output, int n, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
+        int total = n * seqLen;
+        uint gridDim = (uint)((total / 2 + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_relu2Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Fused squared-ReLU GLU (BitNet), all FP32: <c>out = relu(gate)² · up</c>.</summary>
+    public void LaunchReLU2F32(nint gate, nint up, nint output, int n, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
+        uint gridDim = (uint)((n * seqLen + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_relu2F32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Fused BitNet FFN: squared-ReLU GLU + Sub-LN RMSNorm. <c>out = rmsnorm(relu(gate)²·up) · weight</c>.
+    /// The large pre-norm intermediate (relu² amplifies values past FP16 range) is held in FP32 and
+    /// never materialized to FP16; only the normalized O(1) result is stored. One block per token row.
+    /// </summary>
+    public void LaunchReLU2GluRmsNorm(nint gate, nint up, nint weight, nint output,
+                                        int n, float eps, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, wArg = weight, outArg = output;
+        int nArg = n, slArg = seqLen;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &wArg, &outArg, &nArg, &epsArg, &slArg};
+        CudaDriverApi.cuLaunchKernel(_relu2GluRmsNormFunc,
+                (uint)seqLen, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Fused residual-add + RMSNorm with an FP32 residual stream (BitNet, whose residual
+    /// magnitude exceeds FP16 range). Residual is FP32 in/out; x/weight/output are FP16.</summary>
+    public void LaunchFusedAddRmsNormF32Res(nint residualF32, nint xF16, nint weightF16, nint outputF16,
+                                              int hiddenSize, float eps, int rows, nint stream)
+    {
+        nint resArg = residualF32, xArg = xF16, wArg = weightF16, outArg = outputF16;
+        int nArg = hiddenSize;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&resArg, &xArg, &wArg, &outArg, &nArg, &epsArg};
+        CudaDriverApi.cuLaunchKernel(_fusedAddRmsNormF32ResFunc,
+                (uint)rows, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Widen an FP16 buffer to FP32 (seeds the FP32 residual from the FP16 embedding).</summary>
+    public void LaunchCopyF16ToF32(nint srcF16, nint dstF32, int n, nint stream)
+    {
+        nint srcArg = srcF16, dstArg = dstF32;
+        int nArg = n;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg};
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_copyF16ToF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Final residual add with FP32 residual: <c>output_f16 = FP16(residual_f32 + x_f16)</c>.</summary>
+    public void LaunchAddF32ResF16(nint residualF32, nint xF16, nint outputF16, int n, nint stream)
+    {
+        nint resArg = residualF32, xArg = xF16, outArg = outputF16;
+        int nArg = n;
+        void** args = stackalloc void*[] {&resArg, &xArg, &outArg, &nArg};
+        uint gridDim = (uint)((n + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_addF32ResF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>RMSNorm with FP32 input, FP16 weight, FP16 output. For the BitNet final norm over the
+    /// FP32 residual (norm weights are uploaded as FP16, unlike <see cref="LaunchRmsNormF32In"/>).</summary>
+    public void LaunchRmsNormF32InF16W(nint inputF32, nint weightF16, nint outputF16,
+                                         int hiddenSize, float eps, int rows, nint stream)
+    {
+        nint inputArg = inputF32, weightArg = weightF16, outputArg = outputF16;
+        int nArg = hiddenSize;
+        float epsArg = eps;
+        void** args = stackalloc void*[] {&inputArg, &weightArg, &outputArg, &nArg, &epsArg};
+        CudaDriverApi.cuLaunchKernel(_rmsNormF32InF16WFunc,
+                (uint)rows, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
@@ -809,6 +958,11 @@ public sealed unsafe class CudaKernels : IDisposable
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
         _i2sGemvModule.Dispose();
+        _dequantI2sModule.Dispose();
+        _relu2Module.Dispose();
+        _relu2F32Module.Dispose();
+        _relu2GluRmsNormModule.Dispose();
+        _fusedAddRmsNormF32ResModule.Dispose();
         _quantKvModule?.Dispose();
     }
 }
