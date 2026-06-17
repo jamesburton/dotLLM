@@ -36,6 +36,11 @@ layout(push_constant) uniform PushConstants {
     uint  ropeDim;     // number of dims to rotate (<= headDim, even)
     uint  ropeType;    // 0 = Norm (interleaved), 1 = NeoX (rotate-half)
     float theta;
+    uint  freqDim;     // frequency-denominator dim for the exponent 2*pair/freqDim.
+                       // Equals ropeDim for full rotation; for partial NeoX rope
+                       // (ropeDim < headDim, e.g. Gemma-4 global layers) this is the
+                       // FULL head dim — matching the CPU oracle's partial freq table
+                       // (RoPE.PrecomputeFrequencyTablePartial, denom = fullHeadDim).
 } pc;
 
 void main() {
@@ -56,7 +61,7 @@ void main() {
 
         // freq = 1 / theta^(2*pair / ropeDim) = exp(-log(theta) * 2*pair / ropeDim).
         // Matching CUDA exactly: powf(theta, 2*pair/ropeDim).
-        float expn  = float(2u * pair) / float(pc.ropeDim);
+        float expn  = float(2u * pair) / float(pc.freqDim);
         float freq  = 1.0 / pow(pc.theta, expn);
         float angle = float(positions[t]) * freq;
         float c     = cos(angle);
@@ -93,7 +98,7 @@ void main() {
         uint head      = rem % pc.numKvHeads;
         uint t         = rem / pc.numKvHeads;
 
-        float expn  = float(2u * pair) / float(pc.ropeDim);
+        float expn  = float(2u * pair) / float(pc.freqDim);
         float freq  = 1.0 / pow(pc.theta, expn);
         float angle = float(positions[t]) * freq;
         float c     = cos(angle);

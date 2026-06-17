@@ -913,18 +913,26 @@ public sealed unsafe class CudaKernels : IDisposable
         _ => 0,
     };
 
-    /// <summary>FP32 RoPE: in-place rotation on FP32 Q and K.</summary>
+    /// <summary>
+    /// FP32 RoPE: in-place rotation on FP32 Q and K. <paramref name="freqDim"/> is the
+    /// frequency-denominator dim for the exponent <c>2*pair/freqDim</c>: pass 0 (default) to use
+    /// <paramref name="ropeDim"/> (full rotation); for partial NeoX rope (Gemma-4 global layers,
+    /// <paramref name="ropeDim"/> &lt; <paramref name="headDim"/>) pass the FULL head dim so the
+    /// exponent matches the CPU/Vulkan oracle.
+    /// </summary>
     public void LaunchRoPEF32(nint q, nint k, nint positions,
                                 int seqLen, int numHeads, int numKvHeads, int headDim,
-                                int ropeDim, float theta, int ropeType, nint stream)
+                                int ropeDim, float theta, int ropeType, nint stream,
+                                int freqDim = 0)
     {
         nint qArg = q, kArg = k, posArg = positions;
         int slArg = seqLen, nhArg = numHeads, nkvArg = numKvHeads;
         int hdArg = headDim, rdArg = ropeDim, rtArg = ropeType;
+        int fdArg = freqDim; // 0 ⇒ kernel falls back to rope_dim
         float thetaArg = theta;
 
         void** args = stackalloc void*[] {&qArg, &kArg, &posArg, &slArg, &nhArg, &nkvArg,
-                        &hdArg, &rdArg, &thetaArg, &rtArg};
+                        &hdArg, &rdArg, &thetaArg, &rtArg, &fdArg};
 
         int halfRope = ropeDim / 2;
         int totalPairs = seqLen * Math.Max(numHeads, numKvHeads) * halfRope;

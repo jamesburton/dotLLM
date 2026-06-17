@@ -8,7 +8,8 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
     float* __restrict__ k,
     const int* __restrict__ positions,
     const int seq_len, const int num_heads, const int num_kv_heads,
-    const int head_dim, const int rope_dim, const float theta, const int rope_type)
+    const int head_dim, const int rope_dim, const float theta, const int rope_type,
+    const int freq_dim)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_rope = rope_dim / 2;
@@ -20,6 +21,10 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
     // current NeoX model. NOTE: PTX must be regenerated on the CUDA box (no nvcc
     // on the Strix Halo dev host) — no CUDA partial-NeoX model is enabled today.
     int neox_pair_offset = head_dim / 2;
+    // Frequency-denominator dim for the exponent 2*pair/freq_dim. Equals rope_dim for
+    // full rotation; for partial NeoX rope (Gemma-4 global) freq_dim is the FULL head
+    // dim, matching the CPU oracle's partial freq table. Callers pass 0 to mean rope_dim.
+    int fd = freq_dim > 0 ? freq_dim : rope_dim;
     int total_q_pairs = seq_len * num_heads * half_rope;
     int total_k_pairs = seq_len * num_kv_heads * half_rope;
 
@@ -30,7 +35,7 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
         int head = remainder % num_heads;
         int t = remainder / num_heads;
 
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
         float angle = (float)positions[t] * freq;
         float cos_val = cosf(angle), sin_val = sinf(angle);
 
@@ -50,7 +55,7 @@ extern "C" __global__ void __launch_bounds__(256) rope_f32(
         int head = remainder % num_kv_heads;
         int t = remainder / num_kv_heads;
 
-        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+        float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)fd);
         float angle = (float)positions[t] * freq;
         float cos_val = cosf(angle), sin_val = sinf(angle);
 

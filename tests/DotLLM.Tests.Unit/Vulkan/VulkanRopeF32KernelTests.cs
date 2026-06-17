@@ -203,6 +203,73 @@ public class VulkanRopeF32KernelTests
         AssertClose(kExpected, kActual, "K");
     }
 
+    [SkippableTheory]
+    // PARTIAL NeoX with the PRODUCTION frequency denominator = FULL head dim (NOT ropeDim).
+    // This mirrors the real Gemma-4 global-layer CPU path: the production forward builds its
+    // partial freq table via RoPE.PrecomputeFrequencyTablePartial(rotatedDim, fullHeadDim=headDim),
+    // so pair i rotates at angle pos / theta^(2i/headDim) — denominator headDim, NOT ropeDim.
+    // The Vulkan kernel must therefore be driven with freqDim = headDim.
+    //
+    // DISCRIMINATING (the bug this catches): the pre-fix shader (and the older PartialNeoX test
+    // above) used denominator = ropeDim, so at headDim 512 / ropeDim 128 the angles were computed
+    // with /128 instead of /512 — a large divergence that flipped the real-26B next token while
+    // the GlobalHeadDim=32 synthetic fixture's drift stayed below the argmax-flip threshold. With
+    // freqDim defaulting to ropeDim this test FAILS; with freqDim = headDim it passes.
+    // (seqLen, numHeads, numKvHeads, headDim, ropeDim, theta) — last row is the real 26B global config.
+    [InlineData(4, 2, 2, 64, 16, 1_000_000f)]
+    [InlineData(1, 8, 2, 128, 32, 1_000_000f)]
+    [InlineData(6, 16, 2, 512, 128, 1_000_000f)]
+    public void Launch_MatchesCpuReference_PartialNeoX_FullHeadFreqDenom(
+        int seqLen, int numHeads, int numKvHeads, int headDim, int ropeDim, float theta)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        int rotatedPairs = ropeDim / 2;
+
+        var rng = new Random(0xC0DE + seqLen * 13 + numHeads * 7 + headDim + ropeDim);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = i;
+
+        // PRODUCTION partial freq table: rotatedPairs (ropeDim/2) entries per position, but the
+        // exponent denominator is the FULL head dim (headDim), exactly as the real Gemma-4 forward.
+        float[] cosTable = new float[seqLen * rotatedPairs];
+        float[] sinTable = new float[seqLen * rotatedPairs];
+        RoPE.PrecomputeFrequencyTablePartial(seqLen, ropeDim, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpected = (float[])k.Clone();
+        RoPE.ExecutePartialNeoX(
+            qExpected.AsSpan(), kExpected.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, rotatedPairs,
+            cosTable, sinTable);
+
+        using var device = VulkanDevice.Create();
+        using var kernel = RopeF32Kernel.Create(device, spvDir);
+
+        using var bufQ = device.Allocate(q.Length * sizeof(float));
+        using var bufK = device.Allocate(k.Length * sizeof(float));
+        using var bufPos = device.Allocate((long)positions.Length * sizeof(int));
+
+        device.Upload(q.AsSpan(), bufQ);
+        device.Upload(k.AsSpan(), bufK);
+        device.Upload(MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        // freqDim = headDim is the fix: drive the per-pair frequency denominator with the full head.
+        kernel.Launch(bufQ, bufK, bufPos,
+            seqLen, numHeads, numKvHeads, headDim, ropeDim, theta,
+            RopeF32Kernel.Variant.NeoX, freqDim: headDim);
+
+        float[] qActual = new float[q.Length];
+        float[] kActual = new float[k.Length];
+        device.Download(bufQ, qActual);
+        device.Download(bufK, kActual);
+
+        AssertClose(qExpected, qActual, "Q");
+        AssertClose(kExpected, kActual, "K");
+    }
+
     // ─────────────────────────────────────────────────────────────
 
     private static float[] RandomFloats(Random rng, int count)

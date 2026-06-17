@@ -2599,10 +2599,19 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // RoPE(Q, K) — per-layer theta / rotated dims, NeoX. V is NOT roped.
+        // Gemma-4 global layers use PARTIAL NeoX rope: only the leading `ropeDim`
+        // dims rotate (ropeDim < headDim), pairing dim i with i+headDim/2, but the
+        // per-pair frequency denominator is the FULL head dim — NOT ropeDim. The CPU
+        // oracle builds its partial freq table over fullHeadDim
+        // (RoPE.PrecomputeFrequencyTablePartial), so we pass freqDim = headDim here.
+        // For sliding (full-rotation) layers ropeDim == headDim ⇒ freqDim == ropeDim,
+        // byte-identical to the default. Without this the global-layer angles were
+        // computed with denominator ropeDim (128) vs the CPU's 512 — a silent
+        // divergence that only surfaced at the real 26B scale (head_dim 512).
         _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
             seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
             headDim: headDim, ropeDim: ropeDim, theta: ropeTheta,
-            variant: RopeF32Kernel.Variant.NeoX);
+            variant: RopeF32Kernel.Variant.NeoX, freqDim: headDim);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Attention K/V source: either this forward's freshly-projected window
