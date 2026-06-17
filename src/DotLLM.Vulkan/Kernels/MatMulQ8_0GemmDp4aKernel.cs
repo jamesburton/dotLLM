@@ -8,7 +8,7 @@ namespace DotLLM.Vulkan.Kernels;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Tiled-GEMM analogue of <see cref="MatMulQ8_0Dp4aPqKernel"/> (decode GEMV).
+/// Tiled-GEMM analogue of <see cref="MatMulQ8_0MmvqKernel"/> (decode GEMV).
 /// Targets compute-bound prefill (<c>seqLen = N &gt; 1</c>) on devices that
 /// accelerate <c>dotPacked4x8AccSatEXT</c> but lack
 /// <c>VK_KHR_cooperative_matrix</c> — e.g. Intel Arc Xe-LPG. Binding and

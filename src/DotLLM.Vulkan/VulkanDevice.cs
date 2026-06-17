@@ -295,6 +295,23 @@ public sealed class VulkanDevice : IDisposable
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices)
             .ThrowOnError("vkEnumeratePhysicalDevices");
 
+        // Manual override (testing / iGPU targeting): DOTLLM_VULKAN_DEVICE_INDEX
+        // picks a device by enumeration index; DOTLLM_VULKAN_DEVICE_VENDOR (hex
+        // PCI vendor, e.g. 0x8086 for Intel) picks the first device of that
+        // vendor. Either forces the integrated Intel Arc on a box where the
+        // scorer would otherwise pick the discrete NVIDIA. Falls through to
+        // scoring when unset/invalid.
+        nint forced = ResolveForcedDevice(devices);
+        if (forced != 0)
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(forced, out var fp);
+            name = ReadDeviceName(fp);
+            vendor = fp.vendorID;
+            type = fp.deviceType;
+            apiVersion = fp.apiVersion;
+            return forced;
+        }
+
         // Score every device. Prefer: discrete > integrated > other/CPU.
         // Within discrete, prefer AMD/NVIDIA over Intel (Intel rarely has dGPUs,
         // but if one is present it's often weaker than an AMD/NVIDIA dGPU).
@@ -682,6 +699,37 @@ public sealed class VulkanDevice : IDisposable
     }
 
     // Vendor IDs are PCI SIG assignments. 0x10DE=NVIDIA, 0x1002=AMD, 0x8086=Intel, 0x13B5=ARM, 0x5143=Qualcomm.
+    /// <summary>
+    /// Resolves a manually-forced physical device from environment overrides, or
+    /// 0 if none/invalid. <c>DOTLLM_VULKAN_DEVICE_INDEX</c> selects by enumeration
+    /// index; <c>DOTLLM_VULKAN_DEVICE_VENDOR</c> (hex PCI vendor, e.g.
+    /// <c>0x8086</c> for Intel) selects the first device of that vendor.
+    /// </summary>
+    /// <param name="devices">Enumerated physical-device handles.</param>
+    /// <returns>The forced device handle, or 0 when no valid override is set.</returns>
+    private static nint ResolveForcedDevice(nint[] devices)
+    {
+        string? idxEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_INDEX");
+        if (int.TryParse(idxEnv, out int idx) && idx >= 0 && idx < devices.Length)
+            return devices[idx];
+
+        string? vendorEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR");
+        if (!string.IsNullOrEmpty(vendorEnv))
+        {
+            string hex = vendorEnv.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? vendorEnv[2..] : vendorEnv;
+            if (uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out uint wantVendor))
+            {
+                foreach (var dev in devices)
+                {
+                    VulkanApi.vkGetPhysicalDeviceProperties(dev, out var props);
+                    if (props.vendorID == wantVendor)
+                        return dev;
+                }
+            }
+        }
+        return 0;
+    }
+
     private static int ScoreDevice(int deviceType, uint vendorId)
     {
         int typeScore = deviceType switch
