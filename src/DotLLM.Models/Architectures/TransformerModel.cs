@@ -1475,6 +1475,8 @@ public sealed unsafe class TransformerModel : IModel
         int numHeads = Config.NumAttentionHeads;
         var g4 = lw.Gemma4!;
 
+        if (layer == 0) Gemma4DumpCpu("embed", hidden, seqLen * hiddenSize);
+
         // DIFFUSION region per-layer scalar split. On diffusion-gemma the LAST
         // per-layer op uses enc_layer_output_scale for the PROMPT rows [0, P) and
         // layer_output_scale for the CANVAS rows [P, seqLen) — same backbone
@@ -1621,6 +1623,7 @@ public sealed unsafe class TransformerModel : IModel
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
+        Gemma4DumpCpu($"L{layer}_oproj", normOut, seqLen * hiddenSize);
 
         // post_attention_norm, then residual add: attn_out = rms(O)*post_attn + input.
         for (int t = 0; t < seqLen; t++)
@@ -1647,6 +1650,7 @@ public sealed unsafe class TransformerModel : IModel
                         new ReadOnlySpan<float>(residual + t * hiddenSize, hiddenSize),
                         new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                         new Span<float>(attnOutP + t * hiddenSize, hiddenSize));
+                Gemma4DumpCpu($"L{layer}_attnout", attnOutP, seqLen * hiddenSize);
 
                 // ── Dense FFN branch (shared expert) ──────────────────────
                 // cur_mlp = down( geglu(gate·n) * (up·n) ), n = rms(attn_out)*ffn_norm
@@ -1696,6 +1700,23 @@ public sealed unsafe class TransformerModel : IModel
             ArrayPool<float>.Shared.Return(moeBuf);
             ArrayPool<float>.Shared.Return(tmpNormBuf);
         }
+
+        Gemma4DumpCpu($"L{layer}_out", hidden, seqLen * hiddenSize);
+    }
+
+    // Debug op-by-op dump for gemma4 CPU-vs-CUDA bisection. Gated on the
+    // DOTLLM_GEMMA4_DUMP env var (= a directory). Writes "<tag>.cpu.bin" raw F32.
+    private static readonly string? _gemma4DumpDir =
+        Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_DUMP");
+
+    private static unsafe void Gemma4DumpCpu(string tag, float* data, int count)
+    {
+        if (_gemma4DumpDir is null) return;
+        System.IO.Directory.CreateDirectory(_gemma4DumpDir);
+        var bytes = new byte[count * sizeof(float)];
+        fixed (byte* bp = bytes)
+            Buffer.MemoryCopy(data, bp, bytes.Length, (long)count * sizeof(float));
+        System.IO.File.WriteAllBytes(System.IO.Path.Combine(_gemma4DumpDir, $"{tag}.cpu.bin"), bytes);
     }
 
     /// <summary>

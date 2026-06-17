@@ -1729,6 +1729,24 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// custom router (1/√H folded into RouterScale), per-expert down scale (folded into
     /// the F32 down bank at load), layer_output_scale, and the final-logit softcap.
     /// </summary>
+    // Debug op-by-op dump for gemma4 CPU-vs-CUDA bisection. Gated on the
+    // DOTLLM_GEMMA4_DUMP env var (= a directory). Writes "<tag>.cuda.bin" raw F32.
+    private static readonly string? _gemma4DumpDir =
+        Environment.GetEnvironmentVariable("DOTLLM_GEMMA4_DUMP");
+
+    private void Gemma4Dump(string tag, nint deviceF32, int count, nint s)
+    {
+        if (_gemma4DumpDir is null) return;
+        _stream.Synchronize();
+        var buf = new float[count];
+        fixed (float* p = buf)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, deviceF32, (nuint)((long)count * sizeof(float))).ThrowOnError();
+        Directory.CreateDirectory(_gemma4DumpDir);
+        var bytes = new byte[count * sizeof(float)];
+        Buffer.BlockCopy(buf, 0, bytes, 0, bytes.Length);
+        File.WriteAllBytes(Path.Combine(_gemma4DumpDir, $"{tag}.cuda.bin"), bytes);
+    }
+
     private ITensor ForwardGemma4(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
     {
         if (!_kernels.HasGemma4Kernels)
@@ -1770,6 +1788,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (embedScale != 1.0f)
             _kernels.LaunchScaleInplaceF32(_state.HiddenStateF32, seqLen * hiddenSize, embedScale, s);
 
+        Gemma4Dump("embed", _state.HiddenStateF32, seqLen * hiddenSize, s);
+
         int numLayers = DebugMaxLayers switch
         {
             < 0 => 0,
@@ -1788,13 +1808,16 @@ public sealed unsafe class CudaTransformerModel : IModel
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
 
             RunGemma4AttentionF32(layer, in lw, g4, seqLen, eps, s);
+            Gemma4Dump($"L{layer}_oproj", _state.NormOutputF32, seqLen * hiddenSize, s);
             // attn_out = post_attention_norm(O) + residual ; leaves attn_out in HiddenStateF32.
             _kernels.LaunchRmsNormF32(_state.NormOutputF32, g4.PostAttnNorm, _state.NormOutputF32,
                 hiddenSize, eps, seqLen, s);
             _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.HiddenStateF32,
                 seqLen * hiddenSize, s);
+            Gemma4Dump($"L{layer}_attnout", _state.HiddenStateF32, seqLen * hiddenSize, s);
 
             RunGemma4FfnF32(layer, in lw, g4, moeW, seqLen, eps, s);
+            Gemma4Dump($"L{layer}_out", _state.HiddenStateF32, seqLen * hiddenSize, s);
         }
 
         // Final RMSNorm (last token only) + LM head + softcap.
