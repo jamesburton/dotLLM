@@ -7,6 +7,17 @@ REM
 REM compute_75 = Turing, the CUDA 13 floor. PTX is forward-compatible so this
 REM runs on any Turing (SM 7.5), Ampere (8.0/8.6), Ada (8.9), Hopper (9.0),
 REM or Blackwell (10.0/12.0) GPU. CUDA 13 dropped Pascal/Volta (SM 6.x/7.0).
+REM
+REM ARCH POLICY: keep the default at compute_75. The driver JITs PTX to the
+REM actual SM at module load, so compute_75 PTX already runs as native sm_86 on
+REM (e.g.) an RTX 3060 with NO perf penalty. Raising the GLOBAL default does not
+REM make anything faster; it only drops portability to Turing. The ONLY reason
+REM to use compute_86+ is a kernel that emits Ampere-only PTX (mma.sync /
+REM cp.async). For those: build that ONE kernel at the higher arch AND
+REM dispatch-gate it to capable GPUs in C# (e.g. the G3 attention path is
+REM GeForce-Ampere-gated, so its PTX never loads on Turing). Per-kernel arch
+REM overrides live in the ARCH_86 list below; the committed native/ptx tree
+REM stays uniform sm_75 except such gated kernels. See issue #70.
 setlocal EnableDelayedExpansion
 
 set ARCH=%1
@@ -40,8 +51,11 @@ if not defined MSVC_DIR (
     exit /b 1
 )
 set "MSVC_BIN=%MSVC_DIR%\bin\Hostx64\x64"
-if not exist "%MSVC_BIN%\cl.exe" (
-    echo cl.exe not found at %MSVC_BIN%
+REM Delayed expansion below: a pre-set MSVC_DIR may live under "Program Files
+REM (x86)" — the literal ) in (x86) would prematurely close a %VAR% echo inside
+REM a parenthesised if-block, so reference !MSVC_BIN! (delayed) instead.
+if not exist "!MSVC_BIN!\cl.exe" (
+    echo cl.exe not found at "!MSVC_BIN!"
     exit /b 1
 )
 set "PATH=%MSVC_BIN%;%PATH%"
@@ -63,6 +77,12 @@ REM over time steps, so the two kernels backing it must be compiled with FMA
 REM fusion disabled. Costs minor perf; matches the CPU bit-for-bit.
 set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32"
 
+REM Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built
+REM at compute_86 instead of the global default. These are dispatch-gated to
+REM Ampere+ GPUs in C# (the PTX never loads on Turing), so overriding their arch
+REM does not affect portability of the rest of the tree. See ARCH POLICY above.
+set "ARCH_86=attention_flash_mma"
+
 echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
 
@@ -77,18 +97,25 @@ for %%F in ("%KERNEL_DIR%\*.cu") do (
     for %%M in (%NO_FMA%) do (
         if /I "%%~nF"=="%%M" set "FMAD_FLAG=-fmad=false"
     )
-    "%NVCC%" -ptx -arch=%ARCH% !FAST_FLAG! !FMAD_FLAG! -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
+    REM Per-kernel arch override: Ampere-only kernels build at compute_86.
+    set "KARCH=%ARCH%"
+    for %%M in (%ARCH_86%) do (
+        if /I "%%~nF"=="%%M" set "KARCH=compute_86"
+    )
+    "%NVCC%" -ptx -arch=!KARCH! !FAST_FLAG! !FMAD_FLAG! -allow-unsupported-compiler -o "%OUT_DIR%\!BASE!.ptx" "%%F"
     if errorlevel 1 (
         echo FAILED: %%~nxF
         set FAIL=1
     ) else (
+        set "ARCH_NOTE="
+        if /I not "!KARCH!"=="%ARCH%" set "ARCH_NOTE= [!KARCH!]"
         if defined FAST_FLAG (
-            echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)
+            echo   %%~nxF -^> !BASE!.ptx ^(fast_math^)!ARCH_NOTE!
         ) else (
             if defined FMAD_FLAG (
-                echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)
+                echo   %%~nxF -^> !BASE!.ptx ^(precise, no FMA — bit-perfect with CPU^)!ARCH_NOTE!
             ) else (
-                echo   %%~nxF -^> !BASE!.ptx ^(precise^)
+                echo   %%~nxF -^> !BASE!.ptx ^(precise^)!ARCH_NOTE!
             )
         )
     )
