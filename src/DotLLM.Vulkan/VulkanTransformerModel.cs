@@ -2643,6 +2643,92 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
+    /// Diagnostic: run the EMBEDDING (gather + Gemma sqrt(hidden) scale) on the
+    /// GPU for <paramref name="tokenIds"/>, returning the host residual stream
+    /// <c>[seqLen × hiddenSize]</c>. Mirrors the prologue of Forward. For the
+    /// hybrid bisection harness (embedding-vs-pipeline localisation) only.
+    /// </summary>
+    public unsafe float[] RunGemma4EmbeddingOnHost(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions)
+    {
+        int seqLen = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        bool resized = _state.EnsureCapacity(seqLen);
+        if (resized) InvalidateKernelCaches();
+        ValidateTokenIds(tokenIds);
+        UploadPositions(positions);
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+        _state.ResetHiddenSlot();
+        RecordEmbeddingGather(cmdBuf, tokenIds);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        if (_embedScale is not null)
+        {
+            _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, Config.EmbeddingScale!.Value);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+        _submit.SubmitAndWait();
+
+        long bytes = (long)seqLen * hiddenSize * sizeof(float);
+        using var staging = _device.Allocate(bytes);
+        _device.CopyBufferSynchronous(_state.HiddenState, staging, (ulong)bytes);
+        var result = new float[seqLen * hiddenSize];
+        _device.Download(staging, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Diagnostic: run the FINAL head (last-row copy → output RMSNorm → lm_head →
+    /// final-logit soft-cap) on the GPU given a host residual stream
+    /// <paramref name="hidden"/> (<c>[seqLen × hiddenSize]</c>), returning the
+    /// host last-token logits <c>[vocabSize]</c>. Mirrors the tail of Forward.
+    /// For the hybrid bisection harness (embedding-vs-head localisation) only.
+    /// </summary>
+    public unsafe float[] RunGemma4FinalHeadOnHost(ReadOnlySpan<float> hidden, int seqLen)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        if (hidden.Length != (long)seqLen * hiddenSize)
+            throw new ArgumentException($"hidden length {hidden.Length} != seqLen*hidden {(long)seqLen * hiddenSize}.", nameof(hidden));
+
+        bool resized = _state.EnsureCapacity(seqLen);
+        if (resized) InvalidateKernelCaches();
+
+        long bytes = (long)hidden.Length * sizeof(float);
+        using var staging = _device.Allocate(bytes);
+        _state.ResetHiddenSlot();
+        _device.Upload(hidden, staging);
+        _device.CopyBufferSynchronous(staging, _state.HiddenState, (ulong)bytes);
+
+        _submit.Begin();
+        nint cmdBuf = _submit.CommandBuffer;
+        KernelSupport.HostToComputeBarrier(cmdBuf);
+
+        long rowBytes = (long)hiddenSize * sizeof(float);
+        long lastRowOffset = (long)(seqLen - 1) * rowBytes;
+        KernelSupport.ComputeToTransferBarrier(cmdBuf);
+        RecordCopyBufferRange(cmdBuf, _state.HiddenState, _state.NormOutput,
+            srcOffset: (ulong)lastRowOffset, dstOffset: 0, size: (ulong)rowBytes);
+        KernelSupport.TransferToComputeBarrier(cmdBuf);
+
+        _rmsnorm.Record(cmdBuf, _state.NormOutput, _weights.OutputNormWeight, _state.NormOutput,
+            rowCount: 1, n: hiddenSize, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+            _state.NormOutput, _state.Logits,
+            _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: 1);
+        KernelSupport.ComputeToHostBarrier(cmdBuf);
+        _submit.SubmitAndWait();
+
+        var logits = new float[vocabSize];
+        _device.Download(_state.Logits, logits);
+        ApplyFinalLogitSoftcapHost(logits);
+        return logits;
+    }
+
+    /// <summary>
     /// Records the Gemma-4 attention block for one layer (cacheless / single
     /// forward — the AR validation + diffusion paths are cacheless). Mirrors the
     /// CPU <c>RunGemma4Layer</c> attention: attn_norm → Q/K(/V) proj (V branches

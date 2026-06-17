@@ -117,6 +117,8 @@ public sealed unsafe class TransformerModel : IModel
     internal Gemma4LayerOverrideFn? Gemma4LayerOverride { get; set; }
     /// <summary>Predicate selecting which layers the override applies to. Null ⇒ all gemma4 layers when an override is set.</summary>
     internal Func<int, bool>? Gemma4LayerOverrideSelector { get; set; }
+    /// <summary>Diagnostic: invoked with the residual stream right AFTER the embedding lookup (layer = -1), so a harness can capture or replace the embedding (e.g. inject a Vulkan embedding). NOT a production path.</summary>
+    internal Gemma4LayerOverrideFn? Gemma4PostEmbeddingHook { get; set; }
 
     private TransformerModel(ModelConfig config, TransformerWeights weights, TransformerForwardState state,
                        object? mmapAnchor, int ropeDim, RoPEType ropeType,
@@ -723,6 +725,10 @@ public sealed unsafe class TransformerModel : IModel
 
         // 1. EMBEDDING LOOKUP
         EmbeddingLookup(tokenIds, hidden, hiddenSize);
+
+        // Diagnostic embedding hook (bug-#2 bisection): capture or replace the
+        // scaled embedding before the layers. No-op on the normal path (null).
+        Gemma4PostEmbeddingHook?.Invoke(hidden, -1, seqLen);
 
         // 1b. DIFFUSION region embedding (diffusion-gemma only). The unified
         // [prompt | canvas] forward splits at P = _currentMaskSpec.PrefixLength

@@ -284,11 +284,36 @@ public sealed class Gemma4GgufForwardTests
 
         _output.WriteLine($"[hybrid bisect] spec='{spec}' → {vkLayers.Count} VK layers: [{string.Join(",", vkLayers.OrderBy(x => x))}]");
 
+        // When DOTLLM_HYBRID_VK_HEAD=1, also run the FINAL head (norm + lm_head +
+        // softcap) on Vulkan, fed the post-last-layer residual stream. Pin down
+        // whether bug #2 lives in the embedding or the final head: spec=all gives
+        // a correct residual stream (CPU head ⇒ Paris); if the VK head on that
+        // same stream gives the wrong token, the head is the culprit.
+        bool vkHead = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VK_HEAD") == "1";
+        bool vkEmbed = Environment.GetEnvironmentVariable("DOTLLM_HYBRID_VK_EMBED") == "1";
+        float[]? finalHidden = null;
+
+        // Optionally replace the CPU embedding with the Vulkan embedding (inject
+        // it after EmbeddingLookup). Combined with spec=all + VK_HEAD this gives a
+        // fully-Vulkan pipeline EXCEPT the per-layer execution stays per-submit —
+        // so if it breaks 'Paris' the embedding is bug #2; if not, the native
+        // pipelined (single-command-buffer) execution is.
+        if (vkEmbed)
+        {
+            float[] vkEmb = vk.RunGemma4EmbeddingOnHost(promptIds, positions);
+            cpu.Gemma4PostEmbeddingHook = (hidden, _, sl) =>
+                vkEmb.AsSpan(0, sl * hiddenSize).CopyTo(new Span<float>(hidden, sl * hiddenSize));
+        }
+
         if (vkLayers.Count > 0)
         {
             cpu.Gemma4LayerOverrideSelector = layer => vkLayers.Contains(layer);
             cpu.Gemma4LayerOverride = (hidden, layer, sl) =>
+            {
                 vk.RunGemma4LayerOnHost(new Span<float>(hidden, sl * hiddenSize), layer, sl, positions);
+                if (layer == numLayers - 1)
+                    finalHidden = new Span<float>(hidden, sl * hiddenSize).ToArray();
+            };
         }
 
         using ITensor logits = cpu.Forward(promptIds, positions, deviceId: -1, kvCache: null,
@@ -300,7 +325,20 @@ public sealed class Gemma4GgufForwardTests
         for (int v = 0; v < vocab; v++) { float x = p[lastRow + v]; if (x > bestV) { bestV = x; best = v; } }
         string decoded = tokenizer.Decode(new[] { best });
         bool isParis = decoded.Contains("Paris", StringComparison.OrdinalIgnoreCase);
-        _output.WriteLine($"  next token : id={best} '{decoded}' logit={bestV:F3}  PARIS={(isParis ? "YES" : "no")}");
+        _output.WriteLine($"  [CPU head] next token : id={best} '{decoded}' logit={bestV:F3}  PARIS={(isParis ? "YES" : "no")}");
+
+        if (vkHead)
+        {
+            Skip.If(finalHidden is null, "VK-head test needs the last layer on VK — run with DOTLLM_HYBRID_VK_LAYERS=all (or include the last layer).");
+            float[] vkLogits = vk.RunGemma4FinalHeadOnHost(finalHidden, seqLen);
+            int vb = 0; float vv = float.NegativeInfinity;
+            for (int v = 0; v < vkLogits.Length; v++) if (vkLogits[v] > vv) { vv = vkLogits[v]; vb = v; }
+            string vkDecoded = tokenizer.Decode(new[] { vb });
+            bool vkParis = vkDecoded.Contains("Paris", StringComparison.OrdinalIgnoreCase);
+            _output.WriteLine($"  [VK head ] next token : id={vb} '{vkDecoded}' logit={vv:F3}  PARIS={(vkParis ? "YES" : "no")}");
+            Assert.True(vkParis, $"VK head on a correct residual stream: expected 'Paris', got '{vkDecoded}' (id={vb}, logit={vv:F3}). ⇒ the final norm/lm_head/softcap is bug #2.");
+            return;
+        }
 
         Assert.True(isParis, $"spec='{spec}': expected 'Paris', got '{decoded}' (id={best}, logit={bestV:F3}).");
     }
