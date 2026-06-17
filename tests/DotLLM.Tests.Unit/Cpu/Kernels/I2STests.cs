@@ -121,6 +121,94 @@ public sealed unsafe class I2STests
         finally { NativeMemory.Free(w); }
     }
 
+    // ──────────────────── W2A8 (int8-activation) path ────────────────────
+
+    /// <summary>
+    /// The W2A8 SIMD path (AVX2/AVX-VNNI) quantizes activations to int8 before the dot, so its
+    /// result differs from the full-precision float reference by the activation-quant error only.
+    /// On non-AVX2 hardware this same entry point falls back to the float path (exact), so the
+    /// tolerance below holds on every box. We assert a small absolute+relative tolerance rather
+    /// than bit-exactness. Q8_0 is per-32-block absmax int8 (~1/127 relative quant step), so a
+    /// 1e-2 absolute / 2% relative envelope comfortably covers k=256 accumulation.
+    /// </summary>
+    [Fact]
+    public void GemvI2S_W2A8_MatchesFloatReference_WithinQuantTolerance()
+    {
+        var rng = new Random(1234);
+        const int m = 6;     // output rows
+        const int k = 512;   // input dim (4 I2_S blocks / 16 Q8_0 blocks)
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.037f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_S(w, xp, yp, m, k, null);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
+                AssertWithinQuantTolerance(acc, y[r]);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>
+    /// W2A8 GEMM (prefill): each weight row is unpacked once and dotted against all N tokens.
+    /// Validates the multi-token output layout C[t*m + r] against the float reference within
+    /// activation-quant tolerance (or exactly, on the float-fallback path).
+    /// </summary>
+    [Fact]
+    public void GemmI2S_W2A8_MatchesFloatReference_WithinQuantTolerance()
+    {
+        var rng = new Random(4321);
+        const int m = 5;     // output rows (weight rows)
+        const int k = 256;   // input dim
+        const int n = 3;     // tokens
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.021f;
+
+        float[] b = new float[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] c = new float[n * m];
+            fixed (float* bp = b)
+            fixed (float* cp = c)
+                MatMul.GemmI2_S(w, bp, cp, m, k, n, null);
+
+            for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int col = 0; col < k; col++)
+                    acc += ternary[r * k + col] * scale * b[t * k + col];
+                AssertWithinQuantTolerance(acc, c[t * m + r]);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    private static void AssertWithinQuantTolerance(float expected, float actual)
+    {
+        // Absolute floor for near-zero sums; relative band for larger magnitudes.
+        float tol = 1e-2f + 0.02f * MathF.Abs(expected);
+        Assert.True(MathF.Abs(expected - actual) <= tol,
+            $"expected {expected}, got {actual}, |Δ|={MathF.Abs(expected - actual)} > tol {tol}");
+    }
+
     /// <summary>
     /// Test-side reference packer for I2_S: ternary {-1,0,+1} → codes {0,1,2}, 4 per byte
     /// in 128-element blocks, followed by a single float32 per-tensor scale. Caller frees.
