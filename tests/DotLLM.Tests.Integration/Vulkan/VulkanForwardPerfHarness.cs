@@ -150,6 +150,108 @@ public class VulkanForwardPerfHarness
         _output.WriteLine($"decode_tok_per_sec={tokPerSec:F2}");
     }
 
+    /// <summary>
+    /// Isolated bandwidth microbench for the Q4_K MMVQ decode GEMV. Allocates a
+    /// single large device-local Q4_K weight blob, quantizes one random
+    /// activation to Q8_1, then times <c>iters</c> back-to-back dispatches in one
+    /// submit (no inter-dispatch barrier — they all read the immutable weights so
+    /// the GPU can overlap them, exposing the kernel's true streaming bandwidth
+    /// independent of the full forward pass's dispatch/barrier serialization).
+    /// Enable with DOTLLM_VULKAN_MMVQ_BW=1.
+    /// </summary>
+    [SkippableFact]
+    public void MeasureMmvqBandwidth()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MMVQ_BW") == "1",
+            "DOTLLM_VULKAN_MMVQ_BW=1 not set.");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device.");
+        string spvDir = ResolveSpvDir();
+
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct, "No integer-dot-product support.");
+
+        // FFN-down-ish shape: M=4096, K=14336 → ~28 MiB of Q4_K weights per matmul.
+        int m = ParseEnvInt("DOTLLM_VULKAN_MMVQ_BW_M", 4096);
+        int k = ParseEnvInt("DOTLLM_VULKAN_MMVQ_BW_K", 14336);
+        int iters = ParseEnvInt("DOTLLM_VULKAN_MMVQ_BW_ITERS", 50);
+
+        int blocksPerRow = k / 256;
+        long rowBytes = (long)blocksPerRow * 144;
+        long wBytes = (long)m * rowBytes;
+        _output.WriteLine($"mmvq_bw: M={m} K={k} weight_MiB={wBytes / 1048576.0:F1} iters={iters}");
+
+        var rng = new Random(1);
+        byte[] w = new byte[wBytes];
+        rng.NextBytes(w);
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        using var quant = DotLLM.Vulkan.Kernels.QuantizeQ8_1Kernel.TryCreate(device, spvDir)!;
+        using var mmvq = DotLLM.Vulkan.Kernels.MatMulQ4KMmvqKernel.TryCreate(device, spvDir)!;
+
+        long wBufBytes = (wBytes + 3) & ~3L;
+        using var bufW = device.Allocate(wBufBytes);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufXq = device.Allocate(DotLLM.Vulkan.Kernels.QuantizeQ8_1Kernel.PackedBytes(k));
+        using var bufXds = device.Allocate(DotLLM.Vulkan.Kernels.QuantizeQ8_1Kernel.ScaleBytes(k));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(w), bufW);
+        device.Upload(x, bufX);
+
+        // Quantize once.
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            quant.Record(ctx.CommandBuffer, bufX, bufXq, bufXds, k);
+            ctx.SubmitAndWait();
+        }
+
+        // Warmup + timed runs. Each run records `iters` MMVQ dispatches into one
+        // command buffer (no barrier between them) and submits once.
+        void RunBatch()
+        {
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            for (int i = 0; i < iters; i++)
+                mmvq.Record(ctx.CommandBuffer, bufW, bufXq, bufXds, bufY, m, k);
+            ctx.SubmitAndWait();
+        }
+
+        RunBatch(); // warmup (driver pipeline compile)
+        RunBatch();
+
+        const int batches = 5;
+        var sw = Stopwatch.StartNew();
+        for (int b = 0; b < batches; b++) RunBatch();
+        sw.Stop();
+
+        double totalDispatches = (double)batches * iters;
+        double msPerDispatch = sw.Elapsed.TotalMilliseconds / totalDispatches;
+        double gbPerSec = wBytes / (msPerDispatch / 1000.0) / 1e9;
+        _output.WriteLine($"mmvq_bw_ms_per_dispatch={msPerDispatch:F3}");
+        _output.WriteLine($"mmvq_bw_gb_per_sec={gbPerSec:F1}");
+
+        // Serialized variant: ONE dispatch per submit (mirrors the forward pass,
+        // where a full barrier + submit boundary sits around every GEMV). Exposes
+        // the per-dispatch latency tax the batched number hides.
+        void RunSingle()
+        {
+            using var ctx = device.CreateSubmitContext();
+            ctx.Begin();
+            mmvq.Record(ctx.CommandBuffer, bufW, bufXq, bufXds, bufY, m, k);
+            ctx.SubmitAndWait();
+        }
+        RunSingle();
+        const int singles = 100;
+        var sw2 = Stopwatch.StartNew();
+        for (int i = 0; i < singles; i++) RunSingle();
+        sw2.Stop();
+        double msSingle = sw2.Elapsed.TotalMilliseconds / singles;
+        double gbSingle = wBytes / (msSingle / 1000.0) / 1e9;
+        _output.WriteLine($"mmvq_bw_serialized_ms_per_dispatch={msSingle:F3}");
+        _output.WriteLine($"mmvq_bw_serialized_gb_per_sec={gbSingle:F1}");
+    }
+
     private static unsafe int Argmax(ITensor logits)
     {
         int n = logits.Shape[logits.Shape.Rank - 1];
