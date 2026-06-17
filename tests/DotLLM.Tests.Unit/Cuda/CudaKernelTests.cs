@@ -10,6 +10,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Tests individual CUDA kernels against CPU reference implementations.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaKernelTests : IDisposable
 {
     private readonly CudaContext? _ctx;
@@ -158,44 +159,11 @@ public class CudaKernelTests : IDisposable
         }
     }
 
-    [SkippableFact]
-    public void LaunchAttention_ThrowsForExcessiveSharedMemory()
-    {
-        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        Skip.If(_kernels == null, "PTX files not found");
-
-        nint s = _stream!.Handle;
-
-        // seqKv = 100_000 requires ~400 KB shared memory → exceeds any GPU's limit.
-        // All pointer args can be zero since the kernel should never launch.
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            _kernels!.LaunchAttention(
-                q: 0, k: 0, v: 0, output: 0,
-                seqQ: 1, seqKv: 100_000,
-                numHeads: 1, numKvHeads: 1, headDim: 128,
-                positionOffset: 0, slidingWindow: 0, stream: s));
-
-        Assert.Contains("shared memory", ex.Message);
-        Assert.Contains("100000", ex.Message);
-    }
-
-    [SkippableFact]
-    public void LaunchAttentionF32_ThrowsForExcessiveSharedMemory()
-    {
-        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available");
-        Skip.If(_kernels == null, "PTX files not found");
-
-        nint s = _stream!.Handle;
-
-        var ex = Assert.Throws<InvalidOperationException>(() =>
-            _kernels!.LaunchAttentionF32(
-                q: 0, k: 0, v: 0, output: 0,
-                seqQ: 1, seqKv: 100_000,
-                numHeads: 1, numKvHeads: 1, headDim: 128,
-                positionOffset: 0, slidingWindow: 0, stream: s));
-
-        Assert.Contains("shared memory", ex.Message);
-    }
+    // NOTE: The former LaunchAttention[F32]_ThrowsForExcessiveSharedMemory tests were removed.
+    // The attention kernels now use a tiled online softmax with fixed (~2 KB) shared memory
+    // independent of seqKv, so the excessive-shared-memory failure mode they asserted no longer
+    // exists. With null buffers they launched and triggered a sticky CUDA error 700 that poisoned
+    // the context for subsequent tests.
 
     public void Dispose()
     {

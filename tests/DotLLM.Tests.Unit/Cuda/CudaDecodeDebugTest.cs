@@ -17,6 +17,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Generates 15 tokens and compares logits at each step.
 /// </summary>
 [Trait("Category", "GPU")]
+[Collection(CudaCollection.Name)]
 public class CudaDecodeDebugTest
 {
     private readonly ITestOutputHelper _out;
