@@ -53,6 +53,24 @@ internal static partial class CublasApi
         nint C, int Ctype, int ldc,
         int computeType, int algo);
 
+    /// <summary>
+    /// Strided-batched mixed-precision GEMM — FP16 input, configurable accumulate.
+    /// Computes a batch of GEMMs where each matrix in the batch is offset by a fixed stride.
+    /// A stride of 0 broadcasts the same matrix across the batch (used for GQA K/V sharing).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cublasGemmStridedBatchedEx(
+        nint handle,
+        int transa, int transb,
+        int m, int n, int k,
+        nint alpha,
+        nint A, int Atype, int lda, long strideA,
+        nint B, int Btype, int ldb, long strideB,
+        nint beta,
+        nint C, int Ctype, int ldc, long strideC,
+        int batchCount,
+        int computeType, int algo);
+
     // ── cuBLAS constants ─────────────────────────────────────────────
 
     /// <summary>CUBLAS_OP_N — no transpose.</summary>
