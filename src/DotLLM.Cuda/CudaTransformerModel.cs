@@ -1913,11 +1913,17 @@ public sealed unsafe class CudaTransformerModel : IModel
                 lw.VOutputDim, lw.VInputDim, seqLen);
         }
 
+        Gemma4Dump($"A{layer}_qraw", _state.QF32, seqLen * numHeads * headDim, s);
+        Gemma4Dump($"A{layer}_kraw", _state.KF32, seqLen * numKvHeads * headDim, s);
+
         // Per-head Q/K RMSNorm (× learned weight); weight-less V RMSNorm (unit gamma).
         _kernels.LaunchPerHeadRmsNormF32(_state.QF32, g4.QNorm, eps, numHeads, headDim, seqLen, s);
         _kernels.LaunchPerHeadRmsNormF32(_state.KF32, g4.KNorm, eps, numKvHeads, headDim, seqLen, s);
         _kernels.LaunchRmsNormWeightlessF32(_state.VF32, _state.VF32, headDim, eps,
             seqLen * numKvHeads, s);
+        Gemma4Dump($"A{layer}_qnorm", _state.QF32, seqLen * numHeads * headDim, s);
+        Gemma4Dump($"A{layer}_knorm", _state.KF32, seqLen * numKvHeads * headDim, s);
+        Gemma4Dump($"A{layer}_vnorm", _state.VF32, seqLen * numKvHeads * headDim, s);
 
         // RoPE on Q and K (V not roped). Global layers: partial NeoX (pair (i, i+headDim/2),
         // freq base over the full head dim). Sliding layers: full NeoX rotation.
@@ -1935,6 +1941,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta,
                 CudaKernels.ToCudaRopeType(RoPEType.NeoX), s);
         }
+        Gemma4Dump($"A{layer}_qrope", _state.QF32, seqLen * numHeads * headDim, s);
+        Gemma4Dump($"A{layer}_krope", _state.KF32, seqLen * numKvHeads * headDim, s);
 
         // Attention scale = 1.0 (q/k-norm make Q,K unit). The F32 attention kernel
         // hardcodes 1/sqrt(headDim); pre-scale Q by sqrt(headDim) so it cancels.
@@ -1944,6 +1952,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         int slidingWindow = GetGemmaLayerSlidingWindow(layer);
         _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
             seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+        Gemma4Dump($"A{layer}_attn", _state.AttnOutputF32, seqLen * numHeads * headDim, s);
 
         // o_proj → NormOutputF32.
         ProjectF32(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,

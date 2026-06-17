@@ -1516,6 +1516,9 @@ public sealed unsafe class TransformerModel : IModel
         else
             Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
 
+        Gemma4DumpCpu($"A{layer}_qraw", q, seqLen * qStrideLayer);
+        Gemma4DumpCpu($"A{layer}_kraw", k, seqLen * kvStrideLayer);
+
         // Q-norm (rms * attn_q_norm per head), then K-norm (rms * attn_k_norm per
         // kv head). V-norm is WEIGHT-LESS rms per kv head (no scale), all layers.
         if (lw.QNormWeight is not null)
@@ -1523,6 +1526,9 @@ public sealed unsafe class TransformerModel : IModel
         if (lw.KNormWeight is not null)
             ApplyPerHeadNorm(lw.KNormWeight, k, numKvHeadsLayer, headDimLayer, seqLen, eps);
         ApplyPerHeadNormWeightless(v, numKvHeadsLayer, headDimLayer, seqLen, eps);
+        Gemma4DumpCpu($"A{layer}_qnorm", q, seqLen * qStrideLayer);
+        Gemma4DumpCpu($"A{layer}_knorm", k, seqLen * kvStrideLayer);
+        Gemma4DumpCpu($"A{layer}_vnorm", v, seqLen * kvStrideLayer);
 
         // RoPE on Q and K (V is NOT roped). Per-attention-type table/dim/pairing.
         // Global (full-attention) layers use PARTIAL NeoX rope: only the leading
@@ -1544,6 +1550,8 @@ public sealed unsafe class TransformerModel : IModel
                 qSpan, kSpan, positions,
                 numHeads, numKvHeadsLayer, headDimLayer, ropeDimLayer,
                 ropeCos, ropeSin, ropeTypeLayer);
+        Gemma4DumpCpu($"A{layer}_qrope", q, seqLen * qStrideLayer);
+        Gemma4DumpCpu($"A{layer}_krope", k, seqLen * kvStrideLayer);
 
         // Attention: softmax(Qᵀ·K * 1.0 + causal mask) · V, GQA broadcast. Scale is
         // 1.0 (q_norm/k_norm make Q,K unit) — QueryPreAttnScalar=1.0 → 1/sqrt(1)=1.
@@ -1620,6 +1628,7 @@ public sealed unsafe class TransformerModel : IModel
                 layerSlidingWindow, softCap: 0f,
                 _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
         }
+        Gemma4DumpCpu($"A{layer}_attn", attnOut, seqLen * qStrideLayer);
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
