@@ -171,3 +171,54 @@ extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_coale
     for (int tk = causal_len; tk < s; tk++)
         row[(size_t)tk * s] = __float2half(0.0f);
 }
+
+// FP32-scores variant of the coalesced kernel (one thread per softmax row).
+//
+// Reads the QK scores in FP32 (the QK GEMM keeps COMPUTE_32F and writes CUDA_R_32F),
+// runs the same causal max/exp/normalize math in FP32, and writes the normalized probs
+// to a SEPARATE FP16 buffer for the P*V GEMM to consume. This removes the dominant
+// numeric error of the all-FP16 path: rounding the wide-range pre-softmax scores to FP16
+// before exp() (which amplifies the rounding). Post-softmax probs live in [0,1] where
+// FP16 rel error is ~5e-4, so writing the output in FP16 keeps PV on tensor cores at
+// negligible cost. Layout matches the FP16 variant: scores/probs are per-head col-major
+// [s x s], element (tq, tk) at plane_base + tq + tk*s.
+extern "C" __global__ void __launch_bounds__(256) attention_softmax_causal_coalesced_f32in_f16out(
+    const float* __restrict__ scores,
+    half* __restrict__ probs,
+    const int s,
+    const int num_heads)
+{
+    int row_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row_id >= num_heads * s) return;
+
+    int hq = row_id / s;
+    int tq = row_id % s;
+
+    const float* srow = scores + (size_t)hq * s * s + tq;  // element (tq, tk) at srow[tk * s]
+    half* prow = probs + (size_t)hq * s * s + tq;
+    int causal_len = tq + 1;
+
+    // Pass 1: max over the causal prefix (FP32 scores).
+    float max_val = -FLT_MAX;
+    for (int tk = 0; tk < causal_len; tk++)
+    {
+        float v = srow[(size_t)tk * s];
+        if (v > max_val) max_val = v;
+    }
+
+    // Pass 2: exp(x - max), accumulate sum (kept in FP32; not stored yet).
+    float sum_exp = 0.0f;
+    for (int tk = 0; tk < causal_len; tk++)
+        sum_exp += expf(srow[(size_t)tk * s] - max_val);
+
+    float sum_inv = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+
+    // Pass 3a: write normalized probs to FP16 (recompute exp from FP32 scores so the
+    // only FP16 rounding is on the final [0,1] probability).
+    for (int tk = 0; tk < causal_len; tk++)
+        prow[(size_t)tk * s] = __float2half(expf(srow[(size_t)tk * s] - max_val) * sum_inv);
+
+    // Pass 3b: zero the masked tail so P*V's full-key sum ignores it.
+    for (int tk = causal_len; tk < s; tk++)
+        prow[(size_t)tk * s] = __float2half(0.0f);
+}

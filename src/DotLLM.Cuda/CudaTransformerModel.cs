@@ -33,6 +33,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly int _ropeType;
     private readonly bool _useHighPrecisionForward;
 
+    // G3 tensor-core prefill-attention path (cuBLAS QK/PV + coalesced causal softmax).
+    // Owns the grow-on-demand scores scratch; used only when CudaG3Attention.CanUse(...)
+    // confirms a pure square-causal global-attention prefill. Otherwise attention_f16.
+    private readonly CudaG3Attention _g3Attention;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -50,6 +55,17 @@ public sealed unsafe class CudaTransformerModel : IModel
 
     /// <summary>Debug: skip bias add operations.</summary>
     internal bool DebugSkipBias { get; set; }
+
+    /// <summary>
+    /// Debug: when &gt;= 0, copy the row-major attention output ([seqLen × numHeads·headDim])
+    /// of this layer index into <see cref="DebugAttnOutputCapture"/> right after the
+    /// attention dispatch. Used to isolate G3-vs-attention_f16 parity at the attention
+    /// output (before downstream O-proj/FFN/LM-head amplification). -1 disables.
+    /// </summary>
+    internal int DebugCaptureAttnLayer { get; set; } = -1;
+
+    /// <summary>Debug: host copy of the captured attention output (FP16 bits). Null until captured.</summary>
+    internal ushort[]? DebugAttnOutputCapture { get; private set; }
 
     /// <summary>
     /// When true, <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -187,6 +203,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         _ropeDim = ropeDim;
         VramWarning = vramWarning;
         _ropeType = ropeType;
+        _g3Attention = new CudaG3Attention(kernels);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
         if (_useHighPrecisionForward)
         {
@@ -355,6 +372,13 @@ public sealed unsafe class CudaTransformerModel : IModel
         bool quantizedWeights = weights.Layers.Length > 0
             && weights.Layers[0].QQuantType is not (QuantizationType.F32 or QuantizationType.F16);
         CudaGemm.ConfigureDefault(geForceAmpere && quantizedWeights);
+
+        // G3: default the tensor-core prefill-attention path on for GeForce Ampere — the
+        // parts whose FP32-accumulate CUDA-core attention is throttled to ~half rate.
+        // Independent of weight quantization (attention runs on FP16 Q/K/V regardless).
+        // DOTLLM_CUDA_G3_ATTN overrides ("1"/"0"). Gating to a pure square-causal global
+        // prefill happens per-call in CudaG3Attention.CanUse.
+        CudaG3Attention.ConfigureDefault(geForceAmpere);
 
         var state = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
@@ -737,6 +761,21 @@ public sealed unsafe class CudaTransformerModel : IModel
                     _ropeDim, _ropeTheta, effectiveRopeType, s);
                 MarkProfile(ProfileCategory.RopeAndExtras);
 
+                // Dispatch G3 (cuBLAS tensor-core prefill attention) when the call is a
+                // pure square-causal global-attention prefill on an eligible device;
+                // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
+                // same row-major [seq, heads, headDim] output either way.
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset)
+                {
+                    if (_g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                        _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, numHeads, numKvHeads, headDim, s);
+                    else
+                        _kernels.LaunchAttention(qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim,
+                            positionOffset, slidingWindow, s);
+                }
+
                 if (kvCache is CudaQuantizedKvCache cudaQKvCache)
                 {
                     cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
@@ -745,9 +784,7 @@ public sealed unsafe class CudaTransformerModel : IModel
                     // Dequant quantized region + copy window → scratch, then regular attention
                     var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
                     MarkProfile(ProfileCategory.KvUpdate);
-                    _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim,
-                        positions[0], slidingWindow, s);
+                    DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
                 }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
@@ -755,20 +792,26 @@ public sealed unsafe class CudaTransformerModel : IModel
                     int seqKv = cudaKvCache.CurrentLength;
                     MarkProfile(ProfileCategory.KvUpdate);
 
-                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
-                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim,
-                        positions[0], slidingWindow, s);
+                    DispatchAttention(cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                        seqKv, positions[0]);
                 }
                 else
                 {
                     MarkProfile(ProfileCategory.KvUpdate);
-                    _kernels.LaunchAttention(qPtr, kPtr, vPtr, _state.AttnOutput,
-                        seqLen, seqLen, numHeads, numKvHeads, headDim,
-                        0, slidingWindow, s);
+                    DispatchAttention(kPtr, vPtr, seqLen, 0);
                 }
             }
             MarkProfile(ProfileCategory.Attention);
+
+            if (DebugCaptureAttnLayer == layer)
+            {
+                int attnElems = seqLen * numHeads * headDim;
+                var host = new ushort[attnElems];
+                _stream.Synchronize();
+                fixed (ushort* hp = host)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _state.AttnOutput, (nuint)(attnElems * sizeof(ushort))).ThrowOnError();
+                DebugAttnOutputCapture = host;
+            }
 
             // O projection → NormOutput
             Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
@@ -1815,6 +1858,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         _mlaScratchF16?.Dispose();
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
+        _g3Attention.Dispose();
         _state.Dispose();
         _weights.Dispose();
         _cpuWeights?.Dispose();

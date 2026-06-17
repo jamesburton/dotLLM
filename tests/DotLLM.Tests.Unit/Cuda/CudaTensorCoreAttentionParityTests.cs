@@ -37,9 +37,80 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     private const float AbsTol = 5e-3f;
     private const float RelTol = 5e-3f;
 
+    // Input fill scale; override via DOTLLM_CUDA_ATTN_MAG to probe FP16-score precision
+    // at realistic activation magnitudes (default 0.2 mirrors the bench's tiny fill).
+    private static readonly float Magnitude =
+        float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_ATTN_MAG"), out float m) ? m : 4.0f;
+
     private readonly ITestOutputHelper _output;
 
     public CudaTensorCoreAttentionParityTests(ITestOutputHelper output) => _output = output;
+
+    /// <summary>
+    /// Parity of the SHIPPING <see cref="CudaG3Attention.Run"/> formulation (FP32-scores
+    /// GEMM → F32In softmax → direct-write transposed PV) vs <c>attention_f16</c>, with a
+    /// LINEAR compare (both write the same row-major layout). Swept at realistic input
+    /// magnitude — this is the exact code path the model wires in, unlike
+    /// <see cref="RunCublasSoftmaxPath"/> (col-major prototype). Set DOTLLM_CUDA_ATTN_MAG.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(256, 32, 8, 64)]
+    [InlineData(1024, 32, 8, 64)]
+    public void ProductionG3Run_MatchesAttentionF16(int s, int numHeads, int numKvHeads, int headDim)
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string ptxDir = ResolvePtxDir();
+        Skip.IfNot(File.Exists(Path.Combine(ptxDir, "attention_softmax_causal.ptx")), "attention_softmax_causal.ptx not built.");
+
+        using var ctx = CudaContext.Create(0);
+        ctx.MakeCurrent();
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir);
+        using var cublas = CudaCublasHandle.Create();
+        cublas.SetStream(stream);
+        Skip.IfNot(kernels.HasAttentionSoftmaxCausalCoalescedF32In, "F32-scores causal-softmax kernel not loaded.");
+
+        int qElems = s * numHeads * headDim;
+        int kvElems = s * numKvHeads * headDim;
+        int outElems = s * numHeads * headDim;
+
+        using var q = CudaTensor.Allocate(new TensorShape(qElems), DType.Float16, 0);
+        using var k = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var v = CudaTensor.Allocate(new TensorShape(kvElems), DType.Float16, 0);
+        using var outG3 = CudaTensor.Allocate(new TensorShape(outElems), DType.Float16, 0);
+        using var outRef = CudaTensor.Allocate(new TensorShape(outElems), DType.Float16, 0);
+
+        Upload(q.DataPointer, RandomHalf(qElems, 1));
+        Upload(k.DataPointer, RandomHalf(kvElems, 2));
+        Upload(v.DataPointer, RandomHalf(kvElems, 3));
+
+        kernels.LaunchAttention(q.DataPointer, k.DataPointer, v.DataPointer, outRef.DataPointer,
+            seqQ: s, seqKv: s, numHeads, numKvHeads, headDim, 0, 0, stream.Handle);
+        ushort[] refHost = Download(outRef.DataPointer, outElems);
+
+        using var g3 = new CudaG3Attention(kernels);
+        CudaG3Attention.Enabled = true;
+        g3.Run(cublas.Handle, q.DataPointer, k.DataPointer, v.DataPointer, outG3.DataPointer,
+            s, numHeads, numKvHeads, headDim, stream.Handle);
+        stream.Synchronize();
+        ushort[] g3Host = Download(outG3.DataPointer, outElems);
+
+        int mismatches = 0;
+        float maxAbs = 0f, maxRel = 0f; int worst = -1;
+        for (int i = 0; i < outElems; i++)
+        {
+            float a = (float)BitConverter.UInt16BitsToHalf(refHost[i]);
+            float b = (float)BitConverter.UInt16BitsToHalf(g3Host[i]);
+            float abs = MathF.Abs(a - b);
+            float rel = abs / (MathF.Abs(a) + 1e-6f);
+            if (!(abs <= AbsTol || rel <= RelTol)) mismatches++;
+            if (abs > maxAbs) { maxAbs = abs; maxRel = rel; worst = i; }
+        }
+        _output.WriteLine($"PRODUCTION G3 s={s} mag={Magnitude}: mismatches={mismatches}/{outElems} "
+            + $"worst abs={maxAbs:E3} rel={maxRel:E3} @ {worst} (tol abs {AbsTol} OR rel {RelTol})");
+        Assert.True(mismatches == 0,
+            $"CudaG3Attention.Run vs attention_f16: {mismatches}/{outElems} outside tol; worst abs {maxAbs} rel {maxRel}.");
+    }
 
     [SkippableTheory]
     [InlineData(128, 32, 8, 64)]
@@ -123,19 +194,17 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
                         float absDiff = MathF.Abs(a - b);
                         float relDiff = absDiff / (MathF.Abs(a) + 1e-6f);
                         bool pass = absDiff <= AbsTol || relDiff <= RelTol;
-                        if (!pass)
-                        {
-                            mismatches++;
-                            if (absDiff > maxAbs) { maxAbs = absDiff; maxRel = relDiff; worstTq = tq; worstHq = hq; worstD = d; }
-                        }
+                        if (!pass) mismatches++;
+                        // Track the worst element regardless of pass/fail so a sweep can see
+                        // how close to the bar a "passing" magnitude actually sits.
+                        if (absDiff > maxAbs) { maxAbs = absDiff; maxRel = relDiff; worstTq = tq; worstHq = hq; worstD = d; }
                     }
                 }
             }
 
-            _output.WriteLine($"s={s} heads={numHeads} kv={numKvHeads} hd={headDim} coalesced={coalesced}: "
-                + $"mismatches={mismatches}/{outElems} (tol abs {AbsTol} OR rel {RelTol})");
-            if (mismatches > 0)
-                _output.WriteLine($"worst @ (tq={worstTq},hq={worstHq},d={worstD}) absDiff={maxAbs} relDiff={maxRel}");
+            _output.WriteLine($"s={s} mag={Magnitude} coalesced={coalesced}: "
+                + $"mismatches={mismatches}/{outElems} worst abs={maxAbs:E3} rel={maxRel:E3} "
+                + $"@ (tq={worstTq},hq={worstHq},d={worstD}) (tol abs {AbsTol} OR rel {RelTol})");
 
             Assert.True(mismatches == 0,
                 $"cuBLAS+softmax (coalesced={coalesced}) vs attention_f16: {mismatches}/{outElems} elements "
@@ -299,7 +368,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
         var rng = new Random(seed);
         var host = new ushort[elems];
         for (long i = 0; i < elems; i++)
-            host[i] = BitConverter.HalfToUInt16Bits((Half)((rng.NextSingle() - 0.5f) * 0.2f));
+            host[i] = BitConverter.HalfToUInt16Bits((Half)((rng.NextSingle() - 0.5f) * Magnitude));
         return host;
     }
 

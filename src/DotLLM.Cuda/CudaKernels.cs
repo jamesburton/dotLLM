@@ -297,6 +297,9 @@ public sealed unsafe class CudaKernels : IDisposable
     // Coalesced sibling: one thread per softmax row (consecutive threads → consecutive
     // query rows → consecutive addresses), avoiding the per-block strided-read penalty.
     private readonly nint _attentionSoftmaxCausalCoalescedFunc;
+    // FP32-scores variant: reads FP32 QK scores, writes FP16 probs to a separate buffer.
+    // Removes the dominant precision loss of rounding pre-softmax scores to FP16 (G3 e2e).
+    private readonly nint _attentionSoftmaxCausalCoalescedF32InFunc;
 
 
     /// <summary>
@@ -637,6 +640,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _attentionSoftmaxCausalModule = CudaModule.LoadFromFile(attentionSoftmaxCausalPath);
             _attentionSoftmaxCausalFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_f16");
             _attentionSoftmaxCausalCoalescedFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f16");
+            _attentionSoftmaxCausalCoalescedF32InFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f32in_f16out");
         }
     }
 
@@ -653,6 +657,14 @@ public sealed unsafe class CudaKernels : IDisposable
     /// one-block-per-row sibling whose strided reads cap throughput.
     /// </summary>
     public bool HasAttentionSoftmaxCausalCoalesced => _attentionSoftmaxCausalCoalescedFunc != 0;
+
+    /// <summary>
+    /// True when the FP32-scores causal-softmax kernel is loaded (reads FP32 QK scores,
+    /// writes FP16 probs). The G3 prefill path uses this to hold end-to-end logit parity
+    /// at the 5e-3 bar — the all-FP16 variant loses too much precision rounding the
+    /// pre-softmax scores at realistic activation magnitudes.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausalCoalescedF32In => _attentionSoftmaxCausalCoalescedF32InFunc != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1405,6 +1417,29 @@ public sealed unsafe class CudaKernels : IDisposable
                     (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                     0, stream, (nint)args, 0).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Launches the FP32-scores causal softmax: reads FP32 QK <paramref name="scores"/>
+    /// (per-head col-major [s × s]), writes normalized FP16 probs into
+    /// <paramref name="probs"/> with the same layout. Coalesced one-thread-per-row.
+    /// </summary>
+    /// <param name="scores">Device pointer to FP32 QK scores ([numHeads × s × s]).</param>
+    /// <param name="probs">Device pointer to FP16 output probs ([numHeads × s × s]).</param>
+    /// <param name="s">Sequence length (square scores).</param>
+    /// <param name="numHeads">Number of query heads (score planes).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionSoftmaxCausalF32In(nint scores, nint probs, int s, int numHeads, nint stream)
+    {
+        nint scoresArg = scores, probsArg = probs;
+        int sArg = s, nhArg = numHeads;
+        void** args = stackalloc void*[] {&scoresArg, &probsArg, &sArg, &nhArg};
+
+        int totalRows = numHeads * s;
+        uint gridDim = (uint)((totalRows + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalCoalescedF32InFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Embedding lookup with per-format dispatch.</summary>
