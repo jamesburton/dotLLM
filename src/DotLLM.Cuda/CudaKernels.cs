@@ -298,6 +298,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // query rows → consecutive addresses), avoiding the per-block strided-read penalty.
     private readonly nint _attentionSoftmaxCausalCoalescedFunc;
 
+    // Hand-fused FP16 tensor-core (mma.sync) flash-attention prefill kernel — keeps the
+    // s x s scores in shared/registers, never materialising them to global memory.
+    // Prototype for the long-context fused-kernel go/no-go. Optional PTX.
+    private readonly CudaModule? _attentionFlashMmaModule;
+    private readonly nint _attentionFlashMmaFunc;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -638,7 +644,21 @@ public sealed unsafe class CudaKernels : IDisposable
             _attentionSoftmaxCausalFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_f16");
             _attentionSoftmaxCausalCoalescedFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f16");
         }
+
+        // Hand-fused mma.sync flash-attention prefill kernel (G-flash prototype). Optional.
+        string attentionFlashMmaPath = Path.Combine(ptxDir, "attention_flash_mma.ptx");
+        if (File.Exists(attentionFlashMmaPath))
+        {
+            _attentionFlashMmaModule = CudaModule.LoadFromFile(attentionFlashMmaPath);
+            _attentionFlashMmaFunc = _attentionFlashMmaModule.TryGetFunction("attention_flash_mma_f16");
+        }
     }
+
+    /// <summary>
+    /// True when the hand-fused mma.sync flash-attention prefill kernel is loaded
+    /// (attention_flash_mma.ptx present). Prototype path, Llama-3.2-1B head shape only.
+    /// </summary>
+    public bool HasAttentionFlashMma => _attentionFlashMmaFunc != 0;
 
     /// <summary>
     /// True when the causal-softmax kernel for the cuBLAS tensor-core prefill-attention
@@ -1405,6 +1425,38 @@ public sealed unsafe class CudaKernels : IDisposable
                     (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                     0, stream, (nint)args, 0).ThrowOnError();
         }
+    }
+
+    /// <summary>
+    /// Launches the hand-fused mma.sync flash-attention prefill kernel. Prototype:
+    /// headDim must be 64, causal, position_offset 0, FP16 in/out, output row-major
+    /// [seq, numHeads, headDim] (matching <c>attention_f16</c>). One warp per
+    /// (query head, 16-query tile).
+    /// </summary>
+    /// <param name="q">Device pointer to Q [seq, numHeads, headDim] FP16.</param>
+    /// <param name="k">Device pointer to K [seq, numKvHeads, headDim] FP16.</param>
+    /// <param name="v">Device pointer to V [seq, numKvHeads, headDim] FP16.</param>
+    /// <param name="output">Device pointer to output [seq, numHeads, headDim] FP16.</param>
+    /// <param name="seq">Sequence length (prefill).</param>
+    /// <param name="numHeads">Number of query heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA).</param>
+    /// <param name="headDim">Head dimension; must be 64 for this prototype.</param>
+    /// <param name="scale">QK softmax scale (1/sqrt(headDim)).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionFlashMma(nint q, nint k, nint v, nint output,
+        int seq, int numHeads, int numKvHeads, int headDim, float scale, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int seqArg = seq, nhArg = numHeads, nkvArg = numKvHeads;
+        float scArg = scale;
+
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &seqArg, &nhArg, &nkvArg, &scArg };
+
+        uint gridX = (uint)numHeads;
+        uint gridY = (uint)((seq + 15) / 16);   // 16-query tiles
+        CudaDriverApi.cuLaunchKernel(_attentionFlashMmaFunc,
+                gridX, gridY, 1, 32, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Embedding lookup with per-format dispatch.</summary>
