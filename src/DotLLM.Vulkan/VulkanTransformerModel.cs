@@ -246,6 +246,22 @@ public sealed class VulkanTransformerModel : IModel
     // Lazy; grows monotonically; null until the first SC step.
     private VulkanDevice.Buffer? _diffusionScSig;
     private int _diffusionScSigCapacityElems;
+    // ── DiffusionGemma prompt-KV (PKV) phase state ──────────────────────────
+    // Drives the two-phase PKV optimisation inside RecordGemma4Attention. None:
+    // normal cacheless forward (DEFAULT). Prefill: capture each layer's final K/V
+    // into _pkvStore. Decode: read cached prompt K/V and attend [prompt|canvas] under
+    // a rectangular Bidirectional mask with positionOffset = promptLen. Single-threaded
+    // per generation, like _diffusionMaskMode.
+    private DiffusionKvPhase _pkvPhase = DiffusionKvPhase.None;
+    private VulkanDiffusionPromptKv? _pkvStore;
+    private int _pkvPromptLen;
+    // Device-local K/V concat scratch [maxKvCtx × maxKvStride] for the decode phase
+    // (cached prompt K/V | fresh canvas K/V). Lazy; grows monotonically.
+    private VulkanDevice.Buffer? _pkvKConcat;
+    private VulkanDevice.Buffer? _pkvVConcat;
+    private long _pkvConcatCapacityBytes;
+
+    private enum DiffusionKvPhase { None, Prefill, Decode }
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly RopeF32Kernel.Variant _ropeVariant;
@@ -1023,6 +1039,116 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Supported on the DiffusionGemma backbone (gemma4 tower + diffusion config). PKV reuses the
+    /// per-layer prompt K/V across denoise steps; the cacheless diffusion forward remains correct
+    /// and is unaffected when PKV is off.
+    /// </remarks>
+    public bool SupportsDiffusionPromptKv => Config.DiffusionConfig is not null && Config.Gemma4DualFfn;
+
+    /// <inheritdoc/>
+    public void DiffusionPrefillPromptKv(
+        ReadOnlySpan<int> promptTokens, ReadOnlySpan<int> positions, DiffusionPromptKvStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        if (!SupportsDiffusionPromptKv)
+            throw new NotSupportedException("DiffusionPrefillPromptKv requires a DiffusionGemma (gemma4) model.");
+        if (promptTokens.Length == 0)
+            throw new ArgumentException("Prompt must be non-empty for PKV prefill.", nameof(promptTokens));
+        if (promptTokens.Length != positions.Length)
+            throw new ArgumentException("promptTokens and positions length mismatch.", nameof(positions));
+
+        int p = promptTokens.Length;
+        int numLayers = Config.NumLayers;
+        // Per-layer KV block width (nKvHead*headDim) — sliding vs global layers differ.
+        Span<int> kvBlockElems = numLayers <= 256 ? stackalloc int[numLayers] : new int[numLayers];
+        for (int l = 0; l < numLayers; l++)
+            kvBlockElems[l] = GemmaLayerKvHeads(l) * Config.GetLayerHeadDim(l);
+        // The CPU-side store mirrors PromptLen for the generator's bookkeeping.
+        store.BeginPrefill(p, kvBlockElems);
+        // The device-resident store holds the actual K/V (allocated/grown OUTSIDE recording).
+        _pkvStore ??= new VulkanDiffusionPromptKv(_device, numLayers);
+        _pkvStore.BeginPrefill(p, kvBlockElems);
+        if (_pkvStore.LastBeginReallocated) InvalidateKernelCaches();
+
+        _pkvPromptLen = p;
+        _pkvPhase = DiffusionKvPhase.Prefill;
+        // Hybrid(P) with P == seqLen ⇒ every prompt row is in the causal prefix (the region
+        // deltas are inert exactly as the unified forward's prompt rows). No SC on the prompt.
+        _diffusionMaskMode = AttentionMaskMode.Hybrid;
+        _diffusionPrefixLen = p;
+        try
+        {
+            // Run the layer stack only — the prefill needs the captured K/V, not the LM head.
+            Forward(promptTokens, positions, deviceId: -1, kvCache: null);
+        }
+        finally
+        {
+            _pkvPhase = DiffusionKvPhase.None;
+            _diffusionMaskMode = AttentionMaskMode.Causal;
+            _diffusionPrefixLen = 0;
+        }
+    }
+
+    /// <inheritdoc/>
+    public ITensor DiffusionDecodeWithPromptKv(
+        ReadOnlySpan<int> canvasTokens, ReadOnlySpan<int> positions, int deviceId,
+        DiffusionPromptKvStore store)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        if (!SupportsDiffusionPromptKv)
+            throw new NotSupportedException("DiffusionDecodeWithPromptKv requires a DiffusionGemma (gemma4) model.");
+        if (_pkvStore is null || _pkvStore.PromptLen <= 0)
+            throw new InvalidOperationException("PKV store is empty — run DiffusionPrefillPromptKv first.");
+        if (canvasTokens.Length == 0)
+            throw new ArgumentException("Canvas must be non-empty for PKV decode.", nameof(canvasTokens));
+        if (canvasTokens.Length != positions.Length)
+            throw new ArgumentException("canvasTokens and positions length mismatch.", nameof(positions));
+
+        int c = canvasTokens.Length;
+        int p = _pkvStore.PromptLen;
+        // Pre-allocate the K/V concat scratch (max per-layer KV width × (P+C)) BEFORE recording —
+        // growth may invalidate descriptor caches, which is unsafe mid-command-buffer.
+        int maxKvStride = 0;
+        for (int l = 0; l < Config.NumLayers; l++)
+            maxKvStride = Math.Max(maxKvStride, GemmaLayerKvHeads(l) * Config.GetLayerHeadDim(l));
+        EnsurePkvConcat((long)(p + c) * maxKvStride * sizeof(float));
+
+        _pkvPromptLen = p;
+        _pkvPhase = DiffusionKvPhase.Decode;
+        // Bidirectional spec so the region embed (p == 0 ⇒ all C rows are canvas) and region
+        // scalar treat every decode row as canvas; the actual [prompt|canvas] attention is built
+        // from the cached prompt K/V inside RecordGemma4Attention.
+        _diffusionMaskMode = AttentionMaskMode.Bidirectional;
+        _diffusionPrefixLen = 0;
+        try
+        {
+            return Forward(canvasTokens, positions, deviceId, kvCache: null);
+        }
+        finally
+        {
+            _pkvPhase = DiffusionKvPhase.None;
+            _diffusionMaskMode = AttentionMaskMode.Causal;
+            _diffusionPrefixLen = 0;
+        }
+    }
+
+    /// <summary>Lazily (re)allocates the device-local PKV K/V concat scratch to <paramref name="bytes"/> each.</summary>
+    private (VulkanDevice.Buffer k, VulkanDevice.Buffer v) EnsurePkvConcat(long bytes)
+    {
+        if (_pkvKConcat is null || _pkvConcatCapacityBytes < bytes)
+        {
+            _pkvKConcat?.Dispose();
+            _pkvVConcat?.Dispose();
+            _pkvKConcat = _device.AllocateDeviceLocal(bytes);
+            _pkvVConcat = _device.AllocateDeviceLocal(bytes);
+            _pkvConcatCapacityBytes = bytes;
+            InvalidateKernelCaches();
+        }
+        return (_pkvKConcat!, _pkvVConcat!);
+    }
+
+    /// <inheritdoc/>
     public void SetDiffusionSelfCond(ReadOnlySpan<float> prevCanvasLogits, int canvasLen, float scUse)
     {
         if (scUse > 0f && !prevCanvasLogits.IsEmpty && canvasLen > 0)
@@ -1683,10 +1809,14 @@ public sealed class VulkanTransformerModel : IModel
         // contiguous canvas tail is copied into NormOutput[0..], normed there with
         // a unit-gamma weight, and copied back — reuses the shared kernels with no
         // offset-binding or new shader.
+        // A diffusion forward (Hybrid OR Bidirectional) normalises its canvas rows. For
+        // Hybrid the canvas is the tail [P, seqLen); for Bidirectional (PKV decode / LLaDA-
+        // style) every row is canvas (regionP == 0). Mirrors CPU: p = Hybrid ? prefix : 0.
+        if (_diffusionMaskMode != AttentionMaskMode.Causal && _pkvPhase != DiffusionKvPhase.Prefill)
         {
-            int regionP = DiffusionRegionPrefix(seqLen);
+            int regionP = _diffusionMaskMode == AttentionMaskMode.Hybrid ? DiffusionRegionPrefix(seqLen) : 0;
             int canvasLen = seqLen - regionP;
-            if (regionP > 0 && canvasLen > 0)
+            if (canvasLen > 0)
                 RecordDiffusionCanvasEmbed(cmdBuf, regionP, canvasLen, hiddenSize, eps);
         }
 
@@ -2008,6 +2138,14 @@ public sealed class VulkanTransformerModel : IModel
             // HiddenState written by the add.
             if (layer < Config.NumLayers - 1)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        }
+
+        // 3a. PKV prefill: the captured per-layer K/V is all we need — skip the final
+        //     norm + LM head entirely (the generator discards the prefill result).
+        if (_pkvPhase == DiffusionKvPhase.Prefill)
+        {
+            _submit.SubmitAndWait();
+            return UnmanagedTensor.Allocate(new TensorShape(1, vocabSize), DType.Float32, deviceId: -1);
         }
 
         // 3b. DiffusionGemma: final RMSNorm + LM head over ALL positions (the
@@ -2450,9 +2588,12 @@ public sealed class VulkanTransformerModel : IModel
         // norm + RoPE) and V (post weight-less norm; on V-from-K global layers this
         // is the normed copy of the raw K projection) — exactly the buffers the
         // attention kernel reads, so appending them here mirrors the GQA path.
+        int kvStride = numKvHeads * headDim;
         VulkanDevice.Buffer kSrc, vSrc;
         int seqKv;
         int positionOffset;
+        AttentionMaskMode maskMode;
+        int prefixLen;
         if (kvCache is VulkanKvCache vkCache)
         {
             vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
@@ -2461,6 +2602,52 @@ public sealed class VulkanTransformerModel : IModel
             vSrc = vkCache.GetValuesBuffer(layer);
             seqKv = vkCache.CurrentLength;
             positionOffset = positions[0];
+            maskMode = AttentionMaskMode.Causal;
+            prefixLen = 0;
+        }
+        else if (_pkvPhase == DiffusionKvPhase.Prefill)
+        {
+            // Capture this layer's final K/V (post per-head norm + RoPE; V post
+            // weight-less norm, incl. V-from-K) for reuse across denoise steps, then
+            // run the normal causal prompt attention (Hybrid(P) with P == seqLen).
+            var store = _pkvStore!;
+            long kvBytes = (long)seqLen * kvStride * sizeof(float);
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, _state.K, store.Keys(layer), 0, 0, (ulong)kvBytes);
+            RecordCopyBufferRange(cmdBuf, _state.V, store.Values(layer), 0, 0, (ulong)kvBytes);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            kSrc = _state.K;
+            vSrc = _state.V;
+            seqKv = seqLen;
+            positionOffset = 0;
+            maskMode = _diffusionMaskMode;       // Hybrid(P==seqLen) ⇒ all-causal prompt
+            prefixLen = _diffusionPrefixLen;
+        }
+        else if (_pkvPhase == DiffusionKvPhase.Decode)
+        {
+            // Attend the C canvas queries over [cached prompt K/V | fresh canvas K/V]
+            // (length P+C) under a rectangular Bidirectional mask: a canvas query at
+            // logical position P+i attends every prompt key + every canvas key, clipped
+            // by the per-layer sliding window via positionOffset = P.
+            int p = _pkvPromptLen;
+            int c = seqLen;
+            int kvCtx = p + c;
+            var store = _pkvStore!;
+            (VulkanDevice.Buffer kCat, VulkanDevice.Buffer vCat) = EnsurePkvConcat((long)kvCtx * kvStride * sizeof(float));
+            long promptBytes = (long)p * kvStride * sizeof(float);
+            long canvasBytes = (long)c * kvStride * sizeof(float);
+            KernelSupport.ComputeToTransferBarrier(cmdBuf);
+            RecordCopyBufferRange(cmdBuf, store.Keys(layer), kCat, 0, 0, (ulong)promptBytes);
+            RecordCopyBufferRange(cmdBuf, store.Values(layer), vCat, 0, 0, (ulong)promptBytes);
+            RecordCopyBufferRange(cmdBuf, _state.K, kCat, 0, (ulong)promptBytes, (ulong)canvasBytes);
+            RecordCopyBufferRange(cmdBuf, _state.V, vCat, 0, (ulong)promptBytes, (ulong)canvasBytes);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+            kSrc = kCat;
+            vSrc = vCat;
+            seqKv = kvCtx;
+            positionOffset = p;
+            maskMode = AttentionMaskMode.Bidirectional;
+            prefixLen = 0;
         }
         else
         {
@@ -2468,14 +2655,14 @@ public sealed class VulkanTransformerModel : IModel
             vSrc = _state.V;
             seqKv = seqLen;
             positionOffset = 0;
+            // Diffusion: the cacheless canvas forward uses the region-aware mask
+            // (Hybrid(P): prompt prefix causal, canvas bidirectional). On the AR path
+            // _diffusionMaskMode is Causal/0 ⇒ byte-identical.
+            maskMode = _diffusionMaskMode;
+            prefixLen = _diffusionPrefixLen;
         }
 
         // Attention: scale = 1/sqrt(QPAS) = 1.0 (q/k-norm make Q,K unit); no attn softcap.
-        // Diffusion: the cacheless canvas forward uses the region-aware mask
-        // (Hybrid(P): prompt prefix causal, canvas bidirectional). On the AR /
-        // KV-cached path _diffusionMaskMode is Causal/0 ⇒ byte-identical.
-        AttentionMaskMode maskMode = kvCache is VulkanKvCache ? AttentionMaskMode.Causal : _diffusionMaskMode;
-        int prefixLen = kvCache is VulkanKvCache ? 0 : _diffusionPrefixLen;
         RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
             seqQ: seqLen, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -3583,6 +3770,9 @@ public sealed class VulkanTransformerModel : IModel
 
         _diffusionLogits?.Dispose();
         _diffusionScSig?.Dispose();
+        _pkvStore?.Dispose();
+        _pkvKConcat?.Dispose();
+        _pkvVConcat?.Dispose();
 
         _submit.Dispose();
         _state.Dispose();
