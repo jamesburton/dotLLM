@@ -42,6 +42,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _perHeadRmsNormF32Module;
     private readonly CudaModule _rmsnormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
+    private readonly CudaModule _i2sGemvModule;
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
@@ -75,6 +76,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ5_0Func;
     private readonly nint _quantizedGemvQ5_KFunc;
     private readonly nint _quantizedGemvQ6_KFunc;
+    private readonly nint _i2sGemvF16InFunc;
+    private readonly nint _i2sGemvF32InFunc;
     private readonly nint _dequantQ8_0Func;
     private readonly nint _dequantQ4_0Func;
     private readonly nint _dequantQ5_0Func;
@@ -115,6 +118,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "per_head_rmsnorm_f32.ptx"));
         _rmsnormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm_f32.ptx"));
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
+        _i2sGemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "i2_s_gemv.ptx"));
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
         _rmsnormF32Func = _rmsnormF32Module.GetFunction("rmsnorm_f32");
@@ -148,6 +152,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvQ5_0Func = _quantizedGemvModule.GetFunction("quantized_gemv_q5_0");
         _quantizedGemvQ5_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q5_k");
         _quantizedGemvQ6_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q6_k");
+        _i2sGemvF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in");
+        _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
         _dequantQ8_0Func = _dequantModule.GetFunction("dequant_q8_0_f16");
         _dequantQ4_0Func = _dequantModule.GetFunction("dequant_q4_0_f16");
         _dequantQ5_0Func = _dequantModule.GetFunction("dequant_q5_0_f16");
@@ -216,6 +222,32 @@ public sealed unsafe class CudaKernels : IDisposable
 
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
         CudaDriverApi.cuLaunchKernel(_quantizedGemvQ8_0F32InFunc,
+                (uint)n, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// I2_S ternary GEMV (W2A16): <c>y_f16[n] = scale · ternary(W[n,k]) @ x_f16[k]</c>.
+    /// <paramref name="quantWeight"/> must point at the full I2_S tensor including the trailing
+    /// per-tensor float32 scale at byte offset n·k/4 (the kernel reads it from the tail).
+    /// </summary>
+    public void LaunchI2_SGemvF16In(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF16, yArg = yF16;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF16InFunc,
+                (uint)n, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>I2_S ternary GEMV with FP32 activations/output. Exact-match twin for CPU-vs-GPU tests.</summary>
+    public void LaunchI2_SGemvF32In(nint quantWeight, nint xF32, nint yF32, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
                 (uint)n, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -752,6 +784,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _perHeadRmsNormF32Module.Dispose();
         _rmsnormF32Module.Dispose();
         _quantizedGemvF32InModule.Dispose();
+        _i2sGemvModule.Dispose();
         _quantKvModule?.Dispose();
     }
 }
