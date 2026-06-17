@@ -78,6 +78,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ6_KFunc;
     private readonly nint _i2sGemvF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
+    private readonly nint _i2sGemvA8Func;
     private readonly nint _dequantQ8_0Func;
     private readonly nint _dequantQ4_0Func;
     private readonly nint _dequantQ5_0Func;
@@ -154,6 +155,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvQ6_KFunc = _quantizedGemvModule.GetFunction("quantized_gemv_q6_k");
         _i2sGemvF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
+        _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
         _dequantQ8_0Func = _dequantModule.GetFunction("dequant_q8_0_f16");
         _dequantQ4_0Func = _dequantModule.GetFunction("dequant_q4_0_f16");
         _dequantQ5_0Func = _dequantModule.GetFunction("dequant_q5_0_f16");
@@ -248,6 +250,28 @@ public sealed unsafe class CudaKernels : IDisposable
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
+                (uint)n, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// I2_S ternary GEMV (W2A8, <c>__dp4a</c>): <c>y_f32[n] = scale · invActScale · int8dot(W[n,k], xq[k])</c>.
+    /// Activations <paramref name="xqInt8"/> must be quantized per token (symmetric absmax,
+    /// s_act = 127/absmax(x), xq_i = round(x_i·s_act)); <paramref name="invActScale"/> = absmax(x)/127
+    /// = 1/s_act so x_i ≈ xq_i·invActScale. Output is FP32.
+    /// <paramref name="quantWeight"/> must point at the full I2_S tensor including the trailing
+    /// per-tensor float32 scale at byte offset n·k/4 (the kernel reads it from the tail).
+    /// Requires sm_61+ (dotLLM builds compute_61). Validate against the int8 reference, not the
+    /// float CPU path — the dp4a-vs-float diff is expected activation-quant error.
+    /// </summary>
+    public void LaunchI2_SGemvA8(nint quantWeight, nint xqInt8, nint yF32, int n, int k,
+                                  float invActScale, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xqInt8, yArg = yF32;
+        int nArg = n, kArg = k;
+        float sArg = invActScale;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg, &sArg};
+        CudaDriverApi.cuLaunchKernel(_i2sGemvA8Func,
                 (uint)n, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

@@ -107,6 +107,121 @@ public class CudaI2SGemvTest
         Assert.True(meanDiff <= 1e-4f, $"mean abs diff {meanDiff} exceeds 1e-4");
     }
 
+    [SkippableTheory]
+    [InlineData(2560, 2560)]  // attention projection
+    [InlineData(2560, 6912)]  // FFN down (k = 6912)
+    public void I2SGemvA8_MatchesInt8Reference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunA8(n, k);
+    }
+
+    /// <summary>
+    /// Validates Variant B (W2A8, __dp4a) against an INT8 reference computed on the CPU.
+    ///
+    /// The kernel quantizes nothing itself — activations are quantized on the host (per-token symmetric
+    /// absmax, s_act = 127/absmax, xq = round(x·s_act)), and the kernel computes the exact int32 dot
+    /// Σ xq_i·(code_i−1), scaled by weightScale·invActScale (invActScale = absmax/127 = 1/s_act). The CPU
+    /// int8 reference does the SAME integer dot with the SAME int8 inputs, so the two must match to
+    /// integer-math precision (the only float work is the final scale·invActScale multiply + the fp32
+    /// reduction, hence ≤ 1e-4, not bit-exact).
+    ///
+    /// NOTE: the dp4a result vs the *float* CPU reference (MatMul.GemvI2_S over full-precision x) will
+    /// differ — that gap is the expected per-token activation-quant error, NOT a kernel bug. We therefore
+    /// assert against the int8 reference here, exactly as the spec (§2a, §7 row B0) prescribes.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunA8(int n, int k)
+    {
+        var rng = new Random(4321);
+        int rowBytes = k / 4;
+        long packedLen = (long)n * rowBytes + 4;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = 0.02f + (float)rng.NextDouble() * 0.03f;
+        byte[] packed = Pack(ternary, n, k, scale);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+
+        // Host per-token int8 quant: symmetric absmax. s_act = 127/absmax, invActScale = absmax/127.
+        float absmax = 0f;
+        for (int i = 0; i < k; i++) absmax = MathF.Max(absmax, MathF.Abs(x[i]));
+        if (absmax == 0f) absmax = 1f;            // degenerate guard (matches a real quantizer)
+        float sAct = 127f / absmax;
+        float invActScale = absmax / 127f;
+        sbyte[] xq = new sbyte[k];
+        for (int i = 0; i < k; i++)
+        {
+            int q = (int)MathF.Round(x[i] * sAct);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;               // symmetric range, mirror BitNet
+            xq[i] = (sbyte)q;
+        }
+
+        // INT8 CPU reference: out = scale · invActScale · Σ xq_i·(code_i−1). Exact integer dot in long,
+        // then the single float epilogue — mirrors the kernel's math.
+        float[] cpu = new float[n];
+        for (int r = 0; r < n; r++)
+        {
+            long iacc = 0;
+            long rowOff = (long)r * k;
+            for (int col = 0; col < k; col++)
+                iacc += (long)xq[col] * ternary[rowOff + col]; // ternary already == code-1
+            cpu[r] = (float)iacc * scale * invActScale;
+        }
+
+        // GPU.
+        float[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(sbyte))).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+                fixed (sbyte* px = xq)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(sbyte))).ThrowOnError();
+
+                kernels.LaunchI2_SGemvA8(devW, devX, devY, n, k, invActScale, s);
+                stream.Synchronize();
+
+                gpu = new float[n];
+                fixed (float* py = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)py, devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devX);
+                CudaDriverApi.cuMemFree_v2(devY);
+            }
+        }
+
+        float maxDiff = 0, sumDiff = 0;
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(cpu[i] - gpu[i]);
+            sumDiff += d;
+            if (d > maxDiff) maxDiff = d;
+        }
+        float meanDiff = sumDiff / n;
+        _out.WriteLine($"I2_S A8 GEMV {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
+
+        // Integer math on both sides → only the float epilogue/reduction differs. Tight tolerance.
+        Assert.True(maxDiff <= 1e-4f, $"max abs diff {maxDiff} exceeds 1e-4 (dp4a vs int8 reference)");
+        Assert.True(meanDiff <= 1e-5f, $"mean abs diff {meanDiff} exceeds 1e-5");
+    }
+
     /// <summary>Packs ternary {-1,0,+1} into dotLLM I2_S layout + trailing per-tensor float32 scale.</summary>
     private static byte[] Pack(sbyte[] ternary, int n, int k, float scale)
     {
