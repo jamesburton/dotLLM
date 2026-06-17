@@ -100,9 +100,12 @@ public sealed class Gemma4GpuGapProbeTests
         int[] pos = { 0, 1, 2, 3 };
         try
         {
-            // CPU reference logits.
+            // CPU reference logits. The CPU IModel.Forward returns logits for ALL
+            // seqLen positions ([seqLen, vocab]); the CUDA gemma4 forward (like every
+            // CUDA forward) applies the final norm + LM head to the LAST token only
+            // ([1, vocab]). Compare the LAST-position row of both so the two are
+            // shape-compatible — an autoregressive next-token prediction.
             float[] cpuLogits;
-            int cpuArgmax;
             {
                 var (cpuModel, cpuGguf, _) = DotLLM.Models.ModelLoader.LoadFromGguf(
                     path, DotLLM.Core.Configuration.ThreadingConfig.SingleThreaded);
@@ -111,13 +114,11 @@ public sealed class Gemma4GpuGapProbeTests
                 using (var logits = cpuModel.Forward(ids, pos, -1, kvCache: null))
                 {
                     cpuLogits = ToFloatArray(logits);
-                    cpuArgmax = Argmax(cpuLogits);
                 }
             }
 
-            // CUDA logits.
+            // CUDA logits (last token only).
             float[] cudaLogits;
-            int cudaArgmax;
             {
                 var (model, gguf, _) = CudaModelLoader.LoadFromGguf(path, deviceId: 0);
                 using (gguf)
@@ -125,25 +126,24 @@ public sealed class Gemma4GpuGapProbeTests
                 using (var logits = model.Forward(ids, pos, -1, kvCache: null))
                 {
                     cudaLogits = ToFloatArray(logits);
-                    cudaArgmax = Argmax(cudaLogits);
                 }
             }
 
+            // Slice the CPU logits to the last position's vocab row so both vectors
+            // describe the same (final) token's distribution. vocab == CUDA length.
+            int vocab = cudaLogits.Length;
+            Assert.True(cpuLogits.Length % vocab == 0,
+                $"CPU logit length {cpuLogits.Length} not a multiple of CUDA vocab {vocab}.");
+            int lastRow = cpuLogits.Length - vocab;
+            var cpuLast = new float[vocab];
+            Array.Copy(cpuLogits, lastRow, cpuLast, 0, vocab);
+            cpuLogits = cpuLast;
+
+            int cpuArgmax = Argmax(cpuLogits);
+            int cudaArgmax = Argmax(cudaLogits);
+
             _output.WriteLine($"CPU argmax={cpuArgmax} logit={cpuLogits[cpuArgmax]:F4}; "
                 + $"CUDA argmax={cudaArgmax} logit={cudaLogits[cudaArgmax]:F4}");
-            _output.WriteLine($"DIAG lengths: cpu={cpuLogits.Length} cuda={cudaLogits.Length}");
-            // Diagnostic: compare both backends at BOTH argmax indices + global max diff.
-            {
-                int a = cpuArgmax, b = cudaArgmax;
-                int nn = Math.Min(cpuLogits.Length, cudaLogits.Length);
-                if (a >= nn) a = 0; if (b >= nn) b = 0;
-                float maxd = 0f; int maxi = 0;
-                for (int i = 0; i < Math.Min(cpuLogits.Length, cudaLogits.Length); i++)
-                { float dd = MathF.Abs(cpuLogits[i] - cudaLogits[i]); if (dd > maxd) { maxd = dd; maxi = i; } }
-                _output.WriteLine($"DIAG @cpuArgmax[{a}]: cpu={cpuLogits[a]:F6} cuda={cudaLogits[a]:F6}");
-                _output.WriteLine($"DIAG @cudaArgmax[{b}]: cpu={cpuLogits[b]:F6} cuda={cudaLogits[b]:F6}");
-                _output.WriteLine($"DIAG max|cpu-cuda|={maxd:E4} @ {maxi} (cpu={cpuLogits[maxi]:F6} cuda={cudaLogits[maxi]:F6})");
-            }
 
             Assert.Equal(cpuArgmax, cudaArgmax);
 
