@@ -132,6 +132,26 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuStreamSynchronize(nint stream);
 
+    // ── CUDA Graphs ──────────────────────────────────────────────────────────
+
+    [LibraryImport(LibName)]
+    internal static partial int cuStreamBeginCapture_v2(nint stream, int mode);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuStreamEndCapture(nint stream, out nint graph);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphInstantiateWithFlags(out nint graphExec, nint graph, ulong flags);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphLaunch(nint graphExec, nint stream);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphExecDestroy(nint graphExec);
+
+    [LibraryImport(LibName)]
+    internal static partial int cuGraphDestroy(nint graph);
+
     // ── Error ───────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]

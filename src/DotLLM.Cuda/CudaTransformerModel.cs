@@ -37,6 +37,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     private int _profSteps;            // counted steady-state decode steps
     private int _profWarmupSkipped;    // warmup decode steps skipped before accumulation
     private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
+    private static readonly bool s_cudaGraphDecode =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") == "1";
+    private CudaDecodeGraph? _decodeGraph;
+    private CudaKvCache? _decodeGraphCache;
+    private bool _decodeGraphDisabled;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -178,6 +183,53 @@ public sealed unsafe class CudaTransformerModel : IModel
             CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
                 (nuint)(seqLen * sizeof(int))).ThrowOnError();
 
+        bool graphEligible = CanUseDecodeGraph(seqLen, kvCache);
+        bool graphLaunched = false;
+        bool graphCapture = false;
+        bool graphReplayCompatible = false;
+
+        if (graphEligible)
+        {
+            var cudaKvCache = (CudaKvCache)kvCache!;
+            if (!ReferenceEquals(_decodeGraphCache, cudaKvCache))
+            {
+                _decodeGraph?.Dispose();
+                _decodeGraph = null;
+                _decodeGraphCache = cudaKvCache;
+            }
+
+            if (_decodeGraph?.IsCaptured == true)
+            {
+                _decodeGraph.Launch(s);
+                graphLaunched = true;
+            }
+        }
+
+        if (!graphLaunched)
+        {
+        DispatchAgain:
+            graphCapture = false;
+            graphReplayCompatible = false;
+            if (graphEligible && !_decodeGraphDisabled && _decodeGraph?.IsCaptured != true)
+            {
+                _decodeGraph ??= new CudaDecodeGraph();
+                try
+                {
+                    _decodeGraph.Begin(s);
+                    graphCapture = true;
+                    graphReplayCompatible = true;
+                }
+                catch (CudaException)
+                {
+                    _decodeGraph.Dispose();
+                    _decodeGraph = null;
+                    _decodeGraphDisabled = true;
+                }
+            }
+
+            try
+            {
+
         // 2. Embedding lookup → FP16 HiddenState
         _kernels.LaunchEmbeddingLookup(
             _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
@@ -271,7 +323,9 @@ public sealed unsafe class CudaTransformerModel : IModel
                         _state.K, _state.V, positions, seqLen, layer, s, _kernels, _state.PositionsDevice);
                 else
                     cudaKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
-                int seqKv = cudaKvCache.CurrentLength;
+                int seqKv = graphReplayCompatible && seqLen == 1
+                    ? cudaKvCache.MaxLength
+                    : cudaKvCache.CurrentLength;
 
                 if (seqLen == 1)
                     _kernels.LaunchAttentionPos(_state.Q, cudaKvCache.GetKeysPtr(layer),
@@ -413,6 +467,26 @@ public sealed unsafe class CudaTransformerModel : IModel
             _state.NormOutput, _state.LogitsF16,
             _weights.OutputOutputDim, _weights.OutputInputDim, 1);
         _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+            }
+            catch
+            {
+                if (graphCapture)
+                    _decodeGraph?.Abort(s);
+                throw;
+            }
+
+            if (graphCapture && _decodeGraph?.TryEnd(s) != true)
+            {
+                _decodeGraph?.Dispose();
+                _decodeGraph = null;
+                _decodeGraphDisabled = true;
+                goto DispatchAgain;
+            }
+            if (graphCapture)
+            {
+                _decodeGraph!.Launch(s);
+            }
+        }
 
         // Capture dispatch-only time (all launches queued, before GPU wait).
         long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -521,6 +595,16 @@ public sealed unsafe class CudaTransformerModel : IModel
            && qt == QuantizationType.I2_S
            && inputDim == normDim;
 
+    private bool CanUseDecodeGraph(int seqLen, IKvCache? kvCache)
+        => s_cudaGraphDecode
+           && !_decodeGraphDisabled
+           && seqLen == 1
+           && kvCache is CudaKvCache
+           && Config.Architecture == Architecture.BitNet
+           && DebugMaxLayers == 0
+           && DebugRopeTypeOverride < 0
+           && !DebugSkipBias;
+
     /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.
     /// </summary>
@@ -567,6 +651,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     public void Dispose()
     {
         ReportLaunchProfile();
+        _decodeGraph?.Dispose();
         _state.Dispose();
         _weights.Dispose();
         _kernels.Dispose();
