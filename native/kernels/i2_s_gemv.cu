@@ -166,6 +166,178 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
 
 // ───────────────────────── Variant A twin: FP32 activations ─────────────────────────
 // Exact-match reference for CPU-vs-GPU validation and any F32 activation path.
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemv2_f16in(
+    const uint8_t* __restrict__ weight0,
+    const uint8_t* __restrict__ weight1,
+    const half*    __restrict__ x,
+    half*          __restrict__ y0,
+    half*          __restrict__ y1,
+    const int n0,
+    const int n1,
+    const int k)
+{
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = __half2float(x[i]);
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1;
+    const int rowBase = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP;
+    if (rowBase >= totalN) return;
+
+    const int row_bytes = k / 4;
+    const int num_u4    = row_bytes >> 4;
+
+    const uint4* w_rows[I2S_ROWS_PER_WARP];
+    half* y_rows[I2S_ROWS_PER_WARP];
+    int local_rows[I2S_ROWS_PER_WARP];
+    float scales[I2S_ROWS_PER_WARP];
+    float acc[I2S_ROWS_PER_WARP];
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        int globalRow = min(rowBase + rr, totalN - 1);
+        const uint8_t* w;
+        int n;
+        int localRow;
+        if (globalRow < n0)
+        {
+            w = weight0;
+            n = n0;
+            y_rows[rr] = y0;
+            localRow = globalRow;
+        }
+        else
+        {
+            w = weight1;
+            n = n1;
+            y_rows[rr] = y1;
+            localRow = globalRow - n0;
+        }
+
+        local_rows[rr] = localRow;
+        scales[rr] = *reinterpret_cast<const float*>(w + (size_t)n * row_bytes);
+        w_rows[rr] = reinterpret_cast<const uint4*>(w + (size_t)localRow * row_bytes);
+        acc[rr] = 0.0f;
+    }
+
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        int boff    = u << 4;
+        int blkBase = (boff >> 5) << 7;
+        int gp0     = boff & 31;
+
+        uint4 w[I2S_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) w[rr] = w_rows[rr][u];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) i2s_accum_u4(acc[rr], w[rr], xs, blkBase, gp0);
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        float a = i2s_warp_reduce(acc[rr]);
+        int globalRow = rowBase + rr;
+        if (lane == 0 && globalRow < totalN)
+            y_rows[rr][local_rows[rr]] = __float2half(a * scales[rr]);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemv3_f16in(
+    const uint8_t* __restrict__ weight0,
+    const uint8_t* __restrict__ weight1,
+    const uint8_t* __restrict__ weight2,
+    const half*    __restrict__ x,
+    half*          __restrict__ y0,
+    half*          __restrict__ y1,
+    half*          __restrict__ y2,
+    const int n0,
+    const int n1,
+    const int n2,
+    const int k)
+{
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = __half2float(x[i]);
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1 + n2;
+    const int rowBase = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP;
+    if (rowBase >= totalN) return;
+
+    const int row_bytes = k / 4;
+    const int num_u4    = row_bytes >> 4;
+
+    const uint4* w_rows[I2S_ROWS_PER_WARP];
+    half* y_rows[I2S_ROWS_PER_WARP];
+    int local_rows[I2S_ROWS_PER_WARP];
+    float scales[I2S_ROWS_PER_WARP];
+    float acc[I2S_ROWS_PER_WARP];
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        int globalRow = min(rowBase + rr, totalN - 1);
+        const uint8_t* w;
+        int n;
+        int localRow;
+        if (globalRow < n0)
+        {
+            w = weight0;
+            n = n0;
+            y_rows[rr] = y0;
+            localRow = globalRow;
+        }
+        else if (globalRow < n0 + n1)
+        {
+            w = weight1;
+            n = n1;
+            y_rows[rr] = y1;
+            localRow = globalRow - n0;
+        }
+        else
+        {
+            w = weight2;
+            n = n2;
+            y_rows[rr] = y2;
+            localRow = globalRow - n0 - n1;
+        }
+
+        local_rows[rr] = localRow;
+        scales[rr] = *reinterpret_cast<const float*>(w + (size_t)n * row_bytes);
+        w_rows[rr] = reinterpret_cast<const uint4*>(w + (size_t)localRow * row_bytes);
+        acc[rr] = 0.0f;
+    }
+
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        int boff    = u << 4;
+        int blkBase = (boff >> 5) << 7;
+        int gp0     = boff & 31;
+
+        uint4 w[I2S_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) w[rr] = w_rows[rr][u];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) i2s_accum_u4(acc[rr], w[rr], xs, blkBase, gp0);
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        float a = i2s_warp_reduce(acc[rr]);
+        int globalRow = rowBase + rr;
+        if (lane == 0 && globalRow < totalN)
+            y_rows[rr][local_rows[rr]] = __float2half(a * scales[rr]);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
     const uint8_t* __restrict__ weight,
     const float*   __restrict__ x,

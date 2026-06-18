@@ -116,6 +116,99 @@ public class CudaI2SGemvTest
         RunA8(n, k);
     }
 
+    [SkippableFact]
+    public void I2SGemvFusedDecode_MatchesSeparateLaunches()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunFusedDecode();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunFusedDecode()
+    {
+        const int k = 256;
+        const int n0 = 37;
+        const int n1 = 53;
+        const int n2 = 71;
+
+        var rng = new Random(2468);
+        byte[] w0 = RandomPacked(rng, n0, k, 0.021f);
+        byte[] w1 = RandomPacked(rng, n1, k, 0.034f);
+        byte[] w2 = RandomPacked(rng, n2, k, 0.047f);
+
+        Half[] x = new Half[k];
+        for (int i = 0; i < k; i++)
+            x[i] = (Half)((float)(rng.NextDouble() * 2 - 1) * 0.5f);
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        nint s = stream.Handle;
+
+        static nuint PackedBytes(int n, int k) => (nuint)((long)n * (k / 4) + 4);
+        CudaDriverApi.cuMemAlloc_v2(out nint devW0, PackedBytes(n0, k)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW1, PackedBytes(n1, k)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW2, PackedBytes(n2, k)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)(k * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep2, (nuint)(n2 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus2, (nuint)(n2 * sizeof(ushort))).ThrowOnError();
+        try
+        {
+            fixed (byte* p = w0) CudaDriverApi.cuMemcpyHtoD_v2(devW0, (nint)p, PackedBytes(n0, k)).ThrowOnError();
+            fixed (byte* p = w1) CudaDriverApi.cuMemcpyHtoD_v2(devW1, (nint)p, PackedBytes(n1, k)).ThrowOnError();
+            fixed (byte* p = w2) CudaDriverApi.cuMemcpyHtoD_v2(devW2, (nint)p, PackedBytes(n2, k)).ThrowOnError();
+            fixed (Half* p = x) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)p, (nuint)(k * sizeof(ushort))).ThrowOnError();
+
+            kernels.LaunchI2_SGemvF16In(devW0, devX, sep0, n0, k, s);
+            kernels.LaunchI2_SGemvF16In(devW1, devX, sep1, n1, k, s);
+            kernels.LaunchI2_SGemvF16In(devW2, devX, sep2, n2, k, s);
+            kernels.LaunchI2_SGemv2F16In(devW0, devW1, devX, fus0, fus1, n0, n1, k, s);
+            kernels.LaunchI2_SGemv3F16In(devW0, devW1, devW2, devX, fus0, fus1, fus2, n0, n1, n2, k, s);
+            stream.Synchronize();
+
+            AssertHalfClose(sep0, fus0, n0);
+            AssertHalfClose(sep1, fus1, n1);
+            AssertHalfClose(sep2, fus2, n2);
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devW0); CudaDriverApi.cuMemFree_v2(devW1); CudaDriverApi.cuMemFree_v2(devW2);
+            CudaDriverApi.cuMemFree_v2(devX);
+            CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1); CudaDriverApi.cuMemFree_v2(sep2);
+            CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1); CudaDriverApi.cuMemFree_v2(fus2);
+        }
+    }
+
+    private static unsafe void AssertHalfClose(nint expectedDevice, nint actualDevice, int n)
+    {
+        Half[] expected = new Half[n];
+        Half[] actual = new Half[n];
+        fixed (Half* p = expected)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, expectedDevice, (nuint)(n * sizeof(ushort))).ThrowOnError();
+        fixed (Half* p = actual)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, actualDevice, (nuint)(n * sizeof(ushort))).ThrowOnError();
+
+        for (int i = 0; i < n; i++)
+        {
+            float diff = MathF.Abs((float)expected[i] - (float)actual[i]);
+            Assert.True(diff <= 1e-3f, $"index {i}: expected {(float)expected[i]}, actual {(float)actual[i]}");
+        }
+    }
+
+    private static byte[] RandomPacked(Random rng, int n, int k, float scale)
+    {
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++)
+            ternary[i] = (sbyte)(rng.Next(3) - 1);
+        return Pack(ternary, n, k, scale);
+    }
+
     /// <summary>
     /// Validates Variant B (W2A8, __dp4a) against an INT8 reference computed on the CPU.
     ///

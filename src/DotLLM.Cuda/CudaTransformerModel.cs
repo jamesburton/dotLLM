@@ -27,6 +27,17 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly int _ropeDim;
     private readonly int _ropeType;
 
+    // Launch-ceiling profiling (env DOTLLM_PROFILE_LAUNCH=1).
+    // Measures CPU-side kernel-dispatch time (queue all launches, no GPU wait) vs the full
+    // forward including the single _stream.Synchronize(). Zero-cost when the env var is unset.
+    private static readonly bool s_profileLaunch =
+        Environment.GetEnvironmentVariable("DOTLLM_PROFILE_LAUNCH") == "1";
+    private long _profDispatchTicks;   // accumulated dispatch-only ticks (decode steps)
+    private long _profTotalTicks;      // accumulated total forward ticks (decode steps)
+    private int _profSteps;            // counted steady-state decode steps
+    private int _profWarmupSkipped;    // warmup decode steps skipped before accumulation
+    private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -153,6 +164,10 @@ public sealed unsafe class CudaTransformerModel : IModel
         nint s = _stream.Handle;
         nint cublasH = _cublas.Handle;
 
+        // Profiling is only meaningful for the single-token decode step.
+        bool profile = s_profileLaunch && seqLen == 1;
+        long dispatchStartTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         _state.EnsureCapacity(seqLen);
 
         // 1. Upload tokenIds + positions to device
@@ -205,9 +220,20 @@ public sealed unsafe class CudaTransformerModel : IModel
             // ── ATTENTION BLOCK (NormOutput has normalized input) ──
 
             // Q/K/V projections: prefill → cuBLAS HGEMM, decode → quantized GEMV
-            Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
-            Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
-            Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            if (CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+                    lw.QInputDim, lw.KInputDim, lw.VInputDim))
+            {
+                _kernels.LaunchI2_SGemv3F16In(
+                    lw.QQuant, lw.KQuant, lw.VQuant, _state.NormOutput,
+                    _state.Q, _state.K, _state.V,
+                    lw.QOutputDim, lw.KOutputDim, lw.VOutputDim, lw.QInputDim, s);
+            }
+            else
+            {
+                Project(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutput, _state.Q, lw.QOutputDim, lw.QInputDim, seqLen);
+                Project(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutput, _state.K, lw.KOutputDim, lw.KInputDim, seqLen);
+                Project(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutput, _state.V, lw.VOutputDim, lw.VInputDim, seqLen);
+            }
 
             // Optional biases (FP16)
             if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
@@ -277,8 +303,19 @@ public sealed unsafe class CudaTransformerModel : IModel
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
             // Gate/Up projections
-            Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-            Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+            if (CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType,
+                    lw.GateInputDim, lw.UpInputDim))
+            {
+                _kernels.LaunchI2_SGemv2F16In(
+                    lw.GateQuant, lw.UpQuant, _state.NormOutput,
+                    _state.FfnGate, _state.FfnUp,
+                    lw.GateOutputDim, lw.UpOutputDim, lw.GateInputDim, s);
+            }
+            else
+            {
+                Project(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutput, _state.FfnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+                Project(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutput, _state.FfnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+            }
 
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
@@ -357,8 +394,26 @@ public sealed unsafe class CudaTransformerModel : IModel
             _weights.OutputOutputDim, _weights.OutputInputDim, 1);
         _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
 
+        // Capture dispatch-only time (all launches queued, before GPU wait).
+        long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         // 7. Stream sync (single sync point for entire forward pass)
         _stream.Synchronize();
+
+        if (profile)
+        {
+            long totalEndTs = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_profWarmupSkipped < ProfWarmupSteps)
+            {
+                _profWarmupSkipped++;
+            }
+            else
+            {
+                _profDispatchTicks += dispatchEndTs - dispatchStartTs;
+                _profTotalTicks += totalEndTs - dispatchStartTs;
+                _profSteps++;
+            }
+        }
 
         // 8. D2H copy FP32 logits to CPU UnmanagedTensor
         var shape = new TensorShape(1, vocabSize);
@@ -415,6 +470,26 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
     }
 
+    private static bool CanFuseI2SDecode(
+        int seqLen,
+        QuantizationType qt0, QuantizationType qt1,
+        int inputDim0, int inputDim1)
+        => seqLen == 1
+           && qt0 == QuantizationType.I2_S
+           && qt1 == QuantizationType.I2_S
+           && inputDim0 == inputDim1;
+
+    private static bool CanFuseI2SDecode(
+        int seqLen,
+        QuantizationType qt0, QuantizationType qt1, QuantizationType qt2,
+        int inputDim0, int inputDim1, int inputDim2)
+        => seqLen == 1
+           && qt0 == QuantizationType.I2_S
+           && qt1 == QuantizationType.I2_S
+           && qt2 == QuantizationType.I2_S
+           && inputDim0 == inputDim1
+           && inputDim0 == inputDim2;
+
     /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.
     /// </summary>
@@ -438,9 +513,29 @@ public sealed unsafe class CudaTransformerModel : IModel
         return new CudaQuantizedKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, config);
     }
 
+    /// <summary>
+    /// Prints mean CPU-side dispatch ms/token vs total ms/token over the profiled
+    /// steady-state decode steps. No-op unless DOTLLM_PROFILE_LAUNCH=1.
+    /// </summary>
+    private void ReportLaunchProfile()
+    {
+        if (!s_profileLaunch || _profSteps == 0)
+            return;
+
+        double freq = System.Diagnostics.Stopwatch.Frequency;
+        double dispatchMs = (_profDispatchTicks / freq) * 1000.0 / _profSteps;
+        double totalMs = (_profTotalTicks / freq) * 1000.0 / _profSteps;
+        double ratio = totalMs > 0 ? dispatchMs / totalMs : 0;
+        Console.Error.WriteLine(
+            $"[DOTLLM_PROFILE_LAUNCH] decode steps={_profSteps} " +
+            $"dispatch={dispatchMs:F3} ms/token  total={totalMs:F3} ms/token  " +
+            $"ratio(dispatch/total)={ratio:F3}");
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
+        ReportLaunchProfile();
         _state.Dispose();
         _weights.Dispose();
         _kernels.Dispose();
