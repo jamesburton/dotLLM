@@ -266,13 +266,23 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             else if (kvCache is CudaKvCache cudaKvCache)
             {
-                cudaKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
+                if (seqLen == 1)
+                    cudaKvCache.UpdateDevicePositioned(
+                        _state.K, _state.V, positions, seqLen, layer, s, _kernels, _state.PositionsDevice);
+                else
+                    cudaKvCache.UpdateDevice(_state.K, _state.V, positions, seqLen, layer, s);
                 int seqKv = cudaKvCache.CurrentLength;
 
-                _kernels.LaunchAttention(_state.Q, cudaKvCache.GetKeysPtr(layer),
-                    cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                    seqLen, seqKv, numHeads, numKvHeads, headDim,
-                    positions[0], slidingWindow, s);
+                if (seqLen == 1)
+                    _kernels.LaunchAttentionPos(_state.Q, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput, _state.PositionsDevice,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        slidingWindow, s);
+                else
+                    _kernels.LaunchAttention(_state.Q, cudaKvCache.GetKeysPtr(layer),
+                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s);
             }
             else
             {

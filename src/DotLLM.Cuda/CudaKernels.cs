@@ -34,6 +34,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _softmaxModule;
     private readonly CudaModule _embeddingModule;
     private readonly CudaModule _attentionModule;
+    private readonly CudaModule _kvCacheUpdateModule;
     private readonly CudaModule _biasAddModule;
     private readonly CudaModule _perHeadRmsNormModule;
     private readonly CudaModule _convertModule;
@@ -80,6 +81,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _embeddingF16Func;
     private readonly nint _embeddingQ8_0Func;
     private readonly nint _attentionFunc;
+    private readonly nint _attentionPosFunc;
+    private readonly nint _kvCacheUpdatePosFunc;
     private readonly nint _biasAddFunc;
     private readonly nint _perHeadRmsNormFunc;
     private readonly nint _convertF16ToF32Func;
@@ -127,6 +130,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _softmaxModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "softmax.ptx"));
         _embeddingModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "embedding.ptx"));
         _attentionModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "attention.ptx"));
+        _kvCacheUpdateModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "kv_cache_update.ptx"));
         _biasAddModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "bias_add.ptx"));
         _perHeadRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "per_head_rmsnorm.ptx"));
         _convertModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "convert.ptx"));
@@ -173,6 +177,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _embeddingF16Func = _embeddingModule.GetFunction("embedding_lookup_f16");
         _embeddingQ8_0Func = _embeddingModule.GetFunction("embedding_lookup_q8_0");
         _attentionFunc = _attentionModule.GetFunction("attention_f16");
+        _attentionPosFunc = _attentionModule.GetFunction("attention_pos_f16");
+        _kvCacheUpdatePosFunc = _kvCacheUpdateModule.GetFunction("kv_cache_update_pos_f16");
         _biasAddFunc = _biasAddModule.GetFunction("bias_add_f16");
         _perHeadRmsNormFunc = _perHeadRmsNormModule.GetFunction("per_head_rmsnorm_f16");
         _convertF16ToF32Func = _convertModule.GetFunction("convert_f16_to_f32");
@@ -775,6 +781,47 @@ public sealed unsafe class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
     }
 
+    /// <summary>Attention variant that reads the query position from device memory.</summary>
+    public void LaunchAttentionPos(nint q, nint k, nint v, nint output, nint positions,
+                                   int seqQ, int seqKv,
+                                   int numHeads, int numKvHeads, int headDim,
+                                   int slidingWindow, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output, posArg = positions;
+        int sqArg = seqQ, skvArg = seqKv;
+        int nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int swArg = slidingWindow;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg, &posArg,
+                        &sqArg, &skvArg, &nhArg, &nkvArg, &hdArg, &swArg};
+
+        int numBlocks = seqQ * numHeads;
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchKernel(_attentionPosFunc,
+                (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Single-token KV-cache update that reads the target position from device memory.</summary>
+    public void LaunchKvCacheUpdatePos(nint key, nint value, nint cacheKey, nint cacheValue,
+                                       nint positions, int kvStride, nint stream)
+    {
+        nint keyArg = key, valueArg = value, cacheKeyArg = cacheKey, cacheValueArg = cacheValue;
+        nint posArg = positions;
+        int strideArg = kvStride;
+        int blocks = Math.Min(32, (kvStride + BlockSize - 1) / BlockSize);
+
+        void** args = stackalloc void*[]
+        {
+            &keyArg, &valueArg, &cacheKeyArg, &cacheValueArg, &posArg, &strideArg
+        };
+        CudaDriverApi.cuLaunchKernel(_kvCacheUpdatePosFunc,
+                (uint)blocks, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>Bias add: output[t, :] += bias[:]. half2 vectorized (2 elements/thread).</summary>
     public void LaunchBiasAdd(nint output, nint bias, int dim, int seqLen, nint stream)
     {
@@ -1016,6 +1063,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _softmaxModule.Dispose();
         _embeddingModule.Dispose();
         _attentionModule.Dispose();
+        _kvCacheUpdateModule.Dispose();
         _biasAddModule.Dispose();
         _perHeadRmsNormModule.Dispose();
         _convertModule.Dispose();
