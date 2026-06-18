@@ -7,6 +7,9 @@
 .claude/local-paths.md
 .claude/agent-memory/
 
+# Local agent handoff/progress notes (machine-specific, not shared)
+.docs/
+
 # User-specific files
 *.rsuser
 *.suo

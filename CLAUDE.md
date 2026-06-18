@@ -127,6 +127,8 @@ dotLLM/
 
 **Read the relevant doc(s) before starting work on a module.**
 
+**Local handoff:** If `.docs/HANDOFF.md` exists, read it at session start before planning or editing. It is a private, git-ignored progress/task summary for the current local workspace. Maintain it when you discover durable progress, next tasks, benchmark results, or decision context. Use sibling files in `.docs/` such as `.docs/FUTURE_TASKS.md` for load-on-demand detail and link them from the handoff instead of bloating the summary.
+
 | Topic | Document | Read when working on... |
 |-------|----------|------------------------|
 | System architecture & data flow | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Any major feature, onboarding |
