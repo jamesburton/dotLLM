@@ -39,6 +39,8 @@ public sealed unsafe class CudaTransformerModel : IModel
     private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
     private static readonly bool s_cudaGraphDecode =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") == "1";
+    private static readonly bool s_i2sA8Decode =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_I2S_A8") == "1";
     private CudaDecodeGraph? _decodeGraph;
     private CudaKvCache? _decodeGraphCache;
     private bool _decodeGraphDisabled;
@@ -272,7 +274,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             // ── ATTENTION BLOCK (NormOutput has normalized input) ──
 
             // Q/K/V projections: prefill → cuBLAS HGEMM, decode → quantized GEMV
-            if (CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+            if (!s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
                     lw.QInputDim, lw.KInputDim, lw.VInputDim))
             {
                 _kernels.LaunchI2_SGemv3F16In(
@@ -347,7 +349,7 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // Optional attention Sub-LN (BitNet): RMSNorm over the attention output [numHeads·headDim]
             // before the output projection. No-op for non-BitNet models (weight == 0).
-            bool fusedAttnSubNormO = CanFuseI2SNormDecode(
+            bool fusedAttnSubNormO = !s_i2sA8Decode && CanFuseI2SNormDecode(
                 seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
             if (fusedAttnSubNormO)
             {
@@ -377,7 +379,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
             // Gate/Up projections
-            if (CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType,
+            if (!s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType,
                     lw.GateInputDim, lw.UpInputDim))
             {
                 _kernels.LaunchI2_SGemv2F16In(
@@ -543,6 +545,13 @@ public sealed unsafe class CudaTransformerModel : IModel
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
         }
+        else if (CanUseI2SA8Project(qt, seqLen, outputDim, inputDim)) // Decode: I2_S W2A8 GEMV
+        {
+            _kernels.LaunchQuantizeF16ToI8AbsMax(input, _state.A8Input, _state.A8InvScale, inputDim, s);
+            _kernels.LaunchI2_SGemvA8DeviceScale(
+                quantWeight, _state.A8Input, _state.A8OutputF32, outputDim, inputDim, _state.A8InvScale, s);
+            _kernels.LaunchConvertF32ToF16(_state.A8OutputF32, output, outputDim, s);
+        }
         else if (quantWeight != 0 && qt == QuantizationType.I2_S) // Decode: I2_S ternary GEMV
         {
             _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
@@ -594,6 +603,15 @@ public sealed unsafe class CudaTransformerModel : IModel
            && normWeight != 0
            && qt == QuantizationType.I2_S
            && inputDim == normDim;
+
+    private bool CanUseI2SA8Project(QuantizationType qt, int seqLen, int outputDim, int inputDim)
+        => s_i2sA8Decode
+           && seqLen == 1
+           && qt == QuantizationType.I2_S
+           && Config.Architecture == Architecture.BitNet
+           && outputDim != Config.VocabSize
+           && inputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize)
+           && outputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize);
 
     private bool CanUseDecodeGraph(int seqLen, IKvCache? kvCache)
         => s_cudaGraphDecode

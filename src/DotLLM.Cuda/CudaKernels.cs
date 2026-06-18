@@ -98,6 +98,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemvNormF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
     private readonly nint _i2sGemvA8Func;
+    private readonly nint _i2sGemvA8DeviceScaleFunc;
+    private readonly nint _quantizeF16ToI8AbsMaxFunc;
     private readonly nint _dequantI2sF16Func;
     private readonly nint _relu2Func;
     private readonly nint _relu2F32Func;
@@ -194,6 +196,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvNormF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_norm_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
+        _i2sGemvA8DeviceScaleFunc = _i2sGemvModule.GetFunction("i2_s_gemv_a8_device_scale");
+        _quantizeF16ToI8AbsMaxFunc = _i2sGemvModule.GetFunction("quantize_f16_to_i8_absmax");
         _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
         _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
@@ -379,6 +383,29 @@ public sealed unsafe class CudaKernels : IDisposable
         float sArg = invActScale;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg, &sArg};
         CudaDriverApi.cuLaunchKernel(_i2sGemvA8Func,
+                (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Quantizes one FP16 activation vector to int8 with symmetric absmax scaling.</summary>
+    public void LaunchQuantizeF16ToI8AbsMax(nint xF16, nint xqInt8, nint invActScale, int k, nint stream)
+    {
+        nint xArg = xF16, xqArg = xqInt8, scaleArg = invActScale;
+        int kArg = k;
+        void** args = stackalloc void*[] {&xArg, &xqArg, &scaleArg, &kArg};
+        CudaDriverApi.cuLaunchKernel(_quantizeF16ToI8AbsMaxFunc,
+                1, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>I2_S W2A8 GEMV using a device-resident activation inverse scale for graph replay.</summary>
+    public void LaunchI2_SGemvA8DeviceScale(nint quantWeight, nint xqInt8, nint yF32, int n, int k,
+                                             nint invActScale, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xqInt8, yArg = yF32, scaleArg = invActScale;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg, &scaleArg};
+        CudaDriverApi.cuLaunchKernel(_i2sGemvA8DeviceScaleFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

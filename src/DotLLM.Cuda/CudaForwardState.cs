@@ -44,6 +44,11 @@ internal sealed class CudaForwardState : IDisposable
     // General-purpose FP16 scratch buffer
     public nint GemmOutputF16;
 
+    // I2_S W2A8 decode scratch. Activations are quantized per token on GPU.
+    public nint A8Input;        // int8 [max input dim]
+    public nint A8InvScale;     // float [1]
+    public nint A8OutputF32;    // float [max non-LM-head projection output dim]
+
     // On-the-fly dequantization scratch: holds one projection's FP16 weights
     // for cuBLAS GEMM. Sized for the largest projection (max of Gate/Up/Down/Q/O).
     // Reused across all cuBLAS calls — safe because all ops are on the same stream.
@@ -77,6 +82,12 @@ internal sealed class CudaForwardState : IDisposable
             (long)Math.Max(numHeads * headDim, numKvHeads * headDim) * hiddenSize,
             (long)intermediateSize * hiddenSize);
         DequantScratch = AllocDevice(maxProjectionElements * sizeof(ushort));
+
+        int maxA8Input = Math.Max(hiddenSize, intermediateSize);
+        int maxA8Output = Math.Max(hiddenSize, intermediateSize);
+        A8Input = AllocDevice(maxA8Input);
+        A8InvScale = AllocDevice(sizeof(float));
+        A8OutputF32 = AllocDevice((long)maxA8Output * sizeof(float));
 
         // Initial allocation for decode (seqLen=1)
         EnsureCapacity(1);
@@ -160,6 +171,9 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref LogitsF16);
         FreeIfNonZero(ref LogitsF32);
         FreeIfNonZero(ref DequantScratch);
+        FreeIfNonZero(ref A8Input);
+        FreeIfNonZero(ref A8InvScale);
+        FreeIfNonZero(ref A8OutputF32);
         _currentSeqLen = 0;
     }
 }

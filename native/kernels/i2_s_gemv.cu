@@ -571,3 +571,116 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8(
     if (lane == 0) y[row] = acc * scale * inv_act_scale;
     }
 }
+
+extern "C" __global__ void __launch_bounds__(256) quantize_f16_to_i8_absmax(
+    const half* __restrict__ x,
+    int8_t*     __restrict__ xq,
+    float*      __restrict__ inv_act_scale,
+    const int k)
+{
+    __shared__ float warp_max[32];
+    __shared__ float scale;
+    __shared__ float inv_scale;
+
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        local = fmaxf(local, fabsf(__half2float(x[i])));
+
+    for (int off = warpSize / 2; off > 0; off >>= 1)
+        local = fmaxf(local, __shfl_down_sync(0xFFFFFFFF, local, off));
+
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+    if (lane == 0) warp_max[wid] = local;
+    __syncthreads();
+
+    if (wid == 0)
+    {
+        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        local = lane < num_warps ? warp_max[lane] : 0.0f;
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            local = fmaxf(local, __shfl_down_sync(0xFFFFFFFF, local, off));
+        if (lane == 0)
+        {
+            float absmax = local > 0.0f ? local : 1.0f;
+            inv_scale = absmax / 127.0f;
+            scale = 127.0f / absmax;
+            *inv_act_scale = inv_scale;
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+    {
+        float q = rintf(__half2float(x[i]) * scale);
+        q = fminf(127.0f, fmaxf(-127.0f, q));
+        xq[i] = (int8_t)q;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8_device_scale(
+    const uint8_t* __restrict__ weight,
+    const int8_t*  __restrict__ xq,
+    float*         __restrict__ y,
+    const int   n,
+    const int   k,
+    const float* __restrict__ inv_act_scale)
+{
+    const float inv = *inv_act_scale;
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const int row_bytes = k / 4;
+    const int num_u4    = row_bytes >> 4;
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+    const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
+    if (row >= n) return;
+
+    const uint4* w_row  = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
+
+    int iacc = 0;
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        uint4 w = w_row[u];
+        int boff    = u << 4;
+        int blk     = boff >> 5;
+        int gp0     = boff & 31;
+        int blkBase = blk << 7;
+
+        #pragma unroll
+        for (int wi = 0; wi < 4; wi++)
+        {
+            unsigned int word = (&w.x)[wi];
+            int gpw = gp0 + wi * 4;
+            #pragma unroll
+            for (int bi = 0; bi < 4; bi++)
+            {
+                unsigned int p  = (word >> (bi * 8)) & 0xFF;
+                int xb = blkBase + gpw + bi;
+
+                unsigned int w_codes =
+                      ((unsigned int)((p >> 6) & 0x3))
+                    | ((unsigned int)((p >> 4) & 0x3) <<  8)
+                    | ((unsigned int)((p >> 2) & 0x3) << 16)
+                    | ((unsigned int)((p     ) & 0x3) << 24);
+                int w_vec = __vsubss4((int)w_codes, 0x01010101);
+
+                unsigned int a_vec =
+                      ((unsigned int)((unsigned char)__ldg(xq + xb      )))
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  32)) <<  8)
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  64)) << 16)
+                    | ((unsigned int)((unsigned char)__ldg(xq + xb +  96)) << 24);
+
+                iacc = __dp4a((int)a_vec, w_vec, iacc);
+            }
+        }
+    }
+
+    float acc = i2s_warp_reduce((float)iacc);
+    if (lane == 0) y[row] = acc * scale * inv;
+    }
+}
