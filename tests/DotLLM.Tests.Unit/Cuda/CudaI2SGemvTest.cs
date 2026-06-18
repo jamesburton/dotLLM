@@ -158,23 +158,37 @@ public class CudaI2SGemvTest
         CudaDriverApi.cuMemAlloc_v2(out nint fus0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint fus1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint fus2, (nuint)(n2 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint normW, (nuint)(k * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint normX, (nuint)(k * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint normSep, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint normFus, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
         try
         {
+            Half[] norm = new Half[k];
+            for (int i = 0; i < k; i++)
+                norm[i] = (Half)(0.5f + (float)rng.NextDouble());
+
             fixed (byte* p = w0) CudaDriverApi.cuMemcpyHtoD_v2(devW0, (nint)p, PackedBytes(n0, k)).ThrowOnError();
             fixed (byte* p = w1) CudaDriverApi.cuMemcpyHtoD_v2(devW1, (nint)p, PackedBytes(n1, k)).ThrowOnError();
             fixed (byte* p = w2) CudaDriverApi.cuMemcpyHtoD_v2(devW2, (nint)p, PackedBytes(n2, k)).ThrowOnError();
             fixed (Half* p = x) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)p, (nuint)(k * sizeof(ushort))).ThrowOnError();
+            fixed (Half* p = norm) CudaDriverApi.cuMemcpyHtoD_v2(normW, (nint)p, (nuint)(k * sizeof(ushort))).ThrowOnError();
 
             kernels.LaunchI2_SGemvF16In(devW0, devX, sep0, n0, k, s);
             kernels.LaunchI2_SGemvF16In(devW1, devX, sep1, n1, k, s);
             kernels.LaunchI2_SGemvF16In(devW2, devX, sep2, n2, k, s);
             kernels.LaunchI2_SGemv2F16In(devW0, devW1, devX, fus0, fus1, n0, n1, k, s);
             kernels.LaunchI2_SGemv3F16In(devW0, devW1, devW2, devX, fus0, fus1, fus2, n0, n1, n2, k, s);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(normX, devX, (nuint)(k * sizeof(ushort)), s).ThrowOnError();
+            kernels.LaunchRmsNorm(normX, normW, normX, k, 1e-5f, 1, s);
+            kernels.LaunchI2_SGemvF16In(devW0, normX, normSep, n0, k, s);
+            kernels.LaunchI2_SGemvNormF16In(devW0, devX, normW, normFus, n0, k, 1e-5f, s);
             stream.Synchronize();
 
             AssertHalfClose(sep0, fus0, n0);
             AssertHalfClose(sep1, fus1, n1);
             AssertHalfClose(sep2, fus2, n2);
+            AssertHalfClose(normSep, normFus, n0);
         }
         finally
         {
@@ -182,6 +196,8 @@ public class CudaI2SGemvTest
             CudaDriverApi.cuMemFree_v2(devX);
             CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1); CudaDriverApi.cuMemFree_v2(sep2);
             CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1); CudaDriverApi.cuMemFree_v2(fus2);
+            CudaDriverApi.cuMemFree_v2(normW); CudaDriverApi.cuMemFree_v2(normX);
+            CudaDriverApi.cuMemFree_v2(normSep); CudaDriverApi.cuMemFree_v2(normFus);
         }
     }
 

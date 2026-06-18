@@ -92,6 +92,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemvF16InFunc;
     private readonly nint _i2sGemv2F16InFunc;
     private readonly nint _i2sGemv3F16InFunc;
+    private readonly nint _i2sGemvNormF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
     private readonly nint _i2sGemvA8Func;
     private readonly nint _dequantI2sF16Func;
@@ -184,6 +185,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in");
         _i2sGemv2F16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv2_f16in");
         _i2sGemv3F16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv3_f16in");
+        _i2sGemvNormF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_norm_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
         _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
@@ -319,6 +321,25 @@ public sealed unsafe class CudaKernels : IDisposable
             &n0Arg, &n1Arg, &n2Arg, &kArg
         };
         CudaDriverApi.cuLaunchKernel(_i2sGemv3F16InFunc,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>I2_S ternary GEMV whose FP16 input is RMS-normalized in-kernel before projection.</summary>
+    public void LaunchI2_SGemvNormF16In(
+        nint quantWeight, nint xF16, nint normWeightF16, nint yF16,
+        int n, int k, float eps, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF16, normArg = normWeightF16, yArg = yF16;
+        int nArg = n, kArg = k;
+        float epsArg = eps;
+        uint grid = (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock);
+
+        void** args = stackalloc void*[]
+        {
+            &wArg, &xArg, &normArg, &yArg, &nArg, &kArg, &epsArg
+        };
+        CudaDriverApi.cuLaunchKernel(_i2sGemvNormF16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

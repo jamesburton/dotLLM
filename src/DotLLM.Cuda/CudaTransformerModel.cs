@@ -283,12 +283,22 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // Optional attention Sub-LN (BitNet): RMSNorm over the attention output [numHeads·headDim]
             // before the output projection. No-op for non-BitNet models (weight == 0).
-            if (lw.AttnSubNormWeight != 0)
+            bool fusedAttnSubNormO = CanFuseI2SNormDecode(
+                seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
+            if (fusedAttnSubNormO)
+            {
+                _kernels.LaunchI2_SGemvNormF16In(
+                    lw.OQuant, _state.AttnOutput, lw.AttnSubNormWeight, _state.NormOutput,
+                    lw.OOutputDim, lw.OInputDim, eps, s);
+            }
+
+            if (lw.AttnSubNormWeight != 0 && !fusedAttnSubNormO)
                 _kernels.LaunchRmsNorm(_state.AttnOutput, lw.AttnSubNormWeight, _state.AttnOutput,
                     numHeads * headDim, eps, seqLen, s);
 
             // O projection → NormOutput
-            Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
+            if (!fusedAttnSubNormO)
+                Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
             // ── FUSED: attention residual + FFN norm ──
@@ -489,6 +499,17 @@ public sealed unsafe class CudaTransformerModel : IModel
            && qt2 == QuantizationType.I2_S
            && inputDim0 == inputDim1
            && inputDim0 == inputDim2;
+
+    private static bool CanFuseI2SNormDecode(
+        int seqLen,
+        nint normWeight,
+        QuantizationType qt,
+        int inputDim,
+        int normDim)
+        => seqLen == 1
+           && normWeight != 0
+           && qt == QuantizationType.I2_S
+           && inputDim == normDim;
 
     /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.
