@@ -122,27 +122,45 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     const int row_bytes = k / 4;
     const int num_u4    = row_bytes >> 4;     // 16 bytes per uint4
 
-    // Each warp owns I2S_ROWS_PER_WARP consecutive-in-block rows. Staging x once and reusing it across
-    // (warps × rows-per-warp) = I2S_ROWS_PER_BLOCK rows amortizes the half→float x stage further.
+    // Each warp owns I2S_ROWS_PER_WARP consecutive-in-block rows. v3 INTERLEAVES the rows inside ONE
+    // u-loop instead of finishing one row before starting the next (v2): per iteration each lane issues
+    // I2S_ROWS_PER_WARP independent uint4 weight loads (one per row) BEFORE the ALU-heavy decode, so
+    // the rows' load streams overlap and hide global-load latency. The kernel is far from weight-DRAM
+    // saturation (~5× headroom to the 3060's 360 GB/s) — it is latency/ILP-bound — so widening the
+    // in-flight load window is the lever. Numerics unchanged (each row's fp32 sum order is identical).
+    const int rowBase = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP;
+    if (rowBase >= n) return;
+
+    const uint4* w_rows[I2S_ROWS_PER_WARP];
+    float acc[I2S_ROWS_PER_WARP];
     #pragma unroll
     for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
     {
-        const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
-        if (row >= n) return;                 // rows ascend; once past n the rest are too
+        int r = min(rowBase + rr, n - 1);     // clamp tail rows; their result is discarded below
+        w_rows[rr] = reinterpret_cast<const uint4*>(weight + (size_t)r * row_bytes);
+        acc[rr] = 0.0f;
+    }
 
-        const uint4* w_row = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
-        float acc = 0.0f;
-        // The warp's 32 lanes stride over this row's uint4 units → 32 coalesced 16-byte loads in flight.
-        for (int u = lane; u < num_u4; u += warpSize)
-        {
-            uint4 w = w_row[u];
-            int boff = u << 4;                // byte offset of this uint4
-            int blk  = boff >> 5;             // 32 bytes per 128-block
-            int gp0  = boff & 31;             // 0 or 16
-            i2s_accum_u4(acc, w, xs, blk << 7, gp0);
-        }
-        acc = i2s_warp_reduce(acc);
-        if (lane == 0) y[row] = __float2half(acc * scale);
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        int boff   = u << 4;
+        int blkBase = (boff >> 5) << 7;       // (blk) * 128
+        int gp0    = boff & 31;               // 0 or 16
+
+        // Issue all rows' loads first → independent memory traffic overlaps.
+        uint4 w[I2S_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) w[rr] = w_rows[rr][u];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) i2s_accum_u4(acc[rr], w[rr], xs, blkBase, gp0);
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        float a = i2s_warp_reduce(acc[rr]);
+        int row = rowBase + rr;
+        if (lane == 0 && row < n) y[row] = __float2half(a * scale);
     }
 }
 
@@ -167,24 +185,39 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
     const int row_bytes = k / 4;
     const int num_u4    = row_bytes >> 4;
 
+    // Same row-interleaved ILP structure as the f16in twin (kept identical for exact CPU-parity).
+    const int rowBase = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP;
+    if (rowBase >= n) return;
+
+    const uint4* w_rows[I2S_ROWS_PER_WARP];
+    float acc[I2S_ROWS_PER_WARP];
     #pragma unroll
     for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
     {
-        const int row = blockIdx.x * I2S_ROWS_PER_BLOCK + wid * I2S_ROWS_PER_WARP + rr;
-        if (row >= n) return;
+        int r = min(rowBase + rr, n - 1);
+        w_rows[rr] = reinterpret_cast<const uint4*>(weight + (size_t)r * row_bytes);
+        acc[rr] = 0.0f;
+    }
 
-        const uint4* w_row = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
-        float acc = 0.0f;
-        for (int u = lane; u < num_u4; u += warpSize)
-        {
-            uint4 w = w_row[u];
-            int boff = u << 4;
-            int blk  = boff >> 5;
-            int gp0  = boff & 31;
-            i2s_accum_u4(acc, w, xs, blk << 7, gp0);
-        }
-        acc = i2s_warp_reduce(acc);
-        if (lane == 0) y[row] = acc * scale;
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        int boff    = u << 4;
+        int blkBase = (boff >> 5) << 7;
+        int gp0     = boff & 31;
+
+        uint4 w[I2S_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) w[rr] = w_rows[rr][u];
+        #pragma unroll
+        for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++) i2s_accum_u4(acc[rr], w[rr], xs, blkBase, gp0);
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < I2S_ROWS_PER_WARP; rr++)
+    {
+        float a = i2s_warp_reduce(acc[rr]);
+        int row = rowBase + rr;
+        if (lane == 0 && row < n) y[row] = a * scale;
     }
 }
 
