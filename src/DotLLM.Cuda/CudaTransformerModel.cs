@@ -38,7 +38,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private int _profWarmupSkipped;    // warmup decode steps skipped before accumulation
     private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
     private static readonly bool s_cudaGraphDecode =
-        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") == "1";
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") != "0";
     private static readonly bool s_i2sA8Decode =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_I2S_A8") == "1";
     private CudaDecodeGraph? _decodeGraph;

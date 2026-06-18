@@ -148,6 +148,8 @@ The GPU forward pass mirrors the CPU path in `TransformerModel.Forward()` but al
 
 A single CUDA stream executes all operations sequentially on the GPU. **No host–device synchronization occurs during the forward pass** — all kernel launches and cuBLAS calls are asynchronous. The only sync point is `cuStreamSynchronize` before the final logits D2H copy. This minimizes PCIe roundtrips and CPU overhead.
 
+For eligible BitNet single-token decode on the plain CUDA KV-cache, dotLLM captures the decode launch sequence as a CUDA graph and replays it by default. This removes most CPU-side per-token launch dispatch overhead after the first captured token. Set `DOTLLM_CUDA_GRAPH=0` to disable graph replay when debugging or comparing against the raw launch path.
+
 ## cuBLAS GEMM/GEMV
 
 cuBLAS provides the most compute-intensive operations:
