@@ -45,6 +45,11 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaKvCache? _decodeGraphCache;
     private bool _decodeGraphDisabled;
 
+    /// <summary>
+    /// Steady-state status of the single-token decode CUDA graph (last decode step). Diagnostic only.
+    /// </summary>
+    public CudaDecodeGraphState DecodeGraphState { get; private set; } = CudaDecodeGraphState.None;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -488,6 +493,16 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 _decodeGraph!.Launch(s);
             }
+        }
+
+        // Record decode-graph status for diagnostics (single-token decode only; prefill is N/A).
+        if (seqLen == 1)
+        {
+            DecodeGraphState = !s_cudaGraphDecode ? CudaDecodeGraphState.Off
+                : graphLaunched ? CudaDecodeGraphState.Replayed
+                : _decodeGraphDisabled ? CudaDecodeGraphState.Fallback
+                : graphCapture ? CudaDecodeGraphState.Captured
+                : CudaDecodeGraphState.Ineligible;
         }
 
         // Capture dispatch-only time (all launches queued, before GPU wait).

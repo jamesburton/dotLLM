@@ -2,6 +2,26 @@ using DotLLM.Cuda.Interop;
 
 namespace DotLLM.Cuda;
 
+/// <summary>
+/// Steady-state status of the single-token decode CUDA graph, for diagnostics/CLI visibility.
+/// Reflects the most recent decode step.
+/// </summary>
+public enum CudaDecodeGraphState
+{
+    /// <summary>No decode step has run yet (e.g. only prefill so far).</summary>
+    None,
+    /// <summary>Graph capture disabled via <c>DOTLLM_CUDA_GRAPH=0</c>; raw kernel launches used.</summary>
+    Off,
+    /// <summary>Graph enabled but this configuration is ineligible (non-BitNet, multi-token, debug flags, or unsupported KV-cache).</summary>
+    Ineligible,
+    /// <summary>Graph enabled and eligible, but capture failed; fell back to raw kernel launches.</summary>
+    Fallback,
+    /// <summary>The graph was (re)captured on this step.</summary>
+    Captured,
+    /// <summary>A captured graph was replayed (the steady-state fast path).</summary>
+    Replayed,
+}
+
 internal sealed class CudaDecodeGraph : IDisposable
 {
     private const int StreamCaptureModeThreadLocal = 1;

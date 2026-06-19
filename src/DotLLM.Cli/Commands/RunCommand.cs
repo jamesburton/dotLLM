@@ -456,6 +456,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
             long totalMemory = modelWeightsBytes + computeBytes + kvCacheBytes;
 
+            // Backend/decode-path diagnostics
+            string samplerPath = BuildSamplerPath(settings);
+            string? decodeGraph = (model as DotLLM.Cuda.CudaTransformerModel)?.DecodeGraphState
+                .ToString().ToLowerInvariant();
+
             // Detect tool calls in generated output
             string outputText = generatedText.ToString();
             ToolCall[]? detectedToolCalls = null;
@@ -516,6 +521,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                         KvCacheBytes = kvCacheBytes,
                         TotalBytes = totalMemory,
                     },
+                    Backend = new RunBackendDto
+                    {
+                        SamplerPath = samplerPath,
+                        DecodeGraph = decodeGraph,
+                    },
                 };
                 Console.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.RunJsonResult));
             }
@@ -555,6 +565,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 var finishReasonStr = finishReason.ToString().ToLowerInvariant();
                 bodyLines.Add(new Markup($"  [dim]{Markup.Escape(finishReasonStr)} | {promptLen} prompt, {generated} generated[/]"));
+
+                var backendBits = $"sampler: {samplerPath}";
+                if (decodeGraph is not null)
+                    backendBits += $" | cuda graph: {decodeGraph}";
+                bodyLines.Add(new Markup($"  [dim]{Markup.Escape(backendBits)}[/]"));
 
                 // Assemble panel
                 var panelContent = new Rows(
@@ -654,6 +669,20 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         int colonIdx = device.IndexOf(':');
         if (colonIdx < 0) return 0;
         return int.Parse(device.AsSpan(colonIdx + 1));
+    }
+
+    /// <summary>
+    /// Human-readable label for the sampler path that will run, mirroring the auto-build logic in
+    /// <c>SamplerPipeline</c> (greedy when temp ≤ 0; bounded "fast top-k" when top-k is set and
+    /// top-p/min-p are disabled; otherwise the full step pipeline).
+    /// </summary>
+    private static string BuildSamplerPath(Settings settings)
+    {
+        if (settings.Temperature <= 0f)
+            return "greedy (argmax)";
+        if (settings.TopK > 0 && settings.TopP >= 1.0f && settings.MinP <= 0f)
+            return "fast top-k";
+        return "full pipeline";
     }
 
     private static string BuildSamplingLabel(Settings settings)
