@@ -158,13 +158,13 @@ public static class ServerStartup
         {
             Console.WriteLine("[dotllm] Paged KV-cache does not support quantization yet, using quantized simple cache.");
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsQuantized)
         {
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
 
