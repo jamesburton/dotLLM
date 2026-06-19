@@ -911,8 +911,12 @@ public static class Attention
         byte* vQuant = (byte*)kvCache.GetQuantizedValuesPtr(layerIndex);
         float* kWindow = (float*)kvCache.GetWindowKeysPtr(layerIndex);
         float* vWindow = (float*)kvCache.GetWindowValuesPtr(layerIndex);
-        int kQuantRowBytes = kvCache.KeyQuantizedRowBytes;
-        int vQuantRowBytes = kvCache.ValueQuantizedRowBytes;
+        // Per-layer quantized row bytes: equals the scalar property for every uniform
+        // model; for Gemma-4 the sliding/global layers carry distinct widths. The
+        // kvStride local above is already per-layer (derived from the per-call
+        // numKvHeads/headDim the caller passes for this layer).
+        int kQuantRowBytes = kvCache.KeyQuantizedRowBytesOf(layerIndex);
+        int vQuantRowBytes = kvCache.ValueQuantizedRowBytesOf(layerIndex);
 
         if (pool is null || numHeads < 2)
         {

@@ -15,7 +15,7 @@ namespace DotLLM.Engine.KvCache;
 /// </list>
 /// When <c>windowSize == 0</c>, all tokens are quantized immediately (no ring buffer).
 /// </summary>
-public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
+public sealed unsafe class QuantizedKvCache : IQuantizedKvCache, IPerLayerKvCache
 {
     private const int BlockSize = 32;
     private const int Q8_0BlockBytes = 34;
@@ -26,17 +26,21 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
     private readonly nint[]? _keysWindow;   // [numLayers] FP32 ring buffers (null when windowSize=0)
     private readonly nint[]? _valuesWindow; // [numLayers] FP32 ring buffers (null when windowSize=0)
     private readonly int _numLayers;
-    private readonly int _numKvHeads;
-    private readonly int _headDim;
+    private readonly KvGeometry _geom;       // per-layer KV row width (numKvHeads(l) * headDim(l))
+    private readonly bool _uniform;          // _geom.IsUniform, hoisted for the hot path
+    private readonly int _uniformStride;     // _geom.UniformStride when _uniform; else 0
     private readonly int _maxSeqLen;
-    private readonly int _kvStride;          // numKvHeads * headDim
     private readonly int _windowSize;
-    private readonly int _keyQuantRowBytes;
-    private readonly int _valueQuantRowBytes;
+    private readonly int[] _keyQuantRowBytes;   // [numLayers] quantized K row bytes
+    private readonly int[] _valueQuantRowBytes; // [numLayers] quantized V row bytes
     private readonly int[] _layerQuantizedLength; // per-layer eviction tracking
     private int _currentLength;
     private int _quantizedLength;
     private bool _disposed;
+
+    /// <summary>Per-layer KV row width (FP32 elements); scalar shortcut hoisted when uniform.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int Stride(int layerIndex) => _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex);
 
     /// <inheritdoc/>
     public int CurrentLength => _currentLength;
@@ -62,18 +66,48 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
     public KvCacheDType ValueDType { get; }
 
     /// <inheritdoc/>
-    public int KeyQuantizedRowBytes => _keyQuantRowBytes;
+    public int KeyQuantizedRowBytes => _keyQuantRowBytes[0];
 
     /// <inheritdoc/>
-    public int ValueQuantizedRowBytes => _valueQuantRowBytes;
+    public int ValueQuantizedRowBytes => _valueQuantRowBytes[0];
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int KeyQuantizedRowBytesOf(int layerIndex) => _keyQuantRowBytes[layerIndex];
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int ValueQuantizedRowBytesOf(int layerIndex) => _valueQuantRowBytes[layerIndex];
+
+    /// <inheritdoc/>
+    int IPerLayerKvCache.LayerCount => _numLayers;
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
 
     /// <summary>Total bytes allocated for all KV-cache buffers (quantized + window).</summary>
     public long AllocatedBytes { get; }
 
     /// <summary>
-    /// Creates a new quantized KV-cache.
+    /// Creates a new quantized KV-cache with a single uniform per-layer stride
+    /// (<c>numKvHeads * headDim</c>). Byte-identical to the per-layer constructor with
+    /// <see cref="KvGeometry.Uniform"/>.
     /// </summary>
     public QuantizedKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen,
+                             KvCacheDType keyDType, KvCacheDType valueDType, int windowSize)
+        : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen,
+               keyDType, valueDType, windowSize)
+    {
+    }
+
+    /// <summary>
+    /// Creates a new quantized KV-cache with per-layer-strided buffers. For a uniform
+    /// geometry this is byte-identical to the scalar constructor; for Gemma-4 (distinct
+    /// sliding vs global KV row widths) each layer's quantized + window buffers are sized
+    /// to that layer's stride so the two layer classes are addressed correctly.
+    /// </summary>
+    public QuantizedKvCache(KvGeometry geometry, int maxSeqLen,
                              KvCacheDType keyDType, KvCacheDType valueDType, int windowSize)
     {
         if (keyDType == KvCacheDType.F32 && valueDType == KvCacheDType.F32)
@@ -81,24 +115,18 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
         if (windowSize < 0)
             throw new ArgumentOutOfRangeException(nameof(windowSize), windowSize, "Window size must be >= 0.");
 
+        int numLayers = geometry.LayerCount;
         _numLayers = numLayers;
-        _numKvHeads = numKvHeads;
-        _headDim = headDim;
+        _geom = geometry;
+        _uniform = geometry.IsUniform;
+        _uniformStride = geometry.IsUniform ? geometry.UniformStride : 0;
         _maxSeqLen = maxSeqLen;
-        _kvStride = numKvHeads * headDim;
         _windowSize = windowSize;
         KeyDType = keyDType;
         ValueDType = valueDType;
 
-        if (_kvStride % BlockSize != 0)
-            throw new ArgumentException(
-                $"kvStride ({_kvStride}) must be a multiple of {BlockSize} for quantization.",
-                nameof(headDim));
-        System.Diagnostics.Debug.Assert(_kvStride % BlockSize == 0,
-            $"kvStride ({_kvStride}) must be a multiple of {BlockSize}");
-
-        _keyQuantRowBytes = ComputeQuantRowBytes(_kvStride, keyDType);
-        _valueQuantRowBytes = ComputeQuantRowBytes(_kvStride, valueDType);
+        _keyQuantRowBytes = new int[numLayers];
+        _valueQuantRowBytes = new int[numLayers];
         _layerQuantizedLength = new int[numLayers];
 
         _keysQuant = new nint[numLayers];
@@ -106,24 +134,35 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
 
         long totalBytes = 0;
 
-        // Allocate quantized buffers (sized for maxSeqLen — worst case all tokens quantized)
+        // Allocate quantized buffers (sized for maxSeqLen — worst case all tokens quantized),
+        // each at its own per-layer stride. The %BlockSize quantization constraint is checked
+        // per layer (uniform models hit the exact same check on the exact same value).
         for (int i = 0; i < numLayers; i++)
         {
-            nuint kQuantBytes = (nuint)((long)maxSeqLen * _keyQuantRowBytes);
-            nuint vQuantBytes = (nuint)((long)maxSeqLen * _valueQuantRowBytes);
+            int stride = geometry.KvStrideOf(i);
+            if (stride % BlockSize != 0)
+                throw new ArgumentException(
+                    $"kvStride ({stride}) for layer {i} must be a multiple of {BlockSize} for quantization.",
+                    nameof(geometry));
+
+            _keyQuantRowBytes[i] = ComputeQuantRowBytes(stride, keyDType);
+            _valueQuantRowBytes[i] = ComputeQuantRowBytes(stride, valueDType);
+
+            nuint kQuantBytes = (nuint)((long)maxSeqLen * _keyQuantRowBytes[i]);
+            nuint vQuantBytes = (nuint)((long)maxSeqLen * _valueQuantRowBytes[i]);
             _keysQuant[i] = (nint)NativeMemory.AlignedAlloc(kQuantBytes, 64);
             _valuesQuant[i] = (nint)NativeMemory.AlignedAlloc(vQuantBytes, 64);
             totalBytes += (long)(kQuantBytes + vQuantBytes);
         }
 
-        // Allocate window buffers (FP32)
+        // Allocate window buffers (FP32), each at its own per-layer stride.
         if (windowSize > 0)
         {
             _keysWindow = new nint[numLayers];
             _valuesWindow = new nint[numLayers];
-            nuint windowBytes = (nuint)((long)windowSize * _kvStride * sizeof(float));
             for (int i = 0; i < numLayers; i++)
             {
+                nuint windowBytes = (nuint)((long)windowSize * geometry.KvStrideOf(i) * sizeof(float));
                 _keysWindow[i] = (nint)NativeMemory.AlignedAlloc(windowBytes, 64);
                 _valuesWindow[i] = (nint)NativeMemory.AlignedAlloc(windowBytes, 64);
                 totalBytes += (long)(windowBytes * 2);
@@ -143,7 +182,10 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
         int seqLen = positions.Length;
         float* kSrc = (float*)keys.DataPointer;
         float* vSrc = (float*)values.DataPointer;
-        int fpRowBytes = _kvStride * sizeof(float);
+        int stride = Stride(layerIndex);
+        int keyRowBytes = _keyQuantRowBytes[layerIndex];
+        int valueRowBytes = _valueQuantRowBytes[layerIndex];
+        int fpRowBytes = stride * sizeof(float);
 
         // Compute new sequence length (idempotent across layer calls with same positions).
         int maxPos = positions[0];
@@ -160,12 +202,12 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
             for (int evictPos = prevQuantLen; evictPos < newQuantLen; evictPos++)
             {
                 int ringIdx = evictPos % _windowSize;
-                QuantizeRow((float*)_keysWindow![layerIndex] + ringIdx * _kvStride,
-                            (byte*)_keysQuant[layerIndex] + (long)evictPos * _keyQuantRowBytes,
-                            _kvStride, KeyDType);
-                QuantizeRow((float*)_valuesWindow![layerIndex] + ringIdx * _kvStride,
-                            (byte*)_valuesQuant[layerIndex] + (long)evictPos * _valueQuantRowBytes,
-                            _kvStride, ValueDType);
+                QuantizeRow((float*)_keysWindow![layerIndex] + ringIdx * stride,
+                            (byte*)_keysQuant[layerIndex] + (long)evictPos * keyRowBytes,
+                            stride, KeyDType);
+                QuantizeRow((float*)_valuesWindow![layerIndex] + ringIdx * stride,
+                            (byte*)_valuesQuant[layerIndex] + (long)evictPos * valueRowBytes,
+                            stride, ValueDType);
             }
 
             _layerQuantizedLength[layerIndex] = newQuantLen;
@@ -180,12 +222,12 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
 
                 int ringIdx = pos % _windowSize;
                 Buffer.MemoryCopy(
-                    kSrc + i * _kvStride,
-                    (float*)_keysWindow![layerIndex] + ringIdx * _kvStride,
+                    kSrc + i * stride,
+                    (float*)_keysWindow![layerIndex] + ringIdx * stride,
                     fpRowBytes, fpRowBytes);
                 Buffer.MemoryCopy(
-                    vSrc + i * _kvStride,
-                    (float*)_valuesWindow![layerIndex] + ringIdx * _kvStride,
+                    vSrc + i * stride,
+                    (float*)_valuesWindow![layerIndex] + ringIdx * stride,
                     fpRowBytes, fpRowBytes);
             }
 
@@ -201,12 +243,12 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
                     throw new ArgumentOutOfRangeException(nameof(positions),
                         $"Position {pos} exceeds max cache length {_maxSeqLen}.");
 
-                QuantizeRow(kSrc + i * _kvStride,
-                            (byte*)_keysQuant[layerIndex] + (long)pos * _keyQuantRowBytes,
-                            _kvStride, KeyDType);
-                QuantizeRow(vSrc + i * _kvStride,
-                            (byte*)_valuesQuant[layerIndex] + (long)pos * _valueQuantRowBytes,
-                            _kvStride, ValueDType);
+                QuantizeRow(kSrc + i * stride,
+                            (byte*)_keysQuant[layerIndex] + (long)pos * keyRowBytes,
+                            stride, KeyDType);
+                QuantizeRow(vSrc + i * stride,
+                            (byte*)_valuesQuant[layerIndex] + (long)pos * valueRowBytes,
+                            stride, ValueDType);
             }
 
             _quantizedLength = newLength;
@@ -218,8 +260,9 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)
     {
-        var kRef = new TensorRef(positions.Length, _kvStride, keys.DType, keys.DeviceId, keys.DataPointer);
-        var vRef = new TensorRef(positions.Length, _kvStride, values.DType, values.DeviceId, values.DataPointer);
+        int stride = Stride(layerIndex);
+        var kRef = new TensorRef(positions.Length, stride, keys.DType, keys.DeviceId, keys.DataPointer);
+        var vRef = new TensorRef(positions.Length, stride, values.DType, values.DeviceId, values.DataPointer);
         Update(kRef, vRef, positions, layerIndex);
     }
 
@@ -247,7 +290,7 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
     {
         // Return window data if available, otherwise empty ref.
         if (_keysWindow != null && WindowLength > 0)
-            return new TensorRef(WindowLength, _kvStride, DType.Float32, -1, _keysWindow[layerIndex]);
+            return new TensorRef(WindowLength, Stride(layerIndex), DType.Float32, -1, _keysWindow[layerIndex]);
         return default;
     }
 
@@ -256,7 +299,7 @@ public sealed unsafe class QuantizedKvCache : IQuantizedKvCache
     public TensorRef GetValuesRef(int layerIndex)
     {
         if (_valuesWindow != null && WindowLength > 0)
-            return new TensorRef(WindowLength, _kvStride, DType.Float32, -1, _valuesWindow[layerIndex]);
+            return new TensorRef(WindowLength, Stride(layerIndex), DType.Float32, -1, _valuesWindow[layerIndex]);
         return default;
     }
 
