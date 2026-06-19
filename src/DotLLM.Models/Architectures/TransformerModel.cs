@@ -370,26 +370,48 @@ public sealed unsafe class TransformerModel : IModel
         Config.GlobalHeadDim is int ghd && ghd != Config.HeadDim;
 
     /// <summary>
-    /// Rejects the combination of a distinct per-layer head dimension (Gemma 4
-    /// <c>global_head_dim</c> != <c>head_dim</c>) with a KV-cache. The
-    /// <c>SimpleKvCache</c> / paged KV caches allocate a single
-    /// <c>numKvHeads * headDim</c> stride per layer, but a distinct-head-dim model
-    /// has DIFFERENT per-layer K/V block sizes (full-attention layers:
-    /// <c>NumGlobalKvHeads * GlobalHeadDim</c>; sliding layers:
-    /// <c>NumKvHeads * HeadDim</c>). The cacheless forward (diffusion + the
-    /// synthetic forward) fully supports the distinct-head-dim case; per-layer
-    /// KV-cache strides are tracked as future work. Throws a clear message.
+    /// Validates a supplied KV-cache against a distinct-per-layer-head-dim model
+    /// (Gemma 4 <c>global_head_dim</c> != <c>head_dim</c>). Such a model has DIFFERENT
+    /// per-layer K/V row widths (full-attention layers <c>NumGlobalKvHeads *
+    /// GlobalHeadDim</c>; sliding layers <c>NumKvHeads * HeadDim</c>). As of KV Phase 0
+    /// the contiguous F32 <c>SimpleKvCache</c> supports this via per-layer
+    /// strides, so the cache is accepted when its geometry MATCHES
+    /// <see cref="KvGeometry.FromConfig"/>; a mismatched cache (e.g. a uniform cache
+    /// built for a different model) fails fast. Quantized / paged caches do not yet
+    /// carry per-layer strides for distinct-head-dim models and are still rejected.
+    /// Non-distinct (uniform) models skip this entirely — every cache type is valid.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GuardKvCacheHeadDim(IKvCache? kvCache)
     {
-        if (kvCache is not null && HasDistinctPerLayerHeadDim)
-            throw new NotSupportedException(
-                $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
-                + $"({Config.HeadDim}) is supported on the cacheless forward path only — the "
-                + "KV-cache allocates a single per-layer stride and cannot hold the two distinct "
-                + "per-layer K/V block sizes. Run this model without a KV-cache (the diffusion "
-                + "decode path is cacheless). Per-layer KV-cache strides are tracked as future work.");
+        if (kvCache is null || !HasDistinctPerLayerHeadDim)
+            return;
+
+        var geom = KvGeometry.FromConfig(Config);
+
+        if (kvCache is IPerLayerKvCache perLayer)
+        {
+            if (perLayer.LayerCount != geom.LayerCount)
+                throw new ArgumentException(
+                    $"KV-cache layer count {perLayer.LayerCount} does not match model layer count "
+                    + $"{geom.LayerCount}.", nameof(kvCache));
+            for (int l = 0; l < geom.LayerCount; l++)
+            {
+                if (perLayer.KvStrideOf(l) != geom.KvStrideOf(l))
+                    throw new ArgumentException(
+                        $"KV-cache geometry mismatch at layer {l}: cache stride {perLayer.KvStrideOf(l)} "
+                        + $"!= model stride {geom.KvStrideOf(l)}. Build the cache with "
+                        + "KvGeometry.FromConfig(Config).", nameof(kvCache));
+            }
+            return;
+        }
+
+        throw new NotSupportedException(
+            $"Gemma 4 with distinct global_head_dim ({Config.GlobalHeadDim}) and head_dim "
+            + $"({Config.HeadDim}) requires a per-layer-strided KV-cache. Only the contiguous F32 "
+            + $"SimpleKvCache carries per-layer strides today; the supplied "
+            + $"{kvCache.GetType().Name} does not. Build a SimpleKvCache with "
+            + "KvGeometry.FromConfig(Config) (F32) or run cacheless. Per-layer quantized / paged "
+            + "KV strides are tracked as future work.");
     }
 
     /// <inheritdoc/>
@@ -871,7 +893,7 @@ public sealed unsafe class TransformerModel : IModel
                         in lw, layer, seqLen,
                         hidden, residual, normOut, q, k, v, attnOut,
                         numKvHeadsLayer, headDimLayer, qStrideLayer, kvStrideLayer,
-                        positions, eps);
+                        positions, eps, kvCache);
                 }
                 continue;
             }
@@ -1527,7 +1549,7 @@ public sealed unsafe class TransformerModel : IModel
         float* hidden, float* residual, float* normOut,
         float* q, float* k, float* v, float* attnOut,
         int numKvHeadsLayer, int headDimLayer, int qStrideLayer, int kvStrideLayer,
-        ReadOnlySpan<int> positions, float eps)
+        ReadOnlySpan<int> positions, float eps, IKvCache? kvCache = null)
     {
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
@@ -1667,6 +1689,40 @@ public sealed unsafe class TransformerModel : IModel
             {
                 ArrayPool<float>.Shared.Return(kCat);
                 ArrayPool<float>.Shared.Return(vCat);
+            }
+        }
+        else if (kvCache is not null)
+        {
+            // Autoregressive Gemma-4 decode. Store this layer's post-rope K and
+            // post-vnorm V (exactly what cacheless attention consumes) into the
+            // per-layer-strided cache at `positions`, then attend over the full
+            // cached context [0, CurrentLength). The cache row width for this layer
+            // is kvStrideLayer (= numKvHeadsLayer * headDimLayer), which matches the
+            // KvGeometry.FromConfig stride validated up front by GuardKvCacheHeadDim
+            // — so the sliding (e.g. 2×16) and global (2×32) layers each address
+            // their own buffer correctly. Causal mask, positionOffset = positions[0].
+            var kRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)k);
+            var vRef = new TensorRef(seqLen, kvStrideLayer, DType.Float32, -1, (nint)v);
+            kvCache.Update(kRef, vRef, positions, layer);
+
+            int seqKv = kvCache.CurrentLength;
+            if (kvCache is IQuantizedKvCache qkvCache)
+            {
+                // Quantized KV: dequantize tiles on-the-fly during attention. (A
+                // per-layer-strided quantized cache for distinct-head-dim Gemma-4 is
+                // future work — GuardKvCacheHeadDim only admits per-layer F32 today,
+                // so this branch is reached only for uniform-head-dim Gemma-4.)
+                Attention.Execute(q, qkvCache, layer, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
+                    layerSlidingWindow, softCap: 0f);
+            }
+            else
+            {
+                var cachedK = kvCache.GetKeysRef(layer);
+                var cachedV = kvCache.GetValuesRef(layer);
+                Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
+                    _threadPool, layerSlidingWindow, softCap: 0f);
             }
         }
         else

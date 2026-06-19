@@ -346,13 +346,13 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
     }
 
     [Fact]
-    public void Forward_Gemma4_DistinctHeadDim_WithKvCache_Throws()
+    public void Forward_Gemma4_DistinctHeadDim_WithMismatchedUniformKvCache_Throws()
     {
-        // A distinct per-layer head dim is supported on the cacheless path only.
-        // Combining it with a KV-cache must throw NotSupportedException (the
-        // single-stride KV cache cannot hold two distinct per-layer K/V block
-        // sizes). The cacheless forward in the test above proves the supported
-        // path works.
+        // KV Phase 0: a distinct per-layer head dim is now supported on the cached
+        // path WHEN the supplied cache carries matching per-layer strides (proven by
+        // Gemma4CpuKvCacheTests). A UNIFORM cache built with the single sliding-layer
+        // stride mis-addresses the wider global layers, so the geometry-match guard
+        // must reject it — an ArgumentException naming the first mismatched layer.
         string path = Path.Combine(_scratch, "gemma4-distinct-kv.safetensors");
         WriteDistinctHeadDimFixture(path, seed: 91);
 
@@ -361,8 +361,8 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
         using var sf = SafetensorsFile.Open(path);
         using var model = TransformerModel.LoadFromSafetensors(sf, config);
 
-        // Sliding-layer K/V block size; the exact stride is irrelevant — the
-        // guard fires before the cache geometry is consulted.
+        // Uniform single-stride cache (sliding-layer block size) — WRONG geometry for
+        // a distinct-head-dim model: the global layers need a wider row.
         using IKvCache kv = new DotLLM.Engine.KvCache.SimpleKvCache(
             numLayers: NumLayers,
             numKvHeads: DistinctNumKvHeads,
@@ -375,7 +375,7 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
         {
             using ITensor _ = model.Forward(tokenIds, positions, deviceId: -1, kvCache: kv);
         });
-        Assert.IsType<NotSupportedException>(ex);
+        Assert.IsType<ArgumentException>(ex);
     }
 
     private static ModelConfig BuildDistinctHeadDimConfig(int globalHeadDim = DistinctGlobalHeadDim)
