@@ -239,11 +239,15 @@ TurboQuant needs no calibration infrastructure.
   == cacheless). Full Unit/KvCache + gemma-4 forward suites green (the only failures,
   `WeightRepackingTests.ComputeRowsQ8_0Interleaved`, are pre-existing and unrelated).
 
-**Outstanding:**
-- ⬜ `QuantizedKvCache` (CPU) + CPU quantized attention consumer + `IQuantizedKvCache.*Of(int)`
-  per-layer row bytes (KV-PHASE0-PLAN §3.2/§3.4, test §5.3). Required later by
-  TurboQuant/OSCAR; gemma-4 runs F32 KV today so not on the correctness critical path.
-- ⬜ Vulkan refactor to consume `KvGeometry` (§3.5, no functional change).
+- ✅ `QuantizedKvCache` (CPU) generalised to `KvGeometry` + per-layer quant/window buffers +
+  `IQuantizedKvCache.KeyQuantizedRowBytesOf/ValueQuantizedRowBytesOf(int)` (default interface
+  methods, so CUDA compiles unchanged) + CPU quantized attention consumer reads `*Of(layer)`
+  (KV-PHASE0-PLAN §2.3/§3.2/§3.4). Server quantized factories use `KvGeometry.FromConfig`.
+  Test: `QuantizedKvCachePerLayerStrideTests` (§5.3). Full Unit suite 2425/0.
+
+**Outstanding (optional — no functional change / off critical path):**
+- ⬜ Vulkan refactor to consume `KvGeometry` (§3.5, no functional change — `VulkanKvCache`
+  already per-layer; this is dedup against the Core helper).
 - ⬜ CUDA Option-1 constructor/scratch generalisation (§3.6) — gemma-4 CUDA is cacheless
   so off the critical path; constructor surface only.
 - ⬜ Batched (continuous-batching) gemma-4 path stays guarded — it has no gemma-4 layer
