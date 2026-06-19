@@ -42,7 +42,7 @@ public sealed class TopPSampler : ISamplerStep
             for (int i = 0; i < vocabSize; i++)
                 indices[i] = i;
 
-            // Sort ascending by probability using Array.Sort (IntroSort — O(V log V))
+            // Sort ascending by probability using Array.Sort (IntroSort - O(V log V))
             Array.Sort(rentedProbs, rentedIndices, 0, vocabSize);
 
             // Walk backwards (descending probability), accumulate until we exceed topP

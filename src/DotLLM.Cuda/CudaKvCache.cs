@@ -107,6 +107,31 @@ public sealed class CudaKvCache : IKvCache
             _currentLength = newLength;
     }
 
+    internal void UpdateDevicePositioned(nint keysDevice, nint valuesDevice,
+                                           ReadOnlySpan<int> positions, int seqLen,
+                                           int layerIndex, nint stream, CudaKernels kernels,
+                                           nint positionsDevice)
+    {
+        if (seqLen != 1)
+        {
+            UpdateDevice(keysDevice, valuesDevice, positions, seqLen, layerIndex, stream);
+            return;
+        }
+
+        int pos = positions[0];
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(positions),
+                $"Position {pos} exceeds max KV-cache length {_maxSeqLen}.");
+
+        kernels.LaunchKvCacheUpdatePos(
+            keysDevice, valuesDevice, _keys[layerIndex], _values[layerIndex],
+            positionsDevice, _kvStride, stream);
+
+        int newLength = pos + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
     /// <summary>Returns device pointer to cached keys for the given layer.</summary>
     internal nint GetKeysPtr(int layerIndex) => _keys[layerIndex];
 

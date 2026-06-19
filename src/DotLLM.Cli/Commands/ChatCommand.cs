@@ -258,12 +258,14 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        // Create chat template from GGUF metadata, fallback to ChatML
-        string bosTokenStr = tokenizer!.DecodeToken(tokenizer.BosTokenId);
-        string eosTokenStr = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        IChatTemplate chatTemplate;
-        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer);
-        chatTemplate = jinjaTemplate ?? new JinjaChatTemplate(DefaultChatMlTemplateText, bosTokenStr, eosTokenStr);
+        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer!);
+        IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
+        if (jinjaTemplate is null)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]WARNING: model has no GGUF chat template; using a plain completion-style transcript. " +
+                "This usually means the model is not instruction/chat tuned.[/]");
+        }
 
         // Parse tool definitions
         ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
@@ -278,7 +280,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var stopSequences = new List<string>();
         foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>" })
         {
-            if (marker != eosTokenStr) // avoid duplicate with EOS stop condition
+            if (marker != tokenizer!.DecodeToken(tokenizer.EosTokenId)) // avoid duplicate with EOS stop condition
                 stopSequences.Add(marker);
         }
 
@@ -794,10 +796,5 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         };
     }
 
-    // Default ChatML template used as fallback when GGUF has no chat_template
-    internal const string DefaultChatMlTemplateText =
-        "{% for message in messages %}" +
-        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}" +
-        "{% endfor %}" +
-        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
+    internal const string DefaultChatMlTemplateText = GgufChatTemplateFactory.PlainCompletionTemplateText;
 }

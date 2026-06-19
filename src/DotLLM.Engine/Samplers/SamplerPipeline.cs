@@ -1,4 +1,3 @@
-using System.Numerics.Tensors;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Sampling;
 
@@ -17,6 +16,7 @@ public sealed class SamplerPipeline
     private readonly SamplerContext _samplerContext;
     private readonly Random _rng;
     private readonly bool _greedy;
+    private readonly bool _fastTopKSampling;
 
     /// <summary>
     /// Creates a composable sampling pipeline from explicit steps.
@@ -40,6 +40,7 @@ public sealed class SamplerPipeline
         int? seed = null)
     {
         _greedy = false;
+        _fastTopKSampling = false;
         _rng = seed.HasValue ? new Random(seed.Value) : new Random();
         _processors = processors?.ToArray() ?? [];
         _steps = steps.ToArray();
@@ -60,6 +61,7 @@ public sealed class SamplerPipeline
         if (options.SamplerSteps is not null)
         {
             _greedy = false;
+            _fastTopKSampling = false;
             _steps = options.SamplerSteps.ToArray();
 
             // Build processors: use explicit list if provided, otherwise auto-build from flat properties
@@ -90,6 +92,10 @@ public sealed class SamplerPipeline
 
         // Auto-build from flat properties
         _greedy = options.Temperature <= 0f;
+        _fastTopKSampling = !_greedy
+            && options.TopK > 0
+            && options.TopP >= 1.0f
+            && options.MinP <= 0f;
 
         // Build processor chain (only add if enabled)
         if (options.LogitProcessors is not null)
@@ -108,9 +114,9 @@ public sealed class SamplerPipeline
         var steps = new List<ISamplerStep>();
         if (!_greedy)
         {
-            if (options.Temperature != 1.0f)
+            if (!_fastTopKSampling && options.Temperature != 1.0f)
                 steps.Add(new TemperatureSampler());
-            if (options.TopK > 0)
+            if (!_fastTopKSampling && options.TopK > 0)
                 steps.Add(new TopKSampler());
             if (options.TopP < 1.0f)
                 steps.Add(new TopPSampler());
@@ -146,9 +152,16 @@ public sealed class SamplerPipeline
 
         // 2. Greedy: argmax, skip everything else
         if (_greedy)
-            return TensorPrimitives.IndexOfMax(logits);
+            return CategoricalSampler.ArgMax(logits);
 
         // 3. Run sampler steps (temperature → top-k → top-p → min-p)
+        if (_fastTopKSampling)
+            return CategoricalSampler.SampleTopK(
+                logits,
+                _samplerContext.TopK,
+                _samplerContext.Temperature,
+                _rng);
+
         for (int i = 0; i < _steps.Length; i++)
             _steps[i].Apply(logits, _samplerContext);
 

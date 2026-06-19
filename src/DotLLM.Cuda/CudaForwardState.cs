@@ -37,6 +37,8 @@ internal sealed class CudaForwardState : IDisposable
     // Optional high-precision activation buffers. Used by correctness paths
     // where cumulative FP16 activation truncation dominates real-model parity.
     public nint HiddenStateF32;  // [seqLen, hiddenSize]
+    /// <summary>FP32 residual stream [seqLen, hiddenSize]. Used by high-precision F32 paths
+    /// (e.g. Gemma) and by BitNet, whose residual magnitude can exceed FP16's ~65504 ceiling.</summary>
     public nint ResidualF32;     // [seqLen, hiddenSize]
     public nint NormOutputF32;   // [seqLen, hiddenSize]
     public nint QF32;            // [seqLen, numHeads * headDim]
@@ -62,6 +64,11 @@ internal sealed class CudaForwardState : IDisposable
     // General-purpose FP16 scratch buffer
     public nint GemmOutputF16;
 
+    // I2_S W2A8 decode scratch. Activations are quantized per token on GPU.
+    public nint A8Input;        // int8 [max input dim]
+    public nint A8InvScale;     // float [1]
+    public nint A8OutputF32;    // float [max non-LM-head projection output dim]
+
     // On-the-fly dequantization scratch: holds one projection's FP16 weights
     // for cuBLAS GEMM. Sized for the largest projection (max of Gate/Up/Down/Q/O).
     // Reused across all cuBLAS calls — safe because all ops are on the same stream.
@@ -81,9 +88,17 @@ internal sealed class CudaForwardState : IDisposable
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
 
+    // LoRA intermediate scratch: tmp[seqLen, rank] for the two-GEMV delta path.
+    // Sized at maxCapacity × MaxLoraRank (rank cap) in FP16.
+    internal const int MaxLoraRank = 256;
+    public nint LoraTmp;        // [seqLen, MaxLoraRank] FP16
+
+    private readonly bool _useFp32Residual;
+
     public CudaForwardState(int hiddenSize, int numHeads, int numKvHeads, int headDim,
-                              int intermediateSize, int vocabSize)
+                              int intermediateSize, int vocabSize, bool useFp32Residual = false)
     {
+        _useFp32Residual = useFp32Residual;
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
         _numKvHeads = numKvHeads;
@@ -117,6 +132,12 @@ internal sealed class CudaForwardState : IDisposable
         preQ8K = ((preQ8K + 31) / 32) * 32;
         PreQ8_1ScratchK = preQ8K;
         PreQ8_1Scratch = AllocDevice(PreQ8_1ScratchBytes(preQ8K));
+
+        int maxA8Input = Math.Max(hiddenSize, intermediateSize);
+        int maxA8Output = Math.Max(hiddenSize, intermediateSize);
+        A8Input = AllocDevice(maxA8Input);
+        A8InvScale = AllocDevice(sizeof(float));
+        A8OutputF32 = AllocDevice((long)maxA8Output * sizeof(float));
 
         // Initial allocation for decode (seqLen=1)
         EnsureCapacity(1);
@@ -164,6 +185,7 @@ internal sealed class CudaForwardState : IDisposable
         GemmOutputF16 = AllocDevice(Math.Max(maxPerLayer, maxLmHead) * half);
         TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
         PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
+        LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
 
         _currentSeqLen = newCapacity;
     }
@@ -209,6 +231,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref GemmOutputF16);
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
+        FreeIfNonZero(ref LoraTmp);
     }
 
     public void Dispose()
@@ -222,6 +245,9 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref GateUpPacked);
         FreeIfNonZero(ref PreQ8_1Scratch);
         PreQ8_1ScratchK = 0;
+        FreeIfNonZero(ref A8Input);
+        FreeIfNonZero(ref A8InvScale);
+        FreeIfNonZero(ref A8OutputF32);
         _currentSeqLen = 0;
     }
 
