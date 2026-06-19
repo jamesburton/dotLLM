@@ -86,4 +86,51 @@ public class CategoricalSamplerTests
             Assert.Equal(2, result);
         }
     }
+
+    [Fact]
+    public void SampleTopK_ReturnsOnlyTopKToken()
+    {
+        float[] logits = [0.1f, 9.0f, 0.2f, 8.0f, 0.3f, 7.0f];
+        var allowed = new HashSet<int> { 1, 3, 5 };
+
+        for (int i = 0; i < 100; i++)
+        {
+            int result = CategoricalSampler.SampleTopK(logits, topK: 3, temperature: 1.0f, new Random(i));
+            Assert.Contains(result, allowed);
+        }
+    }
+
+    [Fact]
+    public void SampleTopK_K1_ReturnsArgMax()
+    {
+        float[] logits = [0.1f, 9.0f, 0.2f, 8.0f, 0.3f];
+
+        int result = CategoricalSampler.SampleTopK(logits, topK: 1, temperature: 0.8f, new Random(42));
+
+        Assert.Equal(1, result);
+    }
+
+    [Fact]
+    public void SampleTopK_UsesVocabularyOrderForThresholdTies()
+    {
+        float[] logits = [1.0f, 2.0f, 2.0f, 0.5f];
+
+        for (int i = 0; i < 20; i++)
+        {
+            int result = CategoricalSampler.SampleTopK(logits, topK: 2, temperature: 1.0f, new Random(i));
+            Assert.True(result is 1 or 2, $"Expected token 1 or 2, got {result}.");
+        }
+    }
+
+    [Fact]
+    public void SampleTopK_TemperatureKeepsSelectionWithinTopK()
+    {
+        float[] logits = [0.1f, 3.0f, 0.2f, 2.9f, 0.3f];
+
+        for (int i = 0; i < 50; i++)
+        {
+            int result = CategoricalSampler.SampleTopK(logits, topK: 2, temperature: 0.7f, new Random(i));
+            Assert.True(result is 1 or 3, $"Expected token 1 or 3, got {result}.");
+        }
+    }
 }
