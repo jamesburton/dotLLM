@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using System.Numerics.Tensors;
 
 namespace DotLLM.Engine.Samplers;
@@ -12,6 +13,36 @@ namespace DotLLM.Engine.Samplers;
 public static class CategoricalSampler
 {
     private const int StackTopKThreshold = 512;
+
+    /// <summary>
+    /// Returns the index of the maximum value (first occurrence on ties) — the greedy argmax.
+    /// </summary>
+    /// <remarks>
+    /// Equivalent to <see cref="TensorPrimitives.IndexOfMax(ReadOnlySpan{float})"/> for finite inputs.
+    /// On hardware with 256-bit+ vector acceleration that vectorized path wins, so it is used directly.
+    /// On narrower hardware (e.g. SSE4.2-only), <c>IndexOfMax</c>'s index-tracking reduction is markedly
+    /// slower than a tight scalar scan — measured ~8x at a 128k vocabulary on a Westmere Xeon, where the
+    /// new-max branch is almost never taken after the first few elements — so a scalar scan is used.
+    /// NaN values are skipped on the scalar path; callers guarantee finite logits on the greedy path.
+    /// </remarks>
+    public static int ArgMax(ReadOnlySpan<float> values)
+    {
+        if (Vector256.IsHardwareAccelerated)
+            return TensorPrimitives.IndexOfMax(values);
+
+        int bestIdx = 0;
+        float best = values[0];
+        for (int i = 1; i < values.Length; i++)
+        {
+            float v = values[i];
+            if (v > best)
+            {
+                best = v;
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    }
 
     private struct TopKCandidate
     {
@@ -48,7 +79,7 @@ public static class CategoricalSampler
             }
 
             // Floating-point edge case: return highest-probability token
-            return TensorPrimitives.IndexOfMax(probs);
+            return ArgMax(probs);
         }
         finally
         {
@@ -68,7 +99,7 @@ public static class CategoricalSampler
     public static int SampleTopK(ReadOnlySpan<float> logits, int topK, float temperature, Random rng)
     {
         if (topK == 1)
-            return TensorPrimitives.IndexOfMax(logits);
+            return ArgMax(logits);
 
         if (topK <= 0 || topK >= logits.Length)
         {

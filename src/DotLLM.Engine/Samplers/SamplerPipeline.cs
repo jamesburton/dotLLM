@@ -1,4 +1,3 @@
-using System.Numerics.Tensors;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Sampling;
 
@@ -153,7 +152,7 @@ public sealed class SamplerPipeline
 
         // 2. Greedy: argmax, skip everything else
         if (_greedy)
-            return TensorPrimitives.IndexOfMax(logits);
+            return CategoricalSampler.ArgMax(logits);
 
         // 3. Run sampler steps (temperature → top-k → top-p → min-p)
         if (_fastTopKSampling)
