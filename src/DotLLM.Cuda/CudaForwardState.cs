@@ -58,6 +58,11 @@ internal sealed class CudaForwardState : IDisposable
     public nint TokenIdsDevice; // [maxSeqLen] int32
     public nint PositionsDevice;// [maxSeqLen] int32
 
+    // LoRA intermediate scratch: tmp[seqLen, rank] for the two-GEMV delta path.
+    // Sized at maxCapacity × MaxLoraRank (rank cap) in FP16.
+    internal const int MaxLoraRank = 256;
+    public nint LoraTmp;        // [seqLen, MaxLoraRank] FP16
+
     private readonly bool _useFp32Residual;
 
     public CudaForwardState(int hiddenSize, int numHeads, int numKvHeads, int headDim,
@@ -127,6 +132,7 @@ internal sealed class CudaForwardState : IDisposable
         GemmOutputF16 = AllocDevice(Math.Max(maxPerLayer, maxLmHead) * half);
         TokenIdsDevice = AllocDevice((long)newCapacity * sizeof(int));
         PositionsDevice = AllocDevice((long)newCapacity * sizeof(int));
+        LoraTmp = AllocDevice((long)newCapacity * MaxLoraRank * half);
 
         _currentSeqLen = newCapacity;
     }
@@ -163,6 +169,7 @@ internal sealed class CudaForwardState : IDisposable
         FreeIfNonZero(ref GemmOutputF16);
         FreeIfNonZero(ref TokenIdsDevice);
         FreeIfNonZero(ref PositionsDevice);
+        FreeIfNonZero(ref LoraTmp);
     }
 
     public void Dispose()

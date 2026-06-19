@@ -619,6 +619,58 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Applies the LoRA delta for one (layer, proj) site on device:
+    /// <c>yDev += scale · (A[outputDim, rank] · (B[rank, inputDim] · xDev))</c>.
+    /// All operands are FP16 on device; intermediate tmp is <see cref="CudaForwardState.LoraTmp"/>.
+    /// For decode (seqLen == 1): two GEMVs via cuBLAS.
+    /// For prefill (seqLen &gt; 1): two batched GEMMs via cuBLAS.
+    /// Early-returns without error when <paramref name="layer"/>/<paramref name="proj"/> is
+    /// not covered by the staged adapter.
+    /// </summary>
+    /// <param name="layer">Zero-based transformer layer index.</param>
+    /// <param name="proj">Canonical projection name (e.g. <c>q_proj</c>).</param>
+    /// <param name="xDev">Device pointer to the FP16 input [seqLen, inputDim].</param>
+    /// <param name="yDev">Device pointer to the FP16 output [seqLen, outputDim] to accumulate into.</param>
+    /// <param name="seqLen">Number of tokens in the current step (1 = decode, &gt;1 = prefill).</param>
+    private void ApplyLoraDeltaDevice(int layer, string proj, nint xDev, nint yDev, int seqLen)
+    {
+        if (_cudaLora is null)
+            return;
+        if (!_cudaLora.TryGet(layer, proj, out nint aF16, out nint bF16, out int inputDim, out int outputDim))
+            return;
+
+        int rank = _cudaLora.Rank;
+        if (rank > CudaForwardState.MaxLoraRank)
+            throw new InvalidOperationException(
+                $"LoRA rank {rank} exceeds the device delta rank cap ({CudaForwardState.MaxLoraRank}). " +
+                $"Reduce adapter rank or rebuild with a higher MaxLoraRank.");
+
+        float scale = _cudaLora.Scale;
+        nint tmp = _state.LoraTmp;  // [seqLen, MaxLoraRank] FP16
+        nint s = _stream.Handle;
+        nint cublasH = _cublas.Handle;
+
+        if (seqLen == 1)
+        {
+            // Decode path — two GEMVs.
+            // Step 1: tmp[rank] = B[rank, inputDim] · x[inputDim]  (overwrites tmp)
+            CudaGemm.GemvF16(cublasH, bF16, xDev, tmp, rank, inputDim, s);
+
+            // Step 2: y[outputDim] += scale · A[outputDim, rank] · tmp[rank]
+            CudaGemm.GemvF16Accum(cublasH, aF16, tmp, yDev, outputDim, rank, scale, s);
+        }
+        else
+        {
+            // Prefill path — two batched GEMMs.
+            // Step 1: tmp[seqLen, rank] = X[seqLen, inputDim] × B^T  (overwrites tmp)
+            CudaGemm.LinearF16(cublasH, xDev, bF16, tmp, seqLen, inputDim, rank, s);
+
+            // Step 2: Y[seqLen, outputDim] += scale · tmp[seqLen, rank] × A^T
+            CudaGemm.LinearF16Accum(cublasH, tmp, aF16, yDev, seqLen, rank, outputDim, scale, s);
+        }
+    }
+
     private static bool CanFuseI2SDecode(
         int seqLen,
         QuantizationType qt0, QuantizationType qt1,
