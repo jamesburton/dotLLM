@@ -265,6 +265,24 @@ public record ModelConfig
     }
 
     /// <summary>
+    /// Returns the KV-head count for <paramref name="layerIdx"/>. Full-attention
+    /// layers use <see cref="NumGlobalKvHeads"/> when set (Gemma 4); sliding-window
+    /// layers and every other architecture use <see cref="NumKvHeads"/>. Collapses
+    /// to a uniform <see cref="NumKvHeads"/> when <see cref="NumGlobalKvHeads"/> is
+    /// null, so non-Gemma-4 models are unaffected. This is the single source of
+    /// truth for per-layer KV-head resolution (backends delegate here rather than
+    /// re-deriving it) and feeds <see cref="DotLLM.Core.Attention.KvGeometry.FromConfig"/>.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public int GetLayerKvHeads(int layerIdx)
+    {
+        if (NumGlobalKvHeads is int g && IsFullAttentionLayer(layerIdx))
+            return g;
+        return NumKvHeads;
+    }
+
+    /// <summary>
     /// Returns true when <paramref name="layerIdx"/> is a FULL-attention layer.
     /// A layer is full-attention when <see cref="PerLayerSlidingWindow"/> is set
     /// and the entry for that layer is <see langword="null"/> (no sliding window);
