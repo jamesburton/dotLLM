@@ -1,5 +1,6 @@
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
@@ -44,6 +45,12 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaDecodeGraph? _decodeGraph;
     private CudaKvCache? _decodeGraphCache;
     private bool _decodeGraphDisabled;
+
+    // LoRA adapter staging — set by the 5-arg Forward overload.
+#pragma warning disable CS0414 // TODO(Task 3): _currentAdapter will be read in the layer loop when delta application lands.
+    private ILoraAdapter? _currentAdapter;
+#pragma warning restore CS0414
+    private CudaLoraWeights? _cudaLora;
 
     /// <summary>
     /// Steady-state status of the single-token decode CUDA graph (last decode step). Diagnostic only.
@@ -535,6 +542,30 @@ public sealed unsafe class CudaTransformerModel : IModel
         return result;
     }
 
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache);
+
+        if (!ReferenceEquals(_cudaLora?.Source, adapter))
+        {
+            _cudaLora?.Dispose();
+            _cudaLora = CudaLoraWeights.Stage(adapter, Config, _kernels, _stream.Handle);
+        }
+
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
+    }
+
     /// <summary>
     /// Dispatches projection as cuBLAS HGEMM (prefill) or quantized/cuBLAS GEMV (decode).
     /// For quantized weights with no persistent FP16 copy (<paramref name="fp16Weight"/> == 0),
@@ -685,6 +716,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     {
         ReportLaunchProfile();
         _decodeGraph?.Dispose();
+        _cudaLora?.Dispose();
         _state.Dispose();
         _weights.Dispose();
         _kernels.Dispose();
