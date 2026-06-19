@@ -46,10 +46,9 @@ public sealed unsafe class CudaTransformerModel : IModel
     private CudaKvCache? _decodeGraphCache;
     private bool _decodeGraphDisabled;
 
-    // LoRA adapter staging — set by the 5-arg Forward overload.
-#pragma warning disable CS0414 // TODO(Task 3): _currentAdapter will be read in the layer loop when delta application lands.
+    // LoRA adapter staging — set by the 5-arg Forward overload. Read in the layer
+    // loop to gate fused decode kernels off and apply the per-projection delta.
     private ILoraAdapter? _currentAdapter;
-#pragma warning restore CS0414
     private CudaLoraWeights? _cudaLora;
 
     /// <summary>
@@ -283,10 +282,16 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             ref readonly var lw = ref _weights.Layers[layer];
 
+            // When a LoRA adapter is active, every fused decode kernel below is bypassed
+            // so the delta lands against the SAME intermediate buffers the CPU path uses
+            // (see TransformerModel.cs). When no adapter is active this is byte-for-byte
+            // the existing decode path: the fused branches are unchanged.
+            bool adapterActive = _currentAdapter is not null;
+
             // ── ATTENTION BLOCK (NormOutput has normalized input) ──
 
             // Q/K/V projections: prefill → cuBLAS HGEMM, decode → quantized GEMV
-            if (!s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+            if (!adapterActive && !s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
                     lw.QInputDim, lw.KInputDim, lw.VInputDim))
             {
                 _kernels.LaunchI2_SGemv3F16In(
@@ -305,6 +310,17 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.Q, lw.QBias, lw.QOutputDim, seqLen, s);
             if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.K, lw.KBias, lw.KOutputDim, seqLen, s);
             if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(_state.V, lw.VBias, lw.VOutputDim, seqLen, s);
+
+            // LoRA delta (q/k/v): y += scale · (NormOutput · B) · A. Applied AFTER bias and
+            // BEFORE QK-norm + RoPE, mirroring TransformerModel.cs:298-300. x = NormOutput
+            // (the projection input), y = Q/K/V (the raw projection output). No-op for
+            // projections the adapter does not target (ApplyLoraDeltaDevice early-returns).
+            if (adapterActive)
+            {
+                ApplyLoraDeltaDevice(layer, "q_proj", _state.NormOutput, _state.Q, seqLen);
+                ApplyLoraDeltaDevice(layer, "k_proj", _state.NormOutput, _state.K, seqLen);
+                ApplyLoraDeltaDevice(layer, "v_proj", _state.NormOutput, _state.V, seqLen);
+            }
 
             // Optional QK-norms (FP16)
             if (lw.QNormWeight != 0)
@@ -361,7 +377,11 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             // Optional attention Sub-LN (BitNet): RMSNorm over the attention output [numHeads·headDim]
             // before the output projection. No-op for non-BitNet models (weight == 0).
-            bool fusedAttnSubNormO = !s_i2sA8Decode && CanFuseI2SNormDecode(
+            // When an adapter is active we MUST take the unfused path so that, at delta
+            // time, _state.AttnOutput holds the Sub-LN'd attention output — the exact
+            // O-projection input the CPU uses (TransformerModel.cs:354-368: Sub-LN is
+            // applied in place into attnOut, then the O GEMM reads attnOut).
+            bool fusedAttnSubNormO = !adapterActive && !s_i2sA8Decode && CanFuseI2SNormDecode(
                 seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
             if (fusedAttnSubNormO)
             {
@@ -379,6 +399,13 @@ public sealed unsafe class CudaTransformerModel : IModel
                 Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
+            // LoRA delta (o_proj): y += scale · (AttnOutput · B) · A. Mirrors
+            // TransformerModel.cs:374 — x is the Sub-LN'd attention output (AttnOutput,
+            // normed in place above on the unfused path), y is the O-projection output
+            // (NormOutput). Applied after the O bias and BEFORE the fused residual add.
+            if (adapterActive)
+                ApplyLoraDeltaDevice(layer, "o_proj", _state.AttnOutput, _state.NormOutput, seqLen);
+
             // ── FUSED: attention residual + FFN norm ──
             // residual = residual + NormOutput, NormOutput = rmsnorm(new_residual, ffnNormWeight)
             if (fp32Res)
@@ -391,7 +418,7 @@ public sealed unsafe class CudaTransformerModel : IModel
             // ── FFN BLOCK (NormOutput has FFN-normalized input) ──
 
             // Gate/Up projections
-            if (!s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType,
+            if (!adapterActive && !s_i2sA8Decode && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType,
                     lw.GateInputDim, lw.UpInputDim))
             {
                 _kernels.LaunchI2_SGemv2F16In(
@@ -407,6 +434,16 @@ public sealed unsafe class CudaTransformerModel : IModel
 
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_state.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_state.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+
+            // LoRA delta (gate/up): y += scale · (NormOutput · B) · A. Mirrors
+            // TransformerModel.cs:442-443 — x = NormOutput (the FFN-normed input), y =
+            // FfnGate/FfnUp (raw projection outputs). Applied after the gate/up biases
+            // and BEFORE the GLU activation below.
+            if (adapterActive)
+            {
+                ApplyLoraDeltaDevice(layer, "gate_proj", _state.NormOutput, _state.FfnGate, seqLen);
+                ApplyLoraDeltaDevice(layer, "up_proj", _state.NormOutput, _state.FfnUp, seqLen);
+            }
 
             // Gated activation (FP16). BitNet b1.58 uses squared-ReLU GLU followed by a Sub-LN
             // RMSNorm; the un-normalized relu(gate)²·up intermediate overflows FP16, so when the
@@ -435,6 +472,13 @@ public sealed unsafe class CudaTransformerModel : IModel
             // Down projection → NormOutput
             Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
+
+            // LoRA delta (down_proj): y += scale · (SiluOutput · B) · A. Mirrors
+            // TransformerModel.cs:491 — x = SiluOutput (the post-(SwiGLU/ReLU²) GLU,
+            // possibly FFN-Sub-LN'd, down-projection input), y = NormOutput (the down
+            // output). Applied after the down bias, BEFORE the fused residual add.
+            if (adapterActive)
+                ApplyLoraDeltaDevice(layer, "down_proj", _state.SiluOutput, _state.NormOutput, seqLen);
 
             // ── FUSED: FFN residual + next layer's attention norm ──
             if (layer < numLayers - 1)
@@ -714,6 +758,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     private bool CanUseDecodeGraph(int seqLen, IKvCache? kvCache)
         => s_cudaGraphDecode
            && !_decodeGraphDisabled
+           && _currentAdapter is null
            && seqLen == 1
            && kvCache is CudaKvCache
            && Config.Architecture == Architecture.BitNet
