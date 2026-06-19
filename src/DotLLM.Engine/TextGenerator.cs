@@ -1029,10 +1029,11 @@ public sealed class TextGenerator
     {
         return _kvCacheFactory != null
             ? _kvCacheFactory(_model.Config, cacheSize)
+            // KvGeometry.FromConfig is byte-identical to the scalar
+            // (NumLayers, NumKvHeads, HeadDim) form for every uniform model and
+            // supplies distinct per-layer strides for Gemma-4 (sliding vs global).
             : new SimpleKvCache(
-                _model.Config.NumLayers,
-                _model.Config.NumKvHeads,
-                _model.Config.HeadDim,
+                Core.Attention.KvGeometry.FromConfig(_model.Config),
                 cacheSize);
     }
 
@@ -1140,9 +1141,7 @@ public sealed class TextGenerator
             return _draftKvCacheFactory(_draftModel!.Config, cacheSize);
 
         return new SimpleKvCache(
-            _draftModel!.Config.NumLayers,
-            _draftModel.Config.NumKvHeads,
-            _draftModel.Config.HeadDim,
+            Core.Attention.KvGeometry.FromConfig(_draftModel!.Config),
             cacheSize);
     }
 

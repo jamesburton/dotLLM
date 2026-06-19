@@ -183,7 +183,10 @@ public sealed class HybridPrefillDecodeStrategy
             throw new ArgumentException("cacheSize must be at least promptIds.Length.", nameof(cacheSize));
 
         var cfg = _prefillModel.Config;
-        var hostCache = new SimpleKvCache(cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, cacheSize);
+        // FromConfig is byte-identical to the scalar form for uniform models (the
+        // only ones this hybrid handoff currently serves) and keeps the host-prefill
+        // per-layer strides consistent with a per-layer GPU decode cache (Gemma-4).
+        var hostCache = new SimpleKvCache(Core.Attention.KvGeometry.FromConfig(cfg), cacheSize);
 
         int promptLen = promptIds.Length;
         int[] positionsArray = ArrayPool<int>.Shared.Rent(promptLen);
