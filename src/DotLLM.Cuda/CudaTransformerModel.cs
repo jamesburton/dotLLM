@@ -56,8 +56,6 @@ public sealed unsafe class CudaTransformerModel : IModel
     private int _profSteps;            // counted steady-state decode steps
     private int _profWarmupSkipped;    // warmup decode steps skipped before accumulation
     private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
-    private static readonly bool s_cudaGraphDecode =
-        Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") != "0";
     private static readonly bool s_i2sA8Decode =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_I2S_A8") == "1";
 
@@ -608,7 +606,9 @@ public sealed unsafe class CudaTransformerModel : IModel
             && tokenIds.Length == 1
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled            // event injection between launches breaks capture
-            && !isMla && !isMoe)
+            && !isMla && !isMoe
+            && !isBitNet                    // dev's generic capture body omits BitNet's FP32 residual, Sub-LN and relu² — replaying it on BitNet produces garbage
+            && _currentAdapter is null)     // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
         {
             if (kvCache is CudaKvCache stdKv)
             {
@@ -2507,16 +2507,6 @@ public sealed unsafe class CudaTransformerModel : IModel
            && outputDim != Config.VocabSize
            && inputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize)
            && outputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize);
-
-    private bool CanUseDecodeGraph(int seqLen, IKvCache? kvCache)
-        => s_cudaGraphDecode
-           && _currentAdapter is null
-           && seqLen == 1
-           && kvCache is CudaKvCache
-           && Config.Architecture == Architecture.BitNet
-           && DebugMaxLayers == 0
-           && DebugRopeTypeOverride < 0
-           && !DebugSkipBias;
 
     /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.

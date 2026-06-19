@@ -436,15 +436,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
-                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
-                adapter: loraAdapter);
+                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
             InferenceTimings timings = default;
             FinishReason finishReason = FinishReason.Length;
             var generatedText = new System.Text.StringBuilder();
 
-            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions))
+            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
             {
                 if (settings.Json)
                     generatedText.Append(token.Text);
