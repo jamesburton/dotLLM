@@ -12,6 +12,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
+using DotLLM.Core.Lora;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine;
@@ -29,6 +30,7 @@ public sealed class TextGenerator
     private readonly IModel? _draftModel;
     private readonly Func<ModelConfig, int, Core.Attention.IKvCache>? _draftKvCacheFactory;
     private readonly int _speculativeCandidates;
+    private readonly ILoraAdapter? _adapter;
 
     /// <summary>
     /// Creates a new text generator.
@@ -42,12 +44,14 @@ public sealed class TextGenerator
     /// <param name="draftModel">Optional draft model for speculative decoding.</param>
     /// <param name="draftKvCacheFactory">Optional factory for creating the draft model's KV-cache.</param>
     /// <param name="speculativeCandidates">Number of draft tokens per speculative step (K). Default 5.</param>
+    /// <param name="adapter">Optional LoRA adapter applied at every main-model forward pass. Null = base model only.</param>
     public TextGenerator(IModel model, ITokenizer tokenizer,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? kvCacheFactory = null,
                           PrefixCache? prefixCache = null,
                           IModel? draftModel = null,
                           Func<ModelConfig, int, Core.Attention.IKvCache>? draftKvCacheFactory = null,
-                          int speculativeCandidates = 5)
+                          int speculativeCandidates = 5,
+                          ILoraAdapter? adapter = null)
     {
         _model = model;
         _tokenizer = tokenizer;
@@ -56,6 +60,7 @@ public sealed class TextGenerator
         _draftModel = draftModel;
         _draftKvCacheFactory = draftKvCacheFactory;
         _speculativeCandidates = speculativeCandidates;
+        _adapter = adapter;
     }
 
     /// <summary>
@@ -185,7 +190,7 @@ public sealed class TextGenerator
                     for (int i = 0; i < prefillLen; i++)
                         positions[i] = prefillStart + i;
 
-                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache))
+                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, _adapter))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -215,7 +220,7 @@ public sealed class TextGenerator
             else if (promptLen > 0)
             {
                 // 100% cache hit — re-forward last prompt token to get logits
-                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache))
+                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, _adapter))
                 {
                     long ts1 = Stopwatch.GetTimestamp();
                     prefillTicks = ts1 - ts0;
@@ -352,7 +357,7 @@ public sealed class TextGenerator
                     int nextTokenId;
 
                     long fwdStart = Stopwatch.GetTimestamp();
-                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache))
+                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, _adapter))
                     {
                         decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
 
@@ -527,7 +532,7 @@ public sealed class TextGenerator
                     for (int i = 0; i < prefillLen; i++)
                         positions[i] = prefillStart + i;
 
-                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache))
+                    using (ITensor prefillLogits = _model.Forward(suffixTokens, positions, deviceId: -1, kvCache, _adapter))
                     {
                         long ts1 = Stopwatch.GetTimestamp();
                         prefillTicks = ts1 - ts0;
@@ -555,7 +560,7 @@ public sealed class TextGenerator
             else if (promptLen > 0)
             {
                 // 100% cache hit — re-forward last prompt token to get logits
-                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache))
+                using (ITensor logits = _model.Forward([promptIds[^1]], [promptLen - 1], deviceId: -1, kvCache, _adapter))
                 {
                     long ts1 = Stopwatch.GetTimestamp();
                     prefillTicks = ts1 - ts0;
@@ -734,7 +739,7 @@ public sealed class TextGenerator
                     TokenLogprobInfo? tokenLogprob;
 
                     long fwdStart = Stopwatch.GetTimestamp();
-                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache))
+                    using (ITensor logits = _model.Forward([lastToken], [pos], deviceId: -1, kvCache, _adapter))
                     {
                         decodeTicks += Stopwatch.GetTimestamp() - fwdStart;
 

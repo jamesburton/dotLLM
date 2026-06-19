@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using DotLLM.Cli.Helpers;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Models.Architectures;
@@ -168,6 +169,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description("Number of draft tokens per speculative step (K). Default 5.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Path to a HuggingFace PEFT LoRA adapter directory to apply at inference time.</summary>
+        [CommandOption("--lora")]
+        [Description("Path to a HuggingFace PEFT LoRA adapter (directory containing adapter_config.json + adapter_model.safetensors). Omit for base model.")]
+        public string? LoraPath { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -238,6 +244,15 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 Console.Error.WriteLine($"WARNING: {vramWarning}");
             else
                 AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
+        }
+
+        // Load LoRA adapter if requested
+        ILoraAdapter? loraAdapter = null;
+        if (!string.IsNullOrEmpty(settings.LoraPath))
+        {
+            loraAdapter = PeftAdapterLoader.LoadFromDirectory("cli", settings.LoraPath, config);
+            if (!loraAdapter.IsCompatible(config))
+                throw new InvalidOperationException($"LoRA adapter at '{settings.LoraPath}' is incompatible with this base model.");
         }
 
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
@@ -398,7 +413,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
-                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK);
+                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+                adapter: loraAdapter);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
             InferenceTimings timings = default;
@@ -588,6 +604,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
+            loraAdapter?.Dispose();
             pagedFactory?.Dispose();
             model.Dispose();
             gguf.Dispose();
