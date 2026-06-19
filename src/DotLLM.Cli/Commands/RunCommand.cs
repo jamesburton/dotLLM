@@ -255,6 +255,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 throw new InvalidOperationException($"LoRA adapter at '{settings.LoraPath}' is incompatible with this base model.");
         }
 
+        // LoRA on GPU paths isn't applied yet (Phase 4b); warn rather than silently produce base output.
+        if (loraAdapter is not null && model is DotLLM.Cuda.CudaTransformerModel or DotLLM.Cuda.HybridTransformerModel)
+        {
+            const string gpuLoraWarning = "WARNING: --lora is not yet applied on GPU paths; base-model output will be produced. Use --device cpu for LoRA in this milestone.";
+            if (settings.Json) Console.Error.WriteLine(gpuLoraWarning);
+            else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(gpuLoraWarning)}[/]");
+        }
+
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
 
         // Parse tool definitions and format prompt via chat template when tools are provided
@@ -410,6 +418,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 if (!settings.Json)
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)}[/]");
+
+                if (loraAdapter is not null)
+                {
+                    const string specLoraWarning = "WARNING: --lora with speculative decoding does not adapt the draft model; acceptance rates may degrade.";
+                    if (settings.Json) Console.Error.WriteLine(specLoraWarning);
+                    else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(specLoraWarning)}[/]");
+                }
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
