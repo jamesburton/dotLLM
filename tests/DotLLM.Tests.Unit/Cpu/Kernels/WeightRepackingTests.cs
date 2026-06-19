@@ -471,9 +471,16 @@ public sealed unsafe class WeightRepackingTests
                 // Half scale (2 bytes)
                 Half scale = (Half)(rng.NextSingle() * 0.5f);
                 Unsafe.WriteUnaligned(block, scale);
-                // 32 quantized sbytes
+                // 32 quantized sbytes in the VALID Q8_0 range [-127, 127].
+                // Q8_0 quantization sets d = amax/127 and clamps q to [-127, 127]
+                // (see MatMul.QuantizeF32ToQ8_0), so -128 never occurs in real data.
+                // Generating -128 here would exercise an out-of-distribution value the
+                // abs/sign int8-dot emulation (AVX2 / AVX-512BW and the interleaved
+                // kernel, abs(-128) overflows int8) cannot represent — diverging from
+                // the exact VNNI vpdpbusd path on inputs Q8_0 never produces. Match the
+                // valid range so every SIMD path agrees (and the test stays meaningful).
                 for (int i = 0; i < 32; i++)
-                    block[2 + i] = (byte)(rng.Next(256) - 128);
+                    block[2 + i] = (byte)rng.Next(-127, 128);
             }
         }
     }
