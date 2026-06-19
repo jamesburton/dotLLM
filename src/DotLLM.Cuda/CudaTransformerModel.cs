@@ -60,7 +60,6 @@ public sealed unsafe class CudaTransformerModel : IModel
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_GRAPH") != "0";
     private static readonly bool s_i2sA8Decode =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_I2S_A8") == "1";
-    private bool _decodeGraphDisabled;
 
     // LoRA adapter staging — set by the 5-arg Forward overload. Read in the layer
     // loop to gate fused decode kernels off and apply the per-projection delta.
@@ -672,11 +671,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Decode CUDA-graph capture/replay is handled by dev's dedicated
         // ForwardDecodeGraph / ForwardDecodeGraphQuantized early-return path
         // (dispatched near the top of this method when UseGraphCapture is on).
-        // This straight-through body therefore runs without graph wrapping; it
-        // serves prefill, BitNet I2_S decode, and adapter-active decode (all of
-        // which are graph-ineligible). graphReplayCompatible stays false so the
-        // KV/attention dispatch below uses the standard per-step path.
-        bool graphReplayCompatible = false;
+        // This straight-through body runs without graph wrapping; it serves prefill,
+        // BitNet I2_S decode, and adapter-active decode (all graph-ineligible).
 
         // 2. Embedding lookup → FP16 HiddenState
         _kernels.LaunchEmbeddingLookup(
@@ -732,6 +728,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         {
             ref readonly var lw = ref _weights.Layers[layer];
 
+            // When a LoRA adapter is active, every fused decode kernel below is bypassed.
+            // Declared at the top of the loop (before the MLA `goto FfnBlock`) so it is
+            // definitely assigned on every path that reaches the FFN gate/up gating.
+            bool adapterActive = _currentAdapter is not null;
+
             // ── ATTENTION BLOCK ──
             // MLA path: CudaMlaAttention.ForwardF16 absorbs the entire QKV/RoPE/
             // KV-update/Attention/OProj sequence into one helper. Reads raw hidden
@@ -780,11 +781,10 @@ public sealed unsafe class CudaTransformerModel : IModel
                 goto FfnBlock;
             }
 
-            // When a LoRA adapter is active, every fused decode kernel below is bypassed
-            // so the delta lands against the SAME intermediate buffers the CPU path uses
-            // (see TransformerModel.cs). When no adapter is active this is byte-for-byte
-            // the existing decode path: the fused branches are unchanged.
-            bool adapterActive = _currentAdapter is not null;
+            // adapterActive (declared at the top of this layer loop) gates the fused
+            // decode kernels below so the LoRA delta lands against the SAME intermediate
+            // buffers the CPU path uses (see TransformerModel.cs). When no adapter is
+            // active this is byte-for-byte the existing decode path.
 
             // ── ATTENTION BLOCK (NormOutput has normalized input) ──
             // Q/K/V projections. Decode dispatch order:
@@ -2510,7 +2510,6 @@ public sealed unsafe class CudaTransformerModel : IModel
 
     private bool CanUseDecodeGraph(int seqLen, IKvCache? kvCache)
         => s_cudaGraphDecode
-           && !_decodeGraphDisabled
            && _currentAdapter is null
            && seqLen == 1
            && kvCache is CudaKvCache
