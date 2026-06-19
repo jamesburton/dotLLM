@@ -53,8 +53,8 @@ public static class CudaGemm
     /// Accumulating scaled GEMV for single token: y_f16[n] += alpha × W_f16[n,k] × x_f16[k].
     /// Uses FP32 accumulation via cublasGemmEx with beta=1 so it adds into the existing y.
     /// </summary>
-    public static unsafe void GemvF16Accum(nint handle, nint wF16, nint xF16, nint yF16,
-                                             int n, int k, float alpha, nint stream)
+    public static void GemvF16Accum(nint handle, nint wF16, nint xF16, nint yF16,
+                                     int n, int k, float alpha, nint stream)
     {
         LinearF16Accum(handle, xF16, wF16, yF16, 1, k, n, alpha, stream);
     }

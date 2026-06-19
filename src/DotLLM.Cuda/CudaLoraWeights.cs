@@ -112,6 +112,8 @@ public sealed unsafe class CudaLoraWeights : IDisposable
         var buffers = new Dictionary<(int, string), (nint, nint, int, int)>();
         // Temporary F32 device scratch pointers; freed after synchronization.
         var f32Scratch = new List<nint>();
+        // Tracks every successfully-allocated persistent F16 pointer for error-path cleanup.
+        var f16Allocs = new List<nint>();
 
         try
         {
@@ -139,7 +141,9 @@ public sealed unsafe class CudaLoraWeights : IDisposable
 
                     // Alloc persistent F16 buffers
                     CudaDriverApi.cuMemAlloc_v2(out nint aF16Dev, (nuint)aF16Bytes).ThrowOnError();
+                    f16Allocs.Add(aF16Dev);
                     CudaDriverApi.cuMemAlloc_v2(out nint bF16Dev, (nuint)bF16Bytes).ThrowOnError();
+                    f16Allocs.Add(bF16Dev);
 
                     // Queue F32→F16 conversions
                     kernels.LaunchConvertF32ToF16(aF32Dev, aF16Dev, w.OutputDim * rank, stream);
@@ -163,12 +167,10 @@ public sealed unsafe class CudaLoraWeights : IDisposable
             foreach (nint ptr in f32Scratch)
                 CudaDriverApi.cuMemFree_v2(ptr);
 
-            // Free any F16 buffers already stored
-            foreach (var (af16, bf16, _, _) in buffers.Values)
-            {
-                if (af16 != 0) CudaDriverApi.cuMemFree_v2(af16);
-                if (bf16 != 0) CudaDriverApi.cuMemFree_v2(bf16);
-            }
+            // Free any F16 buffers successfully allocated (via f16Allocs, not buffers.Values,
+            // to avoid a double-free when the second cuMemAlloc throws before buffers[...] is set).
+            foreach (nint ptr in f16Allocs)
+                if (ptr != 0) CudaDriverApi.cuMemFree_v2(ptr);
 
             throw;
         }
