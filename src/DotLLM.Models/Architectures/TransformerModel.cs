@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
@@ -30,6 +31,12 @@ public sealed unsafe class TransformerModel : IModel
     private readonly TransformerWeights _weights;
     private readonly TransformerForwardState _state;
     private readonly GgufFile _gguf; // prevent premature GC of mmap
+    // Active LoRA adapter for the current Forward call (when invoked via the
+    // 5-arg adapter-aware overload). Cleared back to null in the try/finally
+    // surrounding the call. Not thread-safe — TransformerModel as a whole is
+    // single-threaded per instance (forward state buffers, MLA caches are
+    // also instance-scoped) so this is consistent with existing semantics.
+    private ILoraAdapter? _currentAdapter;
     private readonly int _ropeDim;
     private readonly RoPEType _ropeType;
     private readonly int? _slidingWindowSize;
@@ -122,6 +129,36 @@ public sealed unsafe class TransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
     /// <summary>
+    /// LoRA-aware forward. When <paramref name="adapter"/> is non-null, each
+    /// adapted projection adds <c>scale × (x · B) · A</c> on top of the base
+    /// projection. When null, this is byte-equivalent to the 4-arg overload.
+    /// </summary>
+    /// <remarks>
+    /// MoE FFN sites are not adapted in this Phase 4a slice — if the model
+    /// has any MoE layer AND <paramref name="adapter"/> targets a gate / up /
+    /// down projection, the call throws <see cref="NotSupportedException"/>.
+    /// MLA-specific projections (DeepSeek-V2/V3 q_a_proj, kv_a_proj_with_mqa,
+    /// …) are also out of scope and silently passed through.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache);
+
+        ValidateAdapterForModel(adapter);
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
+    }
+
+    /// <summary>
     /// Runs a forward pass with optional KV-cache. When <paramref name="kvCache"/> is provided,
     /// K/V projections are stored in the cache after RoPE, and attention reads from the full
     /// cached context — enabling O(1) per-token decode instead of O(n) recomputation.
@@ -195,7 +232,11 @@ public sealed unsafe class TransformerModel : IModel
 
             // The fused decode kernels don't support I2_S; route ternary weights through the
             // standard (unfused) projection path, which dispatches to the I2_S GEMV.
-            if (seqLen == 1 && _threadPool != null && lw.QQuantType != QuantizationType.I2_S)
+            // When a LoRA adapter is active we also need the F32 normalised hidden state
+            // (normOut) to feed LoraDelta — the fused RmsNormQuantize decode path skips
+            // that intermediate. Force the unfused path in both cases.
+            bool adapterActive = _currentAdapter is not null;
+            if (seqLen == 1 && _threadPool != null && lw.QQuantType != QuantizationType.I2_S && !adapterActive)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -246,6 +287,18 @@ public sealed unsafe class TransformerModel : IModel
             AddBias(lw.QBias, q, lw.QOutputDim, seqLen);
             AddBias(lw.KBias, k, lw.KOutputDim, seqLen);
             AddBias(lw.VBias, v, lw.VOutputDim, seqLen);
+
+            // LoRA delta (q/k/v): y += scale * (normOut · B) · A. No-op when
+            // no adapter is active. Applied AFTER bias and BEFORE QK-norm /
+            // RoPE so the delta contributes to the same downstream pipeline
+            // as the base projection. F32 normOut is guaranteed materialised
+            // here (we forced the unfused path above when adapter is active).
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDelta(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
+                ApplyLoraDelta(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
+                ApplyLoraDelta(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+            }
 
             // Optional QK-norms (Qwen3-style): per-head RMSNorm on Q/K after projection, before RoPE
             if (lw.QNormWeight is not null)
@@ -315,6 +368,12 @@ public sealed unsafe class TransformerModel : IModel
                 preQuantAttn, in rwO);
             AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
 
+            // LoRA delta (o_proj): y += scale * (attnOut · B) · A.
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDelta(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
+            }
+
             // g. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
             {
@@ -329,7 +388,10 @@ public sealed unsafe class TransformerModel : IModel
 
             // i. FFN RMSNorm + Pre-quantize + Gate/Up projections
             // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused path.
-            if (seqLen == 1 && _threadPool != null && lw.GateQuantType != QuantizationType.I2_S)
+            // When a LoRA adapter is active we also need F32 normOut to feed LoraDelta
+            // (same reasoning as the Q/K/V site above).
+            bool ffnAdapterActive = _currentAdapter is not null;
+            if (seqLen == 1 && _threadPool != null && lw.GateQuantType != QuantizationType.I2_S && !ffnAdapterActive)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
@@ -374,6 +436,13 @@ public sealed unsafe class TransformerModel : IModel
             AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
             AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
+            // LoRA delta (gate/up): y += scale * (normOut · B) · A.
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDelta(layer, "gate_proj", normOut, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
+                ApplyLoraDelta(layer, "up_proj", normOut, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+            }
+
             // Fused gated activation in a single tiled pass (per token).
             // Activation nonlinearity is config-driven: SiLU → SwiGLU (Llama/Mistral/Qwen/Phi),
             // ReluSquared → squared-ReLU GLU (BitNet b1.58).
@@ -413,6 +482,14 @@ public sealed unsafe class TransformerModel : IModel
             GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen,
                 preQuantSilu, in rwDown);
             AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
+
+            // LoRA delta (down_proj): y += scale * (siluOut · B) · A.
+            // Input is post-SwiGLU (siluOut), not normOut. The base GEMM
+            // already wrote into normOut, so we accumulate delta in place.
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDelta(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim);
+            }
 
             // k. Residual add (per token)
             for (int t = 0; t < seqLen; t++)
@@ -455,6 +532,73 @@ public sealed unsafe class TransformerModel : IModel
             new Span<float>((void*)result.DataPointer, seqLen * vocabSize));
 
         return result;
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="adapter"/> is compatible with this
+    /// model and that its targeted projections do not collide with
+    /// out-of-scope MLA / MoE structures. Called once per LoRA-aware Forward.
+    /// </summary>
+    private void ValidateAdapterForModel(ILoraAdapter adapter)
+    {
+        if (!adapter.IsCompatible(Config))
+            throw new InvalidOperationException(
+                $"LoRA adapter '{adapter.Name}' is not compatible with the loaded model "
+                + "(layer count, hidden size, or per-projection dimensions mismatch).");
+
+        // MLA layers (DeepSeek-V2/V3): the Q/K/V/O projections in the
+        // model are routed through MlaAttention, so adapting "q_proj" /
+        // "k_proj" / "v_proj" via the standard projection sites is not
+        // applicable. Be loud about it rather than silently passing
+        // through. Plain o_proj is also part of MLA (lw.OWeight) and
+        // therefore equally out-of-scope today.
+        if (Config.MlaConfig is not null)
+        {
+            // If any layer-target tuple is recorded we have to refuse.
+            // The adapter type itself doesn't expose the dictionary, but
+            // GetLayerWeights probes are cheap; check the canonical names.
+            string[] mlaUnsupported = ["q_proj", "k_proj", "v_proj", "o_proj"];
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                foreach (var name in mlaUnsupported)
+                {
+                    if (adapter.GetLayerWeights(layer, name) is not null)
+                        throw new NotSupportedException(
+                            $"LoRA adapter '{adapter.Name}' targets MLA-attention projection "
+                            + $"'{name}' at layer {layer}. MLA-LoRA support is a follow-up "
+                            + "(Phase 4a covers standard q/k/v/o + gate/up/down projections only).");
+                }
+            }
+        }
+
+    }
+
+    /// <summary>
+    /// Applies the LoRA delta for <paramref name="projName"/> at
+    /// <paramref name="layer"/> if the active adapter targets that site.
+    /// No-op when there is no active adapter or no entry for this projection.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ApplyLoraDelta(int layer, string projName,
+                                float* x, float* y, int seqLen, int inputDim, int outputDim)
+    {
+        var adapter = _currentAdapter;
+        if (adapter is null) return;
+        var lora = adapter.GetLayerWeights(layer, projName);
+        if (lora is not { } w) return;
+
+        // Defensive shape check — IsCompatible already validated dims, but
+        // we re-check at the call site so a bug in dim plumbing surfaces
+        // here rather than as a silent OOB into x/y buffers.
+        if (w.InputDim != inputDim || w.OutputDim != outputDim)
+            throw new InvalidOperationException(
+                $"LoRA adapter '{adapter.Name}' layer={layer} proj='{projName}' shape "
+                + $"({w.InputDim}x{w.OutputDim}) does not match base projection "
+                + $"({inputDim}x{outputDim}).");
+
+        float scale = adapter.Alpha / adapter.Rank;
+        LoraDelta.Apply((float*)x, (float*)w.BHandle, (float*)w.AHandle, (float*)y,
+                        seqLen, inputDim, outputDim, adapter.Rank, scale);
     }
 
     /// <summary>
