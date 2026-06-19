@@ -255,12 +255,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 throw new InvalidOperationException($"LoRA adapter at '{settings.LoraPath}' is incompatible with this base model.");
         }
 
-        // LoRA on GPU paths isn't applied yet (Phase 4b); warn rather than silently produce base output.
-        if (loraAdapter is not null && model is DotLLM.Cuda.CudaTransformerModel or DotLLM.Cuda.HybridTransformerModel)
+        // HybridTransformerModel does not thread the adapter through its Forward path (neither GPU
+        // nor CPU layers); warn rather than silently producing base output.
+        if (loraAdapter is not null && model is DotLLM.Cuda.HybridTransformerModel)
         {
-            const string gpuLoraWarning = "WARNING: --lora is not yet applied on GPU paths; base-model output will be produced. Use --device cpu for LoRA in this milestone.";
-            if (settings.Json) Console.Error.WriteLine(gpuLoraWarning);
-            else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(gpuLoraWarning)}[/]");
+            const string hybridLoraWarning = "WARNING: --lora is not applied in hybrid mode; neither GPU-offloaded nor CPU-resident layers are adapted. Use --device cpu or --device gpu (full GPU) for full adapter application.";
+            if (settings.Json) Console.Error.WriteLine(hybridLoraWarning);
+            else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(hybridLoraWarning)}[/]");
         }
 
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
