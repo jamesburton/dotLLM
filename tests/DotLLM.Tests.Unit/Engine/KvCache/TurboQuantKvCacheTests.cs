@@ -155,22 +155,79 @@ public sealed unsafe class TurboQuantKvCacheTests
     }
 
     [Fact]
+    public void Qjl_Cache_MatchesStandaloneQjlCodec_ForAHead()
+    {
+        // The QJL cache must reconstruct each head identically to a standalone QJL codec built with
+        // the cache's derived K seed — proving it wires useQjl + the same seed/bit-width per head.
+        using var cache = new TurboQuantKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen, Bits, Seed, useQjl: true);
+        Assert.True(cache.UseQjl);
+        var codecK = new TurboQuantCodec(HeadDim, Bits, Seed, useQjl: true);
+
+        int seqLen = 3;
+        var (k, v) = BuildKv(seqLen, layerSalt: 7);
+        int[] positions = { 0, 1, 2 };
+        try
+        {
+            UpdateCache(cache, k, v, positions, 0);
+            var kRef = cache.GetKeysRef(0);
+            var kOut = new ReadOnlySpan<float>((void*)kRef.DataPointer, seqLen * Stride);
+
+            Span<byte> codes = stackalloc byte[codecK.CodeBytesPerVector];
+            var expected = new float[HeadDim];
+            for (int pos = 0; pos < seqLen; pos++)
+            {
+                for (int h = 0; h < NumKvHeads; h++)
+                {
+                    var src = new ReadOnlySpan<float>((float*)k[pos] + h * HeadDim, HeadDim);
+                    float norm = codecK.Encode(src, codes);
+                    codecK.Decode(codes, norm, expected);
+                    for (int d = 0; d < HeadDim; d++)
+                        Assert.Equal(expected[d], kOut[pos * Stride + h * HeadDim + d], 5);
+                }
+            }
+        }
+        finally { FreeKv(k, v); }
+    }
+
+    [Fact]
+    public void Qjl_Cache_StillCompressedVsF32()
+    {
+        using var tq = new TurboQuantKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen, Bits, Seed, useQjl: true);
+        using var f32 = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
+        Assert.True(tq.UseQjl);
+        Assert.True(tq.AllocatedBytes < f32.AllocatedBytes,
+            $"QJL store ({tq.AllocatedBytes}) should still be smaller than F32 ({f32.AllocatedBytes}).");
+    }
+
+    [Fact]
     public void NonPowerOfTwoHeadDim_Throws()
         => Assert.Throws<ArgumentException>(() => new TurboQuantKvCache(1, 1, 48, 8, Bits, Seed));
 
     [Theory]
-    [InlineData("turboquant", KvCacheDType.TurboQuant, 0)]
-    [InlineData("tq", KvCacheDType.TurboQuant, 0)]
-    [InlineData("tq4", KvCacheDType.TurboQuant, 4)]
-    [InlineData("tq2", KvCacheDType.TurboQuant, 2)]
-    [InlineData("q8_0", KvCacheDType.Q8_0, 0)]
-    [InlineData("f32", KvCacheDType.F32, 0)]
-    public void ParseDType_HandlesTurboQuantAndBits(string input, KvCacheDType expected, int expectedBits)
+    [InlineData("turboquant", KvCacheDType.TurboQuant, 0, false)]
+    [InlineData("tq", KvCacheDType.TurboQuant, 0, false)]
+    [InlineData("tq4", KvCacheDType.TurboQuant, 4, false)]
+    [InlineData("tq2", KvCacheDType.TurboQuant, 2, false)]
+    [InlineData("tqq", KvCacheDType.TurboQuant, 0, true)]
+    [InlineData("tq4q", KvCacheDType.TurboQuant, 4, true)]
+    [InlineData("tq2q", KvCacheDType.TurboQuant, 2, true)]
+    [InlineData("TQ4Q", KvCacheDType.TurboQuant, 4, true)]   // case-insensitive
+    [InlineData("q8_0", KvCacheDType.Q8_0, 0, false)]
+    [InlineData("f32", KvCacheDType.F32, 0, false)]
+    public void ParseDType_HandlesTurboQuantBitsAndQjl(string input, KvCacheDType expected, int expectedBits, bool expectedQjl)
     {
-        var dt = KvCacheConfig.ParseDType(input, out int bits);
+        var dt = KvCacheConfig.ParseDType(input, out int bits, out bool useQjl);
         Assert.Equal(expected, dt);
         Assert.Equal(expectedBits, bits);
+        Assert.Equal(expectedQjl, useQjl);
     }
+
+    [Theory]
+    [InlineData("tq9")]     // bits out of range
+    [InlineData("tqx")]     // malformed
+    [InlineData("tq4x")]    // trailing non-q
+    public void ParseDType_RejectsMalformedTurboQuant(string input)
+        => Assert.Throws<ArgumentException>(() => KvCacheConfig.ParseDType(input));
 
     [Fact]
     public void Config_IsTurboQuant_AndIsQuantizedAreDistinct()

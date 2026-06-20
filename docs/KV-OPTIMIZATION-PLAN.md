@@ -284,6 +284,25 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
   not dense matmul); QJL residual storage layout; interaction with the
   full-precision window boundary.
 
+**Phase 1 progress (slices):**
+- ✅ **Slice 1 — MSE codec** (`TurboQuantCodec`): RHT rotation + per-coord standard-normal
+  Lloyd–Max scalar quant + per-vector norm. Centroids match the paper's b=1/b=2 values;
+  reconstruction relMse tracks ε_b; wrong-seed decode collapses (discriminating).
+- ✅ **Slice 2 — cache** (`TurboQuantKvCache`): per-(pos,head) code+norm store, dequant-to-scratch
+  through the plain-fp32 attention path; `KvCacheDType.TurboQuant`, `tq2..tq8` CLI, server factory.
+- ✅ **Slice 3 — QJL residual** (Algorithm 2, opt-in `useQjl`): MSE at `bits-1` + a seeded
+  Gaussian sketch `S`; stores `sign(S·r)` + `γ=‖r‖` packed in the code blob; decode folds in
+  `x̃_qjl=(√(π/2)/d)·γ·Sᵀ·q` so `E_S[⟨y,x̃⟩]=⟨y,x⟩`. Measured: self/cross-score contraction bias
+  −0.032/−0.034 (MSE) → +0.0006/+0.0002 (QJL); ℓ2 relMse rises (0.009→0.055) — the QJL trade.
+  CLI `tqq`/`tq2q..tq8q`; cache `useQjl` ctor + `KvCacheConfig.TurboQuantUseQjl`. Discriminating
+  tests in `TurboQuantCodecTests`/`TurboQuantKvCacheTests`.
+- ⬜ **Slice 4 — cross-backend dequant** (Vulkan + CUDA): the GPU payoff. Mirror the
+  dequant-to-scratch (and the QJL `Sᵀ·q` fold-in) in the Vulkan/CUDA attention prep. The
+  Gaussian sketch is O(d²) per vector — structure it (Hadamard) if it dominates the GPU path.
+- ⬜ **Model-level parity benchmark**: prefill+decode a real model (Llama-3.1-8B-Q4_K_M) with
+  `TurboQuantKvCache` (4-bit, ±QJL) vs cacheless F32; report logit/perplexity delta. The lossy
+  QUALITY acceptance is a model benchmark, not a unit test.
+
 ### Phase 2 — OSCAR codec (calibrated INT2)
 - **Add:** offline **calibration harness** (compute per-layer attention-aware
   covariance → rotation + clip thresholds), serialised alongside / next to the

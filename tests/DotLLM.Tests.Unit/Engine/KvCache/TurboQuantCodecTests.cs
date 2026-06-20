@@ -188,6 +188,181 @@ public sealed class TurboQuantCodecTests
     public void NonPowerOfTwoHeadDim_Throws()
         => Assert.Throws<ArgumentException>(() => new TurboQuantCodec(96, 4, seed: 1));
 
+    // ── QJL residual stage (Algorithm 2) ──────────────────────────────────
+
+    [Fact]
+    public void Qjl_RequiresAtLeastTwoBits()
+        => Assert.Throws<ArgumentOutOfRangeException>(() => new TurboQuantCodec(128, 1, seed: 1, useQjl: true));
+
+    [Fact]
+    public void Qjl_CodeLayout_PacksMseCodesPlusSignsPlusNorm()
+    {
+        // d=128, 4-bit budget with QJL ⇒ MSE at 3 bits: ceil(128*3/8)=48 code bytes +
+        // ceil(128/8)=16 sign bytes + 4 (γ) = 68. Pure-MSE 4-bit is ceil(128*4/8)=64.
+        var qjl = new TurboQuantCodec(128, 4, seed: 1, useQjl: true);
+        var mse = new TurboQuantCodec(128, 4, seed: 1, useQjl: false);
+        Assert.True(qjl.UseQjl);
+        Assert.False(mse.UseQjl);
+        Assert.Equal(8, qjl.LevelCount);   // MSE stage runs at bits-1 = 3 bits
+        Assert.Equal(16, mse.LevelCount);
+        Assert.Equal(68, qjl.CodeBytesPerVector);
+        Assert.Equal(64, mse.CodeBytesPerVector);
+    }
+
+    [Fact]
+    public void Qjl_RemovesSelfScoreContractionBias()
+    {
+        // DISCRIMINATING: the canonical high-attention case is a query aligned with its key
+        // (y = x), where the score is ‖x‖². The MSE stage is a contraction, so ⟨x, x̃_mse⟩
+        // underestimates ‖x‖² by ≈‖r‖² (the orthogonality principle: the quant error r is
+        // ~orthogonal to the reconstruction, so ⟨x,r⟩≈‖r‖²>0). QJL folds in an unbiased estimate
+        // of that residual, driving the mean self-score error to ≈0. We compare the QJL codec
+        // against the *pure-MSE codec at QJL's internal bit-width* (same seed ⇒ identical MSE
+        // reconstruction), isolating the QJL correction. A no-op / mis-scaled QJL cannot pass:
+        // it would leave the contraction bias intact.
+        const int d = 128, budget = 4;
+        var mse3 = new TurboQuantCodec(d, budget - 1, seed: 4242, useQjl: false); // QJL's MSE stage
+        var qjl4 = new TurboQuantCodec(d, budget, seed: 4242, useQjl: true);
+        var rng = new Random(2025);
+
+        int n = 3000;
+        double biasMse = 0, biasQjl = 0;
+        var cMse = new byte[mse3.CodeBytesPerVector];
+        var cQjl = new byte[qjl4.CodeBytesPerVector];
+        var rMse = new float[d];
+        var rQjl = new float[d];
+
+        for (int v = 0; v < n; v++)
+        {
+            float[] x = RandomGaussian(rng, d);
+            float nMse = mse3.Encode(x, cMse); mse3.Decode(cMse, nMse, rMse);
+            float nQjl = qjl4.Encode(x, cQjl); qjl4.Decode(cQjl, nQjl, rQjl);
+
+            double trueScore = 0, sMse = 0, sQjl = 0;
+            for (int i = 0; i < d; i++)
+            {
+                trueScore += (double)x[i] * x[i];
+                sMse += (double)x[i] * rMse[i];
+                sQjl += (double)x[i] * rQjl[i];
+            }
+            biasMse += (sMse - trueScore) / trueScore;
+            biasQjl += (sQjl - trueScore) / trueScore;
+        }
+        biasMse /= n;
+        biasQjl /= n;
+        _output.WriteLine($"self-score mean rel bias: MSE(3b)={biasMse:F5}, QJL(4b)={biasQjl:F5}");
+
+        // The pure-MSE stage contracts: clearly negative bias (≈ -ε_3 ≈ -0.034).
+        Assert.True(biasMse < -0.01, $"expected MSE contraction bias, got {biasMse:F5}");
+        // QJL removes (nearly) all of it: the residual mean bias is a small fraction of MSE's.
+        Assert.True(Math.Abs(biasQjl) < 0.25 * Math.Abs(biasMse),
+            $"QJL did not debias: |{biasQjl:F5}| vs |{biasMse:F5}|");
+    }
+
+    [Fact]
+    public void Qjl_DebiasesCrossScores_AgainstFullPrecisionQuery()
+    {
+        // Beyond the aligned case: for a query y that is a noisy variant of the key x (a realistic
+        // high-attention pair), the MSE score is still biased low; QJL's mean error is ≈0.
+        const int d = 256, budget = 4;
+        var mse3 = new TurboQuantCodec(d, budget - 1, seed: 9, useQjl: false);
+        var qjl4 = new TurboQuantCodec(d, budget, seed: 9, useQjl: true);
+        var rng = new Random(77);
+
+        int n = 3000;
+        double biasMse = 0, biasQjl = 0;
+        var cMse = new byte[mse3.CodeBytesPerVector];
+        var cQjl = new byte[qjl4.CodeBytesPerVector];
+        var rMse = new float[d];
+        var rQjl = new float[d];
+
+        for (int v = 0; v < n; v++)
+        {
+            float[] x = RandomGaussian(rng, d);
+            float[] noise = RandomGaussian(rng, d);
+            var y = new float[d];
+            for (int i = 0; i < d; i++) y[i] = x[i] + 0.3f * noise[i]; // correlated query
+
+            float nMse = mse3.Encode(x, cMse); mse3.Decode(cMse, nMse, rMse);
+            float nQjl = qjl4.Encode(x, cQjl); qjl4.Decode(cQjl, nQjl, rQjl);
+
+            double trueScore = 0, sMse = 0, sQjl = 0;
+            for (int i = 0; i < d; i++)
+            {
+                trueScore += (double)y[i] * x[i];
+                sMse += (double)y[i] * rMse[i];
+                sQjl += (double)y[i] * rQjl[i];
+            }
+            biasMse += (sMse - trueScore) / trueScore;
+            biasQjl += (sQjl - trueScore) / trueScore;
+        }
+        biasMse /= n;
+        biasQjl /= n;
+        _output.WriteLine($"cross-score mean rel bias: MSE(3b)={biasMse:F5}, QJL(4b)={biasQjl:F5}");
+
+        Assert.True(biasMse < -0.01, $"expected MSE contraction bias, got {biasMse:F5}");
+        Assert.True(Math.Abs(biasQjl) < 0.3 * Math.Abs(biasMse),
+            $"QJL did not debias cross-scores: |{biasQjl:F5}| vs |{biasMse:F5}|");
+    }
+
+    [Fact]
+    public void Qjl_RaisesL2Error_WhileLoweringScoreBias_Tradeoff()
+    {
+        // The QJL residual is a JL-noisy estimate of r: it fixes inner-product bias but RAISES the
+        // per-vector ℓ2 reconstruction error vs pure MSE at the same total budget. Documenting the
+        // trade prevents anyone "optimising" QJL by chasing relMse (which would defeat the point).
+        const int d = 128, budget = 4;
+        var mse = new TurboQuantCodec(d, budget, seed: 31, useQjl: false);
+        var qjl = new TurboQuantCodec(d, budget, seed: 31, useQjl: true);
+        var rng = new Random(8);
+        float[][] xs = new float[400][];
+        for (int i = 0; i < xs.Length; i++) xs[i] = RandomGaussian(rng, d);
+
+        double relMse = MeanRelMse(mse, xs);
+        double relQjl = MeanRelMse(qjl, xs);
+        _output.WriteLine($"relMse: pure-MSE(4b)={relMse:F4}, QJL(4b)={relQjl:F4}");
+        Assert.True(relQjl > relMse, $"expected QJL ℓ2 error {relQjl:F4} > MSE {relMse:F4}");
+    }
+
+    [Fact]
+    public void Qjl_SameSeed_ProducesIdenticalCodes_Deterministic()
+    {
+        const int d = 256, bits = 4;
+        var a = new TurboQuantCodec(d, bits, seed: 1234, useQjl: true);
+        var b = new TurboQuantCodec(d, bits, seed: 1234, useQjl: true);
+        var rng = new Random(99);
+        float[] x = RandomGaussian(rng, d);
+
+        var ca = new byte[a.CodeBytesPerVector];
+        var cb = new byte[b.CodeBytesPerVector];
+        float na = a.Encode(x, ca);
+        float nb = b.Encode(x, cb);
+
+        Assert.Equal(na, nb);
+        Assert.Equal(ca, cb); // includes MSE codes, QJL sign bits, and the packed residual norm γ
+
+        // ... and a different seed yields different sign bits (the sketch is genuinely seeded).
+        var c = new TurboQuantCodec(d, bits, seed: 4321, useQjl: true);
+        var cc = new byte[c.CodeBytesPerVector];
+        c.Encode(x, cc);
+        Assert.NotEqual(ca, cc);
+    }
+
+    [Fact]
+    public void Qjl_ZeroVector_RoundTripsToZero()
+    {
+        const int d = 128, bits = 4;
+        var codec = new TurboQuantCodec(d, bits, seed: 7, useQjl: true);
+        var codes = new byte[codec.CodeBytesPerVector];
+        var recon = new float[d];
+
+        float norm = codec.Encode(new float[d], codes);
+        codec.Decode(codes, norm, recon);
+
+        Assert.Equal(0f, norm);
+        foreach (float r in recon) Assert.Equal(0f, r); // γ=0 ⇒ QJL adds nothing
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────
 
     private static double MeanRelMse(TurboQuantCodec codec, float[][] xs)
