@@ -17,6 +17,16 @@ internal sealed record RunJsonResult
     public required RunUsageDto Usage { get; init; }
     public required RunTimingsDto Timings { get; init; }
     public required RunMemoryDto Memory { get; init; }
+    public RunBackendDto? Backend { get; init; }
+}
+
+/// <summary>Backend/decode-path diagnostics: which sampler path ran and CUDA decode-graph status.</summary>
+internal sealed record RunBackendDto
+{
+    public required string SamplerPath { get; init; }
+
+    /// <summary>CUDA decode-graph state (GPU models only); null on CPU/hybrid.</summary>
+    public string? DecodeGraph { get; init; }
 }
 
 /// <summary>Detected tool call in generated output.</summary>

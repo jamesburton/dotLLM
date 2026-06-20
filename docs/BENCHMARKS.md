@@ -73,6 +73,14 @@ vs llama.cpp        0.68x      0.57x      1.01x      1.01x    1.01x    0.94x  (>
 
 ## Analysis
 
+### BitNet GPU Sampling Notes (2026-06-18)
+
+On the local RTX 3060 + older host CPU test box, BitNet GPU decode with `DOTLLM_CUDA_GRAPH=1` is now mostly limited by host-side sampling and remaining small per-token overhead once graph replay is enabled. A short 64-token run with temperature sampling and repetition penalty measured about 93 tok/s decode, but sampling still cost about 337 ms total.
+
+Negative local experiment: replacing `TopPSampler`'s vectorized softmax + probability sort with a scalar logit-sort/logsumexp mask regressed badly on this machine. With `--temp 0.7 --top-p 0.9 --repeat-penalty 1.15 --repeat-last-n 64`, sampling rose to about 1392 ms for 64 tokens, while decode stayed about 94 tok/s. Do not carry that implementation forward for this host.
+
+Follow-up: keep top-p / categorical sampling optimization open for newer CPUs. This box is not representative of AVX2/AVX-512/modern .NET vector paths; retest on Framework/Meteor Lake/Strix before concluding that logit-space or fused top-p sampling is generally negative. The likely useful variants are bounded-candidate top-p after `top-k`, fused top-p + categorical sampling to avoid the second softmax, or SIMD/vectorized exp/logsum implementations.
+
 ### Decode (memory-bandwidth bound)
 
 | Model | dotLLM tok/s | llama.cpp tok/s | Ratio |

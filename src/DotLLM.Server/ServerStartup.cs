@@ -110,15 +110,10 @@ public static class ServerStartup
         }
 
         // Create chat template
-        string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
-        string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        IChatTemplate chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer)
-            ?? new JinjaChatTemplate(
-                "{% for message in messages %}" +
-                "{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}" +
-                "{% endfor %}" +
-                "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}",
-                bosToken, eosToken);
+        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer);
+        if (declaredChatTemplate is null)
+            Console.WriteLine("[dotllm] Model has no GGUF chat template; using a plain completion-style transcript.");
+        IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
         // Tool call parser
         var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);

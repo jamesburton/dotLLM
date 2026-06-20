@@ -137,4 +137,25 @@ public class SamplerPipelineTests
 
         Assert.Equal(result1, result2);
     }
+
+    [Fact]
+    public void Sample_AutoTopK_ReturnsOnlyTopKToken()
+    {
+        var options = new InferenceOptions
+        {
+            Temperature = 0.8f,
+            TopK = 3
+        };
+        var allowed = new HashSet<int> { 1, 3, 5 };
+
+        for (int seed = 0; seed < 100; seed++)
+        {
+            var pipeline = new SamplerPipeline(options with { Seed = seed });
+            float[] logits = [0.1f, 9.0f, 0.2f, 8.0f, 0.3f, 7.0f];
+
+            int result = pipeline.Sample(logits, []);
+
+            Assert.Contains(result, allowed);
+        }
+    }
 }

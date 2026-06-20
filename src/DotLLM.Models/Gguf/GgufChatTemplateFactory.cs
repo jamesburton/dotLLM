@@ -13,6 +13,20 @@ namespace DotLLM.Models.Gguf;
 public static class GgufChatTemplateFactory
 {
     /// <summary>
+    /// Conservative fallback for base models that do not declare a GGUF chat template.
+    /// It avoids model-specific control tokens such as ChatML's &lt;|im_start|&gt;.
+    /// </summary>
+    public const string PlainCompletionTemplateText =
+        "{% for message in messages %}" +
+        "{% if message['role'] == 'system' %}{{ message['content'] + '\\n\\n' }}" +
+        "{% elif message['role'] == 'user' %}{{ 'User: ' + message['content'] + '\\n' }}" +
+        "{% elif message['role'] == 'assistant' %}{{ 'Assistant: ' + message['content'] + '\\n' }}" +
+        "{% elif message['role'] == 'tool' %}{{ 'Tool: ' + message['content'] + '\\n' }}" +
+        "{% endif %}" +
+        "{% endfor %}" +
+        "{% if add_generation_prompt %}{{ 'Assistant: ' }}{% endif %}";
+
+    /// <summary>
     /// Tries to create a <see cref="JinjaChatTemplate"/> from GGUF metadata.
     /// Returns null if no chat template is present in the metadata.
     /// </summary>
@@ -29,6 +43,15 @@ public static class GgufChatTemplateFactory
 
         return new JinjaChatTemplate(template, bosToken, eosToken);
     }
+
+    /// <summary>
+    /// Creates a plain text completion-style fallback template for models without chat metadata.
+    /// </summary>
+    /// <param name="tokenizer">Tokenizer for resolving BOS/EOS token strings.</param>
+    public static JinjaChatTemplate CreatePlainFallback(ITokenizer tokenizer)
+        => new(PlainCompletionTemplateText,
+            tokenizer.DecodeToken(tokenizer.BosTokenId),
+            tokenizer.DecodeToken(tokenizer.EosTokenId));
 
     /// <summary>
     /// Tries to create a <see cref="JinjaChatTemplate"/> from a ModelConfig.
