@@ -318,9 +318,14 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
     of the shared scratch before this layer's dequant overwrite). `VulkanTransformerModel.CreateTurboQuantKvCache`.
     **End-to-end verified** (`VulkanTurboQuantKvEndToEndTests`): SmolLM-135M tq4 vs F32 picks the same top
     token (' Paris'), last-token logit cosine 0.996. Single-sequence; batched path unaffected (guarded).
-  - ⬜ **CUDA mirror** (`CudaTurboQuantKvCache` + a `turboquant_dequant.cu` PTX kernel, mirroring the
-    existing `CudaQuantizedKvCache` dequant-to-FP16-scratch). Build-verify on this box (no NVIDIA);
-    **runtime-verify on T5500** (user confirmed available with coordination — ssh t5500, 12 GB VRAM).
+  - ✅ **CUDA mirror** (`native/kernels/turboquant.cu` → `turboquant.ptx`: F32 + FP16 encode/dequant
+    kernels; `CudaKernels` launchers; `CudaTurboQuantKvCache`; eager-path routing + `CreateTurboQuantKvCache`
+    in `CudaTransformerModel`). Kernels **runtime-verified bit-exact** vs the CPU codec on T5500's RTX 3060
+    (`CudaTurboQuantKernelTests` 8/8: maxAbsDiff 0.0; encode round-trip ε_b + 100% code agreement). The FP16
+    cache + forward routing are build-verified and mirror the GPU-verified Vulkan path; the end-to-end CUDA
+    run (`CudaTurboQuantKvEndToEndTests`) is **pending SmolLM-135M on T5500** (scp upload to the cmd-shell
+    host fails — copy the GGUF to `C:\Users\james\.dotllm\models\QuantFactory\SmolLM-135M-GGUF\` on T5500,
+    then `dotnet test --filter CudaTurboQuantKvEndToEndTests`).
 - ✅ **Model-level parity benchmark** (`TurboQuantKvParityTests`, env-gated `DOTLLM_TURBOQUANT_PARITY_GGUF`):
   teacher-forced prefill+decode of Llama-3.1-8B-Q4_K_M (8 prefill + 48 decode) with a full-precision
   `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
