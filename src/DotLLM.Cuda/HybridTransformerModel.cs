@@ -642,6 +642,15 @@ public sealed unsafe class HybridTransformerModel : IModel
                 var rl = repackedLayers?[layer];
                 int cpuCacheLayer = layer; // HybridKvCache handles remapping
 
+                // When a LoRA adapter is active the F32 LoRA delta reads the normed
+                // projection input (normOut for Q/K/V and gate/up). The fused
+                // RmsNormQuantize decode fast-path skips materialising normOut (it
+                // writes only the quantised bytes), so force the unfused (prefill-
+                // style) path in both the attention and FFN blocks below — exactly
+                // as TransformerModel does. Adapter-less path keeps the fused fast
+                // path → byte-identical to the 4-arg Forward.
+                bool adapterActive = _currentAdapter is not null;
+
                 // a. Copy hiddenState → residual
                 new Span<float>(hidden, seqLen * hiddenSize)
                     .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
@@ -649,7 +658,7 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // b. RMSNorm + Pre-quantize + Q/K/V projections
                 byte* inputQ8Scratch = (byte*)_cpuState.InputQ8Scratch;
 
-                if (seqLen == 1 && _threadPool != null)
+                if (seqLen == 1 && _threadPool != null && !adapterActive)
                 {
                     // Decode path: try fused RmsNorm+Quantize
                     byte* preQuantNorm = null;
@@ -699,6 +708,17 @@ public sealed unsafe class HybridTransformerModel : IModel
                 AddBias(lw.QBias, q, lw.QOutputDim, seqLen);
                 AddBias(lw.KBias, k, lw.KOutputDim, seqLen);
                 AddBias(lw.VBias, v, lw.VOutputDim, seqLen);
+
+                // LoRA delta (q/k/v): y += scale · (normOut · B) · A. Applied AFTER
+                // bias and BEFORE QK-norm / RoPE — mirrors TransformerModel and the
+                // GPU phase. x = normOut (F32, materialised by the !adapterActive
+                // gate above), y = q/k/v. `layer` is the absolute (global) index.
+                if (_currentAdapter is not null)
+                {
+                    ApplyLoraDeltaCpu(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
+                    ApplyLoraDeltaCpu(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
+                    ApplyLoraDeltaCpu(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+                }
 
                 // Optional QK-norms
                 if (lw.QNormWeight is not null)
@@ -753,6 +773,13 @@ public sealed unsafe class HybridTransformerModel : IModel
                     preQuantAttn, in rwO);
                 AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
 
+                // LoRA delta (o_proj): y += scale · (attnOut · B) · A. x = attnOut,
+                // which holds the Sub-LN'd attention output (the optional Sub-LN above
+                // ran in-place into attnOut) — the exact O-projection input. y = normOut
+                // (the O output). Applied after the O bias and BEFORE the residual add.
+                if (_currentAdapter is not null)
+                    ApplyLoraDeltaCpu(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
+
                 // Residual add
                 for (int t = 0; t < seqLen; t++)
                 {
@@ -766,8 +793,10 @@ public sealed unsafe class HybridTransformerModel : IModel
                 new Span<float>(hidden, seqLen * hiddenSize)
                     .CopyTo(new Span<float>(residual, seqLen * hiddenSize));
 
-                // FFN: RMSNorm + Pre-quantize + Gate/Up projections
-                if (seqLen == 1 && _threadPool != null)
+                // FFN: RMSNorm + Pre-quantize + Gate/Up projections.
+                // Force the unfused path when an adapter is active so normOut (F32)
+                // is materialised for the gate/up LoRA delta — same trap as Q/K/V.
+                if (seqLen == 1 && _threadPool != null && !adapterActive)
                 {
                     byte* preQuantFfn = null;
                     if (IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType))
@@ -809,6 +838,16 @@ public sealed unsafe class HybridTransformerModel : IModel
                 AddBias(lw.GateBias, ffnGate, lw.GateOutputDim, seqLen);
                 AddBias(lw.UpBias, ffnUp, lw.UpOutputDim, seqLen);
 
+                // LoRA delta (gate/up): y += scale · (normOut · B) · A. x = normOut
+                // (FFN-normed input, F32, materialised by the !adapterActive gate
+                // above), y = ffnGate/ffnUp. Applied after biases and BEFORE the GLU
+                // activation below — mirrors TransformerModel and the GPU phase.
+                if (_currentAdapter is not null)
+                {
+                    ApplyLoraDeltaCpu(layer, "gate_proj", normOut, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
+                    ApplyLoraDeltaCpu(layer, "up_proj", normOut, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+                }
+
                 // Gated activation: SwiGLU (default) or squared-ReLU GLU (BitNet b1.58).
                 bool useReluSquared = Config.ActivationFunction == ActivationFunction.ReluSquared;
                 for (int t = 0; t < seqLen; t++)
@@ -838,6 +877,12 @@ public sealed unsafe class HybridTransformerModel : IModel
                 GemmInterleaved(lw.DownWeight, lw.DownQuantType, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen,
                     preQuantSilu, in rwDown);
                 AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
+
+                // LoRA delta (down_proj): y += scale · (siluOut · B) · A. x = siluOut
+                // (the post-GLU, possibly FFN-Sub-LN'd, down-projection input), y = normOut
+                // (down output). Applied after the down bias and BEFORE the FFN residual add.
+                if (_currentAdapter is not null)
+                    ApplyLoraDeltaCpu(layer, "down_proj", siluOut, normOut, seqLen, lw.DownInputDim, lw.DownOutputDim);
 
                 // Residual add
                 for (int t = 0; t < seqLen; t++)
@@ -936,7 +981,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <summary>
     /// Applies the GPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
     /// using the staged FP16 factors (<c>B[rank, inputDim]</c>, <c>A[outputDim, rank]</c>) via
-    /// the shared <see cref="_gpuState.LoraTmp"/> scratch. Mirrors
+    /// the shared <c>_gpuState.LoraTmp</c> scratch. Mirrors
     /// <c>CudaTransformerModel.ApplyLoraDeltaDevice</c> (M2): decode (seqLen==1) uses two GEMVs,
     /// prefill (seqLen&gt;1) uses two batched GEMMs. Early-returns when no adapter is staged or
     /// the adapter does not target <paramref name="proj"/> at this layer.
@@ -977,6 +1022,44 @@ public sealed unsafe class HybridTransformerModel : IModel
             // Step 2: Y[seqLen, outputDim] += scale · tmp[seqLen, rank] × A^T
             CudaGemm.LinearF16Accum(cublasH, tmp, aF16, yDev, seqLen, rank, outputDim, scale, s);
         }
+    }
+
+    /// <summary>
+    /// Applies the CPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
+    /// using the shared F32 <see cref="LoraDelta.Apply(float*, float*, float*, float*, int, int, int, int, float, nint)"/>
+    /// kernel. Mirrors <c>TransformerModel.ApplyLoraDelta</c>'s structure but is scoped to F32
+    /// adapter weights only — the Q8_0 / outer-product / pre-quantised-X fast paths that
+    /// <c>TransformerModel.ApplyLoraDelta</c> dispatches into are out of scope for the hybrid CPU
+    /// phase (the synthetic / parity adapters are F32). Early-returns when no adapter is staged or
+    /// the adapter does not target <paramref name="proj"/> at this layer. <paramref name="layer"/>
+    /// is the absolute (global) layer index.
+    /// </summary>
+    private void ApplyLoraDeltaCpu(int layer, string proj, float* x, float* y,
+                                   int seqLen, int inputDim, int outputDim)
+    {
+        var adapter = _currentAdapter;
+        if (adapter is null)
+            return;
+
+        var lora = adapter.GetLayerWeights(layer, proj);
+        if (lora is not { } w)
+            return; // untargeted projection — no-op
+
+        if (w.InputDim != inputDim || w.OutputDim != outputDim)
+            throw new InvalidOperationException(
+                $"LoRA adapter shape mismatch at layer {layer} proj {proj}: " +
+                $"adapter [{w.InputDim}->{w.OutputDim}] vs projection [{inputDim}->{outputDim}].");
+
+        if (w.WeightDType != LoraWeightDType.F32)
+            throw new NotSupportedException(
+                $"Hybrid CPU LoRA currently supports F32 adapter weights only (proj={proj} is {w.WeightDType}); " +
+                "use --device cpu for other dtypes.");
+
+        // y += (adapter.Alpha / adapter.Rank) · (x · B) · A. Legacy stage-2 path
+        // (aTransposedHandle: 0) — the outer-product fast path is out of scope here.
+        LoraDelta.Apply(x, (float*)w.BHandle, (float*)w.AHandle, y,
+                        seqLen, inputDim, outputDim, adapter.Rank,
+                        adapter.Alpha / adapter.Rank);
     }
 
     // ═══════════════════════════════════════════════════
