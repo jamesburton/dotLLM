@@ -53,9 +53,10 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
         string? ptxDir = FindPtxDir();
         Skip.If(ptxDir == null, "PTX files not found");
-        string modelPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
+        string modelPath = Environment.GetEnvironmentVariable("DOTLLM_SMOLLM_Q8_GGUF")
+            ?? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
         Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
 
         var gguf = GgufFile.Open(modelPath);
