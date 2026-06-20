@@ -330,6 +330,19 @@ public sealed class VulkanTransformerModel : IModel
         => new(_device, KvGeometry.FromConfig(Config), maxSeqLen);
 
     /// <summary>
+    /// Creates a GPU-resident TurboQuant (MSE-stage) KV-cache on this model's device. The caller
+    /// supplies the codec constants (the Vulkan project does not depend on the Engine codec):
+    /// <paramref name="centroids"/> (2^mseBits, scaled by 1/√d), per-K/V RHT sign sets (length
+    /// headDim, ±1), and <paramref name="invSqrtD"/>. Uniform geometry only (headDim a power of two
+    /// ≤ 256); used on the single-sequence autoregressive forward path.
+    /// </summary>
+    public VulkanTurboQuantKvCache CreateTurboQuantKvCache(
+        string spvDir, int maxSeqLen, int mseBits,
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+        => new(_device, spvDir, Config.NumLayers, Config.NumKvHeads, Config.HeadDim,
+               maxSeqLen, mseBits, centroids, signsK, signsV, invSqrtD);
+
+    /// <summary>
     /// Creates a per-layer MLA (DeepSeek-V2/V3) KV-cache sized for this
     /// model. Throws when the model is not an MLA model (no <c>MlaConfig</c>
     /// at construction).
@@ -2059,6 +2072,23 @@ public sealed class VulkanTransformerModel : IModel
                 seqKv = vkCache.CurrentLength;
                 positionOffset = positions[0];
             }
+            else if (kvCache is VulkanTurboQuantKvCache tqCache)
+            {
+                // TurboQuant: encode the freshly-projected K/V into compressed codes, then dequant
+                // the live range into the shared fp32 scratch the attention kernel reads. RoPE(K) →
+                // encode, encode(codes) → dequant, dequant(scratch) → attention are all COMPUTE; the
+                // same COMPUTE barriers also order the previous layer's attention reads of the shared
+                // scratch before this layer's dequant overwrites it (WAR).
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                tqCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                tqCache.RecordDequant(cmdBuf, layer);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                kSrc = tqCache.GetKeysBuffer();
+                vSrc = tqCache.GetValuesBuffer();
+                seqKv = tqCache.CurrentLength;
+                positionOffset = positions[0];
+            }
             else
             {
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -2950,6 +2980,21 @@ public sealed class VulkanTransformerModel : IModel
             kSrc = vkCache.GetKeysBuffer(layer);
             vSrc = vkCache.GetValuesBuffer(layer);
             seqKv = vkCache.CurrentLength;
+            positionOffset = positions[0];
+            maskMode = AttentionMaskMode.Causal;
+            prefixLen = 0;
+        }
+        else if (kvCache is VulkanTurboQuantKvCache tqCache)
+        {
+            // See the GQA path for the barrier rationale (encode → dequant → attention, all COMPUTE).
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            tqCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            tqCache.RecordDequant(cmdBuf, layer);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            kSrc = tqCache.GetKeysBuffer();
+            vSrc = tqCache.GetValuesBuffer();
+            seqKv = tqCache.CurrentLength;
             positionOffset = positions[0];
             maskMode = AttentionMaskMode.Causal;
             prefixLen = 0;
