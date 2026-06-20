@@ -322,10 +322,9 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
     kernels; `CudaKernels` launchers; `CudaTurboQuantKvCache`; eager-path routing + `CreateTurboQuantKvCache`
     in `CudaTransformerModel`). Kernels **runtime-verified bit-exact** vs the CPU codec on T5500's RTX 3060
     (`CudaTurboQuantKernelTests` 8/8: maxAbsDiff 0.0; encode round-trip ε_b + 100% code agreement). The FP16
-    cache + forward routing are build-verified and mirror the GPU-verified Vulkan path; the end-to-end CUDA
-    run (`CudaTurboQuantKvEndToEndTests`) is **pending SmolLM-135M on T5500** (scp upload to the cmd-shell
-    host fails — copy the GGUF to `C:\Users\james\.dotllm\models\QuantFactory\SmolLM-135M-GGUF\` on T5500,
-    then `dotnet test --filter CudaTurboQuantKvEndToEndTests`).
+    cache + forward routing **end-to-end verified** on T5500's RTX 3060 (`CudaTurboQuantKvEndToEndTests`,
+    env-gated `DOTLLM_SMOLLM_Q8_GGUF`): SmolLM tq4 vs FP16 picks the same top token (' Paris'), logit
+    cosine 0.995 — matching Vulkan. **KV Phase 1 (TurboQuant) is complete on CPU + Vulkan + CUDA.**
 - ✅ **Model-level parity benchmark** (`TurboQuantKvParityTests`, env-gated `DOTLLM_TURBOQUANT_PARITY_GGUF`):
   teacher-forced prefill+decode of Llama-3.1-8B-Q4_K_M (8 prefill + 48 decode) with a full-precision
   `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
