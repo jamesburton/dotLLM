@@ -125,29 +125,24 @@ public sealed unsafe class CudaLoraWeights : IDisposable
                     if (maybeW is not { } w)
                         continue;
 
-                    long aF32Bytes = (long)w.OutputDim * rank * sizeof(float);
-                    long bF32Bytes = (long)rank * w.InputDim * sizeof(float);
-                    long aF16Bytes = (long)w.OutputDim * rank * sizeof(ushort);
-                    long bF16Bytes = (long)rank * w.InputDim * sizeof(ushort);
+                    int aElems = w.OutputDim * rank;
+                    int bElems = rank * w.InputDim;
+                    long aF16Bytes = (long)aElems * sizeof(ushort);
+                    long bF16Bytes = (long)bElems * sizeof(ushort);
 
-                    // Alloc F32 scratch, upload host data
-                    CudaDriverApi.cuMemAlloc_v2(out nint aF32Dev, (nuint)aF32Bytes).ThrowOnError();
-                    f32Scratch.Add(aF32Dev);
-                    CudaDriverApi.cuMemcpyHtoD_v2(aF32Dev, w.AHandle, (nuint)aF32Bytes).ThrowOnError();
-
-                    CudaDriverApi.cuMemAlloc_v2(out nint bF32Dev, (nuint)bF32Bytes).ThrowOnError();
-                    f32Scratch.Add(bF32Dev);
-                    CudaDriverApi.cuMemcpyHtoD_v2(bF32Dev, w.BHandle, (nuint)bF32Bytes).ThrowOnError();
-
-                    // Alloc persistent F16 buffers
+                    // Alloc persistent F16 device buffers (the inference target dtype).
+                    // Track in f16Allocs BEFORE any subsequent throw so error cleanup frees them.
                     CudaDriverApi.cuMemAlloc_v2(out nint aF16Dev, (nuint)aF16Bytes).ThrowOnError();
                     f16Allocs.Add(aF16Dev);
                     CudaDriverApi.cuMemAlloc_v2(out nint bF16Dev, (nuint)bF16Bytes).ThrowOnError();
                     f16Allocs.Add(bF16Dev);
 
-                    // Queue F32→F16 conversions
-                    kernels.LaunchConvertF32ToF16(aF32Dev, aF16Dev, w.OutputDim * rank, stream);
-                    kernels.LaunchConvertF32ToF16(bF32Dev, bF16Dev, rank * w.InputDim, stream);
+                    // Stage A (up-projection) per its resolved dtype.
+                    StageFactor(w.ResolvedAWeightDType, w.AHandle, aF16Dev, aElems,
+                                kernels, stream, f32Scratch, layer, proj);
+                    // Stage B (down-projection) per its dtype.
+                    StageFactor(w.WeightDType, w.BHandle, bF16Dev, bElems,
+                                kernels, stream, f32Scratch, layer, proj);
 
                     buffers[(layer, proj)] = (aF16Dev, bF16Dev, w.InputDim, w.OutputDim);
                 }
@@ -176,6 +171,57 @@ public sealed unsafe class CudaLoraWeights : IDisposable
         }
 
         return new CudaLoraWeights(adapter, rank, scale, buffers);
+    }
+
+    /// <summary>
+    /// Stages one A/B factor buffer from host into the pre-allocated F16 device
+    /// target, branching on the factor's source dtype. Host reads are sized by
+    /// the SOURCE dtype to avoid the F32-only over-read that triggered #89.
+    /// </summary>
+    private static void StageFactor(
+        LoraWeightDType dtype,
+        nint hostHandle,
+        nint f16Dev,
+        int elements,
+        CudaKernels kernels,
+        nint stream,
+        List<nint> f32Scratch,
+        int layer,
+        string proj)
+    {
+        switch (dtype)
+        {
+            case LoraWeightDType.F32:
+            {
+                // Legacy path: upload F32 host bytes to scratch, convert F32→F16.
+                // Byte-equivalent to the pre-#89 behaviour for F32 adapters.
+                long f32Bytes = (long)elements * sizeof(float);
+                CudaDriverApi.cuMemAlloc_v2(out nint f32Dev, (nuint)f32Bytes).ThrowOnError();
+                f32Scratch.Add(f32Dev);
+                CudaDriverApi.cuMemcpyHtoD_v2(f32Dev, hostHandle, (nuint)f32Bytes).ThrowOnError();
+                kernels.LaunchConvertF32ToF16(f32Dev, f16Dev, elements, stream);
+                break;
+            }
+
+            case LoraWeightDType.F16:
+            {
+                // Device target is already F16: upload host F16 bytes directly,
+                // no F32 scratch and no conversion. This is the #89 fix.
+                long f16Bytes = (long)elements * sizeof(ushort);
+                CudaDriverApi.cuMemcpyHtoD_v2(f16Dev, hostHandle, (nuint)f16Bytes).ThrowOnError();
+                break;
+            }
+
+            default:
+                // BF16 (no BF16→F16 kernel exists) and Q8_0 (GPU dequant out of
+                // scope) fail safely instead of silently over-reading the host
+                // buffer. The F16 device buffers are already tracked in f16Allocs,
+                // so the caller's catch frees them.
+                throw new NotSupportedException(
+                    $"GPU LoRA staging does not yet support {dtype} adapter weights " +
+                    $"(proj '{proj}', layer {layer}); use --device cpu, or an F32/F16 adapter. " +
+                    "Tracked in #89.");
+        }
     }
 
     /// <inheritdoc/>
