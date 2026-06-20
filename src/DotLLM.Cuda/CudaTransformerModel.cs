@@ -2171,7 +2171,7 @@ public sealed unsafe class CudaTransformerModel : IModel
     public CudaKvCache CreateKvCache(int maxSeqLen)
     {
         _context.MakeCurrent();
-        return new CudaKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+        return new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen);
     }
 
     /// <summary>
@@ -2182,9 +2182,10 @@ public sealed unsafe class CudaTransformerModel : IModel
     public Core.Attention.IKvCache CreateKvCache(int maxSeqLen, Core.Configuration.KvCacheConfig config)
     {
         _context.MakeCurrent();
+        var geom = Core.Attention.KvGeometry.FromConfig(Config);
         if (!config.IsQuantized)
-            return new CudaKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
-        return new CudaQuantizedKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, config);
+            return new CudaKvCache(geom, maxSeqLen);
+        return new CudaQuantizedKvCache(geom, maxSeqLen, config);
     }
 
     /// <inheritdoc/>

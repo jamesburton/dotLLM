@@ -32,7 +32,7 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -61,6 +61,27 @@ public sealed class VulkanKvCache : IKvCache
     public VulkanKvCache(VulkanDevice device, int numLayers, int numKvHeads, int headDim, int maxSeqLen)
         : this(device, BuildUniformStrides(numLayers, numKvHeads, headDim), maxSeqLen)
     {
+    }
+
+    /// <summary>
+    /// Creates the per-layer K/V buffers from a Core <see cref="KvGeometry"/> descriptor.
+    /// Byte-identical to the uniform constructor for every dense/GQA/MoE model and supplies
+    /// distinct per-layer strides for Gemma-4. This is the constructor
+    /// <see cref="VulkanTransformerModel.CreateKvCache"/> uses (via
+    /// <see cref="KvGeometry.FromConfig"/>), so the per-layer-stride derivation lives in one
+    /// place (Core) rather than being rebuilt inline.
+    /// </summary>
+    public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen)
+        : this(device, ExtractStrides(geometry), maxSeqLen)
+    {
+    }
+
+    private static int[] ExtractStrides(KvGeometry geometry)
+    {
+        var strides = new int[geometry.LayerCount];
+        for (int l = 0; l < strides.Length; l++)
+            strides[l] = geometry.KvStrideOf(l);
+        return strides;
     }
 
     /// <summary>
