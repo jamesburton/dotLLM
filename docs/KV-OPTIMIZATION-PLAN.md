@@ -305,14 +305,22 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
     (centroids/signs/invSqrtD) passed as buffers/push-constants so the kernel is backend-pure.
     `TurboQuantCodec` exposes `MseBits`/`RotationSigns`/`InvSqrtD`. **GPU-verified bit-exact** vs the CPU
     codec on gfx1151 (`VulkanTurboQuantDequantF32KernelTests`, maxAbsDiff 0.0).
-  - ⬜ **4b — `VulkanTurboQuantKvCache` + routing + end-to-end.** Store codes+norms in device buffers;
-    on update encode the fresh K/V (readback+CPU-encode first cut, or a GPU encode shader) → upload
-    codes; on attention prep dispatch the 4a dequant kernel into the F32 scratch the attention shader
-    already reads. Route in `VulkanTransformerModel.CreateKvCache` on `KvCacheConfig.IsTurboQuant`.
-    Needs integration into the fence-pipelined forward graph + an end-to-end GPU parity run vs CPU.
+  - ✅ **4b/1 — Vulkan encode kernel** (`turboquant_encode_f32.comp` + `.spv` + `TurboQuantEncodeF32Kernel`):
+    norm → unit dir → forward RHT → nearest centroid → bit-pack; each workgroup owns its (disjoint,
+    uint-aligned) code uints so output is single-writer (no atomics/pre-zeroing). GPU-resident encode is
+    required because the forward records all layers into one command buffer (CPU encode would force a
+    mid-graph readback). GPU-verified: round-trip relMse tracks ε_b and codes are 100% identical to CPU.
+  - ✅ **4b/2 — `VulkanTurboQuantKvCache`**: per-layer codes+norms device buffers + shared fp32 scratch;
+    RecordUpdate=encode, RecordDequant=4a dequant; backend-pure (codec constants passed in). GPU-verified
+    to match the CPU `TurboQuantKvCache` to float-rounding noise (maxAbs ~1e-6, 0% mismatches).
+  - ✅ **4b/3 — forward routing + factory + end-to-end.** Branch at the GQA & Gemma single-seq attention
+    callsites (encode → dequant → attention, all COMPUTE; barriers also order prior-layer attention reads
+    of the shared scratch before this layer's dequant overwrite). `VulkanTransformerModel.CreateTurboQuantKvCache`.
+    **End-to-end verified** (`VulkanTurboQuantKvEndToEndTests`): SmolLM-135M tq4 vs F32 picks the same top
+    token (' Paris'), last-token logit cosine 0.996. Single-sequence; batched path unaffected (guarded).
   - ⬜ **CUDA mirror** (`CudaTurboQuantKvCache` + a `turboquant_dequant.cu` PTX kernel, mirroring the
-    existing `CudaQuantizedKvCache` dequant-to-FP16-scratch). Build-verify only on this box (no NVIDIA);
-    runtime-verify on T5500.
+    existing `CudaQuantizedKvCache` dequant-to-FP16-scratch). Build-verify on this box (no NVIDIA);
+    **runtime-verify on T5500** (user confirmed available with coordination — ssh t5500, 12 GB VRAM).
 - ✅ **Model-level parity benchmark** (`TurboQuantKvParityTests`, env-gated `DOTLLM_TURBOQUANT_PARITY_GGUF`):
   teacher-forced prefill+decode of Llama-3.1-8B-Q4_K_M (8 prefill + 48 decode) with a full-precision
   `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
