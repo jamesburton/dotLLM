@@ -118,10 +118,14 @@ public static class ServerStartup
         // Tool call parser
         var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
 
-        // KV-cache configuration
+        // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
+        // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK, out int tqBits, out bool tqUseQjl);
         var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(options.CacheTypeK),
-            KvCacheConfig.ParseDType(options.CacheTypeV));
+            keyDType,
+            KvCacheConfig.ParseDType(options.CacheTypeV),
+            TurboQuantBits: tqBits > 0 ? tqBits : 4,
+            TurboQuantUseQjl: tqUseQjl);
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
@@ -164,10 +168,11 @@ public static class ServerStartup
         }
         else if (kvConfig.IsTurboQuant)
         {
-            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious).");
+            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
+                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
             kvFactory = (cfg, size) => new TurboQuantKvCache(
                 cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
-                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed);
+                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
         PrefixCache? prefixCache = options.PromptCacheEnabled

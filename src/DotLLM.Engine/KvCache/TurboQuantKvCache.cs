@@ -69,8 +69,11 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <inheritdoc/>
     public int KvStrideOf(int layerIndex) => _stride;
 
-    /// <summary>Bits per quantized coordinate (the codec's bit-width).</summary>
+    /// <summary>Total per-coordinate bit budget (the codec's bit-width).</summary>
     public int Bits => _codecK.Bits;
+
+    /// <summary>Whether the QJL unbiased-score residual stage is active.</summary>
+    public bool UseQjl => _codecK.UseQjl;
 
     /// <summary>Total bytes for the permanent compressed store (codes + norms; excludes scratch).</summary>
     public long AllocatedBytes =>
@@ -83,11 +86,15 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
     /// <param name="numKvHeads">KV heads per layer.</param>
     /// <param name="headDim">Per-head dimension (must be a power of two — RHT rotation).</param>
     /// <param name="maxSeqLen">Max cached positions.</param>
-    /// <param name="bits">Bits per coordinate (1–8; 4 ≈ quality-neutral, lower = more compression).</param>
+    /// <param name="bits">Bits per coordinate (1–8; 4 ≈ quality-neutral, lower = more compression).
+    /// With <paramref name="useQjl"/> this is the total budget (MSE runs at <c>bits-1</c>; requires ≥2).</param>
     /// <param name="seed">Rotation seed; persist it so rollback / prefix reuse stay valid. Keys and
     /// values use independent rotations derived from this seed.</param>
+    /// <param name="useQjl">Enable the QJL 1-bit residual stage for unbiased attention scores
+    /// (debiases the MSE contraction; raises ℓ2 error but removes score bias — see
+    /// <see cref="TurboQuantCodec"/>).</param>
     public TurboQuantKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen,
-                             int bits, ulong seed)
+                             int bits, ulong seed, bool useQjl = false)
     {
         if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
         if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
@@ -100,8 +107,8 @@ public sealed unsafe class TurboQuantKvCache : IKvCache, IPerLayerKvCache
         _maxSeqLen = maxSeqLen;
 
         // Independent K/V rotations (paper-consistent): derive a distinct V seed.
-        _codecK = new TurboQuantCodec(headDim, bits, seed);
-        _codecV = new TurboQuantCodec(headDim, bits, seed ^ 0xD1B54A32D192ED03UL);
+        _codecK = new TurboQuantCodec(headDim, bits, seed, useQjl);
+        _codecV = new TurboQuantCodec(headDim, bits, seed ^ 0xD1B54A32D192ED03UL, useQjl);
         _codeBytes = _codecK.CodeBytesPerVector;
 
         _keyCodes = new nint[numLayers];
