@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
@@ -54,6 +55,14 @@ public sealed unsafe class HybridTransformerModel : IModel
     private readonly int? _slidingWindowSize;
     private nint _fp16TransferBuffer;
     private int _fp16TransferCapacity; // in elements
+
+    // ── LoRA adapter staging (GPU phase) ──
+    // Set by the 5-arg Forward overload; read in the GPU layer loop to apply the
+    // per-projection device delta. Mirrors CudaTransformerModel's M2 fields. The CPU
+    // phase delta (Task 2) will read _currentAdapter separately. Null → adapter-less
+    // path is byte-identical to the 4-arg Forward.
+    private ILoraAdapter? _currentAdapter;
+    private CudaLoraWeights? _cudaLora;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -327,6 +336,40 @@ public sealed unsafe class HybridTransformerModel : IModel
 
     /// <inheritdoc/>
     /// <remarks>
+    /// Implements <see cref="IModel"/>'s default 5-arg overload. When
+    /// <paramref name="adapter"/> is null this delegates to the 4-arg
+    /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>,
+    /// reproducing the adapter-less forward byte-for-byte. Otherwise it stages the
+    /// adapter onto the GPU (identity-cached on <see cref="CudaLoraWeights.Source"/>),
+    /// then runs the 4-arg forward with <see cref="_currentAdapter"/> set so the GPU
+    /// layer loop applies the per-projection delta. The CPU-phase delta is added by a
+    /// separate task; the GPU-phase delta lands here.
+    /// </remarks>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache); // byte-equivalent
+
+        if (!ReferenceEquals(_cudaLora?.Source, adapter))
+        {
+            _cudaLora?.Dispose();
+            _cudaLora = CudaLoraWeights.Stage(adapter, Config, _kernels, _stream.Handle);
+        }
+
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
     /// SYNC WARNING: The GPU phase (layers 0..N-1) replicates logic from
     /// CudaTransformerModel.Forward and the CPU phase (layers N..L-1) replicates logic
     /// from TransformerModel.Forward. Bug fixes to attention, FFN, or norm logic may
@@ -420,6 +463,18 @@ public sealed unsafe class HybridTransformerModel : IModel
             if (lw.KBias != 0) _kernels.LaunchBiasAdd(_gpuState.K, lw.KBias, lw.KOutputDim, seqLen, s);
             if (lw.VBias != 0) _kernels.LaunchBiasAdd(_gpuState.V, lw.VBias, lw.VOutputDim, seqLen, s);
 
+            // LoRA delta (q/k/v): y += scale · (NormOutput · B) · A. Applied AFTER bias and
+            // BEFORE QK-norm + RoPE — mirrors CudaTransformerModel.ApplyLoraDeltaDevice (M2)
+            // and the CPU oracle (TransformerModel.cs). x = NormOutput (projection input),
+            // y = Q/K/V. No-op for projections the adapter does not target (TryGet returns false).
+            // `layer` is the absolute index (GPU phase = global layers 0..gpuLayers-1).
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDeltaDeviceGpu(layer, "q_proj", _gpuState.NormOutput, _gpuState.Q, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "k_proj", _gpuState.NormOutput, _gpuState.K, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "v_proj", _gpuState.NormOutput, _gpuState.V, seqLen);
+            }
+
             if (lw.QNormWeight != 0)
                 _kernels.LaunchPerHeadRmsNorm(_gpuState.Q, lw.QNormWeight, eps, numHeads, headDim, seqLen, s);
             if (lw.KNormWeight != 0)
@@ -454,6 +509,13 @@ public sealed unsafe class HybridTransformerModel : IModel
                 lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_gpuState.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
+            // LoRA delta (o_proj): y += scale · (AttnOutput · B) · A. x = _gpuState.AttnOutput,
+            // which holds the Sub-LN'd attention output when AttnSubNormWeight ran in place above —
+            // the exact O-projection input the CPU oracle uses. y = NormOutput (the O output).
+            // Applied after the O bias and BEFORE the fused residual add. Mirrors M2.
+            if (_currentAdapter is not null)
+                ApplyLoraDeltaDeviceGpu(layer, "o_proj", _gpuState.AttnOutput, _gpuState.NormOutput, seqLen);
+
             // ── FUSED: attention residual + FFN norm ──
             _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
                 lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
@@ -466,6 +528,15 @@ public sealed unsafe class HybridTransformerModel : IModel
 
             if (lw.GateBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnGate, lw.GateBias, lw.GateOutputDim, seqLen, s);
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(_gpuState.FfnUp, lw.UpBias, lw.UpOutputDim, seqLen, s);
+
+            // LoRA delta (gate/up): y += scale · (NormOutput · B) · A. x = NormOutput (FFN-normed
+            // input), y = FfnGate/FfnUp (raw projection outputs). Applied after biases and BEFORE
+            // the GLU activation below — mirrors M2 and the CPU oracle.
+            if (_currentAdapter is not null)
+            {
+                ApplyLoraDeltaDeviceGpu(layer, "gate_proj", _gpuState.NormOutput, _gpuState.FfnGate, seqLen);
+                ApplyLoraDeltaDeviceGpu(layer, "up_proj", _gpuState.NormOutput, _gpuState.FfnUp, seqLen);
+            }
 
             // BitNet's relu(gate)²·up intermediate overflows FP16; fuse activation + Sub-LN RMSNorm
             // (kept in FP32) when the Sub-LN weight is present. See CudaTransformerModel for rationale.
@@ -491,6 +562,12 @@ public sealed unsafe class HybridTransformerModel : IModel
             ProjectGpu(lw.DownQuant, lw.DownQuantType, lw.Down, _gpuState.SiluOutput, _gpuState.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_gpuState.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
+
+            // LoRA delta (down_proj): y += scale · (SiluOutput · B) · A. x = SiluOutput (the
+            // post-GLU, possibly FFN-Sub-LN'd, down-projection input), y = NormOutput (down
+            // output). Applied after the down bias and BEFORE the FFN residual add. Mirrors M2.
+            if (_currentAdapter is not null)
+                ApplyLoraDeltaDeviceGpu(layer, "down_proj", _gpuState.SiluOutput, _gpuState.NormOutput, seqLen);
 
             // ── FUSED: FFN residual + next layer setup ──
             if (layer < gpuLayers - 1)
@@ -856,6 +933,52 @@ public sealed unsafe class HybridTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Applies the GPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
+    /// using the staged FP16 factors (<c>B[rank, inputDim]</c>, <c>A[outputDim, rank]</c>) via
+    /// the shared <see cref="_gpuState.LoraTmp"/> scratch. Mirrors
+    /// <c>CudaTransformerModel.ApplyLoraDeltaDevice</c> (M2): decode (seqLen==1) uses two GEMVs,
+    /// prefill (seqLen&gt;1) uses two batched GEMMs. Early-returns when no adapter is staged or
+    /// the adapter does not target <paramref name="proj"/> at this layer.
+    /// </summary>
+    private void ApplyLoraDeltaDeviceGpu(int layer, string proj, nint xDev, nint yDev, int seqLen)
+    {
+        if (_cudaLora is null)
+            return;
+        if (!_cudaLora.TryGet(layer, proj, out nint aF16, out nint bF16, out int inputDim, out int outputDim))
+            return;
+
+        int rank = _cudaLora.Rank;
+        if (rank > CudaForwardState.MaxLoraRank)
+            throw new InvalidOperationException(
+                $"LoRA rank {rank} exceeds the device delta rank cap ({CudaForwardState.MaxLoraRank}). " +
+                $"Reduce adapter rank or rebuild with a higher MaxLoraRank.");
+
+        float scale = _cudaLora.Scale;
+        nint tmp = _gpuState.LoraTmp;  // [seqLen, MaxLoraRank] FP16
+        nint s = _stream.Handle;
+        nint cublasH = _cublas.Handle;
+
+        if (seqLen == 1)
+        {
+            // Decode path — two GEMVs.
+            // Step 1: tmp[rank] = B[rank, inputDim] · x[inputDim]  (overwrites tmp)
+            CudaGemm.GemvF16(cublasH, bF16, xDev, tmp, rank, inputDim, s);
+
+            // Step 2: y[outputDim] += scale · A[outputDim, rank] · tmp[rank]
+            CudaGemm.GemvF16Accum(cublasH, aF16, tmp, yDev, outputDim, rank, scale, s);
+        }
+        else
+        {
+            // Prefill path — two batched GEMMs.
+            // Step 1: tmp[seqLen, rank] = X[seqLen, inputDim] × B^T  (overwrites tmp)
+            CudaGemm.LinearF16(cublasH, xDev, bF16, tmp, seqLen, inputDim, rank, s);
+
+            // Step 2: Y[seqLen, outputDim] += scale · tmp[seqLen, rank] × A^T
+            CudaGemm.LinearF16Accum(cublasH, tmp, aF16, yDev, seqLen, rank, outputDim, scale, s);
+        }
+    }
+
     // ═══════════════════════════════════════════════════
     //  CPU helpers (same as TransformerModel private methods)
     // ═══════════════════════════════════════════════════
@@ -1165,6 +1288,7 @@ public sealed unsafe class HybridTransformerModel : IModel
     /// <inheritdoc/>
     public void Dispose()
     {
+        _cudaLora?.Dispose();
         _gpuState.Dispose();
         _gpuWeights.Dispose();
         _kernels.Dispose();
