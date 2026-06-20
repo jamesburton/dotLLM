@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using DotLLM.Cli.Helpers;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Models.Architectures;
@@ -168,6 +169,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description("Number of draft tokens per speculative step (K). Default 5.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Path to a HuggingFace PEFT LoRA adapter directory to apply at inference time.</summary>
+        [CommandOption("--lora")]
+        [Description("Path to a HuggingFace PEFT LoRA adapter (directory containing adapter_config.json + adapter_model.safetensors). Omit for base model.")]
+        public string? LoraPath { get; set; }
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -247,6 +253,24 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
         }
 
+        // Load LoRA adapter if requested
+        ILoraAdapter? loraAdapter = null;
+        if (!string.IsNullOrEmpty(settings.LoraPath))
+        {
+            loraAdapter = PeftAdapterLoader.LoadFromDirectory("cli", settings.LoraPath, config);
+            if (!loraAdapter.IsCompatible(config))
+                throw new InvalidOperationException($"LoRA adapter at '{settings.LoraPath}' is incompatible with this base model.");
+        }
+
+        // HybridTransformerModel does not thread the adapter through its Forward path (neither GPU
+        // nor CPU layers); warn rather than silently producing base output.
+        if (loraAdapter is not null && model is DotLLM.Cuda.HybridTransformerModel)
+        {
+            const string hybridLoraWarning = "WARNING: --lora is not applied in hybrid mode; neither GPU-offloaded nor CPU-resident layers are adapted. Use --device cpu or --device gpu (full GPU) for full adapter application.";
+            if (settings.Json) Console.Error.WriteLine(hybridLoraWarning);
+            else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(hybridLoraWarning)}[/]");
+        }
+
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
 
         // Parse tool definitions and format prompt via chat template when tools are provided
@@ -258,7 +282,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
             string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
             var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer)
-                ?? new JinjaChatTemplate(ChatCommand.DefaultChatMlTemplateText, bosToken, eosToken);
+                ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
             var messages = new List<ChatMessage>
             {
@@ -402,6 +426,13 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 if (!settings.Json)
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)}[/]");
+
+                if (loraAdapter is not null)
+                {
+                    const string specLoraWarning = "WARNING: --lora with speculative decoding does not adapt the draft model; acceptance rates may degrade.";
+                    if (settings.Json) Console.Error.WriteLine(specLoraWarning);
+                    else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(specLoraWarning)}[/]");
+                }
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
@@ -412,7 +443,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             FinishReason finishReason = FinishReason.Length;
             var generatedText = new System.Text.StringBuilder();
 
-            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions))
+            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
             {
                 if (settings.Json)
                     generatedText.Append(token.Text);
@@ -462,6 +493,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     * config.NumKvHeads * config.HeadDim
                     * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
             long totalMemory = modelWeightsBytes + computeBytes + kvCacheBytes;
+
+            // Backend/decode-path diagnostics
+            string samplerPath = BuildSamplerPath(settings);
+            string? decodeGraph = (model as DotLLM.Cuda.CudaTransformerModel)?.DecodeGraphState
+                .ToString().ToLowerInvariant();
 
             // Detect tool calls in generated output
             string outputText = generatedText.ToString();
@@ -523,6 +559,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                         KvCacheBytes = kvCacheBytes,
                         TotalBytes = totalMemory,
                     },
+                    Backend = new RunBackendDto
+                    {
+                        SamplerPath = samplerPath,
+                        DecodeGraph = decodeGraph,
+                    },
                 };
                 Console.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.RunJsonResult));
             }
@@ -563,6 +604,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 var finishReasonStr = finishReason.ToString().ToLowerInvariant();
                 bodyLines.Add(new Markup($"  [dim]{Markup.Escape(finishReasonStr)} | {promptLen} prompt, {generated} generated[/]"));
 
+                var backendBits = $"sampler: {samplerPath}";
+                if (decodeGraph is not null)
+                    backendBits += $" | cuda graph: {decodeGraph}";
+                bodyLines.Add(new Markup($"  [dim]{Markup.Escape(backendBits)}[/]"));
+
                 // Assemble panel
                 var panelContent = new Rows(
                     new Text(""),
@@ -580,6 +626,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
+            loraAdapter?.Dispose();
             pagedFactory?.Dispose();
             model.Dispose();
             gguf.Dispose();
@@ -661,6 +708,20 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         int colonIdx = device.IndexOf(':');
         if (colonIdx < 0) return 0;
         return int.Parse(device.AsSpan(colonIdx + 1));
+    }
+
+    /// <summary>
+    /// Human-readable label for the sampler path that will run, mirroring the auto-build logic in
+    /// <c>SamplerPipeline</c> (greedy when temp ≤ 0; bounded "fast top-k" when top-k is set and
+    /// top-p/min-p are disabled; otherwise the full step pipeline).
+    /// </summary>
+    private static string BuildSamplerPath(Settings settings)
+    {
+        if (settings.Temperature <= 0f)
+            return "greedy (argmax)";
+        if (settings.TopK > 0 && settings.TopP >= 1.0f && settings.MinP <= 0f)
+            return "fast top-k";
+        return "full pipeline";
     }
 
     private static string BuildSamplingLabel(Settings settings)

@@ -50,4 +50,16 @@ public class TopPSamplerTests
         Assert.True(float.IsNegativeInfinity(logits[2]));
         Assert.True(float.IsNegativeInfinity(logits[3]));
     }
+
+    [Fact]
+    public void Apply_UniformDistribution_KeepsSmallestPrefixOverThreshold()
+    {
+        float[] logits = [0.0f, 0.0f, 0.0f, 0.0f];
+        var context = new SamplerContext(Temperature: 1.0f, TopK: 0, TopP: 0.50f, MinP: 0f, Seed: null);
+
+        _sampler.Apply(logits, context);
+
+        int kept = logits.Count(v => !float.IsNegativeInfinity(v));
+        Assert.Equal(2, kept);
+    }
 }

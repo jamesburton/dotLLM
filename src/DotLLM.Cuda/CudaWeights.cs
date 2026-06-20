@@ -26,6 +26,8 @@ internal readonly struct CudaLayerWeights
     // Norm weights on device (FP16)
     public readonly nint AttnNormWeight, FfnNormWeight;
     public readonly nint QNormWeight, KNormWeight; // 0 when absent
+    // BitNet Sub-LN weights on device (FP16). 0 when absent (non-BitNet models).
+    public readonly nint AttnSubNormWeight, FfnSubNormWeight;
 
     // Bias on device (FP16, 0 when absent)
     public readonly nint QBias, KBias, VBias, OBias;
@@ -54,6 +56,7 @@ internal readonly struct CudaLayerWeights
         nint down, int downOut, int downIn,
         nint attnNorm, nint ffnNorm,
         nint qNorm, nint kNorm,
+        nint attnSubNorm, nint ffnSubNorm,
         nint qBias, nint kBias, nint vBias, nint oBias,
         nint gateBias, nint upBias, nint downBias,
         nint qQuant, QuantizationType qQt, nint kQuant, QuantizationType kQt,
@@ -72,6 +75,7 @@ internal readonly struct CudaLayerWeights
         Down = down; DownOutputDim = downOut; DownInputDim = downIn;
         AttnNormWeight = attnNorm; FfnNormWeight = ffnNorm;
         QNormWeight = qNorm; KNormWeight = kNorm;
+        AttnSubNormWeight = attnSubNorm; FfnSubNormWeight = ffnSubNorm;
         QBias = qBias; KBias = kBias; VBias = vBias; OBias = oBias;
         GateBias = gateBias; UpBias = upBias; DownBias = downBias;
         QQuant = qQuant; QQuantType = qQt; KQuant = kQuant; KQuantType = kQt;
@@ -356,12 +360,17 @@ internal sealed class CudaWeights : IDisposable
             nint attnNorm = UploadNormWeight(lw.AttnNormWeight, allocs, kernels, stream);
             nint ffnNorm = UploadNormWeight(lw.FfnNormWeight, allocs, kernels, stream);
 
+            // BitNet Sub-LN weights (F32 → FP16). 0 when absent (non-BitNet models).
+            nint attnSubNorm = lw.AttnSubNormWeight is not null ? UploadNormWeight(lw.AttnSubNormWeight, allocs, kernels, stream) : 0;
+            nint ffnSubNorm = lw.FfnSubNormWeight is not null ? UploadNormWeight(lw.FfnSubNormWeight, allocs, kernels, stream) : 0;
+
             layers[i] = new CudaLayerWeights(
                 q, lw.QOutputDim, lw.QInputDim, k, lw.KOutputDim, lw.KInputDim,
                 v, lw.VOutputDim, lw.VInputDim, o, lw.OOutputDim, lw.OInputDim,
                 gate, lw.GateOutputDim, lw.GateInputDim, up, lw.UpOutputDim, lw.UpInputDim,
                 down, lw.DownOutputDim, lw.DownInputDim,
                 attnNorm, ffnNorm, qNorm, kNorm,
+                attnSubNorm, ffnSubNorm,
                 qBias, kBias, vBias, oBias, gateBias, upBias, downBias,
                 qQuant, lw.QQuantType, kQuant, lw.KQuantType,
                 vQuant, lw.VQuantType, oQuant, lw.OQuantType,
@@ -426,6 +435,10 @@ internal sealed class CudaWeights : IDisposable
             return 0; // Non-quantized weights don't need a separate quantized copy
 
         long quantBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
+        if (qt == QuantizationType.I2_S)
+            quantBytes += 4; // include the trailing per-tensor float32 scale (RowByteSize excludes it).
+                             // The I2_S GEMV/dequant kernels read the scale from the tensor tail at
+                             // byte offset n·k/4, so the device copy must include these +4 bytes.
         return AllocAndUpload(hostPtr, quantBytes, allocs);
     }
 
@@ -547,6 +560,23 @@ internal sealed class CudaWeights : IDisposable
             return devF16;
         }
 
+        if (qt == QuantizationType.I2_S)
+        {
+            // I2_S (BitNet ternary): the per-tensor float32 scale lives at the tensor tail
+            // (byte offset n·k/4), not per block — so the tail offset must be derived from
+            // (outputDim, inputDim), which the generic element-count dequant API cannot do.
+            // Upload the packed body + trailing scale (+4), then dequant via the I2_S kernel.
+            long packedBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim + 4;
+            nint devI2s = AllocAndUpload(hostPtr, packedBytes, allocs);
+
+            long i2sFp16Bytes = (long)totalElements * sizeof(ushort);
+            CudaDriverApi.cuMemAlloc_v2(out nint devI2sFp16, (nuint)i2sFp16Bytes).ThrowOnError();
+            allocs.Add(devI2sFp16);
+
+            kernels.LaunchDequantI2_SToF16(devI2s, devI2sFp16, outputDim, inputDim, stream);
+            return devI2sFp16;
+        }
+
         // Quantized: upload raw bytes, dequant to FP16 on device
         long quantBytes = Dequantize.RowByteSize(inputDim, qt) * outputDim;
         nint devQuant = AllocAndUpload(hostPtr, quantBytes, allocs);
@@ -599,7 +629,8 @@ internal sealed class CudaWeights : IDisposable
     /// because the scratch buffer approach requires cuBLAS fallback.
     /// </summary>
     private static bool SkipFp16(QuantizationType qt, CudaKernels kernels) =>
-        kernels.HasLoadedQuantizedGemv(qt);
+        kernels.HasLoadedQuantizedGemv(qt)
+            || qt == QuantizationType.I2_S; // I2_S: decode GEMV + on-the-fly prefill dequant (LaunchDequantI2_SToF16)
 
     /// <summary>Allocate device memory and copy host data.</summary>
     private static nint AllocAndUpload(nint hostPtr, long bytes, List<nint> allocs)
