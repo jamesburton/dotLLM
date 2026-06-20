@@ -908,6 +908,18 @@ public sealed unsafe class CudaTransformerModel : IModel
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
                         positions[0], slidingWindow, s);
                 }
+                else if (kvCache is CudaTurboQuantKvCache cudaTqKvCache)
+                {
+                    // TurboQuant: encode fresh FP16 K/V → codes, then dequant the live range into the
+                    // shared FP16 scratch the attention kernel reads (same shape as a plain F16 cache).
+                    cudaTqKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
+                    int seqKv = cudaTqKvCache.CurrentLength;
+                    var (kCachePtr, vCachePtr) = cudaTqKvCache.PrepareAttentionScratch(layer, s, _kernels);
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
+                        seqLen, seqKv, numHeads, numKvHeads, headDim,
+                        positions[0], slidingWindow, s);
+                }
                 else if (kvCache is CudaKvCache cudaKvCache)
                 {
                     cudaKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s);
@@ -2530,6 +2542,21 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (!config.IsQuantized)
             return new CudaKvCache(geom, maxSeqLen);
         return new CudaQuantizedKvCache(geom, maxSeqLen, config);
+    }
+
+    /// <summary>
+    /// Creates a GPU-resident TurboQuant (MSE-stage) KV-cache on this model's CUDA context. The caller
+    /// supplies the codec constants (the Cuda project does not depend on the Engine codec):
+    /// <paramref name="centroids"/> (2^mseBits, scaled by 1/√d), per-K/V RHT sign sets (length headDim,
+    /// ±1), and <paramref name="invSqrtD"/>. Uniform geometry, headDim a power of two ≤ 256; eager decode.
+    /// </summary>
+    public CudaTurboQuantKvCache CreateTurboQuantKvCache(
+        int maxSeqLen, int mseBits,
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+    {
+        _context.MakeCurrent();
+        return new CudaTurboQuantKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim,
+            maxSeqLen, mseBits, centroids, signsK, signsV, invSqrtD);
     }
 
     /// <summary>

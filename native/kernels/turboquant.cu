@@ -15,6 +15,7 @@
 // to match the Vulkan reference and allow a bit-for-bit comparison against the CPU codec.
 
 #include <stdint.h>
+#include <cuda_fp16.h>
 
 #define TQ_MAX_HEADDIM 256
 
@@ -165,5 +166,120 @@ extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f32(
         codes[vecBaseUint + t] = word;
     }
 
+    if (t == 0) norms[vecHv] = norm;
+}
+
+// ── FP16 variants for the CUDA forward (K/V activations + attention scratch are half) ──────────
+// Identical math to the F32 kernels; only the K/V data I/O is half. Codes (uint), norm (fp32) and
+// the codec constants (centroids/signs, fp32) are unchanged.
+
+extern "C" __global__ void __launch_bounds__(256) turboquant_dequant_f16(
+    const uint32_t* __restrict__ codes,
+    const float*    __restrict__ norms,
+    const float*    __restrict__ centroids,
+    const float*    __restrict__ signs,
+    half*           __restrict__ dst,
+    const int numVectors, const int headDim, const int numKvHeads,
+    const int mseBits, const int codeUintsPerVec, const float invSqrtD)
+{
+    __shared__ float s[TQ_MAX_HEADDIM];
+    const int hv = blockIdx.x;
+    if (hv >= numVectors) return;
+    const int t = threadIdx.x;
+    const int d = headDim;
+    const bool live = t < d;
+
+    if (live)
+    {
+        const unsigned baseBit = (unsigned)hv * (unsigned)codeUintsPerVec * 32u;
+        const unsigned p = baseBit + (unsigned)t * (unsigned)mseBits;
+        const unsigned widx = p >> 5;
+        const unsigned boff = p & 31u;
+        const unsigned mask = (mseBits >= 32) ? 0xFFFFFFFFu : ((1u << mseBits) - 1u);
+        unsigned val = codes[widx] >> boff;
+        if (boff + (unsigned)mseBits > 32u) val |= codes[widx + 1] << (32u - boff);
+        val &= mask;
+        s[t] = centroids[val];
+    }
+    __syncthreads();
+    for (int len = 1; len < d; len <<= 1)
+    {
+        if (live && (t & len) == 0) { const float u = s[t]; const float v = s[t + len]; s[t] = u + v; s[t + len] = u - v; }
+        __syncthreads();
+    }
+    if (live)
+    {
+        const float outv = s[t] * invSqrtD * signs[t] * norms[hv];
+        const int pos    = hv / numKvHeads;
+        const int h      = hv - pos * numKvHeads;
+        const int stride = numKvHeads * d;
+        dst[(size_t)pos * stride + (size_t)h * d + t] = __float2half(outv);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) turboquant_encode_f16(
+    const half*  __restrict__ src,
+    const float* __restrict__ centroids,
+    const float* __restrict__ signs,
+    uint32_t*    __restrict__ codes,
+    float*       __restrict__ norms,
+    const int headDim, const int numKvHeads, const int mseBits, const int codeUintsPerVec,
+    const int levelCount, const int startPos, const float invSqrtD)
+{
+    __shared__ float sh[TQ_MAX_HEADDIM];
+    __shared__ unsigned idx[TQ_MAX_HEADDIM];
+
+    const int b = blockIdx.x;
+    const int t = threadIdx.x;
+    const int d = headDim;
+    const bool live = t < d;
+
+    const int srcRow = b / numKvHeads;
+    const int h      = b - srcRow * numKvHeads;
+    const int stride = numKvHeads * d;
+    const size_t srcOff = (size_t)srcRow * stride + (size_t)h * d;
+
+    const float xt = live ? __half2float(src[srcOff + t]) : 0.0f;
+    sh[t] = xt * xt;
+    __syncthreads();
+    for (int r = d >> 1; r > 0; r >>= 1) { if (t < r) sh[t] += sh[t + r]; __syncthreads(); }
+    const float norm = sqrtf(sh[0]);
+    __syncthreads();
+
+    const float unit = (norm > 0.0f && live) ? (xt / norm) : 0.0f;
+    sh[t] = live ? unit * signs[t] : 0.0f;
+    __syncthreads();
+    for (int len = 1; len < d; len <<= 1)
+    {
+        if (live && (t & len) == 0) { const float u = sh[t]; const float v = sh[t + len]; sh[t] = u + v; sh[t + len] = u - v; }
+        __syncthreads();
+    }
+    if (live)
+    {
+        const float val = sh[t] * invSqrtD;
+        unsigned best = 0; float bestD = fabsf(val - centroids[0]);
+        for (int j = 1; j < levelCount; j++) { const float dist = fabsf(val - centroids[j]); if (dist < bestD) { bestD = dist; best = (unsigned)j; } }
+        idx[t] = best;
+    }
+    __syncthreads();
+
+    const unsigned vecHv = (unsigned)(startPos + srcRow) * (unsigned)numKvHeads + (unsigned)h;
+    const unsigned vecBaseUint = vecHv * (unsigned)codeUintsPerVec;
+    if (t < codeUintsPerVec)
+    {
+        unsigned word = 0u;
+        const unsigned wordLoBit = (unsigned)t * 32u;
+        const unsigned wordHiBit = wordLoBit + 32u;
+        unsigned cStart = wordLoBit / (unsigned)mseBits;
+        for (unsigned c = cStart; c < (unsigned)d; c++)
+        {
+            const unsigned cBit = c * (unsigned)mseBits;
+            if (cBit >= wordHiBit) break;
+            const unsigned code = idx[c];
+            if (cBit >= wordLoBit) word |= code << (cBit - wordLoBit);
+            else                   word |= code >> (wordLoBit - cBit);
+        }
+        codes[vecBaseUint + t] = word;
+    }
     if (t == 0) norms[vecHv] = norm;
 }
