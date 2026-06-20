@@ -164,10 +164,13 @@ public sealed unsafe class HybridTransformerModel : IModel
             }
         }
 
-        // 5. GPU scratch buffers
+        // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+        //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+        //    CudaTransformerModel.LoadFromGguf.
         var gpuState = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
+            config.HeadDim, config.IntermediateSize, config.VocabSize,
+            useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
 
         // 6. CPU scratch buffers (with RoPE tables)
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -274,10 +277,13 @@ public sealed unsafe class HybridTransformerModel : IModel
         // 4. Skip the VRAM-pressure warning — synthetic fixtures are tiny and
         //    the cuMemGetInfo probe would just clutter the test output.
 
-        // 5. GPU scratch buffers
+        // 5. GPU scratch buffers. BitNet's residual stream exceeds FP16 range in deep
+        //    layers, so it carries the residual in FP32 (overflow→NaN otherwise). Mirrors
+        //    CudaTransformerModel.LoadFromGguf / the production LoadFromGguf above.
         var gpuState = new CudaForwardState(
             config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
+            config.HeadDim, config.IntermediateSize, config.VocabSize,
+            useFp32Residual: config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet);
 
         // 6. CPU scratch buffers (with RoPE tables)
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
@@ -419,6 +425,12 @@ public sealed unsafe class HybridTransformerModel : IModel
         nint s = _stream.Handle;
         nint cublasH = _cublas.Handle;
 
+        // BitNet's residual stream exceeds FP16's ~65504 ceiling in deep layers, so it
+        // carries the residual in FP32 (overflow→NaN/zero logits otherwise). Mirrors
+        // CudaTransformerModel.Forward. ResidualF32 is always allocated, so isBitNet gates.
+        bool isBitNet = Config.Architecture == DotLLM.Core.Configuration.Architecture.BitNet;
+        bool fp32Res = _gpuState.ResidualF32 != 0 && isBitNet;
+
         _gpuState.EnsureCapacity(seqLen);
 
         // 1. Upload tokenIds + positions
@@ -440,8 +452,12 @@ public sealed unsafe class HybridTransformerModel : IModel
 
         if (gpuLayers > 0)
         {
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gpuState.Residual, _gpuState.HiddenState,
-                (nuint)hiddenBytes, s).ThrowOnError();
+            // BitNet carries the residual in FP32 (widen the FP16 embedding into ResidualF32).
+            if (fp32Res)
+                _kernels.LaunchCopyF16ToF32(_gpuState.HiddenState, _gpuState.ResidualF32, seqLen * hiddenSize, s);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_gpuState.Residual, _gpuState.HiddenState,
+                    (nuint)hiddenBytes, s).ThrowOnError();
             _kernels.LaunchRmsNorm(_gpuState.HiddenState, _gpuWeights.Layers[0].AttnNormWeight,
                 _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
         }
@@ -517,8 +533,13 @@ public sealed unsafe class HybridTransformerModel : IModel
                 ApplyLoraDeltaDeviceGpu(layer, "o_proj", _gpuState.AttnOutput, _gpuState.NormOutput, seqLen);
 
             // ── FUSED: attention residual + FFN norm ──
-            _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
-                lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+            // BitNet carries the residual in FP32 to avoid FP16 overflow.
+            if (fp32Res)
+                _kernels.LaunchFusedAddRmsNormF32Res(_gpuState.ResidualF32, _gpuState.NormOutput,
+                    lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+            else
+                _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
+                    lw.FfnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
 
             // ── FFN BLOCK ──
             ProjectGpu(lw.GateQuant, lw.GateQuantType, lw.Gate, _gpuState.NormOutput, _gpuState.FfnGate,
@@ -572,16 +593,28 @@ public sealed unsafe class HybridTransformerModel : IModel
             // ── FUSED: FFN residual + next layer setup ──
             if (layer < gpuLayers - 1)
             {
-                // Not last GPU layer: FusedAddRmsNorm for next GPU layer
+                // Not last GPU layer: FusedAddRmsNorm for next GPU layer.
+                // BitNet carries the residual in FP32 to avoid FP16 overflow.
                 ref readonly var nextLw = ref _gpuWeights.Layers[layer + 1];
-                _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
-                    nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+                if (fp32Res)
+                    _kernels.LaunchFusedAddRmsNormF32Res(_gpuState.ResidualF32, _gpuState.NormOutput,
+                        nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchFusedAddRmsNorm(_gpuState.Residual, _gpuState.NormOutput,
+                        nextLw.AttnNormWeight, _gpuState.NormOutput, hiddenSize, eps, seqLen, s);
             }
             else
             {
-                // Last GPU layer: plain Add → HiddenState (boundary transfer source)
-                _kernels.LaunchAdd(_gpuState.Residual, _gpuState.NormOutput, _gpuState.HiddenState,
-                    seqLen * hiddenSize, s);
+                // Last GPU layer: add residual + FFN output. For BitNet, accumulate into the
+                // FP32 residual (ResidualF32 holds the boundary-transfer source — the un-normed
+                // residual the CPU phase resumes from — never truncated to FP16). For non-BitNet
+                // the FP16 HiddenState is the boundary source (unchanged).
+                if (fp32Res)
+                    _kernels.LaunchAddF32F16(_gpuState.ResidualF32, _gpuState.NormOutput, _gpuState.ResidualF32,
+                        seqLen * hiddenSize, s);
+                else
+                    _kernels.LaunchAdd(_gpuState.Residual, _gpuState.NormOutput, _gpuState.HiddenState,
+                        seqLen * hiddenSize, s);
             }
         }
 
@@ -593,17 +626,26 @@ public sealed unsafe class HybridTransformerModel : IModel
         {
             _stream.Synchronize();
 
-            // D2H: HiddenState [seqLen, hiddenSize] as FP16
             int transferElements = seqLen * hiddenSize;
-            EnsureTransferCapacity(transferElements);
-
-            long transferBytes = (long)transferElements * h;
-            CudaDriverApi.cuMemcpyDtoH_v2(_fp16TransferBuffer, _gpuState.HiddenState,
-                (nuint)transferBytes).ThrowOnError();
-
-            // FP16 → FP32 conversion into CPU state
             _cpuState.EnsureCapacity(seqLen);
-            ConvertFp16ToFp32(_fp16TransferBuffer, _cpuState.HiddenState, transferElements);
+
+            if (fp32Res)
+            {
+                // BitNet: the un-normalized residual at the boundary overflows FP16, so the last
+                // GPU layer accumulated it into ResidualF32 (fix above). Transfer that FP32 buffer
+                // straight into the host-side CPU hidden state — skip the FP16 buffer + conversion.
+                CudaDriverApi.cuMemcpyDtoH_v2(_cpuState.HiddenState, _gpuState.ResidualF32,
+                    (nuint)((long)transferElements * sizeof(float))).ThrowOnError();
+            }
+            else
+            {
+                // D2H: HiddenState [seqLen, hiddenSize] as FP16, then widen to FP32 CPU state.
+                EnsureTransferCapacity(transferElements);
+                long transferBytes = (long)transferElements * h;
+                CudaDriverApi.cuMemcpyDtoH_v2(_fp16TransferBuffer, _gpuState.HiddenState,
+                    (nuint)transferBytes).ThrowOnError();
+                ConvertFp16ToFp32(_fp16TransferBuffer, _cpuState.HiddenState, transferElements);
+            }
         }
 
         // ═══════════════════════════════════════════════════
@@ -658,7 +700,11 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // b. RMSNorm + Pre-quantize + Q/K/V projections
                 byte* inputQ8Scratch = (byte*)_cpuState.InputQ8Scratch;
 
-                if (seqLen == 1 && _threadPool != null && !adapterActive)
+                // The fused decode kernels don't support I2_S; route ternary weights through the
+                // standard (unfused) projection path, which dispatches to the I2_S GEMV. Mirrors
+                // TransformerModel.cs:1077 — without this guard I2_S decode throws in FusedQkvDecode.
+                if (seqLen == 1 && _threadPool != null && !adapterActive
+                    && lw.QQuantType != QuantizationType.I2_S)
                 {
                     // Decode path: try fused RmsNorm+Quantize
                     byte* preQuantNorm = null;
@@ -796,7 +842,10 @@ public sealed unsafe class HybridTransformerModel : IModel
                 // FFN: RMSNorm + Pre-quantize + Gate/Up projections.
                 // Force the unfused path when an adapter is active so normOut (F32)
                 // is materialised for the gate/up LoRA delta — same trap as Q/K/V.
-                if (seqLen == 1 && _threadPool != null && !adapterActive)
+                // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused
+                // path (which dispatches the I2_S GEMV). Mirrors TransformerModel.cs:1379.
+                if (seqLen == 1 && _threadPool != null && !adapterActive
+                    && lw.GateQuantType != QuantizationType.I2_S)
                 {
                     byte* preQuantFfn = null;
                     if (IsCompatiblePreQuant(lw.GateQuantType, lw.UpQuantType))
@@ -1083,6 +1132,11 @@ public sealed unsafe class HybridTransformerModel : IModel
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            // BitNet b1.58 ternary: per-tensor scale at the tensor tail (NOT per-row), so the
+            // generic per-row dequant fallback reads garbage. Dispatch the dedicated I2_S GEMV.
+            // Mirrors TransformerModel.cs:2772.
+            MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
         else
             GemvDequantFallback(weights, qt, x, y, m, k);
     }
@@ -1125,6 +1179,11 @@ public sealed unsafe class HybridTransformerModel : IModel
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.I2_S)
+            // BitNet b1.58 ternary: per-tensor scale at the tensor tail (NOT per-row), so the
+            // generic per-row dequant fallback reads garbage. Dispatch the dedicated I2_S GEMM.
+            // Mirrors TransformerModel.cs:2825.
+            MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
         else
             GemmDequantFallback(weights, qt, b, c, m, k, n);
     }
