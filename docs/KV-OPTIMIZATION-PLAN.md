@@ -245,9 +245,18 @@ TurboQuant needs no calibration infrastructure.
   (KV-PHASE0-PLAN §2.3/§3.2/§3.4). Server quantized factories use `KvGeometry.FromConfig`.
   Test: `QuantizedKvCachePerLayerStrideTests` (§5.3). Full Unit suite 2425/0.
 
-**Outstanding (optional — no functional change / off critical path):**
-- ⬜ Vulkan refactor to consume `KvGeometry` (§3.5, no functional change — `VulkanKvCache`
-  already per-layer; this is dedup against the Core helper).
+- ✅ Vulkan refactor (§3.5): `VulkanKvCache` gains a `KvGeometry` ctor + implements
+  `IPerLayerKvCache`; `VulkanTransformerModel.CreateKvCache` calls `KvGeometry.FromConfig`;
+  `GemmaLayerKvHeads` delegates to `Config.GetLayerKvHeads`. No functional change — verified
+  byte-identical via `Gemma4VulkanKvCacheTests` (GPU, passed under the GPU lock).
+- ✅ CUDA Option-1 (§3.6): `CudaKvCache` + `CudaQuantizedKvCache` take `KvGeometry` (scalar
+  ctors forward via `Uniform`), per-layer buffers/row-bytes, shared dequant scratch sized to
+  `max(stride)`, implement `IPerLayerKvCache` + `*Of`; `CudaTransformerModel.CreateKvCache`
+  (both overloads) uses `FromConfig`. No gemma-4 CUDA decode path. Build-verified here
+  (runtime needs T5500); byte-identical for the uniform models CUDA actually serves.
+
+**KV Phase 0 is COMPLETE** (CPU correctness + per-layer F32/quantized caches; Vulkan + CUDA
+type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
 - ⬜ CUDA Option-1 constructor/scratch generalisation (§3.6) — gemma-4 CUDA is cacheless
   so off the critical path; constructor surface only.
 - ⬜ Batched (continuous-batching) gemma-4 path stays guarded — it has no gemma-4 layer

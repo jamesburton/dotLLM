@@ -8,12 +8,14 @@ namespace DotLLM.Cuda;
 /// GPU-resident KV-cache storing FP16 key and value vectors per layer.
 /// Layout: [maxSeqLen, numKvHeads * headDim] per layer, FP16.
 /// </summary>
-public sealed class CudaKvCache : IKvCache
+public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
 {
     private readonly nint[] _keys;
     private readonly nint[] _values;
     private readonly int _numLayers;
-    private readonly int _kvStride;    // numKvHeads * headDim
+    private readonly KvGeometry _geom;     // per-layer KV row width (numKvHeads(l) * headDim(l))
+    private readonly bool _uniform;        // _geom.IsUniform, hoisted for the hot path
+    private readonly int _uniformStride;   // _geom.UniformStride when _uniform; else 0
     private readonly int _maxSeqLen;
     private int _currentLength;
 
@@ -23,24 +25,49 @@ public sealed class CudaKvCache : IKvCache
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
 
+    /// <inheritdoc/>
+    int IPerLayerKvCache.LayerCount => _numLayers;
+
+    /// <inheritdoc/>
+    public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
+
+    /// <summary>Per-layer KV row width (FP16 elements); scalar shortcut hoisted when uniform.</summary>
+    private int Stride(int layerIndex) => _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex);
+
     /// <summary>
-    /// Allocates GPU KV-cache buffers for all layers.
+    /// Allocates GPU KV-cache buffers for all layers with a single uniform
+    /// <c>numKvHeads * headDim</c> stride. Byte-identical to the per-layer constructor
+    /// with <see cref="KvGeometry.Uniform"/>.
     /// </summary>
     /// <param name="numLayers">Number of transformer layers.</param>
     /// <param name="numKvHeads">Number of KV attention heads.</param>
     /// <param name="headDim">Dimension per head.</param>
     /// <param name="maxSeqLen">Maximum sequence length.</param>
     public CudaKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen)
+        : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen)
     {
-        _numLayers = numLayers;
-        _kvStride = numKvHeads * headDim;
-        _maxSeqLen = maxSeqLen;
-        _keys = new nint[numLayers];
-        _values = new nint[numLayers];
+    }
 
-        long bytesPerLayer = (long)maxSeqLen * _kvStride * sizeof(ushort); // FP16
-        for (int i = 0; i < numLayers; i++)
+    /// <summary>
+    /// Allocates GPU KV-cache buffers from a Core <see cref="KvGeometry"/> descriptor.
+    /// Uniform for every dense/GQA/MoE model (byte-identical to the scalar constructor);
+    /// per-layer for Gemma-4. NOTE: the Gemma-4 CUDA attention path is currently cacheless,
+    /// so this per-layer support is the constructor/buffer-sizing surface only — it unblocks
+    /// a future CUDA Gemma-4 decode path without shipping one here.
+    /// </summary>
+    public CudaKvCache(KvGeometry geometry, int maxSeqLen)
+    {
+        _numLayers = geometry.LayerCount;
+        _geom = geometry;
+        _uniform = geometry.IsUniform;
+        _uniformStride = geometry.IsUniform ? geometry.UniformStride : 0;
+        _maxSeqLen = maxSeqLen;
+        _keys = new nint[_numLayers];
+        _values = new nint[_numLayers];
+
+        for (int i = 0; i < _numLayers; i++)
         {
+            long bytesPerLayer = (long)maxSeqLen * geometry.KvStrideOf(i) * sizeof(ushort); // FP16
             CudaDriverApi.cuMemAlloc_v2(out _keys[i], (nuint)bytesPerLayer).ThrowOnError();
             CudaDriverApi.cuMemAlloc_v2(out _values[i], (nuint)bytesPerLayer).ThrowOnError();
         }
@@ -59,7 +86,7 @@ public sealed class CudaKvCache : IKvCache
                                  ReadOnlySpan<int> positions, int seqLen,
                                  int layerIndex, nint stream)
     {
-        long rowBytes = (long)_kvStride * sizeof(ushort); // FP16 KV-cache
+        long rowBytes = (long)Stride(layerIndex) * sizeof(ushort); // FP16 KV-cache
 
         // Detect contiguous positions for bulk copy (common case: prefill or sequential decode)
         bool contiguous = seqLen > 0;
@@ -131,8 +158,9 @@ public sealed class CudaKvCache : IKvCache
         nint newKeyDevice, nint newValueDevice,
         int layerIndex, nint posPtrDevice, nint stream, CudaKernels kernels)
     {
-        kernels.LaunchKvWriteOneF16(newKeyDevice, _keys[layerIndex], _kvStride, posPtrDevice, stream);
-        kernels.LaunchKvWriteOneF16(newValueDevice, _values[layerIndex], _kvStride, posPtrDevice, stream);
+        int stride = Stride(layerIndex);
+        kernels.LaunchKvWriteOneF16(newKeyDevice, _keys[layerIndex], stride, posPtrDevice, stream);
+        kernels.LaunchKvWriteOneF16(newValueDevice, _values[layerIndex], stride, posPtrDevice, stream);
     }
 
     /// <summary>
@@ -185,7 +213,7 @@ public sealed class CudaKvCache : IKvCache
             _keys[layerIndex], _values[layerIndex],
             positionsDevice, position,
             numHeads, numKvHeads, headDim,
-            ropeDim, _kvStride, ropeTheta, ropeType,
+            ropeDim, Stride(layerIndex), ropeTheta, ropeType,
             stream);
 
         int newLength = position + 1;
@@ -228,11 +256,11 @@ public sealed class CudaKvCache : IKvCache
 
     /// <inheritdoc/>
     public TensorRef GetKeysRef(int layerIndex) =>
-        new(_currentLength, _kvStride, DType.Float16, 0, _keys[layerIndex]);
+        new(_currentLength, Stride(layerIndex), DType.Float16, 0, _keys[layerIndex]);
 
     /// <inheritdoc/>
     public TensorRef GetValuesRef(int layerIndex) =>
-        new(_currentLength, _kvStride, DType.Float16, 0, _values[layerIndex]);
+        new(_currentLength, Stride(layerIndex), DType.Float16, 0, _values[layerIndex]);
 
     /// <inheritdoc/>
     public void Rollback(int length)

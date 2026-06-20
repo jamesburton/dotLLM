@@ -321,22 +321,13 @@ public sealed class VulkanTransformerModel : IModel
 
     /// <summary>Creates a <see cref="VulkanKvCache"/> sized for this model.</summary>
     /// <remarks>
-    /// Gemma-4's sliding and global layers carry different KV-head counts AND head
-    /// dims, so its cache is built with an explicit per-layer row stride
-    /// (<c>GemmaLayerKvHeads(l) × GetLayerHeadDim(l)</c>); every other architecture
-    /// uses the uniform <c>NumKvHeads × HeadDim</c> stride.
+    /// Per-layer geometry comes from the single Core helper
+    /// <see cref="KvGeometry.FromConfig"/>: uniform <c>NumKvHeads × HeadDim</c> for every
+    /// dense/GQA/MoE model, and distinct per-layer strides for Gemma-4 (whose sliding and
+    /// global layers carry different KV-head counts AND head dims).
     /// </remarks>
     public VulkanKvCache CreateKvCache(int maxSeqLen)
-    {
-        if (Config.Gemma4DualFfn)
-        {
-            var strides = new int[Config.NumLayers];
-            for (int l = 0; l < strides.Length; l++)
-                strides[l] = GemmaLayerKvHeads(l) * Config.GetLayerHeadDim(l);
-            return new VulkanKvCache(_device, strides, maxSeqLen);
-        }
-        return new(_device, Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
-    }
+        => new(_device, KvGeometry.FromConfig(Config), maxSeqLen);
 
     /// <summary>
     /// Creates a per-layer MLA (DeepSeek-V2/V3) KV-cache sized for this
@@ -1053,10 +1044,10 @@ public sealed class VulkanTransformerModel : IModel
             : 0.0f;
     }
 
-    /// <summary>Gemma-4 per-layer KV-head count (full layers use <see cref="ModelConfig.NumGlobalKvHeads"/>). Mirrors the CPU <c>GetLayerKvHeads</c>.</summary>
+    /// <summary>Gemma-4 per-layer KV-head count. Delegates to the single source of truth
+    /// <see cref="ModelConfig.GetLayerKvHeads"/> (full layers use <see cref="ModelConfig.NumGlobalKvHeads"/>).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int GemmaLayerKvHeads(int layer) =>
-        Config.NumGlobalKvHeads is int g && Config.IsFullAttentionLayer(layer) ? g : Config.NumKvHeads;
+    private int GemmaLayerKvHeads(int layer) => Config.GetLayerKvHeads(layer);
 
     /// <summary>
     /// Gemma-4 per-layer RoPE (theta, rotated-dim count). Full-attention layers use the
