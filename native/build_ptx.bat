@@ -61,7 +61,7 @@ REM produces ~1 ULP precision drift per accumulation versus the CPU's separate
 REM mul+add. The Qwen3MoeHybrid recurrence (GDN) compounds those tiny errors
 REM over time steps, so the two kernels backing it must be compiled with FMA
 REM fusion disabled. Costs minor perf; matches the CPU bit-for-bit.
-set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32"
+set "NO_FMA=conv1d_causal gated_delta_net_scan elementwise_f32 turboquant"
 
 echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
