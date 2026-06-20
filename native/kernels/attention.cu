@@ -286,9 +286,9 @@ extern "C" __global__ void __launch_bounds__(256) attention_pos_f16(
     int kv_stride = num_kv_heads * head_dim;
     int pos_q = positions[tq];
 
-    extern __shared__ float smem[];
-    float* q_shared    = smem;
-    float* score_tile  = smem + head_dim;
+    extern __shared__ float smem2[];
+    float* q_shared    = smem2;
+    float* score_tile  = smem2 + head_dim;
     float* out_accum   = score_tile + TILE_KV;
     float* warp_scratch = out_accum + head_dim;
 

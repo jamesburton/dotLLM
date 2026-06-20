@@ -12,7 +12,7 @@
 
 	// .globl	attention_f16
 .extern .shared .align 16 .b8 smem[];
-.extern .shared .align 16 .b8 smem$1[];
+.extern .shared .align 16 .b8 smem2[];
 
 .visible .entry attention_f16(
 	.param .u64 attention_f16_param_0,
@@ -2003,7 +2003,7 @@ $L__BB2_3:
 
 	// end inline asm
 	shl.b32 	%r78, %r249, 2;
-	mov.u32 	%r79, smem$1;
+	mov.u32 	%r79, smem2;
 	add.s32 	%r80, %r79, %r78;
 	st.shared.f32 	[%r80], %f73;
 	add.s32 	%r249, %r249, %r7;
@@ -2040,7 +2040,7 @@ $L__BB2_6:
 	shr.s32 	%r15, %r92, 1;
 	add.s32 	%r93, %r70, %r70;
 	shl.b32 	%r94, %r93, 2;
-	mov.u32 	%r95, smem$1;
+	mov.u32 	%r95, smem2;
 	add.s32 	%r96, %r95, %r94;
 	div.u32 	%r97, %r271, %r4;
 	shl.b32 	%r98, %r97, 2;
@@ -2203,7 +2203,7 @@ $L__BB2_11:
 	selp.f32 	%f77, 0fFF7FFFFF, %f2, %p12;
 	add.s32 	%r107, %r253, %r70;
 	shl.b32 	%r108, %r107, 2;
-	mov.u32 	%r109, smem$1;
+	mov.u32 	%r109, smem2;
 	add.s32 	%r110, %r109, %r108;
 	st.shared.f32 	[%r110], %f77;
 	add.s32 	%r253, %r253, %r13;
@@ -2667,7 +2667,7 @@ $L__BB2_91:
 
 	mov.u32 	%r64, %ntid.x;
 	cvta.to.global.u64 	%rd11, %rd14;
-	mov.u32 	%r247, smem$1;
+	mov.u32 	%r247, smem2;
 
 $L__BB2_93:
 	cvt.s64.s32 	%rd73, %r271;
