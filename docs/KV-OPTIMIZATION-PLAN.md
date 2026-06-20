@@ -297,11 +297,17 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
   CLI `tqq`/`tq2q..tq8q`; cache `useQjl` ctor + `KvCacheConfig.TurboQuantUseQjl`. Discriminating
   tests in `TurboQuantCodecTests`/`TurboQuantKvCacheTests`.
 - ⬜ **Slice 4 — cross-backend dequant** (Vulkan + CUDA): the GPU payoff. Mirror the
-  dequant-to-scratch (and the QJL `Sᵀ·q` fold-in) in the Vulkan/CUDA attention prep. The
-  Gaussian sketch is O(d²) per vector — structure it (Hadamard) if it dominates the GPU path.
-- ⬜ **Model-level parity benchmark**: prefill+decode a real model (Llama-3.1-8B-Q4_K_M) with
-  `TurboQuantKvCache` (4-bit, ±QJL) vs cacheless F32; report logit/perplexity delta. The lossy
-  QUALITY acceptance is a model benchmark, not a unit test.
+  dequant-to-scratch in the Vulkan/CUDA attention prep. **Target the MSE path** (the model-level
+  quality-neutral winner — see benchmark below); it's also the cheaper O(d log d) shader. The QJL
+  `Sᵀ·q` fold-in is O(d²) and not a model-level win at 4-bit, so GPU QJL is deferred.
+- ✅ **Model-level parity benchmark** (`TurboQuantKvParityTests`, env-gated `DOTLLM_TURBOQUANT_PARITY_GGUF`):
+  teacher-forced prefill+decode of Llama-3.1-8B-Q4_K_M (8 prefill + 48 decode) with a full-precision
+  `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
+  `tq4` PPL **3.091 (+0.05)**, top-1 argmax agreement **97.9%**, mean|Δlogit| 0.196, meanKL 0.0089 —
+  4-bit MSE TurboQuant is quality-neutral. `tq4q` PPL 3.309 (+0.27), top-1 93.8%, mean|Δlogit| 0.418.
+  **Finding:** at an iso-*total*-bit budget, plain MSE beats QJL — QJL (3-bit MSE + 1-bit residual)
+  removes the inner-product *bias* but the extra JL noise costs more ℓ2 accuracy than the debiasing
+  buys at 4-bit. QJL is expected to help only at very low bits or iso-*MSE*-bits, not iso-budget.
 
 ### Phase 2 — OSCAR codec (calibrated INT2)
 - **Add:** offline **calibration harness** (compute per-layer attention-aware
