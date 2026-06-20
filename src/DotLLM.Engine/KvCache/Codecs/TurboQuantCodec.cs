@@ -85,6 +85,17 @@ public sealed class TurboQuantCodec
     /// <summary>The Lloyd–Max centroids (scaled by <c>1/√d</c>), ascending. Exposed for tests.</summary>
     public ReadOnlySpan<float> Centroids => _centroids;
 
+    /// <summary>Bits the MSE stage uses per coordinate (<c>Bits</c>, or <c>Bits-1</c> when QJL). The
+    /// packed MSE codes use this width.</summary>
+    public int MseBits => _mseBits;
+
+    /// <summary>The RHT sign flips (±1), length <c>HeadDim</c>. Exposed so a GPU dequant can
+    /// reproduce the inverse rotation; the same seed reproduces them.</summary>
+    public ReadOnlySpan<float> RotationSigns => _signs;
+
+    /// <summary>The RHT normalization factor <c>1/√HeadDim</c> (applied once on encode/decode).</summary>
+    public float InvSqrtD => _invSqrtD;
+
     /// <summary>
     /// Builds a codec for one KV layer-class.
     /// </summary>

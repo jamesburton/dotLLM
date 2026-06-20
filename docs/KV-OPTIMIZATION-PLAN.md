@@ -296,10 +296,23 @@ type surface unified on `KvGeometry`). Next: Phase 1 (TurboQuant codec).
   −0.032/−0.034 (MSE) → +0.0006/+0.0002 (QJL); ℓ2 relMse rises (0.009→0.055) — the QJL trade.
   CLI `tqq`/`tq2q..tq8q`; cache `useQjl` ctor + `KvCacheConfig.TurboQuantUseQjl`. Discriminating
   tests in `TurboQuantCodecTests`/`TurboQuantKvCacheTests`.
-- ⬜ **Slice 4 — cross-backend dequant** (Vulkan + CUDA): the GPU payoff. Mirror the
-  dequant-to-scratch in the Vulkan/CUDA attention prep. **Target the MSE path** (the model-level
-  quality-neutral winner — see benchmark below); it's also the cheaper O(d log d) shader. The QJL
-  `Sᵀ·q` fold-in is O(d²) and not a model-level win at 4-bit, so GPU QJL is deferred.
+- **Slice 4 — cross-backend dequant** (Vulkan primary, CUDA secondary): the GPU payoff. **Targets the
+  MSE path** (the model-level quality-neutral winner — see benchmark below); cheaper O(d log d) shader.
+  GPU QJL (`Sᵀ·q`, O(d²), not a 4-bit win) deferred. Sub-slices:
+  - ✅ **4a — Vulkan dequant kernel** (`turboquant_dequant_f32.comp` + `.spv` +
+    `TurboQuantDequantF32Kernel`): centroid lookup → cooperative in-place unnormalized Walsh–Hadamard
+    → ×invSqrtD×sign×norm; one workgroup per head-vector, headDim power-of-two ≤ 256; codec constants
+    (centroids/signs/invSqrtD) passed as buffers/push-constants so the kernel is backend-pure.
+    `TurboQuantCodec` exposes `MseBits`/`RotationSigns`/`InvSqrtD`. **GPU-verified bit-exact** vs the CPU
+    codec on gfx1151 (`VulkanTurboQuantDequantF32KernelTests`, maxAbsDiff 0.0).
+  - ⬜ **4b — `VulkanTurboQuantKvCache` + routing + end-to-end.** Store codes+norms in device buffers;
+    on update encode the fresh K/V (readback+CPU-encode first cut, or a GPU encode shader) → upload
+    codes; on attention prep dispatch the 4a dequant kernel into the F32 scratch the attention shader
+    already reads. Route in `VulkanTransformerModel.CreateKvCache` on `KvCacheConfig.IsTurboQuant`.
+    Needs integration into the fence-pipelined forward graph + an end-to-end GPU parity run vs CPU.
+  - ⬜ **CUDA mirror** (`CudaTurboQuantKvCache` + a `turboquant_dequant.cu` PTX kernel, mirroring the
+    existing `CudaQuantizedKvCache` dequant-to-FP16-scratch). Build-verify only on this box (no NVIDIA);
+    runtime-verify on T5500.
 - ✅ **Model-level parity benchmark** (`TurboQuantKvParityTests`, env-gated `DOTLLM_TURBOQUANT_PARITY_GGUF`):
   teacher-forced prefill+decode of Llama-3.1-8B-Q4_K_M (8 prefill + 48 decode) with a full-precision
   `SimpleKvCache` reference vs `tq4` and `tq4q`. **Results** (vs F32 PPL 3.038):
