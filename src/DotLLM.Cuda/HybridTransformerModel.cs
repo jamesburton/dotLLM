@@ -1075,40 +1075,21 @@ public sealed unsafe class HybridTransformerModel : IModel
 
     /// <summary>
     /// Applies the CPU-phase LoRA delta for one projection: <c>y += scale · (x · B) · A</c>,
-    /// using the shared F32 <see cref="LoraDelta.Apply(float*, float*, float*, float*, int, int, int, int, float, nint)"/>
-    /// kernel. Mirrors <c>TransformerModel.ApplyLoraDelta</c>'s structure but is scoped to F32
-    /// adapter weights only — the Q8_0 / outer-product / pre-quantised-X fast paths that
-    /// <c>TransformerModel.ApplyLoraDelta</c> dispatches into are out of scope for the hybrid CPU
-    /// phase (the synthetic / parity adapters are F32). Early-returns when no adapter is staged or
-    /// the adapter does not target <paramref name="proj"/> at this layer. <paramref name="layer"/>
-    /// is the absolute (global) layer index.
+    /// delegating to the shared full dtype-aware <see cref="LoraProjection.Apply"/>. This gives the
+    /// hybrid CPU-resident layers identical adapter-dtype support to the full-CPU
+    /// <c>TransformerModel</c> path — F32 / F16 / BF16 / Q8_0 adapter weights plus the Phase-4d.6
+    /// outer-product stage-2 fast path. Early-returns (inside the shared helper) when no adapter is
+    /// staged or the adapter does not target <paramref name="proj"/> at this layer.
+    /// The hybrid CPU loop does not pre-quantise x for the LoRA path, so <c>preQuantX</c> is null
+    /// (the dequant-once F32 fallback handles every dtype). <paramref name="layer"/> is the
+    /// absolute (global) layer index.
     /// </summary>
     private void ApplyLoraDeltaCpu(int layer, string proj, float* x, float* y,
                                    int seqLen, int inputDim, int outputDim)
     {
-        var adapter = _currentAdapter;
-        if (adapter is null)
-            return;
-
-        var lora = adapter.GetLayerWeights(layer, proj);
-        if (lora is not { } w)
-            return; // untargeted projection — no-op
-
-        if (w.InputDim != inputDim || w.OutputDim != outputDim)
-            throw new InvalidOperationException(
-                $"LoRA adapter shape mismatch at layer {layer} proj {proj}: " +
-                $"adapter [{w.InputDim}->{w.OutputDim}] vs projection [{inputDim}->{outputDim}].");
-
-        if (w.WeightDType != LoraWeightDType.F32)
-            throw new NotSupportedException(
-                $"Hybrid CPU LoRA currently supports F32 adapter weights only (proj={proj} is {w.WeightDType}); " +
-                "use --device cpu for other dtypes.");
-
-        // y += (adapter.Alpha / adapter.Rank) · (x · B) · A. Legacy stage-2 path
-        // (aTransposedHandle: 0) — the outer-product fast path is out of scope here.
-        LoraDelta.Apply(x, (float*)w.BHandle, (float*)w.AHandle, y,
-                        seqLen, inputDim, outputDim, adapter.Rank,
-                        adapter.Alpha / adapter.Rank);
+        LoraProjection.Apply(_currentAdapter!, layer, proj, x, y,
+                             seqLen, inputDim, outputDim, _threadPool,
+                             preQuantX: null, preQuantXType: QuantizationType.F32);
     }
 
     // ═══════════════════════════════════════════════════
