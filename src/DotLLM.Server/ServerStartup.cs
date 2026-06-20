@@ -162,6 +162,13 @@ public static class ServerStartup
                 DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
+        else if (kvConfig.IsTurboQuant)
+        {
+            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious).");
+            kvFactory = (cfg, size) => new TurboQuantKvCache(
+                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed);
+        }
 
         PrefixCache? prefixCache = options.PromptCacheEnabled
             ? new PrefixCache(options.PromptCacheSize)
