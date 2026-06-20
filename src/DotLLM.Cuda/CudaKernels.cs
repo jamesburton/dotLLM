@@ -73,6 +73,12 @@ public sealed unsafe class CudaKernels : IDisposable
     // Stage 1 work that scales with output dim n (n× for MMVQ-large, n/4× for MMQ-4-rows).
     private readonly CudaModule? _quantizeXModule;
     private readonly nint _quantizeXToQ8_1Func;
+
+    // TurboQuant (MSE-stage) KV codec — optional module (turboquant.ptx). The CUDA port of the
+    // Vulkan turboquant_{dequant,encode}_f32 shaders. 0 funcs when the PTX is absent/stale.
+    private readonly CudaModule? _turboquantModule;
+    private readonly nint _turboquantDequantF32Func;
+    private readonly nint _turboquantEncodeF32Func;
     private readonly nint _quantizedGemvQ2_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ4_KMmqPreqFunc;
     private readonly nint _quantizedGemvQ5_KMmqPreqFunc;
@@ -446,6 +452,14 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _quantizeXModule = CudaModule.LoadFromFile(quantizeXPath);
             _quantizeXToQ8_1Func = _quantizeXModule.GetFunction("quantize_x_to_q8_1");
+        }
+
+        string turboquantPath = Path.Combine(ptxDir, "turboquant.ptx");
+        if (File.Exists(turboquantPath))
+        {
+            _turboquantModule = CudaModule.LoadFromFile(turboquantPath);
+            _turboquantDequantF32Func = _turboquantModule.TryGetFunction("turboquant_dequant_f32");
+            _turboquantEncodeF32Func = _turboquantModule.TryGetFunction("turboquant_encode_f32");
         }
 
         _rmsnormFunc = _rmsnormModule.GetFunction("rmsnorm_f16");
@@ -2783,6 +2797,51 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     /// <summary>Dequantize a weight matrix to FP32 on the GPU.</summary>
+    /// <summary>Whether the TurboQuant KV codec kernels are loaded (turboquant.ptx present).</summary>
+    public bool TurboQuantAvailable => _turboquantDequantF32Func != 0 && _turboquantEncodeF32Func != 0;
+
+    /// <summary>
+    /// TurboQuant (MSE-stage) dequant: per-head-vector codes + fp32 norm → contiguous fp32 scratch.
+    /// One CUDA block per head-vector (<paramref name="numVectors"/> = positions × numKvHeads), 256
+    /// threads. Mirrors the Vulkan turboquant_dequant_f32 shader and the CPU codec.
+    /// </summary>
+    public unsafe void LaunchTurboQuantDequantF32(
+        nint codes, nint norms, nint centroids, nint signs, nint dst,
+        int numVectors, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, float invSqrtD, nint stream)
+    {
+        if (_turboquantDequantF32Func == 0)
+            throw new InvalidOperationException("turboquant_dequant_f32 not loaded (turboquant.ptx missing/stale).");
+        nint c = codes, n = norms, ce = centroids, s = signs, d = dst;
+        int nv = numVectors, hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec;
+        float isd = invSqrtD;
+        void** args = stackalloc void*[] { &c, &n, &ce, &s, &d, &nv, &hd, &nkv, &mb, &cu, &isd };
+        CudaDriverApi.cuLaunchKernel(_turboquantDequantF32Func,
+                (uint)numVectors, 1, 1, 256, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// TurboQuant (MSE-stage) encode: contiguous fresh fp32 K/V <c>[seqLen, numKvHeads*headDim]</c> →
+    /// per-head-vector codes + fp32 norm. One CUDA block per head-vector (<paramref name="seqLen"/> ×
+    /// numKvHeads), 256 threads. Destination head-vector index is <c>(startPos + srcRow)*numKvHeads + h</c>.
+    /// </summary>
+    public unsafe void LaunchTurboQuantEncodeF32(
+        nint src, nint centroids, nint signs, nint codes, nint norms,
+        int seqLen, int headDim, int numKvHeads, int mseBits, int codeUintsPerVec, int levelCount, int startPos,
+        float invSqrtD, nint stream)
+    {
+        if (_turboquantEncodeF32Func == 0)
+            throw new InvalidOperationException("turboquant_encode_f32 not loaded (turboquant.ptx missing/stale).");
+        nint sr = src, ce = centroids, sg = signs, co = codes, no = norms;
+        int hd = headDim, nkv = numKvHeads, mb = mseBits, cu = codeUintsPerVec, lc = levelCount, sp = startPos;
+        float isd = invSqrtD;
+        void** args = stackalloc void*[] { &sr, &ce, &sg, &co, &no, &hd, &nkv, &mb, &cu, &lc, &sp, &isd };
+        CudaDriverApi.cuLaunchKernel(_turboquantEncodeF32Func,
+                (uint)(seqLen * numKvHeads), 1, 1, 256, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Dequantizes a quantized weight/KV blob to a contiguous fp32 buffer on device.</summary>
     public void LaunchDequantToF32(nint src, QuantizationType srcDtype,
                                      nint dst, int totalElements, nint stream)
     {
@@ -3813,6 +3872,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2GluRmsNormModule.Dispose();
         _fusedAddRmsNormF32ResModule.Dispose();
         _quantKvModule?.Dispose();
+        _turboquantModule?.Dispose();
         _kvWriteModule?.Dispose();
         _fusedRopeKvWriteModule?.Dispose();
         _attentionMlaModule?.Dispose();
