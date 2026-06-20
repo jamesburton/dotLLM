@@ -10,7 +10,7 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Integration.Models.Lora;
 
 /// <summary>
-/// Hybrid CPU+GPU LoRA parity gate (#82).
+/// Hybrid CPU+GPU LoRA parity vs full-CPU, on SmolLM-135M (#82).
 /// Verifies that <see cref="HybridTransformerModel.Forward"/> with a synthetic LoRA adapter
 /// produces logits that are numerically consistent with the full-CPU reference path.
 /// With a half-layer split (numGpuLayers = cfg.NumLayers / 2) both GPU-resident and
@@ -19,8 +19,9 @@ namespace DotLLM.Tests.Integration.Models.Lora;
 /// Also asserts that hybrid+adapter ≠ hybrid-without-adapter (delta actually fires).
 /// </summary>
 /// <remarks>
-/// Plain [Fact] with early-return no-op when DOTLLM_BITNET_GGUF is unset/missing
+/// Plain [Fact] with early-return no-op when the SmolLM-135M Q8_0 GGUF is absent
 /// or when CUDA is unavailable — no SkippableFact dependency needed.
+/// Model path is hardcoded to the cached location; test skips gracefully if not present.
 /// Kept in its own class to avoid cross-class GPU parallelism.
 /// </remarks>
 public sealed class HybridLoraParityTests
@@ -29,16 +30,16 @@ public sealed class HybridLoraParityTests
 
     public HybridLoraParityTests(ITestOutputHelper output) => _output = output;
 
-    private static string? ModelPath =>
-        Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
+    private static string ModelPath =>
+        @"C:/Users/james/.dotllm/models/QuantFactory/SmolLM-135M-GGUF/SmolLM-135M.Q8_0.gguf";
 
     [Fact]
     public unsafe void HybridAndCpu_LoraLogits_AreNumericallyConsistent()
     {
         // ── Guard 1: model file must be present ──────────────────────────────────
-        if (ModelPath is null || !File.Exists(ModelPath))
+        if (!File.Exists(ModelPath))
         {
-            _output.WriteLine("SKIP: BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
+            _output.WriteLine("SKIP: SmolLM-135M Q8_0 GGUF not found.");
             return;
         }
 
@@ -50,7 +51,7 @@ public sealed class HybridLoraParityTests
         }
 
         // ── Setup ─────────────────────────────────────────────────────────────────
-        using var gguf = GgufFile.Open(ModelPath!);
+        using var gguf = GgufFile.Open(ModelPath);
         var cfg = GgufModelConfigExtractor.Extract(gguf.Metadata);
 
         int[] tok = [1, 2, 3];
@@ -108,7 +109,7 @@ public sealed class HybridLoraParityTests
         double cosine = CosineSimilarity(hybridVec, cpuVec);
         bool adapterChangedHybrid = VectorsAreDifferent(hybridVec, hybridBaseVec, threshold: 1e-4f);
 
-        // Base-vs-base diagnostic (helps isolate pre-existing hybrid divergence from LoRA bugs)
+        // Base-vs-base sanity: hybrid-base should match cpu-base for SmolLM (non-BitNet model)
         using ITensor cpuBaseLogitsRaw = cpuModel.Forward(tok, pos, deviceId: -1, kvCache: null, adapter: null);
         float[] cpuBaseVec = new float[vocabSize];
         fixed (float* dst = cpuBaseVec)
@@ -133,7 +134,7 @@ public sealed class HybridLoraParityTests
         _output.WriteLine(cosineBaseVsBase > 0.999
             ? $"[Diagnostic] Base parity OK (cosine={cosineBaseVsBase:F6} > 0.999)"
             : $"[Diagnostic] Base parity WARN: hybrid-base diverges from cpu-base (cosine={cosineBaseVsBase:F6}). " +
-              $"Pre-existing hybrid-BitNet issue (out of scope for #82).");
+              $"Unexpected for SmolLM-135M — investigate hybrid forward-pass before attributing to LoRA wiring.");
 
         // GATE A: adapter delta must actually fire (hybrid+adapter ≠ hybrid-base).
         Assert.True(adapterChangedHybrid,
