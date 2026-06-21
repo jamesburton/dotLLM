@@ -68,3 +68,26 @@ parser round-trips the assistant `<tool_call>` to `ToolCall(FunctionName="get_we
 string** — so it stays locked to what dotLLM renders at serve time. Tool definitions passed to the
 template use the full `{"type":"function","function":{...}}` objects (as the HF tokenizer expects);
 dotLLM reconstructs the same from its flat `ToolDefinition`.
+
+## 5. Known caveat for tool-use training (resolve in U2)
+The U0 parity test (§3) validates the **serving** tool-render path: dotLLM injects tools via
+`ChatTemplateOptions.Tools` → the template's `{%- if tools %}` branch → the `<tools>` block, identical
+to HF `apply_chat_template(..., tools=...)`.
+
+But `train_task_lora.py:render()` currently calls `apply_chat_template(prompt_msgs, tools=None, ...)`.
+For the `instruction` and `coding` tasks this is exactly right (no tools). For the **`tooluse`** task the
+tool definitions live inside the dataset's ShareGPT **system message text** (e.g. `glaive_func_calling`
+bakes them in), so the `<tools>` block at train time is whatever the dataset author wrote — **not** the
+template-generated block U0 validated. Train==serve therefore holds for the no-tools branch but is **not
+yet guaranteed for the tool-use tool-block**.
+
+**U2 must close this:** extract the tool schemas from the dataset's system turn and pass them through
+`tools=` so the template generates the `<tools>` block consistently (matching dotLLM serving), or pin
+serving to replay the dataset's exact system format. Until then, treat the tool-use adapter's prompt
+parity as unverified.
+
+### Minor harness notes (also U2)
+- `--split` and `--max-examples` both default to 2000 and act as independent caps — set them together to
+  avoid a silently-smaller dataset than intended.
+- The training loop is batch-1, deterministic order, no shuffle/grad-accum — adequate for a smoke harness
+  (smoke converged 3.78→0.22); a real U2 run should add shuffling + gradient accumulation.
