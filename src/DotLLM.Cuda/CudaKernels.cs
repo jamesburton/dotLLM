@@ -346,6 +346,26 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeRenormTopkClampedF32Func;
     private readonly nint _quantizeActQ8_0RoundtripF32Func;
 
+    // Causal softmax over the column-major [s x s] FP16 score buffer produced by the
+    // cuBLAS tensor-core prefill-attention path (QK GEMM -> THIS -> P*V GEMM).
+    // Optional — PTX may be absent on stale builds; HasAttentionSoftmaxCausal reports
+    // false and callers must keep the fused attention_f16 path. Required by a not-yet-
+    // built module would throw across the whole shared-CudaKernels GPU test suite.
+    private readonly CudaModule? _attentionSoftmaxCausalModule;
+    private readonly nint _attentionSoftmaxCausalFunc;
+    // Coalesced sibling: one thread per softmax row (consecutive threads → consecutive
+    // query rows → consecutive addresses), avoiding the per-block strided-read penalty.
+    private readonly nint _attentionSoftmaxCausalCoalescedFunc;
+    // FP32-scores variant: reads FP32 QK scores, writes FP16 probs to a separate buffer.
+    // Removes the dominant precision loss of rounding pre-softmax scores to FP16 (G3 e2e).
+    private readonly nint _attentionSoftmaxCausalCoalescedF32InFunc;
+
+    // Hand-fused FP16 tensor-core (mma.sync) flash-attention prefill kernel — keeps the
+    // s x s scores in shared/registers, never materialising them to global memory.
+    // Prototype for the long-context fused-kernel go/no-go. Optional PTX.
+    private readonly CudaModule? _attentionFlashMmaModule;
+    private readonly nint _attentionFlashMmaFunc;
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -728,6 +748,42 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeRenormTopkClampedF32Func = _gemma4F32Module.TryGetFunction("moe_renorm_topk_clamped_f32");
             _quantizeActQ8_0RoundtripF32Func = _gemma4F32Module.TryGetFunction("quantize_activation_q8_0_roundtrip_f32");
         }
+
+        // Causal softmax for the cuBLAS tensor-core prefill-attention path (G3 prototype).
+        // Optional — PTX may be missing on stale builds.
+        string attentionSoftmaxCausalPath = Path.Combine(ptxDir, "attention_softmax_causal.ptx");
+        if (File.Exists(attentionSoftmaxCausalPath))
+        {
+            _attentionSoftmaxCausalModule = CudaModule.LoadFromFile(attentionSoftmaxCausalPath);
+            _attentionSoftmaxCausalFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_f16");
+            _attentionSoftmaxCausalCoalescedFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f16");
+            _attentionSoftmaxCausalCoalescedF32InFunc = _attentionSoftmaxCausalModule.TryGetFunction("attention_softmax_causal_coalesced_f32in_f16out");
+        }
+
+        // Hand-fused mma.sync flash-attention prefill kernel (G-flash). Optional, and the
+        // ONLY module compiled to compute_86 (mma.sync.m16n8k16 is sm_80+). On a pre-Ampere
+        // GPU (e.g. Turing sm_75) the driver cannot JIT this PTX: cuModuleLoadData JITs
+        // eagerly and would throw, taking down model construction on hardware that should
+        // simply fall back to G3/attention_f16. So the load is best-effort — a failure
+        // leaves HasAttentionFlashMma false and the dispatch never selects it (it is also
+        // arch-gated off in CudaFlashAttention.ConfigureDefault). This keeps non-Ampere
+        // devices unregressed even though the sm_86 PTX ships in every package.
+        string attentionFlashMmaPath = Path.Combine(ptxDir, "attention_flash_mma.ptx");
+        if (File.Exists(attentionFlashMmaPath))
+        {
+            try
+            {
+                var flashModule = CudaModule.LoadFromFile(attentionFlashMmaPath);
+                _attentionFlashMmaFunc = flashModule.TryGetFunction("attention_flash_mma_f16");
+                _attentionFlashMmaModule = flashModule;
+            }
+            catch (CudaException)
+            {
+                // Pre-Ampere driver rejected the sm_86 module — leave flash disabled.
+                _attentionFlashMmaModule = null;
+                _attentionFlashMmaFunc = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -741,6 +797,34 @@ public sealed unsafe class CudaKernels : IDisposable
         && _scaleInplaceF32Func != 0 && _rmsnormWeightlessF32Func != 0
         && _softcapInplaceF32Func != 0 && _moeRenormTopkClampedF32Func != 0
         && _quantizeActQ8_0RoundtripF32Func != 0;
+
+    /// <summary>
+    /// True when the hand-fused mma.sync flash-attention prefill kernel is loaded
+    /// (attention_flash_mma.ptx present). Prototype path, Llama-3.2-1B head shape only.
+    /// </summary>
+    public bool HasAttentionFlashMma => _attentionFlashMmaFunc != 0;
+
+    /// <summary>
+    /// True when the causal-softmax kernel for the cuBLAS tensor-core prefill-attention
+    /// path is loaded (attention_softmax_causal.ptx present). When false, callers must
+    /// keep the fused <c>attention_f16</c> path.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausal => _attentionSoftmaxCausalFunc != 0;
+
+    /// <summary>
+    /// True when the coalesced (one-thread-per-row) causal-softmax kernel is loaded.
+    /// This is the preferred variant — its global reads are coalesced, unlike the
+    /// one-block-per-row sibling whose strided reads cap throughput.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausalCoalesced => _attentionSoftmaxCausalCoalescedFunc != 0;
+
+    /// <summary>
+    /// True when the FP32-scores causal-softmax kernel is loaded (reads FP32 QK scores,
+    /// writes FP16 probs). The G3 prefill path uses this to hold end-to-end logit parity
+    /// at the 5e-3 bar — the all-FP16 variant loses too much precision rounding the
+    /// pre-softmax scores at realistic activation magnitudes.
+    /// </summary>
+    public bool HasAttentionSoftmaxCausalCoalescedF32In => _attentionSoftmaxCausalCoalescedF32InFunc != 0;
 
     /// <summary>True when the MLA Phase A attention kernel is available on this kernel module.</summary>
     public bool HasMlaAttentionKernel => _attentionMlaF32Func != 0;
@@ -1841,6 +1925,109 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_softmaxFunc,
                 (uint)rows, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Causal softmax over the column-major <c>[s x s]</c> FP16 score buffer produced by
+    /// the cuBLAS tensor-core prefill-attention path. Operates in place: one plane per
+    /// query head (base <c>hq * s * s</c>), element <c>(tq, tk)</c> at <c>tq + tk * s</c>.
+    /// Each block softmaxes one query row (fixed <c>tq</c>) over the strided key axis,
+    /// applies the causal mask (<c>tk &gt; tq</c> → 0), and normalizes. The QK GEMM
+    /// already applied the <c>1/sqrt(headDim)</c> scale; it is not re-applied here.
+    /// One block per <c>(query head, query row)</c>; grid = <c>numHeads * s</c>.
+    /// </summary>
+    /// <param name="scores">Device pointer to the FP16 score buffer (<c>numHeads * s * s</c> elements), modified in place.</param>
+    /// <param name="s">Sequence length (rows and columns of each per-head score plane).</param>
+    /// <param name="numHeads">Number of query heads (score planes).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    /// <param name="coalesced">
+    /// When true (default), uses the one-thread-per-row variant whose global reads are
+    /// coalesced — the preferred path. When false, uses the one-block-per-row variant
+    /// (warp-reduced per row, but strided/uncoalesced reads) for A/B comparison.
+    /// </param>
+    public void LaunchAttentionSoftmaxCausal(nint scores, int s, int numHeads, nint stream, bool coalesced = true)
+    {
+        nint scoresArg = scores;
+        int sArg = s, nhArg = numHeads;
+
+        void** args = stackalloc void*[] {&scoresArg, &sArg, &nhArg};
+
+        if (coalesced)
+        {
+            // One thread per row; grid sized to cover numHeads*s rows.
+            int totalRows = numHeads * s;
+            uint gridDim = (uint)((totalRows + BlockSize - 1) / BlockSize);
+            CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalCoalescedFunc,
+                    gridDim, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
+        else
+        {
+            // One block per row.
+            int numBlocks = numHeads * s;
+            CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalFunc,
+                    (uint)numBlocks, 1, 1, BlockSize, 1, 1,
+                    0, stream, (nint)args, 0).ThrowOnError();
+        }
+    }
+
+    /// <summary>
+    /// Launches the FP32-scores causal softmax: reads FP32 QK <paramref name="scores"/>
+    /// (per-head col-major [s × s]), writes normalized FP16 probs into
+    /// <paramref name="probs"/> with the same layout. Coalesced one-thread-per-row.
+    /// </summary>
+    /// <param name="scores">Device pointer to FP32 QK scores ([numHeads × s × s]).</param>
+    /// <param name="probs">Device pointer to FP16 output probs ([numHeads × s × s]).</param>
+    /// <param name="s">Sequence length (square scores).</param>
+    /// <param name="numHeads">Number of query heads (score planes).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionSoftmaxCausalF32In(nint scores, nint probs, int s, int numHeads, nint stream)
+    {
+        nint scoresArg = scores, probsArg = probs;
+        int sArg = s, nhArg = numHeads;
+        void** args = stackalloc void*[] {&scoresArg, &probsArg, &sArg, &nhArg};
+
+        int totalRows = numHeads * s;
+        uint gridDim = (uint)((totalRows + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_attentionSoftmaxCausalCoalescedF32InFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Launches the hand-fused mma.sync flash-attention prefill kernel. Prototype:
+    /// headDim must be 64, causal, position_offset 0, FP16 in/out, output row-major
+    /// [seq, numHeads, headDim] (matching <c>attention_f16</c>). One warp per
+    /// (query head, 16-query tile).
+    /// </summary>
+    /// <param name="q">Device pointer to Q [seq, numHeads, headDim] FP16.</param>
+    /// <param name="k">Device pointer to K [seq, numKvHeads, headDim] FP16.</param>
+    /// <param name="v">Device pointer to V [seq, numKvHeads, headDim] FP16.</param>
+    /// <param name="output">Device pointer to output [seq, numHeads, headDim] FP16.</param>
+    /// <param name="seq">Sequence length (prefill).</param>
+    /// <param name="numHeads">Number of query heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA).</param>
+    /// <param name="headDim">Head dimension; must be 64 for this prototype.</param>
+    /// <param name="scale">QK softmax scale (1/sqrt(headDim)).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionFlashMma(nint q, nint k, nint v, nint output,
+        int seq, int numHeads, int numKvHeads, int headDim, float scale, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, oArg = output;
+        int seqArg = seq, nhArg = numHeads, nkvArg = numKvHeads;
+        float scArg = scale;
+
+        void** args = stackalloc void*[] { &qArg, &kArg, &vArg, &oArg, &seqArg, &nhArg, &nkvArg, &scArg };
+
+        // TUNED layout: one block per (kv head, 16-query tile); `group` warps per block,
+        // one warp per query head sharing that kv head (K/V loaded once, reused group×).
+        int group = numHeads / numKvHeads;
+        uint gridX = (uint)numKvHeads;
+        uint gridY = (uint)((seq + 15) / 16);   // 16-query tiles
+        uint blockX = (uint)(group * 32);       // group warps per block
+        CudaDriverApi.cuLaunchKernel(_attentionFlashMmaFunc,
+                gridX, gridY, 1, blockX, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
