@@ -69,22 +69,27 @@ string** — so it stays locked to what dotLLM renders at serve time. Tool defin
 template use the full `{"type":"function","function":{...}}` objects (as the HF tokenizer expects);
 dotLLM reconstructs the same from its flat `ToolDefinition`.
 
-## 5. Known caveat for tool-use training (resolve in U2)
+## 5. Tool-use rendering caveat — **RESOLVED in U2 (Phase A)**
+
 The U0 parity test (§3) validates the **serving** tool-render path: dotLLM injects tools via
 `ChatTemplateOptions.Tools` → the template's `{%- if tools %}` branch → the `<tools>` block, identical
 to HF `apply_chat_template(..., tools=...)`.
 
-But `train_task_lora.py:render()` currently calls `apply_chat_template(prompt_msgs, tools=None, ...)`.
-For the `instruction` and `coding` tasks this is exactly right (no tools). For the **`tooluse`** task the
-tool definitions live inside the dataset's ShareGPT **system message text** (e.g. `glaive_func_calling`
-bakes them in), so the `<tools>` block at train time is whatever the dataset author wrote — **not** the
-template-generated block U0 validated. Train==serve therefore holds for the no-tools branch but is **not
-yet guaranteed for the tool-use tool-block**.
+**Resolution (commit `0750cf8`):** `scripts/lora/tooluse_render.py` implements:
+- `extract_tools(row)` — reads `row['tools']` (a JSON string already in
+  `{"type":"function","function":{...}}` format; confirmed from
+  `NousResearch/hermes-function-calling-v1 / glaive_func_calling`).
+- `render_tooluse(tok, row)` — strips the dataset's embedded `<tools>` boilerplate from
+  the system turn, then calls `tok.apply_chat_template(prompt_msgs, tools=tools,
+  add_generation_prompt=True)` so the `<tools>` block is **template-generated** —
+  bit-identical to dotLLM's serving render.  Supervises the first `<tool_call>` gpt
+  turn as the labeled completion.
 
-**U2 must close this:** extract the tool schemas from the dataset's system turn and pass them through
-`tools=` so the template generates the `<tools>` block consistently (matching dotLLM serving), or pin
-serving to replay the dataset's exact system format. Until then, treat the tool-use adapter's prompt
-parity as unverified.
+`train_task_lora.py` now routes `--task tooluse` through `render_tooluse` instead of
+the generic `format_row`+`render` path (instruction/coding unchanged).
+6/6 pytest tests pass (`scripts/lora/tests/test_tooluse_render.py`).
+
+**Train==serve is now verified for all three tasks**, including the tool-use `<tools>` block.
 
 ### Minor harness notes (also U2)
 - `--split` and `--max-examples` both default to 2000 and act as independent caps — set them together to
