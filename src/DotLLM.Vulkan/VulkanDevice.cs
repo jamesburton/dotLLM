@@ -168,6 +168,17 @@ public sealed class VulkanDevice : IDisposable
         return (_requiredSubgroupSizeStages & stage) != 0;
     }
 
+    /// <summary>
+    /// True when the physical device advertises both <c>VK_KHR_external_semaphore</c>
+    /// and <c>VK_KHR_external_semaphore_win32</c> AND the device-create call enabled
+    /// them. This is the prerequisite for exporting a <c>VkSemaphore</c> as a Win32
+    /// HANDLE for cross-API synchronisation with CUDA (the M3 async handoff:
+    /// <see cref="CreateExportableSemaphore"/> + <see cref="GetSemaphoreWin32Handle"/>).
+    /// Falls back to <c>false</c> on non-Windows or on drivers that don't expose
+    /// the extension; callers must keep the fence-serialized path available.
+    /// </summary>
+    public bool HasExternalSemaphoreWin32 { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -181,7 +192,8 @@ public sealed class VulkanDevice : IDisposable
         bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment,
         bool hasIntegerDotProduct,
         bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
-        uint requiredSubgroupSizeStages)
+        uint requiredSubgroupSizeStages,
+        bool hasExternalSemaphoreWin32)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -203,6 +215,7 @@ public sealed class VulkanDevice : IDisposable
         MinSubgroupSize = minSubgroupSize;
         MaxSubgroupSize = maxSubgroupSize;
         _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
+        HasExternalSemaphoreWin32 = hasExternalSemaphoreWin32;
     }
 
     /// <summary>
@@ -306,9 +319,15 @@ public sealed class VulkanDevice : IDisposable
                 out bool hasSubgroupSizeControl, out uint minSubgroupSize,
                 out uint maxSubgroupSize, out uint requiredSubgroupSizeStages);
 
+            // Probe VK_KHR_external_semaphore + VK_KHR_external_semaphore_win32
+            // (Win32 only). Required for the M3 cross-API handoff: the Vulkan
+            // forward submit signals an exported semaphore that CUDA waits on.
+            // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
+            ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
+
             nint device = CreateLogicalDevice(
                 physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
-                hasSubgroupSizeControl);
+                hasSubgroupSizeControl, hasExternalSemaphoreWin32);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -328,7 +347,7 @@ public sealed class VulkanDevice : IDisposable
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
                 hasIntegerDotProduct,
                 hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
-                requiredSubgroupSizeStages);
+                requiredSubgroupSizeStages, hasExternalSemaphoreWin32);
             instance = 0;
             return result;
         }
@@ -374,6 +393,21 @@ public sealed class VulkanDevice : IDisposable
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices)
             .ThrowOnError("vkEnumeratePhysicalDevices");
 
+        // Manual override (testing / iGPU targeting): DOTLLM_VULKAN_DEVICE_INDEX picks a device by
+        // enumeration index; DOTLLM_VULKAN_DEVICE_VENDOR (hex, e.g. 0x8086) picks the first device of
+        // that PCI vendor. Either lets us force the integrated Intel Arc on a box where the scorer would
+        // otherwise pick the discrete NVIDIA. Falls through to scoring if unset/invalid.
+        nint forced = ResolveForcedDevice(devices);
+        if (forced != 0)
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(forced, out var fp);
+            name = ReadDeviceName(fp);
+            vendor = fp.vendorID;
+            type = fp.deviceType;
+            apiVersion = fp.apiVersion;
+            return forced;
+        }
+
         // Score every device. Prefer: discrete > integrated > other/CPU.
         // Within discrete, prefer AMD/NVIDIA over Intel (Intel rarely has dGPUs,
         // but if one is present it's often weaker than an AMD/NVIDIA dGPU).
@@ -406,6 +440,34 @@ public sealed class VulkanDevice : IDisposable
         type = bestType;
         apiVersion = bestApi;
         return bestDev;
+    }
+
+    /// <summary>
+    /// Resolves a manually-forced physical device from environment overrides, or 0 if none/invalid.
+    /// <c>DOTLLM_VULKAN_DEVICE_INDEX</c> selects by enumeration index; <c>DOTLLM_VULKAN_DEVICE_VENDOR</c>
+    /// (hex PCI vendor, e.g. 0x8086 for Intel) selects the first device of that vendor.
+    /// </summary>
+    private static nint ResolveForcedDevice(nint[] devices)
+    {
+        string? idxEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_INDEX");
+        if (int.TryParse(idxEnv, out int idx) && idx >= 0 && idx < devices.Length)
+            return devices[idx];
+
+        string? vendorEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR");
+        if (!string.IsNullOrEmpty(vendorEnv))
+        {
+            string hex = vendorEnv.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? vendorEnv[2..] : vendorEnv;
+            if (uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out uint wantVendor))
+            {
+                foreach (var dev in devices)
+                {
+                    VulkanApi.vkGetPhysicalDeviceProperties(dev, out var props);
+                    if (props.vendorID == wantVendor)
+                        return dev;
+                }
+            }
+        }
+        return 0;
     }
 
     // Packed Vulkan API version helpers. Layout: variant(3) | major(7) | minor(10) | patch(12).
@@ -588,6 +650,14 @@ public sealed class VulkanDevice : IDisposable
     internal delegate int VkGetMemoryHostPointerPropertiesEXT(
         nint device, uint handleType, nint pHostPointer,
         ref VkMemoryHostPointerPropertiesExt pMemoryHostPointerProperties);
+
+    // Delegate matching vkGetSemaphoreWin32HandleKHR (VK_KHR_external_semaphore_win32).
+    // Resolved lazily via vkGetDeviceProcAddr after device creation (the extension
+    // must have been enabled at vkCreateDevice). Returns the exportable
+    // semaphore's Win32 HANDLE in pHandle for import into CUDA.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int VkGetSemaphoreWin32HandleKHR(
+        nint device, in VkSemaphoreGetWin32HandleInfoKhr pGetWin32HandleInfo, out nint pHandle);
 
     /// <summary>
     /// Probes <c>VK_EXT_external_memory_host</c> support. The extension lets
@@ -807,6 +877,40 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Probes <c>VK_KHR_external_semaphore</c> + <c>VK_KHR_external_semaphore_win32</c>
+    /// support. Both must be advertised for the Vulkan→CUDA Win32-handle handoff;
+    /// the extensions carry no feature bit, so presence in the device extension
+    /// list is sufficient. Windows-only (the win32 extension does not exist on
+    /// other platforms). Safe on Vulkan 1.0 / non-Windows: returns <c>false</c>
+    /// and callers fall back to the fence-serialized handoff.
+    /// </summary>
+    private static unsafe void ProbeExternalSemaphoreWin32(
+        nint physical, uint apiVersion, out bool hasExternalSemaphoreWin32)
+    {
+        hasExternalSemaphoreWin32 = false;
+
+        // The win32 export handle type only exists on Windows.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return;
+
+        // VK_KHR_external_semaphore is core in Vulkan 1.1; the win32 companion
+        // requires it. Gate on the reported API version.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            hasExternalSemaphoreWin32 =
+                HasDeviceExtension(physical, "VK_KHR_external_semaphore"u8) &&
+                HasDeviceExtension(physical, "VK_KHR_external_semaphore_win32"u8);
+        }
+        catch
+        {
+            hasExternalSemaphoreWin32 = false;
+        }
+    }
+
+    /// <summary>
     /// Returns <c>true</c> when <paramref name="physical"/> advertises the
     /// given device extension. <paramref name="name"/> must be the
     /// NUL-terminated UTF-8 extension name (e.g. <c>"VK_KHR_cooperative_matrix\0"u8</c>).
@@ -909,7 +1013,7 @@ public sealed class VulkanDevice : IDisposable
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
-        bool enableSubgroupSizeControl)
+        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32)
     {
         float priority = 1.0f;
 
@@ -935,16 +1039,20 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extMemName = "VK_KHR_external_memory\0"u8;
         ReadOnlySpan<byte> intDotName = "VK_KHR_shader_integer_dot_product\0"u8;
         ReadOnlySpan<byte> sscName = "VK_EXT_subgroup_size_control\0"u8;
+        ReadOnlySpan<byte> extSemName = "VK_KHR_external_semaphore\0"u8;
+        ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all five
-        // extensions are enabled at once. (The integer-dot-product and
-        // subgroup-size-control strings are harmless to name even on a 1.3
-        // driver where they are core — drivers ignore the duplicate, same as the
-        // external-memory names below.)
+        // Pack name bytes + pointer array onto the stack. Worst case all seven
+        // extension names are enabled at once (coopmat, external-memory ×2,
+        // integer-dot-product, subgroup-size-control, external-semaphore ×2). The
+        // integer-dot-product and subgroup-size-control strings are harmless to
+        // name even on a 1.3 driver where they are core — drivers ignore the
+        // duplicate, same as the external-memory/semaphore names below.
         byte* nameBytes = stackalloc byte[
             coopmatName.Length + extMemHostName.Length + extMemName.Length
-            + intDotName.Length + sscName.Length];
-        nint* namePtrs = stackalloc nint[5];
+            + intDotName.Length + sscName.Length
+            + extSemName.Length + extSemWin32Name.Length];
+        nint* namePtrs = stackalloc nint[7];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -953,6 +1061,20 @@ public sealed class VulkanDevice : IDisposable
             for (int i = 0; i < coopmatName.Length; i++) nameBytes[nameOffset + i] = coopmatName[i];
             namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
             nameOffset += coopmatName.Length;
+        }
+
+        if (enableExternalSemaphoreWin32)
+        {
+            // VK_KHR_external_semaphore is core in 1.1 but, like external_memory,
+            // some drivers (amdvlk) require it named explicitly when the
+            // VkExportSemaphoreCreateInfo pNext struct is used. Enable both names.
+            for (int i = 0; i < extSemName.Length; i++) nameBytes[nameOffset + i] = extSemName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extSemName.Length;
+
+            for (int i = 0; i < extSemWin32Name.Length; i++) nameBytes[nameOffset + i] = extSemWin32Name[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extSemWin32Name.Length;
         }
 
         if (enableExternalMemoryHost)
@@ -1022,6 +1144,21 @@ public sealed class VulkanDevice : IDisposable
             sscFeatures.pNext = featureChain;
             featureChain = (nint)(&sscFeatures);
         }
+
+        // Timeline semaphores (core 1.2) require `timelineSemaphore=VK_TRUE` enabled
+        // at device create. We need them for the D3D12_FENCE export type CUDA imports
+        // cross-vendor (Intel Vulkan → NVIDIA CUDA) — the OPAQUE_WIN32 binary form
+        // fails import on that pairing. Enable alongside the external-semaphore-win32
+        // path so the M3 handoff can create exportable timeline semaphores.
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = default;
+        if (enableExternalSemaphoreWin32)
+        {
+            timelineFeatures.sType = VkStructureType.PhysicalDeviceTimelineSemaphoreFeatures;
+            timelineFeatures.timelineSemaphore = 1; // VK_TRUE
+            timelineFeatures.pNext = featureChain;
+            featureChain = (nint)(&timelineFeatures);
+        }
+
         ci.pNext = featureChain;
 
         if (extCount > 0)
@@ -1501,6 +1638,137 @@ public sealed class VulkanDevice : IDisposable
     }
 
     // ────────────────────────────────────────────────────────────────
+    // External semaphores (cross-API sync with CUDA — M3 async handoff)
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a binary <c>VkSemaphore</c> that may be exported as a Win32 HANDLE
+    /// of <paramref name="handleType"/> (OPAQUE_WIN32 or D3D12_FENCE) for import
+    /// into CUDA. Requires <see cref="HasExternalSemaphoreWin32"/>; the caller
+    /// owns the returned handle and must release it via <see cref="DestroySemaphore"/>.
+    /// </summary>
+    /// <param name="handleType">The external handle type the semaphore will be exported as.</param>
+    /// <returns>The created <c>VkSemaphore</c> handle.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the external-semaphore-win32 extension.</exception>
+    public unsafe nint CreateExportableSemaphore(
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.OpaqueWin32)
+    {
+        if (!HasExternalSemaphoreWin32)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_external_semaphore_win32 — cannot export a semaphore to CUDA.");
+
+        var exportInfo = new VkExportSemaphoreCreateInfo
+        {
+            sType = VkStructureType.ExportSemaphoreCreateInfo,
+            handleTypes = (uint)ToVkHandleType(handleType),
+        };
+
+        var ci = new VkSemaphoreCreateInfo
+        {
+            sType = VkStructureType.SemaphoreCreateInfo,
+            pNext = (nint)(&exportInfo),
+        };
+
+        VulkanApi.vkCreateSemaphore(_device, ci, 0, out nint semaphore)
+            .ThrowOnError("vkCreateSemaphore (exportable)");
+        return semaphore;
+    }
+
+    /// <summary>
+    /// Exports the Win32 HANDLE for an exportable semaphore created by
+    /// <see cref="CreateExportableSemaphore"/>. The returned HANDLE is owned by
+    /// the caller; once CUDA has imported it (CUDA duplicates the handle on
+    /// import for OPAQUE_WIN32), the caller must <c>CloseHandle</c> this copy.
+    /// </summary>
+    /// <param name="semaphore">The exportable semaphore handle.</param>
+    /// <param name="handleType">Must match the type the semaphore was created with.</param>
+    /// <returns>The Win32 NT HANDLE referencing the semaphore.</returns>
+    public unsafe nint GetSemaphoreWin32Handle(
+        nint semaphore,
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.OpaqueWin32)
+    {
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetSemaphoreWin32HandleKHR");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetSemaphoreWin32HandleKHR not resolvable — extension not enabled at device create.");
+
+        var getInfo = new VkSemaphoreGetWin32HandleInfoKhr
+        {
+            sType = VkStructureType.SemaphoreGetWin32HandleInfoKhr,
+            semaphore = semaphore,
+            handleType = (uint)ToVkHandleType(handleType),
+        };
+
+        var getHandle = Marshal.GetDelegateForFunctionPointer<VkGetSemaphoreWin32HandleKHR>(fn);
+        getHandle(_device, getInfo, out nint handle).ThrowOnError("vkGetSemaphoreWin32HandleKHR");
+        return handle;
+    }
+
+    /// <summary>
+    /// Creates an exportable <b>timeline</b> <c>VkSemaphore</c> for the
+    /// cross-vendor M3 handoff. A timeline semaphore is required for the
+    /// <see cref="ExternalSemaphoreHandleType.D3D12Fence"/> handle type, which is
+    /// the form CUDA can import from an Intel-Arc Vulkan device (the
+    /// <see cref="ExternalSemaphoreHandleType.OpaqueWin32"/> binary form fails
+    /// <c>cuImportExternalSemaphore</c> on the Arc→NVIDIA pairing). The semaphore
+    /// starts at counter value <paramref name="initialValue"/> and is advanced by
+    /// each <see cref="SubmitContext.SubmitAndSignalTimeline"/> call.
+    /// </summary>
+    /// <param name="handleType">External handle type — D3D12_FENCE for the working cross-vendor path.</param>
+    /// <param name="initialValue">Initial timeline counter value (typically 0).</param>
+    /// <returns>The created timeline <c>VkSemaphore</c> handle.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the external-semaphore-win32 extension.</exception>
+    public unsafe nint CreateExportableTimelineSemaphore(
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.D3D12Fence,
+        ulong initialValue = 0)
+    {
+        if (!HasExternalSemaphoreWin32)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_external_semaphore_win32 — cannot export a semaphore to CUDA.");
+
+        // pNext chain: VkSemaphoreCreateInfo -> VkExportSemaphoreCreateInfo -> VkSemaphoreTypeCreateInfo.
+        var typeInfo = new VkSemaphoreTypeCreateInfo
+        {
+            sType = VkStructureType.SemaphoreTypeCreateInfo,
+            semaphoreType = VkSemaphoreType.Timeline,
+            initialValue = initialValue,
+        };
+
+        var exportInfo = new VkExportSemaphoreCreateInfo
+        {
+            sType = VkStructureType.ExportSemaphoreCreateInfo,
+            pNext = (nint)(&typeInfo),
+            handleTypes = (uint)ToVkHandleType(handleType),
+        };
+
+        var ci = new VkSemaphoreCreateInfo
+        {
+            sType = VkStructureType.SemaphoreCreateInfo,
+            pNext = (nint)(&exportInfo),
+        };
+
+        VulkanApi.vkCreateSemaphore(_device, ci, 0, out nint semaphore)
+            .ThrowOnError("vkCreateSemaphore (exportable timeline)");
+        return semaphore;
+    }
+
+    /// <summary>Destroys a semaphore previously created by <see cref="CreateExportableSemaphore"/>.</summary>
+    /// <param name="semaphore">The semaphore handle; no-op when zero.</param>
+    public void DestroySemaphore(nint semaphore)
+    {
+        if (semaphore != 0)
+            VulkanApi.vkDestroySemaphore(_device, semaphore, 0);
+    }
+
+    // Maps the public handle-type enum to the internal interop flag bits.
+    private static VkExternalSemaphoreHandleTypeFlags ToVkHandleType(ExternalSemaphoreHandleType t) => t switch
+    {
+        ExternalSemaphoreHandleType.OpaqueWin32 => VkExternalSemaphoreHandleTypeFlags.OpaqueWin32,
+        ExternalSemaphoreHandleType.D3D12Fence => VkExternalSemaphoreHandleTypeFlags.D3D12Fence,
+        _ => throw new ArgumentOutOfRangeException(nameof(t), t, "Unsupported external semaphore handle type."),
+    };
+
+    // ────────────────────────────────────────────────────────────────
     // Forward-pass command submission
     // ────────────────────────────────────────────────────────────────
 
@@ -1566,6 +1834,101 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
         }
 
+        /// <summary>
+        /// Ends the command buffer and submits it on the queue with
+        /// <paramref name="signalSemaphore"/> in <c>pSignalSemaphores</c>, so the
+        /// semaphore signals once the GPU finishes this submission. Does NOT wait
+        /// on the host fence — the consumer (CUDA, via
+        /// <c>cuWaitExternalSemaphoresAsync</c>) gates on the semaphore instead.
+        /// This is the M3 async-handoff submit: it removes the host fence-wait
+        /// stall that serialized the M2 path.
+        /// </summary>
+        /// <param name="signalSemaphore">An exportable semaphore the GPU signals on completion.</param>
+        /// <remarks>
+        /// The fence is still passed to <c>vkQueueSubmit</c> so the host can
+        /// reclaim the command buffer on the next <see cref="Begin"/> (which
+        /// resets it). Callers that reuse the buffer across overlapping steps
+        /// must double-buffer the <see cref="SubmitContext"/> — a single binary
+        /// semaphore + single command buffer cannot overlap two in-flight
+        /// submissions.
+        /// </remarks>
+        public unsafe void SubmitAndSignal(nint signalSemaphore)
+        {
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignal");
+
+            nint cmdBufLocal = _cmdBuf;
+            nint semLocal = signalSemaphore;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = (nint)(&semLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
+                .ThrowOnError("vkQueueSubmit SubmitAndSignal");
+        }
+
+        /// <summary>
+        /// Ends the command buffer and submits it with a <b>timeline</b> signal:
+        /// <paramref name="signalSemaphore"/> is advanced to
+        /// <paramref name="signalValue"/> once the GPU finishes this submission.
+        /// CUDA gates on the same (semaphore, value) pair via
+        /// <c>cuWaitExternalSemaphoresAsync</c>. Does NOT host-wait on the fence —
+        /// this is the M3 async-handoff submit for the cross-vendor D3D12_FENCE path.
+        /// </summary>
+        /// <param name="signalSemaphore">An exportable timeline semaphore.</param>
+        /// <param name="signalValue">The counter value to signal on GPU completion (must exceed the prior signalled value).</param>
+        /// <remarks>
+        /// The fence is still passed so the host can reclaim the command buffer on
+        /// the next <see cref="Begin"/>. Overlapping in-flight submissions require a
+        /// double-buffered <see cref="SubmitContext"/> ring — one command buffer +
+        /// fence cannot host two simultaneous submissions even with a timeline
+        /// semaphore (the fence and command buffer are still single-use-at-a-time).
+        /// </remarks>
+        public unsafe void SubmitAndSignalTimeline(nint signalSemaphore, ulong signalValue)
+        {
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignalTimeline");
+
+            nint cmdBufLocal = _cmdBuf;
+            nint semLocal = signalSemaphore;
+            ulong signalValueLocal = signalValue;
+
+            var timelineInfo = new VkTimelineSemaphoreSubmitInfo
+            {
+                sType = VkStructureType.TimelineSemaphoreSubmitInfo,
+                signalSemaphoreValueCount = 1,
+                pSignalSemaphoreValues = (nint)(&signalValueLocal),
+            };
+
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                pNext = (nint)(&timelineInfo),
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = (nint)(&semLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
+                .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
+        }
+
+        /// <summary>
+        /// Host-waits on the fence from a prior <see cref="SubmitAndSignal"/> and
+        /// resets it for reuse. Call before the next <see cref="Begin"/> when the
+        /// previous submission did not host-wait, to guarantee the command buffer
+        /// is no longer in flight before it is reset.
+        /// </summary>
+        public unsafe void WaitFence()
+        {
+            nint fenceLocal = _fence;
+            VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
+                .ThrowOnError("vkWaitForFences WaitFence");
+            VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences WaitFence");
+        }
+
         /// <inheritdoc/>
         public void Dispose()
         {
@@ -1616,6 +1979,26 @@ public sealed class VulkanDevice : IDisposable
 
         return new SubmitContext(this, cmdBuf, fence);
     }
+}
+
+/// <summary>
+/// External-semaphore handle type for the Vulkan→CUDA M3 async handoff. Selects
+/// which Win32 NT-handle flavour the exportable semaphore is created and exported
+/// as; the same type must be passed to CUDA's <c>cuImportExternalSemaphore</c>.
+/// </summary>
+public enum ExternalSemaphoreHandleType
+{
+    /// <summary>
+    /// Opaque Win32 NT handle (<c>VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT</c>).
+    /// Works when the same handle semantics are understood by both APIs on Windows.
+    /// </summary>
+    OpaqueWin32,
+
+    /// <summary>
+    /// Direct3D 12 fence handle (<c>VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT</c>).
+    /// The cross-vendor-portable Win32 fence both Intel Vulkan and NVIDIA CUDA accept.
+    /// </summary>
+    D3D12Fence,
 }
 
 /// <summary>

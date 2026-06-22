@@ -302,4 +302,20 @@ internal static partial class VulkanApi
     [LibraryImport(LibName)]
     internal static partial int vkResetCommandBuffer(
         nint commandBuffer, uint flags);
+
+    // ── Semaphores ──────────────────────────────────────────────────
+    // Used by the M3 cross-API handoff: an exportable VkSemaphore (created with
+    // VkExportSemaphoreCreateInfo on pNext) is signalled by the Vulkan forward
+    // submit and waited on by CUDA via cuWaitExternalSemaphoresAsync. The Win32
+    // HANDLE getter (vkGetSemaphoreWin32HandleKHR) is an extension entry point
+    // resolved at runtime via vkGetDeviceProcAddr — see VulkanDevice.
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreateSemaphore(
+        nint device, in VkSemaphoreCreateInfo pCreateInfo,
+        nint pAllocator, out nint pSemaphore);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroySemaphore(
+        nint device, nint semaphore, nint pAllocator);
 }

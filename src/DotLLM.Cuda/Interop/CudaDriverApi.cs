@@ -195,6 +195,68 @@ internal static partial class CudaDriverApi
     [LibraryImport(LibName)]
     internal static partial int cuEventElapsedTime(out float milliseconds, nint start, nint end);
 
+    // ── External semaphores (cross-API sync: Vulkan → CUDA) ─────────────
+    //
+    // The Vulkan iGPU exports a VkSemaphore as a Win32 HANDLE (or D3D12 fence)
+    // which CUDA imports via cuImportExternalSemaphore. cuWaitExternalSemaphoresAsync
+    // then gates a CUDA stream on the Vulkan signal without a host fence-wait,
+    // letting the CUDA H2D + compute overlap the next decode step's Vulkan
+    // recording. See HybridVulkanCudaTransformerModel (M3 async pipelining).
+
+    /// <summary>CUexternalSemaphoreHandleType: OPAQUE_WIN32 — a Vulkan VkSemaphore exported as an NT HANDLE. Same-stack handle, may not interop cross-vendor.</summary>
+    internal const int CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32 = 2;
+
+    /// <summary>CUexternalSemaphoreHandleType: D3D12_FENCE — the cross-vendor-portable Win32 handle type; preferred fallback when OPAQUE_WIN32 import fails between Intel Vulkan and NVIDIA CUDA.</summary>
+    internal const int CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE = 4;
+
+    /// <summary>
+    /// Imports an external semaphore (e.g. an exported Vulkan VkSemaphore) into
+    /// CUDA. The current context must be set on the calling thread. For
+    /// OPAQUE_WIN32 the driver duplicates the supplied HANDLE — the caller
+    /// must CloseHandle its own copy afterwards.
+    /// </summary>
+    /// <param name="extSemOut">Receives the imported CUexternalSemaphore handle.</param>
+    /// <param name="semHandleDesc">Pointer to a populated <see cref="CudaExternalSemaphoreHandleDesc"/>.</param>
+    /// <returns>CUresult — 0 on success.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuImportExternalSemaphore(out nint extSemOut, in CudaExternalSemaphoreHandleDesc semHandleDesc);
+
+    /// <summary>
+    /// Enqueues a wait on one or more external semaphores into a stream. The
+    /// stream's subsequent work does not begin until each semaphore is signalled
+    /// (by Vulkan, in the M3 handoff). For a binary semaphore the params must be
+    /// zeroed; for a timeline/D3D12-fence semaphore the wait value applies.
+    /// </summary>
+    /// <param name="extSemArray">Pointer to an array of CUexternalSemaphore handles.</param>
+    /// <param name="paramsArray">Pointer to a matching array of <see cref="CudaExternalSemaphoreWaitParams"/>.</param>
+    /// <param name="numExtSems">Number of semaphores in the arrays.</param>
+    /// <param name="stream">Target CUDA stream.</param>
+    /// <returns>CUresult — 0 on success.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuWaitExternalSemaphoresAsync(
+        in nint extSemArray, in CudaExternalSemaphoreWaitParams paramsArray, uint numExtSems, nint stream);
+
+    /// <summary>
+    /// Enqueues a signal on one or more external semaphores into a stream.
+    /// Used when CUDA must signal back to Vulkan; not required for the
+    /// Vulkan-signals-CUDA-waits M3 first cut, but kept for the timeline /
+    /// ping-pong double-buffering path.
+    /// </summary>
+    /// <param name="extSemArray">Pointer to an array of CUexternalSemaphore handles.</param>
+    /// <param name="paramsArray">Pointer to a matching array of <see cref="CudaExternalSemaphoreSignalParams"/>.</param>
+    /// <param name="numExtSems">Number of semaphores in the arrays.</param>
+    /// <param name="stream">Target CUDA stream.</param>
+    /// <returns>CUresult — 0 on success.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuSignalExternalSemaphoresAsync(
+        in nint extSemArray, in CudaExternalSemaphoreSignalParams paramsArray, uint numExtSems, nint stream);
+
+    /// <summary>Destroys an imported external semaphore handle. Does not affect the underlying Vulkan semaphore.</summary>
+    /// <param name="extSem">The CUexternalSemaphore handle to destroy.</param>
+    /// <returns>CUresult — 0 on success.</returns>
+    [LibraryImport(LibName)]
+    internal static partial int cuDestroyExternalSemaphore(nint extSem);
+
     // ── Error ───────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]
