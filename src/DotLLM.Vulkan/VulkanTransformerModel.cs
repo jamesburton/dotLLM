@@ -990,6 +990,20 @@ public sealed class VulkanTransformerModel : IModel
         Environment.GetEnvironmentVariable(DisableMmqEnvVar) == "1";
 
     /// <summary>
+    /// Env-var opt-IN for the projection-overlap decode PoC (issue #336). Set
+    /// <c>DOTLLM_VULKAN_ENABLE_PROJ_OVERLAP=1</c> to quantize the shared activation ONCE and
+    /// then issue an independent group of MMVQ projections (K‖V) back-to-back with no
+    /// intervening barrier — letting the GPU pipeline the GEMVs (the regime the MMVQ
+    /// bandwidth microbench hit 270–423 GB/s in). Default OFF: unvalidated, opt-in so A/B
+    /// is enable-vs-off. Bit-exact vs the per-op path (same activation quantized identically;
+    /// disjoint outputs). Falls back to the serial path when the group isn't MMVQ-eligible.
+    /// </summary>
+    internal const string EnableProjOverlapEnvVar = "DOTLLM_VULKAN_ENABLE_PROJ_OVERLAP";
+
+    internal static bool IsProjOverlapEnabled() =>
+        Environment.GetEnvironmentVariable(EnableProjOverlapEnvVar) == "1";
+
+    /// <summary>
     /// Records the attention dispatch using Flash-Attention when the kernel
     /// is available, head_dim fits the shader bound, and the sequence is in
     /// the prefill regime (seqQ &gt; 1); falls back to the legacy per-token
@@ -2018,16 +2032,24 @@ public sealed class VulkanTransformerModel : IModel
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
             // K/V projections — read the normalised hidden state written above.
-            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
-                lw.KOutputDim, lw.KInputDim, seqLen);
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
-            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
-                lw.VOutputDim, lw.VInputDim, seqLen);
+            // PoC #336: K and V both read NormOutput and write disjoint buffers, so when both
+            // are MMVQ-eligible they overlap via one shared activation quantize + no barrier
+            // between the two GEMVs. Else the serial per-op path (each quantizes internally).
+            if (!TryRecordMmvqOverlapPair(cmdBuf, _state.NormOutput, lw.KInputDim, seqLen,
+                    lw.K, lw.KDeviceQuantType, _state.K, lw.KOutputDim,
+                    lw.V, lw.VDeviceQuantType, _state.V, lw.VOutputDim))
+            {
+                RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
+                    lw.KOutputDim, lw.KInputDim, seqLen);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
+                    lw.VOutputDim, lw.VInputDim, seqLen);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
             // Optional QKV biases — kernel path keeps the whole forward in
             // one submit. Each bias add writes a different output buffer
             // (Q / K / V are independent), so no inter-bias barrier needed.
-            KernelSupport.ComputeToComputeBarrier(cmdBuf);
             if (lw.QBias is not null) _biasAdd.Record(cmdBuf, _state.Q, lw.QBias, seqLen, lw.QOutputDim);
             if (lw.KBias is not null) _biasAdd.Record(cmdBuf, _state.K, lw.KBias, seqLen, lw.KOutputDim);
             if (lw.VBias is not null) _biasAdd.Record(cmdBuf, _state.V, lw.VBias, seqLen, lw.VOutputDim);
@@ -3869,6 +3891,64 @@ public sealed class VulkanTransformerModel : IModel
         };
         VulkanApi.vkCmdCopyBuffer(cmdBuf, deltaSum.Handle, y.Handle, 1, region);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
+    }
+
+    /// <summary>
+    /// True when <paramref name="qt"/>/<paramref name="inputDim"/> can run through a decode
+    /// MMVQ kernel that reads a pre-quantized Q8_1 activation (Q8_0 or Q4_K weights). Q4_K
+    /// also requires <c>inputDim % 256 == 0</c>. The kernels are null when MMVQ is unsupported
+    /// or disabled, so this also returns false in those cases.
+    /// </summary>
+    private bool MmvqOverlapEligible(QuantType qt, int inputDim) =>
+        (qt == QuantType.Q8_0 && _matmulQ8Mmvq is not null)
+        || (qt == QuantType.Q4_K && _matmulQ4KMmvq is not null
+            && (inputDim % MatMulQ4KMmvqKernel.Q4KGroupSize) == 0);
+
+    /// <summary>
+    /// Records one MMVQ decode GEMV against the <b>already-quantized</b> shared activation in
+    /// <c>_state.Q8_1Xq</c>/<c>Q8_1Xds</c> — no activation quantize, no barrier. Caller must
+    /// have quantized the activation and barriered before the first such call.
+    /// </summary>
+    private void RecordMmvqPrequantized(
+        nint cmdBuf, VulkanDevice.Buffer weights, QuantType qt, VulkanDevice.Buffer output, int m, int k)
+    {
+        if (qt == QuantType.Q8_0)
+            _matmulQ8Mmvq!.Record(cmdBuf, weights, _state.Q8_1Xq!, _state.Q8_1Xds!, output, m: m, k: k);
+        else // Q4_K
+            _matmulQ4KMmvq!.Record(cmdBuf, weights, _state.Q8_1Xq!, _state.Q8_1Xds!, output, m: m, k: k);
+    }
+
+    /// <summary>
+    /// Projection-overlap PoC (issue #336): when both ops in an independent pair read the SAME
+    /// activation <paramref name="input"/> (e.g. K‖V — both read the attn-normed hidden) and
+    /// are MMVQ-eligible, quantize the activation to Q8_1 <b>once</b>, then issue the two MMVQ
+    /// GEMVs back-to-back with <b>no barrier between them</b> (read-after-read on the shared
+    /// Q8_1 scratch; disjoint outputs), one barrier after. This removes the shared-scratch
+    /// hazard that serialised the per-op path and lets the GPU pipeline the two GEMVs, and it
+    /// drops one redundant activation quantize. Bit-exact vs two separate <c>RecordMatmul</c>
+    /// calls. Returns false (caller uses the serial per-op path) when disabled, not decode,
+    /// or either op is not MMVQ-eligible.
+    /// </summary>
+    private bool TryRecordMmvqOverlapPair(
+        nint cmdBuf, VulkanDevice.Buffer input, int inputDim, int seqLen,
+        VulkanDevice.Buffer w1, QuantType qt1, VulkanDevice.Buffer out1, int m1,
+        VulkanDevice.Buffer w2, QuantType qt2, VulkanDevice.Buffer out2, int m2)
+    {
+        if (!IsProjOverlapEnabled() || seqLen != 1) return false;
+        if (_quantizeQ8_1 is null || _state.Q8_1Xq is null || _state.Q8_1Xds is null) return false;
+        if ((inputDim % QuantizeQ8_1Kernel.GroupSize) != 0) return false;
+        if (QuantizeQ8_1Kernel.PackedBytes(inputDim) > _state.Q8_1Xq.Size) return false;
+        if (QuantizeQ8_1Kernel.ScaleBytes(inputDim) > _state.Q8_1Xds.Size) return false;
+        if (!MmvqOverlapEligible(qt1, inputDim) || !MmvqOverlapEligible(qt2, inputDim)) return false;
+
+        _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // No barrier between the two GEMVs: both read the immutable shared Q8_1 activation and
+        // write disjoint outputs, so the GPU is free to pipeline them.
+        RecordMmvqPrequantized(cmdBuf, w1, qt1, out1, m1, inputDim);
+        RecordMmvqPrequantized(cmdBuf, w2, qt2, out2, m2, inputDim);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        return true;
     }
 
     private void RecordMatmul(
