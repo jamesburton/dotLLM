@@ -76,6 +76,18 @@ In continuous batching, different sequences may use different adapters:
 
 This is less efficient than uniform batching but the LoRA matmuls are small (low rank) so the overhead is modest.
 
+## Adapter Stacking (multi-adapter composition)
+
+Distinct from per-sequence batching above, **stacking** composes 2+ adapters onto a *single* request — e.g. `--lora instruct --lora tooluse --lora coding`, optionally weighted (`--lora coding=0.7`). The composed behaviour is the additive sum of each adapter's delta:
+
+```
+y += Σᵢ  wᵢ · (αᵢ/rᵢ) · (x · Bᵢ) · Aᵢ
+```
+
+Because the delta is linear, `LoraComposer.Compose` realises this by **rank-concatenation** into a single composite adapter: `B = [B₁;…;Bₙ]` (rows stacked on the rank axis), `A = [A₁'|…|Aₙ']` (columns concatenated, each `Aᵢ' = (wᵢ·αᵢ/rᵢ)·Aᵢ`), with the composite's `Alpha = Rank = Σrᵢ` so the runtime `scale = Alpha/Rank = 1`. The composite is an ordinary `ILoraAdapter`, so **every backend (CPU, CUDA, hybrid) applies it through the existing single-adapter path with no kernel changes**, capped at `CudaForwardState.MaxLoraRank` (256).
+
+Constraints (current): stacked adapters must have **uniform site coverage** (every `(layer, projection)` targeted by one is targeted by all) and **F32 weights**. A single `--lora` bypasses composition entirely (so non-F32 single adapters are unaffected). GPU stacked-parity is validated by a separate env-gated test.
+
 ## Design Decisions
 
 - **No weight merging**: Adapters are never merged into base weights (`W' = W + αBA`). This enables instant switching and concurrent adapters. Trade-off: small per-layer overhead vs. large flexibility gain.
