@@ -170,10 +170,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
 
-        /// <summary>Path to a HuggingFace PEFT LoRA adapter directory to apply at inference time.</summary>
+        /// <summary>
+        /// Paths to HuggingFace PEFT LoRA adapter directories. Repeatable — each occurrence adds one
+        /// adapter. Optionally suffix with <c>=weight</c> (e.g. <c>path/to/lora=0.7</c>) to blend.
+        /// Two or more adapters are rank-concatenated into a single composite via <see cref="LoraComposer"/>.
+        /// </summary>
         [CommandOption("--lora")]
-        [Description("Path to a HuggingFace PEFT LoRA adapter (directory containing adapter_config.json + adapter_model.safetensors). Omit for base model.")]
-        public string? LoraPath { get; set; }
+        [Description("Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base.")]
+        public string[] LoraPaths { get; set; } = Array.Empty<string>();
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -253,13 +257,40 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
         }
 
-        // Load LoRA adapter if requested
+        // Load LoRA adapter(s) if requested.
+        // innerAdapters: every per-spec adapter (must be disposed in finally).
+        // compositeAdapter: rank-concat result when >1 adapter (also dispose in finally).
+        // loraAdapter: the single adapter passed to the generator (either one inner or the composite).
+        var innerAdapters = new List<ILoraAdapter>();
+        ILoraAdapter? compositeAdapter = null;
         ILoraAdapter? loraAdapter = null;
-        if (!string.IsNullOrEmpty(settings.LoraPath))
+
+        if (settings.LoraPaths.Length > 0)
         {
-            loraAdapter = PeftAdapterLoader.LoadFromDirectory("cli", settings.LoraPath, config);
-            if (!loraAdapter.IsCompatible(config))
-                throw new InvalidOperationException($"LoRA adapter at '{settings.LoraPath}' is incompatible with this base model.");
+            var stack = new List<(ILoraAdapter adapter, float weight)>(settings.LoraPaths.Length);
+            for (int i = 0; i < settings.LoraPaths.Length; i++)
+            {
+                var (path, weight) = LoraSpec.Parse(settings.LoraPaths[i]);
+                string adapterName = $"cli[{i}]";
+                var inner = PeftAdapterLoader.LoadFromDirectory(adapterName, path, config);
+                innerAdapters.Add(inner);
+                if (!inner.IsCompatible(config))
+                    throw new InvalidOperationException(
+                        $"LoRA adapter at '{path}' is incompatible with this base model.");
+                stack.Add((inner, weight));
+            }
+
+            if (stack.Count == 1)
+            {
+                // Single adapter: pass directly; avoids the F32-only composer constraint.
+                loraAdapter = stack[0].adapter;
+            }
+            else
+            {
+                // Multiple adapters: compose into a single rank-concatenated adapter.
+                compositeAdapter = LoraComposer.Compose(stack, config);
+                loraAdapter = compositeAdapter;
+            }
         }
 
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
@@ -418,7 +449,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 if (!settings.Json)
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)}[/]");
 
-                if (loraAdapter is not null)
+                if (settings.LoraPaths.Length > 0)
                 {
                     const string specLoraWarning = "WARNING: --lora with speculative decoding does not adapt the draft model; acceptance rates may degrade.";
                     if (settings.Json) Console.Error.WriteLine(specLoraWarning);
@@ -617,7 +648,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
-            loraAdapter?.Dispose();
+            // Dispose in reverse dependency order: composite first, then each inner adapter.
+            compositeAdapter?.Dispose();
+            foreach (var inner in innerAdapters)
+                inner.Dispose();
             pagedFactory?.Dispose();
             model.Dispose();
             gguf.Dispose();
