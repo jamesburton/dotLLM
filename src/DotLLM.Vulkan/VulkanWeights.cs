@@ -329,6 +329,20 @@ internal sealed class VulkanWeights : IDisposable
         public readonly VulkanDevice.Buffer? PostFfnNormWeight;
 
         /// <summary>
+        /// BitNet b1.58 Sub-LN: optional RMSNorm over the attention output
+        /// [hiddenSize] applied BEFORE the output projection. Null on every
+        /// non-BitNet architecture (no extra norm).
+        /// </summary>
+        public readonly VulkanDevice.Buffer? AttnSubNormWeight;
+
+        /// <summary>
+        /// BitNet b1.58 Sub-LN: optional RMSNorm over the gated FFN intermediate
+        /// [intermediateSize] applied BEFORE the down projection. Null on every
+        /// non-BitNet architecture.
+        /// </summary>
+        public readonly VulkanDevice.Buffer? FfnSubNormWeight;
+
+        /// <summary>
         /// Non-null when the layer uses MLA attention (DeepSeek-V2/V3).
         /// Forward routes through <c>RecordMlaLayer</c> and the Q/K/V slots
         /// above are unused (zero buffers).
@@ -379,6 +393,8 @@ internal sealed class VulkanWeights : IDisposable
             VulkanDevice.Buffer? gateBias, VulkanDevice.Buffer? upBias, VulkanDevice.Buffer? downBias,
             VulkanDevice.Buffer? postAttnNorm = null,
             VulkanDevice.Buffer? postFfnNorm = null,
+            VulkanDevice.Buffer? attnSubNorm = null,
+            VulkanDevice.Buffer? ffnSubNorm = null,
             MlaLayerBuffers? mla = null,
             MoeLayerBuffers? moe = null,
             Gemma4LayerBuffers? gemma4 = null,
@@ -390,6 +406,8 @@ internal sealed class VulkanWeights : IDisposable
             KNormWeight = kNorm;
             PostAttnNormWeight = postAttnNorm;
             PostFfnNormWeight = postFfnNorm;
+            AttnSubNormWeight = attnSubNorm;
+            FfnSubNormWeight = ffnSubNorm;
             Q = q; QDeviceQuantType = qQt; QOutputDim = qM; QInputDim = qK;
             K = k; KDeviceQuantType = kQt; KOutputDim = kM; KInputDim = kK;
             V = v; VDeviceQuantType = vQt; VOutputDim = vM; VInputDim = vK;
@@ -413,6 +431,8 @@ internal sealed class VulkanWeights : IDisposable
             QNormWeight?.Dispose(); KNormWeight?.Dispose();
             PostAttnNormWeight?.Dispose();
             PostFfnNormWeight?.Dispose();
+            AttnSubNormWeight?.Dispose();
+            FfnSubNormWeight?.Dispose();
             FfnNormWeight.Dispose();
             Gate.Dispose(); Up.Dispose(); Down.Dispose();
             GateBias?.Dispose(); UpBias?.Dispose(); DownBias?.Dispose();
@@ -598,6 +618,16 @@ internal sealed class VulkanWeights : IDisposable
             if (!isGemma4 && lw.PostFfnNormWeight is not null)
                 totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
 
+            // BitNet b1.58 Sub-LN: optional RMSNorm weights applied to the attention
+            // output (before o_proj) and the gated FFN intermediate (before ffn_down).
+            // Null on every non-BitNet architecture (UploadOptionalVec returns null).
+            var attnSubNorm = UploadOptionalVec(device, staging, lw.AttnSubNormWeight);
+            if (lw.AttnSubNormWeight is not null)
+                totalBytes += (long)lw.AttnSubNormWeight.Length * sizeof(float);
+            var ffnSubNorm = UploadOptionalVec(device, staging, lw.FfnSubNormWeight);
+            if (lw.FfnSubNormWeight is not null)
+                totalBytes += (long)lw.FfnSubNormWeight.Length * sizeof(float);
+
             // MoE layers replace the dense Gate/Up/Down with per-expert
             // banks (lw.Moe). Stub the dense slots with 64-byte buffers so
             // the LayerBuffers contract still holds — the forward pass
@@ -695,6 +725,7 @@ internal sealed class VulkanWeights : IDisposable
                 down, downDeviceQt, lw.DownOutputDim, lw.DownInputDim,
                 gateBias, upBias, downBias,
                 postAttnNorm, postFfnNorm,
+                attnSubNorm, ffnSubNorm,
                 mla, moe, gemma4,
                 qNorm, kNorm);
 
@@ -884,6 +915,13 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepIq1SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.IQ1_S && (inputDim % 256) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as raw I2_S (BitNet b1.58
+    /// ternary): m·(K/4) packed bytes + one trailing per-tensor float32 scale. Gated on the
+    /// contraction axis being a multiple of the I2_S block size (128), which the GEMV/GEMM
+    /// kernels require.</summary>
+    private static bool KeepI2SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.I2_S && (inputDim % 128) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
     /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / F16 / BF16 / F32 depending on the source and the
     /// alignment constraints.</summary>
@@ -937,6 +975,7 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepIq3XxsOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_XXS;
         if (KeepIq3SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_S;
         if (KeepIq1SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ1_S;
+        if (KeepI2SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.I2_S;
         if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
         if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
         return QuantizationType.F32;
@@ -1013,6 +1052,9 @@ internal sealed class VulkanWeights : IDisposable
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ3_S) * outputDim;
         if (KeepIq1SOnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.IQ1_S) * outputDim;
+        if (KeepI2SOnDevice(qt, inputDim, dequantToFp32))
+            // m·(K/4) packed bytes + one trailing per-tensor float32 scale.
+            return Dequantize.RowByteSize(inputDim, QuantizationType.I2_S) * outputDim + sizeof(float);
         if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
         if (KeepBf16OnDevice(qt, inputDim, dequantToFp32))
@@ -1064,6 +1106,9 @@ internal sealed class VulkanWeights : IDisposable
         {
             long rowBytes = Dequantize.RowByteSize(inputDim, keepQt);
             long bytes = rowBytes * outputDim;
+            // I2_S carries one trailing per-tensor float32 scale after all packed
+            // rows (at offset m·K/4); the kernels read it from the buffer tail.
+            if (keepQt == QuantizationType.I2_S) bytes += sizeof(float);
 
             // Zero-copy import attempt. Opt out via env var so the staging path
             // can be exercised on a host that does support the extension —
@@ -1108,6 +1153,14 @@ internal sealed class VulkanWeights : IDisposable
             {
                 new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
                     .CopyTo(new Span<float>(d, checked((int)elems)));
+            }
+            else if (qt == QuantizationType.I2_S)
+            {
+                // I2_S has a single per-tensor scale at the tail (offset m·K/4), so it must
+                // be dequantised over the whole tensor at once — a per-row loop would read
+                // the scale from mid-matrix packed bytes. Reached only when the raw I2_S
+                // path is bypassed (dequant forced, e.g. lm_head, or K % 128 != 0).
+                Dequantize.ToFloat32(srcPtr, elems, qt, new Span<float>(d, checked((int)elems)));
             }
             else
             {
