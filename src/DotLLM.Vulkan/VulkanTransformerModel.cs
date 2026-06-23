@@ -101,6 +101,11 @@ public sealed class VulkanTransformerModel : IModel
     // for GEMM. 256-element super-block alignment.
     private readonly MatMulIq1SGemvF32Kernel _matmulIq1S;
     private readonly MatMulIq1SGemmF32Kernel _matmulIq1SGemm;
+    // I2_S matmul kernels — BitNet b1.58 ternary (~1.6 bpw). 128-element block
+    // alignment; raw on-device layout is m·(K/4) packed bytes + one trailing
+    // per-tensor float32 scale. Decode via GEMV, prefill via 16x16-tiled GEMM.
+    private readonly MatMulI2SGemvF32Kernel _matmulI2S;
+    private readonly MatMulI2SGemmF32Kernel _matmulI2SGemm;
     // Q6_K_M matmul kernels — Phase 1 sibling of Q4_K / Q5_K, completing the
     // K-quant matmul kernel coverage. Q6_K is structurally simpler on the
     // metadata side (no dmin / 6-bit-packed scales) but has a more intricate
@@ -190,6 +195,10 @@ public sealed class VulkanTransformerModel : IModel
     // model's ActivationFunction is GELUTanh (Gemma 2 / Gemma 3). Null on
     // every SwiGLU architecture so the standard path is byte-identical.
     private readonly GeGluTanhF32Kernel? _geglu;
+    // Gated squared-ReLU (relu(gate)²·up) FFN activation — created only when the
+    // model's ActivationFunction is ReluSquared (BitNet b1.58). Null on every
+    // SwiGLU/GeGLU architecture so the standard path is byte-identical.
+    private readonly ReLU2GluF32Kernel? _relu2glu;
     // In-place scalar multiply for the Gemma sqrt(hidden) embedding scale —
     // created only when Config.EmbeddingScale is set. Null otherwise. Also
     // reused for the Gemma-4 per-layer output scale (layer_output_scale).
@@ -390,6 +399,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq3XxsGemvF32Kernel matmulIq3Xxs, MatMulIq3XxsGemmF32Kernel matmulIq3XxsGemm,
         MatMulIq3SGemvF32Kernel matmulIq3S, MatMulIq3SGemmF32Kernel matmulIq3SGemm,
         MatMulIq1SGemvF32Kernel matmulIq1S, MatMulIq1SGemmF32Kernel matmulIq1SGemm,
+        MatMulI2SGemvF32Kernel matmulI2S, MatMulI2SGemmF32Kernel matmulI2SGemm,
         MatMulF16GemvF32Kernel matmulF16, MatMulF16GemmF32Kernel matmulF16Gemm,
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
@@ -399,7 +409,8 @@ public sealed class VulkanTransformerModel : IModel
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
-        SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ScaleInplaceF32Kernel? embedScale, AddKernel add,
+        SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
+        ScaleInplaceF32Kernel? embedScale, AddKernel add,
         BiasAddF32Kernel biasAdd,
         AttentionMlaF32Kernel? mlaAttention, RopeMlaF32Kernel? mlaRope, MlaKvSplitF32Kernel? mlaKvSplit,
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
@@ -459,6 +470,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq3SGemm = matmulIq3SGemm;
         _matmulIq1S = matmulIq1S;
         _matmulIq1SGemm = matmulIq1SGemm;
+        _matmulI2S = matmulI2S;
+        _matmulI2SGemm = matmulI2SGemm;
         _matmulF16 = matmulF16;
         _matmulF16Gemm = matmulF16Gemm;
         _matmulF16GemmCoopmat = matmulF16GemmCoopmat;
@@ -476,6 +489,7 @@ public sealed class VulkanTransformerModel : IModel
         _flashAttention = flashAttention;
         _swiglu = swiglu;
         _geglu = geglu;
+        _relu2glu = relu2glu;
         _embedScale = embedScale;
         _add = add;
         _biasAdd = biasAdd;
@@ -800,6 +814,10 @@ public sealed class VulkanTransformerModel : IModel
         // created; closes the IQ-family Vulkan matmul coverage.
         var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
         var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
+        // I2_S GEMV + GEMM — BitNet b1.58 ternary. Always created; the dispatcher
+        // routes per device-side QuantizationType.
+        var matmulI2S = MatMulI2SGemvF32Kernel.Create(device, spvDir);
+        var matmulI2SGemm = MatMulI2SGemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created; the
         // dispatcher routes per device-side QuantizationType. The F16 GEMM
         // coopmat path is opportunistic (null on devices without coopmat).
@@ -848,6 +866,12 @@ public sealed class VulkanTransformerModel : IModel
         GeGluTanhF32Kernel? geglu =
             config.ActivationFunction == ActivationFunction.GELUTanh
                 ? GeGluTanhF32Kernel.Create(device, spvDir)
+                : null;
+        // BitNet gated squared-ReLU FFN activation — created only for ReluSquared
+        // models so the SwiGLU/GeGLU paths stay untouched.
+        ReLU2GluF32Kernel? relu2glu =
+            config.ActivationFunction == ActivationFunction.ReluSquared
+                ? ReLU2GluF32Kernel.Create(device, spvDir)
                 : null;
         ScaleInplaceF32Kernel? embedScale =
             config.EmbeddingScale is float es && es != 1.0f
@@ -943,13 +967,14 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq3Xxs, matmulIq3XxsGemm,
             matmulIq3S, matmulIq3SGemm,
             matmulIq1S, matmulIq1SGemm,
+            matmulI2S, matmulI2SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
             matmulQ4KMmvq,
             quantizeQ8_1Rows, matmulQ8Mmq,
-            rmsnorm, rope, attention, flashAttention, swiglu, geglu, embedScale, add,
+            rmsnorm, rope, attention, flashAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -1773,6 +1798,15 @@ public sealed class VulkanTransformerModel : IModel
             // batched O projection reads the freshly-scattered _state.AttnOutput.
             KernelSupport.TransferToComputeBarrier(cmdBuf);
 
+            // BitNet Sub-LN: in-place RMSNorm over the attention output before the
+            // batched output projection. No-op for non-BitNet (AttnSubNormWeight null).
+            if (lw.AttnSubNormWeight is { } attnSubNorm)
+            {
+                _rmsnorm.Record(cmdBuf, _state.AttnOutput, attnSubNorm, _state.AttnOutput,
+                    rowCount: totalTokens, n: lw.OInputDim, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
             // Batched O projection → NormOutput.
             RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
                 lw.OOutputDim, lw.OInputDim, totalTokens);
@@ -1804,8 +1838,23 @@ public sealed class VulkanTransformerModel : IModel
             if (lw.GateBias is not null || lw.UpBias is not null)
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-            _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, totalTokens * intermediateSize);
+            // FFN gate activation: gated squared-ReLU (BitNet) when _relu2glu is
+            // non-null, otherwise the standard SwiGLU. (No GeGLU in this path — the
+            // simple-batched path is never taken by Gemma's four-norm layout.)
+            if (_relu2glu is not null)
+                _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, totalTokens * intermediateSize);
+            else
+                _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, totalTokens * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
+            // the batched down projection. No-op for non-BitNet (FfnSubNormWeight null).
+            if (lw.FfnSubNormWeight is { } ffnSubNorm)
+            {
+                _rmsnorm.Record(cmdBuf, _state.SiluOutput, ffnSubNorm, _state.SiluOutput,
+                    rowCount: totalTokens, n: lw.DownInputDim, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
             RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
                 lw.DownOutputDim, lw.DownInputDim, totalTokens);
@@ -2154,6 +2203,15 @@ public sealed class VulkanTransformerModel : IModel
                 softCap: attnSoftCap, scaleOverride: attnScaleOverride);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
+            // BitNet Sub-LN: in-place RMSNorm over the attention output before the
+            // output projection. No-op for non-BitNet (AttnSubNormWeight null).
+            if (lw.AttnSubNormWeight is { } attnSubNorm)
+            {
+                _rmsnorm.Record(cmdBuf, _state.AttnOutput, attnSubNorm, _state.AttnOutput,
+                    rowCount: seqLen, n: lw.OInputDim, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
+
             // Output projection → NormOutput (reuse slot).
             RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
                 lw.OOutputDim, lw.OInputDim, seqLen);
@@ -2266,13 +2324,25 @@ public sealed class VulkanTransformerModel : IModel
             }
 
             // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
-            // otherwise the standard SwiGLU. Both fuse gate*act + up into
-            // SiluOutput; only the gate non-linearity differs.
+            // gated squared-ReLU (BitNet) when _relu2glu is non-null, otherwise
+            // the standard SwiGLU. All fuse gate*act + up into SiluOutput; only
+            // the gate non-linearity differs.
             if (_geglu is not null)
                 _geglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
+            else if (_relu2glu is not null)
+                _relu2glu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             else
                 _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+            // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
+            // the down projection. No-op for non-BitNet (FfnSubNormWeight null).
+            if (lw.FfnSubNormWeight is { } ffnSubNorm)
+            {
+                _rmsnorm.Record(cmdBuf, _state.SiluOutput, ffnSubNorm, _state.SiluOutput,
+                    rowCount: seqLen, n: lw.DownInputDim, eps: eps);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            }
 
             // Down projection
             RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
@@ -2543,6 +2613,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq3SGemm.InvalidateDescriptorCache();
         _matmulIq1S.InvalidateDescriptorCache();
         _matmulIq1SGemm.InvalidateDescriptorCache();
+        _matmulI2S.InvalidateDescriptorCache();
+        _matmulI2SGemm.InvalidateDescriptorCache();
         _matmulF16.InvalidateDescriptorCache();
         _matmulF16Gemm.InvalidateDescriptorCache();
         _matmulF16GemmCoopmat?.InvalidateDescriptorCache();
@@ -2560,6 +2632,7 @@ public sealed class VulkanTransformerModel : IModel
         _flashAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _geglu?.InvalidateDescriptorCache();
+        _relu2glu?.InvalidateDescriptorCache();
         _embedScale?.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -4283,6 +4356,22 @@ public sealed class VulkanTransformerModel : IModel
             else
                 _matmulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
+        else if (weightQt == QuantType.I2_S)
+        {
+            // I2_S (BitNet b1.58 ternary): 128-element block alignment (enforced by
+            // KeepI2SOnDevice). Decode via GEMV, prefill via 16x16-tiled GEMM. The
+            // per-tensor scale lives at the weight-buffer tail; both kernels read it.
+            if (seqLen == 1)
+            {
+                _matmulI2S.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim);
+            }
+            else
+            {
+                _matmulI2SGemm.Record(cmdBuf, weights, input, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
+        }
         else if (weightQt == QuantType.IQ1_S)
         {
             // IQ1_S: 256-element super-block alignment, ~1.5-1.7 bpw smallest GGUF quant.
@@ -4466,6 +4555,7 @@ public sealed class VulkanTransformerModel : IModel
         _add.Dispose();
         _swiglu.Dispose();
         _geglu?.Dispose();
+        _relu2glu?.Dispose();
         _embedScale?.Dispose();
         _gemma4OnesVec?.Dispose();
         _flashAttention?.Dispose();
@@ -4480,6 +4570,8 @@ public sealed class VulkanTransformerModel : IModel
         _matmulF16.Dispose();
         _matmulIq1SGemm.Dispose();
         _matmulIq1S.Dispose();
+        _matmulI2SGemm.Dispose();
+        _matmulI2S.Dispose();
         _matmulIq4XsGemm.Dispose();
         _matmulIq4Xs.Dispose();
         _matmulIq4NlGemm.Dispose();
