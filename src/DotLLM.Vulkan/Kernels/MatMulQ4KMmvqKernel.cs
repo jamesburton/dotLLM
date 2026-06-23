@@ -38,8 +38,9 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
     /// <summary>Elements per Q4_K super-block.</summary>
     public const int Q4KGroupSize = 256;
 
-    /// <summary>Workgroup width — must match the shader's <c>local_size_x</c>.</summary>
-    private const int WorkgroupSize = 128;
+    /// <summary>Workgroup width — must match the shader's <c>local_size_x</c>. One
+    /// wave32 subgroup per output row (issue #338 coalesced lane=K-position GEMV).</summary>
+    private const int WorkgroupSize = 32;
 
     private const int PushConstantBytes = 4 * sizeof(uint); // M, K, blocksPerRow, pad
 
