@@ -1,0 +1,93 @@
+#version 450
+// I2_S (BitNet b1.58 ternary) matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = scale * sum_k (code(m,k) - 1) * x[k]
+//
+// Sibling of matmul_q2_k_f32_gemv.comp — same dispatch model (one workgroup per
+// output row, 128 threads, shared-memory tree reduce). I2_S is the densest
+// supported quant (~1.6 bpw): each weight is a ternary code {0,1,2} → {-1,0,+1}.
+//
+// Weight layout (matches DotLLM.Cpu.Kernels.MatMul.GemvI2_S / UnpackRow byte-for-byte
+// and bitnet.cpp's I2_S):
+//   Each 128 contiguous elements of a row form one block of 32 bytes:
+//       byte gp (0..31) packs 4 ternary codes (2 bits each) for elements
+//       {gp, gp+32, gp+64, gp+96} at bit offsets {6, 4, 2, 0} respectively.
+//       value = code - 1.
+//   Row stride = K / 4 bytes. There is ONE per-tensor float32 scale for the whole
+//   matrix, stored at byte offset M * (K / 4) (immediately after all packed rows).
+//
+// The scale is fetched in-shader from the weight buffer tail (M*(K/4) is a multiple
+// of 4 because K is a multiple of 128), mirroring the CPU/CUDA convention — the host
+// passes only the weight buffer + dims, no scale push constant.
+//
+// Dispatch: one workgroup per output row (gl_WorkGroupID.x = m), 128 threads stride
+// across the row's 128-element blocks and accumulate, then reduce in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 128
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint I2S_BLOCK_BYTES = 32u;
+const uint I2S_GROUP_SIZE  = 128u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowByteStride = pc.blocksPerRow * I2S_BLOCK_BYTES;   // = K / 4
+    uint rowByteBase = m * rowByteStride;
+
+    // Per-tensor float32 scale at the weight-buffer tail (byte offset M*(K/4)).
+    // M*(K/4) is a multiple of 4, so it is word-aligned — read it directly.
+    uint scaleByteOff = pc.M * rowByteStride;
+    float scale = uintBitsToFloat(weight[scaleByteOff >> 2u]);
+
+    float acc = 0.0;
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint blockByteBase = rowByteBase + b * I2S_BLOCK_BYTES;
+        uint xBase = b * I2S_GROUP_SIZE;
+
+        float subSum = 0.0;
+        for (uint gp = 0u; gp < 32u; gp++) {
+            uint pk = readByte(blockByteBase + gp);
+            float c0 = float(int((pk >> 6u) & 3u) - 1);
+            float c1 = float(int((pk >> 4u) & 3u) - 1);
+            float c2 = float(int((pk >> 2u) & 3u) - 1);
+            float c3 = float(int( pk        & 3u) - 1);
+            subSum += c0 * x[xBase + gp]
+                    + c1 * x[xBase + gp + 32u]
+                    + c2 * x[xBase + gp + 64u]
+                    + c3 * x[xBase + gp + 96u];
+        }
+        acc += subSum;
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0] * scale;
+}
