@@ -1,3 +1,5 @@
+using DotLLM.Core.Attention;
+using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
@@ -105,6 +107,76 @@ public sealed class BitNetVulkanAccuracyTests
         }
 
         AssertLogitParity(cpuVec, vkVec, tokenizer, "decode/GEMV");
+    }
+
+    [SkippableFact]
+    public unsafe void CpuVsVulkan_BatchedPrefill_LastTokenLogits_Match()
+    {
+        Skip.If(ModelPath is null || !File.Exists(ModelPath), "BitNet GGUF not available (set DOTLLM_BITNET_GGUF).");
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
+
+        using var gguf = GgufFile.Open(ModelPath!);
+        var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        int vocab = config.VocabSize;
+
+        // Two distinct prompts ⇒ ≥2 "simple" requests, which routes ForwardBatch through
+        // ForwardBatchSimple (the fused multi-sequence batched path) rather than per-seq
+        // Forward — the only path that exercises that path's I2_S matmuls + Sub-LN + ReLU².
+        string[] prompts = ["The capital of France is", "The sun rises in the"];
+        int[][] tokens = [tokenizer.Encode(prompts[0]), tokenizer.Encode(prompts[1])];
+        foreach (var t in tokens) Assert.True(t.Length > 1, "each batched prompt must be multi-token.");
+
+        // ── CPU reference (golden), per sequence. ──
+        float[][] cpuVecs = new float[prompts.Length][];
+        using (var cpuModel = TransformerModel.LoadFromGguf(gguf, config))
+        {
+            for (int s = 0; s < prompts.Length; s++)
+            {
+                cpuVecs[s] = new float[vocab];
+                using ITensor cpuLogits = cpuModel.Forward(tokens[s], Positions(tokens[s].Length), deviceId: -1);
+                long lastRow = (long)(tokens[s].Length - 1) * vocab;
+                new ReadOnlySpan<float>((float*)cpuLogits.DataPointer + lastRow, vocab).CopyTo(cpuVecs[s]);
+            }
+        }
+
+        // ── Vulkan ForwardBatch (fused batched path under test). ──
+        string spvDir = ResolveSpvDir();
+        float[][] vkVecs = new float[prompts.Length][];
+        using (var vkModel = VulkanTransformerModel.LoadFromGguf(gguf, config, spvDir))
+        {
+            var caches = new IKvCache[prompts.Length];
+            try
+            {
+                var requests = new SequenceForwardRequest[prompts.Length];
+                for (int s = 0; s < prompts.Length; s++)
+                {
+                    caches[s] = vkModel.CreateKvCache(maxSeqLen: tokens[s].Length + 1);
+                    requests[s] = new SequenceForwardRequest
+                    {
+                        TokenIds = tokens[s],
+                        Positions = Positions(tokens[s].Length),
+                        KvCache = caches[s],
+                    };
+                }
+
+                IReadOnlyList<ITensor> results = vkModel.ForwardBatch(requests, deviceId: -1);
+                Assert.Equal(prompts.Length, results.Count);
+                for (int s = 0; s < prompts.Length; s++)
+                {
+                    vkVecs[s] = new float[vocab];
+                    new ReadOnlySpan<float>((float*)results[s].DataPointer, vocab).CopyTo(vkVecs[s]);
+                    results[s].Dispose();
+                }
+            }
+            finally
+            {
+                foreach (var c in caches) c?.Dispose();
+            }
+        }
+
+        for (int s = 0; s < prompts.Length; s++)
+            AssertLogitParity(cpuVecs[s], vkVecs[s], tokenizer, $"batched seq {s} ('{prompts[s]}')");
     }
 
     // ── Helpers ──
