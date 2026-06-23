@@ -54,32 +54,34 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint threads = gl_WorkGroupSize.x;
 
-    uint rowByteStride = pc.blocksPerRow * I2S_BLOCK_BYTES;   // = K / 4
-    uint rowByteBase = m * rowByteStride;
+    uint rowBytes = pc.K >> 2u;        // K/4 packed bytes per row (= blocksPerRow * 32)
+    uint rowByteBase = m * rowBytes;
 
     // Per-tensor float32 scale at the weight-buffer tail (byte offset M*(K/4)).
     // M*(K/4) is a multiple of 4, so it is word-aligned — read it directly.
-    uint scaleByteOff = pc.M * rowByteStride;
+    uint scaleByteOff = pc.M * rowBytes;
     float scale = uintBitsToFloat(weight[scaleByteOff >> 2u]);
 
+    // Stride all 128 lanes over the row's K/4 bytes (one byte = 4 ternary codes →
+    // 4 elements at block-relative positions {gp, gp+32, gp+64, gp+96}). This keeps
+    // every lane busy even when blocksPerRow < 128 (BitNet K dims, e.g. K=2560 → 20
+    // blocks), unlike a one-block-per-lane mapping. Adjacent lanes read adjacent
+    // bytes (same/next uint word) so the weight loads coalesce.
     float acc = 0.0;
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
-        uint blockByteBase = rowByteBase + b * I2S_BLOCK_BYTES;
-        uint xBase = b * I2S_GROUP_SIZE;
+    for (uint byteIdx = tid; byteIdx < rowBytes; byteIdx += threads) {
+        uint b  = byteIdx >> 5u;       // block index (32 bytes per block)
+        uint gp = byteIdx & 31u;       // 0..31 within the block
+        uint xBase = b * I2S_GROUP_SIZE + gp;
 
-        float subSum = 0.0;
-        for (uint gp = 0u; gp < 32u; gp++) {
-            uint pk = readByte(blockByteBase + gp);
-            float c0 = float(int((pk >> 6u) & 3u) - 1);
-            float c1 = float(int((pk >> 4u) & 3u) - 1);
-            float c2 = float(int((pk >> 2u) & 3u) - 1);
-            float c3 = float(int( pk        & 3u) - 1);
-            subSum += c0 * x[xBase + gp]
-                    + c1 * x[xBase + gp + 32u]
-                    + c2 * x[xBase + gp + 64u]
-                    + c3 * x[xBase + gp + 96u];
-        }
-        acc += subSum;
+        uint pk = readByte(rowByteBase + byteIdx);
+        float c0 = float(int((pk >> 6u) & 3u) - 1);
+        float c1 = float(int((pk >> 4u) & 3u) - 1);
+        float c2 = float(int((pk >> 2u) & 3u) - 1);
+        float c3 = float(int( pk        & 3u) - 1);
+        acc += c0 * x[xBase]
+             + c1 * x[xBase + 32u]
+             + c2 * x[xBase + 64u]
+             + c3 * x[xBase + 96u];
     }
 
     partials[tid] = acc;

@@ -45,8 +45,16 @@ public sealed class MatMulI2SGemvF32Kernel : IDisposable
 
     /// <summary>Loads <c>matmul_i2_s_f32_gemv.spv</c> from the given directory and creates the pipeline.</summary>
     public static MatMulI2SGemvF32Kernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, "matmul_i2_s_f32_gemv.spv");
+
+    /// <summary>
+    /// Loads the named SPIR-V from <paramref name="spvDir"/> and creates the pipeline. The
+    /// <paramref name="spvFileName"/> overload exists so a benchmark can A/B successive kernel
+    /// variants (e.g. an alternate-mapping <c>.spv</c>) side by side in one process.
+    /// </summary>
+    public static MatMulI2SGemvF32Kernel Create(VulkanDevice device, string spvDir, string spvFileName)
     {
-        string path = Path.Combine(spvDir, "matmul_i2_s_f32_gemv.spv");
+        string path = Path.Combine(spvDir, spvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
