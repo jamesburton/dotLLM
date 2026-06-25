@@ -1,0 +1,22 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "What is the weather in Tokyo?"
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": "{\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}"
+    }
+  ],
+  "assistant_tool_call": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>",
+  "bos_token": "<|begin_of_text|>",
+  "eos_token": "<|eot_id|>"
+}

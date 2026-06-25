@@ -110,7 +110,7 @@ public static class ServerStartup
         }
 
         // Create chat template
-        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer);
+        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
         if (declaredChatTemplate is null)
             Console.WriteLine("[dotllm] Model has no GGUF chat template; using a plain completion-style transcript.");
         IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);

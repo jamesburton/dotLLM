@@ -303,7 +303,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         {
             string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
             string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer)
+            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture)
                 ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
             var messages = new List<ChatMessage>

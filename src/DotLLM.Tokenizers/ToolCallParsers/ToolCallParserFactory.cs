@@ -48,6 +48,10 @@ public static class ToolCallParserFactory
             // SmolLM3 defaults to the XML (Hermes-compatible) format; the
             // Pythonic variant is template-gated above.
             Architecture.SmolLM3 => new XmlToolCallParser(),
+            // BitNet uses a tool-aware template that emits <tool_call> blocks
+            // (Hermes-compatible). Route to HermesToolCallParser regardless of
+            // what the GGUF metadata declares (the template is substituted).
+            Architecture.BitNet => new HermesToolCallParser(),
             _ => new GenericToolCallParser()
         };
     }

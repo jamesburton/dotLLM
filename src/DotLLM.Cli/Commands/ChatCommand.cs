@@ -258,7 +258,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer!);
+        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer!, config!.Architecture);
         IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
         if (jinjaTemplate is null)
         {
