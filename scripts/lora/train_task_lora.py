@@ -13,6 +13,7 @@ import argparse, os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset_formatters import format_row
 from masking import build_labels
+from tooluse_render import render_tooluse
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import datasets
@@ -67,12 +68,18 @@ def main():
     examples = []
     for row in ds:
         try:
-            msgs = format_row(args.task, row)
+            if args.task == "tooluse":
+                # Route through the canonical tool-use renderer so the <tools> block
+                # is template-generated (matching dotLLM serving) rather than baked
+                # from the dataset's raw system text — closes the U1 FORMAT.md §5 caveat.
+                ids, labels = render_tooluse(tok, row)
+            else:
+                msgs = format_row(args.task, row)
+                if len(msgs) < 2 or msgs[-1]["role"] != "assistant":
+                    continue
+                ids, labels = render(tok, msgs)
         except (KeyError, ValueError):
             continue
-        if len(msgs) < 2 or msgs[-1]["role"] != "assistant":
-            continue
-        ids, labels = render(tok, msgs)
         if len(ids) <= 4096:
             examples.append((ids, labels))
         if len(examples) >= args.max_examples:
