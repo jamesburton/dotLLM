@@ -207,6 +207,7 @@ public sealed class VulkanTransformerModel : IModel
     private readonly QuantizeQ8_1RowsKernel? _quantizeQ8_1Rows;
     private readonly MatMulQ8_0MmqKernel? _matmulQ8Mmq;
     private readonly MatMulQ4KMmqKernel? _matmulQ4KMmq;
+    private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -447,6 +448,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq1SMmvqKernel? matmulIq1SMmvq,
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
         MatMulQ4KMmqKernel? matmulQ4KMmq,
+        MatMulQ6KMmqKernel? matmulQ6KMmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
@@ -536,6 +538,7 @@ public sealed class VulkanTransformerModel : IModel
         _quantizeQ8_1Rows = quantizeQ8_1Rows;
         _matmulQ8Mmq = matmulQ8Mmq;
         _matmulQ4KMmq = matmulQ4KMmq;
+        _matmulQ6KMmq = matmulQ6KMmq;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -811,6 +814,7 @@ public sealed class VulkanTransformerModel : IModel
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows = null;
         MatMulQ8_0MmqKernel? matmulQ8Mmq = null;
         MatMulQ4KMmqKernel? matmulQ4KMmq = null;
+        MatMulQ6KMmqKernel? matmulQ6KMmq = null;
         if (!IsMmqDisabled() && device.HasIntegerDotProduct)
         {
             quantizeQ8_1Rows = QuantizeQ8_1RowsKernel.TryCreate(device, spvDir);
@@ -821,7 +825,8 @@ public sealed class VulkanTransformerModel : IModel
                 // MMQ kernel loaded (issue #340 adds Q4_K alongside Q8_0).
                 matmulQ8Mmq = MatMulQ8_0MmqKernel.TryCreate(device, spvDir);
                 matmulQ4KMmq = MatMulQ4KMmqKernel.TryCreate(device, spvDir);
-                if (matmulQ8Mmq is null && matmulQ4KMmq is null)
+                matmulQ6KMmq = MatMulQ6KMmqKernel.TryCreate(device, spvDir);
+                if (matmulQ8Mmq is null && matmulQ4KMmq is null && matmulQ6KMmq is null)
                 {
                     quantizeQ8_1Rows.Dispose();
                     quantizeQ8_1Rows = null;
@@ -832,7 +837,7 @@ public sealed class VulkanTransformerModel : IModel
         // the mmvqEnabled allocation gate — both pairs need the same device
         // integer-dot support. Enable the rows scratch when any MMQ path is live.
         bool mmqEnabled = quantizeQ8_1Rows is not null
-            && (matmulQ8Mmq is not null || matmulQ4KMmq is not null);
+            && (matmulQ8Mmq is not null || matmulQ4KMmq is not null || matmulQ6KMmq is not null);
 
         // Gemma-4 has a dual head dim (sliding 256 / global 512) and dual KV-head
         // count (sliding 8 / global 2). Size the Q/K/V/AttnOutput scratch for the
@@ -1091,6 +1096,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq1SMmvq,
             quantizeQ8_1Rows, matmulQ8Mmq,
             matmulQ4KMmq,
+            matmulQ6KMmq,
             rmsnorm, rope, attention, flashAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
@@ -4497,6 +4503,22 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulQ6K.Record(cmdBuf, weights, input, output,
                         m: outputDim, k: inputDim);
                 }
+            }
+            else if (_matmulQ6KMmq is not null && _quantizeQ8_1Rows is not null
+                && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
+                && (inputDim % MatMulQ6KMmqKernel.Q6KGroupSize) == 0
+                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
+                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+            {
+                // dp4a MMQ prefill path (issue #341): quantize the F32 activation
+                // B-matrix to Q8_1 row-wise, then run the integer-dot Q6_K GEMM —
+                // the seqLen>1 analogue of the Q6_K MMVQ decode GEMV. Completes the
+                // Q4_K_M prefill win (#340 left ffn_down/attn_v on dequant→FP).
+                _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
+                    n: seqLen, k: inputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                _matmulQ6KMmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
+                    m: outputDim, k: inputDim, n: seqLen);
             }
             else
             {
