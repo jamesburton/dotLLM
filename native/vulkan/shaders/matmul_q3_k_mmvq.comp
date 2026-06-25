@@ -1,0 +1,136 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q3_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q3k[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1 (int8 qs + fp32 scale d_x). Q3_K is
+// scale-only (no dmin): a signed 3-bit quant signed3 = ((hBit<<2)|qBits) − 4 in
+// −4..3, and a per-16-element signed 6-bit scale signedSc = scale6 − 32. Per
+// 16-element sub-block:  sum_i w_i·x_i = d·signedSc·d_x·dp4a(signed3, xq).
+// The −4 offset is folded into each quant byte before dp4a (mirrors Q6_K), so no
+// activation-sum / min term is needed.
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #339, mirrors #338) ───────────────
+// One wave32 subgroup per row; 32 lanes consume one super-block per iteration.
+// 2 lanes share a 16-element sub-block: lane L → sub=L/2, hlf=L%2, owning
+// elements [hlf*8 .. hlf*8+8) (2 dp4a). The sub-block's 16 qs (2-bit) values
+// are one funnelled word and its 16 hmask high bits are the low 16 bits of a
+// funnelled word; consecutive lane pairs read consecutive sub-blocks → coalesced.
+// Reduction: a single subgroupAdd.
+//
+// Q3_K super-block layout (110 bytes / 256 elements; matches matmul_q3_k_f32_gemv.comp):
+//   [0..31]   = hmask[32] (1 high bit/element)
+//   [32..95]  = qs[64] (2 low bits/element, 4 per byte)
+//   [96..107] = scales[12] (16 × 6-bit unsigned, biased −32)
+//   [108,109] = fp16 d
+//   Row stride = (K/256) * 110 bytes (110 % 4 == 2 ⇒ funnelled 4-byte reads).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q3_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 256
+    uint pad;
+} pc;
+
+const uint Q3K_BLOCK_BYTES = 110u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+int unpackQ3Scale(uint scalesBase, uint sub) {
+    uint lowNibble;
+    if (sub < 8u) {
+        lowNibble = readByte(scalesBase + sub) & 0xFu;
+    } else {
+        lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
+    }
+    uint hiByte  = 8u + (sub >> 2u);
+    uint hiShift = (sub & 3u) << 1u;
+    uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
+    uint scale6  = lowNibble | (hiBits << 4u);
+    return int(scale6) - 32;
+}
+
+// Assemble 4 signed (signed3 = ((hBit<<2)|qBits) − 4) bytes for dp4a, from the
+// sub-block's qs word + hmask-16 starting at the given bit offsets.
+uint packQ3(uint qsw, uint hm16, uint qBit0, uint hBit0) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint q2 = (qsw  >> (qBit0 + e * 2u)) & 3u;
+        uint hb = (hm16 >> (hBit0 + e))      & 1u;
+        int s3 = int((hb << 2u) | q2) - 4;   // -4..3
+        res |= (uint(s3) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint sub  = lane >> 1u;               // sub-block 0..15
+    uint hlf = lane & 1u;                // which 8-element hlf
+
+    uint rowByteBase = m * pc.blocksPerRow * Q3K_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q3K_BLOCK_BYTES;
+        float d = readHalf(blockByteBase + 108u);
+        float scF = d * float(unpackQ3Scale(blockByteBase + 96u, sub));
+
+        uint qsw  = read4Bytes(blockByteBase + 32u + sub * 4u);
+        uint hm16 = read4Bytes(blockByteBase + sub * 2u) & 0xFFFFu;
+        uint w0 = packQ3(qsw, hm16, hlf * 16u,       hlf * 8u);
+        uint w1 = packQ3(qsw, hm16, hlf * 16u + 8u,  hlf * 8u + 4u);
+
+        uint xqi = b * 64u + sub * 4u + hlf * 2u;
+        int dotI = dotPacked4x8AccSatEXT(int(w0), int(xq[xqi]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(w1), int(xq[xqi + 1u]), dotI);
+
+        float dX = xds[b * 8u + (sub >> 1u)].x;
+        acc += scF * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}
