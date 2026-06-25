@@ -1,0 +1,140 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// IQ2_XS MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_iq2xs[m,k] * x[k]
+//
+// The activation x[] is pre-quantized to Q8_1. IQ2_XS reconstructs each weight
+// from the 512-entry iq2xs grid of 8 signed magnitudes + a 7-bit sign index:
+//   w = dl · sign · grid[gridIdx*8 + j]
+// The grid magnitude is small (fits int8), so sign·grid is int8 → fed to dp4a:
+//   sum_i w_i·x_i = dl · d_x · dp4a(sign·grid, xq)
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #339) ─────────────────────────────
+// One wave32 subgroup per row; 4 lanes share a 32-element sub-block (32 lanes →
+// 8 sub-blocks/iteration). Lane L → sub-block ib32=L/4, pair l=L%4, owning the
+// pair's 8 elements (= 2 dp4a). Reduction: a single subgroupAdd.
+//
+// IQ2_XS super-block layout (74 bytes / 256 elements; matches matmul_iq2_xs_f32_gemv.comp):
+//   [0,1]   = fp16 d
+//   [2..65] = qs[32] uint16 LE — bits 0..8 = grid index (9b), bits 9..15 = sign index (7b)
+//   [66..73]= scales[8] — two 4-bit sub-scales/byte (l<2 low nibble, l>=2 high)
+//             dl = d * (0.5 + sub_scale) * 0.25.
+//   Row stride = (K/256) * 74 bytes.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW      { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq     { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds    { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufY      { float y[]; };
+layout(set = 0, binding = 4, std430) readonly  buffer BufGrid   { uint  iq2xsGrid[]; };
+layout(set = 0, binding = 5, std430) readonly  buffer BufKsigns { uint  ksigns[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow; // = K / 256
+    uint pad;
+} pc;
+
+const uint IQ2_XS_BLOCK_BYTES = 74u;
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+uint gridByte(uint absIdx) {
+    uint u = iq2xsGrid[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+uint ksignByte(uint absIdx) {
+    uint u = ksigns[absIdx >> 2u];
+    return (u >> ((absIdx & 3u) * 8u)) & 0xFFu;
+}
+
+// Pack 4 sign·grid int8 values (grid bytes jbase..jbase+3) for dp4a.
+uint packSG(uint gridOff, uint signs, uint jbase) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint j = jbase + e;
+        int g = int(gridByte(gridOff + j));                 // magnitude, fits int8
+        int sg = ((signs & (1u << j)) != 0u) ? -g : g;
+        res |= (uint(sg) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31
+    uint ib32 = lane >> 2u;               // sub-block 0..7
+    uint l    = lane & 3u;                // pair 0..3 (8 elements)
+
+    uint rowByteBase = m * pc.blocksPerRow * IQ2_XS_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint blockByteBase = rowByteBase + blk * IQ2_XS_BLOCK_BYTES;
+        float d = readHalf(blockByteBase);
+
+        // pair l's qs uint16 at qsBase + ib32*8 + l*2.
+        uint q = read4Bytes(blockByteBase + 2u + ib32 * 8u + l * 2u) & 0xFFFFu;
+        uint gridIdx  = q & 0x1FFu;
+        uint signsIdx = q >> 9u;
+        uint signs    = ksignByte(signsIdx);
+        uint gridOff  = gridIdx * 8u;
+
+        // scales[ib32]: low nibble for l<2, high nibble for l>=2.
+        uint scaleByte = readByte(blockByteBase + 66u + ib32);
+        uint subScale  = (l < 2u) ? (scaleByte & 0xFu) : (scaleByte >> 4u);
+        float dl = d * (0.5 + float(subScale)) * 0.25;
+
+        uint wLo = packSG(gridOff, signs, 0u);
+        uint wHi = packSG(gridOff, signs, 4u);
+
+        // Pair l's 8 elements: blk*256 + ib32*32 + l*8 → xq uint blk*64 + ib32*8 + l*2.
+        uint xqi = blk * 64u + ib32 * 8u + l * 2u;
+        int dotI = dotPacked4x8AccSatEXT(int(wLo), int(xq[xqi]), 0);
+        dotI = dotPacked4x8AccSatEXT(int(wHi), int(xq[xqi + 1u]), dotI);
+
+        // Sub-block ib32 = one Q8_1 block.
+        float dX = xds[blk * 8u + ib32].x;
+        acc += dl * (dX * float(dotI));
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}

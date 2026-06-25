@@ -182,6 +182,11 @@ public sealed class VulkanTransformerModel : IModel
     // dp4a MMVQ decode path for the IQ2/IQ3/IQ1 codebook-grid quants (issue #339).
     // Reuse the shared Iq2Codebooks/Iq3Codebooks SSBOs (6 bindings each).
     private readonly MatMulIq2XxsMmvqKernel? _matmulIq2XxsMmvq;
+    private readonly MatMulIq2XsMmvqKernel? _matmulIq2XsMmvq;
+    private readonly MatMulIq2SMmvqKernel? _matmulIq2SMmvq;
+    private readonly MatMulIq3XxsMmvqKernel? _matmulIq3XxsMmvq;
+    private readonly MatMulIq3SMmvqKernel? _matmulIq3SMmvq;
+    private readonly MatMulIq1SMmvqKernel? _matmulIq1SMmvq;
     // When true (default whenever the MMVQ decode path is wired),
     // RecordSharedInputMmvqGroup quantizes the shared activation once for a group
     // of same-input Q8_0 projections (Q/K/V share the post-attn-norm input;
@@ -434,6 +439,11 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq4NlMmvqKernel? matmulIq4NlMmvq,
         MatMulIq4XsMmvqKernel? matmulIq4XsMmvq,
         MatMulIq2XxsMmvqKernel? matmulIq2XxsMmvq,
+        MatMulIq2XsMmvqKernel? matmulIq2XsMmvq,
+        MatMulIq2SMmvqKernel? matmulIq2SMmvq,
+        MatMulIq3XxsMmvqKernel? matmulIq3XxsMmvq,
+        MatMulIq3SMmvqKernel? matmulIq3SMmvq,
+        MatMulIq1SMmvqKernel? matmulIq1SMmvq,
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
@@ -516,6 +526,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmvq = matmulIq4NlMmvq;
         _matmulIq4XsMmvq = matmulIq4XsMmvq;
         _matmulIq2XxsMmvq = matmulIq2XxsMmvq;
+        _matmulIq2XsMmvq = matmulIq2XsMmvq;
+        _matmulIq2SMmvq = matmulIq2SMmvq;
+        _matmulIq3XxsMmvq = matmulIq3XxsMmvq;
+        _matmulIq3SMmvq = matmulIq3SMmvq;
+        _matmulIq1SMmvq = matmulIq1SMmvq;
         _quantizeQ8_1Rows = quantizeQ8_1Rows;
         _matmulQ8Mmq = matmulQ8Mmq;
         _rmsnorm = rmsnorm;
@@ -873,6 +888,8 @@ public sealed class VulkanTransformerModel : IModel
         // K-quant MMVQ kernel is live). null when integer-dot is unavailable / SPV
         // missing / env opt-out → RecordMatmul falls back to the F32-in GEMV.
         var matmulIq2XxsMmvq = IsMmvqDisabled() ? null : MatMulIq2XxsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
+        var matmulIq2XsMmvq  = IsMmvqDisabled() ? null : MatMulIq2XsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
+        var matmulIq2SMmvq   = IsMmvqDisabled() ? null : MatMulIq2SMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2Xxs     = MatMulIq2XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2XxsGemm = MatMulIq2XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2Xs      = MatMulIq2XsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
@@ -880,12 +897,15 @@ public sealed class VulkanTransformerModel : IModel
         var matmulIq2S       = MatMulIq2SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var matmulIq2SGemm   = MatMulIq2SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
         var iq3Codebooks = Iq3Codebooks.Create(device);
+        var matmulIq3XxsMmvq = IsMmvqDisabled() ? null : MatMulIq3XxsMmvqKernel.TryCreate(device, spvDir, iq3Codebooks);
         var matmulIq3Xxs     = MatMulIq3XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         var matmulIq3XxsGemm = MatMulIq3XxsGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
+        var matmulIq3SMmvq   = IsMmvqDisabled() ? null : MatMulIq3SMmvqKernel.TryCreate(device, spvDir, iq3Codebooks);
         var matmulIq3S       = MatMulIq3SGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         var matmulIq3SGemm   = MatMulIq3SGemmF32Kernel.CreateWithCodebooks(device, spvDir, iq3Codebooks);
         // IQ1_S GEMV + GEMM — smallest GGUF quant (~1.5-1.7 bpw). Always
         // created; closes the IQ-family Vulkan matmul coverage.
+        var matmulIq1SMmvq = IsMmvqDisabled() ? null : MatMulIq1SMmvqKernel.TryCreate(device, spvDir);
         var matmulIq1S = MatMulIq1SGemvF32Kernel.Create(device, spvDir);
         var matmulIq1SGemm = MatMulIq1SGemmF32Kernel.Create(device, spvDir);
         // I2_S GEMV + GEMM — BitNet b1.58 ternary. Always created; the dispatcher
@@ -1054,6 +1074,11 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq4NlMmvq,
             matmulIq4XsMmvq,
             matmulIq2XxsMmvq,
+            matmulIq2XsMmvq,
+            matmulIq2SMmvq,
+            matmulIq3XxsMmvq,
+            matmulIq3SMmvq,
+            matmulIq1SMmvq,
             quantizeQ8_1Rows, matmulQ8Mmq,
             rmsnorm, rope, attention, flashAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
@@ -2712,6 +2737,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmvq?.InvalidateDescriptorCache();
         _matmulIq4XsMmvq?.InvalidateDescriptorCache();
         _matmulIq2XxsMmvq?.InvalidateDescriptorCache();
+        _matmulIq2XsMmvq?.InvalidateDescriptorCache();
+        _matmulIq2SMmvq?.InvalidateDescriptorCache();
+        _matmulIq3XxsMmvq?.InvalidateDescriptorCache();
+        _matmulIq3SMmvq?.InvalidateDescriptorCache();
+        _matmulIq1SMmvq?.InvalidateDescriptorCache();
         _quantizeQ8_1Rows?.InvalidateDescriptorCache();
         _matmulQ8Mmq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
@@ -4531,28 +4561,96 @@ public sealed class VulkanTransformerModel : IModel
         else if (weightQt == QuantType.IQ2_XS)
         {
             if (seqLen == 1)
-                _matmulIq2Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            {
+                // dp4a MMVQ decode path (issue #339); F32-in fallback otherwise.
+                if (_matmulIq2XsMmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % MatMulIq2XsMmvqKernel.Iq2XsGroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulIq2XsMmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulIq2Xs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                }
+            }
             else
                 _matmulIq2XsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ2_S)
         {
             if (seqLen == 1)
-                _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            {
+                // dp4a MMVQ decode path (issue #339); F32-in fallback otherwise.
+                if (_matmulIq2SMmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % MatMulIq2SMmvqKernel.Iq2SGroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulIq2SMmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulIq2S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                }
+            }
             else
                 _matmulIq2SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ3_XXS)
         {
             if (seqLen == 1)
-                _matmulIq3Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            {
+                // dp4a MMVQ decode path (issue #339); F32-in fallback otherwise.
+                if (_matmulIq3XxsMmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % MatMulIq3XxsMmvqKernel.Iq3XxsGroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulIq3XxsMmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulIq3Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                }
+            }
             else
                 _matmulIq3XxsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
         else if (weightQt == QuantType.IQ3_S)
         {
             if (seqLen == 1)
-                _matmulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+            {
+                // dp4a MMVQ decode path (issue #339); F32-in fallback otherwise.
+                if (_matmulIq3SMmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % MatMulIq3SMmvqKernel.Iq3SGroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulIq3SMmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulIq3S.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
+                }
+            }
             else
                 _matmulIq3SGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
@@ -4577,8 +4675,23 @@ public sealed class VulkanTransformerModel : IModel
             // IQ1_S: 256-element super-block alignment, ~1.5-1.7 bpw smallest GGUF quant.
             if (seqLen == 1)
             {
-                _matmulIq1S.Record(cmdBuf, weights, input, output,
-                    m: outputDim, k: inputDim);
+                // dp4a MMVQ decode path (issue #339); F32-in fallback otherwise.
+                if (_matmulIq1SMmvq is not null && _quantizeQ8_1 is not null
+                    && _state.Q8_1Xq is not null && _state.Q8_1Xds is not null
+                    && (inputDim % MatMulIq1SMmvqKernel.Iq1SGroupSize) == 0
+                    && QuantizeQ8_1Kernel.PackedBytes(inputDim) <= _state.Q8_1Xq.Size
+                    && QuantizeQ8_1Kernel.ScaleBytes(inputDim) <= _state.Q8_1Xds.Size)
+                {
+                    _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+                    KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                    _matmulIq1SMmvq.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, output,
+                        m: outputDim, k: inputDim);
+                }
+                else
+                {
+                    _matmulIq1S.Record(cmdBuf, weights, input, output,
+                        m: outputDim, k: inputDim);
+                }
             }
             else
             {
@@ -4808,6 +4921,11 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmvq?.Dispose();
         _matmulIq4XsMmvq?.Dispose();
         _matmulIq2XxsMmvq?.Dispose();
+        _matmulIq2XsMmvq?.Dispose();
+        _matmulIq2SMmvq?.Dispose();
+        _matmulIq3XxsMmvq?.Dispose();
+        _matmulIq3SMmvq?.Dispose();
+        _matmulIq1SMmvq?.Dispose();
         _matmulQ8Mmvq?.Dispose();
         _quantizeQ8_1?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
