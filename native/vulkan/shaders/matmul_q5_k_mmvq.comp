@@ -1,0 +1,144 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Q5_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
+//
+//   y[m] = sum_k W_q5k[m,k] * x[k]
+//
+// Sibling of matmul_q4_k_mmvq.comp — same coalesced lane=K-position layout, same
+// (scale, min) unpack, same nibble selection and per-sub-block min term. The only
+// structural difference is one extra high-bit (qh) lookup per element producing a
+// 5-bit weight value (0..31) rather than 4-bit. The activation x[] is pre-quantized
+// to Q8_1; per 32-element sub-block j:
+//   sum_i w_i·x_i = d·scale[j]·d_x·dp4a(q5 nibbles, xq) − dmin·min[j]·s
+//
+// NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
+//
+// ── COALESCED lane=K-position layout (issue #338) ─────────────────────────────
+// One wave32 subgroup computes one output row; the 32 lanes cooperatively consume
+// one 256-element super-block per iteration. The super-block qs is 128 bytes = 32
+// uints, so lane L reads qs uint L (consecutive lanes → consecutive words = a
+// coalesced 128-byte region). Lane L handles pair p=L/8, group g=L%8: dp4a's its 4
+// low-nibble weights (sub-block 2p) and 4 high-nibble weights (sub-block 2p+1),
+// each OR'd with the matching qh 5th bit. The per-sub-block min term (−dmin·min·s)
+// is split 1/8 across the sub-block's 8 lanes so the final subgroupAdd yields one
+// min term each. Reduction: a single subgroupAdd (no shared memory, no barriers).
+//
+// Q5_K super-block layout (176 bytes / 256 elements; matches matmul_q5_k_gemv_f32.comp):
+//   [0,1]=fp16 d  [2,3]=fp16 dmin  [4..15]=scales[12] (8×6-bit sc + 8×6-bit mn)
+//   [16..47]=qh[32] (1 bit/element: bit j of qh[i] = 5th bit of element i in sub-block j)
+//   [48..175]=qs[128] (low 4 bits, two per byte; low nibble → even, high → odd sub-block)
+//   Row stride = (K/256) * 176 bytes (176 % 4 == 0 ⇒ word-aligned).
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q5_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) writeonly buffer BufY   { float y[]; };       // [M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output rows
+    uint K;            // columns (multiple of 256)
+    uint blocksPerRow; // = K / 256 (super-blocks)
+    uint pad;
+} pc;
+
+const uint Q5K_BLOCK_BYTES = 176u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// j-th (0..7) (scale, min) pair from the 12-byte scales[] — get_scale_min_k4 (same as Q4_K).
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        uint scLow  = readByte(scalesByteBase + j + 4u) & 0xFu;
+        uint scHigh = (readByte(scalesByteBase + j - 4u) >> 6u) & 0x3u;
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + j + 4u) >> 4u) & 0xFu;
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+// Build 4 packed 5-bit weights (q5 = nibble | (qh_bit << 4), 0..31) ready for dp4a.
+// useHigh selects the high nibble of each qs byte; j is the sub-block index whose
+// bit in each qh byte is the 5th bit.
+uint packQ5(uint qs4, uint qh4, bool useHigh, uint j) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint qsb = (qs4 >> (e * 8u)) & 0xFFu;
+        uint nib = useHigh ? ((qsb >> 4u) & 0xFu) : (qsb & 0xFu);
+        uint hb  = (qh4 >> (e * 8u + j)) & 1u;
+        uint q5  = nib | (hb << 4u);          // 0..31
+        res |= (q5 & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint lane = gl_LocalInvocationID.x;   // 0..31 (one subgroup per workgroup)
+    uint p = lane >> 3u;                  // pairIdx 0..3
+    uint g = lane & 7u;                   // group 0..7 (which 4-element quartet)
+    uint j0 = p * 2u;                     // low-nibble sub-block
+    uint j1 = j0 + 1u;                    // high-nibble sub-block
+
+    uint rowByteBase = m * pc.blocksPerRow * Q5K_BLOCK_BYTES;
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q5K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase);
+        float dmin = readHalf(blockByteBase + 2u);
+        uint scalesBase = blockByteBase + 4u;
+        uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+        uvec2 sm1 = unpackScaleMin(scalesBase, j1);
+
+        // This lane's qs uint (lane = p*8+g over the 32-uint qs region) + the qh
+        // uint for its 4 positions (g of the 8-uint qh region).
+        uint qs4 = weight[((blockByteBase + 48u) >> 2u) + lane];
+        uint qh4 = weight[((blockByteBase + 16u) >> 2u) + g];
+        uint w0 = packQ5(qs4, qh4, false, j0);
+        uint w1 = packQ5(qs4, qh4, true,  j1);
+
+        uint xqBlockBase = b * 64u;
+        uint xdsBase     = b * 8u;
+        vec2 ds0 = xds[xdsBase + j0];
+        vec2 ds1 = xds[xdsBase + j1];
+
+        int dot0 = dotPacked4x8AccSatEXT(int(w0), int(xq[xqBlockBase + j0 * 8u + g]), 0);
+        int dot1 = dotPacked4x8AccSatEXT(int(w1), int(xq[xqBlockBase + j1 * 8u + g]), 0);
+
+        acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y * 0.125;
+        acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y * 0.125;
+    }
+
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
+}
