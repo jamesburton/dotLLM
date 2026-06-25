@@ -1,0 +1,193 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q3_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_q3k[M, K]^T
+//
+// Q3_K is scale-only (no dmin): signed 3-bit signed3 = ((hBit<<2)|q2) − 4 in −4..3,
+// per-16 signed 6-bit scale signedSc = scale6 − 32. Per 16-element sub-block:
+//   sum_i w_i·x_i = d·signedSc·d_x·dp4a(signed3, xq)
+// The −4 is folded into each weight byte before dp4a → symmetric, no min term. The
+// seqLen>1 analogue of matmul_q3_k_mmvq.comp.
+//
+// NOT bit-exact vs the F32-in GEMM (B int8-quantized first); validated vs CPU F32 oracle.
+//
+// Q3_K super-block layout (110 bytes / 256; matches matmul_q3_k_mmvq.comp):
+//   [0..31]=hmask[32] (1 high bit/elem)  [32..95]=qs[64] (2 low bits/elem)
+//   [96..107]=scales[12] (16×6-bit, −32 bias)  [108,109]=fp16 d.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;            // multiple of 256
+    uint N;
+    uint blocksPerRow; // = K / 256
+    uint rowUints;     // unused
+} pc;
+
+const uint TILE_M = 16u;
+const uint TILE_N = 16u;
+const uint SB_BYTES     = 110u;
+const uint SUBS         = 16u;
+const uint CHUNKS       = 8u;
+const uint UINTS_PER_SB = 64u;
+
+shared uint  sharedWq[TILE_M * UINTS_PER_SB]; // signed3 weights, element order
+shared uint  sharedXq[TILE_N * UINTS_PER_SB];
+shared float sharedWdsc[TILE_M * SUBS];       // d · signedSc per (row, sub-16)
+shared float sharedXd[TILE_N * CHUNKS];       // d_x per (token, 32-block)
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+int unpackQ3Scale(uint scalesBase, uint sub) {
+    uint lowNibble;
+    if (sub < 8u) {
+        lowNibble = readByte(scalesBase + sub) & 0xFu;
+    } else {
+        lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
+    }
+    uint hiByte  = 8u + (sub >> 2u);
+    uint hiShift = (sub & 3u) << 1u;
+    uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
+    uint scale6  = lowNibble | (hiBits << 4u);
+    return int(scale6) - 32;
+}
+
+// 4 signed (signed3 = ((hBit<<2)|q2) − 4) bytes for dp4a.
+uint packQ3(uint qsw, uint hm16, uint qBit0, uint hBit0) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint q2 = (qsw  >> (qBit0 + e * 2u)) & 3u;
+        uint hb = (hm16 >> (hBit0 + e))      & 1u;
+        int s3 = int((hb << 2u) | q2) - 4;
+        res |= (uint(s3) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x * TILE_M + gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.y * TILE_N + gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationID.y * TILE_M + gl_LocalInvocationID.x;
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * SB_BYTES;
+    float acc = 0.0;
+
+    for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
+        // ---- 1. Stage weights: 16 rows × 64 element-order uints (decode qs+hmask). ----
+        for (uint s = 0u; s < 4u; s++) {
+            uint idx = tid + s * 256u;
+            uint rLocal = idx >> 6u;
+            uint u      = idx & 63u;
+            uint sub = u >> 2u;
+            uint p   = u & 3u;
+            uint mGlobal = mBase + rLocal;
+            uint packed = 0u;
+            if (mGlobal < pc.M) {
+                uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                uint qsw  = read4Bytes(blockByteBase + 32u + sub * 4u);
+                uint hm16 = read4Bytes(blockByteBase + sub * 2u) & 0xFFFFu;
+                packed = packQ3(qsw, hm16, p * 8u, p * 4u);
+            }
+            sharedWq[rLocal * UINTS_PER_SB + u] = packed;
+        }
+
+        // ---- 2. Stage weight scales: 16 rows × 16 sub-blocks (d·signedSc). ----
+        if (tid < TILE_M * SUBS) {
+            uint rLocal = tid >> 4u;
+            uint sub    = tid & 15u;
+            uint mGlobal = mBase + rLocal;
+            float dsc = 0.0;
+            if (mGlobal < pc.M) {
+                uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                float d = readHalf(blockByteBase + 108u);
+                dsc = d * float(unpackQ3Scale(blockByteBase + 96u, sub));
+            }
+            sharedWdsc[rLocal * SUBS + sub] = dsc;
+        }
+
+        // ---- 3. Stage activations: 16 token rows × 64 int8-uints. ----
+        for (uint s = 0u; s < 4u; s++) {
+            uint idx = tid + s * 256u;
+            uint rLocal = idx >> 6u;
+            uint u      = idx & 63u;
+            uint tGlobal = tBase + rLocal;
+            uint v = 0u;
+            if (tGlobal < pc.N) {
+                v = xq[tGlobal * (pc.K >> 2u) + kSB * UINTS_PER_SB + u];
+            }
+            sharedXq[rLocal * UINTS_PER_SB + u] = v;
+        }
+
+        // ---- 4. Stage activation scales: 16 rows × 8 d_x. ----
+        if (tid < TILE_N * CHUNKS) {
+            uint rLocal = tid >> 3u;
+            uint cc     = tid & 7u;
+            uint tGlobal = tBase + rLocal;
+            float dx = 0.0;
+            if (tGlobal < pc.N) {
+                dx = xds[tGlobal * (pc.K >> 5u) + kSB * CHUNKS + cc].x;
+            }
+            sharedXd[rLocal * CHUNKS + cc] = dx;
+        }
+
+        barrier();
+
+        // ---- 5. dp4a over this super-block for output cell (t, m). ----
+        {
+            uint wRow = gl_LocalInvocationID.x;
+            uint tRow = gl_LocalInvocationID.y;
+            for (uint sub = 0u; sub < SUBS; sub++) {
+                uint wbase = wRow * UINTS_PER_SB + sub * 4u;
+                uint xbase = tRow * UINTS_PER_SB + sub * 4u;
+                int dotI = 0;
+                for (uint g = 0u; g < 4u; g++) {
+                    dotI = dotPacked4x8AccSatEXT(int(sharedWq[wbase + g]), int(sharedXq[xbase + g]), dotI);
+                }
+                float dX = sharedXd[tRow * CHUNKS + (sub >> 1u)];
+                acc += sharedWdsc[wRow * SUBS + sub] * (dX * float(dotI));
+            }
+        }
+
+        barrier();
+    }
+
+    if (m < pc.M && t < pc.N) {
+        c[t * pc.M + m] = acc;
+    }
+}
