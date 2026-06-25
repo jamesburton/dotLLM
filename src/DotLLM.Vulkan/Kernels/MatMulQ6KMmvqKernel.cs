@@ -4,39 +4,41 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
-/// Q4_K MMVQ decode-path GEMV: <c>y[M] = W_q4k[M,K] @ x[K]</c> via integer dp4a.
+/// Q6_K MMVQ decode-path GEMV: <c>y[M] = W_q6k[M,K] @ x[K]</c> via integer dp4a.
 /// The activation <c>x</c> must already be quantized to Q8_1
 /// (<see cref="QuantizeQ8_1Kernel"/>); this kernel runs
 /// <c>dotPacked4x8AccSatEXT</c> (4×int8 → int32 saturating accumulate) against
-/// the 4-bit weight nibbles, then applies the Q4_K super-block scale/min:
-/// <c>d·scale·(d_x·dot) − dmin·min·s</c> per 32-element sub-block.
+/// the signed 6-bit weights (q6−32), then applies the Q6_K super-block scale and
+/// the signed per-16-element sub-block scale: <c>d·scale·(d_x·dot)</c>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Replaces the F32-in <see cref="MatMulQ4KGemvF32Kernel"/> on the decode path
-/// (seqLen==1) on devices that advertise
-/// <see cref="VulkanDevice.HasIntegerDotProduct"/>. Q4_K decode is the largest
-/// remaining gap vs llama.cpp; the float dequant+madd of the F32-in GEMV was a
-/// big part of it, and the integer-dot path removes it.
+/// NEW dp4a path for Q6_K — previously only the F32-dequant
+/// <see cref="MatMulQ6KGemvF32Kernel"/> existed for the decode path. On 8B-class
+/// Q4_K_M models <c>ffn_down</c> and <c>attn_v</c> are Q6_K, so the unchanged
+/// F32-dequant GEMV was the dominant remaining decode cost; this integer-dot
+/// path removes the per-element float dequant+madd and halves activation traffic.
+/// Created only when the device advertises
+/// <see cref="VulkanDevice.HasIntegerDotProduct"/>; the router falls back to the
+/// F32-in GEMV otherwise.
 /// </para>
 /// <para>
 /// Result is NOT bit-exact vs the F32-in GEMV (the activation is int8-quantized
-/// first). Per-32-block scaling keeps the error at the int8-activation-quant
-/// level — validated against the CPU F32 oracle with an argmax-exact +
+/// first) — validated against the CPU F32 oracle with an argmax-exact +
 /// tolerance parity test.
 /// </para>
 /// <para>
-/// Dispatch: one workgroup per output row, 128 threads, shared-memory reduction
-/// (mirrors the F32-in Q4_K GEMV). Same 144-byte super-block layout.
+/// Dispatch: one workgroup (= one wave32 subgroup) per output row, coalesced
+/// lane=K-position layout (issue #338). Same 210-byte super-block layout.
 /// </para>
 /// </remarks>
-public sealed class MatMulQ4KMmvqKernel : IDisposable
+public sealed class MatMulQ6KMmvqKernel : IDisposable
 {
-    /// <summary>Q4_K super-block: 144 bytes for 256 elements.</summary>
-    public const int Q4KBlockBytes = 144;
+    /// <summary>Q6_K super-block: 210 bytes for 256 elements.</summary>
+    public const int Q6KBlockBytes = 210;
 
-    /// <summary>Elements per Q4_K super-block.</summary>
-    public const int Q4KGroupSize = 256;
+    /// <summary>Elements per Q6_K super-block.</summary>
+    public const int Q6KGroupSize = 256;
 
     /// <summary>Workgroup width — must match the shader's <c>local_size_x</c>. One
     /// wave32 subgroup per output row (issue #338 coalesced lane=K-position GEMV).</summary>
@@ -51,7 +53,7 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
     private readonly DescriptorSetCache _descriptorCache;
     private bool _disposed;
 
-    private MatMulQ4KMmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulQ6KMmvqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
     {
         _device = device;
         _module = module;
@@ -61,26 +63,22 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
     }
 
     /// <summary>
-    /// Loads <c>matmul_q4_k_mmvq.spv</c> from <paramref name="spvDir"/> and
-    /// builds the pipeline. Returns <c>null</c> when the SPV is missing OR when
-    /// the device does not advertise integer-dot-product support — the router
-    /// falls back to <see cref="MatMulQ4KGemvF32Kernel"/> in either case.
+    /// Loads <c>matmul_q6_k_mmvq.spv</c> from <paramref name="spvDir"/> and builds
+    /// the pipeline. Returns <c>null</c> when the SPV is missing OR when the device
+    /// does not advertise integer-dot-product support — the router falls back to
+    /// <see cref="MatMulQ6KGemvF32Kernel"/> in either case.
     /// </summary>
-    public static MatMulQ4KMmvqKernel? TryCreate(VulkanDevice device, string spvDir)
+    public static MatMulQ6KMmvqKernel? TryCreate(VulkanDevice device, string spvDir)
     {
         if (!device.HasIntegerDotProduct)
             return null;
 
-        string path = Path.Combine(spvDir, "matmul_q4_k_mmvq.spv");
+        string path = Path.Combine(spvDir, "matmul_q6_k_mmvq.spv");
         if (!File.Exists(path))
             return null;
 
-        // Pin the decode GEMV to wave32 on devices that support a required
-        // compute subgroup size (issue #54 / #330). On RDNA3.5 (gfx1151) the
-        // driver defaults compute to wave64; forcing wave32 PER-KERNEL here —
-        // never globally — matches llama.cpp's K-quant decode strategy. Gated
-        // on device support so it cleanly falls back to the driver default
-        // (subgroupSize=0 = unset) elsewhere, and on an env opt-out for A/B.
+        // Pin the decode GEMV to wave32 (issue #54 / #330); see the Q8_0/Q4_K MMVQ
+        // kernels. Gated on device support, cleanly unset elsewhere.
         uint requiredSubgroupSize = Wave32SubgroupControl.RequiredSubgroupSizeFor(device);
 
         var module = VulkanModule.LoadFromFile(device, path);
@@ -105,17 +103,17 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MatMulQ4KMmvqKernel(device, module, pipeline, pool);
+        return new MatMulQ6KMmvqKernel(device, module, pipeline, pool);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
     /// <summary>
-    /// Records the Q4_K MMVQ GEMV into <paramref name="cmdBuf"/>.
+    /// Records the Q6_K MMVQ GEMV into <paramref name="cmdBuf"/>.
     /// </summary>
     /// <param name="cmdBuf">Open Vulkan command buffer.</param>
-    /// <param name="weightsQ4K">Raw Q4_K blob of <c>M * (K/256) * 144</c> bytes.</param>
+    /// <param name="weightsQ6K">Raw Q6_K blob of <c>M * (K/256) * 210</c> bytes.</param>
     /// <param name="xq">Packed-int8 quantized activations (<see cref="QuantizeQ8_1Kernel"/>), <c>K/4</c> uints.</param>
     /// <param name="xds">Per-block (scale, sum) of the quantized activations, <c>K/32</c> vec2.</param>
     /// <param name="y">FP32 output buffer of length <paramref name="m"/>.</param>
@@ -123,22 +121,22 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
     /// <param name="k">Input dimension (must be a multiple of 256).</param>
     public unsafe void Record(
         nint cmdBuf,
-        VulkanDevice.Buffer weightsQ4K, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
+        VulkanDevice.Buffer weightsQ6K, VulkanDevice.Buffer xq, VulkanDevice.Buffer xds,
         VulkanDevice.Buffer y,
         int m, int k)
     {
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m));
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k));
-        if ((k % Q4KGroupSize) != 0)
-            throw new ArgumentException($"k must be a multiple of {Q4KGroupSize}, got {k}", nameof(k));
+        if ((k % Q6KGroupSize) != 0)
+            throw new ArgumentException($"k must be a multiple of {Q6KGroupSize}, got {k}", nameof(k));
 
-        int blocksPerRow = k / Q4KGroupSize;
-        long rowBytes = (long)blocksPerRow * Q4KBlockBytes;
+        int blocksPerRow = k / Q6KGroupSize;
+        long rowBytes = (long)blocksPerRow * Q6KBlockBytes;
 
         long weightsMin = (long)m * rowBytes;
-        if (weightsQ4K.Size < weightsMin)
+        if (weightsQ6K.Size < weightsMin)
             throw new ArgumentException(
-                $"Weights buffer too small: need >= {weightsMin} bytes, got {weightsQ4K.Size}.", nameof(weightsQ4K));
+                $"Weights buffer too small: need >= {weightsMin} bytes, got {weightsQ6K.Size}.", nameof(weightsQ6K));
         if (xq.Size < QuantizeQ8_1Kernel.PackedBytes(k))
             throw new ArgumentException("Packed activation buffer too small.", nameof(xq));
         if (xds.Size < QuantizeQ8_1Kernel.ScaleBytes(k))
@@ -146,7 +144,7 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
         if (y.Size < (long)m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(y));
 
-        Span<nint> buffers = stackalloc nint[4] { weightsQ4K.Handle, xq.Handle, xds.Handle, y.Handle };
+        Span<nint> buffers = stackalloc nint[4] { weightsQ6K.Handle, xq.Handle, xds.Handle, y.Handle };
         nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
 
         VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
@@ -154,8 +152,8 @@ public sealed class MatMulQ4KMmvqKernel : IDisposable
             cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
-        // One workgroup per output row (the shader uses gl_WorkGroupID.x as the
-        // row index and reduces 128 partials in shared memory).
+        // One workgroup per output row (the shader uses gl_WorkGroupID.x as the row
+        // index; the wave32 subgroup reduces via a single subgroupAdd).
         Span<uint> pc = stackalloc uint[4]
         {
             (uint)m, (uint)k, (uint)blocksPerRow, 0u,

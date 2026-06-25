@@ -1,5 +1,7 @@
 #version 450
-#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 // Q4_K MMVQ decode GEMV: integer-dot (dp4a) matrix-vector multiply.
 //
 //   y[m] = sum_k W_q4k[m,k] * x[k]
@@ -17,15 +19,32 @@
 //
 // NOT bit-exact (x is int8-quantized); validated argmax + tolerance vs CPU F32.
 //
+// ── COALESCED lane=K-position layout (issue #338) ─────────────────────────────
+// The previous layout mapped lane -> WHOLE super-block (thread `tid` owned 256
+// elements), so at one load instruction the warp lanes read words 144 bytes
+// apart => uncoalesced (~34% of peak BW; the #1 decode gap). This shader mirrors
+// llama.cpp `mul_mat_vec`: one wave32 subgroup computes ONE output row, and the
+// 32 lanes COOPERATIVELY consume one super-block per iteration. The super-block's
+// qs is exactly 128 bytes = 32 uints, so lane L reads qs uint L => consecutive
+// lanes read consecutive words = a fully coalesced 128-byte region.
+//
+//   lane L: pairIdx p = L/8, group g = L%8.  Lane reads qs uint (p*8 + g), whose
+//   4 bytes hold 4 low-nibble weights of sub-block j0=2p AND 4 high-nibble
+//   weights of sub-block j1=2p+1 (elements [g*4 .. g*4+4)). It dp4a's each
+//   against the matching 4 activations and adds the FULLY-SCALED contribution.
+//   The per-sub-block min term (-dmin·min·s) is independent of the weights and
+//   must be counted once per sub-block, so each of a sub-block's 8 lanes adds
+//   1/8 of it; the final subgroupAdd then yields exactly one min term per
+//   sub-block. d/dmin (4 B) and scales[12] are read uniformly (cached) by all
+//   lanes. Reduction: a single subgroupAdd (no shared memory, no barriers).
+//
 // Q4_K super-block layout (144 bytes / 256 elements; mirrors matmul_q4_k_gemv_f32.comp):
 //   [0,1]=fp16 d   [2,3]=fp16 dmin   [4..15]=scales[12] (8×6-bit sc + 8×6-bit mn)
 //   [16..143]=qs[128] (two 4-bit values per byte; low nibble → even sub-block,
 //                      high nibble → odd sub-block of the pair). 144 % 4 == 0 ⇒
 //                      no straddle; qs is word-aligned.
-//
-// Dispatch: one workgroup per output row, 128 threads, shared-mem reduction.
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q4_K blob
 layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [K/4] packed int8 activations
@@ -40,7 +59,6 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 const uint Q4K_BLOCK_BYTES = 144u;
-const uint Q4K_GROUP_SIZE  = 256u;
 
 uint readByte(uint absByteOff) {
     uint u = weight[absByteOff >> 2u];
@@ -78,67 +96,54 @@ uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
     return uvec2(sc, mn);
 }
 
-shared float partials[128];
-
 void main() {
     uint m = gl_WorkGroupID.x;
     if (m >= pc.M) return;
 
-    uint tid = gl_LocalInvocationID.x;
-    uint threads = gl_WorkGroupSize.x;
+    uint lane = gl_LocalInvocationID.x;   // 0..31 (one subgroup per workgroup)
+    uint p = lane >> 3u;                  // pairIdx 0..3
+    uint g = lane & 7u;                   // group 0..7 (which 4-element quartet)
+    uint j0 = p * 2u;                     // low-nibble sub-block
+    uint j1 = j0 + 1u;                    // high-nibble sub-block
 
     uint rowByteBase = m * pc.blocksPerRow * Q4K_BLOCK_BYTES;
     float acc = 0.0;
 
-    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
         uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
         float d    = readHalf(blockByteBase);
         float dmin = readHalf(blockByteBase + 2u);
         uint scalesBase = blockByteBase + 4u;
-        uint qsUintRow  = (blockByteBase + 16u) >> 2u;   // word-aligned
-        uint xqBlockBase = b * 64u;   // (b*256)/4 = first activation uint of this super-block
-        uint xdsBase     = b * 8u;    // first Q8_1 block of this super-block
+        uvec2 sm0 = unpackScaleMin(scalesBase, j0);
+        uvec2 sm1 = unpackScaleMin(scalesBase, j1);
 
-        // 8 sub-blocks of 32 elements; pairs share a 32-byte qs slab.
-        for (uint pairIdx = 0u; pairIdx < 4u; pairIdx++) {
-            uint j0 = pairIdx * 2u;          // low-nibble sub-block
-            uint j1 = j0 + 1u;               // high-nibble sub-block
-            uvec2 sm0 = unpackScaleMin(scalesBase, j0);
-            uvec2 sm1 = unpackScaleMin(scalesBase, j1);
-            uint qsBase = qsUintRow + pairIdx * 8u;   // 8 words = 32 bytes for this pair
-            uint xq0 = xqBlockBase + j0 * 8u;         // 8 activation uints for sub-block j0
-            uint xq1 = xqBlockBase + j1 * 8u;
-            vec2 ds0 = xds[xdsBase + j0];             // (d_x, s) for sub-block j0
-            vec2 ds1 = xds[xdsBase + j1];
+        // This lane's qs uint: qs starts at +16 bytes (word-aligned). Lane L owns
+        // uint (p*8 + g) = lane, so the 32 lanes read 32 consecutive uints.
+        uint cur = weight[((blockByteBase + 16u) >> 2u) + lane];
+        uint lo = ( cur        & 0x0Fu)
+                | ((cur >>  8u) & 0x0Fu) << 8u
+                | ((cur >> 16u) & 0x0Fu) << 16u
+                | ((cur >> 24u) & 0x0Fu) << 24u;
+        uint hi = ((cur >>  4u) & 0x0Fu)
+                | ((cur >> 12u) & 0x0Fu) << 8u
+                | ((cur >> 20u) & 0x0Fu) << 16u
+                | ((cur >> 28u) & 0x0Fu) << 24u;
 
-            int dot0 = 0;
-            int dot1 = 0;
-            for (uint g = 0u; g < 8u; g++) {
-                uint cur = weight[qsBase + g];
-                // Low nibbles (even sub-block), high nibbles (odd sub-block),
-                // packed as 4 int8 lanes per uint for dp4a.
-                uint lo = ( cur        & 0x0Fu)
-                        | ((cur >>  8u) & 0x0Fu) << 8u
-                        | ((cur >> 16u) & 0x0Fu) << 16u
-                        | ((cur >> 24u) & 0x0Fu) << 24u;
-                uint hi = ((cur >>  4u) & 0x0Fu)
-                        | ((cur >> 12u) & 0x0Fu) << 8u
-                        | ((cur >> 20u) & 0x0Fu) << 16u
-                        | ((cur >> 28u) & 0x0Fu) << 24u;
-                dot0 = dotPacked4x8AccSatEXT(int(lo), int(xq[xq0 + g]), dot0);
-                dot1 = dotPacked4x8AccSatEXT(int(hi), int(xq[xq1 + g]), dot1);
-            }
-            // contribution = d·sc·(d_x·dot) - dmin·mn·s
-            acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y;
-            acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y;
-        }
+        uint xqBlockBase = b * 64u;       // (b*256)/4 = first activation uint of this super-block
+        uint xdsBase     = b * 8u;        // first Q8_1 block of this super-block
+        vec2 ds0 = xds[xdsBase + j0];     // (d_x, s) for sub-block j0
+        vec2 ds1 = xds[xdsBase + j1];
+
+        int dot0 = dotPacked4x8AccSatEXT(int(lo), int(xq[xqBlockBase + j0 * 8u + g]), 0);
+        int dot1 = dotPacked4x8AccSatEXT(int(hi), int(xq[xqBlockBase + j1 * 8u + g]), 0);
+
+        // d·sc·(d_x·dot)  minus  1/8 of the per-sub-block min term (8 lanes share it).
+        acc += (d * float(sm0.x)) * (ds0.x * float(dot0)) - (dmin * float(sm0.y)) * ds0.y * 0.125;
+        acc += (d * float(sm1.x)) * (ds1.x * float(dot1)) - (dmin * float(sm1.y)) * ds1.y * 0.125;
     }
 
-    partials[tid] = acc;
-    barrier();
-    for (uint stride = threads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
-        barrier();
-    }
-    if (tid == 0u) y[m] = partials[0];
+    // The subgroup IS the row: one reduction yields y[m] (no shared mem, no barrier).
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[m] = total;
 }
