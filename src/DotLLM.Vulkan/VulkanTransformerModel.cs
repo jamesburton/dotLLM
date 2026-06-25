@@ -213,6 +213,8 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MatMulIq4NlMmqKernel? _matmulIq4NlMmq;
     private readonly MatMulQ2KMmqKernel? _matmulQ2KMmq;
     private readonly MatMulQ3KMmqKernel? _matmulQ3KMmq;
+    // Grid-codebook IQ prefill MMQ (reuse the shared Iq2/Iq3/Iq1 codebook SSBOs).
+    private readonly MatMulIq2XxsMmqKernel? _matmulIq2XxsMmq;
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -459,6 +461,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq4NlMmqKernel? matmulIq4NlMmq,
         MatMulQ2KMmqKernel? matmulQ2KMmq,
         MatMulQ3KMmqKernel? matmulQ3KMmq,
+        MatMulIq2XxsMmqKernel? matmulIq2XxsMmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
@@ -554,6 +557,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmq = matmulIq4NlMmq;
         _matmulQ2KMmq = matmulQ2KMmq;
         _matmulQ3KMmq = matmulQ3KMmq;
+        _matmulIq2XxsMmq = matmulIq2XxsMmq;
         _rmsnorm = rmsnorm;
         _rope = rope;
         _attention = attention;
@@ -932,6 +936,7 @@ public sealed class VulkanTransformerModel : IModel
         // K-quant MMVQ kernel is live). null when integer-dot is unavailable / SPV
         // missing / env opt-out → RecordMatmul falls back to the F32-in GEMV.
         var matmulIq2XxsMmvq = IsMmvqDisabled() ? null : MatMulIq2XxsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
+        var matmulIq2XxsMmq  = IsMmqDisabled() ? null : MatMulIq2XxsMmqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2XsMmvq  = IsMmvqDisabled() ? null : MatMulIq2XsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2SMmvq   = IsMmvqDisabled() ? null : MatMulIq2SMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2Xxs     = MatMulIq2XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
@@ -1131,6 +1136,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq4NlMmq,
             matmulQ2KMmq,
             matmulQ3KMmq,
+            matmulIq2XxsMmq,
             rmsnorm, rope, attention, flashAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
@@ -2802,6 +2808,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmq?.InvalidateDescriptorCache();
         _matmulQ2KMmq?.InvalidateDescriptorCache();
         _matmulQ3KMmq?.InvalidateDescriptorCache();
+        _matmulIq2XxsMmq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
@@ -4715,6 +4722,19 @@ public sealed class VulkanTransformerModel : IModel
                     _matmulIq2Xxs.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim);
                 }
             }
+            else if (_matmulIq2XxsMmq is not null && _quantizeQ8_1Rows is not null
+                && _state.Q8_1XqRows is not null && _state.Q8_1XdsRows is not null
+                && (inputDim % MatMulIq2XxsMmqKernel.Iq2XxsGroupSize) == 0
+                && QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) <= _state.Q8_1XqRows.Size
+                && QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) <= _state.Q8_1XdsRows.Size)
+            {
+                // dp4a MMQ prefill path (issue #344).
+                _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
+                    n: seqLen, k: inputDim);
+                KernelSupport.ComputeToComputeBarrier(cmdBuf);
+                _matmulIq2XxsMmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
+                    m: outputDim, k: inputDim, n: seqLen);
+            }
             else
                 _matmulIq2XxsGemm.Record(cmdBuf, weights, input, output, m: outputDim, k: inputDim, n: seqLen);
         }
@@ -5079,6 +5099,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq4NlMmq?.Dispose();
         _matmulQ2KMmq?.Dispose();
         _matmulQ3KMmq?.Dispose();
+        _matmulIq2XxsMmq?.Dispose();
         _quantizeQ8_1Rows?.Dispose();
         _matmulQ4KMmvq?.Dispose();
         _matmulQ6KMmvq?.Dispose();
