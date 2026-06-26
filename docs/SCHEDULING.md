@@ -94,20 +94,53 @@ Each request carries a `RequestPriority` enum (`Critical`, `High`, `Normal` (def
 - `Priority_InferenceRequest_DefaultsToNormal` — guards default.
 - `Priority_CriticalBeatsHighBeatsNormalBeatsLow` — strict tier ordering.
 
-**Preemption (the second half of Step 59) still pending** — see § Preemption below. The `_preemptionCount` field and `BatchSchedulerMetrics.PreemptionCount` are wired through but always read 0 today.
+**Preemption shipped (Phase 9 Step 59, recompute-on-resume)** — see § Preemption below. `SchedulerMetrics.PreemptionCount` now reflects real preemptions.
 
 ## Preemption
 
-When KV-cache memory is exhausted and high-priority requests arrive:
+When KV-cache block pressure builds and a higher-priority request is waiting, the scheduler can
+preempt a lower-priority active sequence to admit the higher-priority one. Enabled via
+`ContinuousBatchSchedulerOptions.EnablePreemption` (default **off**); it engages only when a paged
+pool is wired and `ReserveBlocksPerSequence > 0` (those are what surface block pressure to the
+admission loop).
 
-1. Select lowest-priority active sequences.
-2. **Swap out**: Save their KV-cache blocks to CPU memory (or mark for recomputation).
-3. Free GPU KV blocks for the new request.
-4. Later: when capacity returns, **swap in**: restore KV blocks and resume.
+The flow, inside the admission loop of `Step()` (after zero-refcount trie eviction fails to relieve pressure):
+
+1. **Select victim** — the lowest-priority active `Decoding` sequence **strictly below** the
+   incoming request's priority. Among equal-priority candidates the **most-recently-submitted** is
+   chosen, so older sequences keep running (anti-starvation within a tier). `Critical` (and any
+   same-or-higher tier) is never selected.
+2. **Swap out (recompute strategy)** — free the victim's KV blocks immediately (`PreemptSequence` →
+   `FreeKvCacheOnly`, no trie-completion recording since the sequence is unfinished). The victim's
+   already-generated tokens are **retained**.
+3. **Re-queue** the victim at its **original priority and submission order** so a repeatedly-preempted
+   request keeps its FIFO place ahead of newer same-tier work. Its state returns to `Queued` with an
+   `IsResuming` flag, and `SchedulerMetrics.PreemptionCount` is incremented.
+4. **Repeat** until the pool holds at least `ReserveBlocksPerSequence` free blocks or no eligible
+   victim remains, then admit the incoming request.
+5. **Swap in (resume)** — when the preempted sequence is later re-admitted, `AdmitAndResume` allocates
+   a fresh cache and **recomputes** the KV by re-forwarding `prompt + generated[0 .. n-2]` (the last
+   generated token is re-forwarded by the normal decode step). **No token is sampled on resume**, so
+   the output is token-for-token identical to a sequence that was never preempted.
 
 Swap options:
-- **Recompute**: Discard KV, re-prefill when resuming. Simple, no CPU memory needed.
-- **CPU offload**: Copy KV blocks to CPU memory. Faster resume but uses CPU RAM.
+- **Recompute** (shipped): Discard KV, re-forward prompt + generated tokens on resume. Simple, no host
+  memory needed. This is the implemented strategy.
+- **CPU offload** (future): Copy KV blocks to host memory. Faster resume but uses host RAM.
+
+Unit tests (in `ContinuousBatchSchedulerTests`):
+- `Preemption_LowEvictedForHigh_UnderBlockPressure` — a Low sequence is evicted so a later High can be
+  admitted under block pressure; the victim is re-queued, `PreemptionCount == 1`, and all blocks return
+  to the pool after completion.
+- `Preemption_ResumedSequence_MatchesUnpreemptedOutput` — the preempted/resumed sequence reproduces the
+  unpreempted control output exactly, token-for-token.
+- `Preemption_Disabled_HigherPriorityWaitsInsteadOfPreempting` — with `EnablePreemption = false` the
+  High request waits; `PreemptionCount == 0`.
+- `Preemption_NeverEvictsCriticalActiveSequence` — a High request cannot preempt a `Critical` active
+  sequence; it waits instead.
+
+**Still pending in Step 59**: prefill/decode disaggregation (separate queues/pools) and fairness
+constraints (per-API-key accounting to prevent starvation under a continuous higher-priority stream).
 
 ## Sequence State Machine
 

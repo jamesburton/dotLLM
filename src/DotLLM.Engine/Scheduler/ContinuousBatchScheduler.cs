@@ -36,8 +36,10 @@ namespace DotLLM.Engine.Scheduler;
 ///   <item>Chunked prefill. A long prompt is prefilled in a single forward pass during admission.
 ///   See <see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/> for the partial
 ///   admission cap that mitigates head-of-line blocking at admission time only.</item>
-///   <item>Preemption / swap. Sequences run to completion once admitted. Step 59 will add
-///   priority-based preemption for VRAM-constrained workloads.</item>
+///   <item>Host-memory KV swap. When <see cref="ContinuousBatchSchedulerOptions.EnablePreemption"/>
+///   is set, the scheduler preempts lower-priority active sequences under block pressure and
+///   <em>recomputes</em> their KV-cache on resume (Step 59). CPU-offload of KV blocks (faster resume,
+///   uses host RAM) is the remaining swap strategy.</item>
 ///   <item>Streaming yield. Generated tokens accumulate inside the scheduler and surface only
 ///   when <see cref="ISchedulerRequest.Completion"/> resolves. Streaming through a
 ///   <c>ChannelWriter&lt;GenerationToken&gt;</c> per request is straightforward to add but
@@ -69,12 +71,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private readonly List<SchedulerRequest> _active = new();
 
     private long _submissionCounter;
-    // Preemption is intentionally not implemented in the MVP (deferred to Step 59 / advanced
-    // scheduling). The counter exists so the metrics surface and the eventual implementation
-    // can plug in without an API change.
-#pragma warning disable CS0649
+    // Number of preemptions performed (Step 59 advanced scheduling). Incremented when a lower-priority
+    // active sequence is evicted under block pressure to admit a higher-priority request; the victim is
+    // re-queued and resumes via recompute (see TryPreemptForPressure). Surfaced via GetMetrics().
     private long _preemptionCount;
-#pragma warning restore CS0649
     private bool _disposed;
 
     /// <summary>Number of sequences ever submitted to this scheduler.</summary>
@@ -266,15 +266,27 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
 
             // Block-pool gating: refuse admission if the paged pool can't fit the worst-case
-            // footprint. Try to relieve pressure by evicting zero-refcount trie blocks first.
+            // footprint. Try to relieve pressure by evicting zero-refcount trie blocks first,
+            // then — when preemption is enabled — by evicting lower-priority active sequences.
             if (_pagedPool is not null && _options.ReserveBlocksPerSequence > 0 &&
                 _pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
             {
                 int short_ = _options.ReserveBlocksPerSequence - _pagedPool.FreeBlocks;
                 if (_prefixCache is not null)
                     _prefixCache.TryEvict(short_);
+
                 if (_pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
+                {
+                    // Preempt the lowest-priority active sequence(s) strictly below this request's
+                    // priority to free blocks. Victims are re-queued and resume via recompute.
+                    if (_options.EnablePreemption &&
+                        TryPreemptForPressure(head, _options.ReserveBlocksPerSequence))
+                    {
+                        // Freed enough — re-evaluate the (possibly mutated) queue head and capacity.
+                        continue;
+                    }
                     break;
+                }
             }
 
             SchedulerRequest? seq;
@@ -285,21 +297,27 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
             try
             {
-                AdmitAndPrefill(seq);
-                admittedThisStep++;
-                prefillTokensThisStep += seq.PromptLength;
-                didWork = true;
-
-                // If the first sampled token already triggered a stop condition, AdmitAndPrefill
-                // sets state to Completed — finish out the response and skip the decoding queue.
-                if (seq.State == SequenceState.Completed)
+                if (seq.IsResuming)
                 {
-                    CompleteSequence(seq);
+                    // Re-admitted after preemption: rebuild KV from prompt + generated tokens.
+                    // No first-token sample (output already has tokens); goes straight to Decoding.
+                    AdmitAndResume(seq);
+                    _active.Add(seq);
                 }
                 else
                 {
-                    _active.Add(seq);
+                    AdmitAndPrefill(seq);
+
+                    // If the first sampled token already triggered a stop condition, AdmitAndPrefill
+                    // sets state to Completed — finish out the response and skip the decoding queue.
+                    if (seq.State == SequenceState.Completed)
+                        CompleteSequence(seq);
+                    else
+                        _active.Add(seq);
                 }
+                admittedThisStep++;
+                prefillTokensThisStep += seq.PromptLength;
+                didWork = true;
             }
             catch (OperationCanceledException)
             {
@@ -456,6 +474,153 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         }
 
         seq.State = SequenceState.Decoding;
+    }
+
+    /// <summary>
+    /// Re-admits a preempted sequence by recomputing its KV-cache (swap strategy (i)).
+    /// Re-forwards the retained prompt + already-generated tokens (excluding the most recent one,
+    /// which the decode loop re-forwards) to rebuild KV, then transitions straight to
+    /// <see cref="SequenceState.Decoding"/>. No token is sampled here — the generated output is
+    /// preserved exactly, so resume is observationally identical to never having been preempted.
+    /// </summary>
+    private void AdmitAndResume(SchedulerRequest seq)
+    {
+        Debug.Assert(seq.State == SequenceState.Queued);
+        Debug.Assert(seq.IsResuming);
+
+        int promptLen = seq.PromptLength;
+        int genCount = seq.GeneratedTokens.Count;
+        Debug.Assert(genCount >= 1, "A preempted sequence has always sampled its first token.");
+
+        // KV must cover positions [0, promptLen + genCount - 2]; the last generated token is
+        // re-forwarded by DecodeOneStep. rebuildLen >= promptLen >= 1.
+        int rebuildLen = promptLen + genCount - 1;
+        int cacheSize = Math.Min(promptLen + seq.MaxTokens, _model.Config.MaxSequenceLength);
+
+        // Always a fresh, non-prefix-cached cache: the recompute rebuilds every block from scratch.
+        seq.KvCache = _kvCacheFactory(_model.Config, cacheSize);
+        seq.IsPrefixCached = false;
+        seq.PrefixCachedTokens = 0;
+        seq.State = SequenceState.Prefilling;
+
+        int[] ctx = ArrayPool<int>.Shared.Rent(rebuildLen);
+        int[] positionsArray = ArrayPool<int>.Shared.Rent(rebuildLen);
+        try
+        {
+            Array.Copy(seq.PromptTokenIds, ctx, promptLen);
+            for (int i = 0; i < genCount - 1; i++)
+                ctx[promptLen + i] = seq.GeneratedTokens[i];
+
+            var positions = positionsArray.AsSpan(0, rebuildLen);
+            for (int i = 0; i < rebuildLen; i++)
+                positions[i] = i;
+
+            long ts0 = Stopwatch.GetTimestamp();
+            // Logits are discarded — the next token comes from the decode loop re-forwarding the
+            // retained last generated token. We forward only to repopulate the KV-cache.
+            using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1, seq.KvCache);
+            seq.PrefillTicks += Stopwatch.GetTimestamp() - ts0;
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(ctx);
+            ArrayPool<int>.Shared.Return(positionsArray);
+        }
+
+        seq.IsResuming = false;
+        seq.State = SequenceState.Decoding;
+    }
+
+    // ── Preemption (Step 59) ──
+
+    /// <summary>
+    /// Frees blocks under pressure by preempting active sequences whose priority is strictly below
+    /// <paramref name="incoming"/>. Preempts greedily until the pool holds at least
+    /// <paramref name="neededFreeBlocks"/> free blocks or no eligible victim remains.
+    /// </summary>
+    /// <returns><see langword="true"/> if the pool now has at least <paramref name="neededFreeBlocks"/>
+    /// free blocks.</returns>
+    private bool TryPreemptForPressure(SchedulerRequest incoming, int neededFreeBlocks)
+    {
+        Debug.Assert(_pagedPool is not null);
+        while (_pagedPool!.FreeBlocks < neededFreeBlocks)
+        {
+            int victimIdx = SelectVictim(incoming);
+            if (victimIdx < 0) return false;
+            PreemptSequence(_active[victimIdx]);
+            _active.RemoveAt(victimIdx);
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Selects the preemption victim: the lowest-priority active <see cref="SequenceState.Decoding"/>
+    /// sequence strictly below <paramref name="incoming"/>'s priority. Among equal-priority candidates
+    /// the most-recently-submitted (largest <see cref="SchedulerRequest.SubmissionOrder"/>) is chosen so
+    /// older sequences keep running — anti-starvation within a tier. Returns -1 when none qualify.
+    /// </summary>
+    private int SelectVictim(SchedulerRequest incoming)
+    {
+        int incomingPriority = (int)incoming.Request.Priority;
+        int victimIdx = -1;
+        int victimPriority = int.MaxValue;
+        long victimOrder = long.MinValue;
+
+        for (int i = 0; i < _active.Count; i++)
+        {
+            var s = _active[i];
+            if (s.State != SequenceState.Decoding) continue;
+
+            int p = (int)s.Request.Priority;
+            if (p >= incomingPriority) continue; // never preempt a same-or-higher tier (incl. Critical)
+
+            if (p < victimPriority || (p == victimPriority && s.SubmissionOrder > victimOrder))
+            {
+                victimPriority = p;
+                victimOrder = s.SubmissionOrder;
+                victimIdx = i;
+            }
+        }
+        return victimIdx;
+    }
+
+    /// <summary>
+    /// Preempts a single active sequence: frees its KV-cache (without recording a trie completion —
+    /// the sequence is not finished), retains its generated tokens, and re-queues it at its original
+    /// priority and submission order so it resumes in place via <see cref="AdmitAndResume"/>.
+    /// </summary>
+    private void PreemptSequence(SchedulerRequest seq)
+    {
+        FreeKvCacheOnly(seq);
+        seq.State = SequenceState.Queued;
+        seq.IsResuming = true;
+        seq.IsPrefixCached = false;
+        seq.PrefixCachedTokens = 0;
+        Interlocked.Increment(ref _preemptionCount);
+
+        // Re-queue with the ORIGINAL key (priority + submission order) so a repeatedly-preempted
+        // request keeps its FIFO place ahead of newer same-tier requests (anti-starvation).
+        var key = (PriorityRank: -(int)seq.Request.Priority, Order: seq.SubmissionOrder);
+        lock (_queueLock)
+        {
+            _pendingQueue.Enqueue(seq, key);
+        }
+    }
+
+    /// <summary>
+    /// Disposes a sequence's KV-cache and frees its blocks, <em>without</em> routing a completion
+    /// back to the prefix trie (used for preemption, where the sequence is not finished).
+    /// </summary>
+    private static void FreeKvCacheOnly(SchedulerRequest seq)
+    {
+        var cache = seq.KvCache;
+        if (cache is null) return;
+        seq.KvCache = null;
+        try { cache.Dispose(); }
+        catch
+        {
+            // Disposal failures must not derail the scheduler loop.
+        }
     }
 
     // ── Decode ──

@@ -11,6 +11,9 @@ namespace DotLLM.Engine.Scheduler;
 ///         (or in one step for non-chunked prefill).</item>
 ///   <item><c>Decoding</c> → <c>Completed</c> when a stop condition fires or the
 ///         max-token / cache limit is hit.</item>
+///   <item><c>Decoding</c> → <c>Queued</c> when preempted under KV-cache pressure
+///         (Step 59); the sequence keeps its generated tokens and resumes by recomputing
+///         its KV-cache when re-admitted.</item>
 ///   <item><c>Queued</c>/<c>Prefilling</c>/<c>Decoding</c> → <c>Cancelled</c> when
 ///         the caller cancels the request.</item>
 /// </list>
