@@ -17,8 +17,18 @@ public class VulkanMatMulIq2XxsMmqKernelTests
     private const int BlockBytes = 66;
     private const float RelTol = 6e-2f;
 
+    // Small/medium shapes only. The kernel is bit-correct at every shape, but on the
+    // gfx1151 iGPU the AMD driver miscompiles this grid-codebook shader into a GPU fault
+    // once a single submit's total work is large (per-submit-cumulative — neither
+    // robustBufferAccess nor per-dispatch chunking removes it). Production-scale shapes
+    // (e.g. 8×2048×2048) crash the device, so the kernel is opt-in only
+    // (DOTLLM_VULKAN_ENABLE_IQ2XXS_MMQ=1) and IQ2_XXS prefill defaults to the F32 GEMM.
+    // See VulkanTransformerModel.IsIq2XxsMmqEnabled (issue #344).
     [SkippableTheory]
     [InlineData(2, 4, 256)]
+    [InlineData(1, 1, 256)]
+    [InlineData(17, 33, 512)]
+    [InlineData(7, 4, 768)]
     public void Mmq_MatchesF32Oracle_ArgmaxAndTolerance(int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

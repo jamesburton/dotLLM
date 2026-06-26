@@ -936,7 +936,9 @@ public sealed class VulkanTransformerModel : IModel
         // K-quant MMVQ kernel is live). null when integer-dot is unavailable / SPV
         // missing / env opt-out → RecordMatmul falls back to the F32-in GEMV.
         var matmulIq2XxsMmvq = IsMmvqDisabled() ? null : MatMulIq2XxsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
-        var matmulIq2XxsMmq  = IsMmqDisabled() ? null : MatMulIq2XxsMmqKernel.TryCreate(device, spvDir, iq2Codebooks);
+        // IQ2_XXS MMQ is opt-in (off by default) — driver-faults at scale on gfx1151; see
+        // IsIq2XxsMmqEnabled. Default path: dequant→F32 GEMM (matmulIq2XxsGemm below).
+        var matmulIq2XxsMmq  = (IsMmqDisabled() || !IsIq2XxsMmqEnabled()) ? null : MatMulIq2XxsMmqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2XsMmvq  = IsMmvqDisabled() ? null : MatMulIq2XsMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2SMmvq   = IsMmvqDisabled() ? null : MatMulIq2SMmvqKernel.TryCreate(device, spvDir, iq2Codebooks);
         var matmulIq2Xxs     = MatMulIq2XxsGemvF32Kernel.CreateWithCodebooks(device, spvDir, iq2Codebooks);
@@ -1202,6 +1204,20 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmqEnvVar) == "1";
+
+    /// <summary>
+    /// Opt-IN gate for the IQ2_XXS dp4a MMQ prefill kernel (issue #344). It is OFF by
+    /// default: on the gfx1151 iGPU the AMD driver miscompiles this grid-codebook shader
+    /// into a GPU fault once a single submit's total work is large (verified — every GLSL
+    /// access is provably in-bounds; robustBufferAccess and per-dispatch chunking only
+    /// raise the threshold, they do not remove the fault, which is per-submit-cumulative).
+    /// The kernel is bit-correct at small shapes; until the driver is fixed (or a
+    /// per-chunk separate-submit path is built) IQ2_XXS prefill stays on the working
+    /// dequant→F32 GEMM (<see cref="MatMulIq2XxsGemmF32Kernel"/>). Set
+    /// <c>DOTLLM_VULKAN_ENABLE_IQ2XXS_MMQ=1</c> to opt in (small shapes only).
+    /// </summary>
+    internal static bool IsIq2XxsMmqEnabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_ENABLE_IQ2XXS_MMQ") == "1";
 
     /// <summary>
     /// Records the attention dispatch using Flash-Attention when the kernel
