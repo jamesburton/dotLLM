@@ -7,6 +7,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
+using DotLLM.Engine.Constraints;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -158,6 +159,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description("Tool definitions: JSON array string or file path (prefixed with @). " +
                      "When provided, the prompt is formatted via the model's chat template with tool definitions.")]
         public string? Tools { get; set; }
+
+        /// <summary>Tool selection mode.</summary>
+        [CommandOption("--tool-choice")]
+        [Description("Tool selection: 'auto' (default), 'none', 'required' (constrain output to a valid tool call), or a function name.")]
+        public string ToolChoiceStr { get; set; } = "auto";
 
         /// <summary>Draft model for speculative decoding.</summary>
         [CommandOption("--speculative-model")]
@@ -317,6 +323,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             });
             toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
         }
+        var toolChoice = ChatCommand.ParseToolChoice(settings.ToolChoiceStr, tools);
 
         // Build inference options from CLI flags
         var responseFormat = settings.ResponseFormat.ToLowerInvariant() switch
@@ -327,6 +334,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             "grammar" => BuildGrammarFormat(settings.Grammar),
             _ => null
         };
+
+        // When required/function, constrain output to valid tool-call JSON (bare JSON object).
+        if (responseFormat is null && tools is { Length: > 0 } && (toolChoice is ToolChoice.Required or ToolChoice.Function))
+        {
+            string argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments";
+            responseFormat = toolChoice switch
+            {
+                ToolChoice.Required => new Core.Configuration.ResponseFormat.JsonSchema
+                    { Schema = ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey), Name = "tool_call" },
+                ToolChoice.Function fn => new Core.Configuration.ResponseFormat.JsonSchema
+                    { Schema = ToolCallSchemaBuilder.BuildForFunction(tools.First(t => t.Name == fn.Name), argumentsKey), Name = "tool_call" },
+                _ => responseFormat
+            };
+            // Constrained output is bare JSON → parse with the generic (markerless) parser.
+            toolCallParser = new GenericToolCallParser();
+        }
         var inferenceOptions = new InferenceOptions
         {
             Temperature = settings.Temperature,
@@ -467,9 +490,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
             {
-                if (settings.Json)
-                    generatedText.Append(token.Text);
-                else
+                generatedText.Append(token.Text);
+                if (!settings.Json)
                     Console.Write(token.Text);
 
                 if (token.FinishReason is null || token.Text.Length > 0)
@@ -538,6 +560,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 detectedToolCalls = toolCallParser.TryParse(outputText);
                 if (detectedToolCalls is { Length: > 0 })
                     finishReason = FinishReason.ToolCalls;
+            }
+
+            // For constrained tool-choice paths, display the resolved tool call in non-JSON mode.
+            if (!settings.Json && detectedToolCalls is { Length: > 0 }
+                && (toolChoice is ToolChoice.Required or ToolChoice.Function))
+            {
+                foreach (var tc in detectedToolCalls)
+                    AnsiConsole.MarkupLine($"[dim]tool call:[/] [green]{Markup.Escape(tc.FunctionName)}[/]({Markup.Escape(tc.Arguments)})");
             }
 
             if (settings.Json)
