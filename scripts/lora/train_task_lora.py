@@ -41,11 +41,25 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-4bit", action="store_true")
+    ap.add_argument("--max-seq-len", type=int, default=4096,
+                    help="Drop training examples longer than this (tokens). Lower it (e.g. 1024) "
+                         "to bound activation memory for long-example tasks on small GPUs.")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                    help="Enable gradient checkpointing (saves activation memory at some compute cost).")
+    ap.add_argument("--chat-template", default=None,
+                    help="Path to a Jinja chat template to override the tokenizer's built-in one. "
+                         "Required for tool-use on bases whose template lacks tool support (e.g. BitNet → "
+                         "scripts/lora/templates/bitnet_tooluse.jinja), so the <tools> block is rendered "
+                         "identically to dotLLM serving.")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.base)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    if args.chat_template:
+        with open(args.chat_template, encoding="utf-8") as f:
+            tok.chat_template = f.read()
+        print(f"Using chat template override: {args.chat_template}")
 
     if args.no_4bit:
         model = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16,
@@ -62,6 +76,11 @@ def main():
     lcfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM", target_modules=TARGET_MODULES)
     model = get_peft_model(model, lcfg)
+    # Gradient checkpointing trades compute for a large activation-memory saving —
+    # required to fit long examples (e.g. code) of a full-bf16 base on a 12 GB card.
+    if args.grad_checkpoint:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
     model.print_trainable_parameters()
 
     ds = datasets.load_dataset(args.dataset, args.dataset_config, split=args.split)
@@ -80,7 +99,7 @@ def main():
                 ids, labels = render(tok, msgs)
         except (KeyError, ValueError):
             continue
-        if len(ids) <= 4096:
+        if len(ids) <= args.max_seq_len:
             examples.append((ids, labels))
         if len(examples) >= args.max_examples:
             break
