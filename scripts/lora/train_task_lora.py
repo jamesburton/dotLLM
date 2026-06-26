@@ -41,11 +41,20 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-4bit", action="store_true")
+    ap.add_argument("--chat-template", default=None,
+                    help="Path to a Jinja chat template to override the tokenizer's built-in one. "
+                         "Required for tool-use on bases whose template lacks tool support (e.g. BitNet → "
+                         "scripts/lora/templates/bitnet_tooluse.jinja), so the <tools> block is rendered "
+                         "identically to dotLLM serving.")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.base)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    if args.chat_template:
+        with open(args.chat_template, encoding="utf-8") as f:
+            tok.chat_template = f.read()
+        print(f"Using chat template override: {args.chat_template}")
 
     if args.no_4bit:
         model = AutoModelForCausalLM.from_pretrained(args.base, dtype=torch.bfloat16,
