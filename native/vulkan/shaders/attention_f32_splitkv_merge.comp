@@ -1,0 +1,102 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Split-KV (flash-decoding) MERGE pass. Decode-only (seqQ == 1).
+//
+// One workgroup per query head. Combines the numSplits partial states produced
+// by attention_f32_splitkv.comp — each a running max m_s, running sum l_s, and
+// un-normalized accumulator acc_s[head_dim] — into the final normalized output
+// row using the standard online-softmax combine:
+//
+//   M    = max_s m_s
+//   L    = sum_s exp(m_s - M) * l_s
+//   O[d] = (1/L) * sum_s exp(m_s - M) * acc_s[d]
+//
+// This is the cross-block reduction half of Flash-Decoding.
+
+#define WG_SIZE 256
+#define NEG_INF (-3.4e38)
+
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufPartOut { float partOut[]; }; // [numHeads*numSplits, head_dim]
+layout(set = 0, binding = 1, std430) readonly  buffer BufPartMS  { float partMS[]; };  // [numHeads*numSplits, 2]
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut     { float outp[]; };    // [1, numHeads * head_dim]
+
+layout(push_constant) uniform PushConstants {
+    uint numHeads;
+    uint headDim;
+    uint numSplits;
+} pc;
+
+shared float partialMax[64];
+shared float partialSum[64];
+shared float broadcastSlot;
+
+float workgroupMaxSg(float val) {
+    float sgMax = subgroupMax(val);
+    if (subgroupElect()) partialMax[gl_SubgroupID] = sgMax;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? partialMax[gl_SubgroupInvocationID] : NEG_INF;
+        float reduced = subgroupMax(x);
+        if (subgroupElect()) broadcastSlot = reduced;
+    }
+    barrier();
+    float m = broadcastSlot;
+    barrier();
+    return m;
+}
+
+float workgroupSumSg(float val) {
+    float sgSum = subgroupAdd(val);
+    if (subgroupElect()) partialSum[gl_SubgroupID] = sgSum;
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups) ? partialSum[gl_SubgroupInvocationID] : 0.0;
+        float reduced = subgroupAdd(x);
+        if (subgroupElect()) broadcastSlot = reduced;
+    }
+    barrier();
+    float s = broadcastSlot;
+    barrier();
+    return s;
+}
+
+void main() {
+    uint hq = gl_WorkGroupID.x;
+    if (hq >= pc.numHeads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint headBase = hq * pc.numSplits;
+
+    // 1. Global max over splits.
+    float localMax = NEG_INF;
+    for (uint s = tid; s < pc.numSplits; s += WG_SIZE) {
+        localMax = max(localMax, partMS[(headBase + s) * 2u + 0u]);
+    }
+    float M = workgroupMaxSg(localMax);
+
+    // 2. Combined denominator L = sum_s exp(m_s - M) * l_s.
+    float localL = 0.0;
+    for (uint s = tid; s < pc.numSplits; s += WG_SIZE) {
+        float ms = partMS[(headBase + s) * 2u + 0u];
+        float ls = partMS[(headBase + s) * 2u + 1u];
+        float w = (ms > NEG_INF * 0.5) ? exp(ms - M) : 0.0;
+        localL += w * ls;
+    }
+    float L = workgroupSumSg(localL);
+    float invL = (L > 1e-20) ? (1.0 / L) : 0.0;
+
+    // 3. O[d] = invL * sum_s exp(m_s - M) * acc_s[d]. Coalesced partOut read.
+    uint outBase = hq * pc.headDim;
+    for (uint d = tid; d < pc.headDim; d += WG_SIZE) {
+        float acc = 0.0;
+        for (uint s = 0u; s < pc.numSplits; s++) {
+            float ms = partMS[(headBase + s) * 2u + 0u];
+            float w = (ms > NEG_INF * 0.5) ? exp(ms - M) : 0.0;
+            acc += w * partOut[(headBase + s) * pc.headDim + d];
+        }
+        outp[outBase + d] = acc * invL;
+    }
+}

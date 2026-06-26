@@ -225,6 +225,15 @@ public sealed class VulkanTransformerModel : IModel
     /// When null, every dispatch falls through to <see cref="_attention"/>.
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
+    /// <summary>
+    /// Split-KV (Flash-Decoding) attention kernel for the long-context decode
+    /// path (seqQ == 1). Null when the SPVs are missing (older builds) or the
+    /// env-var opt-out is set. Even when present it is used only for shapes that
+    /// actually split (<see cref="VulkanSplitKvAttentionKernel.WouldSplit"/>);
+    /// short context falls through to <see cref="_attention"/>, keeping that path
+    /// bit-identical to before.
+    /// </summary>
+    private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
     // GeGLU (tanh-approximate GELU) FFN activation — created only when the
     // model's ActivationFunction is GELUTanh (Gemma 2 / Gemma 3). Null on
@@ -464,6 +473,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq2XxsMmqKernel? matmulIq2XxsMmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
         ScaleInplaceF32Kernel? embedScale, AddKernel add,
         BiasAddF32Kernel biasAdd,
@@ -562,6 +572,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope = rope;
         _attention = attention;
         _flashAttention = flashAttention;
+        _splitKvAttention = splitKvAttention;
         _swiglu = swiglu;
         _geglu = geglu;
         _relu2glu = relu2glu;
@@ -1004,6 +1015,13 @@ public sealed class VulkanTransformerModel : IModel
             IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        // Optional split-KV (Flash-Decoding) kernel for the long-context decode
+        // path (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
+        // builds); short-context decode still routes to the per-token kernel.
+        VulkanSplitKvAttentionKernel? splitKvAttention =
+            IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
+                ? null
+                : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         // Gemma GeGLU-tanh FFN activation — created only for GELUTanh models so
         // the SwiGLU path stays untouched. The embedding-scale kernel is
@@ -1139,7 +1157,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulQ2KMmq,
             matmulQ3KMmq,
             matmulIq2XxsMmq,
-            rmsnorm, rope, attention, flashAttention, swiglu, geglu, relu2glu, embedScale, add,
+            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -1165,6 +1183,17 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsFlashAttentionDisabled() =>
         Environment.GetEnvironmentVariable(DisableFlashAttentionEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the split-KV (Flash-Decoding) decode path. Set
+    /// <c>DOTLLM_VULKAN_DISABLE_SPLIT_DECODE=1</c> to force every decode dispatch
+    /// onto the legacy per-token <see cref="AttentionF32Kernel"/> — used for
+    /// same-session A/B benchmarking of the split-KV win.
+    /// </summary>
+    internal const string DisableSplitDecodeEnvVar = "DOTLLM_VULKAN_DISABLE_SPLIT_DECODE";
+
+    internal static bool IsSplitDecodeDisabled() =>
+        Environment.GetEnvironmentVariable(DisableSplitDecodeEnvVar) == "1";
 
     /// <summary>
     /// Env-var opt-out for the dp4a MMVQ decode path (issue #46). Set
@@ -1238,6 +1267,21 @@ public sealed class VulkanTransformerModel : IModel
         float softCap = 0.0f, float scaleOverride = 0.0f,
         AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
+        // Long-context decode (seqQ == 1): split the KV range across many
+        // workgroups (Flash-Decoding) when the shape is worth splitting. Short
+        // context falls through to the per-token kernel (bit-identical to before).
+        if (_splitKvAttention is not null && seqQ == 1
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
+        {
+            _splitKvAttention.Record(cmdBuf, q, k, v, output,
+                seqQ: seqQ, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: slidingWindow,
+                softCap: softCap, scaleOverride: scaleOverride,
+                maskMode: maskMode, prefixLen: prefixLen);
+            return;
+        }
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, q, k, v, output,
@@ -2829,6 +2873,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
+        _splitKvAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _geglu?.InvalidateDescriptorCache();
         _relu2glu?.InvalidateDescriptorCache();
@@ -5067,6 +5112,7 @@ public sealed class VulkanTransformerModel : IModel
         _relu2glu?.Dispose();
         _embedScale?.Dispose();
         _gemma4OnesVec?.Dispose();
+        _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
