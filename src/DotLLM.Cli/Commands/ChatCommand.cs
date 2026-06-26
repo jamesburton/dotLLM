@@ -782,7 +782,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
     }
 
-    private static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
+    internal static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
     {
         return choice.ToLowerInvariant() switch
         {
