@@ -10,10 +10,29 @@ public sealed class VulkanException : Exception
 
     /// <summary>Creates a Vulkan exception with the given error code and message.</summary>
     public VulkanException(int errorCode, string message)
-        : base($"Vulkan error {errorCode} ({ResultName(errorCode)}): {message}")
+        : base($"Vulkan error {errorCode} ({ResultName(errorCode)}): {message}{Hint(errorCode)}")
     {
         ErrorCode = errorCode;
     }
+
+    /// <summary>
+    /// <c>true</c> when the device was lost — a GPU fault / driver TDR reset. The
+    /// VkDevice and all its objects are now invalid; recovery requires recreating
+    /// the device. A device-lost from a compute submit usually means a kernel
+    /// crashed (out-of-bounds access, watchdog timeout, or a driver miscompilation).
+    /// </summary>
+    public bool IsDeviceLost => ErrorCode == -4;
+
+    /// <summary>Actionable hint appended to the message for failures that have a known cause/remedy.</summary>
+    private static string Hint(int r) => r switch
+    {
+        -4 => " — the GPU device was lost (a kernel faulted, the driver watchdog (TDR) fired, "
+            + "or the driver miscompiled a shader). The VkDevice is now invalid. Check the offending "
+            + "compute dispatch; on the gfx1151 iGPU some heavy quantized prefill kernels are known to "
+            + "trip this (see DOTLLM_VULKAN_DISABLE_MMQ to fall back to the F32-dequant GEMM path).",
+        -2 => " — out of device (GPU) memory; reduce the model/batch/context size or free GPU buffers.",
+        _ => string.Empty
+    };
 
     private static string ResultName(int r) => r switch
     {
