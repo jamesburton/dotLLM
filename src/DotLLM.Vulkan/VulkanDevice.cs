@@ -1161,6 +1161,15 @@ public sealed class VulkanDevice : IDisposable
 
         ci.pNext = featureChain;
 
+        // NOTE: with the validation layers enabled you may see a benign
+        // VUID-VkDeviceCreateInfo-pNext-pNext "unexpected VkStructureType" naming a
+        // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo in this chain. It is a
+        // validation false-positive: the chained struct is VkPhysicalDeviceSubgroupSizeControl-
+        // Features and its runtime sType is correct (1000225001, verified). The layer
+        // mis-attributes it because we deliberately request a 1.2 instance while using the
+        // (1.3-core) subgroup-size-control feature via its EXT alias. The driver accepts it
+        // and the wave32 required-subgroup-size pins work. Not a real bug; do not "fix".
+
         if (extCount > 0)
         {
             ci.enabledExtensionCount = extCount;
