@@ -19,7 +19,8 @@ namespace DotLLM.Tests.Integration.Engine;
 /// <item>the extracted <see cref="ModelConfig"/> carries every Gemma-4 feature (dual head dim,
 /// global KV heads, MoE, partial rope 0.25, attn scalar 1.0, softcap 30, dual FFN);</item>
 /// <item>a single-thread cacheless causal forward over raw token ids is DETERMINISTIC and
-/// STABLE — its last-row logit checksum + argmax equal a hard-coded golden, run-to-run;</item>
+/// STABLE — its last-row logit checksum is byte-identical run-to-run, and its argmax equals a
+/// hard-coded cross-environment golden;</item>
 /// <item>the diffusion-gemma fixture loads with a non-null DiffusionConfig + self-cond weights
 /// and a short deterministic denoise loop produces stable, non-degenerate output;</item>
 /// <item>all four quant types (Q8_0, Q4_K, Q5_1, F32) are exercised by the fixture tensors.</item>
@@ -33,12 +34,18 @@ public sealed class SyntheticGemma4RegressionTests
 
     // ── Golden constants ──
     // Captured once from the deterministic fixture (gemma4 tiny, seed 0xC0FFEE, PromptIds below,
-    // single-thread cacheless causal forward) on the dev host (AVX2 dequant path). The ARGMAX is
-    // the firm cross-environment golden (robust to float-bit jitter). The CHECKSUM is an FNV-1a
-    // over the exact float bits of the last logit row — asserted run-to-run for stability, and
-    // hard-coded here as the AVX2-path golden; on a non-AVX2 (scalar dequant) host the last-bit
-    // rounding can differ, so the checksum assertion is gated on AVX2 being available.
-    private const ulong Gemma4LastRowChecksum = 0x2DA986DD36EB50E3UL;
+    // single-thread cacheless causal forward) on a developer AVX2 host. The ARGMAX is the firm
+    // cross-environment golden (robust to float-bit jitter) and IS asserted.
+    //
+    // The CHECKSUM is an FNV-1a over the *raw float32 bits* of the last logit row. It is NOT a
+    // cross-host golden and is deliberately NOT asserted as one: the bits depend on FMA
+    // contraction and on the BCL MathF.Tanh/Exp implementations (final-logit softcap 30, softmax),
+    // none of which are bit-identical across different AVX2 microarchitectures/runtimes — so even
+    // gated on AVX2 a hard-coded value is unportable. (Observed: the capture host yields the value
+    // below; CI consistently yields a different-but-stable 0xA0754E0053B2B1F6, with argmax 144 on
+    // both.) Determinism is instead gated by the run-to-run byte-identity check inside the test;
+    // the value below is retained only as a printed diagnostic reference for the capture host.
+    private const ulong Gemma4LastRowChecksumCaptureHost = 0x2DA986DD36EB50E3UL;
     private const int Gemma4LastRowArgmax = 144;
 
     private static readonly int[] PromptIds = [2, 17, 42, 99, 123, 200, 7];
@@ -165,16 +172,17 @@ public sealed class SyntheticGemma4RegressionTests
             // ── Deterministic forward (two independent loads) ──
             var (c1, a1, vocab) = RunGemma4Forward(path);
             var (c2, a2, _) = RunGemma4Forward(path);
-            _out.WriteLine($"[gemma4 tiny] vocab={vocab} argmax={a1} checksum=0x{c1:X16}");
-            Assert.Equal(c1, c2);   // run-to-run stable
+            _out.WriteLine($"[gemma4 tiny] vocab={vocab} argmax={a1} checksum=0x{c1:X16} " +
+                $"(capture-host reference=0x{Gemma4LastRowChecksumCaptureHost:X16})");
+            // DETERMINISM gate: two independent loads on THIS host must be byte-identical.
+            Assert.Equal(c1, c2);
             Assert.Equal(a1, a2);
             Assert.InRange(a1, 0, vocab - 1);
 
-            // Golden: argmax is the firm cross-environment constant; checksum is the AVX2-path
-            // golden (gated, since scalar-dequant hosts may differ in the last rounding bit).
+            // CORRECTNESS gate: argmax is the firm cross-environment golden. The raw float-bit
+            // checksum is intentionally not asserted as a cross-host golden (see the field comment) —
+            // run-to-run byte-identity above already pins determinism on every host.
             Assert.Equal(Gemma4LastRowArgmax, a1);
-            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
-                Assert.Equal(Gemma4LastRowChecksum, c1);
         }
         finally { File.Delete(path); }
     }
