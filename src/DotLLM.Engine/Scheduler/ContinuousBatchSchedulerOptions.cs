@@ -36,4 +36,26 @@ public sealed record ContinuousBatchSchedulerOptions
     /// <see cref="MaxActiveSequences"/> alone.
     /// </remarks>
     public int ReserveBlocksPerSequence { get; init; } = 0;
+
+    /// <summary>
+    /// When <see langword="true"/>, the scheduler may <em>preempt</em> an active, lower-priority
+    /// sequence to admit a strictly-higher-priority queued request under KV-cache block pressure.
+    /// The preempted sequence is returned to the admission queue (at its original priority and
+    /// submission order) and later <em>resumes by recomputing</em> its KV-cache from
+    /// prompt + already-generated tokens — no host-memory swap is required. Default
+    /// <see langword="false"/> (sequences run to completion once admitted, as in the MVP).
+    /// </summary>
+    /// <remarks>
+    /// <para>Preemption only engages when a paged pool is wired and
+    /// <see cref="ReserveBlocksPerSequence"/> &gt; 0 (those are what surface block pressure to the
+    /// admission loop). The victim is the lowest-priority active sequence strictly below the
+    /// incoming request's priority; among equal-priority candidates the most-recently-submitted is
+    /// chosen so older sequences keep running (anti-starvation within a tier). <c>Critical</c>
+    /// sequences are never selected as victims, and a request never preempts a same-or-higher tier.</para>
+    /// <para><b>Recompute, not swap.</b> This is swap-strategy (i) from <c>docs/SCHEDULING.md</c> § Preemption:
+    /// the victim's KV blocks are freed immediately and rebuilt on resume by re-running the model over
+    /// the retained prompt + generated tokens. Already-generated output is preserved; only the KV
+    /// tensors are recomputed. Host-memory KV offload (strategy (ii)) is a future enhancement.</para>
+    /// </remarks>
+    public bool EnablePreemption { get; init; } = false;
 }

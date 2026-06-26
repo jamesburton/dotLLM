@@ -7,6 +7,17 @@ sequence_item: phase-9-step-59
 
 # Phase 9 Step 59 — Advanced scheduling: scope + first-piece deliverable
 
+> **Progress (update 2026-06-26):**
+> - ✅ Sub-piece 1 — priority-ordered admission (commit `feb4c8c`).
+> - ✅ Sub-piece 2 — **preemption-on-pressure (recompute-on-resume, strategy (i))**. Added
+>   `ContinuousBatchSchedulerOptions.EnablePreemption` (default off), victim selection
+>   (lowest-priority active sequence strictly below the incoming request; newest-first tie-break;
+>   never `Critical`/same-tier), `PreemptSequence`/`FreeKvCacheOnly` (free KV, retain generated
+>   tokens, re-queue at original priority+order), and `AdmitAndResume` (rebuild KV from
+>   prompt + generated[0..n-2], no re-sample). `SchedulerMetrics.PreemptionCount` now live.
+>   4 new unit tests in `ContinuousBatchSchedulerTests`; `docs/SCHEDULING.md § Preemption` refreshed.
+> - ⏳ Remaining: prefill/decode disaggregation (sub-piece 3) and fairness constraints (sub-piece 4).
+
 ## What Step 59 covers
 
 From `docs/ROADMAP.md:169`:

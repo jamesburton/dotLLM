@@ -43,6 +43,13 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
     public int PrefixCachedTokens { get; set; }
 
+    /// <summary>
+    /// True when this sequence was preempted and re-queued and must be re-admitted via the
+    /// recompute-on-resume path (rebuild KV from prompt + already-generated tokens) instead of a
+    /// fresh prompt prefill. Set when the scheduler preempts the sequence; cleared on resume.
+    /// </summary>
+    public bool IsResuming { get; set; }
+
     /// <summary>Sampler pipeline built from the request's <c>InferenceOptions</c>.</summary>
     public SamplerPipeline SamplerPipeline { get; }
 

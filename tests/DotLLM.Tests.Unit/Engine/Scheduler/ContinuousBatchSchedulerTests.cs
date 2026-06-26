@@ -333,7 +333,170 @@ public sealed class ContinuousBatchSchedulerTests
         await hLow.Completion;
     }
 
+    // ── Priority-based preemption (Step 59) ──
+
+    [Fact]
+    public void Preemption_LowEvictedForHigh_UnderBlockPressure()
+    {
+        // Pool of 3 blocks; reserve gate of 3 forces "block pressure" the moment any sequence is
+        // holding blocks. A Low sequence is admitted and starts decoding (2 blocks held); a High
+        // request then arrives and must preempt the Low to be admitted.
+        using var fix = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 4,
+                ReserveBlocksPerSequence = 3,
+                EnablePreemption = true,
+            },
+            totalBlocks: 3,
+            inputEmitter: Ramp);
+
+        var low = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.Low));
+        fix.Scheduler.Step(); // admit + first decode → Low holds 2 blocks, FreeBlocks == 1
+
+        Assert.Equal(SequenceState.Decoding, low.State);
+        Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
+        Assert.Equal(1, fix.PagedPool.FreeBlocks);
+
+        var high = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.High));
+        fix.Scheduler.Step(); // block pressure → preempt Low, admit High
+
+        Assert.Equal(1L, fix.Scheduler.GetMetrics().PreemptionCount);
+        Assert.Equal(1, fix.Scheduler.ActiveCount);   // only High is active
+        Assert.Equal(1, fix.Scheduler.QueueDepth);    // Low was re-queued
+        Assert.Equal(SequenceState.Queued, low.State);
+        Assert.Equal(SequenceState.Decoding, high.State);
+        Assert.False(low.Completion.IsCompleted);
+
+        // Drain both. High finishes first; then Low resumes (recompute) and finishes; blocks return.
+        DriveUntilCompleted(fix.Scheduler, high);
+        DriveUntilCompleted(fix.Scheduler, low);
+        Assert.True(fix.Scheduler.IsIdle);
+        Assert.Equal(fix.PagedPool.TotalBlocks, fix.PagedPool.FreeBlocks);
+    }
+
+    [Fact]
+    public async Task Preemption_ResumedSequence_MatchesUnpreemptedOutput()
+    {
+        // Control: run the prompt alone with no preemption and capture the exact output.
+        int[] controlTokens;
+        FinishReason controlReason;
+        using (var ctl = new TestFixture(totalBlocks: 8, inputEmitter: Ramp))
+        {
+            var h = ctl.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16));
+            DriveUntilIdle(ctl.Scheduler);
+            var r = await h.Completion;
+            controlTokens = r.GeneratedTokenIds;
+            controlReason = r.FinishReason;
+        }
+        Assert.Equal(FinishReason.Stop, controlReason);
+        Assert.Equal(new[] { 5, 6, 7, 8, 9 }, controlTokens); // ramp 5..9 then EOS
+
+        // Preemption: the same sequence is preempted mid-decode, then resumes via recompute.
+        using var fix = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 4,
+                ReserveBlocksPerSequence = 3,
+                EnablePreemption = true,
+            },
+            totalBlocks: 3,
+            inputEmitter: Ramp);
+
+        var low = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.Low));
+        fix.Scheduler.Step();
+        Assert.Equal(SequenceState.Decoding, low.State); // genuinely started before preemption
+
+        var high = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.High));
+        fix.Scheduler.Step();
+        Assert.Equal(1L, fix.Scheduler.GetMetrics().PreemptionCount);
+        Assert.Equal(SequenceState.Queued, low.State);
+
+        DriveUntilCompleted(fix.Scheduler, high);
+        DriveUntilCompleted(fix.Scheduler, low);
+
+        var lowResp = await low.Completion;
+        // Recompute-on-resume must reproduce the unpreempted result exactly, token-for-token.
+        Assert.Equal(controlReason, lowResp.FinishReason);
+        Assert.Equal(controlTokens, lowResp.GeneratedTokenIds);
+        Assert.Equal(4, lowResp.PromptTokenCount);
+    }
+
+    [Fact]
+    public async Task Preemption_Disabled_HigherPriorityWaitsInsteadOfPreempting()
+    {
+        // Same pressure setup, but preemption is gated OFF: the High request must wait for the Low
+        // to free its blocks rather than evicting it. PreemptionCount stays 0.
+        using var fix = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 4,
+                ReserveBlocksPerSequence = 3,
+                EnablePreemption = false,
+            },
+            totalBlocks: 3,
+            inputEmitter: Ramp);
+
+        var low = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.Low));
+        fix.Scheduler.Step();
+        Assert.Equal(SequenceState.Decoding, low.State);
+
+        var high = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.High));
+        fix.Scheduler.Step();
+
+        Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
+        Assert.Equal(SequenceState.Queued, high.State);     // High waits
+        Assert.Equal(SequenceState.Decoding, low.State);    // Low keeps running
+
+        DriveUntilIdle(fix.Scheduler);
+        var rLow = await low.Completion;
+        var rHigh = await high.Completion;
+        Assert.Equal(FinishReason.Stop, rLow.FinishReason);
+        Assert.Equal(FinishReason.Stop, rHigh.FinishReason);
+        Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
+    }
+
+    [Fact]
+    public async Task Preemption_NeverEvictsCriticalActiveSequence()
+    {
+        // A High request cannot preempt a Critical (or any same-or-higher tier) active sequence —
+        // the victim rule only selects strictly-lower priority. High waits instead.
+        using var fix = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 4,
+                ReserveBlocksPerSequence = 3,
+                EnablePreemption = true,
+            },
+            totalBlocks: 3,
+            inputEmitter: Ramp);
+
+        var critical = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.Critical));
+        fix.Scheduler.Step();
+        Assert.Equal(SequenceState.Decoding, critical.State);
+
+        var high = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 16, priority: RequestPriority.High));
+        fix.Scheduler.Step();
+
+        Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
+        Assert.Equal(SequenceState.Decoding, critical.State); // never preempted
+        Assert.Equal(SequenceState.Queued, high.State);       // High waits
+
+        DriveUntilIdle(fix.Scheduler);
+        await critical.Completion;
+        await high.Completion;
+        Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
+    }
+
     // ── Helpers ──
+
+    /// <summary>
+    /// Content-driven token emitter for preemption tests: emits <c>input + 1</c> (a deterministic
+    /// ramp) until the input token reaches 9, then emits EOS. Because it depends only on the
+    /// generated-token chain — not on any per-cache step counter — it produces identical output
+    /// whether or not the sequence was preempted and recomputed mid-flight.
+    /// </summary>
+    private static int Ramp(int lastInputToken) => lastInputToken >= 9 ? EosTokenId : lastInputToken + 1;
 
     private static void DriveUntilIdle(IBatchScheduler scheduler, int maxIterations = 1000)
     {
@@ -397,12 +560,13 @@ public sealed class ContinuousBatchSchedulerTests
         public TestFixture(
             TokenScript? tokenScript = null,
             ContinuousBatchSchedulerOptions? options = null,
-            int totalBlocks = 64)
+            int totalBlocks = 64,
+            Func<int, int>? inputEmitter = null)
         {
             tokenScript ??= TokenScript.Constant(EosTokenId, afterNTokens: 1);
             PagedFactory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize,
                 maxTotalTokens: totalBlocks * BlockSize);
-            Model = new MockModel(tokenScript);
+            Model = new MockModel(tokenScript, inputEmitter);
             Tokenizer = new MockTokenizer();
             Scheduler = new ContinuousBatchScheduler(
                 Model,
@@ -427,9 +591,17 @@ public sealed class ContinuousBatchSchedulerTests
     private sealed class MockModel : IModel
     {
         private readonly TokenScript _script;
+        // Optional content-driven emitter: given the last input token, returns the token to emit.
+        // Independent of the per-cache step counter, so it survives a preempt→recompute resume
+        // (a fresh KvCache resets the step counter, but the generated-token chain is preserved).
+        private readonly Func<int, int>? _inputEmitter;
         private readonly Dictionary<IKvCache, int> _stepCounters = new(ReferenceEqualityComparer.Instance);
 
-        public MockModel(TokenScript script) => _script = script;
+        public MockModel(TokenScript script, Func<int, int>? inputEmitter = null)
+        {
+            _script = script;
+            _inputEmitter = inputEmitter;
+        }
 
         public ModelConfig Config => new()
         {
@@ -471,7 +643,18 @@ public sealed class ContinuousBatchSchedulerTests
                 step = 0;
             }
 
-            int emitToken = _script.Emit(step);
+            int emitToken;
+            if (_inputEmitter is not null)
+            {
+                // Emit from the last input token of this forward (the token whose successor the
+                // scheduler samples). Deterministic in the generated-token chain, not in call count.
+                int lastInput = tokenIds.Length > 0 ? tokenIds[^1] : 0;
+                emitToken = _inputEmitter(lastInput);
+            }
+            else
+            {
+                emitToken = _script.Emit(step);
+            }
             if ((uint)emitToken >= VocabSize) emitToken = 1;
 
             float* dst = (float*)logitsPtr;
