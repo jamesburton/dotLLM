@@ -3,14 +3,11 @@ using System.Runtime.CompilerServices;
 namespace DotLLM.Engine.Constraints.Schema;
 
 /// <summary>
-/// Tracks schema position during JSON generation. Advances in lockstep with
-/// <see cref="JsonCharParser"/>, observing structural events to enforce schema constraints.
+/// Holds all per-position schema-tracking state for a single JSON generation branch.
+/// Extracted from <see cref="SchemaTracker"/> so that Task 4 can generalise to a
+/// set of parallel branches without changing any tracking logic.
 /// </summary>
-/// <remarks>
-/// Value type — copies by value for zero-alloc cloning. Uses <c>InlineArray</c>
-/// for all stacks. Maximum nesting depth: 64 (matches <see cref="JsonCharParser"/>).
-/// </remarks>
-internal struct SchemaTracker
+internal struct BranchState
 {
     private const int MaxDepth = 64;
     private const int MaxKeyLength = 128;
@@ -48,10 +45,10 @@ internal struct SchemaTracker
     private bool _inEnumString;
 
     /// <summary>
-    /// Creates a new schema tracker for the given compiled schema.
+    /// Creates a new branch state for the given compiled schema.
     /// </summary>
     /// <param name="schema">The compiled schema (immutable, shared).</param>
-    public SchemaTracker(CompiledSchema schema)
+    public BranchState(CompiledSchema schema)
     {
         _schema = schema;
         _currentNodeIndex = 0; // root node
@@ -72,11 +69,8 @@ internal struct SchemaTracker
     /// Checks if a character is allowed by the schema at the current position.
     /// Called BEFORE <see cref="JsonCharParser.TryAdvance"/>.
     /// </summary>
-    /// <param name="c">The character to check.</param>
-    /// <param name="parser">The current parser state (before advancing).</param>
-    /// <returns>True if the schema allows this character.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly bool IsCharAllowedBySchema(char c, in JsonCharParser parser)
+    public readonly bool IsCharAllowed(char c, in JsonCharParser parser)
     {
         var state = parser.State;
 
@@ -651,6 +645,51 @@ internal struct SchemaTracker
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool IsWhitespace(char c) => c is ' ' or '\t' or '\n' or '\r';
+}
+
+/// <summary>
+/// Tracks schema position during JSON generation. Advances in lockstep with
+/// <see cref="JsonCharParser"/>, observing structural events to enforce schema constraints.
+/// </summary>
+/// <remarks>
+/// Value type — copies by value for zero-alloc cloning. Uses <c>InlineArray</c>
+/// for all stacks. Maximum nesting depth: 64 (matches <see cref="JsonCharParser"/>).
+/// Delegates to a single <see cref="BranchState"/> (<c>_b0</c>); Task 4 will generalise
+/// to a set of parallel branches.
+/// </remarks>
+internal struct SchemaTracker
+{
+    private BranchState _b0; // single active branch (Task 4 generalises to a set)
+
+    /// <summary>
+    /// Creates a new schema tracker for the given compiled schema.
+    /// </summary>
+    /// <param name="schema">The compiled schema (immutable, shared).</param>
+    public SchemaTracker(CompiledSchema schema) => _b0 = new BranchState(schema);
+
+    /// <summary>
+    /// Whether the schema is fully satisfied.
+    /// </summary>
+    public readonly bool IsComplete(in JsonCharParser p) => _b0.IsComplete(in p);
+
+    /// <summary>
+    /// Checks if a character is allowed by the schema at the current position.
+    /// Called BEFORE <see cref="JsonCharParser.TryAdvance"/>.
+    /// </summary>
+    public readonly bool IsCharAllowedBySchema(char c, in JsonCharParser p) => _b0.IsCharAllowed(c, in p);
+
+    /// <summary>
+    /// Called AFTER a character has been successfully accepted by the JSON parser.
+    /// </summary>
+    public void OnCharAdvanced(char c, in JsonCharParser p) => _b0.OnCharAdvanced(c, in p);
+
+    /// <summary>
+    /// Returns a composite state key for mask caching incorporating schema position.
+    /// </summary>
+    public readonly SchemaStateKey GetSchemaStateKey(in JsonCharParser p) => _b0.GetSchemaStateKey(in p);
+
+    /// <summary>Resets to initial state.</summary>
+    public void Reset() => _b0.Reset();
 }
 
 /// <summary>InlineArray for schema node index stack.</summary>
