@@ -114,6 +114,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// back to <see cref="_attention"/>.
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
+    /// <summary>
+    /// Split-KV (Flash-Decoding) kernel for the long-context decode path
+    /// (seqLen == 1). Null when the SPVs are missing or the env-var opt-out is
+    /// set; used only for shapes that actually split (short context falls back
+    /// to <see cref="_attention"/>, keeping that path unchanged).
+    /// </summary>
+    private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
     private readonly BiasAddF32Kernel _biasAdd;
@@ -185,6 +192,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
@@ -246,6 +254,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rope = rope;
         _attention = attention;
         _flashAttention = flashAttention;
+        _splitKvAttention = splitKvAttention;
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
@@ -412,6 +421,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        VulkanSplitKvAttentionKernel? splitKvAttention =
+            VulkanTransformerModel.IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
+                ? null
+                : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -447,7 +460,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, swiglu, add, biasAdd,
+            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit,
@@ -959,7 +972,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        if (_splitKvAttention is not null && seqLen == 1
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
+        {
+            // Long-context decode: split the KV range across many workgroups
+            // (Flash-Decoding). Short context falls through to the per-token kernel.
+            _splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
+        else if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
@@ -1041,6 +1065,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
+        _splitKvAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -1339,6 +1364,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
