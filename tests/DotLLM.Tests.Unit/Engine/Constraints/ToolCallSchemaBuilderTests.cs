@@ -75,32 +75,28 @@ public class ToolCallSchemaBuilderTests
     }
 
     [Fact]
-    public void BuildForRequired_MultipleTools_UsesEnumForName()
+    public void BuildForRequired_MultipleTools_UsesAnyOfPerTool()
     {
         string schema = ToolCallSchemaBuilder.BuildForRequired([WeatherTool, TimeTool]);
-
         using var doc = JsonDocument.Parse(schema);
-        var root = doc.RootElement;
-
-        // Should be a flat object schema with enum, not anyOf
-        Assert.Equal("object", root.GetProperty("type").GetString());
-        var nameSchema = root.GetProperty("properties").GetProperty("name");
-        Assert.True(nameSchema.TryGetProperty("enum", out var enumProp));
-        Assert.Equal(2, enumProp.GetArrayLength());
+        Assert.True(doc.RootElement.TryGetProperty("anyOf", out var anyOf));
+        Assert.Equal(2, anyOf.GetArrayLength());
+        foreach (var branch in anyOf.EnumerateArray())
+        {
+            Assert.Equal("object", branch.GetProperty("type").GetString());
+            Assert.True(branch.GetProperty("properties").GetProperty("name").TryGetProperty("const", out _));
+            Assert.False(branch.GetProperty("additionalProperties").GetBoolean());
+        }
     }
 
     [Fact]
-    public void BuildForRequired_MultipleTools_EnumContainsBothNames()
+    public void BuildForRequired_MultipleTools_BranchesCoverBothNames()
     {
         string schema = ToolCallSchemaBuilder.BuildForRequired([WeatherTool, TimeTool]);
-
         using var doc = JsonDocument.Parse(schema);
-        var enumValues = doc.RootElement.GetProperty("properties").GetProperty("name").GetProperty("enum");
-
         var names = new List<string>();
-        foreach (var val in enumValues.EnumerateArray())
-            names.Add(val.GetString()!);
-
+        foreach (var branch in doc.RootElement.GetProperty("anyOf").EnumerateArray())
+            names.Add(branch.GetProperty("properties").GetProperty("name").GetProperty("const").GetString()!);
         Assert.Contains("get_weather", names);
         Assert.Contains("get_time", names);
     }
@@ -118,17 +114,13 @@ public class ToolCallSchemaBuilderTests
     }
 
     [Fact]
-    public void BuildForParallelCalls_ItemsHaveEnumName()
+    public void BuildForParallelCalls_ItemsAreAnyOf()
     {
         string schema = ToolCallSchemaBuilder.BuildForParallelCalls([WeatherTool, TimeTool]);
-
         using var doc = JsonDocument.Parse(schema);
         var items = doc.RootElement.GetProperty("items");
-
-        // Items should be a flat object schema with enum for name
-        Assert.Equal("object", items.GetProperty("type").GetString());
-        Assert.True(items.GetProperty("properties").GetProperty("name").TryGetProperty("enum", out var enumProp));
-        Assert.Equal(2, enumProp.GetArrayLength());
+        Assert.True(items.TryGetProperty("anyOf", out var anyOf));
+        Assert.Equal(2, anyOf.GetArrayLength());
     }
 
     [Fact]
@@ -172,5 +164,48 @@ public class ToolCallSchemaBuilderTests
 
         var compiled = DotLLM.Engine.Constraints.Schema.SchemaCompiler.Compile(schema);
         Assert.NotNull(compiled);
+    }
+
+    [Fact]
+    public void BuildForFunction_OuterObject_ForbidsAdditionalProperties()
+    {
+        string schema = ToolCallSchemaBuilder.BuildForFunction(WeatherTool);
+        using var doc = JsonDocument.Parse(schema);
+        Assert.False(doc.RootElement.GetProperty("additionalProperties").GetBoolean());
+    }
+
+    [Fact]
+    public void BuildForFunction_ArgumentsObject_ForbidsAdditionalProperties()
+    {
+        string schema = ToolCallSchemaBuilder.BuildForFunction(WeatherTool);
+        using var doc = JsonDocument.Parse(schema);
+        var args = doc.RootElement.GetProperty("properties").GetProperty("arguments");
+        Assert.False(args.GetProperty("additionalProperties").GetBoolean());
+    }
+
+    [Fact]
+    public void BuildForFunction_NestedObjectArgs_ForbidsAdditionalPropertiesRecursively()
+    {
+        var nested = new ToolDefinition("set_addr", "x",
+            """{"type":"object","properties":{"addr":{"type":"object","properties":{"city":{"type":"string"}}}},"required":["addr"]}""");
+        string schema = ToolCallSchemaBuilder.BuildForFunction(nested);
+        using var doc = JsonDocument.Parse(schema);
+        var addr = doc.RootElement.GetProperty("properties").GetProperty("arguments")
+            .GetProperty("properties").GetProperty("addr");
+        Assert.False(addr.GetProperty("additionalProperties").GetBoolean());
+    }
+
+    [Fact]
+    public void BuildForFunction_DeclaredRequiredPreserved_OptionalNotForced()
+    {
+        // WeatherTool requires "location" only; an optional prop must stay optional.
+        var tool = new ToolDefinition("t", "x",
+            """{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a"]}""");
+        string schema = ToolCallSchemaBuilder.BuildForFunction(tool);
+        using var doc = JsonDocument.Parse(schema);
+        var args = doc.RootElement.GetProperty("properties").GetProperty("arguments");
+        var req = new List<string>();
+        foreach (var r in args.GetProperty("required").EnumerateArray()) req.Add(r.GetString()!);
+        Assert.Equal(["a"], req);
     }
 }
