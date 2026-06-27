@@ -477,6 +477,70 @@ public class JsonSchemaConstraintTests
         Assert.False(TokenAllowedStartingWith(constraint, "\"n"), "must not allow re-opening the name key");
     }
 
+    // -------------------------------------------------------------------------
+    // Multi-tool anyOf branch narrowing (#104)
+    //
+    // Tool names + argument keys are restricted to characters the SchemaStubTokenizer
+    // can emit as single-char tokens (so AdvanceString can drive them). The brief used
+    // "get_weather"/"get_time" with keys "city"/"zone"; '_', 'w', 'h', 'y', 'z' are not
+    // in the stub vocab, so they are adapted to tool names "get"/"set" and argument keys
+    // "cab" (first char 'c') / "den" (first char 'd') — distinct, tokenizable first chars.
+    // -------------------------------------------------------------------------
+
+    private static JsonSchemaConstraint MultiToolConstraint() => CreateConstraint(
+        ToolCallSchemaBuilder.BuildForRequired(
+        [
+            new ToolDefinition("get", "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""),
+            new ToolDefinition("set", "x",
+                """{"type":"object","properties":{"den":{"type":"string"}},"required":["den"]}"""),
+        ]));
+
+    [Fact]
+    public void MultiTool_NameFirst_EnforcesMatchedToolArguments()
+    {
+        var c = MultiToolConstraint();
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{");
+        // Only "cab" (get) may open; "den" (set) must be masked out.
+        Assert.True(TokenAllowedStartingWith(c, "\"c"), "get's arg key 'cab' must be allowed");
+        Assert.False(TokenAllowedStartingWith(c, "\"d"), "set's arg key 'den' must be masked after name=get");
+    }
+
+    [Fact]
+    public void MultiTool_ArgsFirst_NarrowsOnceNameSeen()
+    {
+        var c = MultiToolConstraint();
+        // arguments before name: both tools' first arg keys remain live until name disambiguates.
+        AdvanceString(c, "{\"arguments\":{");
+        Assert.True(TokenAllowedStartingWith(c, "\"c") || TokenAllowedStartingWith(c, "\"d"),
+            "before name, at least one tool's arg key is available");
+    }
+
+    [Fact]
+    public void MultiTool_WrongToolArgKey_Rejected()
+    {
+        var c = MultiToolConstraint();
+        AdvanceString(c, "{\"name\":\"set\",\"arguments\":{");
+        Assert.True(TokenAllowedStartingWith(c, "\"d"), "set's arg key 'den' must be allowed");
+        Assert.False(TokenAllowedStartingWith(c, "\"c"), "get's arg key 'cab' must be masked after name=set");
+    }
+
+    [Fact]
+    public void MultiTool_AboveBranchCap_DoesNotCrash_AndStaysValidJson()
+    {
+        // 12 tools (> K=8) — must NOT fork; falls back to single-branch union behaviour.
+        // Tool names are 't' + tokenizable suffix so AdvanceString can drive the chosen one.
+        string[] suffixes = ["a", "b", "c", "d", "e", "f", "g", "i", "l", "m", "n", "o"];
+        var tools = new List<ToolDefinition>();
+        foreach (var s in suffixes)
+            tools.Add(new ToolDefinition("t" + s, "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""));
+
+        var c = CreateConstraint(ToolCallSchemaBuilder.BuildForRequired(tools.ToArray()));
+        AdvanceString(c, "{\"name\":\"td\",\"arguments\":{"); // must not throw
+        Assert.True(AnyAllowed(c.GetAllowedTokens()), "union fallback must keep the mask non-empty");
+    }
+
     /// <summary>
     /// Helper: advances the constraint character-by-character by finding single-char tokens.
     /// </summary>
