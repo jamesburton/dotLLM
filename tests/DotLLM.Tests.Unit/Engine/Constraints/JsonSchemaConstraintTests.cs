@@ -457,6 +457,26 @@ public class JsonSchemaConstraintTests
         }
     }
 
+    [Fact]
+    public void StrictObject_AfterEmittingKey_NeverAllowsDeadEndPrefix()
+    {
+        // Schema: {name (const="get"), arguments} both required, additionalProperties:false.
+        // Function name "get" uses only chars present in SchemaStubTokenizer.
+        string schema = ToolCallSchemaBuilder.BuildForFunction(new ToolDefinition(
+            "get", "x",
+            """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"""));
+        var constraint = CreateConstraint(schema);
+        // Drive: {"name":"get",
+        AdvanceString(constraint, "{\"name\":\"get\",");
+        // At ObjectNextKey the only un-emitted key is "arguments":
+        // 'n' (would re-enter the "name" dead-end prefix) must be masked out,
+        // 'a' (starts "arguments") must be allowed. The mask must be non-empty.
+        var mask = constraint.GetAllowedTokens();
+        Assert.True(AnyAllowed(mask), "mask must be non-empty");
+        Assert.True(TokenAllowedStartingWith(constraint, "\"a"), "must allow opening the arguments key");
+        Assert.False(TokenAllowedStartingWith(constraint, "\"n"), "must not allow re-opening the name key");
+    }
+
     /// <summary>
     /// Helper: advances the constraint character-by-character by finding single-char tokens.
     /// </summary>
@@ -480,5 +500,35 @@ public class JsonSchemaConstraintTests
                 return i;
         }
         return -1;
+    }
+
+    /// <summary>
+    /// Returns true if any token in the SchemaStubTokenizer vocab is allowed by the mask.
+    /// </summary>
+    private static bool AnyAllowed(TokenMask mask)
+    {
+        var tokenizer = new SchemaStubTokenizer();
+        for (int i = 0; i < tokenizer.VocabSize; i++)
+            if (mask.IsAllowed(i)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Simulates advancing <paramref name="constraint"/> through <paramref name="prefix"/>
+    /// one character at a time (via a clone), returning true only if every character in the
+    /// prefix is allowed in sequence. Uses single-char tokens from <see cref="SchemaStubTokenizer"/>.
+    /// </summary>
+    private static bool TokenAllowedStartingWith(JsonSchemaConstraint constraint, string prefix)
+    {
+        var tokenizer = new SchemaStubTokenizer();
+        var clone = (JsonSchemaConstraint)constraint.Clone();
+        foreach (char c in prefix)
+        {
+            var m = clone.GetAllowedTokens();
+            int tokenId = FindSingleCharToken(tokenizer, c);
+            if (tokenId < 0 || !m.IsAllowed(tokenId)) return false;
+            clone.Advance(tokenId);
+        }
+        return true;
     }
 }

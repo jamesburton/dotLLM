@@ -285,8 +285,15 @@ internal struct SchemaTracker
 
         if (c == '"')
         {
-            // Start key — must have properties defined (or allow additional)
-            return node.Properties != null || !node.AdditionalPropertiesForbidden;
+            // Start key — if additional properties allowed, any key is fine.
+            if (!node.AdditionalPropertiesForbidden)
+                return true;
+            // additionalProperties:false — only allow if trie root can reach an un-emitted property.
+            if (node.PropertyTrieIndex < 0)
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            var trie = _schema.PropertyTries[node.PropertyTrieIndex];
+            return (trie.ReachableTerminalBits(0) & ~emitted) != 0;
         }
 
         return false;
@@ -300,17 +307,15 @@ internal struct SchemaTracker
         if (c == '"')
         {
             ref readonly var node = ref GetNode(_currentNodeIndex);
-            // Must have remaining properties or allow additional
-            if (node.AdditionalPropertiesForbidden && node.PropertyNames != null)
-            {
-                ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
-                ulong allProps = node.PropertyNames.Length < 64
-                    ? (1UL << node.PropertyNames.Length) - 1
-                    : ~0UL;
-                // If all properties emitted, no more keys allowed
-                return (allProps & ~emitted) != 0;
-            }
-            return true;
+            // If additional properties allowed, any key is fine.
+            if (!node.AdditionalPropertiesForbidden)
+                return true;
+            // additionalProperties:false — only allow if trie root can reach an un-emitted property.
+            if (node.PropertyTrieIndex < 0)
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            var trie = _schema.PropertyTries[node.PropertyTrieIndex];
+            return (trie.ReachableTerminalBits(0) & ~emitted) != 0;
         }
 
         return false;
@@ -567,9 +572,14 @@ internal struct SchemaTracker
 
         var trie = _schema.PropertyTries[node.PropertyTrieIndex];
 
-        // Also filter to only non-emitted properties
         if (node.AdditionalPropertiesForbidden)
-            return trie.TryGetChild(_trieNodeIndex, c, out _);
+        {
+            // Char must exist in trie AND the resulting child must reach at least one un-emitted property.
+            if (!trie.TryGetChild(_trieNodeIndex, c, out int child))
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            return (trie.ReachableTerminalBits(child) & ~emitted) != 0;
+        }
 
         // If additional properties allowed, any char is valid even if not in trie
         return trie.TryGetChild(_trieNodeIndex, c, out _) || !node.AdditionalPropertiesForbidden;
