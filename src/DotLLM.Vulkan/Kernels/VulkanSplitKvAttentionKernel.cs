@@ -46,8 +46,24 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     //   - TargetWorkgroups: occupancy target (split-pass workgroups = numHeads*S).
     //   - MinKvPerSplit: floor on KV rows per split so each split has enough work
     //     to amortise its launch + its share of the merge.
-    private const int TargetWorkgroups = 256;
-    private const int MinKvPerSplit = 256;
+    //
+    // Both default to 256 — SWEPT on Llama-3.2-3B / gfx1151 (#347, decode_min_ms,
+    // ctx 512-4096): 256/256 is the sweet spot. More splits regress (~+12% at
+    // ctx4096: smaller splits, merge overhead dominates); fewer splits regress too
+    // (~+6-28%: lost occupancy). Overridable via DOTLLM_VULKAN_SPLIT_TARGET_WG /
+    // DOTLLM_VULKAN_SPLIT_MIN_KV so other archs/deployments can be re-tuned without
+    // recompiling. Read once at type initialization — zero decode-hot-path cost.
+    // An invalid/non-positive value falls back to the default.
+    internal const string TargetWorkgroupsEnvVar = "DOTLLM_VULKAN_SPLIT_TARGET_WG";
+    internal const string MinKvPerSplitEnvVar = "DOTLLM_VULKAN_SPLIT_MIN_KV";
+    private static readonly int TargetWorkgroups = EnvIntOrDefault(TargetWorkgroupsEnvVar, 256);
+    private static readonly int MinKvPerSplit = EnvIntOrDefault(MinKvPerSplitEnvVar, 256);
+
+    private static int EnvIntOrDefault(string envVar, int fallback)
+    {
+        string? v = Environment.GetEnvironmentVariable(envVar);
+        return int.TryParse(v, out int n) && n > 0 ? n : fallback;
+    }
 
     // 13 uints (the shared 12-uint attention block + numSplits) = 52 bytes.
     private const int SplitPushConstantBytes = 13 * sizeof(uint);
