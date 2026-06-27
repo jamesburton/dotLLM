@@ -73,6 +73,13 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// head_dim to <see cref="Attention"/>.
     /// </summary>
     public VulkanFlashAttentionF32Kernel? FlashAttention { get; }
+    /// <summary>
+    /// Optional split-KV (Flash-Decoding) kernel for the long-context decode
+    /// path (seqQ == 1). Null when the SPVs are missing or the env-var opt-out
+    /// is set; only used for shapes that actually split (short context falls
+    /// back to <see cref="Attention"/>).
+    /// </summary>
+    public VulkanSplitKvAttentionKernel? SplitKvAttention { get; }
     public SwiGluF32Kernel SwiGlu { get; }
     public AddKernel Add { get; }
     public SiluInplaceF32Kernel SiluInplace { get; }
@@ -123,6 +130,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope, AttentionF32Kernel attention,
         VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, SiluInplaceF32Kernel silu, Conv1dCausalF32Kernel conv1d,
         GdnL2NormalizeHeadsF32Kernel gdnL2,
         GdnScanStepF32Kernel gdnScan, GdnScanMultiTokenF32Kernel gdnScanMulti,
@@ -156,6 +164,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MatMulBf16 = matmulBf16; MatMulBf16Gemm = matmulBf16Gemm;
         RmsNorm = rmsnorm; Rope = rope; Attention = attention;
         FlashAttention = flashAttention;
+        SplitKvAttention = splitKvAttention;
         SwiGlu = swiglu; Add = add; SiluInplace = silu; Conv1dCausal = conv1d;
         GdnL2Normalize = gdnL2;
         GdnScanStep = gdnScan; GdnScanMultiToken = gdnScanMulti;
@@ -224,6 +233,9 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         VulkanFlashAttentionF32Kernel? flashAttention = VulkanTransformerModel.IsFlashAttentionDisabled()
             ? null
             : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        VulkanSplitKvAttentionKernel? splitKvAttention = VulkanTransformerModel.IsSplitDecodeDisabled()
+            ? null
+            : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var silu = SiluInplaceF32Kernel.Create(device, spvDir);
@@ -263,7 +275,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, swiglu, add, silu, conv1d,
+            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, silu, conv1d,
             gdnL2, gdnScan, gdnScanMulti, gdnPost,
             gdnDecay, sigmoidInplace,
             sigGateMul,
@@ -312,6 +324,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         Rope.InvalidateDescriptorCache();
         Attention.InvalidateDescriptorCache();
         FlashAttention?.InvalidateDescriptorCache();
+        SplitKvAttention?.InvalidateDescriptorCache();
         SwiGlu.InvalidateDescriptorCache();
         Add.InvalidateDescriptorCache();
         SiluInplace.InvalidateDescriptorCache();
@@ -350,6 +363,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         SiluInplace.Dispose();
         Add.Dispose();
         SwiGlu.Dispose();
+        SplitKvAttention?.Dispose();
         FlashAttention?.Dispose();
         Attention.Dispose();
         Rope.Dispose();
