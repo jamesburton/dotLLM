@@ -46,6 +46,11 @@ internal struct BranchState
     // Track whether we are inside a value string with enum/const constraint.
     private bool _inEnumString;
 
+    // Track whether we are inside a free value string with a length bound (maxLength/
+    // minLength), and how many content chars have been emitted into it.
+    private bool _inLengthString;
+    private int _stringValueLength;
+
     /// <summary>
     /// Creates a new branch state for the given compiled schema.
     /// </summary>
@@ -156,6 +161,13 @@ internal struct BranchState
             return;
         }
 
+        // Content char inside a length-bounded free value string
+        if (_inLengthString && newState == JsonParserState.InString)
+        {
+            _stringValueLength++;
+            return;
+        }
+
         // Key string closed: parser transitioned out of InString to ObjectColon
         if (_inKeyString && newState == JsonParserState.ObjectColon)
         {
@@ -164,10 +176,11 @@ internal struct BranchState
         }
 
         // Value string closed (non-key)
-        if (_inEnumString && newState != JsonParserState.InString &&
+        if ((_inEnumString || _inLengthString) && newState != JsonParserState.InString &&
             newState != JsonParserState.InStringEscape && newState != JsonParserState.InStringUnicode)
         {
             _inEnumString = false;
+            _inLengthString = false;
             // Value complete at current level — handled by PopIfValueComplete below
         }
 
@@ -214,7 +227,9 @@ internal struct BranchState
     {
         int parserKey = parser.GetEffectiveStateKey();
         ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
-        int triePos = _inKeyString ? _trieNodeIndex : (_inEnumString ? _enumTrieNodeIndex : 0);
+        int triePos = _inKeyString ? _trieNodeIndex
+            : (_inEnumString ? _enumTrieNodeIndex
+            : (_inLengthString ? _stringValueLength : 0));
 
         return new SchemaStateKey(parserKey, _currentNodeIndex, emitted, triePos);
     }
@@ -229,6 +244,8 @@ internal struct BranchState
         _enumTrieNodeIndex = 0;
         _inKeyString = false;
         _inEnumString = false;
+        _inLengthString = false;
+        _stringValueLength = 0;
     }
 
     // ── anyOf forking support (Task 4) ──────────────────────────────
@@ -275,6 +292,8 @@ internal struct BranchState
         copy._currentNodeIndex = nodeIndex;
         copy._inKeyString = false;
         copy._inEnumString = false;
+        copy._inLengthString = false;
+        copy._stringValueLength = 0;
         copy._keyLength = 0;
         copy._trieNodeIndex = 0;
         copy._enumTrieNodeIndex = 0;
@@ -445,6 +464,16 @@ internal struct BranchState
             return IsEnumTrieCharValid(c);
         }
 
+        // Free string value with a length bound: force close at maxLength, block close
+        // before minLength. (Any content char — including '\' — counts toward length.)
+        if (_inLengthString)
+        {
+            ref readonly var node = ref GetNode(_currentNodeIndex);
+            if (c == '"')
+                return _stringValueLength >= (node.MinLength < 0 ? 0 : node.MinLength);
+            return node.MaxLength < 0 || _stringValueLength < node.MaxLength;
+        }
+
         // Unconstrained string — parser handles
         return true;
     }
@@ -594,6 +623,14 @@ internal struct BranchState
         {
             _inEnumString = true;
             _enumTrieNodeIndex = 0; // root of enum trie
+        }
+        else if (node.AllowedTypes.HasFlag(JsonSchemaType.String)
+                 && (node.MaxLength >= 0 || node.MinLength > 0))
+        {
+            // Free string value with a length bound — count content chars so the close
+            // quote can be forced at maxLength and blocked before minLength.
+            _inLengthString = true;
+            _stringValueLength = 0;
         }
     }
 
