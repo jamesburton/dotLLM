@@ -58,4 +58,19 @@ public sealed record ContinuousBatchSchedulerOptions
     /// tensors are recomputed. Host-memory KV offload (strategy (ii)) is a future enhancement.</para>
     /// </remarks>
     public bool EnablePreemption { get; init; } = false;
+
+    /// <summary>
+    /// Optional cap on the number of concurrently-active sequences for a recurrent model whose
+    /// per-sequence state the scheduler threads (<see cref="DotLLM.Core.Models.IModel.SupportsThreadedSequenceState"/>).
+    /// When non-zero, admission of such sequences is gated so no more than this many run at once.
+    /// Default 0 (unlimited).
+    /// </summary>
+    /// <remarks>
+    /// Each threaded recurrent sequence owns a full per-sequence recurrent-state container (Mamba SSM /
+    /// GDN), which can be tens of MB for a large model — far heavier than a decode-step KV slice. On a
+    /// memory-constrained (e.g. UMA) host this cap bounds the aggregate recurrent-state footprint the
+    /// same way <see cref="ReserveBlocksPerSequence"/> bounds KV-block usage. Ignored for dense models
+    /// and recurrent hosts without threadable state.
+    /// </remarks>
+    public int MaxRecurrentSequences { get; init; } = 0;
 }

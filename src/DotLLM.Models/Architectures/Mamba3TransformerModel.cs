@@ -265,6 +265,12 @@ public sealed unsafe class Mamba3TransformerModel : IModel
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => new Mamba3State(Config);
+
     /// <summary>
     /// Mamba-3 <c>ForwardBatch</c> override. Threads each request's per-seq
     /// <see cref="Mamba3State"/> through the SSD scan so multi-sequence batched

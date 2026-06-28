@@ -33,7 +33,7 @@ namespace DotLLM.Core.Models;
 /// (unused by Mamba-3 itself, but the API shape stays consistent across hosts).
 /// </para>
 /// </remarks>
-public interface IMambaState : IDisposable
+public interface IMambaState : IRecurrentSequenceState
 {
     /// <summary>
     /// Number of Mamba-3 layers this state covers. Must equal the model's layer
@@ -41,9 +41,5 @@ public interface IMambaState : IDisposable
     /// </summary>
     int NumLayers { get; }
 
-    /// <summary>
-    /// Re-zeroes every layer's recurrent state. Call between independent sequences
-    /// when reusing a single state container.
-    /// </summary>
-    void Reset();
+    // Reset() is inherited from IRecurrentSequenceState.
 }

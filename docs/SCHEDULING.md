@@ -23,19 +23,24 @@ Each `ContinuousBatchScheduler.Step()` call:
 2. **Admit** new sequences up to `MaxActiveSequences` and (when paged) sufficient free blocks. Admission allocates the KV-cache, consults the optional `ISchedulerPrefixCache` for reuse, and transitions to `Prefilling`. **Actual prefill work happens in step 3** — admission is purely a slot/cache assignment. Because the prefill forward is deferred, the per-iteration block gate subtracts the blocks already reserved by this step's other pending prefills from the pool's free count, preserving its tight-pressure behaviour (≤1 admit/step when pool-constrained).
 3. **Prefill admitted sequences** — the sequences admitted this Step run their prompt prefill, sized by
    `MaxPrefillTokensPerStep` (0 = unlimited, single shot), then each samples its first token →
-   `Decoding` (or `Completed` if the first token stops). When the model is **stateless**
-   (`IModel.RequiresPerSequenceState == false`) and **≥2** sequences were admitted together, their
-   prefills are fused into a single `IModel.ForwardBatch` (variable per-seq token counts — the dense
-   CPU/Vulkan hosts pack them into one batched dispatch); otherwise each prefills per sequence via
-   `Forward`. Resuming (preempted) sequences always recompute their KV inline, per sequence.
-4. **Decode the active sequences.** Each `Decoding` sequence contributes its last sampled token. When
-   the model is **stateless** (KV-only — `IModel.RequiresPerSequenceState == false`) and **≥2** sequences
-   are decoding, the scheduler fuses them into a single `IModel.ForwardBatch(requests, deviceId)` call
-   (one `SequenceForwardRequest` per sequence, each with its own KV-cache) — a backend overrides
-   `ForwardBatch` to fuse the per-sequence GEMVs into batched GEMMs (the dense CPU/Vulkan hosts do; the
-   default interface impl loops `Forward`). For a single decoder, or a model that needs per-sequence
-   recurrent state (Mamba-3 / Qwen3-MoE-Hybrid GDN / Nemotron-H — see `RequiresPerSequenceState`), it
-   decodes per sequence via `Forward`, keeping single-tenant decode latency unchanged.
+   `Decoding` (or `Completed` if the first token stops). The same `ShouldBatch(count)` rule as decode
+   (step 4) selects the dispatch: dense ≥2 fuse into one `IModel.ForwardBatch` (variable per-seq token
+   counts — the CPU/Vulkan hosts pack them into one dispatch); recurrent threaded-state models always
+   batch (carrying each sequence's freshly-allocated `IMambaState`/`IGdnState`); otherwise per-seq
+   `Forward`. Resuming (preempted) sequences recompute their KV (and, for recurrent hosts, their state)
+   per sequence — threaded-state hosts route that single recompute through `ForwardBatch` too.
+4. **Decode the active sequences.** Each `Decoding` sequence contributes its last sampled token. The
+   dispatch is chosen by `ShouldBatch(count)`:
+   - **Dense** models (`RequiresPerSequenceState == false`) fuse into a single
+     `IModel.ForwardBatch(requests, deviceId)` at **≥2** decoders (each `SequenceForwardRequest` carries
+     its own KV-cache); a single decoder uses `Forward`, keeping single-tenant latency unchanged.
+   - **Recurrent threaded-state** models (`SupportsThreadedSequenceState == true` — Mamba-3,
+     Qwen3-MoE-Hybrid GDN) dispatch **everything via `ForwardBatch`, even a single sequence**, because
+     `ForwardBatch` is the only `IModel` entrypoint that carries the per-seq `IMambaState`/`IGdnState`
+     the scheduler allocates and threads. This both batches recurrent decode and fixes the latent
+     corruption of running >1 concurrent recurrent sequence against a shared model-owned default state.
+   - **Recurrent without a threadable state container** (Nemotron-H — `RequiresPerSequenceState == true`
+     but `SupportsThreadedSequenceState == false`) stays on the per-sequence `Forward` loop.
 5. **Process results** per sequence: apply the constraint token-mask, sample the next token, advance the
    constraint, check stop conditions (EOS, max-tokens) → `Completed` when fired; then sweep
    completed/cancelled — build the `InferenceResponse`, release the KV-cache, complete the task.
@@ -43,15 +48,15 @@ Each `ContinuousBatchScheduler.Step()` call:
 ```
 while (!cancelled):
   SweepCancelled()
-  admitted = Admit(pendingQueue, MaxActiveSequences, prefixCache?)   # KV/prefix only — forward deferred
-  if !model.RequiresPerSequenceState and admitted.Count >= 2:
-    results = Model.ForwardBatch(admitted)               # fused batched prefill
+  admitted = Admit(pendingQueue, EffectiveMaxActive, prefixCache?)   # KV/prefix(+recurrent state) only — forward deferred
+  if ShouldBatch(admitted.Count):                        # dense>=2, or recurrent threaded-state (any count)
+    results = Model.ForwardBatch(admitted)               # fused batched prefill (per-seq state threaded)
     for i, seq in admitted: FinishPrefill(seq, results[i])
   else:
     for seq in admitted: FinishPrefill(seq, Model.Forward(seq))
   ready = active.Where(Decoding)                          # capacity-gated finish here
-  if !model.RequiresPerSequenceState and ready.Count >= 2:
-    results = Model.ForwardBatch(ready)                   # fused batched decode
+  if ShouldBatch(ready.Count):
+    results = Model.ForwardBatch(ready)                   # fused batched decode (per-seq state threaded)
     for i, seq in ready: ProcessDecodeLogits(seq, results[i])
   else:
     for seq in ready: ProcessDecodeLogits(seq, Model.Forward(seq))
@@ -174,9 +179,23 @@ one kernel-dispatch overhead instead of N. Tests: `BatchedPrefill_MultipleSequen
 `BatchedPrefill_SingleAdmission_NotBatched`. Resuming (preempted) sequences keep their inline per-seq
 recompute.
 
-**Still pending in Step 59**: recurrent batched decode/prefill (thread per-seq Mamba/GDN state through
-the scheduler, then drop the gate); separate prefill/decode queues/pools; and fairness constraints
-(per-API-key accounting to prevent starvation under a continuous higher-priority stream).
+**Recurrent batched decode/prefill (shipped, Step 59):** recurrent hosts that expose a threadable
+per-sequence state — `IModel.SupportsThreadedSequenceState == true` (Mamba-3, Qwen3-MoE-Hybrid GDN) —
+are no longer gated off. The scheduler allocates one `IModel.CreateSequenceState()` container per
+sequence at admission, threads it through that sequence's prefill / decode / resume, and disposes it on
+release; every dispatch (incl. single-sequence) routes through `ForwardBatch` so the per-seq
+`IMambaState`/`IGdnState` rides along. This also fixes the prior latent corruption of running >1
+concurrent recurrent sequence against the model-owned default state. `MaxRecurrentSequences` caps
+concurrency to bound aggregate per-seq state memory. Recurrent hosts **without** a threadable container
+(Nemotron-H — `SsmStateCache` has no `IRecurrentSequenceState` yet) keep the per-seq loop. Tests:
+`RecurrentBatched_MultipleSequences_ThreadsPerSeqStateAndMatchesBaseline` (a mock recurrent model that
+throws on null/shared state — so correct output proves per-seq threading; asserts one state alloc/free
+per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
+`RecurrentBatched_MaxRecurrentSequences_CapsConcurrency`, `RecurrentBatched_PerSeqMaxTokens_Honored`.
+
+**Still pending in Step 59**: Nemotron-H recurrent batching (needs an `ISsmState` container + factory);
+separate prefill/decode queues/pools; and fairness constraints (per-API-key accounting to prevent
+starvation under a continuous higher-priority stream).
 
 ## Sequence State Machine
 

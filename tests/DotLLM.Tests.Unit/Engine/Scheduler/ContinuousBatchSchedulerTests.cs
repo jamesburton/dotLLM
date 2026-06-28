@@ -705,6 +705,99 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Equal(0, fix.Model.ForwardBatchCount);
     }
 
+    // ── Recurrent batched decode/prefill (Step 59, threaded per-seq state) ──
+
+    [Fact]
+    public async Task RecurrentBatched_MultipleSequences_ThreadsPerSeqStateAndMatchesBaseline()
+    {
+        // A recurrent (threaded-state) model: the scheduler must allocate one per-seq state per
+        // sequence and thread it through ForwardBatch. The mock model THROWS if a batched request has
+        // a null or shared MambaState, so correct independent output here proves per-seq threading
+        // (not just "it ran"). Distinct prompt lengths → distinct ramp counts (discriminates cross-wiring).
+        int[] promptLens = [3, 5, 7];
+        using var fix = new RecurrentTestFixture();
+        var handles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.True(fix.Model.ForwardBatchCount > 0, "recurrent decode/prefill never used ForwardBatch");
+        // Exactly one state allocated per sequence (threaded across all its steps, not re-allocated),
+        // and every one disposed by completion.
+        Assert.Equal(promptLens.Length, fix.Model.StateCreateCount);
+        Assert.Equal(promptLens.Length, fix.Model.StateDisposeCount);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Stop, r.FinishReason);
+            Assert.Equal(RampExpectedGenerated(promptLens[i]), r.GeneratedTokenCount);
+        }
+    }
+
+    [Fact]
+    public async Task RecurrentBatched_SingleSequence_UsesForwardBatchWithState()
+    {
+        // Even a single recurrent sequence dispatches via ForwardBatch (the only entrypoint that
+        // carries the per-seq state) — unlike a dense single sequence, which stays on per-seq Forward.
+        using var fix = new RecurrentTestFixture();
+        var h = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 32));
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.True(fix.Model.ForwardBatchCount > 0, "single recurrent sequence must route via ForwardBatch");
+        Assert.Equal(1, fix.Model.StateCreateCount);
+        Assert.Equal(1, fix.Model.StateDisposeCount);
+        var r = await h.Completion;
+        Assert.Equal(FinishReason.Stop, r.FinishReason);
+        Assert.Equal(RampExpectedGenerated(4), r.GeneratedTokenCount);
+    }
+
+    [Fact]
+    public void RecurrentBatched_MaxRecurrentSequences_CapsConcurrency()
+    {
+        // MaxRecurrentSequences caps how many threaded recurrent sequences run at once (bounds
+        // aggregate per-seq state memory). With a cap of 1, only one is admitted at a time.
+        using var fix = new RecurrentTestFixture(
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 8, MaxRecurrentSequences = 1 });
+
+        var h1 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+        var h2 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+        var h3 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+
+        fix.Scheduler.Step();
+        Assert.Equal(1, fix.Scheduler.ActiveCount);   // capped to 1 despite MaxActiveSequences=8
+        Assert.Equal(2, fix.Scheduler.QueueDepth);
+
+        DriveUntilCompleted(fix.Scheduler, h1);
+        DriveUntilCompleted(fix.Scheduler, h2);
+        DriveUntilCompleted(fix.Scheduler, h3);
+        Assert.True(fix.Scheduler.IsIdle);
+    }
+
+    [Fact]
+    public async Task RecurrentBatched_PerSeqMaxTokens_Honored()
+    {
+        // Never emits EOS → each sequence stops at its own MaxTokens; the batch shrinks 3→2→1 as
+        // sequences finish at different steps, exercising per-seq finish inside the threaded batch.
+        using var fix = new RecurrentTestFixture(emitter: _ => 7); // constant token, never EOS
+        int[] maxTokens = [2, 4, 6];
+        var handles = new ISchedulerRequest[maxTokens.Length];
+        for (int i = 0; i < maxTokens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: maxTokens[i]));
+
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.True(fix.Model.ForwardBatchCount > 0);
+        Assert.Equal(maxTokens.Length, fix.Model.StateDisposeCount);
+        for (int i = 0; i < maxTokens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Length, r.FinishReason);
+            Assert.Equal(maxTokens[i], r.GeneratedTokenCount);
+        }
+    }
+
     // ── Helpers ──
 
     /// <summary>
@@ -936,6 +1029,152 @@ public sealed class ContinuousBatchSchedulerTests
             return new UnmanagedTensor(new TensorShape(batchSize, VocabSize), DType.Float32, deviceId, logitsPtr);
         }
 
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Fixture for the recurrent (threaded-state) scheduler tests — wires a <see cref="MockRecurrentModel"/>
+    /// (RequiresPerSequenceState + SupportsThreadedSequenceState) so the scheduler exercises the
+    /// allocate-per-seq-state + always-ForwardBatch path.
+    /// </summary>
+    private sealed class RecurrentTestFixture : IDisposable
+    {
+        public PagedKvCacheFactory PagedFactory { get; }
+        public MockRecurrentModel Model { get; }
+        public ContinuousBatchScheduler Scheduler { get; }
+
+        public RecurrentTestFixture(
+            ContinuousBatchSchedulerOptions? options = null,
+            int totalBlocks = 64,
+            Func<int, int>? emitter = null)
+        {
+            PagedFactory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize,
+                maxTotalTokens: totalBlocks * BlockSize);
+            Model = new MockRecurrentModel(emitter ?? Ramp);
+            Scheduler = new ContinuousBatchScheduler(
+                Model,
+                new MockTokenizer(),
+                (_, maxSeq) => PagedFactory.Create(maxSeq),
+                options,
+                pagedPool: PagedFactory.Pool);
+        }
+
+        public void Dispose()
+        {
+            Scheduler.Dispose();
+            PagedFactory.Dispose();
+            Model.Dispose();
+        }
+    }
+
+    /// <summary>Mock per-sequence recurrent state. Implements <see cref="IMambaState"/> so it flows
+    /// through the scheduler's <c>MambaState</c> slot; disposal is counted via a callback so tests can
+    /// assert every allocated state is freed.</summary>
+    private sealed class MockRecurrentState : IMambaState
+    {
+        private readonly Action _onDispose;
+        public int Step;
+        public MockRecurrentState(Action onDispose) => _onDispose = onDispose;
+        public int NumLayers => ContinuousBatchSchedulerTests.NumLayers;
+        public void Reset() => Step = 0;
+        public void Dispose() => _onDispose();
+    }
+
+    /// <summary>
+    /// Deterministic recurrent model. Reports <c>RequiresPerSequenceState</c> AND
+    /// <c>SupportsThreadedSequenceState</c>, so the scheduler allocates one <see cref="MockRecurrentState"/>
+    /// per sequence and dispatches every forward (incl. single-sequence) through <see cref="ForwardBatch"/>.
+    /// Its <see cref="ForwardBatch"/> THROWS if a multi-seq request carries a null or shared MambaState —
+    /// so a scheduler that fails to thread per-seq state surfaces as a test failure, not silent corruption.
+    /// </summary>
+    private sealed class MockRecurrentModel : IModel
+    {
+        private readonly Func<int, int> _emit; // content-driven (ramp): last input token -> emitted token
+        public int ForwardBatchCount { get; private set; }
+        public int StateCreateCount { get; private set; }
+        public int StateDisposeCount { get; private set; }
+
+        public MockRecurrentModel(Func<int, int> emit) => _emit = emit;
+
+        public bool RequiresPerSequenceState => true;
+        public bool SupportsThreadedSequenceState => true;
+        public IRecurrentSequenceState? CreateSequenceState()
+        {
+            StateCreateCount++;
+            return new MockRecurrentState(() => StateDisposeCount++);
+        }
+
+        public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+        {
+            ForwardBatchCount++;
+            if (requests.Count >= 2)
+            {
+                var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                for (int i = 0; i < requests.Count; i++)
+                {
+                    var st = requests[i].MambaState;
+                    if (st is null)
+                        throw new InvalidOperationException(
+                            $"recurrent ForwardBatch[{i}] has null MambaState — scheduler did not thread per-seq state");
+                    if (!seen.Add(st))
+                        throw new InvalidOperationException(
+                            "recurrent ForwardBatch got the SAME MambaState across sequences — state is shared, not per-seq");
+                }
+            }
+            var results = new ITensor[requests.Count];
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                results[i] = ForwardOne(r.TokenIds.Span, deviceId, r.MambaState);
+            }
+            return results;
+        }
+
+        private unsafe ITensor ForwardOne(ReadOnlySpan<int> tokenIds, int deviceId, IMambaState? state)
+        {
+            // Touch the per-seq state so threading is genuinely exercised (and a null would NRE on a
+            // single-seq dispatch too).
+            if (state is MockRecurrentState s) s.Step++;
+
+            int batchSize = tokenIds.Length;
+            long totalFloats = (long)batchSize * VocabSize;
+            nint logitsPtr = (nint)NativeMemory.AlignedAlloc((nuint)(totalFloats * sizeof(float)), 64);
+
+            int lastInput = tokenIds.Length > 0 ? tokenIds[^1] : 0;
+            int emit = _emit(lastInput);
+            if ((uint)emit >= VocabSize) emit = 1;
+
+            float* dst = (float*)logitsPtr;
+            for (int b = 0; b < batchSize; b++)
+            {
+                float* row = dst + (long)b * VocabSize;
+                for (int v = 0; v < VocabSize; v++) row[v] = -10f;
+                row[emit] = 10f;
+            }
+            return new UnmanagedTensor(new TensorShape(batchSize, VocabSize), DType.Float32, deviceId, logitsPtr);
+        }
+
+        // Plain Forward is part of the interface but NOT used by the scheduler for a threaded-state
+        // model (it always routes through ForwardBatch). Provide a functional fallback anyway.
+        public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+            => ForwardOne(tokenIds, deviceId, null);
+        public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId, IKvCache? kvCache)
+            => ForwardOne(tokenIds, deviceId, null);
+
+        public ModelConfig Config => new()
+        {
+            VocabSize = VocabSize,
+            NumLayers = NumLayers,
+            NumAttentionHeads = NumKvHeads,
+            NumKvHeads = NumKvHeads,
+            HiddenSize = HeadDim * NumKvHeads,
+            IntermediateSize = HeadDim * 4,
+            HeadDim = HeadDim,
+            MaxSequenceLength = MaxSeqLen,
+            Architecture = DotLLM.Core.Configuration.Architecture.Llama,
+        };
+
+        public long ComputeMemoryBytes => 0;
         public void Dispose() { }
     }
 
