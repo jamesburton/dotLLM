@@ -519,33 +519,61 @@ internal sealed class JinjaEvaluator
         var obj = EvalExpr(expr.Object);
         int? startVal = expr.Start != null ? ToInt(EvalExpr(expr.Start)) : null;
         int? stopVal = expr.Stop != null ? ToInt(EvalExpr(expr.Stop)) : null;
+        int? stepVal = expr.Step != null ? ToInt(EvalExpr(expr.Step)) : null;
 
         if (obj is string s)
         {
-            int from = startVal ?? 0;
-            int to = stopVal ?? s.Length;
-            if (from < 0) from = Math.Max(0, s.Length + from);
-            if (to < 0) to = Math.Max(0, s.Length + to);
-            to = Math.Min(to, s.Length);
-            from = Math.Min(from, to);
-            return s[from..to];
+            var sliced = SliceSequence(s.Length, startVal, stopVal, stepVal, i => s[i]);
+            var sb = new StringBuilder(sliced.Count);
+            foreach (var c in sliced) sb.Append((char)c!);
+            return sb.ToString();
         }
 
         if (obj is IList list)
-        {
-            int from = startVal ?? 0;
-            int to = stopVal ?? list.Count;
-            if (from < 0) from = Math.Max(0, list.Count + from);
-            if (to < 0) to = Math.Max(0, list.Count + to);
-            to = Math.Min(to, list.Count);
-            from = Math.Min(from, to);
-            var sliced = new List<object?>();
-            for (int i = from; i < to; i++)
-                sliced.Add(list[i]);
-            return sliced;
-        }
+            return SliceSequence(list.Count, startVal, stopVal, stepVal, i => list[i]);
 
         return Undefined;
+    }
+
+    /// <summary>
+    /// Applies Python slice semantics (including negative <paramref name="stepVal"/> for reversal,
+    /// e.g. <c>[::-1]</c>) over a sequence of <paramref name="length"/> items. Index normalization
+    /// follows CPython's <c>PySlice_AdjustIndices</c>.
+    /// </summary>
+    private static List<object?> SliceSequence(int length, int? startVal, int? stopVal, int? stepVal, Func<int, object?> get)
+    {
+        int step = stepVal ?? 1;
+        var result = new List<object?>();
+        if (step == 0) return result; // Python raises; we yield empty rather than throw mid-template.
+
+        int lower, upper;
+        if (step < 0) { lower = -1; upper = length - 1; }
+        else { lower = 0; upper = length; }
+
+        int start;
+        if (startVal is null) start = step < 0 ? upper : lower;
+        else
+        {
+            start = startVal.Value;
+            if (start < 0) start = Math.Max(start + length, lower);
+            else start = Math.Min(start, upper);
+        }
+
+        int stop;
+        if (stopVal is null) stop = step < 0 ? lower : upper;
+        else
+        {
+            stop = stopVal.Value;
+            if (stop < 0) stop = Math.Max(stop + length, lower);
+            else stop = Math.Min(stop, upper);
+        }
+
+        if (step > 0)
+            for (int i = start; i < stop; i += step) result.Add(get(i));
+        else
+            for (int i = start; i > stop; i += step) result.Add(get(i));
+
+        return result;
     }
 
     // ── Scope management ──

@@ -59,6 +59,62 @@ public class JinjaEvaluatorTests
         Assert.Equal("False", Eval("{{ false }}"));
     }
 
+    // ── Slicing with step (#105: Qwen GGUF template uses messages[::-1]) ──
+
+    [Fact]
+    public void Slice_String_Reverse()
+    {
+        Assert.Equal("dcba", Eval("{{ 'abcd'[::-1] }}"));
+    }
+
+    [Fact]
+    public void Slice_String_PositiveStep()
+    {
+        Assert.Equal("ace", Eval("{{ 'abcdef'[::2] }}"));
+    }
+
+    [Fact]
+    public void Slice_String_StartStopStep()
+    {
+        Assert.Equal("bd", Eval("{{ 'abcdef'[1:5:2] }}"));
+    }
+
+    [Fact]
+    public void Slice_String_StartStop_NoStep_StillWorks()
+    {
+        Assert.Equal("bc", Eval("{{ 'abcd'[1:3] }}"));
+    }
+
+    [Fact]
+    public void Slice_List_Reverse_InForLoop()
+    {
+        var vars = new Dictionary<string, object?> { ["xs"] = new List<object?> { 1, 2, 3 } };
+        Assert.Equal("321", Eval("{% for x in xs[::-1] %}{{ x }}{% endfor %}", vars));
+    }
+
+    [Fact]
+    public void Slice_List_NegativeStep_StartStop()
+    {
+        // Python: [10,20,30,40,50][4:1:-1] == [50,40,30]
+        var vars = new Dictionary<string, object?> { ["xs"] = new List<object?> { 10, 20, 30, 40, 50 } };
+        Assert.Equal("50,40,30,", Eval("{% for x in xs[4:1:-1] %}{{ x }},{% endfor %}", vars));
+    }
+
+    [Fact]
+    public void Slice_QwenTemplate_ReversedMessagesLoop()
+    {
+        // The exact construct from the Qwen3 GGUF embedded template (#105 line 18).
+        var vars = new Dictionary<string, object?>
+        {
+            ["messages"] = new List<object?>
+            {
+                new Dictionary<string, object?> { ["role"] = "system", ["content"] = "s" },
+                new Dictionary<string, object?> { ["role"] = "user", ["content"] = "u" },
+            }
+        };
+        Assert.Equal("us", Eval("{%- for m in messages[::-1] %}{{- m.content }}{%- endfor %}", vars));
+    }
+
     // ── String concatenation ──
 
     [Fact]
