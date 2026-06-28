@@ -155,11 +155,13 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                 fixture.OutputWeightPtr, QuantizationType.F32, VocabSize, HiddenSize,
                 fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
             using var kvA = model.CreateKvCache(MaxSeqLen);
-            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvCache: kvA);
+            using var ssmRefA = model.CreateSsmState();
+            using ITensor logitsA = model.Forward(tokensA, positionsA, deviceId: -1, kvCache: kvA, ssmState: ssmRefA);
             referenceA = CopyLogits(logitsA);
 
             using var kvB = model.CreateKvCache(MaxSeqLen);
-            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvCache: kvB);
+            using var ssmRefB = model.CreateSsmState();
+            using ITensor logitsB = model.Forward(tokensB, positionsB, deviceId: -1, kvCache: kvB, ssmState: ssmRefB);
             referenceB = CopyLogits(logitsB);
         }
 
@@ -173,15 +175,17 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                 fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
             using var kvA = model.CreateKvCache(MaxSeqLen);
             using var kvB = model.CreateKvCache(MaxSeqLen);
+            using var ssmA = model.CreateSsmState();
+            using var ssmB = model.CreateSsmState();
             var requests = new[]
             {
                 new SequenceForwardRequest
                 {
-                    TokenIds = tokensA.AsMemory(), Positions = positionsA.AsMemory(), KvCache = kvA,
+                    TokenIds = tokensA.AsMemory(), Positions = positionsA.AsMemory(), KvCache = kvA, SsmState = ssmA,
                 },
                 new SequenceForwardRequest
                 {
-                    TokenIds = tokensB.AsMemory(), Positions = positionsB.AsMemory(), KvCache = kvB,
+                    TokenIds = tokensB.AsMemory(), Positions = positionsB.AsMemory(), KvCache = kvB, SsmState = ssmB,
                 },
             };
             var results = model.ForwardBatch(requests, deviceId: -1);
@@ -240,6 +244,9 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
             for (int s = 0; s < tokens.Length; s++)
             {
                 using var kv = model.CreateKvCache(MaxSeqLen);
+                // Per-seq SSM state so the reference is isolated (the model never auto-resets its
+                // owned _ssmCache, so reusing it across sequences would leak recurrent state).
+                using var ssm = model.CreateSsmState();
                 int firstPos = positions[s][0];
                 if (firstPos > 0)
                 {
@@ -250,9 +257,9 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                         warmupTokens[t] = (t * 5 + s) % VocabSize;
                         warmupPositions[t] = t;
                     }
-                    using (model.Forward(warmupTokens, warmupPositions, deviceId: -1, kvCache: kv)) { }
+                    using (model.Forward(warmupTokens, warmupPositions, deviceId: -1, kvCache: kv, ssmState: ssm)) { }
                 }
-                using ITensor logits = model.Forward(tokens[s], positions[s], deviceId: -1, kvCache: kv);
+                using ITensor logits = model.Forward(tokens[s], positions[s], deviceId: -1, kvCache: kv, ssmState: ssm);
                 referenceLogits[s] = CopyLogits(logits);
             }
         }
@@ -266,11 +273,15 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                 fixture.OutputWeightPtr, QuantizationType.F32, VocabSize, HiddenSize,
                 fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
             var caches = new VulkanNemotronHKvCache[tokens.Length];
+            var ssmStates = new VulkanSsmStateCache[tokens.Length];
             try
             {
                 for (int s = 0; s < tokens.Length; s++)
                 {
                     caches[s] = model.CreateKvCache(MaxSeqLen);
+                    // Per-seq SSM state — the decode seq's warm-up must prime THIS state (not the
+                    // shared model default) so the batched decode reads the right recurrent history.
+                    ssmStates[s] = model.CreateSsmState();
                     int firstPos = positions[s][0];
                     if (firstPos > 0)
                     {
@@ -281,7 +292,7 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                             warmupTokens[t] = (t * 5 + s) % VocabSize;
                             warmupPositions[t] = t;
                         }
-                        using (model.Forward(warmupTokens, warmupPositions, deviceId: -1, kvCache: caches[s])) { }
+                        using (model.Forward(warmupTokens, warmupPositions, deviceId: -1, kvCache: caches[s], ssmState: ssmStates[s])) { }
                     }
                 }
 
@@ -293,6 +304,7 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
                         TokenIds = tokens[s].AsMemory(),
                         Positions = positions[s].AsMemory(),
                         KvCache = caches[s],
+                        SsmState = ssmStates[s],
                     };
                 }
 
@@ -311,7 +323,7 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
             }
             finally
             {
-                for (int s = 0; s < tokens.Length; s++) caches[s]?.Dispose();
+                for (int s = 0; s < tokens.Length; s++) { caches[s]?.Dispose(); ssmStates[s]?.Dispose(); }
             }
         }
 
@@ -319,6 +331,67 @@ public sealed class VulkanNemotronHTransformerModelForwardBatchTests
         {
             AssertLogitsClose(referenceLogits[s], batchedLogits[s], $"Four-seq mixed [seq {s}, N={tokens[s].Length}]");
         }
+    }
+
+    [SkippableFact]
+    public void VulkanNemotronHForwardBatch_ConcurrentDecode_ThreadsPerSeqSsmState()
+    {
+        // Two sequences both DECODING concurrently. This is where a shared model-owned _ssmCache
+        // corrupts (unlike prefill, decode continues the recurrent state), so per-seq SsmState parity
+        // here proves the threading — not just that it ran.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var kinds = new[] { HybridLayerKind.Attention, HybridLayerKind.Ssm, HybridLayerKind.Ffn };
+        using var fixture = NemotronHForwardBatchFixture.Build(kinds, seed: 67);
+
+        int[] preA = [2, 4, 6]; int[] prePosA = [0, 1, 2]; int[] decA = [3]; int[] decPosA = [3];
+        int[] preB = [1, 3, 5, 7]; int[] prePosB = [0, 1, 2, 3]; int[] decB = [2]; int[] decPosB = [4];
+
+        // Reference: each sequence prefilled then decoded in isolation (shared _ssmCache is reset by
+        // each prefill, so sequential per-seq Forwards are independent).
+        float[] refA, refB;
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, fixture.Config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, QuantizationType.F32, VocabSize, HiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
+            using var kvA = model.CreateKvCache(MaxSeqLen);
+            using var ssmRefA = model.CreateSsmState();
+            using (model.Forward(preA, prePosA, -1, kvA, ssmRefA)) { }
+            using (var lg = model.Forward(decA, decPosA, -1, kvA, ssmRefA)) refA = CopyLogits(lg);
+            using var kvB = model.CreateKvCache(MaxSeqLen);
+            using var ssmRefB = model.CreateSsmState();
+            using (model.Forward(preB, prePosB, -1, kvB, ssmRefB)) { }
+            using (var lg = model.Forward(decB, decPosB, -1, kvB, ssmRefB)) refB = CopyLogits(lg);
+        }
+
+        // Batched: prime per-seq states, then a single fused decode ForwardBatch over both.
+        float[] batchA, batchB;
+        {
+            using var device = VulkanDevice.Create();
+            using var model = VulkanNemotronHTransformerModel.BuildFromPrebuiltWeights(
+                device, fixture.Config, fixture.Layers, fixture.OutputNormWeight,
+                fixture.OutputWeightPtr, QuantizationType.F32, VocabSize, HiddenSize,
+                fixture.TokenEmbedPtr, QuantizationType.F32, spvDir);
+            using var kvA = model.CreateKvCache(MaxSeqLen);
+            using var kvB = model.CreateKvCache(MaxSeqLen);
+            using var ssmA = model.CreateSsmState();
+            using var ssmB = model.CreateSsmState();
+            using (model.Forward(preA, prePosA, -1, kvA, ssmA)) { }
+            using (model.Forward(preB, prePosB, -1, kvB, ssmB)) { }
+            var requests = new[]
+            {
+                new SequenceForwardRequest { TokenIds = decA.AsMemory(), Positions = decPosA.AsMemory(), KvCache = kvA, SsmState = ssmA },
+                new SequenceForwardRequest { TokenIds = decB.AsMemory(), Positions = decPosB.AsMemory(), KvCache = kvB, SsmState = ssmB },
+            };
+            var results = model.ForwardBatch(requests, deviceId: -1);
+            try { batchA = CopyLogits(results[0]); batchB = CopyLogits(results[1]); }
+            finally { foreach (var t in results) t.Dispose(); }
+        }
+
+        AssertLogitsClose(refA, batchA, "ConcurrentDecode[A]");
+        AssertLogitsClose(refB, batchB, "ConcurrentDecode[B]");
     }
 
     private static void AssertLogitsClose(float[] reference, float[] actual, string label)
