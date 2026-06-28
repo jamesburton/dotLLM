@@ -40,8 +40,16 @@ sequence_item: phase-9-step-59
 >   Nemotron-H deferred (its `SsmStateCache` has no interface/factory — own follow-up). 4 new tests
 >   (mock recurrent model throws on null/shared state ⇒ correct output proves threading); 29 scheduler
 >   tests + 203 model/forwardbatch tests green. `docs/SCHEDULING.md` refreshed.
-> - ⏳ Remaining: Nemotron-H recurrent batching (needs `ISsmState`); separate prefill/decode
->   queues/pools; and fairness constraints (sub-piece 4).
+> - ✅ Sub-piece 1 (disaggregation) — **prefill/decode disaggregation seam** (#351). `Step()` split
+>   into public `StepPrefill()` (sweep + admit + deferred prefill) and `StepDecode()` (sweep + decode);
+>   `Step()` runs both in sequence (byte-identical). The prefill queue (`_pendingQueue`) and the
+>   decode set (active decoders) are the separate queues; the phase methods are the thread-pool/worker
+>   seam a future disaggregated/multi-replica driver uses (in-process single-GPU keeps `Step()` because
+>   the model forward is single-threaded). 3 new tests (phase-split token-identical to combined Step).
+>   NOTE: literal separate OS thread pools against ONE model instance are unsafe (single-threaded
+>   forward) — the seam is the deliverable; the multi-worker driver + KV transfer is a follow-up.
+> - ⏳ Remaining: Nemotron-H recurrent batching (needs `ISsmState`); disaggregated multi-worker driver
+>   (cross-worker KV transfer); and fairness constraints (sub-piece 4 = (d)).
 
 ## What Step 59 covers
 

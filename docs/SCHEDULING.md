@@ -99,7 +99,23 @@ Different compute characteristics:
 - **Prefill**: Process N prompt tokens. Compute-bound (GEMM). High arithmetic intensity.
 - **Decode**: Process 1 token per sequence. Memory-bandwidth-bound (GEMV). Low arithmetic intensity.
 
-The scheduler can separate these into micro-batches within one iteration for optimal utilization. Prefill benefits from large batch GEMM; decode benefits from batching many sequences together.
+The scheduler separates these into distinct dispatches within one iteration for optimal utilization: prefill benefits from large batch GEMM, decode benefits from batching many sequences together (see steps 3–4 above — each issues its own `ForwardBatch`).
+
+**Disaggregation seam (shipped, Step 59).** `ContinuousBatchScheduler` exposes the two phases of a
+`Step()` individually — `bool StepPrefill()` (sweep + admit + deferred prompt prefill) and
+`bool StepDecode()` (sweep + decode the active set) — with `Step()` simply running prefill then decode
+in sequence (byte-identical to before; a sequence admitted this iteration still decodes the same
+iteration). The two phases are the **separate-queue / separate-thread-pool seam**: the *prefill queue*
+is the priority admission queue (`_pendingQueue`); the *decode queue* is the active-decoder set (in
+continuous batching, decoders are not separately queued — they are the active sequences). A future
+**disaggregated / multi-worker deployment** drives `StepPrefill` and `StepDecode` on separate thread
+pools — or separate model replicas / devices with KV transfer between — so prefill-heavy and
+decode-heavy work scale independently. The **in-process single-GPU** driver
+(`ContinuousBatchSchedulerService.RunLoopAsync`) keeps calling `Step()`, because the model forward is
+single-threaded (instance-scoped forward state) — running both phases concurrently against one model
+instance would corrupt state. Tests: `Disaggregated_AdmittedInStepPrefill_DecodesOnlyInStepDecode`,
+`Disaggregated_SeparatePhases_MatchCombinedStepOutput` (phase-split is token-identical to combined
+`Step()`), `Disaggregated_DecodePhaseAloneIsNoOp_WhenNothingAdmitted`.
 
 ## Request Priority
 
@@ -194,8 +210,9 @@ per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 `RecurrentBatched_MaxRecurrentSequences_CapsConcurrency`, `RecurrentBatched_PerSeqMaxTokens_Honored`.
 
 **Still pending in Step 59**: Nemotron-H recurrent batching (needs an `ISsmState` container + factory);
-separate prefill/decode queues/pools; and fairness constraints (per-API-key accounting to prevent
-starvation under a continuous higher-priority stream).
+a disaggregated multi-worker/replica driver with cross-worker KV transfer (the deployment that
+actually uses the `StepPrefill`/`StepDecode` seam on separate thread pools); and fairness constraints
+(per-API-key accounting to prevent starvation under a continuous higher-priority stream).
 
 ## Sequence State Machine
 
