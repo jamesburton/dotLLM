@@ -160,9 +160,11 @@ With `ContinuousBatchSchedulerOptions.EnableFairness` (default off), admission *
 
 Each request is charged an estimated cost (`promptLength + maxTokens`). The scheduler keeps a per-key running finish tag and a global virtual clock (both under `_queueLock`): a request's intra-tier ordering key is its SFQ **start tag** = `max(virtualClock, keyFinish)`, and admitting a request advances the virtual clock to that tag. A backlogged key's start tags grow so its requests fall behind lighter keys'; a key that goes idle resets to the virtual clock (recent-usage forgiveness). **Priority still dominates across tiers** — fairness only reorders within a tier. With fairness off, every start tag is 0, so admission is byte-identical to FIFO-by-submission-order.
 
-Tests (`ContinuousBatchSchedulerTests`): `Fairness_Enabled_LightKeyInterleavesAheadOfHammerBacklog` (a light client interleaves right after the first of a 5-request hammer flood, vs. waiting behind all 5 with `Fairness_Disabled_..._Fifo`), `Fairness_PriorityStillDominatesAcrossTiers`, `InferenceRequest_ApiKey_DefaultsNull`.
+**Per-key fairness weights.** By default every key is charged its raw cost (weight 1.0 — equal shares). Supply `ContinuousBatchSchedulerOptions.FairnessWeightProvider` (`Func<string, double>`) to give a key a weight `w`: it is then charged `cost / w` into its finish tag, so a higher-weight key's tags grow more slowly and it earns a proportionally larger share of admissions **within its priority tier** under contention (e.g. weight 4 drains a backlog roughly 4× faster than an equal-priority weight-1 key). The provider is consulted once per `Submit` under `_queueLock`, so it must be cheap and side-effect-free; a `null` provider, a returned weight ≤ 0 / non-finite, or the anonymous (`null`-key) bucket all resolve to weight 1.0 — keeping admission byte-identical to the unweighted SFQ path. On the server, weights are sourced per-key from `RateLimitPolicy.Weight` (default 1.0): when fairness is enabled and a `RateLimit` config is present, `ServerStartup` wires `FairnessWeightProvider = apiKey => RateLimit.PolicyFor(apiKey)?.Weight ?? 1.0`.
 
-**Config + telemetry.** Scheduler options (including `EnableFairness` and the other limits) are configurable via `ServerOptions.Scheduler` — a host binding `ServerOptions` from `appsettings.json` sets the whole `ContinuousBatchSchedulerOptions` section; `ServerStartup` passes it to the scheduler (the CLI also takes `--scheduler-fairness`). Per-key token accounting: `ContinuousBatchScheduler.GetPerKeyTokenUsage()` returns a live snapshot of cumulative generated tokens per `ApiKey`, and each completed keyed request increments the `dotllm.engine.tokens.by_key` meter counter (tagged by `key`; zero-overhead when no listener). **Still a follow-up:** per-key fairness *weights* (currently all keys share one weight).
+Tests (`ContinuousBatchSchedulerTests`): `Fairness_Enabled_LightKeyInterleavesAheadOfHammerBacklog` (a light client interleaves right after the first of a 5-request hammer flood, vs. waiting behind all 5 with `Fairness_Disabled_..._Fifo`), `Fairness_PriorityStillDominatesAcrossTiers`, `Fairness_HigherWeightKey_AdmittedProportionallyAhead` (a weight-4 key drains its whole backlog before more than one equal-priority weight-1 request slips through), `Fairness_UniformWeightProvider_MatchesUnweightedSfq` (a uniform weight scales all charges equally ⇒ ordering unchanged), `InferenceRequest_ApiKey_DefaultsNull`.
+
+**Config + telemetry.** Scheduler options (including `EnableFairness` and the other limits) are configurable via `ServerOptions.Scheduler` — a host binding `ServerOptions` from `appsettings.json` sets the whole `ContinuousBatchSchedulerOptions` section; `ServerStartup` passes it to the scheduler (the CLI also takes `--scheduler-fairness`). Per-key token accounting: `ContinuousBatchScheduler.GetPerKeyTokenUsage()` returns a live snapshot of cumulative generated tokens per `ApiKey`, and each completed keyed request increments the `dotllm.engine.tokens.by_key` meter counter (tagged by `key`; zero-overhead when no listener).
 
 ## Preemption
 
@@ -241,7 +243,8 @@ per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 preemption, prefill/decode disaggregation, fairness — are all shipped, as is the in-process
 `DisaggregatedScheduler` driver, config/telemetry wiring, and Nemotron-H recurrent batching on both
 CPU and Vulkan via `ISsmState`): cross-process / cross-device KV transfer + multi-GPU replica placement
-for the disaggregated driver; and per-key fairness *weights*.
+for the disaggregated driver. (Per-key fairness *weights* are now shipped via
+`FairnessWeightProvider` / `RateLimitPolicy.Weight`.)
 
 ## Sequence State Machine
 

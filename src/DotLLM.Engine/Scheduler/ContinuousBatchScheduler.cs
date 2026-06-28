@@ -279,13 +279,26 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// <summary>
     /// Computes a request's start-time-fair-queuing start tag and charges its key's running finish tag.
     /// Must be called under <see cref="_queueLock"/>. An idle key starts at the current virtual clock
-    /// (recent-usage forgiveness); a backlogged key's tags grow by <paramref name="cost"/> each request.
+    /// (recent-usage forgiveness); a backlogged key's tags grow by the <em>weighted</em> cost each request.
+    /// When a <see cref="ContinuousBatchSchedulerOptions.FairnessWeightProvider"/> is configured, the raw
+    /// <paramref name="cost"/> is divided by the key's weight <c>w</c> (so a higher-weight key's tags grow
+    /// more slowly ⇒ a larger admission share). Weight 1.0 (the default / no provider) keeps the charge at
+    /// <c>max(1, cost)</c>, byte-identical to the unweighted SFQ behaviour.
     /// </summary>
     private long ComputeFairnessStartTag(string? apiKey, long cost)
     {
         string key = apiKey ?? AnonymousFairnessKey;
         long start = _keyFinishTag.TryGetValue(key, out long finish) ? Math.Max(_virtualTime, finish) : _virtualTime;
-        _keyFinishTag[key] = start + Math.Max(1, cost);
+
+        long charged = Math.Max(1, cost);
+        // Per-key fairness weight: charge cost/w. Never weighted for the anonymous (null-key) bucket.
+        if (apiKey is not null && _options.FairnessWeightProvider is { } provider)
+        {
+            double weight = provider(apiKey);
+            if (double.IsFinite(weight) && weight > 0.0 && weight != 1.0)
+                charged = Math.Max(1, (long)Math.Round(charged / weight, MidpointRounding.AwayFromZero));
+        }
+        _keyFinishTag[key] = start + charged;
 
         // Opportunistic prune: drop keys that have fully caught up to the virtual clock (idle/served),
         // bounding the map for long-running multi-tenant servers. Only when it has grown past a cap.

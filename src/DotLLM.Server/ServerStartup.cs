@@ -234,11 +234,22 @@ public static class ServerStartup
         ContinuousBatchSchedulerService? scheduler = null;
         if (pagedFactory is not null && kvFactory is not null && draftModel is null)
         {
+            // When fairness is enabled and a rate-limit config is present, source per-API-key
+            // fairness weights from each key's RateLimitPolicy.Weight (default 1.0 ⇒ equal share).
+            var schedulerOptions = options.Scheduler;
+            if (schedulerOptions?.EnableFairness == true && options.RateLimit is { } rateLimit)
+            {
+                schedulerOptions = schedulerOptions with
+                {
+                    FairnessWeightProvider = apiKey => rateLimit.PolicyFor(apiKey)?.Weight ?? 1.0,
+                };
+            }
+
             scheduler = new ContinuousBatchSchedulerService(
                 model,
                 tokenizer,
                 kvFactory,
-                options: options.Scheduler,
+                options: schedulerOptions,
                 pagedPool: pagedFactory.Pool);
             Console.WriteLine(options.Scheduler?.EnableFairness == true
                 ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"

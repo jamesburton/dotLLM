@@ -91,4 +91,21 @@ public sealed record ContinuousBatchSchedulerOptions
     /// is 0 for every request, so admission is byte-identical to FIFO-by-submission-order.</para>
     /// </remarks>
     public bool EnableFairness { get; init; } = false;
+
+    /// <summary>
+    /// Optional per-API-key <b>fairness weight</b> source, consulted only when <see cref="EnableFairness"/>
+    /// is set. Given an API key, returns that key's weight <c>w</c>; the key is then charged
+    /// <c>cost / w</c> into its SFQ finish tag instead of the raw cost. A higher weight makes a key's
+    /// finish tags grow more slowly, so it receives a proportionally larger share of admissions
+    /// <em>within its priority tier</em> under contention (e.g. weight 2 ⇒ roughly twice the admission
+    /// share of an equal-priority weight-1 key). Default <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit"/> under the scheduler's
+    /// queue lock, so it must be cheap and side-effect-free (a dictionary lookup over a static policy table
+    /// is ideal). A <see langword="null"/> provider, or a returned weight ≤ 0 / non-finite, resolves to
+    /// weight <c>1.0</c> — making admission byte-identical to the unweighted SFQ behaviour. The provider is
+    /// never called for a <see langword="null"/> API key (the anonymous bucket always uses weight 1.0).
+    /// </remarks>
+    public Func<string, double>? FairnessWeightProvider { get; init; }
 }
