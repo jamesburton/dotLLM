@@ -963,6 +963,70 @@ public sealed class ContinuousBatchSchedulerTests
     }
 
     [Fact]
+    public void Fairness_HigherWeightKey_AdmittedProportionallyAhead()
+    {
+        // Two equal-priority keys flood the queue with equal backlogs (4 each), but "heavy" carries a
+        // fairness weight of 4 vs "light" weight 1. SFQ charges heavy cost/4, so its start tags grow 4×
+        // slower and it races ahead: by the time the WHOLE heavy backlog has drained, at most ONE light
+        // request has slipped through. With equal weights the interleave is ~1:1 (3 light done by then),
+        // so this asserts the weight is actually applied — not just that SFQ runs.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 1,
+                EnableFairness = true,
+                FairnessWeightProvider = key => key == "heavy" ? 4.0 : 1.0,
+            });
+
+        var heavy = new ISchedulerRequest[4];
+        for (int i = 0; i < heavy.Length; i++)
+            heavy[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "heavy"));
+        var light = new ISchedulerRequest[4];
+        for (int i = 0; i < light.Length; i++)
+            light[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "light"));
+
+        DriveUntilCompleted(fix.Scheduler, heavy[3]); // drive until the LAST heavy request completes
+
+        int lightDone = 0;
+        foreach (var l in light) if (l.Completion.IsCompleted) lightDone++;
+        Assert.True(lightDone <= 1,
+            $"weight fairness failed: {lightDone} light requests slipped ahead before the heavy backlog drained");
+
+        DriveUntilIdle(fix.Scheduler);
+    }
+
+    [Fact]
+    public void Fairness_UniformWeightProvider_MatchesUnweightedSfq()
+    {
+        // A provider that returns the SAME weight for every key (here 2.0) scales all charges equally,
+        // so it must not change relative ordering — admission matches the unweighted SFQ interleave:
+        // the light request still slots in right after the hammer's first request.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions
+            {
+                MaxActiveSequences = 1,
+                EnableFairness = true,
+                FairnessWeightProvider = _ => 2.0,
+            });
+
+        var hammer = new ISchedulerRequest[5];
+        for (int i = 0; i < hammer.Length; i++)
+            hammer[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "hammer"));
+        var light = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "light"));
+
+        DriveUntilCompleted(fix.Scheduler, light);
+
+        int hammerDoneBeforeLight = 0;
+        foreach (var h in hammer) if (h.Completion.IsCompleted) hammerDoneBeforeLight++;
+        Assert.True(hammerDoneBeforeLight <= 1,
+            $"uniform weight changed ordering: light starved behind {hammerDoneBeforeLight} hammer requests");
+
+        DriveUntilIdle(fix.Scheduler);
+    }
+
+    [Fact]
     public async Task PerKeyTokenUsage_AccruesGeneratedTokensPerApiKey()
     {
         // Each request generates exactly 3 tokens (emit 9,9,9 then EOS). Per-key accounting sums
