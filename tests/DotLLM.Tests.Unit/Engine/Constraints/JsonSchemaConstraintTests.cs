@@ -76,6 +76,42 @@ public class JsonSchemaConstraintTests
     }
 
     [Fact]
+    public void StringValue_MaxLength_ForcesCloseAtLimit()
+    {
+        // {"s": "..."} where s has maxLength 3. After 3 content chars only the closing
+        // quote is allowed — so a rambling weak base is forced to terminate the value.
+        var constraint = CreateConstraint("""
+            { "type": "object", "properties": { "s": { "type": "string", "maxLength": 3 } } }
+            """);
+        AdvanceString(constraint, "{\"s\":\"ab");        // 2 content chars (a=6, b=32)
+        var mask = constraint.GetAllowedTokens();
+        Assert.True(mask.IsAllowed(6), "content char allowed below maxLength");
+        Assert.True(mask.IsAllowed(2), "closing quote allowed below maxLength");
+
+        AdvanceString(constraint, "c");                  // 3rd content char -> at maxLength
+        mask = constraint.GetAllowedTokens();
+        Assert.False(mask.IsAllowed(6), "content char must be masked at maxLength");
+        Assert.True(mask.IsAllowed(2), "closing quote must be forced at maxLength");
+    }
+
+    [Fact]
+    public void StringValue_MinLength_BlocksEarlyClose()
+    {
+        // {"s": "..."} where s has minLength 2. The value cannot close before 2 chars.
+        var constraint = CreateConstraint("""
+            { "type": "object", "properties": { "s": { "type": "string", "minLength": 2 } } }
+            """);
+        AdvanceString(constraint, "{\"s\":\"a");         // 1 content char
+        var mask = constraint.GetAllowedTokens();
+        Assert.False(mask.IsAllowed(2), "closing quote must be masked below minLength");
+        Assert.True(mask.IsAllowed(6), "content char allowed below minLength");
+
+        AdvanceString(constraint, "b");                  // now 2 chars
+        mask = constraint.GetAllowedTokens();
+        Assert.True(mask.IsAllowed(2), "closing quote allowed once minLength is met");
+    }
+
+    [Fact]
     public void AtStart_ArraySchema_AllowsOnlyOpenBracket()
     {
         var constraint = CreateConstraint("""
