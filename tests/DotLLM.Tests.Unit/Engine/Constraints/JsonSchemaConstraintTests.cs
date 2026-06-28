@@ -570,10 +570,41 @@ public class JsonSchemaConstraintTests
     }
 
     [Fact]
+    public void MultiTool_PrefixName_ShorterNameClose_PrunesLongerBranch()
+    {
+        // FIX 1 (#104) — prefix-name leak. Tool name "get" is a strict prefix of "gets".
+        // After the const value "get" CLOSES, the "gets" branch (whose const-trie node is
+        // valid-but-non-terminal) MUST be pruned by the pre-advance closing-quote decision,
+        // leaving only get's argument schema enforced. With the pre-fix code (pruning gated to
+        // in-string CONTENT chars, re-checked against the POST-advance parser) the gets branch
+        // survives the closing quote and its exclusive arg key "den" leaks → arguments validated
+        // against the UNION of both tools, breaking "exactly one tool enforced".
+        // All chars (g,e,t,s,c,a,b,d,e,n) are single-char tokens in SchemaStubTokenizer.
+        var c = CreateConstraint(ToolCallSchemaBuilder.BuildForRequired(
+        [
+            new ToolDefinition("get", "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""),
+            new ToolDefinition("gets", "x",
+                """{"type":"object","properties":{"den":{"type":"string"}},"required":["den"]}"""),
+        ]));
+
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{");
+
+        // get's exclusive arg key "cab" must be allowed.
+        Assert.True(TokenAllowedStartingWith(c, "\"c"),
+            "matched tool 'get' arg key 'cab' must be allowed");
+        // gets' exclusive arg key "den" must be masked — the gets branch was pruned when "get" closed.
+        Assert.False(TokenAllowedStartingWith(c, "\"d"),
+            "'gets' arg key 'den' must be masked: the gets branch is pruned once the 'get' name string closes");
+    }
+
+    [Fact]
     public void MultiTool_AboveBranchCap_DoesNotCrash_AndStaysValidJson()
     {
-        // 12 tools (> K=8) — must NOT fork; falls back to single-branch union behaviour.
-        // Tool names are 't' + tokenizable suffix so AdvanceString can drive the chosen one.
+        // 12 tools (> K=8) — must NOT use the anyOf parallel-branch path. FIX 2 (#104): the
+        // builder degrades to a CLOSED enum-flat schema (name enum + additionalProperties:false),
+        // so name stays constrained and extra outer keys are forbidden (stronger than the bare
+        // anyOf root, which left name unconstrained). Tool names are 't' + a tokenizable suffix.
         string[] suffixes = ["a", "b", "c", "d", "e", "f", "g", "i", "l", "m", "n", "o"];
         var tools = new List<ToolDefinition>();
         foreach (var s in suffixes)
@@ -581,8 +612,27 @@ public class JsonSchemaConstraintTests
                 """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""));
 
         var c = CreateConstraint(ToolCallSchemaBuilder.BuildForRequired(tools.ToArray()));
-        AdvanceString(c, "{\"name\":\"td\",\"arguments\":{"); // must not throw
-        Assert.True(AnyAllowed(c.GetAllowedTokens()), "union fallback must keep the mask non-empty");
+
+        // name is enum-constrained: at the name value string only the shared 't' prefix is valid;
+        // a char that no tool name starts with ('n') must be masked.
+        AdvanceString(c, "{\"name\":\"");
+        Assert.True(TokenAllowedStartingWith(c, "t"),
+            "name enum must allow the shared 't' prefix of every tool name");
+        Assert.False(TokenAllowedStartingWith(c, "n"),
+            "a non-tool-name first char must be masked by the name enum (name stays constrained)");
+
+        // Drive a valid name + empty arguments object.
+        AdvanceString(c, "td\",\"arguments\":{}");
+
+        // Outer object: name + arguments both emitted, additionalProperties:false →
+        // no third (undeclared) key may open; only the closing '}' is valid.
+        Assert.False(TokenAllowedStartingWith(c, ","),
+            "no third undeclared key may open (additionalProperties:false on the outer object)");
+        Assert.True(TokenAllowedStartingWith(c, "}"),
+            "the outer object must be closeable once required keys are emitted");
+
+        AdvanceString(c, "}");
+        Assert.True(c.IsComplete(), "the degraded enum-flat schema still terminates as valid JSON");
     }
 
     /// <summary>

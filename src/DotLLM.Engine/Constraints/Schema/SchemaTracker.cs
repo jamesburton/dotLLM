@@ -706,24 +706,28 @@ internal struct BranchState
 /// <remarks>
 /// <para>
 /// Value type — copies by value for zero-alloc cloning. Holds a bounded set of up to
-/// <see cref="K"/> parallel <see cref="BranchState"/> values in an <c>InlineArray</c>, so a
+/// <see cref="MaxParallelBranches"/> parallel <see cref="BranchState"/> values in an <c>InlineArray</c>, so a
 /// whole tracker still copies by value with no heap allocation.
 /// </para>
 /// <para>
 /// A single branch is the common case (any schema without an active <c>anyOf</c> at the
 /// current value position). When the value about to be generated is governed by an
-/// <c>anyOf</c> node with at most <see cref="K"/> alternatives, the single branch forks
+/// <c>anyOf</c> node with at most <see cref="MaxParallelBranches"/> alternatives, the single branch forks
 /// into one branch per alternative. Thereafter <see cref="IsCharAllowedBySchema"/> is the
 /// OR over live branches and <see cref="OnCharAdvanced"/> prunes branches that reject an
 /// accepted string character, narrowing the set until it collapses back to one. An
-/// <c>anyOf</c> with more than <see cref="K"/> alternatives is not forked; the tracker
+/// <c>anyOf</c> with more than <see cref="MaxParallelBranches"/> alternatives is not forked; the tracker
 /// keeps the historical single-branch union overapproximation.
 /// </para>
 /// </remarks>
 internal struct SchemaTracker
 {
-    /// <summary>Maximum number of parallel branches. Matches <see cref="BranchStateArray"/> length.</summary>
-    private const int K = 8;
+    /// <summary>
+    /// Maximum number of parallel <c>anyOf</c> branches the tracker forks into. Matches
+    /// <see cref="BranchStateArray"/> length. Shared with <see cref="ToolCallSchemaBuilder"/>
+    /// so the builder's <c>&gt; K</c> degradation threshold and this fork cap can never drift.
+    /// </summary>
+    internal const int MaxParallelBranches = 8;
 
     private BranchStateArray _branches;
     private int _liveCount;
@@ -754,7 +758,11 @@ internal struct SchemaTracker
     /// Returns a value copy of the single live branch. Only meaningful when the tracker cannot
     /// fork (<see cref="CanFork"/> is <c>false</c>), in which case branch 0 is the sole branch.
     /// </summary>
-    public readonly BranchState GetSingleBranch() => _branches[0];
+    public readonly BranchState GetSingleBranch()
+    {
+        Debug.Assert(!CanFork, "GetSingleBranch must only be called on a non-forking tracker");
+        return _branches[0];
+    }
 
     /// <summary>
     /// Whether the schema is fully satisfied (any live branch is complete).
@@ -782,53 +790,60 @@ internal struct SchemaTracker
     /// <summary>
     /// Called AFTER a character has been successfully accepted by the JSON parser.
     /// Forks the single branch when a governing <c>anyOf</c> value is about to start,
-    /// advances every live branch, and prunes branches that reject an accepted string
-    /// character (collapsing to a single branch when the set narrows to one).
+    /// prunes branches that did not allow the accepted character, and advances the
+    /// survivors (collapsing to a single branch when the set narrows to one).
     /// </summary>
-    public void OnCharAdvanced(char c, in JsonCharParser p)
+    /// <param name="c">The character that was just accepted.</param>
+    /// <param name="p">The parser state AFTER advancing past <paramref name="c"/>.</param>
+    /// <param name="pre">The parser state BEFORE advancing past <paramref name="c"/>.</param>
+    /// <remarks>
+    /// Pruning uses the PRE-advance allow decision (<c>branch.IsCharAllowed(c, in pre)</c>),
+    /// which is exactly the predicate the mask build OR-ed across branches to permit
+    /// <paramref name="c"/>. It is correct for ALL characters — string content, a value/key
+    /// string's CLOSING quote, and structural characters alike — so a branch whose const/enum
+    /// trie is non-terminal at a closing quote (e.g. a tool name that is a strict prefix of
+    /// another) is pruned. Because the mask's OR guarantees at least one branch allowed
+    /// <paramref name="c"/> pre-advance, the live set never empties on a syntactically valid
+    /// character.
+    /// </remarks>
+    public void OnCharAdvanced(char c, in JsonCharParser p, in JsonCharParser pre)
     {
         // Fork BEFORE applying the character, so each new branch processes the value's
         // opening structural character against its own alternative node (the object/array
         // frame is then pushed normally per branch).
         MaybeFork();
 
-        // A branch may be pruned only when we can re-evaluate its accept decision against
-        // the SAME parser state the pre-advance check used. For string-content characters
-        // the parser stays in InString across the character, so IsCharAllowed(c, post-parser)
-        // is exactly the pre-advance decision. Structural characters (which transition the
-        // parser state and are common to all sibling tool-call branches) are never pruned.
-        bool pruneEligible = _liveCount > 1
-            && p.State == JsonParserState.InString
-            && c != '"' && c != '\\';
-
-        if (pruneEligible)
+        if (_liveCount <= 1)
         {
-            int w = 0;
-            for (int i = 0; i < _liveCount; i++)
-            {
-                if (!_branches[i].IsCharAllowed(c, in p))
-                    continue; // prune: branch rejects the accepted character
+            // Single branch: it allowed the char (it is the sole term of the mask's OR), so it
+            // never prunes. Behaviour- and cost-identical to the historical single-branch path.
+            _branches[0].OnCharAdvanced(c, in p);
+            return;
+        }
 
-                _branches[i].OnCharAdvanced(c, in p);
-                if (w != i)
-                    _branches[w] = _branches[i];
-                w++;
-            }
+        int w = 0;
+        for (int i = 0; i < _liveCount; i++)
+        {
+            // Prune by the PRE-advance decision — correct for content, closing quotes and
+            // structural chars alike.
+            if (!_branches[i].IsCharAllowed(c, in pre))
+                continue;
 
-            if (w > 0)
-            {
-                _liveCount = w;
-            }
-            else
-            {
-                // Defensive: every branch rejected a character the parser accepted. The
-                // mask build never emits such a token, but stay in lockstep with the parser.
-                for (int i = 0; i < _liveCount; i++)
-                    _branches[i].OnCharAdvanced(c, in p);
-            }
+            _branches[i].OnCharAdvanced(c, in p);
+            if (w != i)
+                _branches[w] = _branches[i];
+            w++;
+        }
+
+        if (w > 0)
+        {
+            _liveCount = w;
         }
         else
         {
+            // Defensive: every branch rejected a character the parser accepted. The mask build
+            // never emits such a token (the OR guarantees ≥1 allowing branch), but stay in
+            // lockstep with the parser by advancing all branches without pruning.
             for (int i = 0; i < _liveCount; i++)
                 _branches[i].OnCharAdvanced(c, in p);
         }
@@ -869,7 +884,7 @@ internal struct SchemaTracker
 
     /// <summary>
     /// Expands the single live branch into one branch per <c>anyOf</c> alternative when the
-    /// value about to be generated is a union of at most <see cref="K"/> alternatives.
+    /// value about to be generated is a union of at most <see cref="MaxParallelBranches"/> alternatives.
     /// </summary>
     private void MaybeFork()
     {
@@ -879,7 +894,7 @@ internal struct SchemaTracker
         if (!_branches[0].TryGetAnyOfAlternatives(out var alts) || alts.Length < 2)
             return;
 
-        if (alts.Length > K)
+        if (alts.Length > MaxParallelBranches)
         {
             // Degradation: keep the single-branch union overapproximation (no narrowing).
             LogDegradationOnce(alts.Length);
@@ -896,7 +911,7 @@ internal struct SchemaTracker
     {
         if (Interlocked.Exchange(ref _degradationLogged, 1) == 0)
             Debug.WriteLine(
-                $"[SchemaTracker] anyOf with {altCount} alternatives exceeds branch cap {K}; " +
+                $"[SchemaTracker] anyOf with {altCount} alternatives exceeds branch cap {MaxParallelBranches}; " +
                 "falling back to single-branch union overapproximation (no per-branch narrowing).");
     }
 }

@@ -82,9 +82,10 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
         string text = _tokenizer.DecodeToken(tokenId);
         foreach (char c in text)
         {
+            var pre = _parser; // pre-advance parser state — needed for correct branch pruning
             bool ok = _parser.TryAdvance(c);
             Debug.Assert(ok, $"Schema constraint allowed token that advances to invalid JSON state at char '{c}'");
-            _tracker.OnCharAdvanced(c, in _parser);
+            _tracker.OnCharAdvanced(c, in _parser, in pre);
         }
     }
 
@@ -190,9 +191,10 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
         var trackerClone = _tracker;
 
         // First char: schema check already cleared by the bucket. Only need to advance.
+        var preFirst = parserClone; // pre-advance parser state for branch pruning
         if (!parserClone.TryAdvance(bucketFirstChar))
             return false;
-        trackerClone.OnCharAdvanced(bucketFirstChar, in parserClone);
+        trackerClone.OnCharAdvanced(bucketFirstChar, in parserClone, in preFirst);
 
         // Remaining chars: full schema + syntactic check.
         for (int i = 1; i < tokenText.Length; i++)
@@ -200,9 +202,10 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
             char c = tokenText[i];
             if (!trackerClone.IsCharAllowedBySchema(c, in parserClone))
                 return false;
+            var pre = parserClone; // pre-advance parser state for branch pruning
             if (!parserClone.TryAdvance(c))
                 return false;
-            trackerClone.OnCharAdvanced(c, in parserClone);
+            trackerClone.OnCharAdvanced(c, in parserClone, in pre);
         }
         return true;
     }

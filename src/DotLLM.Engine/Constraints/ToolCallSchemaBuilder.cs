@@ -43,9 +43,14 @@ public static class ToolCallSchemaBuilder
 
     /// <summary>
     /// Builds a JSON Schema for required tool calling with any of the provided tools.
-    /// For a single tool, delegates to <see cref="BuildForFunction"/>. For multiple tools,
-    /// emits an <c>anyOf</c> where each branch is the closed per-tool schema from
-    /// <see cref="BuildForFunction"/>, giving per-tool argument validation.
+    /// For a single tool, delegates to <see cref="BuildForFunction"/>. For up to
+    /// <see cref="Schema.SchemaTracker.MaxParallelBranches"/> tools, emits an <c>anyOf</c> where
+    /// each branch is the closed per-tool schema from <see cref="BuildForFunction"/>, giving
+    /// per-tool argument validation (the tracker forks one parallel branch per alternative).
+    /// Beyond that cap the tracker cannot fork, so a bare <c>anyOf</c> would leave <c>name</c>
+    /// unconstrained; instead this degrades to a CLOSED enum-flat schema — name constrained to
+    /// the enum of tool names, permissive arguments, and <c>additionalProperties:false</c> — so
+    /// the output is still valid JSON with a constrained name.
     /// </summary>
     /// <param name="tools">Available tool definitions.</param>
     /// <param name="argumentsKey">Key name for arguments ("arguments" or "parameters").</param>
@@ -55,6 +60,9 @@ public static class ToolCallSchemaBuilder
         if (tools.Length == 1)
             return BuildForFunction(tools[0], argumentsKey);
 
+        if (tools.Length > Schema.SchemaTracker.MaxParallelBranches)
+            return BuildEnumFlat(tools, argumentsKey);
+
         var sb = new StringBuilder(1024);
         sb.Append("{\"anyOf\":[");
         for (int i = 0; i < tools.Length; i++)
@@ -63,6 +71,31 @@ public static class ToolCallSchemaBuilder
             sb.Append(BuildForFunction(tools[i], argumentsKey));
         }
         sb.Append("]}");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Builds the degraded (&gt; <see cref="Schema.SchemaTracker.MaxParallelBranches"/> tools)
+    /// closed enum-flat schema: <c>{"type":"object","properties":{"name":{"type":"string",
+    /// "enum":[…]},"&lt;argsKey&gt;":{"type":"object"}},"required":["name","&lt;argsKey&gt;"],
+    /// "additionalProperties":false}</c>. The name is constrained to the tool-name enum and the
+    /// outer object forbids extra keys; per-tool argument correlation is not enforced (the cap
+    /// on parallel branches makes it intractable for this many tools, by design).
+    /// </summary>
+    private static string BuildEnumFlat(ToolDefinition[] tools, string argumentsKey)
+    {
+        var sb = new StringBuilder(512);
+        sb.Append("{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"enum\":[");
+        for (int i = 0; i < tools.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(JsonQuote(tools[i].Name));
+        }
+        sb.Append("]},");
+        sb.Append(JsonQuote(argumentsKey));
+        sb.Append(":{\"type\":\"object\"}},\"required\":[\"name\",");
+        sb.Append(JsonQuote(argumentsKey));
+        sb.Append("],\"additionalProperties\":false}");
         return sb.ToString();
     }
 
@@ -96,8 +129,12 @@ public static class ToolCallSchemaBuilder
     {
         if (el.ValueKind != JsonValueKind.Object) { el.WriteTo(w); return; }
 
-        bool isObjectType = el.TryGetProperty("type", out var t)
-            && t.ValueKind == JsonValueKind.String && t.GetString() == "object";
+        // Treat an element as an object if it is explicitly "type":"object" OR is an object purely
+        // by inference (has a "properties" key, no explicit type) — matching SchemaCompiler, which
+        // infers Object from "properties". Both forms must get additionalProperties:false injected.
+        bool isObjectType = (el.TryGetProperty("type", out var t)
+                && t.ValueKind == JsonValueKind.String && t.GetString() == "object")
+            || el.TryGetProperty("properties", out _);
         bool hasAddl = el.TryGetProperty("additionalProperties", out _);
 
         w.WriteStartObject();

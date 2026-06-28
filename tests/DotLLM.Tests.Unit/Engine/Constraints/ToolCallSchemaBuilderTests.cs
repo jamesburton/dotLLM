@@ -196,6 +196,65 @@ public class ToolCallSchemaBuilderTests
     }
 
     [Fact]
+    public void BuildForFunction_ObjectByInference_NoExplicitType_ForbidsAdditionalProperties()
+    {
+        // FIX 3 (#104): a params schema that is an object purely via "properties" (no explicit
+        // "type":"object") — which SchemaCompiler treats as an object — must still be hardened
+        // with additionalProperties:false (and recursively for a nested object-by-inference).
+        var tool = new ToolDefinition("t", "x",
+            """{"properties":{"a":{"type":"string"},"addr":{"properties":{"city":{"type":"string"}}}}}""");
+        string schema = ToolCallSchemaBuilder.BuildForFunction(tool);
+        using var doc = JsonDocument.Parse(schema);
+        var args = doc.RootElement.GetProperty("properties").GetProperty("arguments");
+        Assert.False(args.GetProperty("additionalProperties").GetBoolean());
+        var addr = args.GetProperty("properties").GetProperty("addr");
+        Assert.False(addr.GetProperty("additionalProperties").GetBoolean());
+    }
+
+    [Fact]
+    public void BuildForRequired_AboveBranchCap_EmitsClosedEnumFlatSchema()
+    {
+        // FIX 2 (#104): > K tools degrade to a CLOSED enum-flat schema (not a bare anyOf):
+        // name constrained to the enum of tool names + additionalProperties:false.
+        var tools = new ToolDefinition[12];
+        for (int i = 0; i < tools.Length; i++)
+            tools[i] = new ToolDefinition("tool" + i, "x",
+                """{"type":"object","properties":{"a":{"type":"string"}}}""");
+
+        string schema = ToolCallSchemaBuilder.BuildForRequired(tools);
+        using var doc = JsonDocument.Parse(schema);
+        var root = doc.RootElement;
+
+        Assert.Equal("object", root.GetProperty("type").GetString());
+        Assert.False(root.GetProperty("additionalProperties").GetBoolean());
+        var nameNode = root.GetProperty("properties").GetProperty("name");
+        var enumNames = new List<string>();
+        foreach (var e in nameNode.GetProperty("enum").EnumerateArray()) enumNames.Add(e.GetString()!);
+        Assert.Equal(12, enumNames.Count);
+        Assert.Contains("tool0", enumNames);
+        Assert.Contains("tool11", enumNames);
+        var req = new List<string>();
+        foreach (var r in root.GetProperty("required").EnumerateArray()) req.Add(r.GetString()!);
+        Assert.Contains("name", req);
+        Assert.Contains("arguments", req);
+    }
+
+    [Fact]
+    public void BuildForRequired_AtBranchCap_StillUsesAnyOf()
+    {
+        // Exactly K=8 tools must still use the strict per-tool anyOf path.
+        var tools = new ToolDefinition[8];
+        for (int i = 0; i < tools.Length; i++)
+            tools[i] = new ToolDefinition("tool" + i, "x",
+                """{"type":"object","properties":{"a":{"type":"string"}}}""");
+
+        string schema = ToolCallSchemaBuilder.BuildForRequired(tools);
+        using var doc = JsonDocument.Parse(schema);
+        Assert.True(doc.RootElement.TryGetProperty("anyOf", out var anyOf));
+        Assert.Equal(8, anyOf.GetArrayLength());
+    }
+
+    [Fact]
     public void BuildForFunction_DeclaredRequiredPreserved_OptionalNotForced()
     {
         // WeatherTool requires "location" only; an optional prop must stay optional.
