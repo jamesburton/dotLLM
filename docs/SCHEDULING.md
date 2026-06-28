@@ -117,6 +117,23 @@ instance would corrupt state. Tests: `Disaggregated_AdmittedInStepPrefill_Decode
 `Disaggregated_SeparatePhases_MatchCombinedStepOutput` (phase-split is token-identical to combined
 `Step()`), `Disaggregated_DecodePhaseAloneIsNoOp_WhenNothingAdmitted`.
 
+**Disaggregated driver (shipped, Step 59).** `DisaggregatedScheduler` is the driver built on that seam:
+a **prefill worker** and a **decode worker** run as two `ContinuousBatchScheduler` instances over
+*separate model replicas* of the same weights, sharing one paged KV pool. A sequence is prefilled by
+the prefill replica, then its KV-cache is **handed off by reference** (no copy — it lives in the shared
+pool) to the decode replica, which runs it to completion. Because each replica is a distinct `IModel`
+with its own forward scratch, the two phases overlap on separate threads (real parallelism on
+multi-core CPU / future multi-device), sidestepping the single-threaded-forward constraint. The handoff
+is two internal hooks on `ContinuousBatchScheduler` — `ExtractDecodable` (remove post-prefill `Decoding`
+sequences) and `InjectDecodable` (admit a pre-prefilled sequence into the decode set). `Step()` drives
+one synchronous iteration (prefill → handoff → decode); `RunLoopAsync()` runs the two workers on
+separate tasks with a lock-free handoff queue. Backpressure comes from the shared pool's block gate.
+Completion, cancellation, and per-key token accounting all ride on the migrated `SchedulerRequest`.
+Tests in `DisaggregatedSchedulerTests` prove token-parity with a single scheduler, that decode runs on
+the decode replica (the prefill replica never issues a single-token forward), per-seq stop/max-tokens
+across the handoff, and async end-to-end parity. **Still future:** cross-process / cross-device KV
+transfer and multi-GPU replica placement (this driver is in-process, shared-pool).
+
 ## Request Priority
 
 Each request carries a `RequestPriority` enum (`Critical`, `High`, `Normal` (default), `Low`) on `InferenceRequest.Priority`. The scheduler's admission queue is a `PriorityQueue` keyed by `(-(int)Priority, fairnessStartTag, submissionOrder)`, so higher priorities are dequeued first; within a tier, requests order by the fairness start tag (0 for all when fairness is off ⇒ pure FIFO) then by submission order.
@@ -220,11 +237,10 @@ per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 `RecurrentBatched_MaxRecurrentSequences_CapsConcurrency`, `RecurrentBatched_PerSeqMaxTokens_Honored`.
 
 **Still pending in Step 59** (tail follow-ups; the four roadmap sub-items — chunked prefill, priority +
-preemption, prefill/decode disaggregation, fairness — are all shipped): Nemotron-H recurrent batching
-(needs an `ISsmState` container + factory); a disaggregated multi-worker/replica driver with
-cross-worker KV transfer (the deployment that actually uses the `StepPrefill`/`StepDecode` seam on
-separate thread pools); wiring `EnableFairness` / per-key weights from server appsettings; and per-key
-token telemetry.
+preemption, prefill/decode disaggregation, fairness — are all shipped, as is the in-process
+`DisaggregatedScheduler` driver and config/telemetry wiring): Nemotron-H recurrent batching (needs an
+`ISsmState` container + factory); cross-process / cross-device KV transfer + multi-GPU replica
+placement for the disaggregated driver; and per-key fairness *weights*.
 
 ## Sequence State Machine
 

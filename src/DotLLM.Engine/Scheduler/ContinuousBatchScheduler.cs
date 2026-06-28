@@ -541,6 +541,47 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         return didWork;
     }
 
+    // ── Prefill/decode disaggregation handoff (Step 59) ──
+    // These move a sequence between two scheduler instances that share a KV pool: a prefill-worker
+    // scheduler (driven by StepPrefill) hands its post-prefill sequences to a decode-worker scheduler
+    // (driven by StepDecode). The migrated SchedulerRequest carries its own KV-cache, generated tokens,
+    // sampler/constraint/stop state, and completion source, so decode resumes seamlessly. Each method
+    // mutates only its own scheduler's _active and must be called on that scheduler's single driver
+    // thread; the cross-thread transfer between them is the caller's (DisaggregatedScheduler) concern.
+
+    /// <summary>
+    /// Removes every sequence that has finished prefill and is ready to decode (state
+    /// <see cref="SequenceState.Decoding"/>) from this scheduler's active set and appends them to
+    /// <paramref name="into"/>, for handoff to a decode-worker scheduler. Used by
+    /// <see cref="DisaggregatedScheduler"/>; a prefill-worker calls this after each
+    /// <see cref="StepPrefill"/>.
+    /// </summary>
+    internal void ExtractDecodable(List<SchedulerRequest> into)
+    {
+        for (int i = _active.Count - 1; i >= 0; i--)
+        {
+            var s = _active[i];
+            if (s.State == SequenceState.Decoding)
+            {
+                into.Add(s);
+                _active.RemoveAt(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Admits a pre-prefilled sequence (handed off from a prefill-worker scheduler via
+    /// <see cref="ExtractDecodable"/>) into this scheduler's active set so it decodes here. The
+    /// sequence keeps its existing KV-cache (built by the prefill replica over the shared pool). A
+    /// sequence cancelled in-flight (state already <see cref="SequenceState.Cancelled"/>) is admitted
+    /// too and swept on the next <see cref="StepDecode"/>.
+    /// </summary>
+    internal void InjectDecodable(SchedulerRequest seq)
+    {
+        Debug.Assert(seq.State is SequenceState.Decoding or SequenceState.Cancelled);
+        _active.Add(seq);
+    }
+
     /// <summary>Fuses the <paramref name="readyCount"/> ready decoders in <see cref="_decodeReady"/>
     /// into one <see cref="IModel.ForwardBatch"/> call, then samples / stops each independently.</summary>
     private void DecodeBatched(int readyCount)
