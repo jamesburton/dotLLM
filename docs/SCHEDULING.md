@@ -20,10 +20,14 @@ Concrete implementation: `ContinuousBatchScheduler` (step-driven, exposed via `I
 Each `ContinuousBatchScheduler.Step()` call:
 
 1. **Sweep cancelled sequences** — caller-side `CancellationToken` may have flipped state; release their KV-cache.
-2. **Admit** new sequences up to `MaxActiveSequences` and (when paged) sufficient free blocks. Admission allocates the KV-cache, consults the optional `ISchedulerPrefixCache` for reuse, and transitions to `Prefilling`. **Actual prefill work happens in step 3** — admission is purely a slot/cache assignment.
-3. **Prefill admitted sequences** — each newly admitted sequence runs its prompt prefill via
-   `Forward` (per sequence), sized by `MaxPrefillTokensPerStep` (0 = unlimited, single shot), and
-   samples its first token → `Decoding`. (Prefill is per-sequence today; batched prefill is a follow-up.)
+2. **Admit** new sequences up to `MaxActiveSequences` and (when paged) sufficient free blocks. Admission allocates the KV-cache, consults the optional `ISchedulerPrefixCache` for reuse, and transitions to `Prefilling`. **Actual prefill work happens in step 3** — admission is purely a slot/cache assignment. Because the prefill forward is deferred, the per-iteration block gate subtracts the blocks already reserved by this step's other pending prefills from the pool's free count, preserving its tight-pressure behaviour (≤1 admit/step when pool-constrained).
+3. **Prefill admitted sequences** — the sequences admitted this Step run their prompt prefill, sized by
+   `MaxPrefillTokensPerStep` (0 = unlimited, single shot), then each samples its first token →
+   `Decoding` (or `Completed` if the first token stops). When the model is **stateless**
+   (`IModel.RequiresPerSequenceState == false`) and **≥2** sequences were admitted together, their
+   prefills are fused into a single `IModel.ForwardBatch` (variable per-seq token counts — the dense
+   CPU/Vulkan hosts pack them into one batched dispatch); otherwise each prefills per sequence via
+   `Forward`. Resuming (preempted) sequences always recompute their KV inline, per sequence.
 4. **Decode the active sequences.** Each `Decoding` sequence contributes its last sampled token. When
    the model is **stateless** (KV-only — `IModel.RequiresPerSequenceState == false`) and **≥2** sequences
    are decoding, the scheduler fuses them into a single `IModel.ForwardBatch(requests, deviceId)` call
@@ -39,7 +43,12 @@ Each `ContinuousBatchScheduler.Step()` call:
 ```
 while (!cancelled):
   SweepCancelled()
-  Admit(pendingQueue, MaxActiveSequences, prefixCache?)   # prefills each admitted seq (per-seq Forward)
+  admitted = Admit(pendingQueue, MaxActiveSequences, prefixCache?)   # KV/prefix only — forward deferred
+  if !model.RequiresPerSequenceState and admitted.Count >= 2:
+    results = Model.ForwardBatch(admitted)               # fused batched prefill
+    for i, seq in admitted: FinishPrefill(seq, results[i])
+  else:
+    for seq in admitted: FinishPrefill(seq, Model.Forward(seq))
   ready = active.Where(Decoding)                          # capacity-gated finish here
   if !model.RequiresPerSequenceState and ready.Count >= 2:
     results = Model.ForwardBatch(ready)                   # fused batched decode
@@ -149,16 +158,25 @@ Unit tests (in `ContinuousBatchSchedulerTests`):
 - `Preemption_NeverEvictsCriticalActiveSequence` — a High request cannot preempt a `Critical` active
   sequence; it waits instead.
 
-**Batched decode (shipped, Step 59):** the scheduler's steady-state decode is now fused via
+**Batched decode (shipped, Step 59):** the scheduler's steady-state decode is fused via
 `IModel.ForwardBatch` whenever the model is stateless and ≥2 sequences are decoding (gated on
 `IModel.RequiresPerSequenceState`; recurrent hosts keep the per-sequence loop because their
 `ForwardBatch` requires per-sequence Mamba/GDN state the scheduler does not yet thread). Single-tenant
 decode and recurrent-model decode are unchanged.
 
-**Still pending in Step 59**: batched **prefill** (multi-admit → one `ForwardBatch`); recurrent batched
-decode (thread per-seq Mamba/GDN state through the scheduler, then drop the gate); separate
-prefill/decode queues/pools; and fairness constraints (per-API-key accounting to prevent starvation
-under a continuous higher-priority stream).
+**Batched prefill (shipped, Step 59):** the admission loop now *prepares* each newly-admitted sequence
+(KV-cache alloc + prefix seeding + forward range) without forwarding, then fuses the prefills admitted
+in the same Step into one `IModel.ForwardBatch` — same stateless/≥2 gate as decode. The dense CPU and
+Vulkan hosts accept variable per-seq token counts in one batched dispatch, so multi-admit prefill pays
+one kernel-dispatch overhead instead of N. Tests: `BatchedPrefill_MultipleSequences_MatchPerSeqBaseline`
+(token-for-token parity vs the `MaxActiveSequences=1` per-seq baseline),
+`BatchedPrefill_FirstTokenStop_CompletesWithoutDecode`, `BatchedPrefill_StatefulModel_FallsBackToPerSeq`,
+`BatchedPrefill_SingleAdmission_NotBatched`. Resuming (preempted) sequences keep their inline per-seq
+recompute.
+
+**Still pending in Step 59**: recurrent batched decode/prefill (thread per-seq Mamba/GDN state through
+the scheduler, then drop the gate); separate prefill/decode queues/pools; and fairness constraints
+(per-API-key accounting to prevent starvation under a continuous higher-priority stream).
 
 ## Sequence State Machine
 
@@ -180,9 +198,10 @@ The `IScheduler` interface allows different policies:
 `ContinuousBatchScheduler` takes an optional `PrefixTrieManager` constructor
 argument. When supplied:
 
-1. **Admission**: `AdmitAndPrefill` calls `manager.Admit(promptTokens, cacheSize)`
+1. **Admission**: `PreparePrefill` calls `manager.Admit(promptTokens, cacheSize)`
    to mint the per-sequence cache; the longest matching trie prefix is seeded
-   (no prefill compute), and only the suffix runs through `Forward`.
+   (no prefill compute), and only the suffix's forward range is recorded for the
+   deferred (per-seq or batched) prefill pass.
 2. **Eviction pressure**: before refusing admission on block-pool exhaustion,
    the scheduler calls `manager.TryEvict(shortBy)` to recover zero-refcount
    trie blocks. Active sequences are never preempted in this step — that's

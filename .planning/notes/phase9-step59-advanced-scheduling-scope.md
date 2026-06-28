@@ -22,7 +22,14 @@ sequence_item: phase-9-step-59
 >   `ForwardBatch` when the model is stateless (`IModel.RequiresPerSequenceState == false`) and ≥2
 >   sequences decode; recurrent hosts keep the per-seq loop (their `ForwardBatch` needs per-seq
 >   Mamba/GDN state the scheduler doesn't thread yet). 4 new tests; `docs/SCHEDULING.md` refreshed.
-> - ⏳ Remaining: batched **prefill**; recurrent batched decode (thread per-seq state); separate
+> - ✅ Sub-piece 3b — **batched prefill** (#349). The admission loop was refactored to *prepare*
+>   each newly-admitted sequence (KV alloc + prefix seed + forward range) via `PreparePrefill`
+>   without forwarding, then fuse the prefills admitted in one Step into a single `IModel.ForwardBatch`
+>   (`PrefillReadySequences` → `FinishPrefill` per seq) under the same stateless/≥2 gate as decode.
+>   The deferred forward required a `reservedBlocksThisStep` term in the per-iteration block gate so
+>   tight-pressure admission (≤1/step) and all preemption tests stay intact. Resuming (preempted)
+>   sequences keep their inline per-seq recompute. 4 new tests; `docs/SCHEDULING.md` refreshed.
+> - ⏳ Remaining: recurrent batched decode/prefill (thread per-seq state); separate
 >   prefill/decode queues/pools; and fairness constraints (sub-piece 4).
 
 ## What Step 59 covers
