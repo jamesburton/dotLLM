@@ -79,6 +79,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private int[] _decodeTokens = Array.Empty<int>();
     private int[] _decodePositions = Array.Empty<int>();
 
+    // Reusable scratch for batched prefill (Step 59, follow-up to batched decode). The admission
+    // loop prepares each newly-admitted (non-resuming) sequence — KV-cache alloc + prefix seeding +
+    // forward-token range — WITHOUT forwarding, collecting them in _prefillReady; after the loop a
+    // single fused ForwardBatch runs over all of them when the model is stateless and ≥2 are pending.
+    // _prefillBatch is the ForwardBatch request list; _prefillPositions packs every pending prefill's
+    // contiguous position range (forwardStart .. forwardStart+forwardLen-1) so each request can hand
+    // ForwardBatch a stable slice without per-sequence allocation.
+    private readonly List<PendingPrefill> _prefillReady = new();
+    private readonly List<SequenceForwardRequest> _prefillBatch = new();
+    private int[] _prefillPositions = Array.Empty<int>();
+
     private long _submissionCounter;
     // Number of preemptions performed (Step 59 advanced scheduling). Incremented when a lower-priority
     // active sequence is evicted under block pressure to admit a higher-priority request; the victim is
@@ -244,13 +255,22 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
         }
 
-        // 2. Admit new sequences from the queue, subject to capacity. Each admitted sequence
-        //    runs prompt prefill in this same iteration (chunked prefill is a stretch goal).
-        //    Queue draining is priority-ordered: highest RequestPriority drains first, FIFO
-        //    within tier (see _pendingQueue key shape).
+        // 2. Admit new sequences from the queue, subject to capacity. Newly-admitted sequences are
+        //    PREPARED here (KV-cache alloc + prefix seeding + forward-token range) but their prompt
+        //    prefill forward is DEFERRED to step 2b, where all sequences admitted this iteration are
+        //    fused into one IModel.ForwardBatch (the batched-prefill throughput win) when the model
+        //    is stateless. Resuming (preempted) sequences keep their inline recompute forward.
+        //    Queue draining is priority-ordered: highest RequestPriority drains first, FIFO within
+        //    tier (see _pendingQueue key shape).
+        _prefillReady.Clear();
         int admittedThisStep = 0;
         int prefillTokensThisStep = 0;
-        while (_active.Count < _options.MaxActiveSequences)
+        // Blocks tentatively reserved for prepared-but-not-yet-forwarded prefills this step. Each
+        // prepared prefill's blocks are not consumed from the pool until its deferred forward runs,
+        // so the per-iteration block gate must subtract this running reservation from FreeBlocks to
+        // keep its tight-pressure behaviour (≤1 admit/step when pool-constrained) intact.
+        int reservedBlocksThisStep = 0;
+        while (_active.Count + _prefillReady.Count < _options.MaxActiveSequences)
         {
             SchedulerRequest? head;
             lock (_queueLock)
@@ -275,26 +295,30 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
 
             // Block-pool gating: refuse admission if the paged pool can't fit the worst-case
-            // footprint. Try to relieve pressure by evicting zero-refcount trie blocks first,
-            // then — when preemption is enabled — by evicting lower-priority active sequences.
-            if (_pagedPool is not null && _options.ReserveBlocksPerSequence > 0 &&
-                _pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
+            // footprint, accounting for blocks already reserved by this step's pending prefills.
+            // Try to relieve pressure by evicting zero-refcount trie blocks first, then — when
+            // preemption is enabled — by evicting lower-priority active sequences.
+            if (_pagedPool is not null && _options.ReserveBlocksPerSequence > 0)
             {
-                int short_ = _options.ReserveBlocksPerSequence - _pagedPool.FreeBlocks;
-                if (_prefixCache is not null)
-                    _prefixCache.TryEvict(short_);
-
-                if (_pagedPool.FreeBlocks < _options.ReserveBlocksPerSequence)
+                int needed = reservedBlocksThisStep + _options.ReserveBlocksPerSequence;
+                if (_pagedPool.FreeBlocks < needed)
                 {
-                    // Preempt the lowest-priority active sequence(s) strictly below this request's
-                    // priority to free blocks. Victims are re-queued and resume via recompute.
-                    if (_options.EnablePreemption &&
-                        TryPreemptForPressure(head, _options.ReserveBlocksPerSequence))
+                    int short_ = needed - _pagedPool.FreeBlocks;
+                    if (_prefixCache is not null)
+                        _prefixCache.TryEvict(short_);
+
+                    if (_pagedPool.FreeBlocks < needed)
                     {
-                        // Freed enough — re-evaluate the (possibly mutated) queue head and capacity.
-                        continue;
+                        // Preempt the lowest-priority active sequence(s) strictly below this request's
+                        // priority to free blocks. Victims are re-queued and resume via recompute.
+                        if (_options.EnablePreemption &&
+                            TryPreemptForPressure(head, needed))
+                        {
+                            // Freed enough — re-evaluate the (possibly mutated) queue head and capacity.
+                            continue;
+                        }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -310,23 +334,20 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 {
                     // Re-admitted after preemption: rebuild KV from prompt + generated tokens.
                     // No first-token sample (output already has tokens); goes straight to Decoding.
+                    // Recompute is inline (not batched) — preemption is an off-by-default edge path.
                     AdmitAndResume(seq);
                     _active.Add(seq);
+                    didWork = true;
                 }
                 else
                 {
-                    AdmitAndPrefill(seq);
-
-                    // If the first sampled token already triggered a stop condition, AdmitAndPrefill
-                    // sets state to Completed — finish out the response and skip the decoding queue.
-                    if (seq.State == SequenceState.Completed)
-                        CompleteSequence(seq);
-                    else
-                        _active.Add(seq);
+                    // Prepare only; the forward is fused in step 2b.
+                    var pending = PreparePrefill(seq);
+                    _prefillReady.Add(pending);
+                    reservedBlocksThisStep += _options.ReserveBlocksPerSequence;
                 }
                 admittedThisStep++;
                 prefillTokensThisStep += seq.PromptLength;
-                didWork = true;
             }
             catch (OperationCanceledException)
             {
@@ -340,6 +361,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 ReleaseKvCache(seq);
                 seq.CompletionSource.TrySetException(ex);
             }
+        }
+
+        // 2b. Run the deferred prefill forwards prepared above — fused via ForwardBatch when the
+        //     model is stateless and ≥2 are pending, else per-sequence. Samples each first token,
+        //     checks stop conditions, and routes each sequence to active / completion.
+        if (_prefillReady.Count > 0)
+        {
+            PrefillReadySequences();
+            didWork = true;
         }
 
         // 3. Decode one token for each actively-decoding sequence. When the model is stateless
@@ -526,7 +556,20 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     // ── Admission & prefill ──
 
-    private void AdmitAndPrefill(SchedulerRequest seq)
+    /// <summary>One prepared-but-not-yet-forwarded prefill: the sequence plus the contiguous range
+    /// of its prompt to forward (<paramref name="ForwardStart"/> .. <c>+ForwardLen-1</c>). For a
+    /// normal prefill the range is the uncached suffix; on a 100% prefix-cache hit it is the single
+    /// last prompt token (re-forwarded to obtain its logits). Positions equal token indices.</summary>
+    private readonly record struct PendingPrefill(SchedulerRequest Seq, int ForwardStart, int ForwardLen);
+
+    /// <summary>
+    /// Prepares a freshly-admitted sequence for prefill WITHOUT forwarding: allocates (or
+    /// prefix-seeds) its KV-cache, accounts prompt tokens, sets <see cref="SequenceState.Prefilling"/>,
+    /// and computes the contiguous prompt range its deferred forward will run over. The forward and
+    /// first-token sample happen later in <see cref="PrefillReadySequences"/> so multiple admits in
+    /// one Step can fuse into a single <see cref="IModel.ForwardBatch"/>.
+    /// </summary>
+    private PendingPrefill PreparePrefill(SchedulerRequest seq)
     {
         Debug.Assert(seq.State == SequenceState.Queued);
 
@@ -555,69 +598,215 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         Interlocked.Add(ref _prefilledPromptTokens, promptLen - cachedTokens);
         seq.State = SequenceState.Prefilling;
 
-        int vocabSize = _model.Config.VocabSize;
-
         int prefillStart = cachedTokens;
         int prefillLen = promptLen - prefillStart;
 
-        int[] positionsArray = ArrayPool<int>.Shared.Rent(Math.Max(1, prefillLen));
-        try
+        // 100% cache hit (prefillLen == 0): re-forward the last prompt token to obtain its logits.
+        return prefillLen > 0
+            ? new PendingPrefill(seq, prefillStart, prefillLen)
+            : new PendingPrefill(seq, promptLen - 1, 1);
+    }
+
+    /// <summary>
+    /// Runs the deferred prompt-prefill forwards for every sequence in <see cref="_prefillReady"/>:
+    /// fused via <see cref="IModel.ForwardBatch"/> when the model is stateless and ≥2 are pending,
+    /// else per-sequence. Each sequence's first token is sampled from its last-position logits, stop
+    /// conditions are checked, and the sequence is routed to the active set or completed.
+    /// </summary>
+    private void PrefillReadySequences()
+    {
+        int count = _prefillReady.Count;
+
+        // Pack contiguous position ranges for every pending prefill into the shared scratch.
+        int totalTokens = 0;
+        for (int i = 0; i < count; i++) totalTokens += _prefillReady[i].ForwardLen;
+        if (_prefillPositions.Length < totalTokens)
+            _prefillPositions = new int[totalTokens];
+
+        _prefillBatch.Clear();
+        int off = 0;
+        for (int i = 0; i < count; i++)
         {
-            ReadOnlySpan<int> forwardTokens;
-            Span<int> positions;
-            if (prefillLen > 0)
+            var p = _prefillReady[i];
+            for (int t = 0; t < p.ForwardLen; t++)
+                _prefillPositions[off + t] = p.ForwardStart + t;
+            _prefillBatch.Add(new SequenceForwardRequest
             {
-                positions = positionsArray.AsSpan(0, prefillLen);
-                for (int i = 0; i < prefillLen; i++)
-                    positions[i] = prefillStart + i;
-                forwardTokens = promptIds.AsSpan(prefillStart);
-            }
-            else
-            {
-                // 100% cache hit — re-forward last prompt token to obtain its logits.
-                positions = positionsArray.AsSpan(0, 1);
-                positions[0] = promptLen - 1;
-                forwardTokens = promptIds.AsSpan(promptLen - 1, 1);
-            }
-
-            long ts0 = Stopwatch.GetTimestamp();
-            using ITensor prefillLogits = _model.Forward(forwardTokens, positions, deviceId: -1, seq.KvCache);
-            long ts1 = Stopwatch.GetTimestamp();
-            seq.PrefillTicks = ts1 - ts0;
-
-            // Sample first token from last-position logits.
-            unsafe
-            {
-                float* logitPtr = (float*)prefillLogits.DataPointer;
-                int logitRows = prefillLogits.Shape[0];
-                var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
-
-                if (seq.Constraint is not null)
-                    TokenMaskApplier.Apply(logitSpan, seq.Constraint.GetAllowedTokens());
-
-                long sStart = Stopwatch.GetTimestamp();
-                int firstToken = seq.SamplerPipeline.Sample(logitSpan, seq.GeneratedTokens);
-                seq.SamplerTicks += Stopwatch.GetTimestamp() - sStart;
-
-                seq.Constraint?.Advance(firstToken);
-                seq.GeneratedTokens.Add(firstToken);
-            }
-        }
-        finally
-        {
-            ArrayPool<int>.Shared.Return(positionsArray);
+                TokenIds = p.Seq.PromptTokenIds.AsMemory(p.ForwardStart, p.ForwardLen),
+                Positions = _prefillPositions.AsMemory(off, p.ForwardLen),
+                KvCache = p.Seq.KvCache!,
+            });
+            off += p.ForwardLen;
         }
 
-        // Check stop conditions on the first generated token. If satisfied, sequence completes
+        if (!_model.RequiresPerSequenceState && count >= 2)
+        {
+            IReadOnlyList<ITensor> results;
+            long fwdStart = Stopwatch.GetTimestamp();
+            try
+            {
+                results = _model.ForwardBatch(_prefillBatch, deviceId: -1);
+            }
+            catch (OperationCanceledException)
+            {
+                FailReadyPrefills(ex: null);
+                return;
+            }
+            catch (Exception ex)
+            {
+                FailReadyPrefills(ex);
+                return;
+            }
+            long perSeqTicks = (Stopwatch.GetTimestamp() - fwdStart) / count;
+
+            for (int i = 0; i < count; i++)
+            {
+                var seq = _prefillReady[i].Seq;
+                ITensor logits = results[i];
+                seq.PrefillTicks += perSeqTicks;
+                try
+                {
+                    // A per-sequence failure (sampler / constraint) must not abort the rest of the
+                    // batch — the sequence is not yet in _active, so just release its KV and fail it.
+                    FinishPrefill(seq, logits);
+                }
+                catch (OperationCanceledException)
+                {
+                    seq.State = SequenceState.Cancelled;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    seq.State = SequenceState.Completed;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetException(ex);
+                }
+                finally
+                {
+                    logits.Dispose();
+                }
+            }
+        }
+        else
+        {
+            // Single prefill, or a recurrent model whose ForwardBatch needs per-seq state the
+            // scheduler doesn't thread: forward each sequence independently. Positions are already
+            // packed contiguously in _prefillPositions in _prefillReady order (offset tracked below).
+            int posOff = 0;
+            for (int i = 0; i < count; i++)
+            {
+                var p = _prefillReady[i];
+                var seq = p.Seq;
+                long fwdStart = Stopwatch.GetTimestamp();
+                ITensor logits;
+                try
+                {
+                    logits = _model.Forward(
+                        seq.PromptTokenIds.AsSpan(p.ForwardStart, p.ForwardLen),
+                        _prefillPositions.AsSpan(posOff, p.ForwardLen),
+                        deviceId: -1, seq.KvCache);
+                }
+                catch (OperationCanceledException)
+                {
+                    seq.State = SequenceState.Cancelled;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetCanceled();
+                    posOff += p.ForwardLen;
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    seq.State = SequenceState.Completed;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetException(ex);
+                    posOff += p.ForwardLen;
+                    continue;
+                }
+                seq.PrefillTicks += Stopwatch.GetTimestamp() - fwdStart;
+                try
+                {
+                    FinishPrefill(seq, logits);
+                }
+                catch (OperationCanceledException)
+                {
+                    seq.State = SequenceState.Cancelled;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    seq.State = SequenceState.Completed;
+                    ReleaseKvCache(seq);
+                    seq.CompletionSource.TrySetException(ex);
+                }
+                finally { logits.Dispose(); }
+                posOff += p.ForwardLen;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Post-forward processing for one prefilled sequence: samples the first token from its
+    /// last-position logits (<c>[N,vocab]</c> CPU or <c>[1,vocab]</c> GPU — both read row
+    /// <c>Shape[0]-1</c>), advances any constraint, appends it, checks stop conditions, and
+    /// transitions the sequence to <see cref="SequenceState.Decoding"/> (added to the active set) or
+    /// <see cref="SequenceState.Completed"/> (response finished). Throws are propagated to the
+    /// caller, which fails just this sequence.
+    /// </summary>
+    private void FinishPrefill(SchedulerRequest seq, ITensor logits)
+    {
+        int vocabSize = _model.Config.VocabSize;
+        unsafe
+        {
+            float* logitPtr = (float*)logits.DataPointer;
+            int logitRows = logits.Shape[0];
+            var logitSpan = new Span<float>(logitPtr + (long)(logitRows - 1) * vocabSize, vocabSize);
+
+            if (seq.Constraint is not null)
+                TokenMaskApplier.Apply(logitSpan, seq.Constraint.GetAllowedTokens());
+
+            long sStart = Stopwatch.GetTimestamp();
+            int firstToken = seq.SamplerPipeline.Sample(logitSpan, seq.GeneratedTokens);
+            seq.SamplerTicks += Stopwatch.GetTimestamp() - sStart;
+
+            seq.Constraint?.Advance(firstToken);
+            seq.GeneratedTokens.Add(firstToken);
+        }
+
+        // Check stop conditions on the first generated token. If satisfied, the sequence completes
         // without entering the decoding phase.
         if (CheckStopAfterAppend(seq, out var result))
         {
             seq.FinishReason = result == StopResult.StopInclude ? FinishReason.Length : FinishReason.Stop;
             seq.State = SequenceState.Completed;
+            CompleteSequence(seq);
             return;
         }
 
         seq.State = SequenceState.Decoding;
+        _active.Add(seq);
+    }
+
+    /// <summary>Fails every ready prefill when the batched prefill forward itself threw (a
+    /// batch-scoped model error — e.g. device-lost / OOM — cannot be isolated to one sequence).</summary>
+    private void FailReadyPrefills(Exception? ex)
+    {
+        for (int i = 0; i < _prefillReady.Count; i++)
+        {
+            var seq = _prefillReady[i].Seq;
+            ReleaseKvCache(seq);
+            if (ex is null)
+            {
+                seq.State = SequenceState.Cancelled;
+                seq.CompletionSource.TrySetCanceled();
+            }
+            else
+            {
+                seq.State = SequenceState.Completed;
+                seq.CompletionSource.TrySetException(ex);
+            }
+        }
     }
 
     /// <summary>

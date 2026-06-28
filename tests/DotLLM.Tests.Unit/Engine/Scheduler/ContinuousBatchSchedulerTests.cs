@@ -601,6 +601,110 @@ public sealed class ContinuousBatchSchedulerTests
         }
     }
 
+    // ── Batched prefill (Step 59) ────────────────────────────────────────
+
+    [Fact]
+    public async Task BatchedPrefill_MultipleSequences_MatchPerSeqBaseline()
+    {
+        // Distinct prompt lengths → distinct ramp first-tokens AND distinct generated counts. A
+        // batched prefill that cross-wired sequences' last-position logits would sample the wrong
+        // first token and diverge, so this discriminates correctness (not just "it ran").
+        int[] promptLens = [3, 5, 7];
+
+        // Batched: all admitted in one Step (default MaxActiveSequences) → fused prefill ForwardBatch.
+        using var batched = new TestFixture(inputEmitter: Ramp);
+        var bHandles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            bHandles[i] = batched.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+
+        // First Step admits + prefills all three together. Assert the fused prefill happened before
+        // any decode could (so ForwardBatchCount > 0 is attributable to prefill, not decode).
+        batched.Scheduler.Step();
+        Assert.True(batched.Model.ForwardBatchCount > 0, "batched run never fused prefill ForwardBatch");
+        DriveUntilIdle(batched.Scheduler);
+
+        // Per-seq baseline: MaxActiveSequences=1 → one sequence prefills at a time → never batched.
+        using var perSeq = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 },
+            inputEmitter: Ramp);
+        var pHandles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            pHandles[i] = perSeq.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+        DriveUntilIdle(perSeq.Scheduler);
+        Assert.Equal(0, perSeq.Model.ForwardBatchCount);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var b = await bHandles[i].Completion;
+            var p = await pHandles[i].Completion;
+            int expected = RampExpectedGenerated(promptLens[i]);
+            Assert.Equal(FinishReason.Stop, b.FinishReason);
+            Assert.Equal(expected, b.GeneratedTokenCount);              // correct per-seq output under batched prefill
+            Assert.Equal(p.FinishReason, b.FinishReason);              // batched == per-seq
+            Assert.Equal(p.GeneratedTokenCount, b.GeneratedTokenCount);
+            Assert.Equal(p.GeneratedTokenIds, b.GeneratedTokenIds);    // exact token-for-token parity
+        }
+    }
+
+    [Fact]
+    public async Task BatchedPrefill_FirstTokenStop_CompletesWithoutDecode()
+    {
+        // A prompt whose ramp first-token is EOS (last input token == 9 → Ramp emits EOS) must
+        // complete during prefill (zero generated tokens, Stop), even when batched with sequences
+        // that keep going — verifying per-seq stop handling inside the fused prefill path.
+        using var fix = new TestFixture(inputEmitter: Ramp);
+        var hStop = fix.Scheduler.Submit(MakeRequest(promptLen: 9, maxTokens: 16)); // last token 9 → EOS first
+        var hGo = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 16));   // ramps 4..9
+
+        fix.Scheduler.Step(); // admit + fused prefill of both
+        Assert.True(fix.Model.ForwardBatchCount > 0, "expected fused prefill for 2 admitted sequences");
+        DriveUntilIdle(fix.Scheduler);
+
+        var rStop = await hStop.Completion;
+        Assert.Equal(FinishReason.Stop, rStop.FinishReason);
+        Assert.Equal(0, rStop.GeneratedTokenCount);   // stopped on the first (EOS) token, no decode
+
+        var rGo = await hGo.Completion;
+        Assert.Equal(FinishReason.Stop, rGo.FinishReason);
+        Assert.Equal(RampExpectedGenerated(3), rGo.GeneratedTokenCount);
+    }
+
+    [Fact]
+    public async Task BatchedPrefill_StatefulModel_FallsBackToPerSeq()
+    {
+        // A recurrent model (needs per-seq state the scheduler can't supply) must NOT batch-prefill —
+        // it falls back to per-seq Forward, still producing correct output.
+        int[] promptLens = [3, 5, 7];
+        using var fix = new TestFixture(inputEmitter: Ramp, requiresPerSequenceState: true);
+        var handles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.Equal(0, fix.Model.ForwardBatchCount); // gated off for stateful models (prefill + decode)
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Stop, r.FinishReason);
+            Assert.Equal(RampExpectedGenerated(promptLens[i]), r.GeneratedTokenCount);
+        }
+    }
+
+    [Fact]
+    public void BatchedPrefill_SingleAdmission_NotBatched()
+    {
+        // Exactly one admission in a Step must take the per-seq Forward path (no ForwardBatch),
+        // matching the decode-side "only fuse for ≥2" rule.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(tokenId: 7),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 });
+        fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 4));
+
+        fix.Scheduler.Step(); // single admit + prefill
+        Assert.Equal(0, fix.Model.ForwardBatchCount);
+    }
+
     // ── Helpers ──
 
     /// <summary>
