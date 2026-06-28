@@ -478,6 +478,34 @@ public class JsonSchemaConstraintTests
     }
 
     // -------------------------------------------------------------------------
+    // Task 5 (#104): single-tool strict end-to-end, in-process, no model
+    // Tool name "get" and arg key "cab" use only chars present in SchemaStubTokenizer.
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void SingleTool_StrictArguments_RejectsUndeclaredKey_AndTerminates()
+    {
+        string schema = ToolCallSchemaBuilder.BuildForFunction(new ToolDefinition(
+            "get", "x",
+            """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""));
+        var c = CreateConstraint(schema);
+
+        // Drive a fully-valid object up to (but not including) the closing braces.
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{\"cab\":\"a\"");
+
+        // Inside arguments with additionalProperties:false and all required props satisfied,
+        // the only valid continuation is '}'. The comma (undeclared extra key opener) must
+        // be masked out entirely — so the ",\"d" prefix cannot be started.
+        Assert.False(
+            TokenAllowedStartingWith(c, ",\"d"),
+            "undeclared key must be impossible after all required arguments are emitted");
+
+        // Close arguments object then outer object — the constraint must declare IsComplete.
+        AdvanceString(c, "}}");
+        Assert.True(c.IsComplete(), "must be complete after well-formed close of arguments and outer object");
+    }
+
+    // -------------------------------------------------------------------------
     // Multi-tool anyOf branch narrowing (#104)
     //
     // Tool names + argument keys are restricted to characters the SchemaStubTokenizer
