@@ -15,12 +15,13 @@ public class JsonSchemaConstraintTests
         // Token map: 0='{', 1='}', 2='"', 3=':', 4=',', 5='n', 6='a', 7='m', 8='e',
         // 9='g', 10='1', 11='[', 12=']', 13='t', 14='r', 15='u', 16='f', 17='l',
         // 18='s', 19=' ', 20=EOS, 21='"name"', 22='"age"', 23='-', 24='0',
-        // 25='.', 26='2', 27='d', 28='v', 29='c', 30='o', 31='i', 32='b', 33='p'
+        // 25='.', 26='2', 27='d', 28='v', 29='c', 30='o', 31='i', 32='b', 33='p',
+        // 34='\\' (backslash — for the escape-flood constraint test)
         private static readonly string[] Tokens =
             ["{", "}", "\"", ":", ",", "n", "a", "m", "e",
              "g", "1", "[", "]", "t", "r", "u", "f", "l",
              "s", " ", "<eos>", "\"name\"", "\"age\"", "-", "0",
-             ".", "2", "d", "v", "c", "o", "i", "b", "p"];
+             ".", "2", "d", "v", "c", "o", "i", "b", "p", "\\"];
 
         public int VocabSize => Tokens.Length;
         public int BosTokenId => 0;
@@ -55,6 +56,23 @@ public class JsonSchemaConstraintTests
 
         // EOS should not be allowed
         Assert.False(mask.IsAllowed(20), "EOS not allowed at start");
+    }
+
+    [Fact]
+    public void ConstrainedString_RejectsBackslashEscape_WhenTrieHasNoBackslash()
+    {
+        // A const value "name" — inside the constrained value string the only valid
+        // continuation after "na" is 'm'. A weak model must not be able to emit a '\'
+        // escape to break out of the trie (the escape-flood that derailed BitNet
+        // constrained tool calls). '\' is token 34; 'm' is token 7.
+        var constraint = CreateConstraint("""
+            { "type": "object", "properties": { "val": { "const": "name" } },
+              "required": ["val"], "additionalProperties": false }
+            """);
+        AdvanceString(constraint, "{\"val\":\"na");
+        var mask = constraint.GetAllowedTokens();
+        Assert.True(mask.IsAllowed(7), "'m' should be allowed to continue the const \"name\"");
+        Assert.False(mask.IsAllowed(34), "'\\\\' escape must NOT be allowed inside a trie-constrained value string");
     }
 
     [Fact]
