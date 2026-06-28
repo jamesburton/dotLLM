@@ -517,6 +517,22 @@ public class JsonSchemaConstraintTests
     }
 
     [Fact]
+    public void MultiTool_ArgsFirst_ArgKeyConvergesName()
+    {
+        var c = MultiToolConstraint();
+        // Feed get's exclusive argument BEFORE the name. The "cab" key exists only in get's
+        // arguments schema; set requires "den" with additionalProperties:false, so consuming
+        // 'c' as the arg key first char prunes the set branch. With only the get branch live,
+        // the later name value is forced to the "get" const — proving the arguments content
+        // narrowed the union (this is the mirror of MultiTool_NameFirst_EnforcesMatchedToolArguments).
+        AdvanceString(c, "{\"arguments\":{\"cab\":\"a\"},\"name\":\"");
+        Assert.True(TokenAllowedStartingWith(c, "g"),
+            "name must converge to 'get' — its const continuation 'g' stays allowed");
+        Assert.False(TokenAllowedStartingWith(c, "s"),
+            "the set branch was pruned by the 'cab' arg key, so name cannot start the 'set' const");
+    }
+
+    [Fact]
     public void MultiTool_WrongToolArgKey_Rejected()
     {
         var c = MultiToolConstraint();

@@ -727,6 +727,7 @@ internal struct SchemaTracker
 
     private BranchStateArray _branches;
     private int _liveCount;
+    private readonly CompiledSchema _schema;
 
     // Logged at most once per process when an anyOf exceeds the branch cap.
     private static int _degradationLogged;
@@ -737,9 +738,23 @@ internal struct SchemaTracker
     /// <param name="schema">The compiled schema (immutable, shared).</param>
     public SchemaTracker(CompiledSchema schema)
     {
+        _schema = schema;
         _branches[0] = new BranchState(schema);
         _liveCount = 1;
     }
+
+    /// <summary>
+    /// Whether this tracker can ever fork into multiple branches. A schema with no <c>anyOf</c>
+    /// node anywhere is always exactly one live branch, so callers may simulate per-token on a
+    /// single <see cref="BranchState"/> copy instead of cloning the whole (wide) tracker.
+    /// </summary>
+    public readonly bool CanFork => _schema.HasAnyOf;
+
+    /// <summary>
+    /// Returns a value copy of the single live branch. Only meaningful when the tracker cannot
+    /// fork (<see cref="CanFork"/> is <c>false</c>), in which case branch 0 is the sole branch.
+    /// </summary>
+    public readonly BranchState GetSingleBranch() => _branches[0];
 
     /// <summary>
     /// Whether the schema is fully satisfied (any live branch is complete).
