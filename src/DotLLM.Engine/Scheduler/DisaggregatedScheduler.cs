@@ -37,6 +37,13 @@ public sealed class DisaggregatedScheduler : IScheduler, IBatchScheduler, IDispo
     private readonly ContinuousBatchScheduler _prefill;
     private readonly ContinuousBatchScheduler _decode;
 
+    // KV-handoff strategy + the decode replica's cache factory. For the default (reference) transfer the
+    // factory is the shared one and the strategy is a no-op pass-through; for the copy transfer the
+    // factory allocates from the decode replica's own pool and the strategy copies the K/V across.
+    private readonly IKvHandoffTransfer _handoffTransfer;
+    private readonly Func<ModelConfig, int, IKvCache> _decodeKvCacheFactory;
+    private readonly ModelConfig _config;
+
     // Lock-free handoff channel: the prefill worker enqueues post-prefill sequences; the decode worker
     // dequeues and injects them. Only used by the async RunLoopAsync path (Step does the move inline).
     private readonly ConcurrentQueue<SchedulerRequest> _handoff = new();
@@ -63,6 +70,15 @@ public sealed class DisaggregatedScheduler : IScheduler, IBatchScheduler, IDispo
     /// <param name="options">Scheduler options applied to both replicas.</param>
     /// <param name="sharedPagedPool">The shared paged-block pool (admission gating + handoff backing).</param>
     /// <param name="prefixCache">Optional prefix cache — wired to the prefill replica (admission) only.</param>
+    /// <param name="handoffTransfer">KV-handoff strategy. Defaults to <see cref="ReferenceKvHandoffTransfer"/>
+    /// (zero-copy, shared pool). Pass <see cref="CopyKvHandoffTransfer"/> together with a distinct
+    /// <paramref name="decodeKvCacheFactory"/>/<paramref name="decodePagedPool"/> to copy the KV across
+    /// separate pools (the cross-device-transfer simulation).</param>
+    /// <param name="decodeKvCacheFactory">KV-cache factory for the <em>decode</em> replica. When null, the
+    /// decode replica shares <paramref name="sharedKvCacheFactory"/> (the by-reference default). Provide a
+    /// factory backed by a separate pool to give the decode replica its own pool (required for copy transfer).</param>
+    /// <param name="decodePagedPool">The decode replica's own paged-block pool. When null, the decode
+    /// replica shares <paramref name="sharedPagedPool"/>. Provide a separate pool for copy transfer.</param>
     public DisaggregatedScheduler(
         IModel prefillModel,
         IModel decodeModel,
@@ -70,13 +86,21 @@ public sealed class DisaggregatedScheduler : IScheduler, IBatchScheduler, IDispo
         Func<ModelConfig, int, IKvCache> sharedKvCacheFactory,
         ContinuousBatchSchedulerOptions? options = null,
         KvBlockPool? sharedPagedPool = null,
-        PrefixTrieManager? prefixCache = null)
+        PrefixTrieManager? prefixCache = null,
+        IKvHandoffTransfer? handoffTransfer = null,
+        Func<ModelConfig, int, IKvCache>? decodeKvCacheFactory = null,
+        KvBlockPool? decodePagedPool = null)
     {
         ArgumentNullException.ThrowIfNull(prefillModel);
         ArgumentNullException.ThrowIfNull(decodeModel);
+        _handoffTransfer = handoffTransfer ?? ReferenceKvHandoffTransfer.Instance;
+        _config = decodeModel.Config;
+        // The decode replica uses its own factory/pool when supplied (copy transfer), else the shared ones.
+        _decodeKvCacheFactory = decodeKvCacheFactory ?? sharedKvCacheFactory;
+        var decodePool = decodePagedPool ?? sharedPagedPool;
         _prefill = new ContinuousBatchScheduler(prefillModel, tokenizer, sharedKvCacheFactory, options, sharedPagedPool, prefixCache);
         // The decode replica never admits from a queue (it only receives handoffs), so it gets no prefix cache.
-        _decode = new ContinuousBatchScheduler(decodeModel, tokenizer, sharedKvCacheFactory, options, sharedPagedPool, prefixCache: null);
+        _decode = new ContinuousBatchScheduler(decodeModel, tokenizer, _decodeKvCacheFactory, options, decodePool, prefixCache: null);
     }
 
     /// <inheritdoc/>
@@ -106,11 +130,28 @@ public sealed class DisaggregatedScheduler : IScheduler, IBatchScheduler, IDispo
         _extractBuf.Clear();
         _prefill.ExtractDecodable(_extractBuf);
         for (int i = 0; i < _extractBuf.Count; i++)
+        {
+            ApplyHandoff(_extractBuf[i]);
             _decode.InjectDecodable(_extractBuf[i]);
+        }
         if (_extractBuf.Count > 0) didWork = true;
 
         didWork |= _decode.StepDecode();
         return didWork;
+    }
+
+    /// <summary>
+    /// Applies the configured <see cref="IKvHandoffTransfer"/> to a just-prefilled sequence, swapping its
+    /// KV-cache for the one the decode replica should use. For the reference transfer this is a no-op
+    /// (same shared cache object); for the copy transfer it replaces the prefill-pool cache with a fresh
+    /// decode-pool copy and disposes the old one. A sequence without a KV-cache (e.g. recurrent-only) is
+    /// left untouched.
+    /// </summary>
+    private void ApplyHandoff(SchedulerRequest seq)
+    {
+        var cache = seq.KvCache;
+        if (cache is null) return;
+        seq.KvCache = _handoffTransfer.Transfer(cache, _config, _decodeKvCacheFactory);
     }
 
     /// <inheritdoc/>
@@ -175,7 +216,10 @@ public sealed class DisaggregatedScheduler : IScheduler, IBatchScheduler, IDispo
                 if (_extractBuf.Count > 0)
                 {
                     for (int i = 0; i < _extractBuf.Count; i++)
+                    {
+                        ApplyHandoff(_extractBuf[i]);
                         _handoff.Enqueue(_extractBuf[i]);
+                    }
                     _decodeWakeup.Release();
                 }
             }

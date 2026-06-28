@@ -132,8 +132,30 @@ separate tasks with a lock-free handoff queue. Backpressure comes from the share
 Completion, cancellation, and per-key token accounting all ride on the migrated `SchedulerRequest`.
 Tests in `DisaggregatedSchedulerTests` prove token-parity with a single scheduler, that decode runs on
 the decode replica (the prefill replica never issues a single-token forward), per-seq stop/max-tokens
-across the handoff, and async end-to-end parity. **Still future:** cross-process / cross-device KV
-transfer and multi-GPU replica placement (this driver is in-process, shared-pool).
+across the handoff, and async end-to-end parity.
+
+**Pluggable KV-handoff transfer (shipped).** The handoff mechanism is abstracted behind
+`IKvHandoffTransfer.Transfer(source, config, destinationFactory)`, which returns the KV-cache the decode
+replica should use for a just-prefilled sequence. Two implementations:
+
+- `ReferenceKvHandoffTransfer` (**default**) — both replicas share one pool, so it returns the *same*
+  cache object by reference (zero copy; the original shared-pool behaviour). Unchanged.
+- `CopyKvHandoffTransfer` — the prefill and decode replicas use **separate** pools. It allocates a fresh
+  cache from the decode pool, copies the source's per-layer K/V contents across (via the public
+  `IKvCache` surface — `GetKeysRef`/`GetValuesRef` → `Update`, position-preserving, see internal
+  `KvCacheCopy`), disposes the prefill-pool cache, and returns the new one. This is the **in-process
+  stand-in for a cross-process / cross-device KV transfer**: on a single box the transferred state is a
+  byte-for-byte copy between two CPU pools, so decode output is *token-identical* to the by-reference
+  path. `DisaggregatedScheduler` takes optional `handoffTransfer`, `decodeKvCacheFactory`, and
+  `decodePagedPool` parameters (all default to the shared-pool/reference behaviour) and applies the
+  transfer in both `Step()` and the async prefill worker before injecting into the decode replica.
+  `DisaggregatedKvTransferTests` proves copy-transfer output equals reference-transfer output across
+  separate pools, plus a byte-for-byte `CopyKvHandoffTransfer` content check.
+
+**Still future (needs multi-device hardware):** true cross-device transfer routes the copy over a
+device→host→device (or NCCL / RDMA / NVLink) path with explicit placement on both ends — a third
+`IKvHandoffTransfer` implementation behind the same seam, validatable only on a multi-GPU box — and
+multi-GPU replica placement. The seam and the content-copy correctness are landed in-process now.
 
 ## Request Priority
 
