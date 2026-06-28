@@ -628,6 +628,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _submit.SubmitAndWait();
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
     /// <summary>
     /// Phase 5f mirror — NemotronH <c>ForwardBatch</c> override. Mirrors the dense
     /// <see cref="VulkanTransformerModel.ForwardBatch"/> partition / fall-through

@@ -16,7 +16,14 @@ sequence_item: phase-9-step-59
 >   tokens, re-queue at original priority+order), and `AdmitAndResume` (rebuild KV from
 >   prompt + generated[0..n-2], no re-sample). `SchedulerMetrics.PreemptionCount` now live.
 >   4 new unit tests in `ContinuousBatchSchedulerTests`; `docs/SCHEDULING.md § Preemption` refreshed.
-> - ⏳ Remaining: prefill/decode disaggregation (sub-piece 3) and fairness constraints (sub-piece 4).
+> - ✅ Sub-piece 3a — **batched decode** (#348). The "mixed batch / BuildBatch" framing below was
+>   STALE: the scheduler decoded one `Forward(seqLen=1)` per active sequence, while the fused
+>   `IModel.ForwardBatch` (dense CPU/Vulkan, Phase 5a/5b/5f) went unused. Wired decode through
+>   `ForwardBatch` when the model is stateless (`IModel.RequiresPerSequenceState == false`) and ≥2
+>   sequences decode; recurrent hosts keep the per-seq loop (their `ForwardBatch` needs per-seq
+>   Mamba/GDN state the scheduler doesn't thread yet). 4 new tests; `docs/SCHEDULING.md` refreshed.
+> - ⏳ Remaining: batched **prefill**; recurrent batched decode (thread per-seq state); separate
+>   prefill/decode queues/pools; and fairness constraints (sub-piece 4).
 
 ## What Step 59 covers
 

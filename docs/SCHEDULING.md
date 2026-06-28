@@ -21,21 +21,31 @@ Each `ContinuousBatchScheduler.Step()` call:
 
 1. **Sweep cancelled sequences** — caller-side `CancellationToken` may have flipped state; release their KV-cache.
 2. **Admit** new sequences up to `MaxActiveSequences` and (when paged) sufficient free blocks. Admission allocates the KV-cache, consults the optional `ISchedulerPrefixCache` for reuse, and transitions to `Prefilling`. **Actual prefill work happens in step 3** — admission is purely a slot/cache assignment.
-3. **Build a batch** containing one entry per active sequence that needs a forward pass this iteration:
-   - `Prefilling` sequences contribute their next prefill chunk, sized by `MaxPrefillTokensPerStep` (0 = unlimited, single shot).
-   - `Decoding` sequences contribute their last sampled token.
-   When the batch has ≥2 entries, the scheduler calls `IModel.ForwardBatch(requests, deviceId)` — a single dispatch that backends can fuse into one batched kernel (the default interface implementation falls back to a per-sequence `Forward` loop). For a 1-entry batch, the scheduler calls `Forward` directly to avoid the batch-allocation overhead and keep single-tenant decode latency unchanged from `TextGenerator`.
-4. **Process forward results**: for prefilling sequences that just consumed their final chunk, sample the first token and transition to `Decoding`; for decoding sequences, sample the next token. Apply stop conditions (EOS, max-tokens) and transition to `Completed` when fired.
-5. **Sweep completed/cancelled** active entries — build their `InferenceResponse`, release the KV-cache, complete the task.
+3. **Prefill admitted sequences** — each newly admitted sequence runs its prompt prefill via
+   `Forward` (per sequence), sized by `MaxPrefillTokensPerStep` (0 = unlimited, single shot), and
+   samples its first token → `Decoding`. (Prefill is per-sequence today; batched prefill is a follow-up.)
+4. **Decode the active sequences.** Each `Decoding` sequence contributes its last sampled token. When
+   the model is **stateless** (KV-only — `IModel.RequiresPerSequenceState == false`) and **≥2** sequences
+   are decoding, the scheduler fuses them into a single `IModel.ForwardBatch(requests, deviceId)` call
+   (one `SequenceForwardRequest` per sequence, each with its own KV-cache) — a backend overrides
+   `ForwardBatch` to fuse the per-sequence GEMVs into batched GEMMs (the dense CPU/Vulkan hosts do; the
+   default interface impl loops `Forward`). For a single decoder, or a model that needs per-sequence
+   recurrent state (Mamba-3 / Qwen3-MoE-Hybrid GDN / Nemotron-H — see `RequiresPerSequenceState`), it
+   decodes per sequence via `Forward`, keeping single-tenant decode latency unchanged.
+5. **Process results** per sequence: apply the constraint token-mask, sample the next token, advance the
+   constraint, check stop conditions (EOS, max-tokens) → `Completed` when fired; then sweep
+   completed/cancelled — build the `InferenceResponse`, release the KV-cache, complete the task.
 
 ```
 while (!cancelled):
   SweepCancelled()
-  Admit(pendingQueue, MaxActiveSequences, prefixCache?)
-  batch = BuildBatch(active)           # mix of prefill chunks and decode tokens
-  results = batch.Count >= 2 ? Model.ForwardBatch(batch) : Model.Forward(batch[0])
-  for entry in batch:
-    ProcessResult(entry, results[i])   # sample, advance constraint, check stops
+  Admit(pendingQueue, MaxActiveSequences, prefixCache?)   # prefills each admitted seq (per-seq Forward)
+  ready = active.Where(Decoding)                          # capacity-gated finish here
+  if !model.RequiresPerSequenceState and ready.Count >= 2:
+    results = Model.ForwardBatch(ready)                   # fused batched decode
+    for i, seq in ready: ProcessDecodeLogits(seq, results[i])
+  else:
+    for seq in ready: ProcessDecodeLogits(seq, Model.Forward(seq))
   SweepCompleted()
 ```
 
@@ -139,8 +149,16 @@ Unit tests (in `ContinuousBatchSchedulerTests`):
 - `Preemption_NeverEvictsCriticalActiveSequence` — a High request cannot preempt a `Critical` active
   sequence; it waits instead.
 
-**Still pending in Step 59**: prefill/decode disaggregation (separate queues/pools) and fairness
-constraints (per-API-key accounting to prevent starvation under a continuous higher-priority stream).
+**Batched decode (shipped, Step 59):** the scheduler's steady-state decode is now fused via
+`IModel.ForwardBatch` whenever the model is stateless and ≥2 sequences are decoding (gated on
+`IModel.RequiresPerSequenceState`; recurrent hosts keep the per-sequence loop because their
+`ForwardBatch` requires per-sequence Mamba/GDN state the scheduler does not yet thread). Single-tenant
+decode and recurrent-model decode are unchanged.
+
+**Still pending in Step 59**: batched **prefill** (multi-admit → one `ForwardBatch`); recurrent batched
+decode (thread per-seq Mamba/GDN state through the scheduler, then drop the gate); separate
+prefill/decode queues/pools; and fairness constraints (per-API-key accounting to prevent starvation
+under a continuous higher-priority stream).
 
 ## Sequence State Machine
 

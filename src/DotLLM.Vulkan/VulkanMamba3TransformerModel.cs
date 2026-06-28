@@ -845,6 +845,9 @@ public sealed class VulkanMamba3TransformerModel : IModel
         _submit.SubmitAndWait();
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
     /// <summary>
     /// Mamba-3 <c>ForwardBatch</c> override. Threads each request's per-seq
     /// <see cref="VulkanMamba3State"/> through the SSD scan so multi-sequence
