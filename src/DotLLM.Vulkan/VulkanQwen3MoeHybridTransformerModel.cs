@@ -603,6 +603,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         return result;
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
     /// <summary>
     /// Phase 5f mirror — Qwen3MoeHybrid <c>ForwardBatch</c> override. Loops per-seq
     /// <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>

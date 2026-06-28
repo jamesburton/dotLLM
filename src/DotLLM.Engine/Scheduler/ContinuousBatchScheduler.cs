@@ -70,6 +70,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private readonly Lock _queueLock = new();
     private readonly List<SchedulerRequest> _active = new();
 
+    // Reusable scratch for batched decode (Step 59). Cleared/refilled each Step; persisted as
+    // fields to avoid per-iteration allocation on the decode hot path. _decodeReady holds the
+    // active decoders that passed the capacity gate; _decodeBatch is the ForwardBatch request
+    // list; _decodeTokens/_decodePositions back each request's 1-element TokenIds/Positions.
+    private readonly List<SchedulerRequest> _decodeReady = new();
+    private readonly List<SequenceForwardRequest> _decodeBatch = new();
+    private int[] _decodeTokens = Array.Empty<int>();
+    private int[] _decodePositions = Array.Empty<int>();
+
     private long _submissionCounter;
     // Number of preemptions performed (Step 59 advanced scheduling). Incremented when a lower-priority
     // active sequence is evicted under block pressure to admit a higher-priority request; the victim is
@@ -333,21 +342,102 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
         }
 
-        // 3. Decode one token for every actively-decoding sequence.
+        // 3. Decode one token for each actively-decoding sequence. When the model is stateless
+        //    (KV-only — no per-seq SSM/GDN state the scheduler can't supply) and 2+ sequences are
+        //    decoding, fuse them into a single IModel.ForwardBatch (the continuous-batching
+        //    throughput win); otherwise decode per-sequence. Capacity-gated sequences finish here
+        //    without a forward.
+        _decodeReady.Clear();
         for (int i = _active.Count - 1; i >= 0; i--)
         {
             var seq = _active[i];
             if (seq.State != SequenceState.Decoding) continue;
 
+            if (!TryStartDecode(seq, out _))
+            {
+                // Length / max-tokens cap: finish without a forward.
+                seq.State = SequenceState.Completed;
+                CompleteSequence(seq);
+                _active.RemoveAt(i);
+                didWork = true;
+                continue;
+            }
+            _decodeReady.Add(seq);
+        }
+
+        int readyCount = _decodeReady.Count;
+        if (readyCount > 0)
+            didWork = true;
+
+        if (!_model.RequiresPerSequenceState && readyCount >= 2)
+        {
+            DecodeBatched(readyCount);
+        }
+        else
+        {
+            // Single decoder, or a model that needs per-seq recurrent state (which ForwardBatch
+            // cannot batch without that state). Decode each sequence independently.
+            for (int j = 0; j < readyCount; j++)
+                DecodeSingleAndFinish(_decodeReady[j]);
+        }
+
+        return didWork;
+    }
+
+    /// <summary>Fuses the <paramref name="readyCount"/> ready decoders in <see cref="_decodeReady"/>
+    /// into one <see cref="IModel.ForwardBatch"/> call, then samples / stops each independently.</summary>
+    private void DecodeBatched(int readyCount)
+    {
+        if (_decodeTokens.Length < readyCount)
+        {
+            _decodeTokens = new int[readyCount];
+            _decodePositions = new int[readyCount];
+        }
+        _decodeBatch.Clear();
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            _decodeTokens[j] = seq.GeneratedTokens[^1];
+            _decodePositions[j] = seq.Position - 1;
+            _decodeBatch.Add(new SequenceForwardRequest
+            {
+                TokenIds = _decodeTokens.AsMemory(j, 1),
+                Positions = _decodePositions.AsMemory(j, 1),
+                KvCache = seq.KvCache!,
+            });
+        }
+
+        IReadOnlyList<ITensor> results;
+        long fwdStart = Stopwatch.GetTimestamp();
+        try
+        {
+            results = _model.ForwardBatch(_decodeBatch, deviceId: -1);
+        }
+        catch (OperationCanceledException)
+        {
+            FailReadyDecoders(readyCount, ex: null);
+            return;
+        }
+        catch (Exception ex)
+        {
+            FailReadyDecoders(readyCount, ex);
+            return;
+        }
+        long perSeqTicks = (Stopwatch.GetTimestamp() - fwdStart) / readyCount;
+
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            ITensor logits = results[j];
+            seq.DecodeTicks += perSeqTicks;
             try
             {
-                bool finished = DecodeOneStep(seq);
-                didWork = true;
+                bool finished = ProcessDecodeLogits(seq, logits);
                 if (finished)
                 {
                     seq.State = SequenceState.Completed;
                     CompleteSequence(seq);
-                    _active.RemoveAt(i);
+                    _active.Remove(seq);
                 }
             }
             catch (OperationCanceledException)
@@ -355,18 +445,72 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 seq.State = SequenceState.Cancelled;
                 ReleaseKvCache(seq);
                 seq.CompletionSource.TrySetCanceled();
-                _active.RemoveAt(i);
+                _active.Remove(seq);
             }
             catch (Exception ex)
             {
                 seq.State = SequenceState.Completed;
                 ReleaseKvCache(seq);
                 seq.CompletionSource.TrySetException(ex);
-                _active.RemoveAt(i);
+                _active.Remove(seq);
+            }
+            finally
+            {
+                logits.Dispose();
             }
         }
+    }
 
-        return didWork;
+    /// <summary>Fails every ready decoder when the batched forward itself threw (a batch-scoped
+    /// model error — e.g. device-lost / OOM — cannot be isolated to one sequence).</summary>
+    private void FailReadyDecoders(int readyCount, Exception? ex)
+    {
+        for (int j = 0; j < readyCount; j++)
+        {
+            var seq = _decodeReady[j];
+            ReleaseKvCache(seq);
+            if (ex is null)
+            {
+                seq.State = SequenceState.Cancelled;
+                seq.CompletionSource.TrySetCanceled();
+            }
+            else
+            {
+                seq.State = SequenceState.Completed;
+                seq.CompletionSource.TrySetException(ex);
+            }
+            _active.Remove(seq);
+        }
+    }
+
+    /// <summary>Per-sequence decode for one ready sequence, with the same finish / cancel / error
+    /// handling as the batched path.</summary>
+    private void DecodeSingleAndFinish(SchedulerRequest seq)
+    {
+        try
+        {
+            bool finished = DecodeOneStep(seq);
+            if (finished)
+            {
+                seq.State = SequenceState.Completed;
+                CompleteSequence(seq);
+                _active.Remove(seq);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            seq.State = SequenceState.Cancelled;
+            ReleaseKvCache(seq);
+            seq.CompletionSource.TrySetCanceled();
+            _active.Remove(seq);
+        }
+        catch (Exception ex)
+        {
+            seq.State = SequenceState.Completed;
+            ReleaseKvCache(seq);
+            seq.CompletionSource.TrySetException(ex);
+            _active.Remove(seq);
+        }
     }
 
     /// <inheritdoc/>
@@ -625,49 +769,67 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     // ── Decode ──
 
-    private bool DecodeOneStep(SchedulerRequest seq)
+    /// <summary>
+    /// Pre-forward capacity gate for one decoding sequence. Returns <c>false</c> (and sets
+    /// <see cref="FinishReason.Length"/>) when the sequence has hit the KV-cache size or its
+    /// max-tokens cap and should finish without another forward; otherwise returns <c>true</c>
+    /// with <paramref name="nextPos"/> = the position of the last appended token (whose successor
+    /// the next forward generates).
+    /// </summary>
+    private static bool TryStartDecode(SchedulerRequest seq, out int nextPos)
     {
         Debug.Assert(seq.State == SequenceState.Decoding);
-
         int cacheSize = seq.KvCache!.MaxLength;
-        int pos = seq.Position - 1; // position of the last token appended (the one whose successor we generate)
-
-        // Capacity / max-tokens gates.
-        // Position is appended at seq.PromptLength + seq.GeneratedCount - 1 already. The NEXT
-        // forward consumes that token at position (PromptLength + GeneratedCount - 1).
-        int nextPos = pos;
-        if (nextPos >= cacheSize)
+        // Position is appended at PromptLength + GeneratedCount - 1; the next forward consumes that
+        // token at that position. nextPos == seq.Position - 1.
+        nextPos = seq.Position - 1;
+        if (nextPos >= cacheSize || seq.GeneratedCount >= seq.MaxTokens)
         {
             seq.FinishReason = FinishReason.Length;
-            return true;
+            return false;
         }
-        if (seq.GeneratedCount >= seq.MaxTokens)
-        {
-            seq.FinishReason = FinishReason.Length;
-            return true;
-        }
+        return true;
+    }
 
-        int vocabSize = _model.Config.VocabSize;
+    /// <summary>
+    /// Decodes one token for a single sequence (the non-batched path). Runs the capacity gate, one
+    /// <c>IModel.Forward</c>, then <see cref="ProcessDecodeLogits"/>. Returns whether the
+    /// sequence finished.
+    /// </summary>
+    private bool DecodeOneStep(SchedulerRequest seq)
+    {
+        if (!TryStartDecode(seq, out int nextPos))
+            return true;
+
         int lastToken = seq.GeneratedTokens[^1];
         Span<int> tokenSpan = stackalloc int[1] { lastToken };
         Span<int> posSpan = stackalloc int[1] { nextPos };
 
-        int nextTokenId;
         long fwdStart = Stopwatch.GetTimestamp();
-        using (ITensor logits = _model.Forward(tokenSpan, posSpan, deviceId: -1, seq.KvCache))
+        using ITensor logits = _model.Forward(tokenSpan, posSpan, deviceId: -1, seq.KvCache);
+        seq.DecodeTicks += Stopwatch.GetTimestamp() - fwdStart;
+        return ProcessDecodeLogits(seq, logits);
+    }
+
+    /// <summary>
+    /// Per-sequence post-forward processing shared by the single and batched decode paths:
+    /// apply the constraint token-mask, sample the next token, advance the constraint, append it,
+    /// and check stop conditions. <paramref name="logits"/> is this sequence's decode-token logits
+    /// (<c>[1, vocab]</c>). Returns whether the sequence finished.
+    /// </summary>
+    private bool ProcessDecodeLogits(SchedulerRequest seq, ITensor logits)
+    {
+        int vocabSize = _model.Config.VocabSize;
+        int nextTokenId;
+        unsafe
         {
-            seq.DecodeTicks += Stopwatch.GetTimestamp() - fwdStart;
+            var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
+            if (seq.Constraint is not null)
+                TokenMaskApplier.Apply(logitSpan, seq.Constraint.GetAllowedTokens());
 
-            unsafe
-            {
-                var logitSpan = new Span<float>((void*)logits.DataPointer, vocabSize);
-                if (seq.Constraint is not null)
-                    TokenMaskApplier.Apply(logitSpan, seq.Constraint.GetAllowedTokens());
-
-                long sStart = Stopwatch.GetTimestamp();
-                nextTokenId = seq.SamplerPipeline.Sample(logitSpan, seq.GeneratedTokens);
-                seq.SamplerTicks += Stopwatch.GetTimestamp() - sStart;
-            }
+            long sStart = Stopwatch.GetTimestamp();
+            nextTokenId = seq.SamplerPipeline.Sample(logitSpan, seq.GeneratedTokens);
+            seq.SamplerTicks += Stopwatch.GetTimestamp() - sStart;
         }
 
         seq.Constraint?.Advance(nextTokenId);

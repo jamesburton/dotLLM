@@ -162,6 +162,22 @@ public interface IModel : IDisposable
             $"{GetType().Name} does not support DiffusionGemma prompt-KV decode.");
 
     /// <summary>
+    /// True when this model's per-sequence forward carries recurrent state (SSM / linear-attention)
+    /// that the caller must supply per request, beyond the KV-cache. Default <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// Recurrent architectures (Mamba-3, Qwen3-MoE-Hybrid GDN, Nemotron-H) require a per-sequence
+    /// <see cref="SequenceForwardRequest.MambaState"/> / <see cref="SequenceForwardRequest.GdnState"/>
+    /// on every request when <see cref="ForwardBatch"/> is called with 2+ entries (a null state
+    /// throws or corrupts cross-sequence recurrence). The continuous-batch scheduler does not yet
+    /// allocate/thread that state, so it gates batched decode on this flag: <c>false</c> ⇒ a stateless
+    /// (dense KV-only) model whose decode can be safely fused via <see cref="ForwardBatch"/>;
+    /// <c>true</c> ⇒ keep the per-sequence decode loop. Threading recurrent state to lift this is a
+    /// follow-up.
+    /// </remarks>
+    bool RequiresPerSequenceState => false;
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>

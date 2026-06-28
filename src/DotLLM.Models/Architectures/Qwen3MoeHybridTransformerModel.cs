@@ -659,6 +659,9 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         return result;
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
     /// <summary>
     /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
     /// — threads each request's GDN state through to the GDN scan, so multi-seq batched

@@ -488,6 +488,119 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Equal(0L, fix.Scheduler.GetMetrics().PreemptionCount);
     }
 
+    // ── Batched decode (Step 59) ─────────────────────────────────────────
+
+    // Ramp emitter: a prompt ending in token k decodes k+1, k+2, ... until 9 then EOS, so the
+    // generated-token count is a deterministic function of the prompt's last token. Distinct prompt
+    // lengths therefore yield distinct counts — a batched decode that cross-wired sequences' logits
+    // would produce the wrong counts, so this discriminates correctness (not just "it ran").
+    private static int RampExpectedGenerated(int promptLen)
+    {
+        // last input token == promptLen (MakeRequest builds 1..promptLen); ramp to 9, EOS excluded.
+        int n = 0;
+        for (int t = promptLen; t < 9; t++) n++; // emits promptLen+1 .. 9
+        return n;
+    }
+
+    [Fact]
+    public async Task BatchedDecode_MultipleSequences_MatchPerSeqBaseline()
+    {
+        int[] promptLens = [3, 5, 7]; // distinct ramp counts: 6, 4, 2
+
+        // Batched: all admitted together (default MaxActiveSequences) → fused ForwardBatch.
+        using var batched = new TestFixture(inputEmitter: Ramp);
+        var bHandles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            bHandles[i] = batched.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+        DriveUntilIdle(batched.Scheduler);
+
+        // Per-seq baseline: MaxActiveSequences=1 → one sequence active at a time → never batched.
+        using var perSeq = new TestFixture(
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1 },
+            inputEmitter: Ramp);
+        var pHandles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            pHandles[i] = perSeq.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+        DriveUntilIdle(perSeq.Scheduler);
+
+        Assert.True(batched.Model.ForwardBatchCount > 0, "batched run never fused ForwardBatch");
+        Assert.Equal(0, perSeq.Model.ForwardBatchCount);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var b = await bHandles[i].Completion;
+            var p = await pHandles[i].Completion;
+            int expected = RampExpectedGenerated(promptLens[i]);
+            Assert.Equal(FinishReason.Stop, b.FinishReason);
+            Assert.Equal(expected, b.GeneratedTokenCount);          // correct per-seq output under batching
+            Assert.Equal(p.FinishReason, b.FinishReason);           // batched == per-seq
+            Assert.Equal(p.GeneratedTokenCount, b.GeneratedTokenCount);
+        }
+    }
+
+    [Fact]
+    public async Task BatchedDecode_PerSeqStopAndMaxTokens_Honored()
+    {
+        // Never emits EOS → each sequence stops only at its own MaxTokens, so the batch shrinks
+        // 3→2→1 as sequences finish at different steps within the batched-decode loop.
+        using var fix = new TestFixture(tokenScript: TokenScript.Constant(tokenId: 7));
+        int[] maxTokens = [2, 4, 6];
+        var handles = new ISchedulerRequest[maxTokens.Length];
+        for (int i = 0; i < maxTokens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: maxTokens[i]));
+
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.True(fix.Model.ForwardBatchCount > 0, "expected fused decode for 3 concurrent sequences");
+        for (int i = 0; i < maxTokens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Length, r.FinishReason);
+            Assert.Equal(maxTokens[i], r.GeneratedTokenCount);
+        }
+    }
+
+    [Fact]
+    public async Task BatchedDecode_CallsForwardBatch_OnlyWhenTwoPlusActive()
+    {
+        // Two concurrent sequences → batched.
+        using var multi = new TestFixture(tokenScript: TokenScript.Constant(tokenId: 7));
+        var h1 = multi.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+        var h2 = multi.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+        DriveUntilIdle(multi.Scheduler);
+        await h1.Completion; await h2.Completion;
+        Assert.True(multi.Model.ForwardBatchCount > 0);
+
+        // Single sequence → never batched (per-seq Forward path).
+        using var single = new TestFixture(tokenScript: TokenScript.Constant(tokenId: 7));
+        var h = single.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+        DriveUntilIdle(single.Scheduler);
+        await h.Completion;
+        Assert.Equal(0, single.Model.ForwardBatchCount);
+    }
+
+    [Fact]
+    public async Task BatchedDecode_StatefulModel_FallsBackToPerSeq()
+    {
+        // A model that needs per-seq recurrent state must NOT be batch-decoded (the scheduler can't
+        // supply that state) — it falls back to per-sequence Forward, still producing correct output.
+        int[] promptLens = [3, 5, 7];
+        using var fix = new TestFixture(inputEmitter: Ramp, requiresPerSequenceState: true);
+        var handles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+
+        DriveUntilIdle(fix.Scheduler);
+
+        Assert.Equal(0, fix.Model.ForwardBatchCount); // gated off for stateful models
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Stop, r.FinishReason);
+            Assert.Equal(RampExpectedGenerated(promptLens[i]), r.GeneratedTokenCount);
+        }
+    }
+
     // ── Helpers ──
 
     /// <summary>
@@ -561,12 +674,13 @@ public sealed class ContinuousBatchSchedulerTests
             TokenScript? tokenScript = null,
             ContinuousBatchSchedulerOptions? options = null,
             int totalBlocks = 64,
-            Func<int, int>? inputEmitter = null)
+            Func<int, int>? inputEmitter = null,
+            bool requiresPerSequenceState = false)
         {
             tokenScript ??= TokenScript.Constant(EosTokenId, afterNTokens: 1);
             PagedFactory = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize,
                 maxTotalTokens: totalBlocks * BlockSize);
-            Model = new MockModel(tokenScript, inputEmitter);
+            Model = new MockModel(tokenScript, inputEmitter, requiresPerSequenceState);
             Tokenizer = new MockTokenizer();
             Scheduler = new ContinuousBatchScheduler(
                 Model,
@@ -595,12 +709,35 @@ public sealed class ContinuousBatchSchedulerTests
         // Independent of the per-cache step counter, so it survives a preempt→recompute resume
         // (a fresh KvCache resets the step counter, but the generated-token chain is preserved).
         private readonly Func<int, int>? _inputEmitter;
+        private readonly bool _requiresPerSeqState;
         private readonly Dictionary<IKvCache, int> _stepCounters = new(ReferenceEqualityComparer.Instance);
 
-        public MockModel(TokenScript script, Func<int, int>? inputEmitter = null)
+        /// <summary>Number of times <see cref="ForwardBatch"/> was invoked (i.e. the scheduler took
+        /// the fused batched-decode path), for asserting batching is engaged / bypassed.</summary>
+        public int ForwardBatchCount { get; private set; }
+
+        public MockModel(TokenScript script, Func<int, int>? inputEmitter = null,
+            bool requiresPerSequenceState = false)
         {
             _script = script;
             _inputEmitter = inputEmitter;
+            _requiresPerSeqState = requiresPerSequenceState;
+        }
+
+        public bool RequiresPerSequenceState => _requiresPerSeqState;
+
+        // Mirror IModel's default loop ForwardBatch, but count invocations so tests can assert the
+        // scheduler actually fused the decode (vs the per-sequence Forward path).
+        public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+        {
+            ForwardBatchCount++;
+            var results = new ITensor[requests.Count];
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var r = requests[i];
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            }
+            return results;
         }
 
         public ModelConfig Config => new()
