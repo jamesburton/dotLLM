@@ -71,9 +71,17 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     // and FIFO-orders among the same priority via submissionOrder ascending. PriorityQueue is not
     // thread-safe; Submit/Step both serialise mutations through _queueLock — the lock is uncontended
     // in the steady-state single-Step-loop pattern, and Submit happens once per request.
-    private readonly PriorityQueue<SchedulerRequest, (int PriorityRank, long Order)> _pendingQueue = new();
+    private readonly PriorityQueue<SchedulerRequest, (int PriorityRank, long FairTag, long Order)> _pendingQueue = new();
     private readonly Lock _queueLock = new();
     private readonly List<SchedulerRequest> _active = new();
+
+    // Start-time fair-queuing (SFQ) state, all guarded by _queueLock. _keyFinishTag holds each fairness
+    // key's running cumulative cost (finish tag); _virtualTime is the virtual clock advanced to the
+    // start tag of the most-recently-admitted request. Only used when _options.EnableFairness. See
+    // ContinuousBatchSchedulerOptions.EnableFairness for the algorithm.
+    private readonly Dictionary<string, long> _keyFinishTag = new();
+    private long _virtualTime;
+    private const string AnonymousFairnessKey = "\0anonymous";
 
     // Reusable scratch for batched decode (Step 59). Cleared/refilled each Step; persisted as
     // fields to avoid per-iteration allocation on the decode hot path. _decodeReady holds the
@@ -249,14 +257,39 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }, seq);
         }
 
-        // Priority key: most-negative RequestPriority pops first (Critical=3 → -3, Low=0 → 0);
-        // FIFO tie-break within the same tier via ascending submissionOrder.
-        var key = (PriorityRank: -(int)request.Priority, Order: seq.SubmissionOrder);
+        // Priority key: most-negative RequestPriority pops first (Critical=3 → -3, Low=0 → 0); within a
+        // tier, order by the SFQ start tag (0 for everyone when fairness is off ⇒ pure FIFO), then by
+        // submissionOrder as the final FIFO tie-break. Fairness state is computed under _queueLock.
         lock (_queueLock)
         {
-            _pendingQueue.Enqueue(seq, key);
+            if (_options.EnableFairness)
+                seq.FairnessTag = ComputeFairnessStartTag(request.ApiKey, cost: promptIds.Length + maxTokens);
+            _pendingQueue.Enqueue(seq, (-(int)request.Priority, seq.FairnessTag, seq.SubmissionOrder));
         }
         return seq;
+    }
+
+    /// <summary>
+    /// Computes a request's start-time-fair-queuing start tag and charges its key's running finish tag.
+    /// Must be called under <see cref="_queueLock"/>. An idle key starts at the current virtual clock
+    /// (recent-usage forgiveness); a backlogged key's tags grow by <paramref name="cost"/> each request.
+    /// </summary>
+    private long ComputeFairnessStartTag(string? apiKey, long cost)
+    {
+        string key = apiKey ?? AnonymousFairnessKey;
+        long start = _keyFinishTag.TryGetValue(key, out long finish) ? Math.Max(_virtualTime, finish) : _virtualTime;
+        _keyFinishTag[key] = start + Math.Max(1, cost);
+
+        // Opportunistic prune: drop keys that have fully caught up to the virtual clock (idle/served),
+        // bounding the map for long-running multi-tenant servers. Only when it has grown past a cap.
+        if (_keyFinishTag.Count > 1024)
+        {
+            var stale = new List<string>();
+            foreach (var kv in _keyFinishTag)
+                if (kv.Value <= _virtualTime && kv.Key != key) stale.Add(kv.Key);
+            foreach (var k in stale) _keyFinishTag.Remove(k);
+        }
+        return start;
     }
 
     /// <inheritdoc/>
@@ -401,6 +434,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             lock (_queueLock)
             {
                 if (!_pendingQueue.TryDequeue(out seq, out _)) break;
+                // Admitting a request advances the SFQ virtual clock to its start tag, so subsequently
+                // submitted requests from idle keys are forgiven up to here (no-op when fairness is off).
+                if (_options.EnableFairness && seq.FairnessTag > _virtualTime)
+                    _virtualTime = seq.FairnessTag;
             }
 
             try
@@ -1049,12 +1086,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         seq.PrefixCachedTokens = 0;
         Interlocked.Increment(ref _preemptionCount);
 
-        // Re-queue with the ORIGINAL key (priority + submission order) so a repeatedly-preempted
-        // request keeps its FIFO place ahead of newer same-tier requests (anti-starvation).
-        var key = (PriorityRank: -(int)seq.Request.Priority, Order: seq.SubmissionOrder);
+        // Re-queue with the ORIGINAL key (priority + fairness start tag + submission order) so a
+        // repeatedly-preempted request keeps its place ahead of newer same-tier requests (anti-starvation).
         lock (_queueLock)
         {
-            _pendingQueue.Enqueue(seq, key);
+            _pendingQueue.Enqueue(seq, (-(int)seq.Request.Priority, seq.FairnessTag, seq.SubmissionOrder));
         }
     }
 

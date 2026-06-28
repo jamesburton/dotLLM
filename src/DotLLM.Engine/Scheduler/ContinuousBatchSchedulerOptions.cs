@@ -73,4 +73,22 @@ public sealed record ContinuousBatchSchedulerOptions
     /// and recurrent hosts without threadable state.
     /// </remarks>
     public int MaxRecurrentSequences { get; init; } = 0;
+
+    /// <summary>
+    /// When <see langword="true"/>, admission within each priority tier is ordered by per-API-key
+    /// <b>start-time fair queuing (SFQ)</b> instead of pure FIFO, so a single high-volume client can't
+    /// starve others sharing the same tier. Default <see langword="false"/> (FIFO by submission order).
+    /// </summary>
+    /// <remarks>
+    /// <para>Each request is charged an estimated cost (<c>promptLength + maxTokens</c>). The scheduler
+    /// keeps a per-key running finish tag and a global virtual clock; a request's intra-tier ordering key
+    /// is its SFQ <em>start tag</em> = <c>max(virtualClock, keyFinish)</c>, and admitting a request
+    /// advances the virtual clock to that tag. A backlogged key's start tags grow (its requests fall
+    /// behind lighter keys'); a key that goes idle resets to the virtual clock (recent-usage forgiveness).
+    /// Priority still dominates across tiers — fairness only reorders <em>within</em> a tier.</para>
+    /// <para>The fairness identity is <see cref="InferenceRequest.ApiKey"/> (typically the resolved API
+    /// key); a <see langword="null"/> key shares one "anonymous" bucket. With fairness off the start tag
+    /// is 0 for every request, so admission is byte-identical to FIFO-by-submission-order.</para>
+    /// </remarks>
+    public bool EnableFairness { get; init; } = false;
 }
