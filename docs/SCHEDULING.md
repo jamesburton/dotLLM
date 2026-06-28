@@ -35,13 +35,13 @@ Each `ContinuousBatchScheduler.Step()` call:
      `IModel.ForwardBatch(requests, deviceId)` at **≥2** decoders (each `SequenceForwardRequest` carries
      its own KV-cache); a single decoder uses `Forward`, keeping single-tenant latency unchanged.
    - **Recurrent threaded-state** models (`SupportsThreadedSequenceState == true` — Mamba-3,
-     Qwen3-MoE-Hybrid GDN, **and CPU Nemotron-H** via `ISsmState`) dispatch **everything via
+     Qwen3-MoE-Hybrid GDN, **and Nemotron-H** (CPU + Vulkan) via `ISsmState`) dispatch **everything via
      `ForwardBatch`, even a single sequence**, because `ForwardBatch` is the only `IModel` entrypoint
      that carries the per-seq `IMambaState`/`IGdnState`/`ISsmState` the scheduler allocates and threads.
      This both batches recurrent decode and fixes the latent corruption of running >1 concurrent
      recurrent sequence against a shared model-owned default state.
-   - **Recurrent without a threadable state container** (Vulkan Nemotron-H, until its
-     `VulkanSsmStateCache` exposes `ISsmState` — follow-up) stays on the per-sequence `Forward` loop.
+   - All recurrent hosts now expose a threadable state container, so none fall back to the per-seq
+     model-owned-state loop for >1 concurrent sequence.
 5. **Process results** per sequence: apply the constraint token-mask, sample the next token, advance the
    constraint, check stop conditions (EOS, max-tokens) → `Completed` when fired; then sweep
    completed/cancelled — build the `InferenceResponse`, release the KV-cache, complete the task.
@@ -88,7 +88,7 @@ The default interface implementation loops over `Forward` per request — backen
 
 - **CPU (`TransformerModel.ForwardBatch`)**: shipped. Phase 5a fuses the lm_head GEMM at `seqLen = Σ N_i` (commit `479c23f`); Phase 5b fuses the intra-block matmuls (Q/K/V/O/gate/up/down) across the simple subgroup — GQA non-MLA non-MoE non-LoRA-active (commit `92c1345`, ~2.09× speedup at 4× decode batch on Strix Halo / SmolLM-135M Q8_0). Attention stays per-sequence; complex requests fall through to the per-seq loop.
 - **Vulkan dense host (`VulkanTransformerModel.ForwardBatch`)**: shipped. Phase 5f path-1 — same intra-block matmul fusion pattern; attention dispatches per-seq via slice copy into shared scratch (commit `1c04887`). Phase 5e (lm_head-only fusion) was skipped on Vulkan because Vulkan's lm_head runs only on the last token (seqLen=1, returns `[1, vocab]`), making the saving ~150-350 µs per step — noise-floor.
-- **Vulkan other hosts (Qwen3MoeHybrid / NemotronH / Mamba3)**: per-seq dispatch. Per-sequence recurrent-state isolation is shipped — `Qwen3MoeHybrid` via `IGdnState` + `SequenceForwardRequest.GdnState` (commits `03f7ab9`/`a3ad719`/`0f3e4ce`), `Mamba3` via `IMambaState` + `SequenceForwardRequest.MambaState` (session 7); each host's `ForwardBatch` threads the per-seq state through and rejects null-state multi-seq dispatch with a clear diagnostic. Intra-block matmul fusion to mirror Phase 5f's dense-host pattern is the remaining follow-up — every layer in these hosts is per-token recurrent (GDN scan, Mamba SSD scan) or sparse MoE routing, so the fusion target is lm_head fan-out only.
+- **Vulkan other hosts (Qwen3MoeHybrid / NemotronH / Mamba3)**: per-seq dispatch. Per-sequence recurrent-state isolation is shipped for all three — `Qwen3MoeHybrid` via `IGdnState` + `SequenceForwardRequest.GdnState` (commits `03f7ab9`/`a3ad719`/`0f3e4ce`), `Mamba3` via `IMambaState` + `SequenceForwardRequest.MambaState` (session 7), `NemotronH` via `ISsmState` + `SequenceForwardRequest.SsmState` (CPU #355 / Vulkan #356); each host's `ForwardBatch` threads the per-seq state through and rejects null-state multi-seq dispatch with a clear diagnostic. Intra-block matmul fusion to mirror Phase 5f's dense-host pattern is the remaining follow-up — every layer in these hosts is per-token recurrent (GDN scan, Mamba SSD scan) or sparse MoE routing, so the fusion target is lm_head fan-out only.
 - **CUDA**: per-seq fallback. Same mirror needed when a CUDA host is available.
 - **Vulkan block-table attention (Phase 5g)**: deferred — vLLM-style single attention kernel reading per-seq block tables.
 
@@ -239,10 +239,9 @@ per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 
 **Still pending in Step 59** (tail follow-ups; the four roadmap sub-items — chunked prefill, priority +
 preemption, prefill/decode disaggregation, fairness — are all shipped, as is the in-process
-`DisaggregatedScheduler` driver, config/telemetry wiring, and CPU Nemotron-H recurrent batching via
-`ISsmState`): Vulkan Nemotron-H recurrent batching (needs `VulkanSsmStateCache : ISsmState` + threading
-through `RecordSsmLayer`); cross-process / cross-device KV transfer + multi-GPU replica placement for
-the disaggregated driver; and per-key fairness *weights*.
+`DisaggregatedScheduler` driver, config/telemetry wiring, and Nemotron-H recurrent batching on both
+CPU and Vulkan via `ISsmState`): cross-process / cross-device KV transfer + multi-GPU replica placement
+for the disaggregated driver; and per-key fairness *weights*.
 
 ## Sequence State Machine
 

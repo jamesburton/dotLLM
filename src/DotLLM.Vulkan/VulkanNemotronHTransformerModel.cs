@@ -41,6 +41,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly VulkanNemotronHForwardState _state;
     private readonly VulkanSsmStateCache _ssmCache;
 
+    // Caller-supplied per-sequence SSM state for the in-flight forward, set by the
+    // Forward(...,ISsmState?) overload / ForwardBatch and consumed by RecordSsmLayer
+    // (instance-scoped, single-threaded per generation). Null ⇒ use _ssmCache.
+    private VulkanSsmStateCache? _activeSsm;
+
     // Hybrid layout (per-layer kind), SSM config + ordinal map.
     private readonly HybridLayerLayout _layout;
     private readonly MambaSsmConfig _ssm;
@@ -505,6 +510,46 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     }
 
     /// <summary>
+    /// Forward with a caller-supplied per-sequence SSM state — the per-token recurrent state the
+    /// continuous-batch scheduler threads so concurrent sequences don't share the model-owned default.
+    /// Null falls back to <c>_ssmCache</c> (single-sequence behaviour). Attention layers use
+    /// <paramref name="kvCache"/> as usual.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+    {
+        VulkanSsmStateCache? prev = _activeSsm;
+        _activeSsm = ResolveSsm(ssmState);
+        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        finally { _activeSsm = prev; }
+    }
+
+    private VulkanSsmStateCache? ResolveSsm(ISsmState? ssmState)
+    {
+        if (ssmState is null) return null; // use _ssmCache
+        if (ssmState is VulkanSsmStateCache cache)
+        {
+            if (cache.NumSsmLayers != _ssmCache.NumSsmLayers)
+                throw new ArgumentException(
+                    $"SsmState covers {cache.NumSsmLayers} SSM layers but this model has {_ssmCache.NumSsmLayers}.",
+                    nameof(ssmState));
+            return cache;
+        }
+        throw new ArgumentException(
+            $"VulkanNemotronHTransformerModel requires a {nameof(VulkanSsmStateCache)}; got {ssmState.GetType().Name}.",
+            nameof(ssmState));
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => CreateSsmState();
+
+    /// <summary>Allocates a fresh per-sequence SSM state for this model (device-local).</summary>
+    public VulkanSsmStateCache CreateSsmState() => new(_device, _ssm, _ssmCache.NumSsmLayers);
+
+    /// <summary>
     /// Runs the shared NemotronH forward body (embedding + per-layer SSM/GQA/FFN +
     /// final RMSNorm on the last token), leaving the post-final-RMSNorm row in
     /// <see cref="VulkanNemotronHForwardState.NormOutput"/> at offset 0. When
@@ -678,7 +723,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         if (requests.Count == 1)
         {
             var r0 = requests[0];
-            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache, r0.SsmState) };
+        }
+
+        // 2+ requests need per-seq SSM state — a null would silently share the model-owned _ssmCache and
+        // corrupt concurrent decode (mirrors the Mamba-3 / Qwen3-MoE multi-seq contract).
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].SsmState is null)
+                throw new ArgumentException(
+                    $"VulkanNemotronHTransformerModel.ForwardBatch with {requests.Count} requests requires " +
+                    $"every request to supply a per-seq SsmState; request[{i}] has none.",
+                    nameof(requests));
         }
 
         // Partition simple / complex. Simple = KvCache is a VulkanNemotronHKvCache
@@ -700,7 +756,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         foreach (int i in complexIdx)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
         }
 
         // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
@@ -709,7 +765,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             foreach (int i in simpleIdx)
             {
                 var r = requests[i];
-                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
             }
             return results;
         }
@@ -745,8 +801,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         for (int s = 0; s < simpleCount; s++)
         {
             var r = requests[simpleIdx[s]];
-            RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
-                captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+            // Thread this sequence's per-seq SSM state through RecordSsmLayer (set on the instance,
+            // single-threaded; ForwardBatch already guards count>=2 against null state).
+            VulkanSsmStateCache? prev = _activeSsm;
+            _activeSsm = ResolveSsm(r.SsmState);
+            try
+            {
+                RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
+                    captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+            }
+            finally { _activeSsm = prev; }
         }
 
         // Batched lm_head — one matmul over the stacked [N_simple, hidden] capture
@@ -802,8 +866,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int dtOffset = 2 * dInner + 2 * nGroup * dState;
 
         int ssmOrdinal = _ssmLayerOrdinal[absoluteLayerIndex];
-        var convStateBuf = _ssmCache.GetConvStateBuffer(ssmOrdinal);
-        var ssmStateBuf = _ssmCache.GetSsmStateBuffer(ssmOrdinal);
+        var activeSsm = _activeSsm ?? _ssmCache;
+        var convStateBuf = activeSsm.GetConvStateBuffer(ssmOrdinal);
+        var ssmStateBuf = activeSsm.GetSsmStateBuffer(ssmOrdinal);
 
         // 1. ssm_in matmul: NormOutput[seqLen, hidden] @ InWeight^T → Zxbcdt[seqLen, inProjDim]
         RecordMatmul(cmdBuf, ssmW.InWeight, ssmW.InDeviceQuantType, _state.NormOutput, _state.Zxbcdt,
