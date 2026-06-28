@@ -1,16 +1,15 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace DotLLM.Engine.Constraints.Schema;
 
 /// <summary>
-/// Tracks schema position during JSON generation. Advances in lockstep with
-/// <see cref="JsonCharParser"/>, observing structural events to enforce schema constraints.
+/// Holds all per-position schema-tracking state for a single JSON generation branch.
+/// Extracted from <see cref="SchemaTracker"/> so that Task 4 can generalise to a
+/// set of parallel branches without changing any tracking logic.
 /// </summary>
-/// <remarks>
-/// Value type — copies by value for zero-alloc cloning. Uses <c>InlineArray</c>
-/// for all stacks. Maximum nesting depth: 64 (matches <see cref="JsonCharParser"/>).
-/// </remarks>
-internal struct SchemaTracker
+internal struct BranchState
 {
     private const int MaxDepth = 64;
     private const int MaxKeyLength = 128;
@@ -48,10 +47,10 @@ internal struct SchemaTracker
     private bool _inEnumString;
 
     /// <summary>
-    /// Creates a new schema tracker for the given compiled schema.
+    /// Creates a new branch state for the given compiled schema.
     /// </summary>
     /// <param name="schema">The compiled schema (immutable, shared).</param>
-    public SchemaTracker(CompiledSchema schema)
+    public BranchState(CompiledSchema schema)
     {
         _schema = schema;
         _currentNodeIndex = 0; // root node
@@ -72,11 +71,8 @@ internal struct SchemaTracker
     /// Checks if a character is allowed by the schema at the current position.
     /// Called BEFORE <see cref="JsonCharParser.TryAdvance"/>.
     /// </summary>
-    /// <param name="c">The character to check.</param>
-    /// <param name="parser">The current parser state (before advancing).</param>
-    /// <returns>True if the schema allows this character.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public readonly bool IsCharAllowedBySchema(char c, in JsonCharParser parser)
+    public readonly bool IsCharAllowed(char c, in JsonCharParser parser)
     {
         var state = parser.State;
 
@@ -235,6 +231,56 @@ internal struct SchemaTracker
         _inEnumString = false;
     }
 
+    // ── anyOf forking support (Task 4) ──────────────────────────────
+
+    /// <summary>
+    /// Reports whether the value this branch is about to generate is governed by an
+    /// <c>anyOf</c> node, yielding the alternative node indices. Used by
+    /// <see cref="SchemaTracker"/> to expand a single branch into one parallel branch
+    /// per alternative just before the value's opening structural character is applied.
+    /// </summary>
+    /// <param name="alternatives">The alternative node indices when the result is <c>true</c>.</param>
+    /// <returns><c>true</c> when the current value node is an <c>anyOf</c> union.</returns>
+    /// <remarks>
+    /// The current value node is only an <c>anyOf</c> node at a value-start position
+    /// (root value, or a property/array-item value that has just been resolved). While
+    /// inside a key or enum/const string, no fork is possible, so those are excluded.
+    /// </remarks>
+    public readonly bool TryGetAnyOfAlternatives(out ReadOnlySpan<int> alternatives)
+    {
+        if (!_inKeyString && !_inEnumString)
+        {
+            int[]? alts = GetNode(_currentNodeIndex).AnyOfNodeIndices;
+            if (alts != null)
+            {
+                alternatives = alts;
+                return true;
+            }
+        }
+
+        alternatives = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Returns a value copy of this branch re-seeded at <paramref name="nodeIndex"/> as its
+    /// current value node, with key/enum string cursors reset. The object/array frame is
+    /// established normally when the value's opening <c>{</c>/<c>[</c> is consumed, so the
+    /// existing node stack and emitted-property bitmasks are preserved.
+    /// </summary>
+    /// <param name="nodeIndex">The alternative node index to seed the copy with.</param>
+    public readonly BranchState WithCurrentNode(int nodeIndex)
+    {
+        var copy = this;
+        copy._currentNodeIndex = nodeIndex;
+        copy._inKeyString = false;
+        copy._inEnumString = false;
+        copy._keyLength = 0;
+        copy._trieNodeIndex = 0;
+        copy._enumTrieNodeIndex = 0;
+        return copy;
+    }
+
     // ── Value start type restriction ────────────────────────────────
 
     private readonly bool IsValueStartCharAllowed(char c, int nodeIndex)
@@ -285,8 +331,15 @@ internal struct SchemaTracker
 
         if (c == '"')
         {
-            // Start key — must have properties defined (or allow additional)
-            return node.Properties != null || !node.AdditionalPropertiesForbidden;
+            // Start key — if additional properties allowed, any key is fine.
+            if (!node.AdditionalPropertiesForbidden)
+                return true;
+            // additionalProperties:false — only allow if trie root can reach an un-emitted property.
+            if (node.PropertyTrieIndex < 0)
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            var trie = _schema.PropertyTries[node.PropertyTrieIndex];
+            return (trie.ReachableTerminalBits(0) & ~emitted) != 0;
         }
 
         return false;
@@ -300,17 +353,15 @@ internal struct SchemaTracker
         if (c == '"')
         {
             ref readonly var node = ref GetNode(_currentNodeIndex);
-            // Must have remaining properties or allow additional
-            if (node.AdditionalPropertiesForbidden && node.PropertyNames != null)
-            {
-                ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
-                ulong allProps = node.PropertyNames.Length < 64
-                    ? (1UL << node.PropertyNames.Length) - 1
-                    : ~0UL;
-                // If all properties emitted, no more keys allowed
-                return (allProps & ~emitted) != 0;
-            }
-            return true;
+            // If additional properties allowed, any key is fine.
+            if (!node.AdditionalPropertiesForbidden)
+                return true;
+            // additionalProperties:false — only allow if trie root can reach an un-emitted property.
+            if (node.PropertyTrieIndex < 0)
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            var trie = _schema.PropertyTries[node.PropertyTrieIndex];
+            return (trie.ReachableTerminalBits(0) & ~emitted) != 0;
         }
 
         return false;
@@ -567,9 +618,14 @@ internal struct SchemaTracker
 
         var trie = _schema.PropertyTries[node.PropertyTrieIndex];
 
-        // Also filter to only non-emitted properties
         if (node.AdditionalPropertiesForbidden)
-            return trie.TryGetChild(_trieNodeIndex, c, out _);
+        {
+            // Char must exist in trie AND the resulting child must reach at least one un-emitted property.
+            if (!trie.TryGetChild(_trieNodeIndex, c, out int child))
+                return false;
+            ulong emitted = _stackDepth > 0 ? _emittedProps[_stackDepth - 1] : 0;
+            return (trie.ReachableTerminalBits(child) & ~emitted) != 0;
+        }
 
         // If additional properties allowed, any char is valid even if not in trie
         return trie.TryGetChild(_trieNodeIndex, c, out _) || !node.AdditionalPropertiesForbidden;
@@ -641,6 +697,230 @@ internal struct SchemaTracker
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool IsWhitespace(char c) => c is ' ' or '\t' or '\n' or '\r';
+}
+
+/// <summary>
+/// Tracks schema position during JSON generation. Advances in lockstep with
+/// <see cref="JsonCharParser"/>, observing structural events to enforce schema constraints.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Value type — copies by value for zero-alloc cloning. Holds a bounded set of up to
+/// <see cref="MaxParallelBranches"/> parallel <see cref="BranchState"/> values in an <c>InlineArray</c>, so a
+/// whole tracker still copies by value with no heap allocation.
+/// </para>
+/// <para>
+/// A single branch is the common case (any schema without an active <c>anyOf</c> at the
+/// current value position). When the value about to be generated is governed by an
+/// <c>anyOf</c> node with at most <see cref="MaxParallelBranches"/> alternatives, the single branch forks
+/// into one branch per alternative. Thereafter <see cref="IsCharAllowedBySchema"/> is the
+/// OR over live branches and <see cref="OnCharAdvanced"/> prunes branches that reject an
+/// accepted string character, narrowing the set until it collapses back to one. An
+/// <c>anyOf</c> with more than <see cref="MaxParallelBranches"/> alternatives is not forked; the tracker
+/// keeps the historical single-branch union overapproximation.
+/// </para>
+/// </remarks>
+internal struct SchemaTracker
+{
+    /// <summary>
+    /// Maximum number of parallel <c>anyOf</c> branches the tracker forks into. Matches
+    /// <see cref="BranchStateArray"/> length. Shared with <see cref="ToolCallSchemaBuilder"/>
+    /// so the builder's <c>&gt; K</c> degradation threshold and this fork cap can never drift.
+    /// </summary>
+    internal const int MaxParallelBranches = 8;
+
+    private BranchStateArray _branches;
+    private int _liveCount;
+    private readonly CompiledSchema _schema;
+
+    // Logged at most once per process when an anyOf exceeds the branch cap.
+    private static int _degradationLogged;
+
+    /// <summary>
+    /// Creates a new schema tracker for the given compiled schema.
+    /// </summary>
+    /// <param name="schema">The compiled schema (immutable, shared).</param>
+    public SchemaTracker(CompiledSchema schema)
+    {
+        _schema = schema;
+        _branches[0] = new BranchState(schema);
+        _liveCount = 1;
+    }
+
+    /// <summary>
+    /// Whether this tracker can ever fork into multiple branches. A schema with no <c>anyOf</c>
+    /// node anywhere is always exactly one live branch, so callers may simulate per-token on a
+    /// single <see cref="BranchState"/> copy instead of cloning the whole (wide) tracker.
+    /// </summary>
+    public readonly bool CanFork => _schema.HasAnyOf;
+
+    /// <summary>
+    /// Returns a value copy of the single live branch. Only meaningful when the tracker cannot
+    /// fork (<see cref="CanFork"/> is <c>false</c>), in which case branch 0 is the sole branch.
+    /// </summary>
+    public readonly BranchState GetSingleBranch()
+    {
+        Debug.Assert(!CanFork, "GetSingleBranch must only be called on a non-forking tracker");
+        return _branches[0];
+    }
+
+    /// <summary>
+    /// Whether the schema is fully satisfied (any live branch is complete).
+    /// </summary>
+    public readonly bool IsComplete(in JsonCharParser p)
+    {
+        for (int i = 0; i < _liveCount; i++)
+            if (_branches[i].IsComplete(in p))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Checks if a character is allowed by the schema at the current position — the union
+    /// (OR) over all live branches. Called BEFORE <see cref="JsonCharParser.TryAdvance"/>.
+    /// </summary>
+    public readonly bool IsCharAllowedBySchema(char c, in JsonCharParser p)
+    {
+        for (int i = 0; i < _liveCount; i++)
+            if (_branches[i].IsCharAllowed(c, in p))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Called AFTER a character has been successfully accepted by the JSON parser.
+    /// Forks the single branch when a governing <c>anyOf</c> value is about to start,
+    /// prunes branches that did not allow the accepted character, and advances the
+    /// survivors (collapsing to a single branch when the set narrows to one).
+    /// </summary>
+    /// <param name="c">The character that was just accepted.</param>
+    /// <param name="p">The parser state AFTER advancing past <paramref name="c"/>.</param>
+    /// <param name="pre">The parser state BEFORE advancing past <paramref name="c"/>.</param>
+    /// <remarks>
+    /// Pruning uses the PRE-advance allow decision (<c>branch.IsCharAllowed(c, in pre)</c>),
+    /// which is exactly the predicate the mask build OR-ed across branches to permit
+    /// <paramref name="c"/>. It is correct for ALL characters — string content, a value/key
+    /// string's CLOSING quote, and structural characters alike — so a branch whose const/enum
+    /// trie is non-terminal at a closing quote (e.g. a tool name that is a strict prefix of
+    /// another) is pruned. Because the mask's OR guarantees at least one branch allowed
+    /// <paramref name="c"/> pre-advance, the live set never empties on a syntactically valid
+    /// character.
+    /// </remarks>
+    public void OnCharAdvanced(char c, in JsonCharParser p, in JsonCharParser pre)
+    {
+        // Fork BEFORE applying the character, so each new branch processes the value's
+        // opening structural character against its own alternative node (the object/array
+        // frame is then pushed normally per branch).
+        MaybeFork();
+
+        if (_liveCount <= 1)
+        {
+            // Single branch: it allowed the char (it is the sole term of the mask's OR), so it
+            // never prunes. Behaviour- and cost-identical to the historical single-branch path.
+            _branches[0].OnCharAdvanced(c, in p);
+            return;
+        }
+
+        int w = 0;
+        for (int i = 0; i < _liveCount; i++)
+        {
+            // Prune by the PRE-advance decision — correct for content, closing quotes and
+            // structural chars alike.
+            if (!_branches[i].IsCharAllowed(c, in pre))
+                continue;
+
+            _branches[i].OnCharAdvanced(c, in p);
+            if (w != i)
+                _branches[w] = _branches[i];
+            w++;
+        }
+
+        if (w > 0)
+        {
+            _liveCount = w;
+        }
+        else
+        {
+            // Defensive: every branch rejected a character the parser accepted. The mask build
+            // never emits such a token (the OR guarantees ≥1 allowing branch), but stay in
+            // lockstep with the parser by advancing all branches without pruning.
+            for (int i = 0; i < _liveCount; i++)
+                _branches[i].OnCharAdvanced(c, in p);
+        }
+    }
+
+    /// <summary>
+    /// Returns a composite state key for mask caching incorporating schema position.
+    /// The single-branch case returns the byte-identical key of the underlying branch so
+    /// existing cache behaviour is unchanged. The multi-branch case folds all live branches
+    /// into a sentinel composite (<c>NodeIdx = -1</c>) that never collides with a single
+    /// branch (whose node index is always non-negative).
+    /// </summary>
+    public readonly SchemaStateKey GetSchemaStateKey(in JsonCharParser p)
+    {
+        if (_liveCount == 1)
+            return _branches[0].GetSchemaStateKey(in p);
+
+        var hash = new HashCode();
+        hash.Add(_liveCount);
+        for (int i = 0; i < _liveCount; i++)
+        {
+            var k = _branches[i].GetSchemaStateKey(in p);
+            hash.Add(k.ParserKey);
+            hash.Add(k.NodeIdx);
+            hash.Add(k.EmittedProps);
+            hash.Add(k.TriePos);
+        }
+
+        return new SchemaStateKey(hash.ToHashCode(), -1, 0, _liveCount);
+    }
+
+    /// <summary>Resets to a single fresh branch at the schema root.</summary>
+    public void Reset()
+    {
+        _branches[0].Reset();
+        _liveCount = 1;
+    }
+
+    /// <summary>
+    /// Expands the single live branch into one branch per <c>anyOf</c> alternative when the
+    /// value about to be generated is a union of at most <see cref="MaxParallelBranches"/> alternatives.
+    /// </summary>
+    private void MaybeFork()
+    {
+        if (_liveCount != 1)
+            return;
+
+        if (!_branches[0].TryGetAnyOfAlternatives(out var alts) || alts.Length < 2)
+            return;
+
+        if (alts.Length > MaxParallelBranches)
+        {
+            // Degradation: keep the single-branch union overapproximation (no narrowing).
+            LogDegradationOnce(alts.Length);
+            return;
+        }
+
+        var src = _branches[0];
+        for (int i = 0; i < alts.Length; i++)
+            _branches[i] = src.WithCurrentNode(alts[i]);
+        _liveCount = alts.Length;
+    }
+
+    private static void LogDegradationOnce(int altCount)
+    {
+        if (Interlocked.Exchange(ref _degradationLogged, 1) == 0)
+            Debug.WriteLine(
+                $"[SchemaTracker] anyOf with {altCount} alternatives exceeds branch cap {MaxParallelBranches}; " +
+                "falling back to single-branch union overapproximation (no per-branch narrowing).");
+    }
+}
+
+/// <summary>InlineArray of parallel branch states (anyOf narrowing capacity).</summary>
+[InlineArray(8)]
+internal struct BranchStateArray
+{
+    private BranchState _element;
 }
 
 /// <summary>InlineArray for schema node index stack.</summary>

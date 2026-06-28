@@ -457,6 +457,184 @@ public class JsonSchemaConstraintTests
         }
     }
 
+    [Fact]
+    public void StrictObject_AfterEmittingKey_NeverAllowsDeadEndPrefix()
+    {
+        // Schema: {name (const="get"), arguments} both required, additionalProperties:false.
+        // Function name "get" uses only chars present in SchemaStubTokenizer.
+        string schema = ToolCallSchemaBuilder.BuildForFunction(new ToolDefinition(
+            "get", "x",
+            """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"""));
+        var constraint = CreateConstraint(schema);
+        // Drive: {"name":"get",
+        AdvanceString(constraint, "{\"name\":\"get\",");
+        // At ObjectNextKey the only un-emitted key is "arguments":
+        // 'n' (would re-enter the "name" dead-end prefix) must be masked out,
+        // 'a' (starts "arguments") must be allowed. The mask must be non-empty.
+        var mask = constraint.GetAllowedTokens();
+        Assert.True(AnyAllowed(mask), "mask must be non-empty");
+        Assert.True(TokenAllowedStartingWith(constraint, "\"a"), "must allow opening the arguments key");
+        Assert.False(TokenAllowedStartingWith(constraint, "\"n"), "must not allow re-opening the name key");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5 (#104): single-tool strict end-to-end, in-process, no model
+    // Tool name "get" and arg key "cab" use only chars present in SchemaStubTokenizer.
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void SingleTool_StrictArguments_RejectsUndeclaredKey_AndTerminates()
+    {
+        string schema = ToolCallSchemaBuilder.BuildForFunction(new ToolDefinition(
+            "get", "x",
+            """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""));
+        var c = CreateConstraint(schema);
+
+        // Drive a fully-valid object up to (but not including) the closing braces.
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{\"cab\":\"a\"");
+
+        // Inside arguments with additionalProperties:false and all required props satisfied,
+        // the only valid continuation is '}'. The comma (undeclared extra key opener) must
+        // be masked out entirely — so the ",\"d" prefix cannot be started.
+        Assert.False(
+            TokenAllowedStartingWith(c, ",\"d"),
+            "undeclared key must be impossible after all required arguments are emitted");
+
+        // Close arguments object then outer object — the constraint must declare IsComplete.
+        AdvanceString(c, "}}");
+        Assert.True(c.IsComplete(), "must be complete after well-formed close of arguments and outer object");
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-tool anyOf branch narrowing (#104)
+    //
+    // Tool names + argument keys are restricted to characters the SchemaStubTokenizer
+    // can emit as single-char tokens (so AdvanceString can drive them). The brief used
+    // "get_weather"/"get_time" with keys "city"/"zone"; '_', 'w', 'h', 'y', 'z' are not
+    // in the stub vocab, so they are adapted to tool names "get"/"set" and argument keys
+    // "cab" (first char 'c') / "den" (first char 'd') — distinct, tokenizable first chars.
+    // -------------------------------------------------------------------------
+
+    private static JsonSchemaConstraint MultiToolConstraint() => CreateConstraint(
+        ToolCallSchemaBuilder.BuildForRequired(
+        [
+            new ToolDefinition("get", "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""),
+            new ToolDefinition("set", "x",
+                """{"type":"object","properties":{"den":{"type":"string"}},"required":["den"]}"""),
+        ]));
+
+    [Fact]
+    public void MultiTool_NameFirst_EnforcesMatchedToolArguments()
+    {
+        var c = MultiToolConstraint();
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{");
+        // Only "cab" (get) may open; "den" (set) must be masked out.
+        Assert.True(TokenAllowedStartingWith(c, "\"c"), "get's arg key 'cab' must be allowed");
+        Assert.False(TokenAllowedStartingWith(c, "\"d"), "set's arg key 'den' must be masked after name=get");
+    }
+
+    [Fact]
+    public void MultiTool_ArgsFirst_NarrowsOnceNameSeen()
+    {
+        var c = MultiToolConstraint();
+        // arguments before name: both tools' first arg keys remain live until name disambiguates.
+        AdvanceString(c, "{\"arguments\":{");
+        Assert.True(TokenAllowedStartingWith(c, "\"c") || TokenAllowedStartingWith(c, "\"d"),
+            "before name, at least one tool's arg key is available");
+    }
+
+    [Fact]
+    public void MultiTool_ArgsFirst_ArgKeyConvergesName()
+    {
+        var c = MultiToolConstraint();
+        // Feed get's exclusive argument BEFORE the name. The "cab" key exists only in get's
+        // arguments schema; set requires "den" with additionalProperties:false, so consuming
+        // 'c' as the arg key first char prunes the set branch. With only the get branch live,
+        // the later name value is forced to the "get" const — proving the arguments content
+        // narrowed the union (this is the mirror of MultiTool_NameFirst_EnforcesMatchedToolArguments).
+        AdvanceString(c, "{\"arguments\":{\"cab\":\"a\"},\"name\":\"");
+        Assert.True(TokenAllowedStartingWith(c, "g"),
+            "name must converge to 'get' — its const continuation 'g' stays allowed");
+        Assert.False(TokenAllowedStartingWith(c, "s"),
+            "the set branch was pruned by the 'cab' arg key, so name cannot start the 'set' const");
+    }
+
+    [Fact]
+    public void MultiTool_WrongToolArgKey_Rejected()
+    {
+        var c = MultiToolConstraint();
+        AdvanceString(c, "{\"name\":\"set\",\"arguments\":{");
+        Assert.True(TokenAllowedStartingWith(c, "\"d"), "set's arg key 'den' must be allowed");
+        Assert.False(TokenAllowedStartingWith(c, "\"c"), "get's arg key 'cab' must be masked after name=set");
+    }
+
+    [Fact]
+    public void MultiTool_PrefixName_ShorterNameClose_PrunesLongerBranch()
+    {
+        // FIX 1 (#104) — prefix-name leak. Tool name "get" is a strict prefix of "gets".
+        // After the const value "get" CLOSES, the "gets" branch (whose const-trie node is
+        // valid-but-non-terminal) MUST be pruned by the pre-advance closing-quote decision,
+        // leaving only get's argument schema enforced. With the pre-fix code (pruning gated to
+        // in-string CONTENT chars, re-checked against the POST-advance parser) the gets branch
+        // survives the closing quote and its exclusive arg key "den" leaks → arguments validated
+        // against the UNION of both tools, breaking "exactly one tool enforced".
+        // All chars (g,e,t,s,c,a,b,d,e,n) are single-char tokens in SchemaStubTokenizer.
+        var c = CreateConstraint(ToolCallSchemaBuilder.BuildForRequired(
+        [
+            new ToolDefinition("get", "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""),
+            new ToolDefinition("gets", "x",
+                """{"type":"object","properties":{"den":{"type":"string"}},"required":["den"]}"""),
+        ]));
+
+        AdvanceString(c, "{\"name\":\"get\",\"arguments\":{");
+
+        // get's exclusive arg key "cab" must be allowed.
+        Assert.True(TokenAllowedStartingWith(c, "\"c"),
+            "matched tool 'get' arg key 'cab' must be allowed");
+        // gets' exclusive arg key "den" must be masked — the gets branch was pruned when "get" closed.
+        Assert.False(TokenAllowedStartingWith(c, "\"d"),
+            "'gets' arg key 'den' must be masked: the gets branch is pruned once the 'get' name string closes");
+    }
+
+    [Fact]
+    public void MultiTool_AboveBranchCap_DoesNotCrash_AndStaysValidJson()
+    {
+        // 12 tools (> K=8) — must NOT use the anyOf parallel-branch path. FIX 2 (#104): the
+        // builder degrades to a CLOSED enum-flat schema (name enum + additionalProperties:false),
+        // so name stays constrained and extra outer keys are forbidden (stronger than the bare
+        // anyOf root, which left name unconstrained). Tool names are 't' + a tokenizable suffix.
+        string[] suffixes = ["a", "b", "c", "d", "e", "f", "g", "i", "l", "m", "n", "o"];
+        var tools = new List<ToolDefinition>();
+        foreach (var s in suffixes)
+            tools.Add(new ToolDefinition("t" + s, "x",
+                """{"type":"object","properties":{"cab":{"type":"string"}},"required":["cab"]}"""));
+
+        var c = CreateConstraint(ToolCallSchemaBuilder.BuildForRequired(tools.ToArray()));
+
+        // name is enum-constrained: at the name value string only the shared 't' prefix is valid;
+        // a char that no tool name starts with ('n') must be masked.
+        AdvanceString(c, "{\"name\":\"");
+        Assert.True(TokenAllowedStartingWith(c, "t"),
+            "name enum must allow the shared 't' prefix of every tool name");
+        Assert.False(TokenAllowedStartingWith(c, "n"),
+            "a non-tool-name first char must be masked by the name enum (name stays constrained)");
+
+        // Drive a valid name + empty arguments object.
+        AdvanceString(c, "td\",\"arguments\":{}");
+
+        // Outer object: name + arguments both emitted, additionalProperties:false →
+        // no third (undeclared) key may open; only the closing '}' is valid.
+        Assert.False(TokenAllowedStartingWith(c, ","),
+            "no third undeclared key may open (additionalProperties:false on the outer object)");
+        Assert.True(TokenAllowedStartingWith(c, "}"),
+            "the outer object must be closeable once required keys are emitted");
+
+        AdvanceString(c, "}");
+        Assert.True(c.IsComplete(), "the degraded enum-flat schema still terminates as valid JSON");
+    }
+
     /// <summary>
     /// Helper: advances the constraint character-by-character by finding single-char tokens.
     /// </summary>
@@ -480,5 +658,35 @@ public class JsonSchemaConstraintTests
                 return i;
         }
         return -1;
+    }
+
+    /// <summary>
+    /// Returns true if any token in the SchemaStubTokenizer vocab is allowed by the mask.
+    /// </summary>
+    private static bool AnyAllowed(TokenMask mask)
+    {
+        var tokenizer = new SchemaStubTokenizer();
+        for (int i = 0; i < tokenizer.VocabSize; i++)
+            if (mask.IsAllowed(i)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Simulates advancing <paramref name="constraint"/> through <paramref name="prefix"/>
+    /// one character at a time (via a clone), returning true only if every character in the
+    /// prefix is allowed in sequence. Uses single-char tokens from <see cref="SchemaStubTokenizer"/>.
+    /// </summary>
+    private static bool TokenAllowedStartingWith(JsonSchemaConstraint constraint, string prefix)
+    {
+        var tokenizer = new SchemaStubTokenizer();
+        var clone = (JsonSchemaConstraint)constraint.Clone();
+        foreach (char c in prefix)
+        {
+            var m = clone.GetAllowedTokens();
+            int tokenId = FindSingleCharToken(tokenizer, c);
+            if (tokenId < 0 || !m.IsAllowed(tokenId)) return false;
+            clone.Advance(tokenId);
+        }
+        return true;
     }
 }

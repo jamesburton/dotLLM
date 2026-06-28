@@ -168,20 +168,21 @@ When `tool_choice` is `Required` or `Function(name)`, the model output is constr
 }
 ```
 
-**Multiple functions** (`BuildForRequired`):
+**Multiple functions** (`BuildForRequired`, ≤ `SchemaTracker.MaxParallelBranches` = 8 tools):
 ```json
 {
-  "type": "object",
-  "properties": {
-    "name": {"type": "string", "enum": ["get_weather", "get_time"]},
-    "arguments": {"type": "object"}
-  },
-  "required": ["name", "arguments"],
-  "additionalProperties": false
+  "anyOf": [
+    {"type": "object",
+     "properties": {"name": {"const": "get_weather"}, "arguments": {<get_weather schema>}},
+     "required": ["name", "arguments"], "additionalProperties": false},
+    {"type": "object",
+     "properties": {"name": {"const": "get_time"}, "arguments": {<get_time schema>}},
+     "required": ["name", "arguments"], "additionalProperties": false}
+  ]
 }
 ```
 
-Uses `enum` for the name field instead of `anyOf` with per-tool `const` — the `SchemaTracker`'s `anyOf` is an overapproximation that doesn't enforce nested property constraints. The tradeoff: per-tool argument schema validation is not enforced for multi-tool scenarios (arguments are constrained to valid JSON objects only). Single-tool schemas use `const` with full parameter schema enforcement.
+Each tool is a fully-closed `anyOf` branch with its own `name` const and parameter schema. `SchemaTracker` enforces these branches via **bounded parallel branch-narrowing** (#104): up to `K=8` branches are tracked in lockstep; a character is allowed if *any* live branch allows it, and branches are pruned as the `name` const value and the `arguments` keys disambiguate — so per-tool argument schemas *are* enforced, with keys in **any order** (`name`-first or `arguments`-first both converge). Above `K` tools, `BuildForRequired` degrades to a closed `name`-`enum` flat object (`additionalProperties:false`, `name` still constrained, args a permissive object) rather than failing. Single-tool schemas (and `BuildForFunction`) use `const` with full parameter-schema enforcement. All emitted object schemas carry `additionalProperties:false`, injected recursively by `ToolCallSchemaBuilder.Harden`.
 
 **Parallel calls** (`BuildForParallelCalls`):
 ```json
@@ -204,7 +205,7 @@ ToolDefinition[] → ToolCallSchemaBuilder.BuildForRequired()
                  → TokenMask per decode step
 ```
 
-The `SchemaCompiler` already supports `anyOf`, `const`, nested objects, `enum` — no modifications needed. This means tool call arguments are **mathematically guaranteed** to conform to the tool's parameter schema.
+`SchemaCompiler` supports `anyOf`, `const`, nested objects, and `enum`; `SchemaTracker` adds the bounded parallel `anyOf` branch-narrowing (#104) that enforces the *correct* per-tool branch. This means a constrained tool call is **structurally guaranteed** to be a valid JSON object conforming to exactly one tool's parameter schema (no leaked/duplicate keys, self-terminating). Note: structural validity is guaranteed regardless of model, but full *termination* (the model emitting the closing braces + EOS) still depends on model capability — a weak base can run to `MaxTokens` on an unbounded string value.
 
 ### `tool_choice=auto` — No Constraint
 
