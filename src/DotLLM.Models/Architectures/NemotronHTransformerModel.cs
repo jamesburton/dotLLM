@@ -55,6 +55,11 @@ public sealed unsafe class NemotronHTransformerModel : IModel
     private readonly NemotronHForwardState _state;
     private readonly SsmStateCache _ssmCache;
 
+    // Caller-supplied per-sequence SSM state for the in-flight Forward, set by the
+    // Forward(...,ISsmState?) overload and consumed by ForwardSsmBody (instance-scoped, single-threaded
+    // per generation — same pattern as the model's other forward-time state). Null ⇒ use _ssmCache.
+    private SsmStateCache? _activeSsm;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -560,6 +565,86 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         return result;
     }
 
+    /// <summary>
+    /// Forward with a caller-supplied per-sequence SSM state (the per-token recurrent state that the
+    /// continuous-batch scheduler threads so concurrent sequences don't share the model-owned default).
+    /// <paramref name="ssmState"/> null falls back to the model-owned <c>_ssmCache</c> (single-sequence
+    /// behaviour). Attention layers use <paramref name="kvCache"/> as usual.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+    {
+        SsmStateCache? prev = _activeSsm;
+        _activeSsm = ResolveSsm(ssmState);
+        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        finally { _activeSsm = prev; }
+    }
+
+    private SsmStateCache? ResolveSsm(ISsmState? ssmState)
+    {
+        if (ssmState is null) return null; // use _ssmCache
+        if (ssmState is SsmStateCache cache)
+        {
+            if (cache.NumSsmLayers != _numSsmLayers)
+                throw new ArgumentException(
+                    $"SsmState covers {cache.NumSsmLayers} SSM layers but this model has {_numSsmLayers}.",
+                    nameof(ssmState));
+            return cache;
+        }
+        throw new ArgumentException(
+            $"NemotronHTransformerModel requires an {nameof(SsmStateCache)} for its SSM state; got {ssmState.GetType().Name}.",
+            nameof(ssmState));
+    }
+
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => new SsmStateCache(_ssm, _numSsmLayers);
+
+    /// <summary>
+    /// Batched forward across sequences. Nemotron-H SSM state is per-token recurrent, so this threads
+    /// each request's per-seq <see cref="SequenceForwardRequest.SsmState"/> through a per-sequence
+    /// <c>Forward</c> (no cross-sequence fusion — same as Mamba-3). For 2+ requests every entry must
+    /// supply a per-seq <c>SsmState</c> (a null would silently share the model-owned default and corrupt
+    /// concurrent decode). LoRA adapters are not supported.
+    /// </summary>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0) return Array.Empty<ITensor>();
+
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].Adapter is not null)
+                throw new NotSupportedException(
+                    "NemotronHTransformerModel.ForwardBatch does not support LoRA adapters.");
+        }
+
+        if (requests.Count >= 2)
+        {
+            for (int i = 0; i < requests.Count; i++)
+            {
+                if (requests[i].SsmState is null)
+                    throw new ArgumentException(
+                        $"NemotronHTransformerModel.ForwardBatch with {requests.Count} requests requires " +
+                        $"every request to supply a per-seq SsmState; request[{i}] has none.",
+                        nameof(requests));
+            }
+        }
+
+        var results = new ITensor[requests.Count];
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var r = requests[i];
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
+        }
+        return results;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ForwardFfnBody(NemotronHFfnWeights ffn, int seqLen, int hiddenSize,
                                        float* normOut, float* ffnMid, byte* inputQ8Scratch)
@@ -682,7 +767,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
         }
 
         // 2. conv_input = concat(conv_state, xBC rows from zxbcdt)
-        var convState = _ssmCache.GetConvState(ssmOrdinal);
+        var convState = (_activeSsm ?? _ssmCache).GetConvState(ssmOrdinal);
         convState.CopyTo(new Span<float>(convInput, (dConv - 1) * convDim));
         for (int t = 0; t < seqLen; t++)
         {
@@ -743,7 +828,7 @@ public sealed unsafe class NemotronHTransformerModel : IModel
             row.Slice(dInner + bcDim, bcDim).CopyTo(new Span<float>(cBuf + t * bcDim, bcDim));
         }
 
-        var ssmState = _ssmCache.GetSsmState(ssmOrdinal);
+        var ssmState = (_activeSsm ?? _ssmCache).GetSsmState(ssmOrdinal);
 
         Mamba2SelectiveScan.Execute(
             state: ssmState,

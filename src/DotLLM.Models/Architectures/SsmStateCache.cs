@@ -37,7 +37,7 @@ namespace DotLLM.Models.Architectures;
 /// them in place.
 /// </para>
 /// </remarks>
-public sealed unsafe class SsmStateCache : IDisposable
+public sealed unsafe class SsmStateCache : ISsmState
 {
     private readonly int _numSsmLayers;
     private readonly int _convStateElements;

@@ -604,6 +604,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 KvCache = seq.KvCache!,
                 MambaState = seq.RecurrentState as IMambaState,
                 GdnState = seq.RecurrentState as IGdnState,
+                SsmState = seq.RecurrentState as ISsmState,
             });
         }
 
@@ -814,6 +815,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 KvCache = p.Seq.KvCache!,
                 MambaState = p.Seq.RecurrentState as IMambaState,
                 GdnState = p.Seq.RecurrentState as IGdnState,
+                SsmState = p.Seq.RecurrentState as ISsmState,
             });
             off += p.ForwardLen;
         }
@@ -1047,6 +1049,7 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                     KvCache = seq.KvCache!,
                     MambaState = seq.RecurrentState as IMambaState,
                     GdnState = seq.RecurrentState as IGdnState,
+                    SsmState = seq.RecurrentState as ISsmState,
                 };
                 var res = _model.ForwardBatch(new[] { req }, deviceId: -1);
                 res[0].Dispose();
