@@ -420,7 +420,10 @@ internal struct BranchState
 
     private readonly bool IsInStringCharAllowed(char c, in JsonCharParser parser)
     {
-        // Key string: restrict to trie
+        // Key string: restrict to trie. Note: '\' (escape) is NOT unconditionally
+        // allowed — it must be a valid trie edge like any other char. Property names
+        // contain no backslashes, so allowing '\' here let a weak model escape-flood
+        // ('"a\"\"\"...') and break out of the constraint (BitNet tool-call derail).
         if (_inKeyString)
         {
             if (c == '"')
@@ -428,12 +431,10 @@ internal struct BranchState
                 // Closing quote — property name must be complete (terminal)
                 return _schema.PropertyTries.Length > 0 && IsTrieTerminal();
             }
-            if (c == '\\')
-                return true; // escape sequences handled by parser
             return IsTrieCharValid(c);
         }
 
-        // Enum/const value string: restrict to enum trie
+        // Enum/const value string: restrict to enum trie (same escape-flood reasoning).
         if (_inEnumString)
         {
             if (c == '"')
@@ -441,8 +442,6 @@ internal struct BranchState
                 // Closing quote — value must be complete
                 return IsEnumTrieTerminal();
             }
-            if (c == '\\')
-                return true;
             return IsEnumTrieCharValid(c);
         }
 

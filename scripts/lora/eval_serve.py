@@ -28,13 +28,21 @@ def generate(
     max_tokens: int = 128,
     temp: float = 0.0,
     repeat_penalty: float | None = None,
+    repeat_last_n: int | None = None,
     seed: int | None = None,
-    timeout: int = 300,
+    tools_file: str | None = None,
+    tool_choice: str | None = None,
+    timeout: int = 600,
 ) -> dict:
     """Run one generation and return the parsed `RunJsonResult` dict.
 
     `lora` may be a single adapter dir, a list of dirs (stacked), or None (base).
-    Returns the full JSON object; callers usually want `result["text"]`.
+    When `tools_file` is given, `--tools @<file>` is passed and `run` renders the
+    prompt via the model's chat template with those tools (so `prompt` should be the
+    raw user query, not a pre-rendered string); `tool_choice` (e.g. "required")
+    additionally constrains decoding to a valid tool call. Parsed calls are then in
+    the returned dict under `toolCalls`.
+    Returns the full JSON object; callers usually want `result["text"]` / `result["toolCalls"]`.
     """
     loras = [] if lora is None else ([lora] if isinstance(lora, str) else list(lora))
 
@@ -50,8 +58,14 @@ def generate(
     ]
     for d in loras:
         cmd += ["--lora", d]
+    if tools_file is not None:
+        cmd += ["--tools", f"@{tools_file}"]
+    if tool_choice is not None:
+        cmd += ["--tool-choice", tool_choice]
     if repeat_penalty is not None:
         cmd += ["--repeat-penalty", str(repeat_penalty)]
+    if repeat_last_n is not None:
+        cmd += ["--repeat-last-n", str(repeat_last_n)]
     if seed is not None:
         cmd += ["--seed", str(seed)]
 
