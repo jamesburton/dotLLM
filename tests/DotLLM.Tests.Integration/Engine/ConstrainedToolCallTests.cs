@@ -11,7 +11,7 @@ namespace DotLLM.Tests.Integration.Engine;
 
 /// <summary>
 /// End-to-end integration test for the constrained tool-call path used by
-/// <c>run --tool-choice required</c> (#104 / #106).
+/// <c>chat --tool-choice required</c> (#104 / #106).
 /// Test B is env-gated: set <c>DOTLLM_BITNET_GGUF</c> to a valid I2_S GGUF path to
 /// activate it. Without the env var the test runs as a no-op pass (plain <see cref="FactAttribute"/>
 /// + early return, NOT <c>SkippableFact</c>, matching the brief's env-gating requirement).
@@ -24,7 +24,8 @@ public sealed class ConstrainedToolCallTests
     /// <c>--tool-choice required</c> (JSON schema constrained decoding), and asserts that:
     /// <list type="bullet">
     ///   <item>Generation terminated via EOS (<see cref="FinishReason.Stop"/>).</item>
-    ///   <item><see cref="GenericToolCallParser"/> parses the output to exactly one tool call.</item>
+    ///   <item>The production-selected parser (via <see cref="GgufChatTemplateFactory.CreateToolCallParser"/>)
+    ///   parses the output to exactly one tool call.</item>
     ///   <item>The parsed call targets <c>get_weather</c> with a non-empty string <c>city</c> argument.</item>
     /// </list>
     /// When <c>DOTLLM_BITNET_GGUF</c> is unset or points to a missing file the test exits
@@ -37,21 +38,24 @@ public sealed class ConstrainedToolCallTests
         string? ggufPath = Environment.GetEnvironmentVariable("DOTLLM_BITNET_GGUF");
         if (string.IsNullOrEmpty(ggufPath) || !File.Exists(ggufPath)) return;
 
-        // ── load model (same path as CLI RunCommand, no Cli dependency needed) ──
+        // ── load model (same path as CLI ChatCommand, no Cli dependency needed) ──
         using var gguf = GgufFile.Open(ggufPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         using var model = TransformerModel.LoadFromGguf(gguf, config);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
-        // ── build schema — mirrors RunCommand's tool-choice required wiring ───
-        // RunCommand: argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments"
-        // GenericToolCallParser is the fallback for constrained output → "arguments"
+        // ── build schema — mirrors ChatCommand's tool-choice required wiring ───
         var tool = new ToolDefinition(
             "get_weather",
             "Get current weather for a city",
             """{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");
 
-        string schema = ToolCallSchemaBuilder.BuildForRequired([tool], "arguments");
+        // Mirror ChatCommand: select parser + arguments key the same way production does.
+        // For BitNet (Architecture.BitNet) → HermesToolCallParser → "arguments" key.
+        // For Llama 3.1+ → LlamaToolCallParser → "parameters" key.
+        var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+        string argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments";
+        string schema = ToolCallSchemaBuilder.BuildForRequired([tool], argumentsKey);
 
         // ── inference options — greedy + repeat-penalty 1.3, JSON schema constraint ──
         var options = new InferenceOptions
@@ -72,8 +76,7 @@ public sealed class ConstrainedToolCallTests
         Assert.Equal(FinishReason.Stop, response.FinishReason);
 
         // ── assert output parses to a valid get_weather call ──────────────────
-        var parser = new GenericToolCallParser();
-        var calls = parser.TryParse(response.Text);
+        var calls = toolCallParser.TryParse(response.Text);
 
         Assert.NotNull(calls);
         Assert.Single(calls);
