@@ -41,6 +41,13 @@ public sealed class RateLimitMiddleware
     /// </summary>
     public const string LeaseItemKey = "__DotLLM_RateLimitLease";
 
+    /// <summary>
+    /// <see cref="HttpContext.Items"/> key under which the resolved API-key string is stashed for
+    /// downstream endpoints (e.g. to set <see cref="DotLLM.Engine.InferenceRequest.ApiKey"/> for the
+    /// scheduler's per-key admission fairness). Present only on metered paths when rate limiting is enabled.
+    /// </summary>
+    public const string ApiKeyItemKey = "__DotLLM_ApiKey";
+
     private readonly RequestDelegate _next;
     private readonly RateLimitManager _manager;
     private readonly IApiKeyResolver _resolver;
@@ -71,6 +78,8 @@ public sealed class RateLimitMiddleware
         }
 
         var apiKey = _resolver.Resolve(context);
+        // Stash for downstream endpoints (scheduler per-key fairness reads this onto InferenceRequest.ApiKey).
+        context.Items[ApiKeyItemKey] = apiKey;
         int estimated = await EstimateTotalTokensAsync(context, _manager.Config).ConfigureAwait(false);
 
         var result = await _manager.TryAcquireAsync(apiKey, estimated, context.RequestAborted)

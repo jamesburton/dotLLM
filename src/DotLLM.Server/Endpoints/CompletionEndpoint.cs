@@ -131,6 +131,11 @@ public static class CompletionEndpoint
             {
                 TokenIds = promptIds,
                 Options = options,
+                // Carry the resolved API key (stashed by RateLimitMiddleware) for the scheduler's
+                // per-key admission fairness; null when rate limiting / key resolution is off.
+                ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k)
+                    ? k as string
+                    : null,
             };
             result = await scheduler.EnqueueAsync(inferenceRequest, ct);
         }

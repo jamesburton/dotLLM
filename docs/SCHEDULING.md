@@ -119,7 +119,7 @@ instance would corrupt state. Tests: `Disaggregated_AdmittedInStepPrefill_Decode
 
 ## Request Priority
 
-Each request carries a `RequestPriority` enum (`Critical`, `High`, `Normal` (default), `Low`) on `InferenceRequest.Priority`. The scheduler's admission queue is a `PriorityQueue` keyed by `(-(int)Priority, submissionOrder)`, so higher priorities are dequeued before lower priorities and FIFO holds within a tier.
+Each request carries a `RequestPriority` enum (`Critical`, `High`, `Normal` (default), `Low`) on `InferenceRequest.Priority`. The scheduler's admission queue is a `PriorityQueue` keyed by `(-(int)Priority, fairnessStartTag, submissionOrder)`, so higher priorities are dequeued first; within a tier, requests order by the fairness start tag (0 for all when fairness is off ⇒ pure FIFO) then by submission order.
 
 | Level | Admission behavior | Preemption (Step 59, pending) |
 |-------|--------------------|-------------------------------|
@@ -135,6 +135,14 @@ Each request carries a `RequestPriority` enum (`Critical`, `High`, `Normal` (def
 - `Priority_CriticalBeatsHighBeatsNormalBeatsLow` — strict tier ordering.
 
 **Preemption shipped (Phase 9 Step 59, recompute-on-resume)** — see § Preemption below. `SchedulerMetrics.PreemptionCount` now reflects real preemptions.
+
+## Fairness (per-API-key admission, Step 59)
+
+With `ContinuousBatchSchedulerOptions.EnableFairness` (default off), admission **within each priority tier** is ordered by **start-time fair queuing (SFQ)** instead of pure FIFO, so a single high-volume client cannot starve others sharing the tier. The fairness identity is `InferenceRequest.ApiKey` (the resolved API key; `RateLimitMiddleware` stashes it in `HttpContext.Items` and `CompletionEndpoint` copies it onto the request); a `null` key shares one "anonymous" bucket.
+
+Each request is charged an estimated cost (`promptLength + maxTokens`). The scheduler keeps a per-key running finish tag and a global virtual clock (both under `_queueLock`): a request's intra-tier ordering key is its SFQ **start tag** = `max(virtualClock, keyFinish)`, and admitting a request advances the virtual clock to that tag. A backlogged key's start tags grow so its requests fall behind lighter keys'; a key that goes idle resets to the virtual clock (recent-usage forgiveness). **Priority still dominates across tiers** — fairness only reorders within a tier. With fairness off, every start tag is 0, so admission is byte-identical to FIFO-by-submission-order.
+
+Tests (`ContinuousBatchSchedulerTests`): `Fairness_Enabled_LightKeyInterleavesAheadOfHammerBacklog` (a light client interleaves right after the first of a 5-request hammer flood, vs. waiting behind all 5 with `Fairness_Disabled_..._Fifo`), `Fairness_PriorityStillDominatesAcrossTiers`, `InferenceRequest_ApiKey_DefaultsNull`. **Not yet wired:** enabling fairness / per-key weights from server appsettings, and per-key token telemetry — follow-ups.
 
 ## Preemption
 
@@ -209,10 +217,12 @@ throws on null/shared state — so correct output proves per-seq threading; asse
 per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 `RecurrentBatched_MaxRecurrentSequences_CapsConcurrency`, `RecurrentBatched_PerSeqMaxTokens_Honored`.
 
-**Still pending in Step 59**: Nemotron-H recurrent batching (needs an `ISsmState` container + factory);
-a disaggregated multi-worker/replica driver with cross-worker KV transfer (the deployment that
-actually uses the `StepPrefill`/`StepDecode` seam on separate thread pools); and fairness constraints
-(per-API-key accounting to prevent starvation under a continuous higher-priority stream).
+**Still pending in Step 59** (tail follow-ups; the four roadmap sub-items — chunked prefill, priority +
+preemption, prefill/decode disaggregation, fairness — are all shipped): Nemotron-H recurrent batching
+(needs an `ISsmState` container + factory); a disaggregated multi-worker/replica driver with
+cross-worker KV transfer (the deployment that actually uses the `StepPrefill`/`StepDecode` seam on
+separate thread pools); wiring `EnableFairness` / per-key weights from server appsettings; and per-key
+token telemetry.
 
 ## Sequence State Machine
 

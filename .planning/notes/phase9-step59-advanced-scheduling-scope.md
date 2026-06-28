@@ -48,8 +48,20 @@ sequence_item: phase-9-step-59
 >   the model forward is single-threaded). 3 new tests (phase-split token-identical to combined Step).
 >   NOTE: literal separate OS thread pools against ONE model instance are unsafe (single-threaded
 >   forward) — the seam is the deliverable; the multi-worker driver + KV transfer is a follow-up.
-> - ⏳ Remaining: Nemotron-H recurrent batching (needs `ISsmState`); disaggregated multi-worker driver
->   (cross-worker KV transfer); and fairness constraints (sub-piece 4 = (d)).
+> - ✅ Sub-piece 4 — **fairness** (#352). Per-API-key **start-time fair queuing (SFQ)** in admission,
+>   gated by `ContinuousBatchSchedulerOptions.EnableFairness` (default off ⇒ byte-identical FIFO).
+>   New `InferenceRequest.ApiKey` (resolved key stashed by `RateLimitMiddleware`, set on the request by
+>   `CompletionEndpoint`); priority key is now `(−priority, sfqStartTag, submissionOrder)`. Per-key
+>   finish tags + virtual clock under `_queueLock`; admit advances the clock; preempt keeps the tag.
+>   Priority dominates across tiers (fairness reorders within a tier only). 4 tests (light client
+>   interleaves ahead of a hammer flood; FIFO when off; priority dominates; ApiKey default null).
+>
+> **Step 59 COMPLETE** — all four roadmap sub-items shipped: chunked prefill (earlier), priority +
+> preemption (#feb4c8c/sub-piece2), prefill/decode disaggregation seam (#351), fairness (#352);
+> plus the batched-forward throughput line (decode #348, prefill #349, recurrent #350).
+> Tail follow-ups (not Step 59 blockers): Nemotron-H recurrent batching (needs `ISsmState`);
+> disaggregated multi-worker driver + cross-worker KV transfer; wire `EnableFairness`/weights from
+> server appsettings; per-key token telemetry.
 
 ## What Step 59 covers
 

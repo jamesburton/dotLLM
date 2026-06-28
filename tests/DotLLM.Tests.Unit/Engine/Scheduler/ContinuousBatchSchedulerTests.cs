@@ -883,6 +883,85 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Equal(RampExpectedGenerated(4), r.GeneratedTokenCount);
     }
 
+    // ── Per-API-key fairness (Step 59, SFQ admission) ───────────────────
+
+    [Fact]
+    public void InferenceRequest_ApiKey_DefaultsNull()
+    {
+        var req = new InferenceRequest { TokenIds = new[] { 1, 2, 3 } };
+        Assert.Null(req.ApiKey);
+    }
+
+    [Fact]
+    public async Task Fairness_Enabled_LightKeyInterleavesAheadOfHammerBacklog()
+    {
+        // A hammer client floods the queue (5 requests), then a light client submits 1 — all before
+        // any admission. With SFQ fairness, the light request interleaves right after the hammer's
+        // FIRST request (its key is idle → low start tag), instead of waiting behind all 5.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1, EnableFairness = true });
+
+        var hammer = new ISchedulerRequest[5];
+        for (int i = 0; i < hammer.Length; i++)
+            hammer[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "hammer"));
+        var light = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "light"));
+
+        DriveUntilCompleted(fix.Scheduler, light);
+
+        int hammerDoneBeforeLight = 0;
+        foreach (var h in hammer) if (h.Completion.IsCompleted) hammerDoneBeforeLight++;
+        // SFQ admits hammer#1 then light; the rest of the hammer backlog follows.
+        Assert.True(hammerDoneBeforeLight <= 1,
+            $"fairness failed: light was starved behind {hammerDoneBeforeLight} hammer requests");
+
+        DriveUntilIdle(fix.Scheduler);
+        await light.Completion;
+        foreach (var h in hammer) await h.Completion;
+    }
+
+    [Fact]
+    public void Fairness_Disabled_LightKeyWaitsBehindBacklog_Fifo()
+    {
+        // Same setup, fairness OFF: admission is pure FIFO-by-submission-order, so the light request
+        // (submitted last) waits behind ALL 5 hammer requests — the behaviour fairness fixes.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1, EnableFairness = false });
+
+        var hammer = new ISchedulerRequest[5];
+        for (int i = 0; i < hammer.Length; i++)
+            hammer[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "hammer"));
+        var light = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, apiKey: "light"));
+
+        DriveUntilCompleted(fix.Scheduler, light);
+
+        int hammerDoneBeforeLight = 0;
+        foreach (var h in hammer) if (h.Completion.IsCompleted) hammerDoneBeforeLight++;
+        Assert.Equal(5, hammerDoneBeforeLight); // FIFO: light is dead last
+    }
+
+    [Fact]
+    public void Fairness_PriorityStillDominatesAcrossTiers()
+    {
+        // Fairness only reorders WITHIN a priority tier. A High-priority light request still beats a
+        // backlog of Low-priority hammer requests regardless of submission order / fairness tags.
+        using var fix = new TestFixture(
+            tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 1),
+            options: new ContinuousBatchSchedulerOptions { MaxActiveSequences = 1, EnableFairness = true });
+
+        var hammer = new ISchedulerRequest[4];
+        for (int i = 0; i < hammer.Length; i++)
+            hammer[i] = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, priority: RequestPriority.Low, apiKey: "hammer"));
+        var light = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4, priority: RequestPriority.High, apiKey: "light"));
+
+        DriveUntilCompleted(fix.Scheduler, light);
+
+        int hammerDoneBeforeLight = 0;
+        foreach (var h in hammer) if (h.Completion.IsCompleted) hammerDoneBeforeLight++;
+        Assert.Equal(0, hammerDoneBeforeLight); // High light admitted first; priority dominates fairness
+    }
+
     // ── Helpers ──
 
     /// <summary>
@@ -914,7 +993,8 @@ public sealed class ContinuousBatchSchedulerTests
     }
 
     private static InferenceRequest MakeRequest(int promptLen, int maxTokens,
-                                                 RequestPriority priority = RequestPriority.Normal)
+                                                 RequestPriority priority = RequestPriority.Normal,
+                                                 string? apiKey = null)
     {
         // Build prompt: avoid 0 (EOS) to keep things clean. Tokens 1..promptLen.
         var tokens = new int[promptLen];
@@ -925,6 +1005,7 @@ public sealed class ContinuousBatchSchedulerTests
             TokenIds = tokens,
             Options = new InferenceOptions { Temperature = 0f, MaxTokens = maxTokens },
             Priority = priority,
+            ApiKey = apiKey,
         };
     }
 

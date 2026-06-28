@@ -92,6 +92,13 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>Monotonic submission counter used for FIFO tie-breaking among same-priority requests.</summary>
     public long SubmissionOrder { get; }
 
+    /// <summary>
+    /// Start-time-fair-queuing start tag assigned at submission (0 when fairness is disabled). Used as
+    /// the intra-priority-tier ordering key and preserved across preemption re-queues so a resumed
+    /// request keeps its fair position. See <c>ContinuousBatchSchedulerOptions.EnableFairness</c>.
+    /// </summary>
+    public long FairnessTag { get; set; }
+
     public SchedulerRequest(
         InferenceRequest request,
         InferenceOptionsLike options,
