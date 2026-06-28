@@ -302,11 +302,18 @@ The server has two execution paths and picks per-request:
 
 `ContinuousBatchSchedulerOptions`:
 
+Set the whole section via `ServerOptions.Scheduler` (bind it from `appsettings.json`, or pass `--scheduler-fairness` on the CLI to turn on fairness with defaults). `ServerStartup` forwards it to the `ContinuousBatchSchedulerService`; when omitted, scheduler defaults apply.
+
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `MaxActiveSequences` | 64 | Slot cap. KV-cache pressure is the hard limit; this is a soft upper bound for batch-formation cost. |
 | `MaxPrefillTokensPerStep` | 0 (disabled) | Chunked-prefill cap. When non-zero, no single Step iteration prefills more than this many tokens, even if a long prompt has more to feed. Decode tokens of already-decoding sequences keep running every step regardless — prevents head-of-line blocking. |
 | `ReserveBlocksPerSequence` | 0 (disabled) | Admission KV-pressure gate: skip admission when `pagedPool.FreeBlocks < ReserveBlocksPerSequence`. |
+| `EnablePreemption` | false | Allow a higher-priority request to preempt a lower-priority active sequence under block pressure (recompute-on-resume). |
+| `MaxRecurrentSequences` | 0 (disabled) | Caps concurrent recurrent (Mamba/GDN) sequences to bound per-sequence recurrent-state memory. |
+| `EnableFairness` | false | Per-API-key start-time fair queuing in admission so a high-volume key can't starve others sharing a priority tier. The fairness identity is `InferenceRequest.ApiKey` (the resolved API key, stashed by `RateLimitMiddleware`). |
+
+Per-key token observability: `ContinuousBatchScheduler.GetPerKeyTokenUsage()` snapshots cumulative generated tokens per API key, and the `dotllm.engine.tokens.by_key` meter counter (tagged by `key`) records the same — zero-overhead when no listener is subscribed.
 
 ### Engine telemetry providers
 

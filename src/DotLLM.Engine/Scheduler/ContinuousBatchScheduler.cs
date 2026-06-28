@@ -13,6 +13,7 @@ using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Samplers;
 using DotLLM.Engine.Samplers.StopConditions;
+using DotLLM.Telemetry;
 using DotLLM.Tokenizers;
 
 namespace DotLLM.Engine.Scheduler;
@@ -82,6 +83,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private readonly Dictionary<string, long> _keyFinishTag = new();
     private long _virtualTime;
     private const string AnonymousFairnessKey = "\0anonymous";
+
+    // Per-API-key cumulative generated-token accounting (observability). Updated once per completed
+    // request that carries an ApiKey, under _keyTokensLock; snapshot via GetPerKeyTokenUsage(). Also
+    // emitted to the EngineTelemetry.TokensByKey counter (zero-overhead when no listener).
+    private readonly Dictionary<string, long> _keyTokensServed = new();
+    private readonly Lock _keyTokensLock = new();
 
     // Reusable scratch for batched decode (Step 59). Cleared/refilled each Step; persisted as
     // fields to avoid per-iteration allocation on the decode hot path. _decodeReady holds the
@@ -1266,9 +1273,47 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             Timings = timings,
         };
 
+        RecordPerKeyTokens(seq.Request.ApiKey, seq.GeneratedTokens.Count);
+
         ReleaseKvCache(seq);
         seq.CancellationRegistration.Dispose();
         seq.CompletionSource.TrySetResult(response);
+    }
+
+    /// <summary>
+    /// Attributes a completed request's generated tokens to its fairness key (per-key token
+    /// observability). No-op when the request carries no <see cref="InferenceRequest.ApiKey"/> or
+    /// generated nothing. Updates the in-process snapshot map and emits the
+    /// <see cref="EngineTelemetry.TokensByKey"/> counter (zero-overhead when no listener).
+    /// </summary>
+    private void RecordPerKeyTokens(string? apiKey, int generatedCount)
+    {
+        if (apiKey is null || generatedCount <= 0) return;
+
+        lock (_keyTokensLock)
+        {
+            _keyTokensServed[apiKey] = _keyTokensServed.GetValueOrDefault(apiKey) + generatedCount;
+            // Bound the map for long-running multi-tenant servers; the telemetry counter is the
+            // durable record, this map is only a cheap live snapshot.
+            if (_keyTokensServed.Count > 4096)
+                _keyTokensServed.Clear();
+        }
+
+        if (EngineTelemetry.TokensByKey.Enabled)
+            EngineTelemetry.TokensByKey.Add(generatedCount, new KeyValuePair<string, object?>("key", apiKey));
+    }
+
+    /// <summary>
+    /// Returns a snapshot of cumulative generated tokens per API key since startup (requests carrying
+    /// an <see cref="InferenceRequest.ApiKey"/> only). Intended for admin/observability surfaces; the
+    /// authoritative time-series is the <c>dotllm.engine.tokens.by_key</c> meter counter.
+    /// </summary>
+    public IReadOnlyDictionary<string, long> GetPerKeyTokenUsage()
+    {
+        lock (_keyTokensLock)
+        {
+            return new Dictionary<string, long>(_keyTokensServed);
+        }
     }
 
     private static InferenceTimings BuildTimings(
