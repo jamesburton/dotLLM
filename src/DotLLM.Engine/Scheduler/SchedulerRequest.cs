@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Constraints;
+using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Engine.Samplers;
 
@@ -35,6 +36,15 @@ internal sealed class SchedulerRequest : ISchedulerRequest
 
     /// <summary>KV-cache assigned at admission time. Released when the sequence is evicted.</summary>
     public IKvCache? KvCache { get; set; }
+
+    /// <summary>
+    /// Per-sequence recurrent state (Mamba SSM / GDN) for recurrent hosts that support caller-threaded
+    /// state (<see cref="IModel.SupportsThreadedSequenceState"/>). Allocated at admission, threaded
+    /// through this sequence's prefill/decode/resume forwards, and disposed when the KV-cache is
+    /// released. <see langword="null"/> for dense models and recurrent hosts without a threadable
+    /// state container (those keep the per-sequence model-owned-state loop).
+    /// </summary>
+    public IRecurrentSequenceState? RecurrentState { get; set; }
 
     /// <summary>True when the cache was minted by the prefix trie manager; its completion
     /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>

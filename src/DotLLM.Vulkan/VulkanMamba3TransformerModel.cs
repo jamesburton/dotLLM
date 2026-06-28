@@ -848,6 +848,12 @@ public sealed class VulkanMamba3TransformerModel : IModel
     /// <inheritdoc/>
     public bool RequiresPerSequenceState => true;
 
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => CreateMambaState();
+
     /// <summary>
     /// Mamba-3 <c>ForwardBatch</c> override. Threads each request's per-seq
     /// <see cref="VulkanMamba3State"/> through the SSD scan so multi-sequence

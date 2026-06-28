@@ -29,8 +29,19 @@ sequence_item: phase-9-step-59
 >   The deferred forward required a `reservedBlocksThisStep` term in the per-iteration block gate so
 >   tight-pressure admission (≤1/step) and all preemption tests stay intact. Resuming (preempted)
 >   sequences keep their inline per-seq recompute. 4 new tests; `docs/SCHEDULING.md` refreshed.
-> - ⏳ Remaining: recurrent batched decode/prefill (thread per-seq state); separate
->   prefill/decode queues/pools; and fairness constraints (sub-piece 4).
+> - ✅ Sub-piece 3c — **recurrent batched decode/prefill** (#350, Mamba3 + Qwen3-MoE-Hybrid, CPU+Vulkan).
+>   New Core `IRecurrentSequenceState` marker (`IMambaState`/`IGdnState` derive from it); `IModel`
+>   gains `SupportsThreadedSequenceState` + `CreateSequenceState()`. The scheduler allocates one
+>   per-seq state at admission (`SchedulerRequest.RecurrentState`), threads it through prefill/decode/
+>   resume, disposes on release, and dispatches threaded-state models via `ForwardBatch` for ALL counts
+>   (incl. 1 — the only entrypoint carrying the state) via a unified `ShouldBatch(count)` helper. Also a
+>   **correctness fix**: the prior per-seq `Forward` loop shared the model-owned default state across
+>   concurrent recurrent sequences. `MaxRecurrentSequences` option caps concurrency (state memory).
+>   Nemotron-H deferred (its `SsmStateCache` has no interface/factory — own follow-up). 4 new tests
+>   (mock recurrent model throws on null/shared state ⇒ correct output proves threading); 29 scheduler
+>   tests + 203 model/forwardbatch tests green. `docs/SCHEDULING.md` refreshed.
+> - ⏳ Remaining: Nemotron-H recurrent batching (needs `ISsmState`); separate prefill/decode
+>   queues/pools; and fairness constraints (sub-piece 4).
 
 ## What Step 59 covers
 

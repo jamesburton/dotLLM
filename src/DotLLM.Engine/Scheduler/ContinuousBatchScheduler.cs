@@ -58,6 +58,11 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     private readonly ContinuousBatchSchedulerOptions _options;
     private readonly KvBlockPool? _pagedPool;
     private readonly PrefixTrieManager? _prefixCache;
+    // True when the model carries per-sequence recurrent state the scheduler allocates and threads
+    // (Mamba-3 / Qwen3-MoE-Hybrid GDN). Such models dispatch ALL forwards (even single-sequence) via
+    // ForwardBatch — the only IModel entrypoint that carries the per-seq state — which both enables
+    // batched recurrent decode/prefill and fixes cross-sequence corruption from a shared default state.
+    private readonly bool _supportsThreadedState;
     private long _cachedPromptTokens;
     private long _prefilledPromptTokens;
 
@@ -146,7 +151,25 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         _options = options ?? new ContinuousBatchSchedulerOptions();
         _pagedPool = pagedPool;
         _prefixCache = prefixCache;
+        _supportsThreadedState = model.SupportsThreadedSequenceState;
     }
+
+    /// <summary>
+    /// Whether a forward over <paramref name="count"/> sequences should be dispatched as a single
+    /// <see cref="IModel.ForwardBatch"/> rather than per-sequence <c>IModel.Forward</c>:
+    /// recurrent threaded-state models always batch (count ≥ 1 — only <c>ForwardBatch</c> carries the
+    /// per-seq state); dense models fuse only at ≥2; recurrent hosts without threadable state never batch.
+    /// </summary>
+    private bool ShouldBatch(int count) =>
+        _supportsThreadedState ? count >= 1 : (!_model.RequiresPerSequenceState && count >= 2);
+
+    /// <summary>Maximum sequences that may be active at once — <see cref="ContinuousBatchSchedulerOptions.MaxActiveSequences"/>,
+    /// further clamped by <see cref="ContinuousBatchSchedulerOptions.MaxRecurrentSequences"/> for a
+    /// threaded-state recurrent model (bounds aggregate per-seq recurrent-state memory).</summary>
+    private int EffectiveMaxActive =>
+        _supportsThreadedState && _options.MaxRecurrentSequences > 0
+            ? Math.Min(_options.MaxActiveSequences, _options.MaxRecurrentSequences)
+            : _options.MaxActiveSequences;
 
     /// <summary>Cumulative prompt tokens served from the prefix cache (no prefill needed).</summary>
     public long CachedPromptTokens => Interlocked.Read(ref _cachedPromptTokens);
@@ -270,7 +293,8 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         // so the per-iteration block gate must subtract this running reservation from FreeBlocks to
         // keep its tight-pressure behaviour (≤1 admit/step when pool-constrained) intact.
         int reservedBlocksThisStep = 0;
-        while (_active.Count + _prefillReady.Count < _options.MaxActiveSequences)
+        int maxActive = EffectiveMaxActive;
+        while (_active.Count + _prefillReady.Count < maxActive)
         {
             SchedulerRequest? head;
             lock (_queueLock)
@@ -399,14 +423,15 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         if (readyCount > 0)
             didWork = true;
 
-        if (!_model.RequiresPerSequenceState && readyCount >= 2)
+        if (ShouldBatch(readyCount))
         {
             DecodeBatched(readyCount);
         }
         else
         {
-            // Single decoder, or a model that needs per-seq recurrent state (which ForwardBatch
-            // cannot batch without that state). Decode each sequence independently.
+            // Single dense decoder, or a recurrent host without threadable state (Nemotron-H) whose
+            // ForwardBatch can't batch without per-seq state. Decode each sequence independently via
+            // the per-seq Forward (model-owned default state).
             for (int j = 0; j < readyCount; j++)
                 DecodeSingleAndFinish(_decodeReady[j]);
         }
@@ -434,6 +459,8 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 TokenIds = _decodeTokens.AsMemory(j, 1),
                 Positions = _decodePositions.AsMemory(j, 1),
                 KvCache = seq.KvCache!,
+                MambaState = seq.RecurrentState as IMambaState,
+                GdnState = seq.RecurrentState as IGdnState,
             });
         }
 
@@ -596,6 +623,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         seq.PrefixCachedTokens = cachedTokens;
         Interlocked.Add(ref _cachedPromptTokens, cachedTokens);
         Interlocked.Add(ref _prefilledPromptTokens, promptLen - cachedTokens);
+
+        // Recurrent hosts: allocate this sequence's own SSM/GDN state so its prefill (and later decode)
+        // runs against an isolated container — both the batched-throughput enabler and the fix for
+        // concurrent sequences otherwise sharing the model-owned default state.
+        if (_supportsThreadedState)
+            seq.RecurrentState = _model.CreateSequenceState();
+
         seq.State = SequenceState.Prefilling;
 
         int prefillStart = cachedTokens;
@@ -635,11 +669,13 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 TokenIds = p.Seq.PromptTokenIds.AsMemory(p.ForwardStart, p.ForwardLen),
                 Positions = _prefillPositions.AsMemory(off, p.ForwardLen),
                 KvCache = p.Seq.KvCache!,
+                MambaState = p.Seq.RecurrentState as IMambaState,
+                GdnState = p.Seq.RecurrentState as IGdnState,
             });
             off += p.ForwardLen;
         }
 
-        if (!_model.RequiresPerSequenceState && count >= 2)
+        if (ShouldBatch(count))
         {
             IReadOnlyList<ITensor> results;
             long fwdStart = Stopwatch.GetTimestamp();
@@ -834,6 +870,12 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
         seq.KvCache = _kvCacheFactory(_model.Config, cacheSize);
         seq.IsPrefixCached = false;
         seq.PrefixCachedTokens = 0;
+
+        // Recurrent host: the recompute must also rebuild the SSM/GDN state from scratch — allocate a
+        // fresh container (the preempt freed the old one) so the re-forward repopulates it.
+        if (_supportsThreadedState)
+            seq.RecurrentState = _model.CreateSequenceState();
+
         seq.State = SequenceState.Prefilling;
 
         int[] ctx = ArrayPool<int>.Shared.Rent(rebuildLen);
@@ -850,8 +892,26 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
             long ts0 = Stopwatch.GetTimestamp();
             // Logits are discarded — the next token comes from the decode loop re-forwarding the
-            // retained last generated token. We forward only to repopulate the KV-cache.
-            using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1, seq.KvCache);
+            // retained last generated token. We forward only to repopulate the KV-cache (and, for a
+            // recurrent host, the per-seq state). Threaded-state models must route through ForwardBatch
+            // (the only entrypoint that carries the state); others use the plain Forward.
+            if (_supportsThreadedState)
+            {
+                var req = new SequenceForwardRequest
+                {
+                    TokenIds = ctx.AsMemory(0, rebuildLen),
+                    Positions = positionsArray.AsMemory(0, rebuildLen),
+                    KvCache = seq.KvCache!,
+                    MambaState = seq.RecurrentState as IMambaState,
+                    GdnState = seq.RecurrentState as IGdnState,
+                };
+                var res = _model.ForwardBatch(new[] { req }, deviceId: -1);
+                res[0].Dispose();
+            }
+            else
+            {
+                using ITensor _ = _model.Forward(ctx.AsSpan(0, rebuildLen), positions, deviceId: -1, seq.KvCache);
+            }
             seq.PrefillTicks += Stopwatch.GetTimestamp() - ts0;
         }
         finally
@@ -946,10 +1006,26 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     /// </summary>
     private static void FreeKvCacheOnly(SchedulerRequest seq)
     {
+        // Recurrent state is freed alongside the KV — a resumed sequence recomputes both from scratch.
+        DisposeRecurrentState(seq);
         var cache = seq.KvCache;
         if (cache is null) return;
         seq.KvCache = null;
         try { cache.Dispose(); }
+        catch
+        {
+            // Disposal failures must not derail the scheduler loop.
+        }
+    }
+
+    /// <summary>Disposes and clears a sequence's per-seq recurrent state, if any. Safe to call
+    /// repeatedly and on dense sequences (no-op when the state is already null).</summary>
+    private static void DisposeRecurrentState(SchedulerRequest seq)
+    {
+        var state = seq.RecurrentState;
+        if (state is null) return;
+        seq.RecurrentState = null;
+        try { state.Dispose(); }
         catch
         {
             // Disposal failures must not derail the scheduler loop.
@@ -1120,6 +1196,10 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
 
     private void ReleaseKvCache(SchedulerRequest seq)
     {
+        // Free the per-seq recurrent state alongside the KV (before the cache-null early-out, so a
+        // sequence that somehow holds state without a cache still releases it).
+        DisposeRecurrentState(seq);
+
         var cache = seq.KvCache;
         if (cache is null) return;
         seq.KvCache = null;

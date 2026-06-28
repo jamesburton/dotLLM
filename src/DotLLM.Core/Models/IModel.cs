@@ -178,6 +178,37 @@ public interface IModel : IDisposable
     bool RequiresPerSequenceState => false;
 
     /// <summary>
+    /// True when this model can have its per-sequence recurrent state <em>threaded by the caller</em>:
+    /// the caller allocates one container per sequence via <see cref="CreateSequenceState"/> and supplies
+    /// it on every <see cref="ForwardBatch"/> request (via <see cref="SequenceForwardRequest.MambaState"/> /
+    /// <see cref="SequenceForwardRequest.GdnState"/>). Default <c>false</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>For a recurrent model (<see cref="RequiresPerSequenceState"/> = <c>true</c>) this is what lets
+    /// the continuous-batch scheduler fuse its decode/prefill via <see cref="ForwardBatch"/> instead of the
+    /// per-sequence loop: when <c>true</c>, the scheduler allocates and threads a state per sequence and
+    /// dispatches everything through <see cref="ForwardBatch"/> (the only entrypoint that carries the state),
+    /// which also fixes the latent cross-sequence corruption of running &gt;1 concurrent recurrent sequence
+    /// against a shared model-owned default state. When <c>false</c> on a recurrent model (e.g. Nemotron-H,
+    /// whose SSM state has no <see cref="IRecurrentSequenceState"/> container yet), the scheduler keeps the
+    /// per-sequence forward loop. A non-recurrent (dense) model leaves this <c>false</c> and ignores it.</para>
+    /// </remarks>
+    bool SupportsThreadedSequenceState => false;
+
+    /// <summary>
+    /// Allocates a fresh, zero-initialised per-sequence recurrent-state container for this model, or
+    /// <see langword="null"/> when the model carries no caller-threadable recurrent state.
+    /// </summary>
+    /// <remarks>
+    /// Returns non-null exactly when <see cref="SupportsThreadedSequenceState"/> is <c>true</c> — a
+    /// recurrent host returns its concrete <see cref="IMambaState"/> / <see cref="IGdnState"/> sized for
+    /// the model's recurrent layers. The caller owns the returned container's lifetime (dispose when the
+    /// sequence finishes) and supplies it on that sequence's <see cref="ForwardBatch"/> requests. The
+    /// default implementation returns <see langword="null"/>.
+    /// </remarks>
+    IRecurrentSequenceState? CreateSequenceState() => null;
+
+    /// <summary>
     /// Runs a fused forward pass across multiple in-flight sequences.
     /// </summary>
     /// <remarks>
