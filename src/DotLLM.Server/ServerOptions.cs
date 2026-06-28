@@ -1,4 +1,5 @@
 using DotLLM.Engine;
+using DotLLM.Engine.Scheduler;
 using DotLLM.Server.RateLimiting;
 
 namespace DotLLM.Server;
@@ -75,6 +76,15 @@ public sealed record ServerOptions
     public RateLimitConfig? RateLimit { get; init; }
 
     /// <summary>
+    /// Continuous-batch scheduler options. When <c>null</c>, the scheduler uses its defaults
+    /// (fairness off, preemption off, etc.). A host binding <see cref="ServerOptions"/> from
+    /// <c>appsettings.json</c> can set this section to enable per-API-key fairness
+    /// (<see cref="ContinuousBatchSchedulerOptions.EnableFairness"/>), bound recurrent concurrency,
+    /// preemption, the prefill-token cap, and the active-sequence/reserve limits.
+    /// </summary>
+    public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
+
+    /// <summary>
     /// Parses command-line arguments into <see cref="ServerOptions"/>.
     /// </summary>
     public static ServerOptions Parse(string[] args)
@@ -94,6 +104,7 @@ public sealed record ServerOptions
         bool usePaged = true;
         bool warmupEnabled = true;
         int warmupIterations = 3;
+        bool schedulerFairness = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -134,6 +145,8 @@ public sealed record ServerOptions
                     warmupEnabled = false; break;
                 case "--warmup-iterations":
                     warmupIterations = int.Parse(next!); i++; break;
+                case "--scheduler-fairness":
+                    schedulerFairness = true; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -172,6 +185,9 @@ public sealed record ServerOptions
                 Enabled = warmupEnabled,
                 Iterations = warmupIterations,
             },
+            Scheduler = schedulerFairness
+                ? new ContinuousBatchSchedulerOptions { EnableFairness = true }
+                : null,
             ModelId = modelId,
         };
     }

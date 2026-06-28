@@ -962,6 +962,27 @@ public sealed class ContinuousBatchSchedulerTests
         Assert.Equal(0, hammerDoneBeforeLight); // High light admitted first; priority dominates fairness
     }
 
+    [Fact]
+    public async Task PerKeyTokenUsage_AccruesGeneratedTokensPerApiKey()
+    {
+        // Each request generates exactly 3 tokens (emit 9,9,9 then EOS). Per-key accounting sums
+        // generated tokens by ApiKey; null-key requests are not attributed.
+        using var fix = new TestFixture(tokenScript: TokenScript.Constant(EosTokenId, afterNTokens: 3));
+
+        var a1 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 16, apiKey: "alice"));
+        var a2 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 16, apiKey: "alice"));
+        var b1 = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 16, apiKey: "bob"));
+        var anon = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 16)); // null key
+
+        DriveUntilIdle(fix.Scheduler);
+        await Task.WhenAll(a1.Completion, a2.Completion, b1.Completion, anon.Completion);
+
+        var usage = fix.Scheduler.GetPerKeyTokenUsage();
+        Assert.Equal(6, usage["alice"]); // 2 requests × 3 tokens
+        Assert.Equal(3, usage["bob"]);
+        Assert.Equal(2, usage.Count); // null-key request is not attributed
+    }
+
     // ── Helpers ──
 
     /// <summary>

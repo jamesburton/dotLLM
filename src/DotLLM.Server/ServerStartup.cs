@@ -238,9 +238,11 @@ public static class ServerStartup
                 model,
                 tokenizer,
                 kvFactory,
-                options: null,
+                options: options.Scheduler,
                 pagedPool: pagedFactory.Pool);
-            Console.WriteLine("[dotllm] Continuous-batch scheduler active");
+            Console.WriteLine(options.Scheduler?.EnableFairness == true
+                ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
+                : "[dotllm] Continuous-batch scheduler active");
         }
 
         return new ServerState
