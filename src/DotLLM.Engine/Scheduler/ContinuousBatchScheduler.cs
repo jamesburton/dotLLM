@@ -260,13 +260,58 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// One full iteration = the prefill phase then the decode phase, run in sequence (so a sequence
+    /// admitted this iteration also decodes once this iteration, as before). The two phases are also
+    /// exposed individually as <see cref="StepPrefill"/> / <see cref="StepDecode"/> — the
+    /// prefill/decode-disaggregation seam: a disaggregated/multi-worker driver can run them on
+    /// separate thread pools (or model replicas, with KV transfer between), while this in-process
+    /// single-GPU driver runs both here because the model forward is single-threaded.
+    /// </remarks>
     public bool Step()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(ContinuousBatchScheduler));
 
-        bool didWork = false;
+        bool didWork = SweepCancelled();
+        didWork |= AdmitAndPrefillPhase();
+        didWork |= DecodePhase();
+        return didWork;
+    }
 
-        // 1. Sweep cancelled sequences (caller-side cancellation may have flipped state).
+    /// <summary>
+    /// The <b>prefill</b> half of <see cref="Step"/>: sweeps cancellations, then admits queued requests
+    /// from the prefill queue (subject to capacity / block pressure) and runs their deferred prompt
+    /// prefill. Exposed for prefill/decode disaggregation — a prefill worker drives this; the in-process
+    /// driver calls <see cref="Step"/> which runs prefill then decode.
+    /// </summary>
+    /// <returns><see langword="true"/> if any admission/prefill/sweep work was performed.</returns>
+    public bool StepPrefill()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(ContinuousBatchScheduler));
+        bool didWork = SweepCancelled();
+        didWork |= AdmitAndPrefillPhase();
+        return didWork;
+    }
+
+    /// <summary>
+    /// The <b>decode</b> half of <see cref="Step"/>: sweeps cancellations, then advances one decode
+    /// token for every actively-decoding sequence (the decode set is the implicit decode queue).
+    /// Exposed for prefill/decode disaggregation — a decode worker drives this.
+    /// </summary>
+    /// <returns><see langword="true"/> if any decode/sweep work was performed.</returns>
+    public bool StepDecode()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(ContinuousBatchScheduler));
+        bool didWork = SweepCancelled();
+        didWork |= DecodePhase();
+        return didWork;
+    }
+
+    /// <summary>Sweeps caller-cancelled active sequences (cancellation may have flipped state),
+    /// releasing their KV-cache. Idempotent — safe to run at the start of either phase.</summary>
+    private bool SweepCancelled()
+    {
+        bool didWork = false;
         for (int i = _active.Count - 1; i >= 0; i--)
         {
             var s = _active[i];
@@ -277,14 +322,20 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
                 didWork = true;
             }
         }
+        return didWork;
+    }
 
-        // 2. Admit new sequences from the queue, subject to capacity. Newly-admitted sequences are
-        //    PREPARED here (KV-cache alloc + prefix seeding + forward-token range) but their prompt
-        //    prefill forward is DEFERRED to step 2b, where all sequences admitted this iteration are
-        //    fused into one IModel.ForwardBatch (the batched-prefill throughput win) when the model
-        //    is stateless. Resuming (preempted) sequences keep their inline recompute forward.
-        //    Queue draining is priority-ordered: highest RequestPriority drains first, FIFO within
-        //    tier (see _pendingQueue key shape).
+    /// <summary>
+    /// Admits queued requests (priority-ordered, capacity/block-pressure gated) and runs their deferred
+    /// prompt prefill. Newly-admitted sequences are PREPARED (KV-cache alloc + prefix seeding + forward
+    /// range + per-seq recurrent state) but their prefill forward is DEFERRED to <see cref="PrefillReadySequences"/>,
+    /// where all sequences admitted this call fuse into one <see cref="IModel.ForwardBatch"/> when batchable.
+    /// Resuming (preempted) sequences recompute inline. Queue draining is priority-ordered: highest
+    /// <see cref="RequestPriority"/> first, FIFO within tier (see <c>_pendingQueue</c> key shape).
+    /// </summary>
+    private bool AdmitAndPrefillPhase()
+    {
+        bool didWork = false;
         _prefillReady.Clear();
         int admittedThisStep = 0;
         int prefillTokensThisStep = 0;
@@ -387,20 +438,27 @@ public sealed class ContinuousBatchScheduler : IBatchScheduler, IDisposable
             }
         }
 
-        // 2b. Run the deferred prefill forwards prepared above — fused via ForwardBatch when the
-        //     model is stateless and ≥2 are pending, else per-sequence. Samples each first token,
-        //     checks stop conditions, and routes each sequence to active / completion.
+        // Run the deferred prefill forwards prepared above — fused via ForwardBatch when batchable,
+        // else per-sequence. Samples each first token, checks stop conditions, and routes each
+        // sequence to active / completion.
         if (_prefillReady.Count > 0)
         {
             PrefillReadySequences();
             didWork = true;
         }
 
-        // 3. Decode one token for each actively-decoding sequence. When the model is stateless
-        //    (KV-only — no per-seq SSM/GDN state the scheduler can't supply) and 2+ sequences are
-        //    decoding, fuse them into a single IModel.ForwardBatch (the continuous-batching
-        //    throughput win); otherwise decode per-sequence. Capacity-gated sequences finish here
-        //    without a forward.
+        return didWork;
+    }
+
+    /// <summary>
+    /// Advances one decode token for each actively-decoding sequence (the decode set is the implicit
+    /// decode queue). When batchable (<see cref="ShouldBatch"/>) the ready decoders fuse into a single
+    /// <see cref="IModel.ForwardBatch"/>; otherwise each decodes per-sequence. Capacity-gated sequences
+    /// finish here without a forward.
+    /// </summary>
+    private bool DecodePhase()
+    {
+        bool didWork = false;
         _decodeReady.Clear();
         for (int i = _active.Count - 1; i >= 0; i--)
         {

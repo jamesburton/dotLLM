@@ -798,6 +798,91 @@ public sealed class ContinuousBatchSchedulerTests
         }
     }
 
+    // ── Prefill/decode disaggregation seam (Step 59) ─────────────────────
+
+    [Fact]
+    public void Disaggregated_AdmittedInStepPrefill_DecodesOnlyInStepDecode()
+    {
+        // StepPrefill admits + prefills (samples the first token → Decoding) but must NOT decode;
+        // only StepDecode advances decode tokens. Driving StepPrefill alone can never complete a
+        // sequence that finishes by max-tokens.
+        using var fix = new TestFixture(tokenScript: TokenScript.Constant(tokenId: 7)); // never EOS
+        var h = fix.Scheduler.Submit(MakeRequest(promptLen: 3, maxTokens: 4));
+
+        Assert.True(fix.Scheduler.StepPrefill());      // admit + prefill
+        Assert.Equal(SequenceState.Decoding, h.State);
+        Assert.Equal(1, fix.Scheduler.ActiveCount);
+
+        // More prefill-only steps do no further work for this sequence and never complete it.
+        for (int i = 0; i < 5; i++) fix.Scheduler.StepPrefill();
+        Assert.False(h.Completion.IsCompleted);
+
+        // Decode phase drives it to the max-tokens cap.
+        for (int i = 0; i < 10 && !h.Completion.IsCompleted; i++) fix.Scheduler.StepDecode();
+        Assert.True(h.Completion.IsCompletedSuccessfully);
+        Assert.True(fix.Scheduler.IsIdle);
+    }
+
+    [Fact]
+    public async Task Disaggregated_SeparatePhases_MatchCombinedStepOutput()
+    {
+        int[] promptLens = [3, 5, 7];
+
+        // Baseline: combined Step().
+        int[][] combined = new int[promptLens.Length][];
+        using (var baseFix = new TestFixture(inputEmitter: Ramp))
+        {
+            var hs = new ISchedulerRequest[promptLens.Length];
+            for (int i = 0; i < promptLens.Length; i++)
+                hs[i] = baseFix.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+            DriveUntilIdle(baseFix.Scheduler);
+            for (int i = 0; i < promptLens.Length; i++)
+                combined[i] = (await hs[i].Completion).GeneratedTokenIds;
+        }
+
+        // Disaggregated driver: run StepPrefill and StepDecode as separate phases, with several
+        // decode phases between prefills (mimicking a decode worker outpacing a prefill worker).
+        using var fix = new TestFixture(inputEmitter: Ramp);
+        var handles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            handles[i] = fix.Scheduler.Submit(MakeRequest(promptLens[i], maxTokens: 32));
+
+        for (int iter = 0; iter < 1000 && !fix.Scheduler.IsIdle; iter++)
+        {
+            fix.Scheduler.StepPrefill();
+            // Decode runs more often than prefill admission.
+            fix.Scheduler.StepDecode();
+            fix.Scheduler.StepDecode();
+        }
+        Assert.True(fix.Scheduler.IsIdle);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            var r = await handles[i].Completion;
+            Assert.Equal(FinishReason.Stop, r.FinishReason);
+            Assert.Equal(combined[i], r.GeneratedTokenIds); // phase-split is byte-identical to combined Step
+        }
+    }
+
+    [Fact]
+    public async Task Disaggregated_DecodePhaseAloneIsNoOp_WhenNothingAdmitted()
+    {
+        // A decode worker that runs ahead of any admission must be a safe no-op (no prefill happened).
+        using var fix = new TestFixture(inputEmitter: Ramp);
+        Assert.False(fix.Scheduler.StepDecode());      // nothing active yet
+        Assert.False(fix.Scheduler.StepDecode());
+
+        var h = fix.Scheduler.Submit(MakeRequest(promptLen: 4, maxTokens: 32));
+        Assert.False(fix.Scheduler.StepDecode());      // submitted but not yet admitted → still no-op
+        Assert.Equal(SequenceState.Queued, h.State);
+
+        // Now drive both phases to completion.
+        for (int i = 0; i < 1000 && !fix.Scheduler.IsIdle; i++) { fix.Scheduler.StepPrefill(); fix.Scheduler.StepDecode(); }
+        var r = await h.Completion;
+        Assert.Equal(FinishReason.Stop, r.FinishReason);
+        Assert.Equal(RampExpectedGenerated(4), r.GeneratedTokenCount);
+    }
+
     // ── Helpers ──
 
     /// <summary>
