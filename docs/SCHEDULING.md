@@ -35,12 +35,13 @@ Each `ContinuousBatchScheduler.Step()` call:
      `IModel.ForwardBatch(requests, deviceId)` at **≥2** decoders (each `SequenceForwardRequest` carries
      its own KV-cache); a single decoder uses `Forward`, keeping single-tenant latency unchanged.
    - **Recurrent threaded-state** models (`SupportsThreadedSequenceState == true` — Mamba-3,
-     Qwen3-MoE-Hybrid GDN) dispatch **everything via `ForwardBatch`, even a single sequence**, because
-     `ForwardBatch` is the only `IModel` entrypoint that carries the per-seq `IMambaState`/`IGdnState`
-     the scheduler allocates and threads. This both batches recurrent decode and fixes the latent
-     corruption of running >1 concurrent recurrent sequence against a shared model-owned default state.
-   - **Recurrent without a threadable state container** (Nemotron-H — `RequiresPerSequenceState == true`
-     but `SupportsThreadedSequenceState == false`) stays on the per-sequence `Forward` loop.
+     Qwen3-MoE-Hybrid GDN, **and CPU Nemotron-H** via `ISsmState`) dispatch **everything via
+     `ForwardBatch`, even a single sequence**, because `ForwardBatch` is the only `IModel` entrypoint
+     that carries the per-seq `IMambaState`/`IGdnState`/`ISsmState` the scheduler allocates and threads.
+     This both batches recurrent decode and fixes the latent corruption of running >1 concurrent
+     recurrent sequence against a shared model-owned default state.
+   - **Recurrent without a threadable state container** (Vulkan Nemotron-H, until its
+     `VulkanSsmStateCache` exposes `ISsmState` — follow-up) stays on the per-sequence `Forward` loop.
 5. **Process results** per sequence: apply the constraint token-mask, sample the next token, advance the
    constraint, check stop conditions (EOS, max-tokens) → `Completed` when fired; then sweep
    completed/cancelled — build the `InferenceResponse`, release the KV-cache, complete the task.
@@ -238,9 +239,10 @@ per sequence), `RecurrentBatched_SingleSequence_UsesForwardBatchWithState`,
 
 **Still pending in Step 59** (tail follow-ups; the four roadmap sub-items — chunked prefill, priority +
 preemption, prefill/decode disaggregation, fairness — are all shipped, as is the in-process
-`DisaggregatedScheduler` driver and config/telemetry wiring): Nemotron-H recurrent batching (needs an
-`ISsmState` container + factory); cross-process / cross-device KV transfer + multi-GPU replica
-placement for the disaggregated driver; and per-key fairness *weights*.
+`DisaggregatedScheduler` driver, config/telemetry wiring, and CPU Nemotron-H recurrent batching via
+`ISsmState`): Vulkan Nemotron-H recurrent batching (needs `VulkanSsmStateCache : ISsmState` + threading
+through `RecordSsmLayer`); cross-process / cross-device KV transfer + multi-GPU replica placement for
+the disaggregated driver; and per-key fairness *weights*.
 
 ## Sequence State Machine
 

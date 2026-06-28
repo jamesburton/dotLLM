@@ -45,4 +45,12 @@ public readonly record struct SequenceForwardRequest
     /// model, unsafe across multi-sequence batched dispatch.
     /// </summary>
     public IMambaState? MambaState { get; init; }
+
+    /// <summary>
+    /// Optional per-sequence Mamba-2 SSM recurrent state. Used only by Nemotron-H hosts.
+    /// <see langword="null"/> causes the host to fall back to its model-owned default
+    /// state container — safe for single-sequence dispatch from a freshly-constructed
+    /// model, unsafe across multi-sequence batched dispatch.
+    /// </summary>
+    public ISsmState? SsmState { get; init; }
 }
