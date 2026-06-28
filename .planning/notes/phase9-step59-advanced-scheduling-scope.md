@@ -59,9 +59,12 @@ sequence_item: phase-9-step-59
 > **Step 59 COMPLETE** — all four roadmap sub-items shipped: chunked prefill (earlier), priority +
 > preemption (#feb4c8c/sub-piece2), prefill/decode disaggregation seam (#351), fairness (#352);
 > plus the batched-forward throughput line (decode #348, prefill #349, recurrent #350).
-> Tail follow-ups (not Step 59 blockers): Nemotron-H recurrent batching (needs `ISsmState`);
-> disaggregated multi-worker driver + cross-worker KV transfer; wire `EnableFairness`/weights from
-> server appsettings; per-key token telemetry.
+> Tail follow-ups: ✅ config wiring + per-key telemetry (#353 — `ServerOptions.Scheduler` /
+> `--scheduler-fairness`, `GetPerKeyTokenUsage()` + `dotllm.engine.tokens.by_key`); ✅ in-process
+> disaggregated driver (#354 — `DisaggregatedScheduler`: two replicas + shared-pool KV handoff via
+> `ExtractDecodable`/`InjectDecodable`, sync `Step()` + async two-worker `RunLoopAsync`). Remaining:
+> Nemotron-H recurrent batching (needs `ISsmState`); cross-process/cross-device KV transfer +
+> multi-GPU replica placement; per-key fairness weights.
 
 ## What Step 59 covers
 
