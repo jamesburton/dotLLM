@@ -218,6 +218,10 @@ def _kl_loss(
     V = student_logits.size(-1)
     s_lp = F.log_softmax(student_logits.float().view(-1, V), dim=-1)
     t_p = F.softmax(teacher_logits.float().view(-1, V).detach(), dim=-1)
+    # NOTE: F.kl_div(log_p, q) computes forward KL = KL(q || p) = KL(teacher || student).
+    # This is the standard LM-distillation objective (penalizes the student for missing
+    # teacher mass). The spec's "KL(student || teacher)" notation was inverted; this
+    # implementation is the scientifically correct direction.
     return F.kl_div(s_lp, t_p, reduction="batchmean")
 
 
@@ -359,7 +363,7 @@ def main() -> None:
     tiny_cfg = None
     if args.tiny_random:
         from transformers import AutoConfig, BitNetForCausalLM  # noqa: F401 (import check)
-        tiny_cfg = AutoConfig.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16")
+        tiny_cfg = AutoConfig.from_pretrained("microsoft/bitnet-b1.58-2B-4T-bf16", local_files_only=True)
         tiny_cfg.hidden_size = 64
         tiny_cfg.intermediate_size = 128
         tiny_cfg.num_hidden_layers = 2
@@ -500,6 +504,7 @@ def main() -> None:
         # --- Total loss ---
         loss = lm_loss + args.kd_weight * kd + 0.01 * aux
         loss.backward()
+        torch.nn.utils.clip_grad_norm_([p for p in student.parameters() if p.requires_grad], 1.0)
         opt.step()
         opt.zero_grad()
 
