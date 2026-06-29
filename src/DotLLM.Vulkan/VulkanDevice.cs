@@ -263,6 +263,37 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Returns the number of Vulkan physical devices the loader can enumerate, or 0 when no loader /
+    /// driver is present. Used to gate cross-device tests (a two-GPU KV handoff needs ≥ 2 — e.g. the
+    /// Framework iGPU + RTX 3060 box). Does not throw.
+    /// </summary>
+    public static int PhysicalDeviceCount()
+    {
+        if (!IsAvailable()) return 0;
+        try { return ProbePhysicalDeviceCount(); }
+        catch { return 0; }
+    }
+
+    // Isolated so the JIT only resolves VulkanApi P/Invokes when the loader is confirmed present.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int ProbePhysicalDeviceCount()
+    {
+        VulkanLibraryResolver.Register();
+        nint inst = CreateInstance();
+        if (inst == 0) return 0;
+        try
+        {
+            uint count = 0;
+            int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
+            return r >= 0 ? (int)count : 0;
+        }
+        finally
+        {
+            VulkanApi.vkDestroyInstance(inst, 0);
+        }
+    }
+
+    /// <summary>
     /// Creates a Vulkan device bound to the first suitable GPU.
     /// Selection order: discrete GPU (preferring AMD/NVIDIA over Intel) → integrated → first available.
     /// </summary>
