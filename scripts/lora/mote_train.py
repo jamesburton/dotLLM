@@ -393,26 +393,30 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Teacher — loaded (or created) BEFORE build_mote so it is dense
     # ------------------------------------------------------------------
-    if args.tiny_random:
-        from transformers import BitNetForCausalLM
-        teacher = BitNetForCausalLM(tiny_cfg).to(device=teacher_device)
-    else:
-        # BitNet refuses device_map with a CPU or disk device; load without device_map
-        # (defaults to CPU) and move manually, or use device_map only for CUDA.
-        if teacher_device.type == "cpu":
-            teacher = AutoModelForCausalLM.from_pretrained(
-                args.base, dtype=torch.bfloat16
-            )
-            # Already on CPU by default; no explicit move needed.
+    teacher = None
+    if args.kd_weight > 0.0:
+        if args.tiny_random:
+            from transformers import BitNetForCausalLM
+            teacher = BitNetForCausalLM(tiny_cfg).to(device=teacher_device)
         else:
-            teacher = AutoModelForCausalLM.from_pretrained(
-                args.base, dtype=torch.bfloat16, device_map={"": teacher_device}
-            )
+            # BitNet refuses device_map with a CPU or disk device; load without device_map
+            # (defaults to CPU) and move manually, or use device_map only for CUDA.
+            if teacher_device.type == "cpu":
+                teacher = AutoModelForCausalLM.from_pretrained(
+                    args.base, dtype=torch.bfloat16
+                )
+                # Already on CPU by default; no explicit move needed.
+            else:
+                teacher = AutoModelForCausalLM.from_pretrained(
+                    args.base, dtype=torch.bfloat16, device_map={"": teacher_device}
+                )
 
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    print(f"[mote_train] teacher loaded and frozen on {teacher_device} (dense BitNet, no grad)")
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        print(f"[mote_train] teacher loaded and frozen on {teacher_device} (dense BitNet, no grad)")
+    else:
+        print(f"[mote_train] KD disabled (kd_weight=0) — no teacher loaded")
 
     # ------------------------------------------------------------------
     # 3. Student — separate load; build_mote converts target layers
@@ -526,7 +530,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 5. Corpus
     # ------------------------------------------------------------------
-    vocab_size = teacher.config.vocab_size
+    vocab_size = (teacher or student).config.vocab_size
     max_seqs = max(200, max_tokens // args.max_seq_len + 1)
     corpus = _build_corpus(
         tokenizer=None if args.tiny_random else AutoTokenizer.from_pretrained(args.base),
@@ -564,8 +568,10 @@ def main() -> None:
         seq = corpus[step % len(corpus)].unsqueeze(0).to(device)  # [1, T] on student device
 
         # Teacher forward (no grad) — input moved to teacher_device (may be CPU)
-        with torch.no_grad():
-            teacher_logits = teacher(input_ids=seq.to(teacher_device)).logits  # [1, T, V]
+        teacher_logits = None
+        if teacher is not None:
+            with torch.no_grad():
+                teacher_logits = teacher(input_ids=seq.to(teacher_device)).logits  # [1, T, V]
 
         # Student forward
         student_logits = student(input_ids=seq).logits  # [1, T, V]
@@ -577,7 +583,7 @@ def main() -> None:
         )
 
         # --- KD loss: KL(student || teacher) per token ---
-        if args.kd_weight > 0.0:
+        if args.kd_weight > 0.0 and teacher_logits is not None:
             kd = _kl_loss(
                 student_logits[:, :-1, :].contiguous(),
                 teacher_logits[:, :-1, :].contiguous(),
