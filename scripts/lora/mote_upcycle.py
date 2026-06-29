@@ -3,15 +3,21 @@
 Replaces dense BitNetMLP layers in a BitNetForCausalLM with MoTE blocks:
   - N routed experts (identical deep copies of the original BitNetMLP)
   - A BF16 router nn.Linear(hidden_size, n_experts), init N(0, 0.02)
-  - An optional shared expert (frozen fp copy, trainable ternary copy, or none)
+  - An optional shared expert (frozen bf16 plain copy, frozen ternary copy, or none)
 
-Each cloned expert retains its AutoBitLinear layers, so ternary weight-quant
+Each cloned routed expert retains its AutoBitLinear layers, so ternary weight-quant
 (absmean, online) and int8 activation-quant are applied automatically in the
 expert's own forward pass.  No additional quant instrumentation is required.
 
-Router combine weights are renormalized within the top-k selection so they
-sum to 1 per token.  This preserves the init-identity property: with N
-identical clones the MoTE output equals the original dense FFN output.
+Router combine weights are NOT renormalized after top-k selection.  The output is
+the raw gate-weighted sum:
+
+    out = Σ_{i∈top-k} gate_i · expert_i(x)
+
+where gate_i are the raw softmax probabilities.  This matches the Komatsuzaki et al.
+finding that normalizing the combine weights hurts upcycled LMs, and it means the
+init-identity property no longer holds trivially — the test asserts the correct
+structural ratio form instead.
 
 Usage
 -----
@@ -44,6 +50,57 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# Internal helper: plain bf16 shared expert
+# ---------------------------------------------------------------------------
+
+
+def _make_fp_shared_expert(dense_mlp: nn.Module) -> nn.Module:
+    """Return a frozen bf16 (plain) copy of the dense FFN.
+
+    Each ``AutoBitLinear`` sublayer is replaced with a plain ``nn.Linear``
+    using the same bf16 master weights.  ``online_quant`` ternary weight-quant
+    (``WeightQuant``) and int8 activation-quant (``ActQuant``) are both omitted,
+    giving a true bf16 forward.  Non-quantized submodules (e.g. ``BitNetRMSNorm``,
+    ``act_fn``) are preserved as-is.  All parameters are frozen.
+
+    This works for ``online_quant=True`` AutoBitLinear instances (the standard
+    mode for the BitNet b1.58 model) where ``self.weight`` holds the bf16 master
+    weights directly.
+
+    Args:
+        dense_mlp: The original ``BitNetMLP`` module to copy.
+
+    Returns:
+        A frozen ``nn.Module`` whose forward is a plain bf16 matmul.
+    """
+    fp_expert = copy.deepcopy(dense_mlp)
+    # Replace every AutoBitLinear with a plain nn.Linear (same bf16 weights, no quant).
+    # We match by class name to avoid importing AutoBitLinear at module level.
+    for attr_path, module in list(fp_expert.named_modules()):
+        if type(module).__name__ != "AutoBitLinear":
+            continue
+        lin = nn.Linear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            dtype=torch.bfloat16,
+        )
+        lin.weight = nn.Parameter(module.weight.data.clone(), requires_grad=False)
+        if module.bias is not None:
+            lin.bias = nn.Parameter(module.bias.data.clone(), requires_grad=False)
+        # Navigate to the parent module and replace the child attribute.
+        *parent_parts, attr_name = attr_path.split(".")
+        parent: nn.Module = fp_expert
+        for part in parent_parts:
+            parent = getattr(parent, part)
+        setattr(parent, attr_name, lin)
+    # Freeze all remaining parameters (e.g. BitNetRMSNorm scale weights).
+    for p in fp_expert.parameters():
+        p.requires_grad_(False)
+    return fp_expert
+
+
+# ---------------------------------------------------------------------------
 # MoTEBlock
 # ---------------------------------------------------------------------------
 
@@ -55,8 +112,13 @@ class MoTEBlock(nn.Module):
         experts: ModuleList of N cloned BitNetMLP modules.
         router: nn.Linear(hidden_size, n_experts) in BF16, bias=False.
         top_k: Number of experts selected per token.
-        shared: Optional shared expert applied to every token (fp-frozen or
-            ternary-trainable copy of the dense FFN), or None to omit.
+        shared: Optional shared expert applied to every token:
+            - ``"fp"``      — frozen bf16 (plain) forward; plain ``nn.Linear``
+                              sublayers, no ternary weight-quant, no act-quant.
+            - ``"ternary"`` — trainable ternary (AutoBitLinear) forward; identical
+                              deep copy of the dense FFN with bf16 shadow weights,
+                              updated during heal-training (QAT).
+            - ``None``      — no shared expert.
     """
 
     def __init__(
@@ -98,12 +160,11 @@ class MoTEBlock(nn.Module):
             self.router(x_flat.to(self.router.weight.dtype)), dim=-1
         )  # [n_tokens, n_experts]
 
-        # --- Top-k selection; renormalize selected gates to sum to 1 per token ---
-        # Renormalization is essential for the init-identity property:
-        # with top_k=1, the single selected gate becomes 1.0, so
-        # out = 1.0 * expert(x) == dense(x) when all experts are identical clones.
+        # --- Top-k selection (raw gates, NOT renormalized) ---
+        # Output = Σ_{selected} gate_i · expert_i(x) with raw softmax gates.
+        # Renormalizing the selected gates was removed (Komatsuzaki et al. show it
+        # hurts upcycled LMs).
         top_g, top_idx = torch.topk(g, self.top_k, dim=-1)  # [n_tokens, top_k]
-        top_g = top_g / top_g.sum(dim=-1, keepdim=True)     # renorm → sums to 1
 
         # --- Dispatch: accumulate gate-weighted expert outputs ---
         out = torch.zeros(n_tokens, H, dtype=x.dtype, device=x.device)
@@ -123,11 +184,12 @@ class MoTEBlock(nn.Module):
             out = out + self.shared(x_flat)
 
         # --- Switch load-balance aux loss ---
-        # frac[e] = mean fraction of tokens that selected expert e across all k-slots
-        # mean_prob[e] = mean router probability assigned to expert e
+        # frac[e] = fraction of token-expert slots assigned to expert e, normalized
+        #           by top_k so that frac.sum() ≈ 1 (Switch-consistent for top_k > 1).
+        # mean_prob[e] = mean router probability assigned to expert e.
         # aux = E * mean(frac * mean_prob)   (γ coefficient applied by the caller)
         one_hot = F.one_hot(top_idx, self.n_experts)           # [n_tokens, top_k, n_experts]
-        frac = one_hot.sum(dim=1).float().mean(dim=0)          # [n_experts]
+        frac = one_hot.sum(dim=1).float().mean(dim=0) / self.top_k  # [n_experts], sum≈1
         mean_prob = g.mean(dim=0)                              # [n_experts]
         aux: torch.Tensor = self.n_experts * (frac * mean_prob).mean()
 
@@ -164,10 +226,12 @@ def build_mote(
       initialised with weights ~ N(0, 0.02).
     * An optional shared expert:
 
-      - ``"fp"``      — frozen deep copy of the dense ``BitNetMLP`` (bf16 weights,
-                        quantized in forward, but no gradient updates).
-      - ``"ternary"`` — trainable deep copy (bf16 shadow weights updated during
-                        QAT heal-training; ternary quant applied in forward).
+      - ``"fp"``      — frozen bf16 (plain) forward: ``AutoBitLinear`` sublayers
+                        are replaced with plain ``nn.Linear`` using the bf16 master
+                        weights.  No ternary weight-quant, no act-quant.  Frozen.
+      - ``"ternary"`` — trainable ternary (AutoBitLinear) forward: identical deep copy
+                        of the dense ``BitNetMLP`` with bf16 shadow weights.  Updated
+                        during heal-training (QAT).
       - ``"none"``    — no shared expert.
 
     Args:
@@ -211,10 +275,10 @@ def build_mote(
         # Optional shared expert.
         shared_module: Optional[nn.Module] = None
         if shared == "fp":
-            shared_module = copy.deepcopy(dense_mlp)
-            for p in shared_module.parameters():
-                p.requires_grad_(False)
+            # True bf16 forward: replace AutoBitLinear with plain nn.Linear.
+            shared_module = _make_fp_shared_expert(dense_mlp)
         elif shared == "ternary":
+            # Ternary (AutoBitLinear) forward — trainable during heal-training.
             shared_module = copy.deepcopy(dense_mlp)
         # else "none": shared_module stays None
 

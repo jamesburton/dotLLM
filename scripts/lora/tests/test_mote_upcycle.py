@@ -1,9 +1,10 @@
-"""pytest — MoTE upcycle module init-identity gate.
+"""pytest — MoTE upcycle module tests.
 
 Tests:
-    test_mote_init_matches_dense  — routed MoE with identical clones outputs == dense FFN
-    test_mote_shared_fp_equals_dense — shared fp expert output == dense FFN; is frozen
-    test_mote_config_wiring       — module shapes / param counts / shared modes correct
+    test_mote_init_matches_dense          — structural ratio: y_mote == gate_sum * dense(x)
+    test_mote_shared_fp_is_true_bf16      — fp shared uses plain nn.Linear (no ternary quant)
+    test_mote_shared_ternary_init_matches_dense — ternary shared matches dense at init
+    test_mote_config_wiring               — module shapes / param counts / shared modes
 """
 import copy
 import sys
@@ -11,14 +12,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Suppress Torch Inductor compilation errors on Windows (no MSVC cl.exe);
-# dynamo falls back to eager execution automatically.
 import torch
-import torch._dynamo
-torch._dynamo.config.suppress_errors = True
+import torch.nn as nn
+import torch.nn.functional as F
 
 import pytest
-import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
 BASE_MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
@@ -45,30 +43,25 @@ def fresh_layer(base):
 
 
 # ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def load_bitnet_bf16():
-    """Helper matching the brief's test sketch — returns cached base model."""
-    # In pytest context this always hits the module-scoped fixture above, but
-    # the function form is kept so test code reads identically to the brief.
-    return AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, dtype=torch.bfloat16, device_map="cpu"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 1: init-identity — routed-MoE output == dense FFN at init
+# Test 1: structural ratio — y_mote == gate_sum * dense(x) per token
 # ---------------------------------------------------------------------------
 
 def test_mote_init_matches_dense(fresh_layer):
-    """Upcycled block with shared='none' and identical expert clones must produce
-    exactly the same output as the original dense FFN (within bfloat16 tolerance).
+    """Upcycled block with shared='none' and identical expert clones must satisfy
+    the structural ratio y_mote ≈ gate_sum * dense(x) per token.
 
-    Why this discriminates: with N identical clones and top-k routing whose
-    selected gates are renormalized to sum to 1, each token's output is a
-    convex combination of identical expert outputs — which collapses to the
-    single dense output regardless of which expert is chosen.
+    With N identical clones and NON-normalized gates:
+        out[i] = Σ_{k∈selected} gate_k * expert_k(x_i)
+                 = gate_sum_i * dense(x_i)    (all clones are identical)
+
+    where gate_sum_i = sum of the selected top-k raw softmax gates for token i.
+
+    This discriminates:
+      - Wrong clones / quant errors → expert(x) ≠ dense(x) → fails
+      - Bad routing → wrong gate_sum computed → fails
+      - Gate renormalization present → gate_sum becomes 1 for top_k=1, but the
+        expected value uses raw softmax (≠ 1), so y_mote ≠ expected → fails
+      - aux-loss wiring errors → checked via aux ≥ 0 and counts.sum == B*T
     """
     from mote_upcycle import build_mote
 
@@ -77,38 +70,130 @@ def test_mote_init_matches_dense(fresh_layer):
     dense_ffn = base.model.layers[_LAYER_IDX].mlp
 
     build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared="none")
+    mote_block = base.model.layers[_LAYER_IDX].mlp
 
-    x = torch.randn(2, 8, base.config.hidden_size, dtype=torch.bfloat16)
+    B, T = 2, 8
+    x = torch.randn(B, T, base.config.hidden_size, dtype=torch.bfloat16)
+    x_flat = x.view(B * T, base.config.hidden_size)
+
+    # --- Assert: all expert clones produce identical output on the same input ---
     with torch.no_grad():
-        y_dense = dense_ffn(x)
-        y_mote, aux, counts = base.model.layers[_LAYER_IDX].mlp(x)
+        expert_outs = [mote_block.experts[i](x_flat) for i in range(len(mote_block.experts))]
+    for i in range(1, len(expert_outs)):
+        assert torch.allclose(expert_outs[0], expert_outs[i], atol=1e-4), (
+            f"expert[0] and expert[{i}] produce different outputs — "
+            "they should be identical deep copies of the original dense FFN"
+        )
 
-    max_diff = (y_dense - y_mote).abs().max().item()
-    assert torch.allclose(y_dense, y_mote, atol=1e-4), (
-        f"MoTE output diverges from dense at init — max abs diff {max_diff:.6f}"
+    # --- Compute gate_sum (sum of selected top-k raw softmax gates per token) ---
+    with torch.no_grad():
+        g = torch.softmax(
+            mote_block.router(x_flat.to(mote_block.router.weight.dtype)), dim=-1
+        )  # [n_tokens, n_experts]
+        top_g, _ = torch.topk(g, mote_block.top_k, dim=-1)  # [n_tokens, top_k]
+        gate_sum = top_g.sum(dim=-1)  # [n_tokens]
+
+    # --- Run MoTE and dense forward ---
+    with torch.no_grad():
+        y_dense = dense_ffn(x)                         # [B, T, H]
+        y_mote, aux, counts = mote_block(x)            # [B, T, H]
+
+    # --- Structural ratio: y_mote == gate_sum * y_dense ---
+    gate_sum_bcast = gate_sum.view(B, T, 1).to(y_dense.dtype)  # [B, T, 1]
+    expected = gate_sum_bcast * y_dense                          # [B, T, H]
+
+    max_diff = (y_mote - expected).abs().max().item()
+    assert torch.allclose(y_mote, expected, atol=1e-4), (
+        f"MoTE structural ratio broken — max abs diff {max_diff:.6f} "
+        f"(expected y_mote ≈ gate_sum * dense_out; check renorm was removed)"
     )
     assert aux.item() >= 0.0, "aux loss should be non-negative"
     assert counts.shape == (4,), f"expected counts shape (4,), got {counts.shape}"
-    # top_k=1 → each of the 2*8=16 tokens is dispatched to exactly one expert
-    assert counts.sum().item() == 2 * 8, (
-        f"expected total dispatch count 16, got {counts.sum().item()}"
+    assert counts.sum().item() == B * T, (
+        f"expected total dispatch count {B * T}, got {counts.sum().item()}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 2: shared fp expert output == dense; shared is frozen
+# Test 2: shared fp expert uses true bf16 (no ternary quant)
 # ---------------------------------------------------------------------------
 
-def test_mote_shared_fp_equals_dense(fresh_layer):
-    """With shared='fp', the shared expert is a frozen deep copy of the dense FFN
-    and its output must match the dense FFN output within tolerance.
+def test_mote_shared_fp_is_true_bf16(fresh_layer):
+    """shared='fp' must compute a true bf16 forward: no ternary weight quant, no act quant.
+
+    Verification:
+    1. All linear submodules in fp_shared are plain nn.Linear (not AutoBitLinear).
+    2. fp_shared(x) matches a reference plain-bf16 matmul built from the same weights.
+    3. fp_shared is fully frozen (requires_grad=False for all params).
+
+    If the bf16 master weights happen to be numerically near-ternary (e.g. after
+    BitNet training), the code-path check (assertion 1) remains the discriminating
+    factor regardless of numeric closeness to the ternary forward.
+    """
+    from mote_upcycle import build_mote
+    from transformers.integrations.bitnet import AutoBitLinear
+
+    base = fresh_layer
+    dense_ffn = base.model.layers[_LAYER_IDX].mlp
+
+    # Capture bf16 master weights BEFORE build_mote (deep-copied into shared expert)
+    gate_w = dense_ffn.gate_proj.weight.data.clone()
+    up_w = dense_ffn.up_proj.weight.data.clone()
+    down_w = dense_ffn.down_proj.weight.data.clone()
+
+    build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared="fp")
+    mote_block = base.model.layers[_LAYER_IDX].mlp
+
+    B, T = 2, 8
+    x = torch.randn(B, T, base.config.hidden_size, dtype=torch.bfloat16)
+    x_flat = x.view(B * T, base.config.hidden_size)
+
+    with torch.no_grad():
+        # fp_shared is called with x_flat (2D) in MoTEBlock.forward
+        y_fp = mote_block.shared(x_flat)
+
+        # Reference: plain bf16 matmul — same weights, same ffn_sub_norm, no quant
+        gate_ref = F.linear(x_flat, gate_w)
+        up_ref = F.linear(x_flat, up_w)
+        hidden_ref = dense_ffn.act_fn(gate_ref) * up_ref
+        hidden_ref = dense_ffn.ffn_sub_norm(hidden_ref)
+        y_ref = F.linear(hidden_ref, down_w)
+
+    # 1. Code-path check: fp shared must use plain nn.Linear, not AutoBitLinear
+    for mod_name, mod in mote_block.shared.named_modules():
+        assert not isinstance(mod, AutoBitLinear), (
+            f"fp shared expert still contains AutoBitLinear at '{mod_name}'; "
+            "shared='fp' must use plain nn.Linear (true bf16 forward, no WeightQuant/ActQuant)"
+        )
+
+    # 2. Numeric match: fp output == reference plain-bf16 matmul
+    max_diff = (y_fp - y_ref).abs().max().item()
+    assert torch.allclose(y_fp, y_ref, atol=1e-4), (
+        f"fp shared expert output diverges from reference bf16 matmul — max diff {max_diff:.6f}"
+    )
+
+    # 3. Frozen: no trainable params
+    for p in mote_block.shared.parameters():
+        assert not p.requires_grad, "fp shared expert must be frozen (requires_grad=False)"
+
+
+# ---------------------------------------------------------------------------
+# Test 3: shared ternary expert output == dense at init
+# ---------------------------------------------------------------------------
+
+def test_mote_shared_ternary_init_matches_dense(fresh_layer):
+    """shared='ternary' expert is an identical deep copy at init → output == dense FFN.
+
+    The ternary shared expert runs through AutoBitLinear (WeightQuant + ActQuant),
+    identical to the dense forward, so y_shared == y_dense at init.
+    After heal-training, they will diverge — this test only covers init state.
     """
     from mote_upcycle import build_mote
 
     base = fresh_layer
     dense_ffn = base.model.layers[_LAYER_IDX].mlp
 
-    build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared="fp")
+    build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared="ternary")
     mote_block = base.model.layers[_LAYER_IDX].mlp
 
     x = torch.randn(2, 8, base.config.hidden_size, dtype=torch.bfloat16)
@@ -118,14 +203,16 @@ def test_mote_shared_fp_equals_dense(fresh_layer):
 
     max_diff = (y_dense - y_shared).abs().max().item()
     assert torch.allclose(y_dense, y_shared, atol=1e-4), (
-        f"shared fp expert output differs from dense — max abs diff {max_diff:.6f}"
+        f"shared ternary expert diverges from dense FFN at init — max diff {max_diff:.6f}"
     )
-    for p in mote_block.shared.parameters():
-        assert not p.requires_grad, "shared fp expert must be frozen (requires_grad=False)"
+
+    # ternary shared expert must have trainable parameters
+    has_trainable = any(p.requires_grad for p in mote_block.shared.parameters())
+    assert has_trainable, "ternary shared expert must have trainable parameters"
 
 
 # ---------------------------------------------------------------------------
-# Test 3: config wiring — shapes, counts, shared modes
+# Test 4: config wiring — shapes, counts, shared modes
 # ---------------------------------------------------------------------------
 
 def test_mote_config_wiring(base):
@@ -173,6 +260,11 @@ def test_mote_config_wiring(base):
         assert block_fp.shared is not None, "shared='fp' → shared should be present"
         for p in block_fp.shared.parameters():
             assert not p.requires_grad, "fp shared expert must be frozen"
+        # fp shared uses plain nn.Linear (not AutoBitLinear)
+        for mod_name, mod in block_fp.shared.named_modules():
+            assert not isinstance(mod, AutoBitLinear), (
+                f"fp shared expert should use plain nn.Linear, found AutoBitLinear at '{mod_name}'"
+            )
 
         # --- Case C: shared="ternary" ---
         base.model.layers[LAYER].mlp = original_mlp_b
