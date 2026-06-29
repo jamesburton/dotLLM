@@ -25,7 +25,8 @@
 set -euo pipefail
 
 # Repo + branch. Override with DOTLLM_REPO / DOTLLM_BRANCH env vars.
-REPO_URL="${DOTLLM_REPO:-https://github.com/kkokosa/dotLLM.git}"
+# Default is the fork that carries the dev-track / #361 branch (upstream kkokosa/dotLLM does not).
+REPO_URL="${DOTLLM_REPO:-https://github.com/jamesburton/dotLLM.git}"
 # The cross-device seam (#360) lives on dev; the CUDA-side impl (#361) on its branch.
 BRANCH="${DOTLLM_BRANCH:-issue/361-kaggle-dual-cuda-validation}"
 WORK="${DOTLLM_WORK:-/kaggle/working}"

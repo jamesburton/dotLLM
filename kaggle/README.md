@@ -42,6 +42,9 @@ The multi-device primitives already exist (`CudaContext.Create(int deviceId)` + 
 
 ## Notes / gotchas
 - Kaggle sessions are time-boxed (~9–12 h) and idle-timeout; the build is incremental so re-runs are fast.
-- Override the branch with `DOTLLM_BRANCH=dev` (env) to run only the CPU proof before the CUDA impl lands.
+- The notebook clones the **fork** `jamesburton/dotLLM` by default (that's where the dev-track / #361
+  branch lives — upstream `kkokosa/dotLLM` does not have it). Override with `DOTLLM_REPO` / `DOTLLM_BRANCH`.
+  The fork must be reachable from Kaggle (public, or supply a token); set `DOTLLM_BRANCH=dev` to run only
+  the CPU proof.
 - FP16 round-trip: the CUDA cache is FP16, so cross-device parity is to FP16 precision (same as a
   single-device CUDA run) — compare against a CUDA single-device baseline, not the CPU FP32 oracle.
