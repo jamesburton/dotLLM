@@ -460,6 +460,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         var device = CudaDevice.GetDevice(deviceId);
         bool geForceAmpere = device.ComputeCapabilityMajor == 8
             && device.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase);
+        // Turing (sm_75 — Tesla T4 / RTX 20xx): the G3 cuBLAS tensor-core prefill-attention path is a
+        // large prefill win here too — measured ~3.15× (2072→6535 prefill tok/s) on a Tesla T4 with
+        // Llama-3.2-1B Q4_K_M @ 601-token prompt (#362). G1 (FP16-accumulate GEMM) showed NO T4 benefit
+        // and G-flash emits Ampere-only mma.sync, so ONLY G3 is extended to Turing (G1/G-flash unchanged).
+        bool turing = device.ComputeCapabilityMajor == 7 && device.ComputeCapabilityMinor >= 5;
         bool quantizedWeights = weights.Layers.Length > 0
             && weights.Layers[0].QQuantType is not (QuantizationType.F32 or QuantizationType.F16);
         CudaGemm.ConfigureDefault(
@@ -470,7 +475,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // Independent of weight quantization (attention runs on FP16 Q/K/V regardless).
         // DOTLLM_CUDA_G3_ATTN overrides ("1"/"0"). Gating to a pure square-causal global
         // prefill happens per-call in CudaG3Attention.CanUse.
-        CudaG3Attention.ConfigureDefault(geForceAmpere);
+        CudaG3Attention.ConfigureDefault(geForceAmpere || turing);
 
         // G-flash: default the hand-fused mma.sync long-context prefill kernel on for the
         // same GeForce Ampere parts (it emits Ampere-only mma.sync PTX). It is dispatched
