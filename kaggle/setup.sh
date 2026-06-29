@@ -20,7 +20,13 @@
 #   bash kaggle/setup.sh build      # restore + build the solution
 #   bash kaggle/setup.sh test-cpu   # CPU parity tests (proves the seam + .NET 10)
 #   bash kaggle/setup.sh test-cuda  # dual-device CUDA parity (needs 2 GPUs + #361 impl)
+#   bash kaggle/setup.sh bench      # CUDA inference benchmark (prefill+decode tok/s); honours
+#                                   # DOTLLM_CUDA_GEMM_16F / DOTLLM_CUDA_G3_ATTN env toggles
 #   bash kaggle/setup.sh all        # env → dotnet → ptx → build → test-cpu
+#
+# NOTE: kernel launches need PTX whose ISA matches the installed driver. The repo's committed PTX is
+# ISA 9.1 (CUDA 13.1+); on an older driver that JIT-fails with CUDA error 222. The ptx/build/bench
+# steps rebuild PTX with the local toolkit and overwrite the copies in bin/ to avoid that.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -74,11 +80,24 @@ do_dotnet() {
   "$DOTNET_DIR/dotnet" --info | head -n 20
 }
 
+# Rebuild PTX with the LOCAL toolkit (matching THIS driver) and overwrite any committed/stale PTX
+# already copied into build outputs. WHY: the repo commits prebuilt PTX (convenient when nvcc is
+# absent), but those are ISA 9.1 (CUDA 13.1+ toolkit); a driver older than that JIT-fails kernel
+# launches with CUDA error 222 (UNSUPPORTED_PTX_VERSION). The C# build copies the committed PTX into
+# each project's bin/<cfg>/ptx, so the loader would run the stale ISA. Rebuilding locally + syncing to
+# every bin/.../ptx makes the PTX ISA match the installed driver on any box.
+sync_ptx() {
+  bash "$SRC/native/build.sh" >/dev/null
+  echo "  fresh PTX $(grep -m1 '^.version' "$SRC/native/ptx/rmsnorm.ptx" 2>/dev/null) (must be <= the driver's max)"
+  find "$SRC" -type d -name ptx -path '*/bin/*' | while read -r d; do
+    cp -f "$SRC"/native/ptx/*.ptx "$d/" 2>/dev/null || true
+  done
+}
+
 do_ptx() {
   clone_or_update
-  echo "→ compiling CUDA kernels → PTX (compute_75; T4 = sm_75)"
-  bash "$SRC/native/build.sh"
-  ls -1 "$SRC/native/ptx"/*.ptx | head
+  echo "→ compiling CUDA kernels → PTX (compute_75; T4 = sm_75) with the local toolkit"
+  sync_ptx
   echo "PTX file count: $(ls -1 "$SRC/native/ptx"/*.ptx | wc -l)"
 }
 
@@ -87,6 +106,20 @@ do_build() {
   echo "→ dotnet build (Release)"
   "$DOTNET_DIR/dotnet" build "$SRC/dotLLM.sln" -c Release --nologo -v m 2>&1 | tail -n 15 \
     || "$DOTNET_DIR/dotnet" build "$SRC/tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" -c Release --nologo -v m 2>&1 | tail -n 15
+  # Overwrite the committed PTX the build just copied into bin with locally-built, driver-matched PTX.
+  sync_ptx
+}
+
+do_bench() {
+  clone_or_update
+  echo "→ CUDA inference benchmark — prefill + decode tok/s."
+  echo "   Toggle the Turing-gated tensor-core prefill paths with env: DOTLLM_CUDA_GEMM_16F=1 (G1 FP16 GEMM),"
+  echo "   DOTLLM_CUDA_G3_ATTN=1 (G3 cuBLAS TC attention). Model via DOTLLM_BENCH_MODEL_PATH or the filter."
+  "$DOTNET_DIR/dotnet" build "$SRC/benchmarks/DotLLM.Benchmarks/DotLLM.Benchmarks.csproj" -c Release --nologo -v q 2>&1 | tail -2
+  sync_ptx
+  local filter="${DOTLLM_BENCH_FILTER:-*CudaInferenceBenchmarks*}"
+  "$DOTNET_DIR/dotnet" run -c Release --no-build --project "$SRC/benchmarks/DotLLM.Benchmarks" -- --filter "$filter" 2>&1 \
+    | grep -E "prefill=|decode=|CUDA error|error 222|Model override" | tail -n 6
 }
 
 do_test_cpu() {
@@ -109,7 +142,8 @@ case "$step" in
   build)      do_build ;;
   test-cpu)   do_test_cpu ;;
   test-cuda)  do_test_cuda ;;
+  bench)      do_bench ;;
   all)        do_env; do_dotnet; do_ptx; do_build; do_test_cpu ;;
-  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|all)"; exit 2 ;;
+  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|bench|all)"; exit 2 ;;
 esac
 echo "✓ step '$step' done"
