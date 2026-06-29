@@ -72,12 +72,18 @@ arguments equal the gold call.
 2. **The adapter improves tool *selection*** under the constraint (80% vs 70% name): the constraint guarantees a
    *valid* tool name; the adapter nudges the model toward the *right* one (the <100% comes from multi-tool rows where
    the model must still pick correctly).
-3. **`complete` = 0% (the honest remaining limit).** The constraint forces structure + keys, but the argument
-   *values* are free-form strings — and this capability-bound 2B base cannot reliably **terminate** a string value
-   (it rambles to the token cap). This is a base-capacity limit, **not** a constraint defect (cf. `EVAL.md`: the same
-   constraint yields fully-valid, terminating calls on Qwen3-4B). **Next constraint enhancement:** propagate JSON-Schema
-   `maxLength` (and enum/format) into `SchemaTracker` so string values are length-bounded — that would let even this base
-   emit a fully-terminating valid tool call.
+3. **`complete` = 0% for *unbounded* string values (a base limit, now addressable).** With free-form string args the
+   capability-bound 2B base cannot reliably **terminate** a value (it rambles to the token cap) — a base-capacity limit,
+   **not** a constraint defect (cf. `EVAL.md`: the same constraint yields fully-valid, terminating calls on Qwen3-4B).
+   **✅ Addressed (#114): `SchemaTracker` now enforces JSON-Schema `maxLength`/`minLength` on string values.** With a
+   `maxLength`-bounded argument the decoder *forces* the closing quote, so even BitNet emits a **complete, terminating,
+   valid** tool call. Demonstrated — `get_weather` with `"city":{"type":"string","maxLength":12}`, `--tool-choice
+   required`:
+   ```
+   {"name": "get_weather", "arguments": {"city": "<url"}}   ← complete & valid JSON (vs. the never-closing ramble above)
+   ```
+   The string *value* is still base-quality (`<url`, not `Tokyo`) — value correctness needs a stronger base — but the
+   **structure is now decoder-guaranteed to be a fully-formed, self-terminating tool call**.
 
 ### Verdict
 Constrained decoding (#104/#106 + the #112 escape-flood fix) **rescues tool-call structure and function-name accuracy
