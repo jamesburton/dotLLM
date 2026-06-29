@@ -1,3 +1,4 @@
+using System.Buffers;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
@@ -8,7 +9,7 @@ namespace DotLLM.Cuda;
 /// GPU-resident KV-cache storing FP16 key and value vectors per layer.
 /// Layout: [maxSeqLen, numKvHeads * headDim] per layer, FP16.
 /// </summary>
-public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
+public sealed class CudaKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
 {
     private readonly nint[] _keys;
     private readonly nint[] _values;
@@ -18,6 +19,10 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
     private readonly int _uniformStride;   // _geom.UniformStride when _uniform; else 0
     private readonly int _maxSeqLen;
     private int _currentLength;
+    // CUDA context this cache's buffers live on. Non-null only for explicit multi-device placement
+    // (e.g. the cross-device handoff): host↔device staging makes this current first so a copy targets
+    // the right GPU. Null = legacy single-device callers operate on the ambient current context.
+    private readonly CudaContext? _context;
 
     /// <inheritdoc/>
     public int CurrentLength => _currentLength;
@@ -43,8 +48,9 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
     /// <param name="numKvHeads">Number of KV attention heads.</param>
     /// <param name="headDim">Dimension per head.</param>
     /// <param name="maxSeqLen">Maximum sequence length.</param>
-    public CudaKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen)
-        : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen)
+    /// <param name="context">Optional CUDA context for explicit multi-device placement; null uses the current context.</param>
+    public CudaKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen, CudaContext? context = null)
+        : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen, context)
     {
     }
 
@@ -55,15 +61,19 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
     /// so this per-layer support is the constructor/buffer-sizing surface only — it unblocks
     /// a future CUDA Gemma-4 decode path without shipping one here.
     /// </summary>
-    public CudaKvCache(KvGeometry geometry, int maxSeqLen)
+    public CudaKvCache(KvGeometry geometry, int maxSeqLen, CudaContext? context = null)
     {
         _numLayers = geometry.LayerCount;
         _geom = geometry;
         _uniform = geometry.IsUniform;
         _uniformStride = geometry.IsUniform ? geometry.UniformStride : 0;
         _maxSeqLen = maxSeqLen;
+        _context = context;
         _keys = new nint[_numLayers];
         _values = new nint[_numLayers];
+
+        // Bind the target device before allocating so the buffers land on this cache's GPU.
+        _context?.MakeCurrent();
 
         for (int i = 0; i < _numLayers; i++)
         {
@@ -307,9 +317,85 @@ public sealed class CudaKvCache : IKvCache, IPerLayerKvCache
     /// </summary>
     public bool WasRolledBack { get; private set; }
 
+    // ── IHostStagedKvCache: device↔host staging for cross-device KV handoff ──
+    // DownloadLayer reads this cache's FP16 K/V to host (→FP32); UploadLayer converts FP32 host data back
+    // to FP16 and writes it to this cache's device. With a second cache on another device, the
+    // StagedKvHandoffTransfer drives the device→host→device handoff dual GPUs require when they lack P2P.
+
+    /// <inheritdoc/>
+    public int StagedLayerElementCount(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        return _currentLength * Stride(layerIndex);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int count = _currentLength * Stride(layerIndex);
+        if (count == 0) return;
+        if (keys.Length < count || values.Length < count)
+            throw new ArgumentException($"keys/values must hold at least currentLength × kvStride = {count} floats.");
+
+        _context?.MakeCurrent(); // bind the source GPU before the device→host copy
+        long bytes = (long)count * sizeof(ushort); // FP16 device storage
+        ushort[] host = ArrayPool<ushort>.Shared.Rent(count);
+        try
+        {
+            fixed (ushort* hp = host)
+            {
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _keys[layerIndex], (nuint)bytes).ThrowOnError();
+                for (int i = 0; i < count; i++) keys[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+                CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _values[layerIndex], (nuint)bytes).ThrowOnError();
+                for (int i = 0; i < count; i++) values[i] = (float)BitConverter.UInt16BitsToHalf(host[i]);
+            }
+        }
+        finally
+        {
+            ArrayPool<ushort>.Shared.Return(host);
+        }
+    }
+
+    /// <inheritdoc/>
+    public unsafe void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        if (length <= 0) return;
+        if (length > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(length), $"length {length} exceeds cache MaxLength {_maxSeqLen}.");
+        int stride = Stride(layerIndex);
+        int count = length * stride;
+        if (keys.Length < count || values.Length < count)
+            throw new ArgumentException($"keys/values must contain at least length × kvStride = {count} floats.");
+
+        _context?.MakeCurrent(); // bind the destination GPU before the host→device copy
+        long bytes = (long)count * sizeof(ushort);
+        ushort[] host = ArrayPool<ushort>.Shared.Rent(count);
+        try
+        {
+            fixed (ushort* hp = host)
+            {
+                for (int i = 0; i < count; i++) host[i] = BitConverter.HalfToUInt16Bits((Half)keys[i]);
+                CudaDriverApi.cuMemcpyHtoD_v2(_keys[layerIndex], (nint)hp, (nuint)bytes).ThrowOnError();
+                for (int i = 0; i < count; i++) host[i] = BitConverter.HalfToUInt16Bits((Half)values[i]);
+                CudaDriverApi.cuMemcpyHtoD_v2(_values[layerIndex], (nint)hp, (nuint)bytes).ThrowOnError();
+            }
+        }
+        finally
+        {
+            ArrayPool<ushort>.Shared.Return(host);
+        }
+        if (length > _currentLength) _currentLength = length;
+    }
+
     /// <inheritdoc/>
     public void Dispose()
     {
+        _context?.MakeCurrent();
         for (int i = 0; i < _numLayers; i++)
         {
             if (_keys[i] != 0) { CudaDriverApi.cuMemFree_v2(_keys[i]); _keys[i] = 0; }
