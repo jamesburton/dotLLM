@@ -22,6 +22,8 @@
 #   bash kaggle/setup.sh test-cuda  # dual-device CUDA parity (needs 2 GPUs + #361 impl)
 #   bash kaggle/setup.sh bench      # CUDA inference benchmark (prefill+decode tok/s); honours
 #                                   # DOTLLM_CUDA_GEMM_16F / DOTLLM_CUDA_G3_ATTN env toggles
+#   bash kaggle/setup.sh profile    # CUDA decode profile: per-category GPU breakdown + eager-vs-graph,
+#                                   # on 1B+3B (override with DOTLLM_PROFILE_MODELS) — finds the next lever
 #   bash kaggle/setup.sh all        # env → dotnet → ptx → build → test-cpu
 #
 # NOTE: kernel launches need PTX whose ISA matches the installed driver. The repo's committed PTX is
@@ -33,8 +35,9 @@ set -euo pipefail
 # Repo + branch. Override with DOTLLM_REPO / DOTLLM_BRANCH env vars.
 # Default is the fork that carries the dev-track / #361 branch (upstream kkokosa/dotLLM does not).
 REPO_URL="${DOTLLM_REPO:-https://github.com/jamesburton/dotLLM.git}"
-# The cross-device seam (#360) lives on dev; the CUDA-side impl (#361) on its branch.
-BRANCH="${DOTLLM_BRANCH:-issue/361-kaggle-dual-cuda-validation}"
+# `dev` is the single source of truth — it carries all the code (#360 cross-device, #361 CUDA staging,
+# #362 G3-on-Turing) AND the Kaggle tooling. (The old per-issue branches are superseded.)
+BRANCH="${DOTLLM_BRANCH:-dev}"
 WORK="${DOTLLM_WORK:-/kaggle/working}"
 SRC="${DOTLLM_SRC:-$WORK/dotLLM}"
 DOTNET_DIR="${DOTNET_ROOT:-$HOME/.dotnet}"
@@ -122,6 +125,22 @@ do_bench() {
     | grep -E "prefill=|decode=|CUDA error|error 222|Model override" | tail -n 6
 }
 
+do_profile() {
+  clone_or_update
+  echo "→ CUDA decode profile — per-category GPU breakdown + eager-vs-graph (launch-bound vs kernel-bound)."
+  echo "   Models: \$DOTLLM_PROFILE_MODELS (default Llama-3.2-1B + 3B Q4_K_M). Reveals the next decode lever."
+  "$DOTNET_DIR/dotnet" build "$SRC/benchmarks/DotLLM.Benchmarks/DotLLM.Benchmarks.csproj" -c Release --nologo -v q 2>&1 | tail -2
+  sync_ptx
+  local models="${DOTLLM_PROFILE_MODELS:-bartowski/Llama-3.2-1B-Instruct-GGUF:Llama-3.2-1B-Instruct-Q4_K_M.gguf bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf}"
+  for m in $models; do
+    local repo="${m%%:*}" file="${m#*:}"
+    echo ""; echo "######################## DECODE PROFILE: $file ########################"
+    DOTLLM_BENCH_MODEL_PATH="$(python -c "from huggingface_hub import hf_hub_download;print(hf_hub_download('$repo','$file'))")" \
+      "$DOTNET_DIR/dotnet" run -c Release --no-build --project "$SRC/benchmarks/DotLLM.Benchmarks" -- profile-cuda-decode --compare 2>&1 \
+      | grep -vE "^\s*$" | tail -n 70
+  done
+}
+
 do_test_cpu() {
   echo "→ CPU parity tests (DisaggregatedKvTransferTests — proves the staged seam + .NET 10 on Kaggle)"
   "$DOTNET_DIR/dotnet" test "$SRC/tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" \
@@ -143,7 +162,8 @@ case "$step" in
   test-cpu)   do_test_cpu ;;
   test-cuda)  do_test_cuda ;;
   bench)      do_bench ;;
+  profile)    do_profile ;;
   all)        do_env; do_dotnet; do_ptx; do_build; do_test_cpu ;;
-  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|bench|all)"; exit 2 ;;
+  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|bench|profile|all)"; exit 2 ;;
 esac
 echo "✓ step '$step' done"
