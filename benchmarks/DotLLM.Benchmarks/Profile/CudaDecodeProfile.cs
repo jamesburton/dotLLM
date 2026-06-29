@@ -32,6 +32,9 @@ internal static class CudaDecodeProfile
     private const int DefaultDecodeTokens = 200;
     private const int DefaultWarmupTokens = 16;
 
+    private static bool s_printGen;
+    private static ulong _genHash;
+
     public static int Run(string[] args)
     {
         if (!CudaDevice.IsAvailable())
@@ -52,6 +55,9 @@ internal static class CudaDecodeProfile
         bool useGraph = !noGraph;
         bool compare = args.Contains("--compare");
         bool noProfiling = args.Contains("--no-profiling");
+        // --print-gen: emit a hash of the greedy-decoded token sequence so two runs (e.g. coalesced
+        // kernel ON vs OFF) can be compared for correctness — identical hash == identical greedy output.
+        s_printGen = args.Contains("--print-gen");
         // --kv-quant : run with the mixed-precision quantized KV cache
         //              (Q8_0 stored region + 16-row FP16 window). Validates the
         //              quantized-cache CUDA Graphs decode path lands the same
@@ -111,6 +117,7 @@ internal static class CudaDecodeProfile
     {
         using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0);
         model.UseGraphCapture = useGraphCapture;
+        _genHash = 14695981039346656037UL; // FNV-1a offset basis; reset per run for --print-gen parity
 
         int prefillLen = Math.Min(promptTokens.Length, DefaultPrefillTokens);
         int[] prefill = promptTokens[..prefillLen];
@@ -182,6 +189,7 @@ internal static class CudaDecodeProfile
                 wallTimes[i] = sw.Elapsed.TotalMilliseconds;
                 gpuTimes[i] = double.NaN;
                 currentToken = ArgmaxFirstRow(t);
+                _genHash = (_genHash ^ (uint)currentToken) * 1099511628211UL; // FNV-1a over greedy tokens
                 nextPos++;
             }
         }
@@ -192,6 +200,9 @@ internal static class CudaDecodeProfile
         Report(wallTimes, gpuTimes, categoryTimes, prefillLen, kvCapacity,
                config.NumLayers, config.HiddenSize,
                useGraphCapture: useGraphCapture, hideCategory: !hadProfiling);
+
+        if (s_printGen)
+            Console.WriteLine($"GEN_HASH={_genHash:X16} (greedy {DefaultDecodeTokens}-token sequence)");
 
         var sortedWall = (double[])wallTimes.Clone();
         Array.Sort(sortedWall);
