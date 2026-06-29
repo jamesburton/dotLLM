@@ -138,7 +138,12 @@ def _committed_len(cache: DynamicCache, layer_idx: int) -> int:
 
 
 def _crop_span(cache: DynamicCache, lo: int, hi: int, target_len: int) -> None:
-    """Crop layers ``[lo, hi)`` back to ``target_len`` (no-op if shorter/absent)."""
+    """Crop layers ``[lo, hi)`` back to ``target_len`` (no-op if shorter/absent).
+
+    Uses ``cache.layers[li].crop(...)`` — pinned to transformers' internal
+    DynamicCache per-layer structure (version-gated); the public
+    ``DynamicCache.crop`` cannot do the per-span slab/coda crop this needs.
+    """
     for li in range(lo, hi):
         if li < len(cache.layers):
             cache.layers[li].crop(target_len)
@@ -149,7 +154,8 @@ def _is_hard(logits_last: torch.Tensor, signal: str,
     """Return True if the (B=1) token is "hard" under the chosen signal."""
     logf = logits_last.float()
     logp = torch.log_softmax(logf, dim=-1)
-    entropy = float((-(logp.exp() * logp).sum(-1)).item())
+    logp_safe = torch.nan_to_num(logp, nan=0.0, neginf=0.0)  # 0*log(0)->0
+    entropy = float((-(logp.exp() * logp_safe).sum(-1)).item())
     top2 = torch.topk(logf, 2, dim=-1).values
     margin = float((top2[..., 0] - top2[..., 1]).item())
     if signal == "entropy":
