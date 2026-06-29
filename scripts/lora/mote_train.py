@@ -2,7 +2,7 @@
 
 The decoder-layer compatibility problem
 ----------------------------------------
-``MoTEBlock.forward`` returns ``(hidden, aux_loss, expert_counts)`` — a tuple.
+``MoTEBlock.forward`` returns ``(hidden, aux_loss, expert_counts)`` â€” a tuple.
 HF decoder layers call ``self.mlp(x)`` expecting a plain tensor.  This script
 wraps every converted MoTEBlock in a ``MoTEShim`` that:
 
@@ -37,7 +37,7 @@ CLI
       --layers upper-half --tokens 4e8 --kd-weight 0.5 \\
       --out .docs/mote/c1
 
-Smoke test (CPU, seconds — uses a tiny randomly-initialised model):
+Smoke test (CPU, seconds â€” uses a tiny randomly-initialised model):
   python scripts/lora/mote_train.py \\
       --config smoke --n-experts 2 --top-k 1 --shared none \\
       --layers upper-half --tokens 1e5 --kd-weight 0.5 \\
@@ -45,9 +45,9 @@ Smoke test (CPU, seconds — uses a tiny randomly-initialised model):
 
 Writes
 ------
-  <out>/adapter_weights.pt  — trainable MoTE weights (router + routed experts)
-  <out>/mote_config.json    — MoTE hyperparameters used for this run
-  <out>/metrics.json        — final losses + expert-count histogram
+  <out>/adapter_weights.pt  â€” trainable MoTE weights (router + routed experts)
+  <out>/mote_config.json    â€” MoTE hyperparameters used for this run
+  <out>/metrics.json        â€” final losses + expert-count histogram
 """
 
 # Windows: torch.compile's Triton/Inductor back-end requires cl.exe; suppress
@@ -77,7 +77,7 @@ from mote_upcycle import MoTEBlock, build_mote
 
 
 # ---------------------------------------------------------------------------
-# MoTEShim — tensor-return compatibility shim for HF decoder layers
+# MoTEShim â€” tensor-return compatibility shim for HF decoder layers
 # ---------------------------------------------------------------------------
 
 
@@ -85,7 +85,7 @@ class MoTEShim(nn.Module):
     """Thin wrapper that makes MoTEBlock compatible with HF decoder layer forward.
 
     The HF decoder layer calls ``self.mlp(x)`` and splices the result into the
-    residual stream directly — it expects a plain tensor.  MoTEBlock returns
+    residual stream directly â€” it expects a plain tensor.  MoTEBlock returns
     ``(hidden, aux_loss, expert_counts)``.  This shim unpacks the tuple:
 
     * Returns only ``hidden`` to the decoder layer (residual splice is correct).
@@ -107,7 +107,7 @@ class MoTEShim(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, aux, counts = self.mote(x)
-        self.last_aux = aux          # in-graph — gradients flow through backward
+        self.last_aux = aux          # in-graph â€” gradients flow through backward
         self.last_counts = counts.detach()
         return hidden
 
@@ -134,10 +134,10 @@ def _parse_layers(arg: str, n_layers: int) -> list:
     """Resolve the ``--layers`` string to a concrete list of layer indices.
 
     Supported forms:
-      ``upper-half``  → ``range(n_layers // 2, n_layers)``
-      ``all``         → ``range(0, n_layers)``
-      ``15-29``       → ``range(15, 30)``
-      ``15,16,17``    → ``[15, 16, 17]``
+      ``upper-half``  â†’ ``range(n_layers // 2, n_layers)``
+      ``all``         â†’ ``range(0, n_layers)``
+      ``15-29``       â†’ ``range(15, 30)``
+      ``15,16,17``    â†’ ``[15, 16, 17]``
     """
     if arg == "upper-half":
         return list(range(n_layers // 2, n_layers))
@@ -339,7 +339,7 @@ def main() -> None:
         help=(
             "Use a tiny randomly-initialised BitNetForCausalLM (2 layers, hidden=64) "
             "and a synthetic random corpus.  No downloads required.  Use for smoke "
-            "tests and CI — runs in seconds on CPU."
+            "tests and CI â€” runs in seconds on CPU."
         ),
     )
     ap.add_argument(
@@ -357,6 +357,21 @@ def main() -> None:
     ap.add_argument(
         "--teacher-device", default="cpu", choices=["cpu", "cuda"],
         help="Device for the frozen teacher model (default: cpu to save GPU VRAM)",
+    )
+    ap.add_argument(
+        "--checkpoint-every", type=int, default=0,
+        help=(
+            "Save a checkpoint every N steps to {out}/checkpoint/ (0 = disabled). "
+            "Checkpoint contains trainable adapter weights, optimizer state, and step counter."
+        ),
+    )
+    ap.add_argument(
+        "--resume-from", default=None,
+        help=(
+            "Resume from a checkpoint directory written by --checkpoint-every. "
+            "Expects state.json (step + tokens_seen), adapter_weights.pt, optimizer.pt. "
+            "If the directory or state.json is absent, training starts from scratch."
+        ),
     )
     args = ap.parse_args()
 
@@ -391,7 +406,7 @@ def main() -> None:
         # Keep vocab_size from the real config so token IDs are valid.
 
     # ------------------------------------------------------------------
-    # 2. Teacher — loaded (or created) BEFORE build_mote so it is dense
+    # 2. Teacher â€” loaded (or created) BEFORE build_mote so it is dense
     # ------------------------------------------------------------------
     teacher = None
     if args.kd_weight > 0.0:
@@ -416,10 +431,10 @@ def main() -> None:
             p.requires_grad_(False)
         print(f"[mote_train] teacher loaded and frozen on {teacher_device} (dense BitNet, no grad)")
     else:
-        print(f"[mote_train] KD disabled (kd_weight=0) — no teacher loaded")
+        print(f"[mote_train] KD disabled (kd_weight=0) â€” no teacher loaded")
 
     # ------------------------------------------------------------------
-    # 3. Student — separate load; build_mote converts target layers
+    # 3. Student â€” separate load; build_mote converts target layers
     # ------------------------------------------------------------------
     if args.tiny_random:
         from transformers import BitNetForCausalLM
@@ -432,7 +447,7 @@ def main() -> None:
 
     n_layers = len(student.model.layers)
     layer_indices = _parse_layers(args.layers, n_layers)
-    print(f"[mote_train] converting {len(layer_indices)} layers → MoTE: {layer_indices}")
+    print(f"[mote_train] converting {len(layer_indices)} layers â†’ MoTE: {layer_indices}")
 
     student = build_mote(
         student,
@@ -459,6 +474,10 @@ def main() -> None:
 
     _freeze_for_mote_training(student)
 
+    # Compute once here; reused in checkpoint saves and final adapter save (step 7).
+    trainable_names = {
+        name for name, p in student.named_parameters() if p.requires_grad
+    }
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in student.parameters())
     print(
@@ -467,7 +486,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 4. Optimizer — router lr 1e-4 (spec: "lr 1e-4 on the MoE path")
+    # 4. Optimizer â€” router lr 1e-4 (spec: "lr 1e-4 on the MoE path")
     # ------------------------------------------------------------------
     _lr = 1e-4
     _trainable = [p for p in student.parameters() if p.requires_grad]
@@ -487,7 +506,7 @@ def main() -> None:
             warmup_init=False,
         )
         print(f"[mote_train] optimizer: Adafactor (lr={_lr})")
-    else:  # adamw8bit (default) — try bnb, fallback to adafactor
+    else:  # adamw8bit (default) â€” try bnb, fallback to adafactor
         # bnb may import and construct fine but fail at first step() on Windows
         # (illegal-instruction / WinError -1073741795 in CUDA kernels). Verify with
         # a synthetic parameter step before committing to it for the real training.
@@ -528,6 +547,46 @@ def main() -> None:
             )
 
     # ------------------------------------------------------------------
+    # 4.5. Resume from checkpoint (if --resume-from was given)
+    # ------------------------------------------------------------------
+    _resume_step: int = 0
+    _resume_tokens: int = 0
+    if args.resume_from is not None:
+        _ckpt = args.resume_from
+        _ckpt_state_path = os.path.join(_ckpt, "state.json")
+        _ckpt_adapter_path = os.path.join(_ckpt, "adapter_weights.pt")
+        _ckpt_opt_path = os.path.join(_ckpt, "optimizer.pt")
+        if os.path.isfile(_ckpt_state_path):
+            with open(_ckpt_state_path, encoding="utf-8") as _f:
+                _ckpt_state_data = json.load(_f)
+            _resume_step = int(_ckpt_state_data.get("step", 0))
+            _resume_tokens = int(_ckpt_state_data.get("tokens_seen", 0))
+            print(
+                f"[mote_train] resume: checkpoint found  "
+                f"step={_resume_step}  tokens_seen={_resume_tokens}"
+            )
+        else:
+            print(
+                f"[mote_train] resume: {_ckpt_state_path!r} not found "
+                f"-- starting from scratch"
+            )
+        if os.path.isfile(_ckpt_adapter_path) and _resume_step > 0:
+            try:
+                _ckpt_weights = torch.load(
+                    _ckpt_adapter_path, map_location=device, weights_only=True
+                )
+            except TypeError:
+                _ckpt_weights = torch.load(  # type: ignore[call-arg]
+                    _ckpt_adapter_path, map_location=device
+                )
+            student.load_state_dict(_ckpt_weights, strict=False)
+            print(f"[mote_train] resume: adapter weights loaded from {_ckpt_adapter_path}")
+        if os.path.isfile(_ckpt_opt_path) and _resume_step > 0:
+            _opt_state = torch.load(_ckpt_opt_path, map_location="cpu")
+            opt.load_state_dict(_opt_state)
+            print(f"[mote_train] resume: optimizer state loaded from {_ckpt_opt_path}")
+
+    # ------------------------------------------------------------------
     # 5. Corpus
     # ------------------------------------------------------------------
     vocab_size = (teacher or student).config.vocab_size
@@ -549,15 +608,15 @@ def main() -> None:
         )
     print(
         f"[mote_train] corpus: {len(corpus)} sequences "
-        f"× {args.max_seq_len} tokens each"
+        f"Ã— {args.max_seq_len} tokens each"
     )
 
     # ------------------------------------------------------------------
     # 6. Training loop
     # ------------------------------------------------------------------
     student.train()
-    tokens_seen = 0
-    step = 0
+    tokens_seen = _resume_tokens
+    step = _resume_step
     recent_counts: list = []   # last K expert-count tensors
 
     final_lm = final_kd = final_aux = float("nan")
@@ -567,7 +626,7 @@ def main() -> None:
     while tokens_seen < max_tokens:
         seq = corpus[step % len(corpus)].unsqueeze(0).to(device)  # [1, T] on student device
 
-        # Teacher forward (no grad) — input moved to teacher_device (may be CPU)
+        # Teacher forward (no grad) â€” input moved to teacher_device (may be CPU)
         teacher_logits = None
         if teacher is not None:
             with torch.no_grad():
@@ -591,7 +650,7 @@ def main() -> None:
         else:
             kd = torch.zeros(1, device=device).squeeze()
 
-        # --- Aux loss from all MoTE shims (Switch load-balance, γ=0.01) ---
+        # --- Aux loss from all MoTE shims (Switch load-balance, Î³=0.01) ---
         aux = _collect_aux(student, device)
 
         # Log values BEFORE backward (tensors may be freed after)
@@ -608,6 +667,23 @@ def main() -> None:
 
         tokens_seen += seq.size(1)
         step += 1
+
+        # Checkpoint save (if --checkpoint-every is set and step is a multiple)
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            _ckpt_dir = os.path.join(args.out, "checkpoint")
+            os.makedirs(_ckpt_dir, exist_ok=True)
+            _ckpt_adapter = {
+                k: v.cpu() for k, v in student.state_dict().items()
+                if k in trainable_names
+            }
+            torch.save(_ckpt_adapter, os.path.join(_ckpt_dir, "adapter_weights.pt"))
+            torch.save(opt.state_dict(), os.path.join(_ckpt_dir, "optimizer.pt"))
+            with open(os.path.join(_ckpt_dir, "state.json"), "w", encoding="utf-8") as _ckpt_f:
+                json.dump({"step": step, "tokens_seen": tokens_seen}, _ckpt_f)
+            print(
+                f"  [checkpoint] step={step} tokens={tokens_seen:.2e} -> {_ckpt_dir}",
+                flush=True,
+            )
 
         # Accumulate expert counts for histogram (rolling window)
         counts = _collect_counts(student)
@@ -645,7 +721,7 @@ def main() -> None:
 
     sps_report = f"  {_steps_per_sec:.3f} steps/s" if _steps_per_sec else ""
     print(
-        f"[mote_train] training done — {step} steps / {tokens_seen} tokens{sps_report}\n"
+        f"[mote_train] training done â€” {step} steps / {tokens_seen} tokens{sps_report}\n"
         f"             final: lm={final_lm:.4f}  kd={final_kd:.4f}  "
         f"aux={final_aux:.4f}"
     )
@@ -653,16 +729,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 7. Save adapter weights (trainable params only)
     # ------------------------------------------------------------------
-    trainable_names = {
-        name for name, p in student.named_parameters() if p.requires_grad
-    }
+    # trainable_names was computed once after freeze (section 3) -- reuse it here.
     adapter_state = {
         k: v.cpu() for k, v in student.state_dict().items()
         if k in trainable_names
     }
     adapter_path = os.path.join(args.out, "adapter_weights.pt")
     torch.save(adapter_state, adapter_path)
-    print(f"[mote_train] adapter → {adapter_path}  ({len(adapter_state)} tensors)")
+    print(f"[mote_train] adapter â†’ {adapter_path}  ({len(adapter_state)} tensors)")
 
     # ------------------------------------------------------------------
     # 8. Save MoTE config
@@ -713,7 +787,7 @@ def main() -> None:
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
-    print(f"[mote_train] metrics → {metrics_path}")
+    print(f"[mote_train] metrics â†’ {metrics_path}")
 
     # Smoke-test gate (print clearly for the CI gate checker)
     lm_ok = not (final_lm != final_lm)          # NaN check
@@ -725,9 +799,10 @@ def main() -> None:
         f"aux_finite={aux_ok}  experts_used>={2}={experts_ok}"
     )
     if not (lm_ok and kd_ok and aux_ok and experts_ok):
-        raise RuntimeError("Smoke-test gate FAILED — see GATE line above.")
+        raise RuntimeError("Smoke-test gate FAILED â€” see GATE line above.")
     print("[mote_train] GATE PASSED")
 
 
 if __name__ == "__main__":
     main()
+

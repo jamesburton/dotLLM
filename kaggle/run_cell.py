@@ -1,0 +1,257 @@
+"""run_cell.py -- Worker script for one Track-M MoTE grid cell on Kaggle.
+
+Looks up the cell config in grid_manifest.json, runs mote_train.py -> mote_eval.py ->
+push_results.py in sequence.  With --dry-run, prints the exact commands instead.
+With --resume, pulls the prior checkpoint from the kaggle-results branch first.
+
+Usage
+-----
+    python kaggle/run_cell.py --cell-id c1 \
+        [--manifest kaggle/grid_manifest.json] \
+        [--repo-dir .] \
+        [--results-remote https://github.com/jamesburton/dotLLM] \
+        [--resume] [--dry-run]
+
+Environment
+-----------
+    RESULTS_REMOTE : GitHub repo URL for result push (overridden by --results-remote)
+    GH_PAT         : GitHub PAT with repo write access (forwarded to push_results.py)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def run(cmd: list, dry_run: bool = False, **kw) -> None:
+    """Print (and optionally execute) a command list."""
+    print("  $ " + " ".join(str(c) for c in cmd))
+    if not dry_run:
+        subprocess.run(cmd, check=True, **kw)
+
+
+def _pull_checkpoint(cell_id: str, ckpt_dir: str, results_remote: str, out_dir: str) -> None:
+    """Pull checkpoint files from kaggle-results branch into ckpt_dir.
+
+    Silently skips if GH_PAT is unset, the branch does not exist, or no checkpoint
+    is present for this cell.
+    """
+    pat = os.environ.get("GH_PAT")
+    if not pat:
+        print("[run_cell] GH_PAT not set -- cannot pull checkpoint; training from scratch")
+        return
+
+    auth_url = results_remote
+    if results_remote.startswith("https://"):
+        auth_url = results_remote.replace("https://", f"https://{pat}@", 1)
+
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clone_dir = os.path.join(tmpdir, "results_clone")
+        try:
+            subprocess.run(
+                [
+                    "git", "clone", "--depth", "1", "--branch", "kaggle-results",
+                    auth_url, clone_dir,
+                ],
+                check=True,
+                capture_output=True,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except subprocess.CalledProcessError:
+            print("[run_cell] kaggle-results branch not found -- training from scratch")
+            return
+
+        # Copy checkpoint dir
+        remote_ckpt = os.path.join(clone_dir, "results", cell_id, "checkpoint")
+        if os.path.isdir(remote_ckpt):
+            os.makedirs(ckpt_dir, exist_ok=True)
+            shutil.copytree(remote_ckpt, ckpt_dir, dirs_exist_ok=True)
+            print(f"[run_cell] checkpoint restored to {ckpt_dir}")
+        else:
+            print(f"[run_cell] no checkpoint in kaggle-results for {cell_id}")
+
+        # Copy adapter weights if present (needed for eval after resume)
+        remote_adapter = os.path.join(clone_dir, "results", cell_id, "adapter_weights.pt")
+        if os.path.isfile(remote_adapter):
+            os.makedirs(out_dir, exist_ok=True)
+            shutil.copy2(remote_adapter, os.path.join(out_dir, "adapter_weights.pt"))
+            print(f"[run_cell] prior adapter_weights.pt restored to {out_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Run one Track-M MoTE grid cell on Kaggle (train -> eval -> push)"
+    )
+    ap.add_argument(
+        "--cell-id", required=True,
+        help="Cell ID from grid_manifest.json (e.g. c1)",
+    )
+    ap.add_argument(
+        "--manifest",
+        default="kaggle/grid_manifest.json",
+        help="Path to grid_manifest.json (relative to --repo-dir or absolute)",
+    )
+    ap.add_argument(
+        "--repo-dir",
+        default=".",
+        help="Root of the dotLLM repo checkout (default: current directory)",
+    )
+    ap.add_argument(
+        "--results-remote",
+        default=os.environ.get("RESULTS_REMOTE", "https://github.com/jamesburton/dotLLM"),
+        help="GitHub repo URL for result push (env: RESULTS_REMOTE)",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Pull prior checkpoint from kaggle-results branch before training, "
+            "then pass --resume-from to mote_train.py."
+        ),
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print exact commands without executing them.",
+    )
+    args = ap.parse_args()
+
+    repo = os.path.abspath(args.repo_dir)
+    # Manifest path: absolute, or relative to repo_dir
+    if os.path.isabs(args.manifest):
+        manifest_path = args.manifest
+    else:
+        manifest_path = os.path.join(repo, args.manifest)
+
+    # ------------------------------------------------------------------
+    # Load manifest + find cell
+    # ------------------------------------------------------------------
+    if not os.path.isfile(manifest_path):
+        print(f"ERROR: manifest not found: {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+
+    cell = next((c for c in manifest.get("cells", []) if c["id"] == args.cell_id), None)
+    if cell is None:
+        ids = [c["id"] for c in manifest.get("cells", [])]
+        print(
+            f"ERROR: cell {args.cell_id!r} not found in manifest "
+            f"(available: {ids})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(
+        f"[run_cell] cell={args.cell_id}  n_experts={cell['n_experts']}  "
+        f"top_k={cell['top_k']}  shared={cell['shared']!r}  "
+        f"layers={cell['layers']!r}  tokens={cell['tokens']}  "
+        f"kd_weight={cell['kd_weight']}"
+    )
+    if args.dry_run:
+        print("[run_cell] DRY RUN -- commands will be printed but NOT executed")
+
+    out_dir = os.path.join(repo, ".docs", "mote", args.cell_id)
+    ckpt_dir = os.path.join(out_dir, "checkpoint")
+
+    # ------------------------------------------------------------------
+    # Step 0: Resume -- pull prior checkpoint from kaggle-results branch
+    # ------------------------------------------------------------------
+    if args.resume:
+        if not args.dry_run:
+            print(f"\n[run_cell] Step 0: pull checkpoint for resume")
+            _pull_checkpoint(args.cell_id, ckpt_dir, args.results_remote, out_dir)
+            state_json = os.path.join(ckpt_dir, "state.json")
+            if os.path.isfile(state_json):
+                with open(state_json, encoding="utf-8") as f:
+                    st = json.load(f)
+                print(
+                    f"[run_cell] resuming from step={st.get('step', 0)}, "
+                    f"tokens={st.get('tokens_seen', 0)}"
+                )
+            else:
+                print("[run_cell] no prior checkpoint -- training from scratch")
+        else:
+            print(
+                f"\n[run_cell] Step 0 (dry-run): would pull checkpoint from "
+                f"kaggle-results/results/{args.cell_id}/checkpoint/"
+            )
+
+    # ------------------------------------------------------------------
+    # Step 1: mote_train.py
+    # ------------------------------------------------------------------
+    train_cmd = [
+        sys.executable,
+        os.path.join(repo, "scripts", "lora", "mote_train.py"),
+        "--config", args.cell_id,
+        "--n-experts", str(cell["n_experts"]),
+        "--top-k", str(cell["top_k"]),
+        "--shared", cell["shared"],
+        "--layers", cell["layers"],
+        "--tokens", str(cell["tokens"]),
+        "--kd-weight", str(cell["kd_weight"]),
+        "--device", "cuda",
+        "--teacher-device", "cuda",
+        "--optim", "adamw8bit",
+        "--checkpoint-every", "500",
+        "--out", out_dir,
+    ]
+    if args.resume:
+        # Pass checkpoint dir unconditionally; mote_train.py skips gracefully if missing
+        train_cmd.extend(["--resume-from", ckpt_dir])
+
+    print(f"\n[run_cell] Step 1: train")
+    run(train_cmd, dry_run=args.dry_run)
+
+    # ------------------------------------------------------------------
+    # Step 2: mote_eval.py
+    # ------------------------------------------------------------------
+    eval_cmd = [
+        sys.executable,
+        os.path.join(repo, "scripts", "lora", "mote_eval.py"),
+        "--adapter", out_dir,
+        "--device", "cuda",
+    ]
+
+    print(f"\n[run_cell] Step 2: eval")
+    run(eval_cmd, dry_run=args.dry_run)
+
+    # ------------------------------------------------------------------
+    # Step 3: push_results.py
+    # ------------------------------------------------------------------
+    push_cmd = [
+        sys.executable,
+        os.path.join(repo, "kaggle", "push_results.py"),
+        "--cell-id", args.cell_id,
+        "--adapter", out_dir,
+        "--manifest", manifest_path,
+        "--results-remote", args.results_remote,
+    ]
+
+    print(f"\n[run_cell] Step 3: push results")
+    run(push_cmd, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print(f"\n[run_cell] DRY RUN complete -- no commands were executed")
+    else:
+        print(f"\n[run_cell] cell {args.cell_id} COMPLETE")
+
+
+if __name__ == "__main__":
+    main()
