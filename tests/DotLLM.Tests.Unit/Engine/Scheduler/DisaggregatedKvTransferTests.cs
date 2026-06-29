@@ -77,7 +77,60 @@ public sealed class DisaggregatedKvTransferTests
         }
     }
 
-    private static async Task<int[][]> RunDisaggregatedAsync(int[] promptLens, bool copy)
+    [Fact]
+    public async Task StagedTransfer_SeparatePools_MatchesReferenceTransfer()
+    {
+        int[] promptLens = [2, 3, 5, 7];
+
+        // Reference transfer: both replicas share one pool, KV handed off by reference (#354 default).
+        int[][] reference = await RunDisaggregatedAsync(promptLens, copy: false);
+
+        // Staged transfer: prefill and decode use SEPARATE pools; KV is staged device→host→device at handoff
+        // (here both pools are CPU, so "device" is host — but the exact transport the GPU path uses).
+        int[][] staged = await RunDisaggregatedAsync(promptLens, copy: true, separatePoolTransfer: StagedKvHandoffTransfer.Instance);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            Assert.Equal(RampExpectedGenerated(promptLens[i]), staged[i].Length);
+            Assert.Equal(reference[i], staged[i]); // token-identical across the staged cross-pool transfer
+        }
+    }
+
+    [Fact]
+    public void StagedKvHandoffTransfer_TransfersContents_ByteForByte()
+    {
+        using var srcPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+        using var dstPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+
+        const int length = 7;
+        var source = srcPool.Create(MaxSeqLen);
+        FillCache(source, length, seed: 100);
+
+        var config = new RampMockModel().Config;
+        IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
+            source, config, (_, maxSeq) => dstPool.Create(maxSeq));
+
+        Assert.NotSame(source, dest);
+        Assert.Equal(length, dest.CurrentLength);
+
+        var expected = srcPool.Create(MaxSeqLen);
+        FillCache(expected, length, seed: 100);
+        try
+        {
+            for (int layer = 0; layer < NumLayers; layer++)
+            {
+                AssertRefEqual(expected.GetKeysRef(layer), dest.GetKeysRef(layer), length);
+                AssertRefEqual(expected.GetValuesRef(layer), dest.GetValuesRef(layer), length);
+            }
+        }
+        finally
+        {
+            expected.Dispose();
+            dest.Dispose();
+        }
+    }
+
+    private static async Task<int[][]> RunDisaggregatedAsync(int[] promptLens, bool copy, IKvHandoffTransfer? separatePoolTransfer = null)
     {
         using var prefillPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
         using var decodePool = copy
@@ -91,7 +144,7 @@ public sealed class DisaggregatedKvTransferTests
                 prefillModel, decodeModel, new MockTokenizer(),
                 (_, maxSeq) => prefillPool.Create(maxSeq),
                 options: null, sharedPagedPool: prefillPool.Pool,
-                handoffTransfer: CopyKvHandoffTransfer.Instance,
+                handoffTransfer: separatePoolTransfer ?? CopyKvHandoffTransfer.Instance,
                 decodeKvCacheFactory: (_, maxSeq) => decodePool!.Create(maxSeq),
                 decodePagedPool: decodePool!.Pool)
             : new DisaggregatedScheduler(
