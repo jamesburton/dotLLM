@@ -930,6 +930,20 @@ public sealed unsafe class CudaKernels : IDisposable
     public static bool DisableQuantizedGemv { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_QUANTIZED_GEMV") == "1";
 
+    /// <summary>MMVQ-large block size (threads). MUST equal the compiled <c>MMVQ_LARGE_THREADS</c> in
+    /// quantized_gemv_mmq.cu. Tunable via <c>DOTLLM_CUDA_MMVQ_THREADS</c> (32–256, multiple of 32; default
+    /// 128) to sweep occupancy for the decode GEMV — for small-k models (k≤~3072) the default leaves most
+    /// threads idle in the dp4a stage. When overriding, recompile the kernel with the matching #define.</summary>
+    public static uint MmvqLargeThreads { get; set; } = ParseMmvqLargeThreads();
+
+    private static uint ParseMmvqLargeThreads()
+    {
+        if (uint.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_MMVQ_THREADS"), out uint t)
+            && t >= 32 && t <= 256 && (t % 32) == 0)
+            return t;
+        return 128;
+    }
+
     /// <summary>Disable decode-time packed QKV upload/dispatch for diagnostics.</summary>
     public static bool DisablePackedQkv { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_PACKED_QKV") == "1";
@@ -2856,8 +2870,8 @@ public sealed unsafe class CudaKernels : IDisposable
             nint largeFunc = useLargePreq ? largePreqFunc : largeOnTheFlyFunc;
             if (largeFunc != 0)
             {
-                // Must mirror MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu.
-                const uint MmvqLargeThreads = 128;
+                // Block size mirrors MMVQ_LARGE_THREADS in quantized_gemv_mmq.cu (tunable via the
+                // MmvqLargeThreads property / DOTLLM_CUDA_MMVQ_THREADS for occupancy sweeps).
                 if (useLargePreq)
                 {
                     int numChunks = k >> 5;
