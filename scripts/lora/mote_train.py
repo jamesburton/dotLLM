@@ -414,6 +414,19 @@ def main() -> None:
     # Wrap each MoTEBlock so the HF decoder forward receives a plain tensor.
     student = _wrap_mote_shims(student)
 
+    # Move student to training device (build_mote may have created new modules on CPU)
+    student.to(device)
+    # Assert all parameters and buffers are on the training device
+    for name, p in student.named_parameters():
+        assert p.device.type == device.type, (
+            f"Parameter {name} is on {p.device} but training device is {device}"
+        )
+    for name, buf in student.named_buffers():
+        assert buf.device.type == device.type, (
+            f"Buffer {name} is on {buf.device} but training device is {device}"
+        )
+    print(f"[mote_train] student moved to device {device}; all params/buffers verified on {device}")
+
     _freeze_for_mote_training(student)
 
     trainable = sum(p.numel() for p in student.parameters() if p.requires_grad)
@@ -530,6 +543,13 @@ def main() -> None:
         final_kd = kd_val
         final_aux = aux_val
 
+    # Log peak VRAM if on CUDA
+    peak_vram_gb = None
+    if device.type == "cuda":
+        peak_vram_bytes = torch.cuda.max_memory_allocated(device)
+        peak_vram_gb = peak_vram_bytes / 1e9
+        print(f"[mote_train] peak VRAM: {peak_vram_gb:.2f} GB")
+
     print(
         f"[mote_train] training done — {step} steps / {tokens_seen} tokens\n"
         f"             final: lm={final_lm:.4f}  kd={final_kd:.4f}  "
@@ -592,6 +612,8 @@ def main() -> None:
         "steps": step,
         "tokens": tokens_seen,
     }
+    if peak_vram_gb is not None:
+        metrics["peak_vram_gb"] = peak_vram_gb
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
