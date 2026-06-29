@@ -349,6 +349,20 @@ public sealed class VulkanTransformerModel : IModel
     private long _pkvConcatCapacityBytes;
 
     private enum DiffusionKvPhase { None, Prefill, Decode }
+
+    // ── Pipeline parallelism (layer-spanning) ───────────────────────────────
+    // Global index of this model's first layer. 0 for a single-device / first-stage model. When > 0
+    // this is a second (or later) pipeline stage: device weights + the layer loop + KV cache are
+    // window-local (0..NumLayers-1), but the FULL-length CPU-side per-layer lookups (cpuWeights.Layers
+    // and Config.PerLayerSlidingWindow) are offset by _firstLayer at read time. Set by BuildModel.
+    private int _firstLayer;
+    // When non-null, the next Forward seeds HiddenState from these host rows (a previous pipeline
+    // stage's output) instead of gathering token embeddings — the resume-from-hidden entry. Set/cleared
+    // around the inner Forward by ForwardFromHidden; single-threaded per generation like _currentLora.
+    private float[]? _seedHiddenRows;
+    // Reused host-visible staging for the seed upload (grows monotonically; lazy).
+    private VulkanDevice.Buffer? _seedStaging;
+
     private readonly float _ropeTheta;
     private readonly int _ropeDim;
     private readonly RopeF32Kernel.Variant _ropeVariant;
@@ -703,7 +717,8 @@ public sealed class VulkanTransformerModel : IModel
     /// without this hook.
     /// </summary>
     internal static VulkanTransformerModel BuildFromPrebuiltWeights(
-        VulkanDevice device, ModelConfig config, TransformerWeights cpuWeights, string spvDir)
+        VulkanDevice device, ModelConfig config, TransformerWeights cpuWeights, string spvDir,
+        int firstLayer = 0)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -711,17 +726,22 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(spvDir);
 
         RejectUnsupportedArchitecture(config);
-        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null);
+        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null, firstLayer: firstLayer);
     }
 
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
-        TransformerWeights cpuWeights, string spvDir, GgufFile? gguf)
+        TransformerWeights cpuWeights, string spvDir, GgufFile? gguf, int firstLayer = 0)
     {
+        // Pipeline parallelism (layer-spanning): this model covers global layers
+        // [firstLayer .. firstLayer+config.NumLayers). config.NumLayers is the WINDOW size, so the
+        // device weights, the layer loop and the KV cache are all window-local (0-indexed); only the
+        // FULL-length CPU-side lookups (cpuWeights.Layers, Config.PerLayerSlidingWindow) are offset by
+        // _firstLayer at read time. firstLayer=0 (the default) is the single-device / first-stage case.
         // Q8_0 matrices stay on device as 34-byte blocks — the forward pass
         // below dispatches them through the Q8_0 GEMV / GEMM kernels. Other
         // quant types are still dequantised to FP32 at upload.
-        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers);
+        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer);
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
@@ -733,7 +753,7 @@ public sealed class VulkanTransformerModel : IModel
         int moeSharedIntermediate = 0, moeNumSharedExperts = 0;
         for (int i = 0; i < config.NumLayers; i++)
         {
-            ref readonly var lwTmp = ref cpuWeights.Layers[i];
+            ref readonly var lwTmp = ref cpuWeights.Layers[firstLayer + i];
             if (lwTmp.Moe is not null)
             {
                 hasMoe = true;
@@ -1111,7 +1131,7 @@ public sealed class VulkanTransformerModel : IModel
 
         int slidingWindow = config.SlidingWindowSize ?? 0;
 
-        return new VulkanTransformerModel(
+        var model = new VulkanTransformerModel(
             device, ownsDevice,
             config, weights, cpuWeights, state,
             matmul, matmulQ8, matmulQ8Gemm, matmulQ8GemmCoopmat,
@@ -1172,6 +1192,8 @@ public sealed class VulkanTransformerModel : IModel
             ropeTheta, ropeDim, ropeVariant, slidingWindow,
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
+        model._firstLayer = firstLayer;
+        return model;
     }
 
     /// <summary>
@@ -1311,9 +1333,12 @@ public sealed class VulkanTransformerModel : IModel
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int GetLayerSlidingWindow(int layer)
     {
+        // PerLayerSlidingWindow is full-model length; offset the window-local layer to its global index
+        // for a pipeline stage (_firstLayer == 0 on a single-device model, so this is a no-op there).
+        int globalLayer = _firstLayer + layer;
         var perLayer = Config.PerLayerSlidingWindow;
-        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
-            return perLayer[layer] ?? 0;
+        if (perLayer is not null && (uint)globalLayer < (uint)perLayer.Count)
+            return perLayer[globalLayer] ?? 0;
         return _slidingWindow;
     }
 
@@ -2185,6 +2210,18 @@ public sealed class VulkanTransformerModel : IModel
         if (scratchResized)
             InvalidateKernelCaches();
 
+        // Pipeline stage resume (layer-spanning): seed HiddenState from the handed-off hidden rows of a
+        // previous stage instead of gathering token embeddings. Synchronous host→device upload into the
+        // (now correctly-sized) HiddenState slot 0; made visible to the forward submit the same way
+        // DownloadHiddenState reads the post-forward state (fence-ordered on the single queue). Causal
+        // only — ForwardFromHidden rejects the diffusion path, so this never races the canvas-embed logic.
+        bool seedFromHidden = _seedHiddenRows is not null;
+        if (seedFromHidden)
+        {
+            _state.ResetHiddenSlot();
+            UploadHiddenStateRows(_seedHiddenRows!, seqLen);
+        }
+
         // Diffusion forward: pre-allocate the all-position logits buffer and (when
         // self-conditioning is active this step) the SC-signal buffer BEFORE recording
         // begins — both may grow and invalidate descriptor caches, which is only safe
@@ -2227,14 +2264,20 @@ public sealed class VulkanTransformerModel : IModel
         // is the first RMSNorm's COMPUTE read on HiddenState — hidden/residual
         // now alias (no TRANSFER copy in between) so a TRANSFER→COMPUTE
         // barrier is all we need.
-        RecordEmbeddingGather(cmdBuf, tokenIds);
-        KernelSupport.TransferToComputeBarrier(cmdBuf);
+        // Skip the embedding gather when resuming from a seeded hidden state (the previous pipeline
+        // stage already produced these rows and applied any embedding scaling).
+        if (!seedFromHidden)
+        {
+            RecordEmbeddingGather(cmdBuf, tokenIds);
+            KernelSupport.TransferToComputeBarrier(cmdBuf);
+        }
 
         // Gemma sqrt(hidden) embedding scaling — multiply the gathered
         // embedding rows in-place before the first layer. No-op on every
         // architecture that leaves Config.EmbeddingScale null (_embedScale is
-        // null), so non-Gemma output is byte-identical.
-        if (_embedScale is not null)
+        // null), so non-Gemma output is byte-identical. Skipped when seeding
+        // from hidden (the first stage already applied it).
+        if (_embedScale is not null && !seedFromHidden)
         {
             _embedScale.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize,
                 Config.EmbeddingScale!.Value);
@@ -2263,8 +2306,10 @@ public sealed class VulkanTransformerModel : IModel
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
+            // Device weights are window-local (0-indexed); CPU weights are full-length, so offset by
+            // _firstLayer (0 on a single-device model) to read this stage's global layer.
             ref readonly var lw = ref _weights.Layers[layer];
-            ref readonly var cpuLw = ref _cpuWeights.Layers[layer];
+            ref readonly var cpuLw = ref _cpuWeights.Layers[_firstLayer + layer];
 
             // Pre-attention residual snapshot: Residual aliases HiddenState
             // (same physical buffer), so no copy is needed. The barrier from
@@ -2622,7 +2667,7 @@ public sealed class VulkanTransformerModel : IModel
                 // P*hidden elements from the start) hits exactly them — no offset binding.
                 _embedScale!.Record(cmdBuf, _state.HiddenState, seqLen * hiddenSize, g4scale.LayerOutputScale);
                 int regionP = DiffusionRegionPrefix(seqLen);
-                float? encScale = _cpuWeights.Layers[layer].Gemma4?.EncLayerOutputScale;
+                float? encScale = _cpuWeights.Layers[_firstLayer + layer].Gemma4?.EncLayerOutputScale;
                 if (regionP > 0 && encScale is float enc && g4scale.LayerOutputScale != 0f)
                 {
                     KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -2786,6 +2831,63 @@ public sealed class VulkanTransformerModel : IModel
         _device.Download(staging, new Span<float>((void*)result.DataPointer, seqLen * hiddenSize));
 
         return result;
+    }
+
+    /// <summary>
+    /// Resume-from-hidden entry for pipeline parallelism (layer-spanning): runs this stage's layers
+    /// (global <c>[_firstLayer .. _firstLayer+NumLayers)</c>) plus the final norm + LM head over a hidden
+    /// state handed off from the previous stage, skipping the token-embedding gather. The mirror of
+    /// <see cref="DownloadHiddenState"/>: the previous stage produced <paramref name="hiddenRows"/> via
+    /// that method, this stage consumes them. Positions are absolute (same as a normal forward), so RoPE
+    /// and sliding-window masks are correct for the stage's layers. Causal path only.
+    /// </summary>
+    /// <param name="hiddenRows">Row-major <c>[seqLen, hiddenSize]</c> FP32 hidden state from the previous stage.</param>
+    /// <param name="positions">Absolute position of each token (length = seqLen).</param>
+    /// <param name="kvCache">This stage's KV cache (sized to its layer window), or null for a cacheless prefill.</param>
+    /// <returns>Logits for the last position — identical shape/semantics to <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>.</returns>
+    internal ITensor ForwardFromHidden(ReadOnlySpan<float> hiddenRows, ReadOnlySpan<int> positions, IKvCache? kvCache)
+    {
+        if (_diffusionMaskMode != AttentionMaskMode.Causal)
+            throw new NotSupportedException("ForwardFromHidden supports only the causal path.");
+        int seqLen = positions.Length;
+        if (seqLen == 0) throw new ArgumentException("positions must be non-empty.", nameof(positions));
+        long expected = (long)seqLen * Config.HiddenSize;
+        if (hiddenRows.Length != expected)
+            throw new ArgumentException(
+                $"hiddenRows must be seqLen × hiddenSize = {expected} floats; got {hiddenRows.Length}.", nameof(hiddenRows));
+
+        // Forward gathers embeddings from tokenIds unless _seedHiddenRows is set; the IDs are then unused
+        // (validation only — zeros are valid), so pass a zero token per position.
+        _seedHiddenRows = hiddenRows.ToArray();
+        try
+        {
+            int[] dummyTokens = new int[seqLen]; // all zeros; embedding gather is skipped
+            return Forward(dummyTokens, positions, deviceId: 0, kvCache);
+        }
+        finally
+        {
+            _seedHiddenRows = null;
+        }
+    }
+
+    /// <summary>
+    /// Uploads host hidden rows into the current device-local HiddenState slot (the inverse of
+    /// <see cref="DownloadHiddenState"/>): host → host-visible staging → device-local HiddenState via a
+    /// synchronous <c>vkCmdCopyBuffer</c>. Used by the resume-from-hidden seed in <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>.
+    /// </summary>
+    private void UploadHiddenStateRows(ReadOnlySpan<float> rows, int seqLen)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int count = seqLen * hiddenSize;
+        long bytes = (long)count * sizeof(float);
+        if (_seedStaging is null || _seedStaging.Size < bytes)
+        {
+            _seedStaging?.Dispose();
+            _seedStaging = _device.Allocate(bytes); // host-visible, host-coherent
+        }
+        _device.Upload(rows[..count], _seedStaging);                 // host → staging (mapped write)
+        _device.CopyBufferRangeSynchronous(_seedStaging, _state.HiddenState,
+            srcOffset: 0, dstOffset: 0, size: (ulong)bytes);          // staging → device-local HiddenState
     }
 
     /// <summary>
@@ -5082,6 +5184,7 @@ public sealed class VulkanTransformerModel : IModel
         _pkvStore?.Dispose();
         _pkvKConcat?.Dispose();
         _pkvVConcat?.Dispose();
+        _seedStaging?.Dispose();
 
         _submit.Dispose();
         _state.Dispose();
