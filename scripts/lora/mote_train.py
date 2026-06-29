@@ -62,6 +62,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Optional
 
 import torch
@@ -213,11 +214,14 @@ def _kl_loss(
 ) -> torch.Tensor:
     """Per-token mean KL(student || teacher).
 
-    Uses log-softmax for numerical stability.  Teacher logits are detached.
+    Uses log-softmax for numerical stability.  Teacher logits are detached and
+    moved to the student's device (teacher may be on CPU when --teacher-device cpu).
     """
     V = student_logits.size(-1)
+    # Move teacher logits to the student's device (no-op when both are on the same device).
+    t_logits = teacher_logits.to(student_logits.device)
     s_lp = F.log_softmax(student_logits.float().view(-1, V), dim=-1)
-    t_p = F.softmax(teacher_logits.float().view(-1, V).detach(), dim=-1)
+    t_p = F.softmax(t_logits.float().view(-1, V).detach(), dim=-1)
     # NOTE: F.kl_div(log_p, q) computes forward KL = KL(q || p) = KL(teacher || student).
     # This is the standard LM-distillation objective (penalizes the student for missing
     # teacher mass). The spec's "KL(student || teacher)" notation was inverted; this
@@ -342,9 +346,22 @@ def main() -> None:
         "--histogram-steps", type=int, default=50,
         help="Number of recent steps used to build the expert-count histogram",
     )
+    ap.add_argument(
+        "--optim", choices=["adamw8bit", "adafactor", "adamw"], default="adamw8bit",
+        help=(
+            "Optimizer: adamw8bit (bitsandbytes PagedAdamW8bit, auto-falls back to "
+            "adafactor if bnb unavailable); adafactor (Adafactor, no state memory); "
+            "adamw (full AdamW, most memory)."
+        ),
+    )
+    ap.add_argument(
+        "--teacher-device", default="cpu", choices=["cpu", "cuda"],
+        help="Device for the frozen teacher model (default: cpu to save GPU VRAM)",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
+    teacher_device = torch.device(args.teacher_device)
     max_tokens = int(args.tokens)
     os.makedirs(args.out, exist_ok=True)
 
@@ -354,7 +371,8 @@ def main() -> None:
     )
     print(
         f"[mote_train] tokens={max_tokens:.2e}  kd_weight={args.kd_weight}  "
-        f"device={device}  tiny_random={args.tiny_random}"
+        f"device={device}  teacher_device={teacher_device}  "
+        f"optim={args.optim!r}  tiny_random={args.tiny_random}"
     )
 
     # ------------------------------------------------------------------
@@ -377,16 +395,24 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.tiny_random:
         from transformers import BitNetForCausalLM
-        teacher = BitNetForCausalLM(tiny_cfg).to(device=device)
+        teacher = BitNetForCausalLM(tiny_cfg).to(device=teacher_device)
     else:
-        teacher = AutoModelForCausalLM.from_pretrained(
-            args.base, torch_dtype=torch.bfloat16, device_map={"": device}
-        )
+        # BitNet refuses device_map with a CPU or disk device; load without device_map
+        # (defaults to CPU) and move manually, or use device_map only for CUDA.
+        if teacher_device.type == "cpu":
+            teacher = AutoModelForCausalLM.from_pretrained(
+                args.base, dtype=torch.bfloat16
+            )
+            # Already on CPU by default; no explicit move needed.
+        else:
+            teacher = AutoModelForCausalLM.from_pretrained(
+                args.base, dtype=torch.bfloat16, device_map={"": teacher_device}
+            )
 
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
-    print("[mote_train] teacher loaded and frozen (dense BitNet, no grad)")
+    print(f"[mote_train] teacher loaded and frozen on {teacher_device} (dense BitNet, no grad)")
 
     # ------------------------------------------------------------------
     # 3. Student — separate load; build_mote converts target layers
@@ -396,7 +422,7 @@ def main() -> None:
         student = BitNetForCausalLM(tiny_cfg).to(device=device)
     else:
         student = AutoModelForCausalLM.from_pretrained(
-            args.base, torch_dtype=torch.bfloat16, device_map={"": device}
+            args.base, dtype=torch.bfloat16, device_map={"": device}
         )
     student.config.use_cache = False
 
@@ -439,12 +465,63 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Optimizer — router lr 1e-4 (spec: "lr 1e-4 on the MoE path")
     # ------------------------------------------------------------------
-    opt = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=1e-4,
-        weight_decay=0.0,
-        betas=(0.9, 0.95),
-    )
+    _lr = 1e-4
+    _trainable = [p for p in student.parameters() if p.requires_grad]
+    _optim_choice = args.optim
+    opt: torch.optim.Optimizer
+
+    if _optim_choice == "adamw":
+        opt = torch.optim.AdamW(_trainable, lr=_lr, weight_decay=0.0, betas=(0.9, 0.95))
+        print(f"[mote_train] optimizer: AdamW (full, lr={_lr})")
+    elif _optim_choice == "adafactor":
+        from transformers.optimization import Adafactor
+        opt = Adafactor(
+            _trainable,
+            lr=_lr,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
+        print(f"[mote_train] optimizer: Adafactor (lr={_lr})")
+    else:  # adamw8bit (default) — try bnb, fallback to adafactor
+        # bnb may import and construct fine but fail at first step() on Windows
+        # (illegal-instruction / WinError -1073741795 in CUDA kernels). Verify with
+        # a synthetic parameter step before committing to it for the real training.
+        _bnb_ok = False
+        _bnb_err_msg = "not attempted"
+        try:
+            import bitsandbytes as bnb
+            try:
+                opt = bnb.optim.PagedAdamW8bit(_trainable, lr=_lr, weight_decay=0.0, betas=(0.9, 0.95))
+                _bnb_cls_name = "PagedAdamW8bit"
+            except AttributeError:
+                opt = bnb.optim.AdamW8bit(_trainable, lr=_lr, weight_decay=0.0, betas=(0.9, 0.95))
+                _bnb_cls_name = "AdamW8bit"
+            # Verify the optimizer kernel actually works at runtime (Windows wheels are flaky)
+            _vp = torch.zeros(32, device=device, requires_grad=True)
+            _vo = type(opt)([_vp], lr=_lr)
+            _vp.sum().backward()
+            _vo.step()
+            _vo.zero_grad()
+            del _vp, _vo
+            _bnb_ok = True
+            print(f"[mote_train] optimizer: bitsandbytes {_bnb_cls_name} (verified, lr={_lr})")
+        except (ImportError, OSError, RuntimeError, Exception) as _bnb_exc:
+            _bnb_err_msg = repr(_bnb_exc)
+
+        if not _bnb_ok:
+            from transformers.optimization import Adafactor
+            opt = Adafactor(
+                _trainable,
+                lr=_lr,
+                relative_step=False,
+                scale_parameter=False,
+                warmup_init=False,
+            )
+            print(
+                f"[mote_train] optimizer: Adafactor fallback "
+                f"(bitsandbytes runtime error: {_bnb_err_msg}, lr={_lr})"
+            )
 
     # ------------------------------------------------------------------
     # 5. Corpus
@@ -480,13 +557,15 @@ def main() -> None:
     recent_counts: list = []   # last K expert-count tensors
 
     final_lm = final_kd = final_aux = float("nan")
+    _t0 = time.perf_counter()
+    _steps_per_sec: Optional[float] = None
 
     while tokens_seen < max_tokens:
-        seq = corpus[step % len(corpus)].unsqueeze(0).to(device)  # [1, T]
+        seq = corpus[step % len(corpus)].unsqueeze(0).to(device)  # [1, T] on student device
 
-        # Teacher forward (no grad)
+        # Teacher forward (no grad) — input moved to teacher_device (may be CPU)
         with torch.no_grad():
-            teacher_logits = teacher(input_ids=seq).logits  # [1, T, V]
+            teacher_logits = teacher(input_ids=seq.to(teacher_device)).logits  # [1, T, V]
 
         # Student forward
         student_logits = student(input_ids=seq).logits  # [1, T, V]
@@ -531,11 +610,19 @@ def main() -> None:
             if len(recent_counts) > args.histogram_steps:
                 recent_counts.pop(0)
 
+        # Compute rolling steps/sec from step 10 onward (warm-up excluded)
+        if step == 10:
+            _t0 = time.perf_counter()  # reset timer after warm-up
+        elif step > 10:
+            elapsed = time.perf_counter() - _t0
+            _steps_per_sec = (step - 10) / elapsed if elapsed > 0 else None
+
         # Progress logging
         if step <= 5 or step % 20 == 0:
+            sps_str = f"  {_steps_per_sec:.2f} steps/s" if _steps_per_sec else ""
             print(
                 f"  step {step:5d}  tokens {tokens_seen:.2e}  "
-                f"lm {lm_val:.4f}  kd {kd_val:.4f}  aux {aux_val:.4f}",
+                f"lm {lm_val:.4f}  kd {kd_val:.4f}  aux {aux_val:.4f}{sps_str}",
                 flush=True,
             )
 
@@ -550,8 +637,9 @@ def main() -> None:
         peak_vram_gb = peak_vram_bytes / 1e9
         print(f"[mote_train] peak VRAM: {peak_vram_gb:.2f} GB")
 
+    sps_report = f"  {_steps_per_sec:.3f} steps/s" if _steps_per_sec else ""
     print(
-        f"[mote_train] training done — {step} steps / {tokens_seen} tokens\n"
+        f"[mote_train] training done — {step} steps / {tokens_seen} tokens{sps_report}\n"
         f"             final: lm={final_lm:.4f}  kd={final_kd:.4f}  "
         f"aux={final_aux:.4f}"
     )
@@ -614,6 +702,8 @@ def main() -> None:
     }
     if peak_vram_gb is not None:
         metrics["peak_vram_gb"] = peak_vram_gb
+    if _steps_per_sec is not None:
+        metrics["steps_per_sec"] = round(_steps_per_sec, 3)
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
