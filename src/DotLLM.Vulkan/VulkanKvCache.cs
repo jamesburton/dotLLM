@@ -32,7 +32,7 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
@@ -388,6 +388,38 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache
             throw new ArgumentOutOfRangeException(nameof(length));
         _currentLength = length;
     }
+
+    // ── IHostStagedKvCache: device↔host staging for cross-device KV handoff ──
+    // The two halves of a device→host→device transfer: DownloadLayer reads this (prefill-device) cache's
+    // K/V to host; the decode-device cache's UploadLayer (== IngestFromHost) writes it back to its device.
+    // This is the production transport for a two-GPU prefill→decode handoff and is exercised by the
+    // DisaggregatedScheduler's StagedKvHandoffTransfer.
+
+    /// <inheritdoc/>
+    public int StagedLayerElementCount(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        return _currentLength * _kvStride[layerIndex];
+    }
+
+    /// <inheritdoc/>
+    public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int count = _currentLength * _kvStride[layerIndex];
+        if (count == 0) return;
+        if (keys.Length < count || values.Length < count)
+            throw new ArgumentException($"keys/values must hold at least currentLength × kvStride = {count} floats.");
+        // Device-local K/V → host. On a dGPU this is a real VRAM read-back; on UMA the bytes never leave DRAM.
+        _device.Download(_keys[layerIndex], keys[..count]);
+        _device.Download(_values[layerIndex], values[..count]);
+    }
+
+    /// <inheritdoc/>
+    public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+        => IngestFromHost(layerIndex, length, keys, values);
 
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {

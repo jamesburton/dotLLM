@@ -266,7 +266,24 @@ public sealed class VulkanDevice : IDisposable
     /// Creates a Vulkan device bound to the first suitable GPU.
     /// Selection order: discrete GPU (preferring AMD/NVIDIA over Intel) → integrated → first available.
     /// </summary>
-    public static VulkanDevice Create()
+    public static VulkanDevice Create() => CreateCore(forcedIndex: null);
+
+    /// <summary>
+    /// Creates a Vulkan device bound to the physical device at the given <c>vkEnumeratePhysicalDevices</c>
+    /// enumeration index. Unlike the parameterless overload (which scores devices) and the process-global
+    /// <c>DOTLLM_VULKAN_DEVICE_INDEX</c> env override, this lets a single process bind <em>different</em>
+    /// GPUs for different replicas — e.g. prefill on device 0 and decode on device 1 for a cross-device
+    /// <see cref="T:DotLLM.Engine.Scheduler.DisaggregatedScheduler"/> KV handoff. The explicit index takes
+    /// precedence over the env overrides.
+    /// </summary>
+    /// <param name="deviceIndex">Zero-based physical-device enumeration index.</param>
+    public static VulkanDevice Create(int deviceIndex)
+    {
+        if (deviceIndex < 0) throw new ArgumentOutOfRangeException(nameof(deviceIndex));
+        return CreateCore(deviceIndex);
+    }
+
+    private static VulkanDevice CreateCore(int? forcedIndex)
     {
         VulkanLibraryResolver.Register();
         nint instance = CreateInstance();
@@ -275,7 +292,7 @@ public sealed class VulkanDevice : IDisposable
 
         try
         {
-            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type, out uint apiVersion);
+            nint physical = SelectPhysicalDevice(instance, forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion);
             uint queueFamily = SelectComputeQueueFamily(physical);
 
             // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
@@ -381,7 +398,7 @@ public sealed class VulkanDevice : IDisposable
     }
 
     private static nint SelectPhysicalDevice(
-        nint instance, out string name, out uint vendor, out int type, out uint apiVersion)
+        nint instance, int? forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion)
     {
         uint count = 0;
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null)
@@ -392,6 +409,22 @@ public sealed class VulkanDevice : IDisposable
         var devices = new nint[count];
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices)
             .ThrowOnError("vkEnumeratePhysicalDevices");
+
+        // Explicit per-replica selection (Create(int deviceIndex)) takes precedence over env + scoring, so a
+        // single process can bind different GPUs for prefill vs decode in a cross-device handoff.
+        if (forcedIndex is int fi)
+        {
+            if ((uint)fi >= (uint)devices.Length)
+                throw new VulkanException(-3,
+                    $"Requested Vulkan device index {fi} is out of range (0..{devices.Length - 1}).");
+            nint chosen = devices[fi];
+            VulkanApi.vkGetPhysicalDeviceProperties(chosen, out var cp);
+            name = ReadDeviceName(cp);
+            vendor = cp.vendorID;
+            type = cp.deviceType;
+            apiVersion = cp.apiVersion;
+            return chosen;
+        }
 
         // Manual override (testing / iGPU targeting): DOTLLM_VULKAN_DEVICE_INDEX picks a device by
         // enumeration index; DOTLLM_VULKAN_DEVICE_VENDOR (hex, e.g. 0x8086) picks the first device of

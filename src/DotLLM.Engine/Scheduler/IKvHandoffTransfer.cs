@@ -95,6 +95,77 @@ public sealed class CopyKvHandoffTransfer : IKvHandoffTransfer
 }
 
 /// <summary>
+/// Cross-device / cross-pool handoff via an explicit host hop. Each layer's K/V is copied
+/// <em>device→host</em> out of the prefill cache and <em>host→device</em> into a fresh decode-pool cache
+/// over the backend-agnostic <see cref="IHostStagedKvCache"/> seam, then the prefill cache is disposed.
+/// Unlike <see cref="CopyKvHandoffTransfer"/> (which uses the <c>GetKeysRef</c>/<c>Update(TensorRef)</c>
+/// surface that device-local caches do not support), this path works for Vulkan/CUDA caches because the
+/// host staging is explicit — it is the production transport for a two-GPU prefill→decode handoff where the
+/// devices cannot DMA to each other directly. On a single CPU box (separate pools) it is byte-equivalent to
+/// the copy transfer, so it is unit-tested there; the real device→host→device run is hardware-gated.
+/// </summary>
+public sealed class StagedKvHandoffTransfer : IKvHandoffTransfer
+{
+    /// <summary>Shared singleton — the strategy is stateless.</summary>
+    public static readonly StagedKvHandoffTransfer Instance = new();
+
+    /// <inheritdoc/>
+    public IKvCache Transfer(IKvCache source, ModelConfig config, Func<ModelConfig, int, IKvCache> destinationFactory)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(destinationFactory);
+
+        if (source is not IHostStagedKvCache stagedSource)
+            throw new NotSupportedException(
+                $"Source KV-cache {source.GetType().Name} does not implement {nameof(IHostStagedKvCache)}; "
+                + "staged transfer requires host-staging support on both ends.");
+
+        // Allocate a fresh cache from the destination (decode) pool/device, sized to hold the full sequence.
+        IKvCache destination = destinationFactory(config, source.MaxLength);
+        try
+        {
+            if (destination is not IHostStagedKvCache stagedDestination)
+                throw new NotSupportedException(
+                    $"Destination KV-cache {destination.GetType().Name} does not implement {nameof(IHostStagedKvCache)}.");
+
+            int length = source.CurrentLength;
+            if (length > 0)
+                StageLayers(stagedSource, stagedDestination, config.NumLayers, length);
+        }
+        catch
+        {
+            destination.Dispose();
+            throw;
+        }
+
+        // The source cache (on the prefill pool/device) is no longer needed; free its blocks.
+        source.Dispose();
+        return destination;
+    }
+
+    private static void StageLayers(IHostStagedKvCache source, IHostStagedKvCache destination, int numLayers, int length)
+    {
+        for (int layer = 0; layer < numLayers; layer++)
+        {
+            // Per-layer rent: KV row width can differ per layer (e.g. Gemma-4 sliding vs global layers).
+            int count = source.StagedLayerElementCount(layer);
+            float[] keys = ArrayPool<float>.Shared.Rent(count);
+            float[] values = ArrayPool<float>.Shared.Rent(count);
+            try
+            {
+                source.DownloadLayer(layer, keys.AsSpan(0, count), values.AsSpan(0, count));
+                destination.UploadLayer(layer, length, keys.AsSpan(0, count), values.AsSpan(0, count));
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(keys);
+                ArrayPool<float>.Shared.Return(values);
+            }
+        }
+    }
+}
+
+/// <summary>
 /// Backend-agnostic copy of KV-cache contents between two <see cref="IKvCache"/> instances, layer by
 /// layer, over the <see cref="IKvCache.GetKeysRef"/>/<see cref="IKvCache.GetValuesRef"/> /
 /// <see cref="IKvCache.Update(TensorRef, TensorRef, ReadOnlySpan{int}, int)"/> public surface. Works for
