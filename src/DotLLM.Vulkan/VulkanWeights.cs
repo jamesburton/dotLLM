@@ -493,6 +493,13 @@ internal sealed class VulkanWeights : IDisposable
     /// FP32 at upload — the legacy scaffold path, kept as a fallback for
     /// environments where the Q8_0 kernels regress.
     /// </param>
+    /// <param name="firstLayer">
+    /// Index of the first <see cref="TransformerWeights.Layers"/> entry to upload (default 0). Together
+    /// with <paramref name="numLayers"/> this selects the half-open window
+    /// <c>[firstLayer .. firstLayer+numLayers)</c> — used to load only a pipeline stage's slice of layers
+    /// onto a given device for cross-device layer-spanning (pipeline parallelism). The returned
+    /// <see cref="Layers"/> are indexed locally (0-based) within the window.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is sized to fit the largest single matrix in its <i>widest</i>
@@ -502,14 +509,18 @@ internal sealed class VulkanWeights : IDisposable
     /// </remarks>
     public static VulkanWeights Upload(
         VulkanDevice device, TransformerWeights weights, int numLayers,
-        bool dequantToFp32 = false)
+        bool dequantToFp32 = false, int firstLayer = 0)
     {
+        if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
+            throw new ArgumentOutOfRangeException(nameof(firstLayer),
+                $"Layer window [{firstLayer}..{firstLayer + numLayers}) is outside [0..{weights.Layers.Length}).");
+
         long totalBytes = 0;
         ResetUploadCounters();
 
         // Size the reusable staging buffer to the largest single weight upload
-        // (in its on-device byte form).
-        long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32);
+        // (in its on-device byte form) across the uploaded layer window.
+        long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer);
         using var staging = device.Allocate(stagingBytes);
 
         // Token embedding table: [vocabSize, hiddenSize]. Uploaded once as a
@@ -526,10 +537,14 @@ internal sealed class VulkanWeights : IDisposable
             out _, out long tokenEmbedBytes);
         totalBytes += tokenEmbedBytes;
 
+        // Upload an arbitrary layer window [firstLayer .. firstLayer+numLayers): the local LayerBuffers
+        // index is 0..numLayers-1, sourced from the global layer firstLayer+i. firstLayer=0 (the default)
+        // is the single-device / first-pipeline-stage case; firstLayer>0 lets a second pipeline stage hold
+        // only its slice of layers for cross-device layer-spanning (pipeline parallelism).
         var layerBuffers = new LayerBuffers[numLayers];
         for (int i = 0; i < numLayers; i++)
         {
-            ref readonly var lw = ref weights.Layers[i];
+            ref readonly var lw = ref weights.Layers[firstLayer + i];
 
             // Gemma-4 MoE dual-FFN layer: both the dense Gate/Up/Down AND the
             // routed experts run in parallel, V branches off the raw K projection
@@ -982,14 +997,14 @@ internal sealed class VulkanWeights : IDisposable
     }
 
     private static long ComputeMaxUploadBytes(
-        TransformerWeights weights, int numLayers, bool dequantToFp32)
+        TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0)
     {
         long max = 0;
         max = Math.Max(max, UploadBytes(weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType, dequantToFp32: true));
         max = Math.Max(max, UploadBytes(weights.OutputOutputDim, weights.OutputInputDim, weights.OutputQuantType, dequantToFp32));
         for (int i = 0; i < numLayers; i++)
         {
-            ref readonly var lw = ref weights.Layers[i];
+            ref readonly var lw = ref weights.Layers[firstLayer + i];
             max = Math.Max(max, UploadBytes(lw.QOutputDim, lw.QInputDim, lw.QQuantType, dequantToFp32));
             max = Math.Max(max, UploadBytes(lw.KOutputDim, lw.KInputDim, lw.KQuantType, dequantToFp32));
             max = Math.Max(max, UploadBytes(lw.VOutputDim, lw.VInputDim, lw.VQuantType, dequantToFp32));
