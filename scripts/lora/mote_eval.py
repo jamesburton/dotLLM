@@ -50,6 +50,7 @@ import json
 import math
 import os
 import sys
+import warnings
 from typing import Optional
 
 import torch
@@ -154,8 +155,14 @@ def _compute_entropy(counts: torch.Tensor, n_experts: int) -> tuple[float, float
 def _compute_router_dependence(argmax_per_layer: dict, n_experts: int) -> float:
     """Fraction of distinct argmax experts observed across all tokens and layers.
 
-    A value of 1.0 means every expert appeared as the argmax for at least one
-    token; 1/n_experts means only a single expert was ever selected (dead router).
+    **Metric definition**: Measures **top-1 argmax diversity** (expert specialisation)
+    across tokens. A value of 1.0 means every expert appeared as the argmax for at
+    least one token; 1/n_experts means only a single expert was ever selected
+    (dead router). This is a dead-router detection metric, valid for any top_k setting.
+
+    **For load-balance diagnostics across all top_k dispatched experts**, use the
+    **expert-utilization entropy metric** instead (metric a), which captures whether
+    all routed experts (not just argmax) receive roughly equal dispatch volume.
 
     Args:
         argmax_per_layer: Output of :func:`_register_argmax_hooks`.
@@ -188,6 +195,12 @@ def _compute_ppl(total_nll: float, total_tokens: int) -> float:
     if total_tokens == 0:
         return float("inf")
     avg = total_nll / total_tokens
+    if avg > 100.0:
+        warnings.warn(
+            f"[mote_eval] PPL avg NLL ({avg:.2f}) exceeds cap (100.0); "
+            "capping at exp(100). Adapter may be untrained or catastrophically wrong.",
+            UserWarning
+        )
     return math.exp(min(avg, 100.0))
 
 
@@ -306,6 +319,7 @@ def main() -> None:
         dense = AutoModelForCausalLM.from_pretrained(
             base_name, torch_dtype=torch.bfloat16, device_map={"": device}
         )
+    dense.config.use_cache = False
     dense.eval()
     for p in dense.parameters():
         p.requires_grad_(False)
@@ -349,6 +363,10 @@ def main() -> None:
 
     missing_keys, unexpected_keys = student.load_state_dict(
         adapter_state, strict=False
+    )
+    assert not unexpected_keys, (
+        f"[mote_eval] adapter keys did not match the rebuilt model (config drift?): "
+        f"{unexpected_keys}"
     )
     print(
         f"[mote_eval] adapter_weights.pt loaded: {len(adapter_state)} tensors  "
@@ -486,10 +504,10 @@ def main() -> None:
         f"  (H / log(N) = {h_norm:.4f}, log(N) = {log_n_str})"
     )
     print(f"      Expert histogram           = {expert_histogram}")
-    print(f"      Collapsed (H < 0.5·log N)  = {collapsed}")
+    print(f"      Collapsed (H < 0.5*log N)  = {collapsed}")
     print(f"  (b) Val-PPL (MoTE)             = {ppl_mote:.3f}")
     print(f"      Val-PPL (dense baseline)   = {ppl_dense:.3f}")
-    print(f"      ΔPPL  (MoTE − dense)       = {ppl_delta:+.3f}")
+    print(f"      PPL delta (MoTE - dense)   = {ppl_delta:+.3f}")
     print(
         f"  (c) Router input-dependence    = {router_dependence:.4f} "
         f"({n_experts} experts; fraction with distinct argmax)"
@@ -518,7 +536,7 @@ def main() -> None:
     out_path = os.path.join(adapter_dir, "eval.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(results, fh, indent=2)
-    print(f"[mote_eval] eval.json → {out_path}")
+    print(f"[mote_eval] eval.json -> {out_path}")
 
     if collapsed:
         print(
