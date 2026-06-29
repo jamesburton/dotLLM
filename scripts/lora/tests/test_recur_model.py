@@ -2,9 +2,8 @@
 
 Verifiable properties (all run on CPU, no GPU, no background jobs):
 
-  (a) Pass-through config (adapter identity + gate g=1) → recurrence=1 logits
-      match the stock BitNet model within tight numerical tolerance.
-      This is the falsifiable N=1==stock correctness gate from Probe 0.
+  (a) Pass-through config (_bypass_fusion=True, bypassing fusion+gate) → recurrence=1
+      logits match the stock BitNet model within tight numerical tolerance.
 
   (b) build_recur(...).forward(ids, recurrence=k) for k in {1, 2} returns
       finite tensors with the correct shape (batch, seq, vocab).
@@ -73,10 +72,10 @@ def input_ids(base_model):
 def test_passthrough_n1_matches_stock(base_model, input_ids):
     """Pass-through config → N=1 forward reproduces stock BitNet logits.
 
-    This is the Probe-0 N=1==stock check:
-      - fusion identity (W[:,:H]=I, W[:,H:]=0, b=0) → s = prelude_out
-      - gate g=1.0 → state = slab_out
-      ⇒ embed → prelude → slab(prelude_out) → coda = stock model exactly.
+    This is the Probe-0 N=1==stock check. make_passthrough() sets
+    _bypass_fusion=True, bypassing both the fusion linear and the gate
+    arithmetic: fused=prelude_out (exact slice), state=slab_out (direct
+    assign). No identity-weight init or g=1 assignment is needed.
     """
     _, model = base_model
     recur = build_recur(model, P=DEFAULT_P, Q=DEFAULT_Q)

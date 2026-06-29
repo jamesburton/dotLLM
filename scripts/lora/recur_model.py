@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -146,6 +147,11 @@ class RecurModel(nn.Module):
         # Set to False in normal forward; True only during testing.
         self._bypass_fusion: bool = False
 
+        # Gradient checkpointing flag — set True externally (e.g., by training script)
+        # to wrap each slab forward in torch.utils.checkpoint.checkpoint, trading
+        # recomputation for lower peak activation memory (key for high N on 12 GB GPU).
+        self.use_grad_checkpoint: bool = False
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -204,25 +210,40 @@ class RecurModel(nn.Module):
         prelude_out = hidden  # frozen context injected on every loop iteration
         state = hidden        # initial recurrent state = prelude output
 
+        # Slab function defined once outside the recurrence loop — reused for
+        # every iteration and optionally wrapped in grad-checkpoint.
+        _slab_layers = list(layers[P:Q])
+        _layer_kw = layer_kwargs
+
+        def _make_slab_fn(slabs: list, kwargs: dict):
+            def _fn(h: torch.Tensor) -> torch.Tensor:
+                for _layer in slabs:
+                    h = _layer_fwd(_layer, h, **kwargs)
+                return h
+            return _fn
+
+        _slab_fn = _make_slab_fn(_slab_layers, _layer_kw)
+
         # ---- looped slab: layers[P:Q) × recurrence ----
         for _ in range(recurrence):
             if self._bypass_fusion:
                 # Bypass mode (sanity-check only): skip fusion AND gate arithmetic
                 # entirely so the N=1==stock comparison is exact in float32.
-                # fused = prelude_out (slice, no matmul rounding).
                 # state = slab_out (direct assign — avoids h_in+g*(out-h_in) error).
-                fused = prelude_out
-                for layer in layers[P:Q]:
-                    fused = _layer_fwd(layer, fused, **layer_kwargs)
-                state = fused
+                state = _slab_fn(prelude_out)
             else:
                 # Normal forward: fusion adapter + learned gate.
                 fused = self.fusion(torch.cat([prelude_out, state], dim=-1))
-                h = fused
-                for layer in layers[P:Q]:
-                    h = _layer_fwd(layer, h, **layer_kwargs)
+                # Slab forward — optionally grad-checkpointed to cap peak VRAM
+                # when running high recurrence counts (N×full-slab activations).
+                if self.use_grad_checkpoint:
+                    slab_out = torch.utils.checkpoint.checkpoint(
+                        _slab_fn, fused, use_reentrant=False
+                    )
+                else:
+                    slab_out = _slab_fn(fused)
                 # Learned residual gate: state = fused + g * (slab_out - fused)
-                state = self.gate(fused, h)
+                state = self.gate(fused, slab_out)
 
         hidden = state
 
