@@ -140,6 +140,13 @@ class RecurModel(nn.Module):
         # Learned per-loop residual gate
         self.gate = ResidualGate(init=gate_init)
 
+        # Ensure fusion and gate are in the same dtype and device as the base model.
+        # The base model may be bf16 while default nn.Linear/Parameter are float32.
+        dtype = next(base.parameters()).dtype
+        device = next(base.parameters()).device
+        self.fusion = self.fusion.to(dtype=dtype, device=device)
+        self.gate = self.gate.to(dtype=dtype, device=device)
+
         # Internal flag: bypass fusion AND gate with exact operations (no matmul/gate
         # arithmetic).  Used by make_passthrough() so N=1 gives stock model logits
         # exactly.  In bypass mode: fused=prelude_out (slice), state=slab_out
