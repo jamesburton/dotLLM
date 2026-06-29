@@ -1285,13 +1285,25 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public bool IsHostImported => _hostImport is not null;
 
-        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size)
+        /// <summary>
+        /// True when this buffer's memory is <c>HOST_VISIBLE</c> and can be mapped with
+        /// <c>vkMapMemory</c> directly. Host-visible allocations and UMA device-local types are
+        /// mappable; a <em>strictly</em> <c>DEVICE_LOCAL</c> type on a discrete GPU is NOT — host
+        /// readback/upload to such a buffer must stage through a host-visible buffer +
+        /// <c>vkCmdCopyBuffer</c> (see <see cref="VulkanDevice.Download"/> /
+        /// <see cref="VulkanDevice.UploadToDeviceLocal"/>). On UMA parts (Strix Halo iGPU, Intel Arc)
+        /// device-local is typically host-visible too, so the direct map fast-path applies.
+        /// </summary>
+        public bool IsHostVisible { get; }
+
+        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible)
         {
             _device = device;
             _buffer = buffer;
             _memory = memory;
             Size = size;
             _hostImport = null;
+            IsHostVisible = hostVisible;
         }
 
         internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
@@ -1301,6 +1313,7 @@ public sealed class VulkanDevice : IDisposable
             _memory = hostImport.Memory;
             Size = hostImport.Size;
             _hostImport = hostImport;
+            IsHostVisible = true; // wraps host pages — mappable by construction
         }
 
         /// <summary>Underlying <c>VkDeviceMemory</c> handle.</summary>
@@ -1450,7 +1463,19 @@ public sealed class VulkanDevice : IDisposable
             bindResult.ThrowOnError("vkBindBufferMemory");
         }
 
-        return new Buffer(this, buffer, memory, bytes);
+        // Host-visible allocations are mappable; a device-local allocation is mappable only when the
+        // chosen type also carries HOST_VISIBLE (the UMA case). On a discrete GPU the strict
+        // device-local type is NOT mappable, so Download/UploadToDeviceLocal must stage.
+        bool hostVisible = !deviceLocal || MemoryTypeIsHostVisible(typeIndex);
+        return new Buffer(this, buffer, memory, bytes, hostVisible);
+    }
+
+    private unsafe bool MemoryTypeIsHostVisible(uint typeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes; // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        var flags = (VkMemoryPropertyFlags)types[typeIndex * 2];
+        return (flags & VkMemoryPropertyFlags.HostVisible) != 0;
     }
 
     /// <summary>
@@ -1664,12 +1689,35 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>Copies from the start of <paramref name="src"/> into <paramref name="destination"/> host memory.</summary>
+    /// <remarks>
+    /// When <paramref name="src"/> is device-local-only (a discrete GPU's VRAM — see
+    /// <see cref="Buffer.IsHostVisible"/>) the host cannot map it, so the bytes are first copied into a
+    /// transient host-visible staging buffer via <c>vkCmdCopyBuffer</c> and that is mapped instead. On
+    /// UMA parts the device-local memory is host-visible, so it is mapped directly (no copy). This is the
+    /// readback mirror of <see cref="UploadToDeviceLocal"/>; the bug it fixes only surfaces on a discrete
+    /// GPU (e.g. the cross-device KV handoff reading a prefill cache out of an RTX 3060's VRAM).
+    /// </remarks>
     public unsafe void Download(Buffer src, Span<float> destination)
     {
+        if (destination.IsEmpty) return;
         long bytes = (long)destination.Length * sizeof(float);
         if (bytes > src.Size)
             throw new ArgumentException("Destination larger than source buffer.", nameof(destination));
 
+        if (!src.IsHostVisible)
+        {
+            // Device-local-only source: stage device → host-visible buffer, then map the staging copy.
+            using Buffer staging = Allocate(bytes);
+            CopyBufferRangeSynchronous(src, staging, srcOffset: 0, dstOffset: 0, size: (ulong)bytes);
+            DownloadHostVisible(staging, destination, bytes);
+            return;
+        }
+
+        DownloadHostVisible(src, destination, bytes);
+    }
+
+    private unsafe void DownloadHostVisible(Buffer src, Span<float> destination, long bytes)
+    {
         VulkanApi.vkMapMemory(_device, src.Memory, 0, (ulong)bytes, 0, out nint mapped)
             .ThrowOnError("vkMapMemory");
         try
