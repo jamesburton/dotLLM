@@ -150,7 +150,9 @@ def sample_recurrence(
     progress = min(1.0, step / max(1, total_steps))
     mu = mu_min + (mu_max - mu_min) * progress
     sigma = 0.5
-    log_mu = math.log(max(mu, 1e-6))
+    # Mean correction: for LogNormal(loc, scale), E[X]=exp(loc+scale²/2),
+    # so set loc = log(mu) - σ²/2 so that E[X] = mu exactly.
+    log_mu = math.log(max(mu, 1e-6)) - sigma**2 / 2
     raw = torch.distributions.LogNormal(log_mu, sigma).sample().item()
     recurrence = max(1, min(n_max, round(raw)))  # clamp to [1, n_max]
     return recurrence
@@ -223,8 +225,8 @@ def main() -> None:
         ),
     )
     ap.add_argument(
-        "--grad-checkpoint", action="store_true", default=True,
-        help="Enable gradient checkpointing on slab forward (default: True)",
+        "--grad-checkpoint", action=argparse.BooleanOptionalAction, default=True,
+        help="Enable gradient checkpointing on slab forward (default: True; use --no-grad-checkpoint to disable)",
     )
     args = ap.parse_args()
 
@@ -322,10 +324,11 @@ def main() -> None:
     for p in recur.parameters():
         p.requires_grad_(False)
 
-    # 4b. Unfreeze slab layers [P:Q), fusion adapter, gate.g only.
-    #     Slab layers are BitLinear — training them = ternary QAT in bf16 shadow.
+    # 4b. Unfreeze ONLY: slab layers' FFN (mlp.*) for each layer in [P:Q),
+    #     the fusion adapter, and the learned residual gate.
+    #     Per spec: freeze attention (q/k/v/o_proj), layer norms, embeddings.
     for layer in recur.base.model.layers[args.P:args.Q]:
-        for p in layer.parameters():
+        for p in layer.mlp.parameters():
             p.requires_grad_(True)
     recur.fusion.weight.requires_grad_(True)
     recur.fusion.bias.requires_grad_(True)
@@ -338,6 +341,9 @@ def main() -> None:
         f"[recur_train] trainable={trainable:,} / total={total_params:,} "
         f"({100 * trainable / max(total_params, 1):.2f}%)"
     )
+    # Self-verify: print trainable param names (must be mlp.*, fusion.*, gate.g only)
+    trainable_names = [n for n, p in recur.named_parameters() if p.requires_grad]
+    print(f"[recur_train] trainable param names: {trainable_names}")
 
     # ------------------------------------------------------------------
     # 5. Gradient checkpointing on slab
@@ -547,7 +553,7 @@ def main() -> None:
     }
     adapter_path = os.path.join(args.out, "adapter_weights.pt")
     torch.save(adapter_state, adapter_path)
-    print(f"[recur_train] adapter → {adapter_path}  ({len(adapter_state)} tensors)")
+    print(f"[recur_train] adapter -> {adapter_path}  ({len(adapter_state)} tensors)")
 
     # ------------------------------------------------------------------
     # 10. Save recur config
@@ -587,7 +593,7 @@ def main() -> None:
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
-    print(f"[recur_train] metrics → {metrics_path}")
+    print(f"[recur_train] metrics -> {metrics_path}")
 
     # ------------------------------------------------------------------
     # 12. Smoke / GATE check
