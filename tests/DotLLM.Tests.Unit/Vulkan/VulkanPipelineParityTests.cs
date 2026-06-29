@@ -77,9 +77,37 @@ public sealed unsafe class VulkanPipelineParityTests
         _out.WriteLine($"device: {device.DeviceName}; split at layer {splitAt} of {NumLayers}");
 
         float[] full = RunFull(device, fixture, tokenIds, positions, spvDir!);
-        float[] split = RunSplitPrefill(device, fixture, tokenIds, positions, splitAt, spvDir!);
+        float[] split = RunSplitPrefill(device, device, fixture, tokenIds, positions, splitAt, spvDir!);
 
         AssertLogitsMatch(full, split, $"prefill/split={splitAt}");
+    }
+
+    /// <summary>
+    /// Cross-device spanning: stage-0 on physical device 0, stage-1 on physical device 1, hidden state
+    /// handed off device0 → host → device1. Logits must match the single-device full model. Gated on ≥2
+    /// Vulkan devices (skips on single-GPU boxes); runs on the Framework RTX 3060 + Intel Arc pair.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void CrossDevicePipelineSplit_PrefillVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        Skip.If(VulkanDevice.PhysicalDeviceCount() < 2, "Cross-device spanning needs >= 2 Vulkan devices.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] tokenIds = [3, 1, 4, 2];
+        int[] positions = [0, 1, 2, 3];
+
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var dev0 = VulkanDevice.Create(0);
+        using var dev1 = VulkanDevice.Create(1);
+        _out.WriteLine($"stage0 device 0: {dev0.DeviceName}; stage1 device 1: {dev1.DeviceName}; split at {splitAt}/{NumLayers}");
+
+        float[] full = RunFull(dev0, fixture, tokenIds, positions, spvDir!);
+        float[] split = RunSplitPrefill(dev0, dev1, fixture, tokenIds, positions, splitAt, spvDir!);
+
+        AssertLogitsMatch(full, split, $"xdev-prefill/split={splitAt}");
     }
 
     [SkippableTheory]
@@ -100,9 +128,38 @@ public sealed unsafe class VulkanPipelineParityTests
         _out.WriteLine($"device: {device.DeviceName}; split at layer {splitAt} of {NumLayers} (decode)");
 
         float[] full = RunFullDecode(device, fixture, prefillIds, prefillPos, decodeIds, decodePos, spvDir!);
-        float[] split = RunSplitDecode(device, fixture, prefillIds, prefillPos, decodeIds, decodePos, splitAt, spvDir!);
+        float[] split = RunSplitDecode(device, device, fixture, prefillIds, prefillPos, decodeIds, decodePos, splitAt, spvDir!);
 
         AssertLogitsMatch(full, split, $"decode/split={splitAt}");
+    }
+
+    /// <summary>
+    /// Cross-device decode spanning: prefill + one decode step with stage-0 on device 0 and stage-1 on
+    /// device 1 (each with its own device-local KV cache). Gated on ≥2 Vulkan devices.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void CrossDevicePipelineSplit_DecodeVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        Skip.If(VulkanDevice.PhysicalDeviceCount() < 2, "Cross-device spanning needs >= 2 Vulkan devices.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] prefillIds = [3, 1, 4, 2];
+        int[] prefillPos = [0, 1, 2, 3];
+        int[] decodeIds = [5];
+        int[] decodePos = [4];
+
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var dev0 = VulkanDevice.Create(0);
+        using var dev1 = VulkanDevice.Create(1);
+        _out.WriteLine($"stage0 device 0: {dev0.DeviceName}; stage1 device 1: {dev1.DeviceName}; split at {splitAt}/{NumLayers} (decode)");
+
+        float[] full = RunFullDecode(dev0, fixture, prefillIds, prefillPos, decodeIds, decodePos, spvDir!);
+        float[] split = RunSplitDecode(dev0, dev1, fixture, prefillIds, prefillPos, decodeIds, decodePos, splitAt, spvDir!);
+
+        AssertLogitsMatch(full, split, $"xdev-decode/split={splitAt}");
     }
 
     // ── Runners ──────────────────────────────────────────────────────────────
@@ -115,21 +172,22 @@ public sealed unsafe class VulkanPipelineParityTests
     }
 
     private static float[] RunSplitPrefill(
-        VulkanDevice device, DenseFixture fx, int[] ids, int[] pos, int splitAt, string spvDir)
+        VulkanDevice stage0Device, VulkanDevice stage1Device,
+        DenseFixture fx, int[] ids, int[] pos, int splitAt, string spvDir)
     {
         int seqLen = ids.Length;
 
-        // Stage 0: layers [0..splitAt). Run the full forward, discard logits, read the hidden state.
+        // Stage 0: layers [0..splitAt) on stage0Device. Run the full forward, discard logits, read hidden.
         var cfg0 = fx.Config with { NumLayers = splitAt };
-        using var stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg0, fx.Weights, spvDir, firstLayer: 0);
+        using var stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(stage0Device, cfg0, fx.Weights, spvDir, firstLayer: 0);
         using (var _ = stage0.Forward(ids, pos, deviceId: 0, kvCache: null)) { }
-        using ITensor hidden = stage0.DownloadHiddenState(seqLen);
+        using ITensor hidden = stage0.DownloadHiddenState(seqLen); // device0 → host
 
-        // Stage 1: layers [splitAt..L) + final norm + LM head, resumed from the handed-off hidden state.
+        // Stage 1: layers [splitAt..L) + final norm + LM head on stage1Device, resumed from the host hidden.
         var cfg1 = fx.Config with { NumLayers = NumLayers - splitAt };
-        using var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg1, fx.Weights, spvDir, firstLayer: splitAt);
+        using var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(stage1Device, cfg1, fx.Weights, spvDir, firstLayer: splitAt);
         var hiddenSpan = new ReadOnlySpan<float>((void*)hidden.DataPointer, seqLen * HiddenSize);
-        using ITensor logits = stage1.ForwardFromHidden(hiddenSpan, pos, kvCache: null);
+        using ITensor logits = stage1.ForwardFromHidden(hiddenSpan, pos, kvCache: null); // host → device1
         return LastRow(logits);
     }
 
@@ -144,13 +202,14 @@ public sealed unsafe class VulkanPipelineParityTests
     }
 
     private static float[] RunSplitDecode(
-        VulkanDevice device, DenseFixture fx, int[] preIds, int[] prePos, int[] decIds, int[] decPos,
+        VulkanDevice stage0Device, VulkanDevice stage1Device,
+        DenseFixture fx, int[] preIds, int[] prePos, int[] decIds, int[] decPos,
         int splitAt, string spvDir)
     {
         var cfg0 = fx.Config with { NumLayers = splitAt };
         var cfg1 = fx.Config with { NumLayers = NumLayers - splitAt };
-        using var stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg0, fx.Weights, spvDir, firstLayer: 0);
-        using var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg1, fx.Weights, spvDir, firstLayer: splitAt);
+        using var stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(stage0Device, cfg0, fx.Weights, spvDir, firstLayer: 0);
+        using var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(stage1Device, cfg1, fx.Weights, spvDir, firstLayer: splitAt);
         using var kv0 = stage0.CreateKvCache(MaxSeqLen); // K layers, local-indexed
         using var kv1 = stage1.CreateKvCache(MaxSeqLen); // L-K layers, local-indexed
 
