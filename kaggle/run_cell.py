@@ -125,6 +125,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--teacher-device",
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help=(
+            "Device for the frozen teacher model (default: cuda). "
+            "Use --teacher-device cpu if teacher+student together OOM on T4 16 GB."
+        ),
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help="Print exact commands without executing them.",
@@ -157,6 +166,16 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if cell.get("status") == "blocked":
+        note = cell.get("note", "no note provided")
+        print(
+            f"ERROR: cell {args.cell_id!r} is BLOCKED and cannot be run yet.\n"
+            f"  Note: {note}\n"
+            f"  Resolve the blocker, update the manifest status, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     print(
         f"[run_cell] cell={args.cell_id}  n_experts={cell['n_experts']}  "
@@ -207,7 +226,7 @@ def main() -> None:
         "--tokens", str(cell["tokens"]),
         "--kd-weight", str(cell["kd_weight"]),
         "--device", "cuda",
-        "--teacher-device", "cuda",
+        "--teacher-device", args.teacher_device,
         "--optim", "adamw8bit",
         "--checkpoint-every", "500",
         "--out", out_dir,

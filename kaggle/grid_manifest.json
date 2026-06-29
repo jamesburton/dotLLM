@@ -8,8 +8,8 @@
     {"id": "c4", "n_experts": 4, "top_k": 2, "shared": "none",    "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
     {
       "id": "c5", "n_experts": 8, "top_k": 1, "shared": "fp", "layers": "24-29",
-      "tokens": 5000000, "kd_weight": 0.5, "status": "pending",
-      "note": "Scale-up cell. Edit shared and top_k to match the 4-expert winner (best of c0-c4) before running."
+      "tokens": 5000000, "kd_weight": 0.5, "status": "blocked",
+      "note": "top_k/shared must be set to 4-expert winner first. Scale-up cell. Edit shared and top_k to match the 4-expert winner (best of c0-c4) before running."
     }
   ]
 }

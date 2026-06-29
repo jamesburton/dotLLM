@@ -29,8 +29,14 @@ import tempfile
 RESULTS_BRANCH = "kaggle-results"
 
 
-def _run(cmd: list, **kw) -> None:
-    print("  $ " + " ".join(str(c) for c in cmd))
+def _redact(cmd: list, secret: str) -> list:
+    """Return a copy of cmd with every occurrence of secret replaced by ***."""
+    return [str(c).replace(secret, "***") for c in cmd]
+
+
+def _run(cmd: list, *, secret=None, **kw) -> None:
+    display_cmd = _redact(cmd, secret) if secret else cmd
+    print("  $ " + " ".join(str(c) for c in display_cmd))
     subprocess.run(cmd, check=True, **kw)
 
 
@@ -40,7 +46,7 @@ def _auth_url(remote: str, pat: str) -> str:
     return remote  # SSH or other -- pass through unchanged
 
 
-def _clone_or_pull(results_checkout: str, auth_url: str, remote: str) -> None:
+def _clone_or_pull(results_checkout: str, auth_url: str, remote: str, pat: str = "") -> None:
     """Clone or update the kaggle-results branch into results_checkout."""
     if os.path.isdir(os.path.join(results_checkout, ".git")):
         print(f"[push_results] updating existing checkout at {results_checkout}")
@@ -57,6 +63,7 @@ def _clone_or_pull(results_checkout: str, auth_url: str, remote: str) -> None:
             _run(
                 ["git", "clone", "--depth", "1", "--branch", RESULTS_BRANCH,
                  auth_url, results_checkout],
+                secret=pat,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
         except subprocess.CalledProcessError:
@@ -64,6 +71,7 @@ def _clone_or_pull(results_checkout: str, auth_url: str, remote: str) -> None:
             print(f"[push_results] {RESULTS_BRANCH} not found; creating it")
             _run(
                 ["git", "clone", "--depth", "1", auth_url, results_checkout],
+                secret=pat,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
             _run(["git", "-C", results_checkout, "checkout", "-b", RESULTS_BRANCH])
@@ -131,7 +139,7 @@ def main() -> None:
     results_checkout = os.path.join(work_dir, "results_repo")
 
     try:
-        _clone_or_pull(results_checkout, auth, remote)
+        _clone_or_pull(results_checkout, auth, remote, pat=pat)
 
         # Destination: results/<cell-id>/
         dest_dir = os.path.join(results_checkout, "results", cell_id)
@@ -203,6 +211,7 @@ def main() -> None:
             _run(["git", "-C", results_checkout, "commit", "-m", f"results: {cell_id} done"])
             _run(
                 ["git", "-C", results_checkout, "push", auth, f"HEAD:{RESULTS_BRANCH}"],
+                secret=pat,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
             print(f"[push_results] pushed {cell_id} results to {RESULTS_BRANCH}")

@@ -146,6 +146,24 @@ each checkpoint interval.  This is not the default because adapter weights are l
 
 ---
 
+## (e2) T4 16 GB OOM: teacher-device fallback
+
+On a **16 GB single T4** (or any GPU where teacher + student together exceed VRAM):
+
+```
+# T4 16 GB: teacher alone ~5 GB + student ~5 GB -> tight; may OOM at peak activation
+# Fallback: run teacher on CPU (slower cross-device transfer, but fits)
+python kaggle/run_cell.py --cell-id c1 --teacher-device cpu
+```
+
+- `--teacher-device cpu` keeps the frozen teacher in system RAM; only the student occupies GPU VRAM.
+- Prefer **P100 (16 GB)** or **L4 (24 GB)** over T4 x2 for this reason: a single larger GPU avoids the
+  tensor-split overhead of T4 x2 and gives headroom for `--teacher-device cuda`.
+- T4 x2 sessions use tensor-split which can cause uneven memory allocation; if one card OOMs,
+  set `--teacher-device cpu` as a first remediation step.
+
+---
+
 ## (f) Coordination rule — one session per cell-id
 
 The manifest is the claim board.  Protocol:
@@ -157,8 +175,10 @@ The manifest is the claim board.  Protocol:
    the earlier one — this is harmless but wasteful.  Coordinate via Discord/chat instead.
 3. **Done**: `push_results.py` sets status to `"done"` on completion.  Do not re-run a
    "done" cell unless you intentionally want to overwrite results.
-4. **c5 gate**: c5 is blocked on c0-c4 winner.  Check all four cells are "done" and pick
-   the winner before editing c5 and starting its session.
+4. **c5 gate**: c5 status is `"blocked"` in `grid_manifest.json` and `run_cell.py` will
+   refuse to run it until the status is changed.  After c0-c4 complete: pick the 4-expert
+   winner, update `c5.shared` and `c5.top_k` to match, change its status to `"pending"`,
+   commit, then start c5's session.
 
 ---
 
