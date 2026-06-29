@@ -1,6 +1,7 @@
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace DotLLM.Tests.Unit.Vulkan;
 
@@ -17,6 +18,10 @@ public class VulkanMatMulIq2XxsMmqKernelTests
     private const int BlockBytes = 66;
     private const float RelTol = 6e-2f;
 
+    private readonly ITestOutputHelper _out;
+
+    public VulkanMatMulIq2XxsMmqKernelTests(ITestOutputHelper output) => _out = output;
+
     // Small/medium shapes only. The kernel is bit-correct at every shape, but on the
     // gfx1151 iGPU the AMD driver miscompiles this grid-codebook shader into a GPU fault
     // once a single submit's total work is large (per-submit-cumulative — neither
@@ -29,11 +34,31 @@ public class VulkanMatMulIq2XxsMmqKernelTests
     [InlineData(1, 1, 256)]
     [InlineData(17, 33, 512)]
     [InlineData(7, 4, 768)]
-    public void Mmq_MatchesF32Oracle_ArgmaxAndTolerance(int n, int m, int k)
+    public void Mmq_MatchesF32Oracle_ArgmaxAndTolerance(int n, int m, int k) => RunShape(n, m, k);
+
+    /// <summary>
+    /// Opt-in cross-check at production scale (8×2048×2048) — the shape that GPU-faults on the
+    /// AMD gfx1151 iGPU (driver LLPC miscompile, #344). NEVER run by default (it would device-lost the
+    /// AMD box). Set <c>DOTLLM_IQ2XXS_LARGE_CROSSCHECK=1</c> on a NON-AMD GPU to confirm the fault is
+    /// AMD-specific: e.g. on the Framework box run with <c>DOTLLM_VULKAN_DEVICE_INDEX=0</c> (RTX 3060)
+    /// and <c>=1</c> (Intel Arc). A pass on both pins the miscompile to AMD's shader compiler and is a
+    /// strong artifact for the driver bug report (see <c>[[vulkan-iq2xxs-mmq-driver-fault]]</c>).
+    /// </summary>
+    [SkippableFact]
+    public void Mmq_LargeShape_NonAmdCrossCheck()
+    {
+        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_IQ2XXS_LARGE_CROSSCHECK") == "1",
+            "Opt-in (DOTLLM_IQ2XXS_LARGE_CROSSCHECK=1) — 8×2048×2048 faults AMD gfx1151 by design; "
+            + "run only on a non-AMD GPU to confirm the fault is AMD-specific.");
+        RunShape(8, 2048, 2048);
+    }
+
+    private void RunShape(int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
         using var device = VulkanDevice.Create();
+        _out.WriteLine($"device: {device.DeviceName} (type={device.DeviceType}, vendor=0x{device.VendorId:X4}); shape n={n} m={m} k={k}");
         Skip.IfNot(device.HasIntegerDotProduct,
             "Device does not advertise VK_KHR_shader_integer_dot_product — MMQ path is unavailable here.");
 
