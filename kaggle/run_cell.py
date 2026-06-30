@@ -248,6 +248,16 @@ def main() -> None:
         action="store_true",
         help="Print exact commands without executing them.",
     )
+    ap.add_argument(
+        "--eval-only",
+        action="store_true",
+        help=(
+            "Skip training; run only eval + push on an existing adapter at <out>/. "
+            "Use to re-run eval without re-training (e.g. recovery on a Kaggle session "
+            "where train completed and adapter_weights.pt exists but eval crashed). "
+            "Requires adapter_weights.pt in <out>/."
+        ),
+    )
     args = ap.parse_args()
     teacher_device = _resolve_teacher_device(args.teacher_device)
 
@@ -324,30 +334,62 @@ def main() -> None:
             )
 
     # ------------------------------------------------------------------
-    # Step 1: mote_train.py
+    # Step 1: mote_train.py  (skipped in --eval-only mode)
     # ------------------------------------------------------------------
-    train_cmd = [
-        sys.executable,
-        os.path.join(repo, "scripts", "lora", "mote_train.py"),
-        "--config", args.cell_id,
-        "--n-experts", str(cell["n_experts"]),
-        "--top-k", str(cell["top_k"]),
-        "--shared", cell["shared"],
-        "--layers", cell["layers"],
-        "--tokens", str(cell["tokens"]),
-        "--kd-weight", str(cell["kd_weight"]),
-        "--device", "cuda",
-        "--teacher-device", teacher_device,
-        "--optim", "adamw8bit",
-        "--checkpoint-every", "500",
-        "--out", out_dir,
-    ]
-    if args.resume:
-        # Pass checkpoint dir unconditionally; mote_train.py skips gracefully if missing
-        train_cmd.extend(["--resume-from", ckpt_dir])
+    if not args.eval_only:
+        train_cmd = [
+            sys.executable,
+            os.path.join(repo, "scripts", "lora", "mote_train.py"),
+            "--config", args.cell_id,
+            "--n-experts", str(cell["n_experts"]),
+            "--top-k", str(cell["top_k"]),
+            "--shared", cell["shared"],
+            "--layers", cell["layers"],
+            "--tokens", str(cell["tokens"]),
+            "--kd-weight", str(cell["kd_weight"]),
+            "--device", "cuda",
+            "--teacher-device", teacher_device,
+            "--optim", "adamw8bit",
+            "--checkpoint-every", "500",
+            "--out", out_dir,
+        ]
+        if args.resume:
+            # Pass checkpoint dir unconditionally; mote_train.py skips gracefully if missing
+            train_cmd.extend(["--resume-from", ckpt_dir])
 
-    print(f"\n[run_cell] Step 1: train")
-    _run_train(train_cmd, dry_run=args.dry_run)
+        print(f"\n[run_cell] Step 1: train")
+        _run_train(train_cmd, dry_run=args.dry_run)
+
+        # ------------------------------------------------------------------
+        # Step 1b: push training artifacts immediately (before eval)
+        # ------------------------------------------------------------------
+        # Safe-push metrics.json + adapter_weights.pt + mote_config.json + train log
+        # now so a subsequent eval crash cannot lose the trained adapter.
+        # --train-artifacts-only skips eval.json copy and manifest status flip.
+        push_train_cmd = [
+            sys.executable,
+            os.path.join(repo, "kaggle", "push_results.py"),
+            "--cell-id", args.cell_id,
+            "--adapter", out_dir,
+            "--manifest", manifest_path,
+            "--results-remote", args.results_remote,
+            "--train-artifacts-only",
+            "--push-adapter",
+        ]
+        print(f"\n[run_cell] Step 1b: push train artifacts")
+        run(push_train_cmd, dry_run=args.dry_run)
+    else:
+        # --eval-only: skip train + train-artifact push
+        print(f"\n[run_cell] --eval-only: skipping train and train-artifact push")
+        adapter_pt = os.path.join(out_dir, "adapter_weights.pt")
+        if args.dry_run:
+            print(f"  [dry-run] would require {adapter_pt}")
+        elif not os.path.isfile(adapter_pt):
+            print(
+                f"ERROR: --eval-only requires adapter_weights.pt to exist: {adapter_pt}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     # Step 2: mote_eval.py
@@ -360,12 +402,27 @@ def main() -> None:
     ]
 
     print(f"\n[run_cell] Step 2: eval")
-    run(eval_cmd, dry_run=args.dry_run)
+    eval_ok: bool
+    if args.dry_run:
+        print("  $ " + " ".join(str(c) for c in eval_cmd))
+        eval_ok = True
+    else:
+        try:
+            subprocess.run(eval_cmd, check=True)
+            eval_ok = True
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"\n[run_cell] WARNING: eval failed (exit {exc.returncode}). "
+                "Train artifacts are already on kaggle-results. "
+                "Re-run with --eval-only to retry eval without re-training.",
+                file=sys.stderr,
+            )
+            eval_ok = False
 
     # ------------------------------------------------------------------
-    # Step 3: push_results.py
+    # Step 3: push eval results (only if eval succeeded)
     # ------------------------------------------------------------------
-    push_cmd = [
+    push_eval_cmd = [
         sys.executable,
         os.path.join(repo, "kaggle", "push_results.py"),
         "--cell-id", args.cell_id,
@@ -374,13 +431,22 @@ def main() -> None:
         "--results-remote", args.results_remote,
     ]
 
-    print(f"\n[run_cell] Step 3: push results")
-    run(push_cmd, dry_run=args.dry_run)
+    if eval_ok:
+        print(f"\n[run_cell] Step 3: push eval results")
+        run(push_eval_cmd, dry_run=args.dry_run)
+    elif not args.dry_run:
+        print(f"\n[run_cell] Step 3: skipped (eval did not complete)")
 
     if args.dry_run:
         print(f"\n[run_cell] DRY RUN complete -- no commands were executed")
-    else:
+    elif eval_ok:
         print(f"\n[run_cell] cell {args.cell_id} COMPLETE")
+    else:
+        print(
+            f"\n[run_cell] cell {args.cell_id} PARTIAL: train OK, eval FAILED. "
+            "Train artifacts pushed to kaggle-results. "
+            "Re-run with --eval-only to retry eval."
+        )
 
 
 if __name__ == "__main__":

@@ -102,6 +102,16 @@ def main() -> None:
         help="Also push adapter_weights.pt (large -- use only when needed)",
     )
     ap.add_argument(
+        "--train-artifacts-only",
+        action="store_true",
+        help=(
+            "Push only training artifacts (metrics.json, mote_config.json, train log, "
+            "adapter_weights.pt if --push-adapter is set); skip eval.json and do NOT "
+            "flip manifest status to 'done'.  Used by run_cell.py to safe-push results "
+            "immediately after train succeeds, before eval runs."
+        ),
+    )
+    ap.add_argument(
         "--work-dir",
         default=None,
         help="Directory for the results checkout (default: temp dir auto-cleaned)",
@@ -179,24 +189,27 @@ def main() -> None:
                     shutil.copy2(w_src, w_dst)
                     print(f"[push_results] copied {w_rel}")
 
-        # Update manifest: flip cell status to "done"
-        manifest_dest = os.path.join(results_checkout, "grid_manifest.json")
-        manifest_src = manifest_path if (manifest_path and os.path.isfile(manifest_path)) else None
-        if manifest_src is None and os.path.isfile(manifest_dest):
-            manifest_src = manifest_dest  # use what's already in the results branch
+        # Update manifest: flip cell status to "done" (skipped in train-artifacts-only mode)
+        if not args.train_artifacts_only:
+            manifest_dest = os.path.join(results_checkout, "grid_manifest.json")
+            manifest_src = manifest_path if (manifest_path and os.path.isfile(manifest_path)) else None
+            if manifest_src is None and os.path.isfile(manifest_dest):
+                manifest_src = manifest_dest  # use what's already in the results branch
 
-        if manifest_src:
-            with open(manifest_src, encoding="utf-8") as fh:
-                mf = json.load(fh)
-            for c in mf.get("cells", []):
-                if c.get("id") == cell_id:
-                    c["status"] = "done"
-                    break
-            with open(manifest_dest, "w", encoding="utf-8") as fh:
-                json.dump(mf, fh, indent=2)
-            print(f"[push_results] manifest: {cell_id} -> done")
+            if manifest_src:
+                with open(manifest_src, encoding="utf-8") as fh:
+                    mf = json.load(fh)
+                for c in mf.get("cells", []):
+                    if c.get("id") == cell_id:
+                        c["status"] = "done"
+                        break
+                with open(manifest_dest, "w", encoding="utf-8") as fh:
+                    json.dump(mf, fh, indent=2)
+                print(f"[push_results] manifest: {cell_id} -> done")
+            else:
+                print("[push_results] manifest not found -- skipping status update")
         else:
-            print("[push_results] manifest not found -- skipping status update")
+            print("[push_results] train-artifacts-only: skipping manifest status update")
 
         # Git commit + push
         _run(["git", "-C", results_checkout, "config", "user.email", "kaggle-bot@dotllm.dev"])
@@ -208,13 +221,19 @@ def main() -> None:
             capture_output=True, text=True,
         )
         if status.stdout.strip():
-            _run(["git", "-C", results_checkout, "commit", "-m", f"results: {cell_id} done"])
+            commit_msg = (
+                f"results: {cell_id} train"
+                if args.train_artifacts_only
+                else f"results: {cell_id} done"
+            )
+            _run(["git", "-C", results_checkout, "commit", "-m", commit_msg])
             _run(
                 ["git", "-C", results_checkout, "push", auth, f"HEAD:{RESULTS_BRANCH}"],
                 secret=pat,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
-            print(f"[push_results] pushed {cell_id} results to {RESULTS_BRANCH}")
+            kind = "train artifacts" if args.train_artifacts_only else "results"
+            print(f"[push_results] pushed {cell_id} {kind} to {RESULTS_BRANCH}")
         else:
             print(f"[push_results] nothing to commit (idempotent -- already pushed)")
 

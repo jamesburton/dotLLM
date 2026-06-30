@@ -323,6 +323,7 @@ def main() -> None:
     dense.eval()
     for p in dense.parameters():
         p.requires_grad_(False)
+    dense.to(device)  # defensive: device_map / .to() above should cover it; belt-and-suspenders
     print("[mote_eval] dense baseline loaded and frozen")
 
     # ------------------------------------------------------------------
@@ -376,7 +377,25 @@ def main() -> None:
     student.eval()
     for p in student.parameters():
         p.requires_grad_(False)
-    print("[mote_eval] student MoTE frozen for eval")
+    # Move the entire student graph to the eval device.  build_mote() creates new
+    # nn.Linear (router) and expert modules that initialise on CPU.  device_map from
+    # from_pretrained covers only the base weights loaded by that call; new modules
+    # added afterwards start on CPU.  load_state_dict with map_location copies values
+    # but does NOT relocate the destination parameter storage (copy_ keeps the target
+    # tensor on its original device).  Calling .to(device) here is the same pattern
+    # used in mote_train.py and fixes the cuda:0/cpu device-mismatch crash at
+    # self.router() seen in Kaggle eval (RuntimeError: mat2 is on cpu, different
+    # from other tensors on cuda:0).
+    student.to(device)
+    for name, p in student.named_parameters():
+        assert p.device.type == device.type, (
+            f"[mote_eval] parameter {name!r} is on {p.device} but eval device is {device}"
+        )
+    for name, buf in student.named_buffers():
+        assert buf.device.type == device.type, (
+            f"[mote_eval] buffer {name!r} is on {buf.device} but eval device is {device}"
+        )
+    print(f"[mote_eval] student fully on {device}; all params/buffers verified")
 
     # ------------------------------------------------------------------
     # 5. Register per-token argmax hooks on student routers
