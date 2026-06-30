@@ -1479,6 +1479,28 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Size in bytes of the largest <c>DEVICE_LOCAL</c> memory heap — the effective VRAM budget for
+    /// weight/KV/compute allocations. On a discrete GPU this is the dedicated VRAM; on a UMA part
+    /// (Strix Halo iGPU, Intel Arc integrated) it is the driver-reported device-local carve-out of
+    /// system RAM, which is typically far smaller than total system memory and is the real ceiling
+    /// for how many model layers that device can hold when spanning.
+    /// </summary>
+    public unsafe long DeviceLocalHeapBytes()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps; // 16-byte entries: u64 size, u32 flags, padding
+        long max = 0;
+        for (uint i = 0; i < mem.memoryHeapCount; i++)
+        {
+            ulong size = *(ulong*)(heaps + i * 16);
+            uint flags = *(uint*)(heaps + i * 16 + 8);
+            if ((flags & (uint)VkMemoryHeapFlags.DeviceLocal) != 0)
+                max = Math.Max(max, (long)size);
+        }
+        return max;
+    }
+
+    /// <summary>
     /// Copies <paramref name="source"/> bytes from host memory into
     /// <paramref name="dst"/> (which may be device-local, i.e. not
     /// host-mappable) via an intermediate <paramref name="staging"/> buffer.

@@ -60,6 +60,18 @@ internal static class VulkanPipelineSpanProfile
 
         int deviceCount = VulkanDevice.PhysicalDeviceCount();
         Console.WriteLine($"Vulkan physical devices: {deviceCount}");
+        for (int d = 0; d < deviceCount; d++)
+        {
+            try
+            {
+                using var probe = VulkanDevice.Create(d);
+                Console.WriteLine($"  device[{d}] = {probe.DeviceName} (device-local heap {probe.DeviceLocalHeapBytes() / 1024.0 / 1024.0:F0} MiB)");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  device[{d}] = <probe failed: {ex.Message}>");
+            }
+        }
         if (dev1 < 0) dev1 = deviceCount >= 2 ? 1 : 0;
         if (dev0 >= deviceCount || dev1 >= deviceCount)
         {
