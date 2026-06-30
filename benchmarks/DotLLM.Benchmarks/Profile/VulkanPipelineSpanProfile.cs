@@ -31,6 +31,8 @@ internal static class VulkanPipelineSpanProfile
         }
 
         string? ggufPath = null;
+        string repoId = DefaultRepoId;
+        string filename = DefaultFilename;
         int? splitArg = null;
         int dev0 = 0, dev1 = -1;
         int genCount = 0;
@@ -43,6 +45,8 @@ internal static class VulkanPipelineSpanProfile
             switch (args[i])
             {
                 case "--gguf" when i + 1 < args.Length: ggufPath = args[++i]; break;
+                case "--repo" when i + 1 < args.Length: repoId = args[++i]; break;
+                case "--file" when i + 1 < args.Length: filename = args[++i]; break;
                 case "--split" when i + 1 < args.Length: splitArg = int.Parse(args[++i]); break;
                 case "--dev0" when i + 1 < args.Length: dev0 = int.Parse(args[++i]); break;
                 case "--dev1" when i + 1 < args.Length: dev1 = int.Parse(args[++i]); break;
@@ -69,9 +73,9 @@ internal static class VulkanPipelineSpanProfile
         {
             string cacheDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "dotllm-bench");
-            Console.WriteLine($"No --gguf given; downloading {DefaultRepoId}/{DefaultFilename} ...");
+            Console.WriteLine($"No --gguf given; downloading {repoId}/{filename} via HuggingFaceDownloader ...");
             using var dl = new HuggingFaceDownloader();
-            ggufPath = dl.DownloadFileAsync(DefaultRepoId, DefaultFilename, cacheDir).GetAwaiter().GetResult();
+            ggufPath = dl.DownloadFileAsync(repoId, filename, cacheDir).GetAwaiter().GetResult();
         }
 
         Console.WriteLine($"GGUF: {ggufPath} ({new FileInfo(ggufPath).Length / 1024.0 / 1024.0:F1} MiB)");
