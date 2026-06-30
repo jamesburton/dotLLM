@@ -162,6 +162,105 @@ public sealed unsafe class VulkanPipelineParityTests
         AssertLogitsMatch(full, split, $"xdev-decode/split={splitAt}");
     }
 
+    // ── IModel wrapper (VulkanPipelineTransformerModel) — exercises Forward + composite KV routing ──
+
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void PipelineModel_PrefillVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] ids = [3, 1, 4, 2];
+        int[] pos = [0, 1, 2, 3];
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var device = VulkanDevice.Create();
+
+        float[] full = RunFull(device, fixture, ids, pos, spvDir!);
+        float[] pipe = RunPipelineModelPrefill(device, device, fixture, ids, pos, splitAt, spvDir!);
+        AssertLogitsMatch(full, pipe, $"model-prefill/split={splitAt}");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void PipelineModel_DecodeVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] preIds = [3, 1, 4, 2]; int[] prePos = [0, 1, 2, 3];
+        int[] decIds = [5]; int[] decPos = [4];
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var device = VulkanDevice.Create();
+
+        float[] full = RunFullDecode(device, fixture, preIds, prePos, decIds, decPos, spvDir!);
+        float[] pipe = RunPipelineModelDecode(device, device, fixture, preIds, prePos, decIds, decPos, splitAt, spvDir!);
+        AssertLogitsMatch(full, pipe, $"model-decode/split={splitAt}");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void CrossDevicePipelineModel_PrefillVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        Skip.If(VulkanDevice.PhysicalDeviceCount() < 2, "Cross-device spanning needs >= 2 Vulkan devices.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] ids = [3, 1, 4, 2];
+        int[] pos = [0, 1, 2, 3];
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var dev0 = VulkanDevice.Create(0);
+        using var dev1 = VulkanDevice.Create(1);
+        _out.WriteLine($"pipeline model: stage0 {dev0.DeviceName} / stage1 {dev1.DeviceName}; split {splitAt}/{NumLayers}");
+
+        float[] full = RunFull(dev0, fixture, ids, pos, spvDir!);
+        float[] pipe = RunPipelineModelPrefill(dev0, dev1, fixture, ids, pos, splitAt, spvDir!);
+        AssertLogitsMatch(full, pipe, $"xdev-model-prefill/split={splitAt}");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(SplitPoints))]
+    public void CrossDevicePipelineModel_DecodeVsFull_LastTokenLogitsMatch(int splitAt)
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        Skip.If(VulkanDevice.PhysicalDeviceCount() < 2, "Cross-device spanning needs >= 2 Vulkan devices.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        int[] preIds = [3, 1, 4, 2]; int[] prePos = [0, 1, 2, 3];
+        int[] decIds = [5]; int[] decPos = [4];
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var dev0 = VulkanDevice.Create(0);
+        using var dev1 = VulkanDevice.Create(1);
+        _out.WriteLine($"pipeline model decode: stage0 {dev0.DeviceName} / stage1 {dev1.DeviceName}; split {splitAt}/{NumLayers}");
+
+        float[] full = RunFullDecode(dev0, fixture, preIds, prePos, decIds, decPos, spvDir!);
+        float[] pipe = RunPipelineModelDecode(dev0, dev1, fixture, preIds, prePos, decIds, decPos, splitAt, spvDir!);
+        AssertLogitsMatch(full, pipe, $"xdev-model-decode/split={splitAt}");
+    }
+
+    private static float[] RunPipelineModelPrefill(
+        VulkanDevice dev0, VulkanDevice dev1, DenseFixture fx, int[] ids, int[] pos, int splitAt, string spvDir)
+    {
+        using var model = VulkanPipelineTransformerModel.BuildFromPrebuiltWeights(dev0, dev1, fx.Config, fx.Weights, splitAt, spvDir);
+        using ITensor logits = model.Forward(ids, pos, deviceId: 0, kvCache: null);
+        return LastRow(logits);
+    }
+
+    private static float[] RunPipelineModelDecode(
+        VulkanDevice dev0, VulkanDevice dev1, DenseFixture fx,
+        int[] preIds, int[] prePos, int[] decIds, int[] decPos, int splitAt, string spvDir)
+    {
+        using var model = VulkanPipelineTransformerModel.BuildFromPrebuiltWeights(dev0, dev1, fx.Config, fx.Weights, splitAt, spvDir);
+        using var kv = model.CreateKvCache(MaxSeqLen);
+        using (var _ = model.Forward(preIds, prePos, deviceId: 0, kv)) { }
+        using ITensor logits = model.Forward(decIds, decPos, deviceId: 0, kv);
+        return LastRow(logits);
+    }
+
     // ── Runners ──────────────────────────────────────────────────────────────
 
     private static float[] RunFull(VulkanDevice device, DenseFixture fx, int[] ids, int[] pos, string spvDir)
