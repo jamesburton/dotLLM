@@ -146,21 +146,48 @@ each checkpoint interval.  This is not the default because adapter weights are l
 
 ---
 
-## (e2) T4 16 GB OOM: teacher-device fallback
+## (e2) T4 / P100 OOM: auto teacher-device selection
 
-On a **16 GB single T4** (or any GPU where teacher + student together exceed VRAM):
+`run_cell.py` now **auto-detects GPU VRAM** and picks the teacher device automatically:
+
+| GPU | VRAM | Auto teacher device | KD speed |
+|-----|------|---------------------|----------|
+| L4 | 24 GB | `cuda` | Fast (on-GPU) |
+| A100 | 40/80 GB | `cuda` | Fast (on-GPU) |
+| P100 | 16 GB | **`cpu`** | Slower (cross-device) |
+| T4 | ~14.6 GB | **`cpu`** | Slower (cross-device) |
+
+Threshold: **< 20 GB → teacher on CPU** to leave room for student + 8-bit optimizer.
+A notice is printed when CPU fallback activates:
 
 ```
-# T4 16 GB: teacher alone ~5 GB + student ~5 GB -> tight; may OOM at peak activation
-# Fallback: run teacher on CPU (slower cross-device transfer, but fits)
+[run_cell] GPU 14.6GB < 20GB -> teacher on CPU to fit (KD slower). For fast KD use an L4 (24GB).
+```
+
+**Recommendation: use an L4 (24 GB) accelerator** for fast KD (teacher stays on GPU).
+T4 and P100 will work with auto CPU teacher, but KD is noticeably slower.
+
+### Manual override
+
+Pass `--teacher-device {auto,cpu,cuda}` to bypass detection:
+
+```bash
+# Force CPU teacher even on L4 (e.g. to save VRAM for a very large batch):
 python kaggle/run_cell.py --cell-id c1 --teacher-device cpu
+
+# Force CUDA teacher on T4 if you know it fits (risky):
+python kaggle/run_cell.py --cell-id c1 --teacher-device cuda
+
+# Default auto-detection (recommended):
+python kaggle/run_cell.py --cell-id c1
 ```
 
-- `--teacher-device cpu` keeps the frozen teacher in system RAM; only the student occupies GPU VRAM.
-- Prefer **P100 (16 GB)** or **L4 (24 GB)** over T4 x2 for this reason: a single larger GPU avoids the
-  tensor-split overhead of T4 x2 and gives headroom for `--teacher-device cuda`.
-- T4 x2 sessions use tensor-split which can cause uneven memory allocation; if one card OOMs,
-  set `--teacher-device cpu` as a first remediation step.
+### OOM safety net
+
+If the train subprocess exits non-zero and the output contains `CUDA out of memory` or
+`OutOfMemoryError`, `run_cell.py` automatically **retries once** with `--teacher-device cpu`
+and logs a clear message. This catches the case where auto-detection guessed wrong or an
+explicit `--teacher-device cuda` was passed but VRAM was tighter than expected at runtime.
 
 ---
 

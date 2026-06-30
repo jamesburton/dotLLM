@@ -37,6 +37,98 @@ def run(cmd: list, dry_run: bool = False, **kw) -> None:
         subprocess.run(cmd, check=True, **kw)
 
 
+# ---------------------------------------------------------------------------
+# GPU-memory detection and teacher-device resolution
+# ---------------------------------------------------------------------------
+
+
+def _detect_gpu_gb() -> "float | None":
+    """Return total VRAM in GB for GPU 0, or None if torch/CUDA unavailable."""
+    try:
+        import torch  # noqa: PLC0415
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _resolve_teacher_device(requested: str) -> str:
+    """Resolve 'auto' -> 'cuda' (>=20 GB) or 'cpu' (<20 GB / no GPU).
+
+    Explicit 'cuda' or 'cpu' values are returned unchanged.
+    """
+    if requested != "auto":
+        return requested
+    gb = _detect_gpu_gb()
+    if gb is None:
+        print(
+            "[run_cell] No CUDA GPU detected -- teacher on cpu "
+            "(auto; no VRAM to measure)"
+        )
+        return "cpu"
+    if gb >= 20.0:
+        print(
+            f"[run_cell] GPU {gb:.1f}GB >= 20GB -> teacher on cuda (fast on-GPU KD)"
+        )
+        return "cuda"
+    print(
+        f"[run_cell] GPU {gb:.1f}GB < 20GB -> teacher on CPU to fit "
+        f"(KD slower). For fast KD use an L4 (24GB)."
+    )
+    return "cpu"
+
+
+def _run_train(cmd: list, dry_run: bool = False) -> None:
+    """Run mote_train.py, retrying once with --teacher-device cpu on CUDA OOM.
+
+    Output is streamed to stdout in real time while being captured so that
+    CUDA OOM signatures can be detected on failure.
+    """
+    print("  $ " + " ".join(str(c) for c in cmd))
+    if dry_run:
+        return
+
+    # Determine whether a retry makes sense (no point if teacher is already cpu)
+    teacher_already_cpu = (
+        "--teacher-device" in cmd
+        and cmd[cmd.index("--teacher-device") + 1] == "cpu"
+    )
+
+    # Stream output live *and* capture it for OOM detection on failure
+    captured: list[str] = []
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    assert proc.stdout is not None  # always set when stdout=PIPE
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        captured.append(line)
+    proc.wait()
+
+    if proc.returncode == 0:
+        return
+
+    output = "".join(captured)
+    is_oom = "OutOfMemoryError" in output or "CUDA out of memory" in output
+
+    if is_oom and not teacher_already_cpu:
+        print(
+            "\n[run_cell] CUDA OOM detected -- retrying once with --teacher-device cpu"
+        )
+        retry_cmd = list(cmd)
+        if "--teacher-device" in retry_cmd:
+            idx = retry_cmd.index("--teacher-device")
+            retry_cmd[idx + 1] = "cpu"
+        else:
+            retry_cmd.extend(["--teacher-device", "cpu"])
+        print("  $ " + " ".join(str(c) for c in retry_cmd))
+        subprocess.run(retry_cmd, check=True)
+    else:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
 def _pull_checkpoint(cell_id: str, ckpt_dir: str, results_remote: str, out_dir: str) -> None:
     """Pull checkpoint files from kaggle-results branch into ckpt_dir.
 
@@ -126,11 +218,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--teacher-device",
-        default="cuda",
-        choices=["cuda", "cpu"],
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
         help=(
-            "Device for the frozen teacher model (default: cuda). "
-            "Use --teacher-device cpu if teacher+student together OOM on T4 16 GB."
+            "Device for the frozen teacher model. "
+            "'auto' (default): picks cuda on >=20 GB GPUs (L4/A100), "
+            "cpu on <20 GB (T4 ~14.6 GB, P100 ~16 GB). "
+            "Override with 'cuda' or 'cpu' to bypass detection."
         ),
     )
     ap.add_argument(
@@ -139,6 +233,7 @@ def main() -> None:
         help="Print exact commands without executing them.",
     )
     args = ap.parse_args()
+    teacher_device = _resolve_teacher_device(args.teacher_device)
 
     repo = os.path.abspath(args.repo_dir)
     # Manifest path: absolute, or relative to repo_dir
@@ -226,7 +321,7 @@ def main() -> None:
         "--tokens", str(cell["tokens"]),
         "--kd-weight", str(cell["kd_weight"]),
         "--device", "cuda",
-        "--teacher-device", args.teacher_device,
+        "--teacher-device", teacher_device,
         "--optim", "adamw8bit",
         "--checkpoint-every", "500",
         "--out", out_dir,
@@ -236,7 +331,7 @@ def main() -> None:
         train_cmd.extend(["--resume-from", ckpt_dir])
 
     print(f"\n[run_cell] Step 1: train")
-    run(train_cmd, dry_run=args.dry_run)
+    _run_train(train_cmd, dry_run=args.dry_run)
 
     # ------------------------------------------------------------------
     # Step 2: mote_eval.py
