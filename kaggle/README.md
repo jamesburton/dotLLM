@@ -40,6 +40,30 @@ The multi-device primitives already exist (`CudaContext.Create(int deviceId)` + 
    hands off via `StagedKvHandoffTransfer`, decodes on 1, and asserts token-identical output to a
    single-device run. Skips when `CudaDevice.GetDeviceCount() < 2`.
 
+## Dual-CUDA pipeline-parallel / layer-spanning (issue #367)
+
+`dotllm-cuda-pipeline-spanning.ipynb` validates `CudaPipelineTransformerModel` — a transformer **split
+across two CUDA devices** (stage-0 = layers `[0..K)` on GPU 0; stage-1 = layers `[K..L)` + final norm +
+LM head on GPU 1), with the hidden state handed off **device0 → host (FP32) → device1**. It is the CUDA
+mirror of the shipped Vulkan dual-device pipeline (#366), and lets a model span more VRAM than either T4
+holds alone.
+
+| Step | Command | Proves |
+|------|---------|--------|
+| `env`/`dotnet`/`ptx`/`build` | (as above) | toolchain green, driver-matched PTX |
+| `test-pipeline` | `CudaPipelineParityTests` | split model == un-split `CudaTransformerModel` (prefill + decode) |
+
+- The notebook clones **`issue/367-cuda-pipeline-parallel`** (override with `DOTLLM_BRANCH`).
+- `CudaWeights.LoadFromGguf(..., firstLayer, numGpuLayers)` already windows each stage's device upload, and
+  skips the output norm + LM head for the non-final (stage-0) window — so stage-0 holds embedding + its
+  layers and stage-1 holds its layers + head, exactly the Vulkan split.
+- **Single-device fallback:** the `PipelineModel_*` theories run both stages on GPU 0 (two contexts), so the
+  core machinery is provable on one GPU; the `CrossDevicePipelineModel_*` theories need 2 GPUs and skip on a
+  single-GPU box (`CudaDevice.GetDeviceCount() < 2`).
+- Parity is FP16-precision (same as a single-device CUDA run); the FP32 hidden-state round-trip at the
+  boundary is lossless, so the band is tight (abs 5e-3 / rel 5e-3).
+- M-scope: dense / GQA causal (no MLA / MoE / gemma4 / graph-capture), matching #366.
+
 ## Notes / gotchas
 - Kaggle sessions are time-boxed (~9–12 h) and idle-timeout; the build is incremental so re-runs are fast.
 - The notebook clones the **fork** `jamesburton/dotLLM` by default (that's where the dev-track / #361
