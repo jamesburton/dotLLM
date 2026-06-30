@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -240,6 +241,85 @@ public sealed unsafe class VulkanPipelineParityTests
         float[] full = RunFullDecode(dev0, fixture, preIds, prePos, decIds, decPos, spvDir!);
         float[] pipe = RunPipelineModelDecode(dev0, dev1, fixture, preIds, prePos, decIds, decPos, splitAt, spvDir!);
         AssertLogitsMatch(full, pipe, $"xdev-model-decode/split={splitAt}");
+    }
+
+    // ── Micro-batch overlap: pipelined ForwardBatch must equal per-sequence serial Forward ──
+
+    [SkippableFact]
+    public void PipelinedForwardBatch_MatchesPerSequenceForward()
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var device = VulkanDevice.Create();
+        RunPipelinedBatchParity(device, device, fixture, spvDir!, "single-device");
+    }
+
+    [SkippableFact]
+    public void CrossDevicePipelinedForwardBatch_MatchesPerSequenceForward()
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        Skip.If(VulkanDevice.PhysicalDeviceCount() < 2, "Cross-device spanning needs >= 2 Vulkan devices.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var dev0 = VulkanDevice.Create(0);
+        using var dev1 = VulkanDevice.Create(1);
+        _out.WriteLine($"pipelined batch: stage0 {dev0.DeviceName} / stage1 {dev1.DeviceName}");
+        RunPipelinedBatchParity(dev0, dev1, fixture, spvDir!, "cross-device");
+    }
+
+    private void RunPipelinedBatchParity(
+        VulkanDevice dev0, VulkanDevice dev1, DenseFixture fx, string spvDir, string label)
+    {
+        const int split = 2;
+        // Three independent sequences of different lengths.
+        int[][] ids = [[3, 1, 4, 2], [5, 2, 1], [7, 3, 6, 1, 2]];
+        int[][] pos = [[0, 1, 2, 3], [0, 1, 2], [0, 1, 2, 3, 4]];
+
+        using var model = VulkanPipelineTransformerModel.BuildFromPrebuiltWeights(dev0, dev1, fx.Config, fx.Weights, split, spvDir);
+
+        // Reference: per-sequence serial Forward, each with its own fresh KV cache.
+        var reference = new float[ids.Length][];
+        for (int i = 0; i < ids.Length; i++)
+        {
+            using var kv = model.CreateKvCache(MaxSeqLen);
+            using ITensor lg = model.Forward(ids[i], pos[i], deviceId: 0, kv);
+            reference[i] = LastRow(lg);
+        }
+
+        // Pipelined batch over the same three sequences, each with its own composite KV cache.
+        var kvs = new IKvCache[ids.Length];
+        var requests = new List<SequenceForwardRequest>(ids.Length);
+        for (int i = 0; i < ids.Length; i++)
+        {
+            kvs[i] = model.CreateKvCache(MaxSeqLen);
+            requests.Add(new SequenceForwardRequest { TokenIds = ids[i], Positions = pos[i], KvCache = kvs[i] });
+        }
+        try
+        {
+            var batched = model.ForwardBatch(requests, deviceId: 0);
+            Assert.Equal(ids.Length, batched.Count);
+            for (int i = 0; i < ids.Length; i++)
+            {
+                float[] got = LastRow(batched[i]);
+                float maxAbs = 0f;
+                for (int c = 0; c < got.Length; c++) maxAbs = MathF.Max(maxAbs, MathF.Abs(reference[i][c] - got[c]));
+                _out.WriteLine($"[{label}] seq {i}: max|diff| vs serial = {maxAbs:E3}");
+                for (int c = 0; c < got.Length; c++)
+                {
+                    float bar = AbsTol + RelTol * MathF.Abs(reference[i][c]);
+                    Assert.True(MathF.Abs(reference[i][c] - got[c]) <= bar,
+                        $"[{label}] seq {i} col {c}: serial={reference[i][c]:F6} vs batched={got[c]:F6}");
+                }
+                (batched[i] as IDisposable)?.Dispose();
+            }
+        }
+        finally
+        {
+            foreach (var kv in kvs) kv.Dispose();
+        }
     }
 
     private static float[] RunPipelineModelPrefill(

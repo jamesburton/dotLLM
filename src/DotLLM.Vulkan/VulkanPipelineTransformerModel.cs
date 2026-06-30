@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
@@ -194,6 +195,88 @@ public sealed unsafe class VulkanPipelineTransformerModel : IModel
         var hiddenRows = new ReadOnlySpan<float>((void*)hidden.DataPointer, seqLen * Config.HiddenSize);
         return _stage1.ForwardFromHidden(hiddenRows, positions, pipeline?.Stage1); // host → device1
     }
+
+    /// <summary>
+    /// Pipelined batched forward over <paramref name="requests"/> independent sequences, overlapping the
+    /// two devices: a stage-0 producer thread runs each sequence's <c>[0..split)</c> layers on device 0 and
+    /// hands its hidden state to a bounded queue, while this (consumer) thread runs the <c>[split..L)</c>
+    /// layers + head on device 1. So while device 1 finishes sequence <c>i-1</c>, device 0 is already
+    /// computing sequence <c>i</c> — turning the serial stage0→stage1 latency into <c>max(Σstage0, Σstage1)</c>
+    /// plus one stage of fill. Each request carries its own <see cref="VulkanPipelineKvCache"/>; stage-0 and
+    /// stage-1 caches live on different devices and are touched by different threads, so there is no sharing.
+    /// <paramref name="deviceId"/> is ignored (placement is fixed by the two stages). <c>requests.Count == 1</c>
+    /// degenerates to the serial <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>.
+    /// </summary>
+    public IReadOnlyList<ITensor> ForwardBatch(IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        int n = requests.Count;
+        if (n == 0) return [];
+        var results = new ITensor[n];
+        if (n == 1)
+        {
+            var r = requests[0];
+            results[0] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            return results;
+        }
+
+        // Bounded queue (depth ~2) gives backpressure so the stage-0 producer runs at most a couple of
+        // sequences ahead of stage-1. CancellationToken lets a consumer failure unblock a producer parked
+        // on Add() rather than leaking the thread.
+        using var queue = new BlockingCollection<HandoffItem>(boundedCapacity: 2);
+        using var cts = new System.Threading.CancellationTokenSource();
+        Exception? producerError = null;
+
+        var producer = new System.Threading.Thread(() =>
+        {
+            try
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    var req = requests[i];
+                    var pipeline = req.KvCache as VulkanPipelineKvCache;
+                    int seqLen = req.TokenIds.Length;
+                    // Stage 0 on device 0, then copy the hidden state into a managed array so device 0 can
+                    // immediately reuse its HiddenState buffer for sequence i+1.
+                    using (var _ = _stage0.Forward(req.TokenIds.Span, req.Positions.Span, deviceId: 0, pipeline?.Stage0)) { }
+                    float[] rows = new float[seqLen * Config.HiddenSize];
+                    using (ITensor h = _stage0.DownloadHiddenState(seqLen))
+                        new ReadOnlySpan<float>((void*)h.DataPointer, rows.Length).CopyTo(rows);
+                    queue.Add(new HandoffItem(i, rows, req.Positions), cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { /* consumer bailed — stop quietly */ }
+            catch (Exception ex) { producerError = ex; }
+            finally { queue.CompleteAdding(); }
+        })
+        { IsBackground = true, Name = "vk-pipeline-stage0" };
+
+        producer.Start();
+        try
+        {
+            foreach (HandoffItem item in queue.GetConsumingEnumerable())
+            {
+                var req = requests[item.Index];
+                var pipeline = req.KvCache as VulkanPipelineKvCache;
+                results[item.Index] = _stage1.ForwardFromHidden(item.Hidden, item.Positions.Span, pipeline?.Stage1);
+            }
+        }
+        catch
+        {
+            cts.Cancel(); // unblock the producer if it is parked on a full queue
+            throw;
+        }
+        finally
+        {
+            producer.Join();
+        }
+
+        if (producerError is not null)
+            throw new InvalidOperationException("Pipeline stage-0 (device 0) failed during ForwardBatch.", producerError);
+        return results;
+    }
+
+    private readonly record struct HandoffItem(int Index, float[] Hidden, ReadOnlyMemory<int> Positions);
 
     /// <inheritdoc/>
     public void Dispose()
