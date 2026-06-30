@@ -1,7 +1,7 @@
 """pytest — MoTE upcycle module tests.
 
 Tests:
-    test_mote_init_matches_dense          — structural ratio: y_mote == gate_sum * dense(x)
+    test_mote_block_init_identity         — block(x) == dense_ffn(x) at init for ALL shared modes
     test_mote_shared_fp_is_true_bf16      — fp shared uses plain nn.Linear (no ternary quant)
     test_mote_shared_ternary_init_matches_dense — ternary shared matches dense at init
     test_mote_config_wiring               — module shapes / param counts / shared modes
@@ -43,72 +43,95 @@ def fresh_layer(base):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: structural ratio — y_mote == gate_sum * dense(x) per token
+# Test 1: Block-level init identity — block(x) ≈ dense_ffn(x) for ALL shared modes
 # ---------------------------------------------------------------------------
 
-def test_mote_init_matches_dense(fresh_layer):
-    """Upcycled block with shared='none' and identical expert clones must satisfy
-    the structural ratio y_mote ≈ gate_sum * dense(x) per token.
+@pytest.mark.parametrize("shared_mode", ["none", "ternary", "fp"])
+def test_mote_block_init_identity(fresh_layer, shared_mode):
+    """Full MoTE block at init must be equivalent to dense_ffn(x) for all shared modes.
 
-    With N identical clones and NON-normalized gates:
-        out[i] = Σ_{k∈selected} gate_k * expert_k(x_i)
-                 = gate_sum_i * dense(x_i)    (all clones are identical)
+    With normalized routed gates (g_norm sums to 1) and a convex mix α=0.5:
 
-    where gate_sum_i = sum of the selected top-k raw softmax gates for token i.
+      shared='none':    out = Σ g_norm_i · expert_i(x) = dense(x)  [exact: same ternary path]
+      shared='ternary': 0.5·ternary_shared + 0.5·ternary_routed = dense(x)  [exact: identical clones]
+      shared='fp':      out = 0.5·fp_shared(x) + 0.5·ternary_routed(x)
 
-    This discriminates:
-      - Wrong clones / quant errors → expert(x) ≠ dense(x) → fails
-      - Bad routing → wrong gate_sum computed → fails
-      - Gate renormalization present → gate_sum becomes 1 for top_k=1, but the
-        expected value uses raw softmax (≠ 1), so y_mote ≠ expected → fails
-      - aux-loss wiring errors → checked via aux ≥ 0 and counts.sum == B*T
+    For 'none' and 'ternary', the block output is EXACTLY dense(x) (all paths use the same
+    AutoBitLinear clone, per-token activation quantization gives identical per-token results).
+
+    For 'fp', the shared expert uses plain bf16 while routed experts use AutoBitLinear ternary
+    quantization.  For random inputs the two paths differ substantially (act-quant error scales
+    with input magnitude), so we verify the CONVEX COMBINE FORMULA directly rather than
+    comparing to dense_ffn(x).  The formula test discriminates the old additive form
+    (routed_out + shared) because that gives a different output for any non-trivial difference
+    between the fp and ternary paths.
+
+    Old 1.25× additive form for shared='fp':
+      out_old = gate_i * expert_i(x) + shared(x)  ≈ 0.25·ternary + 1.0·fp
+      → differs from 0.5·fp + 0.5·ternary by 0.5·(fp - ternary) → fails formula assert.
+    Also checks: expert clones identical, aux≥0, dispatch counts consistent.
     """
     from mote_upcycle import build_mote
 
     base = fresh_layer
-    # Capture reference to original dense mlp BEFORE build_mote replaces it.
     dense_ffn = base.model.layers[_LAYER_IDX].mlp
 
-    build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared="none")
+    build_mote(base, layers=[_LAYER_IDX], n_experts=4, top_k=1, shared=shared_mode)
     mote_block = base.model.layers[_LAYER_IDX].mlp
 
     B, T = 2, 8
-    x = torch.randn(B, T, base.config.hidden_size, dtype=torch.bfloat16)
-    x_flat = x.view(B * T, base.config.hidden_size)
+    H = base.config.hidden_size
+    x = torch.randn(B, T, H, dtype=torch.bfloat16)
+    x_flat = x.view(B * T, H)
 
-    # --- Assert: all expert clones produce identical output on the same input ---
+    # --- All expert clones must produce identical output (same deepcopy) ---
     with torch.no_grad():
         expert_outs = [mote_block.experts[i](x_flat) for i in range(len(mote_block.experts))]
     for i in range(1, len(expert_outs)):
         assert torch.allclose(expert_outs[0], expert_outs[i], atol=1e-4), (
-            f"expert[0] and expert[{i}] produce different outputs — "
-            "they should be identical deep copies of the original dense FFN"
+            f"expert[0] and expert[{i}] differ — should be identical deep copies"
         )
 
-    # --- Compute gate_sum (sum of selected top-k raw softmax gates per token) ---
     with torch.no_grad():
-        g = torch.softmax(
-            mote_block.router(x_flat.to(mote_block.router.weight.dtype)), dim=-1
-        )  # [n_tokens, n_experts]
-        top_g, _ = torch.topk(g, mote_block.top_k, dim=-1)  # [n_tokens, top_k]
-        gate_sum = top_g.sum(dim=-1)  # [n_tokens]
+        y_dense = dense_ffn(x)              # [B, T, H]
+        y_mote, aux, counts = mote_block(x) # [B, T, H]
 
-    # --- Run MoTE and dense forward ---
-    with torch.no_grad():
-        y_dense = dense_ffn(x)                         # [B, T, H]
-        y_mote, aux, counts = mote_block(x)            # [B, T, H]
+    if shared_mode in ("none", "ternary"):
+        # Exact identity: all paths use the same AutoBitLinear clone → per-token quant
+        # gives the same output regardless of routing scatter/gather order.
+        # none:    g_norm sums to 1 → routed_out = dense exactly.
+        # ternary: 0.5*ternary_shared(x_flat) + 0.5*ternary_routed = dense exactly.
+        max_diff = (y_mote - y_dense).abs().max().item()
+        assert torch.allclose(y_mote, y_dense, atol=1e-4), (
+            f"MoTE block init-identity FAILED for shared={shared_mode!r} — "
+            f"max abs diff {max_diff:.6f}  (expected exact match: same AutoBitLinear clone)"
+        )
+    else:
+        # shared='fp': verify the convex combine formula alpha*fp + (1-alpha)*ternary.
+        # For per-token act quant all expert clones produce the same per-token output, so:
+        #   routed_out[i] = experts[0](x_flat)[i]  for any i (all clones identical)
+        # → y_mote.view(-1, H) == alpha * shared(x_flat) + (1-alpha) * experts[0](x_flat) EXACTLY
+        # (differences only from bf16 summation order, << 1e-3).
+        # Old additive form gives 'routed_out + shared(x_flat)', which differs by
+        # (0.5 - 1.0)*fp + (0.5 - gate_i)*ternary — large for any non-trivial fp-ternary diff.
+        with torch.no_grad():
+            fp_out = mote_block.shared(x_flat)           # [n_tokens, H]
+            ternary_out = mote_block.experts[0](x_flat)  # [n_tokens, H]
+        alpha = mote_block.mix_alpha  # 0.5
+        expected_flat = alpha * fp_out + (1.0 - alpha) * ternary_out  # [n_tokens, H]
+        expected = expected_flat.view(B, T, H)
 
-    # --- Structural ratio: y_mote == gate_sum * y_dense ---
-    gate_sum_bcast = gate_sum.view(B, T, 1).to(y_dense.dtype)  # [B, T, 1]
-    expected = gate_sum_bcast * y_dense                          # [B, T, H]
+        max_diff = (y_mote - expected).abs().max().item()
+        assert torch.allclose(y_mote, expected, atol=1e-3), (
+            f"MoTE fp combine formula broken — max diff {max_diff:.6f} "
+            f"(expected 0.5*fp_shared + 0.5*ternary_routed; "
+            f"old additive form 'routed + shared' would give a different result)"
+        )
 
-    max_diff = (y_mote - expected).abs().max().item()
-    assert torch.allclose(y_mote, expected, atol=1e-4), (
-        f"MoTE structural ratio broken — max abs diff {max_diff:.6f} "
-        f"(expected y_mote ≈ gate_sum * dense_out; check renorm was removed)"
-    )
+    # --- Aux loss and dispatch counts ---
     assert aux.item() >= 0.0, "aux loss should be non-negative"
-    assert counts.shape == (4,), f"expected counts shape (4,), got {counts.shape}"
+    n_exp = len(mote_block.experts)
+    assert counts.shape == (n_exp,), f"expected counts shape ({n_exp},), got {counts.shape}"
     assert counts.sum().item() == B * T, (
         f"expected total dispatch count {B * T}, got {counts.sum().item()}"
     )

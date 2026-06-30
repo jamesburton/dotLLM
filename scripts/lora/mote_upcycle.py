@@ -9,15 +9,31 @@ Each cloned routed expert retains its AutoBitLinear layers, so ternary weight-qu
 (absmean, online) and int8 activation-quant are applied automatically in the
 expert's own forward pass.  No additional quant instrumentation is required.
 
-Router combine weights are NOT renormalized after top-k selection.  The output is
-the raw gate-weighted sum:
+Router combine weights are **normalized** after top-k selection so they sum to 1
+per token (convex combination over selected experts):
 
-    out = Σ_{i∈top-k} gate_i · expert_i(x)
+    g_norm = top_g / top_g.sum(dim=-1, keepdim=True)
+    routed_out = Σ_{i∈top-k} g_norm_i · expert_i(x)
 
-where gate_i are the raw softmax probabilities.  This matches the Komatsuzaki et al.
-finding that normalizing the combine weights hurts upcycled LMs, and it means the
-init-identity property no longer holds trivially — the test asserts the correct
-structural ratio form instead.
+At init, all expert clones are identical deep copies of the original dense FFN, so
+``routed_out == dense_ffn(x)`` regardless of the routing distribution.
+
+When a shared expert is present the block output is a convex mix:
+
+    out = α · shared(x) + (1 − α) · routed_out,   α = 0.5 (default)
+
+At init, ``shared == routed == dense``, so ``out = dense_ffn(x) ✓`` for any α.
+For ``shared="none"``, ``out = routed_out = dense_ffn(x) ✓``.
+
+Note: this **reverses** the earlier 'non-normalized' choice that followed the
+Komatsuzaki et al. heuristic.  A frozen-base upcycle (all experts = dense clones at
+init) must start at dense PPL — the non-normalized+additive form produced
+``≈ 1.25 × dense_ffn(x)`` at init (measured init PPL ~40 vs dense ~13, confirming
+the 1.25× over-count).  The Komatsuzaki finding applies to upcycles that are already
+partially trained; it does not hold at init for a fully-cloned upcycle.
+
+The Switch load-balance aux loss is computed from the pre-normalization full softmax
+probabilities ``g`` (unchanged).
 
 Usage
 -----
@@ -127,6 +143,7 @@ class MoTEBlock(nn.Module):
         router: nn.Linear,
         top_k: int,
         shared: Optional[nn.Module] = None,
+        mix_alpha: float = 0.5,
     ) -> None:
         super().__init__()
         self.experts = experts
@@ -134,6 +151,9 @@ class MoTEBlock(nn.Module):
         self.top_k = top_k
         self.shared = shared
         self.n_experts: int = len(experts)
+        # Convex-mix coefficient for the shared expert: out = α·shared + (1-α)·routed.
+        # At init, shared == routed == dense, so out == dense for any value of α.
+        self.mix_alpha: float = mix_alpha
 
     def forward(
         self, x: torch.Tensor
@@ -160,28 +180,37 @@ class MoTEBlock(nn.Module):
             self.router(x_flat.to(self.router.weight.dtype)), dim=-1
         )  # [n_tokens, n_experts]
 
-        # --- Top-k selection (raw gates, NOT renormalized) ---
-        # Output = Σ_{selected} gate_i · expert_i(x) with raw softmax gates.
-        # Renormalizing the selected gates was removed (Komatsuzaki et al. show it
-        # hurts upcycled LMs).
+        # --- Top-k selection ---
         top_g, top_idx = torch.topk(g, self.top_k, dim=-1)  # [n_tokens, top_k]
 
-        # --- Dispatch: accumulate gate-weighted expert outputs ---
-        out = torch.zeros(n_tokens, H, dtype=x.dtype, device=x.device)
+        # Normalize selected gates to sum to 1 per token (convex combination over experts).
+        # NOTE: This reverses the earlier 'non-normalized' choice. A frozen-base upcycle
+        # must start at dense(x) — the Komatsuzaki heuristic does not hold here (measured
+        # init PPL ~40 vs dense ~13 with non-normalized gates proved the 1.25× over-count).
+        # The Switch aux loss below is computed from the pre-normalization full softmax g.
+        g_norm = top_g / top_g.sum(dim=-1, keepdim=True)  # [n_tokens, top_k], sums to 1
+
+        # --- Dispatch: accumulate normalized-gate-weighted expert outputs ---
+        routed_out = torch.zeros(n_tokens, H, dtype=x.dtype, device=x.device)
         for k_slot in range(self.top_k):
             for e in range(self.n_experts):
                 mask = top_idx[:, k_slot] == e  # [n_tokens] bool
                 if not mask.any():
                     continue
                 expert_out = self.experts[e](x_flat[mask])           # [m, H]
-                gate = top_g[mask, k_slot : k_slot + 1]              # [m, 1]
-                # Accumulate: out[mask] += gate * expert_out
-                # Use index assignment to stay autograd-friendly.
-                out[mask] = out[mask] + gate * expert_out
+                gate = g_norm[mask, k_slot : k_slot + 1]             # [m, 1]
+                # Accumulate: routed_out[mask] += gate * expert_out
+                routed_out[mask] = routed_out[mask] + gate * expert_out
 
-        # --- Optional shared expert (all tokens, always applied) ---
+        # --- Combine: convex mix with optional shared expert ---
         if self.shared is not None:
-            out = out + self.shared(x_flat)
+            # α·shared(x) + (1-α)·routed_out.  At init: shared == routed == dense, so
+            # out = α·dense + (1-α)·dense = dense ✓ for any α.
+            out = self.mix_alpha * self.shared(x_flat) + (1.0 - self.mix_alpha) * routed_out
+        else:
+            # shared="none": routed_out == dense(x) at init (g_norm sums to 1, all clones
+            # are identical to the original dense FFN).
+            out = routed_out
 
         # --- Switch load-balance aux loss ---
         # frac[e] = fraction of token-expert slots assigned to expert e, normalized
