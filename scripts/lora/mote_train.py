@@ -355,8 +355,13 @@ def main() -> None:
         ),
     )
     ap.add_argument(
-        "--teacher-device", default="cpu", choices=["cpu", "cuda"],
-        help="Device for the frozen teacher model (default: cpu to save GPU VRAM)",
+        "--teacher-device", default="cpu",
+        help=(
+            "Device for the frozen teacher model (default: cpu). "
+            "Accepts any torch.device string: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc. "
+            "Use 'cuda:1' on T4x2 to put the teacher on the second GPU while the "
+            "student trains on cuda:0 -- each card holds one model and KD stays on-GPU."
+        ),
     )
     ap.add_argument(
         "--checkpoint-every", type=int, default=0,

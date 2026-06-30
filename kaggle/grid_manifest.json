@@ -1,14 +1,14 @@
 {
-  "note": "Track-M MoTE ablation grid. c5 (n_experts=8) is the scale-up cell -- run c0-c4 first, then set c5.shared and c5.top_k to match the 4-expert winner before launching c5.",
+  "note": "Track-M MoTE ablation grid. c5 (n_experts=8) is the scale-up cell -- run c0-c4 first, then set c5.shared and c5.top_k to match the 4-expert winner before launching c5. Tokens trimmed to 3M (~5860 steps) for Kaggle session safety on T4x2 bf16-eager with cross-card KD; raise with checkpoint/resume if more tokens are needed.",
   "cells": [
-    {"id": "c0", "n_experts": 4, "top_k": 1, "shared": "ternary", "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
-    {"id": "c1", "n_experts": 4, "top_k": 1, "shared": "fp",      "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
-    {"id": "c2", "n_experts": 4, "top_k": 2, "shared": "fp",      "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
-    {"id": "c3", "n_experts": 4, "top_k": 1, "shared": "none",    "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
-    {"id": "c4", "n_experts": 4, "top_k": 2, "shared": "none",    "layers": "24-29", "tokens": 5000000, "kd_weight": 0.5, "status": "pending"},
+    {"id": "c0", "n_experts": 4, "top_k": 1, "shared": "ternary", "layers": "24-29", "tokens": 3000000, "kd_weight": 0.5, "status": "pending"},
+    {"id": "c1", "n_experts": 4, "top_k": 1, "shared": "fp",      "layers": "24-29", "tokens": 3000000, "kd_weight": 0.5, "status": "pending"},
+    {"id": "c2", "n_experts": 4, "top_k": 2, "shared": "fp",      "layers": "24-29", "tokens": 3000000, "kd_weight": 0.5, "status": "pending"},
+    {"id": "c3", "n_experts": 4, "top_k": 1, "shared": "none",    "layers": "24-29", "tokens": 3000000, "kd_weight": 0.5, "status": "pending"},
+    {"id": "c4", "n_experts": 4, "top_k": 2, "shared": "none",    "layers": "24-29", "tokens": 3000000, "kd_weight": 0.5, "status": "pending"},
     {
       "id": "c5", "n_experts": 8, "top_k": 1, "shared": "fp", "layers": "24-29",
-      "tokens": 5000000, "kd_weight": 0.5, "status": "blocked",
+      "tokens": 3000000, "kd_weight": 0.5, "status": "blocked",
       "note": "top_k/shared must be set to 4-expert winner first. Scale-up cell. Edit shared and top_k to match the 4-expert winner (best of c0-c4) before running."
     }
   ]

@@ -42,40 +42,56 @@ def run(cmd: list, dry_run: bool = False, **kw) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _detect_gpu_gb() -> "float | None":
-    """Return total VRAM in GB for GPU 0, or None if torch/CUDA unavailable."""
+def _detect_gpu_info() -> "tuple[int, float | None]":
+    """Return (device_count, vram_gb_for_gpu0) or (0, None) if CUDA unavailable."""
     try:
         import torch  # noqa: PLC0415
 
         if not torch.cuda.is_available():
-            return None
-        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return 0, None
+        count = torch.cuda.device_count()
+        gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        return count, gb
     except Exception:
-        return None
+        return 0, None
 
 
 def _resolve_teacher_device(requested: str) -> str:
-    """Resolve 'auto' -> 'cuda' (>=20 GB) or 'cpu' (<20 GB / no GPU).
+    """Resolve 'auto' to the best teacher device for the available hardware.
 
-    Explicit 'cuda' or 'cpu' values are returned unchanged.
+    Priority (auto mode only):
+      1. >=2 GPUs detected  -> 'cuda:1' (T4x2: student on cuda:0, teacher on cuda:1;
+                               fast on-GPU KD, each card holds one model)
+      2. 1 GPU, VRAM >= 20 GB -> 'cuda' (L4/A100: both fit on one card)
+      3. 1 GPU, VRAM < 20 GB  -> 'cpu'  (single T4/P100: teacher must be on CPU)
+      4. No CUDA              -> 'cpu'
+
+    Explicit values ('cuda', 'cuda:1', 'cpu', etc.) are returned unchanged.
     """
     if requested != "auto":
         return requested
-    gb = _detect_gpu_gb()
-    if gb is None:
+    count, gb = _detect_gpu_info()
+    if count == 0 or gb is None:
         print(
             "[run_cell] No CUDA GPU detected -- teacher on cpu "
             "(auto; no VRAM to measure)"
         )
         return "cpu"
+    if count >= 2:
+        print(
+            f"[run_cell] {count} GPUs detected -> teacher on cuda:1 "
+            f"(student cuda:0) for fast on-GPU KD"
+        )
+        return "cuda:1"
+    # Single GPU path
     if gb >= 20.0:
         print(
             f"[run_cell] GPU {gb:.1f}GB >= 20GB -> teacher on cuda (fast on-GPU KD)"
         )
         return "cuda"
     print(
-        f"[run_cell] GPU {gb:.1f}GB < 20GB -> teacher on CPU to fit "
-        f"(KD slower). For fast KD use an L4 (24GB)."
+        f"[run_cell] GPU {gb:.1f}GB < 20GB, single GPU -> teacher on cpu "
+        f"(KD slower). Use T4x2 or L4 for fast on-GPU KD."
     )
     return "cpu"
 
@@ -219,12 +235,12 @@ def main() -> None:
     ap.add_argument(
         "--teacher-device",
         default="auto",
-        choices=["auto", "cuda", "cpu"],
         help=(
             "Device for the frozen teacher model. "
-            "'auto' (default): picks cuda on >=20 GB GPUs (L4/A100), "
-            "cpu on <20 GB (T4 ~14.6 GB, P100 ~16 GB). "
-            "Override with 'cuda' or 'cpu' to bypass detection."
+            "'auto' (default): on T4x2 -> cuda:1 (fast, student on cuda:0); "
+            "on L4/A100 (>=20 GB single GPU) -> cuda; "
+            "on single T4/P100 (<20 GB) -> cpu (slow). "
+            "Override with any torch.device string: 'auto', 'cpu', 'cuda', 'cuda:1', etc."
         ),
     )
     ap.add_argument(

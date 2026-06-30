@@ -146,37 +146,48 @@ each checkpoint interval.  This is not the default because adapter weights are l
 
 ---
 
-## (e2) T4 / P100 OOM: auto teacher-device selection
+## (e2) T4x2 teacher-split and auto device selection
 
-`run_cell.py` now **auto-detects GPU VRAM** and picks the teacher device automatically:
+**Recommended accelerator: GPU T4 x2** (Settings -> Accelerator in the Kaggle notebook).
+The harness auto-detects and splits teacher/student across both cards for fast on-GPU KD.
 
-| GPU | VRAM | Auto teacher device | KD speed |
-|-----|------|---------------------|----------|
-| L4 | 24 GB | `cuda` | Fast (on-GPU) |
-| A100 | 40/80 GB | `cuda` | Fast (on-GPU) |
-| P100 | 16 GB | **`cpu`** | Slower (cross-device) |
-| T4 | ~14.6 GB | **`cpu`** | Slower (cross-device) |
+### Auto teacher-device priority
 
-Threshold: **< 20 GB → teacher on CPU** to leave room for student + 8-bit optimizer.
-A notice is printed when CPU fallback activates:
+`run_cell.py` resolves `--teacher-device auto` (default) with this priority:
+
+| Condition | Teacher device | KD speed |
+|-----------|---------------|----------|
+| 2 GPUs detected (T4 x2) | `cuda:1` | Fast -- student on cuda:0, teacher on cuda:1 |
+| 1 GPU, VRAM >= 20 GB (L4/A100) | `cuda` | Fast -- both models on same card |
+| 1 GPU, VRAM < 20 GB (single T4/P100) | `cpu` | Slower -- cross-device transfer per step |
+| No CUDA | `cpu` | Slow -- CPU teacher |
+
+On T4 x2, the harness prints:
 
 ```
-[run_cell] GPU 14.6GB < 20GB -> teacher on CPU to fit (KD slower). For fast KD use an L4 (24GB).
+[run_cell] 2 GPUs detected -> teacher on cuda:1 (student cuda:0) for fast on-GPU KD
 ```
 
-**Recommendation: use an L4 (24 GB) accelerator** for fast KD (teacher stays on GPU).
-T4 and P100 will work with auto CPU teacher, but KD is noticeably slower.
+On a single T4 or P100, it prints:
+
+```
+[run_cell] GPU 14.6GB < 20GB, single GPU -> teacher on cpu (KD slower). Use T4x2 or L4 for fast on-GPU KD.
+```
+
+**Session token budget:** each cell is set to **3M tokens** (~5860 steps at seq_len=512).
+At T4 x2 bf16-eager with cross-card KD this fits comfortably within a 9-12 h Kaggle session.
+To run more tokens, raise `tokens` in `grid_manifest.json` and use `--resume` across sessions.
 
 ### Manual override
 
-Pass `--teacher-device {auto,cpu,cuda}` to bypass detection:
+Pass `--teacher-device` with any `torch.device` string to bypass detection:
 
 ```bash
-# Force CPU teacher even on L4 (e.g. to save VRAM for a very large batch):
+# Force CPU teacher (e.g. to save VRAM or debug OOM):
 python kaggle/run_cell.py --cell-id c1 --teacher-device cpu
 
-# Force CUDA teacher on T4 if you know it fits (risky):
-python kaggle/run_cell.py --cell-id c1 --teacher-device cuda
+# Force teacher onto the second GPU explicitly:
+python kaggle/run_cell.py --cell-id c1 --teacher-device cuda:1
 
 # Default auto-detection (recommended):
 python kaggle/run_cell.py --cell-id c1
