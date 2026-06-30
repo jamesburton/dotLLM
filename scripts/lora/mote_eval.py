@@ -35,6 +35,22 @@ Reads from <adapter>/:
 
 Writes:
   <adapter>/eval.json — all three metrics + dense reference PPL
+
+Memory layout
+-------------
+By default (``--sequential``, the safe default for 12 GB GPUs) only ONE model
+is resident on the GPU at a time:
+
+  1. Tokenize/cache the held-out sequences on CPU (token IDs — negligible memory).
+  2. Load student (MoTE + adapter) → run forward over all sequences → collect
+     per-sequence NLL, expert dispatch counts, and router argmax stats → free:
+     ``del student; gc.collect(); torch.cuda.empty_cache()``.
+  3. Load dense baseline → run forward over the *same* cached sequences → collect
+     per-sequence NLL → free.
+  4. Compute metrics from the collected scalars + write eval.json.
+
+Pass ``--no-sequential`` to load both models simultaneously (faster on ≥16 GB
+cards; the original interleaved-loop behaviour).
 """
 
 # Windows: torch.compile's Triton/Inductor back-end requires cl.exe; suppress
@@ -46,6 +62,7 @@ except Exception:
     pass  # older torch or dynamo not available
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -55,7 +72,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # Allow importing sibling scripts from the same directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -204,6 +221,96 @@ def _compute_ppl(total_nll: float, total_tokens: int) -> float:
     return math.exp(min(avg, 100.0))
 
 
+def _load_student(
+    base_name: str,
+    tiny_random: bool,
+    tiny_cfg,
+    layer_indices: list,
+    n_experts: int,
+    top_k: int,
+    shared: str,
+    adapter_path: str,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Load, build MoTE, apply adapter weights, and move student to device."""
+    if tiny_random:
+        from transformers import BitNetForCausalLM
+        student = BitNetForCausalLM(tiny_cfg).to(device=device)
+    else:
+        student = AutoModelForCausalLM.from_pretrained(
+            base_name, torch_dtype=torch.bfloat16, device_map={"": device}
+        )
+    student.config.use_cache = False
+
+    student = build_mote(
+        student,
+        layers=layer_indices,
+        n_experts=n_experts,
+        top_k=top_k,
+        shared=shared,
+    )
+    student = _wrap_mote_shims(student)
+
+    try:
+        adapter_state = torch.load(
+            adapter_path, map_location=device, weights_only=True
+        )
+    except TypeError:
+        adapter_state = torch.load(adapter_path, map_location=device)  # type: ignore[call-arg]
+
+    missing_keys, unexpected_keys = student.load_state_dict(
+        adapter_state, strict=False
+    )
+    assert not unexpected_keys, (
+        f"[mote_eval] adapter keys did not match the rebuilt model (config drift?): "
+        f"{unexpected_keys}"
+    )
+    print(
+        f"[mote_eval] adapter_weights.pt loaded: {len(adapter_state)} tensors  "
+        f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)})"
+    )
+
+    student.eval()
+    for p in student.parameters():
+        p.requires_grad_(False)
+    # build_mote() adds new modules (router, expert linears) that start on CPU;
+    # .to(device) ensures all of them are on the eval device.
+    student.to(device)
+    for name, p in student.named_parameters():
+        assert p.device.type == device.type, (
+            f"[mote_eval] parameter {name!r} is on {p.device} but eval device is {device}"
+        )
+    for name, buf in student.named_buffers():
+        assert buf.device.type == device.type, (
+            f"[mote_eval] buffer {name!r} is on {buf.device} but eval device is {device}"
+        )
+    print(f"[mote_eval] student fully on {device}; all params/buffers verified")
+    return student
+
+
+def _load_dense(
+    base_name: str,
+    tiny_random: bool,
+    tiny_cfg,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Load the dense baseline (frozen, no MoTE) and move to device."""
+    if tiny_random:
+        from transformers import BitNetForCausalLM
+        dense = BitNetForCausalLM(tiny_cfg).to(device=device)
+    else:
+        dense = AutoModelForCausalLM.from_pretrained(
+            base_name, torch_dtype=torch.bfloat16, device_map={"": device}
+        )
+    dense.config.use_cache = False
+    dense.eval()
+    for p in dense.parameters():
+        p.requires_grad_(False)
+    dense.to(device)
+    print("[mote_eval] dense baseline loaded and frozen")
+    return dense
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -261,6 +368,26 @@ def main() -> None:
             "Must be disjoint from the training split used in mote_train.py ('train')."
         ),
     )
+    seq_grp = ap.add_mutually_exclusive_group()
+    seq_grp.add_argument(
+        "--sequential",
+        dest="sequential",
+        action="store_true",
+        default=True,
+        help=(
+            "Evaluate models one at a time (default).  "
+            "Keeps peak VRAM to ~1 model, safe on 12 GB GPUs."
+        ),
+    )
+    seq_grp.add_argument(
+        "--no-sequential",
+        dest="sequential",
+        action="store_false",
+        help=(
+            "Load both models simultaneously (faster on ≥16 GB GPUs).  "
+            "May OOM on 12 GB cards with 2B+ parameter models."
+        ),
+    )
     args = ap.parse_args()
 
     adapter_dir = os.path.abspath(args.adapter)
@@ -289,7 +416,8 @@ def main() -> None:
         f"[mote_eval] adapter={adapter_dir!r}\n"
         f"[mote_eval] n_experts={n_experts}  top_k={top_k}  "
         f"shared={shared!r}  layers={layer_indices}\n"
-        f"[mote_eval] tiny_random={tiny_random}  device={device}"
+        f"[mote_eval] tiny_random={tiny_random}  device={device}  "
+        f"sequential={args.sequential}"
     )
 
     # ------------------------------------------------------------------
@@ -297,8 +425,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     tiny_cfg = None
     if tiny_random:
-        from transformers import AutoConfig  # noqa: F401
-
         tiny_cfg = AutoConfig.from_pretrained(base_name, local_files_only=True)
         tiny_cfg.hidden_size = 64
         tiny_cfg.intermediate_size = 128
@@ -309,106 +435,21 @@ def main() -> None:
         # Retain real vocab_size so token IDs are valid.
 
     # ------------------------------------------------------------------
-    # 3. Dense baseline (frozen, no MoTE) — reference PPL
+    # 3. Resolve vocab_size without loading a full model
+    #    (needed by _build_corpus for tiny_random synthetic IDs)
     # ------------------------------------------------------------------
     if tiny_random:
-        from transformers import BitNetForCausalLM
-
-        dense = BitNetForCausalLM(tiny_cfg).to(device=device)
+        assert tiny_cfg is not None
+        vocab_size: int = tiny_cfg.vocab_size
     else:
-        dense = AutoModelForCausalLM.from_pretrained(
-            base_name, torch_dtype=torch.bfloat16, device_map={"": device}
-        )
-    dense.config.use_cache = False
-    dense.eval()
-    for p in dense.parameters():
-        p.requires_grad_(False)
-    dense.to(device)  # defensive: device_map / .to() above should cover it; belt-and-suspenders
-    print("[mote_eval] dense baseline loaded and frozen")
+        _tmp_cfg = AutoConfig.from_pretrained(base_name)
+        vocab_size = _tmp_cfg.vocab_size
 
     # ------------------------------------------------------------------
-    # 4. Student: rebuild MoTE, load adapter weights, wrap shims
+    # 4. Build held-out corpus (disjoint from training) — CPU only
+    #    Token ID tensors are tiny (~2 MB for 50k tokens); cache them
+    #    so both model passes use identical sequences.
     # ------------------------------------------------------------------
-    if tiny_random:
-        from transformers import BitNetForCausalLM
-
-        student = BitNetForCausalLM(tiny_cfg).to(device=device)
-    else:
-        student = AutoModelForCausalLM.from_pretrained(
-            base_name, torch_dtype=torch.bfloat16, device_map={"": device}
-        )
-    student.config.use_cache = False
-
-    student = build_mote(
-        student,
-        layers=layer_indices,
-        n_experts=n_experts,
-        top_k=top_k,
-        shared=shared,
-    )
-    # Wrap MoTEBlocks so the HF decoder layer forward receives a plain tensor.
-    student = _wrap_mote_shims(student)
-
-    # Load trainable adapter weights (router + routed experts); strict=False
-    # because adapter_weights.pt contains only the trainable subset of the state dict.
-    adapter_path = os.path.join(adapter_dir, "adapter_weights.pt")
-    if not os.path.isfile(adapter_path):
-        raise FileNotFoundError(f"adapter_weights.pt not found in {adapter_dir!r}")
-    try:
-        adapter_state = torch.load(
-            adapter_path, map_location=device, weights_only=True
-        )
-    except TypeError:
-        # weights_only not supported on this torch version — fall back gracefully.
-        adapter_state = torch.load(adapter_path, map_location=device)  # type: ignore[call-arg]
-
-    missing_keys, unexpected_keys = student.load_state_dict(
-        adapter_state, strict=False
-    )
-    assert not unexpected_keys, (
-        f"[mote_eval] adapter keys did not match the rebuilt model (config drift?): "
-        f"{unexpected_keys}"
-    )
-    print(
-        f"[mote_eval] adapter_weights.pt loaded: {len(adapter_state)} tensors  "
-        f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)})"
-    )
-
-    student.eval()
-    for p in student.parameters():
-        p.requires_grad_(False)
-    # Move the entire student graph to the eval device.  build_mote() creates new
-    # nn.Linear (router) and expert modules that initialise on CPU.  device_map from
-    # from_pretrained covers only the base weights loaded by that call; new modules
-    # added afterwards start on CPU.  load_state_dict with map_location copies values
-    # but does NOT relocate the destination parameter storage (copy_ keeps the target
-    # tensor on its original device).  Calling .to(device) here is the same pattern
-    # used in mote_train.py and fixes the cuda:0/cpu device-mismatch crash at
-    # self.router() seen in Kaggle eval (RuntimeError: mat2 is on cpu, different
-    # from other tensors on cuda:0).
-    student.to(device)
-    for name, p in student.named_parameters():
-        assert p.device.type == device.type, (
-            f"[mote_eval] parameter {name!r} is on {p.device} but eval device is {device}"
-        )
-    for name, buf in student.named_buffers():
-        assert buf.device.type == device.type, (
-            f"[mote_eval] buffer {name!r} is on {buf.device} but eval device is {device}"
-        )
-    print(f"[mote_eval] student fully on {device}; all params/buffers verified")
-
-    # ------------------------------------------------------------------
-    # 5. Register per-token argmax hooks on student routers
-    # ------------------------------------------------------------------
-    hooks, argmax_per_layer = _register_argmax_hooks(student)
-    print(
-        f"[mote_eval] argmax hooks registered on {len(hooks)} MoTE layer(s)"
-    )
-
-    # ------------------------------------------------------------------
-    # 6. Build held-out corpus (disjoint from training)
-    # ------------------------------------------------------------------
-    vocab_size: int = dense.config.vocab_size
     max_seqs = max(50, int(args.eval_tokens) // max_seq_len + 1)
 
     tokenizer = (
@@ -419,7 +460,7 @@ def main() -> None:
 
     # For real data: use 'test' split (training used 'train') to ensure disjointness.
     # For tiny_random: _build_corpus generates fresh random IDs; split arg is ignored.
-    corpus = _build_corpus(
+    corpus_raw = _build_corpus(
         tokenizer=tokenizer,
         dataset_name=args.dataset,
         dataset_config=None,
@@ -429,68 +470,201 @@ def main() -> None:
         tiny_random=tiny_random,
         vocab_size=vocab_size,
     )
-    if not corpus:
+    if not corpus_raw:
         raise RuntimeError(
             "Eval corpus is empty.  "
             f"Check --dataset / --dataset-split={args.dataset_split!r}, "
             "or use --tiny-random."
         )
+
+    # Pin to CPU — both model passes will move each seq to device per-batch.
+    cached_seqs: list[torch.Tensor] = [seq.cpu() for seq in corpus_raw]
+    del corpus_raw  # free the original list
+
     print(
-        f"[mote_eval] held-out corpus: {len(corpus)} sequences × {max_seq_len} tokens "
-        f"(split={args.dataset_split!r})"
+        f"[mote_eval] held-out corpus: {len(cached_seqs)} sequences × {max_seq_len} tokens "
+        f"(split={args.dataset_split!r}, cached on CPU)"
     )
 
+    adapter_path = os.path.join(adapter_dir, "adapter_weights.pt")
+    if not os.path.isfile(adapter_path):
+        raise FileNotFoundError(f"adapter_weights.pt not found in {adapter_dir!r}")
+
     # ------------------------------------------------------------------
-    # 7. Evaluation loop
+    # 5a. Sequential path (default — safe on 12 GB GPUs)
+    #     Load student → eval → free → load dense → eval → free
     # ------------------------------------------------------------------
-    total_student_nll: float = 0.0
-    total_dense_nll: float = 0.0
-    total_tokens: int = 0
-    cumulative_counts: Optional[torch.Tensor] = None
+    if args.sequential:
+        # ---- Student (MoTE) pass ----
+        print("[mote_eval] [sequential] loading student MoTE ...")
+        student = _load_student(
+            base_name=base_name,
+            tiny_random=tiny_random,
+            tiny_cfg=tiny_cfg,
+            layer_indices=layer_indices,
+            n_experts=n_experts,
+            top_k=top_k,
+            shared=shared,
+            adapter_path=adapter_path,
+            device=device,
+        )
 
-    with torch.no_grad():
-        for seq in corpus:
-            seq_t = seq.unsqueeze(0).to(device)  # [1, T]
-            n_pred = seq_t.size(1) - 1           # causal targets (shifted)
+        hooks, argmax_per_layer = _register_argmax_hooks(student)
+        print(
+            f"[mote_eval] argmax hooks registered on {len(hooks)} MoTE layer(s)"
+        )
 
-            # Dense baseline forward
-            dense_logits = dense(input_ids=seq_t).logits  # [1, T, V]
-            dense_nll = F.cross_entropy(
-                dense_logits[:, :-1, :].contiguous().view(-1, vocab_size),
-                seq_t[:, 1:].contiguous().view(-1),
-                reduction="sum",
-            ).item()
+        total_student_nll: float = 0.0
+        total_tokens: int = 0
+        cumulative_counts: Optional[torch.Tensor] = None
 
-            # Student (MoTE) forward — argmax hooks fire here
-            student_logits = student(input_ids=seq_t).logits  # [1, T, V]
-            student_nll = F.cross_entropy(
-                student_logits[:, :-1, :].contiguous().view(-1, vocab_size),
-                seq_t[:, 1:].contiguous().view(-1),
-                reduction="sum",
-            ).item()
+        with torch.no_grad():
+            for seq in cached_seqs:
+                seq_t = seq.unsqueeze(0).to(device)  # [1, T]
+                n_pred = seq_t.size(1) - 1
 
-            # Accumulate expert dispatch counts from all MoTE shims
-            counts = _collect_expert_counts(student)
-            if counts is not None:
-                cumulative_counts = (
-                    counts if cumulative_counts is None else cumulative_counts + counts
-                )
+                student_logits = student(input_ids=seq_t).logits  # [1, T, V]
+                student_nll = F.cross_entropy(
+                    student_logits[:, :-1, :].contiguous().view(-1, vocab_size),
+                    seq_t[:, 1:].contiguous().view(-1),
+                    reduction="sum",
+                ).item()
 
-            total_dense_nll += dense_nll
-            total_student_nll += student_nll
-            total_tokens += n_pred
+                counts = _collect_expert_counts(student)
+                if counts is not None:
+                    cumulative_counts = (
+                        counts if cumulative_counts is None else cumulative_counts + counts
+                    )
 
-    # Clean up hooks now that evaluation is complete.
-    for h in hooks:
-        h.remove()
+                total_student_nll += student_nll
+                total_tokens += n_pred
+
+        for h in hooks:
+            h.remove()
+
+        print(
+            f"[mote_eval] student pass done: {total_tokens} prediction tokens; "
+            "freeing student from GPU ..."
+        )
+        del student
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        print("[mote_eval] student freed; GPU cache cleared")
+
+        # ---- Dense baseline pass ----
+        print("[mote_eval] [sequential] loading dense baseline ...")
+        dense = _load_dense(
+            base_name=base_name,
+            tiny_random=tiny_random,
+            tiny_cfg=tiny_cfg,
+            device=device,
+        )
+
+        total_dense_nll: float = 0.0
+        with torch.no_grad():
+            for seq in cached_seqs:
+                seq_t = seq.unsqueeze(0).to(device)
+
+                dense_logits = dense(input_ids=seq_t).logits  # [1, T, V]
+                dense_nll = F.cross_entropy(
+                    dense_logits[:, :-1, :].contiguous().view(-1, vocab_size),
+                    seq_t[:, 1:].contiguous().view(-1),
+                    reduction="sum",
+                ).item()
+                total_dense_nll += dense_nll
+
+        print("[mote_eval] dense pass done; freeing dense from GPU ...")
+        del dense
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        print("[mote_eval] dense freed; GPU cache cleared")
+
+    # ------------------------------------------------------------------
+    # 5b. Non-sequential path (both models resident — for big-GPU users)
+    #     Original interleaved loop behaviour.
+    # ------------------------------------------------------------------
+    else:
+        print("[mote_eval] [non-sequential] loading dense baseline ...")
+        dense = _load_dense(
+            base_name=base_name,
+            tiny_random=tiny_random,
+            tiny_cfg=tiny_cfg,
+            device=device,
+        )
+
+        print("[mote_eval] [non-sequential] loading student MoTE ...")
+        student = _load_student(
+            base_name=base_name,
+            tiny_random=tiny_random,
+            tiny_cfg=tiny_cfg,
+            layer_indices=layer_indices,
+            n_experts=n_experts,
+            top_k=top_k,
+            shared=shared,
+            adapter_path=adapter_path,
+            device=device,
+        )
+
+        hooks, argmax_per_layer = _register_argmax_hooks(student)
+        print(
+            f"[mote_eval] argmax hooks registered on {len(hooks)} MoTE layer(s)"
+        )
+
+        total_student_nll = 0.0
+        total_dense_nll = 0.0
+        total_tokens = 0
+        cumulative_counts = None
+
+        with torch.no_grad():
+            for seq in cached_seqs:
+                seq_t = seq.unsqueeze(0).to(device)  # [1, T]
+                n_pred = seq_t.size(1) - 1
+
+                # Dense baseline forward
+                dense_logits = dense(input_ids=seq_t).logits  # [1, T, V]
+                dense_nll = F.cross_entropy(
+                    dense_logits[:, :-1, :].contiguous().view(-1, vocab_size),
+                    seq_t[:, 1:].contiguous().view(-1),
+                    reduction="sum",
+                ).item()
+
+                # Student (MoTE) forward — argmax hooks fire here
+                student_logits = student(input_ids=seq_t).logits  # [1, T, V]
+                student_nll = F.cross_entropy(
+                    student_logits[:, :-1, :].contiguous().view(-1, vocab_size),
+                    seq_t[:, 1:].contiguous().view(-1),
+                    reduction="sum",
+                ).item()
+
+                counts = _collect_expert_counts(student)
+                if counts is not None:
+                    cumulative_counts = (
+                        counts if cumulative_counts is None else cumulative_counts + counts
+                    )
+
+                total_dense_nll += dense_nll
+                total_student_nll += student_nll
+                total_tokens += n_pred
+
+        for h in hooks:
+            h.remove()
+
+        del student, dense
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print(
         f"[mote_eval] eval done: {total_tokens} prediction tokens across "
-        f"{len(corpus)} sequences"
+        f"{len(cached_seqs)} sequences"
     )
 
     # ------------------------------------------------------------------
-    # 8. Compute metrics
+    # 6. Compute metrics
     # ------------------------------------------------------------------
 
     # (a) Expert-utilization entropy
@@ -513,7 +687,7 @@ def main() -> None:
     router_dependence = _compute_router_dependence(argmax_per_layer, n_experts)
 
     # ------------------------------------------------------------------
-    # 9. Print summary
+    # 7. Print summary
     # ------------------------------------------------------------------
     log_n_str = f"{log_n:.4f}" if n_experts > 1 else "N/A (n_experts=1)"
     print()
@@ -534,7 +708,7 @@ def main() -> None:
     print()
 
     # ------------------------------------------------------------------
-    # 10. Write eval.json
+    # 8. Write eval.json
     # ------------------------------------------------------------------
     results = {
         "expert_entropy_H": h_entropy,
@@ -549,7 +723,7 @@ def main() -> None:
         "top_k": top_k,
         "shared": shared,
         "eval_tokens": total_tokens,
-        "eval_sequences": len(corpus),
+        "eval_sequences": len(cached_seqs),
         "eval_split": args.dataset_split,
     }
     out_path = os.path.join(adapter_dir, "eval.json")
