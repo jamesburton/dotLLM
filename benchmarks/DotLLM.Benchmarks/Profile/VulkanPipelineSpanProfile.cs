@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DotLLM.Core.Attention;
+using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.HuggingFace;
 using DotLLM.Models.Gguf;
@@ -33,6 +34,7 @@ internal static class VulkanPipelineSpanProfile
         int? splitArg = null;
         int dev0 = 0, dev1 = -1;
         int genCount = 0;
+        int batchCount = 0;
         bool parity = true;
         int[] tokenIds = [1, 15043, 29892, 590, 1024, 338]; // BOS + "Hello, my name is" (Llama BPE ids)
 
@@ -45,6 +47,7 @@ internal static class VulkanPipelineSpanProfile
                 case "--dev0" when i + 1 < args.Length: dev0 = int.Parse(args[++i]); break;
                 case "--dev1" when i + 1 < args.Length: dev1 = int.Parse(args[++i]); break;
                 case "--gen" when i + 1 < args.Length: genCount = int.Parse(args[++i]); break;
+                case "--batch" when i + 1 < args.Length: batchCount = int.Parse(args[++i]); break;
                 case "--no-parity": parity = false; break;
                 case "--tokens" when i + 1 < args.Length:
                     tokenIds = Array.ConvertAll(args[++i].Split(','), s => int.Parse(s.Trim())); break;
@@ -148,6 +151,42 @@ internal static class VulkanPipelineSpanProfile
             genSw.Stop();
             Console.WriteLine($"  generated token IDs: {string.Join(",", gen.GetRange(tokenIds.Length, genCount))}");
             Console.WriteLine($"  decode: {genCount / genSw.Elapsed.TotalSeconds:F1} tok/s");
+        }
+
+        // ── Micro-batch overlap: serial loop vs pipelined ForwardBatch ──
+        if (batchCount > 1)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"─── Overlap timing: {batchCount} independent prefills (serial loop vs pipelined ForwardBatch) ───");
+
+            // Serial baseline: N independent Forward calls, each its own KV (no overlap).
+            var serialKv = new IKvCache[batchCount];
+            for (int i = 0; i < batchCount; i++) serialKv[i] = span.CreateKvCache(config.MaxSequenceLength);
+            var serialSw = Stopwatch.StartNew();
+            for (int i = 0; i < batchCount; i++)
+                using (var _ = span.Forward(tokenIds, positions, 0, serialKv[i])) { }
+            serialSw.Stop();
+            foreach (var kv in serialKv) kv.Dispose();
+
+            // Pipelined: one ForwardBatch over N requests (stage0 on dev0 overlaps stage1 on dev1).
+            var batchKv = new IKvCache[batchCount];
+            var requests = new List<SequenceForwardRequest>(batchCount);
+            for (int i = 0; i < batchCount; i++)
+            {
+                batchKv[i] = span.CreateKvCache(config.MaxSequenceLength);
+                requests.Add(new SequenceForwardRequest { TokenIds = tokenIds, Positions = positions, KvCache = batchKv[i] });
+            }
+            var batchSw = Stopwatch.StartNew();
+            var outputs = span.ForwardBatch(requests, 0);
+            batchSw.Stop();
+            foreach (var o in outputs) (o as IDisposable)?.Dispose();
+            foreach (var kv in batchKv) kv.Dispose();
+
+            double serialMs = serialSw.Elapsed.TotalMilliseconds;
+            double batchMs = batchSw.Elapsed.TotalMilliseconds;
+            Console.WriteLine($"  serial loop   : {serialMs,8:F1} ms  ({batchCount * 1000.0 / serialMs:F1} seq/s)");
+            Console.WriteLine($"  pipelined     : {batchMs,8:F1} ms  ({batchCount * 1000.0 / batchMs:F1} seq/s)");
+            Console.WriteLine($"  overlap speed-up: {serialMs / Math.Max(batchMs, 0.001):F2}× ({(dev0 == dev1 ? "same device — expect ~1×" : "cross-device — overlap window")})");
         }
 
         return 0;
