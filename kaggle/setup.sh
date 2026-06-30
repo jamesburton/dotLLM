@@ -20,6 +20,8 @@
 #   bash kaggle/setup.sh build      # restore + build the solution
 #   bash kaggle/setup.sh test-cpu   # CPU parity tests (proves the seam + .NET 10)
 #   bash kaggle/setup.sh test-cuda  # dual-device CUDA parity (needs 2 GPUs + #361 impl)
+#   bash kaggle/setup.sh test-pipeline # CUDA pipeline-parallel (layer-spanning) parity (#367); single-device
+#                                   # split runs on 1 GPU, cross-device split needs 2 GPUs (auto-skips)
 #   bash kaggle/setup.sh bench      # CUDA inference benchmark (prefill+decode tok/s); honours
 #                                   # DOTLLM_CUDA_GEMM_16F / DOTLLM_CUDA_G3_ATTN env toggles
 #   bash kaggle/setup.sh profile    # CUDA decode profile: per-category GPU breakdown + eager-vs-graph,
@@ -154,16 +156,25 @@ do_test_cuda() {
     -c Release --filter "FullyQualifiedName~CudaCrossDeviceKvTransferTests" --nologo 2>&1 | tail -n 15
 }
 
+do_test_pipeline() {
+  echo "→ CUDA pipeline-parallel (layer-spanning) parity test (#367 — CudaPipelineParityTests)"
+  echo "   Single-device split theories run on 1 GPU (both stages on device 0, separate contexts);"
+  echo "   the CrossDevice* theories place stage-0 on GPU0 + stage-1 on GPU1 (auto-skip if < 2 GPUs)."
+  "$DOTNET_DIR/dotnet" test "$SRC/tests/DotLLM.Tests.Unit/DotLLM.Tests.Unit.csproj" \
+    -c Release --filter "FullyQualifiedName~CudaPipelineParityTests" --nologo 2>&1 | tail -n 20
+}
+
 case "$step" in
-  env)        do_env ;;
-  dotnet)     do_dotnet ;;
-  ptx)        do_ptx ;;
-  build)      do_build ;;
-  test-cpu)   do_test_cpu ;;
-  test-cuda)  do_test_cuda ;;
-  bench)      do_bench ;;
-  profile)    do_profile ;;
-  all)        do_env; do_dotnet; do_ptx; do_build; do_test_cpu ;;
-  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|bench|profile|all)"; exit 2 ;;
+  env)           do_env ;;
+  dotnet)        do_dotnet ;;
+  ptx)           do_ptx ;;
+  build)         do_build ;;
+  test-cpu)      do_test_cpu ;;
+  test-cuda)     do_test_cuda ;;
+  test-pipeline) do_test_pipeline ;;
+  bench)         do_bench ;;
+  profile)       do_profile ;;
+  all)           do_env; do_dotnet; do_ptx; do_build; do_test_cpu ;;
+  *) echo "unknown step '$step' (env|dotnet|ptx|build|test-cpu|test-cuda|test-pipeline|bench|profile|all)"; exit 2 ;;
 esac
 echo "✓ step '$step' done"
