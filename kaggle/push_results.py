@@ -28,6 +28,7 @@ import tempfile
 
 
 RESULTS_BRANCH = "kaggle-results"
+_MAX_GIT_BYTES = 95 * 1024 * 1024  # GitHub hard-rejects files > 100 MB; stay well under
 
 
 def _redact(cmd: list, secret: str) -> list:
@@ -180,15 +181,33 @@ def main() -> None:
             shutil.copy2(ckpt_state, os.path.join(dest_dir, "checkpoint", "state.json"))
             print("[push_results] copied checkpoint/state.json")
 
-        # Adapter weights (optional, large)
+        # Adapter weights (optional, large).
+        # --push-adapter is effectively deprecated for the git path: GitHub hard-rejects
+        # any file > 100 MB, so a 1.7 GB adapter_weights.pt would cause an HTTP 500 and
+        # abort the push.  The size guard below enforces a 95 MB ceiling so that the flag
+        # remains a no-op-with-warning for oversized files while still working for any
+        # future small adapter variant.  Large-adapter retention must use a separate
+        # mechanism (Kaggle Dataset output or HF Hub) -- that is out of scope here.
         if args.push_adapter:
+            print(
+                "[push_results] WARNING: --push-adapter is deprecated for the git path. "
+                "GitHub rejects files > 100 MB; oversized adapter weights will be skipped."
+            )
             for w_rel in ("adapter_weights.pt", os.path.join("checkpoint", "adapter_weights.pt")):
                 w_src = os.path.join(adapter_dir, w_rel)
-                w_dst = os.path.join(dest_dir, w_rel)
                 if os.path.isfile(w_src):
-                    os.makedirs(os.path.dirname(w_dst), exist_ok=True)
-                    shutil.copy2(w_src, w_dst)
-                    print(f"[push_results] copied {w_rel}")
+                    size_bytes = os.path.getsize(w_src)
+                    size_mb = size_bytes / (1024 * 1024)
+                    if size_bytes > _MAX_GIT_BYTES:
+                        print(
+                            f"[push_results] skipping {w_rel} "
+                            f"({size_mb:.1f} MB > 95 MB GitHub limit)"
+                        )
+                    else:
+                        w_dst = os.path.join(dest_dir, w_rel)
+                        os.makedirs(os.path.dirname(w_dst), exist_ok=True)
+                        shutil.copy2(w_src, w_dst)
+                        print(f"[push_results] copied {w_rel} ({size_mb:.1f} MB)")
 
         # Update manifest: flip cell status to "done" (skipped in train-artifacts-only mode)
         if not args.train_artifacts_only:

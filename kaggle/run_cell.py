@@ -378,7 +378,10 @@ def main() -> None:
             "--push-adapter",
         ]
         print(f"\n[run_cell] Step 1b: push train artifacts")
-        run(push_train_cmd, dry_run=args.dry_run)
+        try:
+            run(push_train_cmd, dry_run=args.dry_run)
+        except subprocess.CalledProcessError as exc:
+            print(f"[run_cell] push failed (non-fatal): {exc}", file=sys.stderr)
     else:
         # --eval-only: skip train + train-artifact push
         print(f"\n[run_cell] --eval-only: skipping train and train-artifact push")
@@ -434,7 +437,10 @@ def main() -> None:
 
     if eval_ok:
         print(f"\n[run_cell] Step 3: push eval results")
-        run(push_eval_cmd, dry_run=args.dry_run)
+        try:
+            run(push_eval_cmd, dry_run=args.dry_run)
+        except subprocess.CalledProcessError as exc:
+            print(f"[run_cell] push failed (non-fatal): {exc}", file=sys.stderr)
     elif not args.dry_run:
         print(f"\n[run_cell] Step 3: skipped (eval did not complete)")
 
