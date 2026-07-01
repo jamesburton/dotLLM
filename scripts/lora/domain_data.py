@@ -202,33 +202,44 @@ def load_domain_sequences(
 
 
 def _load_math_sequences(tokenizer, n_seqs, seq_len, needed) -> list:
+    """Load formal math reasoning text.
+
+    Priority order:
+    1. ``open-r1/OpenR1-Math-220k`` — long chain-of-thought reasoning with LaTeX;
+       preferred because solutions are genuinely multi-step and symbolically dense
+       (not simple MCQ template completions like MathInstruct).
+    2. ``TIGER-Lab/MathInstruct`` — broader coverage fallback; note that many
+       entries are short MCQ answers that are *easy* for the model (PPL reversed).
+    3. ``lighteval/MATH`` — competition-level math, streaming fallback.
+    """
     label = "math"
     all_ids: list[int] = []
 
-    # Strategy 1: TIGER-Lab/MathInstruct (very likely cached — 262k rows)
+    # Strategy 1: open-r1/OpenR1-Math-220k — long CoT with genuine LaTeX math
+    # Use streaming=True to avoid slow parquet→arrow generation step.
     try:
-        ds = load_dataset("TIGER-Lab/MathInstruct", split="train")
-        _DOMAIN_DATASET_USED["math"] = "TIGER-Lab/MathInstruct (instruction+output, cached)"
+        ds = load_dataset("open-r1/OpenR1-Math-220k", split="train", streaming=True)
+        _DOMAIN_DATASET_USED["math"] = "open-r1/OpenR1-Math-220k (long CoT + LaTeX, streaming)"
         all_ids = _collect_ids_from_dataset(ds, _extract_text_math, tokenizer, needed, label)
     except Exception as exc:
-        print(f"[domain_data:math] MathInstruct unavailable ({exc}); trying OpenR1 ...")
+        print(f"[domain_data:math] OpenR1 unavailable ({exc}); trying MathInstruct ...")
         all_ids = []
 
-    # Strategy 2: open-r1/OpenR1-Math-220k (also likely cached)
+    # Strategy 2: TIGER-Lab/MathInstruct (simpler MCQ text — PPL may be reversed)
     if len(all_ids) < needed:
         try:
-            ds2 = load_dataset("open-r1/OpenR1-Math-220k", split="train")
-            _DOMAIN_DATASET_USED["math"] = "open-r1/OpenR1-Math-220k (problem+solution, cached)"
+            ds2 = load_dataset("TIGER-Lab/MathInstruct", split="train")
+            _DOMAIN_DATASET_USED["math"] = "TIGER-Lab/MathInstruct (instruction+output, cached)"
             extra = _collect_ids_from_dataset(ds2, _extract_text_math, tokenizer, needed - len(all_ids), label)
             all_ids.extend(extra)
         except Exception as exc2:
-            print(f"[domain_data:math] OpenR1 unavailable ({exc2})")
+            print(f"[domain_data:math] MathInstruct unavailable ({exc2})")
 
-    # Strategy 3: lighteval/MATH streaming (small download)
+    # Strategy 3: lighteval/MATH streaming (competition math, small download)
     if len(all_ids) < needed:
         try:
             ds3 = load_dataset("lighteval/MATH", split="train", streaming=True)
-            _DOMAIN_DATASET_USED["math"] = "lighteval/MATH (streaming)"
+            _DOMAIN_DATASET_USED["math"] = "lighteval/MATH (competition math, streaming)"
             extra3 = _collect_ids_from_dataset(ds3, _extract_text_math, tokenizer, needed - len(all_ids), label)
             all_ids.extend(extra3)
         except Exception as exc3:
