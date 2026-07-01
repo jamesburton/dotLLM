@@ -312,6 +312,10 @@ def main() -> None:
         help="Approximate total training tokens (default 4e8 = 400M)",
     )
     ap.add_argument(
+        "--aux-weight", type=float, default=0.01,
+        help="Switch load-balance aux loss weight (default 0.01; lower lets experts specialize)",
+    )
+    ap.add_argument(
         "--kd-weight", type=float, default=0.5,
         help="Weight for KL distillation loss (set 0 to disable KD)",
     )
@@ -665,7 +669,7 @@ def main() -> None:
         aux_val = aux.item()
 
         # --- Total loss ---
-        loss = lm_loss + args.kd_weight * kd + 0.01 * aux
+        loss = lm_loss + args.kd_weight * kd + args.aux_weight * aux
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in student.parameters() if p.requires_grad], 1.0)
         opt.step()
