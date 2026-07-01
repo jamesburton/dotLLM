@@ -1,6 +1,6 @@
 """Hard-domain data loaders for MoTE OOD headroom experiments.
 
-Provides fixed-length token-sequence loaders for three demanding domains
+Provides fixed-length token-sequence loaders for demanding domains
 where 2B-parameter models are expected to show high perplexity relative to
 their chat-distribution training:
 
@@ -14,6 +14,9 @@ their chat-distribution training:
   * **wiki_de** — German Wikipedia (non-English; base trained on English-dominant
                   chat corpus, so non-English is sharply OOD)
                   Primary: ``wikimedia/wikipedia`` 20231101.de (streaming, cached).
+  * **wiki_ja** — Japanese Wikipedia (non-Latin CJK; expected sharply higher PPL
+                  due to script distance and sparse training representation)
+                  Primary: ``wikimedia/wikipedia`` 20231101.ja (streaming, cached).
 
 Public API
 ----------
@@ -21,7 +24,7 @@ Public API
   Returns a list of ``n_seqs`` fixed-length int64 token-ID tensors of shape
   ``[seq_len]``, suitable for LM PPL evaluation.
 
-  ``domain`` is one of: ``"math"``, ``"pg19"``, ``"wiki_de"``.
+  ``domain`` is one of: ``"math"``, ``"pg19"``, ``"wiki_de"``, ``"wiki_ja"``.
 
 Headroom measurement (run as __main__)
 ---------------------------------------
@@ -197,8 +200,10 @@ def load_domain_sequences(
         return _load_pg19_sequences(tokenizer, n_seqs, seq_len, needed)
     elif domain == "wiki_de":
         return _load_wiki_de_sequences(tokenizer, n_seqs, seq_len, needed)
+    elif domain == "wiki_ja":
+        return _load_wiki_ja_sequences(tokenizer, n_seqs, seq_len, needed)
     else:
-        raise ValueError(f"Unknown domain {domain!r}. Choose: math, pg19, wiki_de")
+        raise ValueError(f"Unknown domain {domain!r}. Choose: math, pg19, wiki_de, wiki_ja")
 
 
 def _load_math_sequences(tokenizer, n_seqs, seq_len, needed) -> list:
@@ -303,6 +308,47 @@ def _load_wiki_de_sequences(tokenizer, n_seqs, seq_len, needed) -> list:
         all_ids = _collect_ids_from_dataset(ds, _extract_text_wiki, tokenizer, needed, label)
     except Exception as exc:
         print(f"[domain_data:wiki_de] wikimedia/wikipedia de unavailable ({exc})")
+
+    return _ids_to_sequences(all_ids, n_seqs, seq_len, label)
+
+
+def _load_wiki_ja_sequences(tokenizer, n_seqs, seq_len, needed) -> list:
+    """Load Japanese Wikipedia text (20231101.ja, streaming).
+
+    Japanese is a non-Latin, CJK script language. The BitNet tokenizer
+    (derived from a Llama/Mistral-family BPE vocabulary) is heavily
+    English-centric, so CJK characters are expected to be split into many
+    byte-fallback tokens — artificially increasing token count per character.
+    This makes PPL potentially inflated vs. a native CJK tokenizer, which is
+    noted in the cross-lingual verdict.
+    """
+    label = "wiki_ja"
+    all_ids: list[int] = []
+
+    # Filter out stub/very short articles (common in JA Wikipedia)
+    def _is_substantive(row: dict) -> bool:
+        text = _extract_text_wiki(row)
+        return len(text.strip()) >= 200
+
+    try:
+        ds = load_dataset(
+            "wikimedia/wikipedia",
+            "20231101.ja",
+            split="train",
+            streaming=True,
+        )
+        _DOMAIN_DATASET_USED["wiki_ja"] = "wikimedia/wikipedia 20231101.ja (streaming, cached)"
+        for row in ds:
+            if not _is_substantive(row):
+                continue
+            text = _extract_text_wiki(row)
+            enc = tokenizer(text, add_special_tokens=False)["input_ids"]
+            all_ids.extend(enc)
+            if len(all_ids) >= needed:
+                break
+        print(f"[domain_data:wiki_ja] collected {len(all_ids)} tokens")
+    except Exception as exc:
+        print(f"[domain_data:wiki_ja] wikimedia/wikipedia ja unavailable ({exc})")
 
     return _ids_to_sequences(all_ids, n_seqs, seq_len, label)
 
@@ -423,7 +469,7 @@ def main() -> None:
     ap.add_argument(
         "--domains",
         default="math,pg19,wiki_de",
-        help="Comma-separated list of domains to evaluate (default: math,pg19,wiki_de)",
+        help="Comma-separated list of domains to evaluate (default: math,pg19,wiki_de). Also supports: wiki_ja",
     )
     ap.add_argument("--report", default=None)
     ap.add_argument(
@@ -441,6 +487,20 @@ def main() -> None:
     # ------------------------------------------------------------------
     print(f"[domain_data] loading tokenizer from {args.base!r} ...")
     tok = AutoTokenizer.from_pretrained(args.base)
+
+    # ------------------------------------------------------------------
+    # 1b. Tokenizer CJK analysis (informational — for Japanese headroom)
+    # ------------------------------------------------------------------
+    _ja_sample = "日本語のウィキペディアは、さまざまなトピックについて詳細な記事を提供しています。"
+    _ja_chars = len(_ja_sample)
+    _ja_tok_ids = tok(_ja_sample, add_special_tokens=False)["input_ids"]
+    _ja_tok_count = len(_ja_tok_ids)
+    _ja_tpc = _ja_tok_count / _ja_chars
+    print(
+        f"[domain_data] JA tokenizer probe: {_ja_chars} chars → {_ja_tok_count} tokens "
+        f"({_ja_tpc:.2f} tok/char); "
+        f"{'HIGH fragmentation — BPE byte-fallback' if _ja_tpc > 1.5 else 'moderate fragmentation'}"
+    )
 
     # ------------------------------------------------------------------
     # 2. Build all corpora on CPU (token IDs only, negligible memory)
@@ -581,8 +641,29 @@ def main() -> None:
             for dom in domains
         )
 
+        # Cross-lingual verdict logic (for wiki_de + wiki_ja comparison)
+        crosslingual_note = ""
+        if "wiki_de" in ppl_results and "wiki_ja" in ppl_results:
+            ppl_de = ppl_results["wiki_de"]
+            ppl_ja = ppl_results["wiki_ja"]
+            if ppl_ja > ppl_de * 1.5:
+                xverdict = "PROMISING — PPL scales with language distance from English (JA >> DE). Cross-lingual MoTE experiment recommended."
+            elif ppl_ja > ppl_de * 1.1:
+                xverdict = "MILD — JA slightly above DE but not dramatically so. Tokenizer fragmentation may inflate JA PPL."
+            else:
+                xverdict = "FLAT — JA ≈ DE, no clear language-distance scaling. Tokenizer artifact likely. Recommend moving to downstream task-accuracy instead."
+            crosslingual_note = (
+                f"\n### Cross-lingual scaling verdict\n"
+                f"- DE PPL: {ppl_de:.2f} ({ppl_de/ppl_chat:.2f}x chat)\n"
+                f"- JA PPL: {ppl_ja:.2f} ({ppl_ja/ppl_chat:.2f}x chat)\n"
+                f"- JA/DE ratio: {ppl_ja/ppl_de:.2f}x\n"
+                f"- JA tokenizer: {_ja_tok_count} tokens / {_ja_chars} chars = {_ja_tpc:.2f} tok/char "
+                f"({'HIGH fragmentation — BPE byte-fallback' if _ja_tpc > 1.5 else 'moderate'})\n"
+                f"- **Verdict: {xverdict}**\n"
+            )
+
         entry = f"""
-## hard-domain headroom scan
+## cross-lingual spike (de + ja)
 
 **Date:** 2026-07-01
 **Issue:** #117
@@ -603,7 +684,7 @@ def main() -> None:
 
 ### Sample per-sequence PPLs (sanity check)
 {sample_ppls}
-
+{crosslingual_note}
 ### Verdict
 {winner_verdict}
 """
