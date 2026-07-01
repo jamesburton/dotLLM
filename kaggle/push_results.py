@@ -7,7 +7,8 @@ Also flips the cell status in grid_manifest.json to "done" and commits that upda
 The operation is idempotent: re-running after a successful push produces a no-op commit.
 
 Requires:
-    GH_PAT env var -- GitHub PAT with repo write access.
+    GITHUB_PAT env var -- GitHub PAT with repo write access.
+    (falls back to GH_PAT if GITHUB_PAT is not set)
 
 Usage
 -----
@@ -119,11 +120,11 @@ def main() -> None:
     args = ap.parse_args()
 
     # Validate PAT
-    pat = os.environ.get("GH_PAT")
+    pat = os.environ.get("GITHUB_PAT") or os.environ.get("GH_PAT")
     if not pat:
         print(
-            "ERROR: GH_PAT environment variable not set.\n"
-            "Set it to a GitHub PAT with repo 'Contents: write' access.",
+            "ERROR: GITHUB_PAT environment variable not set (and GH_PAT not found as fallback).\n"
+            "Set GITHUB_PAT to a GitHub PAT with repo 'Contents: write' access.",
             file=sys.stderr,
         )
         sys.exit(1)

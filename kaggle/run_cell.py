@@ -15,7 +15,8 @@ Usage
 Environment
 -----------
     RESULTS_REMOTE : GitHub repo URL for result push (overridden by --results-remote)
-    GH_PAT         : GitHub PAT with repo write access (forwarded to push_results.py)
+    GITHUB_PAT     : GitHub PAT with repo write access (forwarded to push_results.py)
+    GH_PAT         : fallback GitHub PAT if GITHUB_PAT is not set
 """
 
 import argparse
@@ -148,12 +149,12 @@ def _run_train(cmd: list, dry_run: bool = False) -> None:
 def _pull_checkpoint(cell_id: str, ckpt_dir: str, results_remote: str, out_dir: str) -> None:
     """Pull checkpoint files from kaggle-results branch into ckpt_dir.
 
-    Silently skips if GH_PAT is unset, the branch does not exist, or no checkpoint
-    is present for this cell.
+    Silently skips if GITHUB_PAT (or GH_PAT fallback) is unset, the branch does not exist,
+    or no checkpoint is present for this cell.
     """
-    pat = os.environ.get("GH_PAT")
+    pat = os.environ.get("GITHUB_PAT") or os.environ.get("GH_PAT")
     if not pat:
-        print("[run_cell] GH_PAT not set -- cannot pull checkpoint; training from scratch")
+        print("[run_cell] GITHUB_PAT not set -- cannot pull checkpoint; training from scratch")
         return
 
     auth_url = results_remote

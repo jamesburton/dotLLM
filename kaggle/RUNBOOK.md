@@ -18,7 +18,7 @@ LM-only runs (kd_weight=0) run locally on the RTX 3060 where VRAM is tighter.
 
 ---
 
-## (a) Add GH_PAT as a Kaggle Secret
+## (a) Add GITHUB_PAT as a Kaggle Secret
 
 You need a GitHub Personal Access Token (classic or fine-grained) with **Contents: write** on
 `jamesburton/dotLLM`.
@@ -26,11 +26,11 @@ You need a GitHub Personal Access Token (classic or fine-grained) with **Content
 1. Go to https://github.com/settings/tokens and create a token with `repo` scope.
 2. In Kaggle: open the notebook -> **...** menu -> **Settings** -> **Secrets** ->
    **Add New Secret**.
-3. Name: `GH_PAT`, Value: your token string (`ghp_...`).
+3. Name: `GITHUB_PAT`, Value: your token string (`ghp_...`).
 4. Enable the secret for this notebook.
 
-The notebook reads it in Cell 2 via `UserSecretsClient().get_secret("GH_PAT")` and writes it
-to `os.environ["GH_PAT"]` so push_results.py can find it.
+The notebook reads it in Cell 2 via `UserSecretsClient().get_secret("GITHUB_PAT")` and writes it
+to `os.environ["GITHUB_PAT"]` (and `GH_PAT` as fallback) so push_results.py can find it.
 
 ---
 
@@ -46,7 +46,7 @@ c5 must wait for the 4-expert winner.
    - Do NOT pick a cell-id another session is already running.
 3. Enable **GPU T4 x2** accelerator (Settings -> Accelerator).
 4. Enable **Internet** (Settings -> Internet -> On).
-5. Enable the **GH_PAT** secret (Settings -> Secrets -> toggle on).
+5. Enable the **GITHUB_PAT** secret (Settings -> Secrets -> toggle on).
 6. Run all 4 cells top-to-bottom.
 
 ### Parallel split example (two Kaggle accounts / two sessions)
