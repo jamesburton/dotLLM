@@ -382,6 +382,14 @@ def main() -> None:
             "If the directory or state.json is absent, training starts from scratch."
         ),
     )
+    ap.add_argument(
+        "--mix", default=None, choices=["ja_en"],
+        help=(
+            "Mixed-language corpus mode.  "
+            "``ja_en``: ~60%% Japanese (wiki_ja) + ~40%% English (no_robots train) "
+            "interleaved.  Overrides --dataset / --dataset-config / --dataset-split."
+        ),
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -601,20 +609,36 @@ def main() -> None:
     # ------------------------------------------------------------------
     vocab_size = (teacher or student).config.vocab_size
     max_seqs = max(200, max_tokens // args.max_seq_len + 1)
-    corpus = _build_corpus(
-        tokenizer=None if args.tiny_random else AutoTokenizer.from_pretrained(args.base),
-        dataset_name=args.dataset,
-        dataset_config=args.dataset_config,
-        dataset_split=args.dataset_split,
-        max_seq_len=args.max_seq_len,
-        max_sequences=int(max_seqs),
-        tiny_random=args.tiny_random,
-        vocab_size=vocab_size,
-    )
+
+    if args.mix == "ja_en":
+        # Mixed-language corpus: ~60% JA (wiki_ja) + ~40% EN (no_robots train)
+        from domain_data import load_mixed_ja_en_sequences
+        tokenizer = AutoTokenizer.from_pretrained(args.base)
+        corpus, _mix_labels = load_mixed_ja_en_sequences(
+            tokenizer=tokenizer,
+            n_seqs=int(max_seqs),
+            seq_len=args.max_seq_len,
+            ja_frac=0.6,
+        )
+        print(
+            f"[mote_train] mixed corpus ({args.mix}): {len(corpus)} seqs "
+            f"x {args.max_seq_len} tokens each"
+        )
+    else:
+        corpus = _build_corpus(
+            tokenizer=None if args.tiny_random else AutoTokenizer.from_pretrained(args.base),
+            dataset_name=args.dataset,
+            dataset_config=args.dataset_config,
+            dataset_split=args.dataset_split,
+            max_seq_len=args.max_seq_len,
+            max_sequences=int(max_seqs),
+            tiny_random=args.tiny_random,
+            vocab_size=vocab_size,
+        )
     if not corpus:
         raise RuntimeError(
             "Corpus is empty.  "
-            "Check --dataset / --dataset-split, or use --tiny-random."
+            "Check --dataset / --dataset-split, --mix, or use --tiny-random."
         )
     print(
         f"[mote_train] corpus: {len(corpus)} sequences "

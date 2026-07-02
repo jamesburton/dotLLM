@@ -161,6 +161,111 @@ def _ids_to_sequences(
 
 
 # ---------------------------------------------------------------------------
+# Mixed-language corpus loader (JA + EN) for cross-lingual MoTE probes
+# ---------------------------------------------------------------------------
+
+
+def load_mixed_ja_en_sequences(
+    tokenizer,
+    n_seqs: int = 4000,
+    seq_len: int = 512,
+    ja_frac: float = 0.6,
+) -> tuple:
+    """Build a mixed JA (wiki_ja) + EN (no_robots train) training corpus.
+
+    Parameters
+    ----------
+    tokenizer:
+        HuggingFace tokenizer.
+    n_seqs:
+        Total number of fixed-length sequences to produce.
+    seq_len:
+        Token sequence length.
+    ja_frac:
+        Fraction of sequences that should be Japanese (default 0.6 = 60%).
+
+    Returns
+    -------
+    ``(seqs, labels)`` where ``seqs`` is a list of :class:`torch.Tensor`
+    of shape ``[seq_len]`` and ``labels`` is a parallel list of ``"ja"`` or
+    ``"en"`` strings identifying each sequence's source language.
+    """
+    n_ja = int(n_seqs * ja_frac)
+    n_en = n_seqs - n_ja
+    needed_ja = n_ja * seq_len + seq_len
+    needed_en = n_en * seq_len + seq_len
+
+    # -- JA: wikimedia/wikipedia 20231101.ja (streaming) --
+    print(f"[domain_data:mix] loading ~{n_ja} JA sequences from wiki_ja ...")
+    ja_ids: list[int] = []
+    try:
+        ds_ja = load_dataset(
+            "wikimedia/wikipedia", "20231101.ja", split="train", streaming=True
+        )
+        for row in ds_ja:
+            text = _extract_text_wiki(row)
+            if len(text.strip()) < 200:
+                continue
+            enc = tokenizer(text, add_special_tokens=False)["input_ids"]
+            ja_ids.extend(enc)
+            if len(ja_ids) >= needed_ja:
+                break
+        print(f"[domain_data:mix] wiki_ja collected {len(ja_ids)} tokens")
+    except Exception as exc:
+        print(f"[domain_data:mix] wiki_ja failed ({exc}); JA corpus will be truncated")
+
+    # -- EN: HuggingFaceH4/no_robots train split (cached) --
+    print(f"[domain_data:mix] loading ~{n_en} EN sequences from no_robots train ...")
+    en_ids: list[int] = []
+    try:
+        ds_en = load_dataset("HuggingFaceH4/no_robots", split="train")
+        for row in ds_en:
+            if "messages" in row:
+                text = " ".join(
+                    m["content"] for m in row["messages"] if m.get("content")
+                )
+            elif "text" in row:
+                text = row["text"]
+            else:
+                text = " ".join(str(v) for v in row.values() if isinstance(v, str))
+            enc = tokenizer(text, add_special_tokens=False)["input_ids"]
+            en_ids.extend(enc)
+            if len(en_ids) >= needed_en:
+                break
+        print(f"[domain_data:mix] no_robots collected {len(en_ids)} tokens")
+    except Exception as exc:
+        print(f"[domain_data:mix] no_robots failed ({exc}); EN corpus will be truncated")
+
+    ja_seqs = _ids_to_sequences(ja_ids, n_ja, seq_len, "ja_train")
+    en_seqs = _ids_to_sequences(en_ids, n_en, seq_len, "en_train")
+
+    # Interleave at ~3:2 JA:EN ratio so the mix is roughly uniform across the epoch
+    seqs: list = []
+    labels: list[str] = []
+    ja_i = en_i = 0
+    while ja_i < len(ja_seqs) or en_i < len(en_seqs):
+        for _ in range(3):
+            if ja_i < len(ja_seqs):
+                seqs.append(ja_seqs[ja_i])
+                labels.append("ja")
+                ja_i += 1
+        for _ in range(2):
+            if en_i < len(en_seqs):
+                seqs.append(en_seqs[en_i])
+                labels.append("en")
+                en_i += 1
+
+    n_ja_actual = labels.count("ja")
+    n_en_actual = labels.count("en")
+    print(
+        f"[domain_data:mix] mixed corpus: {len(seqs)} seqs total "
+        f"({n_ja_actual} JA = {100*n_ja_actual//max(len(seqs),1)}%, "
+        f"{n_en_actual} EN = {100*n_en_actual//max(len(seqs),1)}%)"
+    )
+    return seqs, labels
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
