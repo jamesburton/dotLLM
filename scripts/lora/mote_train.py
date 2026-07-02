@@ -162,11 +162,15 @@ def _wrap_mote_shims(model: nn.Module) -> nn.Module:
     return model
 
 
-def _freeze_for_mote_training(model: nn.Module) -> None:
+def _freeze_for_mote_training(model: nn.Module, args) -> None:
     """Freeze everything; then unfreeze router + routed-expert weights only.
 
     Frozen:  all base attention/embedding params; shared expert (fp or ternary).
     Trainable: BF16 router nn.Linear + routed-expert AutoBitLinear clones.
+
+    With ``--train-lm-head``: also unfreezes ``model.lm_head`` (the unembedding
+    nn.Linear, ~vocab×hidden params) and ``model.model.norm`` (the final
+    RMSNorm before the head).  Everything else stays frozen.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -178,6 +182,11 @@ def _freeze_for_mote_training(model: nn.Module) -> None:
             for p in shim.experts.parameters():
                 p.requires_grad_(True)
             # shared expert stays frozen regardless of mode
+    if args.train_lm_head:
+        for p in model.lm_head.parameters():
+            p.requires_grad_(True)
+        for p in model.model.norm.parameters():
+            p.requires_grad_(True)
 
 
 def _collect_aux(model: nn.Module, device: torch.device) -> torch.Tensor:
@@ -554,6 +563,16 @@ def main() -> None:
             "eval_curve in metrics.json.  Always runs once at end-of-training."
         ),
     )
+    ap.add_argument(
+        "--train-lm-head", action="store_true", default=False,
+        help=(
+            "Also unfreeze model.lm_head (unembedding nn.Linear, ~vocab×hidden) and "
+            "model.model.norm (final RMSNorm) in addition to the MoTE router + routed "
+            "experts.  Required by the vocab-expansion literature when adapting to a new "
+            "language (e.g. Japanese): the output-layer bottleneck cannot be corrected "
+            "by FFN-only training.  Default: off (original behaviour unchanged)."
+        ),
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -653,7 +672,7 @@ def main() -> None:
         )
     print(f"[mote_train] student moved to device {device}; all params/buffers verified on {device}")
 
-    _freeze_for_mote_training(student)
+    _freeze_for_mote_training(student, args)
 
     # Compute once here; reused in checkpoint saves and final adapter save (step 7).
     trainable_names = {
@@ -665,6 +684,15 @@ def main() -> None:
         f"[mote_train] trainable={trainable:,} / total={total_params:,} "
         f"({100 * trainable / max(total_params, 1):.2f}%)"
     )
+    if args.train_lm_head:
+        lm_head_names = sorted(
+            name for name in trainable_names
+            if name.startswith("lm_head.") or name.startswith("model.norm.")
+        )
+        print(
+            f"[mote_train] --train-lm-head ON: also training lm_head + final norm. "
+            f"Unfrozen params: {lm_head_names}"
+        )
 
     # ------------------------------------------------------------------
     # 4. Optimizer -- router lr 1e-4 (spec: "lr 1e-4 on the MoE path")
