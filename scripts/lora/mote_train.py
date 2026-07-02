@@ -573,6 +573,18 @@ def main() -> None:
             "by FFN-only training.  Default: off (original behaviour unchanged)."
         ),
     )
+    ap.add_argument(
+        "--grad-checkpoint", action="store_true", default=False,
+        help=(
+            "Enable gradient checkpointing (activation recomputation) to reduce "
+            "activation memory at the cost of extra compute during the backward pass.  "
+            "Critical for fitting --train-lm-head on a 12 GB GPU: the lm_head adds "
+            "~330 M params whose activations otherwise push the forward graph past the "
+            "12 GB ceiling.  Calls student.gradient_checkpointing_enable() (non-reentrant "
+            "form preferred) after freeze, and student.enable_input_require_grads() so "
+            "checkpointing activates even when the embedding is frozen.  Default: off."
+        ),
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -693,6 +705,46 @@ def main() -> None:
             f"[mote_train] --train-lm-head ON: also training lm_head + final norm. "
             f"Unfrozen params: {lm_head_names}"
         )
+
+    # ------------------------------------------------------------------
+    # 3b. Gradient checkpointing  (--grad-checkpoint)
+    # ------------------------------------------------------------------
+    # Enable AFTER freeze (trainable set is stable) but before optimizer or
+    # training state is set up.
+    #
+    # HF wraps each decoder layer's forward in torch.utils.checkpoint.  Each
+    # layer runs TWICE: once in the forward pass (intermediate activations
+    # discarded) and once recomputed during backward (recompute pass).
+    #
+    # MoTEShim stashes last_aux / last_counts as attributes during its forward.
+    # The recompute in backward will overwrite last_aux -- but _collect_aux()
+    # is called AFTER the student forward pass and BEFORE loss.backward(), so
+    # it reads the first-pass value while still valid.  The recomputed write
+    # (during backward recompute) is never read by the training loop; gradients
+    # still flow correctly through the in-graph aux tensor.
+    if args.grad_checkpoint:
+        # use_cache=False is required by HF gradient checkpointing; already set
+        # unconditionally above, but reaffirm here for clarity and resilience
+        # against future re-ordering.
+        student.config.use_cache = False
+        # Prefer non-reentrant checkpointing: safer with custom modules and
+        # avoids the reentrant path's "leaf tensor requires_grad" pitfalls.
+        # Fall back to the no-kwargs form for older transformers versions.
+        try:
+            student.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            student.gradient_checkpointing_enable()
+        # With a frozen embedding, no input tensor entering the first decoder
+        # layer has requires_grad=True, which causes HF checkpointing to
+        # silently no-op (the checkpoint wrapper short-circuits when no input
+        # needs grad).  enable_input_require_grads() registers a forward hook
+        # on the embedding that makes the *output* require grad without making
+        # the embedding weights themselves trainable.
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
+        print("[mote_train] gradient checkpointing ENABLED")
 
     # ------------------------------------------------------------------
     # 4. Optimizer -- router lr 1e-4 (spec: "lr 1e-4 on the MoE path")
