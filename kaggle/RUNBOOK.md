@@ -220,6 +220,133 @@ The manifest is the claim board.  Protocol:
 
 ---
 
+---
+
+## lm_head / output-routed experiment (T4 x2) — `run_lmhead.ipynb`
+
+This notebook trains `lm_head` + the converted final transformer block(s) (layers 26-29)
+on the EN+JA mix to convergence — a run that does not fit the local RTX 3060 12 GB but
+fits comfortably on a T4 x2 (each card ~15 GB).
+
+### Hardware & settings
+
+| Setting | Value |
+|---------|-------|
+| Accelerator | **GPU T4 x2** |
+| Internet | **On** (clone + push) |
+| Secret name | **`GITHUB_PAT`** (repo write) |
+| Notebook | `kaggle/run_lmhead.ipynb` |
+
+### Step-by-step
+
+1. Open a Kaggle notebook backed by `kaggle/run_lmhead.ipynb`.
+2. **Settings → Accelerator → GPU T4 x2.**
+3. **Settings → Internet → On.**
+4. **Settings → Secrets → Add New Secret**: Name=`GITHUB_PAT`, Value=`ghp_...` with
+   `repo` / Contents: write scope.
+5. Edit the **CONFIG cell** (Cell 1) if you want to change `TOKENS`, `KD_ON`, `SEQ_LEN`, etc.
+6. **Run All** for interactive (≤9 h); **Save & Run All (Commit)** for longer runs (see below).
+
+### CONFIG cell — tunable parameters
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `TOKENS` | `"2e7"` | Token budget.  Raise to `"5e7"` or `"1e8"` for full convergence. |
+| `KD_ON` | `True` | `False` → LM-only loss (no teacher; ~0.5 ppl worse but faster). |
+| `KD_WEIGHT` | `0.5` | Weight on teacher KL; ignored when `KD_ON=False`. |
+| `TEACHER_DEVICE` | `"cuda:1"` | Teacher on second T4; change to `"cpu"` for single-GPU. |
+| `SEQ_LEN` | `512` | Sequence length. |
+| `EVAL_EVERY` | `500` | Prints JA/EN held-out eval curve every N steps. |
+| `CHECKPOINT_EVERY` | `1000` | Saves checkpoint to `/kaggle/working/ckpt/` every N steps. |
+
+### Write-check-first behavior
+
+**Cell 4** performs a real git push (`results/_writecheck/<ts>.txt` → `kaggle-results`
+branch) **before** any training starts.  If the push fails the cell raises a
+`RuntimeError` with a clear message and notebook execution stops.  You will never
+wait hours for training to finish and then discover you cannot push the results.
+
+Common failure causes and fixes:
+
+| Symptom | Fix |
+|---------|-----|
+| `GITHUB_PAT not set` | Run Cell 3 again; toggle the secret on under Settings → Secrets |
+| `Authentication failed` / `403` | Regenerate token at github.com/settings/tokens; add `repo` scope |
+| `Connection refused` / `timeout` | Enable Internet: Settings → Internet → On |
+
+### Checkpoint persistence and auto-resume across sessions
+
+Kaggle interactive sessions are limited to ~9-12 h.  For longer runs:
+
+#### Single-session (fits in one run)
+
+Run as **Save & Run All (Commit)** or interactively.  Checkpoints land in
+`/kaggle/working/ckpt/ja_lmhead/checkpoint/` and are saved every `CHECKPOINT_EVERY`
+steps.  If the session is interrupted (idle timeout, OOM, etc.) the checkpoint is lost
+**unless** you used **Commit** (see below).
+
+#### Multi-session (run > one session)
+
+1. Always use **Save & Run All (Commit)** — this saves the entire `/kaggle/working/`
+   directory as the version's output dataset.
+2. After the version finishes (or times out), open a **new version** of the notebook.
+3. Under **Data → Add Data**, search for this notebook → choose the previous version's
+   output dataset → attach it as input.
+4. **Cell 6 auto-detects the checkpoint** by scanning:
+   - `/kaggle/working/ckpt/ja_lmhead/checkpoint/state.json` (same-session)
+   - `/kaggle/input/*/ckpt/ja_lmhead/checkpoint/state.json` (attached dataset)
+   It passes `--resume-from <found_path>` to `mote_train.py` automatically.
+5. Training continues from where it left off; final push to `kaggle-results` happens as
+   normal.
+
+> **Note:** Interactive sessions do **not** persist `/kaggle/working/` across kernel
+> restarts.  Only **Commit** runs create a persistent output dataset.  If you are
+> running interactively and a session dies before completion, you must restart from scratch.
+
+#### Checkpoint size warning
+
+Adapter + optimizer checkpoints are typically > 100 MB and **cannot** be pushed to
+GitHub (100 MB file limit).  This is why checkpoints live in `/kaggle/working/` (Kaggle
+Dataset output) rather than `kaggle-results`.  Only small result files (`metrics.json`,
+`eval.json`, `mote_config.json`, eval curve) are pushed to GitHub at the end.
+
+### Results location
+
+After a successful run, results appear on the `kaggle-results` branch under:
+
+```
+results/lmhead_ja/
+  metrics.json       <- final losses + expert histogram
+  eval.json          <- PPL, entropy, router dependence
+  mote_config.json   <- hyperparams used
+  train_log.txt      <- full training log (if available)
+```
+
+Pull locally:
+```bash
+git fetch origin kaggle-results
+git show kaggle-results:results/lmhead_ja/eval.json
+```
+
+### run_cell.py utility modes
+
+The main `run_cell.py` script now supports two standalone utility modes that do not
+require `--cell-id`:
+
+```bash
+# Verify git write access (prints commands with PAT redacted; exit 0=pass, 1=fail):
+GITHUB_PAT=ghp_... python kaggle/run_cell.py --writecheck-only
+# Dry-run (no network):
+GITHUB_PAT=ghp_... python kaggle/run_cell.py --writecheck-only --dry-run
+
+# Auto-detect checkpoint directory (for lm_head or any custom run):
+python kaggle/run_cell.py --resume-auto --ckpt-dir /kaggle/working/ckpt/ja_lmhead/checkpoint
+# Dry-run:
+python kaggle/run_cell.py --resume-auto --ckpt-dir /kaggle/working/ckpt/ja_lmhead/checkpoint --dry-run
+```
+
+---
+
 ## KD-on-Kaggle vs LM-only-on-3060
 
 | Mode | Location | Why |

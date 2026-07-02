@@ -146,6 +146,154 @@ def _run_train(cmd: list, dry_run: bool = False) -> None:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
+def _do_writecheck(results_remote: str, pat: str, dry_run: bool = False) -> bool:
+    """Push a tiny sentinel file to the kaggle-results branch to verify write access.
+
+    Returns True on success, False on failure.  In dry-run mode, prints the commands
+    (with the PAT redacted to ``***``) without executing them and returns True.
+    """
+    import datetime
+    import shutil
+    import tempfile
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    auth_url = results_remote
+    if results_remote.startswith("https://") and pat:
+        auth_url = results_remote.replace("https://", f"https://{pat}@", 1)
+
+    if dry_run:
+        redacted = auth_url.replace(pat, "***") if pat else auth_url
+        print(
+            f"[run_cell] --writecheck-only (dry-run): would push "
+            f"results/_writecheck/{ts}.txt to kaggle-results"
+        )
+        print(f"  $ git clone --depth 1 --branch kaggle-results {redacted} <tmpdir>")
+        print(f"  $ # create results/_writecheck/{ts}.txt")
+        print(f"  $ git commit -m 'writecheck: {ts}'")
+        print(f"  $ git push {redacted} HEAD:kaggle-results")
+        return True
+
+    if not pat:
+        print(
+            "[run_cell] --writecheck-only: GITHUB_PAT not set -- cannot verify write access",
+            file=sys.stderr,
+        )
+        return False
+
+    tmpdir = tempfile.mkdtemp(prefix="dotllm_wcheck_")
+    repo = os.path.join(tmpdir, "repo")
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        # Clone kaggle-results branch; create it if it doesn't exist yet
+        try:
+            subprocess.run(
+                [
+                    "git", "clone", "--depth", "1",
+                    "--branch", "kaggle-results", auth_url, repo,
+                ],
+                check=True, capture_output=True, env=env,
+            )
+        except subprocess.CalledProcessError:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", auth_url, repo],
+                check=True, capture_output=True, env=env,
+            )
+            subprocess.run(
+                ["git", "-C", repo, "checkout", "-b", "kaggle-results"],
+                check=True,
+            )
+
+        check_dir = os.path.join(repo, "results", "_writecheck")
+        os.makedirs(check_dir, exist_ok=True)
+        with open(os.path.join(check_dir, f"{ts}.txt"), "w", encoding="utf-8") as fh:
+            fh.write(f"write-check at {ts}\n")
+
+        subprocess.run(
+            ["git", "-C", repo, "config", "user.email", "kaggle-bot@dotllm.dev"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repo, "config", "user.name", "dotLLM Kaggle Bot"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", repo, "commit", "-m", f"writecheck: {ts}"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repo, "push", auth_url, "HEAD:kaggle-results"],
+            check=True, env=env,
+        )
+        print(
+            f"[run_cell] --writecheck-only: PASSED "
+            f"(pushed results/_writecheck/{ts}.txt to kaggle-results)"
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"[run_cell] --writecheck-only: FAILED ({exc})", file=sys.stderr)
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _detect_resume(ckpt_dir: str, dry_run: bool = False) -> "str | None":
+    """Auto-detect a checkpoint in *ckpt_dir* or a Kaggle Dataset input mount.
+
+    Search order:
+      1. *ckpt_dir*/state.json              -- same-session working dir
+      2. /kaggle/input/*/<rel>/state.json   -- prior version attached as dataset input
+
+    Returns the directory containing state.json, or None if not found.
+    In dry-run mode, prints what would be checked without touching the filesystem.
+    """
+    import glob as _glob
+
+    # Derive a meaningful experiment name for cross-session glob patterns.
+    # If ckpt_dir ends in "checkpoint" (standard layout: <out>/checkpoint),
+    # use the parent directory's name as the experiment identifier.
+    _tail = os.path.basename(ckpt_dir.rstrip("/\\"))
+    if _tail == "checkpoint":
+        _parent = os.path.dirname(ckpt_dir.rstrip("/\\"))
+        exp_name = os.path.basename(_parent)
+    else:
+        exp_name = _tail
+
+    if dry_run:
+        print(f"[run_cell] --resume-auto (dry-run): would check (in order):")
+        print(f"  1. {ckpt_dir}/state.json  (same-session checkpoint)")
+        print(f"  2. /kaggle/input/*/{exp_name}/checkpoint/state.json")
+        print(f"  3. /kaggle/input/*/{exp_name}/state.json")
+        print(f"  4. /kaggle/input/*/checkpoint/state.json  (generic fallback)")
+        print(f"  (Dry-run: filesystem checks skipped)")
+        return None
+
+    # 1. Same-session
+    if os.path.isfile(os.path.join(ckpt_dir, "state.json")):
+        print(f"[run_cell] --resume-auto: found same-session checkpoint at {ckpt_dir}")
+        return ckpt_dir
+
+    # 2. Cross-session: Kaggle dataset input (prior version's output attached)
+    patterns = [
+        f"/kaggle/input/*/{exp_name}/checkpoint/state.json",
+        f"/kaggle/input/*/{exp_name}/state.json",
+        "/kaggle/input/*/checkpoint/state.json",
+        "/kaggle/input/*/state.json",
+    ]
+    candidates = [hit for pat in patterns for hit in _glob.glob(pat)]
+    if candidates:
+        best = max(candidates, key=os.path.getmtime)
+        found = os.path.dirname(best)
+        print(f"[run_cell] --resume-auto: found cross-session checkpoint at {found}")
+        return found
+
+    print(
+        f"[run_cell] --resume-auto: no checkpoint found in {ckpt_dir} "
+        "or /kaggle/input/ -- will train from scratch"
+    )
+    return None
+
+
 def _pull_checkpoint(cell_id: str, ckpt_dir: str, results_remote: str, out_dir: str) -> None:
     """Pull checkpoint files from kaggle-results branch into ckpt_dir.
 
@@ -207,8 +355,12 @@ def main() -> None:
         description="Run one Track-M MoTE grid cell on Kaggle (train -> eval -> push)"
     )
     ap.add_argument(
-        "--cell-id", required=True,
-        help="Cell ID from grid_manifest.json (e.g. c1)",
+        "--cell-id", default=None,
+        help=(
+            "Cell ID from grid_manifest.json (e.g. c1). "
+            "Required for the normal cell-run mode; "
+            "omit when using --writecheck-only or --resume-auto."
+        ),
     )
     ap.add_argument(
         "--manifest",
@@ -259,7 +411,55 @@ def main() -> None:
             "Requires adapter_weights.pt in <out>/."
         ),
     )
+    ap.add_argument(
+        "--writecheck-only",
+        action="store_true",
+        help=(
+            "Push a tiny sentinel file (results/_writecheck/<ts>.txt) to the "
+            "kaggle-results branch to verify write access, then exit 0 on success "
+            "or 1 on failure.  Does not require --cell-id.  "
+            "With --dry-run, prints the git commands (PAT redacted to ***) and exits 0."
+        ),
+    )
+    ap.add_argument(
+        "--resume-auto",
+        action="store_true",
+        help=(
+            "Detect a checkpoint in --ckpt-dir (same-session) or in "
+            "/kaggle/input/*/ (cross-session attached dataset), print the path, "
+            "then exit 0.  Does not require --cell-id.  "
+            "With --dry-run, prints the directories that would be searched."
+        ),
+    )
+    ap.add_argument(
+        "--ckpt-dir",
+        default="/kaggle/working/ckpt",
+        help=(
+            "Checkpoint directory to search when using --resume-auto. "
+            "Default: /kaggle/working/ckpt"
+        ),
+    )
     args = ap.parse_args()
+
+    # ------------------------------------------------------------------
+    # Early-exit utility modes (do not need --cell-id)
+    # ------------------------------------------------------------------
+    if args.writecheck_only:
+        pat = os.environ.get("GITHUB_PAT") or os.environ.get("GH_PAT", "")
+        ok = _do_writecheck(args.results_remote, pat, dry_run=args.dry_run)
+        sys.exit(0 if ok else 1)
+
+    if args.resume_auto:
+        _detect_resume(args.ckpt_dir, dry_run=args.dry_run)
+        sys.exit(0)
+
+    # Beyond this point --cell-id is required
+    if args.cell_id is None:
+        ap.error(
+            "--cell-id is required for the normal cell-run mode "
+            "(use --writecheck-only or --resume-auto for utility modes that don't need it)"
+        )
+
     teacher_device = _resolve_teacher_device(args.teacher_device)
 
     repo = os.path.abspath(args.repo_dir)
