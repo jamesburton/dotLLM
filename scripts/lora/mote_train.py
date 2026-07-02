@@ -60,6 +60,7 @@ except Exception:
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -281,6 +282,159 @@ def _build_corpus(
 
 
 # ---------------------------------------------------------------------------
+# Held-out PPL eval helpers  (--eval-every)
+# ---------------------------------------------------------------------------
+
+# Known dense BitNet 2B reference PPLs (prior eval scans, issue #117)
+_DENSE_JA_PPL_REF: float = 74.4    # wiki_ja held-out
+_DENSE_EN_PPL_REF: float = 13.44   # no_robots test (chat baseline)
+
+
+def _compute_ppl(
+    model: nn.Module,
+    seqs: list,
+    device: torch.device,
+) -> float:
+    """Compute mean cross-entropy PPL over held-out seqs.
+
+    Switches model to eval + no_grad, then restores training mode.
+    Returns ``float('nan')`` if *seqs* is empty.
+    """
+    if not seqs:
+        return float("nan")
+    total_nll = 0.0
+    total_tok = 0
+    model.eval()
+    with torch.no_grad():
+        for seq in seqs:
+            s = seq.unsqueeze(0).to(device)        # [1, T]
+            logits = model(input_ids=s).logits      # [1, T, V]
+            V = logits.size(-1)
+            nll = F.cross_entropy(
+                logits[:, :-1, :].contiguous().view(-1, V),
+                s[:, 1:].contiguous().view(-1),
+                reduction="sum",
+            ).item()
+            total_nll += nll
+            total_tok += s.size(1) - 1
+    model.train()
+    if total_tok == 0:
+        return float("nan")
+    return math.exp(min(total_nll / total_tok, 100.0))
+
+
+def _build_eval_slices(
+    args,
+    tokenizer,
+    vocab_size: int,
+    corpus: list,
+) -> tuple:
+    """Build small held-out eval slices for periodic PPL tracking.
+
+    Returns ``(eval_ja, eval_en, eval_generic)`` where:
+
+    * *eval_ja* / *eval_en* — non-empty only when ``--mix ja_en`` and not
+      ``--tiny-random`` (wiki_ja + no_robots test split respectively).
+    * *eval_generic* — used in generic mode or when JA/EN load fails.
+
+    All three may be empty; callers guard accordingly.
+    """
+    _N = 20   # sequences per language for eval
+    eval_ja: list = []
+    eval_en: list = []
+    eval_generic: list = []
+
+    if args.tiny_random:
+        # Corpus is synthetic random -- reuse tail as generic held-out.
+        n = min(16, max(1, len(corpus) // 4))
+        eval_generic = corpus[-n:]
+        print(f"[eval] tiny_random: last {len(eval_generic)} seqs as generic held-out")
+        return eval_ja, eval_en, eval_generic
+
+    if args.mix == "ja_en" and tokenizer is not None:
+        try:
+            from domain_data import load_domain_sequences
+            eval_ja = load_domain_sequences(
+                "wiki_ja", tokenizer, n_seqs=_N, seq_len=args.max_seq_len
+            )
+            print(f"[eval] held-out JA: {len(eval_ja)} seqs (wiki_ja)")
+        except Exception as exc:
+            print(f"[eval] wiki_ja held-out skipped ({exc})")
+
+        try:
+            eval_en = _build_corpus(
+                tokenizer=tokenizer,
+                dataset_name="HuggingFaceH4/no_robots",
+                dataset_config=None,
+                dataset_split="test",
+                max_seq_len=args.max_seq_len,
+                max_sequences=_N,
+                tiny_random=False,
+                vocab_size=vocab_size,
+            )
+            print(f"[eval] held-out EN: {len(eval_en)} seqs (no_robots test)")
+        except Exception as exc:
+            print(f"[eval] no_robots test held-out skipped ({exc})")
+
+    if not eval_ja and not eval_en:
+        # Fallback: tail of corpus (different step window from training rotation)
+        n = min(_N, max(1, len(corpus) // 5))
+        eval_generic = corpus[-n:]
+        print(f"[eval] generic held-out: last {len(eval_generic)} seqs from training corpus")
+
+    return eval_ja, eval_en, eval_generic
+
+
+def _run_eval(
+    model: nn.Module,
+    eval_ja: list,
+    eval_en: list,
+    eval_generic: list,
+    device: torch.device,
+    step: int,
+    train_lm: float,
+    eval_curve: list,
+) -> None:
+    """Run one held-out PPL eval pass; log a clear line and append to eval_curve.
+
+    Wrapped in try/except -- a failure here never crashes training.
+    """
+    try:
+        _t0 = time.perf_counter()
+        if eval_ja or eval_en:
+            ja_ppl = _compute_ppl(model, eval_ja, device) if eval_ja else float("nan")
+            en_ppl = _compute_ppl(model, eval_en, device) if eval_en else float("nan")
+            ja_str = f"{ja_ppl:.2f}" if not math.isnan(ja_ppl) else "N/A"
+            en_str = f"{en_ppl:.2f}" if not math.isnan(en_ppl) else "N/A"
+            elapsed = time.perf_counter() - _t0
+            print(
+                f"[eval@step {step}] held-out "
+                f"JA_ppl={ja_str} (dense {_DENSE_JA_PPL_REF})  "
+                f"EN_ppl={en_str} (dense {_DENSE_EN_PPL_REF})  |  "
+                f"train_lm={train_lm:.3f}  ({elapsed:.1f}s)",
+                flush=True,
+            )
+            eval_curve.append(
+                {"step": step, "ja_ppl": ja_ppl, "en_ppl": en_ppl, "train_lm": train_lm}
+            )
+        else:
+            gen_ppl = _compute_ppl(model, eval_generic, device) if eval_generic else float("nan")
+            gen_str = f"{gen_ppl:.2f}" if not math.isnan(gen_ppl) else "N/A"
+            elapsed = time.perf_counter() - _t0
+            print(
+                f"[eval@step {step}] held-out "
+                f"ppl={gen_str}  |  train_lm={train_lm:.3f}  ({elapsed:.1f}s)",
+                flush=True,
+            )
+            eval_curve.append({"step": step, "ppl": gen_ppl, "train_lm": train_lm})
+    except Exception as exc:
+        print(
+            f"[eval@step {step}] WARNING: eval failed ({exc}); training continues",
+            flush=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -388,6 +542,16 @@ def main() -> None:
             "Mixed-language corpus mode.  "
             "``ja_en``: ~60%% Japanese (wiki_ja) + ~40%% English (no_robots train) "
             "interleaved.  Overrides --dataset / --dataset-config / --dataset-split."
+        ),
+    )
+    ap.add_argument(
+        "--eval-every", type=int, default=0,
+        help=(
+            "Run a held-out PPL eval every N optimizer steps (0 = disabled, default). "
+            "With --mix ja_en: logs JA_ppl (wiki_ja) + EN_ppl (no_robots test) vs known "
+            "dense references (74.4 / 13.44).  Otherwise logs a single generic held-out "
+            "PPL from the tail of the training corpus.  Appends all eval points to "
+            "eval_curve in metrics.json.  Always runs once at end-of-training."
         ),
     )
     args = ap.parse_args()
@@ -613,9 +777,9 @@ def main() -> None:
     if args.mix == "ja_en":
         # Mixed-language corpus: ~60% JA (wiki_ja) + ~40% EN (no_robots train)
         from domain_data import load_mixed_ja_en_sequences
-        tokenizer = AutoTokenizer.from_pretrained(args.base)
+        _eval_tokenizer = AutoTokenizer.from_pretrained(args.base)
         corpus, _mix_labels = load_mixed_ja_en_sequences(
-            tokenizer=tokenizer,
+            tokenizer=_eval_tokenizer,
             n_seqs=int(max_seqs),
             seq_len=args.max_seq_len,
             ja_frac=0.6,
@@ -625,8 +789,9 @@ def main() -> None:
             f"x {args.max_seq_len} tokens each"
         )
     else:
+        _eval_tokenizer = None if args.tiny_random else AutoTokenizer.from_pretrained(args.base)
         corpus = _build_corpus(
-            tokenizer=None if args.tiny_random else AutoTokenizer.from_pretrained(args.base),
+            tokenizer=_eval_tokenizer,
             dataset_name=args.dataset,
             dataset_config=args.dataset_config,
             dataset_split=args.dataset_split,
@@ -646,12 +811,25 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
+    # 5b. Held-out eval slices  (--eval-every)
+    # ------------------------------------------------------------------
+    eval_ja: list = []
+    eval_en: list = []
+    eval_generic: list = []
+    if args.eval_every > 0:
+        eval_ja, eval_en, eval_generic = _build_eval_slices(
+            args, _eval_tokenizer, vocab_size, corpus
+        )
+
+    # ------------------------------------------------------------------
     # 6. Training loop
     # ------------------------------------------------------------------
     student.train()
     tokens_seen = _resume_tokens
     step = _resume_step
     recent_counts: list = []   # last K expert-count tensors
+    eval_curve: list = []      # eval points written to metrics.json
+    _last_eval_step: int = -1  # prevents double-logging at end-of-training
 
     final_lm = final_kd = final_aux = float("nan")
     _t0 = time.perf_counter()
@@ -719,6 +897,14 @@ def main() -> None:
                 flush=True,
             )
 
+        # Periodic held-out eval
+        if args.eval_every > 0 and step % args.eval_every == 0:
+            _run_eval(
+                student, eval_ja, eval_en, eval_generic,
+                device, step, lm_val, eval_curve,
+            )
+            _last_eval_step = step
+
         # Accumulate expert counts for histogram (rolling window)
         counts = _collect_counts(student)
         if counts is not None:
@@ -745,6 +931,13 @@ def main() -> None:
         final_lm = lm_val
         final_kd = kd_val
         final_aux = aux_val
+
+    # End-of-training held-out eval (always run once if enabled and not just done)
+    if args.eval_every > 0 and step != _last_eval_step:
+        _run_eval(
+            student, eval_ja, eval_en, eval_generic,
+            device, step, final_lm, eval_curve,
+        )
 
     # Log peak VRAM if on CUDA
     peak_vram_gb = None
@@ -818,6 +1011,8 @@ def main() -> None:
         metrics["peak_vram_gb"] = peak_vram_gb
     if _steps_per_sec is not None:
         metrics["steps_per_sec"] = round(_steps_per_sec, 3)
+    if eval_curve:
+        metrics["eval_curve"] = eval_curve
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
