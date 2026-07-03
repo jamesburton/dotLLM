@@ -211,6 +211,97 @@ public sealed class DisaggregatedKvTransferTests
         }
     }
 
+    // ── Cross-process wire format (KvHandoffSerialization) ──
+
+    /// <summary>
+    /// Token parity with every KV byte travelling the serialized wire format (export → stream → import)
+    /// instead of a direct host copy — the in-process proof of the cross-process handoff path.
+    /// </summary>
+    [Fact]
+    public async Task SerializedTransfer_SeparatePools_MatchesReferenceTransfer()
+    {
+        int[] promptLens = [2, 3, 5, 7];
+
+        int[][] reference = await RunDisaggregatedAsync(promptLens, copy: false);
+        int[][] serialized = await RunDisaggregatedAsync(promptLens, copy: true, separatePoolTransfer: SerializedKvHandoffTransfer.Instance);
+
+        for (int i = 0; i < promptLens.Length; i++)
+        {
+            Assert.Equal(RampExpectedGenerated(promptLens[i]), serialized[i].Length);
+            Assert.Equal(reference[i], serialized[i]); // token-identical through the wire format
+        }
+    }
+
+    /// <summary>
+    /// Round-trips the wire format over a real OS anonymous pipe (writer on another thread) — pipes
+    /// deliver partial reads, so this discriminates a Read-vs-ReadExactly bug that a seekable
+    /// MemoryStream can never catch. Contents must arrive byte-for-byte.
+    /// </summary>
+    [Fact]
+    public void Serialization_RoundTrip_OverAnonymousPipe_ByteForByte()
+    {
+        using var srcPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+        using var dstPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+
+        const int length = 7;
+        using var source = srcPool.Create(MaxSeqLen);
+        FillCache(source, length, seed: 100);
+        using var dest = dstPool.Create(MaxSeqLen);
+
+        using var server = new System.IO.Pipes.AnonymousPipeServerStream(System.IO.Pipes.PipeDirection.Out);
+        using var client = new System.IO.Pipes.AnonymousPipeClientStream(
+            System.IO.Pipes.PipeDirection.In, server.GetClientHandleAsString());
+
+        Exception? writerError = null;
+        var writer = new Thread(() =>
+        {
+            try
+            {
+                KvHandoffSerialization.Export(source, NumLayers, server);
+                server.Dispose(); // close the write end so the reader sees EOF after the payload
+            }
+            catch (Exception ex) { writerError = ex; }
+        });
+        writer.Start();
+        KvHandoffSerialization.Import(client, dest, NumLayers);
+        writer.Join();
+        Assert.Null(writerError);
+
+        Assert.Equal(length, dest.CurrentLength);
+        using var expected = srcPool.Create(MaxSeqLen);
+        FillCache(expected, length, seed: 100);
+        for (int layer = 0; layer < NumLayers; layer++)
+        {
+            AssertRefEqual(expected.GetKeysRef(layer), dest.GetKeysRef(layer), length);
+            AssertRefEqual(expected.GetValuesRef(layer), dest.GetValuesRef(layer), length);
+        }
+    }
+
+    /// <summary>A mismatched replica (wrong layer count) or a corrupt stream must fail loudly at import.</summary>
+    [Fact]
+    public void Serialization_Import_RejectsBadHeader()
+    {
+        using var srcPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+        using var dstPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
+        using var source = srcPool.Create(MaxSeqLen);
+        FillCache(source, length: 3, seed: 7);
+
+        using var stream = new MemoryStream();
+        KvHandoffSerialization.Export(source, NumLayers, stream);
+
+        // Wrong layer count: this replica pair disagrees on the model → reject.
+        stream.Position = 0;
+        using (var dest = dstPool.Create(MaxSeqLen))
+            Assert.Throws<InvalidDataException>(() => KvHandoffSerialization.Import(stream, dest, NumLayers + 1));
+
+        // Corrupt magic: not a handoff stream at all.
+        var bytes = stream.ToArray();
+        bytes[0] ^= 0xFF;
+        using (var corrupt = new MemoryStream(bytes))
+        using (var dest = dstPool.Create(MaxSeqLen))
+            Assert.Throws<InvalidDataException>(() => KvHandoffSerialization.Import(corrupt, dest, NumLayers));
+    }
+
     private static unsafe void FillCache(IKvCache cache, int length, int seed)
     {
         long bytes = (long)length * KvStride * sizeof(float);
