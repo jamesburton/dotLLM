@@ -243,6 +243,60 @@ public sealed unsafe class VulkanPipelineParityTests
         AssertLogitsMatch(full, pipe, $"xdev-model-decode/split={splitAt}");
     }
 
+    // ── VRAM trim (#368): stage roles must actually shed the embed table / LM head ──
+
+    /// <summary>
+    /// Discriminating check for the pipeline VRAM trim: a headless stage (no final norm + LM head)
+    /// and an embed-less stage (no token-embedding table) must allocate strictly less device weight
+    /// memory than the same layer window built untrimmed. Guards against a silent regression that
+    /// re-uploads the stubbed tensors (parity tests can't see that — the trim is invisible to logits).
+    /// </summary>
+    [SkippableFact]
+    public void TrimmedPipelineStages_AllocateLessDeviceMemory()
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        const int split = 2;
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var device = VulkanDevice.Create();
+        var cfg0 = fixture.Config with { NumLayers = split };
+        var cfg1 = fixture.Config with { NumLayers = NumLayers - split };
+
+        using var stage0Full = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg0, fixture.Weights, spvDir!, firstLayer: 0);
+        using var stage0Trim = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg0, fixture.Weights, spvDir!, firstLayer: 0, headless: true);
+        using var stage1Full = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg1, fixture.Weights, spvDir!, firstLayer: split);
+        using var stage1Trim = VulkanTransformerModel.BuildFromPrebuiltWeights(device, cfg1, fixture.Weights, spvDir!, firstLayer: split, skipTokenEmbed: true);
+
+        _out.WriteLine($"stage0 full={stage0Full.ComputeMemoryBytes} trimmed={stage0Trim.ComputeMemoryBytes}");
+        _out.WriteLine($"stage1 full={stage1Full.ComputeMemoryBytes} trimmed={stage1Trim.ComputeMemoryBytes}");
+        Assert.True(stage0Trim.ComputeMemoryBytes < stage0Full.ComputeMemoryBytes,
+            "headless stage0 must shed the final-norm + LM-head weight bytes");
+        Assert.True(stage1Trim.ComputeMemoryBytes < stage1Full.ComputeMemoryBytes,
+            "embed-less stage1 must shed the token-embedding table bytes");
+    }
+
+    /// <summary>An embed-less stage entered via Forward (no hidden seed) must fail loudly, not gather from the stub.</summary>
+    [SkippableFact]
+    public void EmbedlessStage_ForwardWithoutSeed_Throws()
+    {
+        Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/driver available.");
+        string? spvDir = FindSpvDir();
+        Skip.If(spvDir is null, "SPIR-V shader files not found; build with Vulkan SDK.");
+
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var device = VulkanDevice.Create();
+        var cfg1 = fixture.Config with { NumLayers = 2 };
+        using var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(
+            device, cfg1, fixture.Weights, spvDir!, firstLayer: 2, skipTokenEmbed: true);
+
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            using var _ = stage1.Forward([1, 2], [0, 1], deviceId: 0, kvCache: null);
+        });
+    }
+
     // ── Micro-batch overlap: pipelined ForwardBatch must equal per-sequence serial Forward ──
 
     [SkippableFact]
