@@ -54,6 +54,28 @@ CPU↔Vulkan numerical parity gate is the synthetic-fixture argmax test, not dec
 
 ## 3. Relative throughput (#41) and capability (#33)
 
-_(bench battery: full-canvas 256 run, PKV A/B, same-session llama.cpp Vulkan diffusion
-baseline, and the LLaDA-8B (plain Llama backbone) cross-engine AR decode ratio — results
-pending)_
+Same session, same box, GPU pre-checked idle (0.5 %). llama.cpp = `llamacpp-vulkan`
+build 74ade5274 / the PR-24423 `llama-diffusion-cli` Vulkan build.
+
+| Measurement | dotLLM Vulkan | llama.cpp Vulkan | Ratio |
+|---|---|---|---|
+| **AR decode, LLaDA-8B Q4_K_M (same file, plain Llama backbone)** | 28.24 tok/s (`decode_min_ms` 34.47) | 44.85 ± 0.05 tok/s (`tg32`) | **0.63×** |
+| 26B diffusion step latency | 3.90 s/step @ canvas 32, SC+PKV on | 0.736 s/step @ canvas 256 | ~36× slower per canvas-token |
+| 26B diffusion effective | 0.29 tok/s (canvas 32) | 34.8 tok/s (256 tok, 10 steps) | — |
+| PKV prompt-cache effect (canvas 32) | 3.90 s/step on vs 4.47 s/step off | n/a | −13 % per step |
+
+**Reading.** The AR ratio (0.63×, up from 0.23× pre-kernel-campaign) says the Vulkan
+GEMV/MMVQ kernels are within striking distance. The diffusion gap is structural, not
+kernel-level: dotLLM's self-conditioning computes the full soft-embed —
+`[canvas × 262 144-vocab] softmax × [vocab × 2 816] embedding GEMM` ≈ 47 GFLOP/step at
+canvas 32 — which alone accounts for the observed ~3.9 s/step, while llama.cpp's
+diffusion build runs `gpu_sampling=on sample_reduce=on` (sparsified SC / on-device
+sampling). Closing the diffusion gap = sparsifying the SC embed (top-K logits, like the
+reference) + moving unmask sampling on-device — filed as the #41 follow-up; the AR
+backbone needs no dedicated work beyond the existing kernel roadmap.
+
+Capability note (#33): both engines complete the factual prompt correctly at full canvas
+(llama.cpp produced a coherent 256-token chat-formatted answer; dotLLM CPU produced the
+coherent French-capital completion in §1). A scored fixed-prompt-set comparison remains
+open under #33 — it only becomes meaningful once the SC sparsification lands and dotLLM
+can run full-canvas in seconds rather than minutes.
