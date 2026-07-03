@@ -356,6 +356,13 @@ public sealed class VulkanTransformerModel : IModel
     // window-local (0..NumLayers-1), but the FULL-length CPU-side per-layer lookups (cpuWeights.Layers
     // and Config.PerLayerSlidingWindow) are offset by _firstLayer at read time. Set by BuildModel.
     private int _firstLayer;
+    // VRAM-trim flags for pipeline stages (both false on a normal single-device model). Set by BuildModel.
+    // _headless: non-last stage — the final-norm/LM-head weights are 64-byte stubs and Forward returns a
+    // dummy logits tensor right after the layer loop (the caller reads DownloadHiddenState instead).
+    // _noTokenEmbed: non-first stage — the embedding table is a 64-byte stub; Forward must always be
+    // seeded via ForwardFromHidden (a token-gather would read the stub).
+    private bool _headless;
+    private bool _noTokenEmbed;
     // When non-null, the next Forward seeds HiddenState from these host rows (a previous pipeline
     // stage's output) instead of gathering token embeddings — the resume-from-hidden entry. Set/cleared
     // around the inner Forward by ForwardFromHidden; single-threaded per generation like _currentLora.
@@ -718,7 +725,7 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     internal static VulkanTransformerModel BuildFromPrebuiltWeights(
         VulkanDevice device, ModelConfig config, TransformerWeights cpuWeights, string spvDir,
-        int firstLayer = 0)
+        int firstLayer = 0, bool skipTokenEmbed = false, bool headless = false)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(config);
@@ -726,13 +733,22 @@ public sealed class VulkanTransformerModel : IModel
         ArgumentNullException.ThrowIfNull(spvDir);
 
         RejectUnsupportedArchitecture(config);
-        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null, firstLayer: firstLayer);
+        return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf: null,
+            firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed, headless: headless);
     }
 
     private static VulkanTransformerModel BuildModel(
         VulkanDevice device, bool ownsDevice, ModelConfig config,
-        TransformerWeights cpuWeights, string spvDir, GgufFile? gguf, int firstLayer = 0)
+        TransformerWeights cpuWeights, string spvDir, GgufFile? gguf, int firstLayer = 0,
+        bool skipTokenEmbed = false, bool headless = false)
     {
+        // The VRAM-trim flags are pipeline-stage roles: a non-first stage never gathers embeddings
+        // (skipTokenEmbed) and a non-last stage never runs the final norm + LM head (headless). Both
+        // are exercised only through the causal ForwardFromHidden pipeline — the diffusion paths
+        // assume a full model.
+        if ((headless || skipTokenEmbed) && config.DiffusionConfig is not null)
+            throw new NotSupportedException("A trimmed pipeline stage is causal-only (no diffusion).");
+
         // Pipeline parallelism (layer-spanning): this model covers global layers
         // [firstLayer .. firstLayer+config.NumLayers). config.NumLayers is the WINDOW size, so the
         // device weights, the layer loop and the KV cache are all window-local (0-indexed); only the
@@ -741,7 +757,8 @@ public sealed class VulkanTransformerModel : IModel
         // Q8_0 matrices stay on device as 34-byte blocks — the forward pass
         // below dispatches them through the Q8_0 GEMV / GEMM kernels. Other
         // quant types are still dequantised to FP32 at upload.
-        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer);
+        var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer,
+            skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless);
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
@@ -1193,6 +1210,8 @@ public sealed class VulkanTransformerModel : IModel
             mlaNumHeads, mlaQkNope, mlaQkRope, mlaVHead,
             mlaScale, mlaRopeTheta);
         model._firstLayer = firstLayer;
+        model._headless = headless;
+        model._noTokenEmbed = skipTokenEmbed;
         return model;
     }
 
@@ -1723,6 +1742,13 @@ public sealed class VulkanTransformerModel : IModel
         IReadOnlyList<SequenceForwardRequest> requests, int deviceId)
     {
         ArgumentNullException.ThrowIfNull(requests);
+        // A trimmed pipeline stage (stubbed embedding table and/or stubbed LM head) cannot serve the
+        // fused batched path — it gathers embeddings and runs the batched lm_head. Pipeline batching
+        // lives in VulkanPipelineTransformerModel.ForwardBatch, which drives the stages per-sequence.
+        if (_headless || _noTokenEmbed)
+            throw new InvalidOperationException(
+                "ForwardBatch is not supported on a trimmed pipeline stage; " +
+                "use VulkanPipelineTransformerModel.ForwardBatch.");
         if (requests.Count == 0) return Array.Empty<ITensor>();
         if (requests.Count == 1)
         {
@@ -2221,6 +2247,14 @@ public sealed class VulkanTransformerModel : IModel
             _state.ResetHiddenSlot();
             UploadHiddenStateRows(_seedHiddenRows!, seqLen);
         }
+        else if (_noTokenEmbed)
+        {
+            // Built without the embedding table (non-first pipeline stage) — a token gather would
+            // read the 64-byte stub. This stage must always be entered via ForwardFromHidden.
+            throw new InvalidOperationException(
+                "This pipeline stage was built without a token-embedding table (skipTokenEmbed); " +
+                "drive it via ForwardFromHidden, not Forward.");
+        }
 
         // Diffusion forward: pre-allocate the all-position logits buffer and (when
         // self-conditioning is active this step) the SC-signal buffer BEFORE recording
@@ -2686,6 +2720,17 @@ public sealed class VulkanTransformerModel : IModel
         // 3a. PKV prefill: the captured per-layer K/V is all we need — skip the final
         //     norm + LM head entirely (the generator discards the prefill result).
         if (_pkvPhase == DiffusionKvPhase.Prefill)
+        {
+            _submit.SubmitAndWait();
+            return UnmanagedTensor.Allocate(new TensorShape(1, vocabSize), DType.Float32, deviceId: -1);
+        }
+
+        // 3a'. Headless pipeline stage (non-last): the final-norm/LM-head weights are 64-byte stubs
+        //      and the logits are discarded by the pipeline wrapper anyway — it reads
+        //      DownloadHiddenState after this returns (fence-ordered by the SubmitAndWait, same
+        //      contract as the full-forward case). Skipping the head here also saves the
+        //      vocab-scale LM-head matmul every decode step.
+        if (_headless)
         {
             _submit.SubmitAndWait();
             return UnmanagedTensor.Allocate(new TensorShape(1, vocabSize), DType.Float32, deviceId: -1);

@@ -500,6 +500,18 @@ internal sealed class VulkanWeights : IDisposable
     /// onto a given device for cross-device layer-spanning (pipeline parallelism). The returned
     /// <see cref="Layers"/> are indexed locally (0-based) within the window.
     /// </param>
+    /// <param name="skipTokenEmbed">
+    /// When <c>true</c>, the token-embedding table is replaced by a 64-byte stub buffer. Used by a
+    /// non-first pipeline stage, which is only ever seeded from a previous stage's hidden state
+    /// (<c>ForwardFromHidden</c>) and never gathers embeddings — saves <c>vocab × hidden × 4</c> device
+    /// bytes (the table is stored F32) plus the equally-large transient staging allocation.
+    /// </param>
+    /// <param name="skipOutputHead">
+    /// When <c>true</c>, the final-norm and LM-head weights are replaced by 64-byte stub buffers. Used by
+    /// a non-last pipeline stage, whose logits are discarded (only its hidden state crosses to the next
+    /// stage) — saves the head matrix (for tied-embedding models another <c>vocab × hidden</c>-scale
+    /// buffer). The owning model must be built headless so it never dispatches against the stubs.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is sized to fit the largest single matrix in its <i>widest</i>
@@ -509,7 +521,8 @@ internal sealed class VulkanWeights : IDisposable
     /// </remarks>
     public static VulkanWeights Upload(
         VulkanDevice device, TransformerWeights weights, int numLayers,
-        bool dequantToFp32 = false, int firstLayer = 0)
+        bool dequantToFp32 = false, int firstLayer = 0,
+        bool skipTokenEmbed = false, bool skipOutputHead = false)
     {
         if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
             throw new ArgumentOutOfRangeException(nameof(firstLayer),
@@ -520,7 +533,8 @@ internal sealed class VulkanWeights : IDisposable
 
         // Size the reusable staging buffer to the largest single weight upload
         // (in its on-device byte form) across the uploaded layer window.
-        long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer);
+        long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer,
+            skipTokenEmbed, skipOutputHead);
         using var staging = device.Allocate(stagingBytes);
 
         // Token embedding table: [vocabSize, hiddenSize]. Uploaded once as a
@@ -530,12 +544,22 @@ internal sealed class VulkanWeights : IDisposable
         // are dequantised to F32 at construction time; keeping them as raw
         // Q8_0 blocks on device would need a GPU gather-and-dequant kernel,
         // which is out of scope for this change.
-        var tokenEmbed = UploadMatrix(device, staging,
-            weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
-            weights.VocabSize, weights.HiddenSize,
-            dequantToFp32: true,
-            out _, out long tokenEmbedBytes);
-        totalBytes += tokenEmbedBytes;
+        // A non-first pipeline stage never gathers (seeded from hidden state),
+        // so it stubs the slot — same contract as the MoE/MLA stub buffers.
+        VulkanDevice.Buffer tokenEmbed;
+        if (skipTokenEmbed)
+        {
+            tokenEmbed = device.AllocateDeviceLocal(64);
+        }
+        else
+        {
+            tokenEmbed = UploadMatrix(device, staging,
+                weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
+                weights.VocabSize, weights.HiddenSize,
+                dequantToFp32: true,
+                out _, out long tokenEmbedBytes);
+            totalBytes += tokenEmbedBytes;
+        }
 
         // Upload an arbitrary layer window [firstLayer .. firstLayer+numLayers): the local LayerBuffers
         // index is 0..numLayers-1, sourced from the global layer firstLayer+i. firstLayer=0 (the default)
@@ -748,15 +772,29 @@ internal sealed class VulkanWeights : IDisposable
                 + gateBytes + upBytes + downBytes;
         }
 
-        var outputNorm = UploadNormVec(device, staging, weights.OutputNormWeight);
-        totalBytes += (long)weights.OutputNormWeight.Length * sizeof(float);
+        // Final norm + LM head. A non-last pipeline stage discards its logits (only the
+        // hidden state crosses the boundary), so it stubs both slots; the owning model is
+        // built headless and never records the final-norm/head dispatches against them.
+        VulkanDevice.Buffer outputNorm, outputWeight;
+        QuantizationType outputDeviceQt;
+        if (skipOutputHead)
+        {
+            outputNorm = device.AllocateDeviceLocal(64);
+            outputWeight = device.AllocateDeviceLocal(64);
+            outputDeviceQt = QuantizationType.F32;
+        }
+        else
+        {
+            outputNorm = UploadNormVec(device, staging, weights.OutputNormWeight);
+            totalBytes += (long)weights.OutputNormWeight.Length * sizeof(float);
 
-        var outputWeight = UploadMatrix(device, staging,
-            weights.OutputWeight, weights.OutputQuantType,
-            weights.OutputOutputDim, weights.OutputInputDim,
-            dequantToFp32,
-            out var outputDeviceQt, out long outputBytes);
-        totalBytes += outputBytes;
+            outputWeight = UploadMatrix(device, staging,
+                weights.OutputWeight, weights.OutputQuantType,
+                weights.OutputOutputDim, weights.OutputInputDim,
+                dequantToFp32,
+                out outputDeviceQt, out long outputBytes);
+            totalBytes += outputBytes;
+        }
 
         return new VulkanWeights(
             device, tokenEmbed, weights.VocabSize, weights.HiddenSize,
@@ -997,11 +1035,16 @@ internal sealed class VulkanWeights : IDisposable
     }
 
     private static long ComputeMaxUploadBytes(
-        TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0)
+        TransformerWeights weights, int numLayers, bool dequantToFp32, int firstLayer = 0,
+        bool skipTokenEmbed = false, bool skipOutputHead = false)
     {
         long max = 0;
-        max = Math.Max(max, UploadBytes(weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType, dequantToFp32: true));
-        max = Math.Max(max, UploadBytes(weights.OutputOutputDim, weights.OutputInputDim, weights.OutputQuantType, dequantToFp32));
+        // Skipped (stubbed) tensors never pass through staging — excluding them matters because the
+        // F32 embed table is frequently the single largest staging allocation (vocab × hidden × 4).
+        if (!skipTokenEmbed)
+            max = Math.Max(max, UploadBytes(weights.VocabSize, weights.HiddenSize, weights.TokenEmbedQuantType, dequantToFp32: true));
+        if (!skipOutputHead)
+            max = Math.Max(max, UploadBytes(weights.OutputOutputDim, weights.OutputInputDim, weights.OutputQuantType, dequantToFp32));
         for (int i = 0; i < numLayers; i++)
         {
             ref readonly var lw = ref weights.Layers[firstLayer + i];

@@ -123,13 +123,19 @@ public sealed unsafe class VulkanPipelineTransformerModel : IModel
         // Each stage is a self-consistent model whose NumLayers is its window size; device weights are
         // uploaded for [0..splitLayer) and [splitLayer..L) respectively. Stage 1 carries firstLayer so its
         // CPU-side per-layer lookups index the right global layer (see VulkanTransformerModel._firstLayer).
+        // VRAM trim: stage 0 is headless (its logits are discarded — only the hidden state crosses the
+        // boundary), so it skips the final-norm/LM-head upload AND the per-token LM-head matmul; stage 1
+        // is only ever seeded via ForwardFromHidden, so it skips the F32 token-embedding table (often the
+        // single largest buffer — vocab × hidden × 4 bytes).
         var cfg0 = config with { NumLayers = splitLayer };
         var cfg1 = config with { NumLayers = config.NumLayers - splitLayer };
         VulkanTransformerModel? stage0 = null;
         try
         {
-            stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(device0, cfg0, cpuWeights, spvDir, firstLayer: 0);
-            var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(device1, cfg1, cpuWeights, spvDir, firstLayer: splitLayer);
+            stage0 = VulkanTransformerModel.BuildFromPrebuiltWeights(
+                device0, cfg0, cpuWeights, spvDir, firstLayer: 0, headless: true);
+            var stage1 = VulkanTransformerModel.BuildFromPrebuiltWeights(
+                device1, cfg1, cpuWeights, spvDir, firstLayer: splitLayer, skipTokenEmbed: true);
             return (stage0, stage1);
         }
         catch
