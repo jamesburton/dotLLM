@@ -32,6 +32,21 @@ namespace DotLLM.Vulkan.Kernels;
 /// at absolute position <c>positionOffset</c>). Callers must route prefill
 /// (<c>seqQ &gt; 1</c>) to the flash / per-token kernels.
 /// </para>
+/// <para>
+/// <b>Fused single-dispatch split+merge — assessed (#370) and deliberately NOT adopted.</b>
+/// The ceiling is too small for the hazard. At the tuned 256/256 heuristic (Llama-3.2-3B,
+/// 24 q-heads / 8 kv-heads / head_dim 128, ctx 4096 ⇒ S=10) the merge pass moves ≈137 KB of
+/// partials per layer against the split pass's ≈33.5 MB unavoidable K/V read (~0.4% of attention
+/// bytes), and the extra dispatch + barrier per attention layer costs ≲0.6% of a decode step —
+/// consistent with the #347 sweep, where merge overhead only became visible in the mis-tuned
+/// many-small-splits regime the heuristic avoids. The only true single-dispatch shape (an
+/// atomic-counter "last workgroup through merges" à la decoupled-lookback) requires
+/// forward-progress guarantees Vulkan does not portably provide — a workgroup spin-waiting on
+/// peers the driver has not scheduled can deadlock, and this codebase already documents gfx1151
+/// driver fragility (IQ2_XXS MMQ). Prior art agrees: CUDA Flash-Decoding and llama.cpp's Vulkan
+/// flash-attention both ship a separate reduce dispatch. Revisit only if a portable device-scope
+/// forward-progress primitive lands in Vulkan.
+/// </para>
 /// </remarks>
 public sealed class VulkanSplitKvAttentionKernel : IDisposable
 {
