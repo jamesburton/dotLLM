@@ -1,4 +1,11 @@
-# DiffusionGemma Handoff
+# DiffusionGemma — Decode Loop Architecture Note
+
+> **Status (2026-07-03): implemented as designed.** This note was written during the planning
+> handoff (originally `docs/HANDOFF.md`, 2026-06-18) and its prescription landed as
+> `DiffusionTextGenerator` (#28, commit `6230300`, merged to `dev` via `41621d5`), with the
+> canvas/scheduler/sampler split it calls for (#27/#30/#31) and the mask-mode seam it warns
+> about (`DiffusionConfig.CanvasAttentionMode`, `821a055`). Retained for the architectural
+> rationale.
 
 ## Decode Loop Architecture Note
 
