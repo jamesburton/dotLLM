@@ -64,6 +64,14 @@ build 74ade5274 / the PR-24423 `llama-diffusion-cli` Vulkan build.
 | 26B diffusion effective | 0.29 tok/s (canvas 32) | 34.8 tok/s (256 tok, 10 steps) | — |
 | PKV prompt-cache effect (canvas 32) | 3.90 s/step on vs 4.47 s/step off | n/a | −13 % per step |
 
+**Full-canvas (256) status.** With the heap-aware allocator fallback the 15.65 GB upload
+now succeeds (no OOM), but the run dies at the first forward with
+`VK_ERROR_DEVICE_LOST` — the Windows TDR watchdog (~2 s/dispatch) kills the monolithic
+dispatches a 263-row forward produces; the dense SC soft-embed alone is ~378 GFLOP in a
+single dispatch (tens of seconds on gfx1151). Canvas 32 stays under the watchdog and is
+the validated configuration. Fix belongs to #121 (sparsified SC + split dispatches), which
+shrinks exactly those dispatches.
+
 **Reading.** The AR ratio (0.63×, up from 0.23× pre-kernel-campaign) says the Vulkan
 GEMV/MMVQ kernels are within striking distance. The diffusion gap is structural, not
 kernel-level: dotLLM's self-conditioning computes the full soft-embed —
