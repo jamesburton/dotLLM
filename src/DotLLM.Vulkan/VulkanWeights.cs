@@ -1582,15 +1582,18 @@ internal sealed class VulkanWeights : IDisposable
     /// <summary>
     /// True when a Gemma-4 MoE layer's experts can stay QUANTIZED on device: the
     /// fused <c>gate_up</c> raw bank is Q4_K (and the contraction axis <c>hidden</c>
-    /// is a multiple of 256) and the <c>down</c> raw bank is Q5_1 (and the expert FF
-    /// width is a multiple of 32). When false the caller falls back to the F32
-    /// host-dequant path (<see cref="UploadGemma4MoeLayer"/>).
+    /// is a multiple of 256) and the <c>down</c> raw bank is Q5_1, Q5_0 or Q8_0 (and
+    /// the expert FF width is a multiple of 32). Q5_0 downs are repacked bit-exactly
+    /// to Q5_1 at upload; Q8_0 downs stay Q8_0 with the per-expert scale folded into
+    /// each block's fp16 <c>d</c> (real unsloth Q4_K_M conversions ship Q5_0/Q8_0
+    /// downs, not Q5_1). When false the caller falls back to the F32 host-dequant
+    /// path (<see cref="UploadGemma4MoeLayer"/>).
     /// </summary>
     private static bool Gemma4ExpertsKeepQuantized(MoeLayerWeights moe)
         => moe.GateExpsRaw != 0 && moe.UpExpsRaw != 0 && moe.DownExpsRaw != 0
         && moe.GateExpsRawQt == QuantizationType.Q4_K
         && moe.UpExpsRawQt == QuantizationType.Q4_K
-        && moe.DownExpsRawQt == QuantizationType.Q5_1
+        && moe.DownExpsRawQt is QuantizationType.Q5_1 or QuantizationType.Q5_0 or QuantizationType.Q8_0
         && (moe.HiddenSize % 256) == 0
         && (moe.IntermediateSize % 32) == 0;
 
@@ -1598,10 +1601,14 @@ internal sealed class VulkanWeights : IDisposable
     /// Uploads a Gemma-4 MoE layer's experts KEPT QUANTIZED on device. The fused
     /// <c>gate_up</c> Q4_K bank is REPACKED into two contiguous Q4_K banks — W1 (gate,
     /// rows <c>[0, Ie)</c> of each expert slab) and W3 (up, rows <c>[Ie, 2*Ie)</c>) —
-    /// and the <c>down</c> Q5_1 bank is copied contiguously into W2. The per-expert
-    /// down scale <c>ffn_down_exps.scale[e]</c> is uploaded as an F32 [numExperts]
-    /// buffer and folded by the Q5_1 indexed-matmul shader (NOT pre-multiplied into
-    /// the weight, since the bank stays quantized). The router gate stays F32.
+    /// and the <c>down</c> bank is copied contiguously into W2: Q5_1 verbatim, Q5_0
+    /// repacked bit-exactly to Q5_1 (<see cref="ConvertQ5_0BlocksToQ5_1"/>), Q8_0
+    /// verbatim with the per-expert scale folded into the block scales
+    /// (<see cref="CopyQ8_0BlocksScaled"/>). For the Q5_1-dispatched banks the
+    /// per-expert down scale <c>ffn_down_exps.scale[e]</c> is uploaded as an F32
+    /// [numExperts] buffer and folded by the Q5_1 indexed-matmul shader (NOT
+    /// pre-multiplied into the weight); Q8_0 banks are pre-folded and their dispatch
+    /// ignores that buffer. The router gate stays F32.
     ///
     /// <para>This is the memory-viable path for the real 26B: experts occupy their
     /// GGUF-quantized footprint (~Q4_K + Q5_1) instead of being dequantised to F32
@@ -1624,12 +1631,19 @@ internal sealed class VulkanWeights : IDisposable
         int numE = moe.NumExperts;
 
         // Per-expert quantized slab byte sizes (one projection each):
-        //   gate/up: Ie rows of hidden Q4_K  → Ie * rowBytes(Q4_K, hidden)
-        //   down:    hidden rows of Ie Q5_1   → hidden * rowBytes(Q5_1, Ie)
+        //   gate/up: Ie rows of hidden Q4_K       → Ie * rowBytes(Q4_K, hidden)
+        //   down:    hidden rows of Ie (src type)  → hidden * rowBytes(srcQt, Ie)
+        // Q5_0 downs are converted to Q5_1 on the way through staging (bit-exact:
+        // d·(q−16) = d·q + m with m = −16·d, same 5-bit payload), so the DEVICE bank
+        // size uses the device type, not the source type.
+        QuantizationType downSrcQt = moe.DownExpsRawQt;
+        QuantizationType downDevQt = downSrcQt == QuantizationType.Q5_0 ? QuantizationType.Q5_1 : downSrcQt;
         long gateUpRowBytes = Dequantize.RowByteSize(hidden, QuantizationType.Q4_K);
         long perGateUpBytes = (long)interm * gateUpRowBytes;
-        long downRowBytes = Dequantize.RowByteSize(interm, QuantizationType.Q5_1);
-        long perDownBytes = (long)hidden * downRowBytes;
+        long downSrcRowBytes = Dequantize.RowByteSize(interm, downSrcQt);
+        long perDownSrcBytes = (long)hidden * downSrcRowBytes;
+        long downDevRowBytes = Dequantize.RowByteSize(interm, downDevQt);
+        long perDownDevBytes = (long)hidden * downDevRowBytes;
         long gateRouterBytes = (long)numE * hidden * sizeof(float);
 
         // The fused gate_up per-expert stride must equal 2 * gate (gate + up halves).
@@ -1637,12 +1651,12 @@ internal sealed class VulkanWeights : IDisposable
             throw new InvalidOperationException(
                 $"Gemma-4 fused gate_up stride mismatch: GateUpExpsRowBytes={g4.GateUpExpsRowBytes} "
                 + $"!= 2*{perGateUpBytes} (Ie={interm}, hidden={hidden}, rowBytes={gateUpRowBytes}).");
-        if (g4.DownExpsRowBytes != perDownBytes)
+        if (g4.DownExpsRowBytes != perDownSrcBytes)
             throw new InvalidOperationException(
-                $"Gemma-4 down stride mismatch: DownExpsRowBytes={g4.DownExpsRowBytes} != {perDownBytes} "
-                + $"(hidden={hidden}, Ie={interm}, rowBytes={downRowBytes}).");
+                $"Gemma-4 down stride mismatch: DownExpsRowBytes={g4.DownExpsRowBytes} != {perDownSrcBytes} "
+                + $"(hidden={hidden}, Ie={interm}, srcQt={downSrcQt}, rowBytes={downSrcRowBytes}).");
 
-        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownBytes));
+        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownDevBytes));
         using var stage = device.Allocate(stageBytes);
 
         // ── Router gate (F32 [numExperts, hidden]) ───────────────────
@@ -1657,11 +1671,12 @@ internal sealed class VulkanWeights : IDisposable
         device.CopyBufferSynchronous(stage, gate, (ulong)gateRouterBytes);
         uploadedBytes += gateRouterBytes;
 
-        // ── Quantized expert banks (Q4_K gate/up, Q5_1 down) ─────────
+        // ── Quantized expert banks (Q4_K gate/up; Q5_1 or Q8_0 down) ─
         var w1Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // gate Q4_K
         var w3Bank = device.AllocateDeviceLocal(perGateUpBytes * numE);   // up   Q4_K
-        var w2Bank = device.AllocateDeviceLocal(perDownBytes * numE);     // down Q5_1
+        var w2Bank = device.AllocateDeviceLocal(perDownDevBytes * numE);  // down Q5_1/Q8_0
 
+        long downBlocks = (long)hidden * (interm / 32);
         for (int e = 0; e < numE; e++)
         {
             nint gateSrc = moe.GateExpsRaw + (nint)(e * g4.GateUpExpsRowBytes);
@@ -1670,16 +1685,38 @@ internal sealed class VulkanWeights : IDisposable
 
             UploadRawBankSlot(device, stage, gateSrc, perGateUpBytes, w1Bank, (long)e * perGateUpBytes);
             UploadRawBankSlot(device, stage, upSrc, perGateUpBytes, w3Bank, (long)e * perGateUpBytes);
-            UploadRawBankSlot(device, stage, downSrc, perDownBytes, w2Bank, (long)e * perDownBytes);
+            switch (downSrcQt)
+            {
+                case QuantizationType.Q5_1:
+                    UploadRawBankSlot(device, stage, downSrc, perDownDevBytes, w2Bank, (long)e * perDownDevBytes);
+                    break;
+                case QuantizationType.Q5_0:
+                    // Bit-exact Q5_0 → Q5_1 repack; rides the validated Q5_1 shader
+                    // (per-expert scale folded by the shader via downScaleBuffer).
+                    UploadQ5_0SlotAsQ5_1(device, stage, downSrc, downBlocks, w2Bank, (long)e * perDownDevBytes);
+                    break;
+                case QuantizationType.Q8_0:
+                    // Q8_0 rides the generic Q8_0 indexed-matmul kernel, which has no
+                    // scale plumbing — fold ffn_down_exps.scale[e] (op #14) into each
+                    // block's fp16 d here (≤2⁻¹¹ relative rounding, inside the gemma4
+                    // GPU parity envelope). The forward MUST NOT apply the scale again.
+                    UploadQ8_0SlotScaled(device, stage, downSrc, downBlocks, g4.DownExpertScale[e],
+                        w2Bank, (long)e * perDownDevBytes);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unexpected gemma4 down quant type {downSrcQt}.");
+            }
         }
-        uploadedBytes += (perGateUpBytes * 2 + perDownBytes) * numE;
+        uploadedBytes += (perGateUpBytes * 2 + perDownDevBytes) * numE;
 
-        // ── Per-expert down scale (folded by the Q5_1 down shader, op #14) ──
+        // ── Per-expert down scale (folded by the Q5_1 down shader, op #14).
+        // For Q8_0 down banks the scale is already folded into the block scales
+        // above and the Q8_0 dispatch ignores this buffer — kept for diagnostics. ──
         downScaleBuffer = UploadNormVec(device, stage, g4.DownExpertScale);
         uploadedBytes += (long)numE * sizeof(float);
 
         return new MoeLayerBuffers(gate, QuantizationType.F32, w1Bank, w2Bank, w3Bank,
-            QuantizationType.Q4_K, QuantizationType.Q5_1, QuantizationType.Q4_K,
+            QuantizationType.Q4_K, downDevQt, QuantizationType.Q4_K,
             moe.NumExperts, moe.NumExpertsPerTok,
             moe.HiddenSize, moe.IntermediateSize, moe.NormTopKProb,
             sharedW1: null, sharedW2: null, sharedW3: null,
@@ -1846,6 +1883,95 @@ internal sealed class VulkanWeights : IDisposable
         {
             new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
                 .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
+    }
+
+    /// <summary>
+    /// Converts <paramref name="blockCount"/> Q5_0 blocks (22 B: fp16 <c>d</c>, 4 B <c>qh</c>,
+    /// 16 B <c>qs</c>; value = <c>d·(q−16)</c>) to Q5_1 blocks (24 B: fp16 <c>d</c>, fp16
+    /// <c>m</c>, <c>qh</c>, <c>qs</c>; value = <c>d·q + m</c>) with <c>d' = d</c> and
+    /// <c>m' = −16·d</c>. The 5-bit payload is copied verbatim and <c>−16·d</c> is exactly
+    /// representable in fp16 (pure exponent shift), so both blocks dequantise to identical
+    /// F32 values — a Q5_0 bank can ride the Q5_1 kernels with no dedicated Q5_0 shader.
+    /// </summary>
+    internal static unsafe void ConvertQ5_0BlocksToQ5_1(nint src, nint dst, long blockCount)
+    {
+        byte* s = (byte*)src;
+        byte* d = (byte*)dst;
+        for (long b = 0; b < blockCount; b++)
+        {
+            Half scale = *(Half*)s;
+            *(Half*)d = scale;
+            *(Half*)(d + 2) = (Half)(-16f * (float)scale);
+            new ReadOnlySpan<byte>(s + 2, 20).CopyTo(new Span<byte>(d + 4, 20)); // qh + qs verbatim
+            s += 22;
+            d += 24;
+        }
+    }
+
+    /// <summary>
+    /// Copies <paramref name="blockCount"/> Q8_0 blocks (34 B: fp16 <c>d</c> + 32×int8)
+    /// multiplying each block's <c>d</c> by <paramref name="scale"/> — folds the Gemma-4
+    /// per-expert <c>ffn_down_exps.scale</c> (op #14) into the weight so the scale-less
+    /// generic Q8_0 indexed-matmul kernel can serve the down projection. The fp16
+    /// re-rounding of <c>d·scale</c> is ≤ 2⁻¹¹ relative.
+    /// </summary>
+    internal static unsafe void CopyQ8_0BlocksScaled(nint src, nint dst, long blockCount, float scale)
+    {
+        byte* s = (byte*)src;
+        byte* d = (byte*)dst;
+        for (long b = 0; b < blockCount; b++)
+        {
+            *(Half*)d = (Half)((float)*(Half*)s * scale);
+            new ReadOnlySpan<byte>(s + 2, 32).CopyTo(new Span<byte>(d + 2, 32));
+            s += 34;
+            d += 34;
+        }
+    }
+
+    /// <summary>
+    /// Stages one per-expert Q5_0 down slab converted to Q5_1
+    /// (<see cref="ConvertQ5_0BlocksToQ5_1"/>) and copies it into
+    /// <paramref name="bank"/> at <paramref name="dstOffset"/>.
+    /// </summary>
+    private static unsafe void UploadQ5_0SlotAsQ5_1(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long blockCount, VulkanDevice.Buffer bank, long dstOffset)
+    {
+        long bytes = blockCount * 24; // Q5_1 block size
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory UploadQ5_0SlotAsQ5_1");
+        try
+        {
+            ConvertQ5_0BlocksToQ5_1(srcPtr, mapped, blockCount);
+        }
+        finally
+        {
+            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+        }
+        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
+    }
+
+    /// <summary>
+    /// Stages one per-expert Q8_0 down slab with the per-expert scale folded into the
+    /// block scales (<see cref="CopyQ8_0BlocksScaled"/>) and copies it into
+    /// <paramref name="bank"/> at <paramref name="dstOffset"/>.
+    /// </summary>
+    private static unsafe void UploadQ8_0SlotScaled(
+        VulkanDevice device, VulkanDevice.Buffer staging,
+        nint srcPtr, long blockCount, float scale, VulkanDevice.Buffer bank, long dstOffset)
+    {
+        long bytes = blockCount * 34; // Q8_0 block size
+        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
+            .ThrowOnError("vkMapMemory UploadQ8_0SlotScaled");
+        try
+        {
+            CopyQ8_0BlocksScaled(srcPtr, mapped, blockCount, scale);
         }
         finally
         {
