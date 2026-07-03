@@ -41,12 +41,11 @@ namespace DotLLM.Models.SafeTensors;
 /// <see cref="DiffusionConfigExtractor.ResolveMaskTokenId(string)"/>.
 /// </para>
 /// <para>
-/// <b>Forward gate (#36).</b> The real 26B checkpoint has
+/// <b>Per-layer head_dim (#36).</b> The real 26B checkpoint has
 /// <c>global_head_dim = 512 != head_dim = 256</c>; this extractor parses that into a
-/// faithful <see cref="ModelConfig"/> (it does NOT throw), but the CPU forward path
-/// rejects a non-uniform head_dim at model-build time
-/// (<c>ValidateGemma4UniformHeadDim</c>, issue #36). Real-weight forward therefore
-/// awaits #36; synthetic fixtures with a uniform head_dim run end-to-end today.
+/// faithful <see cref="ModelConfig"/>, and the forward path supports the per-layer
+/// head dimension (the former <c>ValidateGemma4UniformHeadDim</c> guard was removed
+/// when #36 landed). Real-weight forward runs end-to-end.
 /// </para>
 /// </remarks>
 public static class DiffusionGemmaConfigExtractor

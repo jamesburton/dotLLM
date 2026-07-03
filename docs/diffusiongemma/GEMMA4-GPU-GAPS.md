@@ -1,6 +1,14 @@
 # Gemma-4 / DiffusionGemma on the GPU backends — Gap Report
 
-**Status:** gemma4 (and diffusion-gemma) run on the **CPU** backend only. Neither the
+> **SUPERSEDED (2026-07-03).** This report described the state on 2026-06-16, hours before
+> the gaps it scopes were closed on the same overnight: Vulkan gained the full gemma4
+> forward (dense parity `1f53dca`, MoE fused gate_up Q4_K repack, per-layer-strided KV
+> `14f7c61`, diffusion forward + self-conditioning + PKV `7a09756`) and CUDA gained the
+> gemma4 AR MoE forward (`0d1f477`) — all merged to `dev` via `41621d5`. Real-weight
+> validation: `DiffusionGemmaGgufForwardTests` (CPU) and
+> `DiffusionGemmaVulkanRealGenerationTests` (Vulkan). Retained for the op-by-op mapping.
+
+**Status (historical, 2026-06-16):** gemma4 (and diffusion-gemma) run on the **CPU** backend only. Neither the
 **Vulkan** nor the **CUDA** backend has a gemma4 forward path. This document scopes exactly
 what each GPU backend is missing, mapped to the CPU `RunGemma4Layer` / `Gemma4DenseFfn` /
 `Gemma4Moe` ops, and notes for each op whether an existing GPU kernel already covers it or
