@@ -1482,16 +1482,12 @@ public sealed class VulkanDevice : IDisposable
         // counted in DeviceLocalFallbackCount for harness reporting.
         if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
         {
-            Span<(VkMemoryPropertyFlags required, VkMemoryPropertyFlags excluded)> ladder =
-            [
-                (VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible, default),
-                (VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent, default),
-            ];
-            foreach (var (requiredFlags, excludedFlags) in ladder)
+            // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
+            // sit on the same exhausted carve-out heap as the failed type, so ranking by
+            // flags alone re-fails. Try every eligible type, other heaps before the
+            // failed heap, larger heaps first, host-visible rungs after combined ones.
+            foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
             {
-                if (!TryFindMemoryType(req.memoryTypeBits, requiredFlags, excludedFlags, out uint fbIndex)
-                    || fbIndex == typeIndex)
-                    continue;
                 mai.memoryTypeIndex = fbIndex;
                 allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
                 if (allocResult >= 0)
@@ -1530,6 +1526,52 @@ public sealed class VulkanDevice : IDisposable
         uint* types = (uint*)mem.memoryTypes; // 8-byte entries: u32 propertyFlags, u32 heapIndex
         var flags = (VkMemoryPropertyFlags)types[typeIndex * 2];
         return (flags & VkMemoryPropertyFlags.HostVisible) != 0;
+    }
+
+    /// <summary>
+    /// Candidate memory types for the device-local OOM fallback, best first: for each
+    /// rung (DEVICE_LOCAL+HOST_VISIBLE, then HOST_VISIBLE+HOST_COHERENT) every eligible
+    /// type is yielded — types on a different heap than the exhausted one before types
+    /// sharing it, larger heaps before smaller. On a UMA APU this walks the allocation
+    /// off the small strict carve-out (e.g. 15.8 GiB on Strix Halo) onto the large
+    /// GTT heap that maps the same DRAM.
+    /// </summary>
+    private unsafe List<uint> EnumerateDeviceLocalFallbackTypes(uint typeBits, uint failedTypeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
+        uint failedHeap = types[failedTypeIndex * 2 + 1];
+
+        var ordered = new List<uint>(8);
+        Span<VkMemoryPropertyFlags> rungs =
+        [
+            VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible,
+            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent,
+        ];
+        foreach (var required in rungs)
+        {
+            // Two passes per rung: other-heap types first, failed-heap types last.
+            for (int pass = 0; pass < 2; pass++)
+            {
+                var passList = new List<(uint Index, ulong HeapSize)>(4);
+                for (uint i = 0; i < mem.memoryTypeCount; i++)
+                {
+                    if ((typeBits & (1u << (int)i)) == 0 || i == failedTypeIndex) continue;
+                    var flags = (VkMemoryPropertyFlags)types[i * 2];
+                    if ((flags & required) != required) continue;
+                    uint heapIdx = types[i * 2 + 1];
+                    bool otherHeap = heapIdx != failedHeap;
+                    if (otherHeap != (pass == 0)) continue;
+                    passList.Add((i, *(ulong*)(heaps + heapIdx * 16)));
+                }
+                passList.Sort(static (a, b) => b.HeapSize.CompareTo(a.HeapSize));
+                foreach (var (idx, _) in passList)
+                    if (!ordered.Contains(idx))
+                        ordered.Add(idx);
+            }
+        }
+        return ordered;
     }
 
     /// <summary>
