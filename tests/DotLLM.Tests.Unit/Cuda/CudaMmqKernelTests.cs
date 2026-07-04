@@ -125,6 +125,25 @@ public class CudaMmqKernelTests
             (rng, span) => SynthesiseQ4KBlock(rng, span), requireMmvqLarge: true);
     }
 
+    // ── MMVQ-llamacpp equivalence tests (issue #125) ─────────────────────────
+    // Validates the llama.cpp-faithful coalesced+accumulate-once Q4_K kernel
+    // (quantized_gemv_q4_k_mmvq_llamacpp, opt-in via DOTLLM_CUDA_MMVQ_LLAMACPP)
+    // against the legacy FP-fmuladd path, on the same Qwen3-8B-class shapes
+    // used to validate MMVQ-large above. Same math as MMVQ-large/coalesced,
+    // reordered for coalesced reads + a single end-of-row reduction — expect
+    // the same INT8-requantization peak-relative drift, well inside the 3%
+    // budget already used for the other MMQ/MMVQ equivalence tests.
+    [SkippableTheory]
+    [InlineData(4096, 4096)]
+    [InlineData(11008, 4096)]
+    [InlineData(24576, 4096)]
+    public void MmvqLlamaCppQ4K_MatchesLegacy_Qwen3_8B_Shapes(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunMmqEquivalence(QuantizationType.Q4_K, n, k, blockBytes: 144,
+            (rng, span) => SynthesiseQ4KBlock(rng, span), requireMmvqLlamaCpp: true);
+    }
+
     /// <summary>
     /// Synthetic Llama-70B-class shape: intermediate=14336 → 448 input chunks. Validates
     /// the dynamic shared-memory sizing works past the legacy compile-time MMQ_MAX_CHUNKS=384
@@ -387,7 +406,8 @@ public class CudaMmqKernelTests
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunMmqEquivalence(QuantizationType qt, int n, int k, int blockBytes,
                                            Action<Random, Span<byte>> synthesiseBlock,
-                                           bool requireMmvqLarge = false)
+                                           bool requireMmvqLarge = false,
+                                           bool requireMmvqLlamaCpp = false)
     {
         using var ctx = CudaContext.Create(0);
         using var stream = CudaStream.Create();
@@ -415,6 +435,16 @@ public class CudaMmqKernelTests
             CudaKernels.DisableMmvqLargeIQ4_NL = false;
             CudaKernels.DisableMmvqLargeIQ4_XS = false;
             Skip.IfNot(kernels.HasMmvqLarge(qt), $"MMVQ-large kernel for {qt} not loaded (PTX may be stale)");
+        }
+
+        // Opt into the llama.cpp-faithful coalesced+accumulate-once Q4_K kernel (issue #125) for
+        // this call only; restored in the finally block below regardless of test outcome.
+        bool prevMmvqLlamaCpp = CudaKernels.MmvqLlamaCpp;
+        if (requireMmvqLlamaCpp)
+        {
+            Skip.IfNot(qt == QuantizationType.Q4_K, "MMVQ-llamacpp is Q4_K-only");
+            Skip.IfNot(kernels.HasMmvqLlamaCppQ4K, "MMVQ-llamacpp kernel not loaded (PTX may be stale)");
+            CudaKernels.MmvqLlamaCpp = true;
         }
 
         var rng = new Random(1234 ^ (int)qt ^ n ^ k);
@@ -480,6 +510,7 @@ public class CudaMmqKernelTests
             CudaKernels.DisableMmvqLargeQ6K = prevDisableQ6K;
             CudaKernels.DisableMmvqLargeIQ4_NL = prevDisableIQ4_NL;
             CudaKernels.DisableMmvqLargeIQ4_XS = prevDisableIQ4_XS;
+            CudaKernels.MmvqLlamaCpp = prevMmvqLlamaCpp;
         }
 
         // Compare against the **peak magnitude** of the legacy output rather than

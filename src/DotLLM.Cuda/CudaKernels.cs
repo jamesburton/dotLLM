@@ -64,6 +64,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _quantizedGemvQ2_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ4_KMmvqCoalescedFunc;
+    private readonly nint _quantizedGemvQ4_KMmvqLlamaCppFunc;
     private readonly nint _quantizedGemvQ5_KMmvqLargeFunc;
     private readonly nint _quantizedGemvQ6_KMmvqLargeFunc;
     private readonly nint _quantizedGemvIQ4_NLMmvqLargeFunc;
@@ -423,6 +424,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _quantizedGemvQ2_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q2_k_mmvq_large");
             _quantizedGemvQ4_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_large");
             _quantizedGemvQ4_KMmvqCoalescedFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_coalesced");
+            _quantizedGemvQ4_KMmvqLlamaCppFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q4_k_mmvq_llamacpp");
             _quantizedGemvQ5_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q5_k_mmvq_large");
             _quantizedGemvQ6_KMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_q6_k_mmvq_large");
             _quantizedGemvIQ4_NLMmvqLargeFunc = _quantizedGemvMmqModule.TryGetFunction("quantized_gemv_iq4_nl_mmvq_large");
@@ -463,6 +465,7 @@ public sealed unsafe class CudaKernels : IDisposable
                 SetMaxDynamicSharedBytes(_quantizedGemvIQ4_XSMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLargeFunc, optIn);
+                SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmvqLlamaCppFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ6_KMmvqLargeFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvIQ4_NLMmvqLargeFunc, optIn);
@@ -951,6 +954,16 @@ public sealed unsafe class CudaKernels : IDisposable
     /// the default MMVQ-large. On-the-fly only (ignores preq scratch). Set <c>DOTLLM_CUDA_MMVQ_COALESCED=1</c>.</summary>
     public static bool MmvqCoalesced { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_CUDA_MMVQ_COALESCED") == "1";
+
+    /// <summary>Opt-in: route Q4_K decode GEMV (k ≥ <see cref="MmvqLargeKThreshold"/>) through the
+    /// llama.cpp-faithful coalesced+accumulate-once MMVQ kernel (<c>quantized_gemv_q4_k_mmvq_llamacpp</c>)
+    /// instead of the default MMVQ-large. Unlike <see cref="MmvqCoalesced"/> (#363, warp-per-superblock
+    /// with a per-iteration 8-wide reduction — bit-exact but 3x SLOWER on Kaggle T4), this kernel keeps
+    /// the coalesced 128-byte qs read per super-block but defers ALL cross-lane combination to a single
+    /// end-of-row reduction, matching MMVQ-large's accumulate-once property. On-the-fly only (ignores
+    /// preq scratch). Set <c>DOTLLM_CUDA_MMVQ_LLAMACPP=1</c>.</summary>
+    public static bool MmvqLlamaCpp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_MMVQ_LLAMACPP") == "1";
 
     /// <summary>Disable decode-time packed QKV upload/dispatch for diagnostics.</summary>
     public static bool DisablePackedQkv { get; set; } =
@@ -2655,6 +2668,11 @@ public sealed unsafe class CudaKernels : IDisposable
     /// <c>DOTLLM_DISABLE_MMVQ_LARGE_Q4K=1</c>.</summary>
     public bool HasMmvqLargeQ4K => _quantizedGemvQ4_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ4K;
 
+    /// <summary>True when the llama.cpp-faithful coalesced+accumulate-once Q4_K MMVQ kernel
+    /// (<c>quantized_gemv_q4_k_mmvq_llamacpp</c>) is loaded (PTX present). Independent of
+    /// <see cref="MmvqLlamaCpp"/>, which additionally gates whether the dispatcher routes to it.</summary>
+    public bool HasMmvqLlamaCppQ4K => _quantizedGemvQ4_KMmvqLlamaCppFunc != 0;
+
     /// <summary>True when the MMVQ-large Q5_K GEMV kernel is loaded and not disabled.</summary>
     public bool HasMmvqLargeQ5K => _quantizedGemvQ5_KMmvqLargeFunc != 0 && !DisableMmvqLargeQ5K;
 
@@ -2846,6 +2864,24 @@ public sealed unsafe class CudaKernels : IDisposable
                 "MMQ GEMV kernel not available. Compile native/kernels/quantized_gemv_mmq.cu to PTX.");
 
         bool usePreq = preqScratch != 0 && HasPreQ8_1;
+
+        // llama.cpp-faithful coalesced+accumulate-once Q4_K MMVQ (opt-in, DOTLLM_CUDA_MMVQ_LLAMACPP=1):
+        // same warp-per-superblock coalesced 128-byte qs load as MmvqCoalesced below, but defers ALL
+        // cross-lane reduction to a single end-of-row reduce (MMVQ-large's accumulate-once property).
+        // Checked ahead of MmvqCoalesced so it takes priority if both toggles are set. On-the-fly only.
+        if (MmvqLlamaCpp && qt == QuantizationType.Q4_K && k >= MmvqLargeKThreshold
+            && _quantizedGemvQ4_KMmvqLlamaCppFunc != 0)
+        {
+            nint wLc = quantWeight, xLc = x, yLc = y;
+            int nLc = n, kLc = k;
+            void** argsLc = stackalloc void*[] { &wLc, &xLc, &yLc, &nLc, &kLc };
+            uint dynShmemLc = (uint)ComputeMmqDynamicSharedBytes(qt, k);
+            CheckDynamicSharedBudget(dynShmemLc, qt, k);
+            CudaDriverApi.cuLaunchKernel(_quantizedGemvQ4_KMmvqLlamaCppFunc,
+                    (uint)n, 1, 1, MmvqLargeThreads, 1, 1,
+                    dynShmemLc, stream, (nint)argsLc, 0).ThrowOnError();
+            return;
+        }
 
         // Experimental coalesced Q4_K MMVQ (opt-in, DOTLLM_CUDA_MMVQ_COALESCED=1): warp-per-superblock
         // with coalesced 128-byte qs loads. On-the-fly only (does its own Stage-1 from x, ignores preq).

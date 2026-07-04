@@ -1354,6 +1354,166 @@ extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Q4_K MMVQ LLAMACPP — llama.cpp-faithful coalesced-read / accumulate-once
+// design (issue #125: perf(cuda) llama.cpp-faithful coalesced+accumulate-once
+// Q4_K MMVQ decode kernel). Combines the two properties that #363's
+// quantized_gemv_q4_k_mmvq_coalesced (above) and quantized_gemv_q4_k_mmvq_large
+// each got half right:
+//
+//   - mmvq_coalesced reads each super-block's 128 bytes of qs as ONE coalesced
+//     warp-wide transaction (good), but reduces the 8 lanes of every pair with
+//     an 8-wide shfl_xor INSIDE the super-block loop (bad) — the per-iteration
+//     reduction overhead dominates because there's too little work between
+//     reductions, which is why it measured 3x SLOWER (36.4 vs 109 tok/s,
+//     Kaggle T4, 1B Q4_K_M) despite being bit-exact.
+//   - mmvq_large accumulates a running per-thread register across MANY
+//     (superblock, pair) units with exactly ONE reduction at the very end
+//     (good — this is where its speed comes from), but each thread's qs read
+//     is `w_row + sb*144` at a per-thread-varying sb, landing 144 bytes apart
+//     across the warp — not coalesced (bad, ~25% of T4 peak BW).
+//
+// This kernel takes coalesced's warp-per-superblock addressing (so the 128 B
+// qs read coalesces into one transaction) but defers ALL cross-lane
+// combination to the final Stage-3 reduction, exactly like mmvq_large. Each
+// lane owns one of the 32 uint32 qs words of a super-block (pair = lane>>3
+// selects which of the 4 sub-block pairs; g = lane&7 selects which of the 8
+// g-cells within that pair). Every lane always accumulates its own dp4a
+// partial times the pair's (d, sc) scale into its running `acc` register —
+// this is valid because dp4a partials sum linearly across the 8 lanes of a
+// pair, and the eventual 32-wide Stage-3 reduction performs exactly that sum.
+// The `dmin`-side subtraction term is a per-pair (not per-lane) constant, so
+// only lane g==0 folds it in (once per pair per super-block) to avoid
+// counting it 8x. The loop advances the WHOLE warp to the next super-block
+// together (strided by nwarps), never switching per-lane strides mid-flight.
+//
+// Net effect vs mmvq_large: same coalesced 128 B qs transaction as
+// mmvq_coalesced, but zero intra-loop reductions — only the same single
+// end-of-row reduction mmvq_large already pays for. Opt-in via
+// DOTLLM_CUDA_MMVQ_LLAMACPP=1 (see CudaKernels.cs); mmvq_large stays the
+// default and mmvq_coalesced stays in the tree as the known-bad reference.
+extern "C" __global__ void __launch_bounds__(MMVQ_LARGE_THREADS) quantized_gemv_q4_k_mmvq_llamacpp(
+    const uint8_t* __restrict__ weight,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    const int n,
+    const int k)
+{
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int superblocks_per_row = k / 256;
+    const int num_chunks = k / 32;
+
+    // Dynamic shmem layout identical to mmvq_large / mmvq_coalesced.
+    extern __shared__ uint8_t s_dyn[];
+    int8_t* s_xq = reinterpret_cast<int8_t*>(s_dyn);
+    half*   s_dx = reinterpret_cast<half*>(s_xq + num_chunks * 32);
+    half*   s_sx = s_dx + num_chunks;
+
+    __shared__ float s_warp_partials[MMVQ_LARGE_NWARPS];
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int nwarps  = blockDim.x >> 5;
+
+    // ── Stage 1: quantize x → INT8 per 32-element chunk (identical to mmvq_large) ──
+    for (int c = warp_id; c < num_chunks; c += nwarps)
+    {
+        float v = __half2float(x[c * 32 + lane]);
+        float a = fabsf(v);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, offset));
+        float inv_scale = (a > 0.0f) ? (127.0f / a) : 0.0f;
+        int qi = __float2int_rn(v * inv_scale);
+        qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+        s_xq[c * 32 + lane] = (int8_t)qi;
+        int s = qi;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_xor_sync(0xFFFFFFFF, s, offset);
+        if (lane == 0) { s_dx[c] = __float2half(a / 127.0f); s_sx[c] = __float2half((float)s); }
+    }
+    __syncthreads();
+
+    // ── Stage 2: warp per super-block, coalesced 128 B qs read, accumulate-once ──
+    const uint8_t* w_row = weight + (size_t)row * superblocks_per_row * 144;
+    const int pair = lane >> 3;   // 0..3 — which sub-block pair this lane belongs to
+    const int g    = lane & 7;    // 0..7 — uint32 within the pair's 32-byte qs slice
+    float acc = 0.0f;
+
+    for (int sb = warp_id; sb < superblocks_per_row; sb += nwarps)
+    {
+        const uint8_t* block = w_row + sb * 144;
+        const uint32_t* qs32 = reinterpret_cast<const uint32_t*>(block + 16);
+        uint32_t qpacked = qs32[lane];                 // coalesced 128-byte load across the warp
+        int lo = (int)(qpacked & 0x0F0F0F0F);          // even sub-block nibbles
+        int hi = (int)((qpacked >> 4) & 0x0F0F0F0F);   // odd  sub-block nibbles
+
+        int chunk_even = sb * 8 + pair * 2;
+        int chunk_odd  = sb * 8 + pair * 2 + 1;
+        int xq_e = *reinterpret_cast<const int*>(s_xq + chunk_even * 32 + g * 4);
+        int xq_o = *reinterpret_cast<const int*>(s_xq + chunk_odd  * 32 + g * 4);
+
+        // Per-lane dp4a partial (1/8th of the pair's dot product) — NOT reduced
+        // across the pair's 8 lanes here. Summed implicitly by Stage 3 below.
+        int dot0 = __dp4a(lo, xq_e, 0);
+        int dot1 = __dp4a(hi, xq_o, 0);
+
+        float d    = __half2float(*reinterpret_cast<const half*>(block));
+        float dmin = __half2float(*reinterpret_cast<const half*>(block + 2));
+        const uint8_t* scales_raw = block + 4;
+        int sb_even = pair * 2, sb_odd = pair * 2 + 1;
+        int sc0, m0, sc1, m1;
+        if (sb_even < 4)
+        {
+            sc0 = scales_raw[sb_even]     & 0x3F; m0 = scales_raw[sb_even + 4] & 0x3F;
+            sc1 = scales_raw[sb_odd]      & 0x3F; m1 = scales_raw[sb_odd + 4]  & 0x3F;
+        }
+        else
+        {
+            sc0 = (scales_raw[sb_even + 4] & 0x0F) | ((scales_raw[sb_even - 4] >> 6) << 4);
+            m0  = (scales_raw[sb_even + 4] >> 4)   | ((scales_raw[sb_even]     >> 6) << 4);
+            sc1 = (scales_raw[sb_odd + 4]  & 0x0F) | ((scales_raw[sb_odd - 4]  >> 6) << 4);
+            m1  = (scales_raw[sb_odd + 4]  >> 4)   | ((scales_raw[sb_odd]      >> 6) << 4);
+        }
+
+        float dx_e = __half2float(s_dx[chunk_even]), dx_o = __half2float(s_dx[chunk_odd]);
+
+        // Linear dot-product term: valid per-lane (sums correctly across the
+        // pair's 8 lanes once Stage 3 reduces the whole warp).
+        acc += dx_e * d * (float)sc0 * (float)dot0;
+        acc += dx_o * d * (float)sc1 * (float)dot1;
+
+        // dmin-side term is a per-pair constant (independent of g) — fold it
+        // in exactly once via lane g==0 so Stage 3 doesn't sum it 8x.
+        if (g == 0)
+        {
+            float sx_e = __half2float(s_sx[chunk_even]), sx_o = __half2float(s_sx[chunk_odd]);
+            acc -= dx_e * dmin * (float)m0 * sx_e;
+            acc -= dx_o * dmin * (float)m1 * sx_o;
+        }
+    }
+
+    // ── Stage 3: single warp-shfl reduction → 4-warp shmem fan-in → y ──
+    // (identical to mmvq_large's Stage 3 — the only reduction this kernel pays.)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_xor_sync(0xFFFFFFFF, acc, offset);
+    if (lane == 0) s_warp_partials[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0)
+    {
+        float v = (lane < nwarps) ? s_warp_partials[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_xor_sync(0xFFFFFFFF, v, offset);
+        if (lane == 0) y[row] = __float2half(v);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Q2_K MMVQ-large — same 1-row-per-block structure, Q2_K weight decode.
 //
 // Q2_K has 16 sub-blocks per super-block (16 elements each, like Q6_K), with
