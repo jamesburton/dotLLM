@@ -196,9 +196,11 @@ public sealed unsafe class HybridVulkanCudaTransformerModel : IModel
         // Upload only the CUDA-resident layers to CUDA VRAM. Layers 0..numVulkanLayers-1
         // are handled by Vulkan; no need to pay for them in CUDA VRAM.
         // firstLayer skips the Vulkan slice; numGpuLayers = L-V covers the rest + output norm/LM head.
+        // skipTokenEmbed: the embedding gather happens on the Vulkan side, so the CUDA phase never
+        // reads the table — don't pay vocab × hidden of CUDA VRAM for it (#123).
         int numCudaOnlyLayers = config.NumLayers - numVulkanLayers;
         var cudaWeights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-            numGpuLayers: numCudaOnlyLayers, firstLayer: numVulkanLayers);
+            numGpuLayers: numCudaOnlyLayers, firstLayer: numVulkanLayers, skipTokenEmbed: true);
 
         // CUDA scratch activations (same sizing as CudaTransformerModel).
         var cudaState = new CudaForwardState(

@@ -24,8 +24,10 @@ namespace DotLLM.Cuda;
 /// windowed device-weight upload (<see cref="CudaWeights.LoadFromGguf"/> with <c>firstLayer = SplitLayer</c>),
 /// so only its slice of the model occupies device-1 VRAM. <see cref="CudaWeights.LoadFromGguf"/> already skips
 /// the output norm + LM head for a non-final window (<c>firstLayer + layerCount &lt; NumLayers</c>) and loads
-/// them for the final window, so stage 0 carries embedding + its layers and stage 1 carries its layers + norm
-/// + head — exactly the Vulkan pipeline split.
+/// them for the final window; stage 1 additionally skips the token-embedding table
+/// (<c>skipTokenEmbed</c> — it is only ever seeded from stage 0's hidden state and never gathers). So stage 0
+/// carries embedding + its layers and stage 1 carries its layers + norm + head, each shedding the non-layer
+/// weights it cannot use — the same per-stage trim as the Vulkan pipeline split (#368; CUDA sibling #123).
 /// </para>
 /// <para>
 /// The per-stage CUDA layer loop reuses the proven sequence from
@@ -57,6 +59,12 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
 
     /// <summary>Global layer index at which the second pipeline stage begins.</summary>
     public int SplitLayer => _splitLayer;
+
+    /// <summary>Test seam (#123): stage 0 (embedding + layers <c>[0..SplitLayer)</c>).</summary>
+    internal CudaPipelineStage Stage0 => _stage0;
+
+    /// <summary>Test seam (#123): stage 1 (layers <c>[SplitLayer..L)</c> + norm + head; no embed table).</summary>
+    internal CudaPipelineStage Stage1 => _stage1;
 
     private CudaPipelineTransformerModel(
         ModelConfig config, CudaPipelineStage stage0, CudaPipelineStage stage1, int splitLayer,
@@ -149,6 +157,8 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
         //          output norm + LM head. isFinalStage=false.
         // Stage 1: layers [splitLayer..L) + final norm + LM head. firstLayer=splitLayer, layerCount=L-split →
         //          (splitLayer + (L-split)) == NumLayers ⇒ output norm + LM head are uploaded. isFinalStage=true.
+        //          skipTokenEmbed: stage 1 is only entered via EnqueueFromHidden (never gathers), so the
+        //          vocab × hidden embedding table is not uploaded to device 1 (#123, Vulkan sibling #368).
         CudaPipelineStage? stage0 = null;
         try
         {
@@ -157,7 +167,8 @@ public sealed unsafe class CudaPipelineTransformerModel : IModel
                 firstLayer: 0, layerCount: splitLayer, isFinalStage: false);
             var stage1 = CudaPipelineStage.Build(
                 config, cpuWeights, device1Id, ptxDir,
-                firstLayer: splitLayer, layerCount: config.NumLayers - splitLayer, isFinalStage: true);
+                firstLayer: splitLayer, layerCount: config.NumLayers - splitLayer, isFinalStage: true,
+                skipTokenEmbed: true);
             return (stage0, stage1);
         }
         catch
@@ -261,6 +272,13 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
 
     public long AllocatedBytes => _state.AllocatedBytes;
 
+    /// <summary>
+    /// Test seam for the stage VRAM trim (#123): whether this stage holds the token-embedding table on
+    /// device. A silent re-upload regression is invisible to the logit-parity tests, so the trim tests
+    /// assert on this directly.
+    /// </summary>
+    internal bool HasTokenEmbed => _weights.TokenEmbedDevice != 0;
+
     private CudaPipelineStage(
         ModelConfig config, CudaContext context, CudaStream stream, CudaCublasHandle cublas,
         CudaKernels kernels, CudaWeights weights, CudaForwardState state,
@@ -283,11 +301,14 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
     /// <summary>
     /// Builds a stage on CUDA device <paramref name="deviceId"/> from shared host weights, uploading only
     /// the window <c>[firstLayer .. firstLayer+layerCount)</c>. The output norm + LM head are uploaded iff
-    /// the window reaches the last layer (see <see cref="CudaWeights.LoadFromGguf"/>).
+    /// the window reaches the last layer (see <see cref="CudaWeights.LoadFromGguf"/>). Pass
+    /// <paramref name="skipTokenEmbed"/> for a non-first stage: the embedding table is not uploaded and
+    /// <see cref="EnqueueFromEmbedding"/> throws — the stage must be entered via
+    /// <see cref="EnqueueFromHidden"/>.
     /// </summary>
     public static CudaPipelineStage Build(
         ModelConfig config, TransformerWeights cpuWeights, int deviceId, string ptxDir,
-        int firstLayer, int layerCount, bool isFinalStage)
+        int firstLayer, int layerCount, bool isFinalStage, bool skipTokenEmbed = false)
     {
         CudaContext? context = null;
         CudaStream? stream = null;
@@ -306,7 +327,7 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
             var kernels = new CudaKernels(ptxDir);
 
             weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
-                numGpuLayers: layerCount, firstLayer: firstLayer);
+                numGpuLayers: layerCount, firstLayer: firstLayer, skipTokenEmbed: skipTokenEmbed);
 
             state = new CudaForwardState(
                 config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
@@ -348,6 +369,10 @@ internal sealed unsafe class CudaPipelineStage : IDisposable
     public void EnqueueFromEmbedding(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int seqLen,
                                      CudaKvCache? kvCache)
     {
+        if (_weights.TokenEmbedDevice == 0)
+            throw new InvalidOperationException(
+                "This stage was built without the token-embedding table (skipTokenEmbed) and can only " +
+                "resume from a previous stage's hidden state via " + nameof(EnqueueFromHidden) + ".");
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
         nint s = _stream.Handle;

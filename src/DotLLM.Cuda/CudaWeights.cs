@@ -179,9 +179,17 @@ internal sealed class CudaWeights : IDisposable
     /// <paramref name="firstLayer"/>. Used by the Vulkan+CUDA split to avoid uploading
     /// the Vulkan-resident layers to CUDA VRAM. Default 0 = upload from the beginning.
     /// </param>
+    /// <param name="skipTokenEmbed">
+    /// When <c>true</c>, the token-embedding table is not uploaded and <see cref="TokenEmbedDevice"/>
+    /// stays 0. Used by a non-first pipeline stage (<c>CudaPipelineTransformerModel</c>), which is only
+    /// ever seeded from a previous stage's hidden state and never gathers embeddings — saves the
+    /// vocab × hidden table (FP16 when bulk-dequanted, raw-quant when a per-row lookup kernel exists)
+    /// plus the transient upload. The owning stage must never launch an embedding lookup.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
-                                              int numGpuLayers = -1, int firstLayer = 0)
+                                              int numGpuLayers = -1, int firstLayer = 0,
+                                              bool skipTokenEmbed = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         int layerCount = numGpuLayers < 0
@@ -198,14 +206,20 @@ internal sealed class CudaWeights : IDisposable
         // Otherwise dequant the entire table to FP16 at load time (one-time cost,
         // costs vocab×hidden×2 bytes of VRAM — 1.16 GiB on Qwen3-8B Q4_K_M).
         // K-quant variants need hidden % 256 == 0; HasEmbeddingLookup gates this.
-        nint tokenEmbed;
+        // A non-first pipeline stage never gathers (seeded from a previous stage's
+        // hidden state), so it skips the table entirely — TokenEmbedDevice stays 0.
+        nint tokenEmbed = 0;
         var tokenEmbedQt = cpuWeights.TokenEmbedQuantType;
         // Env-var escape hatch (matches DOTLLM_DISABLE_MMQ_* convention) — forces
         // the legacy bulk-dequant path even when a per-row kernel exists. Used
         // for A/B perf comparison and as a fallback if a per-row kernel ever
         // misbehaves on a new model.
         bool disablePerRowEmbed = Environment.GetEnvironmentVariable("DOTLLM_DISABLE_EMBED_ROWLOOKUP") == "1";
-        if (!disablePerRowEmbed && kernels.HasEmbeddingLookup(tokenEmbedQt, config.HiddenSize))
+        if (skipTokenEmbed)
+        {
+            // Nothing to upload.
+        }
+        else if (!disablePerRowEmbed && kernels.HasEmbeddingLookup(tokenEmbedQt, config.HiddenSize))
         {
             long embedBytes = Dequantize.RowByteSize(config.HiddenSize, tokenEmbedQt) * config.VocabSize;
             tokenEmbed = AllocAndUpload(cpuWeights.TokenEmbedWeight, embedBytes, allocs);
