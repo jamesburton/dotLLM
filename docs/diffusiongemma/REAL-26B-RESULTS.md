@@ -87,3 +87,18 @@ Capability note (#33): both engines complete the factual prompt correctly at ful
 coherent French-capital completion in §1). A scored fixed-prompt-set comparison remains
 open under #33 — it only becomes meaningful once the SC sparsification lands and dotLLM
 can run full-canvas in seconds rather than minutes.
+
+## 4. SC sparsification (issue #121 — in progress)
+
+Branch `issue/121-sc-sparsify-topk`. **Semantics change:** self-conditioning now defaults to
+a **top-K sparsified soft-embed (K = 256)** — per canvas position, the softmax is
+renormalised over the K highest previous-step logits and the soft embedding is the weighted
+sum of just those K embedding rows (`DiffusionConfig.SelfCondTopK`, env `DOTLLM_DG_SC_TOPK`;
+`K <= 0` restores the exact dense reference, `K >= vocab` routes to dense byte-identically).
+This matches the reference llama.cpp diffusion build's `sample_reduce=on` in spirit
+(GEMMA4-GRAPH-SPEC specifies only the dense form, which remains the test oracle). CPU and
+Vulkan consume the same shared helper (`SelfCondSoftEmbed`), so the backends cannot drift.
+The Vulkan diffusion LM head (the ~378 GFLOP monolithic dispatch that tripped the TDR
+watchdog at canvas 256) is now row-chunked (`DiffusionHeadChunkRows`, default 32 rows
+≈ 47 GFLOP/dispatch on the 26B, env `DOTLLM_DG_HEAD_CHUNK_ROWS`). Canvas-256 A/B and the
+per-step latency re-measurement are pending on the Strix box.
