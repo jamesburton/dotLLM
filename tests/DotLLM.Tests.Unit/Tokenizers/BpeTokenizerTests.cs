@@ -498,6 +498,34 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void Encode_VocabWithoutSpaceMarkerOrByteTokens_ManySpaces_DoesNotOverflowSymbolBuffer()
+    {
+        // REGRESSION (#33 harness, synthetic-fixture vocab): the initial-symbol buffer was
+        // sized by CHAR count, but byte fallback emits one symbol per UTF-8 BYTE — the ▁
+        // space marker alone is 3 bytes. On a vocab with NO ▁ token and NO <0xNN> byte
+        // tokens, every space explodes into 3 <unk> symbols and enough spaces overflow the
+        // rented buffer (IndexOutOfRangeException). The buffer must be sized by UTF-8 byte
+        // count (the exact worst case).
+        string[] tokens = ["<unk>", "a", "b"];
+        float[] scores = [0f, -1f, -2f];
+        var tok = BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes: null,
+            bosId: 0, eosId: 0, addBosSpace: true);
+
+        // 20 "ab" words, 19 spaces + 1 prepended ▁ = 20 markers × 3 bytes = 60 fallback
+        // symbols + 40 letters = 100 symbols from 60 normalized chars — overflows a
+        // char-count-sized rental (64-bucket) without the fix.
+        string text = string.Join(' ', Enumerable.Repeat("ab", 20));
+        int[] ids = tok.Encode(text);
+
+        // 20 markers × 3 <unk> bytes + 20 × ("a","b") = 100 symbols, no merges available.
+        Assert.Equal(100, ids.Length);
+        Assert.All(ids, id => Assert.InRange(id, 0, tokens.Length - 1));
+        Assert.Equal(60, ids.Count(id => id == 0));      // 3 <unk> per unmapped ▁
+        Assert.Equal(20, ids.Count(id => id == 1));      // every 'a'
+        Assert.Equal(20, ids.Count(id => id == 2));      // every 'b'
+    }
+
+    [Fact]
     public void GgufFactory_LoadsTiktokenWithPreType()
     {
         // Build GGUF metadata with tokenizer.ggml.pre = "llama3"

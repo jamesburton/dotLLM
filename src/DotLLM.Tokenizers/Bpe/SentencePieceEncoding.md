@@ -161,7 +161,7 @@ The `Trie` stores per-node: `Dictionary<char, TrieNode> Children`, `int TokenId`
 
 | Site | Allocation | Notes |
 |------|-----------|-------|
-| Symbol array | `ArrayPool<Symbol>.Shared.Rent(normalized.Length)` | Returned in `finally` |
+| Symbol array | `ArrayPool<Symbol>.Shared.Rent(Encoding.UTF8.GetByteCount(normalized))` | Byte count, NOT char count — byte fallback emits one symbol per UTF-8 byte (▁ alone is 3), so a char-sized rental overflows on vocabs without a ▁ token. Returned in `finally` |
 | Bigram concat buffer | `stackalloc char[256]` (≤ 256 chars) or `new char[N]` | Stack for almost all tokens |
 | Byte decode buffer | `ArrayPool<byte>.Shared.Rent(16)` | Returned after decode |
 | Result `int[]` | `new int[survivingCount]` | Unavoidable output allocation |

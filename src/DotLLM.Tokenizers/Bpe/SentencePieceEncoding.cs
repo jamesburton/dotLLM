@@ -56,8 +56,13 @@ internal sealed class SentencePieceEncoding : IBpeEncoding
             MemoryExtensions.Replace(rentedNorm.AsSpan(offset, text.Length), ' ', SpaceMarker);
             ReadOnlySpan<char> normalized = rentedNorm.AsSpan(0, normalizedLen);
 
-            // 2. Build initial symbol list: one symbol per Unicode code point.
-            Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(normalizedLen);
+            // 2. Build initial symbol list: one symbol per Unicode code point — EXCEPT when a
+            //    code point has no vocab entry, where byte fallback emits one symbol per UTF-8
+            //    byte (up to 3 per char; the ▁ marker alone is 3 bytes). Size the buffer by the
+            //    UTF-8 byte count, the exact worst case, NOT the char count — a vocab without a
+            //    ▁ token (or text dense in unmapped multi-byte code points) overflows otherwise.
+            int maxSymbols = Encoding.UTF8.GetByteCount(normalized);
+            Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(maxSymbols);
             int symbolCount;
             try
             {
