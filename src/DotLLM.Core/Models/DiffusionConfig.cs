@@ -91,6 +91,28 @@ public sealed record DiffusionConfig
     public required int MaskTokenId { get; init; }
 
     /// <summary>
+    /// Top-K sparsification of the self-conditioning soft-embed (issue #121). Per canvas
+    /// position, only the K highest previous-step logits participate: the softmax is
+    /// renormalised over that subset and the soft token-embedding is the weighted sum of
+    /// just those K embedding rows — replacing the dense
+    /// <c>[canvas, vocab] × [vocab, hidden]</c> contraction (~47 GFLOP/step at canvas 32 on
+    /// the 262 144-token 26B vocab) with a <c>[canvas, K]</c> gather. Matches the reference
+    /// llama.cpp diffusion build's <c>sample_reduce=on</c> behaviour in spirit; the
+    /// GEMMA4-GRAPH-SPEC dense semantics remain available as the exact oracle.
+    /// <list type="bullet">
+    /// <item><b>Default 256.</b> With softmax mass overwhelmingly concentrated in the top
+    /// few hundred tokens, K = 256 is numerically indistinguishable from dense for
+    /// well-trained checkpoints while cutting the soft-embed cost by ~1000×.</item>
+    /// <item><b>K &lt;= 0 ⇒ dense</b> (the exact reference path — full-vocab softmax +
+    /// full embedding sweep). K &gt;= vocab also routes to the dense path and is
+    /// byte-identical to it.</item>
+    /// <item>Overridable at runtime by the <c>DOTLLM_DG_SC_TOPK</c> environment variable
+    /// (takes precedence over this value when set to a parseable integer).</item>
+    /// </list>
+    /// </summary>
+    public int SelfCondTopK { get; init; } = 256;
+
+    /// <summary>
     /// Attention pattern used while denoising the canvas.
     /// <list type="bullet">
     /// <item><see cref="AttentionMaskMode.Hybrid"/> (default) — block-autoregressive: the prompt

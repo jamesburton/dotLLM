@@ -3019,50 +3019,24 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
-    /// Dequantizes one token-embedding row (token id <paramref name="tokenId"/>) into
-    /// <paramref name="dest"/> [hiddenSize], WITHOUT the Gemma embedding scale. Mirrors the
-    /// per-row dequant in <see cref="EmbeddingLookup"/> but raw (the SC soft-embed folds
-    /// the sqrt(n_embd) scale once, per canvas column, after the vocab sweep).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void DequantEmbeddingRowRaw(int tokenId, Span<float> dest, int hiddenSize)
-    {
-        nint embPtr = _weights.TokenEmbedWeight;
-        var qt = _weights.TokenEmbedQuantType;
-        if (qt == QuantizationType.F32)
-        {
-            float* src = (float*)embPtr + (long)tokenId * hiddenSize;
-            new ReadOnlySpan<float>(src, hiddenSize).CopyTo(dest);
-        }
-        else if (qt == QuantizationType.F16)
-        {
-            Half* src = (Half*)embPtr + (long)tokenId * hiddenSize;
-            TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, hiddenSize), dest);
-        }
-        else
-        {
-            long rowBytes = Dequantize.RowByteSize(hiddenSize, qt);
-            nint rowPtr = embPtr + (nint)((long)tokenId * rowBytes);
-            Dequantize.ToFloat32(rowPtr, hiddenSize, qt, dest);
-        }
-    }
-
-    /// <summary>
     /// DiffusionGemma self-conditioning (dg_canvas_embed). For each of the
     /// <paramref name="canvasLen"/> canvas rows (sequence rows [P, P+canvasLen)), adds a
     /// gated GeGLU MLP signal of the PREVIOUS step's canvas logits to the canvas embedding
     /// IN PLACE on <paramref name="hidden"/>, BEFORE the caller's weight-less rms_norm:
     /// <code>
-    /// soft[c]   = sqrt(n_embd) * Σ_v softmax(prev_logits[c])[v] * tok_embd[v]
+    /// soft[c]   = sqrt(n_embd) * Σ_v p(c, v) * tok_embd[v]
     /// normed[c] = rms_norm(soft[c]) * self_cond_pre_norm
     /// sc_sig[c] = self_cond_down( gelu_tanh(self_cond_gate·normed[c]) * (self_cond_up·normed[c]) )
     /// hidden[P+c] += sc_sig[c]
     /// </code>
-    /// The soft-embed sweeps the (vocab × n_embd) table ONCE per step — each embedding row is
-    /// dequantized once and scatter-accumulated into all C canvas soft-vectors weighted by that
-    /// token's probability. The gate/up/down are batched as single [C × …] GEMMs. SC consumes the
-    /// FULL distribution (no mask suppression). Caller guarantees <c>_weights.SelfCond</c>,
-    /// <c>_scPrevLogits</c>, and <c>_scCanvasLen == canvasLen</c> are valid.
+    /// The soft-embed distribution <c>p(c, ·)</c> is computed by
+    /// <see cref="SelfCondSoftEmbed.Compute"/>: dense full-vocab softmax when the resolved
+    /// top-K (<see cref="DiffusionConfig.SelfCondTopK"/> / <c>DOTLLM_DG_SC_TOPK</c>) is
+    /// &lt;= 0 or &gt;= vocab, otherwise the top-K-renormalised sparse form (issue #121).
+    /// The gate/up/down are batched as single [C × …] GEMMs. SC consumes the (possibly
+    /// sparsified) distribution with no mask suppression. Caller guarantees
+    /// <c>_weights.SelfCond</c>, <c>_scPrevLogits</c>, and <c>_scCanvasLen == canvasLen</c>
+    /// are valid.
     /// </summary>
     private void ApplySelfConditioning(float* hidden, int p, int canvasLen, int hiddenSize, float eps)
     {
@@ -3074,9 +3048,6 @@ public sealed unsafe class TransformerModel : IModel
 
         // soft[c] : weighted token-embedding sum per canvas column [canvasLen × hidden].
         float[] softBuf = ArrayPool<float>.Shared.Rent(canvasLen * hiddenSize);
-        // probs[c] : softmax of prev_logits[c] over vocab (sc_temp_inv = 1.0).
-        float[] probsBuf = ArrayPool<float>.Shared.Rent(canvasLen * vocab);
-        float[] rowBuf = ArrayPool<float>.Shared.Rent(hiddenSize);
         // GeGLU MLP scratch (batched over canvasLen).
         float[] normedBuf = ArrayPool<float>.Shared.Rent(canvasLen * hiddenSize);
         float[] gateBuf = ArrayPool<float>.Shared.Rent(canvasLen * ff);
@@ -3086,30 +3057,14 @@ public sealed unsafe class TransformerModel : IModel
         try
         {
             var softSpan = softBuf.AsSpan(0, canvasLen * hiddenSize);
-            softSpan.Clear();
 
-            // probs[c] = softmax(prev_logits[c]) over the full vocab (post-softcap logits,
-            // sc_temp_inv = 1.0 so no rescale).
-            for (int c = 0; c < canvasLen; c++)
-                Softmax.Execute(
-                    prev.AsSpan(c * vocab, vocab),
-                    probsBuf.AsSpan(c * vocab, vocab));
-
-            // Single vocab sweep: read each embedding row ONCE, accumulate into every
-            // canvas soft-vector weighted by that token's probability. soft += prob * row.
-            var rowSpan = rowBuf.AsSpan(0, hiddenSize);
-            for (int v = 0; v < vocab; v++)
-            {
-                DequantEmbeddingRowRaw(v, rowSpan, hiddenSize);
-                for (int c = 0; c < canvasLen; c++)
-                {
-                    float w = probsBuf[c * vocab + v];
-                    if (w == 0f) continue;
-                    TensorPrimitives.MultiplyAdd(
-                        rowSpan, w, softSpan.Slice(c * hiddenSize, hiddenSize),
-                        softSpan.Slice(c * hiddenSize, hiddenSize));
-                }
-            }
+            // soft[c] = Σ_v p(c, v) * tok_embd[v] — dense or top-K sparsified (shared with
+            // the Vulkan backend's host-side SC; this CPU path is the cross-backend oracle).
+            int topK = SelfCondSoftEmbed.ResolveTopK(Config.DiffusionConfig);
+            SelfCondSoftEmbed.Compute(
+                prev.AsSpan(0, canvasLen * vocab), canvasLen, vocab,
+                _weights.TokenEmbedWeight, _weights.TokenEmbedQuantType, hiddenSize,
+                topK, softSpan);
 
             // soft *= sqrt(n_embd); normed = rms_norm(soft) * self_cond_pre_norm.
             for (int c = 0; c < canvasLen; c++)
@@ -3154,8 +3109,6 @@ public sealed unsafe class TransformerModel : IModel
         finally
         {
             ArrayPool<float>.Shared.Return(softBuf);
-            ArrayPool<float>.Shared.Return(probsBuf);
-            ArrayPool<float>.Shared.Return(rowBuf);
             ArrayPool<float>.Shared.Return(normedBuf);
             ArrayPool<float>.Shared.Return(gateBuf);
             ArrayPool<float>.Shared.Return(upBuf);
