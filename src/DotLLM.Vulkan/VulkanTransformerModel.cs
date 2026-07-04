@@ -333,6 +333,17 @@ public sealed class VulkanTransformerModel : IModel
     // Lazy; grows monotonically; null until the first SC step.
     private VulkanDevice.Buffer? _diffusionScSig;
     private int _diffusionScSigCapacityElems;
+    // LM-head row-chunk scratch for the diffusion forward (issue #121, TDR mitigation).
+    // The all-position head at canvas 256 on the 26B is ~378 GFLOP in ONE dispatch —
+    // enough to trip the Windows TDR watchdog (~2 s) on an iGPU. When seqLen exceeds
+    // DiffusionHeadChunkRows the head runs as a row-chunk loop: copy chunk rows of
+    // NormOutput into _diffusionHeadChunkIn, matmul into _diffusionHeadChunkOut, copy
+    // into the big logits buffer at the row offset — bounding every dispatch to
+    // chunkRows × vocab × hidden work. Lazy; grow monotonically; null until the first
+    // chunked diffusion forward.
+    private VulkanDevice.Buffer? _diffusionHeadChunkIn;
+    private VulkanDevice.Buffer? _diffusionHeadChunkOut;
+    private int _diffusionHeadChunkCapacityRows;
     // ── DiffusionGemma prompt-KV (PKV) phase state ──────────────────────────
     // Drives the two-phase PKV optimisation inside RecordGemma4Attention. None:
     // normal cacheless forward (DEFAULT). Prefill: capture each layer's final K/V
@@ -405,6 +416,31 @@ public sealed class VulkanTransformerModel : IModel
 
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _weights.AllocatedBytes;
+
+    /// <summary>
+    /// Maximum rows per LM-head dispatch on the DIFFUSION forward (issue #121). The
+    /// diffusion tail runs the head over every position; on the real 26B
+    /// (vocab 262 144 × hidden 2 816 ≈ 1.5 GFLOP/row) a monolithic canvas-256 dispatch is
+    /// ~378 GFLOP — beyond the Windows TDR watchdog (~2 s) on an iGPU. Diffusion forwards
+    /// with more rows than this run the head as a row-chunk loop with pipeline barriers, so
+    /// no single dispatch plausibly exceeds ~1 s of GPU work. Default 32 (~47 GFLOP/dispatch
+    /// on the 26B); overridable at construction by the <c>DOTLLM_DG_HEAD_CHUNK_ROWS</c>
+    /// environment variable. <c>&lt;= 0</c> disables chunking (the monolithic dispatch).
+    /// The AR path (last-row-only head) is unaffected. Chunking is a pure scheduling
+    /// change — per-row math and results are identical.
+    /// </summary>
+    public int DiffusionHeadChunkRows { get; set; } = ResolveDiffusionHeadChunkRows();
+
+    /// <summary>Resolves the default diffusion LM-head chunk rows (env <c>DOTLLM_DG_HEAD_CHUNK_ROWS</c>, else 32).</summary>
+    private static int ResolveDiffusionHeadChunkRows()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_DG_HEAD_CHUNK_ROWS");
+        if (!string.IsNullOrWhiteSpace(env)
+            && int.TryParse(env, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int rows))
+            return rows;
+        return 32;
+    }
 
     /// <summary>Creates a <see cref="VulkanKvCache"/> sized for this model.</summary>
     /// <remarks>
@@ -2264,6 +2300,11 @@ public sealed class VulkanTransformerModel : IModel
         if (diffusionForward)
         {
             EnsureDiffusionLogits(seqLen, vocabSize);
+            // LM-head row-chunk scratch (issue #121): allocated here, outside recording,
+            // when this forward will run the chunked head (seqLen > chunk rows).
+            int chunkRows = DiffusionHeadChunkRows;
+            if (chunkRows > 0 && seqLen > chunkRows)
+                EnsureDiffusionHeadChunkBuffers(chunkRows, hiddenSize, vocabSize);
             int regionP0 = DiffusionRegionPrefix(seqLen);
             int canvasLen0 = seqLen - regionP0;
             bool scThisStep = _scUse > 0f && _cpuWeights.SelfCond is not null
@@ -2790,6 +2831,16 @@ public sealed class VulkanTransformerModel : IModel
     /// <c>[seqLen, vocab]</c> logits tensor (per-row final soft-cap applied). Used only by the
     /// diffusion forward — the canvas generator gathers the masked-position rows.
     /// </summary>
+    /// <remarks>
+    /// When <paramref name="seqLen"/> exceeds <see cref="DiffusionHeadChunkRows"/> (and the
+    /// chunk scratch was pre-allocated before recording), the head runs as a row-chunk loop —
+    /// copy chunk rows of NormOutput to the chunk-input scratch, matmul into the chunk-output
+    /// scratch, copy into the logits buffer at the row offset — so no single dispatch carries
+    /// more than chunkRows × vocab × hidden work (issue #121: the monolithic canvas-256 head
+    /// on the 26B is ~378 GFLOP and trips the Windows TDR watchdog on an iGPU). Chunking is
+    /// row-partitioned only: each output row's reduction is computed exactly as in the
+    /// monolithic dispatch, so results are identical.
+    /// </remarks>
     private ITensor FinishDiffusionForward(nint cmdBuf, int seqLen, int hiddenSize, int vocabSize, float eps, int deviceId)
     {
         // Final RMSNorm over every row, in place on HiddenState → NormOutput.
@@ -2798,11 +2849,48 @@ public sealed class VulkanTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         VulkanDevice.Buffer logitsBuf = EnsureDiffusionLogits(seqLen, vocabSize);
-        RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
-            _state.NormOutput, logitsBuf,
-            _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: seqLen);
+        int chunkRows = DiffusionHeadChunkRows;
+        bool chunked = chunkRows > 0 && seqLen > chunkRows
+            && _diffusionHeadChunkIn is not null && _diffusionHeadChunkOut is not null
+            && _diffusionHeadChunkCapacityRows >= chunkRows;
+        if (!chunked)
+        {
+            RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+                _state.NormOutput, logitsBuf,
+                _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: seqLen);
+            KernelSupport.ComputeToHostBarrier(cmdBuf);
+        }
+        else
+        {
+            long inRowBytes = (long)hiddenSize * sizeof(float);
+            long outRowBytes = (long)vocabSize * sizeof(float);
+            for (int start = 0; start < seqLen; start += chunkRows)
+            {
+                int rows = Math.Min(chunkRows, seqLen - start);
+                // NormOutput chunk rows → chunk-input scratch. Compute→transfer covers the
+                // rmsnorm write (first chunk) and, on later chunks, the WAR hazard against
+                // the previous chunk's matmul read of the scratch (execution ordering).
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, _state.NormOutput, _diffusionHeadChunkIn!,
+                    srcOffset: (ulong)(start * inRowBytes), dstOffset: 0,
+                    size: (ulong)(rows * inRowBytes));
+                // Transfer→compute also orders the previous chunk's logits copy (transfer
+                // read of the chunk-output scratch) before this chunk's matmul write (WAR).
+                KernelSupport.TransferToComputeBarrier(cmdBuf);
 
-        KernelSupport.ComputeToHostBarrier(cmdBuf);
+                RecordMatmul(cmdBuf, _weights.OutputWeight, _weights.OutputDeviceQuantType,
+                    _diffusionHeadChunkIn!, _diffusionHeadChunkOut!,
+                    _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: rows);
+
+                // Chunk-output scratch → logits buffer at the row offset.
+                KernelSupport.ComputeToTransferBarrier(cmdBuf);
+                RecordCopyBufferRange(cmdBuf, _diffusionHeadChunkOut!, logitsBuf,
+                    srcOffset: 0, dstOffset: (ulong)(start * outRowBytes),
+                    size: (ulong)(rows * outRowBytes));
+            }
+            // The logits landed via TRANSFER writes; make them host-visible for the download.
+            KernelSupport.TransferToHostBarrier(cmdBuf);
+        }
         _submit.SubmitAndWait();
 
         var shape = new TensorShape(seqLen, vocabSize);
@@ -2831,6 +2919,27 @@ public sealed class VulkanTransformerModel : IModel
             InvalidateKernelCaches();
         }
         return _diffusionLogits;
+    }
+
+    /// <summary>
+    /// Lazily (re)allocates the diffusion LM-head row-chunk scratch buffers
+    /// (<c>[chunkRows × hidden]</c> input, <c>[chunkRows × vocab]</c> output) for the
+    /// chunked head loop (issue #121). Must be called OUTSIDE an open command buffer —
+    /// allocation invalidates cached descriptor sets.
+    /// </summary>
+    private void EnsureDiffusionHeadChunkBuffers(int chunkRows, int hiddenSize, int vocabSize)
+    {
+        if (_diffusionHeadChunkIn is null || _diffusionHeadChunkOut is null
+            || _diffusionHeadChunkCapacityRows < chunkRows)
+        {
+            _diffusionHeadChunkIn?.Dispose();
+            _diffusionHeadChunkOut?.Dispose();
+            _diffusionHeadChunkIn = _device.Allocate((long)chunkRows * hiddenSize * sizeof(float));
+            _diffusionHeadChunkOut = _device.Allocate((long)chunkRows * vocabSize * sizeof(float));
+            _diffusionHeadChunkCapacityRows = chunkRows;
+            // New handles invalidate any cached matmul descriptor sets.
+            InvalidateKernelCaches();
+        }
     }
 
     /// <summary>
@@ -3796,12 +3905,17 @@ public sealed class VulkanTransformerModel : IModel
     /// uploads it into <paramref name="dst"/>. SC feeds the previous step's canvas logits back
     /// via a gated GeGLU MLP over a soft token-embedding:
     /// <code>
-    /// soft[c]   = sqrt(n_embd) * Σ_v softmax(prev_logits[c])[v] * tok_embd[v]
+    /// soft[c]   = sqrt(n_embd) * Σ_v p(c, v) * tok_embd[v]
     /// normed[c] = rms_norm(soft[c]) * self_cond_pre_norm
     /// sc_sig[c] = self_cond_down( gelu_tanh(self_cond_gate·normed) * (self_cond_up·normed) )
     /// </code>
     /// Source-confirmed against diffusion-gemma.cpp; runs only on the (small) canvas region,
-    /// once per denoise step. The soft-embed sweeps the tied token-embedding table once.
+    /// once per denoise step. The soft-embed distribution <c>p(c, ·)</c> comes from the SHARED
+    /// <see cref="SelfCondSoftEmbed"/> helper (also used by the CPU oracle): dense full-vocab
+    /// softmax, or the top-K-renormalised sparse form (issue #121) when the resolved K
+    /// (<see cref="DiffusionConfig.SelfCondTopK"/> / <c>DOTLLM_DG_SC_TOPK</c>) is in
+    /// <c>(0, vocab)</c> — replacing the full 262 144-row embedding sweep with a
+    /// <c>[canvas × K]</c> gather, the dominant per-step cost on the real 26B.
     /// </summary>
     private unsafe void ComputeSelfConditioningSignalHost(int canvasLen, int hiddenSize, float eps, VulkanDevice.Buffer dst)
     {
@@ -3812,33 +3926,19 @@ public sealed class VulkanTransformerModel : IModel
         float[] prev = _scPrevLogits!;
 
         var soft = new float[canvasLen * hiddenSize];
-        var probs = new float[vocab];
-        var row = new float[hiddenSize];
         var normed = new float[canvasLen * hiddenSize];
         var gate = new float[canvasLen * ff];
         var up = new float[canvasLen * ff];
         var gelu = new float[canvasLen * ff];
         var sig = new float[canvasLen * hiddenSize];
 
-        // soft[c] = Σ_v softmax(prev_logits[c])[v] * tok_embd[v]. Single vocab sweep:
-        // each embedding row is dequantized once and scatter-accumulated into every
-        // canvas soft-vector weighted by that token's probability.
-        // (Compute per-column probs lazily to avoid a [canvasLen × vocab] buffer.)
-        var allProbs = new float[canvasLen * vocab];
-        for (int c = 0; c < canvasLen; c++)
-            Softmax.Execute(prev.AsSpan(c * vocab, vocab), allProbs.AsSpan(c * vocab, vocab));
-        for (int v = 0; v < vocab; v++)
-        {
-            DequantTokenEmbedRow(v, row, hiddenSize);
-            for (int c = 0; c < canvasLen; c++)
-            {
-                float w = allProbs[c * vocab + v];
-                if (w == 0f) continue;
-                TensorPrimitives.MultiplyAdd(row, w, soft.AsSpan(c * hiddenSize, hiddenSize),
-                    soft.AsSpan(c * hiddenSize, hiddenSize));
-            }
-        }
-        _ = probs;
+        // soft[c] = Σ_v p(c, v) * tok_embd[v] — dense or top-K sparsified, identical to the
+        // CPU TransformerModel path by construction (same shared helper, same weights).
+        int topK = SelfCondSoftEmbed.ResolveTopK(Config.DiffusionConfig);
+        SelfCondSoftEmbed.Compute(
+            prev.AsSpan(0, canvasLen * vocab), canvasLen, vocab,
+            _cpuWeights.TokenEmbedWeight, _cpuWeights.TokenEmbedQuantType, hiddenSize,
+            topK, soft);
 
         // soft *= sqrt(n_embd); normed = rms_norm(soft) * self_cond_pre_norm.
         for (int c = 0; c < canvasLen; c++)
@@ -3885,22 +3985,6 @@ public sealed class VulkanTransformerModel : IModel
                 Dequantize.ToFloat32(rp, k, qt, wRow);
             for (int r = 0; r < rows; r++)
                 output[r * m + mi] = TensorPrimitives.Dot(wRow, input.Slice(r * k, k));
-        }
-    }
-
-    /// <summary>Dequantizes one token-embedding row (raw, no embedding scale) into <paramref name="dest"/> [hidden].</summary>
-    private unsafe void DequantTokenEmbedRow(int tokenId, Span<float> dest, int hiddenSize)
-    {
-        nint embPtr = _cpuWeights.TokenEmbedWeight;
-        var qt = _cpuWeights.TokenEmbedQuantType;
-        if (qt == QuantizationType.F32)
-            new ReadOnlySpan<float>((float*)embPtr + (long)tokenId * hiddenSize, hiddenSize).CopyTo(dest);
-        else if (qt == QuantizationType.F16)
-            TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>((Half*)embPtr + (long)tokenId * hiddenSize, hiddenSize), dest);
-        else
-        {
-            long rowBytes = Dequantize.RowByteSize(hiddenSize, qt);
-            Dequantize.ToFloat32(embPtr + (nint)((long)tokenId * rowBytes), hiddenSize, qt, dest);
         }
     }
 
@@ -5226,6 +5310,8 @@ public sealed class VulkanTransformerModel : IModel
 
         _diffusionLogits?.Dispose();
         _diffusionScSig?.Dispose();
+        _diffusionHeadChunkIn?.Dispose();
+        _diffusionHeadChunkOut?.Dispose();
         _pkvStore?.Dispose();
         _pkvKConcat?.Dispose();
         _pkvVConcat?.Dispose();

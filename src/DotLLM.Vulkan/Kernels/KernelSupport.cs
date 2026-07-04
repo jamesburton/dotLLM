@@ -241,6 +241,30 @@ internal static class KernelSupport
     }
 
     /// <summary>
+    /// Inserts a <c>TRANSFER → HOST</c> barrier so the host can read back data
+    /// a <c>vkCmdCopyBuffer</c> just wrote (e.g. the chunked diffusion LM-head
+    /// logits, which land in the logits buffer via transfer copies) after the
+    /// submit completes.
+    /// </summary>
+    internal static unsafe void TransferToHostBarrier(nint cmdBuf)
+    {
+        var barrier = new VkMemoryBarrier
+        {
+            sType = VkStructureType.MemoryBarrier,
+            srcAccessMask = VkAccessFlags.TransferWrite,
+            dstAccessMask = VkAccessFlags.HostRead,
+        };
+        VulkanApi.vkCmdPipelineBarrier(
+            cmdBuf,
+            srcStageMask: VkPipelineStageFlags.Transfer,
+            dstStageMask: VkPipelineStageFlags.Host,
+            dependencyFlags: 0,
+            memoryBarrierCount: 1, pMemoryBarriers: barrier,
+            bufferMemoryBarrierCount: 0, pBufferMemoryBarriers: 0,
+            imageMemoryBarrierCount: 0, pImageMemoryBarriers: 0);
+    }
+
+    /// <summary>
     /// Inserts a <c>COMPUTE_SHADER → HOST</c> barrier so the host can read
     /// back a compute kernel's output (specifically the final LM-head
     /// logits) after the submit completes.
