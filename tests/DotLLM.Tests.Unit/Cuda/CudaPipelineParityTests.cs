@@ -137,6 +137,49 @@ public sealed unsafe class CudaPipelineParityTests
         AssertLogitsMatch(full, pipe, $"xdev-model-decode/split={splitAt}");
     }
 
+    // ── VRAM trim (#123, CUDA sibling of Vulkan #368): stage 1 must shed the embed table ──
+
+    /// <summary>
+    /// Discriminating check for the stage VRAM trim: stage 1 (only ever seeded from stage 0's hidden
+    /// state) must NOT hold the token-embedding table on device, while stage 0 must. Guards against a
+    /// silent regression that re-uploads the skipped table — invisible to the logit-parity theories.
+    /// (The head half of the trim needs no test: <c>CudaWeights.LoadFromGguf</c> has always skipped the
+    /// output norm + LM head for a non-final window.)
+    /// </summary>
+    [SkippableFact]
+    public void TrimmedStage1_ShedsTokenEmbedTable()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX kernel files not found; build the CUDA native kernels.");
+
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        using var model = CudaPipelineTransformerModel.BuildFromPrebuiltWeights(
+            fixture.Weights, fixture.Config, splitLayer: 2, device0Id: 0, device1Id: 0, ptxDir!);
+
+        Assert.True(model.Stage0.HasTokenEmbed, "stage 0 gathers embeddings and must hold the table");
+        Assert.False(model.Stage1.HasTokenEmbed, "stage 1 is hidden-seeded and must shed the table");
+    }
+
+    /// <summary>An embed-less stage entered via the embedding path must fail loudly, not launch against a null pointer.</summary>
+    [SkippableFact]
+    public void EmbedlessStage_EnqueueFromEmbedding_Throws()
+    {
+        Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir is null, "PTX kernel files not found; build the CUDA native kernels.");
+
+        using var fixture = DenseFixture.Build(seed: 42, ropeType: RoPEType.NeoX);
+        fixture.Weights.RepackWeights();
+        using var stage = CudaPipelineStage.Build(
+            fixture.Config, fixture.Weights, deviceId: 0, ptxDir!,
+            firstLayer: 2, layerCount: 2, isFinalStage: true, skipTokenEmbed: true);
+
+        Assert.False(stage.HasTokenEmbed);
+        Assert.Throws<InvalidOperationException>(
+            () => stage.EnqueueFromEmbedding([3, 1], [0, 1], seqLen: 2, kvCache: null));
+    }
+
     // ── Runners ──────────────────────────────────────────────────────────────
 
     private static float[] RunFull(DenseFixture fx, int[] ids, int[] pos, int deviceId, string ptxDir)
