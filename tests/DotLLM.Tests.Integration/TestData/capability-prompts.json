@@ -1,0 +1,62 @@
+[
+  {
+    "id": "qa-eiffel",
+    "family": "qa",
+    "prompt": "The Eiffel Tower is located in the city of",
+    "rule": { "type": "keyword", "anyOf": [ "Paris" ] }
+  },
+  {
+    "id": "qa-capital-france",
+    "family": "qa",
+    "prompt": "The capital of France is",
+    "rule": { "type": "keyword", "anyOf": [ "Paris" ] }
+  },
+  {
+    "id": "qa-red-planet",
+    "family": "qa",
+    "prompt": "The planet known as the Red Planet is",
+    "rule": { "type": "keyword", "anyOf": [ "Mars" ] }
+  },
+  {
+    "id": "qa-water-formula",
+    "family": "qa",
+    "prompt": "The chemical formula for water is",
+    "rule": { "type": "keyword", "anyOf": [ "H2O", "H₂O" ] }
+  },
+  {
+    "id": "typo-fox",
+    "family": "typo",
+    "prompt": "Correct the spelling mistakes in this sentence: 'The quick brwon fox jumps ovr the lazy dog.' Corrected sentence:",
+    "rule": { "type": "keyword", "allOf": [ "brown", "over the" ] }
+  },
+  {
+    "id": "typo-invitation",
+    "family": "typo",
+    "prompt": "Fix the typos in this sentence: 'She recieved an invitaton to the party.' Corrected sentence:",
+    "rule": { "type": "keyword", "allOf": [ "received", "invitation" ] }
+  },
+  {
+    "id": "typo-weather",
+    "family": "typo",
+    "prompt": "Correct the spelling in this sentence: 'I beleive the wether will be sunny tomorow.' Corrected sentence:",
+    "rule": { "type": "keyword", "allOf": [ "believe", "weather", "tomorrow" ] }
+  },
+  {
+    "id": "code-add",
+    "family": "code",
+    "prompt": "def add(a, b):\n    \"\"\"Return the sum of a and b.\"\"\"\n    return",
+    "rule": { "type": "regex", "pattern": "a\\s*\\+\\s*b" }
+  },
+  {
+    "id": "code-square",
+    "family": "code",
+    "prompt": "def square(x):\n    \"\"\"Return the square of x.\"\"\"\n    return",
+    "rule": { "type": "regex", "pattern": "x\\s*\\*\\*\\s*2|x\\s*\\*\\s*x" }
+  },
+  {
+    "id": "code-hello",
+    "family": "code",
+    "prompt": "# A Python program that prints Hello World\nprint(",
+    "rule": { "type": "regex", "pattern": "hello[,!]?\\s*world" }
+  }
+]
