@@ -64,6 +64,38 @@ holds alone.
   boundary is lossless, so the band is tight (abs 5e-3 / rel 5e-3).
 - M-scope: dense / GQA causal (no MLA / MoE / gemma4 / graph-capture), matching #366.
 
+## Q4_K MMVQ decode-kernel A/B on Turing (issue #125)
+
+Compares the default decode GEMV kernel (`quantized_gemv_q4_k_mmvq_large`) against the new
+llama.cpp-faithful coalesced+accumulate-once kernel (`quantized_gemv_q4_k_mmvq_llamacpp`,
+`DOTLLM_CUDA_MMVQ_LLAMACPP=1`) on a real Turing T4 — the only GPU that reproduces T4's specific
+occupancy/bandwidth characteristics (T5500's Ampere RTX 3060 is fine for correctness but its perf
+numbers are not representative; see #125's design note on why #363's `mmvq_coalesced` looked fine
+on paper but was 3x slower in practice). Any single-GPU Kaggle session works (T4 ×1 or ×2); this
+step doesn't need the second GPU.
+
+One-time setup: same as above (new Notebook → GPU accelerator on → Internet on), or reuse an
+existing `dotllm-dual-cuda-validation.ipynb` session. Then, since the kernel lives on an
+unmerged branch, point `DOTLLM_BRANCH` at it:
+
+```bash
+export DOTLLM_BRANCH=issue/125-llamacpp-coalesced-mmvq
+bash kaggle/setup.sh env && bash kaggle/setup.sh dotnet && bash kaggle/setup.sh ptx && bash kaggle/setup.sh build
+
+# Baseline: default kernel (mmvq_large)
+DOTLLM_CUDA_MMVQ_LLAMACPP=0 bash kaggle/setup.sh profile
+
+# New kernel: llama.cpp-faithful coalesced + accumulate-once
+DOTLLM_CUDA_MMVQ_LLAMACPP=1 bash kaggle/setup.sh profile
+```
+
+Both invocations run `profile-cuda-decode --compare` (see `do_profile` in `setup.sh`) on the same
+`DOTLLM_PROFILE_MODELS` (default: Llama-3.2-1B + 3B Q4_K_M) and print decode tok/s per model —
+diff the two outputs for the A/B. Set `DOTLLM_PROFILE_MODELS` to override the model list (e.g. to
+match the #363 baseline's 1B Q4_K_M exactly). `#363`'s known-bad reference kernel remains available
+for a three-way comparison via `DOTLLM_CUDA_MMVQ_COALESCED=1` (mutually exclusive with
+`DOTLLM_CUDA_MMVQ_LLAMACPP`; the llama.cpp toggle is checked first if both are set).
+
 ## Notes / gotchas
 - Kaggle sessions are time-boxed (~9–12 h) and idle-timeout; the build is incremental so re-runs are fast.
 - The notebook clones the **fork** `jamesburton/dotLLM` by default (that's where the dev-track / #361
