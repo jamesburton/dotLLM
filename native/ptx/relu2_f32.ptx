@@ -7,7 +7,7 @@
 //
 
 .version 8.7
-.target sm_61
+.target sm_75
 .address_size 64
 
 	// .globl	relu2_f32
@@ -46,10 +46,10 @@
 	cvta.to.global.u64 	%rd7, %rd2;
 	add.s64 	%rd8, %rd7, %rd5;
 	ld.global.nc.f32 	%f1, [%rd6];
-	max.ftz.f32 	%f2, %f1, 0f00000000;
-	mul.ftz.f32 	%f3, %f2, %f2;
+	max.f32 	%f2, %f1, 0f00000000;
+	mul.f32 	%f3, %f2, %f2;
 	ld.global.nc.f32 	%f4, [%rd8];
-	mul.ftz.f32 	%f5, %f4, %f3;
+	mul.f32 	%f5, %f4, %f3;
 	cvta.to.global.u64 	%rd9, %rd3;
 	add.s64 	%rd10, %rd9, %rd5;
 	st.global.f32 	[%rd10], %f5;

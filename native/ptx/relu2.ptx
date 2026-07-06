@@ -7,7 +7,7 @@
 //
 
 .version 8.7
-.target sm_61
+.target sm_75
 .address_size 64
 
 	// .globl	relu2_f16
@@ -76,12 +76,12 @@
   cvt.f32.f16 %f4, high;}
 
 	// end inline asm
-	max.ftz.f32 	%f7, %f1, 0f00000000;
-	max.ftz.f32 	%f8, %f2, 0f00000000;
-	mul.ftz.f32 	%f9, %f7, %f7;
-	mul.ftz.f32 	%f5, %f3, %f9;
-	mul.ftz.f32 	%f10, %f8, %f8;
-	mul.ftz.f32 	%f6, %f4, %f10;
+	max.f32 	%f7, %f1, 0f00000000;
+	max.f32 	%f8, %f2, 0f00000000;
+	mul.f32 	%f9, %f7, %f7;
+	mul.f32 	%f5, %f3, %f9;
+	mul.f32 	%f10, %f8, %f8;
+	mul.f32 	%f6, %f4, %f10;
 	add.s64 	%rd10, %rd1, %rd6;
 	// begin inline asm
 	{.reg .f16 low,high;
@@ -115,9 +115,9 @@ $L__BB0_2:
 	{  cvt.f32.f16 %f12, %rs2;}
 
 	// end inline asm
-	max.ftz.f32 	%f14, %f11, 0f00000000;
-	mul.ftz.f32 	%f15, %f14, %f14;
-	mul.ftz.f32 	%f13, %f12, %f15;
+	max.f32 	%f14, %f11, 0f00000000;
+	mul.f32 	%f15, %f14, %f14;
+	mul.f32 	%f13, %f12, %f15;
 	// begin inline asm
 	{  cvt.rn.f16.f32 %rs3, %f13;}
 
