@@ -9,6 +9,7 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -204,19 +205,50 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
-        var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
-        if (resolvedPath is null)
-            return 1;
+        // HuggingFace safetensors directory (config.json + *.safetensors /
+        // index.json)? Auto-detected; loads via the safetensors path. The GGUF
+        // path is unchanged.
+        string? hfDir = RunCommand.TryResolveHfDirectory(settings.Model);
+
+        string resolvedPath;
+        if (hfDir is not null)
+        {
+            resolvedPath = hfDir;
+        }
+        else
+        {
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            if (ggufPath is null)
+                return 1;
+            resolvedPath = ggufPath;
+        }
 
         GgufFile? gguf = null;
+        IDisposable? safetensorsSource = null;
         ModelConfig? config = null;
-        Tokenizers.Bpe.BpeTokenizer? tokenizer = null;
+        ITokenizer? tokenizer = null;
         IModel? model = null;
 
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .Start("Loading model...", ctx =>
             {
+                if (hfDir is not null)
+                {
+                    ctx.Status("Opening HuggingFace safetensors checkpoint...");
+                    var threadingCfg = new ThreadingConfig(
+                        settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                    var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
+                    model = m;
+                    safetensorsSource = src;
+                    config = cfg;
+                    ctx.Status("Loading tokenizer...");
+                    tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                        ?? throw new InvalidOperationException(
+                            $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                    return;
+                }
+
                 ctx.Status("Opening GGUF file...");
                 gguf = GgufFile.Open(resolvedPath);
 
@@ -258,7 +290,12 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer!, config!.Architecture);
+        // GGUF checkpoints carry an embedded Jinja chat template; the HF
+        // safetensors path doesn't surface one here, so it falls back to the
+        // plain completion-style transcript.
+        var jinjaTemplate = gguf is not null
+            ? GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer!, config!.Architecture)
+            : null;
         IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
         if (jinjaTemplate is null)
         {
@@ -267,9 +304,15 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 "This usually means the model is not instruction/chat tuned.[/]");
         }
 
-        // Parse tool definitions
+        // Parse tool definitions. Tool calling relies on the GGUF-embedded chat
+        // template, so it is unavailable on the HF safetensors path.
         ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
-        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+        if (tools is { Length: > 0 } && gguf is null)
+        {
+            AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            tools = null;
+        }
+        IToolCallParser? toolCallParser = tools is { Length: > 0 } && gguf is not null
             ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
             : null;
         ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
@@ -403,6 +446,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
             pagedFactory?.Dispose();
             model?.Dispose();
             gguf?.Dispose();
+            safetensorsSource?.Dispose();
         }
 
         return 0;

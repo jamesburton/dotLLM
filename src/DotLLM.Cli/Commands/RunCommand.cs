@@ -8,6 +8,7 @@ using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -197,17 +198,49 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             return 1;
         }
 
-        var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
-        if (resolvedPath is null)
-            return 1;
+        // HuggingFace safetensors directory? (config.json + *.safetensors /
+        // model.safetensors.index.json). Auto-detected; loads via the
+        // safetensors path instead of GGUF. The GGUF path is unchanged.
+        string? hfDir = TryResolveHfDirectory(settings.Model);
 
-        GgufFile gguf = null!;
+        string resolvedPath;
+        if (hfDir is not null)
+        {
+            resolvedPath = hfDir;
+        }
+        else
+        {
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            if (ggufPath is null)
+                return 1;
+            resolvedPath = ggufPath;
+        }
+
+        GgufFile? gguf = null;
+        IDisposable? safetensorsSource = null;
         ModelConfig config = null!;
-        Tokenizers.Bpe.BpeTokenizer tokenizer = null!;
+        ITokenizer tokenizer = null!;
         IModel model = null!;
 
         void LoadModel()
         {
+            if (hfDir is not null)
+            {
+                // HuggingFace safetensors checkpoint (e.g. BitNet b1.58 bf16).
+                // CPU load via the shared safetensors loader; GPU offload for
+                // this path is not wired through the CLI yet.
+                var threadingCfg = new ThreadingConfig(
+                    settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
+                model = m;
+                safetensorsSource = src;
+                config = cfg;
+                tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                    ?? throw new InvalidOperationException(
+                        $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                return;
+            }
+
             gguf = GgufFile.Open(resolvedPath);
             config = GgufModelConfigExtractor.Extract(gguf.Metadata);
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
@@ -305,11 +338,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         ToolDefinition[]? tools = ChatCommand.ParseToolDefinitions(settings.Tools);
         IToolCallParser? toolCallParser = null;
         string effectivePrompt = settings.Prompt;
+        if (tools is { Length: > 0 } && gguf is null)
+        {
+            // Tool calling relies on the GGUF-embedded chat template; the HF
+            // safetensors path doesn't surface one here. Fall back to the raw
+            // prompt so generation still runs.
+            if (settings.Json)
+                Console.Error.WriteLine("WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.");
+            else
+                AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            tools = null;
+        }
         if (tools is { Length: > 0 })
         {
             string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
             string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture)
+            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer, config.Architecture)
                 ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
             var messages = new List<ChatMessage>
@@ -321,7 +365,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AddGenerationPrompt = true,
                 Tools = tools
             });
-            toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+            toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf!.Metadata, config.Architecture);
         }
         var toolChoice = ChatCommand.ParseToolChoice(settings.ToolChoiceStr, tools);
 
@@ -521,8 +565,19 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             double totalTokPerSec = totalTokens > 0 ? totalTokens / (totalMs / 1000.0) : 0;
 
             // Memory metrics
-            long fileSize = new FileInfo(resolvedPath).Length;
-            long modelWeightsBytes = fileSize - gguf.DataSectionOffset;
+            long modelWeightsBytes;
+            if (gguf is not null)
+            {
+                long fileSize = new FileInfo(resolvedPath).Length;
+                modelWeightsBytes = fileSize - gguf.DataSectionOffset;
+            }
+            else
+            {
+                // HF safetensors: sum the on-disk shard sizes in the directory.
+                modelWeightsBytes = Directory
+                    .EnumerateFiles(resolvedPath, "*.safetensors", SearchOption.TopDirectoryOnly)
+                    .Sum(f => new FileInfo(f).Length);
+            }
             long computeBytes = model.ComputeMemoryBytes;
             int cacheSize = Math.Min(promptLen + settings.MaxTokens, config.MaxSequenceLength);
             // Use actual KV-cache bytes from engine timings (reflects quantization compression).
@@ -684,7 +739,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 inner.Dispose();
             pagedFactory?.Dispose();
             model.Dispose();
-            gguf.Dispose();
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
         }
 
         return 0;
@@ -746,6 +802,29 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
         var match = Regex.Match(Path.GetFileName(resolvedPath), @"\.(Q[\w]+)\.gguf$", RegexOptions.IgnoreCase);
         return match.Success ? match.Groups[1].Value : "unknown";
+    }
+
+    /// <summary>
+    /// Detects whether <paramref name="modelArg"/> points at a HuggingFace
+    /// safetensors checkpoint directory: an existing directory containing a
+    /// <c>config.json</c> alongside either a <c>*.safetensors</c> file or a
+    /// <c>model.safetensors.index.json</c> shard index. Returns the resolved
+    /// directory path, or <see langword="null"/> when it is not such a
+    /// directory (leaving the GGUF resolution path unchanged).
+    /// </summary>
+    internal static string? TryResolveHfDirectory(string modelArg)
+    {
+        if (string.IsNullOrEmpty(modelArg) || !Directory.Exists(modelArg))
+            return null;
+
+        if (!File.Exists(Path.Combine(modelArg, "config.json")))
+            return null;
+
+        bool hasWeights =
+            File.Exists(Path.Combine(modelArg, "model.safetensors.index.json"))
+            || Directory.EnumerateFiles(modelArg, "*.safetensors", SearchOption.TopDirectoryOnly).Any();
+
+        return hasWeights ? Path.GetFullPath(modelArg) : null;
     }
 
     private static int ResolveGpuLayers(Settings settings, ModelConfig config)
