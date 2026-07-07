@@ -110,6 +110,9 @@ public static class HfConfigExtractor
         float? finalLogitSoftcap = null;
         float? queryPreAttnScalar = null;
         ActivationFunction activation = ActivationFunction.SiLU;
+        // BitNet b1.58 uses the squared-ReLU FFN (relu2), mirroring the GGUF path.
+        if (architecture == Architecture.BitNet)
+            activation = ActivationFunction.ReluSquared;
         if (architecture == Architecture.Gemma3)
         {
             // Default sliding_window for Gemma3 if not specified (HF default is 4096).
@@ -666,6 +669,9 @@ public static class HfConfigExtractor
             (_, "mistral") => Architecture.Mistral,
             (_, "phi" or "phi3" or "phi2") => Architecture.Phi,
             (_, "qwen" or "qwen2" or "qwen3") => Architecture.Qwen,
+            // Microsoft BitNet b1.58 — `BitNetForCausalLM` / `model_type=bitnet`.
+            (var a, _) when a is not null && a.Contains("bitnet") => Architecture.BitNet,
+            (_, "bitnet") => Architecture.BitNet,
             _ => throw new InvalidDataException(
                 $"Unsupported HF architecture: architectures[0]='{archName}', model_type='{modelType}'.")
         };
