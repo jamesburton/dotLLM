@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Models.SafeTensors;
 using static DotLLM.Models.Architectures.SafetensorsTensorResolver;
 
@@ -56,11 +57,14 @@ internal static class TransformerWeightsSafetensorsLoader
                                    is DotLLM.Core.Configuration.Architecture.DeepSeekV2
                                    or DotLLM.Core.Configuration.Architecture.DeepSeekV3
                                  && config.MlaConfig is not null;
+            bool isBitNet = config.Architecture is DotLLM.Core.Configuration.Architecture.BitNet;
             for (int i = 0; i < config.NumLayers; i++)
             {
                 layers[i] = isDeepSeekMla
                     ? LoadDeepSeekMlaLayer(i, file, config, owned)
-                    : LoadLayer(i, file, config, owned);
+                    : isBitNet
+                        ? LoadBitNetLayer(i, file, config, owned)
+                        : LoadLayer(i, file, config, owned);
             }
 
             // Final RMSNorm
@@ -254,6 +258,129 @@ internal static class TransformerWeightsSafetensorsLoader
             moe: null,
             mla: null,
             postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm);
+    }
+
+    /// <summary>
+    /// Loads one BitNet b1.58 transformer layer from an HF safetensors
+    /// checkpoint. Unlike <see cref="LoadLayer"/> (which keeps linears at
+    /// F32/F16), every linear projection here is quantized to ternary
+    /// <see cref="QuantizationType.I2_S"/> at load via
+    /// <see cref="DotLLM.Cpu.Kernels.BitNetQuantize.QuantizeToI2S"/> — mirroring
+    /// what the GGUF BitNet path receives pre-quantized from Microsoft's
+    /// converter. The two BitNet Sub-LN norms
+    /// (<c>self_attn.attn_sub_norm.weight</c> over the attention output before
+    /// <c>o_proj</c>, and <c>mlp.ffn_sub_norm.weight</c> over the gated
+    /// intermediate before <c>down_proj</c>) are wired into
+    /// <see cref="TransformerLayerWeights.AttnSubNormWeight"/> /
+    /// <see cref="TransformerLayerWeights.FfnSubNormWeight"/> so the forward
+    /// pass applies Sub-LN exactly as it does for GGUF. The squared-ReLU FFN is
+    /// selected by <see cref="ModelConfig.ActivationFunction"/> = ReluSquared.
+    /// </summary>
+    private static TransformerLayerWeights LoadBitNetLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+    {
+        string prefix = $"model.layers.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = config.IntermediateSize;
+        int qDim = config.NumAttentionHeads * config.HeadDim;
+        int kvDim = config.NumKvHeads * config.HeadDim;
+
+        // Pre-attention RMSNorm.
+        float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
+
+        // Attention projections — quantized to ternary I2_S.
+        var (qPtr, qQt, qM, qK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.q_proj.weight", owned);
+        var (kPtr, kQt, kM, kK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.k_proj.weight", owned);
+        var (vPtr, vQt, vM, vK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.v_proj.weight", owned);
+        var (oPtr, oQt, oM, oK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.o_proj.weight", owned);
+        ValidateProjectionShape(qM, qK, qDim, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
+        ValidateProjectionShape(kM, kK, kvDim, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
+        ValidateProjectionShape(vM, vK, kvDim, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
+        ValidateProjectionShape(oM, oK, hiddenSize, qDim, $"{prefix}.self_attn.o_proj.weight");
+
+        // BitNet attention Sub-LN — RMSNorm over the attention output [hidden]
+        // before o_proj.
+        float[] attnSubNorm = ResolveNorm(file, $"{prefix}.self_attn.attn_sub_norm.weight", hiddenSize);
+
+        // Pre-FFN RMSNorm.
+        float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+
+        // BitNet FFN Sub-LN — RMSNorm over the gated intermediate [intermediate]
+        // before down_proj.
+        float[] ffnSubNorm = ResolveNorm(file, $"{prefix}.mlp.ffn_sub_norm.weight", intermediateSize);
+
+        // Dense SwiGLU-shaped FFN projections — quantized to ternary I2_S.
+        var (gatePtr, gateQt, gateM, gateK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.gate_proj.weight", owned);
+        var (upPtr, upQt, upM, upK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.up_proj.weight", owned);
+        var (downPtr, downQt, downM, downK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.down_proj.weight", owned);
+        ValidateProjectionShape(gateM, gateK, intermediateSize, hiddenSize, $"{prefix}.mlp.gate_proj.weight");
+        ValidateProjectionShape(upM, upK, intermediateSize, hiddenSize, $"{prefix}.mlp.up_proj.weight");
+        ValidateProjectionShape(downM, downK, hiddenSize, intermediateSize, $"{prefix}.mlp.down_proj.weight");
+
+        return new TransformerLayerWeights(
+            attnNorm,
+            qPtr, qQt, qM, qK,
+            kPtr, kQt, kM, kK,
+            vPtr, vQt, vM, vK,
+            oPtr, oQt, oM, oK,
+            ffnNorm,
+            gatePtr, gateQt, gateM, gateK,
+            upPtr, upQt, upM, upK,
+            downPtr, downQt, downM, downK,
+            qBias: null, kBias: null, vBias: null, oBias: null,
+            gateBias: null, upBias: null, downBias: null,
+            qNormWeight: null, kNormWeight: null,
+            moe: null,
+            mla: null,
+            postAttnNormWeight: null, postFfnNormWeight: null,
+            gemma4: null,
+            attnSubNormWeight: attnSubNorm, ffnSubNormWeight: ffnSubNorm);
+    }
+
+    /// <summary>
+    /// Resolves a rank-2 projection weight and quantizes it to ternary
+    /// <see cref="QuantizationType.I2_S"/> for BitNet. The source tensor is
+    /// first upcast to F32 (BF16/F16 → owned scratch, F32 → zero-copy mmap),
+    /// then <see cref="DotLLM.Cpu.Kernels.BitNetQuantize.QuantizeToI2S"/>
+    /// packs it into a fresh 64-byte-aligned buffer of
+    /// <c>m*k/4 + sizeof(float)</c> bytes (registered in
+    /// <paramref name="owned"/>). Any temporary F32 upcast buffer is freed
+    /// once the packed I2_S buffer exists. The element count (<c>m*k</c>) must
+    /// be a multiple of 128 — always true for real BitNet dims.
+    /// </summary>
+    private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsI2S(
+        ISafetensorsTensorSource file, string name, List<nint> owned)
+    {
+        // Upcast to F32 first (temporary — freed below once packed).
+        var temp = new List<nint>();
+        var (f32Ptr, _, m, k) = ResolveLinearAsF32(file, name, temp);
+        try
+        {
+            long count = (long)m * k;
+            if (count % 128 != 0)
+                throw new InvalidDataException(
+                    $"BitNet linear '{name}' element count {count} (shape [{m},{k}]) is not a "
+                    + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
+
+            long packedBytes = count / 4;
+            nuint destBytes = checked((nuint)(packedBytes + sizeof(float)));
+            nint dst = (nint)NativeMemory.AlignedAlloc(destBytes, 64);
+            owned.Add(dst);
+
+            BitNetQuantize.QuantizeToI2S(
+                new ReadOnlySpan<float>((void*)f32Ptr, checked((int)count)),
+                count,
+                new Span<byte>((void*)dst, checked((int)destBytes)));
+
+            return (dst, QuantizationType.I2_S, m, k);
+        }
+        finally
+        {
+            // Free any temporary F32 upcast scratch (BF16/F16 source). An F32
+            // source is a zero-copy mmap view and won't be in `temp`.
+            foreach (var p in temp)
+                NativeMemory.AlignedFree((void*)p);
+        }
     }
 
     /// <summary>

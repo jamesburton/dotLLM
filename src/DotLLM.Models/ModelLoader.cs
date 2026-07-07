@@ -127,6 +127,13 @@ public static class ModelLoader
                     or Architecture.SmolLM3
                     or Architecture.Gemma3 or Architecture.Gemma4
                     or Architecture.DiffusionGemma
+                    // BitNet b1.58 reuses the standard TransformerModel tower: the
+                    // safetensors loader quantizes each linear projection to ternary
+                    // I2_S (BitNetQuantize) and wires the attention/FFN Sub-LN weights,
+                    // while the forward pass honours the squared-ReLU FFN + Sub-LN from
+                    // the ModelConfig (ActivationFunction.ReluSquared + the Sub-LN
+                    // weights being present) — exactly as the GGUF BitNet path does.
+                    or Architecture.BitNet
                     // DiffusionGemma reuses the Gemma-4 MoE transformer tower verbatim
                     // (same forward path, same safetensors loader). The diffusion decode
                     // seam is NOT a model concern — it lives in DiffusionTextGenerator,
@@ -138,7 +145,7 @@ public static class ModelLoader
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, DiffusionGemma, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, DiffusionGemma, BitNet, Mamba3."),
             };
 
             return (model, source, config);
