@@ -156,6 +156,17 @@ public record ModelConfig
     /// </summary>
     public DiffusionConfig? DiffusionConfig { get; init; }
 
+    /// <summary>
+    /// Per-Layer Embeddings (PLE) configuration for the Gemma-4 dense text tower
+    /// (<c>gemma4_text</c>, e.g. E2B/E4B). Non-null only when the checkpoint ships the
+    /// PLE tables (<c>embed_tokens_per_layer</c> + <c>per_layer_model_projection</c> +
+    /// the per-layer gate/projection/norm). When set, the forward pass computes the
+    /// per-layer input tensor once after the embedding lookup and injects a gated
+    /// residual into every decoder layer's output. Null for every other architecture
+    /// (including the Gemma-4 MoE backbone and Gemma 3) — those paths are unaffected.
+    /// </summary>
+    public PerLayerEmbeddingConfig? PerLayerEmbedding { get; init; }
+
     /// <summary>Jinja2 chat template from model metadata. Null if not present.</summary>
     public string? ChatTemplate { get; init; }
 

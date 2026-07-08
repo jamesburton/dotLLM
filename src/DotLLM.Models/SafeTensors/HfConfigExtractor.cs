@@ -60,7 +60,10 @@ public static class HfConfigExtractor
         // = gemma3). Hoist the text sub-object so every field lookup below sees the
         // text-tower shape. Text-only checkpoints (model_type = gemma3_text) have no
         // wrapper.
-        if (architecture == Architecture.Gemma3
+        // Gemma 4 (Gemma4ForConditionalGeneration) is likewise multimodal: model_type
+        // = gemma4 at the top level with the text tower under `text_config` (model_type
+        // = gemma4_text). Hoist for both Gemma 3 and Gemma 4.
+        if (architecture is Architecture.Gemma3 or Architecture.Gemma4
             && root.TryGetProperty("text_config", out var textCfg)
             && textCfg.ValueKind == JsonValueKind.Object)
         {
@@ -113,9 +116,10 @@ public static class HfConfigExtractor
         // BitNet b1.58 uses the squared-ReLU FFN (relu2), mirroring the GGUF path.
         if (architecture == Architecture.BitNet)
             activation = ActivationFunction.ReluSquared;
-        if (architecture == Architecture.Gemma3)
+        if (architecture is Architecture.Gemma3 or Architecture.Gemma4)
         {
             // Default sliding_window for Gemma3 if not specified (HF default is 4096).
+            // Gemma 4 E2B ships an explicit 512, so this default is not hit there.
             if (slidingWindow is null)
                 slidingWindow = 4096;
 
@@ -200,6 +204,24 @@ public static class HfConfigExtractor
         // shared-expert PoC only — multi-shared is a follow-up).
         MoeConfig? moe = ExtractMoeConfig(root, intermediateSize, numLayers, architecture);
 
+        // Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B). Present
+        // when the text config carries `hidden_size_per_layer_input`. The auxiliary
+        // per-layer embedding table (`embed_tokens_per_layer`) and its projection are
+        // loaded/injected by the forward pass. Absent on the Gemma-4 MoE backbone,
+        // Gemma 3, and every other architecture (stays null → no PLE).
+        PerLayerEmbeddingConfig? perLayerEmbedding = null;
+        if (architecture == Architecture.Gemma4
+            && root.TryGetProperty("hidden_size_per_layer_input", out var hsPle)
+            && hsPle.ValueKind == JsonValueKind.Number
+            && hsPle.GetInt32() > 0)
+        {
+            perLayerEmbedding = new PerLayerEmbeddingConfig
+            {
+                PerLayerDim = hsPle.GetInt32(),
+                VocabSize = GetInt32OrDefault(root, "vocab_size_per_layer_input", vocabSize),
+            };
+        }
+
         // Dense-path YaRN scaling. MLA handles its own rope_scaling extraction
         // above (carried inside MlaConfig); for non-MLA architectures we surface
         // YaRN into RoPEConfig so TransformerModel can rebuild the cos/sin
@@ -255,11 +277,12 @@ public static class HfConfigExtractor
             // Gemma scales input embeddings by sqrt(hidden_size) (HF
             // Gemma3TextScaledWordEmbedding). Null for every other architecture
             // so the forward-path multiply is a no-op there.
-            EmbeddingScale = architecture == Architecture.Gemma3
+            EmbeddingScale = architecture is Architecture.Gemma3 or Architecture.Gemma4
                 ? MathF.Sqrt(hiddenSize)
                 : null,
             MlaConfig = mla,
             Moe = moe,
+            PerLayerEmbedding = perLayerEmbedding,
             ChatTemplate = null,
             NoRopeLayers = noRopeLayers,
         };
