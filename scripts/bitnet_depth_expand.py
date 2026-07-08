@@ -185,6 +185,10 @@ def expand_model(model, positions: list[int], near_zero_eps: float = 0.0):
     pos_counts = Counter(positions)
 
     new_layers: list[nn.Module] = []
+    # Track the *final* (post-renumber) indices of the blocks we insert so callers
+    # (e.g. identity_mote.build_identity_mote) know exactly which layers are the
+    # fresh identity blocks vs the original layers. Purely additive book-keeping.
+    inserted_indices: list[int] = []
 
     def make_identity_like(template_layer, layer_idx: int):
         # Construct a brand-new layer of the same class with the right layer_idx, on
@@ -208,6 +212,7 @@ def expand_model(model, positions: list[int], near_zero_eps: float = 0.0):
     next_idx = 0
     n_front = pos_counts.get(-1, 0)
     for _ in range(n_front):
+        inserted_indices.append(len(new_layers))
         new_layers.append(make_identity_like(base_layers[0], next_idx))
         next_idx += 1
 
@@ -217,6 +222,7 @@ def expand_model(model, positions: list[int], near_zero_eps: float = 0.0):
         k = pos_counts.get(orig_i, 0)
         for _ in range(k):
             template = base_layers[min(orig_i, orig_n - 1)]
+            inserted_indices.append(len(new_layers))
             new_layers.append(make_identity_like(template, 0))  # idx fixed below
 
     # Reassign contiguous layer indices everywhere they are cached.
@@ -232,6 +238,8 @@ def expand_model(model, positions: list[int], near_zero_eps: float = 0.0):
         "inserted": len(new_layers) - orig_n,
         "final_layers": len(new_layers),
         "insert_after_original_idx": sorted(positions),
+        # Final (post-renumber) indices of the inserted identity blocks.
+        "inserted_indices": inserted_indices,
     }
     return model, info
 
