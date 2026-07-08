@@ -106,11 +106,19 @@ def reconstruct_model(base_model, cfg: dict, adapter_state: Optional[dict]):
     at = cfg.get("at")
     if at is not None and isinstance(at, str):
         at = [int(x) for x in at.split(",") if x.strip()]
-    if every is None and at is None:
-        # Fall back: derive positions from the recorded inserted count if needed.
-        every = 1
-    n_layers_before = cfg.get("layers_before", base_model.config.num_hidden_layers)
-    positions = bde.plan_insertions(n_layers_before, every=every, at=at)
+    recorded = cfg.get("inserted_indices")
+    if every is None and at is None and recorded:
+        # The trainer records only the FINAL (post-renumber) inserted indices, not the
+        # every/at knob (see identity_mote_train.py). Recover the original-space LLaMA-Pro
+        # positions from them directly so any recorded run round-trips, instead of guessing.
+        # For sorted final indices I_0<..<I_{m-1}, block k sits at final index I_k with k
+        # inserted blocks before it, so it was inserted after original layer (I_k - k - 1).
+        positions = [int(idx) - k - 1 for k, idx in enumerate(sorted(recorded))]
+    else:
+        if every is None and at is None:
+            every = 1  # last-resort default (no inserted_indices recorded)
+        n_layers_before = cfg.get("layers_before", base_model.config.num_hidden_layers)
+        positions = bde.plan_insertions(n_layers_before, every=every, at=at)
     model, info = bde.expand_model(base_model, positions)
 
     inserted_indices = cfg.get("inserted_indices") or info["inserted_indices"]
@@ -241,8 +249,16 @@ def export_to_dotllm(model, cfg: dict, inserted_indices: list[int], out_dir: str
     # in their NATIVE dtype (bf16 for the real BitNet checkpoint — so the export is
     # lossless; f32 for the tiny self-test). dotLLM's BitNet loader upcasts to f32
     # then ternary-quantizes regardless, so any of bf16/f16/f32 source is accepted.
+    # Tied embeddings: BitNet ships tie_word_embeddings, so lm_head.weight shares storage
+    # with embed_tokens.weight. safetensors' save_file rejects shared storage, and dotLLM
+    # re-ties from the config flag (see the synthetic BitNet load test), so we emit the
+    # embedding once and skip the aliased lm_head.weight. Cloning to break the alias would
+    # transiently double the whole model in RAM — avoided deliberately (memory-frugal export).
+    tied = bool(getattr(model.config, "tie_word_embeddings", False))
     tensors: dict[str, torch.Tensor] = {}
     for name, p in model.state_dict().items():
+        if tied and name == "lm_head.weight":
+            continue
         export = _export_name(name)
         t = p.detach().contiguous().cpu()
         tensors[export] = t
