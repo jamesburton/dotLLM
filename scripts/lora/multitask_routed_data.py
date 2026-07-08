@@ -6,12 +6,16 @@ Emits ``(token_ids[seq_len], routing_label)`` pairs where ``routing_label`` is a
 integer expert index used by the SUPERVISED routing loss in
 ``identity_mote_train.py``. Each capability's data is tagged with its own label so
 the router is trained to send that requirement's data to ITS OWN expert
-(math→expert 1, instruction→expert 2, …). Label 0 is RESERVED for the
-identity/skip expert and is never emitted here (general/OOD tokens fall back to it
-at inference).
+(math→expert 1, instruction→expert 2, …). Label 0 is the identity/skip expert:
+the ``general``/``web`` capability maps to it so a general-web slice trains the
+router to send ordinary text to the frozen skip expert (== unchanged base
+output), exercising the no-regression default during training.
 
-Capabilities (label = position in the selected list, starting at 1)
--------------------------------------------------------------------
+Capabilities (non-general caps get labels 1..K; general/web -> 0)
+-----------------------------------------------------------------
+  * ``general``     — HuggingFaceFW/fineweb-edu sample (streaming; label 0 → skip
+                      expert). NOT cached offline — streamed on demand, skipped
+                      with a message if unreachable.
   * ``math``        — openai/gsm8k ``main`` train, chain-of-thought format
                       ``"Question: {q}\nAnswer: {answer_with_CoT ending in #### N}"``.
                       (Cached locally.)
@@ -45,6 +49,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Optional
 
 import torch
 
@@ -59,8 +64,27 @@ from capability_data import (  # noqa: E402  (local import after sys.path tweak)
 # Default capability order (labels 1..K assigned in this order among those selected).
 DEFAULT_CAPABILITIES = ["math", "instruction", "tooluse"]
 
+# Capabilities that map to the RESERVED skip/identity expert (label 0). General
+# web text has no dedicated expert — routing it to expert 0 (frozen down_proj==0)
+# trains the router to leave base behaviour untouched for non-specialist text,
+# so the no-regression default is actually EXERCISED during training.
+GENERAL_CAPS = {"general", "web"}
+
 # Track which HF dataset id was actually used, per capability (for reporting).
 DATASET_USED: dict[str, str] = {}
+
+
+def _assign_labels(caps_in_order: list[str]) -> dict:
+    """Assign routing labels: general/web -> 0 (skip expert), others -> 1..K in order."""
+    label_map: dict[str, int] = {}
+    next_label = 1
+    for cap in caps_in_order:
+        if cap in GENERAL_CAPS:
+            label_map[cap] = 0
+        else:
+            label_map[cap] = next_label
+            next_label += 1
+    return label_map
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +140,48 @@ def _load_coding(tokenizer, n_seqs: int, seq_len: int, needed: int) -> list:
     return _ids_to_sequences(all_ids, n_seqs, seq_len, label)
 
 
+def _load_general_web(tokenizer, n_seqs: int, seq_len: int, needed: int) -> list:
+    """General-web sequences (label 0 → skip/identity expert).
+
+    Streams a general-web corpus (``HuggingFaceFW/fineweb-edu`` sample) so nothing
+    large downloads. These sequences carry routing label 0, training the router to
+    dispatch ordinary text to the frozen skip expert (== unchanged base output).
+    Gracefully returns [] (with a message) if the source is unreachable / offline.
+    """
+    from datasets import load_dataset
+
+    label = "general"
+    all_ids: list[int] = []
+    # (dataset id, config-name) candidates — first that streams wins.
+    candidates = [
+        ("HuggingFaceFW/fineweb-edu", "sample-10BT"),
+        ("HuggingFaceFW/fineweb-edu", "CC-MAIN-2024-10"),
+        ("HuggingFaceFW/fineweb", "sample-10BT"),
+    ]
+    for ds_id, cfg in candidates:
+        try:
+            ds = load_dataset(ds_id, name=cfg, split="train", streaming=True)
+
+            def _extract(row: dict) -> str:
+                return row.get("text", "") or row.get("content", "") or ""
+
+            all_ids = _collect_ids(ds, _extract, tokenizer, needed, label)
+            if all_ids:
+                DATASET_USED[label] = f"{ds_id} ({cfg}) train (streaming; label 0 = skip expert)"
+                break
+        except Exception as exc:  # noqa: BLE001
+            print(f"[multitask:general] {ds_id} ({cfg}) unavailable ({exc})")
+    if not all_ids:
+        print("[multitask:general] no general-web source reachable — capability SKIPPED")
+    return _ids_to_sequences(all_ids, n_seqs, seq_len, label)
+
+
 def _load_one_capability(cap: str, tokenizer, n_seqs: int, seq_len: int) -> list:
     """Dispatch to the right loader; returns list of Tensor[seq_len] (may be empty)."""
     needed = n_seqs * seq_len + seq_len
     try:
+        if cap in GENERAL_CAPS:
+            return _load_general_web(tokenizer, n_seqs, seq_len, needed)
         if cap == "math":
             return _load_math_gsm8k(tokenizer, n_seqs, seq_len, needed)
         if cap == "coding":
@@ -149,35 +211,46 @@ def build_routed_corpus(
     vocab_size: int = 32000,
     interleave: bool = True,
     seed: int = 0,
+    balance: bool = False,
+    balance_target: Optional[int] = None,
 ) -> tuple[list, list, dict]:
     """Build a task-labeled multi-task corpus.
 
     Args:
         tokenizer: HF tokenizer (ignored in ``tiny_random`` mode).
-        capabilities: ordered capability names; labels assigned 1..K over the
-            capabilities that actually load (0 reserved for identity/skip).
+        capabilities: ordered capability names; ``general``/``web`` map to label 0
+            (the skip/identity expert), other caps get labels 1..K in requested
+            order over the capabilities that actually load.
         n_seqs_per_cap: sequences to draw per capability.
         seq_len: tokens per sequence.
         tiny_random: synthetic random ids + labels, no downloads (smoke/CI).
         vocab_size: for ``tiny_random`` id sampling.
         interleave: round-robin capabilities so batches see mixed labels.
         seed: RNG seed for tiny_random / shuffling.
+        balance: oversample under-represented caps (and cap over-represented ones)
+            to ``balance_target`` so every label contributes equally — fixes the
+            starvation of small caps (e.g. no_robots @ 544 vs math/coding @ 4000).
+        balance_target: per-capability target count when ``balance`` is set;
+            defaults to the max loaded count across capabilities.
 
     Returns:
         ``(sequences, labels, label_map)`` where ``sequences[i]`` is a
         ``Tensor[seq_len]`` int64, ``labels[i]`` is its integer routing label
-        (>=1), and ``label_map`` maps capability name → label int.
+        (>=0; 0 == skip expert for general text), and ``label_map`` maps
+        capability name → label int.
     """
     g = torch.Generator().manual_seed(seed)
 
     if tiny_random:
-        label_map = {cap: i + 1 for i, cap in enumerate(capabilities)}
+        label_map = _assign_labels(capabilities)
         per_cap: dict[str, list] = {}
         for cap in capabilities:
             per_cap[cap] = [
                 torch.randint(0, vocab_size, (seq_len,), generator=g)
                 for _ in range(n_seqs_per_cap)
             ]
+        if balance:
+            per_cap = _balance(per_cap, balance_target, g)
         return _assemble(per_cap, label_map, interleave, g)
 
     # Real data: load each capability; compact label map over those that loaded.
@@ -195,11 +268,44 @@ def build_routed_corpus(
             "or use --tiny-random for a smoke test."
         )
 
-    # Labels are assigned in the ORIGINAL requested order among the loaded caps.
-    label_map = {
-        cap: i + 1 for i, cap in enumerate([c for c in capabilities if c in loaded])
-    }
+    if balance:
+        loaded = _balance(loaded, balance_target, g)
+
+    # Labels are assigned in the ORIGINAL requested order among the loaded caps
+    # (general/web -> 0, the rest -> 1..K).
+    label_map = _assign_labels([c for c in capabilities if c in loaded])
     return _assemble(loaded, label_map, interleave, g)
+
+
+def _balance(per_cap: dict, balance_target: Optional[int], g) -> dict:
+    """Equalize per-capability sequence counts to ``balance_target`` (or the max).
+
+    Under-represented caps are OVERSAMPLED by cycling through a reshuffled copy of
+    their sequences; over-represented caps are DOWN-SAMPLED to the target. This
+    stops a small cap (no_robots @ 544) from exhausting early and being dropped by
+    late training batches, and stops a large cap from dominating the router.
+    """
+    counts = {c: len(s) for c, s in per_cap.items() if s}
+    if not counts:
+        return per_cap
+    target = balance_target if balance_target and balance_target > 0 else max(counts.values())
+    out: dict[str, list] = {}
+    for cap, seqs in per_cap.items():
+        n = len(seqs)
+        if n == 0:
+            out[cap] = seqs
+            continue
+        if n >= target:
+            perm = torch.randperm(n, generator=g).tolist()[:target]
+            out[cap] = [seqs[i] for i in perm]
+        else:
+            idxs: list[int] = []
+            while len(idxs) < target:
+                idxs.extend(torch.randperm(n, generator=g).tolist())
+            out[cap] = [seqs[i] for i in idxs[:target]]
+        if len(out[cap]) != n:
+            print(f"[multitask:balance] {cap}: {n} -> {len(out[cap])} seqs (target {target})")
+    return out
 
 
 def _assemble(per_cap: dict, label_map: dict, interleave: bool, g) -> tuple:
@@ -254,6 +360,10 @@ def main() -> None:
     ap.add_argument("--seq-len", type=int, default=256, help="Tokens per sequence.")
     ap.add_argument("--tiny-random", action="store_true",
                     help="Synthetic ids + labels, no downloads.")
+    ap.add_argument("--balance", action="store_true",
+                    help="Equalize per-capability counts (oversample small caps).")
+    ap.add_argument("--balance-target", type=int, default=None,
+                    help="Per-capability target count for --balance (default: max loaded).")
     args = ap.parse_args()
 
     caps = [c.strip() for c in args.capabilities.split(",") if c.strip()]
@@ -270,6 +380,8 @@ def main() -> None:
         n_seqs_per_cap=args.n_seqs,
         seq_len=args.seq_len,
         tiny_random=args.tiny_random,
+        balance=args.balance,
+        balance_target=args.balance_target,
     )
 
     print(f"\n[multitask] label_map = {label_map}")
@@ -282,7 +394,12 @@ def main() -> None:
     for cap, lbl in label_map.items():
         print(f"[multitask]   {cap:12s} -> label {lbl}   dataset: {DATASET_USED.get(cap, '(tiny_random)')}")
     assert shapes_ok, "shape check failed"
-    assert all(l >= 1 for l in labels), "labels must be >= 1 (0 reserved for skip)"
+    assert all(l >= 0 for l in labels), "labels must be >= 0"
+    has_general = any(c in GENERAL_CAPS for c in label_map)
+    if has_general:
+        assert 0 in labels, "general/web capability present but label 0 never emitted"
+        assert all(label_map[c] == 0 for c in label_map if c in GENERAL_CAPS), \
+            "general/web must map to label 0 (skip expert)"
     print("\n[multitask] smoke-test PASSED")
 
 
