@@ -360,6 +360,18 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static CudaTransformerModel LoadFromSafetensors(ISafetensorsTensorSource file,
                                                               ModelConfig config,
                                                               int deviceId = 0, string? ptxDir = null)
+        => LoadFromSafetensors(file, config, deviceId, ptxDir, i2sCache: null);
+
+    /// <summary>
+    /// Safetensors CUDA load with an optional BitNet I2_S weight cache. The cache is consumed by
+    /// the shared CPU weight-production path (<see cref="TransformerWeightsSafetensorsLoader"/>)
+    /// before the resulting ternary-packed tensors are uploaded to the GPU, so repeated BitNet
+    /// loads skip the online bf16→I2_S quantization on CUDA just as on CPU.
+    /// </summary>
+    internal static CudaTransformerModel LoadFromSafetensors(ISafetensorsTensorSource file,
+                                                              ModelConfig config,
+                                                              int deviceId, string? ptxDir,
+                                                              BitNetI2SCacheContext? i2sCache)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -369,7 +381,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // concern, not a GPU one) — CudaWeights.LoadFromGguf reads the raw tensor
         // pointers and uploads them. The misleading method name stays for now; the
         // underlying flow is source-agnostic.
-        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache);
 
         // VRAM estimate: skip for the safetensors path for now — TransformerWeights
         // doesn't expose per-tensor byte sizes cheaply, and the CPU pre-load above

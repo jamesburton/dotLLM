@@ -33,7 +33,7 @@ public static class CudaModelLoader
     /// specified GPU. Delegates to
     /// <see cref="ModelLoader.OpenSafetensorsAndConfig"/> for source+config
     /// resolution, then uploads through
-    /// <see cref="CudaTransformerModel.LoadFromSafetensors"/>. Covers the same
+    /// <c>CudaTransformerModel.LoadFromSafetensors</c>. Covers the same
     /// Transformer-family architectures as the CPU safetensors loader; Mamba3
     /// is not supported on CUDA and throws <see cref="NotSupportedException"/>.
     /// </summary>
@@ -52,7 +52,8 @@ public static class CudaModelLoader
                     "CUDA loader does not yet support Mamba3. Use the CPU safetensors loader "
                     + "(ModelLoader.LoadFromSafetensors) or the GGUF path.");
 
-            var model = CudaTransformerModel.LoadFromSafetensors(source, config, deviceId, ptxDir);
+            var i2sCache = ModelLoader.TryCreateBitNetI2SCache(path, config);
+            var model = CudaTransformerModel.LoadFromSafetensors(source, config, deviceId, ptxDir, i2sCache);
             return (model, source, config);
         }
         catch

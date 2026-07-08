@@ -117,6 +117,11 @@ public static class ModelLoader
 
         (ISafetensorsTensorSource source, ModelConfig config) = OpenSafetensorsAndConfig(safetensorsPath);
 
+        // BitNet checkpoints quantize every linear to ternary I2_S at load; an on-disk cache of
+        // the packed bytes lets repeat loads skip that dominant cost. Null for non-BitNet archs,
+        // when disabled via DOTLLM_I2S_CACHE=0, or when the cache dir is not writable.
+        BitNetI2SCacheContext? i2sCache = TryCreateBitNetI2SCache(safetensorsPath, config);
+
         try
         {
             IModel model = config.Architecture switch
@@ -140,7 +145,7 @@ public static class ModelLoader
                     // which consumes this IModel + ModelConfig.DiffusionConfig (populated
                     // by DiffusionGemmaConfigExtractor). The model exposes the hybrid-mask
                     // canvas Forward (PR-3) the generator drives, so no wrapper is needed.
-                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
@@ -238,6 +243,55 @@ public static class ModelLoader
         {
             source.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Builds a <see cref="BitNetI2SCacheContext"/> for a BitNet checkpoint so repeated loads
+    /// reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in
+    /// a hidden <c>.dotllm-i2s-cache</c> folder beside the checkpoint and is keyed on the
+    /// <c>config.json</c> bytes, the safetensors shard manifest (name + length), and the packer
+    /// version — so a changed checkpoint or packer never reuses stale entries. Returns
+    /// <c>null</c> (caching off) when the architecture is not BitNet, the environment sets
+    /// <c>DOTLLM_I2S_CACHE=0</c>, or the cache directory cannot be created (e.g. a read-only
+    /// checkpoint mount).
+    /// </summary>
+    internal static BitNetI2SCacheContext? TryCreateBitNetI2SCache(string safetensorsPath, ModelConfig config)
+    {
+        if (config.Architecture is not Architecture.BitNet)
+            return null;
+        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_I2S_CACHE"), "0", StringComparison.Ordinal))
+            return null;
+
+        try
+        {
+            string weightsDir = Directory.Exists(safetensorsPath)
+                ? safetensorsPath
+                : Path.GetDirectoryName(Path.GetFullPath(safetensorsPath)) ?? safetensorsPath;
+
+            string configPath = Path.Combine(weightsDir, "config.json");
+            if (!File.Exists(configPath))
+                return null;
+
+            byte[] configBytes = File.ReadAllBytes(configPath);
+            var shards = new DirectoryInfo(weightsDir)
+                .GetFiles("*.safetensors")
+                .OrderBy(f => f.Name, StringComparer.Ordinal)
+                .Select(f => (f.Name, f.Length))
+                .ToArray();
+            if (shards.Length == 0)
+                return null;
+
+            string modelKey = BitNetI2SCache.ComputeModelKey(configBytes, shards, BitNetI2SCache.QuantizerVersion);
+            string cacheDir = Path.Combine(weightsDir, ".dotllm-i2s-cache");
+            Directory.CreateDirectory(cacheDir); // probes writability; throws → caught → cache off
+
+            return new BitNetI2SCacheContext(cacheDir, modelKey);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Any filesystem obstacle disables caching rather than failing the load.
+            return null;
         }
     }
 
