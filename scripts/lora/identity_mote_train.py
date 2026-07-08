@@ -124,21 +124,31 @@ def _freeze_for_training(model: nn.Module, train_inserted_attn: bool) -> None:
 
 
 def _supervised_route_loss(
-    model: nn.Module, label: int, device: torch.device
+    model: nn.Module, labels, device: torch.device
 ) -> torch.Tensor:
-    """Mean over identity-MoTE layers of CE(router_logits, task_label).
+    """Mean over identity-MoTE layers of per-token CE(router_logits, task_label).
 
-    ``label`` is the per-sequence routing target, broadcast to every token. In-graph.
+    ``labels`` is a sequence of ``B`` per-sequence routing targets (one per sequence
+    in the micro-batch). The router runs per-token, so ``block.last_logits`` is
+    ``[B*T, E]`` in **sequence-major** order (row ``n`` is token ``n % T`` of
+    sequence ``n // T``). Each sequence's label is therefore broadcast to its ``T``
+    tokens via ``repeat_interleave(T)``, so a batch that mixes labels aligns cleanly:
+    token ``n`` is supervised toward ``labels[n // T]``. In-graph.
+
+    For ``B == 1`` this reduces to the original behaviour (the single label broadcast
+    to all ``T`` tokens).
     """
+    labels_t = torch.as_tensor([int(x) for x in labels], dtype=torch.long)
+    B = labels_t.numel()
     total: Optional[torch.Tensor] = None
     n = 0
     for block in _iter_mote_blocks(model):
         logits = block.last_logits
         if logits is None:
             continue
-        target = torch.full(
-            (logits.size(0),), int(label), dtype=torch.long, device=logits.device
-        )
+        # Recover T from the flattened [B*T, E] router logits (B known from labels).
+        T = logits.size(0) // B
+        target = labels_t.to(logits.device).repeat_interleave(T)  # [B*T]
         ce = F.cross_entropy(logits.float(), target)
         total = ce if total is None else total + ce
         n += 1
@@ -232,10 +242,21 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-4, help="Expert LR.")
     ap.add_argument("--router-lr", type=float, default=1e-3,
                     help="Router LR (higher: the router is tiny and must move logits fast).")
-    ap.add_argument("--optim", choices=["adamw", "adafactor", "adamw8bit"], default="adamw",
-                    help="Optimizer (adamw default; adamw8bit tries bnb w/ adafactor fallback).")
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="Micro-batch: sequences stacked per optimizer step ([B, seq_len]). "
+                         "Default 1 preserves the original per-sequence path. The LM loss is the "
+                         "batch mean; the supervised routing CE stays per-sequence (each sequence's "
+                         "label is broadcast to its own tokens, so a batch may mix labels).")
+    ap.add_argument("--optim", choices=["adamw", "adamw-fused", "adafactor", "adamw8bit"],
+                    default="adamw",
+                    help="Optimizer. 'adamw' (default) AUTO-USES fused AdamW on CUDA — the fast "
+                         "path on memory-rich GPUs (Strix); 'adamw-fused' forces it (both fall "
+                         "back to foreach/default if fused is unavailable). 'adafactor' is the "
+                         "memory-light path (12GB 3060). 'adamw8bit' tries bitsandbytes w/ "
+                         "adafactor fallback.")
     ap.add_argument("--grad-checkpoint", action="store_true",
-                    help="Gradient checkpointing (activation recompute) — for the 12GB 3060.")
+                    help="Gradient checkpointing (activation recompute) — for the 12GB 3060. "
+                         "OMIT on memory-rich GPUs (Strix) for ~25-35%% speedup (it is opt-in).")
     ap.add_argument("--verify-identity", action="store_true", default=True,
                     help="Verify identity-at-init vs base before training (default on).")
     ap.add_argument("--no-verify-identity", dest="verify_identity", action="store_false")
@@ -405,6 +426,7 @@ def main() -> None:
     # 8. Training loop
     # ------------------------------------------------------------------
     model.train()
+    B = max(1, int(args.batch_size))
     max_tokens = int(args.tokens) if args.tokens and args.tokens > 0 else None
     max_steps = args.steps if args.steps and args.steps > 0 else None
     tokens_seen = 0
@@ -420,20 +442,22 @@ def main() -> None:
         if max_tokens is not None and tokens_seen >= max_tokens:
             return False
         if max_steps is None and max_tokens is None:
-            return step < len(sequences)  # one pass
+            return step * B < len(sequences)  # one pass (B sequences per step)
         return True
 
     while _budget_left():
-        idx = order[step % len(order)]
-        seq = sequences[idx].unsqueeze(0).to(device)  # [1, T]
-        label = labels[idx]
+        # Micro-batch of B sequences (wraps around the corpus); each carries its own
+        # per-sequence routing label, so the batch may mix labels.
+        batch_idx = [order[(step * B + j) % len(order)] for j in range(B)]
+        seqs = torch.stack([sequences[i] for i in batch_idx]).to(device)  # [B, T]
+        batch_labels = [labels[i] for i in batch_idx]
 
-        logits = model(input_ids=seq, use_cache=False).logits  # [1, T, V]
-        lm_loss = F.cross_entropy(
+        logits = model(input_ids=seqs, use_cache=False).logits  # [B, T, V]
+        lm_loss = F.cross_entropy(  # mean over all next-token positions == batch mean
             logits[:, :-1, :].contiguous().view(-1, vocab_size),
-            seq[:, 1:].contiguous().view(-1),
+            seqs[:, 1:].contiguous().view(-1),
         )
-        route_loss = _supervised_route_loss(model, label, device)
+        route_loss = _supervised_route_loss(model, batch_labels, device)
         loss = lm_loss + args.route_weight * route_loss
 
         lm_val = lm_loss.item()
@@ -446,17 +470,22 @@ def main() -> None:
         opt.step()
         opt.zero_grad()
 
+        # Per-step dispatch histogram: last_counts already sums over ALL B*T tokens
+        # in every mote block, so it is meaningful for a batch as-is.
         counts = _collect_counts(model)
         if counts is not None:
             recent_counts.append(counts.cpu())
             if len(recent_counts) > 100:
                 recent_counts.pop(0)
 
-        tokens_seen += seq.size(1)
+        tokens_seen += seqs.numel()  # B * T
         step += 1
         final_lm, final_route = lm_val, route_val
         if step <= 5 or step % 20 == 0:
-            print(f"  step {step:5d}  tok {tokens_seen:.2e}  label {label}  "
+            # Compact per-label multiplicity for the batch (sensible when B > 1).
+            lbl_counts = {l: batch_labels.count(l) for l in sorted(set(batch_labels))}
+            lbl_str = str(batch_labels[0]) if B == 1 else str(lbl_counts)
+            print(f"  step {step:5d}  tok {tokens_seen:.2e}  labels {lbl_str}  "
                   f"lm {lm_val:.4f}  route {route_val:.4f}", flush=True)
 
     elapsed = time.perf_counter() - _t0
@@ -485,6 +514,8 @@ def main() -> None:
         "layers_before": n_layers_before,
         "layers_after": info["final_layers"],
         "seq_len": args.seq_len,
+        "batch_size": B,
+        "optim": args.optim,
         "steps": step,
         "tokens": tokens_seen,
         "route_weight": args.route_weight,
@@ -519,6 +550,29 @@ def main() -> None:
     print("[idm] GATE PASSED")
 
 
+def _build_adamw(param_groups, lr: float, device: torch.device, prefer_fused: bool):
+    """torch.optim.AdamW with the fused CUDA kernel when available.
+
+    Fused AdamW (``fused=True``) is a single-kernel foreach optimizer that is the
+    fast path on memory-rich GPUs (e.g. Strix). It is CUDA-only; on CPU or when the
+    build lacks it we fall back to ``foreach=True`` and then to the default impl.
+    """
+    kwargs = dict(betas=(0.9, 0.95), weight_decay=0.0)
+    if prefer_fused and device.type == "cuda":
+        try:
+            opt = torch.optim.AdamW(param_groups, lr=lr, fused=True, **kwargs)
+            print("[idm] optimizer: AdamW (fused CUDA kernel — fast path on memory-rich GPUs)")
+            return opt
+        except (RuntimeError, ValueError, TypeError) as exc:
+            print(f"[idm] fused AdamW unavailable ({exc}); falling back to foreach/default")
+    try:
+        opt = torch.optim.AdamW(param_groups, lr=lr, foreach=True, **kwargs)
+    except (TypeError, RuntimeError):
+        opt = torch.optim.AdamW(param_groups, lr=lr, **kwargs)
+    print(f"[idm] optimizer: AdamW ({'foreach' if device.type != 'cuda' else 'non-fused'})")
+    return opt
+
+
 def _make_optimizer(choice: str, param_groups, lr: float, device: torch.device):
     if choice == "adafactor":
         from transformers.optimization import Adafactor
@@ -538,7 +592,10 @@ def _make_optimizer(choice: str, param_groups, lr: float, device: torch.device):
             return opt
         except Exception as exc:  # noqa: BLE001
             print(f"[idm] bnb unavailable ({exc}); falling back to AdamW")
-    return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
+    # 'adamw' auto-uses fused on CUDA; 'adamw-fused' forces the same preference
+    # (both degrade to foreach/default off-CUDA or when fused is unavailable).
+    prefer_fused = choice in ("adamw", "adamw-fused")
+    return _build_adamw(param_groups, lr, device, prefer_fused=prefer_fused)
 
 
 if __name__ == "__main__":
