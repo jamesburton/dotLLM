@@ -777,4 +777,62 @@ public sealed class HfConfigExtractorTests
         Assert.Null(cfg.PerLayerSlidingWindow[2]);
         Assert.Equal(128, cfg.PerLayerSlidingWindow[3]);
     }
+
+    /// <summary>
+    /// Gemma-4 E2B (<c>Gemma4ForConditionalGeneration</c>, text tower under
+    /// <c>text_config</c> with <c>model_type=gemma4_text</c>): the dense + PLE shape.
+    /// The extractor must hoist text_config, resolve <see cref="Architecture.Gemma4"/>,
+    /// populate <see cref="Core.Models.ModelConfig.PerLayerEmbedding"/>, set GeGLU-tanh
+    /// activation + the sqrt(hidden) embedding scale, and leave Moe null (dense tower).
+    /// </summary>
+    [Fact]
+    public void Gemma4_E2B_TextTower_DetectsPerLayerEmbeddingsAndDenseGemma()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "intermediate_size": 6144,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "sliding_window": 512,
+                "rms_norm_eps": 1e-6,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "final_logit_softcapping": 30.0,
+                "tie_word_embeddings": true,
+                "enable_moe_block": false,
+                "hidden_size_per_layer_input": 256,
+                "vocab_size_per_layer_input": 262144,
+                "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]
+            }
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma4, cfg.Architecture);
+        Assert.True(cfg.IsGemmaArchitecture);
+        Assert.Equal(1536, cfg.HiddenSize);
+        Assert.Equal(1, cfg.NumKvHeads);                 // MQA
+        Assert.Equal(256, cfg.HeadDim);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(30.0f, cfg.FinalLogitSoftcap);
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Null(cfg.Moe);                            // dense tower
+
+        Assert.NotNull(cfg.PerLayerEmbedding);
+        Assert.Equal(256, cfg.PerLayerEmbedding!.PerLayerDim);
+        Assert.Equal(262144, cfg.PerLayerEmbedding.VocabSize);
+
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(512, cfg.PerLayerSlidingWindow![0]);
+        Assert.Null(cfg.PerLayerSlidingWindow[3]);
+    }
 }

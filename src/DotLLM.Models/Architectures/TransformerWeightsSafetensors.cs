@@ -92,13 +92,45 @@ internal static class TransformerWeightsSafetensorsLoader
                 throw new InvalidDataException(
                     $"lm_head.weight shape [{outM},{outK}] does not match config [vocab={config.VocabSize}, hidden={config.HiddenSize}].");
 
+            // Per-Layer Embeddings (PLE) model-level tables (Gemma-4 dense text tower).
+            PerLayerEmbeddingWeights? pleWeights = null;
+            if (config.PerLayerEmbedding is { } pleCfg)
+            {
+                int lp = config.NumLayers * pleCfg.PerLayerDim;
+                // Big table — keep native quant, gather per token (never upcast wholesale).
+                var (plePtr, plePtrQt, pleM, pleK) = ResolveLinear(file, "model.embed_tokens_per_layer.weight", owned);
+                if (pleM != pleCfg.VocabSize || pleK != lp)
+                    throw new InvalidDataException(
+                        $"model.embed_tokens_per_layer.weight shape [{pleM},{pleK}] does not match "
+                        + $"config [vocab_ple={pleCfg.VocabSize}, numLayers*pleDim={lp}].");
+                // Small projection — F32.
+                var (projPtr, _, projM, projK) = ResolveLinearAsF32(file, "model.per_layer_model_projection.weight", owned);
+                if (projM != lp || projK != config.HiddenSize)
+                    throw new InvalidDataException(
+                        $"model.per_layer_model_projection.weight shape [{projM},{projK}] does not match "
+                        + $"config [numLayers*pleDim={lp}, hidden={config.HiddenSize}].");
+                float[] projNorm = ResolveNorm(file, "model.per_layer_projection_norm.weight", pleCfg.PerLayerDim);
+                GemmaAbsorbOnePlusWeight(projNorm);
+                pleWeights = new PerLayerEmbeddingWeights
+                {
+                    EmbedTokensPerLayer = plePtr,
+                    EmbedTokensPerLayerQt = plePtrQt,
+                    ModelProjection = projPtr,
+                    ProjectionNorm = projNorm,
+                    PerLayerDim = pleCfg.PerLayerDim,
+                    VocabSize = pleCfg.VocabSize,
+                    NumLayers = config.NumLayers,
+                };
+            }
+
             return TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: embPtr, tokenEmbedQt: embQt,
                 vocabSize: config.VocabSize, hiddenSize: config.HiddenSize,
                 layers: layers,
                 outputNormWeight: outputNorm,
                 outputWeight: outPtr, outputQt: outQt, outputM: outM, outputK: outK,
-                ownedAllocations: owned);
+                ownedAllocations: owned,
+                perLayerEmbedding: pleWeights);
         }
         catch
         {
@@ -153,6 +185,23 @@ internal static class TransformerWeightsSafetensorsLoader
         {
             // Post-attention (pre-FFN) RMSNorm — standard two-norm layout.
             ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+        }
+
+        // Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B) only.
+        // Loaded as F32 (small: [pleDim, hidden] and [hidden, pleDim]); the
+        // post-norm is a Gemma RMSNorm so the (1+w) offset is absorbed like every
+        // other Gemma norm. Null/zero for every other architecture.
+        nint pleGate = 0, pleProj = 0;
+        float[]? plePostNorm = null;
+        if (config.PerLayerEmbedding is { } ple)
+        {
+            int pleDim = ple.PerLayerDim;
+            (pleGate, _, int pgM, int pgK) = ResolveLinearAsF32(file, $"{prefix}.per_layer_input_gate.weight", owned);
+            ValidateProjectionShape(pgM, pgK, pleDim, hiddenSize, $"{prefix}.per_layer_input_gate.weight");
+            (pleProj, _, int ppM, int ppK) = ResolveLinearAsF32(file, $"{prefix}.per_layer_projection.weight", owned);
+            ValidateProjectionShape(ppM, ppK, hiddenSize, pleDim, $"{prefix}.per_layer_projection.weight");
+            plePostNorm = ResolveNorm(file, $"{prefix}.post_per_layer_input_norm.weight", hiddenSize);
+            GemmaAbsorbOnePlusWeight(plePostNorm);
         }
 
         // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
@@ -258,7 +307,8 @@ internal static class TransformerWeightsSafetensorsLoader
             qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
             moe: null,
             mla: null,
-            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm);
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm,
+            pleGateWeight: pleGate, pleProjWeight: pleProj, plePostNormWeight: plePostNorm);
     }
 
     /// <summary>

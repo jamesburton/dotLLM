@@ -532,6 +532,19 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly Gemma4LayerWeights? Gemma4;
 
+    // ──────────────────── Per-Layer Embeddings (PLE) ────────────────────
+    // Gemma-4 dense text tower (E2B/E4B) only. Non-zero/non-null iff the model
+    // config carries PerLayerEmbedding. The forward pass, after the MLP residual
+    // add, computes gate→gelu_tanh→(× per-layer input)→proj→post-norm→+residual.
+    // All F32 (upcast at load); dims derive from the config (pleDim / hidden).
+
+    /// <summary>PLE <c>per_layer_input_gate.weight</c> [pleDim, hidden] F32. Zero when absent.</summary>
+    public readonly nint PleGateWeight;
+    /// <summary>PLE <c>per_layer_projection.weight</c> [hidden, pleDim] F32. Zero when absent.</summary>
+    public readonly nint PleProjWeight;
+    /// <summary>PLE <c>post_per_layer_input_norm.weight</c> [hidden] ((1+w) absorbed). Null when absent.</summary>
+    public readonly float[]? PlePostNormWeight;
+
     public TransformerLayerWeights(
         float[] attnNormWeight,
         nint qWeight, QuantizationType qQuantType, int qOutputDim, int qInputDim,
@@ -549,7 +562,8 @@ internal readonly struct TransformerLayerWeights
         MlaLayerWeights? mla = null,
         float[]? postAttnNormWeight = null, float[]? postFfnNormWeight = null,
         Gemma4LayerWeights? gemma4 = null,
-        float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null)
+        float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null,
+        nint pleGateWeight = 0, nint pleProjWeight = 0, float[]? plePostNormWeight = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -569,7 +583,40 @@ internal readonly struct TransformerLayerWeights
         Moe = moe;
         Mla = mla;
         Gemma4 = gemma4;
+        PleGateWeight = pleGateWeight;
+        PleProjWeight = pleProjWeight;
+        PlePostNormWeight = plePostNormWeight;
     }
+}
+
+/// <summary>
+/// Model-level Per-Layer Embeddings (PLE) weight bundle for the Gemma-4 dense text
+/// tower (E2B/E4B). Non-null on <see cref="TransformerWeights.PerLayerEmbedding"/>
+/// only when the checkpoint ships the PLE tables. The per-layer gate/projection/norm
+/// live on <see cref="TransformerLayerWeights"/>; this holds the two model-level
+/// tensors used once per forward to build the per-layer input tensor.
+/// </summary>
+internal sealed class PerLayerEmbeddingWeights
+{
+    /// <summary><c>embed_tokens_per_layer.weight</c> pointer [vocabPle, numLayers*pleDim].
+    /// Kept at its native quant type + gathered per token (the full table is huge —
+    /// never upcast wholesale).</summary>
+    public required nint EmbedTokensPerLayer { get; init; }
+    /// <summary>Quant type of <see cref="EmbedTokensPerLayer"/>.</summary>
+    public required QuantizationType EmbedTokensPerLayerQt { get; init; }
+
+    /// <summary><c>per_layer_model_projection.weight</c> [numLayers*pleDim, hidden] F32.</summary>
+    public required nint ModelProjection { get; init; }
+
+    /// <summary><c>per_layer_projection_norm.weight</c> [pleDim] ((1+w) absorbed).</summary>
+    public required float[] ProjectionNorm { get; init; }
+
+    /// <summary>Per-layer embedding dimension (<c>hidden_size_per_layer_input</c>).</summary>
+    public required int PerLayerDim { get; init; }
+    /// <summary>Per-layer embedding vocabulary (<c>vocab_size_per_layer_input</c>).</summary>
+    public required int VocabSize { get; init; }
+    /// <summary>Number of decoder layers (row width of the PLE table = NumLayers*PerLayerDim).</summary>
+    public required int NumLayers { get; init; }
 }
 
 /// <summary>
@@ -743,6 +790,16 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     public Gemma4SelfCondWeights? SelfCond { get; }
 
+    /// <summary>
+    /// Model-level Per-Layer Embeddings (PLE) weights (Gemma-4 dense text tower,
+    /// E2B/E4B). Non-null only when the checkpoint ships the PLE tables; null for
+    /// every other architecture. When set, the forward pass builds the per-layer
+    /// input tensor once after the embedding lookup and injects a gated residual
+    /// into each decoder layer via the per-layer PLE slots on
+    /// <see cref="TransformerLayerWeights"/>.
+    /// </summary>
+    public PerLayerEmbeddingWeights? PerLayerEmbedding { get; }
+
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
 
@@ -774,7 +831,8 @@ internal sealed class TransformerWeights : IDisposable
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
         List<nint>? ownedAllocations = null,
-        Gemma4SelfCondWeights? selfCond = null)
+        Gemma4SelfCondWeights? selfCond = null,
+        PerLayerEmbeddingWeights? perLayerEmbedding = null)
     {
         TokenEmbedWeight = tokenEmbedWeight;
         TokenEmbedQuantType = tokenEmbedQuantType;
@@ -791,6 +849,7 @@ internal sealed class TransformerWeights : IDisposable
             ? new HashSet<nint>(ownedAllocations)
             : null;
         SelfCond = selfCond;
+        PerLayerEmbedding = perLayerEmbedding;
     }
 
     /// <summary>
@@ -846,14 +905,17 @@ internal sealed class TransformerWeights : IDisposable
         TransformerLayerWeights[] layers,
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
-        List<nint> ownedAllocations)
+        List<nint> ownedAllocations,
+        PerLayerEmbeddingWeights? perLayerEmbedding = null)
     {
         return new TransformerWeights(
             tokenEmbedWeight, tokenEmbedQt, vocabSize, hiddenSize,
             layers,
             outputNormWeight,
             outputWeight, outputQt, outputM, outputK,
-            ownedAllocations);
+            ownedAllocations,
+            selfCond: null,
+            perLayerEmbedding: perLayerEmbedding);
     }
 
     /// <summary>

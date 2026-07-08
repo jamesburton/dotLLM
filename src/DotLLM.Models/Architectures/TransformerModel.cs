@@ -805,6 +805,39 @@ public sealed unsafe class TransformerModel : IModel
             }
         }
 
+        // 1c. Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B).
+        // Build the per-layer input tensor [seq, numLayers*pleDim] ONCE from the
+        // scaled main embedding (`hidden`) and the token-identity table, then inject
+        // a gated residual into every layer's output inside the loop. Null for every
+        // other architecture (buffers stay null, no work). Cross-backend: CUDA/Vulkan
+        // would compute/upload this same buffer and reuse the identical injection.
+        float* pleInputs = null, pleIdentity = null, pleGateScratch = null, pleProjScratch = null;
+        var pleWeights = _weights.PerLayerEmbedding;
+        int pleDim = pleWeights?.PerLayerDim ?? 0;
+        int pleLp = pleWeights is not null ? Config.NumLayers * pleDim : 0;
+        if (pleWeights is not null)
+        {
+            pleInputs = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleLp), 64);
+            pleIdentity = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleLp), 64);
+            pleGateScratch = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * pleDim), 64);
+            pleProjScratch = (float*)NativeMemory.AlignedAlloc((nuint)(sizeof(float) * seqLen * hiddenSize), 64);
+
+            // Token-identity gather: embed_tokens_per_layer[token] scaled by √pleDim.
+            GatherPerLayerIdentity(tokenIds, pleIdentity, pleLp, MathF.Sqrt(pleDim),
+                pleWeights.EmbedTokensPerLayer, pleWeights.EmbedTokensPerLayerQt);
+
+            // Combine with the context projection (output aliases projScratch = pleInputs).
+            PerLayerEmbeddings.ComputeInputs(
+                tokenIdentity: pleIdentity,
+                inputsEmbeds: hidden,
+                projWeight: (float*)pleWeights.ModelProjection,
+                projNormWeight: pleWeights.ProjectionNorm,
+                projScratch: pleInputs,
+                output: pleInputs,
+                seqLen: seqLen, hiddenSize: hiddenSize,
+                numLayers: Config.NumLayers, pleDim: pleDim, eps: eps);
+        }
+
         // 2. TRANSFORMER LAYERS
         var repackedLayers = _weights.RepackedLayers;
         int numLayers = DebugMaxLayers switch
@@ -1520,6 +1553,32 @@ public sealed unsafe class TransformerModel : IModel
                     new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize),
                     new Span<float>(hidden + t * hiddenSize, hiddenSize));
             }
+
+            // l. Per-Layer Embeddings (PLE) injection — Gemma-4 dense text tower.
+            // Gated residual added to the layer output using this layer's slice of the
+            // precomputed per-layer input tensor. No-op for every other architecture
+            // (pleInputs null). See docs verified against HF Gemma4TextDecoderLayer.
+            if (pleInputs is not null && lw.PleGateWeight != 0)
+            {
+                PerLayerEmbeddings.InjectLayer(
+                    hidden: hidden,
+                    perLayerInputs: pleInputs,
+                    layerIdx: layer, numLayers: Config.NumLayers,
+                    gateWeight: (float*)lw.PleGateWeight,
+                    projWeight: (float*)lw.PleProjWeight,
+                    postNormWeight: lw.PlePostNormWeight,
+                    gateScratch: pleGateScratch,
+                    projScratch: pleProjScratch,
+                    seqLen: seqLen, hiddenSize: hiddenSize, pleDim: pleDim, eps: eps);
+            }
+        }
+
+        if (pleInputs is not null)
+        {
+            NativeMemory.AlignedFree(pleInputs);
+            NativeMemory.AlignedFree(pleIdentity);
+            NativeMemory.AlignedFree(pleGateScratch);
+            NativeMemory.AlignedFree(pleProjScratch);
         }
 
         // 3. FINAL NORM (in-place: hidden → hidden)
@@ -3027,6 +3086,47 @@ public sealed unsafe class TransformerModel : IModel
             // (_embeddingScale == 1.0f), so non-Gemma output is bit-identical.
             if (_embeddingScale != 1.0f)
                 TensorPrimitives.Multiply(destSpan, _embeddingScale, destSpan);
+        }
+    }
+
+    /// <summary>
+    /// Gathers the Per-Layer Embeddings (PLE) token-identity rows into
+    /// <paramref name="dest"/> <c>[seq, rowWidth]</c> (rowWidth = numLayers*pleDim),
+    /// dequantizing per token and applying the ScaledWordEmbedding factor
+    /// <paramref name="scale"/> = √pleDim. Mirrors <see cref="EmbeddingLookup"/>'s
+    /// per-row dequant switch but for the wide per-layer table.
+    /// </summary>
+    private void GatherPerLayerIdentity(
+        ReadOnlySpan<int> tokenIds, float* dest, int rowWidth, float scale,
+        nint tablePtr, QuantizationType qt)
+    {
+        int pleVocab = _weights.PerLayerEmbedding!.VocabSize;
+        for (int t = 0; t < tokenIds.Length; t++)
+        {
+            int tokenId = tokenIds[t];
+            if ((uint)tokenId >= (uint)pleVocab)
+                throw new ArgumentOutOfRangeException(nameof(tokenIds),
+                    $"PLE token ID {tokenId} at position {t} is out of range [0, {pleVocab}).");
+
+            var destSpan = new Span<float>(dest + t * rowWidth, rowWidth);
+            if (qt == QuantizationType.F32)
+            {
+                float* src = (float*)tablePtr + (long)tokenId * rowWidth;
+                new ReadOnlySpan<float>(src, rowWidth).CopyTo(destSpan);
+            }
+            else if (qt == QuantizationType.F16)
+            {
+                Half* src = (Half*)tablePtr + (long)tokenId * rowWidth;
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<Half>(src, rowWidth), destSpan);
+            }
+            else
+            {
+                long rowBytes = Dequantize.RowByteSize(rowWidth, qt);
+                nint rowPtr = tablePtr + (nint)((long)tokenId * rowBytes);
+                Dequantize.ToFloat32(rowPtr, rowWidth, qt, destSpan);
+            }
+
+            TensorPrimitives.Multiply(destSpan, scale, destSpan);
         }
     }
 
