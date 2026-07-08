@@ -25,6 +25,38 @@ Pipeline
 This is BUILD-ONLY tooling. The CPU ``--tiny-random`` smoke path proves (a) identity
 at init and (b) one end-to-end train step; the real GPU run is launched separately.
 
+Expert-parallel (Branch-Train-MiX) modes
+-----------------------------------------
+Because a MoTE's experts are DISJOINT parameter blocks over a FROZEN shared base,
+each capability expert can be trained INDEPENDENTLY (as if on a different machine)
+and then losslessly slotted into one MoTE; only the router needs joint retraining.
+Three modes, all reproducible from a shared ``base_spec``:
+
+  * ``--train-only-expert CAP``  (BRANCH) — freeze base + all other experts/routers,
+    force every token through CAP's slot, and train ONLY that expert on ITS data.
+    ``--capabilities`` must still list the FULL canonical roster (fixes slot order).
+    Emits ``expert_<CAP>.pt`` (that slot's weights + base_spec).
+  * ``mote_merge_experts.py``    (MIX)    — merge N per-expert checkpoints into one
+    MoTE (lossless slot concatenation; asserts slot-compatibility). Separate tool.
+  * ``--train-only-router --load-experts <merged>``  (COMBINE) — slot the experts in,
+    freeze ALL experts, train ONLY the routers (supervised routing CE). Emits
+    ``mote_combined.pt`` (all slots + routers + base_spec) for eval.
+
+End-to-end CPU PoC: ``scripts/test_expert_parallel.py`` (proves branch/merge/combine,
+losslessness, correct routing, and no-regression on the tiny synthetic model).
+
+    # BRANCH (run each on its own machine; --capabilities is the shared roster):
+    python scripts/lora/identity_mote_train.py --config mA --tiny-random --tiny-distinct \
+        --capabilities math,instruction --train-only-expert math --steps 40 --out mA
+    python scripts/lora/identity_mote_train.py --config mB --tiny-random --tiny-distinct \
+        --capabilities math,instruction --train-only-expert instruction --steps 40 --out mB
+    # MIX:
+    python scripts/lora/mote_merge_experts.py --experts mA/expert_math.pt \
+        mB/expert_instruction.pt --out merged/merged_experts.pt
+    # COMBINE:
+    python scripts/lora/identity_mote_train.py --config combine --tiny-random --tiny-distinct \
+        --train-only-router --load-experts merged/merged_experts.pt --steps 120 --out combine
+
 Differences vs mote_train.py (the FFN-expert-in-existing-layers / learned-routing
 trainer) — intentionally a NEW trainer, not a modification:
   * experts live in NEW inserted layers (not existing ones);
@@ -81,7 +113,10 @@ from identity_mote import (  # noqa: E402
     IdentityMoTEBlock,
     build_identity_mote,
 )
-from multitask_routed_data import build_routed_corpus  # noqa: E402
+from multitask_routed_data import (  # noqa: E402
+    build_routed_corpus,
+    _assign_labels as _assign_routing_labels,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +295,311 @@ def _build_real_base(base_id: str, device: torch.device):
 
 
 # ---------------------------------------------------------------------------
+# Expert-parallel (Branch-Train-MiX style) construction / freeze / slot I/O
+# ---------------------------------------------------------------------------
+#
+# The design premise: a MoE's experts are DISJOINT parameter blocks. A depth-
+# expanded BitNet with a FROZEN shared base and ZERO-init experts (capability_init
+# ="zero") is fully reproducible: two independent processes that build it from the
+# same ``base_spec`` get bit-identical initial experts and routers (no RNG is
+# consumed after the deterministic base build). So each capability expert can be
+# trained ALONE against the identical base ("on a different machine"), and merging
+# is a lossless slot-wise concatenation — never weight averaging. Only the router
+# needs joint (re)training, and supervised routing makes that cheap.
+
+
+def _resolve_positions(n_layers: int, every, at):
+    """Depth-expansion insertion plan from --every / --at (str or list), with the
+    trainer's default (every=1) when neither is given. Returned list is the set of
+    ORIGINAL layer indices after which an identity block is inserted."""
+    at_list = None
+    if isinstance(at, str) and at.strip():
+        at_list = [int(x) for x in at.split(",") if x.strip() != ""]
+    elif isinstance(at, (list, tuple)):
+        at_list = [int(x) for x in at]
+    ev = every
+    if ev is None and at_list is None:
+        ev = 1
+    return bde.plan_insertions(n_layers, every=ev, at=at_list)
+
+
+def build_base_only(base: str, tiny_random: bool, device: torch.device):
+    """Build just the (pre-expansion) base model — used for the identity reference."""
+    m = _build_tiny_base().to(device) if tiny_random else _build_real_base(base, device)
+    m.eval()
+    return m
+
+
+def construct_mote(
+    *,
+    base: str,
+    tiny_random: bool,
+    device: torch.device,
+    every,
+    at,
+    n_capability_experts: int,
+    capability_init: str,
+    router_identity_bias: float,
+    top_k: int = 1,
+):
+    """Deterministically build base -> depth-expand -> IdentityMoTE.
+
+    Returns ``(model, info, n_layers_before)``. ``model`` IS the expanded base
+    (``expand_model`` mutates in place). No RNG is consumed after the base build,
+    so two calls with identical args produce bit-identical experts/routers — the
+    property that makes independent per-expert training slot-compatible.
+    """
+    base_model = build_base_only(base, tiny_random, device)
+    n_layers_before = base_model.config.num_hidden_layers
+    positions = _resolve_positions(n_layers_before, every, at)
+    model, info = bde.expand_model(base_model, positions)
+    model = build_identity_mote(
+        model,
+        inserted_indices=info["inserted_indices"],
+        n_capability_experts=n_capability_experts,
+        capability_init=capability_init,
+        router_identity_bias=router_identity_bias,
+        top_k=top_k,
+    )
+    model.to(device)
+    model.config.use_cache = False
+    return model, info, n_layers_before
+
+
+def make_base_spec(
+    *,
+    base: str,
+    tiny_random: bool,
+    every,
+    at,
+    capabilities: list,
+    label_map: dict,
+    n_capability_experts: int,
+    capability_init: str,
+    router_identity_bias: float,
+    inserted_indices: list,
+    n_layers_before: int,
+    n_layers_after: int,
+    hidden_size: int,
+    vocab_size: int,
+    seq_len: int,
+    top_k: int = 1,
+) -> dict:
+    """The reproducible recipe needed to rebuild the IDENTICAL MoTE elsewhere.
+
+    Every field here is a construction input; two builders that agree on this spec
+    produce slot-compatible models. Used by the per-expert checkpoint, the merge
+    tool, and the router-retrain step.
+    """
+    return {
+        "base": base,
+        "tiny_random": bool(tiny_random),
+        "every": every,
+        "at": at,
+        "capabilities": list(capabilities),
+        "label_map": {str(k): int(v) for k, v in label_map.items()},
+        "n_capability_experts": int(n_capability_experts),
+        "capability_init": capability_init,
+        "router_identity_bias": float(router_identity_bias),
+        "inserted_indices": list(inserted_indices),
+        "n_layers_before": int(n_layers_before),
+        "n_layers_after": int(n_layers_after),
+        "hidden_size": int(hidden_size),
+        "vocab_size": int(vocab_size),
+        "seq_len": int(seq_len),
+        "top_k": int(top_k),
+    }
+
+
+def construct_mote_from_spec(base_spec: dict, device: torch.device):
+    """Rebuild the exact MoTE described by ``base_spec`` (used by merge + PoC checks)."""
+    model, info, n_before = construct_mote(
+        base=base_spec["base"],
+        tiny_random=base_spec["tiny_random"],
+        device=device,
+        every=base_spec.get("every"),
+        at=base_spec.get("at"),
+        n_capability_experts=base_spec["n_capability_experts"],
+        capability_init=base_spec["capability_init"],
+        router_identity_bias=base_spec["router_identity_bias"],
+        top_k=base_spec.get("top_k", 1),
+    )
+    if info["inserted_indices"] != base_spec["inserted_indices"]:
+        raise RuntimeError(
+            "rebuild mismatch: inserted_indices "
+            f"{info['inserted_indices']} != spec {base_spec['inserted_indices']}"
+        )
+    return model, info
+
+
+def specs_compatible(a: dict, b: dict) -> tuple[bool, list]:
+    """Two base_specs are slot-compatible iff they agree on every construction field
+    that affects the model's parameter layout. Returns (ok, list_of_diffs)."""
+    keys = [
+        "base", "tiny_random", "every", "at", "n_capability_experts",
+        "capability_init", "inserted_indices", "n_layers_before",
+        "n_layers_after", "hidden_size", "vocab_size", "top_k",
+    ]
+    diffs = [k for k in keys if a.get(k) != b.get(k)]
+    return (len(diffs) == 0), diffs
+
+
+def _mote_layer_indices(model: nn.Module) -> list:
+    return list(getattr(model, "_identity_mote_layers", []))
+
+
+def expert_slot_weights(model: nn.Module, slot: int) -> dict:
+    """Extract ONLY expert ``slot``'s per-layer weights, namespaced ``"{layer}.{suffix}"``.
+
+    This is the per-expert payload: disjoint from every other slot, so it can be
+    slotted back into an identically-built MoTE losslessly.
+    """
+    out: dict = {}
+    for layer_idx in _mote_layer_indices(model):
+        block = model.model.layers[layer_idx].mlp
+        expert = block.experts[slot]
+        for name, p in expert.state_dict().items():
+            out[f"{layer_idx}.{name}"] = p.detach().cpu().clone()
+    return out
+
+
+def load_expert_slot_weights(model: nn.Module, slot: int, weights: dict) -> None:
+    """Load a per-expert payload (from :func:`expert_slot_weights`) into ``slot``."""
+    for layer_idx in _mote_layer_indices(model):
+        block = model.model.layers[layer_idx].mlp
+        expert = block.experts[slot]
+        ref = expert.state_dict()
+        new_sd = {}
+        for name in ref:
+            key = f"{layer_idx}.{name}"
+            if key not in weights:
+                raise KeyError(f"missing expert weight {key!r} for slot {slot}")
+            new_sd[name] = weights[key].to(ref[name].dtype)
+        expert.load_state_dict(new_sd)
+
+
+def router_slot_weights(model: nn.Module) -> dict:
+    """Extract every router's weights, namespaced ``"{layer}.{suffix}"``."""
+    out: dict = {}
+    for layer_idx in _mote_layer_indices(model):
+        block = model.model.layers[layer_idx].mlp
+        for name, p in block.router.state_dict().items():
+            out[f"{layer_idx}.{name}"] = p.detach().cpu().clone()
+    return out
+
+
+def load_router_slot_weights(model: nn.Module, weights: dict) -> None:
+    for layer_idx in _mote_layer_indices(model):
+        block = model.model.layers[layer_idx].mlp
+        ref = block.router.state_dict()
+        new_sd = {name: weights[f"{layer_idx}.{name}"].to(ref[name].dtype) for name in ref}
+        block.router.load_state_dict(new_sd)
+
+
+def _freeze_only_expert(model: nn.Module, slot: int, train_router: bool) -> None:
+    """Freeze EVERYTHING except capability expert ``slot`` (Branch-Train per-expert).
+
+    The base, the skip expert, ALL other capability experts, and (by default) the
+    router are frozen; only slot ``slot`` trains. With ``train_router`` the router is
+    also unfrozen (its "slice"), but the router is NOT part of the per-expert payload
+    — it is (re)trained jointly in the merge/combine step regardless.
+    """
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for block in _iter_mote_blocks(model):
+        for p in block.experts[slot].parameters():
+            p.requires_grad_(True)
+        if train_router:
+            for p in block.router.parameters():
+                p.requires_grad_(True)
+
+
+def _freeze_only_router(model: nn.Module) -> None:
+    """Freeze ALL experts (skip + capability); train ONLY the routers (the combine step)."""
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for block in _iter_mote_blocks(model):
+        for p in block.router.parameters():
+            p.requires_grad_(True)
+
+
+CKPT_FORMAT = "idm-expert-parallel/v1"
+
+
+def read_experts_arg(spec: str):
+    """Resolve ``--load-experts`` into ``(slots, base_spec)``.
+
+    ``spec`` is either a merged-experts checkpoint (``kind == "merged"`` from
+    mote_merge_experts.py) or a comma-separated list of per-expert checkpoints
+    (``kind == "expert"``). Returns ``slots = {slot:int -> {capability,label,weights}}``
+    and the shared ``base_spec`` (asserted identical across per-expert files).
+    """
+    paths = [p.strip() for p in spec.split(",") if p.strip()]
+    slots: dict = {}
+    base_spec = None
+    for path in paths:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if obj.get("format") != CKPT_FORMAT:
+            raise ValueError(f"{path}: not an {CKPT_FORMAT} checkpoint")
+        bs = obj["base_spec"]
+        if base_spec is None:
+            base_spec = bs
+        else:
+            ok, diffs = specs_compatible(base_spec, bs)
+            if not ok:
+                raise ValueError(f"{path}: base_spec incompatible with earlier file(s): {diffs}")
+        if obj.get("kind") == "merged":
+            for s, payload in obj["slots"].items():
+                slots[int(s)] = payload
+        elif obj.get("kind") == "expert":
+            slots[int(obj["slot"])] = {
+                "capability": obj.get("capability"),
+                "label": obj.get("label", int(obj["slot"])),
+                "weights": obj["weights"],
+            }
+        else:
+            raise ValueError(f"{path}: unknown kind {obj.get('kind')!r}")
+    return slots, base_spec
+
+
+def save_expert_checkpoint(path, *, capability, slot, base_spec, weights, metrics=None):
+    """Persist ONE capability expert's per-layer weights (the BRANCH output)."""
+    torch.save(
+        {
+            "format": CKPT_FORMAT,
+            "kind": "expert",
+            "capability": capability,
+            "slot": int(slot),
+            "label": int(slot),
+            "base_spec": base_spec,
+            "weights": weights,
+            "metrics": metrics or {},
+        },
+        path,
+    )
+
+
+def save_combined_checkpoint(path, *, base_spec, slots, router):
+    """Persist a complete MoTE spec: all capability-expert slots + trained routers.
+
+    This is the COMBINE output — one artifact an eval harness can rebuild the whole
+    merged, router-retrained model from (base_spec drives construction; ``slots``
+    fills the experts; ``router`` fills the routers). The frozen skip expert and base
+    are omitted (deterministic from base_spec).
+    """
+    torch.save(
+        {
+            "format": CKPT_FORMAT,
+            "kind": "combined",
+            "base_spec": base_spec,
+            "slots": slots,   # {slot:int -> {capability,label,weights}}
+            "router": router,  # {"{layer}.{suffix}" -> tensor}
+        },
+        path,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -352,14 +692,72 @@ def main() -> None:
     ap.add_argument("--no-verify-identity", dest="verify_identity", action="store_false")
     ap.add_argument("--identity-tol", type=float, default=1e-3,
                     help="Max-abs logit tolerance for the identity-at-init check.")
+
+    # Expert-parallel (Branch-Train-MiX) modes — mutually exclusive with each other.
+    ap.add_argument("--train-only-expert", default=None,
+                    help="BRANCH step: freeze the base AND all experts/routers except "
+                         "the named capability's expert, and train ONLY that expert on "
+                         "ITS single-capability data. --capabilities must still list the "
+                         "FULL canonical roster (it fixes the slot ordering); only the "
+                         "named capability's data is loaded. Output: a per-expert "
+                         "checkpoint (that slot's weights only) + base_spec, ready to "
+                         "merge. Simulates training on a separate machine.")
+    ap.add_argument("--train-expert-router-slice", action="store_true",
+                    help="With --train-only-expert, also unfreeze the router while "
+                         "training the expert. The router is discarded at merge (it is "
+                         "re-trained jointly in the combine step); off by default.")
+    ap.add_argument("--train-only-router", action="store_true",
+                    help="COMBINE step: freeze ALL experts (skip + capability) and train "
+                         "ONLY the routers on the full multi-capability labeled corpus "
+                         "(supervised routing CE). Use with --load-experts to slot in the "
+                         "independently-trained experts first.")
+    ap.add_argument("--load-experts", default=None,
+                    help="Path to a merged-experts checkpoint (from mote_merge_experts.py) "
+                         "OR a comma-separated list of per-expert checkpoints. Their slots "
+                         "are loaded into the freshly-built MoTE before training. The "
+                         "base_spec in the file(s) drives construction (guarantees an "
+                         "identical, slot-compatible model). Typically paired with "
+                         "--train-only-router.")
+    ap.add_argument("--tiny-distinct", action="store_true",
+                    help="(--tiny-random only) draw each capability's synthetic ids from a "
+                         "DISJOINT vocab band so capabilities are content-separable and the "
+                         "supervised router can actually learn label-i -> expert-i. Used by "
+                         "the expert-parallel PoC to prove correct routing on a tiny model.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
     os.makedirs(args.out, exist_ok=True)
-    caps = [c.strip() for c in args.capabilities.split(",") if c.strip()]
+    from collections import Counter
 
-    print(f"[idm] config={args.config!r} device={device} tiny_random={args.tiny_random}")
-    print(f"[idm] capabilities(requested)={caps}")
+    # ------------------------------------------------------------------
+    # 0. Mode resolution (Branch-Train-MiX). If loading experts, the file's
+    #    base_spec DRIVES construction so the rebuilt model is slot-compatible.
+    # ------------------------------------------------------------------
+    if args.train_only_expert and args.train_only_router:
+        raise SystemExit("--train-only-expert and --train-only-router are mutually exclusive")
+    mode = "expert" if args.train_only_expert else ("router" if args.train_only_router else "joint")
+
+    loaded_slots = None
+    loaded_base_spec = None
+    if args.load_experts:
+        loaded_slots, loaded_base_spec = read_experts_arg(args.load_experts)
+        # Override construction-affecting args with the spec (guarantees identical layout).
+        args.base = loaded_base_spec["base"]
+        args.tiny_random = loaded_base_spec["tiny_random"]
+        args.every = loaded_base_spec.get("every")
+        args.at = loaded_base_spec.get("at")
+        args.capability_init = loaded_base_spec["capability_init"]
+        args.router_identity_bias = loaded_base_spec["router_identity_bias"]
+        args.capabilities = ",".join(loaded_base_spec["capabilities"])
+        print(f"[idm] --load-experts: {sorted(loaded_slots)} slots; base_spec drives construction")
+
+    caps = [c.strip() for c in args.capabilities.split(",") if c.strip()]
+    # Canonical roster -> stable slot ordering (general/web -> 0, others -> 1..K).
+    full_label_map = _assign_routing_labels(caps)
+    roster_K = len({v for v in full_label_map.values() if v >= 1})
+
+    print(f"[idm] config={args.config!r} device={device} tiny_random={args.tiny_random} mode={mode}")
+    print(f"[idm] capabilities(roster)={caps}  full_label_map={full_label_map}")
 
     # ------------------------------------------------------------------
     # 1. Tokenizer (real only) + base model
@@ -376,27 +774,56 @@ def main() -> None:
     base_model.eval()
     vocab_size = base_model.config.vocab_size
 
+    # K (capability experts) = roster K, or spec/arg override. All modes build the
+    # SAME K slots so per-expert checkpoints slot back losslessly.
+    if loaded_base_spec is not None:
+        K = loaded_base_spec["n_capability_experts"]
+    elif args.n_capability_experts is not None:
+        K = args.n_capability_experts
+    else:
+        K = roster_K
+
     # ------------------------------------------------------------------
-    # 2. Routed multi-task corpus (built first: determines K = #capabilities loaded)
+    # 2. Routed corpus. BRANCH (expert) mode loads ONLY the target capability's
+    #    data but keeps its canonical slot (from the full roster); JOINT/COMBINE
+    #    load the full multi-capability corpus. label_override keeps labels==slots.
     # ------------------------------------------------------------------
+    target_slot = None
+    if mode == "expert":
+        target_cap = args.train_only_expert
+        if target_cap not in full_label_map:
+            raise SystemExit(f"--train-only-expert {target_cap!r} not in roster {caps}")
+        target_slot = full_label_map[target_cap]
+        if target_slot < 1:
+            raise SystemExit(
+                f"{target_cap!r} maps to label {target_slot} (the FROZEN skip expert); "
+                "only capability experts (label>=1) are independently trainable")
+        if target_slot > K:
+            raise SystemExit(f"target slot {target_slot} exceeds K={K}")
+        corpus_caps = [target_cap]
+        override = {target_cap: target_slot}
+        print(f"[idm] BRANCH: training ONLY expert {target_cap!r} -> slot {target_slot} "
+              f"(all else frozen); loading only {target_cap!r} data")
+    else:
+        corpus_caps = caps
+        override = full_label_map
+
     sequences, labels, label_map = build_routed_corpus(
         tokenizer=tokenizer,
-        capabilities=caps,
+        capabilities=corpus_caps,
         n_seqs_per_cap=args.n_seqs_per_cap,
         seq_len=args.seq_len,
         tiny_random=args.tiny_random,
         vocab_size=vocab_size,
         balance=args.balance,
         balance_target=args.balance_target,
+        tiny_distinct=args.tiny_distinct,
+        label_override=override,
     )
-    # Capability experts = labels >= 1 (label 0 == the frozen skip/identity expert,
-    # reused by the general/web capability — it is NOT a trainable capability expert).
-    n_cap_experts = len({v for v in label_map.values() if v >= 1})
-    K = args.n_capability_experts if args.n_capability_experts is not None else n_cap_experts
+    n_cap_experts = len({v for v in full_label_map.values() if v >= 1})
     if K < n_cap_experts:
         print(f"[idm] WARNING: K={K} < #capability-experts={n_cap_experts}; "
               f"labels > K will be unroutable.")
-    from collections import Counter
     print(f"[idm] label_map={label_map}  K(capability experts)={K}  "
           f"n_experts={K + 1} (incl. skip=label 0)")
     print(f"[idm] corpus: {len(sequences)} sequences x {args.seq_len} tokens  "
@@ -417,12 +844,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Depth-expand (insert identity blocks)
     # ------------------------------------------------------------------
-    at = [int(x) for x in args.at.split(",")] if args.at else None
-    every = args.every
-    if every is None and at is None:
-        every = 1  # default: interleave one block after every original layer
     n_layers_before = base_model.config.num_hidden_layers
-    positions = bde.plan_insertions(n_layers_before, every=every, at=at)
+    positions = _resolve_positions(n_layers_before, args.every, args.at)
     model, info = bde.expand_model(base_model, positions)
     inserted_indices = info["inserted_indices"]
     print(f"[idm] depth-expand: {info['original_layers']} -> {info['final_layers']} "
@@ -441,6 +864,35 @@ def main() -> None:
     )
     model.to(device)
     model.config.use_cache = False
+
+    # Reproducible recipe for rebuilding this exact MoTE elsewhere (per-expert ckpt,
+    # merge tool, combine step). Slot-compatibility is checked against it.
+    base_spec = make_base_spec(
+        base=args.base, tiny_random=args.tiny_random, every=args.every, at=args.at,
+        capabilities=caps, label_map=full_label_map, n_capability_experts=K,
+        capability_init=args.capability_init, router_identity_bias=args.router_identity_bias,
+        inserted_indices=inserted_indices, n_layers_before=n_layers_before,
+        n_layers_after=info["final_layers"], hidden_size=model.config.hidden_size,
+        vocab_size=vocab_size, seq_len=args.seq_len, top_k=1,
+    )
+    if loaded_base_spec is not None:
+        ok, diffs = specs_compatible(base_spec, loaded_base_spec)
+        if not ok:
+            raise RuntimeError(f"rebuilt model is NOT slot-compatible with --load-experts: {diffs}")
+
+    # ------------------------------------------------------------------
+    # 5b. Slot in independently-trained experts (COMBINE / --load-experts).
+    # ------------------------------------------------------------------
+    if loaded_slots:
+        for slot, payload in sorted(loaded_slots.items()):
+            load_expert_slot_weights(model, slot, payload["weights"])
+            # Lossless check: the just-loaded slot must equal the source payload.
+            back = expert_slot_weights(model, slot)
+            for k in payload["weights"]:
+                if not torch.equal(back[k], payload["weights"][k]):
+                    raise RuntimeError(f"slot {slot} load not lossless at {k}")
+        print(f"[idm] slotted {len(loaded_slots)} independently-trained experts "
+              f"(lossless verified): slots {sorted(loaded_slots)}")
 
     # ------------------------------------------------------------------
     # 6. Identity-at-init verification (THE critical invariant)
@@ -461,7 +913,12 @@ def main() -> None:
                 "Refusing to train — the whole no-regression guarantee rests on this."
             )
         # Bulletproof check for zero-init: identity must survive a RANDOM router.
-        if args.capability_init == "zero":
+        # Only valid at TRUE init (all experts output 0). Once independently-trained
+        # experts are slotted in (--load-experts / COMBINE), capability experts have
+        # non-zero down_proj, so routing to them legitimately changes the output — the
+        # random-router check no longer applies. The plain check above (default router
+        # routes every token to the skip expert) still validates no-regression at start.
+        if args.capability_init == "zero" and not loaded_slots:
             saved = {}
             with torch.no_grad():
                 for i, block in enumerate(_iter_mote_blocks(model)):
@@ -480,9 +937,21 @@ def main() -> None:
                 )
 
     # ------------------------------------------------------------------
-    # 7. Freeze + optimizer
+    # 7. Freeze + optimizer (mode-specific)
     # ------------------------------------------------------------------
-    _freeze_for_training(model, train_inserted_attn=args.train_inserted_attn)
+    if mode == "expert":
+        _freeze_only_expert(model, target_slot, train_router=args.train_expert_router_slice)
+        # Force ALL tokens through the target slot so the expert trains as a dense FFN
+        # over its own data (the untrained router would otherwise gate them to skip).
+        for block in _iter_mote_blocks(model):
+            block.force_slot = target_slot
+        print(f"[idm] FREEZE: base + all experts + {'router kept' if args.train_expert_router_slice else 'router'} "
+              f"frozen; training ONLY capability expert slot {target_slot} (force_slot={target_slot})")
+    elif mode == "router":
+        _freeze_only_router(model)
+        print("[idm] FREEZE: ALL experts (skip + capability) frozen; training ONLY routers")
+    else:
+        _freeze_for_training(model, train_inserted_attn=args.train_inserted_attn)
 
     router_params, expert_params = [], []
     for block in _iter_mote_blocks(model):
@@ -568,7 +1037,12 @@ def main() -> None:
             mult = 1.0 + args.route_force_weight
             label_weights = {l: mult for l in starved_labels}
         route_loss = _supervised_route_loss(model, batch_labels, device, label_weights)
-        loss = lm_loss + args.route_weight * route_loss
+        # BRANCH (expert) mode trains the expert on its data with pure LM loss — the
+        # router is frozen and (re)trained jointly in the COMBINE step, so the routing
+        # objective is excluded here to keep the expert slot-clean. route_loss is still
+        # computed for logging.
+        route_coeff = 0.0 if mode == "expert" else args.route_weight
+        loss = lm_loss + route_coeff * route_loss
 
         lm_val = lm_loss.item()
         route_val = route_loss.item()
@@ -619,17 +1093,54 @@ def main() -> None:
     print(f"[idm] final: lm={final_lm:.4f}  route={final_route:.4f}")
 
     # ------------------------------------------------------------------
-    # 9. Save adapter (trainable tensors only) + config + metrics
+    # 9. Save adapter (trainable tensors only) + config + metrics.
+    #    Plus a mode-specific expert-parallel artifact:
+    #      expert  -> per-expert checkpoint (that slot's weights + base_spec)
+    #      router  -> combined checkpoint (all slots + trained routers + base_spec)
     # ------------------------------------------------------------------
     trainable_names = {n for n, p in model.named_parameters() if p.requires_grad}
     adapter = {k: v.cpu() for k, v in model.state_dict().items() if k in trainable_names}
     torch.save(adapter, os.path.join(args.out, "adapter_weights.pt"))
+
+    expert_ckpt_path = None
+    combined_ckpt_path = None
+    if mode == "expert":
+        expert_ckpt_path = os.path.join(args.out, f"expert_{args.train_only_expert}.pt")
+        save_expert_checkpoint(
+            expert_ckpt_path,
+            capability=args.train_only_expert,
+            slot=target_slot,
+            base_spec=base_spec,
+            weights=expert_slot_weights(model, target_slot),
+            metrics={"lm_loss": final_lm, "route_loss": final_route, "steps": step},
+        )
+        print(f"[idm] BRANCH output -> {expert_ckpt_path} (slot {target_slot} weights + base_spec)")
+    elif mode == "router":
+        # Gather every capability slot (1..K) so the combined file rebuilds the whole
+        # merged, router-retrained MoTE. Slots carry the loaded experts' identity.
+        combined_slots = {}
+        for s in range(1, K + 1):
+            payload = loaded_slots.get(s) if loaded_slots else None
+            combined_slots[s] = {
+                "capability": (payload or {}).get("capability"),
+                "label": s,
+                "weights": expert_slot_weights(model, s),
+            }
+        combined_ckpt_path = os.path.join(args.out, "mote_combined.pt")
+        save_combined_checkpoint(
+            combined_ckpt_path,
+            base_spec=base_spec,
+            slots=combined_slots,
+            router=router_slot_weights(model),
+        )
+        print(f"[idm] COMBINE output -> {combined_ckpt_path} (all {K} expert slots + routers + base_spec)")
 
     histo = torch.stack(recent_counts).sum(0).tolist() if recent_counts else []
     experts_used = sum(1 for c in histo if c > 0)
 
     cfg = {
         "config": args.config,
+        "mode": mode,
         "base": args.base,
         "capabilities": caps,
         "label_map": label_map,
@@ -652,6 +1163,8 @@ def main() -> None:
     }
     with open(os.path.join(args.out, "identity_mote_config.json"), "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
+    with open(os.path.join(args.out, "base_spec.json"), "w", encoding="utf-8") as fh:
+        json.dump(base_spec, fh, indent=2)
 
     metrics = {
         "lm_loss": final_lm,

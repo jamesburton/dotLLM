@@ -142,6 +142,14 @@ class IdentityMoTEBlock(nn.Module):
         # Side-channel set on every forward: router logits (in-graph) + counts (detached).
         self.last_logits: Optional[torch.Tensor] = None
         self.last_counts: Optional[torch.Tensor] = None
+        # BRANCH-training override: when set to a slot index, ALL tokens are dispatched
+        # to that single expert with gate 1.0, IGNORING the (frozen, untrained) router.
+        # This is how each capability expert is trained ALONE as a dense FFN over its
+        # own data (Branch-Train-MiX): without it, a zero-init router would send every
+        # token to the skip expert and the capability expert would get no gradient.
+        # Router logits are still computed (for logging); dispatch is forced. Leave None
+        # for normal (routed) inference/training.
+        self.force_slot: Optional[int] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, H = x.shape
@@ -151,6 +159,22 @@ class IdentityMoTEBlock(nn.Module):
         # --- Router (raw logits kept for the supervised routing loss) ---
         route_logits = self.router(x_flat.to(self.router.weight.dtype))  # [N, E]
         g = torch.softmax(route_logits, dim=-1)                          # [N, E]
+
+        if self.force_slot is not None:
+            # Force every token through one expert (gate 1.0) — dense-FFN branch train.
+            s = int(self.force_slot)
+            top_idx = torch.full((n_tokens, self.top_k), s, dtype=torch.long, device=x.device)
+            top_idx[:, 1:] = 0  # extra slots (top_k>1) unused; gate below zeroes them
+            g_norm = torch.zeros(n_tokens, self.top_k, dtype=g.dtype, device=x.device)
+            g_norm[:, 0] = 1.0
+            out = torch.zeros(n_tokens, H, dtype=x.dtype, device=x.device)
+            expert_out = self.experts[s](x_flat)                         # [N, H]
+            out = out + expert_out
+            one_hot = F.one_hot(top_idx[:, :1], self.n_experts)          # [N, 1, E]
+            expert_counts = one_hot.sum(dim=(0, 1))
+            self.last_logits = route_logits
+            self.last_counts = expert_counts.detach()
+            return out.view(B, T, H)
 
         # --- Top-k selection with per-token normalised gates (sum to 1) ---
         top_g, top_idx = torch.topk(g, self.top_k, dim=-1)              # [N, k]

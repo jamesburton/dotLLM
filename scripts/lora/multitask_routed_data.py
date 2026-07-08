@@ -213,6 +213,8 @@ def build_routed_corpus(
     seed: int = 0,
     balance: bool = False,
     balance_target: Optional[int] = None,
+    tiny_distinct: bool = False,
+    label_override: Optional[dict] = None,
 ) -> tuple[list, list, dict]:
     """Build a task-labeled multi-task corpus.
 
@@ -232,6 +234,19 @@ def build_routed_corpus(
             starvation of small caps (e.g. no_robots @ 544 vs math/coding @ 4000).
         balance_target: per-capability target count when ``balance`` is set;
             defaults to the max loaded count across capabilities.
+        tiny_distinct: (``tiny_random`` only) draw each capability's synthetic ids
+            from a DISJOINT vocab band keyed by the capability's routing label, so
+            the capabilities are content-separable and a supervised router can
+            actually learn to route label-i data to expert-i. Off by default (the
+            legacy smoke path draws all caps from the full vocab). This is what the
+            expert-parallel PoC uses to prove correct routing on a tiny model.
+        label_override: optional ``{capability -> label int}`` forcing the routing
+            label for each capability, overriding the positional ``_assign_labels``.
+            REQUIRED to keep slots stable when a single capability is loaded in
+            isolation (train-one-expert): the canonical slot for e.g. ``instruction``
+            is fixed by the FULL roster, not by its index in a singleton subset. The
+            ``tiny_distinct`` band is also keyed by this forced label so the solo
+            expert trains on the SAME distribution the router later routes to it.
 
     Returns:
         ``(sequences, labels, label_map)`` where ``sequences[i]`` is a
@@ -241,14 +256,25 @@ def build_routed_corpus(
     """
     g = torch.Generator().manual_seed(seed)
 
+    def _band_randint(label: int, n_bands: int) -> torch.Tensor:
+        """A synthetic sequence drawn from the vocab band owned by ``label``."""
+        if tiny_distinct and n_bands > 0:
+            band = max(1, vocab_size // n_bands)
+            lo = (label * band) % vocab_size
+            hi = min(lo + band, vocab_size)
+            if hi <= lo:  # degenerate (label * band wrapped); fall back to full range
+                lo, hi = 0, vocab_size
+            return torch.randint(lo, hi, (seq_len,), generator=g)
+        return torch.randint(0, vocab_size, (seq_len,), generator=g)
+
     if tiny_random:
-        label_map = _assign_labels(capabilities)
+        label_map = dict(label_override) if label_override else _assign_labels(capabilities)
+        # Number of distinct bands = max label + 1 (labels are 0..K, contiguous).
+        n_bands = (max(label_map.values()) + 1) if label_map else 1
         per_cap: dict[str, list] = {}
         for cap in capabilities:
-            per_cap[cap] = [
-                torch.randint(0, vocab_size, (seq_len,), generator=g)
-                for _ in range(n_seqs_per_cap)
-            ]
+            lbl = label_map[cap]
+            per_cap[cap] = [_band_randint(lbl, n_bands) for _ in range(n_seqs_per_cap)]
         if balance:
             per_cap = _balance(per_cap, balance_target, g)
         return _assemble(per_cap, label_map, interleave, g)
@@ -271,9 +297,13 @@ def build_routed_corpus(
     if balance:
         loaded = _balance(loaded, balance_target, g)
 
-    # Labels are assigned in the ORIGINAL requested order among the loaded caps
+    # Labels: forced by label_override when given (keeps slots stable for a solo
+    # capability), else assigned in the requested order among the loaded caps
     # (general/web -> 0, the rest -> 1..K).
-    label_map = _assign_labels([c for c in capabilities if c in loaded])
+    if label_override:
+        label_map = {c: label_override[c] for c in loaded if c in label_override}
+    else:
+        label_map = _assign_labels([c for c in capabilities if c in loaded])
     return _assemble(loaded, label_map, interleave, g)
 
 
