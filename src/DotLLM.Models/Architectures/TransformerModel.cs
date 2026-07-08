@@ -180,11 +180,23 @@ public sealed unsafe class TransformerModel : IModel
     /// </summary>
     public static TransformerModel LoadFromSafetensors(
         ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading)
+        => LoadFromSafetensors(file, config, threading, i2sCache: null);
+
+    /// <summary>
+    /// Loads a transformer model from an opened HuggingFace-convention safetensors source with
+    /// threading configuration and an optional BitNet I2_S weight cache. When
+    /// <paramref name="i2sCache"/> is supplied (BitNet checkpoints only), each linear
+    /// projection's ternary-packed bytes are served from / persisted to disk, avoiding the
+    /// dominant online bf16→I2_S quantization cost on repeated loads.
+    /// </summary>
+    internal static TransformerModel LoadFromSafetensors(
+        ISafetensorsTensorSource file, ModelConfig config, ThreadingConfig threading,
+        BitNetI2SCacheContext? i2sCache)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
 
-        var weights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        var weights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache);
         return BuildFromPrebuiltWeightsInternal(weights, config, threading, anchorSource: file);
     }
 

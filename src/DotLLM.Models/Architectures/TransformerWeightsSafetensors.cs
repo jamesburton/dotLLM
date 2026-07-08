@@ -38,7 +38,8 @@ internal static class TransformerWeightsSafetensorsLoader
     /// against the HF naming scheme for the architectures in
     /// <paramref name="config"/>. Throws on missing required tensors.
     /// </summary>
-    public static TransformerWeights Load(ISafetensorsTensorSource file, ModelConfig config)
+    public static TransformerWeights Load(
+        ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -63,7 +64,7 @@ internal static class TransformerWeightsSafetensorsLoader
                 layers[i] = isDeepSeekMla
                     ? LoadDeepSeekMlaLayer(i, file, config, owned)
                     : isBitNet
-                        ? LoadBitNetLayer(i, file, config, owned)
+                        ? LoadBitNetLayer(i, file, config, owned, i2sCache)
                         : LoadLayer(i, file, config, owned);
             }
 
@@ -277,7 +278,8 @@ internal static class TransformerWeightsSafetensorsLoader
     /// selected by <see cref="ModelConfig.ActivationFunction"/> = ReluSquared.
     /// </summary>
     private static TransformerLayerWeights LoadBitNetLayer(
-        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned,
+        BitNetI2SCacheContext? i2sCache)
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
@@ -289,10 +291,10 @@ internal static class TransformerWeightsSafetensorsLoader
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
 
         // Attention projections — quantized to ternary I2_S.
-        var (qPtr, qQt, qM, qK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.q_proj.weight", owned);
-        var (kPtr, kQt, kM, kK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.k_proj.weight", owned);
-        var (vPtr, vQt, vM, vK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.v_proj.weight", owned);
-        var (oPtr, oQt, oM, oK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.o_proj.weight", owned);
+        var (qPtr, qQt, qM, qK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.q_proj.weight", owned, i2sCache);
+        var (kPtr, kQt, kM, kK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.k_proj.weight", owned, i2sCache);
+        var (vPtr, vQt, vM, vK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.v_proj.weight", owned, i2sCache);
+        var (oPtr, oQt, oM, oK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.o_proj.weight", owned, i2sCache);
         ValidateProjectionShape(qM, qK, qDim, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
         ValidateProjectionShape(kM, kK, kvDim, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
         ValidateProjectionShape(vM, vK, kvDim, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
@@ -310,9 +312,9 @@ internal static class TransformerWeightsSafetensorsLoader
         float[] ffnSubNorm = ResolveNorm(file, $"{prefix}.mlp.ffn_sub_norm.weight", intermediateSize);
 
         // Dense SwiGLU-shaped FFN projections — quantized to ternary I2_S.
-        var (gatePtr, gateQt, gateM, gateK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.gate_proj.weight", owned);
-        var (upPtr, upQt, upM, upK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.up_proj.weight", owned);
-        var (downPtr, downQt, downM, downK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.down_proj.weight", owned);
+        var (gatePtr, gateQt, gateM, gateK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.gate_proj.weight", owned, i2sCache);
+        var (upPtr, upQt, upM, upK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.up_proj.weight", owned, i2sCache);
+        var (downPtr, downQt, downM, downK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.down_proj.weight", owned, i2sCache);
         ValidateProjectionShape(gateM, gateK, intermediateSize, hiddenSize, $"{prefix}.mlp.gate_proj.weight");
         ValidateProjectionShape(upM, upK, intermediateSize, hiddenSize, $"{prefix}.mlp.up_proj.weight");
         ValidateProjectionShape(downM, downK, hiddenSize, intermediateSize, $"{prefix}.mlp.down_proj.weight");
@@ -349,30 +351,42 @@ internal static class TransformerWeightsSafetensorsLoader
     /// be a multiple of 128 — always true for real BitNet dims.
     /// </summary>
     private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsI2S(
-        ISafetensorsTensorSource file, string name, List<nint> owned)
+        ISafetensorsTensorSource file, string name, List<nint> owned, BitNetI2SCacheContext? i2sCache)
     {
-        // Upcast to F32 first (temporary — freed below once packed).
+        // Shape from the tensor descriptor — cheap and avoids the bf16→f32 upcast on a cache hit.
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException(
+                $"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+
+        long count = (long)m * k;
+        if (count % 128 != 0)
+            throw new InvalidDataException(
+                $"BitNet linear '{name}' element count {count} (shape [{m},{k}]) is not a "
+                + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
+
+        long packedBytes = count / 4;
+        nuint destBytes = checked((nuint)(packedBytes + sizeof(float)));
+        nint dst = (nint)NativeMemory.AlignedAlloc(destBytes, 64);
+        owned.Add(dst);
+        var destSpan = new Span<byte>((void*)dst, checked((int)destBytes));
+
+        // Cache hit: reuse the packed I2_S bytes verbatim, skipping both the bf16→f32 upcast
+        // and the absmean/round/pack quantization (the dominant online-load cost).
+        if (i2sCache is not null && i2sCache.TryLoad(name, destSpan))
+            return (dst, QuantizationType.I2_S, m, k);
+
+        // Miss: upcast to F32 (temporary), quantize into dst, then persist the packed bytes.
         var temp = new List<nint>();
-        var (f32Ptr, _, m, k) = ResolveLinearAsF32(file, name, temp);
         try
         {
-            long count = (long)m * k;
-            if (count % 128 != 0)
-                throw new InvalidDataException(
-                    $"BitNet linear '{name}' element count {count} (shape [{m},{k}]) is not a "
-                    + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
-
-            long packedBytes = count / 4;
-            nuint destBytes = checked((nuint)(packedBytes + sizeof(float)));
-            nint dst = (nint)NativeMemory.AlignedAlloc(destBytes, 64);
-            owned.Add(dst);
-
+            var (f32Ptr, _, _, _) = ResolveLinearAsF32(file, name, temp);
             BitNetQuantize.QuantizeToI2S(
                 new ReadOnlySpan<float>((void*)f32Ptr, checked((int)count)),
                 count,
-                new Span<byte>((void*)dst, checked((int)destBytes)));
-
-            return (dst, QuantizationType.I2_S, m, k);
+                destSpan);
         }
         finally
         {
@@ -381,6 +395,9 @@ internal static class TransformerWeightsSafetensorsLoader
             foreach (var p in temp)
                 NativeMemory.AlignedFree((void*)p);
         }
+
+        i2sCache?.Store(name, destSpan);
+        return (dst, QuantizationType.I2_S, m, k);
     }
 
     /// <summary>
