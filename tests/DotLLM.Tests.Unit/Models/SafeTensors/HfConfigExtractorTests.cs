@@ -364,6 +364,64 @@ public sealed class HfConfigExtractorTests
         Assert.True(cfg.Moe.IsMoeLayer(3));
     }
 
+    /// <summary>
+    /// AllenAI OLMoE-1B-7B-0924 config (verbatim from the HF checkpoint,
+    /// 2026-07). <c>model_type=olmoe</c> / <c>OlmoeForCausalLM</c> must resolve
+    /// to <see cref="Architecture.QwenMoe"/> (it reuses the Qwen-MoE tensor
+    /// layout + GQA attention). MoE fields: 64 experts, top-8,
+    /// <c>norm_topk_prob=false</c>, NO shared expert. OLMoE carries no
+    /// <c>moe_intermediate_size</c> — the per-expert width is the top-level
+    /// <c>intermediate_size</c> (1024). NeoX RoPE (Llama-descended). Every
+    /// layer is MoE (no decoder_sparse_step).
+    /// </summary>
+    [Fact]
+    public void Olmoe_1B7B_0924_ResolvesToQwenMoe_RoutedOnly()
+    {
+        const string json = """
+        {
+            "architectures": ["OlmoeForCausalLM"],
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 1024,
+            "vocab_size": 50304,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-5,
+            "clip_qkv": null,
+            "num_experts": 64,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": false,
+            "tie_word_embeddings": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.Equal(2048, cfg.HiddenSize);
+        Assert.Equal(16, cfg.NumLayers);
+        Assert.Equal(16, cfg.NumAttentionHeads);
+        Assert.Equal(16, cfg.NumKvHeads);
+        Assert.Equal(128, cfg.HeadDim); // 2048 / 16 (no explicit head_dim)
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(8, cfg.Moe.NumExpertsPerTok);
+        // OLMoE has no moe_intermediate_size → per-expert width == intermediate_size.
+        Assert.Equal(1024, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // No shared expert (routed-only path).
+        Assert.Null(cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate);
+        // Every layer is MoE.
+        Assert.Equal(1, cfg.Moe.DecoderSparseStep);
+        Assert.True(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(15));
+    }
+
     [Fact]
     public void DeepSeekV2Lite_PopulatesMlaAndMoe()
     {

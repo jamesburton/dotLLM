@@ -656,6 +656,22 @@ public static class HfConfigExtractor
                 || a.Contains("qwen2_moe") || a.Contains("qwen3_moe")
                 || a.Contains("qwenmoe") || a.Contains("qwen_moe")) => Architecture.QwenMoe,
             (_, "qwen2_moe" or "qwen3_moe" or "qwen_moe") => Architecture.QwenMoe,
+            // AllenAI OLMoE — `OlmoeForCausalLM` / `model_type=olmoe`. Reuses the
+            // Qwen-MoE tensor layout verbatim (`mlp.gate` router +
+            // `mlp.experts.{j}.{gate,up,down}_proj`) and the Llama-style GQA
+            // attention path, so it dispatches to Architecture.QwenMoe rather than
+            // its own enum. Two OLMoE-specific traits are handled downstream:
+            //   (1) QK-norm is a SINGLE RMSNorm over the WHOLE Q/K projection
+            //       (weight length num_heads*head_dim / num_kv_heads*head_dim),
+            //       applied before the reshape into heads — NOT the per-head norm
+            //       Qwen3/Gemma use. AttentionTensorLoader auto-detects the norm
+            //       length and TransformerModel.ApplyPerHeadNorm applies whole-
+            //       projection vs per-head accordingly.
+            //   (2) No shared expert (num_experts=64, top-8, norm_topk_prob=false)
+            //       — the extractor leaves SharedExpertIntermediateSize null so the
+            //       loader takes the routed-only path.
+            (var a, _) when a is not null && a.Contains("olmoe") => Architecture.QwenMoe,
+            (_, "olmoe") => Architecture.QwenMoe,
             // Granite-3.x MoE — `GraniteMoeForCausalLM` / `model_type=granitemoe`.
             // Must be checked before `Llama` / `Mistral` fall-throughs because the
             // base "Granite" name doesn't collide but the MoE-specific tensor
