@@ -190,12 +190,15 @@ def _load_tooluse_sequences(tokenizer, n_seqs: int, seq_len: int, needed: int) -
     all_ids: list[int] = []
 
     try:
+        # Held-out slice via streaming .skip(): streaming datasets don't accept
+        # `train[3000:]` slice syntax (raises "Bad split"), so load the full train
+        # stream and skip the first 3000 rows used for the prior tooluse LoRA.
         ds = load_dataset(
             "NousResearch/hermes-function-calling-v1",
             "glaive_func_calling",
-            split="train[3000:]",
+            split="train",
             streaming=True,
-        )
+        ).skip(3000)
         _CAP_DATASET_USED[label] = (
             "NousResearch/hermes-function-calling-v1 glaive_func_calling "
             "train[3000:] (held-out; train[:3000] used for tooluse LoRA)"
