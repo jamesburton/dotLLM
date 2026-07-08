@@ -756,6 +756,18 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     private readonly List<nint>? _ownedAllocations;
 
+    /// <summary>
+    /// Live subset of <see cref="_ownedAllocations"/> — the owned host buffers that
+    /// have NOT yet been freed. Built once from <see cref="_ownedAllocations"/> at
+    /// construction. The direct-to-device GPU upload path removes entries as it
+    /// frees them per-tensor (<see cref="TryReleaseOwnedHostAllocation"/>); anything
+    /// still present is freed by <see cref="Dispose"/>. Using a set (not the list)
+    /// as the free source makes early release and final disposal mutually exclusive,
+    /// so a streamed buffer is never double-freed. Null iff <see cref="_ownedAllocations"/>
+    /// is null (pure-mmap GGUF load with nothing to own).
+    /// </summary>
+    private readonly HashSet<nint>? _liveOwnedAllocations;
+
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
         TransformerLayerWeights[] layers,
@@ -775,7 +787,53 @@ internal sealed class TransformerWeights : IDisposable
         OutputOutputDim = outputOutputDim;
         OutputInputDim = outputInputDim;
         _ownedAllocations = ownedAllocations;
+        _liveOwnedAllocations = ownedAllocations is not null
+            ? new HashSet<nint>(ownedAllocations)
+            : null;
         SelfCond = selfCond;
+    }
+
+    /// <summary>
+    /// Number of loader-owned host allocations still live (not yet freed). Used by
+    /// the direct-to-device upload path and tests to observe streamed releases. Zero
+    /// for a pure-mmap GGUF load (nothing owned).
+    /// </summary>
+    internal int LiveOwnedAllocationCount => _liveOwnedAllocations?.Count ?? 0;
+
+    /// <summary>
+    /// Releases a single loader-owned host allocation early — used by the GPU
+    /// weight-upload path (direct-to-device streaming) to free each host scratch
+    /// buffer immediately after its synchronous host→device copy has completed,
+    /// instead of holding the entire host weight set resident until
+    /// <see cref="Dispose"/>. This roughly halves the transient CPU-RAM peak on the
+    /// GPU load path, where the host copy and the device copy would otherwise coexist
+    /// for the whole model.
+    /// <para>
+    /// <paramref name="hostPtr"/> is freed ONLY when it is a tracked owned allocation
+    /// (a bf16/f16 → F32 upcast, or an I2_S ternary-packed buffer). Memory-mapped
+    /// zero-copy views (F32 safetensors tensors, GGUF mmap pointers) are NOT owned and
+    /// are silently ignored — freeing them would corrupt the mmap and is never done.
+    /// </para>
+    /// <para>
+    /// Idempotent and memory-safe: a pointer already released (or never owned) returns
+    /// <c>false</c> without touching memory, so a duplicate call cannot double-free, and
+    /// <see cref="Dispose"/> will not re-free a streamed buffer (it drains the same live
+    /// set). The caller MUST guarantee the host bytes have already been fully consumed by
+    /// the device copy before calling — for CUDA that is the synchronous
+    /// <c>cuMemcpyHtoD_v2</c>, which blocks until the transfer completes; the subsequent
+    /// on-device dequant kernels read device memory only and never the freed host buffer.
+    /// </para>
+    /// </summary>
+    /// <param name="hostPtr">A host pointer previously handed to the upload path.</param>
+    /// <returns><c>true</c> if this call freed an owned allocation; otherwise <c>false</c>.</returns>
+    internal unsafe bool TryReleaseOwnedHostAllocation(nint hostPtr)
+    {
+        if (hostPtr == nint.Zero || _liveOwnedAllocations is null)
+            return false;
+        if (!_liveOwnedAllocations.Remove(hostPtr))
+            return false;
+        NativeMemory.AlignedFree((void*)hostPtr);
+        return true;
     }
 
     /// <summary>
@@ -958,15 +1016,20 @@ internal sealed class TransformerWeights : IDisposable
         RepackedOutput?.Dispose();
         RepackedOutput = null;
 
-        if (_ownedAllocations is not null)
+        // Free only the STILL-LIVE owned allocations. The direct-to-device upload
+        // path may have already freed (and removed) some of these per-tensor via
+        // TryReleaseOwnedHostAllocation; draining the live set here guarantees each
+        // owned buffer is freed exactly once whether or not streaming ran.
+        if (_liveOwnedAllocations is not null)
         {
-            foreach (var ptr in _ownedAllocations)
+            foreach (var ptr in _liveOwnedAllocations)
             {
                 if (ptr != nint.Zero)
                     NativeMemory.AlignedFree((void*)ptr);
             }
-            _ownedAllocations.Clear();
+            _liveOwnedAllocations.Clear();
         }
+        _ownedAllocations?.Clear();
     }
 
     private static TransformerLayerWeights LoadLayer(

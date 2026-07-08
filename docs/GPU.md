@@ -80,6 +80,15 @@ GGUF file (mmap'd on host)
 
 **Why dequantize on GPU?** Sending smaller quantized data over PCIe and dequantizing on-device is faster than dequantizing on CPU and sending larger FP16 data. GPU dequantization of a full Q4_K layer takes microseconds with massive parallelism.
 
+### Direct-to-device host streaming (transient RAM peak)
+
+For sources that materialize **owned host scratch** — the safetensors bf16/f16 → F32 upcasts and BitNet I2_S ternary-packed buffers (GGUF projections are zero-copy mmap views and own nothing) — the upload path frees each host buffer **as soon as its synchronous `cuMemcpyHtoD_v2` completes**, rather than holding the entire host `TransformerWeights` resident until the whole model is uploaded. This roughly halves the transient CPU-RAM peak, which otherwise held the host copy and the device copy of every weight simultaneously.
+
+- The per-tensor free is driven by an `onHostTensorUploaded` hook threaded into `CudaWeights.LoadFromGguf`, invoked for each per-layer Q/K/V/O and dense Gate/Up/Down host pointer after its copy. `TransformerWeights.TryReleaseOwnedHostAllocation` frees only *owned* allocations and ignores mmap views (never freed).
+- **Memory-safety:** `cuMemcpyHtoD_v2` blocks the host until the transfer finishes; the on-device dequant kernels queued on the stream read the uploaded device buffers only, never the host pointer — so the buffer is safe to free before the final `cuStreamSynchronize`. Each owned buffer is read exactly once in its block.
+- **Disabled when host weights are retained for CPU-side compute:** the high-precision I-quant forward and the Gemma-4 host LM head keep `_cpuWeights` alive, so streaming is turned off up front (`WillRetainHostWeights`, a conservative superset of the retain decision). Hybrid/pipeline splits also retain the host bundle and do not stream.
+- **Vulkan does not apply this.** The Vulkan backend deliberately retains the full host `TransformerWeights` for the model's lifetime (host-side embedding lookup, per-layer norm reads, self-conditioning, Gemma-4 scales), and its `UploadMatrix` can *zero-copy import* an owned host buffer directly into a device buffer (`VK_EXT_external_memory_host`) — freeing such a buffer would be a use-after-free. Applying the CUDA-style per-tensor free there would require a larger redesign (device-side embedding + threading the import-vs-staging decision back to the caller).
+
 ### VRAM Estimation
 
 | Component | Formula | Example (Llama 3.2 1B, Q8_0) | Example (Llama 3 8B, Q4_K_M) |
