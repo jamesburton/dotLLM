@@ -2770,6 +2770,24 @@ public sealed unsafe class TransformerModel : IModel
         int numHeads, int headDim, int seqLen, float eps)
     {
         int stride = numHeads * headDim;
+
+        // OLMoE applies a SINGLE RMSNorm over the entire Q/K projection (weight
+        // length == num_heads*head_dim) before splitting into heads, whereas
+        // Qwen3/Gemma apply a PER-HEAD RMSNorm (weight length == head_dim) after
+        // the split. Distinguish by the resolved weight length. When numHeads==1
+        // the two are numerically identical, so the guard is harmless.
+        if (numHeads > 1 && normWeight.Length == stride)
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                float* row = qk + t * stride;
+                RmsNorm.Execute(
+                    new ReadOnlySpan<float>(row, stride), normWeight, eps,
+                    new Span<float>(row, stride));
+            }
+            return;
+        }
+
         for (int t = 0; t < seqLen; t++)
         {
             for (int h = 0; h < numHeads; h++)
