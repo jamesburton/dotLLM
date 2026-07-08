@@ -357,6 +357,33 @@ internal static class TransformerWeightsSafetensorsLoader
         // Pre-FFN RMSNorm.
         float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
 
+        // BitNet-MoE (identity-MoTE): the inserted layers are per-layer top-1 MoE. When the
+        // config marks this layer MoE, the FFN is a bank of ternary I2_S experts + F32 router
+        // (+ optional bias), not the dense SwiGLU-shaped FFN below. The per-expert FFN Sub-LN
+        // lives in the MoE bundle; there is no layer-level ffn_sub_norm on a MoE layer.
+        if (config.Moe is not null && config.Moe.IsMoeLayer(layerIdx))
+        {
+            var moeBundle = LoadBitNetMoeLayer(layerIdx, file, config, owned);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias: null, kBias: null, vBias: null, oBias: null,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight: null, kNormWeight: null,
+                moe: moeBundle,
+                mla: null,
+                postAttnNormWeight: null, postFfnNormWeight: null,
+                gemma4: null,
+                attnSubNormWeight: attnSubNorm, ffnSubNormWeight: null);
+        }
+
         // BitNet FFN Sub-LN — RMSNorm over the gated intermediate [intermediate]
         // before down_proj.
         float[] ffnSubNorm = ResolveNorm(file, $"{prefix}.mlp.ffn_sub_norm.weight", intermediateSize);
@@ -387,6 +414,138 @@ internal static class TransformerWeightsSafetensorsLoader
             postAttnNormWeight: null, postFfnNormWeight: null,
             gemma4: null,
             attnSubNormWeight: attnSubNorm, ffnSubNormWeight: ffnSubNorm);
+    }
+
+    /// <summary>
+    /// Loads a BitNet-MoE (identity-MoTE) FFN layer: an F32 router
+    /// (<c>mlp.gate.weight</c> + optional <c>mlp.gate.bias</c>) over a bank of ternary
+    /// I2_S experts. Each expert's <c>{gate,up,down}_proj</c> is absmean-quantized to I2_S
+    /// and packed into a <b>contiguous per-projection bank</b> (payload only, no inline tail
+    /// scale) with a parallel per-expert α scale vector — the exact layout
+    /// <see cref="DotLLM.Cpu.Kernels.MatMul.MoeIndexedMatmulI2_S"/> consumes. The per-expert
+    /// BitNet FFN Sub-LN (<c>experts.{e}.ffn_sub_norm.weight</c>) is resolved into the bundle.
+    /// The skip expert (identity-MoTE expert 0, all-zero <c>down_proj</c>) needs no special
+    /// handling: it packs to all-zero trits and outputs exactly 0.
+    /// </summary>
+    private static unsafe MoeLayerWeights LoadBitNetMoeLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadBitNetMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.mlp";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router — F32 [E, H] + optional additive bias [E] (identity-MoTE / Qwen3 aux-free).
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+        float[]? gateBias = ResolveOptionalBias(file, $"{prefix}.gate.bias", numExperts);
+
+        // Contiguous packed-trit banks. gate/up: [I, H] → I·H/4 bytes; down: [H, I] → H·I/4.
+        long gateUpRowBytes = (long)intermediateSize * hiddenSize / 4;
+        long downRowBytes = (long)hiddenSize * intermediateSize / 4;
+        nint gateBank = AllocBank(gateUpRowBytes * numExperts, owned);
+        nint upBank = AllocBank(gateUpRowBytes * numExperts, owned);
+        nint downBank = AllocBank(downRowBytes * numExperts, owned);
+
+        var gateScales = new float[numExperts];
+        var upScales = new float[numExperts];
+        var downScales = new float[numExperts];
+        var expertFfnSubNorm = new float[numExperts][];
+
+        for (int e = 0; e < numExperts; e++)
+        {
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.gate_proj.weight",
+                (byte*)gateBank + e * gateUpRowBytes, intermediateSize, hiddenSize, out gateScales[e]);
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.up_proj.weight",
+                (byte*)upBank + e * gateUpRowBytes, intermediateSize, hiddenSize, out upScales[e]);
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.down_proj.weight",
+                (byte*)downBank + e * downRowBytes, hiddenSize, intermediateSize, out downScales[e]);
+            expertFfnSubNorm[e] = ResolveNorm(file, $"{prefix}.experts.{e}.ffn_sub_norm.weight", intermediateSize);
+        }
+
+        // The routed F32 W1/W2/W3 pointer arrays are unused on the I2_S path (the CPU forward
+        // branches on RoutedExpertQuantType); pass empty arrays.
+        var bundle = new MoeLayerWeights(
+            gate,
+            w1: Array.Empty<nint>(), w2: Array.Empty<nint>(), w3: Array.Empty<nint>(),
+            numExperts, moe.NumExpertsPerTok, hiddenSize, intermediateSize,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null)
+        {
+            RoutedExpertQuantType = QuantizationType.I2_S,
+            GateExpsI2SBase = gateBank, GateExpsI2SRowBytes = gateUpRowBytes, GateExpsI2SScales = gateScales,
+            UpExpsI2SBase = upBank, UpExpsI2SRowBytes = gateUpRowBytes, UpExpsI2SScales = upScales,
+            DownExpsI2SBase = downBank, DownExpsI2SRowBytes = downRowBytes, DownExpsI2SScales = downScales,
+            ExpertFfnSubNorm = expertFfnSubNorm,
+            GateBias = gateBias,
+        };
+        return bundle;
+    }
+
+    /// <summary>Allocates a 64-byte-aligned native scratch buffer registered in <paramref name="owned"/>.</summary>
+    private static unsafe nint AllocBank(long bytes, List<nint> owned)
+    {
+        nint p = (nint)NativeMemory.AlignedAlloc(checked((nuint)bytes), 64);
+        owned.Add(p);
+        return p;
+    }
+
+    /// <summary>
+    /// Absmean-quantizes one expert projection to ternary I2_S and writes the <b>packed
+    /// payload only</b> (<c>m·k/4</c> bytes, no tail scale) into <paramref name="bankSlot"/>,
+    /// returning the per-tensor α in <paramref name="scale"/>. Mirrors
+    /// <see cref="ResolveLinearAsI2S"/> but splits the tail scale into a separate vector so the
+    /// indexed-MoE kernel can address contiguous packed banks + a scale-per-expert.
+    /// </summary>
+    private static unsafe void PackExpertI2SIntoBank(
+        ISafetensorsTensorSource file, string name,
+        byte* bankSlot, int expectedM, int expectedK, out float scale)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+        ValidateProjectionShape(m, k, expectedM, expectedK, name);
+
+        long count = (long)m * k;
+        if (count % 128 != 0)
+            throw new InvalidDataException(
+                $"BitNet expert '{name}' element count {count} (shape [{m},{k}]) is not a "
+                + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
+
+        long payloadBytes = count / 4;
+        int packedLen = checked((int)(payloadBytes + sizeof(float)));
+
+        // TODO(perf): this upcasts bf16→F32 then quantizes on every load; the dense BitNet
+        // path caches packed bytes via BitNetI2SCache. A per-expert cache keyed by tensor name
+        // would remove the repeated absmean/pack cost for real checkpoints. Load-time only.
+        var temp = new List<nint>();
+        byte[] packed = System.Buffers.ArrayPool<byte>.Shared.Rent(packedLen);
+        try
+        {
+            var (f32Ptr, _, _, _) = ResolveLinearAsF32(file, name, temp);
+            var packedSpan = packed.AsSpan(0, packedLen);
+            BitNetQuantize.QuantizeToI2S(
+                new ReadOnlySpan<float>((void*)f32Ptr, checked((int)count)), count, packedSpan);
+
+            new ReadOnlySpan<byte>(packed, 0, checked((int)payloadBytes))
+                .CopyTo(new Span<byte>(bankSlot, checked((int)payloadBytes)));
+            scale = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<float>(
+                ref packed[checked((int)payloadBytes)]);
+        }
+        finally
+        {
+            foreach (var p in temp)
+                NativeMemory.AlignedFree((void*)p);
+            System.Buffers.ArrayPool<byte>.Shared.Return(packed);
+        }
     }
 
     /// <summary>

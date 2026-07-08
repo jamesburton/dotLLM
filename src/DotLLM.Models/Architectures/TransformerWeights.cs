@@ -204,6 +204,63 @@ internal sealed class MoeLayerWeights
     /// </summary>
     public bool HasRawQuantView => GateExpsRaw != 0 && UpExpsRaw != 0 && DownExpsRaw != 0;
 
+    // ── BitNet ternary (I2_S) routed-expert banks (CPU) ─────────────────────────
+    // Populated by the safetensors BitNet-MoE loader (LoadBitNetMoeLayer). The
+    // per-expert {gate,up,down}_proj are ternary I2_S, laid out as CONTIGUOUS
+    // packed-trit banks (payload only, NO inline tail scale) with a parallel
+    // per-expert absmean scale vector — the exact shape MatMul.MoeIndexedMatmulI2_S
+    // consumes. The BitNet expert body differs from SwiGLU: it is
+    // down( ffn_sub_norm( relu2(gate(x)) * up(x) ) ), so the per-expert
+    // ffn_sub_norm RMSNorm weights live here too. The router (Gate/GateBias) stays
+    // F32. Mutable (set post-construction) — same policy as the Vulkan quant overlay.
+
+    /// <summary>
+    /// Quant type of the routed experts. <see cref="QuantizationType.F32"/> (default)
+    /// selects the SwiGLU path over the <see cref="W1"/>/<see cref="W2"/>/<see cref="W3"/>
+    /// F32 pointers. <see cref="QuantizationType.I2_S"/> selects the BitNet-MoE path over
+    /// the packed ternary banks below (relu2 + per-expert <see cref="ExpertFfnSubNorm"/>).
+    /// <para><b>Q4_K/Q8_0 extension point:</b> add the new quant type here and a matching
+    /// indexed-matmul kernel dispatch in the BitNet-MoE forward; the loader and this bundle
+    /// already carry per-expert base+stride banks and a per-expert scale/format field.</para>
+    /// </summary>
+    public QuantizationType RoutedExpertQuantType = QuantizationType.F32;
+
+    /// <summary>Contiguous packed-trit bank base for <c>gate_proj</c> (payload only, no tail
+    /// scale). Expert <c>e</c> lives at <c>GateExpsI2SBase + e*GateExpsI2SRowBytes</c>. 0 when
+    /// the routed experts are not I2_S.</summary>
+    public nint GateExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>gate_proj</c> expert banks (= <c>I·H/4</c>).</summary>
+    public long GateExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>gate_proj</c> [numExperts]. Null when not I2_S.</summary>
+    public float[]? GateExpsI2SScales;
+
+    /// <summary>Contiguous packed-trit bank base for <c>up_proj</c>. See <see cref="GateExpsI2SBase"/>.</summary>
+    public nint UpExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>up_proj</c> expert banks (= <c>I·H/4</c>).</summary>
+    public long UpExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>up_proj</c> [numExperts].</summary>
+    public float[]? UpExpsI2SScales;
+
+    /// <summary>Contiguous packed-trit bank base for <c>down_proj</c>. See <see cref="GateExpsI2SBase"/>.</summary>
+    public nint DownExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>down_proj</c> expert banks (= <c>H·I/4</c>).</summary>
+    public long DownExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>down_proj</c> [numExperts].</summary>
+    public float[]? DownExpsI2SScales;
+
+    /// <summary>Per-expert BitNet FFN Sub-LN weight, <c>[numExperts][moeIntermediateSize]</c>.
+    /// Applied as an RMSNorm over the gated intermediate <c>relu2(gate)*up</c> before
+    /// <c>down_proj</c>, per the expert that produced the row. Null for non-BitNet MoE.</summary>
+    public float[][]? ExpertFfnSubNorm;
+
+    /// <summary>Optional router bias <c>[numExperts]</c> added to the gate logits before
+    /// softmax/top-k. Required for identity-MoTE (top-1 selection is bias-shifted) and
+    /// Qwen3 aux-loss-free routing; harmless (null) elsewhere.</summary>
+    public float[]? GateBias;
+
+    /// <summary>True when the routed experts are ternary I2_S (BitNet-MoE forward path).</summary>
+    public bool IsBitNetI2S => RoutedExpertQuantType == QuantizationType.I2_S;
+
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
         float[] gate,
