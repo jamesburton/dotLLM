@@ -39,12 +39,14 @@ Smoke test (CPU, seconds, no downloads)::
         --steps 3 --seq-len 32 --n-seqs-per-cap 4 \
         --out .docs/mote/identity_smoke
 
-Real GPU run (launched separately — do NOT run here)::
+Real GPU run (launched separately — do NOT run here). ``general`` maps to label 0
+(the frozen skip expert), so general-web text trains the router to leave base
+behaviour untouched; ``--balance`` equalizes the label mix so no capability starves::
 
     python scripts/lora/identity_mote_train.py \
-        --config idm_2b --device cuda --grad-checkpoint \
-        --every 4 --n-capability-experts 3 \
-        --capabilities math,instruction,tooluse \
+        --config idm_2b --device cuda --grad-checkpoint --batch-size 4 \
+        --every 4 \
+        --capabilities general,math,instruction,coding --balance \
         --seq-len 256 --n-seqs-per-cap 4000 --tokens 6e6 \
         --route-weight 1.0 --out .docs/mote/idm_2b
 """
@@ -124,27 +126,107 @@ def _freeze_for_training(model: nn.Module, train_inserted_attn: bool) -> None:
 
 
 def _supervised_route_loss(
-    model: nn.Module, label: int, device: torch.device
+    model: nn.Module, labels, device: torch.device, label_weights: Optional[dict] = None
 ) -> torch.Tensor:
-    """Mean over identity-MoTE layers of CE(router_logits, task_label).
+    """Mean over identity-MoTE layers of per-token CE(router_logits, task_label).
 
-    ``label`` is the per-sequence routing target, broadcast to every token. In-graph.
+    ``labels`` is a sequence of ``B`` per-sequence routing targets (one per sequence
+    in the micro-batch). The router runs per-token, so ``block.last_logits`` is
+    ``[B*T, E]`` in **sequence-major** order (row ``n`` is token ``n % T`` of
+    sequence ``n // T``). Each sequence's label is therefore broadcast to its ``T``
+    tokens via ``repeat_interleave(T)``, so a batch that mixes labels aligns cleanly:
+    token ``n`` is supervised toward ``labels[n // T]``. In-graph.
+
+    For ``B == 1`` this reduces to the original behaviour (the single label broadcast
+    to all ``T`` tokens).
+
+    ``label_weights`` (optional) maps ``label -> multiplier``: tokens whose label is
+    listed get that weight in a per-token weighted CE. Used by ``--route-force-weight``
+    to push extra routing pressure onto a STARVED expert so training drives its tokens
+    to the intended label. ``None`` (default) is the unweighted mean.
     """
+    labels_t = torch.as_tensor([int(x) for x in labels], dtype=torch.long)
+    B = labels_t.numel()
+    if label_weights:
+        w_seq = torch.tensor(
+            [float(label_weights.get(int(x), 1.0)) for x in labels], dtype=torch.float32
+        )
+    else:
+        w_seq = None
     total: Optional[torch.Tensor] = None
     n = 0
     for block in _iter_mote_blocks(model):
         logits = block.last_logits
         if logits is None:
             continue
-        target = torch.full(
-            (logits.size(0),), int(label), dtype=torch.long, device=logits.device
-        )
-        ce = F.cross_entropy(logits.float(), target)
+        # Recover T from the flattened [B*T, E] router logits (B known from labels).
+        T = logits.size(0) // B
+        target = labels_t.to(logits.device).repeat_interleave(T)  # [B*T]
+        if w_seq is not None:
+            w_tok = w_seq.to(logits.device).repeat_interleave(T)  # [B*T]
+            ce_tok = F.cross_entropy(logits.float(), target, reduction="none")
+            ce = (ce_tok * w_tok).sum() / w_tok.sum().clamp_min(1e-8)
+        else:
+            ce = F.cross_entropy(logits.float(), target)
         total = ce if total is None else total + ce
         n += 1
     if total is None:
         return torch.zeros((), device=device)
     return total / n
+
+
+# ---------------------------------------------------------------------------
+# Routing-imbalance monitoring
+# ---------------------------------------------------------------------------
+
+
+def _data_label_fracs(labels, n_experts: int) -> torch.Tensor:
+    """Expected (target) dispatch fractions = per-label share of the training data."""
+    hist = torch.zeros(n_experts, dtype=torch.float64)
+    for l in labels:
+        li = int(l)
+        if 0 <= li < n_experts:
+            hist[li] += 1.0
+    s = hist.sum()
+    return (hist / s) if s > 0 else hist
+
+
+def _dispatch_fracs(recent_counts: list, n_experts: int) -> torch.Tensor:
+    """Observed dispatch fractions over the rolling window of per-step counts."""
+    if not recent_counts:
+        return torch.zeros(n_experts, dtype=torch.float64)
+    tot = torch.stack(recent_counts).sum(0).to(torch.float64)
+    s = tot.sum()
+    return (tot / s) if s > 0 else tot
+
+
+def _route_monitor(disp: torch.Tensor, target: torch.Tensor, threshold: float):
+    """Compare observed vs target dispatch fractions.
+
+    Returns ``(warnings, starved, overused)`` where ``starved``/``overused`` are sets
+    of labels whose dispatch fraction is below ``1/threshold`` / above ``threshold``
+    times their data fraction (default threshold 2.0 => the 0.5x / 2x band).
+    """
+    warnings: list = []
+    starved: set = set()
+    overused: set = set()
+    for e in range(target.numel()):
+        df = float(target[e])
+        if df <= 0.0:
+            continue
+        pf = float(disp[e]) if e < disp.numel() else 0.0
+        ratio = pf / df if df > 0 else 0.0
+        if ratio < (1.0 / threshold):
+            starved.add(e)
+            warnings.append(
+                f"label {e} STARVED: dispatch {pf:.3f} << data {df:.3f} (ratio {ratio:.2f}x)"
+            )
+        elif ratio > threshold:
+            overused.add(e)
+            warnings.append(
+                f"label {e} OVERUSED: dispatch {pf:.3f} >> data {df:.3f} (ratio {ratio:.2f}x)"
+            )
+    return warnings, starved, overused
 
 
 def _collect_counts(model: nn.Module) -> Optional[torch.Tensor]:
@@ -221,6 +303,12 @@ def main() -> None:
     ap.add_argument("--n-seqs-per-cap", type=int, default=64,
                     help="Sequences per capability.")
     ap.add_argument("--seq-len", type=int, default=256, help="Tokens per sequence.")
+    ap.add_argument("--balance", action="store_true",
+                    help="Balance the corpus across labels: oversample under-represented "
+                         "capabilities (e.g. no_robots @ 544) and cap over-represented ones "
+                         "so every expert sees an equal share and no cap exhausts late.")
+    ap.add_argument("--balance-target", type=int, default=None,
+                    help="Per-capability target count for --balance (default: max loaded).")
 
     # Training
     ap.add_argument("--tokens", type=float, default=0.0,
@@ -229,13 +317,36 @@ def main() -> None:
                     help="Hard cap on optimizer steps (0 = unlimited; used for smoke).")
     ap.add_argument("--route-weight", type=float, default=1.0,
                     help="Weight of the supervised routing CE loss.")
+    ap.add_argument("--route-monitor", action="store_true", default=True,
+                    help="Monitor per-label dispatch fractions vs the data mix and WARN on "
+                         "imbalance (default ON, log-only).")
+    ap.add_argument("--no-route-monitor", dest="route_monitor", action="store_false")
+    ap.add_argument("--route-imbalance-threshold", type=float, default=2.0,
+                    help="Warn when a label's dispatch fraction is <1/T or >T times its data "
+                         "fraction (default 2.0 => the 0.5x/2x band).")
+    ap.add_argument("--route-force-weight", type=float, default=0.0,
+                    help="Correction knob (opt-in, default 0=off). When >0, tokens of a "
+                         "capability whose expert the monitor flags as STARVED get their "
+                         "supervised-routing CE multiplied by (1 + this), pushing training to "
+                         "drive those tokens to the intended expert.")
     ap.add_argument("--lr", type=float, default=1e-4, help="Expert LR.")
     ap.add_argument("--router-lr", type=float, default=1e-3,
                     help="Router LR (higher: the router is tiny and must move logits fast).")
-    ap.add_argument("--optim", choices=["adamw", "adafactor", "adamw8bit"], default="adamw",
-                    help="Optimizer (adamw default; adamw8bit tries bnb w/ adafactor fallback).")
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="Micro-batch: sequences stacked per optimizer step ([B, seq_len]). "
+                         "Default 1 preserves the original per-sequence path. The LM loss is the "
+                         "batch mean; the supervised routing CE stays per-sequence (each sequence's "
+                         "label is broadcast to its own tokens, so a batch may mix labels).")
+    ap.add_argument("--optim", choices=["adamw", "adamw-fused", "adafactor", "adamw8bit"],
+                    default="adamw",
+                    help="Optimizer. 'adamw' (default) AUTO-USES fused AdamW on CUDA — the fast "
+                         "path on memory-rich GPUs (Strix); 'adamw-fused' forces it (both fall "
+                         "back to foreach/default if fused is unavailable). 'adafactor' is the "
+                         "memory-light path (12GB 3060). 'adamw8bit' tries bitsandbytes w/ "
+                         "adafactor fallback.")
     ap.add_argument("--grad-checkpoint", action="store_true",
-                    help="Gradient checkpointing (activation recompute) — for the 12GB 3060.")
+                    help="Gradient checkpointing (activation recompute) — for the 12GB 3060. "
+                         "OMIT on memory-rich GPUs (Strix) for ~25-35%% speedup (it is opt-in).")
     ap.add_argument("--verify-identity", action="store_true", default=True,
                     help="Verify identity-at-init vs base before training (default on).")
     ap.add_argument("--no-verify-identity", dest="verify_identity", action="store_false")
@@ -275,14 +386,21 @@ def main() -> None:
         seq_len=args.seq_len,
         tiny_random=args.tiny_random,
         vocab_size=vocab_size,
+        balance=args.balance,
+        balance_target=args.balance_target,
     )
-    n_caps = len(label_map)
-    K = args.n_capability_experts if args.n_capability_experts is not None else n_caps
-    if K < n_caps:
-        print(f"[idm] WARNING: K={K} < #capabilities={n_caps}; labels > K will be unroutable.")
+    # Capability experts = labels >= 1 (label 0 == the frozen skip/identity expert,
+    # reused by the general/web capability — it is NOT a trainable capability expert).
+    n_cap_experts = len({v for v in label_map.values() if v >= 1})
+    K = args.n_capability_experts if args.n_capability_experts is not None else n_cap_experts
+    if K < n_cap_experts:
+        print(f"[idm] WARNING: K={K} < #capability-experts={n_cap_experts}; "
+              f"labels > K will be unroutable.")
+    from collections import Counter
     print(f"[idm] label_map={label_map}  K(capability experts)={K}  "
-          f"n_experts={K + 1} (incl. skip)")
-    print(f"[idm] corpus: {len(sequences)} sequences x {args.seq_len} tokens")
+          f"n_experts={K + 1} (incl. skip=label 0)")
+    print(f"[idm] corpus: {len(sequences)} sequences x {args.seq_len} tokens  "
+          f"per-label counts={dict(sorted(Counter(labels).items()))}")
 
     # ------------------------------------------------------------------
     # 3. Snapshot base logits for the identity check (before in-place expansion)
@@ -405,6 +523,7 @@ def main() -> None:
     # 8. Training loop
     # ------------------------------------------------------------------
     model.train()
+    B = max(1, int(args.batch_size))
     max_tokens = int(args.tokens) if args.tokens and args.tokens > 0 else None
     max_steps = args.steps if args.steps and args.steps > 0 else None
     tokens_seen = 0
@@ -412,6 +531,15 @@ def main() -> None:
     final_lm = final_route = float("nan")
     recent_counts: list = []
     order = list(range(len(sequences)))
+    n_experts_total = K + 1
+    target_fracs = _data_label_fracs(labels, n_experts_total)
+    starved_labels: set = set()  # updated by the monitor; drives --route-force-weight
+    last_disp = target_fracs.clone()
+    if args.route_monitor:
+        print(f"[idm] route-monitor ON (threshold {args.route_imbalance_threshold}x); "
+              f"target dispatch fracs={[round(x, 3) for x in target_fracs.tolist()]}")
+    if args.route_force_weight > 0:
+        print(f"[idm] route-force ON: starved-label CE x{1 + args.route_force_weight:.2f}")
     _t0 = time.perf_counter()
 
     def _budget_left() -> bool:
@@ -420,20 +548,26 @@ def main() -> None:
         if max_tokens is not None and tokens_seen >= max_tokens:
             return False
         if max_steps is None and max_tokens is None:
-            return step < len(sequences)  # one pass
+            return step * B < len(sequences)  # one pass (B sequences per step)
         return True
 
     while _budget_left():
-        idx = order[step % len(order)]
-        seq = sequences[idx].unsqueeze(0).to(device)  # [1, T]
-        label = labels[idx]
+        # Micro-batch of B sequences (wraps around the corpus); each carries its own
+        # per-sequence routing label, so the batch may mix labels.
+        batch_idx = [order[(step * B + j) % len(order)] for j in range(B)]
+        seqs = torch.stack([sequences[i] for i in batch_idx]).to(device)  # [B, T]
+        batch_labels = [labels[i] for i in batch_idx]
 
-        logits = model(input_ids=seq, use_cache=False).logits  # [1, T, V]
-        lm_loss = F.cross_entropy(
+        logits = model(input_ids=seqs, use_cache=False).logits  # [B, T, V]
+        lm_loss = F.cross_entropy(  # mean over all next-token positions == batch mean
             logits[:, :-1, :].contiguous().view(-1, vocab_size),
-            seq[:, 1:].contiguous().view(-1),
+            seqs[:, 1:].contiguous().view(-1),
         )
-        route_loss = _supervised_route_loss(model, label, device)
+        label_weights = None
+        if args.route_force_weight > 0 and starved_labels:
+            mult = 1.0 + args.route_force_weight
+            label_weights = {l: mult for l in starved_labels}
+        route_loss = _supervised_route_loss(model, batch_labels, device, label_weights)
         loss = lm_loss + args.route_weight * route_loss
 
         lm_val = lm_loss.item()
@@ -446,17 +580,38 @@ def main() -> None:
         opt.step()
         opt.zero_grad()
 
+        # Per-step dispatch histogram: last_counts already sums over ALL B*T tokens
+        # in every mote block, so it is meaningful for a batch as-is.
         counts = _collect_counts(model)
         if counts is not None:
             recent_counts.append(counts.cpu())
             if len(recent_counts) > 100:
                 recent_counts.pop(0)
 
-        tokens_seen += seq.size(1)
+        tokens_seen += seqs.numel()  # B * T
         step += 1
         final_lm, final_route = lm_val, route_val
+
+        # Routing-imbalance monitor (rolling window) — log-only by default; also
+        # refreshes the STARVED set that --route-force-weight acts on.
+        if args.route_monitor and recent_counts and (step <= 5 or step % 20 == 0):
+            last_disp = _dispatch_fracs(recent_counts, n_experts_total)
+            warns, starved_labels, _overused = _route_monitor(
+                last_disp, target_fracs, args.route_imbalance_threshold
+            )
+            print(f"  [monitor] dispatch={[round(x, 3) for x in last_disp.tolist()]}  "
+                  f"target={[round(x, 3) for x in target_fracs.tolist()]}", flush=True)
+            for w in warns:
+                print(f"  [monitor] WARNING route imbalance: {w}", flush=True)
+            if args.route_force_weight > 0 and starved_labels:
+                print(f"  [monitor] forcing CE x{1 + args.route_force_weight:.2f} for "
+                      f"starved labels {sorted(starved_labels)}", flush=True)
+
         if step <= 5 or step % 20 == 0:
-            print(f"  step {step:5d}  tok {tokens_seen:.2e}  label {label}  "
+            # Compact per-label multiplicity for the batch (sensible when B > 1).
+            lbl_counts = {l: batch_labels.count(l) for l in sorted(set(batch_labels))}
+            lbl_str = str(batch_labels[0]) if B == 1 else str(lbl_counts)
+            print(f"  step {step:5d}  tok {tokens_seen:.2e}  labels {lbl_str}  "
                   f"lm {lm_val:.4f}  route {route_val:.4f}", flush=True)
 
     elapsed = time.perf_counter() - _t0
@@ -485,9 +640,14 @@ def main() -> None:
         "layers_before": n_layers_before,
         "layers_after": info["final_layers"],
         "seq_len": args.seq_len,
+        "batch_size": B,
+        "optim": args.optim,
         "steps": step,
         "tokens": tokens_seen,
         "route_weight": args.route_weight,
+        "balance": args.balance,
+        "balance_target": args.balance_target,
+        "route_force_weight": args.route_force_weight,
         "tiny_random": args.tiny_random,
     }
     with open(os.path.join(args.out, "identity_mote_config.json"), "w", encoding="utf-8") as fh:
@@ -500,6 +660,8 @@ def main() -> None:
         "experts_used": experts_used,
         "steps": step,
         "tokens": tokens_seen,
+        "dispatch_fracs": [round(x, 4) for x in last_disp.tolist()],
+        "target_fracs": [round(x, 4) for x in target_fracs.tolist()],
     }
     if device.type == "cuda":
         metrics["peak_vram_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
@@ -517,6 +679,29 @@ def main() -> None:
     if not (lm_ok and route_ok and step > 0):
         raise RuntimeError("Smoke gate FAILED — see GATE line above.")
     print("[idm] GATE PASSED")
+
+
+def _build_adamw(param_groups, lr: float, device: torch.device, prefer_fused: bool):
+    """torch.optim.AdamW with the fused CUDA kernel when available.
+
+    Fused AdamW (``fused=True``) is a single-kernel foreach optimizer that is the
+    fast path on memory-rich GPUs (e.g. Strix). It is CUDA-only; on CPU or when the
+    build lacks it we fall back to ``foreach=True`` and then to the default impl.
+    """
+    kwargs = dict(betas=(0.9, 0.95), weight_decay=0.0)
+    if prefer_fused and device.type == "cuda":
+        try:
+            opt = torch.optim.AdamW(param_groups, lr=lr, fused=True, **kwargs)
+            print("[idm] optimizer: AdamW (fused CUDA kernel — fast path on memory-rich GPUs)")
+            return opt
+        except (RuntimeError, ValueError, TypeError) as exc:
+            print(f"[idm] fused AdamW unavailable ({exc}); falling back to foreach/default")
+    try:
+        opt = torch.optim.AdamW(param_groups, lr=lr, foreach=True, **kwargs)
+    except (TypeError, RuntimeError):
+        opt = torch.optim.AdamW(param_groups, lr=lr, **kwargs)
+    print(f"[idm] optimizer: AdamW ({'foreach' if device.type != 'cuda' else 'non-fused'})")
+    return opt
 
 
 def _make_optimizer(choice: str, param_groups, lr: float, device: torch.device):
@@ -538,7 +723,10 @@ def _make_optimizer(choice: str, param_groups, lr: float, device: torch.device):
             return opt
         except Exception as exc:  # noqa: BLE001
             print(f"[idm] bnb unavailable ({exc}); falling back to AdamW")
-    return torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95), weight_decay=0.0)
+    # 'adamw' auto-uses fused on CUDA; 'adamw-fused' forces the same preference
+    # (both degrade to foreach/default off-CUDA or when fused is unavailable).
+    prefer_fused = choice in ("adamw", "adamw-fused")
+    return _build_adamw(param_groups, lr, device, prefer_fused=prefer_fused)
 
 
 if __name__ == "__main__":
