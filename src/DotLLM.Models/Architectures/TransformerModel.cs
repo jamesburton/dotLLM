@@ -1351,11 +1351,40 @@ public sealed unsafe class TransformerModel : IModel
                 }
 
                 MoeLayerWeights moe = lw.Moe!;
+                // BitNet-ternary MoE (identity-MoTE): experts are I2_S with a relu² +
+                // per-expert ffn_sub_norm body, dispatched through the indexed I2_S kernel.
+                // The router (Gate + optional GateBias) stays F32.
+                // CROSS-BACKEND TODO (CPU-first landed here): mirror this in CudaMoeFfn
+                // (add an I2_S variant of native moe_grouped_gemv.cu — the quant path already
+                // uploads per-expert quant bytes) and VulkanTransformerModel (new
+                // moe_indexed_matmul_i2s_f32.comp; the q4_k/q8_0 indexed shaders are templates),
+                // plus the GateBias add in each backend's router. See
+                // .planning/2026-07-08-mote-dotllm-export-design.md §3.4.
+                if (moe.IsBitNetI2S)
+                {
+                    MoeSwiGluMlp.ExecuteBitNetMoe(
+                        hidden: new ReadOnlySpan<float>(normOut, seqLen * hiddenSize),
+                        gateWeights: moe.Gate,
+                        gateBias: moe.GateBias is not null ? moe.GateBias.AsSpan() : ReadOnlySpan<float>.Empty,
+                        gateBank: (byte*)moe.GateExpsI2SBase, gateRowBytes: moe.GateExpsI2SRowBytes, gateScales: moe.GateExpsI2SScales!,
+                        upBank: (byte*)moe.UpExpsI2SBase, upRowBytes: moe.UpExpsI2SRowBytes, upScales: moe.UpExpsI2SScales!,
+                        downBank: (byte*)moe.DownExpsI2SBase, downRowBytes: moe.DownExpsI2SRowBytes, downScales: moe.DownExpsI2SScales!,
+                        expertFfnSubNorm: moe.ExpertFfnSubNorm!,
+                        output: new Span<float>(normOut, seqLen * hiddenSize),
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        seqLen: seqLen,
+                        normTopKProb: moe.NormTopKProb,
+                        rmsEps: eps,
+                        threadPool: _threadPool);
+                }
                 // Route through the shared-expert-aware overload iff we need
                 // shared-expert addition OR the raw-softmax (non-renormalised)
                 // Qwen1.5-MoE gating. The simple Mixtral path stays the call
                 // target for the common case.
-                if (moe.HasSharedExpert || !moe.NormTopKProb)
+                else if (moe.HasSharedExpert || !moe.NormTopKProb)
                 {
                     ReadOnlySpan<float> sharedGateSpan = moe.SharedExpertGate is not null
                         ? moe.SharedExpertGate.AsSpan()
