@@ -35,6 +35,17 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly int _ropeType;
     private readonly bool _useHighPrecisionForward;
 
+    /// <summary>
+    /// Number of loader-owned host allocations that were stream-freed (released as
+    /// soon as their host→device copy completed, rather than at
+    /// <see cref="TransformerWeights.Dispose"/>) during the most recent load on the
+    /// direct-to-device path. Zero when the host weights were retained for a CPU-side
+    /// forward (high-precision I-quant / Gemma-4), for a pure-mmap GGUF load where the
+    /// per-layer projections are mmap views (nothing owned to free), or for the hybrid /
+    /// pipeline paths (which retain the host bundle). Diagnostic only.
+    /// </summary>
+    internal static int LastLoadStreamedHostFreeCount { get; private set; }
+
     // ── Gemma-4 (DiffusionGemma AR) per-attention-type rope params ──
     // Sliding (SWA) layers use _ropeTheta/_ropeDim (full NeoX rotation over the
     // sliding head dim). Global (full-attention) layers use _gemma4GlobalRopeTheta
@@ -448,7 +459,32 @@ public sealed unsafe class CudaTransformerModel : IModel
                           $"Consider a smaller model or quantization format.";
         }
 
-        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
+        // ── Direct-to-device weight streaming ──
+        // On the quantized/BitNet path the CPU weights are disposed immediately after
+        // upload (see the ctor), so we can free each owned host scratch buffer (bf16→F32
+        // upcasts, I2_S packed) as soon as its synchronous H2D copy completes, instead of
+        // holding the whole host TransformerWeights resident through the entire upload.
+        // That roughly halves the transient CPU-RAM peak (host copy + device copy no longer
+        // coexist for the full model). We MUST disable it whenever the host weights will be
+        // retained for a CPU-side forward — the high-precision I-quant path and Gemma-4's
+        // host LM head both read those host buffers later. WillRetainHostWeights is a
+        // conservative superset of the ctor's retain decision (it ignores the
+        // EnableHighPrecisionIQuants env gate), so we never stream-free a buffer the forward
+        // might read.
+        int streamedFreeCount = 0;
+        Action<nint>? onHostTensorUploaded = null;
+        if (!WillRetainHostWeights(cpuWeights, config))
+        {
+            onHostTensorUploaded = ptr =>
+            {
+                if (cpuWeights.TryReleaseOwnedHostAllocation(ptr))
+                    streamedFreeCount++;
+            };
+        }
+
+        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
+            onHostTensorUploaded: onHostTensorUploaded);
+        LastLoadStreamedHostFreeCount = streamedFreeCount;
 
         // Gemma-4 full-attention (global) layers may use a distinct head dim and
         // KV-head count (GlobalHeadDim / NumGlobalKvHeads). Size the Q/K/V scratch
@@ -1891,6 +1927,44 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         _kernels.LaunchQuantizeXToQ8_1(input, _state.PreQ8_1Scratch, inputDim, stream);
         return _state.PreQ8_1Scratch;
+    }
+
+    /// <summary>
+    /// Whether the CUDA model will RETAIN the host <see cref="TransformerWeights"/> after
+    /// upload (and therefore must NOT stream-free per-tensor host scratch during upload).
+    /// This is a conservative SUPERSET of the constructor's retain condition
+    /// (<c>_useHighPrecisionForward || _isGemma4</c>): it flags any IQ-quant model
+    /// regardless of the <see cref="EnableHighPrecisionIQuants"/> env gate, and any Gemma-4
+    /// dual-FFN model (host LM head). Computed from <paramref name="cpuWeights"/> +
+    /// <paramref name="config"/> BEFORE upload, so the streaming decision is made up front.
+    /// Erring toward "retain" only forfeits the RAM optimization in rare cases; it can never
+    /// free a buffer the forward later reads.
+    /// </summary>
+    private static bool WillRetainHostWeights(TransformerWeights cpuWeights, ModelConfig config)
+    {
+        // Gemma-4 dual-FFN keeps the host weights for the CPU LM head (mirrors _isGemma4,
+        // which is exactly `weights.Gemma4Layers is not null` ⇔ config.Gemma4DualFfn).
+        if (config.Gemma4DualFfn)
+            return true;
+
+        // High-precision I-quant forward retains host weights for the dequant→F32→dot CPU
+        // fallback. Mirror ShouldUseHighPrecisionForward's IQ detector, but read the quant
+        // types off the CPU weights (identical to the device-side types) and ignore the env
+        // gate for a conservative superset.
+        if (IsIQuant(cpuWeights.OutputQuantType))
+            return true;
+        foreach (ref readonly var lw in cpuWeights.Layers.AsSpan())
+        {
+            if (IsIQuant(lw.QQuantType) || IsIQuant(lw.KQuantType) || IsIQuant(lw.VQuantType)
+                || IsIQuant(lw.OQuantType) || IsIQuant(lw.GateQuantType)
+                || IsIQuant(lw.UpQuantType) || IsIQuant(lw.DownQuantType))
+                return true;
+        }
+        return false;
+
+        static bool IsIQuant(QuantizationType qt) =>
+            qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
     }
 
     private static bool ShouldUseHighPrecisionForward(CudaWeights weights)

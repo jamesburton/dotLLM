@@ -186,10 +186,25 @@ internal sealed class CudaWeights : IDisposable
     /// vocab × hidden table (FP16 when bulk-dequanted, raw-quant when a per-row lookup kernel exists)
     /// plus the transient upload. The owning stage must never launch an embedding lookup.
     /// </param>
+    /// <param name="onHostTensorUploaded">
+    /// Optional direct-to-device streaming hook. When non-null, it is invoked with each
+    /// per-layer linear-projection HOST pointer (Q/K/V/O and dense Gate/Up/Down) right
+    /// after that tensor's synchronous host→device copy completes, so the caller can free
+    /// the host scratch buffer immediately instead of holding the whole host weight set
+    /// until upload finishes — roughly halving the transient CPU-RAM peak. The callback is
+    /// expected to free only its own owned host allocations and ignore mmap views (see
+    /// <see cref="TransformerWeights.TryReleaseOwnedHostAllocation"/>). It is NOT invoked for
+    /// the token-embedding table or LM head (which may alias each other via tied embeddings)
+    /// nor for MoE / MLA / Gemma-4 layers (uploaded by dedicated loaders). Null (the default)
+    /// preserves the legacy batch behavior: all host buffers stay resident until the caller
+    /// disposes <paramref name="cpuWeights"/>. The caller MUST pass null whenever it retains
+    /// <paramref name="cpuWeights"/> for a CPU-side forward.
+    /// </param>
     public static CudaWeights LoadFromGguf(TransformerWeights cpuWeights, ModelConfig config,
                                               CudaKernels kernels, nint stream,
                                               int numGpuLayers = -1, int firstLayer = 0,
-                                              bool skipTokenEmbed = false)
+                                              bool skipTokenEmbed = false,
+                                              Action<nint>? onHostTensorUploaded = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(firstLayer);
         int layerCount = numGpuLayers < 0
@@ -345,6 +360,24 @@ internal sealed class CudaWeights : IDisposable
                 oBias = UploadBias(lw.OBias, allocs, kernels, stream);
                 qNorm = lw.QNormWeight is not null ? UploadNormWeight(lw.QNormWeight, allocs, kernels, stream) : 0;
                 kNorm = lw.KNormWeight is not null ? UploadNormWeight(lw.KNormWeight, allocs, kernels, stream) : 0;
+
+                // Direct-to-device streaming: every host→device copy of the attention
+                // projections above used the SYNCHRONOUS cuMemcpyHtoD_v2 (via AllocAndUpload /
+                // UploadQuantized / TryUploadPackedThree), which blocks until the transfer is
+                // complete. The on-device dequant kernels queued on `stream` read the uploaded
+                // DEVICE buffers only — never these host pointers — so the host scratch is safe
+                // to free now, before the final cuStreamSynchronize. Each owned host buffer is
+                // read exactly once in this block (F32 upcasts via UploadAndDequant; I2_S via the
+                // packed/quantized upload), so freeing here cannot race a later read. The callback
+                // frees only owned allocations and ignores mmap views. V is 0 on V-from-K layers,
+                // which the callback treats as a no-op.
+                if (onHostTensorUploaded is not null)
+                {
+                    onHostTensorUploaded(lw.QWeight);
+                    onHostTensorUploaded(lw.KWeight);
+                    onHostTensorUploaded(lw.VWeight);
+                    onHostTensorUploaded(lw.OWeight);
+                }
             }
 
             nint gate = 0, up = 0, down = 0;
@@ -380,6 +413,19 @@ internal sealed class CudaWeights : IDisposable
                 gateBias = UploadBias(lw.GateBias, allocs, kernels, stream);
                 upBias = UploadBias(lw.UpBias, allocs, kernels, stream);
                 downBias = UploadBias(lw.DownBias, allocs, kernels, stream);
+
+                // Stream-free the dense FFN host scratch (same safety argument as the
+                // attention block above). Restricted to genuinely-dense layers: a Gemma-4
+                // layer is `isMoeLayer` yet also uploads dense slots, but it retains its CPU
+                // weights for the host LM head, so `onHostTensorUploaded` is null for it and
+                // this never runs. Pure-MoE layers zero these slots and are handled by the
+                // MoE loader, so they are excluded by `!isMoeLayer`.
+                if (onHostTensorUploaded is not null && !isMoeLayer)
+                {
+                    onHostTensorUploaded(lw.GateWeight);
+                    onHostTensorUploaded(lw.UpWeight);
+                    onHostTensorUploaded(lw.DownWeight);
+                }
             }
 
             nint attnNorm = UploadNormWeight(lw.AttnNormWeight, allocs, kernels, stream);
