@@ -113,7 +113,30 @@ public static unsafe partial class MatMul
             throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
 
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+        GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
+    }
 
+    /// <summary>
+    /// I2_S ternary GEMV with an <b>explicitly supplied</b> per-tensor scale (rather than
+    /// reading it from the weight-tensor tail). Used by the indexed-MoE path, where the
+    /// per-expert α comes from a scale-per-expert vector and the expert weight banks store
+    /// packed trits only (no inline tail scale). <paramref name="weights"/> points at the
+    /// packed payload (<c>m·k/4</c> bytes); the inner compute is identical to
+    /// <see cref="GemvI2_S(byte*, float*, float*, int, int, ComputeThreadPool?)"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void GemvI2_S(byte* weights, float* x, float* result, int m, int k,
+                                float scale, ComputeThreadPool? threadPool)
+    {
+        if (k % I2SBlockSize != 0)
+            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
+        GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
+    }
+
+    [SkipLocalsInit]
+    private static void GemvI2_SCore(byte* weights, float* x, float* result, int m, int k,
+                                     float scale, ComputeThreadPool? threadPool)
+    {
         if (I2SUseW2A8)
         {
             GemvI2_SW2A8(weights, x, result, m, k, scale, threadPool);
@@ -188,7 +211,38 @@ public static unsafe partial class MatMul
             throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
 
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+        GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
+    }
 
+    /// <summary>
+    /// I2_S ternary GEMM with an <b>explicitly supplied</b> per-tensor scale (rather than
+    /// reading it from the weight-tensor tail). Used by the indexed-MoE path
+    /// (<see cref="MoeIndexedMatmulI2_S"/>): the per-expert α comes from a scale-per-expert
+    /// vector and the expert weight banks store packed trits only (no inline tail scale).
+    /// <paramref name="weights"/> points at the packed payload (<c>m·k/4</c> bytes); the inner
+    /// compute is identical to
+    /// <see cref="GemmI2_S(byte*, float*, float*, int, int, int, ComputeThreadPool?)"/>.
+    /// </summary>
+    [SkipLocalsInit]
+    public static void GemmI2_S(byte* weights, float* b, float* c, int m, int k, int n,
+                                float scale, ComputeThreadPool? threadPool)
+    {
+        if (n == 1)
+        {
+            GemvI2_S(weights, b, c, m, k, scale, threadPool);
+            return;
+        }
+
+        if (k % I2SBlockSize != 0)
+            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
+
+        GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
+    }
+
+    [SkipLocalsInit]
+    private static void GemmI2_SCore(byte* weights, float* b, float* c, int m, int k, int n,
+                                     float scale, ComputeThreadPool? threadPool)
+    {
         if (I2SUseW2A8)
         {
             GemmI2_SW2A8(weights, b, c, m, k, n, scale, threadPool);
@@ -494,6 +548,153 @@ public static unsafe partial class MatMul
                 dest[outBase + gp + 64] = (sbyte)(((packed >> 2) & 0x3) - 1);
                 dest[outBase + gp + 96] = (sbyte)((packed & 0x3) - 1);
             }
+        }
+    }
+
+    // ─────────────────────────── Indexed (MoE) I2_S matmul ───────────────────────────
+
+    /// <summary>
+    /// Indexed ternary (I2_S) Mixture-of-Experts matmul — <c>moe_indexed_matmul_i2_s</c>.
+    /// For each input row <c>t</c> (a token·top-k-slot assignment), computes
+    /// <c>C[t, r] = expertScales[e] · dot(ternary(W_e[r, :]), B[t, :])</c> where
+    /// <c>e = rowExpertIds[t]</c> selects the expert.
+    ///
+    /// <para>This fuses two existing CPU kernels: (a) the per-expert weight-base-offset
+    /// addressing used by the grouped CPU MoE FFN path (<c>ProcessRoutedExpert</c> →
+    /// <c>base + e·rowBytes</c>), and (b) the trit-unpack + per-tensor-α dequant inner loop
+    /// of the dense I2_S GEMM (<see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/>).
+    /// The per-expert scale is taken from the <paramref name="expertScales"/> vector (indexed
+    /// by expert id), so the expert weight banks store <b>packed trits only</b> — no inline
+    /// tail scale.</para>
+    ///
+    /// <para>Rows are grouped by expert (counting sort, the same dtype-agnostic idiom the MoE
+    /// router uses for bucketing); each touched expert then runs one batched I2_S GEMM over its
+    /// gathered rows, so each weight row is trit-unpacked exactly once per expert and reused
+    /// across that expert's batch. Output is written in original row order.</para>
+    /// </summary>
+    /// <param name="expertWeights">Base pointer of the packed I2_S expert banks. Expert <c>e</c>'s
+    /// packed payload (<c>m·k/4</c> bytes) lives at <c>expertWeights + e·expertRowBytes</c>.</param>
+    /// <param name="expertRowBytes">Byte stride between consecutive expert banks (≥ <c>m·k/4</c>).</param>
+    /// <param name="expertScales">Per-expert α scale, indexed by expert id. Must cover every id in <paramref name="rowExpertIds"/>.</param>
+    /// <param name="b">F32 activation rows [n × k], row-major.</param>
+    /// <param name="c">F32 output [n × m], row-major (<c>c[t·m + r]</c>). Fully overwritten for routed rows.</param>
+    /// <param name="m">Output features per expert (weight rows).</param>
+    /// <param name="k">Input dimension (a multiple of 128).</param>
+    /// <param name="n">Number of input rows (token·slot assignments).</param>
+    /// <param name="rowExpertIds">Length-<paramref name="n"/> expert id assigned to each input row.</param>
+    /// <param name="threadPool">Optional thread pool — forwarded to the per-expert GEMM.</param>
+    [SkipLocalsInit]
+    public static void MoeIndexedMatmulI2_S(
+        byte* expertWeights, long expertRowBytes, ReadOnlySpan<float> expertScales,
+        float* b, float* c, int m, int k, int n,
+        ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool)
+    {
+        if (k % I2SBlockSize != 0)
+            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
+        if (rowExpertIds.Length < n)
+            throw new ArgumentException("rowExpertIds too small", nameof(rowExpertIds));
+        if (n == 0) return;
+
+        // ── Group rows by expert (counting sort) ───────────────────────────────
+        // Determine the expert-id range so we can size the histogram tightly.
+        int maxExpert = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int e = rowExpertIds[t];
+            if (e < 0) throw new ArgumentException($"rowExpertIds[{t}] is negative", nameof(rowExpertIds));
+            if (e > maxExpert) maxExpert = e;
+        }
+        int numExperts = maxExpert + 1;
+        if (expertScales.Length < numExperts)
+            throw new ArgumentException("expertScales too small for the routed expert ids", nameof(expertScales));
+
+        // cursors[e..e+1) delimits expert e's rows inside groupedRows after the scan.
+        int[] cursorsBuf = ArrayPool<int>.Shared.Rent(numExperts + 1);
+        int[] groupedRowsBuf = ArrayPool<int>.Shared.Rent(n);
+        // Per-expert batched activation / output scratch — sized for the full batch (worst
+        // case: all rows route to one expert).
+        float[] batchInBuf = ArrayPool<float>.Shared.Rent(n * k);
+        float[] batchOutBuf = ArrayPool<float>.Shared.Rent(n * m);
+
+        try
+        {
+            Span<int> cursors = cursorsBuf.AsSpan(0, numExperts + 1);
+            cursors.Clear();
+
+            // Histogram.
+            for (int t = 0; t < n; t++) cursors[rowExpertIds[t]]++;
+
+            // Exclusive prefix sum → bucket offsets.
+            int running = 0;
+            for (int e = 0; e <= numExperts; e++)
+            {
+                int cnt = cursors[e];
+                cursors[e] = running;
+                running += cnt;
+            }
+
+            // Scatter row indices into per-expert contiguous groups using write cursors.
+            int[] writeCursorBuf = ArrayPool<int>.Shared.Rent(numExperts);
+            try
+            {
+                Span<int> writeCursor = writeCursorBuf.AsSpan(0, numExperts);
+                for (int e = 0; e < numExperts; e++) writeCursor[e] = cursors[e];
+                for (int t = 0; t < n; t++)
+                {
+                    int e = rowExpertIds[t];
+                    groupedRowsBuf[writeCursor[e]++] = t;
+                }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(writeCursorBuf);
+            }
+
+            // ── Per-expert batched I2_S GEMM (touched experts only) ─────────────
+            fixed (float* batchInPtr = batchInBuf)
+            fixed (float* batchOutPtr = batchOutBuf)
+            {
+                for (int e = 0; e < numExperts; e++)
+                {
+                    int start = cursors[e];
+                    int end = cursors[e + 1];
+                    int batch = end - start;
+                    if (batch == 0) continue;
+
+                    // Gather this expert's rows into a contiguous batch [batch × k].
+                    for (int bi = 0; bi < batch; bi++)
+                    {
+                        int t = groupedRowsBuf[start + bi];
+                        Buffer.MemoryCopy(
+                            b + (long)t * k,
+                            batchInPtr + (long)bi * k,
+                            (long)k * sizeof(float),
+                            (long)k * sizeof(float));
+                    }
+
+                    // One batched ternary GEMM with this expert's bank + α.
+                    byte* bank = expertWeights + (nint)(e * expertRowBytes);
+                    GemmI2_S(bank, batchInPtr, batchOutPtr, m, k, batch, expertScales[e], threadPool);
+
+                    // Scatter output rows back to original positions [n × m].
+                    for (int bi = 0; bi < batch; bi++)
+                    {
+                        int t = groupedRowsBuf[start + bi];
+                        Buffer.MemoryCopy(
+                            batchOutPtr + (long)bi * m,
+                            c + (long)t * m,
+                            (long)m * sizeof(float),
+                            (long)m * sizeof(float));
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(cursorsBuf);
+            ArrayPool<int>.Shared.Return(groupedRowsBuf);
+            ArrayPool<float>.Shared.Return(batchInBuf);
+            ArrayPool<float>.Shared.Return(batchOutBuf);
         }
     }
 }
