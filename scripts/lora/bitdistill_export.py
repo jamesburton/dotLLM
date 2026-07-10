@@ -113,7 +113,11 @@ def export(model, out_dir: str) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     tensors = {}
     for name, p in model.state_dict().items():
-        tensors[export_name(name)] = p.detach().contiguous().cpu()
+        # .clone() breaks shared storage — tied embed_tokens/lm_head (e.g. Qwen3-0.6B
+        # ties word embeddings) otherwise alias the same tensor and safetensors refuses
+        # to save shared memory. Cloning yields a distinct on-disk lm_head so the dotLLM
+        # loader gets an explicit head whether or not it re-ties.
+        tensors[export_name(name)] = p.detach().contiguous().cpu().clone()
     save_file(tensors, os.path.join(out_dir, "model.safetensors"),
               metadata={"format": "pt", "producer": "bitdistill_export.py"})
     cfg = build_dotllm_config(model)
@@ -196,6 +200,26 @@ def run_self_test(tol: float = 1e-4) -> bool:
         r = verify_round_trip(student, tmp, _fresh, ids, tol=tol)
         print(f"[self-test] round-trip: max_abs={r['max_abs']:.3e} "
               f"argmax_match={r['argmax_match']} (tol={tol:.1e})")
+
+        # tied-embedding guard: Qwen3-0.6B ties word embeddings, so embed_tokens and
+        # lm_head alias the same storage; export must clone to avoid safetensors'
+        # shared-memory rejection (regression: real export failed here before the fix).
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+        tcfg = Qwen3Config(vocab_size=64, hidden_size=32, intermediate_size=64,
+                           num_hidden_layers=2, num_attention_heads=4,
+                           num_key_value_heads=2, head_dim=8,
+                           max_position_embeddings=64, tie_word_embeddings=True)
+        torch.manual_seed(0)
+        tied = Qwen3ForCausalLM(tcfg)
+        bd.convert_to_bitnet_student(tied)
+        tied.eval()
+        tmp2 = tempfile.mkdtemp(prefix="bitdistill_export_tied_")
+        try:
+            export(tied, tmp2)   # must NOT raise on shared embed/lm_head storage
+            print("[self-test] tied-embedding export: OK (no shared-memory error)")
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
         ok = r["ok"] and r["argmax_match"]
         print(f"[self-test] {'PASS' if ok else 'FAIL'}")
         return ok
