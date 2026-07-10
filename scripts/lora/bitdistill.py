@@ -570,6 +570,17 @@ def train(args) -> int:
               f"({nover} MLPs; teacher keeps silu for KD targets)")
     student.to(device)
     student.train()
+    if args.grad_checkpoint:
+        # Activation recompute — trades compute for VRAM so the full-vocab logit-KD
+        # workload fits a 12 GB card (identical math, just recomputed on backward).
+        try:
+            student.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            student.gradient_checkpointing_enable()
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
+        print("[bitdistill] gradient checkpointing ENABLED (student)")
     print(f"[bitdistill] student: {info['bitlinears']} BitLinears + "
           f"{info['subnorms']} SubLNs over {info['layers']} layers")
 
@@ -667,8 +678,9 @@ def train(args) -> int:
             ppl = compute_ppl(student, ppl_slice, device)
             acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
             ck = os.path.join(args.out, f"ckpt_{mtok}")
-            save_checkpoint(student, ck, step, tokens_seen,
-                            extra={"ppl": ppl, "gsm8k_acc": acc, "milestone": mtok})
+            if args.save_ckpt:
+                save_checkpoint(student, ck, step, tokens_seen,
+                                extra={"ppl": ppl, "gsm8k_acc": acc, "milestone": mtok})
             curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc})
             print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  -> {ck}", flush=True)
             next_milestone += 1
@@ -678,8 +690,9 @@ def train(args) -> int:
     ppl = compute_ppl(student, ppl_slice, device)
     acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
     curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc, "final": True})
-    save_checkpoint(student, os.path.join(args.out, "final"), step, tokens_seen,
-                    extra={"ppl": ppl, "gsm8k_acc": acc})
+    if args.save_ckpt:
+        save_checkpoint(student, os.path.join(args.out, "final"), step, tokens_seen,
+                        extra={"ppl": ppl, "gsm8k_acc": acc})
     with open(os.path.join(args.out, "curve.json"), "w", encoding="utf-8") as f:
         json.dump({"base": args.base, "curve": curve,
                    "args": {k: v for k, v in vars(args).items()}}, f, indent=2)
@@ -733,6 +746,13 @@ def parse_args(argv=None):
                    help="Streaming CPT corpus (general web; FALCON-family alt: tiiuae/falcon-refinedweb).")
     p.add_argument("--cpt-config", default="sample-10BT", dest="cpt_config",
                    help="CPT dataset config (use '' / None if the dataset has no config).")
+    p.add_argument("--no-save-ckpt", action="store_false", dest="save_ckpt",
+                   help="Skip writing model checkpoints (milestone + final); still records the PPL "
+                        "curve. Use on hosts whose CPU torch allocator fails on the state_dict copy "
+                        "(the ablation only needs curve.json, not the weights).")
+    p.add_argument("--grad-checkpoint", action="store_true", dest="grad_checkpoint",
+                   help="Enable gradient checkpointing (activation recompute) so the run fits a "
+                        "12 GB GPU. Identical math to the non-checkpointed path; only slower.")
     p.add_argument("--ffn-activation", choices=["silu", "relu2"], default="silu", dest="ffn_activation",
                    help="Student FFN activation: silu (SwiGLU, matches Qwen3 teacher; default) or "
                         "relu2 (squared-ReLU-GLU, canonical BitNet). Teacher stays silu for KD targets.")
