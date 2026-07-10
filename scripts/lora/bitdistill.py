@@ -232,6 +232,36 @@ def set_quant_alpha(model, alpha: float) -> None:
             m.quant_alpha.fill_(a)
 
 
+def set_student_ffn_activation(model, activation: str) -> int:
+    """Override each decoder MLP's activation (default silu-SwiGLU -> relu2 ablation).
+
+    Squared-ReLU-GLU (relu2) is the canonical BitNet-2B FFN activation: non-negative,
+    sparse activations that quantize cleaner than SwiGLU's silu. Distilling a silu
+    teacher into a relu2 student tests whether relu2 yields a better ternary student
+    (the student must absorb the activation change on top of ternarization; the
+    TEACHER keeps silu, so the KD targets are unchanged). Also updates
+    config.hidden_act so the exported dotLLM checkpoint round-trips the activation.
+    """
+    if activation == "silu":
+        return 0
+    if activation == "relu2":
+        try:
+            from transformers.activations import ACT2FN
+            act = ACT2FN["relu2"]
+        except (ImportError, KeyError):
+            act = lambda x: F.relu(x).pow(2)  # noqa: E731
+    else:
+        raise ValueError(f"unsupported ffn activation {activation!r}")
+    n = 0
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        if hasattr(mlp, "act_fn"):
+            mlp.act_fn = act
+            n += 1
+    model.config.hidden_act = activation
+    return n
+
+
 # ===========================================================================
 # Distillation losses
 # ===========================================================================
@@ -534,6 +564,10 @@ def train(args) -> int:
     student.config.use_cache = False
 
     info = convert_to_bitnet_student(student)
+    if args.ffn_activation != "silu":
+        nover = set_student_ffn_activation(student, args.ffn_activation)
+        print(f"[bitdistill] student FFN activation -> {args.ffn_activation} "
+              f"({nover} MLPs; teacher keeps silu for KD targets)")
     student.to(device)
     student.train()
     print(f"[bitdistill] student: {info['bitlinears']} BitLinears + "
@@ -699,6 +733,9 @@ def parse_args(argv=None):
                    help="Streaming CPT corpus (general web; FALCON-family alt: tiiuae/falcon-refinedweb).")
     p.add_argument("--cpt-config", default="sample-10BT", dest="cpt_config",
                    help="CPT dataset config (use '' / None if the dataset has no config).")
+    p.add_argument("--ffn-activation", choices=["silu", "relu2"], default="silu", dest="ffn_activation",
+                   help="Student FFN activation: silu (SwiGLU, matches Qwen3 teacher; default) or "
+                        "relu2 (squared-ReLU-GLU, canonical BitNet). Teacher stays silu for KD targets.")
     p.add_argument("--cpt-local-parquet", default=None, dest="cpt_local_parquet",
                    help="Path/glob to a LOCAL parquet shard to stream from (no network). Robust "
                         "path for unattended runs — pre-download one fineweb-edu shard and pass it.")
