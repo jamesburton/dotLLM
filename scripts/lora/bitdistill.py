@@ -147,6 +147,10 @@ class BitLinear(nn.Module):
         with torch.no_grad():
             m.weight.copy_(lin.weight)          # init from teacher weights
         assert lin.bias is None, "BitLinear assumes bias-free Linear (Qwen3/BitNet)"
+        # Adopt the source Linear's dtype so a bf16 model yields bf16 BitLinear master
+        # weights (and bf16 SubLN) — otherwise the fresh float32 params mismatch the
+        # bf16 activations in F.linear (the GPU train() path has no autocast to hide it).
+        m.to(lin.weight.dtype)
         return m
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -480,6 +484,18 @@ def run_self_test(tau: float = 5.0, lambda_kd: float = 10.0, gamma: float = 1e-5
         _ = student(input_ids=input_ids, use_cache=False).logits
     print("[self-test] precision anneal alpha in {0,1} forwards: OK")
 
+    # --- (e) bf16 model + convert => consistent-dtype forward (GPU bf16 path guard) ---
+    # Regression: convert() must not leave BitLinear master weights in float32 while
+    # the model is bf16 (the GPU path had no autocast -> "BFloat16 != float" matmul).
+    bf16_student = copy.deepcopy(teacher).to(torch.bfloat16)
+    convert_to_bitnet_student(bf16_student)
+    bad = [n for n, p in bf16_student.named_parameters() if p.dtype != torch.bfloat16]
+    assert not bad, f"convert left non-bf16 params on a bf16 model: {bad[:4]} ..."
+    bf16_ids = torch.randint(0, teacher.config.vocab_size, (1, 8))
+    with torch.no_grad():
+        _ = bf16_student(input_ids=bf16_ids, use_cache=False).logits
+    print("[self-test] bf16 convert+forward: OK (no dtype mismatch)")
+
     s_cap.remove()
     t_cap.remove()
     print("[self-test] PASS")
@@ -546,14 +562,16 @@ def train(args) -> int:
         try:
             cpt_stream = bdata.cpt_token_stream(
                 tokenizer, seq_len, dataset_name=args.cpt_dataset,
-                dataset_config=args.cpt_config)
+                dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet)
         except Exception as e:
             print(f"[bitdistill] cpt_config {args.cpt_config!r} failed ({e}); retry config=None")
             cpt_stream = bdata.cpt_token_stream(
-                tokenizer, seq_len, dataset_name=args.cpt_dataset, dataset_config=None)
+                tokenizer, seq_len, dataset_name=args.cpt_dataset, dataset_config=None,
+                local_parquet=args.cpt_local_parquet)
         ppl_slice = bdata.load_ppl_slice(tokenizer, n=20, seq_len=seq_len,
                                          dataset_name=args.cpt_dataset,
-                                         dataset_config=args.cpt_config)
+                                         dataset_config=args.cpt_config,
+                                         local_parquet=args.cpt_local_parquet)
         gsm8k = bdata.load_gsm8k(tokenizer, n=args.eval_n_gsm8k, seq_len=seq_len) \
             if args.eval_gsm8k else []
 
@@ -681,6 +699,9 @@ def parse_args(argv=None):
                    help="Streaming CPT corpus (general web; FALCON-family alt: tiiuae/falcon-refinedweb).")
     p.add_argument("--cpt-config", default="sample-10BT", dest="cpt_config",
                    help="CPT dataset config (use '' / None if the dataset has no config).")
+    p.add_argument("--cpt-local-parquet", default=None, dest="cpt_local_parquet",
+                   help="Path/glob to a LOCAL parquet shard to stream from (no network). Robust "
+                        "path for unattended runs — pre-download one fineweb-edu shard and pass it.")
     p.add_argument("--tiny-random-corpus", action="store_true", dest="tiny_random_corpus",
                    help="Use a synthetic random token stream (real model, no dataset download).")
     p.add_argument("--tiny-model", action="store_true", dest="tiny_model",

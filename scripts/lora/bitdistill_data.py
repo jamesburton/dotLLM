@@ -55,21 +55,30 @@ def cpt_token_stream(
     dataset_split: str = "train",
     text_field: str = "text",
     seed: int = 0,
+    local_parquet: Optional[str] = None,
 ) -> Iterator[torch.Tensor]:
-    """Yield fixed-length token sequences from a *streaming* HF dataset.
+    """Yield fixed-length token sequences from a streaming HF dataset.
 
     Documents are tokenized on the fly and packed into contiguous ``seq_len``
     windows (GPT-style packing). Streaming avoids materialising the corpus; the
     budget-curve driver simply pulls as many windows as the token budget needs.
 
-    Falls back gracefully: if ``dataset_config`` is invalid for the dataset the
-    caller should catch and retry with ``dataset_config=None``.
+    ``local_parquet`` (path or glob): stream from a LOCAL parquet shard instead of
+    the hub — no network dependency, so a flaky link can't kill a long run. This
+    is the robust path for unattended runs (pre-download one fineweb-edu shard).
+    Otherwise falls back gracefully: if ``dataset_config`` is invalid for the
+    dataset the caller should catch and retry with ``dataset_config=None``.
     """
     import datasets as hf_datasets
 
-    ds = hf_datasets.load_dataset(
-        dataset_name, dataset_config, split=dataset_split, streaming=True
-    )
+    if local_parquet:
+        ds = hf_datasets.load_dataset(
+            "parquet", data_files=local_parquet, split=dataset_split, streaming=True
+        )
+    else:
+        ds = hf_datasets.load_dataset(
+            dataset_name, dataset_config, split=dataset_split, streaming=True
+        )
     ds = ds.shuffle(seed=seed, buffer_size=10_000)
 
     buf: list[int] = []
@@ -132,10 +141,11 @@ def load_ppl_slice(
     seq_len: int = 512,
     dataset_name: str = "HuggingFaceFW/fineweb-edu",
     dataset_config: Optional[str] = "sample-10BT",
+    local_parquet: Optional[str] = None,
 ) -> list:
     """Return a small held-out list of packed sequences for PPL tracking."""
     stream = cpt_token_stream(
         tokenizer, seq_len, dataset_name=dataset_name,
-        dataset_config=dataset_config, seed=12345,
+        dataset_config=dataset_config, seed=12345, local_parquet=local_parquet,
     )
     return take(stream, n)
