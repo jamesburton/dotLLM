@@ -232,33 +232,68 @@ def set_quant_alpha(model, alpha: float) -> None:
             m.quant_alpha.fill_(a)
 
 
-def set_student_ffn_activation(model, activation: str) -> int:
+class _SiluReluSquaredBlend(nn.Module):
+    """FFN activation that anneals silu -> relu2: (1-a)*silu(x) + a*relu2(x).
+
+    ``a`` is a settable buffer (0 = pure silu, 1 = pure relu2). Ramping a 0->1 over
+    training eases the source-target activation gap when distilling a silu teacher
+    into a relu2 student, instead of taking the full silu->relu2 jump at step 0.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("alpha", torch.tensor(0.0), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = float(self.alpha)
+        s = F.silu(x)
+        if a <= 0.0:
+            return s
+        r = F.relu(x).pow(2)
+        return r if a >= 1.0 else (1.0 - a) * s + a * r
+
+
+def set_ffn_anneal(model, alpha: float) -> None:
+    """Set the silu->relu2 anneal scalar on every blended FFN activation."""
+    a = float(max(0.0, min(1.0, alpha)))
+    for m in model.modules():
+        if isinstance(m, _SiluReluSquaredBlend):
+            m.alpha.fill_(a)
+
+
+def set_student_ffn_activation(model, activation: str, anneal_steps: int = 0) -> int:
     """Override each decoder MLP's activation (default silu-SwiGLU -> relu2 ablation).
 
-    Squared-ReLU-GLU (relu2) is the canonical BitNet-2B FFN activation: non-negative,
-    sparse activations that quantize cleaner than SwiGLU's silu. Distilling a silu
-    teacher into a relu2 student tests whether relu2 yields a better ternary student
-    (the student must absorb the activation change on top of ternarization; the
-    TEACHER keeps silu, so the KD targets are unchanged). Also updates
-    config.hidden_act so the exported dotLLM checkpoint round-trips the activation.
+    Squared-ReLU-GLU (relu2) is the canonical BitNet-2B FFN activation. Distilling a
+    silu teacher into a relu2 student tests whether relu2 yields a better ternary
+    student (the student must absorb the activation change on top of ternarization;
+    the TEACHER keeps silu, so the KD targets are unchanged). With ``anneal_steps>0``
+    the student's FFN activation is a silu->relu2 blend (ramp a 0->1 externally via
+    :func:`set_ffn_anneal`) to ease the source-target gap. Updates config.hidden_act
+    so the exported dotLLM checkpoint round-trips the (final) activation.
     """
     if activation == "silu":
         return 0
-    if activation == "relu2":
+    if activation != "relu2":
+        raise ValueError(f"unsupported ffn activation {activation!r}")
+
+    if anneal_steps > 0:
+        make_act = _SiluReluSquaredBlend  # starts at silu (a=0), annealed to relu2
+    else:
         try:
             from transformers.activations import ACT2FN
-            act = ACT2FN["relu2"]
+            hard = ACT2FN["relu2"]
         except (ImportError, KeyError):
-            act = lambda x: F.relu(x).pow(2)  # noqa: E731
-    else:
-        raise ValueError(f"unsupported ffn activation {activation!r}")
+            hard = lambda x: F.relu(x).pow(2)  # noqa: E731
+        make_act = lambda: hard  # noqa: E731
+
     n = 0
     for layer in model.model.layers:
         mlp = layer.mlp
         if hasattr(mlp, "act_fn"):
-            mlp.act_fn = act
+            mlp.act_fn = make_act()
             n += 1
-    model.config.hidden_act = activation
+    model.config.hidden_act = "relu2"
     return n
 
 
@@ -565,9 +600,11 @@ def train(args) -> int:
 
     info = convert_to_bitnet_student(student)
     if args.ffn_activation != "silu":
-        nover = set_student_ffn_activation(student, args.ffn_activation)
+        nover = set_student_ffn_activation(student, args.ffn_activation, args.ffn_anneal_steps)
+        anneal_note = (f", silu->relu2 anneal over {args.ffn_anneal_steps} steps"
+                       if args.ffn_anneal_steps > 0 else "")
         print(f"[bitdistill] student FFN activation -> {args.ffn_activation} "
-              f"({nover} MLPs; teacher keeps silu for KD targets)")
+              f"({nover} MLPs{anneal_note}; teacher keeps silu for KD targets)")
     student.to(device)
     student.train()
     if args.grad_checkpoint:
@@ -638,6 +675,9 @@ def train(args) -> int:
         # progressive precision anneal (bf16 -> ternary)
         alpha = 1.0 if warmup <= 0 else min(1.0, step / warmup)
         set_quant_alpha(student, alpha)
+        # FFN activation anneal (silu -> relu2), if requested
+        if args.ffn_anneal_steps > 0:
+            set_ffn_anneal(student, min(1.0, step / args.ffn_anneal_steps))
         lam = args.lambda_kd if lam_warmup <= 0 else args.lambda_kd * min(1.0, step / lam_warmup)
 
         batch = torch.stack([next(cpt_stream) for _ in range(bs)]).to(device)  # [B, T]
@@ -756,6 +796,10 @@ def parse_args(argv=None):
     p.add_argument("--ffn-activation", choices=["silu", "relu2"], default="silu", dest="ffn_activation",
                    help="Student FFN activation: silu (SwiGLU, matches Qwen3 teacher; default) or "
                         "relu2 (squared-ReLU-GLU, canonical BitNet). Teacher stays silu for KD targets.")
+    p.add_argument("--ffn-anneal-steps", type=int, default=0, dest="ffn_anneal_steps",
+                   help="With --ffn-activation relu2: anneal the student FFN activation silu->relu2 "
+                        "over this many steps (0 = hard relu2 from step 0). Eases the source-target "
+                        "gap so the relu2 student can realize its quant-friendliness advantage.")
     p.add_argument("--cpt-local-parquet", default=None, dest="cpt_local_parquet",
                    help="Path/glob to a LOCAL parquet shard to stream from (no network). Robust "
                         "path for unattended runs — pre-download one fineweb-edu shard and pass it.")
