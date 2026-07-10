@@ -504,6 +504,13 @@ public static unsafe partial class MatMul
     /// Unpacks one I2_S-packed weight row (K codes, K a multiple of 128) into float {-1,0,+1}.
     /// Within each 128-element block, byte at <c>gp</c> holds elements {gp, +32, +64, +96}
     /// at bit offsets {6,4,2,0}; code value maps via <c>(code - 1)</c>.
+    ///
+    /// <para><b>Not AVX2-vectorized (issue #128):</b> this path is only reached when
+    /// <see cref="I2SUseW2A8"/> is <c>false</c> (i.e. <see cref="Avx2.IsSupported"/> is already
+    /// <c>false</c> on the running box, per <see cref="GemvI2_SCore"/> / <see cref="GemmI2_SCore"/>),
+    /// so an <c>Avx2</c>-gated fast path here would be dead code on every machine that reaches it.
+    /// The hot GEMV-decode path (<see cref="UnpackRowI8"/>, used by the W2A8 SIMD tier) is the one
+    /// profiled and vectorized — see its doc comment for the measured before/after.</para>
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -530,12 +537,57 @@ public static unsafe partial class MatMul
     /// {-1,0,+1}, laid out contiguously so that each 32-element slice aligns with a Q8_0 block.
     /// Same bit layout as <see cref="UnpackRow"/>: within a 128-element block, byte at <c>gp</c>
     /// holds elements {gp, +32, +64, +96} at bit offsets {6,4,2,0}; ternary = <c>code - 1</c>.
+    ///
+    /// <para><b>Issue #128 (GEMV-decode unpack vectorization).</b> This is the row-unpack used by
+    /// the W2A8 SIMD tier (<see cref="GemvI2_SW2A8Rows"/>/<see cref="GemmI2_SW2A8Rows"/>), which is
+    /// only reachable when <see cref="Avx2.IsSupported"/> is <c>true</c> — so the fast path below is
+    /// always live whenever this method runs. Profiling on real BitNet-shaped rows
+    /// (m=6912,k=2560 and m=2560,k=6912, Strix Halo / Zen 5 AVX2+AVX-VNNI) showed unpack at 80–84%
+    /// of total <c>GemvI2_S</c> wall time for the GEMV/decode path (unamortized — a fresh unpack per
+    /// call), which is well above the vectorization threshold; the GEMM/prefill path amortizes this
+    /// cost across N tokens and was not the target.</para>
+    ///
+    /// <para>Vectorized via <see cref="Avx2"/>: each 32-byte packed chunk (one 128-element block)
+    /// is zero-extended byte→int16 (<c>Avx2.ConvertToVector256Int16</c>, 2× to cover all 32 bytes),
+    /// then for each of the 4 bit offsets {6,4,2,0} the 2-bit field is extracted via
+    /// <c>Avx2.ShiftRightLogical</c> + AND 0x3, ternary-mapped via subtract-1 (all done in int16 to
+    /// avoid byte-lane shift limitations — AVX2 has no per-byte variable/immediate shift), then
+    /// narrowed back to int8 via <c>Avx2.PackSignedSaturate</c> + the standard
+    /// <c>Avx2.Permute4x64</c> (control <c>0xD8</c>) lane fix-up that undoes AVX2's cross-128-bit-lane
+    /// pack ordering. Falls back to the scalar shift/mask loop on non-AVX2 hardware (defensive; in
+    /// practice unreachable given the <see cref="I2SUseW2A8"/> gate above, but kept per the project's
+    /// "always provide scalar fallback" convention).</para>
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void UnpackRowI8(byte* rowPtr, sbyte* dest, int k)
     {
         int blocks = k / I2SBlockSize;
+
+        if (Avx2.IsSupported)
+        {
+            for (int blk = 0; blk < blocks; blk++)
+            {
+                byte* bp = rowPtr + blk * 32;
+                sbyte* outp = dest + blk * I2SBlockSize;
+
+                Vector256<byte> packed = Unsafe.ReadUnaligned<Vector256<byte>>(bp);
+
+                // Zero-extend all 32 packed bytes to int16 lanes (two 128-bit halves → two
+                // full 256-bit int16 vectors of 16 lanes each: w0 = bytes[0..15], w1 = bytes[16..31]).
+                Vector256<short> w0 = Avx2.ConvertToVector256Int16(packed.GetLower());
+                Vector256<short> w1 = Avx2.ConvertToVector256Int16(packed.GetUpper());
+
+                // gp, gp+32, gp+64, gp+96 ← bit offsets 6, 4, 2, 0 (literal shift counts — AVX2's
+                // ShiftRightLogical immediate form requires a JIT-visible constant per callsite).
+                UnpackI2SField6(w0, w1, outp);
+                UnpackI2SField4(w0, w1, outp + 32);
+                UnpackI2SField2(w0, w1, outp + 64);
+                UnpackI2SField0(w0, w1, outp + 96);
+            }
+            return;
+        }
+
         for (int blk = 0; blk < blocks; blk++)
         {
             byte* bp = rowPtr + blk * 32;
@@ -549,6 +601,51 @@ public static unsafe partial class MatMul
                 dest[outBase + gp + 96] = (sbyte)((packed & 0x3) - 1);
             }
         }
+    }
+
+    /// <summary>Extracts the bit-6 2-bit code field. See <see cref="UnpackRowI8"/> for the shared algorithm.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void UnpackI2SField6(Vector256<short> w0, Vector256<short> w1, sbyte* outp)
+        => UnpackI2SFieldCore(Avx2.ShiftRightLogical(w0, 6), Avx2.ShiftRightLogical(w1, 6), outp);
+
+    /// <summary>Extracts the bit-4 2-bit code field. See <see cref="UnpackRowI8"/> for the shared algorithm.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void UnpackI2SField4(Vector256<short> w0, Vector256<short> w1, sbyte* outp)
+        => UnpackI2SFieldCore(Avx2.ShiftRightLogical(w0, 4), Avx2.ShiftRightLogical(w1, 4), outp);
+
+    /// <summary>Extracts the bit-2 2-bit code field. See <see cref="UnpackRowI8"/> for the shared algorithm.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void UnpackI2SField2(Vector256<short> w0, Vector256<short> w1, sbyte* outp)
+        => UnpackI2SFieldCore(Avx2.ShiftRightLogical(w0, 2), Avx2.ShiftRightLogical(w1, 2), outp);
+
+    /// <summary>Extracts the bit-0 2-bit code field (no shift needed). See <see cref="UnpackRowI8"/> for the shared algorithm.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void UnpackI2SField0(Vector256<short> w0, Vector256<short> w1, sbyte* outp)
+        => UnpackI2SFieldCore(w0, w1, outp);
+
+    /// <summary>
+    /// Common tail of the 2-bit-field extraction: mask to 2 bits, ternary-map (<c>code - 1</c>),
+    /// narrow int16→int8, and write the 32 resulting bytes to <paramref name="outp"/> (matching
+    /// the original byte order — see <see cref="UnpackRowI8"/> for the pack/permute lane fix-up
+    /// rationale). <paramref name="shifted0"/>/<paramref name="shifted1"/> are the already
+    /// bit-shifted int16 lanes for bytes[0..15] / bytes[16..31] respectively.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void UnpackI2SFieldCore(Vector256<short> shifted0, Vector256<short> shifted1, sbyte* outp)
+    {
+        Vector256<short> three = Vector256.Create((short)3);
+        Vector256<short> one = Vector256.Create((short)1);
+
+        Vector256<short> c0 = Avx2.Subtract(Avx2.And(shifted0, three), one);
+        Vector256<short> c1 = Avx2.Subtract(Avx2.And(shifted1, three), one);
+
+        // Narrow int16 → int8 (values are in [-1,2], well within sbyte range — no saturation).
+        // PackSignedSaturate interleaves 128-bit halves across the 256-bit result (AVX2 lane
+        // quirk); Permute4x64(0xD8) restores sequential byte order: bytes[0..15] then [16..31].
+        Vector256<sbyte> packed = Avx2.PackSignedSaturate(c0, c1);
+        Vector256<sbyte> ordered = Avx2.Permute4x64(packed.AsInt64(), 0xD8).AsSByte();
+
+        Unsafe.WriteUnaligned(outp, ordered);
     }
 
     // ─────────────────────────── Indexed (MoE) I2_S matmul ───────────────────────────
