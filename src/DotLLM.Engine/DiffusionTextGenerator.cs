@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Core.Tensors;
@@ -105,14 +106,16 @@ public sealed class DiffusionTextGenerator
     /// canvas of <see cref="DiffusionConfig.CanvasLength"/>.</param>
     /// <param name="onCanvasStep">Optional streaming callback invoked after each denoise step and on
     /// canvas completion, with the live canvas snapshot.</param>
+    /// <param name="adapter">Optional LoRA adapter applied during every denoise forward pass.</param>
     /// <returns>The decoded text and per-run statistics.</returns>
     public DiffusionResult Generate(
         string prompt,
         int? targetLength = null,
-        Action<DiffusionCanvasState>? onCanvasStep = null)
+        Action<DiffusionCanvasState>? onCanvasStep = null,
+        ILoraAdapter? adapter = null)
     {
         int[] promptIds = _tokenizer.Encode(prompt);
-        return Generate(promptIds, targetLength, onCanvasStep);
+        return Generate(promptIds, targetLength, onCanvasStep, adapter);
     }
 
     /// <summary>
@@ -121,11 +124,13 @@ public sealed class DiffusionTextGenerator
     /// <param name="promptTokens">Prompt token ids (already encoded).</param>
     /// <param name="targetLength">Optional total generated-token target (see the text overload).</param>
     /// <param name="onCanvasStep">Optional per-step streaming callback (see the text overload).</param>
+    /// <param name="adapter">Optional LoRA adapter applied during every denoise forward pass.</param>
     /// <returns>The decoded text and per-run statistics.</returns>
     public DiffusionResult Generate(
         ReadOnlySpan<int> promptTokens,
         int? targetLength = null,
-        Action<DiffusionCanvasState>? onCanvasStep = null)
+        Action<DiffusionCanvasState>? onCanvasStep = null,
+        ILoraAdapter? adapter = null)
     {
         int canvasLength = _diffusion.CanvasLength;
         if (canvasLength < 1)
@@ -155,7 +160,7 @@ public sealed class DiffusionTextGenerator
             int prefixLen = context.Count;
 
             var blockResult = RunCanvas(context, prefixLen, blockLen, vocabSize, maskTokenId,
-                onCanvasStep, canvasStats.Count);
+                onCanvasStep, canvasStats.Count, adapter);
 
             totalSteps += blockResult.Steps;
             canvasStats.Add(new DiffusionCanvasStats(
@@ -213,7 +218,7 @@ public sealed class DiffusionTextGenerator
     /// </summary>
     private CanvasRun RunCanvas(
         List<int> context, int prefixLen, int blockLen, int vocabSize, int maskTokenId,
-        Action<DiffusionCanvasState>? onCanvasStep, int canvasIndex)
+        Action<DiffusionCanvasState>? onCanvasStep, int canvasIndex, ILoraAdapter? adapter)
     {
         // canvas[i] is the committed token at canvas position i, or maskTokenId while masked.
         int[] canvas = new int[blockLen];
@@ -309,7 +314,7 @@ public sealed class DiffusionTextGenerator
                     : _model.Forward(
                         seqTokens.AsSpan(0, seqLen),
                         positions.AsSpan(0, seqLen),
-                        deviceId: -1, kvCache: null, adapter: null, hybrid);
+                        deviceId: -1, kvCache: null, adapter, hybrid);
                 using (logits)
                 {
                     // Capture the FULL canvas-region logits ([blockLen × vocab]) for the NEXT
@@ -365,7 +370,7 @@ public sealed class DiffusionTextGenerator
             // emitted as the mask token: commit their argmax so the block is fully materialised.
             // In practice the proportional budget unmasks everything by MaxSteps; this is a guard.
             if (maskedCount > 0)
-                FillRemainingMasked(context, prefixLen, blockLen, vocabSize, maskTokenId, canvas, ref maskedCount);
+                FillRemainingMasked(context, prefixLen, blockLen, vocabSize, maskTokenId, canvas, ref maskedCount, adapter);
 
             // Final completion snapshot for the streaming consumer.
             if (onCanvasStep is not null)
@@ -444,7 +449,7 @@ public sealed class DiffusionTextGenerator
     /// </summary>
     private void FillRemainingMasked(
         List<int> context, int prefixLen, int blockLen, int vocabSize, int maskTokenId,
-        int[] canvas, ref int maskedCount)
+        int[] canvas, ref int maskedCount, ILoraAdapter? adapter)
     {
         int seqLen = prefixLen + blockLen;
         int[] seqTokens = ArrayPool<int>.Shared.Rent(seqLen);
@@ -456,7 +461,7 @@ public sealed class DiffusionTextGenerator
 
             using ITensor logits = _model.Forward(
                 seqTokens.AsSpan(0, seqLen), positions.AsSpan(0, seqLen),
-                deviceId: -1, kvCache: null, adapter: null, CanvasMaskSpec(prefixLen));
+                deviceId: -1, kvCache: null, adapter, CanvasMaskSpec(prefixLen));
 
             unsafe
             {

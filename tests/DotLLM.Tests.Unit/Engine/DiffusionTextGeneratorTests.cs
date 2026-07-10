@@ -96,6 +96,29 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
                 $"mask count increased at step {i}: {masks[i - 1]} → {masks[i]}");
     }
 
+    // ───────────────────────── LoRA adapter wiring ─────────────────────────
+
+    [Fact]
+    public void Generate_WithAdapter_PassesAdapterToEveryForwardCall()
+    {
+        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
+        var tok = new StubTokenizer();
+        var diffusion = new DiffusionConfig
+        {
+            CanvasLength = 4,
+            MaxDenoisingSteps = 4,
+            MaskTokenId = MaskTokenId,
+        };
+        var gen = new DiffusionTextGenerator(model, tok, new EntropyBoundSampler(), diffusion);
+        var adapter = new FakeLoraAdapter();
+
+        gen.Generate([5, 5], adapter: adapter);
+
+        Assert.True(model.ForwardCount > 0);
+        Assert.True(model.AllForwardsSawAdapter);
+        Assert.Same(adapter, model.LastAdapter);
+    }
+
     // ───────────────────────── Confidence early stop ─────────────────────────
 
     [Fact]
@@ -335,6 +358,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         public bool AllForwardsWereHybrid { get; private set; } = true;
         public int FirstHybridPrefixLen { get; private set; } = -1;
         public int FirstSeqLen { get; private set; } = -1;
+        public ILoraAdapter? LastAdapter { get; private set; }
+        public bool AllForwardsSawAdapter { get; private set; } = true;
 
         public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
             => Build(tokenIds.Length);
@@ -351,6 +376,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         {
             if (kvCache is not null) AllForwardsWereCacheless = false;
             if (maskSpec.Mode != AttentionMaskMode.Hybrid) AllForwardsWereHybrid = false;
+            LastAdapter = adapter;
+            if (adapter is null) AllForwardsSawAdapter = false;
             if (ForwardCount == 0)
             {
                 FirstHybridPrefixLen = maskSpec.PrefixLength;
@@ -390,5 +417,17 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         }
         public string DecodeToken(int tokenId) => $"t{tokenId}";
         public int CountTokens(string text) => Encode(text).Length;
+    }
+
+    /// <summary>Minimal no-op adapter used only to assert reference identity flows through to <c>Forward</c>.</summary>
+    private sealed class FakeLoraAdapter : ILoraAdapter
+    {
+        public string Name => "fake";
+        public int Rank => 4;
+        public float Alpha => 8f;
+        public IReadOnlyList<string> TargetModules => [];
+        public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName) => null;
+        public bool IsCompatible(ModelConfig baseConfig) => true;
+        public void Dispose() { }
     }
 }

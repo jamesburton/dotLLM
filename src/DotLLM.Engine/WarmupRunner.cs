@@ -48,7 +48,7 @@ public static class WarmupRunner
 
     /// <summary>
     /// Runs warm-up denoising passes for a masked text-diffusion model. Drives a single small
-    /// canvas through <see cref="DiffusionTextGenerator.Generate(string, int?, System.Action{DiffusionCanvasState}?)"/>
+    /// canvas through <see cref="DiffusionTextGenerator.Generate(string, int?, System.Action{DiffusionCanvasState}?, DotLLM.Core.Lora.ILoraAdapter?)"/>
     /// to trigger JIT compilation of the cacheless hybrid forward + denoise loop. CPU-only — uses
     /// no GPU dependency.
     /// </summary>
