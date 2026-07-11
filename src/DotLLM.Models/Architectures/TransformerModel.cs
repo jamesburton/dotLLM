@@ -1017,7 +1017,9 @@ public sealed unsafe class TransformerModel : IModel
                             cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
                             cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
                             cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
-                            attnScaleMultiplier: mlaScaleMultiplier);
+                            attnScaleMultiplier: mlaScaleMultiplier,
+                            loraAdapter: _currentAdapter,
+                            loraLayer: layer);
                     }
                     else
                     {
@@ -1047,7 +1049,9 @@ public sealed unsafe class TransformerModel : IModel
                             cachedLatent: _mlaLatentKvState.GetLatentPointer(layer),
                             cachedKPe: _mlaLatentKvState.GetKPePointer(layer),
                             cachedLength: _mlaLatentKvState.GetCurrentLength(layer),
-                            attnScaleMultiplier: mlaScaleMultiplier);
+                            attnScaleMultiplier: mlaScaleMultiplier,
+                            loraAdapter: _currentAdapter,
+                            loraLayer: layer);
                     }
                     _mlaLatentKvState.Advance(layer, seqLen);
                 }
@@ -2749,10 +2753,21 @@ public sealed unsafe class TransformerModel : IModel
         // also resolves per-expert "mlp.experts.{j}.{proj}" entries — see
         // Gemma4Moe / PeftAdapterLoader's MoeExpertPathRegex). Adapters that
         // target standard q/k/v/o or gate/up/down on MLA layers still pass
-        // through silently for the MLA-specific projection names
-        // (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj) that have no
-        // ApplyLoraDelta hook yet — a non-applicable target is a no-op rather
-        // than an error.
+        // through silently — applying the delta there requires the
+        // MLA-specific (q_a_proj, q_b_proj, q_proj, kv_a_proj_with_mqa,
+        // kv_b_proj, o_proj) projection names, which are all wired: every one
+        // of the three MLA forward kernels — Execute (Phase A, expanded
+        // cache), ExecuteLatent (Phase B, absorbed decode), and
+        // ExecuteLatentHybrid (Phase C, hybrid expand-prefill / absorbed-
+        // decode) — now applies each of those deltas, including kv_b_proj,
+        // which is never expanded as a plain GEMV in the absorbed kernels:
+        // its delta is folded into the absorbed Q/K/V math via a low-rank
+        // "delta-expansion" over the cached latent (Phase B) or applied
+        // directly to the fully-expanded per-position scratch (Phase C's
+        // expand-prefill sub-path) — see
+        // MlaAttention.ApplyKvBProjLoraDeltaExpanded for the derivation. A
+        // target that isn't one of the above names (or the per-expert MoE
+        // names) is a no-op rather than an error.
     }
 
     /// <summary>
