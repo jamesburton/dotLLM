@@ -316,6 +316,29 @@ def logit_kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor,
     return F.kl_div(s_logp, t_p, reduction="batchmean") * (tau * tau)
 
 
+def sparse_logit_kd_loss(student_logits: torch.Tensor, teacher_topk_logits: torch.Tensor,
+                         teacher_topk_idx: torch.Tensor, teacher_lse: torch.Tensor,
+                         tau: float) -> torch.Tensor:
+    """Top-K sparse variant of :func:`logit_kd_loss` for an offline-cached teacher.
+
+    Uses the teacher's TRUE top-K probabilities (no renormalisation): with the cached
+    per-token log-sum-exp of the full teacher logits at ``tau``, the true probability of
+    top-K token k is ``exp(logit_k/tau - lse)``. The KL then simply drops the (small)
+    tail mass outside top-K rather than re-inflating the kept mass to 1 — so it never
+    sharpens the teacher and converges to :func:`logit_kd_loss` as K → vocab.
+
+    ``student_logits`` [N, V]; ``teacher_topk_logits`` / ``teacher_topk_idx`` [N, K];
+    ``teacher_lse`` [N] = ``logsumexp(teacher_logits / tau, dim=-1)``.
+    """
+    t_logp_k = teacher_topk_logits.float() / tau - teacher_lse.float().unsqueeze(-1)  # [N, K] true log-probs
+    t_p_k = t_logp_k.exp()                                                            # [N, K] true (partial) probs
+    s_logp = F.log_softmax(student_logits.float() / tau, dim=-1)                      # [N, V]
+    s_logp_k = torch.gather(s_logp, -1, teacher_topk_idx)                             # [N, K]
+    # KL(t‖s) restricted to the top-K support (tail mass dropped), mean over N rows.
+    kl = (t_p_k * (t_logp_k - s_logp_k)).sum(-1).mean()
+    return kl * (tau * tau)
+
+
 def _relation(a: torch.Tensor, n_rel_heads: int) -> torch.Tensor:
     """MiniLM relation matrix for a projection output ``a`` of shape [B, T, C].
 
@@ -589,8 +612,13 @@ def train(args) -> int:
     else:
         print(f"[bitdistill] loading base {args.base!r} (fp) ...")
         dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+        # Load the safetensors file ONCE and move to device, then deepcopy the on-device model for
+        # the second instance. Reading the same file twice segfaults torch/safetensors on the
+        # ROCm-Windows build (0xC0000005 in the 2nd from_pretrained); and deepcopying on CPU before
+        # moving trips a HIP allocator failure. Load→to(device)→deepcopy matches the tiny_model path.
+        import copy
         teacher = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(device)
-        student = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(device)
+        student = copy.deepcopy(teacher)
 
     teacher.eval()
     for p in teacher.parameters():
@@ -631,7 +659,15 @@ def train(args) -> int:
           f"relation_heads={rel_heads}")
 
     trainable = [p for p in student.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+    if args.optimizer == "adafactor":
+        # Memory-light optimizer (no per-param 2nd-moment state like AdamW) — lets batch>2 fit the
+        # 3060's 12 GB with a teacher+student in memory. Fixed-lr mode to match the AdamW A/B.
+        from transformers.optimization import Adafactor
+        opt = Adafactor(trainable, lr=args.lr, relative_step=False, scale_parameter=False,
+                        warmup_init=False, weight_decay=0.0)
+    else:
+        opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+    print(f"[bitdistill] optimizer={args.optimizer}")
 
     # --- corpus + eval slices ---
     seq_len = args.max_seq_len
@@ -776,7 +812,9 @@ def parse_args(argv=None):
                    help="Sequences per step (paper: 32).")
     p.add_argument("--max-seq-len", type=int, default=512, dest="max_seq_len",
                    help="Tokens per sequence (paper: 512).")
-    p.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate.")
+    p.add_argument("--lr", type=float, default=1e-4, help="Optimizer learning rate.")
+    p.add_argument("--optimizer", choices=["adamw", "adafactor"], default="adamw",
+                   help="adamw (default) or adafactor (memory-light; enables batch>2 on 12GB).")
     p.add_argument("--precision-warmup-steps", type=int, default=0, dest="precision_warmup_steps",
                    help="Anneal FP->ternary over this many steps (0 = ternary from step 0).")
     p.add_argument("--lambda-warmup-steps", type=int, default=0, dest="lambda_warmup_steps",
@@ -815,7 +853,179 @@ def parse_args(argv=None):
     p.add_argument("--eval-n-gsm8k", type=int, default=100, dest="eval_n_gsm8k",
                    help="Number of GSM8K examples for the accuracy eval.")
     p.add_argument("--log-every", type=int, default=20, dest="log_every")
+    # offline KD (two-phase): cache a frozen teacher's top-K logits, then train student from cache.
+    p.add_argument("--make-teacher-cache", default=None, dest="make_teacher_cache",
+                   help="Phase 1: run the teacher over the CPT stream and write its top-K logit cache "
+                        "to this dir (only the teacher is resident — avoids teacher+student co-residence).")
+    p.add_argument("--from-teacher-cache", default=None, dest="from_teacher_cache",
+                   help="Phase 2: train the ternary student against a cached teacher (this dir). Only "
+                        "the student is resident. Loss = CE + lambda * sparse top-K KD (no AD term).")
+    p.add_argument("--top-k", type=int, default=128, dest="top_k",
+                   help="Top-K teacher logits to cache per token (tau softens the teacher, so larger K "
+                        "keeps more mass; the cache reports mean top-K mass coverage).")
     return p.parse_args(argv)
+
+
+def generate_teacher_cache(args) -> int:
+    """Phase 1 of offline KD: run the frozen FP teacher once over the CPT stream and cache its
+    top-K logits (+ per-token log-sum-exp for faithful sparse KD, + the input_ids) per batch.
+    Only ONE model is ever resident, so this sidesteps the teacher+student co-residence that
+    crashes at >=1.7B on the ROCm-Windows build. The cache is reusable across student runs."""
+    import json
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    device = torch.device(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(args.base)
+    dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+    print(f"[cache] loading teacher {args.base!r} ...", flush=True)
+    teacher = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher.config.use_cache = False
+
+    seq_len, bs, K, tau = args.max_seq_len, args.batch_size, args.top_k, args.tau
+    stream = bdata.cpt_token_stream(
+        tokenizer, seq_len, dataset_name=args.cpt_dataset, dataset_config=args.cpt_config,
+        local_parquet=args.cpt_local_parquet)
+    max_tokens = int(args.tokens)
+    n_batches = (max_tokens + bs * seq_len - 1) // (bs * seq_len)
+    os.makedirs(args.make_teacher_cache, exist_ok=True)
+    print(f"[cache] {n_batches} batches (bs={bs} seq={seq_len} top_k={K} tau={tau}) -> {args.make_teacher_cache}", flush=True)
+
+    mass_sum, mass_cnt = 0.0, 0
+    for i in range(n_batches):
+        batch = torch.stack([next(stream) for _ in range(bs)]).to(device)      # [B, T]
+        with torch.no_grad():
+            logits = teacher(input_ids=batch, use_cache=False).logits.float()  # [B, T, V]
+            lse = torch.logsumexp(logits / tau, dim=-1)                        # [B, T]
+            topv, topi = logits.topk(K, dim=-1)                               # [B, T, K]
+            mass = (topv / tau - lse.unsqueeze(-1)).exp().sum(-1)             # [B, T] top-K softmax mass
+        mass_sum += float(mass.mean()); mass_cnt += 1
+        torch.save({"input_ids": batch.to(torch.int32).cpu(),
+                    "topk_logits": topv.to(torch.float16).cpu(),
+                    "topk_idx": topi.to(torch.int32).cpu(),
+                    "lse": lse.to(torch.float32).cpu()},
+                   os.path.join(args.make_teacher_cache, f"batch_{i:06d}.pt"))
+        if i % 50 == 0 or i == n_batches - 1:
+            print(f"  cached {i + 1}/{n_batches}  mean top-{K} mass={mass_sum / mass_cnt:.4f}", flush=True)
+
+    meta = {"n_batches": n_batches, "batch_size": bs, "seq_len": seq_len, "top_k": K,
+            "tau": tau, "base": args.base, "tokens": max_tokens,
+            "mean_topk_mass": mass_sum / max(mass_cnt, 1)}
+    with open(os.path.join(args.make_teacher_cache, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[cache] DONE {n_batches} batches; mean top-{K} mass={meta['mean_topk_mass']:.4f} "
+          f"(higher = sparse KD closer to dense) -> {args.make_teacher_cache}", flush=True)
+    return 0
+
+
+def train_from_cache(args) -> int:
+    """Phase 2 of offline KD: train the ternary student alone against a cached teacher (Phase 1).
+    Student is the only resident model. Loss = CE + lambda * sparse_top-K KD (no attention-relation
+    term — it needs teacher hidden states and was shown not to help)."""
+    import json, glob, time
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    device = torch.device(args.device)
+    cache_dir = args.from_teacher_cache
+    with open(os.path.join(cache_dir, "meta.json")) as f:
+        meta = json.load(f)
+    seq_len, tau = meta["seq_len"], meta["tau"]
+    base = args.base or meta["base"]
+    print(f"[from-cache] base={base} seq_len={seq_len} tau={tau} top_k={meta['top_k']} "
+          f"mean_topk_mass={meta.get('mean_topk_mass', float('nan')):.4f}", flush=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(base)
+    dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
+    student = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(device)
+    student.config.use_cache = False
+    info = convert_to_bitnet_student(student)
+    if args.ffn_activation != "silu":
+        set_student_ffn_activation(student, args.ffn_activation, args.ffn_anneal_steps)
+    student.to(device); student.train()
+    if args.grad_checkpoint:
+        try:
+            student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            student.gradient_checkpointing_enable()
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
+    print(f"[from-cache] student: {info['bitlinears']} BitLinears + {info['subnorms']} SubLNs", flush=True)
+
+    trainable = [p for p in student.parameters() if p.requires_grad]
+    if args.optimizer == "adafactor":
+        from transformers.optimization import Adafactor
+        opt = Adafactor(trainable, lr=args.lr, relative_step=False, scale_parameter=False,
+                        warmup_init=False, weight_decay=0.0)
+    else:
+        opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0, betas=(0.9, 0.95))
+
+    ppl_slice = bdata.load_ppl_slice(tokenizer, n=20, seq_len=seq_len, dataset_name=args.cpt_dataset,
+                                     dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet)
+    gsm8k = bdata.load_gsm8k(tokenizer, n=args.eval_n_gsm8k, seq_len=seq_len) if args.eval_gsm8k else []
+    milestones = sorted(int(float(x)) for x in args.milestones.split(",")) if args.milestones else []
+    curve, next_ms = [], 0
+
+    cache_files = sorted(glob.glob(os.path.join(cache_dir, "batch_*.pt")))
+    if not cache_files:
+        raise SystemExit(f"no cache batches in {cache_dir}")
+    V = student.config.vocab_size
+    max_tokens, warmup = int(args.tokens), args.precision_warmup_steps
+    tokens_seen, step, ci = 0, 0, 0
+    t0 = time.perf_counter()
+    print(f"[from-cache] training to {max_tokens:.2e} tokens over {len(cache_files)} cached batches", flush=True)
+
+    while tokens_seen < max_tokens and (args.max_steps == 0 or step < args.max_steps):
+        alpha = 1.0 if warmup <= 0 else min(1.0, step / warmup)
+        set_quant_alpha(student, alpha)
+        lam = args.lambda_kd
+        c = torch.load(cache_files[ci % len(cache_files)]); ci += 1
+        batch = c["input_ids"].to(device).long()                          # [B, T]
+        topv = c["topk_logits"].to(device)                                # [B, T, K]
+        topi = c["topk_idx"].to(device).long()
+        lse = c["lse"].to(device)                                         # [B, T]
+
+        s_logits = student(input_ids=batch, use_cache=False).logits
+        ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V),
+                             batch[:, 1:].contiguous().view(-1))
+        Kd = topv.size(-1)
+        ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
+                                  topv[:, :-1, :].contiguous().view(-1, Kd),
+                                  topi[:, :-1, :].contiguous().view(-1, Kd),
+                                  lse[:, :-1].contiguous().view(-1), tau)
+        loss = ce + lam * ld
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+        opt.step()
+        tokens_seen += batch.numel(); step += 1
+
+        if step <= 5 or step % args.log_every == 0:
+            sps = step / max(time.perf_counter() - t0, 1e-9)
+            print(f"  step {step:6d}  tok {tokens_seen:.3e}  a={alpha:.2f}  "
+                  f"CE {ce.item():.4f}  LD {ld.item():.4f}  loss {loss.item():.4f}  {sps:.2f} it/s", flush=True)
+
+        while next_ms < len(milestones) and tokens_seen >= milestones[next_ms]:
+            mtok = milestones[next_ms]
+            set_quant_alpha(student, 1.0)
+            ppl = compute_ppl(student, ppl_slice, device)
+            acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+            ck = os.path.join(args.out, f"ckpt_{mtok}")
+            if args.save_ckpt:
+                save_checkpoint(student, ck, step, tokens_seen,
+                                extra={"ppl": ppl, "gsm8k_acc": acc, "milestone": mtok})
+            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc})
+            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  -> {ck}", flush=True)
+            next_ms += 1
+
+    set_quant_alpha(student, 1.0)
+    ppl = compute_ppl(student, ppl_slice, device)
+    acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc, "final": True})
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "curve.json"), "w") as f:
+        json.dump({"base": base, "from_cache": cache_dir, "curve": curve, "meta": meta}, f, indent=2)
+    print(f"[from-cache] done: {step} steps / {tokens_seen} tokens. final ppl={ppl:.3f} "
+          f"gsm8k_acc={acc}. curve -> {args.out}/curve.json", flush=True)
+    return 0
 
 
 def main(argv=None) -> int:
@@ -824,6 +1034,10 @@ def main(argv=None) -> int:
         args.cpt_config = None
     if args.self_test:
         return 0 if run_self_test(tau=args.tau, lambda_kd=args.lambda_kd, gamma=args.gamma) else 1
+    if args.make_teacher_cache:
+        return generate_teacher_cache(args)
+    if args.from_teacher_cache:
+        return train_from_cache(args)
     return train(args)
 
 
