@@ -1930,10 +1930,11 @@ public sealed unsafe class TransformerModel : IModel
     /// Gemma-4 dense FFN branch: <c>down( geglu(gate·n) * (up·n) )</c> where
     /// <c>n = rms(attn_out) * ffn_norm</c>. Writes [seqLen × hidden] into
     /// <paramref name="dense"/>. Uses the layer's dense gate/up/down slots and the
-    /// model-wide dense intermediate width. LoRA (when active) applies only to this
-    /// dense/"shared expert" branch — the routed MoE experts (<see cref="Gemma4Moe"/>)
-    /// have no LoRA hook (per-expert projection names are not yet wired; see
-    /// <see cref="ValidateAdapterForModel"/>).
+    /// model-wide dense intermediate width. LoRA (when active) applies to this
+    /// dense/"shared expert" branch here; the routed MoE experts
+    /// (<see cref="Gemma4Moe"/>) get their own per-expert LoRA delta via the shared
+    /// <c>MoeSwiGluMlp.ExecuteRoutedFromAssignments</c> kernel's
+    /// <c>"mlp.experts.{j}.{proj}"</c> lookup.
     /// </summary>
     private unsafe void Gemma4DenseFfn(
         in TransformerLayerWeights lw, int layer, float* attnOut, float* dense, float* normScratch,
@@ -2109,7 +2110,7 @@ public sealed unsafe class TransformerModel : IModel
                 numExperts, topK, hiddenSize, moeInterm, seqLen,
                 ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty, ReadOnlySpan<nint>.Empty,
                 0, ReadOnlySpan<float>.Empty,
-                loraAdapter: null, loraLayer: -1,
+                loraAdapter: _currentAdapter, loraLayer: layer,
                 threadPool: _threadPool,
                 useGeGLU: true);
         }
@@ -2744,13 +2745,14 @@ public sealed unsafe class TransformerModel : IModel
         // Phase 4d.2: MLA / MoE rejections are lifted. The standard
         // ApplyLoraDelta call sites are only reached on non-MLA / dense FFN
         // layers (the MLA branch in Forward routes through MlaAttention which
-        // has its own LoRA hooks; MoE routes through MoeSwiGluMlp). Adapters
-        // that target standard q/k/v/o or gate/up/down on MLA / MoE layers
-        // therefore pass through silently — applying the delta requires the
-        // MLA-specific (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj)
-        // or per-expert (mlp.experts.{j}.{...}) projection names which the
-        // PEFT loader will eventually emit. Until those code paths are wired,
-        // a non-applicable target is a no-op rather than an error.
+        // has its own LoRA hooks; MoE routes through MoeSwiGluMlp, which now
+        // also resolves per-expert "mlp.experts.{j}.{proj}" entries — see
+        // Gemma4Moe / PeftAdapterLoader's MoeExpertPathRegex). Adapters that
+        // target standard q/k/v/o or gate/up/down on MLA layers still pass
+        // through silently for the MLA-specific projection names
+        // (q_a_proj, q_b_proj, kv_a_proj_with_mqa, kv_b_proj) that have no
+        // ApplyLoraDelta hook yet — a non-applicable target is a no-op rather
+        // than an error.
     }
 
     /// <summary>

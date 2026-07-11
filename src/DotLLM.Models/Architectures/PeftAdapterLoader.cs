@@ -48,6 +48,24 @@ public static unsafe class PeftAdapterLoader
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
+    /// Per-expert MoE LoRA tensor names — the standard HF <c>peft</c> convention for MoE
+    /// target_modules inserts an <c>experts.{expertIndex}</c> segment between the module
+    /// prefix and the projection name, e.g.
+    /// <c>model.layers.{i}.mlp.experts.{j}.gate_proj.lora_A.weight</c> (verified against the
+    /// <c>peft</c> MoE-support convention; not confirmed against any real DiffusionGemma
+    /// adapter we've sampled locally — none of them target experts). Parsed as a SEPARATE
+    /// regex (mirroring <see cref="SelfConditioningPathRegex"/>) rather than folding into
+    /// <see cref="ProjectionPathRegex"/>'s <c>proj</c> alternation, since the (layer, expert,
+    /// proj) tuple needs its own composed storage key
+    /// (<c>"mlp.experts.{expert}.{proj}"</c> — matches the naming <c>LoraAdapter</c>'s
+    /// per-expert MoE shape validation and <c>MoeSwiGluMlp.ExpertProjectionName</c> already
+    /// use) instead of a bare projection name.
+    /// </summary>
+    private static readonly Regex MoeExpertPathRegex = new(
+        @"^(?:base_model\.(?:model\.)?)?model\.(?:(?<enc>encoder\.language_model)\.|(?<dec>decoder)\.)?layers\.(?<layer>\d+)\.mlp\.experts\.(?<expert>\d+)\.(?<proj>gate_proj|up_proj|down_proj)\.lora_(?<which>A|B)(?:\.default)?\.weight$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
     /// Loads a PEFT LoRA adapter from the directory at <paramref name="path"/>.
     /// </summary>
     /// <param name="name">Logical name to register under.</param>
@@ -165,21 +183,39 @@ public static unsafe class PeftAdapterLoader
             }
             else
             {
-                // DiffusionGemma self-conditioning LoRA — model-level module, no real
-                // layer index. Route to the sentinel layer under the same gate_proj/
-                // up_proj/down_proj names as the dense FFN so IsCompatibleEntry's
-                // existing shape validation applies unchanged.
-                var scMatch = SelfConditioningPathRegex.Match(tensor.Name);
-                if (!scMatch.Success)
+                var expertMatch = MoeExpertPathRegex.Match(tensor.Name);
+                if (expertMatch.Success)
                 {
-                    unrecognised.Add(tensor.Name);
-                    continue;
+                    // Compose the same "mlp.experts.{expert}.{proj}" storage key that
+                    // MoeSwiGluMlp.ExpertProjectionName produces at runtime and that
+                    // LoraAdapter.TryValidatePerExpertMoeProjection already validates —
+                    // no changes needed on either of those to accept this key shape.
+                    layer = int.Parse(expertMatch.Groups["layer"].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    string expert = expertMatch.Groups["expert"].Value;
+                    proj = $"mlp.experts.{expert}.{expertMatch.Groups["proj"].Value}";
+                    which = expertMatch.Groups["which"].Value;
+                    region = expertMatch.Groups["enc"].Success ? LoraRegion.Encoder
+                        : expertMatch.Groups["dec"].Success ? LoraRegion.Decoder
+                        : LoraRegion.Any;
                 }
+                else
+                {
+                    // DiffusionGemma self-conditioning LoRA — model-level module, no real
+                    // layer index. Route to the sentinel layer under the same gate_proj/
+                    // up_proj/down_proj names as the dense FFN so IsCompatibleEntry's
+                    // existing shape validation applies unchanged.
+                    var scMatch = SelfConditioningPathRegex.Match(tensor.Name);
+                    if (!scMatch.Success)
+                    {
+                        unrecognised.Add(tensor.Name);
+                        continue;
+                    }
 
-                layer = LoraAdapter.SelfConditioningLayerIndex;
-                proj = scMatch.Groups["proj"].Value;
-                which = scMatch.Groups["which"].Value;
-                region = LoraRegion.Any;
+                    layer = LoraAdapter.SelfConditioningLayerIndex;
+                    proj = scMatch.Groups["proj"].Value;
+                    which = scMatch.Groups["which"].Value;
+                    region = LoraRegion.Any;
+                }
             }
 
             var key = (layer, proj, region);

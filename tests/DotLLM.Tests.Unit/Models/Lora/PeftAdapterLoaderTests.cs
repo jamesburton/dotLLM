@@ -274,6 +274,64 @@ public sealed class PeftAdapterLoaderTests : IDisposable
     }
 
     [Fact]
+    public void LoadFromDirectory_ParsesPerExpertMoeNaming()
+    {
+        // Standard HF PEFT MoE naming convention: per-expert tensors carry an extra
+        // numeric index between "mlp." and the projection name — e.g.
+        // "model.layers.{i}.mlp.experts.{j}.gate_proj.lora_A.weight". No real local
+        // adapter targets experts today (checked: none of the sampled
+        // diffusiongemma_* adapter_config.json files have "experts" in
+        // target_modules) so this is a synthetic PEFT fixture, not a real one.
+        var cfg = BuildBaseConfig() with
+        {
+            Moe = new MoeConfig { NumExperts = 4, NumExpertsPerTok = 2, MoeIntermediateSize = 32 },
+        };
+        string dir = Path.Combine(_scratch, $"moe-adapter-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        var cfgObj = new
+        {
+            r = 8,
+            lora_alpha = 16.0,
+            target_modules = new[] { "experts.gate_proj", "experts.up_proj", "experts.down_proj" },
+            task_type = "CAUSAL_LM",
+            use_rslora = false,
+            use_dora = false,
+        };
+        File.WriteAllText(Path.Combine(dir, "adapter_config.json"), JsonSerializer.Serialize(cfgObj));
+
+        var rng = new Random(11);
+        int hidden = cfg.HiddenSize;
+        int interm = cfg.Moe!.MoeIntermediateSize;
+        var b = new SafetensorsFixtureBuilder()
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.gate_proj.lora_A.weight",
+                [8, hidden], RandomVec(rng, 8 * hidden, 0.02f))
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.gate_proj.lora_B.weight",
+                [interm, 8], RandomVec(rng, interm * 8, 0.02f))
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.up_proj.lora_A.weight",
+                [8, hidden], RandomVec(rng, 8 * hidden, 0.02f))
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.up_proj.lora_B.weight",
+                [interm, 8], RandomVec(rng, interm * 8, 0.02f))
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.down_proj.lora_A.weight",
+                [8, interm], RandomVec(rng, 8 * interm, 0.02f))
+            .AddFloat32("base_model.model.model.layers.0.mlp.experts.2.down_proj.lora_B.weight",
+                [hidden, 8], RandomVec(rng, hidden * 8, 0.02f));
+        b.WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
+
+        using var adapter = PeftAdapterLoader.LoadFromDirectory("moe-experts", dir, cfg);
+
+        Assert.NotNull(adapter.GetLayerWeights(0, "mlp.experts.2.gate_proj"));
+        Assert.NotNull(adapter.GetLayerWeights(0, "mlp.experts.2.up_proj"));
+        Assert.NotNull(adapter.GetLayerWeights(0, "mlp.experts.2.down_proj"));
+        // Only expert 2 was populated — expert 0 (a different index) must not
+        // resolve, proving the loader parsed the expert index rather than
+        // collapsing all experts onto one entry.
+        Assert.Null(adapter.GetLayerWeights(0, "mlp.experts.0.gate_proj"));
+
+        Assert.True(adapter.IsCompatible(cfg));
+    }
+
+    [Fact]
     public void LoadFromDirectory_RejectsUseRslora()
     {
         var cfg = BuildBaseConfig();
