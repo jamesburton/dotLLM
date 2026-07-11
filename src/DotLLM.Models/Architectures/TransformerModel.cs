@@ -2779,6 +2779,30 @@ public sealed unsafe class TransformerModel : IModel
                                 QuantizationType preQuantXType = QuantizationType.F32)
     {
         if (_currentAdapter is null) return;
+
+        // DIFFUSION region split: real DiffusionGemma PEFT adapters train INDEPENDENT
+        // LoRA deltas for the prompt (encoder) and canvas (decoder) rows of the SAME
+        // unified [prompt|canvas] forward — mirroring the backbone's own region-aware
+        // per-layer scalar (see RunGemma4Layer's regionP / enc_layer_output_scale).
+        // preQuantX is never non-null on this path (only the generic non-Gemma4 layer
+        // path passes it, and that path never runs under DiffusionConfig), so a plain
+        // pointer-offset split is safe here.
+        bool diffusion = Config.DiffusionConfig is not null;
+        if (diffusion && _currentMaskSpec.Mode == AttentionMaskMode.Hybrid && preQuantX is null)
+        {
+            int p = Math.Clamp(_currentMaskSpec.PrefixLength, 0, seqLen);
+            if (p > 0)
+                LoraProjection.Apply(_currentAdapter, layer, projName, x, y,
+                                     p, inputDim, outputDim, _threadPool,
+                                     region: LoraRegion.Encoder);
+            if (p < seqLen)
+                LoraProjection.Apply(_currentAdapter, layer, projName,
+                                     x + (long)p * inputDim, y + (long)p * outputDim,
+                                     seqLen - p, inputDim, outputDim, _threadPool,
+                                     region: LoraRegion.Decoder);
+            return;
+        }
+
         LoraProjection.Apply(_currentAdapter, layer, projName, x, y,
                              seqLen, inputDim, outputDim, _threadPool,
                              preQuantX, preQuantXType);

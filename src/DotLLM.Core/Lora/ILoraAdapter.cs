@@ -44,8 +44,9 @@ public interface ILoraAdapter : IDisposable
 
     /// <summary>
     /// Looks up the (A, B) factor pair for <paramref name="layerIndex"/> /
-    /// <paramref name="projName"/>. Returns <c>null</c> when this adapter
-    /// does not adapt that projection at that layer.
+    /// <paramref name="projName"/> / <paramref name="region"/>. Returns
+    /// <c>null</c> when this adapter does not adapt that projection at that
+    /// layer/region.
     /// </summary>
     /// <param name="layerIndex">Zero-based transformer layer index.</param>
     /// <param name="projName">
@@ -53,11 +54,18 @@ public interface ILoraAdapter : IDisposable
     /// <c>v_proj</c>, <c>o_proj</c>, <c>gate_proj</c>, <c>up_proj</c>,
     /// <c>down_proj</c>.
     /// </param>
+    /// <param name="region">
+    /// Sequence region to look up (see <see cref="LoraRegion"/>). Adapters
+    /// without a region-specific entry for <paramref name="region"/> fall
+    /// back to their <see cref="LoraRegion.Any"/> entry — the single-region
+    /// case (every AR model, and diffusion adapters trained without a
+    /// separate encoder/decoder split) is unaffected by this parameter.
+    /// </param>
     /// <returns>
     /// <see cref="LoraLayerWeights"/> when the adapter targets this site,
     /// otherwise <c>null</c>.
     /// </returns>
-    LoraLayerWeights? GetLayerWeights(int layerIndex, string projName);
+    LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any);
 
     /// <summary>
     /// Verifies the adapter's per-projection input/output dimensions are

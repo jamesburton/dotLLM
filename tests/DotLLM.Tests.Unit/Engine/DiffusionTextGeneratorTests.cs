@@ -426,7 +426,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         public int Rank => 4;
         public float Alpha => 8f;
         public IReadOnlyList<string> TargetModules => [];
-        public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName) => null;
+        public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any) => null;
         public bool IsCompatible(ModelConfig baseConfig) => true;
         public void Dispose() { }
     }

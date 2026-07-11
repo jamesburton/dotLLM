@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text.Json;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Models.Architectures;
@@ -158,6 +159,62 @@ public sealed class PeftAdapterLoaderTests : IDisposable
         using var adapter = PeftAdapterLoader.LoadFromDirectory("test-noprefix", dir, cfg);
 
         Assert.NotNull(adapter.GetLayerWeights(0, "q_proj"));
+    }
+
+    [Fact]
+    public void LoadFromDirectory_ParsesRegionTaggedDiffusionGemmaNaming()
+    {
+        // Real DiffusionGemma PEFT adapters (e.g. diffusiongemma_instruct_selfcond) train
+        // INDEPENDENT deltas for the HF model's decoder.layers.* (canvas/decoder region) and
+        // encoder.language_model.layers.* (prompt/encoder region) module trees, over the same
+        // shared backbone weight — plus a decoder.self_conditioning.* module with no per-layer
+        // index (recognised-but-unsupported: skipped, not a hard failure).
+        var cfg = BuildBaseConfig();
+        int qOut = cfg.NumAttentionHeads * cfg.HeadDim;
+        string dir = Path.Combine(_scratch, $"dg-adapter-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        var cfgObj = new
+        {
+            r = 8,
+            lora_alpha = 16.0,
+            target_modules = new[] { "q_proj" },
+            task_type = "CAUSAL_LM",
+            use_rslora = false,
+            use_dora = false,
+        };
+        File.WriteAllText(Path.Combine(dir, "adapter_config.json"), JsonSerializer.Serialize(cfgObj));
+
+        var rng = new Random(7);
+        var b = new SafetensorsFixtureBuilder()
+            .AddFloat32("base_model.model.model.decoder.layers.0.self_attn.q_proj.lora_A.weight",
+                [8, cfg.HiddenSize], RandomVec(rng, 8 * cfg.HiddenSize, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.layers.0.self_attn.q_proj.lora_B.weight",
+                [qOut, 8], RandomVec(rng, qOut * 8, 0.02f))
+            .AddFloat32("base_model.model.model.encoder.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+                [8, cfg.HiddenSize], RandomVec(rng, 8 * cfg.HiddenSize, 0.02f))
+            .AddFloat32("base_model.model.model.encoder.language_model.layers.0.self_attn.q_proj.lora_B.weight",
+                [qOut, 8], RandomVec(rng, qOut * 8, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.gate_proj.lora_A.weight",
+                [8, cfg.HiddenSize], RandomVec(rng, 8 * cfg.HiddenSize, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.gate_proj.lora_B.weight",
+                [cfg.IntermediateSize, 8], RandomVec(rng, cfg.IntermediateSize * 8, 0.02f));
+        b.WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
+
+        using var adapter = PeftAdapterLoader.LoadFromDirectory("dg-region", dir, cfg);
+
+        var decoderW = adapter.GetLayerWeights(0, "q_proj", LoraRegion.Decoder);
+        var encoderW = adapter.GetLayerWeights(0, "q_proj", LoraRegion.Encoder);
+        Assert.NotNull(decoderW);
+        Assert.NotNull(encoderW);
+        // Independently-trained deltas — the two A handles must be DIFFERENT buffers (not the
+        // same tensor aliased twice), proving the loader kept them separate by region.
+        Assert.NotEqual(decoderW!.Value.AHandle, encoderW!.Value.AHandle);
+
+        // No unregioned ("Any") entry exists for this (layer, proj) — every tensor for
+        // q_proj/layer 0 was region-tagged — so the plain (non-region) lookup used by every
+        // AR/non-diffusion caller finds nothing here (not a false match on the wrong region).
+        Assert.Null(adapter.GetLayerWeights(0, "q_proj"));
     }
 
     [Fact]

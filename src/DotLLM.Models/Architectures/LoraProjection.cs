@@ -40,10 +40,11 @@ public static unsafe class LoraProjection
                              float* x, float* y, int seqLen, int inputDim, int outputDim,
                              ComputeThreadPool? threadPool,
                              byte* preQuantX = null,
-                             QuantizationType preQuantXType = QuantizationType.F32)
+                             QuantizationType preQuantXType = QuantizationType.F32,
+                             LoraRegion region = LoraRegion.Any)
     {
         if (adapter is null) return;
-        var lora = adapter.GetLayerWeights(layer, projName);
+        var lora = adapter.GetLayerWeights(layer, projName, region);
         if (lora is not { } w) return;
 
         // Defensive shape check — IsCompatible already validated dims, but
@@ -67,8 +68,17 @@ public static unsafe class LoraProjection
         // dispatch a (layer, proj) pair through this path. The cache also
         // covers F16 / BF16 / Q8_0-B adapters — the dequant-and-transpose
         // happens once at first use.
-        nint aTransposedHandle = LoraStage2.EnsureATransposedF32(
-            adapter as LoraAdapter, layer, projName, in w, adapter.Rank);
+        //
+        // Region-tagged (Encoder/Decoder) entries skip this cache: InstallATransposedHandle
+        // only ever writes back into the region-UNAWARE _layers dictionary, so caching a
+        // region-tagged w's transposed-A there would either silently miss (leaking the
+        // freshly-built buffer every call) or, worse, collide with a same-(layer,proj)
+        // Any-region entry belonging to a different delta. Region-tagged adapters take the
+        // slower per-token GEMV stage 2 instead — a documented perf-only gap, not a
+        // correctness one.
+        nint aTransposedHandle = region == LoraRegion.Any
+            ? LoraStage2.EnsureATransposedF32(adapter as LoraAdapter, layer, projName, in w, adapter.Rank)
+            : 0;
 
         // Phase 4d.5 / Gap 2 — fast-path plumbing: when both base and adapter
         // B are Q8_0 AND the caller pre-quantised x, we can route stage 1

@@ -30,7 +30,18 @@ namespace DotLLM.Models.Architectures;
 public static unsafe class PeftAdapterLoader
 {
     private static readonly Regex ProjectionPathRegex = new(
-        @"^(?:base_model\.(?:model\.)?)?model\.layers\.(?<layer>\d+)\.(?<scope>self_attn|mlp)\.(?<proj>q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\.lora_(?<which>A|B)(?:\.default)?\.weight$",
+        @"^(?:base_model\.(?:model\.)?)?model\.(?:(?<enc>encoder\.language_model)\.|(?<dec>decoder)\.)?layers\.(?<layer>\d+)\.(?<scope>self_attn|mlp)\.(?<proj>q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)\.lora_(?<which>A|B)(?:\.default)?\.weight$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// DiffusionGemma's <c>decoder.self_conditioning.{gate,up,down}_proj</c> LoRA tensors —
+    /// recognised-but-unsupported (there is no per-layer index and no ApplyLoraDelta hook for
+    /// the self-conditioning module). Matched separately so these are SKIPPED rather than
+    /// tripping the "unrecognised tensor name" hard failure that every other unmatched name
+    /// gets — the adapter still loads, just without applying this portion of its delta.
+    /// </summary>
+    private static readonly Regex SelfConditioningPathRegex = new(
+        @"^(?:base_model\.(?:model\.)?)?model\.decoder\.self_conditioning\.(?:gate_proj|up_proj|down_proj)\.lora_(?:A|B)(?:\.default)?\.weight$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
@@ -114,10 +125,13 @@ public static unsafe class PeftAdapterLoader
 
     private static void LoadTensors(SafetensorsFile file, LoraAdapter adapter, int rank, bool preserveSourceDType = false)
     {
-        // Group tensors by (layer, proj) so we can validate that A and B
+        // Group tensors by (layer, proj, region) so we can validate that A and B
         // arrive in matched pairs. Per PEFT convention the writer typically
-        // emits both halves together but we don't assume ordering.
-        var pending = new Dictionary<(int Layer, string Proj), PendingPair>();
+        // emits both halves together but we don't assume ordering. DiffusionGemma
+        // real adapters carry INDEPENDENT deltas for the same (layer, proj) under
+        // decoder.* (canvas) vs encoder.language_model.* (prompt) — region keeps
+        // those separate instead of colliding.
+        var pending = new Dictionary<(int Layer, string Proj, LoraRegion Region), PendingPair>();
         var unrecognised = new List<string>();
 
         foreach (var tensor in file.Tensors)
@@ -131,6 +145,12 @@ public static unsafe class PeftAdapterLoader
                 continue;
             }
 
+            // DiffusionGemma self-conditioning LoRA — recognised but unsupported (no
+            // per-layer index, no ApplyLoraDelta hook for that module). Skip rather
+            // than fail the whole adapter load.
+            if (SelfConditioningPathRegex.IsMatch(tensor.Name))
+                continue;
+
             var match = ProjectionPathRegex.Match(tensor.Name);
             if (!match.Success)
             {
@@ -141,8 +161,11 @@ public static unsafe class PeftAdapterLoader
             int layer = int.Parse(match.Groups["layer"].Value, System.Globalization.CultureInfo.InvariantCulture);
             string proj = match.Groups["proj"].Value;
             string which = match.Groups["which"].Value; // "A" or "B"
+            LoraRegion region = match.Groups["enc"].Success ? LoraRegion.Encoder
+                : match.Groups["dec"].Success ? LoraRegion.Decoder
+                : LoraRegion.Any;
 
-            var key = (layer, proj);
+            var key = (layer, proj, region);
             if (!pending.TryGetValue(key, out var pair))
             {
                 pair = new PendingPair();
@@ -153,7 +176,7 @@ public static unsafe class PeftAdapterLoader
             {
                 if (pair.AAssigned)
                     throw new InvalidDataException(
-                        $"PEFT adapter has duplicate lora_A entry for layer={layer} proj='{proj}'.");
+                        $"PEFT adapter has duplicate lora_A entry for layer={layer} proj='{proj}' region={region}.");
                 pair.AAssigned = true;
                 pair.ATensor = tensor;
             }
@@ -161,7 +184,7 @@ public static unsafe class PeftAdapterLoader
             {
                 if (pair.BAssigned)
                     throw new InvalidDataException(
-                        $"PEFT adapter has duplicate lora_B entry for layer={layer} proj='{proj}'.");
+                        $"PEFT adapter has duplicate lora_B entry for layer={layer} proj='{proj}' region={region}.");
                 pair.BAssigned = true;
                 pair.BTensor = tensor;
             }
@@ -171,7 +194,7 @@ public static unsafe class PeftAdapterLoader
         {
             throw new InvalidDataException(
                 "PEFT adapter contains tensor names that do not match the expected "
-                + "{base_model.model.|model.}layers.{i}.{self_attn|mlp}.{proj}.lora_{A|B}[.default].weight "
+                + "{base_model.model.|model.}[decoder.|encoder.language_model.]layers.{i}.{self_attn|mlp}.{proj}.lora_{A|B}[.default].weight "
                 + "convention. Unrecognised: " + string.Join(", ", unrecognised));
         }
 
@@ -179,15 +202,15 @@ public static unsafe class PeftAdapterLoader
             throw new InvalidDataException(
                 "PEFT adapter contains no recognised LoRA factor tensors.");
 
-        foreach (var ((layer, proj), pair) in pending)
+        foreach (var ((layer, proj, region), pair) in pending)
         {
             if (!pair.AAssigned)
                 throw new InvalidDataException(
-                    $"PEFT adapter is missing lora_A for layer={layer} proj='{proj}' "
+                    $"PEFT adapter is missing lora_A for layer={layer} proj='{proj}' region={region} "
                     + "(only lora_B was found).");
             if (!pair.BAssigned)
                 throw new InvalidDataException(
-                    $"PEFT adapter is missing lora_B for layer={layer} proj='{proj}' "
+                    $"PEFT adapter is missing lora_B for layer={layer} proj='{proj}' region={region} "
                     + "(only lora_A was found).");
 
             // PEFT layout: A is [r, d_out], B is [r, d_in]. dotLLM uses the
@@ -210,7 +233,7 @@ public static unsafe class PeftAdapterLoader
 
             if (rA != rank || rB != rank)
                 throw new InvalidDataException(
-                    $"PEFT adapter rank mismatch at layer={layer} proj='{proj}': "
+                    $"PEFT adapter rank mismatch at layer={layer} proj='{proj}' region={region}: "
                     + $"adapter_config.r={rank}, lora_A rank dim={rA}, lora_B rank dim={rB}.");
 
             // dotLLM expects:
@@ -286,7 +309,7 @@ public static unsafe class PeftAdapterLoader
                 BHandle: bHandle,
                 InputDim: inputDim,
                 OutputDim: outputDim,
-                WeightDType: storeDType));
+                WeightDType: storeDType), region);
         }
     }
 

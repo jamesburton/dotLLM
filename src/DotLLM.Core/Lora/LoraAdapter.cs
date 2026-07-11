@@ -27,6 +27,13 @@ namespace DotLLM.Core.Lora;
 public sealed unsafe class LoraAdapter : ILoraAdapter
 {
     private readonly Dictionary<(int Layer, string Proj), LoraLayerWeights> _layers;
+    // Lazily allocated: only non-null when a region-tagged (Encoder/Decoder) entry is
+    // added (real DiffusionGemma PEFT adapters trained with separate encoder/decoder
+    // LoRA deltas over the same shared backbone weight). Kept SEPARATE from _layers
+    // rather than folding region into its key, so every existing consumer that
+    // enumerates/looks up _layers (Vulkan adapter upload, MoE per-expert validation,
+    // the stage-2 outer-product cache) is unaffected for the single-region case.
+    private Dictionary<(int Layer, string Proj, LoraRegion Region), LoraLayerWeights>? _regionLayers;
     private readonly object _lock = new();
     private bool _disposed;
 
@@ -76,10 +83,11 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     /// safely free them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when an entry already exists for that <c>(layer, proj)</c>
+    /// Thrown when an entry already exists for that <c>(layer, proj, region)</c>
     /// key (PEFT shipped duplicate <c>lora_A</c> / <c>lora_B</c> tensors).
     /// </exception>
-    public void AddLayerWeights(int layerIndex, string projName, LoraLayerWeights weights)
+    public void AddLayerWeights(int layerIndex, string projName, LoraLayerWeights weights,
+                                LoraRegion region = LoraRegion.Any)
     {
         ArgumentException.ThrowIfNullOrEmpty(projName);
         if (layerIndex < 0)
@@ -87,18 +95,40 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
 
         lock (_lock)
         {
-            if (!_layers.TryAdd((layerIndex, projName), weights))
+            if (region == LoraRegion.Any)
+            {
+                if (!_layers.TryAdd((layerIndex, projName), weights))
+                {
+                    throw new InvalidOperationException(
+                        $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection '{projName}'.");
+                }
+                return;
+            }
+
+            _regionLayers ??= new Dictionary<(int, string, LoraRegion), LoraLayerWeights>();
+            if (!_regionLayers.TryAdd((layerIndex, projName, region), weights))
             {
                 throw new InvalidOperationException(
-                    $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection '{projName}'.");
+                    $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection "
+                    + $"'{projName}' region {region}.");
             }
         }
     }
 
     /// <inheritdoc/>
-    public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName)
+    public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any)
     {
         if (string.IsNullOrEmpty(projName)) return null;
+
+        if (region != LoraRegion.Any
+            && _regionLayers is { } regional
+            && regional.TryGetValue((layerIndex, projName, region), out var regionalW))
+        {
+            return regionalW;
+        }
+
+        // Falls back to the single-region entry for: (a) region == Any, (b) a
+        // region-specific query against an adapter with no region split at all.
         return _layers.TryGetValue((layerIndex, projName), out var w) ? w : null;
     }
 
@@ -111,6 +141,24 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
         int kvOut = baseConfig.NumKvHeads * baseConfig.HeadDim;
 
         foreach (var ((layer, proj), w) in _layers)
+        {
+            if (!IsCompatibleEntry(layer, proj, w, baseConfig, qOut, kvOut))
+                return false;
+        }
+        if (_regionLayers is not null)
+        {
+            foreach (var ((layer, proj, _), w) in _regionLayers)
+            {
+                if (!IsCompatibleEntry(layer, proj, w, baseConfig, qOut, kvOut))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool IsCompatibleEntry(int layer, string proj, LoraLayerWeights w,
+                                          ModelConfig baseConfig, int qOut, int kvOut)
+    {
         {
             if ((uint)layer >= (uint)baseConfig.NumLayers)
                 return false;
@@ -319,6 +367,17 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
                 if (w.ATransposedHandle != 0) NativeMemory.AlignedFree((void*)w.ATransposedHandle);
             }
             _layers.Clear();
+
+            if (_regionLayers is not null)
+            {
+                foreach (var w in _regionLayers.Values)
+                {
+                    if (w.AHandle != 0) NativeMemory.AlignedFree((void*)w.AHandle);
+                    if (w.BHandle != 0) NativeMemory.AlignedFree((void*)w.BHandle);
+                    if (w.ATransposedHandle != 0) NativeMemory.AlignedFree((void*)w.ATransposedHandle);
+                }
+                _regionLayers.Clear();
+            }
         }
     }
 }
