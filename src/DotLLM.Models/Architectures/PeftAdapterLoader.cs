@@ -45,6 +45,24 @@ public static unsafe class PeftAdapterLoader
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
+    /// Per-expert MoE LoRA tensor names — the standard HF <c>peft</c> convention for MoE
+    /// target_modules inserts an <c>experts.{expertIndex}</c> segment between the module
+    /// prefix and the projection name, e.g.
+    /// <c>model.layers.{i}.mlp.experts.{j}.gate_proj.lora_A.weight</c> (verified against the
+    /// <c>peft</c> MoE-support convention; not confirmed against any real DiffusionGemma
+    /// adapter we've sampled locally — none of them target experts). Parsed as a SEPARATE
+    /// regex (mirroring <see cref="SelfConditioningPathRegex"/>) rather than folding into
+    /// <see cref="ProjectionPathRegex"/>'s <c>proj</c> alternation, since the (layer, expert,
+    /// proj) tuple needs its own composed storage key
+    /// (<c>"mlp.experts.{expert}.{proj}"</c> — matches the naming <c>LoraAdapter</c>'s
+    /// per-expert MoE shape validation and <c>MoeSwiGluMlp.ExpertProjectionName</c> already
+    /// use) instead of a bare projection name.
+    /// </summary>
+    private static readonly Regex MoeExpertPathRegex = new(
+        @"^(?:base_model\.(?:model\.)?)?model\.(?:(?<enc>encoder\.language_model)\.|(?<dec>decoder)\.)?layers\.(?<layer>\d+)\.mlp\.experts\.(?<expert>\d+)\.(?<proj>gate_proj|up_proj|down_proj)\.lora_(?<which>A|B)(?:\.default)?\.weight$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
     /// Loads a PEFT LoRA adapter from the directory at <paramref name="path"/>.
     /// </summary>
     /// <param name="name">Logical name to register under.</param>
@@ -152,14 +170,29 @@ public static unsafe class PeftAdapterLoader
                 continue;
 
             var match = ProjectionPathRegex.Match(tensor.Name);
-            if (!match.Success)
+            string proj;
+            if (match.Success)
             {
-                unrecognised.Add(tensor.Name);
-                continue;
+                proj = match.Groups["proj"].Value;
+            }
+            else
+            {
+                match = MoeExpertPathRegex.Match(tensor.Name);
+                if (!match.Success)
+                {
+                    unrecognised.Add(tensor.Name);
+                    continue;
+                }
+
+                // Compose the same "mlp.experts.{expert}.{proj}" storage key that
+                // MoeSwiGluMlp.ExpertProjectionName produces at runtime and that
+                // LoraAdapter.TryValidatePerExpertMoeProjection already validates —
+                // no changes needed on either of those to accept this key shape.
+                string expert = match.Groups["expert"].Value;
+                proj = $"mlp.experts.{expert}.{match.Groups["proj"].Value}";
             }
 
             int layer = int.Parse(match.Groups["layer"].Value, System.Globalization.CultureInfo.InvariantCulture);
-            string proj = match.Groups["proj"].Value;
             string which = match.Groups["which"].Value; // "A" or "B"
             LoraRegion region = match.Groups["enc"].Success ? LoraRegion.Encoder
                 : match.Groups["dec"].Success ? LoraRegion.Decoder
