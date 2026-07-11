@@ -541,6 +541,18 @@ public static class MlaAttention
     /// </param>
     /// <param name="cachedLength">Positions already in the cache for this layer.</param>
     /// <param name="attnScaleMultiplier">See <see cref="Execute"/>.</param>
+    /// <param name="loraAdapter">
+    /// Optional active LoRA adapter for MLA-specific projection deltas.
+    /// <c>q_a_proj</c>/<c>q_b_proj</c>/<c>q_proj</c>/<c>kv_a_proj_with_mqa</c>/
+    /// <c>o_proj</c> are plain per-token GEMVs here (same as <see cref="Execute"/>)
+    /// so their deltas are applied identically. <c>kv_b_proj</c> is never
+    /// expanded as a GEMV in this absorbed kernel (that's the whole Phase B
+    /// memory win), so its delta is applied via a separate low-rank
+    /// "delta-expansion" over the cached latent — see
+    /// <see cref="ApplyKvBProjLoraDeltaExpanded"/> — rather than by adding to
+    /// a materialised <c>kv_b_proj</c> output row.
+    /// </param>
+    /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     public static unsafe void ExecuteLatent(
         ReadOnlySpan<float> hidden,
         Span<float> output,
@@ -567,7 +579,9 @@ public static class MlaAttention
         nint cachedLatent,
         nint cachedKPe,
         int cachedLength,
-        float attnScaleMultiplier = 1.0f)
+        float attnScaleMultiplier = 1.0f,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         ValidateArgs(seqLen, hiddenSize, numHeads, qkNopeHeadDim, qkRopeHeadDim, vHeadDim,
                      qLoraRank, kvLoraRank, hidden, output);
@@ -577,6 +591,7 @@ public static class MlaAttention
         int qkHeadDim = qkNopeHeadDim + qkRopeHeadDim;
         int qTotal = numHeads * qkHeadDim;
         int perHeadKvBOut = qkNopeHeadDim + vHeadDim;
+        int kvBOutputDim = numHeads * perHeadKvBOut;
         float scale = attnScaleMultiplier / MathF.Sqrt(qkHeadDim);
 
         // Scratch (managed, per call; native persistent scratch is a later
@@ -593,23 +608,42 @@ public static class MlaAttention
         float[] attnOutBuf = new float[seqLen * numHeads * vHeadDim];
 
         // ── Q projection (identical to Execute) ─────────────────────────
-        for (int t = 0; t < seqLen; t++)
+        if (qLoraRank > 0)
         {
-            var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
-            var qRow = qBuf.AsSpan(t * qTotal, qTotal);
-
-            if (qLoraRank > 0)
+            for (int t = 0; t < seqLen; t++)
             {
+                var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
                 var latent = qLatentBuf.AsSpan(t * qLoraRank, qLoraRank);
                 MatVec(qAProj, hiddenRow, latent, qLoraRank, hiddenSize);
+            }
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_a_proj",
+                hidden, qLatentBuf, seqLen, hiddenSize, qLoraRank);
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                var latent = qLatentBuf.AsSpan(t * qLoraRank, qLoraRank);
                 var latentNorm = qLatentNormBuf.AsSpan(t * qLoraRank, qLoraRank);
                 RmsNormScalar(latent, qALayernormWeight, rmsNormEps, latentNorm);
+
+                var qRow = qBuf.AsSpan(t * qTotal, qTotal);
                 MatVec(qBProj, latentNorm, qRow, qTotal, qLoraRank);
             }
-            else
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_b_proj",
+                qLatentNormBuf, qBuf, seqLen, qLoraRank, qTotal);
+        }
+        else
+        {
+            for (int t = 0; t < seqLen; t++)
             {
+                var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
+                var qRow = qBuf.AsSpan(t * qTotal, qTotal);
                 MatVec(qProj, hiddenRow, qRow, qTotal, hiddenSize);
             }
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_proj",
+                hidden, qBuf, seqLen, hiddenSize, qTotal);
         }
 
         // ── KV down-projection + split (identical to Execute) ───────────
@@ -619,7 +653,14 @@ public static class MlaAttention
             var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
             var compRow = compressedKvBuf.AsSpan(t * compressedKvDim, compressedKvDim);
             MatVec(kvAProjWithMqa, hiddenRow, compRow, compressedKvDim, hiddenSize);
+        }
 
+        ApplyLoraDelta(loraAdapter, loraLayer, "kv_a_proj_with_mqa",
+            hidden, compressedKvBuf, seqLen, hiddenSize, compressedKvDim);
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            var compRow = compressedKvBuf.AsSpan(t * compressedKvDim, compressedKvDim);
             var latent = compRow.Slice(0, kvLoraRank);
             var kPe = compRow.Slice(kvLoraRank, qkRopeHeadDim);
 
@@ -627,7 +668,10 @@ public static class MlaAttention
             RmsNormScalar(latent, kvALayernormWeight, rmsNormEps, latentNorm);
 
             kPe.CopyTo(kPeBuf.AsSpan(t * qkRopeHeadDim, qkRopeHeadDim));
-            // NOTE: no kv_b_proj expansion — that's the Phase B win.
+            // NOTE: no kv_b_proj expansion — that's the Phase B win. Its
+            // LoRA delta (if any) is applied later via a low-rank
+            // "delta-expansion" over the cached latent — see
+            // ApplyKvBProjLoraDeltaExpanded below.
         }
 
         // ── RoPE on Q.rope and shared K_pe (identical to Execute) ───────
@@ -696,13 +740,33 @@ public static class MlaAttention
         ReadOnlySpan<float> kPeReadAll =
             new ReadOnlySpan<float>((void*)cachedKPe, seqKv * qkRopeHeadDim);
 
+        // ── kv_b_proj LoRA delta (Phase B never expands the base kv_b_proj
+        // weight — that's the whole memory win — so its delta cannot be
+        // folded into the same GEMV the way Execute does). Since a LoRA
+        // delta is intrinsically low-rank (rank << kvLoraRank, kvBOutputDim),
+        // materialising the delta's per-position expansion over the cached
+        // latent is cheap (O(seqKv · rank · (kvLoraRank + kvBOutputDim)),
+        // proportional to rank, NOT to the dense kv_b_proj dims) and does
+        // not defeat Phase B's avoidance of the dense expansion. Given
+        // K_nope'[h,s] = K_nope[h,s] + ΔK_nope[h,s] and
+        // V'[h,s] = V[h,s] + ΔV[h,s] (both linear in c_kv[s]), the two
+        // correction terms are added directly into the score and the
+        // weighted-V accumulation below — see ApplyKvBProjLoraDeltaExpanded
+        // for the exact identity.
+        float[]? kvBDelta = ApplyKvBProjLoraDeltaExpanded(
+            loraAdapter, loraLayer, latentReadAll, seqKv, kvLoraRank, kvBOutputDim);
+
         float[] scores = new float[seqLen * seqKv];
+        float[] attnOutDeltaVBuf = kvBDelta is not null ? new float[seqLen * numHeads * vHeadDim] : [];
         for (int h = 0; h < numHeads; h++)
         {
             for (int t = 0; t < seqLen; t++)
             {
                 var qAbsH = qAbsorbedBuf.AsSpan(t * numHeads * kvLoraRank + h * kvLoraRank, kvLoraRank);
                 var qPeH = qBuf.AsSpan(t * qTotal + h * qkHeadDim + qkNopeHeadDim, qkRopeHeadDim);
+                var qNopeH = kvBDelta is not null
+                    ? qBuf.AsSpan(t * qTotal + h * qkHeadDim, qkNopeHeadDim)
+                    : default;
 
                 int queryPos = cachedLength + t;
 
@@ -720,6 +784,13 @@ public static class MlaAttention
                     float dot = TensorPrimitives.Dot(qAbsH, cKvS)
                               + TensorPrimitives.Dot(qPeH, kPeS);
 
+                    if (kvBDelta is not null)
+                    {
+                        var kNopeDeltaS = kvBDelta.AsSpan(
+                            s * kvBOutputDim + h * perHeadKvBOut, qkNopeHeadDim);
+                        dot += TensorPrimitives.Dot(qNopeH, kNopeDeltaS);
+                    }
+
                     scores[t * seqKv + s] = dot * scale;
                 }
 
@@ -729,12 +800,23 @@ public static class MlaAttention
                 var outLatentH = attnOutLatentBuf.AsSpan(
                     t * numHeads * kvLoraRank + h * kvLoraRank, kvLoraRank);
                 outLatentH.Clear();
+                var outDeltaVH = kvBDelta is not null
+                    ? attnOutDeltaVBuf.AsSpan(t * numHeads * vHeadDim + h * vHeadDim, vHeadDim)
+                    : default;
+                if (kvBDelta is not null) outDeltaVH.Clear();
                 for (int s = 0; s <= queryPos && s < seqKv; s++)
                 {
                     float w = scores[t * seqKv + s];
                     if (w == 0f) continue;
                     var cKvS = latentReadAll.Slice(s * kvLoraRank, kvLoraRank);
                     TensorPrimitives.MultiplyAdd(cKvS, w, outLatentH, outLatentH);
+
+                    if (kvBDelta is not null)
+                    {
+                        var vDeltaS = kvBDelta.AsSpan(
+                            s * kvBOutputDim + h * perHeadKvBOut + qkNopeHeadDim, vHeadDim);
+                        TensorPrimitives.MultiplyAdd(vDeltaS, w, outDeltaVH, outDeltaVH);
+                    }
                 }
             }
         }
@@ -755,6 +837,13 @@ public static class MlaAttention
                     var wRow = kvBProj.Slice((wUvBaseRow + v) * kvLoraRank, kvLoraRank);
                     outH[v] = TensorPrimitives.Dot(wRow, outLatentH);
                 }
+
+                if (kvBDelta is not null)
+                {
+                    var outDeltaVH = attnOutDeltaVBuf.AsSpan(
+                        t * numHeads * vHeadDim + h * vHeadDim, vHeadDim);
+                    TensorPrimitives.Add(outH, outDeltaVH, outH);
+                }
             }
         }
 
@@ -766,6 +855,37 @@ public static class MlaAttention
             var outRow = output.Slice(t * hiddenSize, hiddenSize);
             MatVec(oProj, attnRow, outRow, hiddenSize, oInputDim);
         }
+
+        ApplyLoraDelta(loraAdapter, loraLayer, "o_proj",
+            attnOutBuf, output, seqLen, oInputDim, hiddenSize);
+    }
+
+    /// <summary>
+    /// Computes the <c>kv_b_proj</c> LoRA delta expanded per cached position,
+    /// i.e. <c>ΔW_kvB @ c_kv[s]</c> for every <c>s</c> in <c>[0, seqKv)</c>,
+    /// shape <c>[seqKv, kvBOutputDim]</c> laid out identically to
+    /// <see cref="Execute"/>'s per-head <c>[qkNopeHeadDim + vHeadDim]</c>
+    /// blocks. Returns <c>null</c> when no adapter targets <c>kv_b_proj</c>
+    /// at this layer (zero-cost when LoRA is inactive).
+    /// </summary>
+    /// <remarks>
+    /// A LoRA delta is intrinsically low-rank
+    /// (<c>ΔW = scale · A @ B</c>, rank ≪ kvLoraRank, kvBOutputDim), so
+    /// materialising its per-position expansion is <c>O(seqKv · rank ·
+    /// (kvLoraRank + kvBOutputDim))</c> — proportional to rank, not to the
+    /// dense projection dims — and does not defeat the absorbed kernel's
+    /// avoidance of the dense <c>kv_b_proj</c> GEMV for the base weight.
+    /// </remarks>
+    private static unsafe float[]? ApplyKvBProjLoraDeltaExpanded(
+        ILoraAdapter? adapter, int layer,
+        ReadOnlySpan<float> latentReadAll, int seqKv, int kvLoraRank, int kvBOutputDim)
+    {
+        if (adapter is null || layer < 0) return null;
+        if (adapter.GetLayerWeights(layer, "kv_b_proj") is null) return null;
+
+        float[] delta = new float[seqKv * kvBOutputDim];
+        ApplyLoraDelta(adapter, layer, "kv_b_proj", latentReadAll, delta, seqKv, kvLoraRank, kvBOutputDim);
+        return delta;
     }
 
     /// <summary>
@@ -822,6 +942,14 @@ public static class MlaAttention
     /// <param name="cachedKPe">See <see cref="ExecuteLatent"/>.</param>
     /// <param name="cachedLength">See <see cref="ExecuteLatent"/>.</param>
     /// <param name="attnScaleMultiplier">See <see cref="Execute"/>.</param>
+    /// <param name="loraAdapter">See <see cref="ExecuteLatent"/>. On the
+    /// prefill (expand-then-MHA) path, <c>kv_b_proj</c>'s delta is applied
+    /// directly to the fully-expanded per-position scratch (same as
+    /// <see cref="Execute"/>'s single-token GEMV), since this path already
+    /// materialises the dense expansion — no absorbed-math correction is
+    /// needed here (unlike the decode/<see cref="ExecuteLatent"/> path).
+    /// </param>
+    /// <param name="loraLayer">See <see cref="ExecuteLatent"/>.</param>
     public static unsafe void ExecuteLatentHybrid(
         ReadOnlySpan<float> hidden,
         Span<float> output,
@@ -848,7 +976,9 @@ public static class MlaAttention
         nint cachedLatent,
         nint cachedKPe,
         int cachedLength,
-        float attnScaleMultiplier = 1.0f)
+        float attnScaleMultiplier = 1.0f,
+        ILoraAdapter? loraAdapter = null,
+        int loraLayer = -1)
     {
         // Decode (seqLen == 1): absorbed kernel is the bandwidth-optimal
         // choice. Delegate unchanged — the persistent latent cache is
@@ -861,7 +991,8 @@ public static class MlaAttention
                 rmsNormEps, ropeCosTable, ropeSinTable,
                 qAProj, qALayernormWeight, qBProj, qProj,
                 kvAProjWithMqa, kvALayernormWeight, kvBProj, oProj,
-                cachedLatent, cachedKPe, cachedLength, attnScaleMultiplier);
+                cachedLatent, cachedKPe, cachedLength, attnScaleMultiplier,
+                loraAdapter, loraLayer);
             return;
         }
 
@@ -888,23 +1019,42 @@ public static class MlaAttention
         float[] attnOutBuf = new float[seqLen * numHeads * vHeadDim];
 
         // ── Q projection (identical to ExecuteLatent / Execute) ────────
-        for (int t = 0; t < seqLen; t++)
+        if (qLoraRank > 0)
         {
-            var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
-            var qRow = qBuf.AsSpan(t * qTotal, qTotal);
-
-            if (qLoraRank > 0)
+            for (int t = 0; t < seqLen; t++)
             {
+                var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
                 var latent = qLatentBuf.AsSpan(t * qLoraRank, qLoraRank);
                 MatVec(qAProj, hiddenRow, latent, qLoraRank, hiddenSize);
+            }
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_a_proj",
+                hidden, qLatentBuf, seqLen, hiddenSize, qLoraRank);
+
+            for (int t = 0; t < seqLen; t++)
+            {
+                var latent = qLatentBuf.AsSpan(t * qLoraRank, qLoraRank);
                 var latentNorm = qLatentNormBuf.AsSpan(t * qLoraRank, qLoraRank);
                 RmsNormScalar(latent, qALayernormWeight, rmsNormEps, latentNorm);
+
+                var qRow = qBuf.AsSpan(t * qTotal, qTotal);
                 MatVec(qBProj, latentNorm, qRow, qTotal, qLoraRank);
             }
-            else
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_b_proj",
+                qLatentNormBuf, qBuf, seqLen, qLoraRank, qTotal);
+        }
+        else
+        {
+            for (int t = 0; t < seqLen; t++)
             {
+                var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
+                var qRow = qBuf.AsSpan(t * qTotal, qTotal);
                 MatVec(qProj, hiddenRow, qRow, qTotal, hiddenSize);
             }
+
+            ApplyLoraDelta(loraAdapter, loraLayer, "q_proj",
+                hidden, qBuf, seqLen, hiddenSize, qTotal);
         }
 
         // ── KV down-projection + split (identical to ExecuteLatent) ────
@@ -914,7 +1064,14 @@ public static class MlaAttention
             var hiddenRow = hidden.Slice(t * hiddenSize, hiddenSize);
             var compRow = compressedKvBuf.AsSpan(t * compressedKvDim, compressedKvDim);
             MatVec(kvAProjWithMqa, hiddenRow, compRow, compressedKvDim, hiddenSize);
+        }
 
+        ApplyLoraDelta(loraAdapter, loraLayer, "kv_a_proj_with_mqa",
+            hidden, compressedKvBuf, seqLen, hiddenSize, compressedKvDim);
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            var compRow = compressedKvBuf.AsSpan(t * compressedKvDim, compressedKvDim);
             var latent = compRow.Slice(0, kvLoraRank);
             var kPe = compRow.Slice(kvLoraRank, qkRopeHeadDim);
 
@@ -981,6 +1138,13 @@ public static class MlaAttention
             {
                 var latentRow = latentReadAll.Slice(s * kvLoraRank, kvLoraRank);
                 MatVec(kvBProj, latentRow, kvBExpandedRowBuf, kvBOutputDim, kvLoraRank);
+
+                // This path (unlike ExecuteLatent's absorbed decode) already
+                // materialises the full dense kv_b_proj expansion per cached
+                // position, so the LoRA delta can be added directly to the
+                // expanded row exactly as Execute does for its per-token GEMV.
+                ApplyLoraDelta(loraAdapter, loraLayer, "kv_b_proj",
+                    latentRow, kvBExpandedRowBuf, 1, kvLoraRank, kvBOutputDim);
 
                 for (int h = 0; h < numHeads; h++)
                 {
@@ -1051,6 +1215,9 @@ public static class MlaAttention
             var outRow = output.Slice(t * hiddenSize, hiddenSize);
             MatVec(oProj, attnRow, outRow, hiddenSize, oInputDim);
         }
+
+        ApplyLoraDelta(loraAdapter, loraLayer, "o_proj",
+            attnOutBuf, output, seqLen, oInputDim, hiddenSize);
     }
 
     /// <summary>
