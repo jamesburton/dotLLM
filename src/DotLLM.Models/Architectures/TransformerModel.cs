@@ -2809,6 +2809,30 @@ public sealed unsafe class TransformerModel : IModel
     }
 
     /// <summary>
+    /// Applies the LoRA delta for DiffusionGemma's model-level self-conditioning module
+    /// (<see cref="ApplySelfConditioning"/>'s gate/up/down GeGLU MLP). Unlike
+    /// <see cref="ApplyLoraDelta"/>, this does NOT go through the diffusion
+    /// encoder/decoder region split: self-conditioning is a single computation that runs
+    /// once per forward and only ever touches canvas rows (there is no prompt/canvas row
+    /// split to make for it — the caller already restricts <paramref name="x"/> /
+    /// <paramref name="y"/> to the <c>canvasLen</c> rows). Looked up under
+    /// <see cref="LoraAdapter.SelfConditioningLayerIndex"/> with
+    /// <see cref="LoraRegion.Any"/>, using the same <c>gate_proj</c>/<c>up_proj</c>/
+    /// <c>down_proj</c> names the dense FFN uses (see
+    /// <see cref="PeftAdapterLoader"/>'s <c>SelfConditioningPathRegex</c>).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ApplySelfConditioningLoraDelta(string projName,
+                                                float* x, float* y, int canvasLen, int inputDim, int outputDim)
+    {
+        if (_currentAdapter is null) return;
+
+        LoraProjection.Apply(_currentAdapter, LoraAdapter.SelfConditioningLayerIndex, projName, x, y,
+                             canvasLen, inputDim, outputDim, _threadPool,
+                             region: LoraRegion.Any);
+    }
+
+    /// <summary>
     /// Applies RMSNorm per attention head to a Q or K tensor [seqLen, numHeads * headDim].
     /// Used for QK-norm (Qwen3-style) where each head vector is independently normalized
     /// after projection and before RoPE.
@@ -3337,6 +3361,11 @@ public sealed unsafe class TransformerModel : IModel
                 // g = gate·normed ; u = up·normed  (batched [canvasLen × ff]).
                 Gemm(sc.GatePtr, sc.GateQt, normedP, gateP, sc.GateOut, sc.GateIn, canvasLen);
                 Gemm(sc.UpPtr, sc.UpQt, normedP, upP, sc.UpOut, sc.UpIn, canvasLen);
+                if (_currentAdapter is not null)
+                {
+                    ApplySelfConditioningLoraDelta("gate_proj", normedP, gateP, canvasLen, sc.GateIn, sc.GateOut);
+                    ApplySelfConditioningLoraDelta("up_proj", normedP, upP, canvasLen, sc.UpIn, sc.UpOut);
+                }
 
                 // gelu_tanh(g) * u   (SAME GeGLU-tanh as the dense FFN).
                 for (int c = 0; c < canvasLen; c++)
@@ -3347,7 +3376,11 @@ public sealed unsafe class TransformerModel : IModel
 
                 // sc_sig = down·(gelu*u)   [canvasLen × hidden].
                 fixed (float* geluP = geluBuf)
+                {
                     Gemm(sc.DownPtr, sc.DownQt, geluP, sigP, sc.DownOut, sc.DownIn, canvasLen);
+                    if (_currentAdapter is not null)
+                        ApplySelfConditioningLoraDelta("down_proj", geluP, sigP, canvasLen, sc.DownIn, sc.DownOut);
+                }
 
                 // canvas += sc_sig (added to the scaled embeddings; caller rms_noscales after).
                 for (int c = 0; c < canvasLen; c++)

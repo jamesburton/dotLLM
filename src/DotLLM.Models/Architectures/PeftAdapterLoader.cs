@@ -35,13 +35,16 @@ public static unsafe class PeftAdapterLoader
 
     /// <summary>
     /// DiffusionGemma's <c>decoder.self_conditioning.{gate,up,down}_proj</c> LoRA tensors —
-    /// recognised-but-unsupported (there is no per-layer index and no ApplyLoraDelta hook for
-    /// the self-conditioning module). Matched separately so these are SKIPPED rather than
-    /// tripping the "unrecognised tensor name" hard failure that every other unmatched name
-    /// gets — the adapter still loads, just without applying this portion of its delta.
+    /// the model-level self-conditioning module (runs once per forward, not inside the
+    /// per-layer loop, so it has no real transformer layer index). Matched separately from
+    /// <see cref="ProjectionPathRegex"/> because the path has no <c>layers.{i}</c> segment;
+    /// routed into the SAME pending-pair machinery as ordinary per-layer entries, keyed under
+    /// <see cref="LoraAdapter.SelfConditioningLayerIndex"/> with region
+    /// <see cref="LoraRegion.Any"/> (see <see cref="TransformerModel.ApplySelfConditioningLoraDelta"/>
+    /// for the application side).
     /// </summary>
     private static readonly Regex SelfConditioningPathRegex = new(
-        @"^(?:base_model\.(?:model\.)?)?model\.decoder\.self_conditioning\.(?:gate_proj|up_proj|down_proj)\.lora_(?:A|B)(?:\.default)?\.weight$",
+        @"^(?:base_model\.(?:model\.)?)?model\.decoder\.self_conditioning\.(?<proj>gate_proj|up_proj|down_proj)\.lora_(?<which>A|B)(?:\.default)?\.weight$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
@@ -145,25 +148,39 @@ public static unsafe class PeftAdapterLoader
                 continue;
             }
 
-            // DiffusionGemma self-conditioning LoRA — recognised but unsupported (no
-            // per-layer index, no ApplyLoraDelta hook for that module). Skip rather
-            // than fail the whole adapter load.
-            if (SelfConditioningPathRegex.IsMatch(tensor.Name))
-                continue;
+            int layer;
+            string proj;
+            string which; // "A" or "B"
+            LoraRegion region;
 
             var match = ProjectionPathRegex.Match(tensor.Name);
-            if (!match.Success)
+            if (match.Success)
             {
-                unrecognised.Add(tensor.Name);
-                continue;
+                layer = int.Parse(match.Groups["layer"].Value, System.Globalization.CultureInfo.InvariantCulture);
+                proj = match.Groups["proj"].Value;
+                which = match.Groups["which"].Value;
+                region = match.Groups["enc"].Success ? LoraRegion.Encoder
+                    : match.Groups["dec"].Success ? LoraRegion.Decoder
+                    : LoraRegion.Any;
             }
+            else
+            {
+                // DiffusionGemma self-conditioning LoRA — model-level module, no real
+                // layer index. Route to the sentinel layer under the same gate_proj/
+                // up_proj/down_proj names as the dense FFN so IsCompatibleEntry's
+                // existing shape validation applies unchanged.
+                var scMatch = SelfConditioningPathRegex.Match(tensor.Name);
+                if (!scMatch.Success)
+                {
+                    unrecognised.Add(tensor.Name);
+                    continue;
+                }
 
-            int layer = int.Parse(match.Groups["layer"].Value, System.Globalization.CultureInfo.InvariantCulture);
-            string proj = match.Groups["proj"].Value;
-            string which = match.Groups["which"].Value; // "A" or "B"
-            LoraRegion region = match.Groups["enc"].Success ? LoraRegion.Encoder
-                : match.Groups["dec"].Success ? LoraRegion.Decoder
-                : LoraRegion.Any;
+                layer = LoraAdapter.SelfConditioningLayerIndex;
+                proj = scMatch.Groups["proj"].Value;
+                which = scMatch.Groups["which"].Value;
+                region = LoraRegion.Any;
+            }
 
             var key = (layer, proj, region);
             if (!pending.TryGetValue(key, out var pair))

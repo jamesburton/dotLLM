@@ -26,6 +26,23 @@ namespace DotLLM.Core.Lora;
 /// </remarks>
 public sealed unsafe class LoraAdapter : ILoraAdapter
 {
+    /// <summary>
+    /// Sentinel layer index reserved for DiffusionGemma's model-level
+    /// <c>decoder.self_conditioning.*</c> module. Self-conditioning runs ONCE per
+    /// forward (not inside the per-layer loop) and has no real transformer layer
+    /// index — real layer indices are always <c>&gt;= 0</c> and
+    /// <c>&lt; ModelConfig.NumLayers</c>, so a negative sentinel can never collide
+    /// with one. Entries are keyed with this sentinel + the SAME proj names used by
+    /// the dense FFN (<c>gate_proj</c>/<c>up_proj</c>/<c>down_proj</c>) so
+    /// <see cref="IsCompatibleEntry"/>'s existing shape-validation switch applies
+    /// unchanged (self-conditioning's gate/up/down are the same
+    /// <c>[HiddenSize→IntermediateSize]</c> / <c>[IntermediateSize→HiddenSize]</c>
+    /// shape family as the dense FFN's). Region is always <see cref="LoraRegion.Any"/>
+    /// — self-conditioning only ever touches canvas rows structurally, so there is no
+    /// prompt/canvas split to make for it.
+    /// </summary>
+    public const int SelfConditioningLayerIndex = -1;
+
     private readonly Dictionary<(int Layer, string Proj), LoraLayerWeights> _layers;
     // Lazily allocated: only non-null when a region-tagged (Encoder/Decoder) entry is
     // added (real DiffusionGemma PEFT adapters trained with separate encoder/decoder
@@ -90,8 +107,9 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
                                 LoraRegion region = LoraRegion.Any)
     {
         ArgumentException.ThrowIfNullOrEmpty(projName);
-        if (layerIndex < 0)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex, "Layer index must be non-negative.");
+        if (layerIndex < 0 && layerIndex != SelfConditioningLayerIndex)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex,
+                $"Layer index must be non-negative (or the {nameof(SelfConditioningLayerIndex)} sentinel).");
 
         lock (_lock)
         {
@@ -156,7 +174,10 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     private static bool IsCompatibleEntry(int layer, string proj, LoraLayerWeights w, ModelConfig baseConfig)
     {
         {
-            if ((uint)layer >= (uint)baseConfig.NumLayers)
+            // The self-conditioning sentinel is not a real transformer layer index —
+            // skip the layer-count bound check for it. Every other entry validates
+            // against the real per-layer bound as before.
+            if (layer != SelfConditioningLayerIndex && (uint)layer >= (uint)baseConfig.NumLayers)
                 return false;
 
             // Gemma-4-family models have a PER-LAYER head dim / kv-head count: global

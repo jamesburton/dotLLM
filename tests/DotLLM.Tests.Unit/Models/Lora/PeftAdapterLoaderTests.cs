@@ -168,7 +168,8 @@ public sealed class PeftAdapterLoaderTests : IDisposable
         // INDEPENDENT deltas for the HF model's decoder.layers.* (canvas/decoder region) and
         // encoder.language_model.layers.* (prompt/encoder region) module trees, over the same
         // shared backbone weight — plus a decoder.self_conditioning.* module with no per-layer
-        // index (recognised-but-unsupported: skipped, not a hard failure).
+        // index (loaded under LoraAdapter.SelfConditioningLayerIndex — see
+        // LoadFromDirectory_LoadsSelfConditioningTensors for dedicated coverage).
         var cfg = BuildBaseConfig();
         int qOut = cfg.NumAttentionHeads * cfg.HeadDim;
         string dir = Path.Combine(_scratch, $"dg-adapter-{Guid.NewGuid():N}");
@@ -215,6 +216,61 @@ public sealed class PeftAdapterLoaderTests : IDisposable
         // q_proj/layer 0 was region-tagged — so the plain (non-region) lookup used by every
         // AR/non-diffusion caller finds nothing here (not a false match on the wrong region).
         Assert.Null(adapter.GetLayerWeights(0, "q_proj"));
+    }
+
+    [Fact]
+    public void LoadFromDirectory_LoadsSelfConditioningTensors()
+    {
+        // DiffusionGemma's decoder.self_conditioning.{gate,up,down}_proj LoRA tensors are a
+        // model-level module (no layers.{i} segment, runs once per forward) — they must now
+        // LOAD (not be silently skipped) under the LoraAdapter.SelfConditioningLayerIndex
+        // sentinel, with the SAME gate_proj/up_proj/down_proj shape validation the dense FFN
+        // branches use.
+        var cfg = BuildBaseConfig();
+        string dir = Path.Combine(_scratch, $"sc-adapter-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        var cfgObj = new
+        {
+            r = 8,
+            lora_alpha = 16.0,
+            target_modules = new[] { "gate_proj", "up_proj", "down_proj" },
+            task_type = "CAUSAL_LM",
+            use_rslora = false,
+            use_dora = false,
+        };
+        File.WriteAllText(Path.Combine(dir, "adapter_config.json"), JsonSerializer.Serialize(cfgObj));
+
+        var rng = new Random(99);
+        var b = new SafetensorsFixtureBuilder()
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.gate_proj.lora_A.weight",
+                [8, cfg.HiddenSize], RandomVec(rng, 8 * cfg.HiddenSize, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.gate_proj.lora_B.weight",
+                [cfg.IntermediateSize, 8], RandomVec(rng, cfg.IntermediateSize * 8, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.up_proj.lora_A.weight",
+                [8, cfg.HiddenSize], RandomVec(rng, 8 * cfg.HiddenSize, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.up_proj.lora_B.weight",
+                [cfg.IntermediateSize, 8], RandomVec(rng, cfg.IntermediateSize * 8, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.down_proj.lora_A.weight",
+                [8, cfg.IntermediateSize], RandomVec(rng, 8 * cfg.IntermediateSize, 0.02f))
+            .AddFloat32("base_model.model.model.decoder.self_conditioning.down_proj.lora_B.weight",
+                [cfg.HiddenSize, 8], RandomVec(rng, cfg.HiddenSize * 8, 0.02f));
+        b.WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
+
+        using var adapter = PeftAdapterLoader.LoadFromDirectory("sc-adapter", dir, cfg);
+
+        var gate = adapter.GetLayerWeights(LoraAdapter.SelfConditioningLayerIndex, "gate_proj");
+        var up = adapter.GetLayerWeights(LoraAdapter.SelfConditioningLayerIndex, "up_proj");
+        var down = adapter.GetLayerWeights(LoraAdapter.SelfConditioningLayerIndex, "down_proj");
+        Assert.NotNull(gate);
+        Assert.NotNull(up);
+        Assert.NotNull(down);
+        Assert.Equal(cfg.HiddenSize, gate!.Value.InputDim);
+        Assert.Equal(cfg.IntermediateSize, gate.Value.OutputDim);
+        Assert.Equal(cfg.IntermediateSize, down!.Value.InputDim);
+        Assert.Equal(cfg.HiddenSize, down.Value.OutputDim);
+
+        Assert.True(adapter.IsCompatible(cfg));
     }
 
     [Fact]
