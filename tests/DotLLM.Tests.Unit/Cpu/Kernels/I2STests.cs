@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using Xunit;
@@ -199,6 +200,50 @@ public sealed unsafe class I2STests
             }
         }
         finally { NativeMemory.Free(w); }
+    }
+
+    // ──────────────────── SIMD unpack parity (decode-bound stage) ────────────────────
+
+    /// <summary>
+    /// The AVX2 SIMD ternary unpack (<see cref="MatMul.UnpackRowI8Avx2"/>) must be BIT-EXACT
+    /// against the scalar reference (<see cref="MatMul.UnpackRowI8Scalar"/>) for every packed
+    /// byte pattern. The packed payload is filled with a deterministic cycling pattern so all
+    /// 256 byte values (hence every 4-code quartet combination) are exercised, across several
+    /// K sizes (1 block … BitNet ffn-row width). This pins the exact layout the W2A8 int8 dot
+    /// consumes, so a divergent SIMD path can never ship silently.
+    /// </summary>
+    [Theory]
+    [InlineData(128)]    // 1 block
+    [InlineData(256)]    // 2 blocks
+    [InlineData(2560)]   // BitNet attn row (20 blocks)
+    [InlineData(6912)]   // BitNet ffn row (54 blocks)
+    public void UnpackRowI8_Simd_MatchesScalar_BitExact(int k)
+    {
+        // The cross-platform Vector256 path runs on every host (hardware-accelerated where AVX2
+        // exists, software fallback otherwise) with identical numeric results, so parity verified
+        // here (SSE4.2-only) transfers to the AVX2 hardware lowering.
+        int rowBytes = k / 4;
+        byte* packed = (byte*)NativeMemory.Alloc((nuint)rowBytes);
+        sbyte* refBuf = (sbyte*)NativeMemory.Alloc((nuint)k);
+        sbyte* simdBuf = (sbyte*)NativeMemory.Alloc((nuint)k);
+        try
+        {
+            // Deterministic pattern; gcd(31,256)=1 so all 256 byte values appear once rowBytes≥256.
+            for (int i = 0; i < rowBytes; i++) packed[i] = (byte)((i * 31 + 7) & 0xFF);
+
+            MatMul.UnpackRowI8Scalar(packed, refBuf, k);
+            MatMul.UnpackRowI8Simd(packed, simdBuf, k);
+
+            for (int i = 0; i < k; i++)
+                Assert.True(refBuf[i] == simdBuf[i],
+                    $"mismatch at element {i} (k={k}): scalar={refBuf[i]} simd={simdBuf[i]}");
+        }
+        finally
+        {
+            NativeMemory.Free(packed);
+            NativeMemory.Free(refBuf);
+            NativeMemory.Free(simdBuf);
+        }
     }
 
     private static void AssertWithinQuantTolerance(float expected, float actual)

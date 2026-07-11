@@ -530,10 +530,30 @@ public static unsafe partial class MatMul
     /// {-1,0,+1}, laid out contiguously so that each 32-element slice aligns with a Q8_0 block.
     /// Same bit layout as <see cref="UnpackRow"/>: within a 128-element block, byte at <c>gp</c>
     /// holds elements {gp, +32, +64, +96} at bit offsets {6,4,2,0}; ternary = <c>code - 1</c>.
+    ///
+    /// <para>This is the GEMV decode-bound stage: for a single-token GEMV each weight row is
+    /// unpacked fresh on every call with no amortization across tokens (unlike GEMM, which
+    /// unpacks each row once and reuses it across all N). Dispatches to the vectorized path
+    /// (<see cref="UnpackRowI8Simd"/>) when 256-bit vectors are hardware-accelerated, else the
+    /// scalar reference (<see cref="UnpackRowI8Scalar"/>); both produce bit-identical output.</para>
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void UnpackRowI8(byte* rowPtr, sbyte* dest, int k)
+    internal static void UnpackRowI8(byte* rowPtr, sbyte* dest, int k)
+    {
+        if (Vector256.IsHardwareAccelerated)
+            UnpackRowI8Simd(rowPtr, dest, k);
+        else
+            UnpackRowI8Scalar(rowPtr, dest, k);
+    }
+
+    /// <summary>
+    /// Scalar reference unpack (see <see cref="UnpackRowI8"/>). Kept as the correctness oracle
+    /// for the SIMD path and used on hardware without AVX2.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void UnpackRowI8Scalar(byte* rowPtr, sbyte* dest, int k)
     {
         int blocks = k / I2SBlockSize;
         for (int blk = 0; blk < blocks; blk++)
@@ -549,6 +569,51 @@ public static unsafe partial class MatMul
                 dest[outBase + gp + 96] = (sbyte)((packed & 0x3) - 1);
             }
         }
+    }
+
+    /// <summary>
+    /// Vectorized SIMD unpack (see <see cref="UnpackRowI8"/>), written against the cross-platform
+    /// <see cref="Vector256"/> API so it lowers to VPSRLW/VPAND/VPSUBB on AVX2 and degrades to the
+    /// software fallback elsewhere (identical results either way).
+    ///
+    /// <para>The I2_S layout is ideal for this: within a 128-element block all four output quarters
+    /// {gp, +32, +64, +96} are the <b>same</b> 32 packed bytes at bit offsets {6,4,2,0}. So one
+    /// 32-byte load feeds four (shift → mask 0x03 → subtract 1 → store) sequences — ~13 vector ops
+    /// replacing 128 scalar bit-extractions per block. The shift is done on 16-bit lanes (no byte
+    /// shift exists); masking to the low two bits discards the bits that bleed across byte
+    /// boundaries, since for every shift count s∈{0,2,4,6} bits s and s+1 stay within the source
+    /// byte (s+1 ≤ 7), so <c>(lane16 >> s) &amp; 0x03</c> equals <c>(byte >> s) &amp; 0x03</c> per byte.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void UnpackRowI8Simd(byte* rowPtr, sbyte* dest, int k)
+    {
+        int blocks = k / I2SBlockSize;
+        Vector256<byte> mask3 = Vector256.Create((byte)0x03);
+        Vector256<sbyte> one = Vector256.Create((sbyte)1);
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            byte* bp = rowPtr + (long)blk * 32;
+            sbyte* outBase = dest + (long)blk * I2SBlockSize;
+
+            Vector256<byte> packed = Vector256.Load(bp);
+            Vector256<ushort> p16 = packed.AsUInt16();
+
+            StoreQuarterI8(outBase, Vector256.ShiftRightLogical(p16, 6).AsByte(), mask3, one);      // elements {gp}
+            StoreQuarterI8(outBase + 32, Vector256.ShiftRightLogical(p16, 4).AsByte(), mask3, one); // elements {gp+32}
+            StoreQuarterI8(outBase + 64, Vector256.ShiftRightLogical(p16, 2).AsByte(), mask3, one); // elements {gp+64}
+            StoreQuarterI8(outBase + 96, packed, mask3, one);                                       // elements {gp+96}
+        }
+    }
+
+    /// <summary>Masks a shifted vector to 2-bit codes {0,1,2} and stores ternary <c>code-1</c> as int8.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreQuarterI8(sbyte* dst, Vector256<byte> shifted,
+                                       Vector256<byte> mask3, Vector256<sbyte> one)
+    {
+        Vector256<sbyte> codes = (shifted & mask3).AsSByte(); // {0,1,2} per byte
+        Vector256<sbyte> tern = codes - one;                  // {-1,0,+1}
+        Vector256.Store(tern, dst);
     }
 
     // ─────────────────────────── Indexed (MoE) I2_S matmul ───────────────────────────
