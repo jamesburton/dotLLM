@@ -1694,6 +1694,18 @@ public sealed unsafe class TransformerModel : IModel
         else
             Gemm(lw.VWeight, lw.VQuantType, normOut, v, lw.VOutputDim, lw.VInputDim, seqLen);
 
+        // LoRA delta (q/k/v): y += scale * (normIn · B) · A. No-op when no adapter is
+        // active. Applied AFTER the base projection and BEFORE QK-norm/RoPE, same
+        // ordering as the generic Llama-style layer path. No v_proj delta on VFromK
+        // layers — the base model has no v_proj weight there for an adapter to target.
+        if (_currentAdapter is not null)
+        {
+            ApplyLoraDelta(layer, "q_proj", normOut, q, seqLen, lw.QInputDim, lw.QOutputDim);
+            ApplyLoraDelta(layer, "k_proj", normOut, k, seqLen, lw.KInputDim, lw.KOutputDim);
+            if (!g4.VFromK)
+                ApplyLoraDelta(layer, "v_proj", normOut, v, seqLen, lw.VInputDim, lw.VOutputDim);
+        }
+
         // Q-norm (rms * attn_q_norm per head), then K-norm (rms * attn_k_norm per
         // kv head). V-norm is WEIGHT-LESS rms per kv head (no scale), all layers.
         if (lw.QNormWeight is not null)
@@ -1835,6 +1847,8 @@ public sealed unsafe class TransformerModel : IModel
 
         // O projection: attnOut [seqLen × numHeads*headDim] → normOut [seqLen × hidden]
         Gemm(lw.OWeight, lw.OQuantType, attnOut, normOut, lw.OOutputDim, lw.OInputDim, seqLen);
+        if (_currentAdapter is not null)
+            ApplyLoraDelta(layer, "o_proj", attnOut, normOut, seqLen, lw.OInputDim, lw.OOutputDim);
 
         // post_attention_norm, then residual add: attn_out = rms(O)*post_attn + input.
         for (int t = 0; t < seqLen; t++)
@@ -1864,7 +1878,7 @@ public sealed unsafe class TransformerModel : IModel
 
                 // ── Dense FFN branch (shared expert) ──────────────────────
                 // cur_mlp = down( geglu(gate·n) * (up·n) ), n = rms(attn_out)*ffn_norm
-                Gemma4DenseFfn(in lw, attnOutP, denseP, tmpP, normOut, seqLen, eps);
+                Gemma4DenseFfn(in lw, layer, attnOutP, denseP, tmpP, normOut, seqLen, eps);
                 // cur_mlp = rms(cur_mlp) * post_ffw_norm_1
                 for (int t = 0; t < seqLen; t++)
                     RmsNorm.Execute(
@@ -1916,10 +1930,13 @@ public sealed unsafe class TransformerModel : IModel
     /// Gemma-4 dense FFN branch: <c>down( geglu(gate·n) * (up·n) )</c> where
     /// <c>n = rms(attn_out) * ffn_norm</c>. Writes [seqLen × hidden] into
     /// <paramref name="dense"/>. Uses the layer's dense gate/up/down slots and the
-    /// model-wide dense intermediate width.
+    /// model-wide dense intermediate width. LoRA (when active) applies only to this
+    /// dense/"shared expert" branch — the routed MoE experts (<see cref="Gemma4Moe"/>)
+    /// have no LoRA hook (per-expert projection names are not yet wired; see
+    /// <see cref="ValidateAdapterForModel"/>).
     /// </summary>
     private unsafe void Gemma4DenseFfn(
-        in TransformerLayerWeights lw, float* attnOut, float* dense, float* normScratch,
+        in TransformerLayerWeights lw, int layer, float* attnOut, float* dense, float* normScratch,
         float* hiddenScratch, int seqLen, float eps)
     {
         int hiddenSize = Config.HiddenSize;
@@ -1937,6 +1954,11 @@ public sealed unsafe class TransformerModel : IModel
 
         Gemm(lw.GateWeight, lw.GateQuantType, hiddenScratch, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
         Gemm(lw.UpWeight, lw.UpQuantType, hiddenScratch, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        if (_currentAdapter is not null)
+        {
+            ApplyLoraDelta(layer, "gate_proj", hiddenScratch, ffnGate, seqLen, lw.GateInputDim, lw.GateOutputDim);
+            ApplyLoraDelta(layer, "up_proj", hiddenScratch, ffnUp, seqLen, lw.UpInputDim, lw.UpOutputDim);
+        }
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1947,6 +1969,8 @@ public sealed unsafe class TransformerModel : IModel
         }
 
         Gemm(lw.DownWeight, lw.DownQuantType, siluOut, dense, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        if (_currentAdapter is not null)
+            ApplyLoraDelta(layer, "down_proj", siluOut, dense, seqLen, lw.DownInputDim, lw.DownOutputDim);
     }
 
     /// <summary>
