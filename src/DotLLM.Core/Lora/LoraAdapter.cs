@@ -137,31 +137,36 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     {
         ArgumentNullException.ThrowIfNull(baseConfig);
 
-        int qOut = baseConfig.NumAttentionHeads * baseConfig.HeadDim;
-        int kvOut = baseConfig.NumKvHeads * baseConfig.HeadDim;
-
         foreach (var ((layer, proj), w) in _layers)
         {
-            if (!IsCompatibleEntry(layer, proj, w, baseConfig, qOut, kvOut))
+            if (!IsCompatibleEntry(layer, proj, w, baseConfig))
                 return false;
         }
         if (_regionLayers is not null)
         {
             foreach (var ((layer, proj, _), w) in _regionLayers)
             {
-                if (!IsCompatibleEntry(layer, proj, w, baseConfig, qOut, kvOut))
+                if (!IsCompatibleEntry(layer, proj, w, baseConfig))
                     return false;
             }
         }
         return true;
     }
 
-    private static bool IsCompatibleEntry(int layer, string proj, LoraLayerWeights w,
-                                          ModelConfig baseConfig, int qOut, int kvOut)
+    private static bool IsCompatibleEntry(int layer, string proj, LoraLayerWeights w, ModelConfig baseConfig)
     {
         {
             if ((uint)layer >= (uint)baseConfig.NumLayers)
                 return false;
+
+            // Gemma-4-family models have a PER-LAYER head dim / kv-head count: global
+            // (full-attention) layers use GlobalHeadDim/NumGlobalKvHeads, sliding layers use
+            // the uniform HeadDim/NumKvHeads. A single model-wide qOut/kvOut (as if every
+            // layer were uniform) would wrongly reject a correctly-shaped adapter entry at a
+            // global layer (or wrongly ACCEPT a wrong-shaped one at a sliding layer) — compute
+            // per-layer, exactly like the forward pass does via GetLayerHeadDim/GetLayerKvHeads.
+            int qOut = baseConfig.NumAttentionHeads * baseConfig.GetLayerHeadDim(layer);
+            int kvOut = baseConfig.GetLayerKvHeads(layer) * baseConfig.GetLayerHeadDim(layer);
 
             // Validate the projection's input/output dimensions match the
             // base model's per-projection shape.
