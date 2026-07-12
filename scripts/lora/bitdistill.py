@@ -71,6 +71,7 @@ except Exception:
     pass
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -87,6 +88,7 @@ import bitdistill_data as bdata  # noqa: E402
 import csharp_exec_eval as cse  # noqa: E402
 import tooluse_exec_eval as tue  # noqa: E402
 import instruction_exec_eval as iue  # noqa: E402
+import corpus_mix as cmix  # noqa: E402
 
 
 # ===========================================================================
@@ -610,6 +612,59 @@ def run_self_test(tau: float = 5.0, lambda_kd: float = 10.0, gamma: float = 1e-5
 # ===========================================================================
 # Training loop / budget curve
 # ===========================================================================
+def _parse_mix_weights(spec: str) -> dict:
+    """'tooluse=35,csharp=35,instruction=20' -> {'tooluse':35.0,...}. Empty -> {}."""
+    out = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, val = part.partition("=")
+        out[name.strip()] = float(val) if val.strip() else 1.0
+    return out
+
+
+def build_mixed_stream(args, tokenizer, seq_len, general_stream):
+    """Return ``general_stream`` unchanged unless ``--mix-weights`` is set, in which case
+    return the B4 weighted multi-corpus mix (general anchor + tool-use/instruction/C#).
+    Used by BOTH ``train`` (online KD) and ``generate_teacher_cache`` so the offline
+    top-K KD targets are cached over the same distribution the student trains on."""
+    if not getattr(args, "mix_weights", None):
+        return general_stream
+    import capability_data as capdata
+    weights = {**cmix.STANDARD_WEIGHTS, **_parse_mix_weights(args.mix_weights)}
+    factories = {}
+    if weights.get("general", 0) > 0:
+        factories["general"] = general_stream  # infinite iterator (never cycles)
+    if weights.get("tooluse", 0) > 0:
+        factories["tooluse"] = capdata.load_capability_sequences(
+            "tooluse", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+    if weights.get("instruction", 0) > 0:
+        factories["instruction"] = capdata.load_capability_sequences(
+            "instruction", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+    if weights.get("csharp", 0) > 0:
+        try:  # B3 stream is single-pass; materialise a cycling pool (list -> auto-cycles)
+            import csharp_train_data as cstd
+            factories["csharp"] = list(itertools.islice(
+                cstd.csharp_train_stream(tokenizer, seq_len), args.mix_n_seqs))
+            if not factories["csharp"]:
+                raise ValueError("empty C# corpus")
+        except Exception as e:  # noqa: BLE001
+            print(f"[bitdistill] C# train corpus unavailable ({e}); dropping from mix", flush=True)
+            factories.pop("csharp", None)
+    if args.curriculum_phase_a > 0:
+        stream = cmix.curriculum_stream(
+            factories, seq_len=seq_len, total_tokens=int(args.tokens),
+            phase_a_fraction=args.curriculum_phase_a, phase_b_weights=weights,
+            schedule=args.mix_schedule, seed=args.mix_seed)
+    else:
+        stream = cmix.standard_capability_mix(
+            factories, weights, schedule=args.mix_schedule, seed=args.mix_seed)
+    print(f"[bitdistill] MIX enabled ({args.mix_schedule}): "
+          f"{ {k: weights[k] for k in factories} }", flush=True)
+    return stream
+
+
 def train(args) -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -703,6 +758,7 @@ def train(args) -> int:
             cpt_stream = bdata.cpt_token_stream(
                 tokenizer, seq_len, dataset_name=args.cpt_dataset, dataset_config=None,
                 local_parquet=args.cpt_local_parquet)
+        cpt_stream = build_mixed_stream(args, tokenizer, seq_len, cpt_stream)
         ppl_slice = bdata.load_ppl_slice(tokenizer, n=20, seq_len=seq_len,
                                          dataset_name=args.cpt_dataset,
                                          dataset_config=args.cpt_config,
@@ -908,6 +964,21 @@ def parse_args(argv=None):
                         "(deterministic length/format/keyword constraint probes; no judge).")
     p.add_argument("--eval-n-instruction", type=int, default=None, dest="eval_n_instruction",
                    help="Number of instruction constraint probes (default: the full built-in set).")
+    p.add_argument("--mix-weights", default=None, dest="mix_weights",
+                   help="Enable the B4 multi-corpus capability mix. Comma list of name=weight "
+                        "(e.g. 'tooluse=35,csharp=35,instruction=20,general=10'). Omitted names "
+                        "default to corpus_mix.STANDARD_WEIGHTS; a name with no available corpus is "
+                        "dropped and the rest renormalize. Unset -> single cpt (general) stream.")
+    p.add_argument("--mix-schedule", default="stride", choices=["stride", "random"], dest="mix_schedule",
+                   help="Interleave schedule: 'stride' (deterministic, exact ratios) or 'random' (seeded).")
+    p.add_argument("--mix-seed", type=int, default=0, dest="mix_seed",
+                   help="Seed for --mix-schedule random (stride ignores it).")
+    p.add_argument("--mix-n-seqs", type=int, default=4096, dest="mix_n_seqs",
+                   help="Pool size (sequences) materialised per finite capability corpus for the "
+                        "mix (they cycle; not a token cap).")
+    p.add_argument("--curriculum-phase-a", type=float, default=0.0, dest="curriculum_phase_a",
+                   help="If >0, run a Phase-A general+instruction warm-up for this FRACTION of "
+                        "--tokens before the capability-heavy Phase-B mix.")
     p.add_argument("--log-every", type=int, default=20, dest="log_every")
     # offline KD (two-phase): cache a frozen teacher's top-K logits, then train student from cache.
     p.add_argument("--make-teacher-cache", default=None, dest="make_teacher_cache",
@@ -943,6 +1014,7 @@ def generate_teacher_cache(args) -> int:
     stream = bdata.cpt_token_stream(
         tokenizer, seq_len, dataset_name=args.cpt_dataset, dataset_config=args.cpt_config,
         local_parquet=args.cpt_local_parquet)
+    stream = build_mixed_stream(args, tokenizer, seq_len, stream)  # cache over the mix if --mix-weights
     max_tokens = int(args.tokens)
     n_batches = (max_tokens + bs * seq_len - 1) // (bs * seq_len)
     os.makedirs(args.make_teacher_cache, exist_ok=True)
