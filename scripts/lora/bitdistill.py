@@ -1043,7 +1043,17 @@ def generate_teacher_cache(args) -> int:
     print(f"[cache] {n_batches} batches (bs={bs} seq={seq_len} top_k={K} tau={tau}) -> {args.make_teacher_cache}", flush=True)
 
     mass_sum, mass_cnt = 0.0, 0
-    for i in range(n_batches):
+    # Resume: skip batches already on disk and fast-forward the (deterministic) stream past them,
+    # so an interrupted cache-gen continues instead of overwriting from batch 0.
+    done = len([f for f in os.listdir(args.make_teacher_cache)
+                if f.startswith("batch_") and f.endswith(".pt")])
+    start = min(done, n_batches)
+    if start > 0:
+        print(f"[cache] resuming: {start}/{n_batches} batches already on disk; "
+              f"fast-forwarding stream by {start * bs} sequences...", flush=True)
+        for _ in range(start * bs):
+            next(stream)
+    for i in range(start, n_batches):
         batch = torch.stack([next(stream) for _ in range(bs)]).to(device)      # [B, T]
         with torch.no_grad():
             logits = teacher(input_ids=batch, use_cache=False).logits.float()  # [B, T, V]
