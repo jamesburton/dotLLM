@@ -84,6 +84,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bitdistill_data as bdata  # noqa: E402
+import csharp_exec_eval as cse  # noqa: E402
 
 
 # ===========================================================================
@@ -706,6 +707,8 @@ def train(args) -> int:
                                          local_parquet=args.cpt_local_parquet)
         gsm8k = bdata.load_gsm8k(tokenizer, n=args.eval_n_gsm8k, seq_len=seq_len) \
             if args.eval_gsm8k else []
+        csharp_tasks = cse.load_csharp_tasks(n=args.eval_n_csharp, bench_dir=args.csharp_bench_dir) \
+            if args.eval_csharp else []
 
     milestones = sorted(int(float(x)) for x in args.milestones.split(",")) if args.milestones else []
     curve = []
@@ -767,28 +770,35 @@ def train(args) -> int:
             set_quant_alpha(student, 1.0)  # eval at full ternary
             ppl = compute_ppl(student, ppl_slice, device)
             acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+            csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                             bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
             ck = os.path.join(args.out, f"ckpt_{mtok}")
             if args.save_ckpt:
                 save_checkpoint(student, ck, step, tokens_seen,
-                                extra={"ppl": ppl, "gsm8k_acc": acc, "milestone": mtok})
-            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc})
-            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  -> {ck}", flush=True)
+                                extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1,
+                                       "milestone": mtok})
+            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+                          "csharp_pass1": csharp_p1})
+            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  csharp_pass1={csharp_p1}  -> {ck}", flush=True)
             next_milestone += 1
 
     # final save + curve
     set_quant_alpha(student, 1.0)
     ppl = compute_ppl(student, ppl_slice, device)
     acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
-    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc, "final": True})
+    csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                     bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
+    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+                  "csharp_pass1": csharp_p1, "final": True})
     if args.save_ckpt:
         save_checkpoint(student, os.path.join(args.out, "final"), step, tokens_seen,
-                        extra={"ppl": ppl, "gsm8k_acc": acc})
+                        extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1})
     with open(os.path.join(args.out, "curve.json"), "w", encoding="utf-8") as f:
         json.dump({"base": args.base, "curve": curve,
                    "args": {k: v for k, v in vars(args).items()}}, f, indent=2)
     s_cap.remove(); t_cap.remove()
     print(f"[bitdistill] done: {step} steps / {tokens_seen} tokens. "
-          f"final ppl={ppl:.3f} gsm8k_acc={acc}. curve -> {args.out}/curve.json")
+          f"final ppl={ppl:.3f} gsm8k_acc={acc} csharp_pass1={csharp_p1}. curve -> {args.out}/curve.json")
     return 0
 
 
@@ -866,6 +876,14 @@ def parse_args(argv=None):
                    help="Run GSM8K accuracy eval at each milestone (the go/no-go signal).")
     p.add_argument("--eval-n-gsm8k", type=int, default=100, dest="eval_n_gsm8k",
                    help="Number of GSM8K examples for the accuracy eval.")
+    p.add_argument("--eval-csharp", action="store_true", dest="eval_csharp",
+                   help="Run C# compile+xUnit pass@1 eval at each milestone (in-process generate "
+                        "-> dotnet build+test via the coding_tasks harness).")
+    p.add_argument("--eval-n-csharp", type=int, default=12, dest="eval_n_csharp",
+                   help="Number of held-out C# execution tasks for the pass@1 eval (expensive: "
+                        "each task generates + runs dotnet build/test).")
+    p.add_argument("--csharp-bench-dir", default=cse.DEFAULT_BENCH_DIR, dest="csharp_bench_dir",
+                   help="Path to the coding_tasks harness dir (tasks/ + templates/ + task_runner).")
     p.add_argument("--log-every", type=int, default=20, dest="log_every")
     # offline KD (two-phase): cache a frozen teacher's top-K logits, then train student from cache.
     p.add_argument("--make-teacher-cache", default=None, dest="make_teacher_cache",
@@ -976,6 +994,8 @@ def train_from_cache(args) -> int:
     ppl_slice = bdata.load_ppl_slice(tokenizer, n=20, seq_len=seq_len, dataset_name=args.cpt_dataset,
                                      dataset_config=args.cpt_config, local_parquet=args.cpt_local_parquet)
     gsm8k = bdata.load_gsm8k(tokenizer, n=args.eval_n_gsm8k, seq_len=seq_len) if args.eval_gsm8k else []
+    csharp_tasks = cse.load_csharp_tasks(n=args.eval_n_csharp, bench_dir=args.csharp_bench_dir) \
+        if args.eval_csharp else []
     milestones = sorted(int(float(x)) for x in args.milestones.split(",")) if args.milestones else []
     curve, next_ms = [], 0
 
@@ -1022,23 +1042,30 @@ def train_from_cache(args) -> int:
             set_quant_alpha(student, 1.0)
             ppl = compute_ppl(student, ppl_slice, device)
             acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
+            csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                             bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
             ck = os.path.join(args.out, f"ckpt_{mtok}")
             if args.save_ckpt:
                 save_checkpoint(student, ck, step, tokens_seen,
-                                extra={"ppl": ppl, "gsm8k_acc": acc, "milestone": mtok})
-            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc})
-            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  -> {ck}", flush=True)
+                                extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1,
+                                       "milestone": mtok})
+            curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+                          "csharp_pass1": csharp_p1})
+            print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  csharp_pass1={csharp_p1}  -> {ck}", flush=True)
             next_ms += 1
 
     set_quant_alpha(student, 1.0)
     ppl = compute_ppl(student, ppl_slice, device)
     acc = eval_gsm8k(student, tokenizer, gsm8k, device) if gsm8k else float("nan")
-    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc, "final": True})
+    csharp_p1 = cse.eval_csharp_exec(student, tokenizer, csharp_tasks, device,
+                                     bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
+    curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
+                  "csharp_pass1": csharp_p1, "final": True})
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "curve.json"), "w") as f:
         json.dump({"base": base, "from_cache": cache_dir, "curve": curve, "meta": meta}, f, indent=2)
     print(f"[from-cache] done: {step} steps / {tokens_seen} tokens. final ppl={ppl:.3f} "
-          f"gsm8k_acc={acc}. curve -> {args.out}/curve.json", flush=True)
+          f"gsm8k_acc={acc} csharp_pass1={csharp_p1}. curve -> {args.out}/curve.json", flush=True)
     return 0
 
 
