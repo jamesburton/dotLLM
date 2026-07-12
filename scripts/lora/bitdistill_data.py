@@ -106,14 +106,28 @@ def load_gsm8k(
     tokenizer,
     n: int = 100,
     split: str = "test",
-    seq_len: int = 512,
+    seq_len: int = 1024,
+    few_shot: int = 4,
 ) -> list:
-    """Return a small list of GSM8K examples for the go/no-go accuracy eval.
+    """Return a small list of GSM8K examples for the accuracy eval.
 
     Each item is ``{"prompt_ids": LongTensor, "answer": str, "question": str}``.
     The gold numeric answer is parsed from the ``#### N`` marker GSM8K uses.
+
+    ``few_shot`` prepends this many train examples (with their chain-of-thought
+    solutions) to every prompt. Zero-shot GSM8K on a base/hybrid-reasoning model
+    massively undercounts capability — measured FP Qwen3-1.7B: 15% zero-shot vs
+    70% with 4-shot CoT — so few-shot is the default. Long prompts are kept from
+    the tail (``[-seq_len:]``) so the actual question survives truncation.
     """
     import datasets as hf_datasets
+
+    prefix = ""
+    if few_shot > 0:
+        train = hf_datasets.load_dataset("openai/gsm8k", "main", split="train")
+        exs = list(itertools.islice(iter(train), few_shot))
+        prefix = "".join(
+            f"Question: {r['question'].strip()}\nAnswer: {r['answer'].strip()}\n\n" for r in exs)
 
     ds = hf_datasets.load_dataset("openai/gsm8k", "main", split=split)
     out = []
@@ -121,8 +135,8 @@ def load_gsm8k(
         q = row["question"].strip()
         a_full = row["answer"].strip()
         gold = a_full.split("####")[-1].strip().replace(",", "") if "####" in a_full else ""
-        prompt = f"Question: {q}\nAnswer:"
-        ids = tokenizer(prompt, add_special_tokens=False)["input_ids"][:seq_len]
+        prompt = prefix + f"Question: {q}\nAnswer:"
+        ids = tokenizer(prompt, add_special_tokens=False)["input_ids"][-seq_len:]
         out.append(
             {
                 "prompt_ids": torch.tensor(ids, dtype=torch.long),

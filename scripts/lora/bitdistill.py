@@ -439,23 +439,37 @@ def _extract_number(text: str) -> str:
     return nums[-1].rstrip(".") if nums else ""
 
 
-def eval_gsm8k(model, tokenizer, examples: list, device, max_new_tokens: int = 96) -> float:
-    """Greedy-decode GSM8K prompts; return exact-match accuracy of the final number."""
+def eval_gsm8k(model, tokenizer, examples: list, device,
+               max_new_tokens: int = 256, chunk: int = 16) -> float:
+    """Greedy-decode GSM8K prompts (batched, left-padded); exact-match accuracy of the
+    final generated number. Generation temporarily forces ``use_cache=True`` (the student
+    trains with it off, which makes autoregressive decode O(n²)); with few-shot CoT prompts
+    the answer is the last number before the model rolls into the next ``Question:``."""
     if not examples:
         return float("nan")
     was_training = model.training
     model.eval()
+    prev_cache = getattr(model.config, "use_cache", True)
+    model.config.use_cache = True
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
     correct = 0
     with torch.no_grad():
-        for ex in examples:
-            ids = ex["prompt_ids"].unsqueeze(0).to(device)
-            out = model.generate(
-                ids, max_new_tokens=max_new_tokens, do_sample=False,
-                pad_token_id=(tokenizer.eos_token_id or 0),
-            )
-            gen = tokenizer.decode(out[0, ids.size(1):], skip_special_tokens=True)
-            if _extract_number(gen) == ex["answer"] and ex["answer"] != "":
-                correct += 1
+        for i in range(0, len(examples), chunk):
+            batch = examples[i:i + chunk]
+            maxlen = max(e["prompt_ids"].size(0) for e in batch)
+            input_ids = torch.full((len(batch), maxlen), pad_id, dtype=torch.long)
+            attn = torch.zeros((len(batch), maxlen), dtype=torch.long)
+            for j, e in enumerate(batch):  # left-pad so all sequences end aligned
+                L = e["prompt_ids"].size(0)
+                input_ids[j, maxlen - L:] = e["prompt_ids"]
+                attn[j, maxlen - L:] = 1
+            out = model.generate(input_ids=input_ids.to(device), attention_mask=attn.to(device),
+                                 max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=pad_id)
+            for j, e in enumerate(batch):
+                gen = tokenizer.decode(out[j, maxlen:], skip_special_tokens=True).split("Question:")[0]
+                if _extract_number(gen) == e["answer"] and e["answer"] != "":
+                    correct += 1
+    model.config.use_cache = prev_cache
     if was_training:
         model.train()
     return correct / len(examples)
