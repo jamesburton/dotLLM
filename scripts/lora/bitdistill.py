@@ -1013,6 +1013,10 @@ def parse_args(argv=None):
     p.add_argument("--from-teacher-cache", default=None, dest="from_teacher_cache",
                    help="Phase 2: train the ternary student against a cached teacher (this dir). Only "
                         "the student is resident. Loss = CE + lambda * sparse top-K KD (no AD term).")
+    p.add_argument("--resume-from", default=None, dest="resume_from",
+                   help="train_from_cache: resume from a milestone ckpt dir (loads student_state.pt + "
+                        "state.json step/tokens, fast-forwards the cache index, skips completed "
+                        "milestones). Optimizer state restarts fresh.")
     p.add_argument("--top-k", type=int, default=128, dest="top_k",
                    help="Top-K teacher logits to cache per token (tau softens the teacher, so larger K "
                         "keeps more mass; the cache reports mean top-K mass coverage).")
@@ -1106,6 +1110,13 @@ def train_from_cache(args) -> int:
     if args.ffn_activation != "silu":
         set_student_ffn_activation(student, args.ffn_activation, args.ffn_anneal_steps)
     student.to(device); student.train()
+    resume_step, resume_tokens = 0, 0
+    if args.resume_from:
+        rsd = torch.load(os.path.join(args.resume_from, "student_state.pt"), map_location="cpu")
+        student.load_state_dict(rsd); del rsd
+        rst = json.load(open(os.path.join(args.resume_from, "state.json"), encoding="utf-8"))
+        resume_step, resume_tokens = int(rst["step"]), int(rst["tokens"])
+        print(f"[from-cache] RESUME from {args.resume_from}: step={resume_step} tokens={resume_tokens:.3e}", flush=True)
     if args.warmstart_init:
         import gptq_init
         if args.tiny_model or args.tiny_random_corpus:
@@ -1151,9 +1162,12 @@ def train_from_cache(args) -> int:
         raise SystemExit(f"no cache batches in {cache_dir}")
     V = student.config.vocab_size
     max_tokens, warmup = int(args.tokens), args.precision_warmup_steps
-    tokens_seen, step, ci = 0, 0, 0
+    tokens_seen, step, ci = resume_tokens, resume_step, resume_step
+    while next_ms < len(milestones) and milestones[next_ms] <= tokens_seen:
+        next_ms += 1  # skip milestones already completed before the resume point
     t0 = time.perf_counter()
-    print(f"[from-cache] training to {max_tokens:.2e} tokens over {len(cache_files)} cached batches", flush=True)
+    print(f"[from-cache] training to {max_tokens:.2e} tokens over {len(cache_files)} cached batches "
+          f"(from {tokens_seen:.2e})", flush=True)
 
     while tokens_seen < max_tokens and (args.max_steps == 0 or step < args.max_steps):
         alpha = 1.0 if warmup <= 0 else min(1.0, step / warmup)
