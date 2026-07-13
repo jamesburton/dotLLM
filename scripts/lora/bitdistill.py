@@ -88,6 +88,7 @@ import bitdistill_data as bdata  # noqa: E402
 import csharp_exec_eval as cse  # noqa: E402
 import tooluse_exec_eval as tue  # noqa: E402
 import instruction_exec_eval as iue  # noqa: E402
+import continuous_eval as cve  # noqa: E402
 import corpus_mix as cmix  # noqa: E402
 
 
@@ -981,6 +982,12 @@ def parse_args(argv=None):
                         "(deterministic length/format/keyword constraint probes; no judge).")
     p.add_argument("--eval-n-instruction", type=int, default=None, dest="eval_n_instruction",
                    help="Number of instruction constraint probes (default: the full built-in set).")
+    p.add_argument("--eval-nll", action="store_true", dest="eval_nll",
+                   help="Compute teacher-forced GSM8K gold-answer NLL at each milestone (cheap, "
+                        "on-GPU, one forward per example; smooth capability signal under the flat "
+                        "exact-match). Recorded as gsm8k_nll in curve/ckpts.")
+    p.add_argument("--eval-n-nll", type=int, default=40, dest="eval_n_nll",
+                   help="Number of held-out GSM8K examples for the gold-NLL metric.")
     p.add_argument("--mix-weights", default=None, dest="mix_weights",
                    help="Enable the B4 multi-corpus capability mix. Comma list of name=weight "
                         "(e.g. 'tooluse=35,csharp=35,instruction=20,general=10'). Omitted names "
@@ -1154,6 +1161,7 @@ def train_from_cache(args) -> int:
         if args.eval_csharp else []
     tooluse_ex = tue.load_tooluse_eval(tokenizer, n=args.eval_n_tooluse) if args.eval_tooluse else []
     instruction_ex = iue.load_instruction_eval(tokenizer, n=args.eval_n_instruction) if args.eval_instruction else []
+    nll_ex = cve.load_gsm8k_nll(tokenizer, n=args.eval_n_nll) if args.eval_nll else []
     milestones = sorted(int(float(x)) for x in args.milestones.split(",")) if args.milestones else []
     curve, next_ms = [], 0
 
@@ -1215,17 +1223,18 @@ def train_from_cache(args) -> int:
                                              bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
             tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
             instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
+            gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
             ck = os.path.join(args.out, f"ckpt_{mtok}")
             if args.save_ckpt:
                 save_checkpoint(student, ck, step, tokens_seen,
                                 extra={"ppl": ppl, "gsm8k_acc": acc, "csharp_pass1": csharp_p1,
                                        "tooluse_acc": tooluse_a, "instruction_acc": instruction_a,
-                                       "milestone": mtok})
+                                       "gsm8k_nll": gnll, "milestone": mtok})
             curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
                           "csharp_pass1": csharp_p1,
-                          "tooluse_acc": tooluse_a, "instruction_acc": instruction_a})
+                          "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll})
             print(f"[milestone {mtok:.2e}] ppl={ppl:.3f}  gsm8k_acc={acc}  csharp_pass1={csharp_p1}  "
-                  f"tooluse_acc={tooluse_a}  instruction_acc={instruction_a}  -> {ck}", flush=True)
+                  f"tooluse_acc={tooluse_a}  instruction_acc={instruction_a}  gsm8k_nll={gnll}  -> {ck}", flush=True)
             next_ms += 1
 
     set_quant_alpha(student, 1.0)
@@ -1235,15 +1244,16 @@ def train_from_cache(args) -> int:
                                      bench_dir=args.csharp_bench_dir) if csharp_tasks else float("nan")
     tooluse_a = tue.eval_tooluse_inproc(student, tokenizer, tooluse_ex, device) if tooluse_ex else float("nan")
     instruction_a = iue.eval_instruction_inproc(student, tokenizer, instruction_ex, device) if instruction_ex else float("nan")
+    gnll = cve.eval_gsm8k_nll(student, tokenizer, nll_ex, device) if nll_ex else float("nan")
     curve.append({"tokens": tokens_seen, "step": step, "ppl": ppl, "gsm8k_acc": acc,
                   "csharp_pass1": csharp_p1,
-                  "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "final": True})
+                  "tooluse_acc": tooluse_a, "instruction_acc": instruction_a, "gsm8k_nll": gnll, "final": True})
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "curve.json"), "w") as f:
         json.dump({"base": base, "from_cache": cache_dir, "curve": curve, "meta": meta}, f, indent=2)
     print(f"[from-cache] done: {step} steps / {tokens_seen} tokens. final ppl={ppl:.3f} "
           f"gsm8k_acc={acc} csharp_pass1={csharp_p1} tooluse_acc={tooluse_a} "
-          f"instruction_acc={instruction_a}. curve -> {args.out}/curve.json", flush=True)
+          f"instruction_acc={instruction_a} gsm8k_nll={gnll}. curve -> {args.out}/curve.json", flush=True)
     return 0
 
 
