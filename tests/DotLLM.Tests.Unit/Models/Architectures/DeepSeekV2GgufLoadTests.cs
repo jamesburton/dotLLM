@@ -134,7 +134,9 @@ public sealed class DeepSeekV2GgufLoadTests
         // MLA
         b.AddUInt32("deepseek2.attention.q_lora_rank", (uint)qLoraRank);
         b.AddUInt32("deepseek2.attention.kv_lora_rank", (uint)KvLoraRank);
-        b.AddUInt32("deepseek2.attention.key_length", (uint)QkNope);
+        // GGUF attention.key_length stores the TOTAL per-head qk dim (qk_nope + qk_rope),
+        // not just qk_nope — matches the 8498fd4 (#186) fix.
+        b.AddUInt32("deepseek2.attention.key_length", (uint)(QkNope + QkRope));
         b.AddUInt32("deepseek2.attention.value_length", (uint)VHead);
 
         // MoE
