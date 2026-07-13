@@ -151,6 +151,30 @@ internal static partial class VulkanApi
     internal static partial void vkDestroyShaderModule(
         nint device, nint shaderModule, nint pAllocator);
 
+    // ── Pipeline cache ───────────────────────────────────────────────
+    // One VkPipelineCache per device amortises the driver's SPIR-V→ISA
+    // compilation. Create at device init (optionally seeded from disk),
+    // pass to every vkCreateComputePipelines call, retrieve and persist on
+    // shutdown. The blob embeds a header with vendorID/deviceID/UUID that
+    // the driver validates on load — mismatches are silently ignored.
+
+    [LibraryImport(LibName)]
+    internal static partial int vkCreatePipelineCache(
+        nint device, in VkPipelineCacheCreateInfo pCreateInfo,
+        nint pAllocator, out nint pPipelineCache);
+
+    // Two-call pattern: first call with pData=0 to get the size, second
+    // call with an allocated buffer to receive the bytes.
+    // pDataSize is size_t* — mapped to ref nuint.
+    [LibraryImport(LibName)]
+    internal static partial int vkGetPipelineCacheData(
+        nint device, nint pipelineCache,
+        ref nuint pDataSize, nint pData);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyPipelineCache(
+        nint device, nint pipelineCache, nint pAllocator);
+
     // ── Pipeline layout & compute pipeline ──────────────────────────
 
     [LibraryImport(LibName)]

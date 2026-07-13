@@ -27,6 +27,7 @@ public sealed class VulkanDevice : IDisposable
     private nint _device;
     private nint _queue;
     private nint _commandPool;
+    private nint _pipelineCache;
     private bool _disposed;
 
     /// <summary>Device name (e.g. "AMD Radeon RX 7900 XT", "NVIDIA GeForce RTX 4090").</summary>
@@ -34,6 +35,9 @@ public sealed class VulkanDevice : IDisposable
 
     /// <summary>PCI vendor ID (0x10DE = NVIDIA, 0x1002 = AMD, 0x8086 = Intel).</summary>
     public uint VendorId { get; }
+
+    /// <summary>PCI device ID uniquely identifying the GPU model within a vendor.</summary>
+    public uint DeviceId { get; }
 
     /// <summary>Vulkan device type (discrete, integrated, virtual, CPU).</summary>
     public int DeviceType { get; }
@@ -102,9 +106,20 @@ public sealed class VulkanDevice : IDisposable
     internal nint CommandPool => _commandPool;
     internal nint PhysicalDevice => _physicalDevice;
 
+    /// <summary>
+    /// The device-level pipeline cache. Created at device init and optionally
+    /// seeded from a per-device file on disk. Passed to every
+    /// <c>vkCreateComputePipelines</c> call so the driver can re-use previously
+    /// compiled ISA without repeating the SPIR-V → ISA translation.
+    /// Zero if creation failed (safe — drivers treat a null cache handle as
+    /// "no cache" rather than an error).
+    /// </summary>
+    internal nint PipelineCache => _pipelineCache;
+
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
-        nint commandPool, string name, uint vendor, int type, uint queueFamily,
+        nint commandPool, nint pipelineCache,
+        string name, uint vendor, uint deviceId, int type, uint queueFamily,
         uint subgroupSize, bool hasSubgroupArithmetic,
         bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes,
         bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment)
@@ -114,8 +129,10 @@ public sealed class VulkanDevice : IDisposable
         _device = device;
         _queue = queue;
         _commandPool = commandPool;
+        _pipelineCache = pipelineCache;
         DeviceName = name;
         VendorId = vendor;
+        DeviceId = deviceId;
         DeviceType = type;
         QueueFamilyIndex = queueFamily;
         SubgroupSize = subgroupSize;
@@ -183,7 +200,7 @@ public sealed class VulkanDevice : IDisposable
 
         try
         {
-            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type, out uint apiVersion);
+            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out uint deviceId, out int type, out uint apiVersion);
             uint queueFamily = SelectComputeQueueFamily(physical);
 
             // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
@@ -221,9 +238,16 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkCreateCommandPool(device, cpInfo, 0, out nint pool)
                 .ThrowOnError("vkCreateCommandPool");
 
+            // Create the pipeline cache, seeded from disk if a prior serialised
+            // blob exists for this vendor+device combination. The driver validates
+            // the embedded header (vendorID/deviceID/UUID); any mismatch causes it
+            // to silently start with an empty cache, so feeding stale bytes is safe.
+            nint pipelineCache = CreatePipelineCache(device, vendor, deviceId);
+
             // Transfer ownership of instance to the device on success.
             var result = new VulkanDevice(
-                instance, physical, device, queue, pool, name, vendor, type, queueFamily,
+                instance, physical, device, queue, pool, pipelineCache,
+                name, vendor, deviceId, type, queueFamily,
                 subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
                 hasExternalMemoryHost, minImportedHostPointerAlignment);
             instance = 0;
@@ -259,7 +283,7 @@ public sealed class VulkanDevice : IDisposable
     }
 
     private static nint SelectPhysicalDevice(
-        nint instance, out string name, out uint vendor, out int type, out uint apiVersion)
+        nint instance, out string name, out uint vendor, out uint deviceId, out int type, out uint apiVersion)
     {
         uint count = 0;
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null)
@@ -278,6 +302,7 @@ public sealed class VulkanDevice : IDisposable
         int bestScore = int.MinValue;
         string bestName = "unknown";
         uint bestVendor = 0;
+        uint bestDeviceId = 0;
         int bestType = 0;
         uint bestApi = 0;
 
@@ -293,6 +318,7 @@ public sealed class VulkanDevice : IDisposable
                 bestDev = dev;
                 bestName = devName;
                 bestVendor = props.vendorID;
+                bestDeviceId = props.deviceID;
                 bestType = props.deviceType;
                 bestApi = props.apiVersion;
             }
@@ -300,9 +326,116 @@ public sealed class VulkanDevice : IDisposable
 
         name = bestName;
         vendor = bestVendor;
+        deviceId = bestDeviceId;
         type = bestType;
         apiVersion = bestApi;
         return bestDev;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Pipeline cache — create (load) and save (shutdown)
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the per-device path for the persisted pipeline cache blob.
+    /// The filename encodes <paramref name="vendorId"/> and <paramref name="deviceId"/>
+    /// so different GPUs on the same machine don't clobber each other.
+    /// </summary>
+    private static string GetPipelineCachePath(uint vendorId, uint deviceId)
+    {
+        string dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "dotllm");
+        return Path.Combine(dir, $"vulkan_pipeline_cache_{vendorId:x4}_{deviceId:x4}.bin");
+    }
+
+    /// <summary>
+    /// Creates a <c>VkPipelineCache</c> for <paramref name="device"/>, optionally
+    /// seeding it from the file at <see cref="GetPipelineCachePath"/>. Any IO or
+    /// Vulkan error during loading falls back to an empty cache — device init never
+    /// throws because of cache issues.
+    /// </summary>
+    private static unsafe nint CreatePipelineCache(nint device, uint vendorId, uint deviceId)
+    {
+        // Attempt to read a previously saved blob. Corruption or GPU mismatch
+        // is handled by the driver (it validates the embedded header), so we
+        // just need to swallow any IO exception here.
+        byte[]? priorBlob = null;
+        try
+        {
+            string path = GetPipelineCachePath(vendorId, deviceId);
+            if (File.Exists(path))
+                priorBlob = File.ReadAllBytes(path);
+        }
+        catch
+        {
+            // Ignore — proceed with an empty cache.
+        }
+
+        fixed (byte* dataPtr = priorBlob)
+        {
+            var ci = new VkPipelineCacheCreateInfo
+            {
+                sType = VkStructureType.PipelineCacheCreateInfo,
+                initialDataSize = priorBlob is not null ? (nuint)priorBlob.Length : 0u,
+                pInitialData = priorBlob is not null ? (nint)dataPtr : 0,
+            };
+
+            // On failure, return 0 (null handle). callers pass 0 to
+            // vkCreateComputePipelines which the spec treats as "no cache" —
+            // perfectly valid, just without the disk-warm benefit.
+            int r = VulkanApi.vkCreatePipelineCache(device, ci, 0, out nint cache);
+            return r >= 0 ? cache : 0;
+        }
+    }
+
+    /// <summary>
+    /// Serialises <paramref name="pipelineCache"/> to disk via the two-call
+    /// <c>vkGetPipelineCacheData</c> pattern and writes atomically (temp-file + move).
+    /// Any IO or Vulkan error is swallowed — shutdown should always succeed
+    /// even if the cache can't be persisted.
+    /// </summary>
+    private static unsafe void SavePipelineCache(nint device, nint pipelineCache, uint vendorId, uint deviceId)
+    {
+        try
+        {
+            // First call: retrieve the required buffer size.
+            nuint dataSize = 0;
+            int r = VulkanApi.vkGetPipelineCacheData(device, pipelineCache, ref dataSize, 0);
+            if (r < 0 || dataSize == 0)
+                return;
+
+            // Second call: retrieve the actual bytes into a pinned buffer.
+            byte[] blob = new byte[(int)dataSize];
+            fixed (byte* blobPtr = blob)
+            {
+                r = VulkanApi.vkGetPipelineCacheData(device, pipelineCache, ref dataSize, (nint)blobPtr);
+                if (r < 0)
+                    return;
+            }
+
+            // Write atomically: temp-file in the same directory, then Move.
+            string targetPath = GetPipelineCachePath(vendorId, deviceId);
+            string dir = Path.GetDirectoryName(targetPath)!;
+            Directory.CreateDirectory(dir);
+
+            string tmpPath = Path.Combine(dir, Path.GetRandomFileName());
+            try
+            {
+                File.WriteAllBytes(tmpPath, blob);
+                File.Move(tmpPath, targetPath, overwrite: true);
+            }
+            catch
+            {
+                // Best-effort cleanup if the move failed.
+                try { File.Delete(tmpPath); } catch { /* ignore */ }
+                throw;
+            }
+        }
+        catch
+        {
+            // Never propagate — dispose must not throw.
+        }
     }
 
     // Packed Vulkan API version helpers. Layout: variant(3) | major(7) | minor(10) | patch(12).
@@ -1188,6 +1321,14 @@ public sealed class VulkanDevice : IDisposable
         {
             VulkanApi.vkDestroyCommandPool(_device, _commandPool, 0);
             _commandPool = 0;
+        }
+        if (_pipelineCache != 0 && _device != 0)
+        {
+            // Persist the cache blob before the device is torn down — the cache
+            // object is a device child and becomes invalid after vkDestroyDevice.
+            SavePipelineCache(_device, _pipelineCache, VendorId, DeviceId);
+            VulkanApi.vkDestroyPipelineCache(_device, _pipelineCache, 0);
+            _pipelineCache = 0;
         }
         if (_device != 0)
         {
