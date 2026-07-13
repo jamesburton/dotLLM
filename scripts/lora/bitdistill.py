@@ -926,6 +926,10 @@ def parse_args(argv=None):
                    help="Anneal FP->ternary over this many steps (0 = ternary from step 0).")
     p.add_argument("--lambda-warmup-steps", type=int, default=0, dest="lambda_warmup_steps",
                    help="Ramp λ from 0 to --lambda-kd over this many steps (0 = full from step 0).")
+    p.add_argument("--micro-batch", type=int, default=0, dest="micro_batch",
+                   help="train_from_cache: split each cached batch into micro-batches of this size "
+                        "with gradient accumulation (0 = full cached batch). Lowers peak VRAM so 1.7B "
+                        "fits the 12 GB card; the accumulated gradient is identical to the full batch.")
     # data
     p.add_argument("--cpt-dataset", default="HuggingFaceFW/fineweb-edu", dest="cpt_dataset",
                    help="Streaming CPT corpus (general web; FALCON-family alt: tiiuae/falcon-refinedweb).")
@@ -1161,24 +1165,32 @@ def train_from_cache(args) -> int:
         topi = c["topk_idx"].to(device).long()
         lse = c["lse"].to(device)                                         # [B, T]
 
-        s_logits = student(input_ids=batch, use_cache=False).logits
-        ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V),
-                             batch[:, 1:].contiguous().view(-1))
-        Kd = topv.size(-1)
-        ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
-                                  topv[:, :-1, :].contiguous().view(-1, Kd),
-                                  topi[:, :-1, :].contiguous().view(-1, Kd),
-                                  lse[:, :-1].contiguous().view(-1), tau)
-        loss = ce + lam * ld
-        opt.zero_grad(); loss.backward()
+        B = batch.size(0)
+        mb = args.micro_batch if args.micro_batch and args.micro_batch > 0 else B
+        opt.zero_grad()
+        ce_val = ld_val = 0.0
+        for j in range(0, B, mb):                                             # grad-accum micro-batches
+            sl = slice(j, min(j + mb, B))
+            frac = (sl.stop - sl.start) / B                                   # weight so accum == full-batch mean
+            s_logits = student(input_ids=batch[sl], use_cache=False).logits
+            ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V),
+                                 batch[sl, 1:].contiguous().view(-1))
+            Kd = topv.size(-1)
+            ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
+                                      topv[sl, :-1, :].contiguous().view(-1, Kd),
+                                      topi[sl, :-1, :].contiguous().view(-1, Kd),
+                                      lse[sl, :-1].contiguous().view(-1), tau)
+            ((ce + lam * ld) * frac).backward()
+            ce_val += ce.item() * frac; ld_val += ld.item() * frac
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
+        loss_val = ce_val + lam * ld_val
         tokens_seen += batch.numel(); step += 1
 
         if step <= 5 or step % args.log_every == 0:
             sps = step / max(time.perf_counter() - t0, 1e-9)
             print(f"  step {step:6d}  tok {tokens_seen:.3e}  a={alpha:.2f}  "
-                  f"CE {ce.item():.4f}  LD {ld.item():.4f}  loss {loss.item():.4f}  {sps:.2f} it/s", flush=True)
+                  f"CE {ce_val:.4f}  LD {ld_val:.4f}  loss {loss_val:.4f}  {sps:.2f} it/s", flush=True)
 
         while next_ms < len(milestones) and tokens_seen >= milestones[next_ms]:
             mtok = milestones[next_ms]
