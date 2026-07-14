@@ -189,8 +189,8 @@ def _collect_hessians(student, layers: dict, calib_iter: Iterator, device, *,
             x = inp[0]
             if getattr(module, "sub_norm", None) is not None:
                 x = module.sub_norm(x)               # the tensor that actually multiplies W
-            x = x.reshape(-1, x.shape[-1]).to(hessian_device, torch.float32)
-            h = x.t() @ x
+            x = x.reshape(-1, x.shape[-1]).float()   # XtX on the forward device (GPU = fast)
+            h = (x.t() @ x).to(hessian_device)       # park the accumulator on hessian_device (CPU = low VRAM)
             H[name] = h if H[name] is None else H[name] + h
         return hook
 
@@ -240,9 +240,9 @@ def gptq_warmstart_init(
     n_calib_batches: int = 8,
     calib_batch_size: int = 4,
     scale_search: bool = True,
-    n_scale_grid: int = 21,
+    n_scale_grid: int = 31,
     scale_lo: float = 0.5,
-    scale_hi: float = 1.5,
+    scale_hi: float = 2.0,
     use_gptq: bool = True,
     percdamp: float = 0.01,
     hessian_device: Optional[str] = None,
@@ -305,8 +305,10 @@ def gptq_warmstart_init(
                 print(f"[gptq-init]   {name}: no calibration activations captured; skipped.")
             continue
         orig_dtype = module.weight.dtype
-        W0 = module.weight.detach().to(hdev, torch.float32)
-        Hn = Hn.to(hdev)
+        # Per-layer solve on the compute device (GPU): only ONE Hessian resident at a time,
+        # so the O(n^3) Cholesky/scale-search runs on cuSOLVER instead of crawling on CPU.
+        W0 = module.weight.detach().to(device, torch.float32)
+        Hn = Hn.to(device)
 
         base_alpha = float(W0.abs().mean().clamp(min=1e-5))
 
