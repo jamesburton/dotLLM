@@ -1137,6 +1137,9 @@ def train_from_cache(args) -> int:
             n_calib_batches=args.warmstart_batches,
             calib_batch_size=max(1, args.batch_size // 2),
             hessian_device=("cpu" if args.warmstart_hessian_cpu else None))
+        if args.save_ckpt and not args.resume_from:  # persist the warm-started init immediately
+            save_checkpoint(student, os.path.join(args.out, "ckpt_warmstart"), 0, 0, extra={"warmstart": True})
+            print(f"[from-cache] warm-start saved -> {args.out}/ckpt_warmstart (resume-safe)", flush=True)
     if args.grad_checkpoint:
         try:
             student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
