@@ -132,12 +132,8 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
     with Hessian error feedback (the classic GPTQ recipe: Frantar et al. 2210.17323). Plain
     RTN is exactly this with the error-feedback term removed.
     """
-    # The sequential OBS column-loop + cholesky_inverse run on CPU LAPACK: robust (cuSOLVER
-    # stalls on some near-degenerate layer Hessians) and cheap vs the O(n^3) already done. The
-    # matmul-heavy scale search stays on the caller's device (GPU). Return T on the input device.
-    dev = W0.device
-    W = W0.clone().to("cpu", torch.float32)
-    H = H.clone().to("cpu", torch.float32)
+    W = W0.clone().to(torch.float32)
+    H = H.clone().to(torch.float32)
     cols = W.shape[1]
 
     # Dead (never-activated) input dims: pin diag so Cholesky is well posed; force weight 0.
@@ -165,7 +161,7 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
         if j + 1 < cols and float(d) != 0.0:
             err = (w - t * alpha) / d                          # OBS error to redistribute
             W[:, j + 1:] -= err.unsqueeze(1) * Hinv[j, j + 1:].unsqueeze(0)
-    return T.to(dev)
+    return T
 
 
 def _rtn_ternary(W0: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -193,8 +189,8 @@ def _collect_hessians(student, layers: dict, calib_iter: Iterator, device, *,
             x = inp[0]
             if getattr(module, "sub_norm", None) is not None:
                 x = module.sub_norm(x)               # the tensor that actually multiplies W
-            x = x.reshape(-1, x.shape[-1]).float()   # XtX on the forward device (GPU = fast)
-            h = (x.t() @ x).to(hessian_device)       # park the accumulator on hessian_device (CPU = low VRAM)
+            x = x.reshape(-1, x.shape[-1]).to(hessian_device, torch.float32)
+            h = x.t() @ x
             H[name] = h if H[name] is None else H[name] + h
         return hook
 
@@ -244,9 +240,9 @@ def gptq_warmstart_init(
     n_calib_batches: int = 8,
     calib_batch_size: int = 4,
     scale_search: bool = True,
-    n_scale_grid: int = 31,
+    n_scale_grid: int = 21,
     scale_lo: float = 0.5,
-    scale_hi: float = 2.0,
+    scale_hi: float = 1.5,
     use_gptq: bool = True,
     percdamp: float = 0.01,
     hessian_device: Optional[str] = None,
@@ -309,10 +305,8 @@ def gptq_warmstart_init(
                 print(f"[gptq-init]   {name}: no calibration activations captured; skipped.")
             continue
         orig_dtype = module.weight.dtype
-        # Per-layer solve on the compute device (GPU): only ONE Hessian resident at a time,
-        # so the O(n^3) Cholesky/scale-search runs on cuSOLVER instead of crawling on CPU.
-        W0 = module.weight.detach().to(device, torch.float32)
-        Hn = Hn.to(device)
+        W0 = module.weight.detach().to(hdev, torch.float32)
+        Hn = Hn.to(hdev)
 
         base_alpha = float(W0.abs().mean().clamp(min=1e-5))
 
