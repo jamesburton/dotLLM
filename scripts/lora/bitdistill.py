@@ -324,7 +324,7 @@ def logit_kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor,
 
 def sparse_logit_kd_loss(student_logits: torch.Tensor, teacher_topk_logits: torch.Tensor,
                          teacher_topk_idx: torch.Tensor, teacher_lse: torch.Tensor,
-                         tau: float) -> torch.Tensor:
+                         tau: float, loss_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Top-K sparse variant of :func:`logit_kd_loss` for an offline-cached teacher.
 
     Uses the teacher's TRUE top-K probabilities (no renormalisation): with the cached
@@ -340,8 +340,13 @@ def sparse_logit_kd_loss(student_logits: torch.Tensor, teacher_topk_logits: torc
     t_p_k = t_logp_k.exp()                                                            # [N, K] true (partial) probs
     s_logp = F.log_softmax(student_logits.float() / tau, dim=-1)                      # [N, V]
     s_logp_k = torch.gather(s_logp, -1, teacher_topk_idx)                             # [N, K]
-    # KL(t‖s) restricted to the top-K support (tail mass dropped), mean over N rows.
-    kl = (t_p_k * (t_logp_k - s_logp_k)).sum(-1).mean()
+    # KL(t‖s) restricted to the top-K support (tail mass dropped), per row [N].
+    kl_row = (t_p_k * (t_logp_k - s_logp_k)).sum(-1)
+    if loss_mask is not None:                                                        # completion-masked mean
+        m = loss_mask.float()
+        kl = (kl_row * m).sum() / m.sum().clamp(min=1.0)
+    else:
+        kl = kl_row.mean()
     return kl * (tau * tau)
 
 
@@ -630,24 +635,38 @@ def build_mixed_stream(args, tokenizer, seq_len, general_stream):
     return the B4 weighted multi-corpus mix (general anchor + tool-use/instruction/C#).
     Used by BOTH ``train`` (online KD) and ``generate_teacher_cache`` so the offline
     top-K KD targets are cached over the same distribution the student trains on."""
+    cmask = getattr(args, "completion_mask", False)
+
+    def _m_iter(it):                       # bare-tensor iterator -> (t, all-ones mask)
+        for t in it:
+            yield t, torch.ones_like(t, dtype=torch.int8)
+
+    def _m_list(lst):                      # list of bare tensors -> list of (t, ones)
+        return [(t, torch.ones_like(t, dtype=torch.int8)) for t in lst]
+
     if not getattr(args, "mix_weights", None):
-        return general_stream
+        return _m_iter(general_stream) if cmask else general_stream
     import capability_data as capdata
     weights = {**cmix.STANDARD_WEIGHTS, **_parse_mix_weights(args.mix_weights)}
     factories = {}
     if weights.get("general", 0) > 0:
-        factories["general"] = general_stream  # infinite iterator (never cycles)
+        factories["general"] = _m_iter(general_stream) if cmask else general_stream
     if weights.get("tooluse", 0) > 0:
-        factories["tooluse"] = capdata.load_capability_sequences(
-            "tooluse", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+        seqs = capdata.load_capability_sequences("tooluse", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+        factories["tooluse"] = _m_list(seqs) if cmask else seqs
     if weights.get("instruction", 0) > 0:
-        factories["instruction"] = capdata.load_capability_sequences(
-            "instruction", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+        seqs = capdata.load_capability_sequences("instruction", tokenizer, n_seqs=args.mix_n_seqs, seq_len=seq_len)
+        factories["instruction"] = _m_list(seqs) if cmask else seqs
     if weights.get("csharp", 0) > 0:
         try:  # B3 stream is single-pass; materialise a cycling pool (list -> auto-cycles)
             import csharp_train_data as cstd
-            factories["csharp"] = list(itertools.islice(
-                cstd.csharp_train_stream(tokenizer, seq_len), args.mix_n_seqs))
+            if cmask:  # real completion mask from B3 (prompt positions labelled -100)
+                pairs = list(itertools.islice(
+                    cstd.csharp_train_stream(tokenizer, seq_len, return_labels=True), args.mix_n_seqs))
+                factories["csharp"] = [(ids, (lab != -100).to(torch.int8)) for ids, lab in pairs]
+            else:
+                factories["csharp"] = list(itertools.islice(
+                    cstd.csharp_train_stream(tokenizer, seq_len), args.mix_n_seqs))
             if not factories["csharp"]:
                 raise ValueError("empty C# corpus")
         except Exception as e:  # noqa: BLE001
@@ -661,7 +680,7 @@ def build_mixed_stream(args, tokenizer, seq_len, general_stream):
     else:
         stream = cmix.standard_capability_mix(
             factories, weights, schedule=args.mix_schedule, seed=args.mix_seed)
-    print(f"[bitdistill] MIX enabled ({args.mix_schedule}): "
+    print(f"[bitdistill] MIX enabled ({args.mix_schedule}){' +completion-mask' if cmask else ''}: "
           f"{ {k: weights[k] for k in factories} }", flush=True)
     return stream
 
@@ -1024,6 +1043,11 @@ def parse_args(argv=None):
                    help="train_from_cache: resume from a milestone ckpt dir (loads student_state.pt + "
                         "state.json step/tokens, fast-forwards the cache index, skips completed "
                         "milestones). Optimizer state restarts fresh.")
+    p.add_argument("--completion-mask", action="store_true", dest="completion_mask",
+                   help="Completion-masked CE+KD: compute loss only on completion (answer) tokens, "
+                        "not prompt tokens, for corpora that provide a mask (C# via return_labels; "
+                        "general text = all tokens). Requires a cache generated with --completion-mask "
+                        "(stores per-token loss_mask); a no-op on unmasked caches. Off by default.")
     p.add_argument("--top-k", type=int, default=128, dest="top_k",
                    help="Top-K teacher logits to cache per token (tau softens the teacher, so larger K "
                         "keeps more mass; the cache reports mean top-K mass coverage).")
@@ -1069,18 +1093,25 @@ def generate_teacher_cache(args) -> int:
         for _ in range(start * bs):
             next(stream)
     for i in range(start, n_batches):
-        batch = torch.stack([next(stream) for _ in range(bs)]).to(device)      # [B, T]
+        items = [next(stream) for _ in range(bs)]                              # tensor or (tensor, mask)
+        if isinstance(items[0], tuple):
+            batch = torch.stack([it[0] for it in items]).to(device)            # [B, T]
+            lmask = torch.stack([it[1] for it in items]).to(torch.int8)        # [B, T] completion mask
+        else:
+            batch, lmask = torch.stack(items).to(device), None
         with torch.no_grad():
             logits = teacher(input_ids=batch, use_cache=False).logits.float()  # [B, T, V]
             lse = torch.logsumexp(logits / tau, dim=-1)                        # [B, T]
             topv, topi = logits.topk(K, dim=-1)                               # [B, T, K]
             mass = (topv / tau - lse.unsqueeze(-1)).exp().sum(-1)             # [B, T] top-K softmax mass
         mass_sum += float(mass.mean()); mass_cnt += 1
-        torch.save({"input_ids": batch.to(torch.int32).cpu(),
+        save_obj = {"input_ids": batch.to(torch.int32).cpu(),
                     "topk_logits": topv.to(torch.float16).cpu(),
                     "topk_idx": topi.to(torch.int32).cpu(),
-                    "lse": lse.to(torch.float32).cpu()},
-                   os.path.join(args.make_teacher_cache, f"batch_{i:06d}.pt"))
+                    "lse": lse.to(torch.float32).cpu()}
+        if lmask is not None:
+            save_obj["loss_mask"] = lmask.cpu()                                # [B, T] int8
+        torch.save(save_obj, os.path.join(args.make_teacher_cache, f"batch_{i:06d}.pt"))
         if i % 50 == 0 or i == n_batches - 1:
             print(f"  cached {i + 1}/{n_batches}  mean top-{K} mass={mass_sum / mass_cnt:.4f}", flush=True)
 
@@ -1189,6 +1220,7 @@ def train_from_cache(args) -> int:
         topv = c["topk_logits"].to(device)                                # [B, T, K]
         topi = c["topk_idx"].to(device).long()
         lse = c["lse"].to(device)                                         # [B, T]
+        lmask = c["loss_mask"].to(device) if (args.completion_mask and "loss_mask" in c) else None
 
         B = batch.size(0)
         mb = args.micro_batch if args.micro_batch and args.micro_batch > 0 else B
@@ -1198,13 +1230,20 @@ def train_from_cache(args) -> int:
             sl = slice(j, min(j + mb, B))
             frac = (sl.stop - sl.start) / B                                   # weight so accum == full-batch mean
             s_logits = student(input_ids=batch[sl], use_cache=False).logits
-            ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V),
-                                 batch[sl, 1:].contiguous().view(-1))
+            tgt = batch[sl, 1:].contiguous()
+            mflat = None
+            if lmask is not None:                                             # completion-masked: drop prompt tokens
+                mslc = lmask[sl, 1:].contiguous()
+                tgt = tgt.masked_fill(mslc == 0, -100)                        # CE ignores -100
+                mflat = mslc.reshape(-1)
+                if int((tgt != -100).sum()) == 0:                            # pure-prompt micro-batch: no signal
+                    continue
+            ce = F.cross_entropy(s_logits[:, :-1, :].contiguous().view(-1, V), tgt.view(-1))
             Kd = topv.size(-1)
             ld = sparse_logit_kd_loss(s_logits[:, :-1, :].contiguous().view(-1, V),
                                       topv[sl, :-1, :].contiguous().view(-1, Kd),
                                       topi[sl, :-1, :].contiguous().view(-1, Kd),
-                                      lse[sl, :-1].contiguous().view(-1), tau)
+                                      lse[sl, :-1].contiguous().view(-1), tau, loss_mask=mflat)
             ((ce + lam * ld) * frac).backward()
             ce_val += ce.item() * frac; ld_val += ld.item() * frac
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
