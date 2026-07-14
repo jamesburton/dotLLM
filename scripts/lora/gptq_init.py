@@ -132,8 +132,12 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
     with Hessian error feedback (the classic GPTQ recipe: Frantar et al. 2210.17323). Plain
     RTN is exactly this with the error-feedback term removed.
     """
-    W = W0.clone().to(torch.float32)
-    H = H.clone().to(torch.float32)
+    # The sequential OBS column-loop + cholesky_inverse run on CPU LAPACK: robust (cuSOLVER
+    # stalls on some near-degenerate layer Hessians) and cheap vs the O(n^3) already done. The
+    # matmul-heavy scale search stays on the caller's device (GPU). Return T on the input device.
+    dev = W0.device
+    W = W0.clone().to("cpu", torch.float32)
+    H = H.clone().to("cpu", torch.float32)
     cols = W.shape[1]
 
     # Dead (never-activated) input dims: pin diag so Cholesky is well posed; force weight 0.
@@ -161,7 +165,7 @@ def _gptq_ternary(W0: torch.Tensor, H: torch.Tensor, alpha: float,
         if j + 1 < cols and float(d) != 0.0:
             err = (w - t * alpha) / d                          # OBS error to redistribute
             W[:, j + 1:] -= err.unsqueeze(1) * Hinv[j, j + 1:].unsqueeze(0)
-    return T
+    return T.to(dev)
 
 
 def _rtn_ternary(W0: torch.Tensor, alpha: float) -> torch.Tensor:
