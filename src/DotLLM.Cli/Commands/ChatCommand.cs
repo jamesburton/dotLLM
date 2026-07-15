@@ -263,7 +263,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 {
                     var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                     ctx.Status($"Loading {config.Architecture} model ({config.NumLayers} layers, {threading.EffectiveThreadCount} threads)...");
-                    model = TransformerModel.LoadFromGguf(gguf, config, threading);
+                    // Shared per-architecture CPU dispatch — routes hybrid architectures
+                    // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+                    model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
                 }
                 else if (gpuLayers >= config.NumLayers)
                 {

@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Server.RateLimiting;
@@ -94,7 +95,9 @@ public static class ServerStartup
         if (gpuLayers <= 0)
         {
             Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            model = TransformerModel.LoadFromGguf(gguf, config, threading);
+            // Shared per-architecture CPU dispatch — routes hybrid architectures
+            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
         }
         else if (gpuLayers >= config.NumLayers)
         {
