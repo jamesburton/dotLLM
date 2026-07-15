@@ -728,21 +728,21 @@ internal sealed class VulkanWeights : IDisposable
                     // custom-router input is a plain rmsnorm(attn_out, RouterScale·invSqrtH)
                     // dispatch on device (CPU does rms·(1/√H)·ffn_gate_inp_s).
                     float invSqrtH = 1.0f / MathF.Sqrt(weights.HiddenSize);
-                    float[] routerScaleScaled = new float[g4.RouterScale.Length];
+                    float[] routerScaleScaled = new float[g4.RouterScale!.Length];
                     for (int j = 0; j < routerScaleScaled.Length; j++)
                         routerScaleScaled[j] = g4.RouterScale[j] * invSqrtH;
 
                     gemma4 = new Gemma4LayerBuffers(
-                        UploadNormVec(device, staging, g4.PreFfwNorm2),
-                        UploadNormVec(device, staging, g4.PostFfwNorm1),
-                        UploadNormVec(device, staging, g4.PostFfwNorm2),
+                        UploadNormVec(device, staging, g4.PreFfwNorm2!),
+                        UploadNormVec(device, staging, g4.PostFfwNorm1!),
+                        UploadNormVec(device, staging, g4.PostFfwNorm2!),
                         UploadNormVec(device, staging, g4.PostFfwNorm),
                         UploadNormVec(device, staging, routerScaleScaled),
                         g4.LayerOutputScale,
                         g4.VFromK,
                         downScaleBuf);
-                    totalBytes += (long)(g4.PreFfwNorm2.Length + g4.PostFfwNorm1.Length
-                        + g4.PostFfwNorm2.Length + g4.PostFfwNorm.Length + g4.RouterScale.Length) * sizeof(float);
+                    totalBytes += (long)(g4.PreFfwNorm2!.Length + g4.PostFfwNorm1!.Length
+                        + g4.PostFfwNorm2!.Length + g4.PostFfwNorm.Length + g4.RouterScale.Length) * sizeof(float);
                 }
                 else
                 {
@@ -1608,7 +1608,7 @@ internal sealed class VulkanWeights : IDisposable
                 scale: 1.0f, w3Bank, (long)e * perGateUpBytes);
             // Fold the per-expert down scale into the weight (op #14).
             DequantAndUploadSlot(device, stage, downSrc, perDownElems, moe.DownExpsRawQt,
-                scale: g4.DownExpertScale[e], w2Bank, (long)e * perDownBytes);
+                scale: g4.DownExpertScale![e], w2Bank, (long)e * perDownBytes);
         }
         uploadedBytes += (perGateUpBytes * 2 + perDownBytes) * numE;
 
@@ -1743,7 +1743,7 @@ internal sealed class VulkanWeights : IDisposable
                     // scale plumbing — fold ffn_down_exps.scale[e] (op #14) into each
                     // block's fp16 d here (≤2⁻¹¹ relative rounding, inside the gemma4
                     // GPU parity envelope). The forward MUST NOT apply the scale again.
-                    UploadQ8_0SlotScaled(device, stage, downSrc, downBlocks, g4.DownExpertScale[e],
+                    UploadQ8_0SlotScaled(device, stage, downSrc, downBlocks, g4.DownExpertScale![e],
                         w2Bank, (long)e * perDownDevBytes);
                     break;
                 default:
@@ -1755,7 +1755,7 @@ internal sealed class VulkanWeights : IDisposable
         // ── Per-expert down scale (folded by the Q5_1 down shader, op #14).
         // For Q8_0 down banks the scale is already folded into the block scales
         // above and the Q8_0 dispatch ignores this buffer — kept for diagnostics. ──
-        downScaleBuffer = UploadNormVec(device, stage, g4.DownExpertScale);
+        downScaleBuffer = UploadNormVec(device, stage, g4.DownExpertScale!);
         uploadedBytes += (long)numE * sizeof(float);
 
         return new MoeLayerBuffers(gate, QuantizationType.F32, w1Bank, w2Bank, w3Bank,

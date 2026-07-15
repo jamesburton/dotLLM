@@ -93,7 +93,7 @@ internal static unsafe class CudaGemma4WeightsLoader
         float invSqrtH = 1.0f / MathF.Sqrt(hidden);
 
         // ── Router scale with 1/sqrt(hidden) folded in ──
-        float[] routerScaleScaled = new float[g4.RouterScale.Length];
+        float[] routerScaleScaled = new float[g4.RouterScale!.Length];
         for (int j = 0; j < routerScaleScaled.Length; j++)
             routerScaleScaled[j] = g4.RouterScale[j] * invSqrtH;
         nint routerScaleDev = UploadF32Array(routerScaleScaled, allocs);
@@ -110,9 +110,9 @@ internal static unsafe class CudaGemma4WeightsLoader
                 : throw new InvalidOperationException("Gemma4 layer missing attn_q_norm."),
             KNorm = cpuLayer.KNormWeight is { } kn ? UploadF32Array(kn, allocs)
                 : throw new InvalidOperationException("Gemma4 layer missing attn_k_norm."),
-            PreFfwNorm2 = UploadF32Array(g4.PreFfwNorm2, allocs),
-            PostFfwNorm1 = UploadF32Array(g4.PostFfwNorm1, allocs),
-            PostFfwNorm2 = UploadF32Array(g4.PostFfwNorm2, allocs),
+            PreFfwNorm2 = UploadF32Array(g4.PreFfwNorm2!, allocs),
+            PostFfwNorm1 = UploadF32Array(g4.PostFfwNorm1!, allocs),
+            PostFfwNorm2 = UploadF32Array(g4.PostFfwNorm2!, allocs),
             PostFfwNorm = UploadF32Array(g4.PostFfwNorm, allocs),
             RouterScaleDevice = routerScaleDev,
             LayerOutputScale = g4.LayerOutputScale,
@@ -151,7 +151,7 @@ internal static unsafe class CudaGemma4WeightsLoader
             Dequantize.ToFloat32(
                 moe.DownExpsRaw + (nint)((long)e * downStride),
                 (long)hidden * interm, moe.DownExpsRawQt, downF32);
-            float ds = g4.DownExpertScale[e];
+            float ds = g4.DownExpertScale![e];
             for (int i = 0; i < downF32.Length; i++) downF32[i] *= ds;
             downProj[e] = UploadF32Span(downF32, allocs);
         }

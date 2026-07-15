@@ -312,6 +312,46 @@ public record ModelConfig
     }
 
     /// <summary>
+    /// Number of trailing layers that REUSE an earlier layer's KV instead of
+    /// projecting/caching their own (Gemma-4 E2B/E4B
+    /// <c>attention.shared_kv_layers</c>; llama.cpp <c>n_layer_kv_from_start =
+    /// n_layer - shared_kv_layers</c>). Zero (the default) means every layer has
+    /// its own KV — all non-Gemma-4-PLE architectures are unaffected. When
+    /// positive, layers <c>[NumLayers - NumSharedKvLayers, NumLayers)</c> skip
+    /// their K/V projections entirely and attend over the KV of
+    /// <see cref="SharedKvDonorLayer(int)"/> (the last own-KV layer of the same
+    /// attention type: sliding layers borrow the last own-KV sliding layer,
+    /// full-attention layers the last own-KV full layer).
+    /// </summary>
+    public int NumSharedKvLayers { get; init; }
+
+    /// <summary>
+    /// Returns true when <paramref name="layerIdx"/> projects and stores its own
+    /// K/V. False only for the trailing <see cref="NumSharedKvLayers"/> shared-KV
+    /// layers (Gemma-4 E2B/E4B); always true when sharing is off.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public bool LayerHasOwnKv(int layerIdx)
+        => NumSharedKvLayers <= 0 || layerIdx < NumLayers - NumSharedKvLayers;
+
+    /// <summary>
+    /// Returns the donor layer whose KV a shared-KV layer reuses. Mirrors
+    /// llama.cpp's gemma3n/gemma4 reuse rule
+    /// (<c>n_layer_kv_from_start - (is_swa(il) ? 2 : 1)</c>): with
+    /// <c>kvFromStart = NumLayers - NumSharedKvLayers</c>, a sliding-window shared
+    /// layer borrows layer <c>kvFromStart - 2</c> (the last own-KV sliding layer)
+    /// and a full-attention shared layer borrows <c>kvFromStart - 1</c> (the last
+    /// own-KV full layer). Only meaningful when <see cref="LayerHasOwnKv(int)"/>
+    /// is false for <paramref name="layerIdx"/>.
+    /// </summary>
+    public int SharedKvDonorLayer(int layerIdx)
+    {
+        int kvFromStart = NumLayers - NumSharedKvLayers;
+        return kvFromStart - (IsFullAttentionLayer(layerIdx) ? 1 : 2);
+    }
+
+    /// <summary>
     /// Returns true when <paramref name="layerIdx"/> should skip the per-layer
     /// RoPE rotation (NoPE behaviour). Defaults to false when
     /// <see cref="NoRopeLayers"/> is null or empty — every layer applies RoPE.

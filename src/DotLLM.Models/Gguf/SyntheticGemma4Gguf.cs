@@ -90,6 +90,37 @@ public static class SyntheticGemma4Gguf
         CanvasLength = 32,
     };
 
+    /// <summary>
+    /// Dense-PLE preset mirroring the real <c>gemma-4-E4B-it</c> GGUF shape at toy
+    /// scale: NO experts, Per-Layer Embeddings (per_layer_token_embd + model proj +
+    /// per-layer inp_gate/proj/post_norm), 4 trailing shared-KV layers (donor rule:
+    /// sliding→kvFromStart-2, global→kvFromStart-1 — layers 2/3 here), dual head dim
+    /// 16/32, attn_v on EVERY layer (no V-from-K), a rope_freqs proportional-rope
+    /// factor tensor, full-dim rotation on both layer kinds, layer_output_scale and
+    /// the 30.0 final soft-cap. GlobalLayerStride 4 over 8 layers ⇒ pattern
+    /// S S S F | S S S F with layers 4-7 shared.
+    /// </summary>
+    public static SyntheticGemma4Config E4BLike => new()
+    {
+        BlockCount = 8,
+        GlobalLayerStride = 4,
+        HiddenSize = 256,
+        HeadCount = 4,
+        SlidingHeadDim = 16,
+        GlobalHeadDim = 32,
+        SlidingKvHeads = 2,
+        GlobalKvHeads = 2,
+        DenseFeedForward = 64,
+        VocabSize = 256,
+        ContextLength = 128,
+        SlidingWindow = 8,
+        PerLayerDim = 16,
+        SharedKvLayers = 4,
+        IncludeExperts = false,
+        EmitRopeFreqs = true,
+        GlobalLayersHaveV = true,
+    };
+
     /// <summary>Builds the autoregressive <c>gemma4</c> fixture to a byte array.</summary>
     public static byte[] BuildGemma4(SyntheticGemma4Config? config = null, uint seed = 0xC0FFEEu)
         => Build(config ?? Tiny, diffusion: false, seed);
@@ -157,10 +188,19 @@ public static class SyntheticGemma4Gguf
         w.AddUInt32($"{arch}.rope.dimension_count", (uint)cfg.GlobalHeadDim);        // full head, partial 0.25 in forward
         w.AddUInt32($"{arch}.rope.dimension_count_swa", (uint)cfg.SlidingHeadDim);   // full rotation
 
-        // MoE.
-        w.AddUInt32($"{arch}.expert_count", (uint)cfg.ExpertCount);
-        w.AddUInt32($"{arch}.expert_used_count", (uint)cfg.ExpertUsedCount);
-        w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)cfg.ExpertFeedForward);
+        // MoE (26B shape only — the dense E2B/E4B tower has no experts).
+        if (cfg.IncludeExperts)
+        {
+            w.AddUInt32($"{arch}.expert_count", (uint)cfg.ExpertCount);
+            w.AddUInt32($"{arch}.expert_used_count", (uint)cfg.ExpertUsedCount);
+            w.AddUInt32($"{arch}.expert_feed_forward_length", (uint)cfg.ExpertFeedForward);
+        }
+
+        // Dense-PLE (E2B/E4B) variant metadata.
+        if (cfg.PerLayerDim > 0)
+            w.AddUInt32($"{arch}.embedding_length_per_layer_input", (uint)cfg.PerLayerDim);
+        if (cfg.SharedKvLayers > 0)
+            w.AddUInt32($"{arch}.attention.shared_kv_layers", (uint)cfg.SharedKvLayers);
 
         // Diffusion-only metadata.
         if (diffusion)
@@ -180,6 +220,25 @@ public static class SyntheticGemma4Gguf
 
         // token_embd [K=hidden, M=vocab].
         AddMatrix(w, rng, "token_embd.weight", inK: H, outM: vocab, cfg.TokenEmbdQuant, 0.02f);
+
+        // Model-level PLE tables + rope_freqs (dense E2B/E4B variant only).
+        if (cfg.PerLayerDim > 0)
+        {
+            int lp = cfg.PerLayerDim * cfg.BlockCount;
+            // per_layer_token_embd [K=pleDim*L, M=vocab] — native-quant gather table.
+            AddMatrix(w, rng, "per_layer_token_embd.weight", inK: lp, outM: vocab, QuantizationType.F32, 0.05f);
+            // per_layer_model_proj [K=hidden, M=pleDim*L].
+            AddMatrix(w, rng, "per_layer_model_proj.weight", inK: H, outM: lp, QuantizationType.F32, 0.05f);
+            AddNorm(w, rng, "per_layer_proj_norm.weight", cfg.PerLayerDim);
+        }
+        if (cfg.EmitRopeFreqs)
+        {
+            // Proportional-rope factors ≥ 1 (divisors), like Llama-3.1/E4B tables.
+            var ff = new float[cfg.GlobalHeadDim / 2];
+            for (int i = 0; i < ff.Length; i++) ff[i] = 1.0f + 0.5f * i / ff.Length;
+            byte[] data = System.Runtime.InteropServices.MemoryMarshal.AsBytes(ff.AsSpan()).ToArray();
+            w.AddTensor("rope_freqs.weight", new[] { ff.Length }, (uint)QuantizationType.F32, data);
+        }
 
         for (int i = 0; i < cfg.BlockCount; i++)
             AddLayer(w, rng, cfg, i, diffusion);
@@ -213,12 +272,19 @@ public static class SyntheticGemma4Gguf
         int ie = cfg.ExpertFeedForward;
         int e = cfg.ExpertCount;
 
+        // Shared-KV layers never use their own K/V; the real E4B still ships the
+        // (dead) weights, and so do we — optionally zeroed to discriminate
+        // donor-KV usage from own-KV usage in tests.
+        bool sharedKvLayer = cfg.SharedKvLayers > 0 && layer >= cfg.BlockCount - cfg.SharedKvLayers;
+        float kvScale = sharedKvLayer && cfg.ZeroSharedKvWeights ? 0f : 0.05f;
+
         AddNorm(w, rng, $"{p}.attn_norm.weight", H);
         AddMatrix(w, rng, $"{p}.attn_q.weight", inK: H, outM: qOut, cfg.AttnQuant, 0.05f);
-        AddMatrix(w, rng, $"{p}.attn_k.weight", inK: H, outM: kvOut, cfg.AttnQuant, 0.05f);
-        // V-less on global layers (V-from-K). Sliding layers carry attn_v.
-        if (!global)
-            AddMatrix(w, rng, $"{p}.attn_v.weight", inK: H, outM: kvOut, cfg.AttnQuant, 0.05f);
+        AddMatrix(w, rng, $"{p}.attn_k.weight", inK: H, outM: kvOut, cfg.AttnQuant, kvScale);
+        // V-less on global layers (V-from-K) unless the config ships V everywhere
+        // (E4B). Sliding layers always carry attn_v.
+        if (!global || cfg.GlobalLayersHaveV)
+            AddMatrix(w, rng, $"{p}.attn_v.weight", inK: H, outM: kvOut, cfg.AttnQuant, kvScale);
         AddMatrix(w, rng, $"{p}.attn_output.weight", inK: qOut, outM: H, cfg.AttnQuant, 0.05f);
         // QK-norm: head_dim sized (plain RMSNorm weight, F32).
         AddNorm(w, rng, $"{p}.attn_q_norm.weight", hd);
@@ -231,24 +297,35 @@ public static class SyntheticGemma4Gguf
         AddMatrix(w, rng, $"{p}.ffn_up.weight", inK: H, outM: ff, cfg.DenseFfnQuant, 0.05f);
         AddMatrix(w, rng, $"{p}.ffn_down.weight", inK: ff, outM: H, cfg.DenseFfnQuant, 0.05f);
 
-        // Router (ffn_gate_inp [K=hidden, M=experts]) + channel scale [hidden] (F32).
-        AddMatrix(w, rng, $"{p}.ffn_gate_inp.weight", inK: H, outM: e, QuantizationType.F32, 0.05f);
-        AddNorm(w, rng, $"{p}.ffn_gate_inp.scale", H);
+        if (cfg.IncludeExperts)
+        {
+            // Router (ffn_gate_inp [K=hidden, M=experts]) + channel scale [hidden] (F32).
+            AddMatrix(w, rng, $"{p}.ffn_gate_inp.weight", inK: H, outM: e, QuantizationType.F32, 0.05f);
+            AddNorm(w, rng, $"{p}.ffn_gate_inp.scale", H);
 
-        // Fused gate_up experts [K=hidden, 2*Ie, E]: per expert a [2*Ie, hidden] slab.
-        AddExpertBank(w, rng, $"{p}.ffn_gate_up_exps.weight",
-            inK: H, midOut: 2 * ie, experts: e, cfg.ExpertGateUpQuant, 0.05f);
-        // Down experts [K=Ie, hidden, E]: per expert a [hidden, Ie] slab.
-        AddExpertBank(w, rng, $"{p}.ffn_down_exps.weight",
-            inK: ie, midOut: H, experts: e, cfg.ExpertDownQuant, 0.05f);
-        // Per-expert down scale [E] (F32).
-        AddNorm(w, rng, $"{p}.ffn_down_exps.scale", e);
+            // Fused gate_up experts [K=hidden, 2*Ie, E]: per expert a [2*Ie, hidden] slab.
+            AddExpertBank(w, rng, $"{p}.ffn_gate_up_exps.weight",
+                inK: H, midOut: 2 * ie, experts: e, cfg.ExpertGateUpQuant, 0.05f);
+            // Down experts [K=Ie, hidden, E]: per expert a [hidden, Ie] slab.
+            AddExpertBank(w, rng, $"{p}.ffn_down_exps.weight",
+                inK: ie, midOut: H, experts: e, cfg.ExpertDownQuant, 0.05f);
+            // Per-expert down scale [E] (F32).
+            AddNorm(w, rng, $"{p}.ffn_down_exps.scale", e);
 
-        // Five-norm dual-FFN extras.
-        AddNorm(w, rng, $"{p}.pre_ffw_norm_2.weight", H);
-        AddNorm(w, rng, $"{p}.post_ffw_norm_1.weight", H);
-        AddNorm(w, rng, $"{p}.post_ffw_norm_2.weight", H);
+            // Dual-FFN split norms (MoE layers only).
+            AddNorm(w, rng, $"{p}.pre_ffw_norm_2.weight", H);
+            AddNorm(w, rng, $"{p}.post_ffw_norm_1.weight", H);
+            AddNorm(w, rng, $"{p}.post_ffw_norm_2.weight", H);
+        }
         AddNorm(w, rng, $"{p}.post_ffw_norm.weight", H);
+
+        // Per-layer PLE slots (dense E2B/E4B variant).
+        if (cfg.PerLayerDim > 0)
+        {
+            AddMatrix(w, rng, $"{p}.inp_gate.weight", inK: H, outM: cfg.PerLayerDim, QuantizationType.F32, 0.1f);
+            AddMatrix(w, rng, $"{p}.proj.weight", inK: cfg.PerLayerDim, outM: H, QuantizationType.F32, 0.1f);
+            AddNorm(w, rng, $"{p}.post_norm.weight", H);
+        }
 
         // Per-layer output scale [1] (F32), near 1.0 to keep activations stable.
         AddScalarNear(w, rng, $"{p}.layer_output_scale.weight", 1.0f, 0.05f);

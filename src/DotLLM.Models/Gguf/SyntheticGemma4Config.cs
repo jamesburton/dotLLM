@@ -74,6 +74,41 @@ public sealed record SyntheticGemma4Config
     /// </summary>
     public int GlobalLayerStride { get; init; } = 6;
 
+    // ── Dense-PLE (E2B/E4B) variant knobs ──
+    /// <summary>
+    /// Per-layer embedding dimension (<c>embedding_length_per_layer_input</c>).
+    /// 0 (default) = no PLE (26B MoE shape). &gt;0 emits the model-level
+    /// <c>per_layer_token_embd/model_proj/proj_norm</c> tensors plus per-layer
+    /// <c>inp_gate/proj/post_norm</c>, matching the E4B GGUF.
+    /// </summary>
+    public int PerLayerDim { get; init; }
+
+    /// <summary>
+    /// Trailing layers that reuse an earlier layer's KV
+    /// (<c>attention.shared_kv_layers</c>). 0 (default) = every layer has its own
+    /// KV. When &gt;0 the layout must place a sliding layer at
+    /// <c>kvFromStart-2</c> and a global layer at <c>kvFromStart-1</c> (the
+    /// llama.cpp donor rule), where <c>kvFromStart = BlockCount - SharedKvLayers</c>.
+    /// </summary>
+    public int SharedKvLayers { get; init; }
+
+    /// <summary>False emits a dense-only tower (no router/expert tensors and no
+    /// MoE metadata) — the E2B/E4B shape. True (default) = the 26B MoE shape.</summary>
+    public bool IncludeExperts { get; init; } = true;
+
+    /// <summary>Emit a <c>rope_freqs.weight</c> proportional-rope factor tensor
+    /// [GlobalHeadDim/2] (E4B full-attention layers). Default false.</summary>
+    public bool EmitRopeFreqs { get; init; }
+
+    /// <summary>Emit ALL-ZERO K/V projection weights on the shared-KV layers
+    /// (which never use them). Discriminates "donor KV used" from "own KV used":
+    /// output must be identical to the same fixture with random shared-layer K/V.</summary>
+    public bool ZeroSharedKvWeights { get; init; }
+
+    /// <summary>Emit attn_v on GLOBAL layers too (E4B ships V everywhere; the 26B
+    /// omits it on global layers → V-from-K). Default false = 26B behaviour.</summary>
+    public bool GlobalLayersHaveV { get; init; }
+
     // ── Special token ids ──
     /// <summary>Beginning-of-sequence token id (Gemma uses 2).</summary>
     public int BosTokenId { get; init; } = 2;
@@ -146,5 +181,15 @@ public sealed record SyntheticGemma4Config
         // token_embd row K = hidden.
         Req(HiddenSize % Block(TokenEmbdQuant) == 0, "HiddenSize not block-valid for TokenEmbdQuant.");
         Req(VocabSize > MaskTokenId && VocabSize > BosTokenId && VocabSize > EosTokenId, "special token ids must be < VocabSize.");
+
+        // Shared-KV layout: the llama.cpp donor rule requires a sliding layer at
+        // kvFromStart-2 and a global layer at kvFromStart-1.
+        if (SharedKvLayers > 0)
+        {
+            int kvFromStart = BlockCount - SharedKvLayers;
+            Req(kvFromStart >= 2, "SharedKvLayers leaves fewer than 2 own-KV layers.");
+            Req(!IsGlobalLayer(kvFromStart - 2), "layer kvFromStart-2 must be sliding (donor rule).");
+            Req(IsGlobalLayer(kvFromStart - 1), "layer kvFromStart-1 must be global (donor rule).");
+        }
     }
 }
