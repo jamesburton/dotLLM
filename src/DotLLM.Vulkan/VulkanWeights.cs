@@ -699,6 +699,17 @@ internal sealed class VulkanWeights : IDisposable
 
             MoeLayerBuffers? moe = null;
             Gemma4LayerBuffers? gemma4 = null;
+            if (isGemma4 && lw.Moe is null)
+            {
+                // Dense-PLE gemma4 (E2B/E4B, issue #136): CPU-only for now — the
+                // Vulkan graph has no PLE injection / shared-KV donor reads yet.
+                // Fail fast with a clear message instead of NRE-ing on the
+                // MoE-only Gemma4LayerWeights fields below.
+                throw new NotSupportedException(
+                    "The Gemma-4 dense-PLE variant (E2B/E4B: per-layer embeddings, shared KV "
+                    + "layers, rope_freqs) is not yet supported on the Vulkan backend. "
+                    + "Use the CPU backend for this model.");
+            }
             if (lw.Moe is not null)
             {
                 if (isGemma4)
