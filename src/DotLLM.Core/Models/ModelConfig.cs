@@ -106,6 +106,16 @@ public record ModelConfig
     /// </summary>
     public float? QueryPreAttnScalar { get; init; }
 
+    /// <summary>
+    /// Interleaved sliding-window pattern period. 0 (default) = the sliding
+    /// window (when set) applies to every layer (Mistral convention). N &gt; 0 =
+    /// layer <c>il</c> uses the sliding window iff <c>il % N &lt; N - 1</c>
+    /// (llama.cpp <c>set_swa_pattern(N, dense_first=false)</c>); the remaining
+    /// layers use dense full-context attention. gpt-oss uses N=2 (even layers
+    /// windowed, odd layers dense).
+    /// </summary>
+    public int SlidingWindowPattern { get; init; }
+
     /// <summary>MLA configuration. Only set for DeepSeek-style MLA attention.</summary>
     public MlaConfig? MlaConfig { get; init; }
 

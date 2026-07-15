@@ -126,6 +126,34 @@ public sealed record MoeConfig
     public IReadOnlyList<int>? MlpOnlyLayers { get; init; }
 
     /// <summary>
+    /// When <c>true</c> the router applies softmax over the <b>selected</b>
+    /// top-k logits only (gpt-oss / llama.cpp
+    /// <c>LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT</c>): top-k selection
+    /// runs on the raw (bias-added) logits, then the k gating weights are
+    /// <c>softmax(logits[topk])</c>. When <c>false</c> (default), the Mixtral
+    /// convention applies: softmax over all experts first, then top-k (with
+    /// optional renormalisation per <see cref="NormTopKProb"/>).
+    /// </summary>
+    public bool SoftmaxAfterTopK { get; init; }
+
+    /// <summary>
+    /// When <c>true</c> the experts use the gpt-oss clamped SwiGLU variant
+    /// (llama.cpp <c>ggml_swiglu_oai</c>): with <c>x = min(gate, limit)</c>
+    /// and <c>y = clamp(up, -limit, limit)</c>,
+    /// <c>out = x * sigmoid(alpha * x) * (y + 1)</c> where alpha=1.702 and
+    /// limit=7. When <c>false</c> (default), plain SwiGLU
+    /// (<c>silu(gate) * up</c>) is used.
+    /// </summary>
+    public bool UseSwiGluOai { get; init; }
+
+    /// <summary>
+    /// When <c>true</c> the router and every expert projection carry additive
+    /// bias tensors (gpt-oss: <c>ffn_gate_inp.bias</c>,
+    /// <c>ffn_{gate,up,down}_exps.bias</c>). Default false.
+    /// </summary>
+    public bool HasExpertBiases { get; init; }
+
+    /// <summary>
     /// Returns true if layer <paramref name="layerIdx"/> is a routed-MoE
     /// layer under the current configuration. Checks the
     /// <see cref="MlpOnlyLayers"/> override first (forced dense), then the

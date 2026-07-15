@@ -77,6 +77,14 @@ public static class GgufModelConfigExtractor
         if (swValue > 0)
             slidingWindowSize = (int)swValue;
 
+        // Interleaved SWA pattern (gpt-oss: window on even layers, dense on odd —
+        // llama.cpp set_swa_pattern(2, dense_first=false); the metadata key is
+        // optional and defaults to 2 for gpt-oss).
+        int slidingWindowPattern = 0;
+        if (architecture == Architecture.GptOss && slidingWindowSize is not null)
+            slidingWindowPattern = (int)metadata.GetUInt32OrDefault(
+                $"{arch}.attention.sliding_window_pattern", 2);
+
         int vocabSize = ResolveVocabSize(metadata, arch);
 
         string? chatTemplate = metadata.GetStringOrDefault("tokenizer.chat_template", null!);
@@ -121,6 +129,10 @@ public static class GgufModelConfigExtractor
             if (gdnConfig is { } gdn)
                 hybridLayout = BuildQwen3MoeHybridLayout(numLayers, gdn.FullAttnInterval, numKvHeads);
         }
+        else if (architecture == Architecture.GptOss)
+        {
+            moeConfig = ExtractGptOssMoeConfig(metadata, arch, intermediateSize);
+        }
 
         return new ModelConfig
         {
@@ -141,6 +153,7 @@ public static class GgufModelConfigExtractor
             RoPEConfig = ropeConfig,
             PositionEncodingType = ropeConfig.HasValue ? PositionEncodingType.RoPE : PositionEncodingType.None,
             SlidingWindowSize = slidingWindowSize,
+            SlidingWindowPattern = slidingWindowPattern,
             HybridLayout = hybridLayout,
             SsmConfig = ssmConfig,
             MlaConfig = mlaConfig,
@@ -348,6 +361,33 @@ public static class GgufModelConfigExtractor
         };
     }
 
+    /// <summary>
+    /// Extracts the gpt-oss MoE configuration. Every layer is a routed-MoE
+    /// layer (no dense lead, no shared experts). Router gating is
+    /// softmax-after-top-k over raw (bias-added) logits; experts use the
+    /// clamped <c>swiglu_oai</c> activation; router and expert projections all
+    /// carry biases. Per llama.cpp's <c>LLM_ARCH_OPENAI_MOE</c>.
+    /// </summary>
+    private static MoeConfig ExtractGptOssMoeConfig(GgufMetadata metadata, string arch,
+                                                     int denseIntermediate)
+    {
+        int expertCount = (int)metadata.GetUInt32($"{arch}.expert_count");
+        int expertUsed = (int)metadata.GetUInt32($"{arch}.expert_used_count");
+        int moeIntermediate = (int)metadata.GetUInt32OrDefault(
+            $"{arch}.expert_feed_forward_length", (uint)denseIntermediate);
+
+        return new MoeConfig
+        {
+            NumExperts = expertCount,
+            NumExpertsPerTok = expertUsed,
+            MoeIntermediateSize = moeIntermediate,
+            SoftmaxAfterTopK = true,
+            UseSwiGluOai = true,
+            HasExpertBiases = true,
+            DecoderSparseStep = 1,
+        };
+    }
+
     private static HybridLayerLayout? TryExtractHybridLayout(GgufMetadata metadata, string arch, int numLayers)
     {
         string kvKey = $"{arch}.attention.head_count_kv";
@@ -527,6 +567,8 @@ public static class GgufModelConfigExtractor
             // BuildGemma4Config turns into a non-null DiffusionConfig.
             "diffusion-gemma" or "diffusion_gemma" => Architecture.DiffusionGemma,
             "bitnet" or "bitnet-b1.58" or "bitnet-25" => Architecture.BitNet,
+            // OpenAI gpt-oss (llama.cpp LLM_ARCH_OPENAI_MOE).
+            "gpt-oss" => Architecture.GptOss,
             _ => throw new InvalidDataException($"Unsupported GGUF architecture: '{archString}'.")
         };
     }
@@ -836,7 +878,8 @@ public static class GgufModelConfigExtractor
         RoPEType ropeType = architecture switch
         {
             Architecture.Qwen or Architecture.QwenMoe
-                or Architecture.Qwen3MoeHybrid or Architecture.Phi => RoPEType.NeoX,
+                or Architecture.Qwen3MoeHybrid or Architecture.Phi
+                or Architecture.GptOss => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

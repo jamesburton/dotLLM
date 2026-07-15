@@ -44,6 +44,8 @@ public static class QuantizationTypeExtensions
         QuantizationType.IQ3_S => elementCount / 256 * 110,
         // I2_S: n/4 packed bytes (4 ternary codes/byte) + one trailing per-tensor float32 scale.
         QuantizationType.I2_S => elementCount / 4 + 4,
+        // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
+        QuantizationType.MXFP4 => elementCount / 32 * 17,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

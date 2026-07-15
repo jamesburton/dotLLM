@@ -278,5 +278,19 @@ public enum Architecture
     DiffusionGemma,
 
     /// <summary>Microsoft BitNet b1.58 family (ternary-weight, I2_S quantization).</summary>
-    BitNet
+    BitNet,
+
+    /// <summary>
+    /// OpenAI gpt-oss family (gpt-oss-20b / gpt-oss-120b). GGUF architecture
+    /// string: <c>gpt-oss</c> (llama.cpp <c>LLM_ARCH_OPENAI_MOE</c>). GQA
+    /// attention with per-head <b>attention sinks</b> (a learned scalar logit
+    /// per head joining the softmax denominator), <b>alternating
+    /// sliding-window / dense attention</b> (window on even layers, dense on
+    /// odd — llama.cpp <c>set_swa_pattern(2, dense_first=false)</c>), NeoX
+    /// RoPE with YaRN scaling, and a routed-MoE FFN in every layer using the
+    /// clamped <c>swiglu_oai</c> activation (alpha=1.702, limit=7) with
+    /// per-expert biases and softmax-after-top-k router gating. Expert
+    /// weights ship in MXFP4.
+    /// </summary>
+    GptOss
 }
