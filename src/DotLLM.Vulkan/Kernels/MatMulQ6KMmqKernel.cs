@@ -36,8 +36,10 @@ public sealed class MatMulQ6KMmqKernel : IDisposable
     /// <summary>Elements per Q6_K super-block.</summary>
     public const int Q6KGroupSize = 256;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    // issue #139: 64×64 output tile per workgroup (16×16 threads × 4×4 register
+    // tile each) — must match TILE_M/TILE_N in the shader.
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;

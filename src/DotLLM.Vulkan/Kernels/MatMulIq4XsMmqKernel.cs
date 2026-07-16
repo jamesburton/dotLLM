@@ -26,8 +26,10 @@ public sealed class MatMulIq4XsMmqKernel : IDisposable
     /// <summary>Elements per IQ4_XS super-block.</summary>
     public const int Iq4XsGroupSize = 256;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    // issue #139: 64×64 output tile per workgroup (16×16 threads × 4×4 register
+    // tile each) — must match TILE_M/TILE_N in matmul_iq4_xs_mmq.comp.
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint);
 
     private readonly VulkanDevice _device;
