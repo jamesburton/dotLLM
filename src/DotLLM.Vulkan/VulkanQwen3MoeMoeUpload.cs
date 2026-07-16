@@ -154,30 +154,17 @@ internal static class VulkanQwen3MoeMoeUpload
             bankQt = QuantizationType.Q6_K;
         }
 
-        // Sized to the largest *whole-bank* upload — the per-bank dequant
-        // (UploadRoutedBank) writes ALL experts into staging at once before a
-        // single device copy, so staging must fit the entire numExperts ×
-        // per-expert-bytes blob. For Q6_K-resident the per-expert byte size
-        // is smaller (≈1.7 GB total vs ≈8 GB at qwen35moe-A3B scale at fp32),
-        // but the F32 path is the upper bound and dictates the allocation.
-        // Staging is host-visible and disposed at end-of-call regardless.
-        long maxBankBytesF32 = (long)numE * Math.Max(w1Elems, w2Elems) * sizeof(float);
+        // Bounded persistently-mapped staging (issue #147): banks stream through
+        // it one expert slab (or chunk) at a time — the previous whole-bank
+        // staging write (≈8 GB at qwen35moe-A3B scale at fp32) is gone.
+        long maxSlabBytesF32 = Math.Max(w1Elems, w2Elems) * sizeof(float);
         long gateBytes = (long)numE * hiddenSize * sizeof(float);
-        long stageBytes = Math.Max(maxBankBytesF32, gateBytes);
-        using var staging = device.Allocate(stageBytes);
+        long stageBytes = Math.Max(maxSlabBytesF32, gateBytes);
+        using var staging = VulkanStagingBuffer.Create(device, stageBytes);
 
         // ── Router gate ──────────────────────────────────────────────────────
         var gate = device.AllocateDeviceLocal(gateBytes);
-        nint mappedGate = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)gateBytes, "vkMapMemory VulkanQwen3MoeMoeUpload router gate");
-        try
-        {
-            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)mappedGate, moe.Gate.Length));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, gate, (ulong)gateBytes);
+        staging.UploadFloats(moe.Gate, gate);
 
         // ── Routed expert banks. Two cases:
         //   (1) F32 (default): dequant each per-expert slice into staging at
@@ -262,20 +249,16 @@ internal static class VulkanQwen3MoeMoeUpload
     /// expert's contiguous slot, then issues a single device copy. Mirrors
     /// the CPU <c>DequantRoutedExpertsIntoScratch</c> pattern.
     /// </summary>
-    private static unsafe void UploadRoutedBank(
-        VulkanDevice device, VulkanDevice.Buffer staging, MoeLayerWeights moe,
+    private static void UploadRoutedBank(
+        VulkanDevice device, VulkanStagingBuffer staging, MoeLayerWeights moe,
         char kind, VulkanDevice.Buffer bank, int numE, long perExpertElems)
     {
         long perExpertBytes = perExpertElems * sizeof(float);
-        long totalBytes = (long)numE * perExpertBytes;
 
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)totalBytes, "vkMapMemory VulkanQwen3MoeMoeUpload routed bank");
-        try
         {
-            float* dst = (float*)mapped;
             for (int e = 0; e < numE; e++)
             {
-                Span<float> slot = new(dst + (long)e * perExpertElems, checked((int)perExpertElems));
+                long slotOffset = (long)e * perExpertBytes;
 
                 if (moe.HasRawQuantView)
                 {
@@ -306,7 +289,8 @@ internal static class VulkanQwen3MoeMoeUpload
                     long rowBytes = Dequantize.RowByteSize(kDim, qt);
                     long perExpertSrcBytes = rowBytes * mDim;
                     nint expertSrc = srcPtr + (nint)(e * perExpertSrcBytes);
-                    Dequantize.ToFloat32(expertSrc, (int)perExpertElems, qt, slot);
+                    VulkanWeights.DequantAndUploadSlot(device, staging, expertSrc,
+                        perExpertElems, qt, scale: 1.0f, bank, slotOffset);
                 }
                 else
                 {
@@ -320,16 +304,10 @@ internal static class VulkanQwen3MoeMoeUpload
                         'U' => moe.W3[e],
                         _ => 0,
                     };
-                    new ReadOnlySpan<float>((void*)src, checked((int)perExpertElems))
-                        .CopyTo(slot);
+                    staging.UploadBytes(src, perExpertBytes, bank, slotOffset);
                 }
             }
         }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, bank, (ulong)totalBytes);
     }
 
     /// <summary>
@@ -345,8 +323,8 @@ internal static class VulkanQwen3MoeMoeUpload
     /// fused-expert tensors store experts contiguously in the same per-row
     /// stride.
     /// </summary>
-    private static unsafe void UploadRoutedBankQ6K(
-        VulkanDevice device, VulkanDevice.Buffer staging, MoeLayerWeights moe,
+    private static void UploadRoutedBankQ6K(
+        VulkanDevice device, VulkanStagingBuffer staging, MoeLayerWeights moe,
         char kind, VulkanDevice.Buffer bank, int numE, long perExpertBytes)
     {
         long totalBytes = (long)numE * perExpertBytes;
@@ -379,67 +357,31 @@ internal static class VulkanQwen3MoeMoeUpload
                 throw new ArgumentOutOfRangeException(nameof(kind));
         }
 
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)totalBytes, "vkMapMemory VulkanQwen3MoeMoeUpload routed Q6_K bank");
-        try
-        {
-            byte* dst = (byte*)mapped;
-            byte* src = (byte*)srcPtr;
-            for (int e = 0; e < numE; e++)
-            {
-                // GGUF fused-expert layout [E, M, K] (K innermost) gives a
-                // per-expert byte stride of `perExpertBytes` — same on both
-                // sides, so this is a flat copy. Use Buffer.MemoryCopy for
-                // long-length safety; staging is host-visible so it costs
-                // ~CPU memcpy bandwidth (~30 GB/s on Strix Halo).
-                long off = (long)e * perExpertBytes;
-                Buffer.MemoryCopy(src + off, dst + off, perExpertBytes, perExpertBytes);
-            }
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, bank, (ulong)totalBytes);
+        // GGUF fused-expert layout [E, M, K] (K innermost) matches the bank
+        // layout byte-for-byte, so the whole bank is one contiguous streamed
+        // copy through the bounded staging buffer.
+        staging.UploadBytes(srcPtr, totalBytes, bank);
     }
 
     /// <summary>
     /// Uploads an F32 matrix from an unmanaged pointer (the shared-expert
     /// projections live as <c>nint</c> in <see cref="MoeLayerWeights"/>).
     /// </summary>
-    private static unsafe VulkanDevice.Buffer UploadF32FromPointer(
-        VulkanDevice device, VulkanDevice.Buffer staging, nint src, long elems)
+    private static VulkanDevice.Buffer UploadF32FromPointer(
+        VulkanDevice device, VulkanStagingBuffer staging, nint src, long elems)
     {
         long bytes = elems * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeMoeUpload F32-from-pointer");
-        try
-        {
-            new ReadOnlySpan<float>((void*)src, checked((int)elems))
-                .CopyTo(new Span<float>((void*)mapped, checked((int)elems)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadBytes(src, bytes, buf);
         return buf;
     }
 
-    private static unsafe VulkanDevice.Buffer UploadFloatArray(
-        VulkanDevice device, VulkanDevice.Buffer staging, float[] data)
+    private static VulkanDevice.Buffer UploadFloatArray(
+        VulkanDevice device, VulkanStagingBuffer staging, float[] data)
     {
         long bytes = (long)data.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeMoeUpload float-array");
-        try
-        {
-            data.AsSpan().CopyTo(new Span<float>((void*)mapped, data.Length));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadFloats(data, buf);
         return buf;
     }
 }

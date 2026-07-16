@@ -514,9 +514,11 @@ internal sealed class VulkanWeights : IDisposable
     /// </param>
     /// <remarks>
     /// <para>
-    /// Staging is sized to fit the largest single matrix in its <i>widest</i>
-    /// on-host form (FP32 for non-Q8_0 matrices or when <paramref name="dequantToFp32"/>
-    /// is true; raw Q8_0 bytes for Q8_0 matrices when kept on device).
+    /// Staging is a single bounded, persistently-mapped buffer
+    /// (<see cref="VulkanStagingBuffer"/>, cap <c>DOTLLM_VULKAN_STAGING_MB</c>,
+    /// default 64 MiB) shared by every upload in this call — larger tensors
+    /// stream through it in chunks, so peak staging host commit is bounded by
+    /// the cap regardless of model size (issue #147).
     /// </para>
     /// </remarks>
     public static VulkanWeights Upload(
@@ -531,11 +533,18 @@ internal sealed class VulkanWeights : IDisposable
         long totalBytes = 0;
         ResetUploadCounters();
 
-        // Size the reusable staging buffer to the largest single weight upload
-        // (in its on-device byte form) across the uploaded layer window.
+        // Bounded persistently-mapped staging (issue #147): sized to the largest single
+        // upload but capped at VulkanStagingBuffer.MaxChunkBytes — larger tensors stream
+        // through it in chunks. Mapped ONCE for the whole load, so no per-upload
+        // vkMapMemory re-charges the allocation's host commit (the #146 flake trigger).
         long stagingBytes = ComputeMaxUploadBytes(weights, numLayers, dequantToFp32, firstLayer,
             skipTokenEmbed, skipOutputHead);
-        using var staging = device.Allocate(stagingBytes);
+        using var staging = VulkanStagingBuffer.Create(device, stagingBytes);
+
+        // Small dedicated staging for norm-vec / bias / scale uploads (issue #147):
+        // KB-scale vectors never touch the multi-MB matrix staging buffer, so the
+        // commit charge attributable to tiny uploads is a fixed 256 KiB.
+        using var vecStaging = VulkanStagingBuffer.Create(device, VecStagingBytes);
 
         // Token embedding table: [vocabSize, hiddenSize]. Uploaded once as a
         // device-local F32 buffer so VulkanTransformerModel.Forward can gather
@@ -577,20 +586,20 @@ internal sealed class VulkanWeights : IDisposable
             bool isGemma4 = lw.Gemma4 is not null;
             bool vFromK = lw.Gemma4?.VFromK ?? false;
 
-            var attnNorm = UploadNormVec(device, staging, lw.AttnNormWeight);
+            var attnNorm = UploadNormVec(device, vecStaging, lw.AttnNormWeight);
             totalBytes += (long)lw.AttnNormWeight.Length * sizeof(float);
 
             // Per-head Q/K RMSNorm weights [headDim] (Gemma-4, Qwen3). Null when
             // the architecture has no QK-norm (UploadOptionalVec returns null).
-            var qNorm = UploadOptionalVec(device, staging, lw.QNormWeight);
-            var kNorm = UploadOptionalVec(device, staging, lw.KNormWeight);
+            var qNorm = UploadOptionalVec(device, vecStaging, lw.QNormWeight);
+            var kNorm = UploadOptionalVec(device, vecStaging, lw.KNormWeight);
             if (lw.QNormWeight is not null) totalBytes += (long)lw.QNormWeight.Length * sizeof(float);
             if (lw.KNormWeight is not null) totalBytes += (long)lw.KNormWeight.Length * sizeof(float);
 
             // Gemma four-norm layout: optional post-attention RMSNorm weight
             // applied to the attention output before the residual add. Null on
             // non-Gemma architectures (UploadOptionalVec returns null).
-            var postAttnNorm = UploadOptionalVec(device, staging, lw.PostAttnNormWeight);
+            var postAttnNorm = UploadOptionalVec(device, vecStaging, lw.PostAttnNormWeight);
             if (lw.PostAttnNormWeight is not null)
                 totalBytes += (long)lw.PostAttnNormWeight.Length * sizeof(float);
 
@@ -630,22 +639,22 @@ internal sealed class VulkanWeights : IDisposable
                     v = UploadMatrix(device, staging, lw.VWeight, lw.VQuantType, lw.VOutputDim, lw.VInputDim,
                         dequantToFp32, out vDeviceQt, out vBytes);
                 }
-                qBias = UploadOptionalVec(device, staging, lw.QBias);
-                kBias = UploadOptionalVec(device, staging, lw.KBias);
-                vBias = UploadOptionalVec(device, staging, lw.VBias);
+                qBias = UploadOptionalVec(device, vecStaging, lw.QBias);
+                kBias = UploadOptionalVec(device, vecStaging, lw.KBias);
+                vBias = UploadOptionalVec(device, vecStaging, lw.VBias);
             }
             var o = UploadMatrix(device, staging, lw.OWeight, lw.OQuantType, lw.OOutputDim, lw.OInputDim,
                 dequantToFp32, out var oDeviceQt, out long oBytes);
-            var oBias = UploadOptionalVec(device, staging, lw.OBias);
+            var oBias = UploadOptionalVec(device, vecStaging, lw.OBias);
 
             MlaLayerBuffers? mla = null;
             if (lw.Mla is not null)
             {
-                mla = UploadMlaLayer(device, staging, lw.Mla, weights.HiddenSize, out long mlaBytes);
+                mla = UploadMlaLayer(device, staging, vecStaging, lw.Mla, weights.HiddenSize, out long mlaBytes);
                 totalBytes += mlaBytes;
             }
 
-            var ffnNorm = UploadNormVec(device, staging, lw.FfnNormWeight);
+            var ffnNorm = UploadNormVec(device, vecStaging, lw.FfnNormWeight);
             totalBytes += (long)lw.FfnNormWeight.Length * sizeof(float);
 
             // Gemma four-norm layout: optional post-FFN RMSNorm weight applied
@@ -653,17 +662,17 @@ internal sealed class VulkanWeights : IDisposable
             // For Gemma-4 this is forced null — the combined post_ffw_norm is
             // applied INSIDE RecordGemma4Ffn (g4.PostFfwNorm), so the shared
             // residual-#2 post-FFN norm must NOT also fire (double-norm).
-            var postFfnNorm = isGemma4 ? null : UploadOptionalVec(device, staging, lw.PostFfnNormWeight);
+            var postFfnNorm = isGemma4 ? null : UploadOptionalVec(device, vecStaging, lw.PostFfnNormWeight);
             if (!isGemma4 && lw.PostFfnNormWeight is not null)
                 totalBytes += (long)lw.PostFfnNormWeight.Length * sizeof(float);
 
             // BitNet b1.58 Sub-LN: optional RMSNorm weights applied to the attention
             // output (before o_proj) and the gated FFN intermediate (before ffn_down).
             // Null on every non-BitNet architecture (UploadOptionalVec returns null).
-            var attnSubNorm = UploadOptionalVec(device, staging, lw.AttnSubNormWeight);
+            var attnSubNorm = UploadOptionalVec(device, vecStaging, lw.AttnSubNormWeight);
             if (lw.AttnSubNormWeight is not null)
                 totalBytes += (long)lw.AttnSubNormWeight.Length * sizeof(float);
-            var ffnSubNorm = UploadOptionalVec(device, staging, lw.FfnSubNormWeight);
+            var ffnSubNorm = UploadOptionalVec(device, vecStaging, lw.FfnSubNormWeight);
             if (lw.FfnSubNormWeight is not null)
                 totalBytes += (long)lw.FfnSubNormWeight.Length * sizeof(float);
 
@@ -692,9 +701,9 @@ internal sealed class VulkanWeights : IDisposable
                     dequantToFp32, out upDeviceQt, out upBytes);
                 down = UploadMatrix(device, staging, lw.DownWeight, lw.DownQuantType, lw.DownOutputDim, lw.DownInputDim,
                     dequantToFp32, out downDeviceQt, out downBytes);
-                gateBias = UploadOptionalVec(device, staging, lw.GateBias);
-                upBias = UploadOptionalVec(device, staging, lw.UpBias);
-                downBias = UploadOptionalVec(device, staging, lw.DownBias);
+                gateBias = UploadOptionalVec(device, vecStaging, lw.GateBias);
+                upBias = UploadOptionalVec(device, vecStaging, lw.UpBias);
+                downBias = UploadOptionalVec(device, vecStaging, lw.DownBias);
             }
 
             MoeLayerBuffers? moe = null;
@@ -723,14 +732,14 @@ internal sealed class VulkanWeights : IDisposable
                     VulkanDevice.Buffer? downScaleBuf = null;
                     if (Gemma4ExpertsKeepQuantized(lw.Moe))
                     {
-                        moe = UploadGemma4MoeLayerQuantized(device, lw.Moe, lw.Gemma4!,
+                        moe = UploadGemma4MoeLayerQuantized(device, staging, vecStaging, lw.Moe, lw.Gemma4!,
                             out var dsBuf, out long moeBytes);
                         downScaleBuf = dsBuf;
                         totalBytes += moeBytes;
                     }
                     else
                     {
-                        moe = UploadGemma4MoeLayer(device, lw.Moe, lw.Gemma4!, out long moeBytes);
+                        moe = UploadGemma4MoeLayer(device, staging, lw.Moe, lw.Gemma4!, out long moeBytes);
                         totalBytes += moeBytes;
                     }
 
@@ -744,11 +753,11 @@ internal sealed class VulkanWeights : IDisposable
                         routerScaleScaled[j] = g4.RouterScale[j] * invSqrtH;
 
                     gemma4 = new Gemma4LayerBuffers(
-                        UploadNormVec(device, staging, g4.PreFfwNorm2!),
-                        UploadNormVec(device, staging, g4.PostFfwNorm1!),
-                        UploadNormVec(device, staging, g4.PostFfwNorm2!),
-                        UploadNormVec(device, staging, g4.PostFfwNorm),
-                        UploadNormVec(device, staging, routerScaleScaled),
+                        UploadNormVec(device, vecStaging, g4.PreFfwNorm2!),
+                        UploadNormVec(device, vecStaging, g4.PostFfwNorm1!),
+                        UploadNormVec(device, vecStaging, g4.PostFfwNorm2!),
+                        UploadNormVec(device, vecStaging, g4.PostFfwNorm),
+                        UploadNormVec(device, vecStaging, routerScaleScaled),
                         g4.LayerOutputScale,
                         g4.VFromK,
                         downScaleBuf);
@@ -757,7 +766,7 @@ internal sealed class VulkanWeights : IDisposable
                 }
                 else
                 {
-                    moe = UploadMoeLayer(device, lw.Moe, out long moeBytes);
+                    moe = UploadMoeLayer(device, staging, vecStaging, lw.Moe, out long moeBytes);
                     totalBytes += moeBytes;
                 }
             }
@@ -796,7 +805,7 @@ internal sealed class VulkanWeights : IDisposable
         }
         else
         {
-            outputNorm = UploadNormVec(device, staging, weights.OutputNormWeight);
+            outputNorm = UploadNormVec(device, vecStaging, weights.OutputNormWeight);
             totalBytes += (long)weights.OutputNormWeight.Length * sizeof(float);
 
             outputWeight = UploadMatrix(device, staging,
@@ -910,6 +919,10 @@ internal sealed class VulkanWeights : IDisposable
         LastUploadZeroCopyBytes = 0;
         LastUploadFallbackReason = string.Empty;
     }
+
+    /// <summary>Capacity of the dedicated norm-vec/bias staging buffer (256 KiB —
+    /// comfortably above the largest norm/bias vector; UploadFloats chunks if ever exceeded).</summary>
+    private const long VecStagingBytes = 256 * 1024;
 
     /// <summary>Returns true when the matrix will be kept on device as Q8_0 blocks.</summary>
     private static bool KeepQ8OnDevice(QuantizationType qt, bool dequantToFp32)
@@ -1159,7 +1172,7 @@ internal sealed class VulkanWeights : IDisposable
     /// </para>
     /// </remarks>
     private static unsafe VulkanDevice.Buffer UploadMatrix(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, QuantizationType qt, int outputDim, int inputDim,
         bool dequantToFp32,
         out QuantizationType deviceQuantType,
@@ -1190,17 +1203,7 @@ internal sealed class VulkanWeights : IDisposable
             }
 
             var buf = device.AllocateDeviceLocal(bytes);
-            nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
-            try
-            {
-                new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
-                    .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
-            }
-            finally
-            {
-                VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-            }
-            device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+            staging.UploadBytes(srcPtr, bytes, buf);
 
             LastUploadStagingMatrices++;
             deviceQuantType = keepQt;
@@ -1208,72 +1211,79 @@ internal sealed class VulkanWeights : IDisposable
             return buf;
         }
 
-        // FP32 dequantised upload.
+        // FP32 dequantised upload — streamed through the bounded staging buffer so the
+        // largest F32 expansions (the token-embed table in particular) never materialise
+        // a GB-scale host-resident allocation (issue #147).
         long fpBytes = elems * sizeof(float);
         var fpBuf = device.AllocateDeviceLocal(fpBytes);
 
-        nint fpMapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)fpBytes, "vkMapMemory VulkanWeights.UploadMatrix staging");
-        try
+        if (qt == QuantizationType.F32)
         {
-            float* d = (float*)fpMapped;
-            if (qt == QuantizationType.F32)
+            staging.UploadBytes(srcPtr, fpBytes, fpBuf);
+        }
+        else if (qt == QuantizationType.I2_S)
+        {
+            // I2_S has a single per-tensor scale at the tail (offset m·K/4), so it must
+            // be dequantised over the whole tensor at once — a per-row loop would read
+            // the scale from mid-matrix packed bytes. Reached only when the raw I2_S
+            // path is bypassed (dequant forced, e.g. lm_head, or K % 128 != 0). When the
+            // tensor exceeds the staging cap this takes a one-off full-size staging
+            // allocation (rare; ledgered as justified in the #147 audit).
+            if (fpBytes <= staging.Capacity)
             {
-                new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
-                    .CopyTo(new Span<float>(d, checked((int)elems)));
-            }
-            else if (qt == QuantizationType.I2_S)
-            {
-                // I2_S has a single per-tensor scale at the tail (offset m·K/4), so it must
-                // be dequantised over the whole tensor at once — a per-row loop would read
-                // the scale from mid-matrix packed bytes. Reached only when the raw I2_S
-                // path is bypassed (dequant forced, e.g. lm_head, or K % 128 != 0).
-                Dequantize.ToFloat32(srcPtr, elems, qt, new Span<float>(d, checked((int)elems)));
+                Dequantize.ToFloat32(srcPtr, elems, qt,
+                    new Span<float>((void*)staging.Mapped, checked((int)elems)));
+                staging.Flush(fpBuf, 0, fpBytes);
             }
             else
             {
-                long rowBytes = Dequantize.RowByteSize(inputDim, qt);
-                for (int row = 0; row < outputDim; row++)
+                using var big = device.Allocate(fpBytes);
+                nint mapped = device.MapMemoryWithRetry(big.Memory, 0, (ulong)fpBytes,
+                    "vkMapMemory VulkanWeights.UploadMatrix I2_S full dequant");
+                try
                 {
-                    nint rowSrc = srcPtr + (nint)(row * rowBytes);
-                    Dequantize.ToFloat32(rowSrc, inputDim, qt,
-                        new Span<float>(d + (long)row * inputDim, inputDim));
+                    Dequantize.ToFloat32(srcPtr, elems, qt,
+                        new Span<float>((void*)mapped, checked((int)elems)));
                 }
+                finally
+                {
+                    VulkanApi.vkUnmapMemory(device.Handle, big.Memory);
+                }
+                device.CopyBufferSynchronous(big, fpBuf, (ulong)fpBytes);
             }
         }
-        finally
+        else
         {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
+            long srcRowBytes = Dequantize.RowByteSize(inputDim, qt);
+            staging.UploadRows(outputDim, (long)inputDim * sizeof(float), fpBuf, 0,
+                (chunkPtr, firstRow, rowCount) =>
+                {
+                    float* d = (float*)chunkPtr;
+                    for (int i = 0; i < rowCount; i++)
+                    {
+                        nint rowSrc = srcPtr + (nint)((firstRow + i) * srcRowBytes);
+                        Dequantize.ToFloat32(rowSrc, inputDim, qt,
+                            new Span<float>(d + (long)i * inputDim, inputDim));
+                    }
+                });
         }
-
-        device.CopyBufferSynchronous(staging, fpBuf, (ulong)fpBytes);
 
         deviceQuantType = QuantizationType.F32;
         uploadedBytes = fpBytes;
         return fpBuf;
     }
 
-    private static unsafe VulkanDevice.Buffer UploadNormVec(
-        VulkanDevice device, VulkanDevice.Buffer staging, float[] normWeight)
+    private static VulkanDevice.Buffer UploadNormVec(
+        VulkanDevice device, VulkanStagingBuffer staging, float[] normWeight)
     {
         long bytes = (long)normWeight.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadNormVec staging");
-        try
-        {
-            normWeight.AsSpan().CopyTo(new Span<float>((void*)mapped, normWeight.Length));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadFloats(normWeight, buf);
         return buf;
     }
 
     private static VulkanDevice.Buffer? UploadOptionalVec(
-        VulkanDevice device, VulkanDevice.Buffer staging, float[]? vec)
+        VulkanDevice device, VulkanStagingBuffer staging, float[]? vec)
     {
         if (vec is null) return null;
         return UploadNormVec(device, staging, vec);
@@ -1290,8 +1300,8 @@ internal sealed class VulkanWeights : IDisposable
     /// so the forward path can RMSNorm just the latent slice without a
     /// stride-aware kernel.
     /// </summary>
-    private static unsafe MlaLayerBuffers UploadMlaLayer(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static MlaLayerBuffers UploadMlaLayer(
+        VulkanDevice device, VulkanStagingBuffer staging, VulkanStagingBuffer vecStaging,
         MlaLayerWeights mla, int hiddenSize, out long uploadedBytes)
     {
         uploadedBytes = 0;
@@ -1303,7 +1313,7 @@ internal sealed class VulkanWeights : IDisposable
         {
             qAProj = UploadFp32Matrix(device, staging, mla.QAProj, mla.QLoraRank, hiddenSize, out long qABytes);
             qBProj = UploadFp32Matrix(device, staging, mla.QBProj, qTotal, mla.QLoraRank, out long qBBytes);
-            qALayernorm = UploadNormVec(device, staging, mla.QALayernormWeight!);
+            qALayernorm = UploadNormVec(device, vecStaging, mla.QALayernormWeight!);
             uploadedBytes += qABytes + qBBytes + (long)mla.QLoraRank * sizeof(float);
         }
         else
@@ -1323,7 +1333,7 @@ internal sealed class VulkanWeights : IDisposable
             kPePtr, mla.QkRopeHeadDim, hiddenSize, out long kPeBytes);
         uploadedBytes += latentBytes + kPeBytes;
 
-        var kvALayernorm = UploadNormVec(device, staging, mla.KvALayernormWeight);
+        var kvALayernorm = UploadNormVec(device, vecStaging, mla.KvALayernormWeight);
         uploadedBytes += (long)mla.KvLoraRank * sizeof(float);
 
         var kvBProj = UploadFp32Matrix(device, staging,
@@ -1356,8 +1366,9 @@ internal sealed class VulkanWeights : IDisposable
     /// every mode — the indexed-matmul kernel is F32-only in tree, no Q8_0 variant exists.
     /// </para>
     /// </remarks>
-    private static unsafe MoeLayerBuffers UploadMoeLayer(
-        VulkanDevice device, MoeLayerWeights moe, out long uploadedBytes)
+    private static MoeLayerBuffers UploadMoeLayer(
+        VulkanDevice device, VulkanStagingBuffer stage, VulkanStagingBuffer vecStage,
+        MoeLayerWeights moe, out long uploadedBytes)
     {
         uploadedBytes = 0;
         int hidden = moe.HiddenSize;
@@ -1398,16 +1409,8 @@ internal sealed class VulkanWeights : IDisposable
             : 0;
         long perSharedW3Bytes = perSharedW1Bytes;
 
-        // Stage sized to the largest single per-expert matrix OR the gate row,
-        // whichever is bigger. The bank-pack copies one expert at a time so
-        // we never need to stage the full bank at once. Shared-expert
-        // matrices are sized off sharedIntermediate which may be larger than
-        // the routed intermediate (DeepSeek-V2-Lite: shared==3*moe_intermediate),
-        // so include them in the staging bound.
-        long stageBytes = Math.Max(gateBytes, Math.Max(perExpertW1Bytes, perExpertW2Bytes));
-        if (hasShared)
-            stageBytes = Math.Max(stageBytes, Math.Max(perSharedW1Bytes, perSharedW2Bytes));
-        using var stage = device.Allocate(stageBytes);
+        // Every upload streams through the shared bounded staging buffer — one
+        // expert slab (or a chunk of it) at a time; no per-layer staging alloc.
 
         // ── Router gate ──────────────────────────────────────────────
         VulkanDevice.Buffer gate;
@@ -1423,16 +1426,7 @@ internal sealed class VulkanWeights : IDisposable
         else
         {
             gate = device.AllocateDeviceLocal(gateBytes);
-            nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateBytes, "vkMapMemory UploadMoeLayer gate");
-            try
-            {
-                moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
-            }
-            finally
-            {
-                VulkanApi.vkUnmapMemory(device.Handle, stage.Memory);
-            }
-            device.CopyBufferSynchronous(stage, gate, (ulong)gateBytes);
+            stage.UploadFloats(moe.Gate, gate);
             gateDeviceQt = QuantizationType.F32;
         }
         uploadedBytes += gateBytes;
@@ -1529,7 +1523,7 @@ internal sealed class VulkanWeights : IDisposable
             }
             else
             {
-                sharedExpertGate = UploadNormVec(device, stage, moe.SharedExpertGate);
+                sharedExpertGate = UploadNormVec(device, vecStage, moe.SharedExpertGate);
                 sharedExpertGateDeviceQt = QuantizationType.F32;
                 uploadedBytes += (long)moe.SharedExpertGate.Length * sizeof(float);
             }
@@ -1569,8 +1563,9 @@ internal sealed class VulkanWeights : IDisposable
     /// this way — that is what the deferred Q4_K + Q5_1 indexed-MoE matmul shaders
     /// (keep experts quantized on device) are for.</para>
     /// </summary>
-    private static unsafe MoeLayerBuffers UploadGemma4MoeLayer(
-        VulkanDevice device, MoeLayerWeights moe, Gemma4LayerWeights g4, out long uploadedBytes)
+    private static MoeLayerBuffers UploadGemma4MoeLayer(
+        VulkanDevice device, VulkanStagingBuffer stage, MoeLayerWeights moe, Gemma4LayerWeights g4,
+        out long uploadedBytes)
     {
         uploadedBytes = 0;
         int hidden = moe.HiddenSize;
@@ -1583,18 +1578,9 @@ internal sealed class VulkanWeights : IDisposable
         long perDownBytes = perDownElems * sizeof(float);
         long gateRouterBytes = (long)numE * hidden * sizeof(float);
 
-        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownBytes));
-        using var stage = device.Allocate(stageBytes);
-
         // ── Router gate (F32 [numExperts, hidden]) ───────────────────
         var gate = device.AllocateDeviceLocal(gateRouterBytes);
-        nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateRouterBytes, "vkMapMemory UploadGemma4MoeLayer gate");
-        try
-        {
-            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
-        }
-        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
-        device.CopyBufferSynchronous(stage, gate, (ulong)gateRouterBytes);
+        stage.UploadFloats(moe.Gate, gate);
         uploadedBytes += gateRouterBytes;
 
         // ── Expert banks (F32), one expert slice at a time ───────────
@@ -1670,8 +1656,9 @@ internal sealed class VulkanWeights : IDisposable
     /// <c>Ie</c> rows (<see cref="MoeLayerWeights.UpExpsRaw"/>, pre-offset by the loader).
     /// Each contiguous bank uses a per-expert stride of <c>Ie * rowBytes</c>.</para>
     /// </summary>
-    private static unsafe MoeLayerBuffers UploadGemma4MoeLayerQuantized(
-        VulkanDevice device, MoeLayerWeights moe, Gemma4LayerWeights g4,
+    private static MoeLayerBuffers UploadGemma4MoeLayerQuantized(
+        VulkanDevice device, VulkanStagingBuffer stage, VulkanStagingBuffer vecStage,
+        MoeLayerWeights moe, Gemma4LayerWeights g4,
         out VulkanDevice.Buffer downScaleBuffer, out long uploadedBytes)
     {
         uploadedBytes = 0;
@@ -1705,18 +1692,9 @@ internal sealed class VulkanWeights : IDisposable
                 $"Gemma-4 down stride mismatch: DownExpsRowBytes={g4.DownExpsRowBytes} != {perDownSrcBytes} "
                 + $"(hidden={hidden}, Ie={interm}, srcQt={downSrcQt}, rowBytes={downSrcRowBytes}).");
 
-        long stageBytes = Math.Max(gateRouterBytes, Math.Max(perGateUpBytes, perDownDevBytes));
-        using var stage = device.Allocate(stageBytes);
-
         // ── Router gate (F32 [numExperts, hidden]) ───────────────────
         var gate = device.AllocateDeviceLocal(gateRouterBytes);
-        nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateRouterBytes, "vkMapMemory UploadGemma4MoeLayerQuantized gate");
-        try
-        {
-            moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
-        }
-        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
-        device.CopyBufferSynchronous(stage, gate, (ulong)gateRouterBytes);
+        stage.UploadFloats(moe.Gate, gate);
         uploadedBytes += gateRouterBytes;
 
         // ── Quantized expert banks (Q4_K gate/up; Q5_1 or Q8_0 down) ─
@@ -1760,7 +1738,7 @@ internal sealed class VulkanWeights : IDisposable
         // ── Per-expert down scale (folded by the Q5_1 down shader, op #14).
         // For Q8_0 down banks the scale is already folded into the block scales
         // above and the Q8_0 dispatch ignores this buffer — kept for diagnostics. ──
-        downScaleBuffer = UploadNormVec(device, stage, g4.DownExpertScale!);
+        downScaleBuffer = UploadNormVec(device, vecStage, g4.DownExpertScale!);
         uploadedBytes += (long)numE * sizeof(float);
 
         return new MoeLayerBuffers(gate, QuantizationType.F32, w1Bank, w2Bank, w3Bank,
@@ -1780,22 +1758,25 @@ internal sealed class VulkanWeights : IDisposable
     /// <paramref name="scale"/>, then copies the slice into <paramref name="bank"/>
     /// at <paramref name="dstOffsetBytes"/>. Used by the Gemma-4 F32 expert upload.
     /// </summary>
-    private static unsafe void DequantAndUploadSlot(
-        VulkanDevice device, VulkanDevice.Buffer stage,
+    internal static unsafe void DequantAndUploadSlot(
+        VulkanDevice device, VulkanStagingBuffer stage,
         nint src, long elems, QuantizationType qt, float scale,
         VulkanDevice.Buffer bank, long dstOffsetBytes)
     {
-        long bytes = elems * sizeof(float);
-        nint mapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.DequantAndUploadSlot");
-        try
+        // Chunk on 256-element boundaries — every GGUF block size (32 for the
+        // legacy quants, 256 for K-quants/IQ) divides 256, so each chunk starts
+        // on an exact source-block boundary.
+        long chunkElems = Math.Max(256, stage.Capacity / sizeof(float) / 256 * 256);
+        long srcBytesPer256 = Dequantize.RowByteSize(256, qt);
+        for (long e0 = 0; e0 < elems; e0 += chunkElems)
         {
-            var dst = new Span<float>((void*)mapped, checked((int)elems));
-            Dequantize.ToFloat32(src, elems, qt, dst);
+            long n = Math.Min(chunkElems, elems - e0);
+            var dst = new Span<float>((void*)stage.Mapped, checked((int)n));
+            Dequantize.ToFloat32(src + (nint)(e0 / 256 * srcBytesPer256), n, qt, dst);
             if (scale != 1.0f)
                 for (int i = 0; i < dst.Length; i++) dst[i] *= scale;
+            stage.Flush(bank, dstOffsetBytes + e0 * sizeof(float), n * sizeof(float));
         }
-        finally { VulkanApi.vkUnmapMemory(device.Handle, stage.Memory); }
-        device.CopyBufferRangeSynchronous(stage, bank, srcOffset: 0, dstOffset: (ulong)dstOffsetBytes, size: (ulong)bytes);
     }
 
     /// <summary>True iff a Q8_0 MoE overlay can be kept on device as raw Q8_0 blocks —
@@ -1902,39 +1883,15 @@ internal sealed class VulkanWeights : IDisposable
 
     /// <summary>Copies <paramref name="bytes"/> raw bytes from <paramref name="srcPtr"/>
     /// through <paramref name="staging"/> into the device-local <paramref name="dst"/>.</summary>
-    private static unsafe void UploadRawBytes(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadRawBytes(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer dst)
-    {
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadMoeLayer raw");
-        try
-        {
-            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
-                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, dst, (ulong)bytes);
-    }
+        => staging.UploadBytes(srcPtr, bytes, dst);
 
-    private static unsafe void UploadRawBankSlot(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadRawBankSlot(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
-    {
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadRawBankSlot");
-        try
-        {
-            new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
-                .CopyTo(new Span<byte>((void*)mapped, checked((int)bytes)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
-    }
+        => staging.UploadBytes(srcPtr, bytes, bank, dstOffset);
 
     /// <summary>
     /// Converts <paramref name="blockCount"/> Q5_0 blocks (22 B: fp16 <c>d</c>, 4 B <c>qh</c>,
@@ -1984,21 +1941,17 @@ internal sealed class VulkanWeights : IDisposable
     /// (<see cref="ConvertQ5_0BlocksToQ5_1"/>) and copies it into
     /// <paramref name="bank"/> at <paramref name="dstOffset"/>.
     /// </summary>
-    private static unsafe void UploadQ5_0SlotAsQ5_1(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadQ5_0SlotAsQ5_1(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long blockCount, VulkanDevice.Buffer bank, long dstOffset)
     {
-        long bytes = blockCount * 24; // Q5_1 block size
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadQ5_0SlotAsQ5_1");
-        try
+        long blocksPerChunk = Math.Max(1, staging.Capacity / 24); // Q5_1 block size
+        for (long b0 = 0; b0 < blockCount; b0 += blocksPerChunk)
         {
-            ConvertQ5_0BlocksToQ5_1(srcPtr, mapped, blockCount);
+            long n = Math.Min(blocksPerChunk, blockCount - b0);
+            ConvertQ5_0BlocksToQ5_1(srcPtr + (nint)(b0 * 22), staging.Mapped, n);
+            staging.Flush(bank, dstOffset + b0 * 24, n * 24);
         }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
     }
 
     /// <summary>
@@ -2006,69 +1959,40 @@ internal sealed class VulkanWeights : IDisposable
     /// block scales (<see cref="CopyQ8_0BlocksScaled"/>) and copies it into
     /// <paramref name="bank"/> at <paramref name="dstOffset"/>.
     /// </summary>
-    private static unsafe void UploadQ8_0SlotScaled(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadQ8_0SlotScaled(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long blockCount, float scale, VulkanDevice.Buffer bank, long dstOffset)
     {
-        long bytes = blockCount * 34; // Q8_0 block size
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadQ8_0SlotScaled");
-        try
+        long blocksPerChunk = Math.Max(1, staging.Capacity / 34); // Q8_0 block size
+        for (long b0 = 0; b0 < blockCount; b0 += blocksPerChunk)
         {
-            CopyQ8_0BlocksScaled(srcPtr, mapped, blockCount, scale);
+            long n = Math.Min(blocksPerChunk, blockCount - b0);
+            CopyQ8_0BlocksScaled(srcPtr + (nint)(b0 * 34), staging.Mapped, n, scale);
+            staging.Flush(bank, dstOffset + b0 * 34, n * 34);
         }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
     }
 
     /// <summary>
     /// Uploads one per-expert F32 matrix from an unmanaged source pointer
     /// into a slot of a packed bank buffer at <paramref name="dstOffset"/>.
     /// </summary>
-    private static unsafe void UploadExpertBankSlot(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static void UploadExpertBankSlot(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
-    {
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadExpertBankSlot");
-        try
-        {
-            int elems = checked((int)(bytes / sizeof(float)));
-            new ReadOnlySpan<float>((void*)srcPtr, elems)
-                .CopyTo(new Span<float>((void*)mapped, elems));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferRangeSynchronous(staging, bank, srcOffset: 0, dstOffset: (ulong)dstOffset, size: (ulong)bytes);
-    }
+        => staging.UploadBytes(srcPtr, bytes, bank, dstOffset);
 
     /// <summary>
     /// Uploads a contiguous F32 row-major matrix from an unmanaged pointer to
     /// a device-local buffer via the supplied staging buffer. Used by the MLA
     /// path where every projection is F32 (no quant path on MLA today).
     /// </summary>
-    private static unsafe VulkanDevice.Buffer UploadFp32Matrix(
-        VulkanDevice device, VulkanDevice.Buffer staging,
+    private static VulkanDevice.Buffer UploadFp32Matrix(
+        VulkanDevice device, VulkanStagingBuffer staging,
         nint srcPtr, int outputDim, int inputDim, out long uploadedBytes)
     {
-        long elems = (long)outputDim * inputDim;
-        long bytes = elems * sizeof(float);
+        long bytes = (long)outputDim * inputDim * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-
-        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadFp32Matrix staging");
-        try
-        {
-            new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))
-                .CopyTo(new Span<float>((void*)mapped, checked((int)elems)));
-        }
-        finally
-        {
-            VulkanApi.vkUnmapMemory(device.Handle, staging.Memory);
-        }
-        device.CopyBufferSynchronous(staging, buf, (ulong)bytes);
+        staging.UploadBytes(srcPtr, bytes, buf);
         uploadedBytes = bytes;
         return buf;
     }
