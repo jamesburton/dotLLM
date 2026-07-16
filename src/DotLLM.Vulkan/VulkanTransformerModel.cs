@@ -152,6 +152,7 @@ public sealed class VulkanTransformerModel : IModel
     // or when the model's hidden size exceeds the shader's on-chip cap;
     // router falls back to the standalone (rmsnorm + matmul_q8_0) pair.
     private readonly RmsNormMatmulQ8_0FusedKernel? _rmsnormMatmulQ8Fused;
+    private readonly RmsNormQuantizeQ8_1FusedKernel? _rmsnormQuantQ8Fused;
     // dp4a MMVQ decode path (issue #46) — both null when the device lacks
     // integer-dot-product support, the SPVs are missing, or the env-var
     // opt-out is set; RecordMatmul then falls back to the F32-in Q8_0 GEMV.
@@ -389,10 +390,25 @@ public sealed class VulkanTransformerModel : IModel
     {
         "start", "embed", "qkv_proj", "rope", "kv_update", "attention",
         "o_proj", "norm_resid", "ffn_gate_up", "ffn_act", "ffn_down", "lm_head",
+        "attn_split",
     };
     private const byte DpCatStart = 0, DpCatEmbed = 1, DpCatQkv = 2, DpCatRope = 3,
         DpCatKv = 4, DpCatAttn = 5, DpCatO = 6, DpCatResid = 7, DpCatGateUp = 8,
-        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11;
+        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12;
+
+    // Cached delegate for the split-KV kernel's inter-pass profiler hook — when
+    // the GPU decode profiler is active this splits the "attention" category
+    // into split-pass ("attn_split") and merge-pass (remaining "attention")
+    // time. Allocated once; passed as null when profiling is off.
+    private Action<nint>? _dpAttnSplitStampCached;
+    private Action<nint>? DpAttnSplitStamp
+    {
+        get
+        {
+            if (!_dpActive || !DecodeProfileGpuEnabled || _dpQueryPool == 0) return null;
+            return _dpAttnSplitStampCached ??= cb => DpStamp(cb, DpCatAttnSplit);
+        }
+    }
 
     /// <summary>
     /// Records the per-forward timestamp-pool reset + the "start" stamp. Call
@@ -832,6 +848,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulF16GemmCoopmatKernel? matmulF16GemmCoopmat,
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
+        RmsNormQuantizeQ8_1FusedKernel? rmsnormQuantQ8Fused,
         QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
         MatMulQ4KMmvqKernel? matmulQ4KMmvq,
         MatMulQ6KMmvqKernel? matmulQ6KMmvq,
@@ -930,6 +947,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16 = matmulBf16;
         _matmulBf16Gemm = matmulBf16Gemm;
         _rmsnormMatmulQ8Fused = rmsnormMatmulQ8Fused;
+        _rmsnormQuantQ8Fused = rmsnormQuantQ8Fused;
         _quantizeQ8_1 = quantizeQ8_1;
         _matmulQ8Mmvq = matmulQ8Mmvq;
         _matmulQ4KMmvq = matmulQ4KMmvq;
@@ -1410,6 +1428,21 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused =
             RmsNormMatmulQ8_0FusedKernel.TryCreate(device, spvDir);
 
+        // Fused rmsnorm + Q8_1 activation quantize for the decode MMVQ shared
+        // groups (issue #145): removes one dispatch + one barrier per group
+        // (2/layer). Only useful when the Q8_0 shared-group MMVQ path is live;
+        // requires subgroup arithmetic so its reduction is bit-identical to the
+        // standalone rmsnorm_f32_sg the fallback path uses (honour the same
+        // force-shared-reduce test hook). Opt-out:
+        // DOTLLM_VULKAN_DISABLE_FUSED_RMSNORM_QUANT=1.
+        RmsNormQuantizeQ8_1FusedKernel? rmsnormQuantQ8Fused = null;
+        if (quantizeQ8_1 is not null && matmulQ8Mmvq is not null
+            && !RmsNormF32Kernel.IsForceSharedReduce()
+            && Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_FUSED_RMSNORM_QUANT") != "1")
+        {
+            rmsnormQuantQ8Fused = RmsNormQuantizeQ8_1FusedKernel.TryCreate(device, spvDir);
+        }
+
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
@@ -1553,6 +1586,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
             rmsnormMatmulQ8Fused,
+            rmsnormQuantQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
             matmulQ4KMmvq,
             matmulQ6KMmvq,
@@ -1715,7 +1749,8 @@ public sealed class VulkanTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
                 softCap: softCap, scaleOverride: scaleOverride,
-                maskMode: maskMode, prefixLen: prefixLen);
+                maskMode: maskMode, prefixLen: prefixLen,
+                interPassStamp: DpAttnSplitStamp);
             return;
         }
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
@@ -2834,18 +2869,17 @@ public sealed class VulkanTransformerModel : IModel
             }
             else
             {
-                _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
-                    rowCount: seqLen, n: hiddenSize, eps: eps);
-                BarrierComputeToCompute(cmdBuf);
-
                 // Q/K/V all read the post-attn-norm hidden state. On the MMVQ
                 // decode path this shares one Q8_1 activation-quant across the
-                // three GEMVs (issue #46 follow-up). Non-qualifying groups fall
-                // back to per-projection RecordMatmul with the same barriers.
+                // three GEMVs (issue #46 follow-up), and the attn rmsnorm is
+                // fused with that quantize when the group qualifies (issue
+                // #145). Non-qualifying groups fall back to standalone rmsnorm
+                // + per-projection RecordMatmul with the same barriers.
                 _mmvqGroupScratch[0] = new(lw.Q, lw.QDeviceQuantType, _state.Q, lw.QOutputDim);
                 _mmvqGroupScratch[1] = new(lw.K, lw.KDeviceQuantType, _state.K, lw.KOutputDim);
                 _mmvqGroupScratch[2] = new(lw.V, lw.VDeviceQuantType, _state.V, lw.VOutputDim);
-                RecordSharedInputMmvqGroup(cmdBuf, _state.NormOutput, lw.QInputDim, seqLen,
+                RecordNormedSharedInputMmvqGroup(cmdBuf, _state.HiddenState, lw.AttnNormWeight,
+                    _state.NormOutput, lw.QInputDim, seqLen, eps,
                     _mmvqGroupScratch.AsSpan(0, 3));
             }
 
@@ -3047,17 +3081,16 @@ public sealed class VulkanTransformerModel : IModel
             }
             else
             {
-                _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
-                    rowCount: seqLen, n: hiddenSize, eps: eps);
-                BarrierComputeToCompute(cmdBuf);
-
                 // Gate/Up both read the post-ffn-norm hidden state. On the MMVQ
                 // decode path this shares one Q8_1 activation-quant across the two
-                // GEMVs. Non-qualifying groups fall back to per-projection
-                // RecordMatmul with the same barriers.
+                // GEMVs, and the ffn rmsnorm is fused with that quantize when the
+                // group qualifies (issue #145). Non-qualifying groups fall back to
+                // standalone rmsnorm + per-projection RecordMatmul with the same
+                // barriers.
                 _mmvqGroupScratch[0] = new(lw.Gate, lw.GateDeviceQuantType, _state.FfnGate, lw.GateOutputDim);
                 _mmvqGroupScratch[1] = new(lw.Up, lw.UpDeviceQuantType, _state.FfnUp, lw.UpOutputDim);
-                RecordSharedInputMmvqGroup(cmdBuf, _state.NormOutput, lw.GateInputDim, seqLen,
+                RecordNormedSharedInputMmvqGroup(cmdBuf, _state.HiddenState, lw.FfnNormWeight,
+                    _state.NormOutput, lw.GateInputDim, seqLen, eps,
                     _mmvqGroupScratch.AsSpan(0, 2));
             }
 
@@ -3462,6 +3495,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulBf16.InvalidateDescriptorCache();
         _matmulBf16Gemm.InvalidateDescriptorCache();
         _rmsnormMatmulQ8Fused?.InvalidateDescriptorCache();
+        _rmsnormQuantQ8Fused?.InvalidateDescriptorCache();
         _quantizeQ8_1?.InvalidateDescriptorCache();
         _matmulQ8Mmvq?.InvalidateDescriptorCache();
         _matmulQ4KMmvq?.InvalidateDescriptorCache();
@@ -4999,6 +5033,45 @@ public sealed class VulkanTransformerModel : IModel
     /// to recording them individually.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// Records an RMSNorm followed by a shared-input projection group, fusing the
+    /// norm with the group's Q8_1 activation quantize into ONE dispatch when the
+    /// decode MMVQ shared path qualifies (issue #145): fused rmsnorm+quantize →
+    /// barrier → GEMVs, instead of rmsnorm → barrier → quantize → barrier → GEMVs
+    /// (saves one dispatch + one full-pipeline barrier per group, 2 per dense
+    /// layer). The fused shader still writes the normalized F32 row into
+    /// <paramref name="normOut"/> so downstream consumers (LoRA deltas) are
+    /// unaffected. Non-qualifying shapes fall back to the standalone rmsnorm +
+    /// <see cref="RecordSharedInputMmvqGroup"/> pair — bit-identical output either
+    /// way (the fused shader replicates the standalone reduction + quantization).
+    /// </summary>
+    private void RecordNormedSharedInputMmvqGroup(
+        nint cmdBuf, VulkanDevice.Buffer input, VulkanDevice.Buffer normWeight,
+        VulkanDevice.Buffer normOut, int inputDim, int seqLen, float eps,
+        ReadOnlySpan<MmvqGroupProjection> projections)
+    {
+        if (_rmsnormQuantQ8Fused is not null && CanShareMmvqQuant(inputDim, seqLen, projections))
+        {
+            _rmsnormQuantQ8Fused.Record(cmdBuf, input, normWeight, normOut,
+                _state.Q8_1Xq!, _state.Q8_1Xds!, inputDim, eps);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            foreach (var p in projections)
+            {
+                // No inter-GEMV barrier — same reasoning as the unfused shared
+                // group: the GEMVs only read the shared scratch and write
+                // disjoint outputs.
+                _matmulQ8Mmvq!.Record(cmdBuf, p.Weights, _state.Q8_1Xq!, _state.Q8_1Xds!, p.Output,
+                    m: p.OutputDim, k: inputDim);
+            }
+            return;
+        }
+
+        _rmsnorm.Record(cmdBuf, input, normWeight, normOut,
+            rowCount: seqLen, n: inputDim, eps: eps);
+        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        RecordSharedInputMmvqGroup(cmdBuf, normOut, inputDim, seqLen, projections);
+    }
+
     private void RecordSharedInputMmvqGroup(
         nint cmdBuf, VulkanDevice.Buffer input, int inputDim, int seqLen,
         ReadOnlySpan<MmvqGroupProjection> projections)
@@ -5929,6 +6002,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
+        _rmsnormQuantQ8Fused?.Dispose();
         _matmulBf16Gemm.Dispose();
         _matmulBf16.Dispose();
         _matmulF16GemmCoopmat?.Dispose();
