@@ -96,6 +96,26 @@ public sealed class BpeTokenizer : ITokenizer
     }
 
     /// <summary>
+    /// Creates a Gemma-4 SPM-style merge-ranked BPE tokenizer
+    /// (GGUF <c>tokenizer.ggml.model = "gemma4"</c>).
+    /// Spaces are escaped to <c>▁</c> before merge-ranked BPE runs over raw UTF-8 text;
+    /// pre-tokenization only splits newline runs (llama.cpp <c>LLAMA_VOCAB_PRE_TYPE_GEMMA4</c>).
+    /// </summary>
+    /// <param name="tokens">Vocabulary strings indexed by token ID.</param>
+    /// <param name="merges">Merge table entries in "A B" format; index = rank (lower = applied first).</param>
+    /// <param name="tokenTypes">Per-token type flags. Null = all normal.</param>
+    /// <param name="bosId">Beginning-of-sequence token ID.</param>
+    /// <param name="eosId">End-of-sequence token ID.</param>
+    public static BpeTokenizer CreateGemma4(
+        string[] tokens, string[] merges, int[]? tokenTypes, int bosId, int eosId)
+    {
+        var specialTokens = BuildSpecialTokenTable(tokens, tokenTypes);
+        return new BpeTokenizer(
+            new Gemma4SpmBpeEncoding(tokens, merges, tokenTypes),
+            specialTokens, bosId, eosId, tokens.Length);
+    }
+
+    /// <summary>
     /// Creates a tiktoken BPE tokenizer with an explicit, pre-compiled
     /// pre-tokenization regex. Used by the HuggingFace <c>tokenizer.json</c>
     /// adapter when the model declares a <c>Split</c> regex that is not
