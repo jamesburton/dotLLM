@@ -184,6 +184,26 @@ public sealed class VulkanDevice : IDisposable
     internal nint CommandPool => _commandPool;
     internal nint PhysicalDevice => _physicalDevice;
 
+    /// <summary>
+    /// Nanoseconds per timestamp tick (<c>VkPhysicalDeviceLimits.timestampPeriod</c>).
+    /// Read lazily for the env-gated decode profiler (issue #143). Returns 0 when
+    /// the reported value is implausible (&lt;=0 or &gt;10µs) — callers should then
+    /// skip GPU timestamping.
+    /// </summary>
+    internal unsafe float TimestampPeriodNs
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            // The C# struct's byte tail starts at offset 292 (after the UUID),
+            // but VkPhysicalDeviceLimits is 8-byte aligned in the C layout, so
+            // it begins at 296 = tail+4. timestampPeriod is the float at limits
+            // offset 424 (right after timestampComputeAndGraphics) → tail+428.
+            float p = *(float*)(props.tail + 428);
+            return p >= 0.01f && p < 10_000f ? p : 0f;
+        }
+    }
+
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
         nint commandPool, string name, uint vendor, int type, uint queueFamily,
@@ -1355,6 +1375,18 @@ public sealed class VulkanDevice : IDisposable
     public Buffer Allocate(long bytes) => AllocateInternal(bytes, deviceLocal: false);
 
     /// <summary>
+    /// Allocates a host-visible storage buffer optimised for per-token CPU
+    /// readback (e.g. the logits buffer): prefers a memory type that is also
+    /// <c>HOST_CACHED</c> so host reads go through the CPU cache hierarchy.
+    /// The default host-visible type on AMD/Windows is write-combined
+    /// (uncached) — CPU reads from it run at &lt;1 GB/s, which cost ~0.4 ms
+    /// per decoded token on a 49k-vocab logits row (issue #143). Falls back
+    /// to the plain host-visible type when no cached type exists.
+    /// </summary>
+    public Buffer AllocateHostReadback(long bytes)
+        => AllocateInternal(bytes, deviceLocal: false, preferHostCached: true);
+
+    /// <summary>
     /// Allocates a storage buffer of <paramref name="bytes"/> bytes backed by
     /// device-local memory. The buffer is <b>not</b> host-mappable; use this
     /// for immutable weights and the KV cache, populating the contents via
@@ -1419,7 +1451,7 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
 
-    private Buffer AllocateInternal(long bytes, bool deviceLocal)
+    private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
@@ -1457,6 +1489,14 @@ public sealed class VulkanDevice : IDisposable
             {
                 typeIndex = FindMemoryType(req.memoryTypeBits, VkMemoryPropertyFlags.DeviceLocal);
             }
+        }
+        else if (preferHostCached
+            && TryFindMemoryType(req.memoryTypeBits,
+                required: required | VkMemoryPropertyFlags.HostCached,
+                excluded: default,
+                out typeIndex))
+        {
+            // Cached host-visible type found — CPU readback at full speed.
         }
         else
         {
@@ -2040,6 +2080,7 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public void Begin()
         {
+            _splitThisForward = false;
             VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer");
             var begin = new VkCommandBufferBeginInfo
             {
@@ -2071,6 +2112,67 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
                 .ThrowOnError("vkWaitForFences SubmitContext");
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        // Lazily-allocated second command buffer for SplitSubmit. At most ONE
+        // split per Begin/SubmitAndWait cycle: with two buffers, a second split
+        // would reset a buffer submitted earlier in the SAME forward (no fence
+        // yet) — guarded below.
+        private nint _cmdBufAlt;
+        private bool _splitThisForward;
+
+        /// <summary>
+        /// Mid-forward split: ends and submits everything recorded so far
+        /// WITHOUT a fence or host wait, then re-opens recording on a second
+        /// command buffer. The GPU starts executing the first chunk while the
+        /// host keeps recording — llama.cpp's chunked-submit overlap (issue
+        /// #143: hides most of the ~0.2-0.3 ms/token host recording cost on
+        /// small models). Queue-timeline pipeline barriers already recorded
+        /// (and recorded later) synchronize across the submit boundary, so the
+        /// dependency chain is unchanged — results are bit-identical.
+        /// At most one split per forward; the final <see cref="SubmitAndWait"/>
+        /// fence covers both submissions (same-queue ordering), so both
+        /// buffers are idle by the next <see cref="Begin"/>.
+        /// </summary>
+        public unsafe void SplitSubmit()
+        {
+            if (_splitThisForward)
+                throw new InvalidOperationException(
+                    "SplitSubmit may be called at most once per forward (two-buffer ring).");
+            _splitThisForward = true;
+
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SplitSubmit");
+            nint cmdBufLocal = _cmdBuf;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
+                .ThrowOnError("vkQueueSubmit SplitSubmit");
+
+            if (_cmdBufAlt == 0)
+            {
+                var cbai = new VkCommandBufferAllocateInfo
+                {
+                    sType = VkStructureType.CommandBufferAllocateInfo,
+                    commandPool = _device._commandPool,
+                    level = VkCommandBufferLevel.Primary,
+                    commandBufferCount = 1,
+                };
+                VulkanApi.vkAllocateCommandBuffers(_device._device, cbai, out _cmdBufAlt)
+                    .ThrowOnError("vkAllocateCommandBuffers SplitSubmit");
+            }
+
+            (_cmdBuf, _cmdBufAlt) = (_cmdBufAlt, _cmdBuf);
+            VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer SplitSubmit");
+            var begin = new VkCommandBufferBeginInfo
+            {
+                sType = VkStructureType.CommandBufferBeginInfo,
+                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+            };
+            VulkanApi.vkBeginCommandBuffer(_cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SplitSubmit");
         }
 
         /// <summary>
@@ -2184,6 +2286,12 @@ public sealed class VulkanDevice : IDisposable
                 nint local = _cmdBuf;
                 VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
                 _cmdBuf = 0;
+            }
+            if (_cmdBufAlt != 0)
+            {
+                nint local = _cmdBufAlt;
+                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
+                _cmdBufAlt = 0;
             }
         }
     }
