@@ -1,0 +1,108 @@
+# Issue #147 — Vulkan load-path host-allocation elimination (ledger)
+
+Machine: Strix Halo (gfx1151, UMA, **32 GiB** RAM), Windows, AMD proprietary driver.
+Harness: `profile-vulkan-load` (commit `10c5715b`) — one load per process; peak commit =
+`Process.PeakPagedMemorySize64`. GPU runs under `scripts/gpu-lock.sh` as `agent-147-loadpath`.
+
+## Before / after (dev baseline `c443891f` vs this branch)
+
+| Model | Load ms (warm) before → after | Peak commit MiB before → after | Logits SHA-256 (first forward) |
+|---|---|---|---|
+| Llama-3.2-3B IQ4_XS (Q6_K embed) | 1657 → **1096** | 4861 → **3445** (−1.4 GiB) | `0230545FB73C85AA` = identical |
+| Llama-3.1-8B Q4_K_M (Q4_K embed) | 2969 → **2285** | 8821 → **6900** (−1.9 GiB) | `37997DF35ABEDF05` = identical |
+| gemma-4-26B-A4B Q4_K_M (Q6_K embed) | 59.7 s cold / 119.9 s pressured → **43.5–46.9 s** | 24484 → **21773** (−2.7 GiB) | `98946D9E0CEB4F70` = identical |
+
+Notes on the numbers:
+- 26B wall time is noise-dominated on this 32 GiB box (16 GiB model + ~21 GiB commit ⇒ chronic
+  paging; baseline itself swung 59.7→119.9 s run-to-run). Peak commit is the stable metric.
+- Peak-commit deltas ≈ the old staging allocation (vocab×hidden×4: 1.5 / 2.0 / 2.75 GiB).
+- Staging-cap sweep on the 8B (warm, `DOTLLM_VULKAN_STAGING_MB` = 32/64/128/256):
+  load 2283 / 2334 / 2695 / 3514 ms, peak commit 6871 / 6901 / 6965 / 7071 MiB — 32 and 64 are
+  equivalent within noise, larger caps mildly WORSE on both metrics (bigger resident map, longer
+  per-chunk fence waits). 64 MiB kept as the default (headroom for wide rows / expert slabs).
+
+## Stress gate (the #146 trigger)
+
+`DOTLLM_VULKAN_STRESS_LOAD_CYCLES=20` × 2 runs with the 3B IQ4_XS, under a detached 8 GiB
+touched-commit hog on the 32 GiB box: **40/40 cycles green, zero `[vulkan-mem]` transient
+retries** (baseline flaked ~2/15 with retry-rescue). The #146 retry stays as a safety net.
+
+## What was eliminated
+
+1. **Giant staging buffer + per-upload remap** (commit `be991b41`): staging is now a single
+   `VulkanStagingBuffer` capped at `DOTLLM_VULKAN_STAGING_MB` (default 64 MiB), persistently
+   mapped once; large tensors stream in chunks; a dedicated 256 KiB vec-staging buffer carries
+   norm/bias/scale vectors. Converted: `VulkanWeights` (dense/MLA/MoE/Gemma4),
+   `VulkanNemotronHWeights`, `VulkanQwen3MoeHybridWeights`, `VulkanMamba3Weights`,
+   `VulkanQwen3MoeMoeUpload` (its whole-bank staging write — ~8 GiB at qwen35moe-A3B fp32
+   scale — became per-expert / contiguous streaming).
+2. **CPU F32 dequant of the token-embed table** (commit `f5e8ddb7`): Q4_K/Q6_K embeds (all
+   three gate models) now upload raw quantized bytes and dequant ON DEVICE via new
+   `q4_k/q6_k_dequant_f32` shaders — bit-identical to the CPU oracle (`precise` math, same op
+   order; 0-ULP kernel tests incl. >32768-block chunked dispatch; discriminating end-to-end
+   table comparison vs `DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1`).
+3. **Per-expert slot copies for contiguous raw-quant MoE banks** (commit for item 3): whole-bank
+   zero-copy import attempt, falling back to ONE streamed copy.
+
+## Zero-copy import audit (item 3)
+
+**Driver regression found:** on this box's CURRENT AMD driver, EVERY mmap import fails at
+`vkAllocateMemory` with `VK_ERROR_INVALID_EXTERNAL_HANDLE` (−1000072003) for BOTH handle types
+(`HOST_MAPPED_FOREIGN_MEMORY` and `HOST_ALLOCATION`) — `HostVisibleBuffer`'s docs (and
+`docs/GPU.md`) record that HOST_MAPPED_FOREIGN previously worked here. All import paths
+therefore fall back to bounded staging today; the import code (incl. the new bank/embed
+imports) is exercised in fallback mode only on this box. Re-validate after a driver update or
+on Linux radv.
+
+Per-tensor-class audit (UMA, assuming the import works):
+
+| Tensor class | Import status | Reason |
+|---|---|---|
+| Raw-quant dense matrices | implemented (pre-existing) | contiguous mmap range |
+| Token-embed quantized source (Q4_K/Q6_K) | **implemented (#147)** | contiguous; feeds device dequant |
+| Routed MoE raw-quant banks (Q8_0/F16 kept-native) | **implemented (#147)** | GGUF fused-expert tensor is expert-contiguous with the bank's exact stride |
+| Qwen3-MoE Q6_K resident banks (`VulkanQwen3MoeMoeUpload`) | follow-up | same contiguity argument; per-forward streamed path, wants separate validation |
+| Gemma-4 fused gate_up banks (Q4_K) | not importable | gate/up rows interleave per expert — packed W1/W3 layout ≠ source; would need stride-aware indexed-matmul shaders |
+| Gemma-4 down banks (Q5_0→Q5_1 repack, Q8_0 scale-fold) | not importable | bytes transformed en route (Q5_1-verbatim sub-case is importable but rare in the wild; follow-up) |
+| F32-dequant fallback matrices | not importable | transformed host-side |
+| Norm/bias/scale vectors | not importable, justified | managed `float[]` (GC-movable), KB-scale |
+| MLA F32 projections | unsafe today | loader-owned upcast buffers with early-free semantics (`TryReleaseOwnedHostAllocation`); import would require lifetime changes |
+| LoRA adapter tensors | justified as-is | per-tensor one-shot staging, MB-scale, one-time per adapter |
+
+Safety notes for import-in-place: alignment handled by `HostVisibleBuffer` (page-round +
+bindOffset); lifetime contract = the `GgufFile` mmap must outlive the model (already the
+documented contract for dense weights); page-cache: imported pages are the OS file cache —
+first-touch faults stream from disk during the first forward instead of at load.
+
+## Host-materialisation ledger (item 4 sweep)
+
+| Site | Size | Verdict |
+|---|---|---|
+| Weight staging buffer (was vocab×hidden×4) | 1.5–2.9 GiB → ≤64 MiB + 256 KiB | **fixed** (item 1) |
+| Token-embed CPU F32 dequant (Q4_K/Q6_K) | vocab×hidden×4 through staging | **fixed** (item 2, GPU dequant) |
+| Token-embed CPU dequant, other types (Q8_0/F16/F32; NemotronH/Qwen3-hybrid/Mamba3 embeds) | streamed, host-bounded | follow-up: reuse `UploadTokenEmbedding` + add q8_0/f16 dequant shaders; tables ≤8× smaller than the K-quant gate models' |
+| `VulkanQwen3MoeMoeUpload` whole-bank staging write | ~8 GiB at A3B fp32 scale | **fixed** (item 1) |
+| DeepSeek-MoE loader F32 host dequant of all experts (`TransformerWeights.LoadFromGguf` without `skipF32MoeDequant`) | ~2.2 GiB/layer (V2-Lite Q4_K_M) | follow-up: `VulkanTransformerModel.LoadFromGguf` does NOT pass `skipF32MoeDequant: true` (CUDA does). Passing it needs an audit that every Vulkan MoE fallback consumes raw views — multi-GiB win for DeepSeek-family Vulkan loads |
+| MLA loader F32 upcasts (F16/BF16→F32, loader-owned) | per-projection | justified today (CPU MLA oracle is F32-only); revisit with native F16 MLA kernels |
+| Gemma-4 F32 expert-dequant fallback (`UploadGemma4MoeLayer`) | streamed, host-bounded | justified — synthetic-fixture/correctness path; quantized path is the production default |
+| I2_S force-dequant full-size one-off staging (`UploadMatrix`) | tensor-sized, rare | justified — single trailing per-tensor scale prevents block-aligned chunking (BitNet lm_head force-dequant only) |
+| Norm/bias `float[]` in loader | KB-scale | justified |
+| Q5_0→Q5_1 / Q8_0-scale-fold repacks (Gemma-4 down) | streamed through bounded staging | justified — bit-exact transform must happen somewhere; now chunked |
+
+## Pre-existing baseline failure (NOT from this branch)
+
+`VulkanPipelineParityTests.PipelinedForwardBatch_MatchesPerSequenceForward` fails on the dev
+baseline (`c443891f`, verified by stashing all #147 changes and rebuilding):
+`[single-device] seq 1 col 0: serial=0.045437 vs batched=0.004787` (seq 0 matches 0.000E+000).
+Batched-decode cross-talk shape, unrelated to the load path. Vulkan unit suite otherwise:
+868 passed / 41 skipped with #147 item 1 applied; MoE subset re-run after item 3: 98 passed.
+
+## KERNEL_MAP.md updates to fold in (worktree cannot edit the main repo's `.docs/`)
+
+- §1 embedding: token-embed table is now GPU-dequanted at load for Q4_K/Q6_K (bit-exact,
+  `q4_k/q6_k_dequant_f32.comp`); host F32 image eliminated; gather unchanged.
+- Env-var section: add `DOTLLM_VULKAN_STAGING_MB`, `DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT`.
+- §12 / load notes: staging bounded + persistently mapped (#147); #146 retry is now a safety
+  net; "Recurring transient VK_ERROR_MEMORY_MAP_FAILED at load" note can be retired.
+- Zero-copy import: current driver rejects ALL mmap imports (`VK_ERROR_INVALID_EXTERNAL_HANDLE`
+  at vkAllocateMemory, both handle types) — regression vs the documented earlier behaviour.
