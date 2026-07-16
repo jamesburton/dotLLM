@@ -424,9 +424,7 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {
         int byteLen = source.Length * sizeof(float);
-        Interop.VulkanApi.vkMapMemory(
-                _device.Handle, staging.Memory, 0, (ulong)byteLen, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory IngestFromHost staging");
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)byteLen, "vkMapMemory IngestFromHost staging");
         try
         {
             fixed (float* src = source)

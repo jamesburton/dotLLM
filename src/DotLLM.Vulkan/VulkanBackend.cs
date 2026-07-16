@@ -177,8 +177,7 @@ public sealed class VulkanBackend : IBackend
     /// </summary>
     private unsafe void MapAndCopyIn(VulkanDevice.Buffer staging, nint hostPtr, long bytes)
     {
-        VulkanApi.vkMapMemory(_device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanBackend H2D staging");
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanBackend H2D staging");
         try
         {
             System.Buffer.MemoryCopy((void*)hostPtr, (void*)mapped, bytes, bytes);
@@ -195,8 +194,7 @@ public sealed class VulkanBackend : IBackend
     /// </summary>
     private unsafe void MapAndCopyOut(VulkanDevice.Buffer staging, nint hostPtr, long bytes)
     {
-        VulkanApi.vkMapMemory(_device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanBackend D2H staging");
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanBackend D2H staging");
         try
         {
             System.Buffer.MemoryCopy((void*)mapped, (void*)hostPtr, bytes, bytes);

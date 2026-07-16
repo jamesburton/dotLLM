@@ -477,8 +477,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer dst)
     {
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanMamba3Weights raw");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanMamba3Weights raw");
         try
         {
             new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -538,8 +537,7 @@ internal sealed class VulkanMamba3Weights : IDisposable
         long bytes = expectedElements * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanMamba3Weights.UploadTensor staging");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanMamba3Weights.UploadTensor staging");
         try
         {
             new ReadOnlySpan<float>((void*)handle.Pointer, checked((int)expectedElements))
