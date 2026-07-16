@@ -24,3 +24,7 @@ date,host,device,backend,runtime,runtime_version,model,quant,pp_tok_s,tg_tok_s,t
 2026-06,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,dev-2026-06,Llama-3.2-3B-Instruct,IQ4_XS,,53,2048,"split-KV #345","ctx-2048 decode; 45 @ ctx4096"
 2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,issue139-e058f785,Llama-3.2-3B-Instruct,IQ4_XS,1581,56.7,400,"register-tiled MMQ 64x64 + flash-attn rework (#139)","prefill 231->1581 (6.8x); decode unchanged; min of 3 same-session"
 2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,issue139-e058f785,Meta-Llama-3.1-8B-Instruct,Q4_K_M,605,24.1,400,"register-tiled MMQ 64x64 + flash-attn rework (#139)","prefill 96->605 (6.3x); decode_min 38.2ms unchanged"
+2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,llama.cpp,b9672,SmolLM-135M,Q8_0,42841,625.1,512,"-ngl 99 -fa 1 tg@d512 same-session","#143 comparator run"
+2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,dev-bae21b39,SmolLM-135M,Q8_0,12153,546,512,"bench --device vulkan -p 512 -n 128 -r 3 (#143)","decode 231->545 (2.35x): HOST_CACHED readback + split-KV floor fix + chunked-submit overlap; 0.87x llama.cpp"
+2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,dev-bae21b39,Llama-3.2-3B-Instruct,IQ4_XS,1581,74.2,347-sweep,"split-KV MinKvPerSplit 256->16 (#143)","decode 68.5->74.2 at #347 sweep protocol; regime bug fix"
+2026-07-16,strix-halo,Radeon-8060S-gfx1151,vulkan,dotLLM,dev-bae21b39,Meta-Llama-3.1-8B-Instruct,Q4_K_M,605,28.4,347-sweep,"split-KV MinKvPerSplit 256->16 (#143)","decode 27.5->28.4 at #347 sweep protocol"
