@@ -14,6 +14,10 @@ if (args.Length > 0 && args[0] == "profile-vulkan-host-import")
 {
     return VulkanHostImportProfile.Run(args[1..]);
 }
+if (args.Length > 0 && args[0] == "profile-vulkan-load")
+{
+    return VulkanLoadProfile.Run(args[1..]);
+}
 if (args.Length > 0 && args[0] == "span-vulkan")
 {
     return VulkanPipelineSpanProfile.Run(args[1..]);

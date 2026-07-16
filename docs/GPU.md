@@ -494,7 +494,8 @@ On the Strix Halo amdvlk path, the framework still loads correctly (staging fall
 ### Scope and anti-goals
 
 - **Scope**: raw quant-block weight uploads in `VulkanWeights.UploadMatrix` (Q8_0 / Q4_K / Q5_K / Q6_K / F16 / BF16). When the contraction axis is aligned to the format's group size and the matrix is kept on device verbatim, the upload is a candidate for zero-copy import.
-- **Out of scope**: F32-dequant uploads (norm vectors, token embeddings, FP32 weights) cannot be zero-copy imported because the bytes have to be transformed host-side before the GPU sees them. Same for MoE expert banks where weights are packed into a single contiguous device buffer — there is no host-side equivalent of the packed layout. KV-cache and forward-pass scratch buffers are device-local (written by kernels, no host alias).
+- **Also in scope (#147)**: raw-quant routed-MoE banks (the GGUF fused-expert tensor is expert-contiguous with exactly the packed bank's per-expert stride, so the whole bank imports as one range — `VulkanWeights.UploadRoutedBankWhole`), and the QUANTIZED token-embed source feeding the GPU-side dequant (see below).
+- **Out of scope**: F32-dequant uploads (norm vectors, FP32 weights) cannot be zero-copy imported because the bytes have to be transformed host-side before the GPU sees them. Same for Gemma-4 fused `gate_up` banks (gate/up rows interleave per expert — the packed W1/W3 layout differs from the source) and the repacked/scale-folded Gemma-4 down banks. KV-cache and forward-pass scratch buffers are device-local (written by kernels, no host alias).
 - **Not changed**: the CPU GGUF loading path. The original read-only `MemoryMappedFile` is the source of truth; the Vulkan import path reads the same pages without modifying mmap semantics.
 
 ### Microbench
@@ -505,17 +506,43 @@ dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-h
 
 Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace.
 
-## Vulkan Memory-Pressure Retry (transient map/alloc failures)
+```
+dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-load --gguf path/to/model.gguf [--no-forward]
+```
 
-On Windows/WDDM a `vkMapMemory` must make the **entire** allocation host-resident (residency is
-allocation-granular, not range-granular). The weight-upload path allocates a transient host-visible
-staging buffer sized for the largest single upload — the token-embed F32 dequant dominates at
-`vocab × hidden × 4` bytes (≈1.6 GB for Llama-3.2-3B, ≈2.1 GB for Llama-3.1-8B) — and re-maps it for
-every staged upload (norm vectors, biases, dequant matrices). Under system memory pressure (heavy
-back-to-back runs where the previous process's allocations are not yet reclaimed) the allocation or a
-re-map of this GB-scale buffer fails transiently: `VK_ERROR_MEMORY_MAP_FAILED` at `vkMapMemory` or
-`VK_ERROR_OUT_OF_DEVICE_MEMORY` at `vkAllocateMemory`, even though the same call succeeds moments
-later (issue #146: ~2/15 heavy back-to-back loads on Strix Halo).
+Load-path profiler (#147): one end-to-end `VulkanTransformerModel.LoadFromGguf` per process, reporting
+gguf-open / model-load / first-forward wall time, peak commit + working set, upload-path counters
+(zero-copy vs staging, embed-dequant path, import-rejection stage/VkResult) and a SHA-256 over the
+first-forward logits row — the load-parity gate for load-path changes.
+
+## Vulkan Load-Path Staging (bounded, persistently mapped) and Memory-Pressure Retry
+
+**Bounded staging (issue #147, the #146 root-cause fix).** Weight uploads stream through a single
+`VulkanStagingBuffer`: capacity `min(largest single upload, DOTLLM_VULKAN_STAGING_MB)` (default
+64 MiB), mapped ONCE for the whole load. Tensors larger than the cap stream through it in chunks
+(raw bytes, managed float spans, or row-chunked host dequant), each chunk fence-waited before reuse.
+A dedicated 256 KiB vec-staging buffer carries norm/bias/scale vectors so KB-scale uploads never
+touch the matrix staging buffer. Peak host commit attributable to staging is therefore bounded by
+the cap regardless of model size, and there are zero re-maps after construction. All per-arch
+uploaders (`VulkanWeights`, NemotronH, Qwen3-MoE-hybrid, Mamba-3, `VulkanQwen3MoeMoeUpload`) use it.
+
+**GPU-side token-embed dequant (issue #147).** For Q4_K / Q6_K embed tables (the llama.cpp `*_K_M` /
+IQ4 file types) the raw quantized bytes go to the device (zero-copy imported when the driver allows,
+else streamed at their quantized size) and a one-time `q4_k/q6_k_dequant_f32` compute dispatch
+expands them into the device-local F32 gather table — the host never materialises the
+`vocab × hidden × 4` F32 image. The shaders mirror the CPU oracle's op order and are
+`precise`-qualified, so the table (and therefore first-forward logits) is BIT-IDENTICAL to the CPU
+path. `DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1` forces the legacy CPU dequant (parity-test escape
+hatch); `VulkanWeights.LastTokenEmbedDequantPath` reports which path fired. Other embed source types
+(Q8_0 / F16 / F32, and the NemotronH / Qwen3-hybrid / Mamba-3 embeds) keep the streamed CPU dequant.
+
+**Memory-pressure retry (issue #146, retained as a safety net).** On Windows/WDDM a `vkMapMemory`
+must make the **entire** allocation host-resident (residency is allocation-granular, not
+range-granular). Before #147 the staging buffer was sized for the largest single upload — the
+token-embed F32 dequant at `vocab × hidden × 4` bytes (≈1.6 GB for Llama-3.2-3B, ≈2.1 GB for
+Llama-3.1-8B) — and re-mapped for every staged upload, so under system memory pressure the map
+failed transiently (`VK_ERROR_MEMORY_MAP_FAILED`, ~2/15 heavy back-to-back loads on Strix Halo).
+The bounded staging removes that trigger; the retry remains for genuine pressure on allocations.
 
 All Vulkan maps route through `VulkanDevice.MapMemoryWithRetry`, and `AllocateInternal` wraps its
 allocation (including the device-local fallback enumeration) in the same policy: on a transient
