@@ -113,7 +113,8 @@ internal sealed unsafe class TransformerForwardState : IDisposable
         float ropeTheta,
         int globalRopeDim = 0, float globalRopeTheta = 0f,
         int qBlockElems = 0, int kvBlockElems = 0,
-        int globalFullHeadDim = 0)
+        int globalFullHeadDim = 0,
+        float[]? globalFreqFactors = null)
     {
         _hiddenSize = hiddenSize;
         _numHeads = numHeads;
@@ -147,7 +148,14 @@ internal sealed unsafe class TransformerForwardState : IDisposable
             // (globalFullHeadDim, e.g. 512) — NOT the rotated count. When
             // globalFullHeadDim <= globalRopeDim (Gemma 3 / full rotation) the two
             // coincide and the standard precompute is used.
-            if (globalFullHeadDim > globalRopeDim)
+            // Proportional-rope frequency factors (Gemma-4 E2B/E4B rope_freqs
+            // tensor): the full-attention layers rotate the FULL head dim with the
+            // per-pair theta divided by the factor (ggml theta/ff). Mutually
+            // exclusive with the 26B partial-rotary path in practice.
+            if (globalFreqFactors is not null)
+                DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableWithFactors(
+                    maxSeqLen, globalRopeDim, globalRopeTheta, globalFreqFactors, GlobalCosTable, GlobalSinTable);
+            else if (globalFullHeadDim > globalRopeDim)
                 DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTablePartial(
                     maxSeqLen, globalRopeDim, globalFullHeadDim, globalRopeTheta, GlobalCosTable, GlobalSinTable);
             else

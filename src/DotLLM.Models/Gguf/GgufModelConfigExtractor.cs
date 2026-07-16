@@ -558,12 +558,17 @@ public static class GgufModelConfigExtractor
     /// those keys and leave <see cref="ModelConfig.PartialRotaryFactor"/> null — the
     /// forward path uses <c>DimensionCount</c> as the rotated span when the factor
     /// is null, which is exactly the GGUF representation.</para>
-    /// <para><b>PLE / AltUp / Laurel.</b> The released
-    /// <c>unsloth/gemma-4-26B-A4B</c> and <c>diffusiongemma-26B</c> GGUFs report
-    /// <c>embedding_length_per_layer_input = 0</c> and carry no
-    /// <c>per_layer_*</c>/<c>altup</c>/<c>laurel</c> tensors — this conversion does
-    /// NOT use Gemma-3n-style per-layer embeddings / alternating updates / learned
-    /// augmented residuals, so none are wired here.</para>
+    /// <para><b>PLE / shared KV (dense E2B/E4B).</b> The dense text-tower GGUFs
+    /// (<c>unsloth/gemma-4-E4B-it</c>) report
+    /// <c>embedding_length_per_layer_input &gt; 0</c> and ship the Gemma-3n-style
+    /// <c>per_layer_*</c> PLE tensors, plus <c>attention.shared_kv_layers</c>
+    /// (trailing layers reuse an earlier layer's KV) and a <c>rope_freqs</c>
+    /// proportional-rope factor tensor for the full-attention layers — all wired
+    /// below. The MoE 26B GGUFs report 0 / omit these and are unaffected.</para>
+    /// <para><b>AltUp / Laurel / activation sparsity.</b> Gemma-3n-only components
+    /// that Gemma 4 dropped: no released <c>gemma4</c> GGUF carries
+    /// <c>altup_*</c>/<c>laurel_*</c> tensors and llama.cpp's <c>gemma4.cpp</c>
+    /// graph has no gaussian-topk sparsity, so none are wired here.</para>
     /// </remarks>
     private static ModelConfig BuildGemma4Config(GgufMetadata metadata, string arch, Architecture architecture)
     {
@@ -642,6 +647,45 @@ public static class GgufModelConfigExtractor
             };
         }
 
+        // ── Per-Layer Embeddings (PLE) — the dense Gemma-4 text tower (E2B/E4B). ──
+        // embedding_length_per_layer_input > 0 marks the PLE variant: an auxiliary
+        // per-layer token-embedding table (per_layer_token_embd, width
+        // pleDim*numLayers) plus a context projection (per_layer_model_proj) feed a
+        // gated residual into every layer (llama.cpp gemma4.cpp build_inp_per_layer /
+        // project_per_layer_inputs). The released MoE 26B GGUFs report 0 here and
+        // carry no per_layer_* tensors, so this stays null for them.
+        PerLayerEmbeddingConfig? perLayerEmbedding = null;
+        uint pleDim = metadata.GetUInt32OrDefault($"{arch}.embedding_length_per_layer_input", 0);
+        if (pleDim > 0)
+        {
+            perLayerEmbedding = new PerLayerEmbeddingConfig
+            {
+                PerLayerDim = (int)pleDim,
+                // The gemma4 GGUF has a single vocabulary — per_layer_token_embd
+                // has the same row count as token_embd.
+                VocabSize = vocabSize,
+            };
+        }
+
+        // ── Shared trailing KV layers (Gemma-4 E2B/E4B). ──
+        // attention.shared_kv_layers = number of TRAILING layers that reuse an
+        // earlier layer's KV (llama.cpp: n_layer_kv_from_start = n_layer - shared).
+        // The reuse rule itself lives on ModelConfig.SharedKvDonorLayer.
+        int sharedKvLayers = (int)metadata.GetUInt32OrDefault($"{arch}.attention.shared_kv_layers", 0);
+        if (sharedKvLayers < 0 || sharedKvLayers >= numLayers)
+            throw new InvalidDataException(
+                $"gemma4 GGUF '{arch}.attention.shared_kv_layers' = {sharedKvLayers} must be in [0, {numLayers}).");
+
+        // Partial rotary: the MoE 26B rotates only the leading 0.25 fraction of the
+        // 512-dim global head (validated end-to-end). The dense-PLE E2B/E4B variant
+        // instead rotates the FULL head dim on both layer kinds
+        // (rope.dimension_count == key_length, rope.dimension_count_swa ==
+        // key_length_swa; llama.cpp n_rot(il) comes straight from those keys) and
+        // modulates the global-layer frequencies via the rope_freqs.weight
+        // proportional-rope factor tensor (loaded by TransformerWeights). Gate on
+        // the PLE marker, which cleanly separates the two released families.
+        float? partialRotaryFactor = perLayerEmbedding is null ? 0.25f : null;
+
         float? finalLogitSoftcap = null;
         float fls = metadata.GetFloat32OrDefault($"{arch}.final_logit_softcapping", 0f);
         if (fls > 0f) finalLogitSoftcap = fls;
@@ -696,7 +740,9 @@ public static class GgufModelConfigExtractor
             // rotated span — partial_rotary_factor 0.25 selects the rotated dims).
             // The forward path multiplies this factor by the global head dim and
             // rounds down to even. Sliding layers keep full rotation (factor n/a).
-            PartialRotaryFactor = 0.25f,
+            // Null on the dense-PLE E2B/E4B variant (full-dim rotation + rope_freqs
+            // proportional factors — see above).
+            PartialRotaryFactor = partialRotaryFactor,
             NumGlobalKvHeads = numGlobalKvHeads,
             GlobalHeadDim = globalHeadDimNullable,
             // Gemma 4 q_norm/k_norm make Q,K unit so the attention softmax scale
@@ -717,6 +763,8 @@ public static class GgufModelConfigExtractor
             FinalLogitSoftcap = finalLogitSoftcap,
             EmbeddingScale = MathF.Sqrt(hiddenSize),
             Moe = moe,
+            PerLayerEmbedding = perLayerEmbedding,
+            NumSharedKvLayers = sharedKvLayers,
             ChatTemplate = chatTemplate,
             DiffusionConfig = diffusion,
         };

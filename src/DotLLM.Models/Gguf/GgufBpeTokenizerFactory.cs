@@ -42,7 +42,13 @@ public static class GgufBpeTokenizerFactory
             ? metadata.GetFloat32Array("tokenizer.ggml.scores")
             : new float[tokens.Length];
 
-        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId);
+        // tokenizer.ggml.add_space_prefix: SentencePiece defaults to prepending ▁
+        // to text that doesn't start with a space; gemma4 (and some Llama
+        // derivatives) explicitly disable it — "The" must encode to the bare 'The'
+        // token, not '▁The'. Absent key keeps the historical default (true).
+        bool addSpacePrefix = metadata.GetBoolOrDefault("tokenizer.ggml.add_space_prefix", true);
+
+        return BpeTokenizer.CreateSentencePiece(tokens, scores, tokenTypes, bosId, eosId, addSpacePrefix);
     }
 
     private static BpeTokenizer LoadTiktoken(

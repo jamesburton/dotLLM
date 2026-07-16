@@ -33,6 +33,52 @@ public sealed class RoPETests
     }
 
     [Fact]
+    public void PrecomputeFrequencyTableWithFactors_KnownFactors_MatchesHandCalculated()
+    {
+        // ggml semantics (ggml_rope_cache_init): angle for pair i at position p is
+        //   p * theta^(-2i/headDim) / factors[i]        (theta/ff — factor DIVIDES).
+        // headDim=4 → halfDim=2, theta=10000, factors=[2, 4], pos=3:
+        //   base freq[0]=1.0   → angle = 3 * 1.0  / 2 = 1.5
+        //   base freq[1]=0.01  → angle = 3 * 0.01 / 4 = 0.0075
+        const int headDim = 4;
+        const float theta = 10000f;
+        const int maxSeqLen = 4;
+        int halfDim = headDim / 2;
+        float[] factors = { 2f, 4f };
+
+        float[] cos = new float[maxSeqLen * halfDim];
+        float[] sin = new float[maxSeqLen * halfDim];
+        RoPE.PrecomputeFrequencyTableWithFactors(maxSeqLen, headDim, theta, factors, cos, sin);
+
+        Assert.Equal(MathF.Cos(1.5f), cos[3 * halfDim + 0], 1e-5f);
+        Assert.Equal(MathF.Sin(1.5f), sin[3 * halfDim + 0], 1e-5f);
+        Assert.Equal(MathF.Cos(0.0075f), cos[3 * halfDim + 1], 1e-5f);
+        Assert.Equal(MathF.Sin(0.0075f), sin[3 * halfDim + 1], 1e-5f);
+    }
+
+    [Fact]
+    public void PrecomputeFrequencyTableWithFactors_UnitFactors_MatchesPlainTable()
+    {
+        const int headDim = 64;
+        const float theta = 1_000_000f;
+        const int maxSeqLen = 32;
+        int halfDim = headDim / 2;
+        float[] ones = new float[halfDim];
+        Array.Fill(ones, 1.0f);
+
+        float[] cosF = new float[maxSeqLen * halfDim], sinF = new float[maxSeqLen * halfDim];
+        float[] cosP = new float[maxSeqLen * halfDim], sinP = new float[maxSeqLen * halfDim];
+        RoPE.PrecomputeFrequencyTableWithFactors(maxSeqLen, headDim, theta, ones, cosF, sinF);
+        RoPE.PrecomputeFrequencyTable(maxSeqLen, headDim, theta, cosP, sinP);
+
+        for (int i = 0; i < cosF.Length; i++)
+        {
+            Assert.Equal(cosP[i], cosF[i], 1e-6f);
+            Assert.Equal(sinP[i], sinF[i], 1e-6f);
+        }
+    }
+
+    [Fact]
     public void PrecomputeFrequencyTable_PositionZero_CosOnesSinZeros()
     {
         const int headDim = 128;
