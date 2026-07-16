@@ -106,6 +106,11 @@ public static class BenchRunner
 
         // Timed greedy decode: n single-token forwards. Only the Forward calls
         // are inside the stopwatch windows; argmax runs between them.
+        // DOTLLM_BENCH_DUMP_TOKENS=<path> appends one line of generated token
+        // IDs per rep — the exact-token parity gate for pipeline/submit
+        // changes (issue #143): diff the dump between two builds/env configs.
+        string? dumpPath = Environment.GetEnvironmentVariable("DOTLLM_BENCH_DUMP_TOKENS");
+        List<int>? dumped = dumpPath is { Length: > 0 } ? new List<int>(decodeTokens) : null;
         double decodeMs = 0;
         int[] single = new int[1];
         int[] singlePos = new int[1];
@@ -119,7 +124,14 @@ public static class BenchRunner
             decodeMs += sw.Elapsed.TotalMilliseconds;
             using (logits)
                 nextToken = ArgmaxLastRow(logits);
+            dumped?.Add(nextToken);
             nextPos++;
+        }
+
+        if (dumped is not null)
+        {
+            try { File.AppendAllText(dumpPath!, string.Join(' ', dumped) + Environment.NewLine); }
+            catch { /* diagnostics only */ }
         }
 
         return new BenchRep(prefillSw.Elapsed.TotalMilliseconds, decodeMs, promptLen, decodeTokens);

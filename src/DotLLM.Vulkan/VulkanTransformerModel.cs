@@ -302,6 +302,23 @@ public sealed class VulkanTransformerModel : IModel
     // descriptor churn) from ProfileCounters. Prints an aggregate to stderr
     // every DecodeProfileReportEvery tokens. Zero cost when the env var is
     // unset (single bool check per Forward).
+    // Decode record/execute overlap: the layer index at which the forward's
+    // command stream is split-submitted (no fence) so GPU execution overlaps
+    // the host recording of the remaining layers. Small values start the GPU
+    // sooner but the split chunk must carry enough GPU work to outlast the
+    // recording of the rest (~8 µs/layer to record vs ~50 µs/layer to execute
+    // on SmolLM-135M, so the no-bubble condition is L ≳ 4). Swept on
+    // SmolLM-135M @d512: L=1: 510, L=2: 524, L=4: 523-526, L=6: 538,
+    // L=8: 543 (best), L=12: 534, L=15: 509 tok/s median. 0 disables.
+    // Override via DOTLLM_VULKAN_DECODE_SPLIT_LAYER.
+    private static readonly int DecodeSplitLayer = ReadDecodeSplitLayer();
+
+    private static int ReadDecodeSplitLayer()
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DECODE_SPLIT_LAYER");
+        return v is null ? 8 : int.TryParse(v, out int n) && n >= 0 ? n : 8;
+    }
+
     private static readonly bool DecodeProfileEnabled =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DECODE_PROFILE") == "1";
     // DOTLLM_VULKAN_DECODE_PROFILE_GPU=1 additionally writes a BOTTOM_OF_PIPE
@@ -390,9 +407,6 @@ public sealed class VulkanTransformerModel : IModel
                     (nint)p, sizeof(ulong), flags: 0x1 | 0x2) < 0)
                 return;
         }
-        if (_dpGpuTotalMs == 0)
-            Console.Error.WriteLine(
-                $"[decode-profile] raw ts[0]={_dpTsScratch![0]} ts[1]={_dpTsScratch[1]} ts[last]={_dpTsScratch[_dpQueryCount - 1]} n={_dpQueryCount}");
         double toMs = _dpTsPeriodNs / 1_000_000.0;
         for (int i = 1; i < _dpQueryCount; i++)
         {
@@ -2684,6 +2698,20 @@ public sealed class VulkanTransformerModel : IModel
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
+            // Decode record/execute overlap (issue #143): after the first few
+            // layers are recorded, submit them WITHOUT a fence so the GPU starts
+            // executing while the host records the remaining layers. Hides most
+            // of the ~0.2-0.3 ms/token command-recording cost behind GPU work.
+            // Bit-identical: only the submit boundary moves; the barrier chain
+            // (which synchronizes across submits on the same queue timeline) is
+            // unchanged. AR causal decode only; one split per forward.
+            if (DecodeSplitLayer > 0 && layer == DecodeSplitLayer && seqLen == 1
+                && !diffusionForward && layer < Config.NumLayers - 1)
+            {
+                _submit.SplitSubmit();
+                cmdBuf = _submit.CommandBuffer;
+            }
+
             // Device weights are window-local (0-indexed); CPU weights are full-length, so offset by
             // _firstLayer (0 on a single-device model) to read this stage's global layer.
             ref readonly var lw = ref _weights.Layers[layer];
