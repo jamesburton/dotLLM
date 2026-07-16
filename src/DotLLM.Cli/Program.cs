@@ -44,6 +44,10 @@ app.Configure(config =>
         .WithDescription("Run greedy text generation on a GGUF model.")
         .WithExample("run", "QuantFactory/SmolLM-135M-GGUF", "--prompt", "The capital of France is", "--max-tokens", "64");
 
+    config.AddCommand<BenchCommand>("bench")
+        .WithDescription("Benchmark prefill/decode throughput (llama-bench equivalent).")
+        .WithExample("bench", "QuantFactory/SmolLM-135M-GGUF", "--device", "cpu", "-p", "512", "-n", "128", "-r", "5");
+
     config.AddCommand<ChatCommand>("chat")
         .WithDescription("Interactive multi-turn chat with a GGUF model.")
         .WithExample("chat", "QuantFactory/SmolLM-135M-GGUF", "--system", "You are a helpful assistant.");
