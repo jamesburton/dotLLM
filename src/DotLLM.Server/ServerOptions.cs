@@ -57,6 +57,17 @@ public sealed record ServerOptions
     /// <summary>Number of draft candidates per speculative step (K).</summary>
     public int SpeculativeCandidates { get; init; } = 5;
 
+    /// <summary>
+    /// Maximum prompt tokens per prefill forward pass (llama.cpp <c>-ub</c> / micro-batch analog).
+    /// 0 (default) = whole prompt in one forward pass. On the single-request
+    /// <see cref="DotLLM.Engine.TextGenerator"/> path this chunks the prompt-suffix prefill; when
+    /// the continuous-batch scheduler is active it is applied as the scheduler's per-step prefill
+    /// admission cap (<see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/>) unless
+    /// the <see cref="Scheduler"/> section already sets one — a single prompt longer than the cap
+    /// still prefills in one forward pass there (admission-level cap, not intra-prompt chunking).
+    /// </summary>
+    public int PrefillChunkSize { get; init; }
+
     /// <summary>Model display name (derived from file path).</summary>
     public string ModelId { get; init; } = "default";
 
@@ -105,6 +116,9 @@ public sealed record ServerOptions
         bool warmupEnabled = true;
         int warmupIterations = 3;
         bool schedulerFairness = false;
+        string? speculativeModel = null;
+        int speculativeCandidates = 5;
+        int prefillChunkSize = 0;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -147,6 +161,12 @@ public sealed record ServerOptions
                     warmupIterations = int.Parse(next!); i++; break;
                 case "--scheduler-fairness":
                     schedulerFairness = true; break;
+                case "--speculative-model" or "--draft-model":
+                    speculativeModel = next; i++; break;
+                case "--speculative-k" or "--draft-tokens":
+                    speculativeCandidates = int.Parse(next!); i++; break;
+                case "--prefill-chunk-size" or "--ubatch-size":
+                    prefillChunkSize = int.Parse(next!); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -188,6 +208,9 @@ public sealed record ServerOptions
             Scheduler = schedulerFairness
                 ? new ContinuousBatchSchedulerOptions { EnableFairness = true }
                 : null,
+            SpeculativeModel = speculativeModel,
+            SpeculativeCandidates = speculativeCandidates,
+            PrefillChunkSize = prefillChunkSize,
             ModelId = modelId,
         };
     }

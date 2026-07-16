@@ -114,15 +114,21 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         public bool NoPaged { get; set; }
 
         /// <summary>Draft model for speculative decoding.</summary>
-        [CommandOption("--speculative-model")]
+        [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
         public string? SpeculativeModel { get; set; }
 
         /// <summary>Number of draft candidates per speculative step.</summary>
-        [CommandOption("--speculative-k")]
+        [CommandOption("--speculative-k|--draft-tokens")]
         [Description("Number of draft tokens per speculative step (K). Default 5.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
     }
 
     /// <inheritdoc/>
@@ -150,6 +156,7 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             UsePaged = !settings.NoPaged,
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
+            PrefillChunkSize = settings.PrefillChunkSize,
             ModelId = "none",
         };
 

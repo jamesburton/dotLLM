@@ -167,15 +167,21 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         public string ToolChoiceStr { get; set; } = "auto";
 
         /// <summary>Draft model for speculative decoding.</summary>
-        [CommandOption("--speculative-model")]
+        [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
         public string? SpeculativeModel { get; set; }
 
         /// <summary>Number of draft candidates per speculative step.</summary>
-        [CommandOption("--speculative-k")]
+        [CommandOption("--speculative-k|--draft-tokens")]
         [Description("Number of draft tokens per speculative step (K). Default 5.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
 
         /// <summary>
         /// Paths to HuggingFace PEFT LoRA adapter directories. Repeatable — each occurrence adds one
@@ -520,7 +526,8 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
-                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK);
+                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+                prefillChunkSize: settings.PrefillChunkSize);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
             InferenceTimings timings = default;

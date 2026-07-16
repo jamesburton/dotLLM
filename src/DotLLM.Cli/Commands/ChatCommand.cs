@@ -195,6 +195,23 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(1)]
         public int PromptCacheSize { get; set; } = 1;
 
+        /// <summary>Draft model for speculative decoding.</summary>
+        [CommandOption("--speculative-model|--draft-model")]
+        [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
+        public string? SpeculativeModel { get; set; }
+
+        /// <summary>Number of draft candidates per speculative step.</summary>
+        [CommandOption("--speculative-k|--draft-tokens")]
+        [Description("Number of draft tokens per speculative step (K). Default 5.")]
+        [DefaultValue(5)]
+        public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
         /// <summary>Verbose debug output.</summary>
         [CommandOption("--verbose|-v")]
         [Description("Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details.")]
@@ -437,7 +454,45 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         PrefixCache? prefixCache = !settings.NoPromptCache
             ? new PrefixCache(settings.PromptCacheSize)
             : null;
-        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache);
+
+        // Load speculative draft model if requested (mirrors `dotllm run` wiring).
+        IModel? draftModel = null;
+        GgufFile? draftGguf = null;
+        if (!string.IsNullOrEmpty(settings.SpeculativeModel))
+        {
+            var draftPath = GgufFileResolver.Resolve(settings.SpeculativeModel, null);
+            if (draftPath is null)
+            {
+                AnsiConsole.MarkupLine("[red]Speculative draft model not found.[/]");
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftGguf = GgufFile.Open(draftPath);
+            var draftConfig = GgufModelConfigExtractor.Extract(draftGguf.Metadata);
+            if (!DotLLM.Engine.SpeculativeConstants.AreVocabsCompatible(config!.VocabSize, draftConfig.VocabSize))
+            {
+                AnsiConsole.MarkupLine(
+                    $"[red]Draft model vocab size ({draftConfig.VocabSize}) differs from target ({config.VocabSize}) " +
+                    $"by more than {DotLLM.Engine.SpeculativeConstants.MaxVocabSizeDifference} tokens. " +
+                    "Models must share the same base tokenizer.[/]");
+                draftGguf.Dispose();
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig,
+                new ThreadingConfig(settings.Threads, settings.DecodeThreads));
+            AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={Path.GetFileName(draftPath)}[/]");
+        }
+
+        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
+            draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            prefillChunkSize: settings.PrefillChunkSize);
 
         try
         {
@@ -446,6 +501,8 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         finally
         {
             pagedFactory?.Dispose();
+            draftModel?.Dispose();
+            draftGguf?.Dispose();
             model?.Dispose();
             gguf?.Dispose();
             safetensorsSource?.Dispose();

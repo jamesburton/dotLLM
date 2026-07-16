@@ -112,11 +112,24 @@ When vocab sizes differ, probability comparison uses the shared range (`Math.Min
 # CLI: run with speculative decoding
 dotllm run model.gguf --speculative-model draft.gguf --speculative-k 5 -p "Hello"
 
+# Interactive chat with speculative decoding
+dotllm chat model.gguf --speculative-model draft.gguf --speculative-k 5
+
 # Serve: pass at startup
 dotllm serve model.gguf --speculative-model draft.gguf --speculative-k 5
 
 # Serve: select draft model from the web UI's Load Model modal
 ```
+
+`--draft-model` and `--draft-tokens` are accepted as aliases of `--speculative-model` and
+`--speculative-k` on `run`, `chat`, and `serve`, and by the standalone server's argument
+parser (`ServerOptions.Parse`). `ServerOptions.SpeculativeModel` / `SpeculativeCandidates`
+can also be bound from `appsettings.json` by a host that binds `ServerOptions` from
+configuration. Vocabulary compatibility (above) is validated at startup with a clear error
+on all three surfaces.
+
+Note: when a draft model is configured, `serve` uses the single-request `TextGenerator`
+path — the continuous-batch scheduler does not support draft models yet and is not started.
 
 The serve UI shows three-state compatibility feedback when selecting a draft model:
 - **Green**: exact vocab match

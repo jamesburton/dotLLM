@@ -304,6 +304,8 @@ The server has two execution paths and picks per-request:
 
 Set the whole section via `ServerOptions.Scheduler` (bind it from `appsettings.json`, or pass `--scheduler-fairness` on the CLI to turn on fairness with defaults). `ServerStartup` forwards it to the `ContinuousBatchSchedulerService`; when omitted, scheduler defaults apply.
 
+`--prefill-chunk-size N` (alias `--ubatch-size`, llama.cpp `-ub` analog; also bindable as `ServerOptions.PrefillChunkSize`) caps prompt-prefill work. Honest semantics per path: on the **single-request `TextGenerator` path** it truly chunks the prompt into ≤ N-token forward passes (bounding peak activation memory); on the **scheduler path** it is applied as `MaxPrefillTokensPerStep` (per-step admission cap — a single prompt longer than N still prefills in one forward pass once admitted) unless the bound `Scheduler` section already sets that cap explicitly.
+
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `MaxActiveSequences` | 64 | Slot cap. KV-cache pressure is the hard limit; this is a soft upper bound for batch-formation cost. |

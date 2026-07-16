@@ -213,7 +213,10 @@ public static class ServerStartup
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            prefixTrieManager: prefixTrieManager);
+            prefixTrieManager: prefixTrieManager,
+            prefillChunkSize: options.PrefillChunkSize);
+        if (options.PrefillChunkSize > 0)
+            Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
 
         // Diffusion models (DiffusionGemma) route chat completions through a masked-canvas
         // diffusion generator instead of the autoregressive TextGenerator. Built only when the
@@ -237,16 +240,7 @@ public static class ServerStartup
         ContinuousBatchSchedulerService? scheduler = null;
         if (pagedFactory is not null && kvFactory is not null && draftModel is null)
         {
-            // When fairness is enabled and a rate-limit config is present, source per-API-key
-            // fairness weights from each key's RateLimitPolicy.Weight (default 1.0 ⇒ equal share).
-            var schedulerOptions = options.Scheduler;
-            if (schedulerOptions?.EnableFairness == true && options.RateLimit is { } rateLimit)
-            {
-                schedulerOptions = schedulerOptions with
-                {
-                    FairnessWeightProvider = apiKey => rateLimit.PolicyFor(apiKey)?.Weight ?? 1.0,
-                };
-            }
+            var schedulerOptions = ResolveSchedulerOptions(options);
 
             scheduler = new ContinuousBatchSchedulerService(
                 model,
@@ -283,6 +277,45 @@ public static class ServerStartup
             DraftGguf = draftGguf,
             LoraRegistry = CreateLoraRegistry(),
         };
+    }
+
+    /// <summary>
+    /// Derives the effective <see cref="ContinuousBatchSchedulerOptions"/> for a server config:
+    /// applies <see cref="ServerOptions.PrefillChunkSize"/> as the scheduler's per-step prefill
+    /// admission cap (<see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/>) when
+    /// the <see cref="ServerOptions.Scheduler"/> section doesn't already set one, and wires
+    /// per-API-key fairness weights from the rate-limit policy table when fairness is enabled.
+    /// Returns <see langword="null"/> when nothing is configured (scheduler defaults apply).
+    /// </summary>
+    /// <remarks>
+    /// Honest semantics note: on the scheduler path this is an <b>admission-level</b> cap — a
+    /// single prompt longer than the cap still prefills in one forward pass once admitted
+    /// (see <see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/> remarks). True
+    /// intra-prompt chunking applies on the single-request <see cref="TextGenerator"/> path.
+    /// </remarks>
+    public static ContinuousBatchSchedulerOptions? ResolveSchedulerOptions(ServerOptions options)
+    {
+        var schedulerOptions = options.Scheduler;
+
+        if (options.PrefillChunkSize > 0 && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
+        {
+            schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
+            {
+                MaxPrefillTokensPerStep = options.PrefillChunkSize,
+            };
+        }
+
+        // When fairness is enabled and a rate-limit config is present, source per-API-key
+        // fairness weights from each key's RateLimitPolicy.Weight (default 1.0 ⇒ equal share).
+        if (schedulerOptions?.EnableFairness == true && options.RateLimit is { } rateLimit)
+        {
+            schedulerOptions = schedulerOptions with
+            {
+                FairnessWeightProvider = apiKey => rateLimit.PolicyFor(apiKey)?.Weight ?? 1.0,
+            };
+        }
+
+        return schedulerOptions;
     }
 
     /// <summary>
