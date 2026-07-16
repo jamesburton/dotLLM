@@ -293,6 +293,210 @@ public sealed class VulkanTransformerModel : IModel
             try { File.AppendAllText(path, text); } catch { /* diagnostics only */ }
         }
     }
+    // issue #143: env-gated decode overhead profiler
+    // (DOTLLM_VULKAN_DECODE_PROFILE=1). Unlike the prefill profiler above it
+    // never splits the submit — it measures the three host-visible phases of
+    // each seqLen==1 Forward (record, submit+fence-wait, logits download)
+    // with four Stopwatch reads, plus the inter-forward host gap and a
+    // census of recorded commands (dispatches / barriers / copies /
+    // descriptor churn) from ProfileCounters. Prints an aggregate to stderr
+    // every DecodeProfileReportEvery tokens. Zero cost when the env var is
+    // unset (single bool check per Forward).
+    private static readonly bool DecodeProfileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DECODE_PROFILE") == "1";
+    // DOTLLM_VULKAN_DECODE_PROFILE_GPU=1 additionally writes a BOTTOM_OF_PIPE
+    // timestamp at every op-category boundary (~300 queries/token on a
+    // 30-layer model) and reports per-category GPU time. Since every
+    // dispatch is barrier-serialised, consecutive-timestamp deltas ARE the
+    // category GPU cost (execution + barrier drain). Adds measurable
+    // overhead (~0.2 ms/token) — use for attribution, not headline numbers.
+    private static readonly bool DecodeProfileGpuEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DECODE_PROFILE_GPU") == "1";
+    private const int DecodeProfileReportEvery = 64;
+    private const int DpMaxQueries = 2048;
+    private nint _dpQueryPool;
+    private bool _dpQueryPoolFailed;
+    private int _dpQueryCount;
+    private byte[]? _dpQueryCats;
+    private ulong[]? _dpTsScratch;
+    private double[]? _dpGpuMsByCat;
+    private double _dpGpuTotalMs;
+    private float _dpTsPeriodNs;
+    private static readonly string[] DpCatNames =
+    {
+        "start", "embed", "qkv_proj", "rope", "kv_update", "attention",
+        "o_proj", "norm_resid", "ffn_gate_up", "ffn_act", "ffn_down", "lm_head",
+    };
+    private const byte DpCatStart = 0, DpCatEmbed = 1, DpCatQkv = 2, DpCatRope = 3,
+        DpCatKv = 4, DpCatAttn = 5, DpCatO = 6, DpCatResid = 7, DpCatGateUp = 8,
+        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11;
+
+    /// <summary>
+    /// Records the per-forward timestamp-pool reset + the "start" stamp. Call
+    /// immediately after <c>_submit.Begin()</c>. No-op unless the GPU decode
+    /// profiler is active for this forward.
+    /// </summary>
+    private void DpBeginRecord(nint cmdBuf)
+    {
+        if (!_dpActive || !DecodeProfileGpuEnabled || _dpQueryPoolFailed) return;
+        if (_dpQueryPool == 0)
+        {
+            _dpTsPeriodNs = _device.TimestampPeriodNs;
+            if (_dpTsPeriodNs <= 0f)
+            {
+                _dpQueryPoolFailed = true;
+                return;
+            }
+            var qci = new VkQueryPoolCreateInfo
+            {
+                sType = 11, // VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO
+                queryType = 2, // VK_QUERY_TYPE_TIMESTAMP
+                queryCount = DpMaxQueries,
+            };
+            if (VulkanApi.vkCreateQueryPool(_device.Handle, qci, 0, out _dpQueryPool) < 0
+                || _dpQueryPool == 0)
+            {
+                _dpQueryPoolFailed = true;
+                return;
+            }
+            _dpQueryCats = new byte[DpMaxQueries];
+            _dpTsScratch = new ulong[DpMaxQueries];
+            _dpGpuMsByCat = new double[DpCatNames.Length];
+            Console.Error.WriteLine($"[decode-profile] timestampPeriod={_dpTsPeriodNs} ns/tick");
+        }
+        VulkanApi.vkCmdResetQueryPool(cmdBuf, _dpQueryPool, 0, DpMaxQueries);
+        _dpQueryCount = 0;
+        DpStamp(cmdBuf, DpCatStart);
+    }
+
+    /// <summary>Writes one category-boundary timestamp (GPU decode profiler only).</summary>
+    private void DpStamp(nint cmdBuf, byte cat)
+    {
+        if (!_dpActive || _dpQueryPool == 0 || !DecodeProfileGpuEnabled) return;
+        if (_dpQueryCount >= DpMaxQueries) return;
+        _dpQueryCats![_dpQueryCount] = cat;
+        VulkanApi.vkCmdWriteTimestamp(cmdBuf, VkPipelineStageFlags.BottomOfPipe,
+            _dpQueryPool, (uint)_dpQueryCount++);
+    }
+
+    private unsafe void DpCollectGpu()
+    {
+        if (!_dpActive || _dpQueryPool == 0 || _dpQueryCount < 2) return;
+        fixed (ulong* p = _dpTsScratch)
+        {
+            // 64-bit results; fence already waited so WAIT returns immediately.
+            if (VulkanApi.vkGetQueryPoolResults(_device.Handle, _dpQueryPool, 0,
+                    (uint)_dpQueryCount, (nuint)(_dpQueryCount * sizeof(ulong)),
+                    (nint)p, sizeof(ulong), flags: 0x1 | 0x2) < 0)
+                return;
+        }
+        if (_dpGpuTotalMs == 0)
+            Console.Error.WriteLine(
+                $"[decode-profile] raw ts[0]={_dpTsScratch![0]} ts[1]={_dpTsScratch[1]} ts[last]={_dpTsScratch[_dpQueryCount - 1]} n={_dpQueryCount}");
+        double toMs = _dpTsPeriodNs / 1_000_000.0;
+        for (int i = 1; i < _dpQueryCount; i++)
+        {
+            double ms = (_dpTsScratch![i] - _dpTsScratch[i - 1]) * toMs;
+            _dpGpuMsByCat![_dpQueryCats![i]] += ms;
+        }
+        _dpGpuTotalMs += (_dpTsScratch![_dpQueryCount - 1] - _dpTsScratch[0]) * toMs;
+    }
+    private bool _dpActive;
+    private int _dpTokens;
+    private double _dpRecordMs, _dpWaitMs, _dpDownloadMs, _dpGapMs;
+    private double _dpForwardMinMs = double.MaxValue, _dpForwardMaxMs;
+    private long _dpT0, _dpT1, _dpT2;
+    private long _dpLastEndTicks;
+    private long _dpDispatch0, _dpBarrier0, _dpCopy0, _dpDescW0, _dpDescA0;
+    private int _dpGc0, _dpGc1, _dpGc2;
+
+    private void DpBegin(int seqLen)
+    {
+        _dpActive = DecodeProfileEnabled && seqLen == 1;
+        if (!_dpActive) return;
+        _dpT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_dpTokens == 0)
+        {
+            _dpDispatch0 = Interop.ProfileCounters.Dispatches;
+            _dpBarrier0 = Interop.ProfileCounters.Barriers;
+            _dpCopy0 = Interop.ProfileCounters.Copies;
+            _dpDescW0 = Interop.ProfileCounters.DescriptorWrites;
+            _dpDescA0 = Interop.ProfileCounters.DescriptorAllocs;
+            _dpGc0 = GC.CollectionCount(0);
+            _dpGc1 = GC.CollectionCount(1);
+            _dpGc2 = GC.CollectionCount(2);
+        }
+        else if (_dpLastEndTicks != 0)
+        {
+            _dpGapMs += TicksToMs(_dpT0 - _dpLastEndTicks);
+        }
+    }
+
+    private static double TicksToMs(long ticks)
+        => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    private void DpPreSubmit()
+    {
+        if (!_dpActive) return;
+        _dpT1 = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void DpPostSubmit()
+    {
+        if (!_dpActive) return;
+        DpCollectGpu();
+        _dpT2 = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private void DpEnd()
+    {
+        if (!_dpActive) return;
+        _dpActive = false;
+        long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+        _dpLastEndTicks = t3;
+        _dpRecordMs += TicksToMs(_dpT1 - _dpT0);
+        _dpWaitMs += TicksToMs(_dpT2 - _dpT1);
+        _dpDownloadMs += TicksToMs(t3 - _dpT2);
+        double fwd = TicksToMs(t3 - _dpT0);
+        if (fwd < _dpForwardMinMs) _dpForwardMinMs = fwd;
+        if (fwd > _dpForwardMaxMs) _dpForwardMaxMs = fwd;
+        if (++_dpTokens < DecodeProfileReportEvery) return;
+
+        double n = _dpTokens;
+        long disp = Interop.ProfileCounters.Dispatches - _dpDispatch0;
+        long barr = Interop.ProfileCounters.Barriers - _dpBarrier0;
+        long copy = Interop.ProfileCounters.Copies - _dpCopy0;
+        long descW = Interop.ProfileCounters.DescriptorWrites - _dpDescW0;
+        long descA = Interop.ProfileCounters.DescriptorAllocs - _dpDescA0;
+        Console.Error.WriteLine(
+            $"[decode-profile] tokens={_dpTokens} " +
+            $"fwd_avg={(_dpRecordMs + _dpWaitMs + _dpDownloadMs) / n:F3}ms " +
+            $"(min={_dpForwardMinMs:F3} max={_dpForwardMaxMs:F3}) | " +
+            $"record={_dpRecordMs / n:F3} wait={_dpWaitMs / n:F3} " +
+            $"download={_dpDownloadMs / n:F3} gap={_dpGapMs / (n - 1):F3} ms/tok | " +
+            $"dispatches={disp / n:F1} barriers={barr / n:F1} copies={copy / n:F1} " +
+            $"descWrites={descW / n:F1} descAllocs={descA / n:F1} /tok | " +
+            $"GC {GC.CollectionCount(0) - _dpGc0}/{GC.CollectionCount(1) - _dpGc1}/{GC.CollectionCount(2) - _dpGc2}");
+        if (_dpGpuMsByCat is not null && _dpGpuTotalMs > 0)
+        {
+            var gsb = new System.Text.StringBuilder();
+            gsb.Append($"[decode-profile]   gpu_total={_dpGpuTotalMs / n:F3} ms/tok |");
+            for (int c = 0; c < DpCatNames.Length; c++)
+            {
+                if (_dpGpuMsByCat[c] <= 0) continue;
+                gsb.Append($" {DpCatNames[c]}={_dpGpuMsByCat[c] / n:F3}");
+            }
+            Console.Error.WriteLine(gsb.ToString());
+            Array.Clear(_dpGpuMsByCat);
+            _dpGpuTotalMs = 0;
+        }
+        _dpTokens = 0;
+        _dpRecordMs = _dpWaitMs = _dpDownloadMs = _dpGapMs = 0;
+        _dpForwardMinMs = double.MaxValue;
+        _dpForwardMaxMs = 0;
+        _dpLastEndTicks = 0;
+    }
+
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -2351,6 +2555,8 @@ public sealed class VulkanTransformerModel : IModel
         int seqLen = tokenIds.Length;
         if (seqLen == 0) throw new ArgumentException("tokenIds must be non-empty.", nameof(tokenIds));
 
+        DpBegin(seqLen);
+
         int hiddenSize = Config.HiddenSize;
         int numHeads = Config.NumAttentionHeads;
         int numKvHeads = Config.NumKvHeads;
@@ -2421,6 +2627,7 @@ public sealed class VulkanTransformerModel : IModel
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
         ProfBegin(seqLen);
+        DpBeginRecord(cmdBuf);
 
         // Canonicalise the hidden-slot rotation to slot 0 so the embedding
         // gather below writes into the same physical buffer every forward
@@ -2473,6 +2680,7 @@ public sealed class VulkanTransformerModel : IModel
         }
 
         ProfSample("embed");
+        DpStamp(cmdBuf, DpCatEmbed);
 
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
@@ -2575,6 +2783,7 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.VInputDim, lw.VOutputDim);
             }
             ProfSample("qkv_proj");
+            DpStamp(cmdBuf, DpCatQkv);
 
             // RoPE on Q and K
             _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
@@ -2582,6 +2791,7 @@ public sealed class VulkanTransformerModel : IModel
                 headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
                 variant: _ropeVariant);
             ProfSample("rope");
+            DpStamp(cmdBuf, DpCatRope);
 
             // Attention input buffers: either the uncached K/V window or the full KV cache.
             VulkanDevice.Buffer kSrc, vSrc;
@@ -2639,6 +2849,7 @@ public sealed class VulkanTransformerModel : IModel
             float attnScaleOverride = GetAttentionScaleOverride();
             float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
             ProfSample("kv_update");
+            DpStamp(cmdBuf, DpCatKv);
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -2646,6 +2857,7 @@ public sealed class VulkanTransformerModel : IModel
                 softCap: attnSoftCap, scaleOverride: attnScaleOverride);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfSample("attention");
+            DpStamp(cmdBuf, DpCatAttn);
 
             // BitNet Sub-LN: in-place RMSNorm over the attention output before the
             // output projection. No-op for non-BitNet (AttnSubNormWeight null).
@@ -2674,6 +2886,7 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.OInputDim, lw.OOutputDim);
             }
             ProfSample("o_proj");
+            DpStamp(cmdBuf, DpCatO);
             }  // end of GQA branch (else of MLA)
 
             // Gemma four-norm layout: post-attention RMSNorm applied to the
@@ -2698,6 +2911,7 @@ public sealed class VulkanTransformerModel : IModel
             _state.RotateHiddenSlot();
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfSample("norm_resid");
+            DpStamp(cmdBuf, DpCatResid);
 
             // Pre-FFN residual snapshot: Residual aliases HiddenState (same
             // slot); no copy needed.
@@ -2770,6 +2984,7 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.UpInputDim, lw.UpOutputDim);
             }
             ProfSample("ffn_gate_up");
+            DpStamp(cmdBuf, DpCatGateUp);
 
             // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
             // gated squared-ReLU (BitNet) when _relu2glu is non-null, otherwise
@@ -2783,6 +2998,7 @@ public sealed class VulkanTransformerModel : IModel
                 _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
             ProfSample("ffn_act");
+            DpStamp(cmdBuf, DpCatAct);
 
             // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
             // the down projection. No-op for non-BitNet (FfnSubNormWeight null).
@@ -2813,6 +3029,7 @@ public sealed class VulkanTransformerModel : IModel
                     seqLen, lw.DownInputDim, lw.DownOutputDim);
             }
             ProfSample("ffn_down");
+            DpStamp(cmdBuf, DpCatDown);
             }  // end of dense-FFN branch (else of MoE)
 
             // Gemma four-norm layout: post-FFN RMSNorm applied to the FFN
@@ -2832,6 +3049,7 @@ public sealed class VulkanTransformerModel : IModel
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
             ProfSample("norm_resid");
+            DpStamp(cmdBuf, DpCatResid);
 
             // Gemma-4 per-layer output scale (layer_output_scale) — the LAST
             // per-layer op, an in-place scalar multiply on the post-residual
@@ -2913,8 +3131,11 @@ public sealed class VulkanTransformerModel : IModel
             _weights.OutputOutputDim, _weights.OutputInputDim, seqLen: 1);
 
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
+        DpStamp(cmdBuf, DpCatLmHead);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
+        DpPreSubmit();
         _submit.SubmitAndWait();
+        DpPostSubmit();
         if (_profActive)
         {
             _profMs!.TryGetValue("lm_head", out double lmAcc);
@@ -2938,6 +3159,7 @@ public sealed class VulkanTransformerModel : IModel
             // when Config.FinalLogitSoftcap is null or non-positive.
             ApplyFinalLogitSoftcapHost(dest);
         }
+        DpEnd();
         return result;
     }
 

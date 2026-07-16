@@ -629,6 +629,20 @@ internal struct VkPhysicalDeviceTimelineSemaphoreFeatures
     internal uint timelineSemaphore; // VkBool32
 }
 
+// VkQueryPoolCreateInfo — timestamp query pool for the env-gated decode
+// profiler (issue #143). sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO (11),
+// queryType = VK_QUERY_TYPE_TIMESTAMP (2).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkQueryPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal int queryType;
+    internal uint queryCount;
+    internal uint pipelineStatistics;
+}
+
 // VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
 // we need in the compute-only hot loop are listed.
 internal static class VkPipelineStageFlags

@@ -265,7 +265,10 @@ internal sealed class VulkanForwardState : IDisposable
 
         // LM-head logits are always one token (last). Positions buffer sized for some reasonable
         // default; grows with EnsureCapacity.
-        Logits = device.Allocate((long)vocabSize * sizeof(float));
+        // Logits are read back by the host EVERY decoded token — prefer a
+        // HOST_CACHED memory type (the default write-combined host-visible type
+        // reads at <1 GB/s on the CPU: ~0.4 ms per 49k-vocab row — issue #143).
+        Logits = device.AllocateHostReadback((long)vocabSize * sizeof(float));
         PositionsBuffer = device.Allocate(Math.Max(1, initialSeqLen) * sizeof(int));
 
         // AllocateForCapacity allocates the per-seqLen prefill MMQ scratch

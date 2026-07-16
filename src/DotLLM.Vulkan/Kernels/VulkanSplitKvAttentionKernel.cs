@@ -62,17 +62,26 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
     //   - MinKvPerSplit: floor on KV rows per split so each split has enough work
     //     to amortise its launch + its share of the merge.
     //
-    // Both default to 256 — SWEPT on Llama-3.2-3B / gfx1151 (#347, decode_min_ms,
-    // ctx 512-4096): 256/256 is the sweet spot. More splits regress (~+12% at
-    // ctx4096: smaller splits, merge overhead dominates); fewer splits regress too
-    // (~+6-28%: lost occupancy). Overridable via DOTLLM_VULKAN_SPLIT_TARGET_WG /
-    // DOTLLM_VULKAN_SPLIT_MIN_KV so other archs/deployments can be re-tuned without
-    // recompiling. Read once at type initialization — zero decode-hot-path cost.
-    // An invalid/non-positive value falls back to the default.
+    // TargetWorkgroups defaults to 256 — SWEPT on Llama-3.2-3B / gfx1151 (#347,
+    // decode_min_ms, ctx 512-4096): more total workgroups regress (~+12% at
+    // ctx4096: smaller splits, merge overhead dominates); fewer regress too
+    // (~+6-28%: lost occupancy). MinKvPerSplit defaults to 16 (issue #143 —
+    // re-swept including a small-head model): it exists only to stop degenerate
+    // splits; the occupancy target above is what should normally bound S. The
+    // original 256 floor capped S=3 on SmolLM-135M (9 heads, ctx 512-640) —
+    // 27 split workgroups on a 40-CU part — making decode attention 4x slower
+    // than S=28 (2.21 → 0.53 ms/token GPU time). Lowering the floor to 16 also
+    // measured FASTER on the original sweep models at ctx 512 (Llama-3.2-3B
+    // IQ4_XS 68.5 → 74.2 tok/s; Llama-3.1-8B Q4_K_M 27.5 → 28.4 tok/s), and at
+    // long ctx the occupancy bound binds first so S is unchanged there.
+    // Overridable via DOTLLM_VULKAN_SPLIT_TARGET_WG / DOTLLM_VULKAN_SPLIT_MIN_KV
+    // so other archs/deployments can be re-tuned without recompiling. Read once
+    // at type initialization — zero decode-hot-path cost. An invalid/
+    // non-positive value falls back to the default.
     internal const string TargetWorkgroupsEnvVar = "DOTLLM_VULKAN_SPLIT_TARGET_WG";
     internal const string MinKvPerSplitEnvVar = "DOTLLM_VULKAN_SPLIT_MIN_KV";
     private static readonly int TargetWorkgroups = EnvIntOrDefault(TargetWorkgroupsEnvVar, 256);
-    private static readonly int MinKvPerSplit = EnvIntOrDefault(MinKvPerSplitEnvVar, 256);
+    private static readonly int MinKvPerSplit = EnvIntOrDefault(MinKvPerSplitEnvVar, 16);
 
     private static int EnvIntOrDefault(string envVar, int fallback)
     {

@@ -251,14 +251,53 @@ internal static partial class VulkanApi
         nint commandBuffer, nint layout, uint stageFlags,
         uint offset, uint size, nint pValues);
 
-    [LibraryImport(LibName)]
-    internal static partial void vkCmdDispatch(
-        nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
+    // ── Timestamp queries (decode profiler, issue #143) ─────────────
 
     [LibraryImport(LibName)]
-    internal static partial void vkCmdCopyBuffer(
+    internal static partial int vkCreateQueryPool(
+        nint device, in VkQueryPoolCreateInfo pCreateInfo, nint pAllocator, out nint pQueryPool);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkDestroyQueryPool(nint device, nint queryPool, nint pAllocator);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdResetQueryPool(
+        nint commandBuffer, nint queryPool, uint firstQuery, uint queryCount);
+
+    [LibraryImport(LibName)]
+    internal static partial void vkCmdWriteTimestamp(
+        nint commandBuffer, uint pipelineStage, nint queryPool, uint query);
+
+    [LibraryImport(LibName)]
+    internal static partial int vkGetQueryPoolResults(
+        nint device, nint queryPool, uint firstQuery, uint queryCount,
+        nuint dataSize, nint pData, ulong stride, uint flags);
+
+    [LibraryImport(LibName, EntryPoint = "vkCmdDispatch")]
+    private static partial void vkCmdDispatchNative(
+        nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
+
+    /// <summary>Counted wrapper over <c>vkCmdDispatch</c> (see <see cref="ProfileCounters"/>).</summary>
+    internal static void vkCmdDispatch(
+        nint commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        ProfileCounters.Dispatches++;
+        vkCmdDispatchNative(commandBuffer, groupCountX, groupCountY, groupCountZ);
+    }
+
+    [LibraryImport(LibName, EntryPoint = "vkCmdCopyBuffer")]
+    private static partial void vkCmdCopyBufferNative(
         nint commandBuffer, nint srcBuffer, nint dstBuffer,
         uint regionCount, in VkBufferCopy pRegions);
+
+    /// <summary>Counted wrapper over <c>vkCmdCopyBuffer</c> (see <see cref="ProfileCounters"/>).</summary>
+    internal static void vkCmdCopyBuffer(
+        nint commandBuffer, nint srcBuffer, nint dstBuffer,
+        uint regionCount, in VkBufferCopy pRegions)
+    {
+        ProfileCounters.Copies++;
+        vkCmdCopyBufferNative(commandBuffer, srcBuffer, dstBuffer, regionCount, in pRegions);
+    }
 
     // Inserts an execution / memory dependency between commands. Used on the
     // hot forward path to chain kernel dispatches without a host wait: a
