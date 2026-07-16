@@ -344,10 +344,25 @@ public sealed class VulkanTransformerModel : IModel
     {
         "start", "embed", "qkv_proj", "rope", "kv_update", "attention",
         "o_proj", "norm_resid", "ffn_gate_up", "ffn_act", "ffn_down", "lm_head",
+        "attn_split",
     };
     private const byte DpCatStart = 0, DpCatEmbed = 1, DpCatQkv = 2, DpCatRope = 3,
         DpCatKv = 4, DpCatAttn = 5, DpCatO = 6, DpCatResid = 7, DpCatGateUp = 8,
-        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11;
+        DpCatAct = 9, DpCatDown = 10, DpCatLmHead = 11, DpCatAttnSplit = 12;
+
+    // Cached delegate for the split-KV kernel's inter-pass profiler hook — when
+    // the GPU decode profiler is active this splits the "attention" category
+    // into split-pass ("attn_split") and merge-pass (remaining "attention")
+    // time. Allocated once; passed as null when profiling is off.
+    private Action<nint>? _dpAttnSplitStampCached;
+    private Action<nint>? DpAttnSplitStamp
+    {
+        get
+        {
+            if (!_dpActive || !DecodeProfileGpuEnabled || _dpQueryPool == 0) return null;
+            return _dpAttnSplitStampCached ??= cb => DpStamp(cb, DpCatAttnSplit);
+        }
+    }
 
     /// <summary>
     /// Records the per-forward timestamp-pool reset + the "start" stamp. Call
@@ -1688,7 +1703,8 @@ public sealed class VulkanTransformerModel : IModel
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: slidingWindow,
                 softCap: softCap, scaleOverride: scaleOverride,
-                maskMode: maskMode, prefixLen: prefixLen);
+                maskMode: maskMode, prefixLen: prefixLen,
+                interPassStamp: DpAttnSplitStamp);
             return;
         }
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)

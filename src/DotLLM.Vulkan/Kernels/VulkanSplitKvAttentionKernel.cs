@@ -256,7 +256,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
         float softCap = 0.0f, float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        Action<nint>? interPassStamp = null)
     {
         if (seqQ != 1)
             throw new ArgumentException("VulkanSplitKvAttentionKernel is decode-only (seqQ must be 1).", nameof(seqQ));
@@ -327,6 +328,12 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
 
         // Split writes partOut/partMS → merge reads them.
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
+
+        // Optional profiler hook (issue #145): a timestamp written here — after
+        // the split-pass barrier, before the merge dispatch — separates the
+        // split-pass GPU time from the merge-pass GPU time in the decode
+        // profiler's barrier-serialised timeline. Null (production) costs nothing.
+        interPassStamp?.Invoke(cmdBuf);
 
         // ── Pass 2: merge ────────────────────────────────────────────────
         Span<nint> mergeBuffers = stackalloc nint[3] { _partOut!.Handle, _partMS!.Handle, output.Handle };
