@@ -45,12 +45,31 @@ public static class ModelLoader
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         if (diffusionOverride is not null)
             config = config with { DiffusionConfig = diffusionOverride };
-        IModel model = config.Architecture switch
+        IModel model = CreateCpuModelFromGguf(gguf, config, threading);
+        return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Creates the architecture-appropriate CPU <see cref="IModel"/> for an already-opened
+    /// GGUF file. This is THE per-architecture CPU dispatch point — CLI commands and the
+    /// server call it so hybrid architectures (Nemotron-H Mamba layers, Qwen3MoeHybrid
+    /// Gated-DeltaNet layers) route to their dedicated loaders instead of the plain
+    /// <see cref="TransformerModel"/>, whose tensor naming they do not follow (e.g. a GDN
+    /// layer has no <c>attn_output.weight</c>).
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file. Must remain alive for the lifetime of the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded CPU model.</returns>
+    public static IModel CreateCpuModelFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig? threading = null)
+    {
+        var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
+        return config.Architecture switch
         {
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config),
-            _ => TransformerModel.LoadFromGguf(gguf, config, threading ?? ThreadingConfig.SingleThreaded),
+            Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
-        return (model, gguf, config);
     }
 
     /// <summary>

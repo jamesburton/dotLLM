@@ -248,15 +248,10 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             int gpuLayers = ResolveGpuLayers(settings, config);
             if (gpuLayers <= 0)
             {
-                if (config.Architecture == Architecture.NemotronH)
-                {
-                    model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
-                }
-                else
-                {
-                    model = TransformerModel.LoadFromGguf(gguf, config,
-                        new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
-                }
+                // Shared per-architecture CPU dispatch — routes hybrid architectures
+                // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+                model = ModelLoader.CreateCpuModelFromGguf(gguf, config,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
             }
             else if (gpuLayers >= config.NumLayers)
             {
