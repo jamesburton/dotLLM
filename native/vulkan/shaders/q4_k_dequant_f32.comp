@@ -1,0 +1,99 @@
+#version 450
+// Q4_K dequantization to FP32.
+//
+// Reads a tightly-packed Q4_K blob (one 144-byte super-block per 256 elements)
+// and produces a contiguous FP32 buffer of the dequantized values. Layout
+// matches DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ4_K and llama.cpp's
+// block_q4_K byte-for-byte:
+//
+//   bytes [0, 1]     = fp16 d      — global delta
+//   bytes [2, 3]     = fp16 dmin   — global min delta
+//   bytes [4..15]    = scales[12]  — 8 × (6-bit scale, 6-bit min) packed
+//   bytes [16..143]  = qs[128]     — 4-bit quants, 2 per byte
+//
+// Scale/min unpack for sub-block j in [0, 8) (UnpackQ4Q5Scales):
+//   j < 4:  sc = scales[j] & 63;             mn = scales[j+4] & 63
+//   j >= 4: sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+//           mn = (scales[j+4] >> 4)  | ((scales[j]   >> 6) << 4)
+//
+// Per-element decode (t in [0, 256), j = t/32, i = t%32):
+//   qsByte = qs[(j/2)*32 + i]
+//   nibble = (j%2 == 0) ? qsByte & 0xF : qsByte >> 4
+//   value  = (d * sc) * nibble - (dmin * mn)
+//
+// The multiply/subtract sequence mirrors the CPU scalar oracle exactly and is
+// marked `precise` so the compiler cannot contract it into an FMA — the
+// GPU-dequantised token-embed table must be bit-identical to the CPU path
+// (issue #147 load-parity gate).
+//
+// Dispatch:
+//   One workgroup per 144-byte super-block, 256 threads, one element per
+//   thread. Large tensors are dispatched in chunks: gl_WorkGroupID.x is
+//   offset by pc.firstBlock.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer BufY { float dst[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint totalBlocks;
+    uint srcUints;
+    uint firstBlock;
+} pc;
+
+const uint Q4K_BLOCK_BYTES = 144u;
+const uint Q4K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = src[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = src[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = src[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x + pc.firstBlock;
+    if (block >= pc.totalBlocks) return;
+
+    uint t = gl_LocalInvocationID.x;        // 0..255
+    uint blockBase  = block * Q4K_BLOCK_BYTES;
+    uint scalesBase = blockBase + 4u;
+    uint qsBase     = blockBase + 16u;
+
+    float d    = readHalf(blockBase);
+    float dmin = readHalf(blockBase + 2u);
+
+    uint j = t >> 5u;                        // sub-block 0..7
+    uint i = t & 31u;
+
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesBase + j) & 63u;
+        mn = readByte(scalesBase + j + 4u) & 63u;
+    } else {
+        sc = (readByte(scalesBase + j + 4u) & 0xFu) | ((readByte(scalesBase + j - 4u) >> 6u) << 4u);
+        mn = (readByte(scalesBase + j + 4u) >> 4u)  | ((readByte(scalesBase + j) >> 6u) << 4u);
+    }
+
+    uint qsByte = readByte(qsBase + (j >> 1u) * 32u + i);
+    uint nibble = ((j & 1u) == 0u) ? (qsByte & 0xFu) : (qsByte >> 4u);
+
+    precise float scf = d * float(sc);
+    precise float mnf = dmin * float(mn);
+    precise float v = scf * float(nibble) - mnf;
+    dst[block * Q4K_GROUP_SIZE + t] = v;
+}

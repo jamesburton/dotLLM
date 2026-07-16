@@ -3,6 +3,7 @@ using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
 using DotLLM.Vulkan.Interop;
+using DotLLM.Vulkan.Kernels;
 
 namespace DotLLM.Vulkan;
 
@@ -512,6 +513,12 @@ internal sealed class VulkanWeights : IDisposable
     /// stage) — saves the head matrix (for tied-embedding models another <c>vocab × hidden</c>-scale
     /// buffer). The owning model must be built headless so it never dispatches against the stubs.
     /// </param>
+    /// <param name="spvDir">
+    /// Directory containing the compiled Vulkan SPIR-V blobs. When non-null and the
+    /// token-embed table is Q4_K / Q6_K, the table is dequantised ON DEVICE by the
+    /// matching dequant shader instead of on the host (issue #147). Null (tests,
+    /// legacy callers) falls back to the streamed CPU dequant.
+    /// </param>
     /// <remarks>
     /// <para>
     /// Staging is a single bounded, persistently-mapped buffer
@@ -524,7 +531,8 @@ internal sealed class VulkanWeights : IDisposable
     public static VulkanWeights Upload(
         VulkanDevice device, TransformerWeights weights, int numLayers,
         bool dequantToFp32 = false, int firstLayer = 0,
-        bool skipTokenEmbed = false, bool skipOutputHead = false)
+        bool skipTokenEmbed = false, bool skipOutputHead = false,
+        string? spvDir = null)
     {
         if (firstLayer < 0 || firstLayer + numLayers > weights.Layers.Length)
             throw new ArgumentOutOfRangeException(nameof(firstLayer),
@@ -558,15 +566,13 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice.Buffer tokenEmbed;
         if (skipTokenEmbed)
         {
+            LastTokenEmbedDequantPath = "skipped";
             tokenEmbed = device.AllocateDeviceLocal(64);
         }
         else
         {
-            tokenEmbed = UploadMatrix(device, staging,
-                weights.TokenEmbedWeight, weights.TokenEmbedQuantType,
-                weights.VocabSize, weights.HiddenSize,
-                dequantToFp32: true,
-                out _, out long tokenEmbedBytes);
+            tokenEmbed = UploadTokenEmbedding(device, staging, weights, spvDir,
+                out long tokenEmbedBytes);
             totalBytes += tokenEmbedBytes;
         }
 
@@ -822,6 +828,111 @@ internal sealed class VulkanWeights : IDisposable
             outputNorm, outputWeight, outputDeviceQt,
             weights.OutputOutputDim, weights.OutputInputDim,
             totalBytes);
+    }
+
+    /// <summary>
+    /// Set <c>DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1</c> to force the legacy
+    /// CPU dequant of the token-embed table (streamed through staging). Used by
+    /// the embedding-row parity test as the discriminating baseline, and as an
+    /// operational escape hatch for the GPU-side dequant.
+    /// </summary>
+    private static bool IsEmbedGpuDequantDisabled() =>
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT") == "1";
+
+    /// <summary>
+    /// Diagnostic — how the token-embed table was materialised on the most recent
+    /// <see cref="Upload"/> call: <c>"gpu-q4_k"</c> / <c>"gpu-q6_k"</c> (device-side
+    /// dequant, suffixed <c>"-imported"</c> when the quantized source was zero-copy
+    /// imported), <c>"cpu"</c> (host dequant streamed through staging), or
+    /// <c>"skipped"</c> (stubbed pipeline stage).
+    /// </summary>
+    public static string LastTokenEmbedDequantPath { get; private set; } = string.Empty;
+
+    /// <summary>
+    /// Uploads the token-embedding table as a device-local F32 buffer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// GPU-side dequant path (issue #147): when the source table is Q4_K / Q6_K
+    /// (the llama.cpp <c>*_K_M</c> / IQ4 file-type embeds), the RAW quantized
+    /// bytes go to the device (zero-copy imported when the driver allows,
+    /// otherwise streamed through the bounded staging buffer at their quantized
+    /// size — 3.5-6.6 bpw instead of 32) and a one-time <c>q4_k/q6_k_dequant_f32</c>
+    /// compute dispatch expands them into the device-local F32 gather table.
+    /// The host never materialises the vocab×hidden×4 F32 image, and the shader
+    /// is bit-identical to the CPU oracle (<c>precise</c> math, same op order).
+    /// </para>
+    /// <para>
+    /// Every other source type falls back to the CPU dequant streamed through
+    /// staging (host commit still bounded by the staging cap). Follow-up quant
+    /// types (Q8_0, F16 — SmolLM/TinyLlama-class embeds) are ledgered in the
+    /// #147 audit; their tables are ≤8× smaller than the K-quant gate models'.
+    /// </para>
+    /// </remarks>
+    private static VulkanDevice.Buffer UploadTokenEmbedding(
+        VulkanDevice device, VulkanStagingBuffer staging, TransformerWeights weights,
+        string? spvDir, out long uploadedBytes)
+    {
+        int vocab = weights.VocabSize;
+        int hidden = weights.HiddenSize;
+        QuantizationType qt = weights.TokenEmbedQuantType;
+        long elems = (long)vocab * hidden;
+        long fpBytes = elems * sizeof(float);
+
+        bool gpuEligible = spvDir is not null
+            && !IsEmbedGpuDequantDisabled()
+            && qt is QuantizationType.Q4_K or QuantizationType.Q6_K
+            && (hidden % 256) == 0
+            && File.Exists(Path.Combine(spvDir,
+                qt == QuantizationType.Q4_K ? "q4_k_dequant_f32.spv" : "q6_k_dequant_f32.spv"));
+
+        if (!gpuEligible)
+        {
+            LastTokenEmbedDequantPath = "cpu";
+            return UploadMatrix(device, staging,
+                weights.TokenEmbedWeight, qt, vocab, hidden,
+                dequantToFp32: true, out _, out uploadedBytes);
+        }
+
+        long qBytes = Dequantize.RowByteSize(hidden, qt) * vocab;
+        long totalBlocks = elems / 256;
+
+        var dst = device.AllocateDeviceLocal(fpBytes);
+        VulkanDevice.Buffer? srcBuf = null;
+        try
+        {
+            bool imported = TryZeroCopyImport(device, weights.TokenEmbedWeight, qBytes, out srcBuf);
+            if (!imported)
+            {
+                srcBuf = device.AllocateDeviceLocal(qBytes);
+                staging.UploadBytes(weights.TokenEmbedWeight, qBytes, srcBuf);
+            }
+
+            if (qt == QuantizationType.Q4_K)
+            {
+                using var kernel = Q4KDequantF32Kernel.Create(device, spvDir!);
+                kernel.Launch(srcBuf!, dst, totalBlocks);
+                LastTokenEmbedDequantPath = imported ? "gpu-q4_k-imported" : "gpu-q4_k";
+            }
+            else
+            {
+                using var kernel = Q6KDequantF32Kernel.Create(device, spvDir!);
+                kernel.Launch(srcBuf!, dst, totalBlocks);
+                LastTokenEmbedDequantPath = imported ? "gpu-q6_k-imported" : "gpu-q6_k";
+            }
+        }
+        catch
+        {
+            dst.Dispose();
+            throw;
+        }
+        finally
+        {
+            srcBuf?.Dispose();
+        }
+
+        uploadedBytes = fpBytes;
+        return dst;
     }
 
     /// <summary>

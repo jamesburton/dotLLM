@@ -64,7 +64,8 @@ internal static class VulkanLoadProfile
         Console.WriteLine($"upload-counters  : zeroCopy={VulkanWeights.LastUploadZeroCopyMatrices} matrices " +
                           $"({VulkanWeights.LastUploadZeroCopyBytes / (1024.0 * 1024):F1} MiB), " +
                           $"staging={VulkanWeights.LastUploadStagingMatrices} matrices, " +
-                          $"lastFallbackReason='{VulkanWeights.LastUploadFallbackReason}'");
+                          $"lastFallbackReason='{VulkanWeights.LastUploadFallbackReason}', " +
+                          $"embedDequant='{VulkanWeights.LastTokenEmbedDequantPath}'");
         ReportPeaks("after-load");
 
         if (forward)

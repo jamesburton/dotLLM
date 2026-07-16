@@ -1081,7 +1081,7 @@ public sealed class VulkanTransformerModel : IModel
         // below dispatches them through the Q8_0 GEMV / GEMM kernels. Other
         // quant types are still dequantised to FP32 at upload.
         var weights = VulkanWeights.Upload(device, cpuWeights, config.NumLayers, firstLayer: firstLayer,
-            skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless);
+            skipTokenEmbed: skipTokenEmbed, skipOutputHead: headless, spvDir: spvDir);
 
         // MoE detection: any layer with non-null Moe in CPU weights. We
         // don't gate on config.Moe because Mixtral/Qwen-MoE configs may
