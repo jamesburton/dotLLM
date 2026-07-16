@@ -51,7 +51,7 @@ public sealed class MoeIndexedMatmulQ5_1MmvqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BuffersPerSet);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BuffersPerSet);
     }
 
     /// <summary>

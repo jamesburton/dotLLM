@@ -133,7 +133,7 @@ public sealed class AttentionF32Kernel : IDisposable
             DispatchMode.Subgroup => subgroupPipeline!,
             _                     => sharedPipeline,
         };
-        _descriptorCache = new DescriptorSetCache(device, pool, active.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, active, buffersPerSet: 4);
     }
 
     /// <summary>

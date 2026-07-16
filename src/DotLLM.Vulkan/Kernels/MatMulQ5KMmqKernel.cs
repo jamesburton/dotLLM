@@ -41,7 +41,7 @@ public sealed class MatMulQ5KMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>

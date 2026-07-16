@@ -53,7 +53,7 @@ public sealed class Mamba2SelectiveScanF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BufferCount);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BufferCount);
     }
 
     /// <summary>Loads <c>mamba2_selective_scan_f32.spv</c> from <paramref name="spvDir"/>.</summary>

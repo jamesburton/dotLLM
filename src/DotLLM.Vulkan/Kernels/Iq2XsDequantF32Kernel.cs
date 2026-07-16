@@ -37,7 +37,7 @@ public sealed class Iq2XsDequantF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
         _codebooks = codebooks;
         _ownsCodebooks = ownsCodebooks;
     }

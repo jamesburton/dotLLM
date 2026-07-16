@@ -23,4 +23,11 @@ internal static class ProfileCounters
 
     /// <summary>Total descriptor-set allocations (via KernelSupport.AllocateDescriptorSet).</summary>
     internal static long DescriptorAllocs;
+
+    /// <summary>
+    /// Subset of <see cref="Barriers"/> emitted by the hazard-scoped tracker
+    /// (issue #144, <see cref="VulkanHazardTracker"/>). Legacy blanket
+    /// barriers show up in <see cref="Barriers"/> only.
+    /// </summary>
+    internal static long HazardBarriers;
 }

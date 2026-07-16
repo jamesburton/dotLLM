@@ -55,7 +55,7 @@ public sealed class RmsNormF32Kernel : IDisposable
         // Cache keyed on the active pipeline's descriptor-set layout. Since
         // _useSubgroup is fixed at construction, one cache per kernel is enough.
         ComputePipeline active = (useSubgroup && subgroupPipeline != null) ? subgroupPipeline : sharedPipeline;
-        _descriptorCache = new DescriptorSetCache(device, pool, active.DescriptorSetLayout, buffersPerSet: 3);
+        _descriptorCache = new DescriptorSetCache(device, pool, active, buffersPerSet: 3);
     }
 
     /// <summary>

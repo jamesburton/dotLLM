@@ -203,6 +203,14 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
 
+        // Hazard-scoped barriers (issue #144): declare the append's access set
+        // (reads the fresh K/V activations, writes the per-layer cache rows)
+        // so the tracker emits the RoPE→copy barrier and the later
+        // copy→attention barrier only when actually pending. One declaration
+        // per buffer pair covers both the contiguous and per-row forms.
+        _device.ActiveHazards?.OnTransfer(kDev.Handle, _keys[layerIndex].Handle);
+        _device.ActiveHazards?.OnTransfer(vDev.Handle, _values[layerIndex].Handle);
+
         if (contiguous)
         {
             int startPos = positions[0];
