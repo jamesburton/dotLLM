@@ -30,7 +30,9 @@
 
 set -u
 
-LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-/e/Development/dotLLM/.gpu-lock}"
+# Default: <repo-root>/.gpu-lock (script lives in <repo-root>/scripts). Override with
+# DOTLLM_GPU_LOCK_DIR — worktrees/other checkouts MUST point at ONE shared dir per box.
+LOCK_DIR="${DOTLLM_GPU_LOCK_DIR:-$(cd "$(dirname "$0")/.." && pwd)/.gpu-lock}"
 HOLDER_FILE="$LOCK_DIR/holder"
 
 cmd="${1:-}"
