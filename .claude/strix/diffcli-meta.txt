@@ -1,0 +1,21 @@
+0.01.253.985 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.254.552 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.01.352.193 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+0.14.094.816 I diffusion: -n 1 -> 1 blocks, n_ubatch=2304 n_batch=2304 n_ctx=2304 (canvas_length=256)
+0.14.094.825 I diffusion: --fit has no effect here; context is sized from -n and the canvas. Set -ngl / --n-cpu-moe to control device memory.
+0.14.099.963 W llama_context: n_ctx_seq (2304) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.17.112.391 W ggml_vulkan: Failed to allocate pinned memory (Requested buffer size exceeds device buffer size limit: ErrorOutOfDeviceMemory)
+0.17.172.163 I diffusion_params: steps=1 schedule=0 algorithm=4 temperature=0.800 eps=0.001000 mask_token=4
+0.17.172.222 I diffusion_eb: max_steps=48 t=[0.400,0.800] entropy_bound=0.1000 stability=1 confidence=0.0050 kv_cache=on gpu_sampling=on sample_reduce=on
+0.52.854.997 W diffusion_generate_entropy_bound: on-device sampling unsupported on this backend; using host sampling
+0.52.939.964 I diffusion step: 0/48 [                                                  ] 0%1.03.063.665 I diffusion step: 1/48 [=                                                 ] 2%1.09.808.439 I diffusion step: 2/48 [==                                                ] 4%1.14.975.455 I diffusion step: 3/48 [===                                               ] 6%1.18.972.508 I diffusion step: 4/48 [====                                              ] 8%1.23.015.813 I diffusion step: 5/48 [=====                                             ] 10%1.26.946.821 I diffusion step: 6/48 [======                                            ] 12%1.29.874.813 I diffusion step: 7/48 [=======                                           ] 14%1.32.560.877 I diffusion step: 8/48 [========                                          ] 16%
+<|channel>thought
+The user said "hi".
+This is a standard greeting.
+I should respond politely and offer assistance.
+
+Plan:
+1. Say "Hello!" or "Hi!".
+2. Ask how I can help them today.<channel|>Hello! How can I help you today?
+total time: 74944.07ms, time per step: 8327.12ms (9 steps over 1 blocks, entropy-bound)
+throughput: 3.4 tok/s (256 tok in 74944.07ms), in-step parallel 31 tok/s (256-tok canvas x 9.0 steps/block)
