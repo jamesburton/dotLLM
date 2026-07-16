@@ -19,6 +19,31 @@ Implementation: Trie for prefix matching, compiled regex. Vocabulary loaded from
 
 Vocabulary from GGUF: `tokenizer.ggml.tokens` + `tokenizer.ggml.scores`.
 
+### Gemma-4 SPM-style merge-ranked BPE (`tokenizer.ggml.model = "gemma4"`)
+
+Gemma-4 GGUFs (26B-A4B, E4B, DiffusionGemma) look SentencePiece-like (▁ space
+markers, `<0xNN>` byte tokens, flat −1000 `tokenizer.ggml.scores`) but tokenize
+with **merge-ranked BPE** over the `tokenizer.ggml.merges` table (~515k entries).
+Matches llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`:
+
+- **Normalize**: escape every space to `▁` (U+2581); NO `▁` prepend
+  (`tokenizer.ggml.add_space_prefix = false`).
+- **Pre-tokenize**: `[^\n]+|[\n]+` only — split newline runs off, no word-level
+  splitting; raw UTF-8 code points, no GPT-2 byte encoding.
+- **Newline-run shortcut** (llama.cpp PR #21343): a whole `\n`-run that exists in
+  the vocab is emitted directly, bypassing BPE.
+- **Merges**: rank-ordered (lowest first, leftmost tie-break); split each merge
+  entry at the first space at index ≥ 1. Byte fallback to `<0xNN>` for code
+  points outside the vocab.
+- llama.cpp also forces `add_bos = true` for this pre-type (the GGUFs already
+  carry `add_bos_token = true`).
+
+Implemented in `Gemma4SpmBpeEncoding` (`BpeTokenizer.CreateGemma4`); routed by
+`GgufBpeTokenizerFactory` when `tokenizer.ggml.model == "gemma4"` **and** merges
+are present (files without merges keep the SentencePiece longest-match fallback).
+Oracle-pinned parity tests: `Gemma4TokenizerParityTests` (integration, vs
+`llama-tokenize --ids`) and `Gemma4BpeTokenizerTests` (unit, synthetic vocab).
+
 ### HuggingFace tokenizer.json
 
 JSON format containing: model type, vocabulary, merges, pre-tokenizer config, normalizer, post-processor, added tokens. Full specification of the tokenization pipeline.
