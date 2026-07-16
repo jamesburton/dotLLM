@@ -94,8 +94,15 @@ first-touch faults stream from disk during the first forward instead of at load.
 `VulkanPipelineParityTests.PipelinedForwardBatch_MatchesPerSequenceForward` fails on the dev
 baseline (`c443891f`, verified by stashing all #147 changes and rebuilding):
 `[single-device] seq 1 col 0: serial=0.045437 vs batched=0.004787` (seq 0 matches 0.000E+000).
-Batched-decode cross-talk shape, unrelated to the load path. Vulkan unit suite otherwise:
-868 passed / 41 skipped with #147 item 1 applied; MoE subset re-run after item 3: 98 passed.
+Batched-decode cross-talk shape, unrelated to the load path — and FLAKY: it failed on the
+stashed dev baseline and on the item-1 full-suite run, then passed on the final-state re-run.
+
+Suite results on the final branch state (split into <10-min chunks): 218 + 142 + 224 + 294 =
+878 passed, 0 failed, 41 skipped across the full `~Vulkan` population. One earlier
+single-process 13-minute run of the A–Ma chunk reported "Failed: 3" with the failing names lost
+to output truncation; the identical population re-run green in splits immediately after —
+consistent with cumulative-pressure flakiness on this 32 GiB box (2.3 GiB free RAM during the
+campaign), not with a deterministic regression.
 
 ## KERNEL_MAP.md updates to fold in (worktree cannot edit the main repo's `.docs/`)
 
