@@ -2052,6 +2052,19 @@ public sealed class VulkanDevice : IDisposable
     // ────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Hazard-scoped barrier tracker armed for the recording currently in
+    /// progress on this device (issue #144), or <c>null</c> when the legacy
+    /// blanket-barrier scheme is in effect. Armed by
+    /// <see cref="VulkanTransformerModel"/> right after
+    /// <see cref="SubmitContext.Begin"/> on its tracked forward path;
+    /// disarmed automatically by every <see cref="SubmitContext"/>
+    /// begin/submit so an aborted recording can never leak tracking into an
+    /// unrelated model's command buffer. Recording is single-threaded per
+    /// device, so a plain field suffices.
+    /// </summary>
+    internal VulkanHazardTracker? ActiveHazards;
+
+    /// <summary>
     /// Reusable command-buffer + fence pair used by the fence-pipelined
     /// forward pass. One instance per <see cref="VulkanTransformerModel"/>;
     /// <see cref="Begin"/> resets and opens the buffer, <see cref="SubmitAndWait"/>
@@ -2080,6 +2093,9 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public void Begin()
         {
+            // A fresh recording always starts untracked; the model re-arms
+            // the hazard tracker for its tracked path after Begin returns.
+            _device.ActiveHazards = null;
             _splitThisForward = false;
             VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer");
             var begin = new VkCommandBufferBeginInfo
@@ -2097,6 +2113,7 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public unsafe void SubmitAndWait()
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer");
 
             nint cmdBufLocal = _cmdBuf;
@@ -2173,6 +2190,11 @@ public sealed class VulkanDevice : IDisposable
                 flags = VkCommandBufferUsageFlags.OneTimeSubmit,
             };
             VulkanApi.vkBeginCommandBuffer(_cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SplitSubmit");
+
+            // Keep the hazard tracker (issue #144) pointed at the live buffer.
+            // Epoch state carries across the chunk boundary: pipeline barriers
+            // synchronize prior command buffers in same-queue submission order.
+            _device.ActiveHazards?.OnCommandBufferSwitch(_cmdBuf);
         }
 
         /// <summary>
@@ -2195,6 +2217,7 @@ public sealed class VulkanDevice : IDisposable
         /// </remarks>
         public unsafe void SubmitAndSignal(nint signalSemaphore)
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignal");
 
             nint cmdBufLocal = _cmdBuf;
@@ -2230,6 +2253,7 @@ public sealed class VulkanDevice : IDisposable
         /// </remarks>
         public unsafe void SubmitAndSignalTimeline(nint signalSemaphore, ulong signalValue)
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignalTimeline");
 
             nint cmdBufLocal = _cmdBuf;

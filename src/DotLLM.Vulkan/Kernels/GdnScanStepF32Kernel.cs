@@ -36,7 +36,7 @@ public sealed class GdnScanStepF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 7);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 7);
     }
 
     /// <summary>Loads <c>gdn_scan_step_f32.spv</c> from <paramref name="spvDir"/>.</summary>

@@ -52,7 +52,7 @@ public sealed class GroupRmsNormF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BufferCount);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BufferCount);
     }
 
     /// <summary>Loads <c>group_rmsnorm_f32.spv</c> from <paramref name="spvDir"/>.</summary>

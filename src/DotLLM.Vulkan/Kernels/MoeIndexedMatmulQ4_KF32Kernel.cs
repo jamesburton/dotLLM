@@ -49,7 +49,7 @@ public sealed class MoeIndexedMatmulQ4_KF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>Loads <c>moe_indexed_matmul_q4_k_f32.spv</c> from <paramref name="spvDir"/>.</summary>

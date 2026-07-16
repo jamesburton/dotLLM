@@ -63,7 +63,7 @@ public sealed class RmsNormMatmulQ8_0FusedKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 5);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 5);
     }
 
     /// <summary>

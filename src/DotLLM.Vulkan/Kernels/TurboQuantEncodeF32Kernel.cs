@@ -39,7 +39,7 @@ public sealed class TurboQuantEncodeF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: BindingCount);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: BindingCount);
     }
 
     /// <summary>Loads <c>turboquant_encode_f32.spv</c> from the given directory and creates the pipeline.</summary>

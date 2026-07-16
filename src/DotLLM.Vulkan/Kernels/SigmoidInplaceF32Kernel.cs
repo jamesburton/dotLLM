@@ -30,7 +30,7 @@ public sealed class SigmoidInplaceF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 1);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 1);
     }
 
     /// <summary>Loads <c>sigmoid_inplace_f32.spv</c> from <paramref name="spvDir"/>.</summary>

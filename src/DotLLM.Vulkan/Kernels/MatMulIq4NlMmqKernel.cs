@@ -40,7 +40,7 @@ public sealed class MatMulIq4NlMmqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>Loads <c>matmul_iq4_nl_mmq.spv</c>; null when missing or no integer-dot support.</summary>

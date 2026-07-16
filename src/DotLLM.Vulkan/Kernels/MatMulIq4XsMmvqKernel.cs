@@ -35,7 +35,7 @@ public sealed class MatMulIq4XsMmvqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>Loads <c>matmul_iq4_xs_mmvq.spv</c>; null when the SPV is missing or the device

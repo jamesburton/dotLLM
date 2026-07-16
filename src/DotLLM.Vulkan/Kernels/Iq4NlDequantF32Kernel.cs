@@ -34,7 +34,7 @@ public sealed class Iq4NlDequantF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 2);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 2);
     }
 
     /// <summary>Loads <c>iq4_nl_dequant_f32.spv</c> from the given directory and creates the pipeline.</summary>

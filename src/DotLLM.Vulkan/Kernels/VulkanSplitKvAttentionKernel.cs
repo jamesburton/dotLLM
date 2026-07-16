@@ -126,8 +126,8 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         _mergeModule = mergeModule;
         _mergePipeline = mergePipeline;
         _mergePool = mergePool;
-        _splitCache = new DescriptorSetCache(device, splitPool, splitPipeline.DescriptorSetLayout, buffersPerSet: 5);
-        _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline.DescriptorSetLayout, buffersPerSet: 3);
+        _splitCache = new DescriptorSetCache(device, splitPool, splitPipeline, buffersPerSet: 5);
+        _mergeCache = new DescriptorSetCache(device, mergePool, mergePipeline, buffersPerSet: 3);
     }
 
     /// <summary>

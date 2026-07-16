@@ -37,7 +37,7 @@ public sealed class MatMulIq4NlGemmF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 3);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
     /// <summary>Loads <c>matmul_iq4_nl_f32_gemm.spv</c> from the given directory and creates the pipeline.</summary>
