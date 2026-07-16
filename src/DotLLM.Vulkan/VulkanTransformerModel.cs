@@ -329,8 +329,14 @@ public sealed class VulkanTransformerModel : IModel
     // single batched barrier is emitted only on a real conflict, letting
     // independent ops (Q/K/V, gate/up, per-expert matmuls) overlap — the
     // llama.cpp ggml-vulkan model. Kill-switch restores blanket barriers.
+    // DEFAULT = legacy (blanket) barriers. Hazard tracking measured perf-NEUTRAL on
+    // gfx1151 (#144 ledger) and the #144+#145 combination intermittently DEVICE_LOSTs
+    // (under-sync interaction, issue #148) — so hazard mode is opt-IN via
+    // DOTLLM_VULKAN_HAZARD_BARRIERS=1 until root-caused. DOTLLM_VULKAN_LEGACY_BARRIERS=1
+    // still forces legacy explicitly (wins over both).
     private static readonly bool LegacyBarriersEnabled =
-        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_LEGACY_BARRIERS") == "1";
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_LEGACY_BARRIERS") == "1" ||
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HAZARD_BARRIERS") != "1";
     // Debug aid: keep the tracker armed but force a barrier at every guard —
     // legacy-equivalent ordering through the tracked code path.
     private static readonly bool HazardValidateEnabled =
