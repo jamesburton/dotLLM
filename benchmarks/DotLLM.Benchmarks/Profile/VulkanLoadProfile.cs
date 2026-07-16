@@ -4,6 +4,7 @@ using DotLLM.Core.Tensors;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
+using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Benchmarks.Profile;
 
@@ -66,6 +67,9 @@ internal static class VulkanLoadProfile
                           $"staging={VulkanWeights.LastUploadStagingMatrices} matrices, " +
                           $"lastFallbackReason='{VulkanWeights.LastUploadFallbackReason}', " +
                           $"embedDequant='{VulkanWeights.LastTokenEmbedDequantPath}'");
+        if (VulkanWeights.LastUploadFallbackReason == "import_rejected")
+            Console.WriteLine($"import-reject    : stage='{HostVisibleBuffer.LastImportFailureStage}' " +
+                              $"vkResult={HostVisibleBuffer.LastImportFailureCode}");
         ReportPeaks("after-load");
 
         if (forward)

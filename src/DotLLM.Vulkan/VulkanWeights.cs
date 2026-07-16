@@ -1542,32 +1542,15 @@ internal sealed class VulkanWeights : IDisposable
         }
         uploadedBytes += gateBytes;
 
-        // ── Bank packing (per-routed-expert, F32 only) ───────────────
-        long w1BankBytes = perExpertW1Bytes * numE;
-        long w2BankBytes = perExpertW2Bytes * numE;
-        long w3BankBytes = perExpertW3Bytes * numE;
-        var w1Bank = device.AllocateDeviceLocal(w1BankBytes);
-        var w2Bank = device.AllocateDeviceLocal(w2BankBytes);
-        var w3Bank = device.AllocateDeviceLocal(w3BankBytes);
-
-        for (int e = 0; e < numE; e++)
-        {
-            if (routedW1Qt != QuantizationType.F32)
-                UploadRawBankSlot(device, stage, moe.GateExpsRaw + (nint)((long)e * perExpertW1Bytes), perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
-            else
-                UploadExpertBankSlot(device, stage, moe.W1[e], perExpertW1Bytes, w1Bank, (long)e * perExpertW1Bytes);
-
-            if (routedW2Qt != QuantizationType.F32)
-                UploadRawBankSlot(device, stage, moe.DownExpsRaw + (nint)((long)e * perExpertW2Bytes), perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
-            else
-                UploadExpertBankSlot(device, stage, moe.W2[e], perExpertW2Bytes, w2Bank, (long)e * perExpertW2Bytes);
-
-            if (routedW3Qt != QuantizationType.F32)
-                UploadRawBankSlot(device, stage, moe.UpExpsRaw + (nint)((long)e * perExpertW3Bytes), perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
-            else
-                UploadExpertBankSlot(device, stage, moe.W3[e], perExpertW3Bytes, w3Bank, (long)e * perExpertW3Bytes);
-        }
-        uploadedBytes += w1BankBytes + w2BankBytes + w3BankBytes;
+        // ── Routed expert banks ──────────────────────────────────────
+        // Raw-quant banks are expert-contiguous in the GGUF fused-expert tensor with
+        // exactly the bank's per-expert stride, so the whole bank is one contiguous
+        // region: zero-copy import it in place when the driver allows, otherwise one
+        // streamed copy. F32 banks pack per-expert host pointers (non-contiguous).
+        var w1Bank = UploadRoutedBankWhole(device, stage, routedW1Qt, moe.GateExpsRaw, moe.W1, perExpertW1Bytes, numE);
+        var w2Bank = UploadRoutedBankWhole(device, stage, routedW2Qt, moe.DownExpsRaw, moe.W2, perExpertW2Bytes, numE);
+        var w3Bank = UploadRoutedBankWhole(device, stage, routedW3Qt, moe.UpExpsRaw, moe.W3, perExpertW3Bytes, numE);
+        uploadedBytes += (perExpertW1Bytes + perExpertW2Bytes + perExpertW3Bytes) * numE;
 
         // ── Shared-expert per-expert buffers (separate buffers, NOT a packed bank — the
         //    matmul kernel reads its weight buffer from offset 0). Each shared expert
@@ -1888,6 +1871,37 @@ internal sealed class VulkanWeights : IDisposable
                 for (int i = 0; i < dst.Length; i++) dst[i] *= scale;
             stage.Flush(bank, dstOffsetBytes + e0 * sizeof(float), n * sizeof(float));
         }
+    }
+
+    /// <summary>
+    /// Uploads one routed-expert bank. Raw-quant sources (Q8_0 / F16 kept-native
+    /// banks) are expert-contiguous in the GGUF fused-expert tensor with exactly the
+    /// bank's per-expert stride, so the bank is (a) a zero-copy
+    /// <c>VK_EXT_external_memory_host</c> import of the mmap'd range when the driver
+    /// accepts it, or (b) a single streamed staging copy. F32 banks pack the
+    /// per-expert host matrices (separate allocations — never contiguous, never
+    /// importable) slot by slot.
+    /// </summary>
+    private static VulkanDevice.Buffer UploadRoutedBankWhole(
+        VulkanDevice device, VulkanStagingBuffer stage,
+        QuantizationType routedQt, nint raw, nint[] f32Experts,
+        long perExpertBytes, int numE)
+    {
+        long bankBytes = perExpertBytes * numE;
+        if (routedQt != QuantizationType.F32)
+        {
+            if (TryZeroCopyImport(device, raw, bankBytes, out var imported))
+                return imported!;
+            var rawBank = device.AllocateDeviceLocal(bankBytes);
+            stage.UploadBytes(raw, bankBytes, rawBank);
+            LastUploadStagingMatrices++;
+            return rawBank;
+        }
+
+        var bank = device.AllocateDeviceLocal(bankBytes);
+        for (int e = 0; e < numE; e++)
+            stage.UploadBytes(f32Experts[e], perExpertBytes, bank, (long)e * perExpertBytes);
+        return bank;
     }
 
     /// <summary>True iff a Q8_0 MoE overlay can be kept on device as raw Q8_0 blocks —
