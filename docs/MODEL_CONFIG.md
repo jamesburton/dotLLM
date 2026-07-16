@@ -76,6 +76,24 @@ Differences between architectures are captured entirely in ModelConfig.
 - MlaConfig: latent_dim (e.g., 512), rope_dim (e.g., 64)
 - See [ATTENTION.md](ATTENTION.md) for MLA details
 
+### gpt-oss (OpenAI gpt-oss-20b / 120b)
+- GGUF arch string: `gpt-oss` (llama.cpp `LLM_ARCH_OPENAI_MOE`)
+- Norm: RMSNorm; pre-FFN norm tensor is named `post_attention_norm`
+- Attention: GQA (20b: 64Q/8KV, head_dim 64) with **per-head attention sinks**
+  (`attn_sinks.weight` [numHeads] — a learned scalar logit that joins each
+  head's softmax denominator) and Q/K/V/O biases
+- **Alternating sliding window**: window 128 on even layers, dense on odd
+  (`SlidingWindowPattern` = 2, llama.cpp `set_swa_pattern(2, dense_first=false)`)
+- Position: NeoX RoPE, theta 150000, YaRN (factor 32, original context 4096);
+  cos/sin tables carry the ggml mscale `attn_factor * (1 + 0.1*ln(factor))`
+- FFN: routed MoE in **every** layer — 32 experts, top-4, router bias,
+  **top-k on raw logits then softmax over the selected k** (softmax-after-top-k),
+  per-expert gate/up/down biases, clamped `swiglu_oai` activation
+  (`x = min(gate,7); y = clamp(up,-7,7); out = x*sigmoid(1.702x)*(y+1)`)
+- Expert weights: MXFP4 (consumed straight from the mmap on CPU —
+  `MoeQuantSwiGluMlp`); attention/embeddings/LM head: Q8_0
+- Tokenizer: gpt2-model BPE with `gpt-4o` (o200k) pre-tokenizer
+
 ## GGUF → ModelConfig Mapping
 
 ```csharp

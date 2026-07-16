@@ -348,11 +348,19 @@ public sealed unsafe class TransformerModel : IModel
                  && rcfg.ScalingFactor > 1.0f
                  && rcfg.OrigMaxSeqLen > 0)
         {
+            // gpt-oss (llama.cpp ggml_rope_ext yarn, ext_factor=1) additionally
+            // applies the attention-magnitude concentration
+            // mscale = attn_factor * (1 + 0.1 * ln(factor)) to cos/sin. Other
+            // dense-YaRN archs (SmolLM3, Llama 3.1+) keep the plain AttnFactor
+            // convention established when they were wired.
+            float mscaleMultiplier = config.Architecture == DotLLM.Core.Configuration.Architecture.GptOss
+                ? rcfg.AttnFactor * (1.0f + 0.1f * MathF.Log(rcfg.ScalingFactor))
+                : rcfg.AttnFactor;
             DotLLM.Cpu.Kernels.RoPE.PrecomputeFrequencyTableYarn(
                 config.MaxSequenceLength, ropeDim, ropeTheta,
                 rcfg.ScalingFactor, rcfg.OrigMaxSeqLen,
                 rcfg.BetaFast, rcfg.BetaSlow,
-                mscaleMultiplier: rcfg.AttnFactor,
+                mscaleMultiplier: mscaleMultiplier,
                 state.CosTable, state.SinTable);
         }
 
@@ -664,8 +672,13 @@ public sealed unsafe class TransformerModel : IModel
     /// Returns the effective sliding-window size for <paramref name="layer"/>.
     /// Honours <see cref="ModelConfig.PerLayerSlidingWindow"/> when set (each entry
     /// may be null for full attention or a positive int for sliding); otherwise
-    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>.
-    /// Used for Gemma 3's interleaved local/global pattern.
+    /// falls back to the model-wide <see cref="ModelConfig.SlidingWindowSize"/>,
+    /// optionally modulated by <see cref="ModelConfig.SlidingWindowPattern"/> —
+    /// pattern N &gt; 0 applies the window only to layers where
+    /// <c>layer % N &lt; N - 1</c> (llama.cpp <c>set_swa_pattern(N,
+    /// dense_first=false)</c>; gpt-oss N=2: even layers windowed, odd dense).
+    /// Used for Gemma 3's interleaved local/global pattern and gpt-oss's
+    /// alternating sliding/dense attention.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int? GetLayerSlidingWindow(int layer)
@@ -673,7 +686,10 @@ public sealed unsafe class TransformerModel : IModel
         var perLayer = Config.PerLayerSlidingWindow;
         if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
             return perLayer[layer];
-        return _slidingWindowSize;
+        if (_slidingWindowSize is null) return null;
+        int pattern = Config.SlidingWindowPattern;
+        if (pattern <= 0) return _slidingWindowSize;
+        return (layer % pattern) < pattern - 1 ? _slidingWindowSize : null;
     }
 
     /// <summary>
@@ -1259,10 +1275,13 @@ public sealed unsafe class TransformerModel : IModel
             // e. Attention — with or without KV-cache
             // Gemma 3 family extras (no-op on every other architecture):
             //  - PerLayerSlidingWindow[layer]: per-layer sliding-window override
-            //    (Gemma 3 interleaves local/global attention).
+            //    (Gemma 3 interleaves local/global attention; gpt-oss alternates
+            //    windowed/dense via ModelConfig.SlidingWindowPattern).
             //  - QueryPreAttnScalar: override the default 1/sqrt(headDim) scale.
             //  - AttnLogitSoftcap: pre-softmax tanh soft-cap (Gemma 2 sets 50.0;
             //    Gemma 3 leaves null but the plumbing is wired).
+            // gpt-oss extras: lw.AttnSinks — per-head sink logits joining each
+            // head's softmax denominator (null for every other architecture).
             int? layerSlidingWindow = GetLayerSlidingWindow(layer);
             float attnScale = Config.QueryPreAttnScalar is float qpas && qpas > 0
                 ? 1.0f / MathF.Sqrt(qpas)
@@ -1287,7 +1306,7 @@ public sealed unsafe class TransformerModel : IModel
                     // Quantized path: dequantize KV tiles on-the-fly during attention
                     Attention.Execute(q, qkvCache, layer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], _threadPool,
-                        layerSlidingWindow, attnSoftCap);
+                        layerSlidingWindow, attnSoftCap, lw.AttnSinks);
                 }
                 else
                 {
@@ -1296,7 +1315,8 @@ public sealed unsafe class TransformerModel : IModel
 
                     Attention.Execute(q, (float*)cachedK.DataPointer, (float*)cachedV.DataPointer, attnOut,
                         seqLen, seqKv, numHeads, numKvHeadsLayer, headDimLayer, positions[0], attnScale,
-                        _threadPool, layerSlidingWindow, attnSoftCap);
+                        _threadPool, layerSlidingWindow, attnSoftCap,
+                        AttentionMaskMode.Causal, 0, lw.AttnSinks);
                 }
             }
             else
@@ -1308,7 +1328,7 @@ public sealed unsafe class TransformerModel : IModel
                 Attention.Execute(q, k, v, attnOut,
                     seqLen, seqLen, numHeads, numKvHeadsLayer, headDimLayer, 0, attnScale, _threadPool,
                     layerSlidingWindow, attnSoftCap,
-                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength);
+                    _currentMaskSpec.Mode, _currentMaskSpec.PrefixLength, lw.AttnSinks);
             }
 
             // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output
@@ -1410,6 +1430,29 @@ public sealed unsafe class TransformerModel : IModel
                         normTopKProb: moe.NormTopKProb,
                         rmsEps: eps,
                         threadPool: _threadPool);
+                }
+                // Quantized-expert path (gpt-oss): consume the raw GGUF expert
+                // banks directly (MXFP4/Q8_0), with router/expert biases,
+                // softmax-after-top-k gating, and clamped swiglu_oai.
+                else if (moe.UseQuantExperts)
+                {
+                    MoeQuantSwiGluMlp.Execute(
+                        hidden: normOut, output: normOut, seqLen: seqLen,
+                        routerWeight: moe.Gate,
+                        routerBias: moe.RouterBias is null ? ReadOnlySpan<float>.Empty : moe.RouterBias,
+                        gateExpsBase: moe.GateExpsRaw, gateQt: moe.GateExpsRawQt,
+                        upExpsBase: moe.UpExpsRaw, upQt: moe.UpExpsRawQt,
+                        downExpsBase: moe.DownExpsRaw, downQt: moe.DownExpsRawQt,
+                        gateBias: moe.GateExpsBias is null ? ReadOnlySpan<float>.Empty : moe.GateExpsBias,
+                        upBias: moe.UpExpsBias is null ? ReadOnlySpan<float>.Empty : moe.UpExpsBias,
+                        downBias: moe.DownExpsBias is null ? ReadOnlySpan<float>.Empty : moe.DownExpsBias,
+                        numExperts: moe.NumExperts,
+                        numExpertsPerTok: moe.NumExpertsPerTok,
+                        hiddenSize: hiddenSize,
+                        intermediateSize: moe.IntermediateSize,
+                        softmaxAfterTopK: moe.SoftmaxAfterTopK,
+                        useSwiGluOai: moe.UseSwiGluOai,
+                        pool: _threadPool);
                 }
                 // Route through the shared-expert-aware overload iff we need
                 // shared-expert addition OR the raw-softmax (non-renormalised)
@@ -3071,6 +3114,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvQ5_K((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.Q6_K)
             MatMul.GemvQ6_K((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.MXFP4)
+            MatMul.GemvMxfp4((byte*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F32)
             MatMul.GemvF32((float*)weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.F16)
@@ -3124,6 +3169,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmQ5_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
         else if (qt == QuantizationType.Q6_K)
             MatMul.GemmQ6_K((byte*)weights, b, c, m, k, n, _threadPool, preQuantizedInput);
+        else if (qt == QuantizationType.MXFP4)
+            MatMul.GemmMxfp4((byte*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F32)
             MatMul.GemmF32((float*)weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.F16)

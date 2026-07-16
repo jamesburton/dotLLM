@@ -261,6 +261,36 @@ internal sealed class MoeLayerWeights
     /// <summary>True when the routed experts are ternary I2_S (BitNet-MoE forward path).</summary>
     public bool IsBitNetI2S => RoutedExpertQuantType == QuantizationType.I2_S;
 
+    // ── Quantized-expert CPU path (gpt-oss) ───────────────────────────────
+    // When UseQuantExperts is true the CPU forward runs
+    // DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp directly on the raw GGUF views
+    // (GateExpsRaw / UpExpsRaw / DownExpsRaw + their quant types) instead of
+    // the F32 W1/W2/W3 banks — no F32 host inflation. The W1/W2/W3 arrays are
+    // zero-filled placeholders in this mode.
+
+    /// <summary>True = CPU forward consumes the raw quantized expert banks via
+    /// <c>MoeQuantSwiGluMlp</c> (gpt-oss). False = classic F32 W1/W2/W3 path.</summary>
+    public bool UseQuantExperts;
+
+    /// <summary>Optional router bias [NumExperts] (gpt-oss <c>ffn_gate_inp.bias</c>).</summary>
+    public float[]? RouterBias;
+
+    /// <summary>Optional per-expert gate bias, flat [NumExperts × IntermediateSize].</summary>
+    public float[]? GateExpsBias;
+
+    /// <summary>Optional per-expert up bias, flat [NumExperts × IntermediateSize].</summary>
+    public float[]? UpExpsBias;
+
+    /// <summary>Optional per-expert down bias, flat [NumExperts × HiddenSize].</summary>
+    public float[]? DownExpsBias;
+
+    /// <summary>True = clamped swiglu_oai activation (gpt-oss); false = plain SwiGLU.</summary>
+    public bool UseSwiGluOai;
+
+    /// <summary>True = softmax over the selected top-k raw logits (gpt-oss);
+    /// false = Mixtral softmax-then-topk gating.</summary>
+    public bool SoftmaxAfterTopK;
+
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
         float[] gate,
@@ -567,6 +597,14 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly MoeLayerWeights? Moe;
 
+    /// <summary>
+    /// Optional per-head attention-sink logits [numHeads] (gpt-oss
+    /// <c>attn_sinks.weight</c>). When non-null each head's attention softmax
+    /// denominator additionally includes <c>exp(sink[h] - max)</c>. Null for
+    /// architectures without sinks (zero overhead).
+    /// </summary>
+    public readonly float[]? AttnSinks;
+
     // ──────────────────────────── MLA attention ────────────────────────────
     // DeepSeek-V2/V3 replaces the monolithic Q/K/V/O projections with a
     // low-rank-factorised set. When <see cref="Mla"/> is non-null, the
@@ -620,7 +658,8 @@ internal readonly struct TransformerLayerWeights
         float[]? postAttnNormWeight = null, float[]? postFfnNormWeight = null,
         Gemma4LayerWeights? gemma4 = null,
         float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null,
-        nint pleGateWeight = 0, nint pleProjWeight = 0, float[]? plePostNormWeight = null)
+        nint pleGateWeight = 0, nint pleProjWeight = 0, float[]? plePostNormWeight = null,
+        float[]? attnSinks = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
@@ -643,6 +682,7 @@ internal readonly struct TransformerLayerWeights
         PleGateWeight = pleGateWeight;
         PleProjWeight = pleProjWeight;
         PlePostNormWeight = plePostNormWeight;
+        AttnSinks = attnSinks;
     }
 }
 
@@ -1294,12 +1334,45 @@ internal sealed class TransformerWeights : IDisposable
         // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output [hiddenSize] before o_proj.
         float[]? attnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_sub_norm.weight", hiddenSize);
 
-        // FFN norm
-        var ffnNormDesc = tensors[$"{prefix}.ffn_norm.weight"];
+        // Optional per-head attention sinks (gpt-oss): F32 [numHeads] scalar logits.
+        float[]? attnSinks = LoadOptionalBias(dataBase, tensors, $"{prefix}.attn_sinks.weight");
+
+        // FFN norm — gpt-oss names its pre-FFN norm "post_attention_norm"
+        // (llama.cpp LLM_TENSOR_ATTN_POST_NORM); it plays the same role as
+        // ffn_norm (applied to the post-attention residual before the FFN/MoE).
+        var ffnNormDesc = tensors.TryGetValue($"{prefix}.ffn_norm.weight", out var ffnNormD)
+            ? ffnNormD
+            : tensors[$"{prefix}.post_attention_norm.weight"];
         float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
 
         // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
         float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
+
+        // Routed-MoE layer with quantized experts (gpt-oss): the dense
+        // ffn_gate/up/down tensors are absent; a 3D-stacked expert block with
+        // per-expert biases is loaded instead and consumed by
+        // MoeQuantSwiGluMlp straight from the mmap (no F32 inflation).
+        if (config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
+            && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
+        {
+            MoeLayerWeights quantMoe = LoadQuantExpertMoeLayer(layerIdx, dataBase, tensors, config);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias, kBias, vBias, oBias,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight, kNormWeight,
+                moe: quantMoe,
+                mla: null,
+                attnSinks: attnSinks);
+        }
 
         // FFN projections — check for fused gate+up (Phi-3 style: ffn_up.weight has 2x intermediate rows)
         nint gatePtr, upPtr, downPtr;
@@ -1361,7 +1434,8 @@ internal sealed class TransformerWeights : IDisposable
             qBias, kBias, vBias, oBias,
             gateBias, upBias, downBias,
             qNormWeight, kNormWeight,
-            attnSubNormWeight: attnSubNormWeight, ffnSubNormWeight: ffnSubNormWeight);
+            attnSubNormWeight: attnSubNormWeight, ffnSubNormWeight: ffnSubNormWeight,
+            attnSinks: attnSinks);
     }
 
     /// <summary>
@@ -1598,6 +1672,110 @@ internal sealed class TransformerWeights : IDisposable
             postAttnNormWeight: postAttnNorm, postFfnNormWeight: null,
             gemma4: gemma4,
             pleGateWeight: pleGatePtr, pleProjWeight: pleProjPtr, plePostNormWeight: plePostNorm);
+    }
+
+    /// <summary>
+    /// Loads a routed-MoE layer whose experts stay in their on-disk
+    /// quantization (gpt-oss convention: MXFP4 experts + F32 biases on the
+    /// router and every expert projection). Populates the raw GGUF views and
+    /// per-expert bias arrays consumed by
+    /// <see cref="DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp"/>; the F32 W1/W2/W3
+    /// banks are zero-filled placeholders.
+    /// </summary>
+    /// <remarks>
+    /// Tensor naming (llama.cpp <c>LLM_ARCH_OPENAI_MOE</c>):
+    /// <c>ffn_gate_inp.{weight,bias}</c> — router [hidden, E] + [E];
+    /// <c>ffn_{gate,up}_exps.{weight,bias}</c> — [hidden, I, E] + [I, E];
+    /// <c>ffn_down_exps.{weight,bias}</c> — [I, hidden, E] + [hidden, E].
+    /// Bias arrays are stored expert-major on disk ([inner, E] → expert e's
+    /// slice is a contiguous run at <c>e * inner</c>), matching the flat
+    /// layout the CPU kernel indexes.
+    /// </remarks>
+    internal static MoeLayerWeights LoadQuantExpertMoeLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config)
+    {
+        var moe = config.Moe
+            ?? throw new InvalidOperationException("LoadQuantExpertMoeLayer called without Moe config.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int numExperts = moe.NumExperts;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        // Router (2D, F32 — small, dequant inline) + optional bias.
+        var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        float[] router = new float[numExperts * hiddenSize];
+        Dequantize.ToFloat32(
+            dataBase + (nint)routerDesc.DataOffset,
+            (long)numExperts * hiddenSize,
+            routerDesc.QuantizationType,
+            router);
+        float[]? routerBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_gate_inp.bias");
+
+        var gateDesc = tensors[$"{prefix}.ffn_gate_exps.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up_exps.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
+
+        // Validate 3D shapes: [K, M, E] with K innermost.
+        ValidateExpertShape(gateDesc, K: hiddenSize, M: moeIntermediate, E: numExperts);
+        ValidateExpertShape(upDesc, K: hiddenSize, M: moeIntermediate, E: numExperts);
+        ValidateExpertShape(downDesc, K: moeIntermediate, M: hiddenSize, E: numExperts);
+
+        // Optional per-expert biases, kept flat ([E × inner], expert-major).
+        float[]? gateBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_gate_exps.bias");
+        float[]? upBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_up_exps.bias");
+        float[]? downBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_down_exps.bias");
+
+        // Zero-filled placeholder banks (satisfy MoeLayerWeights validation;
+        // the CPU forward never dereferences them in quant-expert mode).
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+
+        var bundle = new MoeLayerWeights(
+            gate: router,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null,
+            gateExpsRaw: dataBase + (nint)gateDesc.DataOffset, gateExpsRawQt: gateDesc.QuantizationType,
+            gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
+            upExpsRaw: dataBase + (nint)upDesc.DataOffset, upExpsRawQt: upDesc.QuantizationType,
+            upExpsMDim: moeIntermediate, upExpsKDim: hiddenSize,
+            downExpsRaw: dataBase + (nint)downDesc.DataOffset, downExpsRawQt: downDesc.QuantizationType,
+            downExpsMDim: hiddenSize, downExpsKDim: moeIntermediate,
+            sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
+            sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
+            sharedDownRaw: Array.Empty<nint>(), sharedDownRawQt: QuantizationType.F32)
+        {
+            UseQuantExperts = true,
+            RouterBias = routerBias,
+            GateExpsBias = gateBias,
+            UpExpsBias = upBias,
+            DownExpsBias = downBias,
+            UseSwiGluOai = moe.UseSwiGluOai,
+            SoftmaxAfterTopK = moe.SoftmaxAfterTopK,
+        };
+        return bundle;
+    }
+
+    private static void ValidateExpertShape(GgufTensorDescriptor desc, int K, int M, int E)
+    {
+        if (desc.Shape.Rank != 3 || desc.Shape[0] != K || desc.Shape[1] != M || desc.Shape[2] != E)
+            throw new InvalidDataException(
+                $"Fused-experts tensor '{desc.Name}' shape does not match expected " +
+                $"[{K}, {M}, {E}] (got rank {desc.Shape.Rank}: " +
+                $"[{string.Join(", ", Enumerable.Range(0, desc.Shape.Rank).Select(i => desc.Shape[i]))}]).");
     }
 
     private static (nint ptr, QuantizationType qt, int outputDim, int inputDim) LoadLinear(

@@ -68,6 +68,24 @@ struct block_q5_K {          // 176 bytes, 256 values
 };
 ```
 
+### MXFP4 (4.25 bits/weight)
+
+```
+struct block_mxfp4 {         // 17 bytes, 32 values (GGUF type 39)
+    uint8_t e;               // E8M0 shared scale (power of two)
+    uint8_t qs[16];          // 32 × 4-bit e2m1 indices packed into 16 bytes
+};
+Value table (doubled e2m1): {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12}
+Scale: e8m0_to_fp32_half(e) = 2^(e-127) / 2  (halved to compensate doubling)
+Unpack: lo nibbles → elements 0..15, hi nibbles → elements 16..31
+Dequantize: val = kvalues[nibble] * scale
+```
+
+OCP Microscaling FP4. Used by OpenAI gpt-oss checkpoints for MoE expert
+weights. CPU vec_dot pairs MXFP4 weights with Q8_0-quantized activations
+(nibble→sbyte pshufb LUT + integer MAC), mirroring llama.cpp's
+`ggml_vec_dot_mxfp4_q8_0`.
+
 ## Kernel Types
 
 Each quantization format needs two kernels:

@@ -128,5 +128,15 @@ public enum QuantizationType
     /// codes 0→-1, 1→0, 2→+1; a single per-tensor float32 scale follows the packed data.
     /// This is bitnet.cpp's <c>GGML_TYPE_I2_S</c> (id 36, not a mainline ggml type).
     /// </summary>
-    I2_S = 36
+    I2_S = 36,
+
+    /// <summary>
+    /// MXFP4 (OCP Microscaling FP4): blocks of 32 elements sharing one E8M0
+    /// power-of-two scale byte, each element a 4-bit E2M1 float encoded as an
+    /// index into the doubled-e2m1 value table {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
+    /// (stored doubled; the shared scale is halved to compensate — matches
+    /// llama.cpp's <c>GGML_TYPE_MXFP4</c> = 39, block = 1 + 16 = 17 bytes).
+    /// Used by OpenAI gpt-oss checkpoints for MoE expert weights.
+    /// </summary>
+    MXFP4 = 39
 }
