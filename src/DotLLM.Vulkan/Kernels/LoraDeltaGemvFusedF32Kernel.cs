@@ -209,7 +209,10 @@ public sealed class LoraDeltaGemvFusedF32Kernel : IDisposable
         }
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)rank, (uint)seqLen, 1);
 
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // Stage B writes tmp → stage A reads it. Under the hazard tracker
+        // (issue #144) stage A's guard emits this RAW barrier itself.
+        if (_device.ActiveHazards is null)
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // Stage A: y[t, m] += sum_r A[m, r] * tmp[t, r], in place.
         Span<nint> buffersA = stackalloc nint[3] { tmp.Handle, aWeight.Handle, y.Handle };

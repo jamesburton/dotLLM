@@ -84,16 +84,16 @@ internal sealed class VulkanHazardTracker
         => _alwaysBarrier = alwaysBarrier;
 
     /// <summary>
-    /// Arms the tracker for a fresh recording. Epochs and per-buffer state
-    /// reset — the previous forward's fence wait made all prior writes
-    /// visible, so carrying state across forwards would only add barriers.
+    /// Arms the tracker for a fresh recording. Per-buffer entries are KEPT
+    /// (dictionary stays warm across decode steps — buffer handles are stable)
+    /// and the barrier watermark advances to the current epoch: the previous
+    /// forward's fence wait made every prior write visible, which is exactly
+    /// the semantics of "a barrier covering all recorded ops".
     /// </summary>
     internal void Begin(nint cmdBuf)
     {
         _cmdBuf = cmdBuf;
-        _op = 0;
-        _lastBarrier = 0;
-        _access.Clear();
+        _lastBarrier = _op;
     }
 
     /// <summary>
@@ -126,38 +126,57 @@ internal sealed class VulkanHazardTracker
         OnAccess(buffers, 0b10u);
     }
 
+    // Diagnostic (issue #144): DOTLLM_VULKAN_HAZARD_DEBUG=1 prints the first
+    // guards of the process with the buffer that forced each barrier.
+    private static readonly bool DebugLog =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_HAZARD_DEBUG") == "1";
+    private static int _debugRemaining = 700;
+
+    /// <summary>
+    /// Single pass per op: one dictionary lookup per buffer does BOTH the
+    /// hazard check and the epoch stamp. Emitting the barrier mid-pass is
+    /// sound — the barrier lands in the command stream before the caller's
+    /// dispatch regardless, buffers already stamped carry the current op's
+    /// epoch (&gt; the new watermark, as required), and once one hazard is
+    /// found the batched barrier covers every remaining one.
+    /// </summary>
     [SkipLocalsInit]
     private void OnAccess(ReadOnlySpan<nint> buffers, uint writesMask)
     {
+        long op = ++_op;
         bool hazard = _alwaysBarrier;
-        if (!hazard)
-        {
-            for (int i = 0; i < buffers.Length; i++)
-            {
-                if (!_access.TryGetValue(buffers[i], out var a))
-                    continue; // Never touched (e.g. weights): no hazard possible.
-                bool writes = (writesMask & (1u << i)) != 0;
-                if (a.Write > _lastBarrier || (writes && a.Read > _lastBarrier))
-                {
-                    hazard = true;
-                    break;
-                }
-            }
-        }
-
         if (hazard)
         {
             EmitBarrier();
-            _lastBarrier = _op; // Every op recorded so far is before this barrier.
+            _lastBarrier = op - 1;
         }
 
-        long op = ++_op;
         for (int i = 0; i < buffers.Length; i++)
         {
             ref var a = ref CollectionsMarshal.GetValueRefOrAddDefault(_access, buffers[i], out _);
-            if ((writesMask & (1u << i)) != 0)
+            bool writes = (writesMask & (1u << i)) != 0;
+            // Epochs equal to the CURRENT op are self-references (the same
+            // buffer bound at two bindings of one dispatch, e.g. in-place
+            // norms) — an intra-dispatch ordering no barrier can express;
+            // only earlier ops constitute hazards.
+            if (!hazard
+                && ((a.Write > _lastBarrier && a.Write != op)
+                    || (writes && a.Read > _lastBarrier && a.Read != op)))
+            {
+                hazard = true;
+                if (DebugLog && _debugRemaining > 0)
+                {
+                    _debugRemaining--;
+                    Console.Error.WriteLine(
+                        $"[hazard] op={op} n={buffers.Length} mask=0x{writesMask:x} idx={i} " +
+                        $"buf=0x{buffers[i]:x} w={a.Write} r={a.Read} lastB={_lastBarrier}");
+                }
+                EmitBarrier();
+                _lastBarrier = op - 1; // Every previously recorded op precedes this barrier.
+            }
+            if (writes)
                 a.Write = op;
-            else if (a.Read < op)
+            else
                 a.Read = op;
         }
     }

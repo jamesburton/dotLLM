@@ -292,8 +292,12 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         // Order this layer's split write after any prior compute reads of the
         // shared partial scratch (the previous layer's merge pass) and after any
         // prior writes — self-contained WAR/RAW protection independent of the
-        // model's inter-kernel barriers.
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // model's inter-kernel barriers. When the hazard tracker (issue #144)
+        // is armed, the split dispatch's own guard (via GetOrCreate below)
+        // detects the same WAR/RAW on _partOut/_partMS and emits the minimal
+        // batched barrier — the blanket one here would just double up.
+        if (_device.ActiveHazards is null)
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // ── Pass 1: split ────────────────────────────────────────────────
         Span<nint> splitBuffers = stackalloc nint[5]
@@ -325,8 +329,10 @@ public sealed class VulkanSplitKvAttentionKernel : IDisposable
         }
         VulkanApi.vkCmdDispatch(cmdBuf, (uint)(numHeads * numSplits), 1, 1);
 
-        // Split writes partOut/partMS → merge reads them.
-        KernelSupport.ComputeToComputeBarrier(cmdBuf);
+        // Split writes partOut/partMS → merge reads them. Under the hazard
+        // tracker the merge's guard emits this RAW barrier itself.
+        if (_device.ActiveHazards is null)
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // ── Pass 2: merge ────────────────────────────────────────────────
         Span<nint> mergeBuffers = stackalloc nint[3] { _partOut!.Handle, _partMS!.Handle, output.Handle };
