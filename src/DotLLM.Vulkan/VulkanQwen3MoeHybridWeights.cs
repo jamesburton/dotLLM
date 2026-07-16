@@ -442,8 +442,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
             long bytes = rowBytes * outputDim;
 
             var buf = device.AllocateDeviceLocal(bytes);
-            VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanQwen3MoeHybridWeights.UploadProjectionMatrix raw quant");
+            nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeHybridWeights.UploadProjectionMatrix raw quant");
             try
             {
                 new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -463,8 +462,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         long fpBytes = elems * sizeof(float);
         var fpBuf = device.AllocateDeviceLocal(fpBytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)fpBytes, 0, out nint fpMapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeHybridWeights.UploadProjectionMatrix F32");
+        nint fpMapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)fpBytes, "vkMapMemory VulkanQwen3MoeHybridWeights.UploadProjectionMatrix F32");
         try
         {
             float* dst = (float*)fpMapped;
@@ -507,8 +505,7 @@ internal sealed class VulkanQwen3MoeHybridWeights : IDisposable
         long bytes = (long)data.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeHybridWeights.UploadFloatArray");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeHybridWeights.UploadFloatArray");
         try
         {
             data.AsSpan().CopyTo(new Span<float>((void*)mapped, data.Length));

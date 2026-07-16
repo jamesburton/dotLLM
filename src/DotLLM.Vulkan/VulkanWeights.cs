@@ -1190,8 +1190,7 @@ internal sealed class VulkanWeights : IDisposable
             }
 
             var buf = device.AllocateDeviceLocal(bytes);
-            VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-                .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
+            nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadMatrix staging (raw quant)");
             try
             {
                 new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -1213,8 +1212,7 @@ internal sealed class VulkanWeights : IDisposable
         long fpBytes = elems * sizeof(float);
         var fpBuf = device.AllocateDeviceLocal(fpBytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)fpBytes, 0, out nint fpMapped)
-            .ThrowOnError("vkMapMemory VulkanWeights.UploadMatrix staging");
+        nint fpMapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)fpBytes, "vkMapMemory VulkanWeights.UploadMatrix staging");
         try
         {
             float* d = (float*)fpMapped;
@@ -1260,8 +1258,7 @@ internal sealed class VulkanWeights : IDisposable
         long bytes = (long)normWeight.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanWeights.UploadNormVec staging");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadNormVec staging");
         try
         {
             normWeight.AsSpan().CopyTo(new Span<float>((void*)mapped, normWeight.Length));
@@ -1426,8 +1423,7 @@ internal sealed class VulkanWeights : IDisposable
         else
         {
             gate = device.AllocateDeviceLocal(gateBytes);
-            VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateBytes, 0, out nint gateMapped)
-                .ThrowOnError("vkMapMemory UploadMoeLayer gate");
+            nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateBytes, "vkMapMemory UploadMoeLayer gate");
             try
             {
                 moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
@@ -1592,8 +1588,7 @@ internal sealed class VulkanWeights : IDisposable
 
         // ── Router gate (F32 [numExperts, hidden]) ───────────────────
         var gate = device.AllocateDeviceLocal(gateRouterBytes);
-        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateRouterBytes, 0, out nint gateMapped)
-            .ThrowOnError("vkMapMemory UploadGemma4MoeLayer gate");
+        nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateRouterBytes, "vkMapMemory UploadGemma4MoeLayer gate");
         try
         {
             moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
@@ -1715,8 +1710,7 @@ internal sealed class VulkanWeights : IDisposable
 
         // ── Router gate (F32 [numExperts, hidden]) ───────────────────
         var gate = device.AllocateDeviceLocal(gateRouterBytes);
-        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)gateRouterBytes, 0, out nint gateMapped)
-            .ThrowOnError("vkMapMemory UploadGemma4MoeLayerQuantized gate");
+        nint gateMapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)gateRouterBytes, "vkMapMemory UploadGemma4MoeLayerQuantized gate");
         try
         {
             moe.Gate.AsSpan().CopyTo(new Span<float>((void*)gateMapped, moe.Gate.Length));
@@ -1792,8 +1786,7 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice.Buffer bank, long dstOffsetBytes)
     {
         long bytes = elems * sizeof(float);
-        VulkanApi.vkMapMemory(device.Handle, stage.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanWeights.DequantAndUploadSlot");
+        nint mapped = device.MapMemoryWithRetry(stage.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.DequantAndUploadSlot");
         try
         {
             var dst = new Span<float>((void*)mapped, checked((int)elems));
@@ -1913,8 +1906,7 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer dst)
     {
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadMoeLayer raw");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadMoeLayer raw");
         try
         {
             new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -1931,8 +1923,7 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
     {
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadRawBankSlot");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadRawBankSlot");
         try
         {
             new ReadOnlySpan<byte>((void*)srcPtr, checked((int)bytes))
@@ -1998,8 +1989,7 @@ internal sealed class VulkanWeights : IDisposable
         nint srcPtr, long blockCount, VulkanDevice.Buffer bank, long dstOffset)
     {
         long bytes = blockCount * 24; // Q5_1 block size
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadQ5_0SlotAsQ5_1");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadQ5_0SlotAsQ5_1");
         try
         {
             ConvertQ5_0BlocksToQ5_1(srcPtr, mapped, blockCount);
@@ -2021,8 +2011,7 @@ internal sealed class VulkanWeights : IDisposable
         nint srcPtr, long blockCount, float scale, VulkanDevice.Buffer bank, long dstOffset)
     {
         long bytes = blockCount * 34; // Q8_0 block size
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadQ8_0SlotScaled");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadQ8_0SlotScaled");
         try
         {
             CopyQ8_0BlocksScaled(srcPtr, mapped, blockCount, scale);
@@ -2042,8 +2031,7 @@ internal sealed class VulkanWeights : IDisposable
         VulkanDevice device, VulkanDevice.Buffer staging,
         nint srcPtr, long bytes, VulkanDevice.Buffer bank, long dstOffset)
     {
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory UploadExpertBankSlot");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory UploadExpertBankSlot");
         try
         {
             int elems = checked((int)(bytes / sizeof(float)));
@@ -2070,8 +2058,7 @@ internal sealed class VulkanWeights : IDisposable
         long bytes = elems * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanWeights.UploadFp32Matrix staging");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanWeights.UploadFp32Matrix staging");
         try
         {
             new ReadOnlySpan<float>((void*)srcPtr, checked((int)elems))

@@ -1503,46 +1503,65 @@ public sealed class VulkanDevice : IDisposable
             typeIndex = FindMemoryType(req.memoryTypeBits, required);
         }
 
+        uint preferredTypeIndex = typeIndex;
         var mai = new VkMemoryAllocateInfo
         {
             sType = VkStructureType.MemoryAllocateInfo,
             allocationSize = req.size,
             memoryTypeIndex = typeIndex,
         };
-        int allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out nint memory);
-
-        // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
-        // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
-        // HOST_VISIBLE GTT) can be far smaller than what the device can actually
-        // address. When it is exhausted, retry on the combined DEVICE_LOCAL +
-        // HOST_VISIBLE type, then plain host-visible — the llama.cpp
-        // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
-        // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
-        // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
-        // counted in DeviceLocalFallbackCount for harness reporting.
-        if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
+        int allocResult;
+        nint memory;
+        for (int attempt = 0; ; attempt++)
         {
-            // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
-            // sit on the same exhausted carve-out heap as the failed type, so ranking by
-            // flags alone re-fails. Try every eligible type, other heaps before the
-            // failed heap, larger heaps first, host-visible rungs after combined ones.
-            foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
+            typeIndex = preferredTypeIndex;
+            mai.memoryTypeIndex = typeIndex;
+            allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+
+            // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
+            // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
+            // HOST_VISIBLE GTT) can be far smaller than what the device can actually
+            // address. When it is exhausted, retry on the combined DEVICE_LOCAL +
+            // HOST_VISIBLE type, then plain host-visible — the llama.cpp
+            // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
+            // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
+            // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
+            // counted in DeviceLocalFallbackCount for harness reporting.
+            if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
             {
-                mai.memoryTypeIndex = fbIndex;
-                allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
-                if (allocResult >= 0)
+                // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
+                // sit on the same exhausted carve-out heap as the failed type, so ranking by
+                // flags alone re-fails. Try every eligible type, other heaps before the
+                // failed heap, larger heaps first, host-visible rungs after combined ones.
+                foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
                 {
-                    typeIndex = fbIndex;
-                    Interlocked.Increment(ref _deviceLocalFallbacks);
-                    break;
+                    mai.memoryTypeIndex = fbIndex;
+                    allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                    if (allocResult >= 0)
+                    {
+                        typeIndex = fbIndex;
+                        Interlocked.Increment(ref _deviceLocalFallbacks);
+                        break;
+                    }
                 }
             }
+
+            // Transient memory pressure (issue #146): under back-to-back heavy runs the
+            // previous process's allocations may not be reclaimed yet, so a large staging
+            // or weight allocation fails once and succeeds moments later. Bounded
+            // retry-with-backoff before giving up — same policy as MapMemoryWithRetry.
+            if (allocResult >= 0 || !IsTransientMemoryResult(allocResult) || attempt >= s_memRetries)
+                break;
+            LogMemoryRetry("vkAllocateMemory",
+                $"AllocateInternal(deviceLocal={deviceLocal})", bytes, allocResult, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
         }
 
         if (allocResult < 0)
         {
             VulkanApi.vkDestroyBuffer(_device, buffer, 0);
-            allocResult.ThrowOnError("vkAllocateMemory");
+            allocResult.ThrowOnError(
+                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")})");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
@@ -1566,6 +1585,100 @@ public sealed class VulkanDevice : IDisposable
         uint* types = (uint*)mem.memoryTypes; // 8-byte entries: u32 propertyFlags, u32 heapIndex
         var flags = (VkMemoryPropertyFlags)types[typeIndex * 2];
         return (flags & VkMemoryPropertyFlags.HostVisible) != 0;
+    }
+
+    /// <summary>VkResult VK_ERROR_OUT_OF_HOST_MEMORY.</summary>
+    private const int VkErrorOutOfHostMemory = -1;
+
+    /// <summary>VkResult VK_ERROR_MEMORY_MAP_FAILED.</summary>
+    private const int VkErrorMemoryMapFailed = -5;
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_DIAG=1</c> dumps the physical-device heap/type table to stderr
+    /// when a map/alloc hits a transient memory failure — the issue #146 diagnosis aid.
+    /// </summary>
+    private static readonly bool s_memDiag =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_DIAG") == "1";
+
+    /// <summary>
+    /// Number of retries after a transient memory failure (<c>VK_ERROR_MEMORY_MAP_FAILED</c> /
+    /// host / device OOM) on <c>vkMapMemory</c> and <c>vkAllocateMemory</c>. Under memory
+    /// pressure on UMA boxes (issue #146: back-to-back heavy runs on Strix Halo, the previous
+    /// process's allocations not yet reclaimed) these calls fail transiently and succeed on
+    /// retry — observed ~2/15 model loads failing at the GB-scale weight-staging buffer.
+    /// Override with <c>DOTLLM_VULKAN_MEM_RETRIES</c> (0 disables, max 8). Default 4, with
+    /// exponential backoff 25/100/400/1600 ms.
+    /// </summary>
+    private static readonly int s_memRetries = ParseMemRetries();
+
+    private static int ParseMemRetries()
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_RETRIES");
+        return int.TryParse(v, out int n) && n >= 0 ? Math.Min(n, 8) : 4;
+    }
+
+    /// <summary>
+    /// True for VkResults that indicate memory pressure rather than API misuse —
+    /// the only failures worth retrying with backoff.
+    /// </summary>
+    internal static bool IsTransientMemoryResult(int result)
+        => result is VkErrorOutOfHostMemory or VkErrorOutOfDeviceMemory or VkErrorMemoryMapFailed;
+
+    /// <summary>Backoff before retry <paramref name="attempt"/> (0-based): 25, 100, 400, 1600, ... ms.</summary>
+    internal static int RetryBackoffMs(int attempt) => 25 << Math.Min(2 * attempt, 12);
+
+    /// <summary>
+    /// Maps <paramref name="memory"/> with bounded retry-with-backoff on transient memory
+    /// failures. All load-path (weight/KV staging) and host-copy maps go through this instead
+    /// of raw <c>vkMapMemory</c>: on Windows/WDDM the map must make the <em>entire</em>
+    /// allocation host-resident (residency is allocation-granular, not range-granular), so
+    /// mapping a GB-scale staging buffer transiently fails with
+    /// <c>VK_ERROR_MEMORY_MAP_FAILED</c> under system memory pressure even though the same
+    /// call succeeds moments later (issue #146). Throws with <paramref name="site"/> +
+    /// size context when all attempts fail.
+    /// </summary>
+    internal nint MapMemoryWithRetry(nint memory, ulong offset, ulong size, string site)
+    {
+        int r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out nint mapped);
+        for (int attempt = 0; r < 0 && IsTransientMemoryResult(r) && attempt < s_memRetries; attempt++)
+        {
+            LogMemoryRetry("vkMapMemory", site, (long)size, r, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
+            r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out mapped);
+        }
+        if (r < 0)
+            r.ThrowOnError($"{site} ({size} bytes{(IsTransientMemoryResult(r) ? $", {s_memRetries} retries exhausted" : "")})");
+        return mapped;
+    }
+
+    private void LogMemoryRetry(string op, string site, long bytes, int result, int attempt)
+    {
+        Console.Error.WriteLine(
+            $"[vulkan-mem] transient {op} failure at '{site}' (VkResult {result}, {bytes} bytes); " +
+            $"retrying {attempt + 1}/{s_memRetries} after {RetryBackoffMs(attempt)} ms");
+        if (s_memDiag && attempt == 0)
+            DumpMemoryDiagnostics();
+    }
+
+    /// <summary>Dumps the heap/type table to stderr (DOTLLM_VULKAN_MEM_DIAG=1 only).</summary>
+    private unsafe void DumpMemoryDiagnostics()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
+        for (uint i = 0; i < mem.memoryHeapCount; i++)
+        {
+            ulong size = *(ulong*)(heaps + i * 16);
+            uint flags = *(uint*)(heaps + i * 16 + 8);
+            Console.Error.WriteLine($"[vulkan-mem]   heap[{i}] size={size / (1024.0 * 1024 * 1024):F2} GiB flags=0x{flags:x}");
+        }
+        for (uint i = 0; i < mem.memoryTypeCount; i++)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem]   type[{i}] heap={types[i * 2 + 1]} props=0x{types[i * 2]:x} " +
+                $"({(VkMemoryPropertyFlags)types[i * 2]})");
+        }
+        Console.Error.WriteLine($"[vulkan-mem]   deviceLocalFallbacks={DeviceLocalFallbackCount}");
     }
 
     /// <summary>
@@ -1659,8 +1772,7 @@ public sealed class VulkanDevice : IDisposable
             throw new ArgumentException("Destination buffer too small.", nameof(dst));
 
         // 1. Copy host → staging.
-        VulkanApi.vkMapMemory(_device, staging.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory staging");
+        nint mapped = MapMemoryWithRetry(staging.Memory, 0, (ulong)source.Length, "vkMapMemory staging");
         try
         {
             source.CopyTo(new Span<byte>((void*)mapped, source.Length));
@@ -1810,8 +1922,7 @@ public sealed class VulkanDevice : IDisposable
         if (bytes > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var destSpan = new Span<float>((void*)mapped, source.Length);
@@ -1833,8 +1944,7 @@ public sealed class VulkanDevice : IDisposable
         if (source.Length > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)source.Length, "vkMapMemory");
         try
         {
             var destSpan = new Span<byte>((void*)mapped, source.Length);
@@ -1876,8 +1986,7 @@ public sealed class VulkanDevice : IDisposable
 
     private unsafe void DownloadHostVisible(Buffer src, Span<float> destination, long bytes)
     {
-        VulkanApi.vkMapMemory(_device, src.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        nint mapped = MapMemoryWithRetry(src.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var srcSpan = new ReadOnlySpan<float>((void*)mapped, destination.Length);

@@ -505,6 +505,30 @@ dotnet run --project benchmarks/DotLLM.Benchmarks -c Release -- profile-vulkan-h
 
 Reports wall time and process RSS delta for both staging and host-import paths, plus the per-matrix import success/fail breakdown. Default model: TinyLlama-1.1B Q8_0 from HuggingFace.
 
+## Vulkan Memory-Pressure Retry (transient map/alloc failures)
+
+On Windows/WDDM a `vkMapMemory` must make the **entire** allocation host-resident (residency is
+allocation-granular, not range-granular). The weight-upload path allocates a transient host-visible
+staging buffer sized for the largest single upload — the token-embed F32 dequant dominates at
+`vocab × hidden × 4` bytes (≈1.6 GB for Llama-3.2-3B, ≈2.1 GB for Llama-3.1-8B) — and re-maps it for
+every staged upload (norm vectors, biases, dequant matrices). Under system memory pressure (heavy
+back-to-back runs where the previous process's allocations are not yet reclaimed) the allocation or a
+re-map of this GB-scale buffer fails transiently: `VK_ERROR_MEMORY_MAP_FAILED` at `vkMapMemory` or
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` at `vkAllocateMemory`, even though the same call succeeds moments
+later (issue #146: ~2/15 heavy back-to-back loads on Strix Halo).
+
+All Vulkan maps route through `VulkanDevice.MapMemoryWithRetry`, and `AllocateInternal` wraps its
+allocation (including the device-local fallback enumeration) in the same policy: on a transient
+result (`-1` host OOM, `-2` device OOM, `-5` map failed) the call is retried with exponential backoff
+(25/100/400/1600 ms, 4 retries by default). Non-transient errors (device lost, invalid handle) throw
+immediately.
+
+- `DOTLLM_VULKAN_MEM_RETRIES=N` — retry count (0 disables, max 8; default 4).
+- `DOTLLM_VULKAN_MEM_DIAG=1` — dumps the heap/type table to stderr on the first retry.
+- Each retry logs a `[vulkan-mem]` warning to stderr with the failing site and byte size.
+- Stress regression: `DOTLLM_VULKAN_STRESS_LOAD_CYCLES=N` enables the load/dispose cycle test in
+  `VulkanMemoryPressureRetryTests`.
+
 ## Future Work
 
 - **Flash Attention**: Replace naive attention with tiled flash attention for O(N) memory and better SM utilization

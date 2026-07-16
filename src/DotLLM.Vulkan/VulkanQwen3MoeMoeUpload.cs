@@ -168,8 +168,7 @@ internal static class VulkanQwen3MoeMoeUpload
 
         // ── Router gate ──────────────────────────────────────────────────────
         var gate = device.AllocateDeviceLocal(gateBytes);
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)gateBytes, 0, out nint mappedGate)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeMoeUpload router gate");
+        nint mappedGate = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)gateBytes, "vkMapMemory VulkanQwen3MoeMoeUpload router gate");
         try
         {
             moe.Gate.AsSpan().CopyTo(new Span<float>((void*)mappedGate, moe.Gate.Length));
@@ -270,8 +269,7 @@ internal static class VulkanQwen3MoeMoeUpload
         long perExpertBytes = perExpertElems * sizeof(float);
         long totalBytes = (long)numE * perExpertBytes;
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)totalBytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeMoeUpload routed bank");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)totalBytes, "vkMapMemory VulkanQwen3MoeMoeUpload routed bank");
         try
         {
             float* dst = (float*)mapped;
@@ -381,8 +379,7 @@ internal static class VulkanQwen3MoeMoeUpload
                 throw new ArgumentOutOfRangeException(nameof(kind));
         }
 
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)totalBytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeMoeUpload routed Q6_K bank");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)totalBytes, "vkMapMemory VulkanQwen3MoeMoeUpload routed Q6_K bank");
         try
         {
             byte* dst = (byte*)mapped;
@@ -414,8 +411,7 @@ internal static class VulkanQwen3MoeMoeUpload
     {
         long bytes = elems * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeMoeUpload F32-from-pointer");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeMoeUpload F32-from-pointer");
         try
         {
             new ReadOnlySpan<float>((void*)src, checked((int)elems))
@@ -434,8 +430,7 @@ internal static class VulkanQwen3MoeMoeUpload
     {
         long bytes = (long)data.Length * sizeof(float);
         var buf = device.AllocateDeviceLocal(bytes);
-        VulkanApi.vkMapMemory(device.Handle, staging.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory VulkanQwen3MoeMoeUpload float-array");
+        nint mapped = device.MapMemoryWithRetry(staging.Memory, 0, (ulong)bytes, "vkMapMemory VulkanQwen3MoeMoeUpload float-array");
         try
         {
             data.AsSpan().CopyTo(new Span<float>((void*)mapped, data.Length));
