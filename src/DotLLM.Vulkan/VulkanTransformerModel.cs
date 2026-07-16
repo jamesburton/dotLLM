@@ -215,6 +215,84 @@ public sealed class VulkanTransformerModel : IModel
     private readonly MatMulQ3KMmqKernel? _matmulQ3KMmq;
     // Grid-codebook IQ prefill MMQ (reuse the shared Iq2/Iq3/Iq1 codebook SSBOs).
     private readonly MatMulIq2XxsMmqKernel? _matmulIq2XxsMmq;
+
+    // issue #139: env-gated prefill per-op-category profiler
+    // (DOTLLM_VULKAN_PREFILL_PROFILE=1). Splits the single per-forward command
+    // buffer at category boundaries (SubmitAndWait + re-Begin) so each bucket's
+    // wall time ≈ its GPU time — the submits are synchronous, so a host
+    // Stopwatch around a split measures the dispatches recorded since the last
+    // split. Adds ~0.1 ms per split (≈ layers × 9 splits per prefill), which is
+    // noise vs the multi-hundred-ms prefill it exists to break down. Zero cost
+    // when the env var is unset (single bool check per Forward). Output goes to
+    // stderr; set DOTLLM_VULKAN_PREFILL_PROFILE_OUT=<path> to also append to a
+    // file (useful under test runners that swallow console output).
+    private static readonly bool PrefillProfileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_PROFILE") == "1";
+    private Dictionary<string, double>? _profMs;
+    private Dictionary<string, int>? _profCounts;
+    private Dictionary<string, int>? _profDispatches;
+    private bool _profActive;
+    private long _profLastTicks;
+    private long _profStartTicks;
+
+    private void ProfBegin(int seqLen)
+    {
+        _profActive = PrefillProfileEnabled && seqLen > 1;
+        if (!_profActive) return;
+        (_profMs ??= new()).Clear();
+        (_profCounts ??= new()).Clear();
+        (_profDispatches ??= new()).Clear();
+        _profStartTicks = _profLastTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    /// <summary>
+    /// Profiling split point: submits + waits everything recorded since the last
+    /// split, charges the elapsed wall time to <paramref name="category"/>, and
+    /// re-opens the per-forward command buffer. No-op unless profiling is active.
+    /// </summary>
+    private void ProfSample(string category)
+    {
+        if (!_profActive) return;
+        _submit.SubmitAndWait();
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double ms = (now - _profLastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _profMs!.TryGetValue(category, out double acc);
+        _profMs[category] = acc + ms;
+        _profCounts!.TryGetValue(category, out int c);
+        _profCounts[category] = c + 1;
+        _submit.Begin();
+        KernelSupport.HostToComputeBarrier(_submit.CommandBuffer);
+        _profLastTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    /// <summary>Counts which matmul/attention kernel variant was dispatched (profiling only).</summary>
+    private void ProfNote(string kernel, int m, int k, int n)
+    {
+        if (!_profActive) return;
+        string key = $"{kernel} m={m} k={k} n={n}";
+        _profDispatches!.TryGetValue(key, out int c);
+        _profDispatches[key] = c + 1;
+    }
+
+    private void ProfEnd(int seqLen)
+    {
+        if (!_profActive) return;
+        _profActive = false;
+        double total = (System.Diagnostics.Stopwatch.GetTimestamp() - _profStartTicks)
+            * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"[prefill-profile] seqLen={seqLen} layers={Config.NumLayers} total_ms={total:F1}");
+        foreach (var kv in _profMs!.OrderByDescending(kv => kv.Value))
+            sb.AppendLine($"[prefill-profile]   {kv.Key,-16} {kv.Value,9:F1} ms  ({kv.Value / total * 100.0,5:F1} %)  splits={_profCounts![kv.Key]}");
+        foreach (var kv in _profDispatches!.OrderByDescending(kv => kv.Value))
+            sb.AppendLine($"[prefill-profile]   dispatch {kv.Key} x{kv.Value}");
+        string text = sb.ToString();
+        Console.Error.Write(text);
+        if (Environment.GetEnvironmentVariable("DOTLLM_VULKAN_PREFILL_PROFILE_OUT") is { Length: > 0 } path)
+        {
+            try { File.AppendAllText(path, text); } catch { /* diagnostics only */ }
+        }
+    }
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
     private readonly AttentionF32Kernel _attention;
@@ -1378,6 +1456,7 @@ public sealed class VulkanTransformerModel : IModel
         }
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
+            ProfNote("attn_flash", seqQ, seqKv, numHeads);
             _flashAttention.Record(cmdBuf, q, k, v, output,
                 seqQ: seqQ, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -1386,6 +1465,7 @@ public sealed class VulkanTransformerModel : IModel
                 maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
+        if (seqQ > 1) ProfNote("attn_naive", seqQ, seqKv, numHeads);
         _attention.Record(cmdBuf, q, k, v, output,
             seqQ: seqQ, seqKv: seqKv,
             numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
@@ -2340,6 +2420,7 @@ public sealed class VulkanTransformerModel : IModel
         _submit.Begin();
         nint cmdBuf = _submit.CommandBuffer;
         KernelSupport.HostToComputeBarrier(cmdBuf);
+        ProfBegin(seqLen);
 
         // Canonicalise the hidden-slot rotation to slot 0 so the embedding
         // gather below writes into the same physical buffer every forward
@@ -2391,6 +2472,8 @@ public sealed class VulkanTransformerModel : IModel
                 RecordDiffusionCanvasEmbed(cmdBuf, regionP, canvasLen, hiddenSize, eps);
         }
 
+        ProfSample("embed");
+
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {
             // Device weights are window-local (0-indexed); CPU weights are full-length, so offset by
@@ -2413,6 +2496,7 @@ public sealed class VulkanTransformerModel : IModel
                 // unchanged).
                 RecordMlaLayer(cmdBuf, layer, mlaW, lw, seqLen, eps,
                     positions, kvCache);
+                ProfSample("attn_block_mla");
             }
             else if (lw.Gemma4 is not null)
             {
@@ -2424,6 +2508,7 @@ public sealed class VulkanTransformerModel : IModel
                 // per-layer-strided cache and attention reads the full window;
                 // otherwise (diffusion / single-shot) it is cacheless.
                 RecordGemma4Attention(cmdBuf, layer, lw, seqLen, eps, positions, kvCache);
+                ProfSample("attn_block_g4");
             }
             else
             {
@@ -2489,12 +2574,14 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "v_proj", _state.NormOutput, _state.V,
                     seqLen, lw.VInputDim, lw.VOutputDim);
             }
+            ProfSample("qkv_proj");
 
             // RoPE on Q and K
             _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
                 seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
                 headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
                 variant: _ropeVariant);
+            ProfSample("rope");
 
             // Attention input buffers: either the uncached K/V window or the full KV cache.
             VulkanDevice.Buffer kSrc, vSrc;
@@ -2551,12 +2638,14 @@ public sealed class VulkanTransformerModel : IModel
             int layerSlidingWindow = GetLayerSlidingWindow(layer);
             float attnScaleOverride = GetAttentionScaleOverride();
             float attnSoftCap = Config.AttnLogitSoftcap ?? 0.0f;
+            ProfSample("kv_update");
             RecordAttention(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
                 numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
                 positionOffset: positionOffset, slidingWindow: layerSlidingWindow,
                 softCap: attnSoftCap, scaleOverride: attnScaleOverride);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfSample("attention");
 
             // BitNet Sub-LN: in-place RMSNorm over the attention output before the
             // output projection. No-op for non-BitNet (AttnSubNormWeight null).
@@ -2584,6 +2673,7 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "o_proj", _state.AttnOutput, _state.NormOutput,
                     seqLen, lw.OInputDim, lw.OOutputDim);
             }
+            ProfSample("o_proj");
             }  // end of GQA branch (else of MLA)
 
             // Gemma four-norm layout: post-attention RMSNorm applied to the
@@ -2607,6 +2697,7 @@ public sealed class VulkanTransformerModel : IModel
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfSample("norm_resid");
 
             // Pre-FFN residual snapshot: Residual aliases HiddenState (same
             // slot); no copy needed.
@@ -2629,6 +2720,7 @@ public sealed class VulkanTransformerModel : IModel
                     // works unchanged.
                     RecordMoeLayer(cmdBuf, layer, moeW, lw, seqLen, eps);
                 }
+                ProfSample("ffn_moe");
             }
             else
             {
@@ -2677,6 +2769,7 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "up_proj", _state.NormOutput, _state.FfnUp,
                     seqLen, lw.UpInputDim, lw.UpOutputDim);
             }
+            ProfSample("ffn_gate_up");
 
             // FFN gate activation: GeGLU-tanh (Gemma) when _geglu is non-null,
             // gated squared-ReLU (BitNet) when _relu2glu is non-null, otherwise
@@ -2689,6 +2782,7 @@ public sealed class VulkanTransformerModel : IModel
             else
                 _swiglu.Record(cmdBuf, _state.FfnGate, _state.FfnUp, _state.SiluOutput, seqLen * intermediateSize);
             KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            ProfSample("ffn_act");
 
             // BitNet Sub-LN: in-place RMSNorm over the gated FFN intermediate before
             // the down projection. No-op for non-BitNet (FfnSubNormWeight null).
@@ -2718,6 +2812,7 @@ public sealed class VulkanTransformerModel : IModel
                 MaybeApplyLoraDelta(cmdBuf, layer, "down_proj", _state.SiluOutput, _state.NormOutput,
                     seqLen, lw.DownInputDim, lw.DownOutputDim);
             }
+            ProfSample("ffn_down");
             }  // end of dense-FFN branch (else of MoE)
 
             // Gemma four-norm layout: post-FFN RMSNorm applied to the FFN
@@ -2736,6 +2831,7 @@ public sealed class VulkanTransformerModel : IModel
             // needed.
             _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
+            ProfSample("norm_resid");
 
             // Gemma-4 per-layer output scale (layer_output_scale) — the LAST
             // per-layer op, an in-place scalar multiply on the post-residual
@@ -2819,6 +2915,14 @@ public sealed class VulkanTransformerModel : IModel
         // 4. COMPUTE→HOST barrier for the vocab-row download that follows, submit, wait.
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
+        if (_profActive)
+        {
+            _profMs!.TryGetValue("lm_head", out double lmAcc);
+            _profMs["lm_head"] = lmAcc + (System.Diagnostics.Stopwatch.GetTimestamp() - _profLastTicks)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            _profCounts!["lm_head"] = 1;
+            ProfEnd(seqLen);
+        }
 
         // 5. Return logits as a host-resident UnmanagedTensor [1, vocabSize].
         var shape = new TensorShape(1, vocabSize);
@@ -4599,6 +4703,25 @@ public sealed class VulkanTransformerModel : IModel
             return;
         }
 
+        // issue #139: prefill (seqLen>1) analogue of the decode sharing above —
+        // every projection in the group reads the same activation matrix, so the
+        // Q8_1 row-wise quantize (previously re-run per projection: 3× for Q/K/V,
+        // 2× for gate/up, every layer) runs ONCE into the shared rows scratch and
+        // each MMQ GEMM reads that one quantized copy. No inter-GEMM barrier:
+        // the GEMMs only read the scratch and write disjoint outputs. Results are
+        // bit-identical to the per-projection path (same quantized bits feed the
+        // same kernels); disable via DOTLLM_VULKAN_MMVQ_NO_SHARE=1.
+        if (CanShareMmqRowsQuant(inputDim, seqLen, projections))
+        {
+            _quantizeQ8_1Rows!.Record(cmdBuf, input, _state.Q8_1XqRows!, _state.Q8_1XdsRows!,
+                n: seqLen, k: inputDim);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            foreach (var p in projections)
+                RecordMmqGemmPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output,
+                    p.OutputDim, inputDim, seqLen);
+            return;
+        }
+
         // Fallback: dispatch each projection independently, with a barrier between
         // them, at the caller's real seqLen. RecordMatmul routes each to the
         // appropriate kernel (decode MMVQ / prefill MMQ / coopmat / scalar). The
@@ -4639,6 +4762,94 @@ public sealed class VulkanTransformerModel : IModel
         foreach (var p in projections)
             if (p.WeightQt != QuantType.Q8_0) return false;
         return true;
+    }
+
+    /// <summary>
+    /// Returns true when every projection in <paramref name="projections"/> qualifies
+    /// for the shared prefill (seqLen&gt;1) Q8_1 rows activation-quant (issue #139):
+    /// sharing enabled, the rows quantize + scratch wired and large enough for
+    /// <c>[seqLen, inputDim]</c>, and every member has a live MMQ kernel for its
+    /// weight quant with a compatible alignment. The group reads one input buffer,
+    /// so a single quantize feeds every GEMM.
+    /// </summary>
+    private bool CanShareMmqRowsQuant(int inputDim, int seqLen, ReadOnlySpan<MmvqGroupProjection> projections)
+    {
+        if (seqLen <= 1) return false;
+        if (!_mmvqShareActivation || projections.Length < 2) return false;
+        if (_quantizeQ8_1Rows is null || _state.Q8_1XqRows is null || _state.Q8_1XdsRows is null)
+            return false;
+        if ((inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0) return false;
+        if (QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size) return false;
+        if (QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size) return false;
+        foreach (var p in projections)
+            if (!HasMmqPrefillKernel(p.WeightQt, inputDim)) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// True when the prefill MMQ kernel for <paramref name="qt"/> is loaded and
+    /// <paramref name="inputDim"/> meets its block alignment — i.e. RecordMatmul
+    /// would take the MMQ path for this projection at seqLen&gt;1. IQ2_XXS is
+    /// excluded (opt-in gated; see <see cref="IsIq2XxsMmqEnabled"/>).
+    /// </summary>
+    private bool HasMmqPrefillKernel(QuantType qt, int inputDim) => qt switch
+    {
+        QuantType.Q8_0 => _matmulQ8Mmq is not null && (inputDim % MatMulQ8_0MmqKernel.Q8_0GroupSize) == 0,
+        QuantType.Q2_K => _matmulQ2KMmq is not null && (inputDim % MatMulQ2KMmqKernel.Q2KGroupSize) == 0,
+        QuantType.Q3_K => _matmulQ3KMmq is not null && (inputDim % MatMulQ3KMmqKernel.Q3KGroupSize) == 0,
+        QuantType.Q4_K => _matmulQ4KMmq is not null && (inputDim % MatMulQ4KMmqKernel.Q4KGroupSize) == 0,
+        QuantType.Q5_K => _matmulQ5KMmq is not null && (inputDim % MatMulQ5KMmqKernel.Q5KGroupSize) == 0,
+        QuantType.Q6_K => _matmulQ6KMmq is not null && (inputDim % MatMulQ6KMmqKernel.Q6KGroupSize) == 0,
+        QuantType.IQ4_XS => _matmulIq4XsMmq is not null && (inputDim % MatMulIq4XsMmqKernel.Iq4XsGroupSize) == 0,
+        QuantType.IQ4_NL => _matmulIq4NlMmq is not null && (inputDim % MatMulIq4NlMmqKernel.Iq4NlGroupSize) == 0,
+        _ => false,
+    };
+
+    /// <summary>
+    /// Dispatches the prefill MMQ GEMM for <paramref name="qt"/> against the ALREADY
+    /// populated shared Q8_1 rows scratch (no quantize, no barrier — the caller
+    /// ordered the one shared quantize). Callers must have verified
+    /// <see cref="HasMmqPrefillKernel"/> for this quant/shape.
+    /// </summary>
+    private void RecordMmqGemmPreQuantized(
+        nint cmdBuf, VulkanDevice.Buffer weights, QuantType qt,
+        VulkanDevice.Buffer output, int outputDim, int inputDim, int seqLen)
+    {
+        var xq = _state.Q8_1XqRows!;
+        var xds = _state.Q8_1XdsRows!;
+        switch (qt)
+        {
+            case QuantType.Q8_0:
+                _matmulQ8Mmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q8_0_mmq", outputDim, inputDim, seqLen);
+                break;
+            case QuantType.Q2_K:
+                _matmulQ2KMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantType.Q3_K:
+                _matmulQ3KMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantType.Q4_K:
+                _matmulQ4KMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_k_mmq", outputDim, inputDim, seqLen);
+                break;
+            case QuantType.Q5_K:
+                _matmulQ5KMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            case QuantType.Q6_K:
+                _matmulQ6KMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q6_k_mmq", outputDim, inputDim, seqLen);
+                break;
+            case QuantType.IQ4_XS:
+                _matmulIq4XsMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("iq4_xs_mmq", outputDim, inputDim, seqLen);
+                break;
+            case QuantType.IQ4_NL:
+                _matmulIq4NlMmq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim, n: seqLen);
+                break;
+            default:
+                throw new InvalidOperationException($"No prefill MMQ kernel for {qt}.");
+        }
     }
 
     private void RecordMatmul(
@@ -4690,6 +4901,7 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 _matmulQ8Mmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q8_0_mmq", outputDim, inputDim, seqLen);
             }
             else if (_matmulQ8GemmCoopmat is not null)
             {
@@ -4697,11 +4909,13 @@ public sealed class VulkanTransformerModel : IModel
                 // at Llama-3 prefill shapes. See MatMulQ8_0GemmCoopmatKernel.
                 _matmulQ8GemmCoopmat.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q8_0_coopmat", outputDim, inputDim, seqLen);
             }
             else
             {
                 _matmulQ8Gemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q8_0_f32gemm", outputDim, inputDim, seqLen);
             }
         }
         else if (weightQt == QuantType.Q2_K)
@@ -4832,11 +5046,13 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 _matmulQ4KMmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_k_mmq", outputDim, inputDim, seqLen);
             }
             else
             {
                 _matmulQ4KGemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q4_k_f32gemm", outputDim, inputDim, seqLen);
             }
         }
         else if (weightQt == QuantType.Q5_K)
@@ -4932,11 +5148,13 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 _matmulQ6KMmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q6_k_mmq", outputDim, inputDim, seqLen);
             }
             else
             {
                 _matmulQ6KGemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("q6_k_f32gemm", outputDim, inputDim, seqLen);
             }
         }
         else if (weightQt == QuantType.IQ4_NL)
@@ -5019,11 +5237,13 @@ public sealed class VulkanTransformerModel : IModel
                 KernelSupport.ComputeToComputeBarrier(cmdBuf);
                 _matmulIq4XsMmq.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("iq4_xs_mmq", outputDim, inputDim, seqLen);
             }
             else
             {
                 _matmulIq4XsGemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("iq4_xs_f32gemm", outputDim, inputDim, seqLen);
             }
         }
         else if (weightQt == QuantType.IQ2_XXS)
@@ -5222,11 +5442,13 @@ public sealed class VulkanTransformerModel : IModel
             {
                 _matmulF16GemmCoopmat.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("f16_coopmat", outputDim, inputDim, seqLen);
             }
             else
             {
                 _matmulF16Gemm.Record(cmdBuf, weights, input, output,
                     m: outputDim, k: inputDim, n: seqLen);
+                ProfNote("f16_f32gemm", outputDim, inputDim, seqLen);
             }
         }
         else if (weightQt == QuantType.BF16)
