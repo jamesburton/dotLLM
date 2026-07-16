@@ -281,6 +281,16 @@ public sealed class VulkanTransformerModel : IModel
     // quantized-MoE layer.
     private readonly MoeIndexedMatmulQ4_KF32Kernel? _moeIndexedMatmulQ4K;
     private readonly MoeIndexedMatmulQ5_1F32Kernel? _moeIndexedMatmulQ5_1;
+    // Indexed MMVQ (dp4a) decode variants of the quantized expert matmuls
+    // (issue #137). Used on the S==1 decode path when the expanded MoE
+    // activations have been Q8_1-quantized (quantize_q8_1_rows into the
+    // MoeQ8_1Xq/Xds scratch): coalesced subgroup-per-cell reads replace the
+    // scalar per-thread byte streams, matching the dense mmvq bandwidth.
+    // Null without device integer-dot support / SPVs / gemma4 MoE, or when
+    // DOTLLM_VULKAN_DISABLE_MOE_MMVQ=1 — the scalar kernels then serve decode.
+    private readonly MoeIndexedMatmulQ4KMmvqKernel? _moeIndexedMatmulQ4KMmvq;
+    private readonly MoeIndexedMatmulQ5_1MmvqKernel? _moeIndexedMatmulQ5_1Mmvq;
+    private readonly MoeIndexedMatmulQ8_0MmvqKernel? _moeIndexedMatmulQ8Mmvq;
     // Tiled (shared-memory) variant of the indexed matmul. Wins on prefill at
     // large N (seqLen * topK ≥ 32) by amortising the x-row load across a
     // TILE_M-wide output tile; the scalar variant remains for decode (small N)
@@ -406,6 +416,17 @@ public sealed class VulkanTransformerModel : IModel
     /// <inheritdoc/>
     public long ComputeMemoryBytes => _state.AllocatedBytes + _weights.AllocatedBytes;
 
+    /// <summary>
+    /// Diagnostic: number of per-layer routed-MoE dispatches that took the indexed
+    /// MMVQ (dp4a) decode fast path (issue #137). Increments once per MoE layer per
+    /// S==1 forward when the coalesced quantized expert GEMVs ran; stays 0 when the
+    /// scalar indexed kernels served every dispatch (multi-token forwards, missing
+    /// kernels/scratch, unsupported bank quant mix, or the
+    /// <c>DOTLLM_VULKAN_DISABLE_MOE_MMVQ=1</c> opt-out). Parity tests use it to
+    /// assert the path under test actually executed.
+    /// </summary>
+    public long MoeMmvqDispatchCount { get; private set; }
+
     /// <summary>Creates a <see cref="VulkanKvCache"/> sized for this model.</summary>
     /// <remarks>
     /// Per-layer geometry comes from the single Core helper
@@ -503,6 +524,9 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8,
         MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K,
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1,
+        MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq,
+        MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq,
+        MoeIndexedMatmulQ8_0MmvqKernel? moeIndexedMatmulQ8Mmvq,
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled,
         MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta,
         MoeExpertOffsetsKernel? moeExpertOffsets,
@@ -608,6 +632,9 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ8 = moeIndexedMatmulQ8;
         _moeIndexedMatmulQ4K = moeIndexedMatmulQ4K;
         _moeIndexedMatmulQ5_1 = moeIndexedMatmulQ5_1;
+        _moeIndexedMatmulQ4KMmvq = moeIndexedMatmulQ4KMmvq;
+        _moeIndexedMatmulQ5_1Mmvq = moeIndexedMatmulQ5_1Mmvq;
+        _moeIndexedMatmulQ8Mmvq = moeIndexedMatmulQ8Mmvq;
         _moeIndexedMatmulTiled = moeIndexedMatmulTiled;
         _moeIndexedLoraDelta = moeIndexedLoraDelta;
         _moeExpertOffsets = moeExpertOffsets;
@@ -1095,6 +1122,9 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8 = null;
         MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K = null;
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1 = null;
+        MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq = null;
+        MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq = null;
+        MoeIndexedMatmulQ8_0MmvqKernel? moeIndexedMatmulQ8Mmvq = null;
         MoeIndexedMatmulTiledF32Kernel? moeIndexedMatmulTiled = null;
         MoeIndexedLoraDeltaF32Kernel? moeIndexedLoraDelta = null;
         MoeExpertOffsetsKernel? moeExpertOffsets = null;
@@ -1115,6 +1145,16 @@ public sealed class VulkanTransformerModel : IModel
                 // quantized on device (the real 26B's F32 experts are tens of GB).
                 moeIndexedMatmulQ4K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir);
                 moeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
+                // Indexed MMVQ decode variants (issue #137): dp4a + coalesced
+                // subgroup-per-cell reads for the S==1 expert GEMVs. TryCreate
+                // self-gates on device integer-dot support; env opt-out shares
+                // the dense-MMVQ A/B switch plus a dedicated MoE toggle.
+                if (!IsMmvqDisabled() && !IsMoeMmvqDisabled())
+                {
+                    moeIndexedMatmulQ4KMmvq = MoeIndexedMatmulQ4KMmvqKernel.TryCreate(device, spvDir);
+                    moeIndexedMatmulQ5_1Mmvq = MoeIndexedMatmulQ5_1MmvqKernel.TryCreate(device, spvDir);
+                    moeIndexedMatmulQ8Mmvq = MoeIndexedMatmulQ8_0MmvqKernel.TryCreate(device, spvDir);
+                }
             }
             moeIndexedMatmulTiled = MoeIndexedMatmulTiledF32Kernel.Create(device, spvDir);
             moeIndexedLoraDelta = MoeIndexedLoraDeltaF32Kernel.Create(device, spvDir);
@@ -1199,6 +1239,7 @@ public sealed class VulkanTransformerModel : IModel
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
             moeIndexedMatmulQ4K, moeIndexedMatmulQ5_1,
+            moeIndexedMatmulQ4KMmvq, moeIndexedMatmulQ5_1Mmvq, moeIndexedMatmulQ8Mmvq,
             moeIndexedMatmulTiled, moeIndexedLoraDelta,
             moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
             moeWeightedScatter, moeBroadcast,
@@ -1247,6 +1288,18 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsMmvqDisabled() =>
         Environment.GetEnvironmentVariable(DisableMmvqEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the indexed MoE MMVQ decode path (issue #137). Set
+    /// <c>DOTLLM_VULKAN_DISABLE_MOE_MMVQ=1</c> to force the S==1 expert matmuls
+    /// onto the scalar per-cell indexed kernels — used for same-session A/B
+    /// benchmarking of the coalesced dp4a expert GEMVs. When unset, the path
+    /// is used on decode whenever the kernels + scratch are wired.
+    /// </summary>
+    internal const string DisableMoeMmvqEnvVar = "DOTLLM_VULKAN_DISABLE_MOE_MMVQ";
+
+    internal static bool IsMoeMmvqDisabled() =>
+        Environment.GetEnvironmentVariable(DisableMoeMmvqEnvVar) == "1";
 
     /// <summary>
     /// Env-var opt-out for the shared-activation-quant optimisation on the MMVQ
@@ -3035,6 +3088,9 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ4KMmvq?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ5_1Mmvq?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ8Mmvq?.InvalidateDescriptorCache();
         _moeIndexedMatmulTiled?.InvalidateDescriptorCache();
         _moeExpertOffsets?.InvalidateDescriptorCache();
         _moeExpandGroupByExpert?.InvalidateDescriptorCache();
@@ -3685,14 +3741,75 @@ public sealed class VulkanTransformerModel : IModel
         _moeBroadcast!.Record(cmdBuf, _state.NormOutput, _state.MoeExpandedInput!,
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        RecordMoeIndexedMatmul(cmdBuf, moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
-            moeW.W1DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        RecordMoeIndexedMatmul(cmdBuf, moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
-            moeW.W3DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+
+        // ── Indexed MMVQ decode fast path (issue #137) ──────────────────────
+        // S==1 only: the dense decode GEMVs already run coalesced dp4a (mmvq);
+        // the scalar per-cell indexed kernels left the expert GEMVs far below
+        // that bandwidth. Quantize the expanded activations to Q8_1 row-wise
+        // once for the gate/up pair (K = hidden), and again for the down input
+        // (K = interm) after the GeGLU — same scratch, WAR-ordered by the
+        // barriers. Multi-token forwards (prefill / diffusion) keep the scalar
+        // kernels, so every existing seqLen>1 parity path stays byte-identical.
+        bool useMoeMmvq = seqLen == 1
+            && _quantizeQ8_1Rows is not null
+            && _state.MoeQ8_1Xq is not null && _state.MoeQ8_1Xds is not null
+            && moeW.W1DeviceQuantType == QuantType.Q4_K
+            && moeW.W3DeviceQuantType == QuantType.Q4_K
+            && _moeIndexedMatmulQ4KMmvq is not null
+            && (hidden % 256) == 0 && (interm % 32) == 0
+            && moeW.W2DeviceQuantType switch
+            {
+                QuantType.Q5_1 => _moeIndexedMatmulQ5_1Mmvq is not null && g4.DownExpertScale is not null,
+                QuantType.Q8_0 => _moeIndexedMatmulQ8Mmvq is not null,
+                _ => false,
+            };
+
+        if (useMoeMmvq)
+        {
+            MoeMmvqDispatchCount++;
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.MoeExpandedInput!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                n: expandedRows, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _moeIndexedMatmulQ4KMmvq!.Record(cmdBuf, moeW.W1Bank, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                _state.MoeTopkIndices!, _state.MoeGateInter!, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            _moeIndexedMatmulQ4KMmvq!.Record(cmdBuf, moeW.W3Bank, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                _state.MoeTopkIndices!, _state.MoeUpInter!, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            RecordMoeIndexedMatmul(cmdBuf, moeW.W1Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeGateInter!,
+                moeW.W1DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            RecordMoeIndexedMatmul(cmdBuf, moeW.W3Bank, _state.MoeExpandedInput!, _state.MoeTopkIndices!, _state.MoeUpInter!,
+                moeW.W3DeviceQuantType, m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
         _geglu!.Record(cmdBuf, _state.MoeGateInter!, _state.MoeUpInter!, _state.MoeSiluInter!, expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
-        if (moeW.W2DeviceQuantType == QuantType.Q5_1)
+        if (useMoeMmvq)
+        {
+            // Re-quantize the GeGLU output rows (K = interm) into the same
+            // scratch (the gate/up reads completed before the geglu barrier).
+            _quantizeQ8_1Rows!.Record(cmdBuf, _state.MoeSiluInter!, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                n: expandedRows, k: interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            if (moeW.W2DeviceQuantType == QuantType.Q5_1)
+            {
+                // The Q5_1 mmvq shader folds the per-expert ffn_down_exps.scale
+                // (op #14) into its output — same fold order as the scalar kernel.
+                _moeIndexedMatmulQ5_1Mmvq!.Record(cmdBuf, moeW.W2Bank, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                    _state.MoeTopkIndices!, _state.MoeDownRows!, g4.DownExpertScale!,
+                    m: hidden, k: interm, n: expandedRows, numExperts: numE);
+            }
+            else
+            {
+                // Q8_0 down bank: per-expert scale pre-folded into the block
+                // scales at upload — the kernel must not apply it again.
+                _moeIndexedMatmulQ8Mmvq!.Record(cmdBuf, moeW.W2Bank, _state.MoeQ8_1Xq!, _state.MoeQ8_1Xds!,
+                    _state.MoeTopkIndices!, _state.MoeDownRows!,
+                    m: hidden, k: interm, n: expandedRows, numExperts: numE);
+            }
+        }
+        else if (moeW.W2DeviceQuantType == QuantType.Q5_1)
         {
             // Quantized down path: the Q5_1 indexed-matmul shader folds the per-expert
             // ffn_down_exps.scale (op #14) into its output, so the weighted-scatter below
@@ -5245,6 +5362,9 @@ public sealed class VulkanTransformerModel : IModel
         _moeExpertOffsets?.Dispose();
         _moeIndexedLoraDelta?.Dispose();
         _moeIndexedMatmulTiled?.Dispose();
+        _moeIndexedMatmulQ5_1Mmvq?.Dispose();
+        _moeIndexedMatmulQ4KMmvq?.Dispose();
+        _moeIndexedMatmulQ8Mmvq?.Dispose();
         _moeIndexedMatmulQ5_1?.Dispose();
         _moeIndexedMatmulQ4K?.Dispose();
         _moeIndexedMatmulQ8?.Dispose();

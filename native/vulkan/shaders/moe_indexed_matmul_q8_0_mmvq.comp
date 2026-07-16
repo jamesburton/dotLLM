@@ -1,0 +1,105 @@
+#version 450
+#extension GL_EXT_integer_dot_product        : require
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// MoE INDEXED Q8_0 MMVQ decode GEMV (issue #137): integer-dot (dp4a)
+// matrix-vector multiply over a packed Q8_0 expert bank.
+//
+//   y[n, m] = sum_k dequant_q8_0(bank[indices[n], m, k]) * x[n, k]
+//
+// The gathered/indexed variant of matmul_q8_0_mmvq.comp: the weight row is
+// looked up through the per-row expert index (bank layout [numExperts, M, K])
+// and the activation rows come from the row-major Q8_1-quantized expanded MoE
+// input (quantize_q8_1_rows.comp). The COALESCED lane=K-position window layout,
+// the awkward 34-byte block stride handling (uint16 indexing — always 2-byte
+// aligned), and the single subgroupAdd reduction are identical to the proven
+// dense decode shader (#338). Q8_0 is symmetric — no min term, the Q8_1
+// block-sum is unused.
+//
+// Gemma-4 note: for Q8_0 down banks the per-expert ffn_down_exps.scale[e] is
+// pre-folded into each block's fp16 d at upload (UploadQ8_0SlotScaled), so
+// this kernel needs no scale buffer and MUST NOT apply it again.
+//
+// NOT bit-exact vs moe_indexed_matmul_q8_0_f32.comp (x is int8-quantized);
+// validated argmax + tolerance vs the CPU MoE oracle.
+//
+// Dispatch: 2D grid — gl_WorkGroupID.x = m, gl_WorkGroupID.y = n. One wave32
+// subgroup per (n, m) output cell.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };   // Q8_0 blob [numExperts, M, K]
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };     // [N * K/4] packed int8 activations
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };    // [N * K/32] (d_x, s)
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; };// [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };      // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (multiple of 32)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size — bounds-check only
+    uint blocksPerRow;  // = K / 32
+} pc;
+
+const uint UINT16_PER_BLOCK = 17u;  // 34 bytes = 1 fp16 scale + 32 int8 qs
+const uint WINDOW_BLOCKS    = 8u;   // 32 lanes * 8 int8/lane = 8 blocks/window
+
+// One uint16 (little-endian) from the 4-byte-indexed bank at uint16 index.
+// The 34-byte block stride is even, so every uint16 index is 2-byte aligned.
+uint readU16(uint idx16) {
+    uint w = bank[idx16 >> 1u];
+    return ((idx16 & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+}
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.y;
+    if (m >= pc.M || n >= pc.N) return;
+
+    uint expert = uint(indices[n]);
+    if (expert >= pc.numExperts) return; // defensive: bad index leaves y untouched
+
+    uint lane = gl_LocalInvocationID.x;        // 0..31
+    uint blockInWindow = lane >> 2u;           // 0..7 : block of the 8-block window
+    uint subInBlock    = lane & 3u;            // 0..3 : 8-int8 quarter of that block
+    uint qOff16        = 1u + 4u * subInBlock; // uint16 offset into the block's qs
+
+    uint rowBase16  = (expert * pc.M + m) * pc.blocksPerRow * UINT16_PER_BLOCK;
+    uint xqRowBase  = n * (pc.K >> 2u);
+    uint xdsRowBase = n * (pc.K >> 5u);
+
+    float acc = 0.0;
+    for (uint w0 = 0u; w0 < pc.blocksPerRow; w0 += WINDOW_BLOCKS) {
+        uint blk = w0 + blockInWindow;
+        if (blk >= pc.blocksPerRow)
+            continue;
+
+        uint blkBase16 = rowBase16 + blk * UINT16_PER_BLOCK;
+
+        // fp16 weight scale (uint16 at the block base), shared by the block's 4 lanes.
+        float dW = unpackHalf2x16(readU16(blkBase16)).x;
+        float dX = xds[xdsRowBase + blk].x;
+
+        // This lane's 8 int8 weights, read as four contiguous uint16 -> two uint32.
+        uint qb = blkBase16 + qOff16;
+        uint w32a = readU16(qb)      | (readU16(qb + 1u) << 16u);
+        uint w32b = readU16(qb + 2u) | (readU16(qb + 3u) << 16u);
+
+        // Matching 8 activations at int8 index 8*subInBlock of block blk.
+        uint xbase = xqRowBase + blk * 8u + 2u * subInBlock;
+        uint xa = xq[xbase];
+        uint xb = xq[xbase + 1u];
+
+        int dotI = 0;
+        dotI = dotPacked4x8AccSatEXT(int(w32a), int(xa), dotI);
+        dotI = dotPacked4x8AccSatEXT(int(w32b), int(xb), dotI);
+
+        acc += (dW * dX) * float(dotI);
+    }
+
+    // The subgroup IS the (n, m) cell: one reduction yields y[n*M + m].
+    float total = subgroupAdd(acc);
+    if (subgroupElect())
+        y[n * pc.M + m] = total;
+}
