@@ -316,13 +316,14 @@ public sealed class VulkanTransformerModel : IModel
 
     private static int ReadDecodeSplitLayer()
     {
-        // DEFAULT 0 (disabled) pending issue #148: the fenceless chunked submit
-        // intermittently DEVICE_LOSTs on gfx1151 (faults at vkQueueSubmit
-        // SplitSubmit across BOTH barrier modes; 4/4 stable with split off,
-        // same session). Worth ~7-9% decode on SmolLM when stable — re-enable
-        // via DOTLLM_VULKAN_DECODE_SPLIT_LAYER=8 or by fixing #148.
+        // Default 8 (see sweep above). Was briefly 0 during #148: intermittent
+        // DEVICE_LOSTs turned out to be cumulative gfx1151 driver-state
+        // degradation after heavy load/dispose churn (24/24 clean across the
+        // split×barrier matrix once the driver state cleared — 2026-07-17),
+        // NOT the fenceless chunked submit. If spells recur after heavy churn,
+        // set DOTLLM_VULKAN_DECODE_SPLIT_LAYER=0 while diagnosing, and see #148.
         string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DECODE_SPLIT_LAYER");
-        return v is null ? 0 : int.TryParse(v, out int n) && n >= 0 ? n : 0;
+        return v is null ? 8 : int.TryParse(v, out int n) && n >= 0 ? n : 8;
     }
 
     // ── Hazard-scoped barriers (issue #144) ────────────────────────────
