@@ -5009,8 +5009,8 @@ public sealed class VulkanTransformerModel : IModel
     }
 
     /// <summary>
-    /// One projection in a same-input MMVQ group: the Q8_0 weight blob, its
-    /// device-side quant type, the output buffer, and the output dimension.
+    /// One projection in a same-input MMVQ group: the quantized weight blob,
+    /// its device-side quant type, the output buffer, and the output dimension.
     /// </summary>
     private readonly record struct MmvqGroupProjection(
         VulkanDevice.Buffer Weights, QuantType WeightQt,
@@ -5024,9 +5024,11 @@ public sealed class VulkanTransformerModel : IModel
     /// </summary>
     /// <remarks>
     /// <para>
-    /// When the MMVQ decode path is wired, sharing is enabled
-    /// (<see cref="_mmvqShareActivation"/>), and every projection is Q8_0 with a
-    /// qualifying shape, the activation is quantized to Q8_1 once into the shared
+    /// When sharing is enabled (<see cref="_mmvqShareActivation"/>) and every
+    /// projection has a live MMVQ decode kernel for its weight quant with a
+    /// qualifying shape (any mix of MMVQ-wired quants — the Q8_1 activation
+    /// format is weight-quant-independent; issue #150 extended the group from
+    /// Q8_0-only), the activation is quantized to Q8_1 once into the shared
     /// <c>_state.Q8_1Xq</c>/<c>_state.Q8_1Xds</c> scratch, then each projection's
     /// integer-dot GEMV runs against that one quantized copy. Recording is:
     /// <c>quantize → barrier → GEMV_0, GEMV_1, …</c> with NO barrier between the
@@ -5039,8 +5041,9 @@ public sealed class VulkanTransformerModel : IModel
     /// Results are bit-identical to the per-projection path
     /// (<c>DOTLLM_VULKAN_MMVQ_NO_SHARE=1</c>): the same quantized activation feeds
     /// every GEMV, so sharing only removes redundant quantize dispatches. When the
-    /// group does not qualify (sharing off, a non-Q8_0 member, an unsupported
-    /// shape, or scratch too small) each projection falls back to a standalone
+    /// group does not qualify (sharing off, a member without an MMVQ decode
+    /// kernel, an unsupported shape, or scratch too small) each projection falls
+    /// back to a standalone
     /// <see cref="RecordMatmul"/> with a separating barrier — identical semantics
     /// to recording them individually.
     /// </para>
@@ -5072,8 +5075,8 @@ public sealed class VulkanTransformerModel : IModel
                 // No inter-GEMV barrier — same reasoning as the unfused shared
                 // group: the GEMVs only read the shared scratch and write
                 // disjoint outputs.
-                _matmulQ8Mmvq!.Record(cmdBuf, p.Weights, _state.Q8_1Xq!, _state.Q8_1Xds!, p.Output,
-                    m: p.OutputDim, k: inputDim);
+                RecordMmvqGemvPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output,
+                    p.OutputDim, inputDim);
             }
             return;
         }
@@ -5091,6 +5094,9 @@ public sealed class VulkanTransformerModel : IModel
         if (CanShareMmvqQuant(inputDim, seqLen, projections))
         {
             // One activation quant shared by every projection in the group.
+            // The Q8_1 activation format is weight-quant-independent: every
+            // MMVQ decode kernel consumes the same packed xq/xds pair, so
+            // mixed-quant groups (e.g. Q4_K q/k + Q6_K v) share the one quant.
             _quantizeQ8_1!.Record(cmdBuf, input, _state.Q8_1Xq!, _state.Q8_1Xds!, inputDim);
             BarrierComputeToCompute(cmdBuf);
             foreach (var p in projections)
@@ -5098,8 +5104,8 @@ public sealed class VulkanTransformerModel : IModel
                 // No inter-GEMV barrier: all GEMVs only read the shared scratch
                 // and write disjoint outputs (read-after-write on the scratch is
                 // ordered by the single barrier above).
-                _matmulQ8Mmvq!.Record(cmdBuf, p.Weights, _state.Q8_1Xq!, _state.Q8_1Xds!, p.Output,
-                    m: p.OutputDim, k: inputDim);
+                RecordMmvqGemvPreQuantized(cmdBuf, p.Weights, p.WeightQt, p.Output,
+                    p.OutputDim, inputDim);
             }
             return;
         }
@@ -5141,28 +5147,119 @@ public sealed class VulkanTransformerModel : IModel
     /// <summary>
     /// Returns true when every projection in <paramref name="projections"/>
     /// qualifies for the shared MMVQ activation-quant: decode step
-    /// (<paramref name="seqLen"/>==1), sharing enabled, the MMVQ decode path
-    /// wired, the shared scratch present and large enough for
-    /// <paramref name="inputDim"/>, and every member is Q8_0 with a 32-aligned
-    /// input. The group's input dim is identical for all members (they read the
-    /// same buffer) — asserted via the shared-scratch size check on
-    /// <paramref name="inputDim"/>. Prefill (seqLen&gt;1) never shares: the
-    /// quantize_q8_1 / MMVQ kernels are single-row decode kernels, so each
+    /// (<paramref name="seqLen"/>==1), sharing enabled, the quantize kernel and
+    /// shared scratch present and large enough for <paramref name="inputDim"/>,
+    /// and every member has a live MMVQ decode kernel for its weight quant with
+    /// a compatible alignment (issue #150 — the Q8_1 activation format is
+    /// weight-quant-independent, so mixed-quant groups qualify too). The
+    /// group's input dim is identical for all members (they read the same
+    /// buffer) — asserted via the shared-scratch size check on
+    /// <paramref name="inputDim"/>. Prefill (seqLen&gt;1) never shares here:
+    /// the quantize_q8_1 / MMVQ kernels are single-row decode kernels, so each
     /// projection must fall back to the row-wise MMQ / GEMM path.
     /// </summary>
     private bool CanShareMmvqQuant(int inputDim, int seqLen, ReadOnlySpan<MmvqGroupProjection> projections)
     {
         if (seqLen != 1) return false;
         if (!_mmvqShareActivation || projections.Length < 2) return false;
-        if (_matmulQ8Mmvq is null || _quantizeQ8_1 is null
-            || _state.Q8_1Xq is null || _state.Q8_1Xds is null)
+        if (_quantizeQ8_1 is null || _state.Q8_1Xq is null || _state.Q8_1Xds is null)
             return false;
         if ((inputDim % QuantizeQ8_1Kernel.GroupSize) != 0) return false;
         if (QuantizeQ8_1Kernel.PackedBytes(inputDim) > _state.Q8_1Xq.Size) return false;
         if (QuantizeQ8_1Kernel.ScaleBytes(inputDim) > _state.Q8_1Xds.Size) return false;
         foreach (var p in projections)
-            if (p.WeightQt != QuantType.Q8_0) return false;
+            if (!HasMmvqDecodeKernel(p.WeightQt, inputDim)) return false;
         return true;
+    }
+
+    /// <summary>
+    /// True when the decode MMVQ GEMV kernel for <paramref name="qt"/> is loaded
+    /// and <paramref name="inputDim"/> meets its block alignment — i.e.
+    /// RecordMatmul would take the MMVQ path for this projection at seqLen==1.
+    /// Mirrors <see cref="HasMmqPrefillKernel"/> for the decode side (issue #150).
+    /// </summary>
+    private bool HasMmvqDecodeKernel(QuantType qt, int inputDim) => qt switch
+    {
+        QuantType.Q8_0 => _matmulQ8Mmvq is not null && (inputDim % MatMulQ8_0MmvqKernel.Q8_0GroupSize) == 0,
+        QuantType.Q2_K => _matmulQ2KMmvq is not null && (inputDim % MatMulQ2KMmvqKernel.Q2KGroupSize) == 0,
+        QuantType.Q3_K => _matmulQ3KMmvq is not null && (inputDim % MatMulQ3KMmvqKernel.Q3KGroupSize) == 0,
+        QuantType.Q4_K => _matmulQ4KMmvq is not null && (inputDim % MatMulQ4KMmvqKernel.Q4KGroupSize) == 0,
+        QuantType.Q5_K => _matmulQ5KMmvq is not null && (inputDim % MatMulQ5KMmvqKernel.Q5KGroupSize) == 0,
+        QuantType.Q6_K => _matmulQ6KMmvq is not null && (inputDim % MatMulQ6KMmvqKernel.Q6KGroupSize) == 0,
+        QuantType.IQ4_NL => _matmulIq4NlMmvq is not null && (inputDim % MatMulIq4NlMmvqKernel.Iq4NlGroupSize) == 0,
+        QuantType.IQ4_XS => _matmulIq4XsMmvq is not null && (inputDim % MatMulIq4XsMmvqKernel.Iq4XsGroupSize) == 0,
+        QuantType.IQ2_XXS => _matmulIq2XxsMmvq is not null && (inputDim % MatMulIq2XxsMmvqKernel.Iq2XxsGroupSize) == 0,
+        QuantType.IQ2_XS => _matmulIq2XsMmvq is not null && (inputDim % MatMulIq2XsMmvqKernel.Iq2XsGroupSize) == 0,
+        QuantType.IQ2_S => _matmulIq2SMmvq is not null && (inputDim % MatMulIq2SMmvqKernel.Iq2SGroupSize) == 0,
+        QuantType.IQ3_XXS => _matmulIq3XxsMmvq is not null && (inputDim % MatMulIq3XxsMmvqKernel.Iq3XxsGroupSize) == 0,
+        QuantType.IQ3_S => _matmulIq3SMmvq is not null && (inputDim % MatMulIq3SMmvqKernel.Iq3SGroupSize) == 0,
+        QuantType.IQ1_S => _matmulIq1SMmvq is not null && (inputDim % MatMulIq1SMmvqKernel.Iq1SGroupSize) == 0,
+        _ => false,
+    };
+
+    /// <summary>
+    /// Dispatches the decode MMVQ GEMV for <paramref name="qt"/> against the
+    /// ALREADY populated shared Q8_1 activation scratch (no quantize, no
+    /// barrier — the caller ordered the one shared quantize). Callers must have
+    /// verified <see cref="HasMmvqDecodeKernel"/> for this quant/shape. The
+    /// dispatched kernel and quantized activation bits are identical to the
+    /// standalone <see cref="RecordMatmul"/> decode path, so outputs are
+    /// bit-identical shared vs unshared.
+    /// </summary>
+    private void RecordMmvqGemvPreQuantized(
+        nint cmdBuf, VulkanDevice.Buffer weights, QuantType qt,
+        VulkanDevice.Buffer output, int outputDim, int inputDim)
+    {
+        var xq = _state.Q8_1Xq!;
+        var xds = _state.Q8_1Xds!;
+        switch (qt)
+        {
+            case QuantType.Q8_0:
+                _matmulQ8Mmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q2_K:
+                _matmulQ2KMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q3_K:
+                _matmulQ3KMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q4_K:
+                _matmulQ4KMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q5_K:
+                _matmulQ5KMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.Q6_K:
+                _matmulQ6KMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ4_NL:
+                _matmulIq4NlMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ4_XS:
+                _matmulIq4XsMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ2_XXS:
+                _matmulIq2XxsMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ2_XS:
+                _matmulIq2XsMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ2_S:
+                _matmulIq2SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ3_XXS:
+                _matmulIq3XxsMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ3_S:
+                _matmulIq3SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            case QuantType.IQ1_S:
+                _matmulIq1SMmvq!.Record(cmdBuf, weights, xq, xds, output, m: outputDim, k: inputDim);
+                break;
+            default:
+                throw new InvalidOperationException(
+                    $"No MMVQ decode kernel for {qt}; callers must check HasMmvqDecodeKernel first.");
+        }
     }
 
     /// <summary>
