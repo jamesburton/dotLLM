@@ -80,6 +80,53 @@ public class VulkanFlashAttentionCoopmatKernelTests
         // Long-context prefill: 32 KV tiles per Q-tile, 128 Q-tiles per head.
         => RunOne(seqQ: 2048, seqKv: 2048, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 0);
 
+    // Issue #378: headDim<=64 + seqKv>=SeqKvThreshold(640) routes to the
+    // LDS-halved hd64 shader — none of the shapes above cross that seqKv
+    // threshold (max is 512), so they all still exercise the base 128-dim
+    // shader post-#378. These specifically exercise the hd64 dispatch path.
+    [SkippableFact]
+    public void Launch_Hd64_Gqa3_SmolLm_LongPrefill()
+        // SmolLM shape (9 heads / 3 kv heads) at seqKv just past the
+        // hd64 dispatch threshold.
+        => RunOne(seqQ: 640, seqKv: 640, numHeads: 9, numKvHeads: 3, headDim: 64, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd64_PartialTiles_LongPrefill()
+        // Non-tile-multiple seqQ/seqKv at hd64-eligible length — validates
+        // the zero-padded partial-tile paths under the smaller MAX_HEAD_DIM.
+        => RunOne(seqQ: 777, seqKv: 809, numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd64_ChunkedPrefill_PositionOffset()
+        => RunOne(seqQ: 128, seqKv: 768, numHeads: 8, numKvHeads: 2, headDim: 64, positionOffset: 640);
+
+    [SkippableFact]
+    public void Launch_Hd64_SlidingWindow()
+        => RunOne(seqQ: 96, seqKv: 700, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, slidingWindow: 100);
+
+    [SkippableFact]
+    public void Launch_Hd64_Alibi()
+        => RunOne(seqQ: 64, seqKv: 704, numHeads: 6, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, useAlibi: true);
+
+    [SkippableFact]
+    public void Launch_Hd64_HeadDim32_SmallerThanTile()
+        // headDim (32) strictly less than the hd64 shader's own MAX_HEAD_DIM
+        // (64) — exercises the padded-chunk / skipped-slice logic inside the
+        // smaller tile, mirroring what Launch_HeadDim80_NonChunkMultiple does
+        // for the 128-dim shader.
+        => RunOne(seqQ: 64, seqKv: 700, numHeads: 4, numKvHeads: 2, headDim: 32, positionOffset: 0);
+
+    [SkippableFact]
+    public void Launch_Hd64_JustBelowThreshold_UsesBaseShader()
+        // seqKv = SeqKvThreshold - 1 must NOT dispatch hd64 — this shape is
+        // a regression guard for the threshold boundary itself (asserts
+        // correctness of whichever shader actually gets selected, not which
+        // one that is).
+        => RunOne(seqQ: 64, seqKv: VulkanFlashAttentionCoopmatKernel.SeqKvThreshold - 1,
+            numHeads: 4, numKvHeads: 2, headDim: 64, positionOffset: 0);
+
     [SkippableFact]
     public void Launch_ChunkedPrefill_PositionOffset()
         // Second chunk of a chunked prefill: 64 new queries against 192 total
