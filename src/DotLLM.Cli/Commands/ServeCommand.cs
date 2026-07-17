@@ -129,6 +129,24 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
+
+        /// <summary>Idle-unload duration in seconds (#369, ollama parity).</summary>
+        [CommandOption("--keep-alive")]
+        [Description("Idle-unload duration in seconds (ollama parity; default 300 = 5 min). 0 = unload after each request. Negative = never unload.")]
+        [DefaultValue(300.0)]
+        public double KeepAlive { get; set; } = 300;
+
+        /// <summary>Maximum number of models resident at once (#369).</summary>
+        [CommandOption("--max-resident-models")]
+        [Description("Maximum number of models resident at once, counting the active one (default 1 = classic single-model hot-swap). Set > 1 to hold multiple models concurrently.")]
+        [DefaultValue(1)]
+        public int MaxResidentModels { get; set; } = 1;
+
+        /// <summary>Total byte budget across all resident models (#369).</summary>
+        [CommandOption("--resident-memory-budget")]
+        [Description("Total byte budget across all resident models. 0 (default) = unlimited, only --max-resident-models bounds residency.")]
+        [DefaultValue(0L)]
+        public long ResidentMemoryBudgetBytes { get; set; }
     }
 
     /// <inheritdoc/>
@@ -157,6 +175,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             SpeculativeModel = settings.SpeculativeModel,
             SpeculativeCandidates = settings.SpeculativeK,
             PrefillChunkSize = settings.PrefillChunkSize,
+            KeepAliveSeconds = settings.KeepAlive,
+            MaxResidentModels = settings.MaxResidentModels,
+            ResidentMemoryBudgetBytes = settings.ResidentMemoryBudgetBytes,
             ModelId = "none",
         };
 

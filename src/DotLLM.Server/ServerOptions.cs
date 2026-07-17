@@ -96,6 +96,37 @@ public sealed record ServerOptions
     public ContinuousBatchSchedulerOptions? Scheduler { get; init; }
 
     /// <summary>
+    /// Server-wide default idle-unload duration in seconds (#369, ollama parity — ollama's own
+    /// default is 5 min). Per-model/per-request <c>keep_alive</c> overrides take precedence when
+    /// present. 0 = unload immediately after each use. Negative = never auto-unload.
+    /// </summary>
+    public double KeepAliveSeconds { get; init; } = 300;
+
+    /// <summary>
+    /// Maximum number of models resident at once, counting the active one (#369). Default 1
+    /// reproduces the original single-model hot-swap behavior exactly — the previous model is
+    /// evicted the instant a new one loads. Set &gt; 1 to hold multiple models concurrently
+    /// (subject to <see cref="ResidentMemoryBudgetBytes"/>), servable via the <c>model</c> field on
+    /// chat/completion requests or an explicit <c>POST /v1/models/load</c>.
+    /// </summary>
+    public int MaxResidentModels { get; init; } = 1;
+
+    /// <summary>
+    /// Total byte budget across all resident models (#369). 0 (default) = unlimited — only
+    /// <see cref="MaxResidentModels"/> bounds residency. Accounted against each model's GGUF file
+    /// size on disk as a proxy for its host-RAM (mmap) or VRAM footprint.
+    /// </summary>
+    public long ResidentMemoryBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Interval between idle-unload sweeps (#369). Default 5s — bounds the worst-case delay
+    /// between a model crossing its keep-alive and actually being unloaded (including the
+    /// <c>keep_alive: 0</c> "unload after each use" case, which is enforced on the next tick
+    /// rather than synchronously in the request path, to keep response latency unaffected).
+    /// </summary>
+    public TimeSpan IdleSweepInterval { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// Parses command-line arguments into <see cref="ServerOptions"/>.
     /// </summary>
     public static ServerOptions Parse(string[] args)
@@ -119,6 +150,9 @@ public sealed record ServerOptions
         string? speculativeModel = null;
         int speculativeCandidates = 5;
         int prefillChunkSize = 0;
+        double keepAliveSeconds = 300;
+        int maxResidentModels = 1;
+        long residentMemoryBudgetBytes = 0;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -167,6 +201,12 @@ public sealed record ServerOptions
                     speculativeCandidates = int.Parse(next!); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
+                case "--keep-alive":
+                    keepAliveSeconds = double.Parse(next!); i++; break;
+                case "--max-resident-models":
+                    maxResidentModels = int.Parse(next!); i++; break;
+                case "--resident-memory-budget":
+                    residentMemoryBudgetBytes = long.Parse(next!); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -211,6 +251,9 @@ public sealed record ServerOptions
             SpeculativeModel = speculativeModel,
             SpeculativeCandidates = speculativeCandidates,
             PrefillChunkSize = prefillChunkSize,
+            KeepAliveSeconds = keepAliveSeconds,
+            MaxResidentModels = maxResidentModels,
+            ResidentMemoryBudgetBytes = residentMemoryBudgetBytes,
             ModelId = modelId,
         };
     }

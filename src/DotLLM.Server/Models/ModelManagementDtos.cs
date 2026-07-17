@@ -76,6 +76,15 @@ public sealed record ModelLoadRequest
     [JsonPropertyName("speculative_k")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? SpeculativeK { get; init; }
+
+    /// <summary>
+    /// Idle-unload duration in seconds for this model (#369, ollama parity). Null = use the
+    /// server-wide default (<see cref="ServerOptions.KeepAliveSeconds"/>, 5 min). 0 = unload
+    /// immediately after each use. Negative = never auto-unload.
+    /// </summary>
+    [JsonPropertyName("keep_alive")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? KeepAlive { get; init; }
 }
 
 /// <summary>

@@ -93,6 +93,16 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("diffusion")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DiffusionOptionsDto? Diffusion { get; init; }
+
+    /// <summary>
+    /// Idle-unload duration in seconds for the target model (#369, ollama parity). Null = use the
+    /// server-wide default. 0 = unload immediately after this request. Negative = never
+    /// auto-unload. Combine with <see cref="Model"/> to route to (and keep resident) a specific
+    /// model when the server has more than one loaded.
+    /// </summary>
+    [JsonPropertyName("keep_alive")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? KeepAlive { get; init; }
 }
 
 /// <summary>

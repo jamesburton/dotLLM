@@ -66,6 +66,15 @@ public sealed record CompletionRequest
     [JsonPropertyName("prefix_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PrefixId { get; init; }
+
+    /// <summary>
+    /// Idle-unload duration in seconds for the target model (#369, ollama parity). Null = use the
+    /// server-wide default. 0 = unload immediately after this request. Negative = never
+    /// auto-unload.
+    /// </summary>
+    [JsonPropertyName("keep_alive")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? KeepAlive { get; init; }
 }
 
 /// <summary>

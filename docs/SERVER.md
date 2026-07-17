@@ -67,7 +67,61 @@ Extract embedding vectors from text.
 Implementation: Run input through the model, capture hidden state at `PreLmHead` hook point, apply pooling (mean pool over tokens by default, configurable), L2 normalize. Minimal additional code given the hook system.
 
 ### `GET /v1/models`
-List loaded models: `{"data": [{"id": "llama-3-8b-q4_k_m", "object": "model"}]}`
+Lists every **resident** model — the active one plus any stashed-but-loaded models (#369):
+```json
+{"data": [
+  {"id": "llama-3-8b-q4_k_m", "object": "model", "is_active": true,
+   "idle_seconds": 4.2, "keep_alive_seconds": 300, "expires_in_seconds": 295.8, "size_bytes": 4900000000}
+]}
+```
+`expires_in_seconds` is omitted when the model's keep-alive is negative (pinned, never auto-unloads).
+
+## Model Keep-Alive / Idle-Unload / Multi-Model Residency (#369)
+
+Ollama-parity daemon lifecycle: idle models unload automatically, and — when configured — more than
+one model can be resident (loaded and instantly servable) at once.
+
+### Keep-alive
+
+Every loaded model tracks a **keep-alive** duration:
+
+| Value | Meaning |
+|-------|---------|
+| *(unset)* | Server default — `ServerOptions.KeepAliveSeconds`, default **300s** (5 min, matches ollama). |
+| `0` | Unload after this use (checked on the next idle-sweep tick, not synchronously — see below). |
+| positive N | Unload after N seconds idle. |
+| negative | Never auto-unload (pin the model resident). |
+
+Set it per-request via `"keep_alive": <seconds>` on `POST /v1/chat/completions`, `POST /v1/completions`,
+or `POST /v1/models/load`; each sets that model's override going forward (subsequent requests reuse
+the last-set override unless they specify their own). A background sweep
+(`ServerOptions.IdleSweepInterval`, default 5s) evicts models past their keep-alive — including the
+active one, but only when it isn't mid-generation (an in-flight request is never interrupted; the
+sweep just retries next tick). A later request against an idled-out model **lazily reloads it**
+(from the same resolved path/options) rather than requiring an explicit `/v1/models/load` call again.
+
+### Multi-model residency
+
+`ServerOptions.MaxResidentModels` (default **1**) bounds how many models can be loaded
+concurrently, counting the active one. Default-compatible: at `1`, loading a new model always
+evicts the previous one immediately — exactly the original single-model hot-swap behavior.
+Set it `> 1` (plus optionally `ServerOptions.ResidentMemoryBudgetBytes`, default 0 = unlimited byte
+budget, only the count bounds residency) to hold several models resident. When a new load would
+exceed the budget, the least-recently-used stashed model is evicted first (simple LRU).
+
+Route requests to a specific resident model with the standard OpenAI `"model"` field on chat/completion
+requests — reactivating an already-resident model is a cheap in-memory field-swap (no GGUF reload),
+while a not-yet-resident model triggers a normal load (evicting LRU stashed models first if needed).
+
+CLI flags: `--keep-alive <seconds>`, `--max-resident-models <n>`, `--resident-memory-budget <bytes>`.
+
+### Concurrency scoping
+
+Requests to different resident models are **still serialized** through the same request gate as
+single-model mode — `ContinuousBatchScheduler`/`ContinuousBatchSchedulerService` have no multi-model
+dispatch story, and building one was out of scope for #369. The win is reload-cost elimination
+(µs-scale reactivation vs. seconds-scale disk reload), not concurrent cross-model execution. See
+`docs/perf/ISSUE_369_MODEL_KEEPALIVE.md` (if still present) for the full scoping rationale.
 
 ### `POST /v1/tokenize` (extension)
 **Request**: `{"text": "Hello world", "model": "..."}`
