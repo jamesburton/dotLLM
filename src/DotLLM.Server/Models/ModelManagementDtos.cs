@@ -111,6 +111,15 @@ public sealed record ModelLoadRequest
     [JsonPropertyName("yarn_beta_slow")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public float? YarnBetaSlow { get; init; }
+
+    /// <summary>
+    /// Idle-unload duration in seconds for this model (#369, ollama parity). Null = use the
+    /// server-wide default (<see cref="ServerOptions.KeepAliveSeconds"/>, 5 min). 0 = unload
+    /// immediately after each use. Negative = never auto-unload.
+    /// </summary>
+    [JsonPropertyName("keep_alive")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? KeepAlive { get; init; }
 }
 
 /// <summary>

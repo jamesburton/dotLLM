@@ -64,6 +64,18 @@ public static class ServerStartup
         Options = options,
         IsReady = false,
         LoraRegistry = CreateLoraRegistry(),
+        Residency = CreateResidencyManager(options),
+    };
+
+    /// <summary>
+    /// Builds a <see cref="ModelResidencyManager"/> from the residency-related fields of
+    /// <see cref="ServerOptions"/> (#369).
+    /// </summary>
+    public static ModelResidencyManager CreateResidencyManager(ServerOptions options) => new()
+    {
+        MaxResidentModels = Math.Max(1, options.MaxResidentModels),
+        MemoryBudgetBytes = options.ResidentMemoryBudgetBytes,
+        DefaultKeepAliveSeconds = options.KeepAliveSeconds,
     };
 
     /// <summary>
@@ -254,6 +266,8 @@ public static class ServerStartup
                 : "[dotllm] Continuous-batch scheduler active");
         }
 
+        long estimatedBytes = SafeFileLength(resolvedPath);
+
         return new ServerState
         {
             Options = options,
@@ -277,7 +291,29 @@ public static class ServerStartup
             DraftModelPath = draftModelPath,
             DraftGguf = draftGguf,
             LoraRegistry = CreateLoraRegistry(),
+            Residency = CreateResidencyManager(options),
+            EstimatedBytes = estimatedBytes,
+            LastUsedUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>
+    /// Best-effort file size lookup used for eviction budget accounting (#369). Never
+    /// blocks/throws — returns 0 when the size can't be determined. Resolves symlinks first:
+    /// <see cref="FileInfo.Length"/> reports <c>0</c> for the reparse point itself on Windows
+    /// (verified against a Hugging Face hub cache NTFS symlink, e.g. <c>hf download</c>'s default
+    /// layout) rather than the target's actual size, which would otherwise silently defeat the
+    /// memory-budget accounting for every model resolved through that cache.
+    /// </summary>
+    public static long SafeFileLength(string path)
+    {
+        try
+        {
+            if (File.ResolveLinkTarget(path, returnFinalTarget: true) is FileInfo target)
+                return target.Length;
+            return new FileInfo(path).Length;
+        }
+        catch { return 0; }
     }
 
     /// <summary>
@@ -372,20 +408,19 @@ public static class ServerStartup
 
         app.MapDotLLMEndpoints(serveUi);
 
-        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
-        // the host shuts down. Stopped earlier in SwapModelAsync when the model is swapped.
-        if (state.Scheduler is { } scheduler)
-        {
-            var loopCts = new CancellationTokenSource();
-            state.SchedulerLoopCts = loopCts;
-            state.SchedulerLoopTask = Task.Run(() => scheduler.RunLoopAsync(loopCts.Token));
+        var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+        state.ShutdownToken = lifetime.ApplicationStopping;
 
-            var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
-            lifetime.ApplicationStopping.Register(() =>
-            {
-                try { loopCts.Cancel(); } catch { /* already disposed */ }
-            });
-        }
+        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
+        // the host shuts down. Stopped/rebuilt on model swap, activation, and idle-unload (#369) —
+        // see ServerState.StartSchedulerLoop, which every one of those paths funnels through.
+        state.StartSchedulerLoop();
+
+        // Idle-unload sweep (#369): periodically evicts models past their keep-alive, including
+        // the active one (never interrupting an in-flight request — see ServerState.SweepIdleAsync).
+        // Runs even with the default single-model configuration, so idle-unload works out of the
+        // box for every server, not just multi-model setups.
+        _ = Task.Run(() => state.RunIdleSweepLoopAsync(state.Options.IdleSweepInterval, state.ShutdownToken));
 
         return app;
     }
