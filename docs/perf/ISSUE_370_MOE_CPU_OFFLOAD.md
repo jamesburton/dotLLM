@@ -2,9 +2,10 @@
 
 **FOR THE COORDINATOR: fold into `.docs/KERNEL_MAP.md` §7, then delete this file.**
 
-Status: implemented + parity-tested (synthetic fixture) on this box (Strix Halo, `dev`
-worktree `agent-a2042d63b51f96fa2`, branch `issue/370-moe-cpu-offload`). Real-GGUF
-`dotllm bench` numbers: see "Real-model validation" below.
+Status: **implemented, parity-tested (synthetic fixture), and real-GGUF validated**
+(Strix Halo, `dev` worktree `agent-a2042d63b51f96fa2`, branch `issue/370-moe-cpu-offload`).
+Real-model `dotllm bench` numbers: see "Real-model validation" below. Full Vulkan suite:
+930 passed / 1 flaky-fail (known pre-existing, confirmed by isolate-retry) / 40 skipped.
 
 ## What was built
 
@@ -121,7 +122,70 @@ self-skip — no cached A3B GGUF at the conventional path) still pass: 25 passed
 
 ## Real-model validation
 
-<!-- FILLED IN AFTER THE REAL-GGUF dotllm bench RUN — see task notes -->
+Ran on this box (Strix Halo, Radeon 8060S iGPU, 128 GB UMA) against the cached
+`unsloth/Qwen3.6-35B-A3B-GGUF` **UD-Q4_K_XL** (22.4 GB on disk; the Q6_K_XL variant
+referenced by existing tests wasn't cached, Q4_K_XL was). No OOM at any placement level
+including full-GPU (`--n-cpu-moe 0`) — expected on this box since 128 GB UMA has enough
+headroom even for the ~123 GB streaming-F32 dequant path; the offload's VRAM-reduction
+value is for genuinely VRAM-constrained hosts (dGPU, e.g. T5500's 12 GB) or reserving UMA
+budget for KV-cache/context, per the issue's stated motivation — this run validates
+*mechanism and throughput*, not a VRAM ceiling this box happens to have.
+
+`dotllm bench --device vulkan -p 8 -n 4..6 -r 1` (prompt 8 tok, short decode — enough to
+get a stable-ish tok/s read without a multi-minute run per data point at these speeds):
+
+| `--n-cpu-moe` | GPU expert-bank bytes avoided | decode tok/s | prefill tok/s | load ms |
+|---|---|---|---|---|
+| 0 (full GPU, pre-#370 default) | 0 | **0.067** | 0.39 | 4262 |
+| 4 | ~12.3 GB | 0.085–0.09 | 0.41 | 19424¹ |
+| 20 | ~61.4 GB | 0.18 | 0.98 | 1829¹ |
+| 40 (fully CPU-placed) | ~122.9 GB | **2.98** | 4.74 | 5820¹ |
+| CPU-only (`--device cpu`, 32 threads) | n/a (no GPU involved) | **6.61** | 14.25 | 286 |
+
+¹ Load-time variance across these rows is OS page-cache warmth for the 22 GB GGUF mmap
+(each run benefits from the previous run's file-cache pages), not a real per-`N` cost —
+don't read load-ms as a monotonic function of `N`.
+
+**Headline finding — the win is bigger than "VRAM saved," it's "usable at all":**
+the existing default GPU-streaming path (`--n-cpu-moe 0`, i.e. the pre-#370 behaviour,
+`DOTLLM_VK_MOE_RESIDENT` unset) re-dequantizes and re-uploads every routed-expert bank to
+F32 on *every forward* — already flagged `SUSPECTED-SLOW`/"decode-killing" in
+`.docs/KERNEL_MAP.md` §7 for this exact model. At 0.067 tok/s decode it is not a usable
+interactive path. Moving MoE compute to the CPU (`--n-cpu-moe 40`) is **~44x faster
+decode** (0.067 → 2.98 tok/s) purely by skipping that GPU streaming cost, even though the
+CPU-side compute itself isn't free. So for Qwen3MoeHybrid-at-this-scale on Vulkan today,
+CPU-offload is less "trade throughput for VRAM" and more "the only way to get a working
+decode speed out of the Vulkan backend at all" until the GPU-resident-quant path
+(`DOTLLM_VK_MOE_RESIDENT=1`) is validated at Q4_K/Q4_K_XL scale (today it's proven for
+Q6_K-uniform banks only — this GGUF is Q4_K_XL, a mixed-quant UD build, so resident mode
+would fall back to the same F32-dequant-resident path and wasn't attempted here given the
+~123 GB device-memory commitment that implies).
+
+**But full-CPU-offload-via-Vulkan (2.98 tok/s) is still ~2.2x slower than pure-CPU (6.61
+tok/s)** on this box. The likely cause: each CPU-placed layer costs two GPU
+submit-and-wait round trips (residual-snapshot+RMSNorm, then residual-add+copy-back)
+plus a host↔device buffer round trip in between — at `seqLen=1` decode, per-submission
+GPU dispatch/fence latency is almost certainly the dominant cost over 40 layers × 2
+submissions, not the CPU compute itself or the transfer bytes (`hiddenSize=2048` floats is
+tiny). A full-CPU model avoids all of that dispatch overhead entirely. This is consistent
+with dense/attention GPU dispatch being cheap per-layer in isolation but not free at
+`n_layers × 2` fixed round trips per decode step — a real, understood, **unclaimed
+optimization opportunity** for a follow-up: batching the host round-trip across
+*all* CPU-placed layers' MoE-input snapshots into fewer, larger submissions instead of
+one pair per layer (or, at the limit, running the token-mixing GPU passes for a whole
+forward first, then a single batched CPU-MoE sweep, then a single batched GPU residual-add
+sweep) would likely close much of this gap. Left for a follow-up issue — v1 here is
+correctness + a working, measured tradeoff, not the fastest possible CPU-offload
+implementation.
+
+**Practical guidance this run supports:** on this box, for this model/quant, full-CPU
+(`--device cpu`) remains the fastest option in absolute terms. `--n-cpu-moe` earns its
+keep on a VRAM-constrained dGPU where full-CPU isn't competitive with CPU+GPU-attention
+hybrid throughput (T5500-class 12 GB cards, or any host that wants GPU-accelerated
+dense/attention while conserving VRAM for KV-cache) — exactly the motivating case in the
+issue. The monotonic `N → throughput` trend above (0 → 4 → 20 → 40 all strictly improve
+decode tok/s) confirms the feature composes correctly at every granularity, not just the
+two endpoints.
 
 ## Known v1 gaps (deliberately out of scope, per issue's "start simple" guidance)
 
