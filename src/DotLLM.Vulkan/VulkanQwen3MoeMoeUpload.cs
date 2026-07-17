@@ -22,25 +22,43 @@ namespace DotLLM.Vulkan;
 /// the lifetime of the model.
 /// </para>
 /// <para>
-/// <b>Resident-quant overlay (Q6_K).</b> When the caller asks for a
+/// <b>Resident-quant overlay (Q6_K, Q4_K).</b> When the caller asks for a
 /// resident-quant upload (<c>residentQuant: true</c>) AND the source MoE
-/// banks are uniformly Q6_K, the routed banks are uploaded as raw Q6_K
-/// bytes (210 bytes per 256-element super-block, layout matching
-/// <c>DotLLM.Cpu.Kernels.DequantizeKQuants.DequantizeQ6_KScalar</c>) so the
-/// device-side <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>
-/// can dequantise per row. This is the only way the Qwen3.6-A3B-Q6_K_XL
-/// routed banks (~25 GB Q6_K vs ~120 GB F32) fit on Strix Halo's 128 GB
-/// unified memory while still resident across forwards. Falls back to F32
-/// dequant when the source isn't Q6_K — the F32 indexed kernel is the
-/// historical correctness-first path and remains the streaming default.
+/// banks are uniformly one of the supported quant types, the routed banks
+/// are uploaded as raw quant bytes (block-sized per <c>Dequantize.RowByteSize</c>,
+/// layout matching the corresponding <c>DotLLM.Cpu.Kernels.Dequantize*</c>
+/// scalar reference) so a matching device-side indexed matmul kernel
+/// (<see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> or
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>) can
+/// dequantise per row. This is what lets multi-GB routed banks (e.g.
+/// Qwen3.6-A3B-Q6_K_XL: ~25 GB Q6_K vs ~120 GB F32; UD-Q4_K_XL: ~15 GB Q4_K)
+/// fit on Strix Halo's 128 GB unified memory while still resident across
+/// forwards. Falls back to F32 dequant when the source isn't uniformly one
+/// of the supported quant types (or is a quant type without a resident
+/// kernel wired up) — the F32 indexed kernel is the historical
+/// correctness-first path and remains the streaming default.
 /// </para>
 /// </remarks>
 internal static class VulkanQwen3MoeMoeUpload
 {
     /// <summary>
+    /// Quant types with a resident (raw-block, on-device-dequant) indexed
+    /// matmul kernel wired into <see cref="VulkanQwen3MoeHybridTransformerModel.RecordIndexedMoeMatmul"/>.
+    /// Adding a new entry here requires: (1) a kernel following the
+    /// <c>MoeIndexedMatmulQ6_KF32Kernel</c> pattern, (2) wiring it into
+    /// <see cref="VulkanQwen3MoeHybridKernels"/>, and (3) a dispatch arm in
+    /// <c>RecordIndexedMoeMatmul</c>.
+    /// </summary>
+    private static readonly HashSet<QuantizationType> s_ResidentQuantTypes = new()
+    {
+        QuantizationType.Q6_K,
+        QuantizationType.Q4_K,
+    };
+
+    /// <summary>
     /// One layer's worth of device-resident MoE weights: router gate, three
-    /// routed-expert banks (F32 or Q6_K-resident), optional shared-expert
-    /// projections, optional Qwen1.5-MoE sigmoid gate.
+    /// routed-expert banks (F32, Q6_K-resident, or Q4_K-resident), optional
+    /// shared-expert projections, optional Qwen1.5-MoE sigmoid gate.
     /// </summary>
     public sealed class LayerBundle : IDisposable
     {
@@ -50,6 +68,7 @@ internal static class VulkanQwen3MoeMoeUpload
         /// <list type="bullet">
         ///   <item><c>F32</c>: <c>[numExperts, intermediate, hidden]</c> contiguous floats.</item>
         ///   <item><c>Q6_K</c>: <c>[numExperts, intermediate, (hidden/256)*210]</c> raw block bytes.</item>
+        ///   <item><c>Q4_K</c>: <c>[numExperts, intermediate, (hidden/256)*144]</c> raw block bytes.</item>
         /// </list>
         /// </summary>
         public VulkanDevice.Buffer W1Bank { get; }
@@ -119,16 +138,18 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="moe">CPU-side weight bundle; raw quant view is consulted when present.</param>
     /// <param name="hiddenSize">Hidden dim, needed to size W1/W3 banks.</param>
     /// <param name="residentQuant">
-    /// When <c>true</c>, opt into Q6_K-resident upload of the routed banks
-    /// when the source is uniformly Q6_K (the only resident-quant variant
-    /// implemented today — see <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>).
+    /// When <c>true</c>, opt into resident-quant upload of the routed banks
+    /// when the source is uniformly one of <see cref="s_ResidentQuantTypes"/>
+    /// (currently Q6_K and Q4_K — see
+    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> and
+    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>).
     /// Source bytes are copied without dequantisation, so device memory is
-    /// ~25 GB instead of ~120 GB at qwen35moe-A3B-Q6_K_XL scale. When the
-    /// source isn't Q6_K (or this flag is <c>false</c>), the routed banks
-    /// dequant to F32 — the historical correctness-first path. Always
-    /// <c>true</c> in resident-MoE mode (the bundle survives across
-    /// forwards), <c>false</c> in streaming mode (per-forward F32 upload
-    /// is the existing default).
+    /// ~25 GB instead of ~120 GB at qwen35moe-A3B-Q6_K_XL scale (Q4_K is
+    /// smaller still). When the source isn't uniformly a supported quant
+    /// type (or this flag is <c>false</c>), the routed banks dequant to F32
+    /// — the historical correctness-first path. Always <c>true</c> in
+    /// resident-MoE mode (the bundle survives across forwards), <c>false</c>
+    /// in streaming mode (per-forward F32 upload is the existing default).
     /// </param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
@@ -144,14 +165,15 @@ internal static class VulkanQwen3MoeMoeUpload
         // produced by llama.cpp's quantizer always do. A mixed quant layer
         // (e.g. Q6_K W1/W3 + Q5_K W2 from a hand-edited UD-style GGUF) falls
         // back to F32 since the dispatcher only carries one bank kernel per
-        // bundle.
+        // bundle. Only quant types with a resident indexed-matmul kernel
+        // wired up (see s_ResidentQuantTypes) are eligible.
         QuantizationType bankQt = QuantizationType.F32;
         if (residentQuant && moe.HasRawQuantView
-            && moe.GateExpsRawQt == QuantizationType.Q6_K
-            && moe.UpExpsRawQt == QuantizationType.Q6_K
-            && moe.DownExpsRawQt == QuantizationType.Q6_K)
+            && moe.GateExpsRawQt == moe.UpExpsRawQt
+            && moe.GateExpsRawQt == moe.DownExpsRawQt
+            && s_ResidentQuantTypes.Contains(moe.GateExpsRawQt))
         {
-            bankQt = QuantizationType.Q6_K;
+            bankQt = moe.GateExpsRawQt;
         }
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
@@ -174,10 +196,10 @@ internal static class VulkanQwen3MoeMoeUpload
         //       staging at the expert's contiguous slot, then copy. 3 device
         //       buffers per layer, each at ~25% of the F32 size.
         VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
-        if (bankQt == QuantizationType.Q6_K)
+        if (bankQt != QuantizationType.F32)
         {
-            long w1RowBytes = Dequantize.RowByteSize(hiddenSize, QuantizationType.Q6_K);
-            long w2RowBytes = Dequantize.RowByteSize(interm, QuantizationType.Q6_K);
+            long w1RowBytes = Dequantize.RowByteSize(hiddenSize, bankQt);
+            long w2RowBytes = Dequantize.RowByteSize(interm, bankQt);
             long w1PerExpertBytes = w1RowBytes * interm;
             long w2PerExpertBytes = w2RowBytes * hiddenSize;
             long w1BankBytes = (long)numE * w1PerExpertBytes;
@@ -187,11 +209,11 @@ internal static class VulkanQwen3MoeMoeUpload
             w2Bank = device.AllocateDeviceLocal(w2BankBytes);
             w3Bank = device.AllocateDeviceLocal(w1BankBytes);
 
-            UploadRoutedBankQ6K(device, staging, moe, kind: 'G', bank: w1Bank,
+            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'G', bank: w1Bank,
                 numE: numE, perExpertBytes: w1PerExpertBytes);
-            UploadRoutedBankQ6K(device, staging, moe, kind: 'D', bank: w2Bank,
+            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'D', bank: w2Bank,
                 numE: numE, perExpertBytes: w2PerExpertBytes);
-            UploadRoutedBankQ6K(device, staging, moe, kind: 'U', bank: w3Bank,
+            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'U', bank: w3Bank,
                 numE: numE, perExpertBytes: w1PerExpertBytes);
         }
         else
@@ -311,46 +333,46 @@ internal static class VulkanQwen3MoeMoeUpload
     }
 
     /// <summary>
-    /// Resident-Q6_K variant of <see cref="UploadRoutedBank"/>. Walks the
-    /// experts of one routed projection and copies the raw Q6_K block bytes
-    /// into the staging buffer at the expert's contiguous slot, then issues a
-    /// single device copy. The destination layout is
-    /// <c>[numExperts, M_kind, RowByteSize(K_kind, Q6_K)]</c> — what the
-    /// indexed Q6_K matmul shader (<c>moe_indexed_matmul_q6_k_f32.comp</c>)
-    /// expects: each per-expert slab is <c>M</c> rows of
-    /// <c>(K/256) * 210</c> bytes, expert slabs contiguous. Source byte
-    /// layout in <c>moe.GateExpsRaw</c> et al. matches because GGUF's
-    /// fused-expert tensors store experts contiguously in the same per-row
-    /// stride.
+    /// Resident-quant variant of <see cref="UploadRoutedBank"/>. Walks the
+    /// experts of one routed projection and copies the raw quant block bytes
+    /// (Q6_K, Q4_K, ...) into the staging buffer at the expert's contiguous
+    /// slot, then issues a single device copy. The destination layout is
+    /// <c>[numExperts, M_kind, RowByteSize(K_kind, quantType)]</c> — what the
+    /// matching indexed matmul shader (e.g. <c>moe_indexed_matmul_q6_k_f32.comp</c>,
+    /// <c>moe_indexed_matmul_q4_k_f32.comp</c>) expects: each per-expert slab
+    /// is <c>M</c> rows of <c>RowByteSize(K, quantType)</c> bytes, expert
+    /// slabs contiguous. Source byte layout in <c>moe.GateExpsRaw</c> et al.
+    /// matches because GGUF's fused-expert tensors store experts contiguously
+    /// in the same per-row stride.
     /// </summary>
-    private static void UploadRoutedBankQ6K(
+    private static void UploadRoutedBankResidentQuant(
         VulkanDevice device, VulkanStagingBuffer staging, MoeLayerWeights moe,
-        char kind, VulkanDevice.Buffer bank, int numE, long perExpertBytes)
+        QuantizationType quantType, char kind, VulkanDevice.Buffer bank, int numE, long perExpertBytes)
     {
         long totalBytes = (long)numE * perExpertBytes;
         if (!moe.HasRawQuantView)
             throw new InvalidOperationException(
-                "Q6_K-resident MoE upload requires moe.HasRawQuantView — synthetic fixtures must populate the raw view.");
+                $"{quantType}-resident MoE upload requires moe.HasRawQuantView — synthetic fixtures must populate the raw view.");
 
         nint srcPtr;
         switch (kind)
         {
             case 'G':
-                if (moe.GateExpsRawQt != QuantizationType.Q6_K)
+                if (moe.GateExpsRawQt != quantType)
                     throw new InvalidOperationException(
-                        $"Q6_K-resident upload (kind=G) requires Q6_K source, got {moe.GateExpsRawQt}.");
+                        $"{quantType}-resident upload (kind=G) requires {quantType} source, got {moe.GateExpsRawQt}.");
                 srcPtr = moe.GateExpsRaw;
                 break;
             case 'D':
-                if (moe.DownExpsRawQt != QuantizationType.Q6_K)
+                if (moe.DownExpsRawQt != quantType)
                     throw new InvalidOperationException(
-                        $"Q6_K-resident upload (kind=D) requires Q6_K source, got {moe.DownExpsRawQt}.");
+                        $"{quantType}-resident upload (kind=D) requires {quantType} source, got {moe.DownExpsRawQt}.");
                 srcPtr = moe.DownExpsRaw;
                 break;
             case 'U':
-                if (moe.UpExpsRawQt != QuantizationType.Q6_K)
+                if (moe.UpExpsRawQt != quantType)
                     throw new InvalidOperationException(
-                        $"Q6_K-resident upload (kind=U) requires Q6_K source, got {moe.UpExpsRawQt}.");
+                        $"{quantType}-resident upload (kind=U) requires {quantType} source, got {moe.UpExpsRawQt}.");
                 srcPtr = moe.UpExpsRaw;
                 break;
             default:

@@ -28,16 +28,19 @@ namespace DotLLM.Vulkan;
 /// sigmoid-inplace). MoE routed experts default to streaming (re-uploaded
 /// every forward — correctness-first, fits any model size); set
 /// <c>DOTLLM_VK_MOE_RESIDENT=1</c> to opt in to per-layer resident caching.
-/// Resident mode auto-detects uniformly Q6_K source banks at upload time
-/// and keeps them on device as raw Q6_K blocks (≈25 GB at qwen35moe-A3B
-/// scale on a 128 GB Strix Halo unified-memory host — fits) dispatching
-/// through <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>.
-/// Non-Q6_K source banks (or mixed-quant layers) fall back to F32 dequant +
-/// upload — fits when the model is small enough that ≈4× expansion stays
-/// under device-memory bounds; at Qwen3.6-35B-A3B scale (256 experts × 40
-/// layers × 3 matrices × ~1M elems) the fully-F32 resident layout would
-/// consume ~120 GB and would NOT fit, so the Q6_K-resident path is the
-/// only resident option for Qwen3.6-A3B-UD-Q6_K_XL.
+/// Resident mode auto-detects uniformly Q6_K or Q4_K source banks at upload
+/// time and keeps them on device as raw quant blocks (≈25 GB Q6_K, or
+/// smaller still for Q4_K, at qwen35moe-A3B scale on a 128 GB Strix Halo
+/// unified-memory host — fits) dispatching through
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> or
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>
+/// respectively. Other source quants (or mixed-quant layers) fall back to
+/// F32 dequant + upload — fits when the model is small enough that ≈4×
+/// expansion stays under device-memory bounds; at Qwen3.6-35B-A3B scale
+/// (256 experts × 40 layers × 3 matrices × ~1M elems) the fully-F32
+/// resident layout would consume ~120 GB and would NOT fit, so the
+/// Q6_K/Q4_K-resident paths are the only resident options at that scale
+/// (Q4_K is what the cached UD-Q4_K_XL checkpoint actually uses).
 /// </para>
 /// <para>
 /// <b>Submission boundaries.</b> Two submissions per layer × 40 layers + a
@@ -1006,9 +1009,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         // Resolve this layer's routed experts: either fetch a resident bundle
         // (opt-in) or upload fresh and dispose after the layer (default —
         // safe for any model size). When resident-mode is on, the upload
-        // also opts into a Q6_K-resident bank when the source allows (~25 GB
-        // Q6_K vs ~120 GB F32 at qwen35moe-A3B scale — the only way the
-        // resident layout fits on a 128 GB Strix Halo unified-memory host).
+        // also opts into a resident-quant bank (Q6_K or Q4_K) when the
+        // source allows (~25 GB Q6_K, or smaller for Q4_K, vs ~120 GB F32 at
+        // qwen35moe-A3B scale — the only way the resident layout fits on a
+        // 128 GB Strix Halo unified-memory host).
         VulkanQwen3MoeMoeUpload.LayerBundle moeBuf;
         bool disposeAfterLayer;
         if (_residentMoeEnabled)
@@ -1017,9 +1021,20 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             // model after that. See _residentMoeBundles field docstring
             // for the device-memory caveat — DOTLLM_VK_MOE_RESIDENT=1
             // is opt-in for models that fit.
+            bool firstUpload = _residentMoeBundles[layer] is null;
             moeBuf = _residentMoeBundles[layer]
                 ?? (_residentMoeBundles[layer] = VulkanQwen3MoeMoeUpload.UploadLayer(
                     _device, lw.Moe, hiddenSize, residentQuant: true));
+            if (firstUpload && layer == 0)
+            {
+                // One-line diagnostic so DOTLLM_VK_MOE_RESIDENT=1 runs make
+                // the chosen bank storage type observable (#371) — this is
+                // the only place that knows whether the resident-quant
+                // overlay engaged or silently fell back to F32.
+                Console.Error.WriteLine(
+                    $"[dotLLM] Vulkan resident-MoE bank quant type: {moeBuf.BankQuantType} " +
+                    $"(source: gate={lw.Moe.GateExpsRawQt}, up={lw.Moe.UpExpsRawQt}, down={lw.Moe.DownExpsRawQt})");
+            }
             disposeAfterLayer = false;
         }
         else
@@ -1313,6 +1328,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         {
             case QuantizationType.Q6_K:
                 _kernels.MoeIndexedMatmulQ6K.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            case QuantizationType.Q4_K:
+                _kernels.MoeIndexedMatmulQ4K.Record(cmdBuf, bank, x, indices, y,
                     m: m, k: k, n: n, numExperts: numExperts);
                 break;
             case QuantizationType.F32:
