@@ -37,6 +37,14 @@ namespace DotLLM.Vulkan.Kernels;
 /// 34-byte Q8_0 block layout and 2-mod-4 phase funnel as
 /// <see cref="MatMulQ8_0GemmKernel"/>.
 /// </para>
+/// <para>
+/// Issue #377: a second 32×32 tile variant (<c>matmul_q8_0_mmq_small.spv</c>,
+/// TM=TN=2) is also loaded when present. <see cref="Record"/> picks the
+/// smaller tile when either output dimension is small relative to the fixed
+/// 64×64 tile (SmolLM-135M's H=576 wastes lanes on tail tiles of the 64×64
+/// shader) — see <see cref="SmallTileThreshold"/>. Falls back to the 64×64
+/// tile unconditionally if the small-tile SPV is missing (older SPV cache).
+/// </para>
 /// </remarks>
 public sealed class MatMulQ8_0MmqKernel : IDisposable
 {
@@ -46,32 +54,64 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
     /// <summary>Elements per Q8_0 block.</summary>
     public const int Q8_0GroupSize = 32;
 
+    /// <summary>
+    /// Issue #377: output shapes with <c>M &lt;= threshold</c> OR
+    /// <c>N &lt;= threshold</c> dispatch the 32×32 tile instead of the 64×64
+    /// tile. Tuned on gfx1151 (Strix Halo) via same-session A/B — NOT copied
+    /// from llama.cpp's warptile cutoffs, which target different hardware.
+    /// </summary>
+    public const int SmallTileThreshold = 128;
+
+    /// <summary>
+    /// Issue #377: set <c>DOTLLM_VULKAN_MMQ_SMALL_TILE=0</c> to force every
+    /// shape onto the 64×64 tile (as if the small-tile SPV were absent).
+    /// Escape hatch for A/B comparison and for rolling back the small tile
+    /// on hardware where it regresses without needing a rebuild.
+    /// </summary>
+    private static readonly bool SmallTileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MMQ_SMALL_TILE") != "0";
+
     private const int TileM = 64;
     private const int TileN = 64;
+    private const int SmallTileM = 32;
+    private const int SmallTileN = 32;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
+    private readonly VulkanModule? _smallModule;
+    private readonly ComputePipeline? _smallPipeline;
     private readonly nint _descriptorPool;
+    private readonly nint _smallDescriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly DescriptorSetCache? _smallDescriptorCache;
     private bool _disposed;
 
-    private MatMulQ8_0MmqKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulQ8_0MmqKernel(
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        VulkanModule? smallModule, ComputePipeline? smallPipeline, nint smallPool)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _smallModule = smallModule;
+        _smallPipeline = smallPipeline;
+        _smallDescriptorPool = smallPool;
+        if (smallPipeline is not null)
+            _smallDescriptorCache = new DescriptorSetCache(device, smallPool, smallPipeline, buffersPerSet: 4);
     }
 
     /// <summary>
-    /// Loads <c>matmul_q8_0_mmq.spv</c> from <paramref name="spvDir"/> and builds
-    /// the pipeline. Returns <c>null</c> when the SPV is missing OR when the
-    /// device does not advertise integer-dot-product support — the router falls
-    /// back to <see cref="MatMulQ8_0GemmCoopmatKernel"/> /
-    /// <see cref="MatMulQ8_0GemmKernel"/> in either case.
+    /// Loads <c>matmul_q8_0_mmq.spv</c> (and, if present, the #377 small-tile
+    /// <c>matmul_q8_0_mmq_small.spv</c>) from <paramref name="spvDir"/> and
+    /// builds the pipeline(s). Returns <c>null</c> when the base SPV is
+    /// missing OR when the device does not advertise integer-dot-product
+    /// support — the router falls back to
+    /// <see cref="MatMulQ8_0GemmCoopmatKernel"/> / <see cref="MatMulQ8_0GemmKernel"/>
+    /// in either case.
     /// </summary>
     public static MatMulQ8_0MmqKernel? TryCreate(VulkanDevice device, string spvDir)
     {
@@ -102,12 +142,50 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
             throw;
         }
 
+        VulkanModule? smallModule = null;
+        ComputePipeline? smallPipeline = null;
+        nint smallPool = 0;
+        string smallPath = Path.Combine(spvDir, "matmul_q8_0_mmq_small.spv");
+        if (File.Exists(smallPath))
+        {
+            smallModule = VulkanModule.LoadFromFile(device, smallPath);
+            try
+            {
+                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+                bindings[0] = new VkDescriptorBinding(0);
+                bindings[1] = new VkDescriptorBinding(1);
+                bindings[2] = new VkDescriptorBinding(2);
+                bindings[3] = new VkDescriptorBinding(3);
+                smallPipeline = smallModule.CreateComputePipeline(
+                    entryPoint: "main",
+                    bindings: bindings,
+                    pushConstantBytes: PushConstantBytes);
+                // Separate pool per pipeline (mirrors LoraDeltaGemvFusedF32Kernel's
+                // dual-pool pattern): DescriptorSetCache.Reset() calls
+                // vkResetDescriptorPool on its whole pool, which would silently
+                // invalidate the OTHER pipeline's still-referenced sets mid-forward
+                // if both caches shared one pool.
+                smallPool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+            }
+            catch
+            {
+                smallModule.Dispose();
+                module.Dispose();
+                pipeline.Dispose();
+                throw;
+            }
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new MatMulQ8_0MmqKernel(device, module, pipeline, pool);
+        return new MatMulQ8_0MmqKernel(device, module, pipeline, pool, smallModule, smallPipeline, smallPool);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _smallDescriptorCache?.Reset();
+    }
 
     /// <summary>
     /// Dispatches the MMQ GEMM synchronously (wraps <see cref="Record"/> with a
@@ -161,12 +239,24 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
         if (outputC.Size < (long)n * m * sizeof(float))
             throw new ArgumentException("Output buffer too small.", nameof(outputC));
 
-        Span<nint> buffers = stackalloc nint[4] { weightsQ8.Handle, xq.Handle, xds.Handle, outputC.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        // Issue #377: route small output shapes to the 32x32 tile — the fixed
+        // 64x64 tile wastes lanes on tail tiles when M or N is small (e.g.
+        // SmolLM-135M's H=576). Only takes effect if the small-tile SPV was
+        // found at TryCreate time; otherwise always uses the 64x64 tile.
+        bool useSmallTile = _smallPipeline is not null && SmallTileEnabled
+            && (m <= SmallTileThreshold || n <= SmallTileThreshold);
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        ComputePipeline pipeline = useSmallTile ? _smallPipeline! : _pipeline;
+        DescriptorSetCache descriptorCache = useSmallTile ? _smallDescriptorCache! : _descriptorCache;
+        int tileM = useSmallTile ? SmallTileM : TileM;
+        int tileN = useSmallTile ? SmallTileN : TileN;
+
+        Span<nint> buffers = stackalloc nint[4] { weightsQ8.Handle, xq.Handle, xds.Handle, outputC.Handle };
+        nint descriptorSet = descriptorCache.GetOrCreate(buffers);
+
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[5]
@@ -176,12 +266,12 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        uint groupsX = (uint)((m + TileM - 1) / TileM);
-        uint groupsY = (uint)((n + TileN - 1) / TileN);
+        uint groupsX = (uint)((m + tileM - 1) / tileM);
+        uint groupsY = (uint)((n + tileN - 1) / tileN);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
     }
 
@@ -195,5 +285,10 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
         _pipeline.Dispose();
         _module.Dispose();
+
+        if (_smallDescriptorPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _smallDescriptorPool, 0);
+        _smallPipeline?.Dispose();
+        _smallModule?.Dispose();
     }
 }

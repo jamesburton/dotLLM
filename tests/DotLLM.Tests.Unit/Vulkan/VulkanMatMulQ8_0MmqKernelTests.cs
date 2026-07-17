@@ -54,6 +54,13 @@ public class VulkanMatMulQ8_0MmqKernelTests
     [InlineData(16, 8192, 2048)]     // Llama-3.2-1B gate/up projection
     [InlineData(16, 2048, 8192)]     // Llama-3.2-1B down projection
     [InlineData(7, 4, 96)]           // K=96, blocksPerRow=3 (odd) — phase/stride family
+    // Issue #377: all shapes above have N <= 17, so they all route through the
+    // new 32x32 small tile (SmallTileThreshold=128) — none exercise the
+    // original 64x64 tile any more. These force it explicitly.
+    [InlineData(256, 4096, 2048)]    // large batch, both M and N > threshold -> 64x64 tile
+    [InlineData(129, 129, 64)]       // just above threshold on both axes -> 64x64 tile, small shape
+    [InlineData(128, 4096, 2048)]    // N == SmallTileThreshold boundary -> small tile (<=)
+    [InlineData(129, 4096, 2048)]    // N == SmallTileThreshold + 1 -> large tile
     public void Mmq_MatchesF32Oracle_ArgmaxAndTolerance(int n, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
