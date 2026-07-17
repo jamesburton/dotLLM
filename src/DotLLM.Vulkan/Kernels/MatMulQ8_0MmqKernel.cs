@@ -27,11 +27,15 @@ namespace DotLLM.Vulkan.Kernels;
 /// tolerance parity test.
 /// </para>
 /// <para>
-/// Dispatch: 2-D grid, workgroup <c>(16, 16, 1)</c> — one 16×16 output cell of
-/// <c>C</c> per workgroup. The 16-row weight tile is funnel-read into shared
-/// memory as packed int8 once per K-block and reused across 16 tokens; the
-/// 16-token activation tile is reused across 16 weight rows. Same 34-byte Q8_0
-/// block layout and 2-mod-4 phase funnel as <see cref="MatMulQ8_0GemmKernel"/>.
+/// Dispatch: 2-D grid, workgroup <c>(16, 16, 1)</c> — one 64×64 output tile of
+/// <c>C</c> per workgroup (issue #366 register-tiled rewrite, mirroring the
+/// #139 Q4_K/Q6_K/IQ4_XS 64×64 tiling that this kernel was NOT included in at
+/// the time — #139's scope was iq4_xs/q4_k/q6_k only). Each thread computes a
+/// 4×4 register tile (strided by 16). The 64-row weight tile is funnel-read
+/// into shared memory as packed int8 once per K-block and reused across 64
+/// tokens; the 64-token activation tile is reused across 64 weight rows. Same
+/// 34-byte Q8_0 block layout and 2-mod-4 phase funnel as
+/// <see cref="MatMulQ8_0GemmKernel"/>.
 /// </para>
 /// </remarks>
 public sealed class MatMulQ8_0MmqKernel : IDisposable
@@ -42,8 +46,8 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
     /// <summary>Elements per Q8_0 block.</summary>
     public const int Q8_0GroupSize = 32;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
