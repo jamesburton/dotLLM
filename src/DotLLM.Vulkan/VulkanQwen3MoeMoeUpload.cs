@@ -22,21 +22,26 @@ namespace DotLLM.Vulkan;
 /// the lifetime of the model.
 /// </para>
 /// <para>
-/// <b>Resident-quant overlay (Q6_K, Q4_K).</b> When the caller asks for a
-/// resident-quant upload (<c>residentQuant: true</c>) AND the source MoE
-/// banks are uniformly one of the supported quant types, the routed banks
-/// are uploaded as raw quant bytes (block-sized per <c>Dequantize.RowByteSize</c>,
-/// layout matching the corresponding <c>DotLLM.Cpu.Kernels.Dequantize*</c>
-/// scalar reference) so a matching device-side indexed matmul kernel
-/// (<see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> or
-/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>) can
+/// <b>Resident-quant overlay (Q6_K, Q4_K, Q5_K), per bank.</b> When the
+/// caller asks for a resident-quant upload (<c>residentQuant: true</c>),
+/// EACH of the three routed banks (gate/up/down, i.e. W1/W3/W2)
+/// independently resolves to raw-quant-resident storage if its own source
+/// quant is one of <see cref="s_ResidentQuantTypes"/> — there is no
+/// requirement that all three banks share one quant type. Resident bytes are
+/// block-sized per <c>Dequantize.RowByteSize</c>, layout matching the
+/// corresponding <c>DotLLM.Cpu.Kernels.Dequantize*</c> scalar reference, so a
+/// matching device-side indexed matmul kernel
+/// (<see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>,
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>, or
+/// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ5_KF32Kernel"/>) can
 /// dequantise per row. This is what lets multi-GB routed banks (e.g.
-/// Qwen3.6-A3B-Q6_K_XL: ~25 GB Q6_K vs ~120 GB F32; UD-Q4_K_XL: ~15 GB Q4_K)
-/// fit on Strix Halo's 128 GB unified memory while still resident across
-/// forwards. Falls back to F32 dequant when the source isn't uniformly one
-/// of the supported quant types (or is a quant type without a resident
-/// kernel wired up) — the F32 indexed kernel is the historical
-/// correctness-first path and remains the streaming default.
+/// Qwen3.6-A3B-Q6_K_XL: ~25 GB Q6_K vs ~120 GB F32; UD-Q4_K_XL: gate/up
+/// Q4_K + down Q5_K, per-bank resident since #372) fit on Strix Halo's
+/// 128 GB unified memory while still resident across forwards. A bank falls
+/// back to F32 dequant, independently of its sibling banks, when its own
+/// source isn't one of the supported quant types — the F32 indexed kernel
+/// is the historical correctness-first path and remains the streaming
+/// default.
 /// </para>
 /// </remarks>
 internal static class VulkanQwen3MoeMoeUpload
@@ -53,7 +58,20 @@ internal static class VulkanQwen3MoeMoeUpload
     {
         QuantizationType.Q6_K,
         QuantizationType.Q4_K,
+        QuantizationType.Q5_K,
     };
+
+    /// <summary>
+    /// Resolves the on-device storage type for ONE routed bank, independent
+    /// of its sibling banks: raw-quant-resident when <paramref name="residentQuant"/>
+    /// is requested, a raw view is available, and the source quant is in
+    /// <see cref="s_ResidentQuantTypes"/>; F32 dequant otherwise.
+    /// </summary>
+    private static QuantizationType ResolveBankQuantType(
+        QuantizationType sourceQt, bool residentQuant, bool hasRawQuantView)
+        => residentQuant && hasRawQuantView && s_ResidentQuantTypes.Contains(sourceQt)
+            ? sourceQt
+            : QuantizationType.F32;
 
     /// <summary>
     /// One layer's worth of device-resident MoE weights: router gate, three
@@ -64,11 +82,12 @@ internal static class VulkanQwen3MoeMoeUpload
     {
         public VulkanDevice.Buffer Gate { get; }
         /// <summary>
-        /// Routed-expert W1 (gate) bank. Layout depends on <see cref="BankQuantType"/>:
+        /// Routed-expert W1 (gate) bank. Layout depends on <see cref="W1QuantType"/>:
         /// <list type="bullet">
         ///   <item><c>F32</c>: <c>[numExperts, intermediate, hidden]</c> contiguous floats.</item>
         ///   <item><c>Q6_K</c>: <c>[numExperts, intermediate, (hidden/256)*210]</c> raw block bytes.</item>
         ///   <item><c>Q4_K</c>: <c>[numExperts, intermediate, (hidden/256)*144]</c> raw block bytes.</item>
+        ///   <item><c>Q5_K</c>: <c>[numExperts, intermediate, (hidden/256)*176]</c> raw block bytes.</item>
         /// </list>
         /// </summary>
         public VulkanDevice.Buffer W1Bank { get; }
@@ -78,14 +97,17 @@ internal static class VulkanQwen3MoeMoeUpload
         public VulkanDevice.Buffer W3Bank { get; }
 
         /// <summary>
-        /// Storage type of the three routed banks (<see cref="W1Bank"/>,
-        /// <see cref="W2Bank"/>, <see cref="W3Bank"/>) — one of
-        /// <see cref="QuantizationType.F32"/> (default; bank holds dequantised
-        /// floats) or <see cref="QuantizationType.Q6_K"/> (resident raw Q6_K
-        /// blocks). The Vulkan model's <c>RecordMoeLayer</c> dispatches the
-        /// matching indexed kernel based on this field.
+        /// Storage type of <see cref="W1Bank"/> (gate) — <see cref="QuantizationType.F32"/>
+        /// (dequantised floats) or one of <see cref="s_ResidentQuantTypes"/> (resident raw
+        /// blocks). Resolved independently per bank (#372) — see <see cref="ResolveBankQuantType"/>.
+        /// The Vulkan model's <c>RecordIndexedMoeMatmul</c> dispatches the matching indexed
+        /// kernel per bank based on these fields.
         /// </summary>
-        public QuantizationType BankQuantType { get; }
+        public QuantizationType W1QuantType { get; }
+        /// <summary>Storage type of <see cref="W2Bank"/> (down). See <see cref="W1QuantType"/>.</summary>
+        public QuantizationType W2QuantType { get; }
+        /// <summary>Storage type of <see cref="W3Bank"/> (up). See <see cref="W1QuantType"/>.</summary>
+        public QuantizationType W3QuantType { get; }
 
         public int NumExperts { get; }
         public int NumExpertsPerTok { get; }
@@ -106,14 +128,14 @@ internal static class VulkanQwen3MoeMoeUpload
 
         public LayerBundle(
             VulkanDevice.Buffer gate, VulkanDevice.Buffer w1Bank, VulkanDevice.Buffer w2Bank, VulkanDevice.Buffer w3Bank,
-            QuantizationType bankQuantType,
+            QuantizationType w1QuantType, QuantizationType w2QuantType, QuantizationType w3QuantType,
             int numExperts, int numExpertsPerTok, int intermediate, bool normTopKProb,
             bool hasShared, int numSharedExperts, int sharedIntermediate,
             VulkanDevice.Buffer? sharedGate, VulkanDevice.Buffer? sharedUp, VulkanDevice.Buffer? sharedDown,
             VulkanDevice.Buffer? sharedExpertGate)
         {
             Gate = gate; W1Bank = w1Bank; W2Bank = w2Bank; W3Bank = w3Bank;
-            BankQuantType = bankQuantType;
+            W1QuantType = w1QuantType; W2QuantType = w2QuantType; W3QuantType = w3QuantType;
             NumExperts = numExperts; NumExpertsPerTok = numExpertsPerTok;
             IntermediateSize = intermediate; NormTopKProb = normTopKProb;
             HasSharedExpert = hasShared; NumSharedExperts = numSharedExperts;
@@ -138,18 +160,23 @@ internal static class VulkanQwen3MoeMoeUpload
     /// <param name="moe">CPU-side weight bundle; raw quant view is consulted when present.</param>
     /// <param name="hiddenSize">Hidden dim, needed to size W1/W3 banks.</param>
     /// <param name="residentQuant">
-    /// When <c>true</c>, opt into resident-quant upload of the routed banks
-    /// when the source is uniformly one of <see cref="s_ResidentQuantTypes"/>
-    /// (currently Q6_K and Q4_K — see
-    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/> and
-    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>).
-    /// Source bytes are copied without dequantisation, so device memory is
-    /// ~25 GB instead of ~120 GB at qwen35moe-A3B-Q6_K_XL scale (Q4_K is
-    /// smaller still). When the source isn't uniformly a supported quant
-    /// type (or this flag is <c>false</c>), the routed banks dequant to F32
-    /// — the historical correctness-first path. Always <c>true</c> in
-    /// resident-MoE mode (the bundle survives across forwards), <c>false</c>
-    /// in streaming mode (per-forward F32 upload is the existing default).
+    /// When <c>true</c>, opt into resident-quant upload for each routed bank
+    /// whose own source quant is one of <see cref="s_ResidentQuantTypes"/>
+    /// (currently Q6_K, Q4_K, Q5_K — see
+    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ6_KF32Kernel"/>,
+    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ4_KF32Kernel"/>, and
+    /// <see cref="DotLLM.Vulkan.Kernels.MoeIndexedMatmulQ5_KF32Kernel"/>).
+    /// Resolved independently per bank (#372) — gate/up/down do NOT need to
+    /// share one quant type, matching llama.cpp "UD" mixed-quant GGUFs whose
+    /// down-projection often quantizes differently from gate/up. Resident
+    /// bytes are copied without dequantisation, so device memory is ~25 GB
+    /// instead of ~120 GB at qwen35moe-A3B-Q6_K_XL scale (Q4_K/Q5_K are
+    /// smaller still). A bank whose own source isn't a supported quant type
+    /// (or when this flag is <c>false</c>) dequants to F32 — the historical
+    /// correctness-first path — independently of its sibling banks. Always
+    /// <c>true</c> in resident-MoE mode (the bundle survives across
+    /// forwards), <c>false</c> in streaming mode (per-forward F32 upload is
+    /// the existing default).
     /// </param>
     public static unsafe LayerBundle UploadLayer(
         VulkanDevice device, MoeLayerWeights moe, int hiddenSize,
@@ -160,21 +187,13 @@ internal static class VulkanQwen3MoeMoeUpload
         long w1Elems = (long)interm * hiddenSize;
         long w2Elems = (long)hiddenSize * interm;
 
-        // Decide bank storage type once per layer. We require ALL three
-        // routed projections to share one quant type — Qwen3.6-A3B GGUFs
-        // produced by llama.cpp's quantizer always do. A mixed quant layer
-        // (e.g. Q6_K W1/W3 + Q5_K W2 from a hand-edited UD-style GGUF) falls
-        // back to F32 since the dispatcher only carries one bank kernel per
-        // bundle. Only quant types with a resident indexed-matmul kernel
-        // wired up (see s_ResidentQuantTypes) are eligible.
-        QuantizationType bankQt = QuantizationType.F32;
-        if (residentQuant && moe.HasRawQuantView
-            && moe.GateExpsRawQt == moe.UpExpsRawQt
-            && moe.GateExpsRawQt == moe.DownExpsRawQt
-            && s_ResidentQuantTypes.Contains(moe.GateExpsRawQt))
-        {
-            bankQt = moe.GateExpsRawQt;
-        }
+        // Resolve each bank's storage type independently (#372) — gate/up/down
+        // no longer need to share one quant type. Only quant types with a
+        // resident indexed-matmul kernel wired up (see s_ResidentQuantTypes)
+        // are eligible; anything else falls back to F32 for that bank alone.
+        QuantizationType w1Qt = ResolveBankQuantType(moe.GateExpsRawQt, residentQuant, moe.HasRawQuantView);
+        QuantizationType w2Qt = ResolveBankQuantType(moe.DownExpsRawQt, residentQuant, moe.HasRawQuantView);
+        QuantizationType w3Qt = ResolveBankQuantType(moe.UpExpsRawQt, residentQuant, moe.HasRawQuantView);
 
         // Bounded persistently-mapped staging (issue #147): banks stream through
         // it one expert slab (or chunk) at a time — the previous whole-bank
@@ -188,47 +207,20 @@ internal static class VulkanQwen3MoeMoeUpload
         var gate = device.AllocateDeviceLocal(gateBytes);
         staging.UploadFloats(moe.Gate, gate);
 
-        // ── Routed expert banks. Two cases:
+        // ── Routed expert banks. Each bank independently takes one of two
+        //    paths based on its own resolved quant type:
         //   (1) F32 (default): dequant each per-expert slice into staging at
         //       the expert's contiguous slot, then copy the whole bank to
-        //       device memory. 3 device buffers per layer, each ~F32 sized.
-        //   (2) Q6_K resident: copy each per-expert raw block slab into
-        //       staging at the expert's contiguous slot, then copy. 3 device
-        //       buffers per layer, each at ~25% of the F32 size.
-        VulkanDevice.Buffer w1Bank, w2Bank, w3Bank;
-        if (bankQt != QuantizationType.F32)
-        {
-            long w1RowBytes = Dequantize.RowByteSize(hiddenSize, bankQt);
-            long w2RowBytes = Dequantize.RowByteSize(interm, bankQt);
-            long w1PerExpertBytes = w1RowBytes * interm;
-            long w2PerExpertBytes = w2RowBytes * hiddenSize;
-            long w1BankBytes = (long)numE * w1PerExpertBytes;
-            long w2BankBytes = (long)numE * w2PerExpertBytes;
-
-            w1Bank = device.AllocateDeviceLocal(w1BankBytes);
-            w2Bank = device.AllocateDeviceLocal(w2BankBytes);
-            w3Bank = device.AllocateDeviceLocal(w1BankBytes);
-
-            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'G', bank: w1Bank,
-                numE: numE, perExpertBytes: w1PerExpertBytes);
-            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'D', bank: w2Bank,
-                numE: numE, perExpertBytes: w2PerExpertBytes);
-            UploadRoutedBankResidentQuant(device, staging, moe, bankQt, kind: 'U', bank: w3Bank,
-                numE: numE, perExpertBytes: w1PerExpertBytes);
-        }
-        else
-        {
-            long w1BankBytes = (long)numE * w1Elems * sizeof(float);
-            long w2BankBytes = (long)numE * w2Elems * sizeof(float);
-            long w3BankBytes = w1BankBytes;
-            w1Bank = device.AllocateDeviceLocal(w1BankBytes);
-            w2Bank = device.AllocateDeviceLocal(w2BankBytes);
-            w3Bank = device.AllocateDeviceLocal(w3BankBytes);
-
-            UploadRoutedBank(device, staging, moe, kind: 'G', bank: w1Bank, numE: numE, perExpertElems: w1Elems);
-            UploadRoutedBank(device, staging, moe, kind: 'D', bank: w2Bank, numE: numE, perExpertElems: w2Elems);
-            UploadRoutedBank(device, staging, moe, kind: 'U', bank: w3Bank, numE: numE, perExpertElems: w1Elems);
-        }
+        //       device memory. Device buffer is ~F32 sized.
+        //   (2) Resident-quant: copy each per-expert raw block slab into
+        //       staging at the expert's contiguous slot, then copy. Device
+        //       buffer is at a fraction of the F32 size (quant-dependent).
+        VulkanDevice.Buffer w1Bank = UploadRoutedBankAnyQuant(
+            device, staging, moe, w1Qt, kind: 'G', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems);
+        VulkanDevice.Buffer w2Bank = UploadRoutedBankAnyQuant(
+            device, staging, moe, w2Qt, kind: 'D', numE: numE, mDim: hiddenSize, kDim: interm, elemsF32: w2Elems);
+        VulkanDevice.Buffer w3Bank = UploadRoutedBankAnyQuant(
+            device, staging, moe, w3Qt, kind: 'U', numE: numE, mDim: interm, kDim: hiddenSize, elemsF32: w1Elems);
 
         // ── Shared expert (optional) ─────────────────────────────────────────
         VulkanDevice.Buffer? sharedGate = null, sharedUp = null, sharedDown = null;
@@ -257,12 +249,42 @@ internal static class VulkanQwen3MoeMoeUpload
         // bundle self-contained and free of borrowed references.
         return new LayerBundle(
             gate, w1Bank, w2Bank, w3Bank,
-            bankQuantType: bankQt,
+            w1QuantType: w1Qt, w2QuantType: w2Qt, w3QuantType: w3Qt,
             numExperts: numE, numExpertsPerTok: moe.NumExpertsPerTok,
             intermediate: interm, normTopKProb: moe.NormTopKProb,
             hasShared: hasShared, numSharedExperts: numShared, sharedIntermediate: sharedI,
             sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
             sharedExpertGate: sharedExpertGate);
+    }
+
+    /// <summary>
+    /// Allocates and uploads ONE routed bank at its resolved quant type —
+    /// either resident-quant raw bytes or an F32 dequant, chosen independently
+    /// per bank by the caller (#372). <paramref name="mDim"/>/<paramref name="kDim"/>
+    /// are the bank's own output/input dims (W1/W3: mDim=intermediate,
+    /// kDim=hidden; W2: mDim=hidden, kDim=intermediate — dims swap for the
+    /// down projection).
+    /// </summary>
+    private static VulkanDevice.Buffer UploadRoutedBankAnyQuant(
+        VulkanDevice device, VulkanStagingBuffer staging, MoeLayerWeights moe,
+        QuantizationType quantType, char kind, int numE, int mDim, int kDim, long elemsF32)
+    {
+        if (quantType == QuantizationType.F32)
+        {
+            long bankBytes = (long)numE * elemsF32 * sizeof(float);
+            var bank = device.AllocateDeviceLocal(bankBytes);
+            UploadRoutedBank(device, staging, moe, kind, bank, numE, elemsF32);
+            return bank;
+        }
+        else
+        {
+            long rowBytes = Dequantize.RowByteSize(kDim, quantType);
+            long perExpertBytes = rowBytes * mDim;
+            long bankBytes = (long)numE * perExpertBytes;
+            var bank = device.AllocateDeviceLocal(bankBytes);
+            UploadRoutedBankResidentQuant(device, staging, moe, quantType, kind, bank, numE, perExpertBytes);
+            return bank;
+        }
     }
 
     /// <summary>

@@ -1032,7 +1032,8 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 // the only place that knows whether the resident-quant
                 // overlay engaged or silently fell back to F32.
                 Console.Error.WriteLine(
-                    $"[dotLLM] Vulkan resident-MoE bank quant type: {moeBuf.BankQuantType} " +
+                    $"[dotLLM] Vulkan resident-MoE bank quant types: gate={moeBuf.W1QuantType} " +
+                    $"up={moeBuf.W3QuantType} down={moeBuf.W2QuantType} " +
                     $"(source: gate={lw.Moe.GateExpsRawQt}, up={lw.Moe.UpExpsRawQt}, down={lw.Moe.DownExpsRawQt})");
             }
             disposeAfterLayer = false;
@@ -1272,17 +1273,17 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             seqLen: seqLen, topK: topK, hidden: hidden);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 4. Indexed expert matmuls. Two paths share the same buffer
-        //    contract (bank/x/indices/y) and the same shape (m, k, n,
-        //    numExperts) — only the dequant differs:
+        // 4. Indexed expert matmuls. All paths share the same buffer contract
+        //    (bank/x/indices/y) and the same shape (m, k, n, numExperts) —
+        //    only the dequant differs, and each bank picks its OWN kernel
+        //    independently via its own resolved quant type (#372):
         //       F32 banks  → MoeIndexedMatmul (plain F32 dot)
-        //       Q6_K banks → MoeIndexedMatmulQ6K (per-row Q6_K dequant in
-        //                    the inner loop)
+        //       Q6_K/Q4_K/Q5_K banks → the matching per-row-dequant kernel
         //    See VulkanQwen3MoeMoeUpload remarks for the residency caveat.
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
+        RecordIndexedMoeMatmul(cmdBuf, moeW.W1QuantType,
             moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
             m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
+        RecordIndexedMoeMatmul(cmdBuf, moeW.W3QuantType,
             moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
             m: interm, k: hidden, n: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1293,7 +1294,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 6. Indexed down matmul.
-        RecordIndexedMoeMatmul(cmdBuf, moeW,
+        RecordIndexedMoeMatmul(cmdBuf, moeW.W2QuantType,
             moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
             m: hidden, k: interm, n: expandedRows, numExperts: numE);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
@@ -1312,19 +1313,21 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     }
 
     /// <summary>
-    /// Per-bank-quant-type dispatcher for a routed-expert indexed matmul. Bank
-    /// storage type is recorded once at upload time on
-    /// <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.BankQuantType"/>; this
-    /// helper picks the matching kernel so the caller stays oblivious to
-    /// whether the layer is F32-streaming or Q6_K-resident.
+    /// Per-bank-quant-type dispatcher for a routed-expert indexed matmul. Each
+    /// bank's storage type is resolved independently at upload time (#372,
+    /// see <see cref="VulkanQwen3MoeMoeUpload.LayerBundle.W1QuantType"/> /
+    /// <c>W2QuantType</c> / <c>W3QuantType</c>); the caller passes the
+    /// specific bank's own quant type here so this helper stays oblivious to
+    /// whether the layer is F32-streaming or resident, and whether sibling
+    /// banks share its quant type or not.
     /// </summary>
     private void RecordIndexedMoeMatmul(
-        nint cmdBuf, VulkanQwen3MoeMoeUpload.LayerBundle moeW,
+        nint cmdBuf, QuantizationType bankQuantType,
         VulkanDevice.Buffer bank, VulkanDevice.Buffer x,
         VulkanDevice.Buffer indices, VulkanDevice.Buffer y,
         int m, int k, int n, int numExperts)
     {
-        switch (moeW.BankQuantType)
+        switch (bankQuantType)
         {
             case QuantizationType.Q6_K:
                 _kernels.MoeIndexedMatmulQ6K.Record(cmdBuf, bank, x, indices, y,
@@ -1332,6 +1335,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 break;
             case QuantizationType.Q4_K:
                 _kernels.MoeIndexedMatmulQ4K.Record(cmdBuf, bank, x, indices, y,
+                    m: m, k: k, n: n, numExperts: numExperts);
+                break;
+            case QuantizationType.Q5_K:
+                _kernels.MoeIndexedMatmulQ5K.Record(cmdBuf, bank, x, indices, y,
                     m: m, k: k, n: n, numExperts: numExperts);
                 break;
             case QuantizationType.F32:
@@ -1345,7 +1352,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 // future upload-side regression that introduces a new bank
                 // quant type without updating this dispatch site.
                 throw new InvalidOperationException(
-                    $"Unsupported MoE bank quant type: {moeW.BankQuantType}. " +
+                    $"Unsupported MoE bank quant type: {bankQuantType}. " +
                     "Add a kernel dispatch arm and an upload-side branch in " +
                     "VulkanQwen3MoeMoeUpload.UploadLayer.");
         }
