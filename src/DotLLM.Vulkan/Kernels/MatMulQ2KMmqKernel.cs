@@ -14,7 +14,12 @@ namespace DotLLM.Vulkan.Kernels;
 /// The compute-bound seqLen&gt;1 analogue of <see cref="MatMulQ2KMmvqKernel"/> (decode).
 /// Replaces the dequant→FP GEMM (<see cref="MatMulQ2KGemmF32Kernel"/>) on the seqLen&gt;1
 /// path; falls back to it when the device lacks integer-dot-product support. NOT bit-exact
-/// (activation int8-quant); validated against the CPU F32 oracle. Workgroup <c>(16,16,1)</c>.
+/// (activation int8-quant); validated against the CPU F32 oracle.
+/// </remarks>
+/// <remarks>
+/// Dispatch: 2-D grid, workgroup <c>(16, 16, 1)</c> — one 64×64 output tile of <c>C</c>
+/// per workgroup (issue #367 register-tiled rewrite, mirroring #139/#366's Q4_K/Q6_K/
+/// Q8_0 64×64 tiling). Each thread computes a 4×4 register tile (strided by 16).
 /// </remarks>
 public sealed class MatMulQ2KMmqKernel : IDisposable
 {
@@ -24,8 +29,8 @@ public sealed class MatMulQ2KMmqKernel : IDisposable
     /// <summary>Elements per Q2_K super-block.</summary>
     public const int Q2KGroupSize = 256;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
+    private const int TileM = 64;
+    private const int TileN = 64;
     private const int PushConstantBytes = 5 * sizeof(uint);
 
     private readonly VulkanDevice _device;
