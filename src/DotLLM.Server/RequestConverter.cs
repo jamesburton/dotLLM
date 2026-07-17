@@ -69,13 +69,17 @@ public static class RequestConverter
         var allStops = new List<string>(stopSequences);
         AddRequestStopSequences(allStops, request.Stop);
 
-        return new InferenceOptions
+        var options = new InferenceOptions
         {
             Temperature = request.Temperature ?? defaults.Temperature,
             TopK = request.TopK ?? defaults.TopK,
             TopP = request.TopP ?? defaults.TopP,
             MinP = request.MinP ?? defaults.MinP,
             RepetitionPenalty = request.RepetitionPenalty ?? defaults.RepetitionPenalty,
+            FrequencyPenalty = request.FrequencyPenalty ?? 0f,
+            PresencePenalty = request.PresencePenalty ?? 0f,
+            LogitBias = ParseLogitBias(request.LogitBias),
+            TopNSigma = request.TopNSigma ?? -1f,
             MaxTokens = request.MaxTokens ?? defaults.MaxTokens,
             Seed = request.Seed ?? defaults.Seed,
             StopSequences = allStops,
@@ -84,6 +88,8 @@ public static class RequestConverter
             TopLogprobs = Math.Clamp(request.TopLogprobs ?? 0, 0, 20),
             Threading = threading,
         };
+        return ApplyDryOverrides(options, request.DryMultiplier, request.DryBase,
+            request.DryAllowedLength, request.DryPenaltyLastN, request.DrySequenceBreakers);
     }
 
     /// <summary>
@@ -95,13 +101,17 @@ public static class RequestConverter
         var stops = new List<string>();
         AddRequestStopSequences(stops, request.Stop);
 
-        return new InferenceOptions
+        var options = new InferenceOptions
         {
             Temperature = request.Temperature ?? defaults.Temperature,
             TopK = request.TopK ?? defaults.TopK,
             TopP = request.TopP ?? defaults.TopP,
             MinP = request.MinP ?? defaults.MinP,
             RepetitionPenalty = request.RepetitionPenalty ?? defaults.RepetitionPenalty,
+            FrequencyPenalty = request.FrequencyPenalty ?? 0f,
+            PresencePenalty = request.PresencePenalty ?? 0f,
+            LogitBias = ParseLogitBias(request.LogitBias),
+            TopNSigma = request.TopNSigma ?? -1f,
             MaxTokens = request.MaxTokens ?? defaults.MaxTokens,
             Seed = request.Seed ?? defaults.Seed,
             StopSequences = stops,
@@ -110,6 +120,49 @@ public static class RequestConverter
             TopLogprobs = Math.Clamp(request.TopLogprobs ?? 0, 0, 20),
             Threading = threading,
         };
+        return ApplyDryOverrides(options, request.DryMultiplier, request.DryBase,
+            request.DryAllowedLength, request.DryPenaltyLastN, request.DrySequenceBreakers);
+    }
+
+    /// <summary>
+    /// Applies request-level DRY overrides on top of the <see cref="InferenceOptions"/> defaults
+    /// (<see cref="InferenceOptions.DryBase"/>=1.75, <see cref="InferenceOptions.DryAllowedLength"/>=2,
+    /// etc.) — every field is optional per request, absent fields keep the default.
+    /// </summary>
+    private static InferenceOptions ApplyDryOverrides(InferenceOptions options,
+        float? dryMultiplier, float? dryBase, int? dryAllowedLength, int? dryPenaltyLastN,
+        string[]? drySequenceBreakers)
+    {
+        if (dryMultiplier is null && dryBase is null && dryAllowedLength is null
+            && dryPenaltyLastN is null && drySequenceBreakers is null)
+            return options;
+
+        return options with
+        {
+            DryMultiplier = dryMultiplier ?? options.DryMultiplier,
+            DryBase = dryBase ?? options.DryBase,
+            DryAllowedLength = dryAllowedLength ?? options.DryAllowedLength,
+            DryPenaltyLastN = dryPenaltyLastN ?? options.DryPenaltyLastN,
+            DrySequenceBreakers = drySequenceBreakers ?? options.DrySequenceBreakers,
+        };
+    }
+
+    /// <summary>
+    /// Parses the OpenAI-compatible <c>logit_bias</c> map (string token-id keys) into a
+    /// token-id-keyed dictionary. Non-numeric keys are skipped. Returns null when empty/absent.
+    /// </summary>
+    public static IReadOnlyDictionary<int, float>? ParseLogitBias(Dictionary<string, float>? logitBias)
+    {
+        if (logitBias is null || logitBias.Count == 0)
+            return null;
+
+        var result = new Dictionary<int, float>(logitBias.Count);
+        foreach (var (key, value) in logitBias)
+        {
+            if (int.TryParse(key, out int tokenId))
+                result[tokenId] = value;
+        }
+        return result.Count > 0 ? result : null;
     }
 
     /// <summary>

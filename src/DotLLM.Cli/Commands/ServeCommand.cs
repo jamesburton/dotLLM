@@ -129,6 +129,34 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
         [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default). With the continuous-batch scheduler this caps prefill tokens admitted per step instead.")]
         [DefaultValue(0)]
         public int PrefillChunkSize { get; set; }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-freq-base")]
+        [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
+        public float? RopeFreqBase { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value.")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--yarn-beta-fast")]
+        [Description("YaRN beta-fast parameter override.")]
+        public float? YarnBetaFast { get; set; }
+
+        [CommandOption("--yarn-beta-slow")]
+        [Description("YaRN beta-slow parameter override.")]
+        public float? YarnBetaSlow { get; set; }
     }
 
     /// <inheritdoc/>
@@ -158,6 +186,9 @@ internal sealed class ServeCommand : AsyncCommand<ServeCommand.Settings>
             SpeculativeCandidates = settings.SpeculativeK,
             PrefillChunkSize = settings.PrefillChunkSize,
             ModelId = "none",
+            RopeOverride = ServerOptions.BuildRopeOverride(settings.RopeScaling, settings.RopeFreqBase,
+                settings.RopeScale, settings.YarnOrigCtx, settings.YarnAttnFactor,
+                settings.YarnBetaFast, settings.YarnBetaSlow),
         };
 
         ServerState? state = null;

@@ -1,3 +1,4 @@
+using DotLLM.Core.Configuration;
 using DotLLM.Engine;
 using DotLLM.Engine.Scheduler;
 using DotLLM.Server.RateLimiting;
@@ -72,6 +73,13 @@ public sealed record ServerOptions
     public string ModelId { get; init; } = "default";
 
     /// <summary>
+    /// RoPE scaling overrides applied on top of the GGUF-derived config at load time
+    /// (llama.cpp <c>--rope-scaling</c>/<c>--rope-freq-base</c>/<c>--yarn-*</c> flag family).
+    /// Null = use the GGUF-derived <see cref="Core.Models.ModelConfig.RoPEConfig"/> unchanged.
+    /// </summary>
+    public RoPEOverrideOptions? RopeOverride { get; init; }
+
+    /// <summary>
     /// Whether the LoRA admin write endpoints (<c>POST /v1/lora/load</c>,
     /// <c>DELETE /v1/lora/{name}</c>) are enabled. Read-only <c>GET /v1/lora</c>
     /// is always available. Defaults to <c>false</c> — opt-in via configuration.
@@ -119,6 +127,13 @@ public sealed record ServerOptions
         string? speculativeModel = null;
         int speculativeCandidates = 5;
         int prefillChunkSize = 0;
+        string? ropeScaling = null;
+        float? ropeFreqBase = null;
+        float? ropeScale = null;
+        int? yarnOrigCtx = null;
+        float? yarnAttnFactor = null;
+        float? yarnBetaFast = null;
+        float? yarnBetaSlow = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -167,6 +182,20 @@ public sealed record ServerOptions
                     speculativeCandidates = int.Parse(next!); i++; break;
                 case "--prefill-chunk-size" or "--ubatch-size":
                     prefillChunkSize = int.Parse(next!); i++; break;
+                case "--rope-scaling":
+                    ropeScaling = next; i++; break;
+                case "--rope-freq-base":
+                    ropeFreqBase = float.Parse(next!); i++; break;
+                case "--rope-scale":
+                    ropeScale = float.Parse(next!); i++; break;
+                case "--yarn-orig-ctx":
+                    yarnOrigCtx = int.Parse(next!); i++; break;
+                case "--yarn-attn-factor":
+                    yarnAttnFactor = float.Parse(next!); i++; break;
+                case "--yarn-beta-fast":
+                    yarnBetaFast = float.Parse(next!); i++; break;
+                case "--yarn-beta-slow":
+                    yarnBetaSlow = float.Parse(next!); i++; break;
                 default:
                     // Positional: treat as model if not set
                     if (model is null && !arg.StartsWith('-'))
@@ -212,6 +241,41 @@ public sealed record ServerOptions
             SpeculativeCandidates = speculativeCandidates,
             PrefillChunkSize = prefillChunkSize,
             ModelId = modelId,
+            RopeOverride = BuildRopeOverride(ropeScaling, ropeFreqBase, ropeScale,
+                yarnOrigCtx, yarnAttnFactor, yarnBetaFast, yarnBetaSlow),
         };
     }
+
+    /// <summary>
+    /// Builds a <see cref="RoPEOverrideOptions"/> from individually-parsed CLI flag values.
+    /// Returns null (no-op) when none were set. Shared by the raw <see cref="Parse"/> path and
+    /// (indirectly, via matching flags) the Spectre.Console-based <c>dotllm serve</c> command.
+    /// </summary>
+    public static RoPEOverrideOptions? BuildRopeOverride(string? scalingType, float? freqBase,
+        float? scalingFactor, int? origCtx, float? attnFactor, float? betaFast, float? betaSlow)
+    {
+        var overrides = new RoPEOverrideOptions
+        {
+            ScalingType = scalingType is null ? null : ParseRopeScalingType(scalingType),
+            FreqBase = freqBase,
+            ScalingFactor = scalingFactor,
+            OrigMaxSeqLen = origCtx,
+            AttnFactor = attnFactor,
+            BetaFast = betaFast,
+            BetaSlow = betaSlow,
+        };
+        return overrides.HasAnyOverride ? overrides : null;
+    }
+
+    private static RoPEScalingType ParseRopeScalingType(string value) => value.ToLowerInvariant() switch
+    {
+        "none" => RoPEScalingType.None,
+        "linear" => RoPEScalingType.Linear,
+        "yarn" => RoPEScalingType.YaRN,
+        "ntk" => RoPEScalingType.NTK,
+        "dynamic" or "dynamic_ntk" or "dynamic-ntk" => RoPEScalingType.DynamicNTK,
+        "su" or "longrope" => RoPEScalingType.Su,
+        _ => throw new InvalidOperationException(
+            $"Unknown --rope-scaling value '{value}'. Expected: none, linear, yarn, ntk, dynamic."),
+    };
 }

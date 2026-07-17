@@ -140,7 +140,7 @@ public sealed class TextGenerator
         var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
-        var pipeline = new SamplerPipeline(options);
+        var pipeline = new SamplerPipeline(options, _tokenizer);
 
         // Logprobs capture setup
         bool captureLogprobs = options.Logprobs;
@@ -534,7 +534,7 @@ public sealed class TextGenerator
         var telemetry = new TelemetryRecorder(_model.Config, options);
 
         // Build sampling pipeline
-        var pipeline = new SamplerPipeline(options);
+        var pipeline = new SamplerPipeline(options, _tokenizer);
 
         // Logprobs capture setup
         bool captureLogprobs = options.Logprobs;
