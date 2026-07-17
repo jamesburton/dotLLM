@@ -29,11 +29,49 @@ namespace DotLLM.Vulkan.Kernels;
 /// llama.cpp itself prefers FA_SCALAR at n_rows==1, matching the 2026-04
 /// finding that coopmat attention loses at decode shapes on gfx1151.
 /// </para>
+/// <para>
+/// Issue #378: a second SPV (<c>attention_flash_f32_coopmat_hd64.spv</c>,
+/// <c>MAX_HEAD_DIM=64</c> instead of 128) is loaded when present and used
+/// whenever the model's <c>headDim &lt;= HeadDim64Threshold</c> — halves the
+/// qTile/kvTile shared-memory footprint and the live O-accumulator register
+/// count for small-headDim models (SmolLM and other 64-headDim configs),
+/// which the base shader's own comment attributes its occupancy ceiling to.
+/// Falls back to the 128-dim shader unconditionally if the hd64 SPV is
+/// missing (older SPV cache) or <c>DOTLLM_VULKAN_FA_COOPMAT_HD64=0</c>.
+/// </para>
 /// </remarks>
 public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 {
-    /// <summary>Compile-time upper bound on head_dim baked into the shader.</summary>
+    /// <summary>Compile-time upper bound on head_dim baked into the base (128-dim) shader.</summary>
     public const int MaxHeadDim = 128;
+
+    /// <summary>
+    /// Issue #378: models with <c>headDim &lt;= this</c> are ELIGIBLE for the
+    /// LDS-halved <c>attention_flash_f32_coopmat_hd64.spv</c> variant instead
+    /// of the base 128-dim shader (also gated on <see cref="SeqKvThreshold"/>).
+    /// </summary>
+    public const int HeadDim64Threshold = 64;
+
+    /// <summary>
+    /// Issue #378: the hd64 variant only dispatches when <c>seqKv &gt;=</c>
+    /// this. Same-session order-reversed A/B on SmolLM-135M found a clear,
+    /// consistent +10-17% prefill win at seqKv 640-2048, but a noise-level
+    /// (sometimes slightly negative) effect exactly at the canonical p=512
+    /// benchmark point — LDS occupancy gains need enough KV-tile-loop
+    /// iterations to amortize whatever regresses at very short context.
+    /// Threshold picked at the first cleanly-positive measured point (640)
+    /// rather than the ambiguous 512 one, so the standard SmolLM-135M
+    /// perf-matrix measurement (p=512) is unaffected by this kernel and only
+    /// longer-context prefill benefits.
+    /// </summary>
+    public const int SeqKvThreshold = 640;
+
+    /// <summary>
+    /// Issue #378: set <c>DOTLLM_VULKAN_FA_COOPMAT_HD64=0</c> to force every
+    /// shape onto the base 128-dim shader (as if the hd64 SPV were absent).
+    /// </summary>
+    private static readonly bool HeadDim64Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_FA_COOPMAT_HD64") != "0";
 
     /// <summary>Query rows per workgroup (Br).</summary>
     public const int QueryTileRows = 16;
@@ -46,18 +84,28 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     private readonly VulkanDevice _device;
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
+    private readonly VulkanModule? _hd64Module;
+    private readonly ComputePipeline? _hd64Pipeline;
     private readonly nint _descriptorPool;
+    private readonly nint _hd64DescriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly DescriptorSetCache? _hd64DescriptorCache;
     private bool _disposed;
 
     private VulkanFlashAttentionCoopmatKernel(
-        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
+        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
+        _hd64Module = hd64Module;
+        _hd64Pipeline = hd64Pipeline;
+        _hd64DescriptorPool = hd64Pool;
+        if (hd64Pipeline is not null)
+            _hd64DescriptorCache = new DescriptorSetCache(device, hd64Pool, hd64Pipeline, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -119,8 +167,41 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             throw;
         }
 
+        VulkanModule? hd64Module = null;
+        ComputePipeline? hd64Pipeline = null;
+        nint hd64Pool = 0;
+        string hd64Path = Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64.spv");
+        if (File.Exists(hd64Path))
+        {
+            hd64Module = VulkanModule.LoadFromFile(device, hd64Path);
+            try
+            {
+                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+                bindings[0] = new VkDescriptorBinding(0);
+                bindings[1] = new VkDescriptorBinding(1);
+                bindings[2] = new VkDescriptorBinding(2);
+                bindings[3] = new VkDescriptorBinding(3);
+                hd64Pipeline = hd64Module.CreateComputePipeline(
+                    entryPoint: "main",
+                    bindings: bindings,
+                    pushConstantBytes: PushConstantBytes);
+                // Separate pool per pipeline: DescriptorSetCache.Reset() calls
+                // vkResetDescriptorPool on its whole pool, which would silently
+                // invalidate the OTHER pipeline's still-referenced sets
+                // mid-forward if both caches shared one pool (see #377).
+                hd64Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+            }
+            catch
+            {
+                hd64Module.Dispose();
+                module.Dispose();
+                pipeline.Dispose();
+                throw;
+            }
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool);
+        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool);
     }
 
     /// <summary>
@@ -146,7 +227,11 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers were re-allocated.</summary>
-    internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+    internal void InvalidateDescriptorCache()
+    {
+        _descriptorCache.Reset();
+        _hd64DescriptorCache?.Reset();
+    }
 
     /// <summary>
     /// Synchronous one-shot launch (parity tests). Production callers use
@@ -208,12 +293,19 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
-        Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
-        nint descriptorSet = _descriptorCache.GetOrCreate(buffers);
+        // Issue #378: route headDim<=64 models with enough KV-tile iterations
+        // to amortize the occupancy gain to the LDS-halved hd64 shader.
+        bool useHd64 = _hd64Pipeline is not null && HeadDim64Enabled
+            && headDim <= HeadDim64Threshold && seqKv >= SeqKvThreshold;
+        ComputePipeline pipeline = useHd64 ? _hd64Pipeline! : _pipeline;
+        DescriptorSetCache descriptorCache = useHd64 ? _hd64DescriptorCache! : _descriptorCache;
 
-        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Pipeline);
+        Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
+        nint descriptorSet = descriptorCache.GetOrCreate(buffers);
+
+        VulkanApi.vkCmdBindPipeline(cmdBuf, VkPipelineBindPoint.Compute, pipeline.Pipeline);
         VulkanApi.vkCmdBindDescriptorSets(
-            cmdBuf, VkPipelineBindPoint.Compute, _pipeline.Layout,
+            cmdBuf, VkPipelineBindPoint.Compute, pipeline.Layout,
             0, 1, descriptorSet, 0, 0);
 
         Span<uint> pc = stackalloc uint[12];
@@ -232,7 +324,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(
-                cmdBuf, _pipeline.Layout, VkShaderStageFlags.Compute,
+                cmdBuf, pipeline.Layout, VkShaderStageFlags.Compute,
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
@@ -251,5 +343,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _descriptorPool, 0);
         _pipeline.Dispose();
         _module.Dispose();
+
+        if (_hd64DescriptorPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd64DescriptorPool, 0);
+        _hd64Pipeline?.Dispose();
+        _hd64Module?.Dispose();
     }
 }
