@@ -81,12 +81,23 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
         [DefaultValue(false)]
         public bool Json { get; set; }
 
+        [CommandOption("--n-cpu-moe")]
+        [Description(
+            "MoE CPU/GPU expert offload (#370, llama.cpp --n-cpu-moe equivalent, Vulkan " +
+            "Qwen3MoeHybrid only): put the first N MoE layers' routed experts on the CPU " +
+            "instead of the GPU, trading decode/prefill throughput for reduced device " +
+            "memory. 0 = fully GPU-resident/streaming (default). No-op on cpu/cuda backends " +
+            "or non-Qwen3MoeHybrid Vulkan models.")]
+        [DefaultValue(0)]
+        public int NCpuMoeLayers { get; set; }
+
         public override ValidationResult Validate()
         {
             if (PromptTokens <= 0) return ValidationResult.Error("--prompt-tokens|-p must be positive.");
             if (GenTokens <= 0) return ValidationResult.Error("--gen-tokens|-n must be positive.");
             if (Reps <= 0) return ValidationResult.Error("--reps|-r must be positive.");
             if (Depth < 0) return ValidationResult.Error("--depth must be >= 0.");
+            if (NCpuMoeLayers < 0) return ValidationResult.Error("--n-cpu-moe must be >= 0.");
             string dev = Device.Split(':')[0].ToLowerInvariant();
             if (dev is not ("cpu" or "vulkan" or "cuda" or "gpu"))
                 return ValidationResult.Error($"Unknown --device '{Device}'. Expected cpu, vulkan, or cuda[:N].");
@@ -172,10 +183,15 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                         {
                             vulkanDevice = DotLLM.Vulkan.VulkanDevice.Create();
                             var vkMoe = DotLLM.Vulkan.VulkanQwen3MoeHybridTransformerModel.BuildFromGguf(
-                                vulkanDevice, gguf, config, ResolveSpvDir());
+                                vulkanDevice, gguf, config, ResolveSpvDir(), settings.NCpuMoeLayers);
                             model = vkMoe;
                             kvFactory = size => vkMoe.CreateKvCache(size);
                             deviceLabel = vulkanDevice.DeviceName;
+                            if (vkMoe.NCpuMoeLayers > 0 && !settings.Json)
+                                AnsiConsole.MarkupLine(
+                                    $"[grey]MoE CPU offload: {vkMoe.NCpuMoeLayers} layer(s), " +
+                                    $"~{vkMoe.EstimatedCpuOffloadVramSavedBytes / (1024.0 * 1024.0):F0} MiB " +
+                                    "GPU expert-bank upload avoided.[/]");
                             break;
                         }
                         case Architecture.NemotronH:

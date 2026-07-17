@@ -1916,11 +1916,26 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>Copies <paramref name="source"/> from host memory into the start of <paramref name="dst"/>.</summary>
+    /// <remarks>
+    /// When <paramref name="dst"/> is device-local-only (a discrete GPU's VRAM, or —
+    /// as issue #370's CPU-MoE-offload host round-trip discovered — a scratch buffer
+    /// allocated strictly DEVICE_LOCAL even on a UMA part) the host cannot map it
+    /// directly, so the bytes are staged through a transient host-visible buffer and
+    /// <c>vkCmdCopyBuffer</c>'d across (mirrors <see cref="UploadToDeviceLocal"/> /
+    /// the <see cref="Download"/> readback-side fix, #364).
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<float> source, Buffer dst)
     {
         long bytes = (long)source.Length * sizeof(float);
         if (bytes > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
+
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(bytes);
+            UploadToDeviceLocal(MemoryMarshal.AsBytes(source), staging, dst);
+            return;
+        }
 
         nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
@@ -1939,10 +1954,21 @@ public sealed class VulkanDevice : IDisposable
     /// Used for quantized weight blobs (Q8_0, Q4_K, etc.) where the GPU sees the
     /// data as <c>uint[]</c> and the shader extracts bytes.
     /// </summary>
+    /// <remarks>
+    /// Stages through a transient host-visible buffer when <paramref name="dst"/> is
+    /// device-local-only — see the <see cref="Upload(ReadOnlySpan{float}, Buffer)"/> remarks.
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<byte> source, Buffer dst)
     {
         if (source.Length > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
+
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(source.Length);
+            UploadToDeviceLocal(source, staging, dst);
+            return;
+        }
 
         nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)source.Length, "vkMapMemory");
         try
