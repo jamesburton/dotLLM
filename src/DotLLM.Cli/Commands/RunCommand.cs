@@ -71,6 +71,77 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [DefaultValue(0)]
         public int RepeatLastN { get; set; }
 
+        [CommandOption("--frequency-penalty")]
+        [Description("OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled.")]
+        [DefaultValue(0f)]
+        public float FrequencyPenalty { get; set; }
+
+        [CommandOption("--presence-penalty")]
+        [Description("OpenAI-style presence penalty: subtracted once for any token already seen. 0 = disabled.")]
+        [DefaultValue(0f)]
+        public float PresencePenalty { get; set; }
+
+        [CommandOption("--logit-bias|-l")]
+        [Description("Per-token additive logit bias 'token_id=bias', repeatable (e.g. '-l 15043=-100').")]
+        public string[] LogitBias { get; set; } = Array.Empty<string>();
+
+        [CommandOption("--top-nsigma|--top-n-sigma")]
+        [Description("Top-nσ sampling threshold. Negative = disabled (default).")]
+        [DefaultValue(-1f)]
+        public float TopNSigma { get; set; } = -1f;
+
+        [CommandOption("--dry-multiplier")]
+        [Description("DRY (Don't Repeat Yourself) repetition penalty multiplier. 0 = disabled (default).")]
+        [DefaultValue(0f)]
+        public float DryMultiplier { get; set; }
+
+        [CommandOption("--dry-base")]
+        [Description("DRY exponential base for the match-length penalty curve.")]
+        [DefaultValue(1.75f)]
+        public float DryBase { get; set; } = 1.75f;
+
+        [CommandOption("--dry-allowed-length")]
+        [Description("Minimum matched n-gram length before DRY starts penalizing.")]
+        [DefaultValue(2)]
+        public int DryAllowedLength { get; set; } = 2;
+
+        [CommandOption("--dry-penalty-last-n")]
+        [Description("Number of recent tokens considered for DRY matching. 0 = full history.")]
+        [DefaultValue(0)]
+        public int DryPenaltyLastN { get; set; }
+
+        [CommandOption("--dry-sequence-breaker")]
+        [Description("Token string that resets DRY n-gram matching, repeatable. Default: newline, ':', '\"', '*'.")]
+        public string[]? DrySequenceBreakers { get; set; }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-freq-base")]
+        [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
+        public float? RopeFreqBase { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value.")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--yarn-beta-fast")]
+        [Description("YaRN beta-fast parameter override.")]
+        public float? YarnBetaFast { get; set; }
+
+        [CommandOption("--yarn-beta-slow")]
+        [Description("YaRN beta-slow parameter override.")]
+        public float? YarnBetaSlow { get; set; }
+
         [CommandOption("--seed|-s")]
         [Description("Random seed for reproducible sampling. Omit for non-deterministic.")]
         public int? Seed { get; set; }
@@ -249,6 +320,7 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
             gguf = GgufFile.Open(resolvedPath);
             config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
             int gpuLayers = ResolveGpuLayers(settings, config);
@@ -403,6 +475,17 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             MinP = settings.MinP,
             RepetitionPenalty = settings.RepeatPenalty,
             RepetitionPenaltyWindow = settings.RepeatLastN,
+            FrequencyPenalty = settings.FrequencyPenalty,
+            PresencePenalty = settings.PresencePenalty,
+            LogitBias = ParseLogitBias(settings.LogitBias),
+            TopNSigma = settings.TopNSigma,
+            DryMultiplier = settings.DryMultiplier,
+            DryBase = settings.DryBase,
+            DryAllowedLength = settings.DryAllowedLength,
+            DryPenaltyLastN = settings.DryPenaltyLastN,
+            DrySequenceBreakers = settings.DrySequenceBreakers is { Length: > 0 }
+                ? settings.DrySequenceBreakers
+                : new InferenceOptions().DrySequenceBreakers,
             MaxTokens = settings.MaxTokens,
             Seed = settings.Seed,
             ResponseFormat = responseFormat,
@@ -844,6 +927,66 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         int colonIdx = device.IndexOf(':');
         if (colonIdx < 0) return 0;
         return int.Parse(device.AsSpan(colonIdx + 1));
+    }
+
+    /// <summary>
+    /// Builds a <see cref="RoPEOverrideOptions"/> from CLI flags. Returns null (no-op) when none
+    /// of the RoPE override flags were set.
+    /// </summary>
+    private static RoPEOverrideOptions? BuildRoPEOverride(Settings settings)
+    {
+        RoPEScalingType? scalingType = settings.RopeScaling is null ? null : ParseRopeScalingType(settings.RopeScaling);
+
+        var overrides = new RoPEOverrideOptions
+        {
+            ScalingType = scalingType,
+            FreqBase = settings.RopeFreqBase,
+            ScalingFactor = settings.RopeScale,
+            OrigMaxSeqLen = settings.YarnOrigCtx,
+            AttnFactor = settings.YarnAttnFactor,
+            BetaFast = settings.YarnBetaFast,
+            BetaSlow = settings.YarnBetaSlow,
+        };
+        return overrides.HasAnyOverride ? overrides : null;
+    }
+
+    private static RoPEScalingType ParseRopeScalingType(string value) => value.ToLowerInvariant() switch
+    {
+        "none" => RoPEScalingType.None,
+        "linear" => RoPEScalingType.Linear,
+        "yarn" => RoPEScalingType.YaRN,
+        "ntk" => RoPEScalingType.NTK,
+        "dynamic" or "dynamic_ntk" or "dynamic-ntk" => RoPEScalingType.DynamicNTK,
+        "su" or "longrope" => RoPEScalingType.Su,
+        _ => throw new InvalidOperationException(
+            $"Unknown --rope-scaling value '{value}'. Expected: none, linear, yarn, ntk, dynamic."),
+    };
+
+    /// <summary>
+    /// Parses <c>--logit-bias</c> entries of the form <c>token_id=bias</c> (e.g. <c>15043=-100</c>)
+    /// into a token-id-keyed dictionary. Returns null when no entries are given.
+    /// </summary>
+    private static IReadOnlyDictionary<int, float>? ParseLogitBias(string[] entries)
+    {
+        if (entries.Length == 0)
+            return null;
+
+        var result = new Dictionary<int, float>(entries.Length);
+        foreach (var entry in entries)
+        {
+            int eq = entry.IndexOf('=');
+            if (eq <= 0 || eq == entry.Length - 1)
+                throw new InvalidOperationException(
+                    $"Invalid --logit-bias entry '{entry}'. Expected 'token_id=bias' (e.g. '15043=-100').");
+
+            if (!int.TryParse(entry.AsSpan(0, eq), out int tokenId))
+                throw new InvalidOperationException($"Invalid token id in --logit-bias entry '{entry}'.");
+            if (!float.TryParse(entry.AsSpan(eq + 1), System.Globalization.CultureInfo.InvariantCulture, out float bias))
+                throw new InvalidOperationException($"Invalid bias value in --logit-bias entry '{entry}'.");
+
+            result[tokenId] = bias;
+        }
+        return result;
     }
 
     /// <summary>

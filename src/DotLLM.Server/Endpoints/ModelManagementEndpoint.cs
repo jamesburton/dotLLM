@@ -49,6 +49,11 @@ public static class ModelManagementEndpoint
                         SpeculativeModel = request.SpeculativeModel,
                         SpeculativeCandidates = request.SpeculativeK ?? state.Options.SpeculativeCandidates,
                         ModelId = Path.GetFileNameWithoutExtension(resolvedPath),
+                        RopeOverride = ServerOptions.BuildRopeOverride(
+                            request.RopeScaling, request.RopeFreqBase, request.RopeScale,
+                            request.YarnOrigCtx, request.YarnAttnFactor,
+                            request.YarnBetaFast, request.YarnBetaSlow)
+                            ?? state.Options.RopeOverride,
                     };
                     var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), ct);
 

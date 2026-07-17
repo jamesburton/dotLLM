@@ -56,6 +56,39 @@ public sealed record ChatCompletionRequest
     [JsonPropertyName("min_p")]
     public float? MinP { get; init; }
 
+    /// <summary>
+    /// Per-token additive logit bias (OpenAI API compatible): a map from token id (as a string key)
+    /// to a bias value applied before sampling. Typical range is -100..100.
+    /// </summary>
+    [JsonPropertyName("logit_bias")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, float>? LogitBias { get; init; }
+
+    /// <summary>Top-nσ sampling threshold (llama.cpp <c>--top-nsigma</c>). Negative = disabled.</summary>
+    [JsonPropertyName("top_n_sigma")]
+    public float? TopNSigma { get; init; }
+
+    /// <summary>DRY repetition penalty multiplier. 0/absent = disabled.</summary>
+    [JsonPropertyName("dry_multiplier")]
+    public float? DryMultiplier { get; init; }
+
+    /// <summary>DRY exponential base for the match-length penalty curve.</summary>
+    [JsonPropertyName("dry_base")]
+    public float? DryBase { get; init; }
+
+    /// <summary>Minimum matched n-gram length before DRY starts penalizing.</summary>
+    [JsonPropertyName("dry_allowed_length")]
+    public int? DryAllowedLength { get; init; }
+
+    /// <summary>Number of recent tokens considered for DRY matching. 0 = full history.</summary>
+    [JsonPropertyName("dry_penalty_last_n")]
+    public int? DryPenaltyLastN { get; init; }
+
+    /// <summary>Token strings that reset DRY n-gram matching.</summary>
+    [JsonPropertyName("dry_sequence_breakers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? DrySequenceBreakers { get; init; }
+
     [JsonPropertyName("logprobs")]
     public bool? Logprobs { get; init; }
 

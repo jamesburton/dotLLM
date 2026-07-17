@@ -83,6 +83,7 @@ public static class ServerStartup
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);

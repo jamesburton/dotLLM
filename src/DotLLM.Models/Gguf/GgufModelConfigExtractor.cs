@@ -164,6 +164,39 @@ public static class GgufModelConfigExtractor
     }
 
     /// <summary>
+    /// Applies user-supplied RoPE overrides (CLI <c>--rope-scaling</c>/<c>--rope-freq-base</c>/etc.,
+    /// or server <c>ModelLoadRequest</c> equivalents) on top of the GGUF-derived <see cref="ModelConfig.RoPEConfig"/>
+    /// (and <see cref="ModelConfig.GlobalRoPEConfig"/> for dual-RoPE architectures like Gemma 4).
+    /// No new scaling math — every override field is a straight replacement of the corresponding
+    /// <see cref="RoPEConfig"/> field, everything else derived from GGUF metadata is left as-is.
+    /// A no-op (returns <paramref name="config"/> unchanged) when <paramref name="overrides"/> is
+    /// null, has no fields set, or the model has no RoPE config to override (non-RoPE architectures).
+    /// </summary>
+    public static ModelConfig ApplyRoPEOverride(ModelConfig config, RoPEOverrideOptions? overrides)
+    {
+        if (overrides is null || !overrides.HasAnyOverride)
+            return config;
+
+        ModelConfig result = config;
+        if (config.RoPEConfig is { } rope)
+            result = result with { RoPEConfig = ApplyOverride(rope, overrides) };
+        if (config.GlobalRoPEConfig is { } globalRope)
+            result = result with { GlobalRoPEConfig = ApplyOverride(globalRope, overrides) };
+        return result;
+    }
+
+    private static RoPEConfig ApplyOverride(RoPEConfig rope, RoPEOverrideOptions overrides) => rope with
+    {
+        Theta = overrides.FreqBase ?? rope.Theta,
+        ScalingType = overrides.ScalingType ?? rope.ScalingType,
+        ScalingFactor = overrides.ScalingFactor ?? rope.ScalingFactor,
+        OrigMaxSeqLen = overrides.OrigMaxSeqLen ?? rope.OrigMaxSeqLen,
+        AttnFactor = overrides.AttnFactor ?? rope.AttnFactor,
+        BetaFast = overrides.BetaFast ?? rope.BetaFast,
+        BetaSlow = overrides.BetaSlow ?? rope.BetaSlow,
+    };
+
+    /// <summary>
     /// Extracts an <see cref="MlaConfig"/> from DeepSeek-V2/V3 GGUF metadata.
     /// Required keys (per llama.cpp's gguf_writer):
     /// <list type="bullet">

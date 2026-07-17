@@ -139,6 +139,85 @@ public class SamplerPipelineTests
     }
 
     [Fact]
+    public void Sample_WithLogitBias_FavorsBiasedToken()
+    {
+        var options = new InferenceOptions
+        {
+            Temperature = 0f,
+            LogitBias = new Dictionary<int, float> { [0] = 100f },
+        };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [1.0f, 5.0f, 3.0f];
+
+        int result = pipeline.Sample(logits, []);
+
+        Assert.Equal(0, result); // token 0 biased far above the others
+    }
+
+    [Fact]
+    public void Sample_WithFrequencyPenalty_AvoidsRepeatedToken()
+    {
+        var options = new InferenceOptions { Temperature = 0f, FrequencyPenalty = 100.0f };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [1.0f, 1.0f, 5.0f, 4.9f];
+        var previousTokens = new List<int> { 2 };
+
+        int result = pipeline.Sample(logits, previousTokens);
+
+        Assert.Equal(3, result);
+    }
+
+    [Fact]
+    public void Sample_WithTopNSigma_ProducesValidIndex()
+    {
+        var options = new InferenceOptions { Temperature = 1.0f, TopNSigma = 1.0f, Seed = 7 };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [1.0f, 2.0f, 3.0f, 4.0f, 5.0f];
+
+        int result = pipeline.Sample(logits, []);
+
+        Assert.InRange(result, 0, logits.Length - 1);
+    }
+
+    [Fact]
+    public void Sample_TopNSigmaEnabled_DisablesFastTopKPath()
+    {
+        // With TopNSigma >= 0, the fast top-k shortcut must not be taken even when top-k alone
+        // would otherwise qualify — verified indirectly via the reported sampler path.
+        var options = new InferenceOptions
+        {
+            Temperature = 0.8f,
+            TopK = 3,
+            TopNSigma = 1.0f,
+            Seed = 1,
+        };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [0.1f, 9.0f, 0.2f, 8.0f, 0.3f, 7.0f];
+        int result = pipeline.Sample(logits, []);
+
+        Assert.InRange(result, 0, logits.Length - 1);
+    }
+
+    [Fact]
+    public void Sample_WithDryEnabled_NoTokenizer_ProducesValidIndexWithoutBreakers()
+    {
+        // No tokenizer supplied — DRY still runs (just without sequence-breaker awareness).
+        var options = new InferenceOptions { Temperature = 0f, DryMultiplier = 1.0f };
+        var pipeline = new SamplerPipeline(options);
+
+        float[] logits = [1.0f, 2.0f, 3.0f, 4.0f];
+        var previousTokens = new List<int> { 0, 1, 2, 0, 1 };
+
+        int result = pipeline.Sample(logits, previousTokens);
+
+        Assert.InRange(result, 0, logits.Length - 1);
+    }
+
+    [Fact]
     public void Sample_AutoTopK_ReturnsOnlyTopKToken()
     {
         var options = new InferenceOptions

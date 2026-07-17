@@ -28,10 +28,20 @@ Primary chat endpoint. Accepts OpenAI-compatible request format.
   "logit_bias": {"1234": -100},
   "frequency_penalty": 0.5,
   "presence_penalty": 0.3,
+  "top_n_sigma": 1.0,
+  "dry_multiplier": 0.8,
+  "dry_base": 1.75,
+  "dry_allowed_length": 2,
+  "dry_penalty_last_n": 0,
+  "dry_sequence_breakers": ["\n", ":", "\"", "*"],
   "n": 1,
   "lora_adapter": "customer-support"
 }
 ```
+
+Also accepted (not shown above): `top_k`, `min_p`, `repetition_penalty` — see [SAMPLING.md](SAMPLING.md)
+for the full parameter reference, including the DRY/top-nσ/logit-bias/frequency/presence-penalty
+processors these fields drive. `POST /v1/completions` accepts the same sampling parameter set.
 
 **Response** (non-streaming):
 ```json

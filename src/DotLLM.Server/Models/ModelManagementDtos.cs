@@ -76,6 +76,41 @@ public sealed record ModelLoadRequest
     [JsonPropertyName("speculative_k")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? SpeculativeK { get; init; }
+
+    /// <summary>RoPE scaling override: "none", "linear", "yarn", "ntk", "dynamic". Overrides the GGUF-derived value.</summary>
+    [JsonPropertyName("rope_scaling")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? RopeScaling { get; init; }
+
+    /// <summary>RoPE base frequency (theta) override.</summary>
+    [JsonPropertyName("rope_freq_base")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? RopeFreqBase { get; init; }
+
+    /// <summary>RoPE scaling factor override (linear/YaRN/NTK).</summary>
+    [JsonPropertyName("rope_scale")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? RopeScale { get; init; }
+
+    /// <summary>YaRN original context length override.</summary>
+    [JsonPropertyName("yarn_orig_ctx")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? YarnOrigCtx { get; init; }
+
+    /// <summary>YaRN attention factor override.</summary>
+    [JsonPropertyName("yarn_attn_factor")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? YarnAttnFactor { get; init; }
+
+    /// <summary>YaRN beta-fast parameter override.</summary>
+    [JsonPropertyName("yarn_beta_fast")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? YarnBetaFast { get; init; }
+
+    /// <summary>YaRN beta-slow parameter override.</summary>
+    [JsonPropertyName("yarn_beta_slow")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? YarnBetaSlow { get; init; }
 }
 
 /// <summary>
