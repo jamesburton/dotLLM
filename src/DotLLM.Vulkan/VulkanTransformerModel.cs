@@ -595,6 +595,7 @@ public sealed class VulkanTransformerModel : IModel
     /// When null, every dispatch falls through to <see cref="_attention"/>.
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
+    private readonly VulkanFlashAttentionCoopmatKernel? _flashAttentionCoopmat;
     /// <summary>
     /// Split-KV (Flash-Decoding) attention kernel for the long-context decode
     /// path (seqQ == 1). Null when the SPVs are missing (older builds) or the
@@ -886,6 +887,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq2XxsMmqKernel? matmulIq2XxsMmq,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, GeGluTanhF32Kernel? geglu, ReLU2GluF32Kernel? relu2glu,
         ScaleInplaceF32Kernel? embedScale, AddKernel add,
@@ -989,6 +991,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope = rope;
         _attention = attention;
         _flashAttention = flashAttention;
+        _flashAttentionCoopmat = flashAttentionCoopmat;
         _splitKvAttention = splitKvAttention;
         _swiglu = swiglu;
         _geglu = geglu;
@@ -1466,6 +1469,17 @@ public sealed class VulkanTransformerModel : IModel
             IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        // Cooperative-matrix FA prefill kernel (issue #149) — preferred over the
+        // scalar FA shader when the device has the 16x16x16 f16->f32 subgroup
+        // tile (llama.cpp's FA_COOPMAT1 path). Kill-switch:
+        // DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1 (falls back to the scalar
+        // FA kernel above; the AMD LLPC compiler has miscompiled complex
+        // shaders before — see the IQ2_XXS MMQ history).
+        VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat =
+            IsFlashAttentionDisabled() || IsCoopmatAttentionDisabled()
+                || config.HeadDim > VulkanFlashAttentionCoopmatKernel.MaxHeadDim
+                ? null
+                : VulkanFlashAttentionCoopmatKernel.TryCreate(device, spvDir);
         // Optional split-KV (Flash-Decoding) kernel for the long-context decode
         // path (seqQ == 1). Disabled by env-var opt-out or missing SPV (older
         // builds); short-context decode still routes to the per-token kernel.
@@ -1622,7 +1636,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulQ2KMmq,
             matmulQ3KMmq,
             matmulIq2XxsMmq,
-            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
+            rmsnorm, rope, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -1653,6 +1667,18 @@ public sealed class VulkanTransformerModel : IModel
 
     internal static bool IsFlashAttentionDisabled() =>
         Environment.GetEnvironmentVariable(DisableFlashAttentionEnvVar) == "1";
+
+    /// <summary>
+    /// Env-var opt-out for the cooperative-matrix Flash-Attention prefill
+    /// kernel (issue #149). Set <c>DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION=1</c>
+    /// to force prefill attention onto the scalar
+    /// <see cref="VulkanFlashAttentionF32Kernel"/> — the A/B baseline and the
+    /// escape hatch should the driver miscompile the coopmat shader.
+    /// </summary>
+    internal const string DisableCoopmatAttentionEnvVar = "DOTLLM_VULKAN_DISABLE_COOPMAT_ATTENTION";
+
+    internal static bool IsCoopmatAttentionDisabled() =>
+        Environment.GetEnvironmentVariable(DisableCoopmatAttentionEnvVar) == "1";
 
     /// <summary>
     /// Env-var opt-out for the split-KV (Flash-Decoding) decode path. Set
@@ -1763,6 +1789,21 @@ public sealed class VulkanTransformerModel : IModel
                 softCap: softCap, scaleOverride: scaleOverride,
                 maskMode: maskMode, prefixLen: prefixLen,
                 interPassStamp: DpAttnSplitStamp);
+            return;
+        }
+        // Prefill (seqQ > 1): prefer the cooperative-matrix FA kernel (issue
+        // #149, llama.cpp FA_COOPMAT1 analogue) over the scalar FA shader.
+        // Same tiling, same mask semantics; f16-matmul numerics (see kernel).
+        if (_flashAttentionCoopmat is not null && seqQ > 1
+            && headDim <= VulkanFlashAttentionCoopmatKernel.MaxHeadDim)
+        {
+            ProfNote("attn_flash_cm", seqQ, seqKv, numHeads);
+            _flashAttentionCoopmat.Record(cmdBuf, q, k, v, output,
+                seqQ: seqQ, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: slidingWindow,
+                softCap: softCap, scaleOverride: scaleOverride,
+                maskMode: maskMode, prefixLen: prefixLen);
             return;
         }
         if (_flashAttention is not null && seqQ > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
@@ -3537,6 +3578,7 @@ public sealed class VulkanTransformerModel : IModel
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
+        _flashAttentionCoopmat?.InvalidateDescriptorCache();
         _splitKvAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _geglu?.InvalidateDescriptorCache();
@@ -6010,6 +6052,7 @@ public sealed class VulkanTransformerModel : IModel
         _gemma4OnesVec?.Dispose();
         _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
+        _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
         _rmsnorm.Dispose();
