@@ -192,12 +192,73 @@ public class VulkanFlashAttentionCoopmatKernelTests
         => RunOne(seqQ: 48, seqKv: 48, numHeads: 4, numKvHeads: 2, headDim: 64,
             positionOffset: 0, maskMode: AttentionMaskMode.Hybrid, prefixLen: 20);
 
+    // Issue #382: 2-row-block doubled-query-tile variant (corrects #381's
+    // invalid BR=32 coopmat approach — every coopmat op here stays at the
+    // native M=16, looped over 2 row blocks). Opt-in via ForceRb2ForTests so
+    // these don't need the process-wide DOTLLM_VULKAN_FA_COOPMAT_2RB env var.
+    // Same shape coverage as #381's (reverted) tests: GQA groups, partial
+    // tiles crossing the row-block boundary, chunked-prefill position
+    // offset, sliding window, ALiBi, headDim smaller than MAX_HEAD_DIM, a
+    // single-row-block case (seqQ < 16), and the canonical p=512 shape.
+    [SkippableFact]
+    public void Launch_Rb2_Gqa3_SmolLm_P512()
+        // The canonical SmolLM-135M perf-matrix shape this issue targets.
+        => RunOne(seqQ: 512, seqKv: 512, numHeads: 9, numKvHeads: 3, headDim: 64,
+            positionOffset: 0, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_PartialTiles()
+        // Non-tile-multiple seqQ/seqKv: exercises rowsInTile values that
+        // land in EITHER row block (777 % 32 = 9, so the final Q-tile has
+        // only 9 valid rows, entirely inside row block 0 -- see
+        // Launch_Rb2_PartialTile_SecondRowBlock for a row-block-1 case).
+        => RunOne(seqQ: 777, seqKv: 809, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_PartialTile_SecondRowBlock()
+        // seqQ = 40: final Q-tile has 8 valid rows (40 - 32), which live
+        // ENTIRELY in row block 1 (rows 16-31 of the tile, of which only
+        // 16-23 are valid) -- discriminates the rb=1 zero-padding/masking
+        // path specifically, which Launch_Rb2_PartialTiles' 777 case does
+        // not reach (its remainder sits in row block 0).
+        => RunOne(seqQ: 40, seqKv: 64, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_ChunkedPrefill_PositionOffset()
+        => RunOne(seqQ: 128, seqKv: 768, numHeads: 8, numKvHeads: 2, headDim: 64,
+            positionOffset: 640, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_SlidingWindow()
+        => RunOne(seqQ: 96, seqKv: 700, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, slidingWindow: 100, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_Alibi()
+        => RunOne(seqQ: 64, seqKv: 704, numHeads: 6, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, useAlibi: true, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_HeadDim32_SmallerThanTile()
+        => RunOne(seqQ: 64, seqKv: 700, numHeads: 4, numKvHeads: 2, headDim: 32,
+            positionOffset: 0, forceRb2: true);
+
+    [SkippableFact]
+    public void Launch_Rb2_SingleRowBlock()
+        // seqQ < ROW_BLOCK (16): every row lives in row block 0; row block 1
+        // is entirely padding. Discriminates row-block-1-fully-inactive.
+        => RunOne(seqQ: 11, seqKv: 64, numHeads: 4, numKvHeads: 2, headDim: 64,
+            positionOffset: 0, forceRb2: true);
+
     // ─────────────────────────────────────────────────────────────
 
     private static void RunOne(int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset, int slidingWindow = 0, float softCap = 0.0f, bool useAlibi = false,
         float scaleOverride = 0.0f,
-        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0,
+        bool forceRb2 = false)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -217,6 +278,12 @@ public class VulkanFlashAttentionCoopmatKernelTests
             slidingWindow, softCap, useAlibi, scaleOverride, maskMode, prefixLen);
 
         using var kernel = VulkanFlashAttentionCoopmatKernel.Create(device, spvDir);
+        if (forceRb2)
+        {
+            Skip.If(!File.Exists(Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64_2rb.spv")),
+                "attention_flash_f32_coopmat_hd64_2rb.spv not built.");
+            kernel.ForceRb2ForTests = true;
+        }
 
         using var bufQ   = device.Allocate((long)qh.Length * sizeof(float));
         using var bufK   = device.Allocate((long)kh.Length * sizeof(float));

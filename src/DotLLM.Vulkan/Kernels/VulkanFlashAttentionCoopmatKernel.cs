@@ -39,6 +39,18 @@ namespace DotLLM.Vulkan.Kernels;
 /// Falls back to the 128-dim shader unconditionally if the hd64 SPV is
 /// missing (older SPV cache) or <c>DOTLLM_VULKAN_FA_COOPMAT_HD64=0</c>.
 /// </para>
+/// <para>
+/// Issue #382 (corrects #381's invalid approach): a third SPV
+/// (<c>attention_flash_f32_coopmat_hd64_2rb.spv</c>) doubles the effective
+/// query tile (BR 16-&gt;32) by looping the QK^T/P·V coopmat phases over TWO
+/// 16-row blocks that share one KV-tile LDS load, instead of (invalidly)
+/// declaring a 32-row coopmat type — gfx1151 only has a native 16x16x16
+/// tile. Opt-in via <c>DOTLLM_VULKAN_FA_COOPMAT_2RB=1</c>
+/// (<see cref="Rb2Enabled"/>) since the arithmetic-intensity/instruction-count
+/// trade-off is an open empirical question, matching #378's "measure before
+/// defaulting on" precedent. Falls back to the hd64 shader (or base shader)
+/// when the 2rb SPV is missing or not enabled.
+/// </para>
 /// </remarks>
 public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
 {
@@ -73,8 +85,20 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     private static readonly bool HeadDim64Enabled =
         Environment.GetEnvironmentVariable("DOTLLM_VULKAN_FA_COOPMAT_HD64") != "0";
 
-    /// <summary>Query rows per workgroup (Br).</summary>
+    /// <summary>
+    /// Issue #382: set <c>DOTLLM_VULKAN_FA_COOPMAT_2RB=1</c> to opt into the
+    /// 2-row-block doubled-query-tile variant for headDim&lt;=64 models. Off
+    /// by default — see the class remarks for why this stays opt-in until
+    /// benchmarked.
+    /// </summary>
+    private static readonly bool Rb2Enabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_FA_COOPMAT_2RB") == "1";
+
+    /// <summary>Query rows per workgroup (Br) for the base and BR=16 hd64 shaders.</summary>
     public const int QueryTileRows = 16;
+
+    /// <summary>Query rows per workgroup (Br) for the #382 2-row-block hd64 variant.</summary>
+    public const int QueryTileRowsRb2 = 32;
 
     /// <summary>KV tile columns per workgroup iteration (Bc).</summary>
     public const int KvTileCols = 64;
@@ -86,15 +110,30 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly VulkanModule? _hd64Module;
     private readonly ComputePipeline? _hd64Pipeline;
+    private readonly VulkanModule? _rb2Module;
+    private readonly ComputePipeline? _rb2Pipeline;
     private readonly nint _descriptorPool;
     private readonly nint _hd64DescriptorPool;
+    private readonly nint _rb2DescriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
     private readonly DescriptorSetCache? _hd64DescriptorCache;
+    private readonly DescriptorSetCache? _rb2DescriptorCache;
     private bool _disposed;
+
+    /// <summary>
+    /// Test-only override for the #382 2rb opt-in gate: <c>true</c> forces
+    /// the 2rb dispatch path (when its SPV is loaded) regardless of
+    /// <see cref="Rb2Enabled"/>, <c>false</c> forces it off, <c>null</c>
+    /// (default) defers to <see cref="Rb2Enabled"/>. Avoids parity tests
+    /// needing to mutate the process-wide <c>DOTLLM_VULKAN_FA_COOPMAT_2RB</c>
+    /// env var, which would leak into other tests sharing the process.
+    /// </summary>
+    internal bool? ForceRb2ForTests { get; set; }
 
     private VulkanFlashAttentionCoopmatKernel(
         VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool,
-        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool)
+        VulkanModule? hd64Module, ComputePipeline? hd64Pipeline, nint hd64Pool,
+        VulkanModule? rb2Module, ComputePipeline? rb2Pipeline, nint rb2Pool)
     {
         _device = device;
         _module = module;
@@ -106,6 +145,11 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         _hd64DescriptorPool = hd64Pool;
         if (hd64Pipeline is not null)
             _hd64DescriptorCache = new DescriptorSetCache(device, hd64Pool, hd64Pipeline, buffersPerSet: 4);
+        _rb2Module = rb2Module;
+        _rb2Pipeline = rb2Pipeline;
+        _rb2DescriptorPool = rb2Pool;
+        if (rb2Pipeline is not null)
+            _rb2DescriptorCache = new DescriptorSetCache(device, rb2Pool, rb2Pipeline, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -200,8 +244,43 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             }
         }
 
+        VulkanModule? rb2Module = null;
+        ComputePipeline? rb2Pipeline = null;
+        nint rb2Pool = 0;
+        string rb2Path = Path.Combine(spvDir, "attention_flash_f32_coopmat_hd64_2rb.spv");
+        if (File.Exists(rb2Path))
+        {
+            rb2Module = VulkanModule.LoadFromFile(device, rb2Path);
+            try
+            {
+                Span<VkDescriptorBinding> bindings = stackalloc VkDescriptorBinding[4];
+                bindings[0] = new VkDescriptorBinding(0);
+                bindings[1] = new VkDescriptorBinding(1);
+                bindings[2] = new VkDescriptorBinding(2);
+                bindings[3] = new VkDescriptorBinding(3);
+                rb2Pipeline = rb2Module.CreateComputePipeline(
+                    entryPoint: "main",
+                    bindings: bindings,
+                    pushConstantBytes: PushConstantBytes);
+                // Separate pool per pipeline — see the #377 note above.
+                rb2Pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
+            }
+            catch
+            {
+                rb2Module.Dispose();
+                hd64Module?.Dispose();
+                module.Dispose();
+                hd64Pipeline?.Dispose();
+                pipeline.Dispose();
+                throw;
+            }
+        }
+
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 4);
-        return new VulkanFlashAttentionCoopmatKernel(device, module, pipeline, pool, hd64Module, hd64Pipeline, hd64Pool);
+        return new VulkanFlashAttentionCoopmatKernel(
+            device, module, pipeline, pool,
+            hd64Module, hd64Pipeline, hd64Pool,
+            rb2Module, rb2Pipeline, rb2Pool);
     }
 
     /// <summary>
@@ -231,6 +310,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
     {
         _descriptorCache.Reset();
         _hd64DescriptorCache?.Reset();
+        _rb2DescriptorCache?.Reset();
     }
 
     /// <summary>
@@ -293,12 +373,19 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
         if (v.Size      < kvBytes)  throw new ArgumentException("V buffer too small.",      nameof(v));
         if (output.Size < outBytes) throw new ArgumentException("Output buffer too small.", nameof(output));
 
+        // Issue #382: opt-in 2-row-block doubled-query-tile variant for
+        // headDim<=64 models — checked before #378's hd64 gate since it's a
+        // more specific alternative for the same headDim range.
+        bool useRb2 = _rb2Pipeline is not null && (ForceRb2ForTests ?? Rb2Enabled) && headDim <= HeadDim64Threshold;
+
         // Issue #378: route headDim<=64 models with enough KV-tile iterations
         // to amortize the occupancy gain to the LDS-halved hd64 shader.
-        bool useHd64 = _hd64Pipeline is not null && HeadDim64Enabled
+        bool useHd64 = !useRb2 && _hd64Pipeline is not null && HeadDim64Enabled
             && headDim <= HeadDim64Threshold && seqKv >= SeqKvThreshold;
-        ComputePipeline pipeline = useHd64 ? _hd64Pipeline! : _pipeline;
-        DescriptorSetCache descriptorCache = useHd64 ? _hd64DescriptorCache! : _descriptorCache;
+
+        ComputePipeline pipeline = useRb2 ? _rb2Pipeline! : useHd64 ? _hd64Pipeline! : _pipeline;
+        DescriptorSetCache descriptorCache = useRb2 ? _rb2DescriptorCache! : useHd64 ? _hd64DescriptorCache! : _descriptorCache;
+        int queryTileRows = useRb2 ? QueryTileRowsRb2 : QueryTileRows;
 
         Span<nint> buffers = stackalloc nint[4] { q.Handle, k.Handle, v.Handle, output.Handle };
         nint descriptorSet = descriptorCache.GetOrCreate(buffers);
@@ -328,7 +415,7 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        uint qTiles = ((uint)seqQ + (uint)QueryTileRows - 1u) / (uint)QueryTileRows;
+        uint qTiles = ((uint)seqQ + (uint)queryTileRows - 1u) / (uint)queryTileRows;
         uint groups = qTiles * (uint)numHeads;
         VulkanApi.vkCmdDispatch(cmdBuf, groups, 1, 1);
     }
@@ -348,5 +435,10 @@ public sealed class VulkanFlashAttentionCoopmatKernel : IDisposable
             VulkanApi.vkDestroyDescriptorPool(_device.Handle, _hd64DescriptorPool, 0);
         _hd64Pipeline?.Dispose();
         _hd64Module?.Dispose();
+
+        if (_rb2DescriptorPool != 0)
+            VulkanApi.vkDestroyDescriptorPool(_device.Handle, _rb2DescriptorPool, 0);
+        _rb2Pipeline?.Dispose();
+        _rb2Module?.Dispose();
     }
 }
