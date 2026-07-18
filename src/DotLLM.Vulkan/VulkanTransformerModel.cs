@@ -158,6 +158,12 @@ public sealed class VulkanTransformerModel : IModel
     // opt-out is set; RecordMatmul then falls back to the F32-in Q8_0 GEMV.
     private readonly QuantizeQ8_1Kernel? _quantizeQ8_1;
     private readonly MatMulQ8_0MmvqKernel? _matmulQ8Mmvq;
+    // Residual-fused Q8_0 MMVQ decode GEMV (issue #379) — folds the
+    // post-matmul residual add into the kernel's final store, eliminating
+    // the separate AddKernel dispatch + barrier at o_proj/down_proj residual
+    // sites. Null under the same conditions as _matmulQ8Mmvq (plus a missing
+    // fused SPV); the router then falls back to _matmulQ8Mmvq + AddKernel.
+    private readonly MatMulQ8_0MmvqResidualKernel? _matmulQ8MmvqResidual;
     // dp4a MMVQ decode path for Q4_K (issue #52) — null under the same
     // conditions as _matmulQ8Mmvq; reuses _quantizeQ8_1 + the Q8_1Xq/Xds
     // activation scratch. RecordMatmul falls back to the F32-in Q4_K GEMV.
@@ -207,6 +213,11 @@ public sealed class VulkanTransformerModel : IModel
     // F32-in Q8_0 GEMM for seqLen>1.
     private readonly QuantizeQ8_1RowsKernel? _quantizeQ8_1Rows;
     private readonly MatMulQ8_0MmqKernel? _matmulQ8Mmq;
+    // Residual-fused Q8_0 MMQ prefill GEMM (issue #379) — prefill analogue of
+    // _matmulQ8MmvqResidual. Null under the same conditions as _matmulQ8Mmq
+    // (plus a missing fused SPV); the router then falls back to
+    // _matmulQ8Mmq + AddKernel.
+    private readonly MatMulQ8_0MmqResidualKernel? _matmulQ8MmqResidual;
     private readonly MatMulQ4KMmqKernel? _matmulQ4KMmq;
     private readonly MatMulQ6KMmqKernel? _matmulQ6KMmq;
     private readonly MatMulQ5KMmqKernel? _matmulQ5KMmq;
@@ -863,6 +874,7 @@ public sealed class VulkanTransformerModel : IModel
         RmsNormMatmulQ8_0FusedKernel? rmsnormMatmulQ8Fused,
         RmsNormQuantizeQ8_1FusedKernel? rmsnormQuantQ8Fused,
         QuantizeQ8_1Kernel? quantizeQ8_1, MatMulQ8_0MmvqKernel? matmulQ8Mmvq,
+        MatMulQ8_0MmvqResidualKernel? matmulQ8MmvqResidual,
         MatMulQ4KMmvqKernel? matmulQ4KMmvq,
         MatMulQ6KMmvqKernel? matmulQ6KMmvq,
         MatMulQ5KMmvqKernel? matmulQ5KMmvq,
@@ -877,6 +889,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulIq3SMmvqKernel? matmulIq3SMmvq,
         MatMulIq1SMmvqKernel? matmulIq1SMmvq,
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows, MatMulQ8_0MmqKernel? matmulQ8Mmq,
+        MatMulQ8_0MmqResidualKernel? matmulQ8MmqResidual,
         MatMulQ4KMmqKernel? matmulQ4KMmq,
         MatMulQ6KMmqKernel? matmulQ6KMmq,
         MatMulQ5KMmqKernel? matmulQ5KMmq,
@@ -964,6 +977,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnormQuantQ8Fused = rmsnormQuantQ8Fused;
         _quantizeQ8_1 = quantizeQ8_1;
         _matmulQ8Mmvq = matmulQ8Mmvq;
+        _matmulQ8MmvqResidual = matmulQ8MmvqResidual;
         _matmulQ4KMmvq = matmulQ4KMmvq;
         _matmulQ6KMmvq = matmulQ6KMmvq;
         _matmulQ5KMmvq = matmulQ5KMmvq;
@@ -979,6 +993,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1SMmvq = matmulIq1SMmvq;
         _quantizeQ8_1Rows = quantizeQ8_1Rows;
         _matmulQ8Mmq = matmulQ8Mmq;
+        _matmulQ8MmqResidual = matmulQ8MmqResidual;
         _matmulQ4KMmq = matmulQ4KMmq;
         _matmulQ6KMmq = matmulQ6KMmq;
         _matmulQ5KMmq = matmulQ5KMmq;
@@ -1212,6 +1227,7 @@ public sealed class VulkanTransformerModel : IModel
         // (Q8_1Xq / Q8_1Xds) is only allocated when both kernels are live.
         QuantizeQ8_1Kernel? quantizeQ8_1 = null;
         MatMulQ8_0MmvqKernel? matmulQ8Mmvq = null;
+        MatMulQ8_0MmvqResidualKernel? matmulQ8MmvqResidual = null;
         MatMulQ4KMmvqKernel? matmulQ4KMmvq = null;
         MatMulQ6KMmvqKernel? matmulQ6KMmvq = null;
         MatMulQ5KMmvqKernel? matmulQ5KMmvq = null;
@@ -1223,6 +1239,11 @@ public sealed class VulkanTransformerModel : IModel
         {
             quantizeQ8_1 = QuantizeQ8_1Kernel.TryCreate(device, spvDir);
             matmulQ8Mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir);
+            // Residual-fused Q8_0 MMVQ (issue #379) — independent SPV load;
+            // missing it just disables the fusion, not the base MMVQ path.
+            matmulQ8MmvqResidual = matmulQ8Mmvq is not null
+                ? MatMulQ8_0MmvqResidualKernel.TryCreate(device, spvDir)
+                : null;
             // Q4_K MMVQ (issue #52) reuses quantizeQ8_1; it is an independent
             // weight-format path, so a missing Q4_K SPV must not disable Q8_0
             // MMVQ (and vice versa).
@@ -1247,6 +1268,7 @@ public sealed class VulkanTransformerModel : IModel
             {
                 quantizeQ8_1?.Dispose();
                 matmulQ8Mmvq?.Dispose();
+                matmulQ8MmvqResidual?.Dispose();
                 matmulQ4KMmvq?.Dispose();
                 matmulQ6KMmvq?.Dispose();
                 matmulQ5KMmvq?.Dispose();
@@ -1256,6 +1278,7 @@ public sealed class VulkanTransformerModel : IModel
                 matmulIq4XsMmvq?.Dispose();
                 quantizeQ8_1 = null;
                 matmulQ8Mmvq = null;
+                matmulQ8MmvqResidual = null;
                 matmulQ4KMmvq = null;
                 matmulQ6KMmvq = null;
                 matmulQ5KMmvq = null;
@@ -1282,6 +1305,7 @@ public sealed class VulkanTransformerModel : IModel
         // null => the router falls back to the coopmat / scalar Q8_0 GEMM.
         QuantizeQ8_1RowsKernel? quantizeQ8_1Rows = null;
         MatMulQ8_0MmqKernel? matmulQ8Mmq = null;
+        MatMulQ8_0MmqResidualKernel? matmulQ8MmqResidual = null;
         MatMulQ4KMmqKernel? matmulQ4KMmq = null;
         MatMulQ6KMmqKernel? matmulQ6KMmq = null;
         MatMulQ5KMmqKernel? matmulQ5KMmq = null;
@@ -1298,6 +1322,11 @@ public sealed class VulkanTransformerModel : IModel
                 // row-wise Q8_1 activation quantizer. Keep the quantizer if any
                 // MMQ kernel loaded (issue #340 adds Q4_K alongside Q8_0).
                 matmulQ8Mmq = MatMulQ8_0MmqKernel.TryCreate(device, spvDir);
+                // Residual-fused Q8_0 MMQ (issue #379) — independent SPV load;
+                // missing it just disables the fusion, not the base MMQ path.
+                matmulQ8MmqResidual = matmulQ8Mmq is not null
+                    ? MatMulQ8_0MmqResidualKernel.TryCreate(device, spvDir)
+                    : null;
                 matmulQ4KMmq = MatMulQ4KMmqKernel.TryCreate(device, spvDir);
                 matmulQ6KMmq = MatMulQ6KMmqKernel.TryCreate(device, spvDir);
                 matmulQ5KMmq = MatMulQ5KMmqKernel.TryCreate(device, spvDir);
@@ -1614,6 +1643,7 @@ public sealed class VulkanTransformerModel : IModel
             rmsnormMatmulQ8Fused,
             rmsnormQuantQ8Fused,
             quantizeQ8_1, matmulQ8Mmvq,
+            matmulQ8MmvqResidual,
             matmulQ4KMmvq,
             matmulQ6KMmvq,
             matmulQ5KMmvq,
@@ -1628,6 +1658,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulIq3SMmvq,
             matmulIq1SMmvq,
             quantizeQ8_1Rows, matmulQ8Mmq,
+            matmulQ8MmqResidual,
             matmulQ4KMmq,
             matmulQ6KMmq,
             matmulQ5KMmq,
@@ -2875,6 +2906,17 @@ public sealed class VulkanTransformerModel : IModel
             // gather's TRANSFER→COMPUTE on layer 0) has already made the
             // hidden-state writes visible to this rmsnorm.
 
+            // Issue #379: set when the o_proj / down_proj matmul below was
+            // fused directly with its residual add (single dispatch, wrote
+            // straight into AddScratch) — the shared residual-add code
+            // further down then skips the separate AddKernel dispatch for
+            // that half of the layer. Declared here (outer per-layer scope)
+            // because the matmul lives inside the MLA/Gemma4/GQA and
+            // MoE/dense-FFN branches below, but the shared residual-add code
+            // that needs to know about it sits after those branches close.
+            bool oProjFused = false;
+            bool downProjFused = false;
+
             if (lw.Mla is { } mlaW)
             {
                 // MLA (DeepSeek-V2/V3) attention block — projection ladder +
@@ -3047,15 +3089,31 @@ public sealed class VulkanTransformerModel : IModel
                 BarrierComputeToCompute(cmdBuf);
             }
 
-            // Output projection → NormOutput (reuse slot).
-            RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
-                lw.OOutputDim, lw.OInputDim, seqLen);
+            // Output projection → NormOutput (reuse slot). Issue #379: fuse
+            // the residual add directly into this matmul's final store when
+            // it qualifies (Q8_0, no bias / LoRA / Gemma post-attn-norm
+            // sitting between the raw matmul result and the residual add —
+            // any of those would mutate NormOutput before the add, which the
+            // fused kernel bypasses entirely by writing straight into
+            // AddScratch). Falls back to the standard matmul (+ bias +
+            // barrier) otherwise; the residual add itself happens in the
+            // shared code below either way.
+            oProjFused = lw.OBias is null && _currentLora is null && lw.PostAttnNormWeight is null
+                && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.O, lw.ODeviceQuantType,
+                    _state.AttnOutput, _state.Residual, _state.AddScratch,
+                    lw.OOutputDim, lw.OInputDim, seqLen);
 
-            BarrierComputeToCompute(cmdBuf);
-            if (lw.OBias is not null)
+            if (!oProjFused)
             {
-                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
+                RecordMatmul(cmdBuf, lw.O, lw.ODeviceQuantType, _state.AttnOutput, _state.NormOutput,
+                    lw.OOutputDim, lw.OInputDim, seqLen);
+
                 BarrierComputeToCompute(cmdBuf);
+                if (lw.OBias is not null)
+                {
+                    _biasAdd.Record(cmdBuf, _state.NormOutput, lw.OBias, seqLen, lw.OOutputDim);
+                    BarrierComputeToCompute(cmdBuf);
+                }
             }
 
             // LoRA delta (o_proj): y += scale * (attnOut · B) · A.
@@ -3086,7 +3144,10 @@ public sealed class VulkanTransformerModel : IModel
             // HiddenState — no copies, just a label swap. The single
             // ComputeToComputeBarrier covers the shader_write→shader_read
             // ordering the FFN rmsnorm needs to see the new hidden state.
-            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+            // Issue #379: skipped entirely when oProjFused already wrote
+            // Residual + matmul(...) straight into AddScratch above.
+            if (!oProjFused)
+                _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
             BarrierComputeToCompute(cmdBuf);
             ProfSample("norm_resid");
@@ -3187,15 +3248,26 @@ public sealed class VulkanTransformerModel : IModel
                 BarrierComputeToCompute(cmdBuf);
             }
 
-            // Down projection
-            RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
-                lw.DownOutputDim, lw.DownInputDim, seqLen);
+            // Down projection. Issue #379: fuse the residual add directly
+            // into this matmul's final store under the same qualification
+            // rules as the o_proj site above (Q8_0, no bias / LoRA / Gemma
+            // post-ffn-norm in between).
+            downProjFused = lw.DownBias is null && _currentLora is null && lw.PostFfnNormWeight is null
+                && TryRecordMatmulWithResidualQ8_0(cmdBuf, lw.Down, lw.DownDeviceQuantType,
+                    _state.SiluOutput, _state.Residual, _state.AddScratch,
+                    lw.DownOutputDim, lw.DownInputDim, seqLen);
 
-            BarrierComputeToCompute(cmdBuf);
-            if (lw.DownBias is not null)
+            if (!downProjFused)
             {
-                _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
+                RecordMatmul(cmdBuf, lw.Down, lw.DownDeviceQuantType, _state.SiluOutput, _state.NormOutput,
+                    lw.DownOutputDim, lw.DownInputDim, seqLen);
+
                 BarrierComputeToCompute(cmdBuf);
+                if (lw.DownBias is not null)
+                {
+                    _biasAdd.Record(cmdBuf, _state.NormOutput, lw.DownBias, seqLen, lw.DownOutputDim);
+                    BarrierComputeToCompute(cmdBuf);
+                }
             }
 
             // LoRA delta (down_proj): y += scale * (siluOut · B) · A.
@@ -3223,8 +3295,10 @@ public sealed class VulkanTransformerModel : IModel
             // Residual add #2: AddScratch = Residual + NormOutput; then rotate
             // the slot so the new hidden state lives in the buffer we just
             // wrote. See residual add #1 comment above for why no copy is
-            // needed.
-            _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
+            // needed. Issue #379: skipped when downProjFused already wrote
+            // Residual + matmul(...) straight into AddScratch above.
+            if (!downProjFused)
+                _add.Record(cmdBuf, _state.Residual, _state.NormOutput, _state.AddScratch, seqLen * hiddenSize);
             _state.RotateHiddenSlot();
             ProfSample("norm_resid");
             DpStamp(cmdBuf, DpCatResid);
@@ -3551,6 +3625,7 @@ public sealed class VulkanTransformerModel : IModel
         _rmsnormQuantQ8Fused?.InvalidateDescriptorCache();
         _quantizeQ8_1?.InvalidateDescriptorCache();
         _matmulQ8Mmvq?.InvalidateDescriptorCache();
+        _matmulQ8MmvqResidual?.InvalidateDescriptorCache();
         _matmulQ4KMmvq?.InvalidateDescriptorCache();
         _matmulQ6KMmvq?.InvalidateDescriptorCache();
         _matmulQ5KMmvq?.InvalidateDescriptorCache();
@@ -3566,6 +3641,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq1SMmvq?.InvalidateDescriptorCache();
         _quantizeQ8_1Rows?.InvalidateDescriptorCache();
         _matmulQ8Mmq?.InvalidateDescriptorCache();
+        _matmulQ8MmqResidual?.InvalidateDescriptorCache();
         _matmulQ4KMmq?.InvalidateDescriptorCache();
         _matmulQ6KMmq?.InvalidateDescriptorCache();
         _matmulQ5KMmq?.InvalidateDescriptorCache();
@@ -5392,6 +5468,64 @@ public sealed class VulkanTransformerModel : IModel
         }
     }
 
+    /// <summary>
+    /// Issue #379: attempts a single fused dispatch that computes
+    /// <c>output = matmul(weights, input) + residual</c> for Q8_0 weights,
+    /// replacing the (RecordMatmul → barrier → AddKernel) triple at
+    /// residual-connection call sites (o_proj, down_proj). Returns
+    /// <c>false</c> when the quant type isn't Q8_0 or the fused kernels /
+    /// activation scratch aren't wired — callers must fall back to the
+    /// unfused RecordMatmul + AddKernel pair in that case. Only called at
+    /// sites that have already confirmed no bias / no LoRA delta / no
+    /// intervening in-place norm applies to this projection's output, so the
+    /// residual is the ONLY transform between the raw matmul result and the
+    /// value that would have been added — required for the fused store's
+    /// bit-exact-vs-unfused guarantee to hold.
+    /// </summary>
+    private bool TryRecordMatmulWithResidualQ8_0(
+        nint cmdBuf,
+        VulkanDevice.Buffer weights, QuantType weightQt,
+        VulkanDevice.Buffer input, VulkanDevice.Buffer residual, VulkanDevice.Buffer output,
+        int outputDim, int inputDim, int seqLen)
+    {
+        if (weightQt != QuantType.Q8_0)
+            return false;
+
+        if (seqLen == 1)
+        {
+            if (_matmulQ8MmvqResidual is null || _quantizeQ8_1 is null
+                || _state.Q8_1Xq is null || _state.Q8_1Xds is null
+                || (inputDim % QuantizeQ8_1Kernel.GroupSize) != 0
+                || QuantizeQ8_1Kernel.PackedBytes(inputDim) > _state.Q8_1Xq.Size
+                || QuantizeQ8_1Kernel.ScaleBytes(inputDim) > _state.Q8_1Xds.Size)
+            {
+                return false;
+            }
+
+            _quantizeQ8_1.Record(cmdBuf, input, _state.Q8_1Xq, _state.Q8_1Xds, inputDim);
+            BarrierComputeToCompute(cmdBuf);
+            _matmulQ8MmvqResidual.Record(cmdBuf, weights, _state.Q8_1Xq, _state.Q8_1Xds, residual, output,
+                m: outputDim, k: inputDim);
+            return true;
+        }
+
+        if (_matmulQ8MmqResidual is null || _quantizeQ8_1Rows is null
+            || _state.Q8_1XqRows is null || _state.Q8_1XdsRows is null
+            || (inputDim % QuantizeQ8_1RowsKernel.GroupSize) != 0
+            || QuantizeQ8_1RowsKernel.PackedBytes(seqLen, inputDim) > _state.Q8_1XqRows.Size
+            || QuantizeQ8_1RowsKernel.ScaleBytes(seqLen, inputDim) > _state.Q8_1XdsRows.Size)
+        {
+            return false;
+        }
+
+        _quantizeQ8_1Rows.Record(cmdBuf, input, _state.Q8_1XqRows, _state.Q8_1XdsRows,
+            n: seqLen, k: inputDim);
+        BarrierComputeToCompute(cmdBuf);
+        _matmulQ8MmqResidual.Record(cmdBuf, weights, _state.Q8_1XqRows, _state.Q8_1XdsRows, residual, output,
+            m: outputDim, k: inputDim, n: seqLen);
+        return true;
+    }
+
     private void RecordMatmul(
         nint cmdBuf,
         VulkanDevice.Buffer weights, QuantType weightQt,
@@ -6191,6 +6325,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulQ2KGemm.Dispose();
         _matmulQ2K.Dispose();
         _matmulQ8Mmq?.Dispose();
+        _matmulQ8MmqResidual?.Dispose();
         _matmulQ4KMmq?.Dispose();
         _matmulQ6KMmq?.Dispose();
         _matmulQ5KMmq?.Dispose();
@@ -6214,6 +6349,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq3SMmvq?.Dispose();
         _matmulIq1SMmvq?.Dispose();
         _matmulQ8Mmvq?.Dispose();
+        _matmulQ8MmvqResidual?.Dispose();
         _quantizeQ8_1?.Dispose();
         _matmulQ8GemmCoopmat?.Dispose();
         _matmulQ8Gemm.Dispose();
