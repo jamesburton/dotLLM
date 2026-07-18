@@ -244,6 +244,24 @@ public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCac
             _currentLength = newLength;
     }
 
+    /// <summary>
+    /// Validates <paramref name="positions"/> and advances <see cref="CurrentLength"/> as if
+    /// <see cref="RecordUpdate"/> had run, WITHOUT recording any copy commands. Used by the
+    /// fused RoPE+KV-write path (<c>RopeKvWriteF32Kernel</c>, issue #380), which writes cache
+    /// rows directly via its own compute dispatch instead of going through <see cref="RecordUpdate"/>'s
+    /// <c>vkCmdCopyBuffer</c> calls, but still needs the same length-tracking side effect.
+    /// </summary>
+    internal void AdvanceCurrentLength(ReadOnlySpan<int> positions, int seqLen)
+    {
+        if (positions.Length != seqLen)
+            throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+
+        int maxPos = ValidateAndFindMaxPos(positions, seqLen);
+        int newLength = maxPos + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
     private int ValidateAndFindMaxPos(ReadOnlySpan<int> positions, int seqLen)
     {
         int maxPos = -1;
