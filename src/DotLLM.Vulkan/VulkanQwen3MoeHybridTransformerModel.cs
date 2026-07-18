@@ -104,6 +104,10 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
     private readonly VulkanQwen3MoeMoeUpload.LayerBundle?[] _residentMoeBundles;
     private readonly bool _residentMoeEnabled;
 
+    // #383: opt-in dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks —
+    // see the constructor assignment for rollout rationale.
+    private readonly bool _moeIndexedMmqEnabled;
+
     // CPU/GPU per-layer MoE expert placement (#370, llama.cpp `--n-cpu-moe`
     // shorthand equivalent): _cpuMoeLayer[i] == true means layer i's routed
     // expert compute runs entirely on the CPU (Cpu/Kernels/MoeSwiGluMlp.cs)
@@ -206,6 +210,12 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         _residentMoeEnabled =
             string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_RESIDENT"), "1", StringComparison.Ordinal);
         _residentMoeBundles = new VulkanQwen3MoeMoeUpload.LayerBundle?[cpuLayers.Length];
+        // #383: dp4a indexed-matmul MMQ for Q4_K-resident gate/up banks, opt-in
+        // pending real-model perf validation (same cautious rollout as prior new
+        // MMQ kernels, e.g. #344's gated IQ2_XXS path) -- flip the default once
+        // measured safe/fast on real hardware.
+        _moeIndexedMmqEnabled =
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VK_MOE_INDEXED_MMQ"), "1", StringComparison.Ordinal);
 
         int n = Math.Clamp(nCpuMoeLayers, 0, cpuLayers.Length);
         NCpuMoeLayers = n;
@@ -1316,12 +1326,43 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         //       F32 banks  → MoeIndexedMatmul (plain F32 dot)
         //       Q6_K/Q4_K/Q5_K banks → the matching per-row-dequant kernel
         //    See VulkanQwen3MoeMoeUpload remarks for the residency caveat.
-        RecordIndexedMoeMatmul(cmdBuf, moeW.W1QuantType,
-            moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
-        RecordIndexedMoeMatmul(cmdBuf, moeW.W3QuantType,
-            moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
-            m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        //
+        // #383: when both gate/up banks are Q4_K-resident and the dp4a MMQ kernel
+        // is available, quantize MoeExpandedInput to Q8_1 ONCE (gate and up share
+        // the same activation row + K=hidden) and route both through the dp4a
+        // indexed matmul instead of the scalar per-element kernel. Down (K=
+        // intermediate, a different activation buffer) isn't covered by this pass
+        // — it stays on its own resolved-bank kernel (Q5_K for the cached
+        // UD-Q4_K_XL checkpoint, no MMQ variant wired for that bank yet).
+        bool useGateUpMmq = _moeIndexedMmqEnabled
+            && _kernels.MoeIndexedMatmulQ4KMmq is not null
+            && moeW.W1QuantType == QuantizationType.Q4_K
+            && moeW.W3QuantType == QuantizationType.Q4_K
+            && (hidden % MoeIndexedMatmulQ4KMmqKernel.Q4_KGroupSize) == 0;
+        if (useGateUpMmq)
+        {
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
+                _state.MoeExpandedInput, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                n: expandedRows, k: hidden);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.MoeIndexedMatmulQ4KMmq!.Record(cmdBuf,
+                moeW.W1Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeGateInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            _kernels.MoeIndexedMatmulQ4KMmq!.Record(cmdBuf,
+                moeW.W3Bank, _state.MoeExpandedInputXq, _state.MoeExpandedInputXds,
+                _state.MoeTopkIndices, _state.MoeUpInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W1QuantType,
+                moeW.W1Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeGateInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W3QuantType,
+                moeW.W3Bank, _state.MoeExpandedInput, _state.MoeTopkIndices, _state.MoeUpInter,
+                m: interm, k: hidden, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 5. SwiGLU: silu(gate) * up

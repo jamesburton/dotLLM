@@ -74,6 +74,13 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
     public VulkanDevice.Buffer MoeTopkIndices { get; private set; } = null!;
     public VulkanDevice.Buffer MoeTopkWeights { get; private set; } = null!;
     public VulkanDevice.Buffer MoeExpandedInput { get; private set; } = null!;
+    // #383: Q8_1-quantized copy of MoeExpandedInput, feeding the dp4a MMQ indexed
+    // matmul (MoeIndexedMatmulQ4KMmqKernel) for gate/up when the bank resolves to
+    // Q4_K-resident. Sized for K=hiddenSize (gate/up's contraction dim); the down
+    // matmul's K=intermediate isn't covered yet (down currently stays on the
+    // scalar F32 kernel — Q5_K MMQ variant not implemented).
+    public VulkanDevice.Buffer MoeExpandedInputXq { get; private set; } = null!;
+    public VulkanDevice.Buffer MoeExpandedInputXds { get; private set; } = null!;
     public VulkanDevice.Buffer MoeGateInter { get; private set; } = null!;
     public VulkanDevice.Buffer MoeUpInter { get; private set; } = null!;
     public VulkanDevice.Buffer MoeSiluInter { get; private set; } = null!;
@@ -186,6 +193,11 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         MoeTopkIndices = _device.AllocateDeviceLocal(topkIdxBytes);
         MoeTopkWeights = _device.AllocateDeviceLocal(topkWBytes);
         MoeExpandedInput = _device.AllocateDeviceLocal(expandBytes);
+        long expandedRows = (long)seqLen * _moeTopK;
+        long xqBytes = Math.Max(4L, expandedRows * (_hiddenSize / 4) * sizeof(uint));
+        long xdsBytes = Math.Max(8L, expandedRows * (_hiddenSize / 32) * 2 * sizeof(float));
+        MoeExpandedInputXq = _device.AllocateDeviceLocal(xqBytes);
+        MoeExpandedInputXds = _device.AllocateDeviceLocal(xdsBytes);
         MoeGateInter = _device.AllocateDeviceLocal(interBytes);
         MoeUpInter = _device.AllocateDeviceLocal(interBytes);
         MoeSiluInter = _device.AllocateDeviceLocal(interBytes);
@@ -205,7 +217,7 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         _capacitySeqLen = seqLen;
         AllocatedBytes = hiddenBytes * 4 + qBytes * 3 + kvBytes * 2 + 2 * (long)seqLen * _qElems * sizeof(float)
             + convInputBytes + convBytes + vDimBytes * 3 + kDimBytes * 2 + alphaBytes * 2
-            + routerBytes + topkIdxBytes + topkWBytes + expandBytes + interBytes * 3 + downRowsBytes
+            + routerBytes + topkIdxBytes + topkWBytes + expandBytes + xqBytes + xdsBytes + interBytes * 3 + downRowsBytes
             + hiddenBytes * 3 + sharedInterBytes * 3 + sharedGateLogitBytes
             + (long)_vocabSize * sizeof(float) + (long)seqLen * sizeof(int)
             + (long)(_gdnKDim * 2 + _gdnVDim * 2 + _nVHead * 2) * sizeof(float);
@@ -221,6 +233,7 @@ internal sealed class VulkanQwen3MoeHybridForwardState : IDisposable
         GdnQBuf?.Dispose(); GdnKBuf?.Dispose(); GdnVBuf?.Dispose(); GdnOut?.Dispose();
         MoeRouterLogits?.Dispose(); MoeTopkIndices?.Dispose(); MoeTopkWeights?.Dispose();
         MoeExpandedInput?.Dispose();
+        MoeExpandedInputXq?.Dispose(); MoeExpandedInputXds?.Dispose();
         MoeGateInter?.Dispose(); MoeUpInter?.Dispose(); MoeSiluInter?.Dispose(); MoeDownRows?.Dispose();
         MoeSharedInput?.Dispose(); MoeSharedGate?.Dispose(); MoeSharedUp?.Dispose();
         MoeSharedSilu?.Dispose(); MoeSharedSumA?.Dispose(); MoeSharedSumB?.Dispose();

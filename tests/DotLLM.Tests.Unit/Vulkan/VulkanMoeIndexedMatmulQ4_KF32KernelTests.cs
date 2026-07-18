@@ -79,8 +79,10 @@ public sealed class VulkanMoeIndexedMatmulQ4_KF32KernelTests
     /// <summary>
     /// CPU reference: per-row Q4_K dequant + dot-product against x. Reads the
     /// same bytes the GPU shader sees from the bank slab of the routed expert.
+    /// Internal (not private) so <see cref="VulkanMoeIndexedMatmulQ4KMmqKernelTests"/>
+    /// can reuse the same F32-in oracle to validate the dp4a variant's tolerance.
     /// </summary>
-    private static unsafe float[] CpuIndexedMatmulQ4K(
+    internal static unsafe float[] CpuIndexedMatmulQ4K(
         byte[] bankQ4K, float[] x, int[] indices, int m, int k, int n, int numExperts)
     {
         int blocksPerRow = k / Q4KFixture.Q4KGroupSize;
