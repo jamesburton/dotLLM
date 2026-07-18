@@ -33,12 +33,15 @@ Hosts: `strix-halo` (Radeon 8060S gfx1151, Vulkan), `t5500` (RTX 3060, CUDA),
 ## Reading the matrix (as of 2026-07-18, strix-halo Vulkan)
 
 - Decode: dotLLM ≈ 0.55–0.85× llama.cpp on dense (SmolLM now EXCEEDS fresh llama.cpp,
-  3B 0.85×, 8B 0.70×); 26B MoE 0.72× after #137; 35B-A3B MoE ≈ 0.21–0.24× (resident-MoE,
-  #372, 2026-07-18 fresh comparator).
+  3B 0.85×, 8B 0.70×); 26B MoE 0.72× after #137; 35B-A3B MoE ≈ 0.32× (resident-MoE +
+  #383 gate/up/down dp4a MMQ, opt-in `DOTLLM_VK_MOE_INDEXED_MMQ=1`, up from 0.21×
+  pre-fix).
 - Prefill: dotLLM ≈ 0.71–0.79× llama.cpp on dense after #139/#366/#367/#378-380 (was
-  0.10×); 35B-A3B MoE ≈ 0.022–0.023× — now the single biggest gap in the whole matrix.
-  Root cause: MoE prefill has no dp4a indexed-MMQ kernel (scalar F32 only), unlike dense
-  models' register-tiled MMQ or MoE decode's MMVQ path — the next campaign target.
+  0.10×); 35B-A3B MoE ≈ 0.06× after #383's dp4a MMQ (up from 0.023× pre-fix, still the
+  single biggest gap in the whole matrix). #383 swapped the scalar per-cell MoE indexed
+  matmul for the same dp4a math dense models' register-tiled MMQ uses, keeping the
+  one-thread-per-cell dispatch shape (no expert-grouping architecture change) — real
+  fix (llama.cpp-style expert-grouped register-tiled MMQ) remains open, tracked in #383.
 - ollama ≈ 0.8× llama.cpp decode at equal settings (its own overhead); llama.cpp at
   optimum flags is the reference target everywhere.
 - Qwen3.6-35B-A3B specifically: real end-to-end prefill+decode numbers only exist since
