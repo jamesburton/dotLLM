@@ -30,9 +30,17 @@ Hosts: `strix-halo` (Radeon 8060S gfx1151, Vulkan), `t5500` (RTX 3060, CUDA),
 - ollama rows exist only on strix-halo.
 - CPU-backend rows are functional smoke numbers, not tuned measurements.
 
-## Reading the matrix (as of 2026-07-16, strix-halo Vulkan)
+## Reading the matrix (as of 2026-07-18, strix-halo Vulkan)
 
-- Decode: dotLLM ≈ 0.55–0.72× llama.cpp (dense 0.55–0.57×; 26B MoE 0.72× after #137).
-- Prefill: dotLLM ≈ 0.10× llama.cpp on dense — the dominant gap (#139 in flight).
+- Decode: dotLLM ≈ 0.55–0.85× llama.cpp on dense (SmolLM now EXCEEDS fresh llama.cpp,
+  3B 0.85×, 8B 0.70×); 26B MoE 0.72× after #137; 35B-A3B MoE ≈ 0.21–0.24× (resident-MoE,
+  #372, 2026-07-18 fresh comparator).
+- Prefill: dotLLM ≈ 0.71–0.79× llama.cpp on dense after #139/#366/#367/#378-380 (was
+  0.10×); 35B-A3B MoE ≈ 0.022–0.023× — now the single biggest gap in the whole matrix.
+  Root cause: MoE prefill has no dp4a indexed-MMQ kernel (scalar F32 only), unlike dense
+  models' register-tiled MMQ or MoE decode's MMVQ path — the next campaign target.
 - ollama ≈ 0.8× llama.cpp decode at equal settings (its own overhead); llama.cpp at
   optimum flags is the reference target everywhere.
+- Qwen3.6-35B-A3B specifically: real end-to-end prefill+decode numbers only exist since
+  2026-07-18 (issue #373's VK_ERROR_DEVICE_LOST at prefill>2 tokens closed
+  cannot-reproduce — see `.docs/KERNEL_MAP.md` §7).
