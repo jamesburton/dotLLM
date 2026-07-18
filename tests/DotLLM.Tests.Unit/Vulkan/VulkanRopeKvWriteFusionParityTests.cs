@@ -212,10 +212,15 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         for (int i = 0; i < seqLen; i++) positions[i] = positionOffset + i;
 
         // CPU reference (Norm/interleaved) via scalar path using pre-computed tables —
-        // same oracle VulkanRopeF32KernelTests uses.
-        float[] cosTable = new float[seqLen * halfDim];
-        float[] sinTable = new float[seqLen * halfDim];
-        RoPE.PrecomputeFrequencyTableScalar(seqLen, headDim, theta, cosTable, sinTable);
+        // same oracle VulkanRopeF32KernelTests uses. RoPE.ExecuteScalar indexes the
+        // table by ABSOLUTE position (positions[t], not t), so the table must cover
+        // [0, positionOffset+seqLen) — sizing it to seqLen alone (as the zero-offset
+        // callers can get away with) throws ArgumentOutOfRangeException once
+        // positionOffset > 0.
+        int tableLen = positionOffset + seqLen;
+        float[] cosTable = new float[tableLen * halfDim];
+        float[] sinTable = new float[tableLen * halfDim];
+        RoPE.PrecomputeFrequencyTableScalar(tableLen, headDim, theta, cosTable, sinTable);
 
         float[] qExpected = (float[])q.Clone();
         float[] kExpectedRotated = (float[])k.Clone();
