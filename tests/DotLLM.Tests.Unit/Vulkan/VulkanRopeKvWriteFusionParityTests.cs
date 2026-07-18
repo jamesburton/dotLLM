@@ -169,13 +169,175 @@ public sealed class VulkanRopeKvWriteFusionParityTests
     ///   </item>
     /// </list>
     /// </remarks>
-    [Fact(Skip = "Scaffold only — no fused Vulkan RoPE+KV-write kernel exists yet. " +
-                  "Fill in against a RopeKvWriteF32Kernel (rope_kv_write_f32.comp) once implemented; " +
-                  "see the remarks above and on the containing class for the exact contract/oracle.")]
-    public void FusedRopeKvWrite_MatchesTwoDispatchBaseline()
+    private const float AbsTol = 1e-4f;
+    private const float RelTol = 1e-3f;
+
+    /// <summary>
+    /// Bit-for-bit (within the standard RoPE tolerance) parity between the fused
+    /// <see cref="RopeKvWriteF32Kernel"/> single dispatch and the CURRENT two-dispatch
+    /// path (<see cref="RopeF32Kernel"/> + <see cref="VulkanKvCache.RecordUpdate"/>) run
+    /// side by side against independent cache instances. Also spot-checks against the CPU
+    /// <see cref="RoPE.ExecuteScalar"/> oracle for Q/K, exactly as <c>VulkanRopeF32KernelTests</c>
+    /// does, plus a byte-for-byte V-cache-row check.
+    /// </summary>
+    [SkippableTheory]
+    // (seqLen, numHeads, numKvHeads, headDim, theta, positionOffset) — decode (seqLen=1),
+    // short/long prefill (contiguous positions), GQA and MHA, Llama-3 theta, and a non-zero
+    // positionOffset case (append past an already-populated cache prefix, matching a
+    // continuing-decode call).
+    [InlineData(1, 9, 3, 64, 10000f, 0)]     // decode, SmolLM-135M GQA shape
+    [InlineData(1, 9, 3, 64, 10000f, 17)]    // decode continuing at position 17 (non-zero offset)
+    [InlineData(4, 2, 2, 64, 10000f, 0)]     // short prefill, MHA
+    [InlineData(4, 9, 3, 64, 10000f, 0)]     // short prefill, GQA
+    [InlineData(256, 9, 3, 64, 10000f, 0)]   // long prefill, GQA — SmolLM-135M prefill shape
+    [InlineData(1, 32, 8, 128, 500000f, 0)]  // decode, Llama-3 style theta
+    [InlineData(8, 4, 2, 64, 10000f, 5)]     // prefill continuing at a non-zero cache offset
+    public void FusedRopeKvWrite_MatchesTwoDispatchBaseline(
+        int seqLen, int numHeads, int numKvHeads, int headDim, float theta, int positionOffset)
     {
-        // Intentionally empty — see [Fact(Skip=...)] reason and XML remarks above
-        // for the contract this test should assert once a fused kernel exists.
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+        Skip.IfNot(
+            RopeKvWriteF32Kernel.IsAvailable(spvDir),
+            "rope_kv_write_f32.spv not built — run native/vulkan/build.ps1.");
+
+        int ropeDim = headDim; // rotate the full head
+        int halfDim = ropeDim / 2;
+        int maxSeqLen = positionOffset + seqLen + 1;
+
+        var rng = new Random(0x380F0 + seqLen * 13 + numHeads * 7 + headDim + positionOffset);
+        float[] q = RandomFloats(rng, seqLen * numHeads * headDim);
+        float[] k = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        float[] v = RandomFloats(rng, seqLen * numKvHeads * headDim);
+        int[] positions = new int[seqLen];
+        for (int i = 0; i < seqLen; i++) positions[i] = positionOffset + i;
+
+        // CPU reference (Norm/interleaved) via scalar path using pre-computed tables —
+        // same oracle VulkanRopeF32KernelTests uses. RoPE.ExecuteScalar indexes the
+        // table by ABSOLUTE position (positions[t], not t), so the table must cover
+        // [0, positionOffset+seqLen) — sizing it to seqLen alone (as the zero-offset
+        // callers can get away with) throws ArgumentOutOfRangeException once
+        // positionOffset > 0.
+        int tableLen = positionOffset + seqLen;
+        float[] cosTable = new float[tableLen * halfDim];
+        float[] sinTable = new float[tableLen * halfDim];
+        RoPE.PrecomputeFrequencyTableScalar(tableLen, headDim, theta, cosTable, sinTable);
+
+        float[] qExpected = (float[])q.Clone();
+        float[] kExpectedRotated = (float[])k.Clone();
+        RoPE.ExecuteScalar(
+            qExpected.AsSpan(), kExpectedRotated.AsSpan(), positions,
+            numHeads, numKvHeads, headDim, ropeDim,
+            cosTable, sinTable);
+
+        using var device = VulkanDevice.Create();
+
+        int qElems = seqLen * numHeads * headDim;
+        int kElems = seqLen * numKvHeads * headDim;
+        int kvStride = numKvHeads * headDim;
+
+        // ── Baseline: unfused RopeF32Kernel + VulkanKvCache.RecordUpdate, on its own cache. ──
+        using var ropeKernel = RopeF32Kernel.Create(device, spvDir);
+        using var bufQBaseline = device.Allocate((long)qElems * sizeof(float));
+        using var bufKBaseline = device.Allocate((long)kElems * sizeof(float));
+        using var bufVBaseline = device.Allocate((long)kElems * sizeof(float));
+        using var bufPos = device.Allocate((long)seqLen * sizeof(int));
+        var kvCacheBaseline = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
+
+        device.Upload(q.AsSpan(), bufQBaseline);
+        device.Upload(k.AsSpan(), bufKBaseline);
+        device.Upload(v.AsSpan(), bufVBaseline);
+        device.Upload(System.Runtime.InteropServices.MemoryMarshal.AsBytes(positions.AsSpan()), bufPos);
+
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            ropeKernel.Record(ctx.CommandBuffer, bufQBaseline, bufKBaseline, bufPos,
+                seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                headDim: headDim, ropeDim: ropeDim, theta: theta,
+                variant: RopeF32Kernel.Variant.Norm);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            kvCacheBaseline.RecordUpdate(ctx.CommandBuffer, bufKBaseline, bufVBaseline, positions, seqLen, layerIndex: 0);
+            KernelSupport.TransferToComputeBarrier(ctx.CommandBuffer);
+            ctx.SubmitAndWait();
+        }
+
+        float[] qBaselineActual = new float[qElems];
+        device.Download(bufQBaseline, qBaselineActual);
+        float[] kCacheBaseline = new float[maxSeqLen * kvStride];
+        float[] vCacheBaseline = new float[maxSeqLen * kvStride];
+        device.Download(kvCacheBaseline.GetKeysBuffer(0), kCacheBaseline);
+        device.Download(kvCacheBaseline.GetValuesBuffer(0), vCacheBaseline);
+
+        // ── Fused: RopeKvWriteF32Kernel, on an independent cache. ──
+        using var fusedKernel = RopeKvWriteF32Kernel.Create(device, spvDir);
+        using var bufQFused = device.Allocate((long)qElems * sizeof(float));
+        using var bufKFused = device.Allocate((long)kElems * sizeof(float));
+        using var bufVFused = device.Allocate((long)kElems * sizeof(float));
+        var kvCacheFused = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
+
+        device.Upload(q.AsSpan(), bufQFused);
+        device.Upload(k.AsSpan(), bufKFused);
+        device.Upload(v.AsSpan(), bufVFused);
+
+        using (var ctx = device.CreateSubmitContext())
+        {
+            ctx.Begin();
+            fusedKernel.Record(ctx.CommandBuffer,
+                bufQFused, bufKFused, bufVFused, bufPos,
+                kvCacheFused.GetKeysBuffer(0), kvCacheFused.GetValuesBuffer(0),
+                startPos: positionOffset, kvStride: kvStride,
+                seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                headDim: headDim, ropeDim: ropeDim, theta: theta,
+                variant: RopeF32Kernel.Variant.Norm);
+            KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+            ctx.SubmitAndWait();
+        }
+        kvCacheFused.AdvanceCurrentLength(positions, seqLen);
+
+        float[] qFusedActual = new float[qElems];
+        device.Download(bufQFused, qFusedActual);
+        float[] kCacheFused = new float[maxSeqLen * kvStride];
+        float[] vCacheFused = new float[maxSeqLen * kvStride];
+        device.Download(kvCacheFused.GetKeysBuffer(0), kCacheFused);
+        device.Download(kvCacheFused.GetValuesBuffer(0), vCacheFused);
+
+        // Q: fused kernel vs CPU oracle AND vs the unfused baseline's Q output.
+        AssertClose(qExpected, qFusedActual, "Q vs CPU oracle");
+        AssertClose(qBaselineActual, qFusedActual, "Q fused vs unfused baseline");
+
+        // K-cache: fused kernel's cache rows vs the unfused baseline's cache rows
+        // (both already contain the SAME rotated K — the CPU oracle for K was computed
+        // above into kExpectedRotated but is not directly indexed against cache rows
+        // here since the baseline path already validates that mapping via VulkanRopeF32KernelTests).
+        AssertClose(kCacheBaseline, kCacheFused, "K-cache fused vs unfused baseline");
+
+        // Spot-check K-cache rows against the CPU oracle directly (rotated K values written at
+        // [positionOffset + t, :]).
+        for (int t = 0; t < seqLen; t++)
+        {
+            int cacheRow = positionOffset + t;
+            for (int e = 0; e < kvStride; e++)
+            {
+                float expected = kExpectedRotated[t * kvStride + e];
+                float actual = kCacheFused[cacheRow * kvStride + e];
+                float diff = MathF.Abs(expected - actual);
+                float rel = diff / MathF.Max(MathF.Abs(expected), 1e-7f);
+                Assert.True(diff <= AbsTol || rel <= RelTol,
+                    $"K-cache[{cacheRow},{e}]: expected {expected}, actual {actual} (diff={diff}, rel={rel})");
+            }
+        }
+
+        // V-cache: zero-tolerance copy check — fused vs unfused baseline, AND fused vs the
+        // raw V source (no rotation should ever touch V).
+        Assert.Equal(vCacheBaseline, vCacheFused);
+        for (int t = 0; t < seqLen; t++)
+        {
+            int cacheRow = positionOffset + t;
+            for (int e = 0; e < kvStride; e++)
+            {
+                Assert.Equal(v[t * kvStride + e], vCacheFused[cacheRow * kvStride + e]);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -310,5 +472,35 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         // trivially fail; we don't assert a specific latency bound since iGPU
         // clocks vary run-to-run (see vulkan-perf-ab-clock-ramp-confound memory).
         Assert.True(usPerIter > 0, "Timed loop should report positive elapsed time.");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+
+    private static float[] RandomFloats(Random rng, int count)
+    {
+        var arr = new float[count];
+        for (int i = 0; i < count; i++)
+            arr[i] = (float)(rng.NextDouble() * 2.0 - 1.0); // [-1, 1]
+        return arr;
+    }
+
+    private static void AssertClose(float[] expected, float[] actual, string tensorName)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int errors = 0;
+        float maxAbs = 0, maxRel = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float e = expected[i];
+            float a = actual[i];
+            float diff = MathF.Abs(e - a);
+            float rel = diff / MathF.Max(MathF.Abs(e), 1e-7f);
+            if (diff > maxAbs) maxAbs = diff;
+            if (rel > maxRel) maxRel = rel;
+            if (diff > AbsTol && rel > RelTol) errors++;
+        }
+        Assert.True(errors == 0,
+            $"{tensorName}: Numerical drift exceeded tolerance: " +
+            $"errors={errors}/{expected.Length}, maxAbs={maxAbs:G9}, maxRel={maxRel:G9}");
     }
 }

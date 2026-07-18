@@ -598,6 +598,12 @@ public sealed class VulkanTransformerModel : IModel
 
     private readonly RmsNormF32Kernel _rmsnorm;
     private readonly RopeF32Kernel _rope;
+    // Fused RoPE + KV-cache-write (issue #380, Vulkan port of CudaTransformerModel's
+    // FusedRopeAndUpdateDevice). Null when rope_kv_write_f32.spv is missing (older SPV
+    // dir) — the forward loop falls back to the unfused _rope + VulkanKvCache.RecordUpdate
+    // pair. Only engaged for a plain VulkanKvCache destination with contiguous positions;
+    // TurboQuant / MLA / non-contiguous batched writes always use the unfused path.
+    private readonly RopeKvWriteF32Kernel? _ropeKvWrite;
     private readonly AttentionF32Kernel _attention;
     /// <summary>
     /// Flash-Attention F32 kernel for the GQA prefill path (seqQ &gt; 1). Null
@@ -898,7 +904,7 @@ public sealed class VulkanTransformerModel : IModel
         MatMulQ2KMmqKernel? matmulQ2KMmq,
         MatMulQ3KMmqKernel? matmulQ3KMmq,
         MatMulIq2XxsMmqKernel? matmulIq2XxsMmq,
-        RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
+        RmsNormF32Kernel rmsnorm, RopeF32Kernel rope, RopeKvWriteF32Kernel? ropeKvWrite,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
         VulkanFlashAttentionCoopmatKernel? flashAttentionCoopmat,
         VulkanSplitKvAttentionKernel? splitKvAttention,
@@ -1004,6 +1010,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq2XxsMmq = matmulIq2XxsMmq;
         _rmsnorm = rmsnorm;
         _rope = rope;
+        _ropeKvWrite = ropeKvWrite;
         _attention = attention;
         _flashAttention = flashAttention;
         _flashAttentionCoopmat = flashAttentionCoopmat;
@@ -1489,6 +1496,9 @@ public sealed class VulkanTransformerModel : IModel
 
         var rmsnorm = RmsNormF32Kernel.Create(device, spvDir);
         var rope = RopeF32Kernel.Create(device, spvDir);
+        // Optional fused RoPE + KV-cache-write (issue #380). Null on SPV dirs predating
+        // this kernel — router falls back to the standalone (rope + RecordUpdate) pair.
+        var ropeKvWrite = RopeKvWriteF32Kernel.TryCreate(device, spvDir);
         var attention = AttentionF32Kernel.Create(device, spvDir);
         // Optional Flash-Attention kernel for the GQA prefill path. Disabled by
         // env-var opt-out, by missing SPV (older builds), or when the model's
@@ -1667,7 +1677,7 @@ public sealed class VulkanTransformerModel : IModel
             matmulQ2KMmq,
             matmulQ3KMmq,
             matmulIq2XxsMmq,
-            rmsnorm, rope, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
+            rmsnorm, rope, ropeKvWrite, attention, flashAttention, flashAttentionCoopmat, splitKvAttention, swiglu, geglu, relu2glu, embedScale, add,
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
@@ -1970,6 +1980,24 @@ public sealed class VulkanTransformerModel : IModel
         // host-dequantised to F32 at load). DiffusionGemma generation additionally
         // needs the non-causal canvas attention + region-aware embed / self-cond,
         // which are not wired here yet — but the cacheless gemma4 backbone runs.
+    }
+
+    /// <summary>
+    /// True if <paramref name="positions"/> is ascending-contiguous (each entry is the
+    /// previous plus one) — the shape <see cref="RopeKvWriteF32Kernel"/> and
+    /// <see cref="VulkanKvCache.RecordUpdate"/>'s fast path both require. Mirrors
+    /// <c>VulkanKvCache.IsContiguousAscending</c> (private there); duplicated here since the
+    /// fused-path gate at the call site needs to check BEFORE deciding whether to invoke
+    /// <see cref="VulkanKvCache.RecordUpdate"/> at all.
+    /// </summary>
+    private static bool IsContiguousAscending(ReadOnlySpan<int> positions)
+    {
+        for (int i = 1; i < positions.Length; i++)
+        {
+            if (positions[i] != positions[i - 1] + 1)
+                return false;
+        }
+        return true;
     }
 
     /// <inheritdoc/>
@@ -3006,54 +3034,94 @@ public sealed class VulkanTransformerModel : IModel
             ProfSample("qkv_proj");
             DpStamp(cmdBuf, DpCatQkv);
 
-            // RoPE on Q and K
-            _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
-                seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
-                headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
-                variant: _ropeVariant);
-            ProfSample("rope");
-            DpStamp(cmdBuf, DpCatRope);
-
             // Attention input buffers: either the uncached K/V window or the full KV cache.
             VulkanDevice.Buffer kSrc, vSrc;
             int seqKv;
             int positionOffset;
-            if (kvCache is VulkanKvCache vkCache)
+
+            // Fused RoPE + KV-cache-write (issue #380, Vulkan port of CudaTransformerModel's
+            // FusedRopeAndUpdateDevice / native/kernels/fused_rope_kv_write.cu). Collapses the
+            // RoPE dispatch + COMPUTE→COMPUTE barrier + 2x vkCmdCopyBuffer + TRANSFER→COMPUTE
+            // barrier into one COMPUTE dispatch + one COMPUTE→COMPUTE barrier. Gated to a plain
+            // VulkanKvCache destination (matches the CUDA precedent's kvCache is CudaKvCache
+            // gate) AND ascending-contiguous positions (VulkanKvCache.RecordUpdate's fast path —
+            // the fused shader only knows startPos + t, not a per-token position lookup; the
+            // TurboQuant / non-contiguous-batched paths below are unaffected and keep using their
+            // existing unfused sequences).
+            bool useFusedRopeKv = _ropeKvWrite is not null
+                && kvCache is VulkanKvCache
+                && IsContiguousAscending(positions);
+
+            if (useFusedRopeKv)
             {
-                // RoPE writes K; attention (via the cache buffers) reads K.
-                // Barrier the RoPE → KV copy, then the KV copy → attention.
+                var vkCache = (VulkanKvCache)kvCache!;
+                int kvStride = vkCache.KvStrideOf(layer);
+                _ropeKvWrite!.Record(cmdBuf,
+                    _state.Q, _state.K, _state.V, _state.PositionsBuffer,
+                    vkCache.GetKeysBuffer(layer), vkCache.GetValuesBuffer(layer),
+                    startPos: positions[0], kvStride: kvStride,
+                    seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                    headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+                    variant: _ropeVariant);
+                ProfSample("rope");
+                DpStamp(cmdBuf, DpCatRope);
                 BarrierComputeToCompute(cmdBuf);
-                vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
-                BarrierTransferToCompute(cmdBuf);
+                // RecordUpdate would normally advance CurrentLength as a side effect of the
+                // vkCmdCopyBuffer path; the fused kernel writes cache rows directly without
+                // going through it, so mirror the length-tracking here.
+                vkCache.AdvanceCurrentLength(positions, seqLen);
                 kSrc = vkCache.GetKeysBuffer(layer);
                 vSrc = vkCache.GetValuesBuffer(layer);
                 seqKv = vkCache.CurrentLength;
                 positionOffset = positions[0];
             }
-            else if (kvCache is VulkanTurboQuantKvCache tqCache)
-            {
-                // TurboQuant: encode the freshly-projected K/V into compressed codes, then dequant
-                // the live range into the shared fp32 scratch the attention kernel reads. RoPE(K) →
-                // encode, encode(codes) → dequant, dequant(scratch) → attention are all COMPUTE; the
-                // same COMPUTE barriers also order the previous layer's attention reads of the shared
-                // scratch before this layer's dequant overwrites it (WAR).
-                BarrierComputeToCompute(cmdBuf);
-                tqCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
-                BarrierComputeToCompute(cmdBuf);
-                tqCache.RecordDequant(cmdBuf, layer);
-                BarrierComputeToCompute(cmdBuf);
-                kSrc = tqCache.GetKeysBuffer();
-                vSrc = tqCache.GetValuesBuffer();
-                seqKv = tqCache.CurrentLength;
-                positionOffset = positions[0];
-            }
             else
             {
-                BarrierComputeToCompute(cmdBuf);
-                kSrc = _state.K;
-                vSrc = _state.V;
-                seqKv = seqLen;
-                positionOffset = 0;
+                // RoPE on Q and K
+                _rope.Record(cmdBuf, _state.Q, _state.K, _state.PositionsBuffer,
+                    seqLen: seqLen, numHeads: numHeads, numKvHeads: numKvHeads,
+                    headDim: headDim, ropeDim: _ropeDim, theta: _ropeTheta,
+                    variant: _ropeVariant);
+                ProfSample("rope");
+                DpStamp(cmdBuf, DpCatRope);
+
+                if (kvCache is VulkanKvCache vkCache)
+                {
+                    // RoPE writes K; attention (via the cache buffers) reads K.
+                    // Barrier the RoPE → KV copy, then the KV copy → attention.
+                    BarrierComputeToCompute(cmdBuf);
+                    vkCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+                    BarrierTransferToCompute(cmdBuf);
+                    kSrc = vkCache.GetKeysBuffer(layer);
+                    vSrc = vkCache.GetValuesBuffer(layer);
+                    seqKv = vkCache.CurrentLength;
+                    positionOffset = positions[0];
+                }
+                else if (kvCache is VulkanTurboQuantKvCache tqCache)
+                {
+                    // TurboQuant: encode the freshly-projected K/V into compressed codes, then dequant
+                    // the live range into the shared fp32 scratch the attention kernel reads. RoPE(K) →
+                    // encode, encode(codes) → dequant, dequant(scratch) → attention are all COMPUTE; the
+                    // same COMPUTE barriers also order the previous layer's attention reads of the shared
+                    // scratch before this layer's dequant overwrites it (WAR).
+                    BarrierComputeToCompute(cmdBuf);
+                    tqCache.RecordUpdate(cmdBuf, _state.K, _state.V, positions, seqLen, layer);
+                    BarrierComputeToCompute(cmdBuf);
+                    tqCache.RecordDequant(cmdBuf, layer);
+                    BarrierComputeToCompute(cmdBuf);
+                    kSrc = tqCache.GetKeysBuffer();
+                    vSrc = tqCache.GetValuesBuffer();
+                    seqKv = tqCache.CurrentLength;
+                    positionOffset = positions[0];
+                }
+                else
+                {
+                    BarrierComputeToCompute(cmdBuf);
+                    kSrc = _state.K;
+                    vSrc = _state.V;
+                    seqKv = seqLen;
+                    positionOffset = 0;
+                }
             }
 
             // Gemma 3 family extras (no-op on every other architecture):
@@ -3652,6 +3720,7 @@ public sealed class VulkanTransformerModel : IModel
         _matmulIq2XxsMmq?.InvalidateDescriptorCache();
         _rmsnorm.InvalidateDescriptorCache();
         _rope.InvalidateDescriptorCache();
+        _ropeKvWrite?.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
         _flashAttentionCoopmat?.InvalidateDescriptorCache();
@@ -6286,6 +6355,7 @@ public sealed class VulkanTransformerModel : IModel
         _flashAttentionCoopmat?.Dispose();
         _attention.Dispose();
         _rope.Dispose();
+        _ropeKvWrite?.Dispose();
         _rmsnorm.Dispose();
         _rmsnormMatmulQ8Fused?.Dispose();
         _rmsnormQuantQ8Fused?.Dispose();
