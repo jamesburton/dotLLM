@@ -119,9 +119,17 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
     /// <c>VK_KHR_shader_integer_dot_product</c> or the SPV is missing — callers fall back to
     /// <see cref="MoeIndexedMatmulQ4K"/>.</summary>
     public MoeIndexedMatmulQ4KMmqKernel? MoeIndexedMatmulQ4KMmq { get; }
-    /// <summary>Row-wise F32-to-Q8_1 activation quantizer feeding <see cref="MoeIndexedMatmulQ4KMmq"/>. Same
-    /// lifetime gating as that kernel (both null together, both non-null together).</summary>
+    /// <summary>Row-wise F32-to-Q8_1 activation quantizer feeding <see cref="MoeIndexedMatmulQ4KMmq"/> and
+    /// <see cref="MoeIndexedMatmulQ5KMmq"/> (shared kernel, different scratch buffers per call site — the
+    /// quantizer itself is stateless). Same lifetime gating as those kernels (all three null together, all
+    /// three non-null together).</summary>
     public QuantizeQ8_1RowsKernel? QuantizeQ8_1RowsActivations { get; }
+    /// <summary>Q5_K-resident MoE indexed matmul via dp4a (issue #383 follow-up) — the down/W2 sibling of
+    /// <see cref="MoeIndexedMatmulQ4KMmq"/>, feeding the cached unsloth/Qwen3.6-35B-A3B-GGUF UD-Q4_K_XL
+    /// checkpoint's down-projection bank (Q5_K per #372). Null when the device lacks
+    /// <c>VK_KHR_shader_integer_dot_product</c> or the SPV is missing — callers fall back to
+    /// <see cref="MoeIndexedMatmulQ5K"/>.</summary>
+    public MoeIndexedMatmulQ5KMmqKernel? MoeIndexedMatmulQ5KMmq { get; }
     public MoeWeightedScatterF32Kernel MoeWeightedScatter { get; }
     public MoeSigmoidGatedAddF32Kernel MoeSigmoidGatedAdd { get; }
 
@@ -159,6 +167,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulF32Kernel moeIndexedMatmul, MoeIndexedMatmulQ6_KF32Kernel moeIndexedMatmulQ6K,
         MoeIndexedMatmulQ4_KF32Kernel moeIndexedMatmulQ4K, MoeIndexedMatmulQ5_KF32Kernel moeIndexedMatmulQ5K,
         MoeIndexedMatmulQ4KMmqKernel? moeIndexedMatmulQ4KMmq, QuantizeQ8_1RowsKernel? quantizeQ8_1RowsActivations,
+        MoeIndexedMatmulQ5KMmqKernel? moeIndexedMatmulQ5KMmq,
         MoeWeightedScatterF32Kernel moeWeightedScatter,
         MoeSigmoidGatedAddF32Kernel moeSigmoidGatedAdd)
     {
@@ -195,6 +204,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmul = moeIndexedMatmul; MoeIndexedMatmulQ6K = moeIndexedMatmulQ6K;
         MoeIndexedMatmulQ4K = moeIndexedMatmulQ4K; MoeIndexedMatmulQ5K = moeIndexedMatmulQ5K;
         MoeIndexedMatmulQ4KMmq = moeIndexedMatmulQ4KMmq; QuantizeQ8_1RowsActivations = quantizeQ8_1RowsActivations;
+        MoeIndexedMatmulQ5KMmq = moeIndexedMatmulQ5KMmq;
         MoeWeightedScatter = moeWeightedScatter;
         MoeSigmoidGatedAdd = moeSigmoidGatedAdd;
     }
@@ -285,13 +295,19 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         var quantizeQ8_1Rows = moeIndexedQ4KMmq is not null
             ? QuantizeQ8_1RowsKernel.TryCreate(device, spvDir)
             : null;
+        // #383 follow-up: the down/W2 Q5_K sibling, same quantizer, same gating.
+        var moeIndexedQ5KMmq = quantizeQ8_1Rows is not null
+            ? MoeIndexedMatmulQ5KMmqKernel.TryCreate(device, spvDir)
+            : null;
         if (quantizeQ8_1Rows is null)
         {
-            // Keep the "both null together" invariant documented on the properties:
-            // if the quantizer SPV is missing even though the MMQ kernel loaded,
-            // don't leave a half-wired dp4a path -- fall back entirely to F32.
+            // Keep the "both/all null together" invariant documented on the properties:
+            // if the quantizer SPV is missing even though an MMQ kernel loaded, don't
+            // leave a half-wired dp4a path -- fall back entirely to F32.
             moeIndexedQ4KMmq?.Dispose();
             moeIndexedQ4KMmq = null;
+            moeIndexedQ5KMmq?.Dispose();
+            moeIndexedQ5KMmq = null;
         }
         var moeScatter = MoeWeightedScatterF32Kernel.Create(device, spvDir);
         var moeSigmoidGatedAdd = MoeSigmoidGatedAddF32Kernel.Create(device, spvDir);
@@ -320,7 +336,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
             gdnDecay, sigmoidInplace,
             sigGateMul,
             moeTopk, moeBroadcast, moeIndexed, moeIndexedQ6K, moeIndexedQ4K, moeIndexedQ5K,
-            moeIndexedQ4KMmq, quantizeQ8_1Rows, moeScatter, moeSigmoidGatedAdd);
+            moeIndexedQ4KMmq, quantizeQ8_1Rows, moeIndexedQ5KMmq, moeScatter, moeSigmoidGatedAdd);
     }
 
     /// <summary>Invalidates every kernel's cached descriptor sets. Call after scratch buffers re-allocate.</summary>
@@ -385,6 +401,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeIndexedMatmulQ5K.InvalidateDescriptorCache();
         MoeIndexedMatmulQ4KMmq?.InvalidateDescriptorCache();
         QuantizeQ8_1RowsActivations?.InvalidateDescriptorCache();
+        MoeIndexedMatmulQ5KMmq?.InvalidateDescriptorCache();
         MoeWeightedScatter.InvalidateDescriptorCache();
         MoeSigmoidGatedAdd.InvalidateDescriptorCache();
     }
@@ -395,6 +412,7 @@ internal sealed class VulkanQwen3MoeHybridKernels : IDisposable
         MoeWeightedScatter.Dispose();
         MoeIndexedMatmulQ4KMmq?.Dispose();
         QuantizeQ8_1RowsActivations?.Dispose();
+        MoeIndexedMatmulQ5KMmq?.Dispose();
         MoeIndexedMatmulQ5K.Dispose();
         MoeIndexedMatmulQ4K.Dispose();
         MoeIndexedMatmulQ6K.Dispose();

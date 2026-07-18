@@ -1370,10 +1370,30 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             n: expandedRows * interm);
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
-        // 6. Indexed down matmul.
-        RecordIndexedMoeMatmul(cmdBuf, moeW.W2QuantType,
-            moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
-            m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        // 6. Indexed down matmul. #383 follow-up: same dp4a swap as gate/up, for the
+        // Q5_K-resident down bank (K=intermediate, MoeSiluInter as input — a
+        // different activation buffer than gate/up's, so its own quantize pass).
+        bool useDownMmq = _moeIndexedMmqEnabled
+            && _kernels.MoeIndexedMatmulQ5KMmq is not null
+            && moeW.W2QuantType == QuantizationType.Q5_K
+            && (interm % MoeIndexedMatmulQ5KMmqKernel.Q5_KGroupSize) == 0;
+        if (useDownMmq)
+        {
+            _kernels.QuantizeQ8_1RowsActivations!.Record(cmdBuf,
+                _state.MoeSiluInter, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                n: expandedRows, k: interm);
+            KernelSupport.ComputeToComputeBarrier(cmdBuf);
+            _kernels.MoeIndexedMatmulQ5KMmq!.Record(cmdBuf,
+                moeW.W2Bank, _state.MoeSiluInterXq, _state.MoeSiluInterXds,
+                _state.MoeTopkIndices, _state.MoeDownRows,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
+        else
+        {
+            RecordIndexedMoeMatmul(cmdBuf, moeW.W2QuantType,
+                moeW.W2Bank, _state.MoeSiluInter, _state.MoeTopkIndices, _state.MoeDownRows,
+                m: hidden, k: interm, n: expandedRows, numExperts: numE);
+        }
         KernelSupport.ComputeToComputeBarrier(cmdBuf);
 
         // 7. Weighted scatter into NormOutput.
