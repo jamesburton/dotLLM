@@ -458,6 +458,25 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         return (ptr, qt, outDim, inDim);
     }
 
+    // Coarse env-gated prefill profiler (DOTLLM_VULKAN_MOE_PREFILL_PROFILE=1), mirroring
+    // VulkanTransformerModel's per-category profiler but at per-layer-submission
+    // granularity (2a token-mixing vs 2b MoE FFN) since this model already issues one
+    // SubmitAndWait per phase per layer -- no extra mid-command-buffer splits needed.
+    private static readonly bool MoePrefillProfileEnabled =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MOE_PREFILL_PROFILE") == "1";
+    private double _profAttnMs;
+    private double _profMoeMs;
+    private double _profEmbedMs;
+    private double _profHeadMs;
+
+    private static double ProfElapsedMs(ref long lastTicks)
+    {
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double ms = (now - lastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        lastTicks = now;
+        return ms;
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
         => Forward(tokenIds, positions, deviceId, kvCache: null, gdnState: null);
@@ -534,6 +553,9 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         UploadPositions(positions);
 
         var kinds = _layout.LayerKind;
+        bool profActive = MoePrefillProfileEnabled && seqLen > 1;
+        if (profActive) { _profAttnMs = _profMoeMs = _profEmbedMs = _profHeadMs = 0; }
+        long profT0 = profActive ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // ── 1. Token embedding (single submission) ────────────────────────────
         _submit.Begin();
@@ -542,6 +564,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
         RecordEmbeddingGather(cmdBuf, tokenIds);
         KernelSupport.TransferToComputeBarrier(cmdBuf);
         _submit.SubmitAndWait();
+        if (profActive) { _profEmbedMs += ProfElapsedMs(ref profT0); }
 
         // ── 2. Per-layer body. Two submissions per layer: one for the
         //      token-mixing path, one for the MoE FFN (which needs a host
@@ -589,6 +612,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
                 0, 0, (ulong)((long)seqLen * hiddenSize * sizeof(float)));
             KernelSupport.ComputeToHostBarrier(cmdBuf);
             _submit.SubmitAndWait();
+            if (profActive) { _profAttnMs += ProfElapsedMs(ref profT0); }
 
             // ── 2b. MoE submission. Per-layer CPU/GPU expert placement (#370,
             //        `DOTLLM_N_CPU_MOE` / explicit nCpuMoeLayers): layers
@@ -604,6 +628,7 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             {
                 RunGpuPlacedMoeLayer(layer, lw, layerBuf, seqLen, hiddenSize, eps);
             }
+            if (profActive) { _profMoeMs += ProfElapsedMs(ref profT0); }
         }
 
         // ── 3. Final norm + LM head (single submission, last token only) ──────
@@ -626,6 +651,17 @@ public sealed class VulkanQwen3MoeHybridTransformerModel : IModel
             outputDim: _weights.OutputOutputDim, inputDim: _weights.OutputInputDim, seqLen: 1);
         KernelSupport.ComputeToHostBarrier(cmdBuf);
         _submit.SubmitAndWait();
+        if (profActive)
+        {
+            _profHeadMs += ProfElapsedMs(ref profT0);
+            double total = _profEmbedMs + _profAttnMs + _profMoeMs + _profHeadMs;
+            Console.Error.WriteLine(
+                $"[moe-prefill-profile] seqLen={seqLen} layers={_cpuLayers.Length} total_ms={total:F1}  " +
+                $"embed={_profEmbedMs:F1}ms({_profEmbedMs / total * 100:F1}%)  " +
+                $"attn(2a)={_profAttnMs:F1}ms({_profAttnMs / total * 100:F1}%)  " +
+                $"moe(2b)={_profMoeMs:F1}ms({_profMoeMs / total * 100:F1}%)  " +
+                $"head={_profHeadMs:F1}ms({_profHeadMs / total * 100:F1}%)");
+        }
 
         // ── 4. Download logits ─────────────────────────────────────────────────
         var shape = new TensorShape(1, vocabSize);
