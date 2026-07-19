@@ -2465,18 +2465,20 @@ public sealed class VulkanTransformerModel : IModel
             // ── Attention block ────────────────────────────────────────────
             // Batched RMSNorm → Q/K/V — all at seqLen=totalTokens against the
             // existing state scratch.
-            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.AttnNormWeight, _state.NormOutput,
-                rowCount: totalTokens, n: hiddenSize, eps: eps);
-            BarrierComputeToCompute(cmdBuf);
-
-            RecordMatmul(cmdBuf, lw.Q, lw.QDeviceQuantType, _state.NormOutput, _state.Q,
-                lw.QOutputDim, lw.QInputDim, totalTokens);
-            BarrierComputeToCompute(cmdBuf);
-            RecordMatmul(cmdBuf, lw.K, lw.KDeviceQuantType, _state.NormOutput, _state.K,
-                lw.KOutputDim, lw.KInputDim, totalTokens);
-            BarrierComputeToCompute(cmdBuf);
-            RecordMatmul(cmdBuf, lw.V, lw.VDeviceQuantType, _state.NormOutput, _state.V,
-                lw.VOutputDim, lw.VInputDim, totalTokens);
+            // Q/K/V all read the post-attn-norm hidden state. Shares one Q8_1
+            // activation-quant across the three GEMMs via the seqLen>1 MMQ
+            // sharing path (issue #391 follow-up — this path previously
+            // re-quantized the identical NormOutput 3x/layer; the
+            // single-sequence Forward() path already shared this quantize
+            // via the same helper). Non-qualifying shapes fall back to
+            // standalone rmsnorm + per-projection RecordMatmul with the same
+            // barriers — bit-identical output either way.
+            _mmvqGroupScratch[0] = new(lw.Q, lw.QDeviceQuantType, _state.Q, lw.QOutputDim);
+            _mmvqGroupScratch[1] = new(lw.K, lw.KDeviceQuantType, _state.K, lw.KOutputDim);
+            _mmvqGroupScratch[2] = new(lw.V, lw.VDeviceQuantType, _state.V, lw.VOutputDim);
+            RecordNormedSharedInputMmvqGroup(cmdBuf, _state.HiddenState, lw.AttnNormWeight,
+                _state.NormOutput, lw.QInputDim, totalTokens, eps,
+                _mmvqGroupScratch.AsSpan(0, 3));
             BarrierComputeToCompute(cmdBuf);
 
             // Optional Q/K/V biases — add across all totalTokens rows.
@@ -2647,15 +2649,13 @@ public sealed class VulkanTransformerModel : IModel
             BarrierComputeToCompute(cmdBuf);
 
             // ── FFN block (dense — model has no MoE layer in the simple-batched path) ──
-            _rmsnorm.Record(cmdBuf, _state.HiddenState, lw.FfnNormWeight, _state.NormOutput,
-                rowCount: totalTokens, n: hiddenSize, eps: eps);
-            BarrierComputeToCompute(cmdBuf);
-
-            RecordMatmul(cmdBuf, lw.Gate, lw.GateDeviceQuantType, _state.NormOutput, _state.FfnGate,
-                lw.GateOutputDim, lw.GateInputDim, totalTokens);
-            BarrierComputeToCompute(cmdBuf);
-            RecordMatmul(cmdBuf, lw.Up, lw.UpDeviceQuantType, _state.NormOutput, _state.FfnUp,
-                lw.UpOutputDim, lw.UpInputDim, totalTokens);
+            // Gate/Up both read the post-ffn-norm hidden state — same shared
+            // activation-quant treatment as Q/K/V above (issue #391 follow-up).
+            _mmvqGroupScratch[0] = new(lw.Gate, lw.GateDeviceQuantType, _state.FfnGate, lw.GateOutputDim);
+            _mmvqGroupScratch[1] = new(lw.Up, lw.UpDeviceQuantType, _state.FfnUp, lw.UpOutputDim);
+            RecordNormedSharedInputMmvqGroup(cmdBuf, _state.HiddenState, lw.FfnNormWeight,
+                _state.NormOutput, lw.GateInputDim, totalTokens, eps,
+                _mmvqGroupScratch.AsSpan(0, 2));
             BarrierComputeToCompute(cmdBuf);
             if (lw.GateBias is not null) _biasAdd.Record(cmdBuf, _state.FfnGate, lw.GateBias, totalTokens, lw.GateOutputDim);
             if (lw.UpBias is not null) _biasAdd.Record(cmdBuf, _state.FfnUp, lw.UpBias, totalTokens, lw.UpOutputDim);
