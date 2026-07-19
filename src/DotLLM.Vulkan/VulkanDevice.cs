@@ -179,6 +179,16 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasExternalSemaphoreWin32 { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_AMD_shader_info</c> AND
+    /// the device-create call enabled it. Prerequisite for
+    /// <see cref="GetShaderStatisticsAmd"/>, which queries the driver's actual
+    /// post-compile VGPR/SGPR/LDS allocation for a compiled pipeline — a
+    /// vendor-specific (AMD proprietary driver only) diagnostic extension, not
+    /// part of any codepath's correctness or performance.
+    /// </summary>
+    public bool HasShaderInfoAmd { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
@@ -213,7 +223,8 @@ public sealed class VulkanDevice : IDisposable
         bool hasIntegerDotProduct,
         bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
         uint requiredSubgroupSizeStages,
-        bool hasExternalSemaphoreWin32)
+        bool hasExternalSemaphoreWin32,
+        bool hasShaderInfoAmd)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -236,6 +247,7 @@ public sealed class VulkanDevice : IDisposable
         MaxSubgroupSize = maxSubgroupSize;
         _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
         HasExternalSemaphoreWin32 = hasExternalSemaphoreWin32;
+        HasShaderInfoAmd = hasShaderInfoAmd;
     }
 
     /// <summary>
@@ -393,9 +405,14 @@ public sealed class VulkanDevice : IDisposable
             // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
             ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
 
+            // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
+            // Vulkan-version gate. Just an extension-presence check; enabling
+            // it at device-create is what makes vkGetShaderInfoAMD resolvable.
+            bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
+
             nint device = CreateLogicalDevice(
                 physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
-                hasSubgroupSizeControl, hasExternalSemaphoreWin32);
+                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -415,7 +432,7 @@ public sealed class VulkanDevice : IDisposable
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
                 hasIntegerDotProduct,
                 hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
-                requiredSubgroupSizeStages, hasExternalSemaphoreWin32);
+                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd);
             instance = 0;
             return result;
         }
@@ -1097,7 +1114,7 @@ public sealed class VulkanDevice : IDisposable
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
         bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
-        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32)
+        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd)
     {
         float priority = 1.0f;
 
@@ -1125,18 +1142,20 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> sscName = "VK_EXT_subgroup_size_control\0"u8;
         ReadOnlySpan<byte> extSemName = "VK_KHR_external_semaphore\0"u8;
         ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
+        ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all seven
+        // Pack name bytes + pointer array onto the stack. Worst case all eight
         // extension names are enabled at once (coopmat, external-memory ×2,
-        // integer-dot-product, subgroup-size-control, external-semaphore ×2). The
-        // integer-dot-product and subgroup-size-control strings are harmless to
-        // name even on a 1.3 driver where they are core — drivers ignore the
-        // duplicate, same as the external-memory/semaphore names below.
+        // integer-dot-product, subgroup-size-control, external-semaphore ×2,
+        // shader-info-amd). The integer-dot-product and subgroup-size-control
+        // strings are harmless to name even on a 1.3 driver where they are
+        // core — drivers ignore the duplicate, same as the external-memory/
+        // semaphore names below.
         byte* nameBytes = stackalloc byte[
             coopmatName.Length + extMemHostName.Length + extMemName.Length
             + intDotName.Length + sscName.Length
-            + extSemName.Length + extSemWin32Name.Length];
-        nint* namePtrs = stackalloc nint[7];
+            + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length];
+        nint* namePtrs = stackalloc nint[8];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -1190,6 +1209,13 @@ public sealed class VulkanDevice : IDisposable
             for (int i = 0; i < sscName.Length; i++) nameBytes[nameOffset + i] = sscName[i];
             namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
             nameOffset += sscName.Length;
+        }
+
+        if (enableShaderInfoAmd)
+        {
+            for (int i = 0; i < shaderInfoAmdName.Length; i++) nameBytes[nameOffset + i] = shaderInfoAmdName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += shaderInfoAmdName.Length;
         }
 
         // Feature structs chained through pNext on top of the extension enables:
@@ -2172,6 +2198,68 @@ public sealed class VulkanDevice : IDisposable
     {
         if (semaphore != 0)
             VulkanApi.vkDestroySemaphore(_device, semaphore, 0);
+    }
+
+    // Delegate matching vkGetShaderInfoAMD (VK_AMD_shader_info). Resolved
+    // lazily via vkGetDeviceProcAddr after device creation (the extension must
+    // have been enabled at vkCreateDevice) — same pattern as
+    // vkGetSemaphoreWin32HandleKHR above.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate int VkGetShaderInfoAMD(
+        nint device, nint pipeline, uint shaderStage, int infoType,
+        ref nuint pInfoSize, void* pInfo);
+
+    /// <summary>
+    /// Queries the driver's actual post-compile shader statistics (physical/
+    /// used VGPR and SGPR counts, LDS usage, scratch memory usage) for a
+    /// compiled compute pipeline via <c>VK_AMD_shader_info</c>. Ground-truth
+    /// diagnostic — unlike SPIR-V-level IR inspection, this reflects what the
+    /// driver's own ISA backend actually allocated, including register spill
+    /// and LDS bank layout the SPIR-V disassembly cannot show.
+    /// </summary>
+    /// <param name="pipeline">The <c>VkPipeline</c> handle (e.g. <c>ComputePipeline.Pipeline</c>).</param>
+    /// <param name="shaderStage">Defaults to the compute stage — the only stage dotLLM's compute kernels use.</param>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable <c>VK_AMD_shader_info</c> (see <see cref="HasShaderInfoAmd"/>).</exception>
+    /// <exception cref="VulkanException">Thrown when the driver rejects the query (non-AMD driver, wrong pipeline type).</exception>
+    internal unsafe VkShaderStatisticsInfoAmd GetShaderStatisticsAmd(
+        nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        if (!HasShaderInfoAmd)
+            throw new InvalidOperationException(
+                "Device does not support VK_AMD_shader_info — cannot query shader statistics.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetShaderInfoAMD not resolvable — extension not enabled at device create.");
+
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+
+        VkShaderStatisticsInfoAmd stats = default;
+        nuint infoSize = (nuint)sizeof(VkShaderStatisticsInfoAmd);
+        int r = getShaderInfo(
+            _device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics,
+            ref infoSize, &stats);
+        r.ThrowOnError("vkGetShaderInfoAMD");
+        return stats;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC ONLY (temporary, for the #390-followup investigation): calls
+    /// <c>vkGetShaderInfoAMD</c> with <c>pInfo=null</c> to fetch the driver's
+    /// self-reported required buffer size for <c>VkShaderStatisticsInfoAMD</c>,
+    /// to check it against our assumed C# struct layout (<c>sizeof</c> should
+    /// be 72 bytes per the Vulkan spec's C struct).
+    /// </summary>
+    internal unsafe int GetShaderInfoAmdReportedSize(nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0) throw new VulkanException(-3, "vkGetShaderInfoAMD not resolvable.");
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+        nuint size = 0;
+        int r = getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics, ref size, null);
+        r.ThrowOnError("vkGetShaderInfoAMD (size query)");
+        return (int)size;
     }
 
     // Maps the public handle-type enum to the internal interop flag bits.

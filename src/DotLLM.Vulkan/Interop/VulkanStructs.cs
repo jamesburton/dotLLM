@@ -872,3 +872,45 @@ internal struct VkExternalMemoryBufferCreateInfo
     internal nint pNext;
     internal uint handleTypes;
 }
+
+// VK_AMD_shader_info — vkGetShaderInfoAMD's VkShaderInfoTypeAMD parameter.
+// Only Statistics is used (post-compile VGPR/SGPR/LDS usage); Binary and
+// Disassembly return driver-internal blobs we have no use for here.
+internal static class VkShaderInfoTypeAmd
+{
+    internal const int Statistics = 0;
+    internal const int Binary = 1;
+    internal const int Disassembly = 2;
+}
+
+// VkShaderResourceUsageAMD — nested inside VkShaderStatisticsInfoAMD. `size_t`
+// fields map to `nuint` (this project only targets 64-bit Windows/Linux, where
+// nuint is 8 bytes, matching the native ABI).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderResourceUsageAmd
+{
+    internal uint numUsedVgprs;
+    internal uint numUsedSgprs;
+    internal uint ldsSizePerLocalWorkGroup;
+    internal nuint ldsUsageSizeInBytes;
+    internal nuint scratchMemUsageInBytes;
+}
+
+// VkShaderStatisticsInfoAMD — returned by vkGetShaderInfoAMD with infoType =
+// VK_SHADER_INFO_TYPE_STATISTICS_AMD. Reports the driver's actual post-compile
+// register/LDS allocation for a given pipeline stage — ground truth for the
+// "is the MMQ kernel register-spilling / LDS-limited on occupancy" question
+// that black-box timing (#384-#390) could not answer.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderStatisticsInfoAmd
+{
+    internal uint shaderStageMask; // VkShaderStageFlags bitmask
+    internal VkShaderResourceUsageAmd resourceUsage;
+    internal uint numPhysicalVgprs;
+    internal uint numPhysicalSgprs;
+    internal uint numAvailableVgprs;
+    internal uint numAvailableSgprs;
+    internal uint computeWorkGroupSizeX;
+    internal uint computeWorkGroupSizeY;
+    internal uint computeWorkGroupSizeZ;
+}

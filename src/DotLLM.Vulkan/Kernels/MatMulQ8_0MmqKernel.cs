@@ -109,6 +109,9 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
 
+    /// <summary>Raw <c>VkPipeline</c> handle — for diagnostics only (e.g. <see cref="VulkanDevice.GetShaderStatisticsAmd"/>).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
+
     /// <summary>
     /// Dispatches the MMQ GEMM synchronously (wraps <see cref="Record"/> with a
     /// one-shot submit + fence wait). Use <see cref="Record"/> directly on the
