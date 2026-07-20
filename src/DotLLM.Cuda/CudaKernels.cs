@@ -104,6 +104,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly int _maxDynamicSharedBytesOptIn;
     private readonly CudaModule _i2sGemvModule;
     private readonly CudaModule _dequantI2sModule;
+    private readonly CudaModule _pq2_0GemvModule;
+    private readonly CudaModule _dequantPQ2_0Module;
     private readonly CudaModule _relu2Module;
     private readonly CudaModule _relu2F32Module;
     private readonly CudaModule _relu2GluRmsNormModule;
@@ -158,6 +160,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemvA8DeviceScaleFunc;
     private readonly nint _quantizeF16ToI8AbsMaxFunc;
     private readonly nint _dequantI2sF16Func;
+    private readonly nint _pq2_0GemvF32InFunc;
+    private readonly nint _pq2_0GemvF16InFunc;
+    private readonly nint _dequantPQ2_0F16Func;
     private readonly nint _relu2Func;
     private readonly nint _relu2F32Func;
     private readonly nint _relu2GluRmsNormFunc;
@@ -400,6 +405,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
         _i2sGemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "i2_s_gemv.ptx"));
         _dequantI2sModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_i2_s.ptx"));
+        _pq2_0GemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_gemv.ptx"));
+        _dequantPQ2_0Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_pq2_0.ptx"));
         _relu2Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2.ptx"));
         _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
@@ -540,6 +547,9 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvA8DeviceScaleFunc = _i2sGemvModule.GetFunction("i2_s_gemv_a8_device_scale");
         _quantizeF16ToI8AbsMaxFunc = _i2sGemvModule.GetFunction("quantize_f16_to_i8_absmax");
         _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
+        _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
+        _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
+        _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
         _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
         _relu2GluRmsNormFunc = _relu2GluRmsNormModule.GetFunction("relu2_glu_rmsnorm_f16");
@@ -1201,6 +1211,64 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_dequantI2sF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// PQ2_0 (PrismML Bonsai ternary) GEMV with FP32 activations/output. Exact-match twin for
+    /// CPU-vs-GPU tests (see the CPU reference, MatMul.GemvPQ2_0). Correctness-first: one warp
+    /// per output row, grid-strided over rows (unlike I2_S's fixed rows-per-block launch
+    /// contract, this kernel loops internally so any grid size is correct).
+    /// </summary>
+    public void LaunchPQ2_0GemvF32In(nint quantWeight, nint xF32, nint yF32, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+
+        int warpsPerBlock = BlockSize / 32;
+        uint gridDim = (uint)Math.Min((n + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_pq2_0GemvF32InFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>PQ2_0 ternary GEMV with FP16 activations/output — the production decode path.</summary>
+    public void LaunchPQ2_0GemvF16In(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF16, yArg = yF16;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+
+        int warpsPerBlock = BlockSize / 32;
+        uint gridDim = (uint)Math.Min((n + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_pq2_0GemvF16InFunc,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Dequantizes a PQ2_0 (PrismML Bonsai ternary) weight matrix to dense FP16 on the GPU for
+    /// prefill GEMM. <c>dst[row·k + col] = (code(W[row,col]) - 1) · group_scale</c>. Unlike I2_S,
+    /// the scale is per-128-element-group (not per-tensor), so no tensor-tail offset is read —
+    /// <paramref name="src"/> points at the packed row-major PQ2_0 payload only.
+    /// </summary>
+    public void LaunchDequantPQ2_0ToF16(nint src, nint dst, int n, int k, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
+
+        long totalGroups = (long)n * (k / 128);
+        uint gridDim = (uint)Math.Min((totalGroups + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_dequantPQ2_0F16Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -4131,6 +4199,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _quantizedGemvMmqModule?.Dispose();
         _i2sGemvModule.Dispose();
         _dequantI2sModule.Dispose();
+        _pq2_0GemvModule.Dispose();
+        _dequantPQ2_0Module.Dispose();
         _relu2Module.Dispose();
         _relu2F32Module.Dispose();
         _relu2GluRmsNormModule.Dispose();

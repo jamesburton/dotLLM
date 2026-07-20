@@ -138,5 +138,22 @@ public enum QuantizationType
     /// llama.cpp's <c>GGML_TYPE_MXFP4</c> = 39, block = 1 + 16 = 17 bytes).
     /// Used by OpenAI gpt-oss checkpoints for MoE expert weights.
     /// </summary>
-    MXFP4 = 39
+    MXFP4 = 39,
+
+    /// <summary>
+    /// PrismML ternary weights (Bonsai model family). Same 2-bit code packing as
+    /// <see cref="I2_S"/> (4 codes/byte, codes 0→-1, 1→0, 2→+1) but with a per-128-element
+    /// <c>fp16</c> scale instead of I2_S's single per-tensor <c>fp32</c> scale — block layout
+    /// is <c>scale(Half) + codes[32](uint8)</c> per 128-element group (scale FIRST, then
+    /// codes), 34 bytes/group (2.125 bpw). GGUF type id 42, not a mainline ggml type:
+    /// PrismML's own llama.cpp fork (branch <c>prism</c>) exists specifically because
+    /// upstream llama.cpp interprets the same type id as a different (group-64) block size.
+    /// Byte layout (including the scale-before-codes ordering, not the other way round)
+    /// confirmed empirically against real <c>Ternary-Bonsai-27B-Q2_0.gguf</c> tensor data:
+    /// decoding with scale-then-codes gives 0% invalid ternary codes and a tight, plausible
+    /// per-group scale distribution across 200 sampled groups; every other byte-ordering
+    /// hypothesis (codes-then-scale, or separate contiguous code/scale regions) produces
+    /// invalid codes and/or wildly inconsistent scale magnitudes.
+    /// </summary>
+    PQ2_0 = 42
 }

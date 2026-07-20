@@ -2556,6 +2556,8 @@ public sealed unsafe class CudaTransformerModel : IModel
                 // Quantized: dequant into scratch, then GEMM
                 if (qt == QuantizationType.I2_S)
                     _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                else if (qt == QuantizationType.PQ2_0)
+                    _kernels.LaunchDequantPQ2_0ToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
                 else
                     _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
                         outputDim * inputDim, s);
@@ -2573,6 +2575,10 @@ public sealed unsafe class CudaTransformerModel : IModel
         else if (quantWeight != 0 && qt == QuantizationType.I2_S) // Decode: I2_S ternary GEMV
         {
             _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.PQ2_0) // Decode: PQ2_0 ternary GEMV
+        {
+            _kernels.LaunchPQ2_0GemvF16In(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && _kernels.HasMmq(qt) && !CudaKernels.ForceDirectGemv)
         {
