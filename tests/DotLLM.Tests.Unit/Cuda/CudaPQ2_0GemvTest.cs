@@ -38,6 +38,103 @@ public class CudaPQ2_0GemvTest
         Run(n, k);
     }
 
+    /// <summary>
+    /// Validates the v2 F16 production decode kernel (shared-x staging + warp-per-row,
+    /// PQ2_0_ROWS_PER_BLOCK=16) against the CPU float reference. Covers real Bonsai attention
+    /// and FFN shapes plus n values that are NOT multiples of 16 (37, 3) to exercise the
+    /// tail-row clamp path (<c>min(rowBase+rr, n-1)</c> when a block's last warp only partially
+    /// overlaps valid rows, and the n=3 case where a single block covers far more rows than
+    /// exist).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(512, 5120)]
+    [InlineData(512, 17408)]
+    [InlineData(37, 5120)]
+    [InlineData(3, 5120)]
+    public void PQ2_0GemvF16In_MatchesCpuFloatReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunF16(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunF16(int n, int k)
+    {
+        var rng = new Random(5678);
+        int groupsPerRow = k / 128;
+        int rowBytes = groupsPerRow * 34;
+        long packedLen = (long)n * rowBytes;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float[] groupScales = new float[n * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.01f + rng.NextSingle() * 0.05f;
+        byte[] packed = Pack(ternary, groupScales, n, k);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+        Half[] xh = new Half[k];
+        for (int i = 0; i < k; i++) xh[i] = (Half)x[i];
+
+        // CPU reference — full-precision float, same math the kernel approximates in F16.
+        float[] cpu = new float[n];
+        fixed (byte* w = packed)
+        fixed (float* px = x, py = cpu)
+            MatMul.GemvPQ2_0(w, px, py, n, k, null);
+
+        // GPU — F16 in/out production path.
+        Half[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(ushort))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+                fixed (Half* px = xh)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
+
+                kernels.LaunchPQ2_0GemvF16In(devW, devX, devY, n, k, s);
+                stream.Synchronize();
+
+                gpu = new Half[n];
+                fixed (Half* py = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)py, devY, (nuint)((long)n * sizeof(ushort))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devX);
+                CudaDriverApi.cuMemFree_v2(devY);
+            }
+        }
+
+        float maxAbsDiff = 0, sumAbsDiff = 0;
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(cpu[i] - (float)gpu[i]);
+            sumAbsDiff += d;
+            if (d > maxAbsDiff) maxAbsDiff = d;
+        }
+        float meanAbsDiff = sumAbsDiff / n;
+        _out.WriteLine($"PQ2_0 GEMV F16In {n}×{k}: max abs diff={maxAbsDiff:E4}, mean={meanAbsDiff:E4}");
+
+        // F16 has ~3 decimal digits of precision; the CPU reference is full float32. Looser than
+        // the F32In exact-match test, but still tight — max magnitude here is O(1-10) given the
+        // synthetic scale/x ranges, so an absolute 5e-2 bar comfortably separates "F16 rounding"
+        // from "wrong row/tail-clamp/shared-stage logic".
+        Assert.True(maxAbsDiff <= 5e-2f, $"max abs diff {maxAbsDiff} exceeds 5e-2 (F16 vs CPU float32)");
+        Assert.True(meanAbsDiff <= 1e-2f, $"mean abs diff {meanAbsDiff} exceeds 1e-2");
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void Run(int n, int k)
     {

@@ -20,6 +20,14 @@ public sealed unsafe class CudaKernels : IDisposable
     private const int I2sRowsPerBlock = 16;
 
     /// <summary>
+    /// PQ2_0 GEMV output rows processed per block (warp-per-row scheme, mirrors
+    /// <see cref="I2sRowsPerBlock"/>): 8 warps each own <c>PQ2_0_ROWS_PER_WARP</c>=2 rows. Grid
+    /// is sized ceil(n / this). Must stay in sync with <c>PQ2_0_ROWS_PER_BLOCK</c> in
+    /// native/kernels/pq2_0_gemv.cu.
+    /// </summary>
+    private const int Pq2_0RowsPerBlock = 16;
+
+    /// <summary>
     /// Max CUDA blocks for dequant kernel launches. Kernels use grid-stride loops,
     /// so capping grid size amortizes block launch overhead on GPUs with many SMs
     /// (e.g. RTX 3050 has 20 SMs; launching 65K+ blocks per dequant overwhelms the
@@ -1236,15 +1244,20 @@ public sealed unsafe class CudaKernels : IDisposable
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 
-    /// <summary>PQ2_0 ternary GEMV with FP16 activations/output — the production decode path.</summary>
+    /// <summary>
+    /// PQ2_0 ternary GEMV with FP16 activations/output — the production decode path. v2:
+    /// shared-x staging (half-width) + warp-per-row (<see cref="Pq2_0RowsPerBlock"/> rows/block),
+    /// mirroring I2_S's proven scheme — see native/kernels/pq2_0_gemv.cu's file header for the
+    /// full rationale. Grid is uncapped (not <see cref="MaxDequantGridSize"/>-limited like the
+    /// v1 grid-stride kernel was) since each block now covers a fixed row count.
+    /// </summary>
     public void LaunchPQ2_0GemvF16In(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
     {
         nint wArg = quantWeight, xArg = xF16, yArg = yF16;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
 
-        int warpsPerBlock = BlockSize / 32;
-        uint gridDim = (uint)Math.Min((n + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
+        uint gridDim = (uint)((n + Pq2_0RowsPerBlock - 1) / Pq2_0RowsPerBlock);
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_pq2_0GemvF16InFunc,
