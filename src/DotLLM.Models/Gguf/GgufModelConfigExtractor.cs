@@ -95,7 +95,7 @@ public static class GgufModelConfigExtractor
 
         // GDN models reuse the same {arch}.ssm.* key names as Mamba-2 but with
         // different semantics — skip Mamba-2 SSM config extraction for them.
-        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid
+        MambaSsmConfig? ssmConfig = architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense
             ? null
             : TryExtractSsmConfig(metadata, arch);
 
@@ -120,10 +120,15 @@ public static class GgufModelConfigExtractor
             // value.
             headDim = mlaConfig.QkNopeHeadDim + mlaConfig.QkRopeHeadDim;
         }
-        else if (architecture is Architecture.Qwen3MoeHybrid)
+        else if (architecture is Architecture.Qwen3MoeHybrid or Architecture.Qwen3HybridDense)
         {
             gdnConfig = TryExtractGdnConfig(metadata, arch);
-            moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
+            // Dense hybrid (Qwen3HybridDense, e.g. Bonsai) has no MoE sublayer at all —
+            // don't call TryExtractQwenMoeConfig for it. It would return null anyway
+            // (no {arch}.expert_count key), but calling it only for the MoE variant
+            // keeps the intent explicit rather than relying on that null-return.
+            if (architecture is Architecture.Qwen3MoeHybrid)
+                moeConfig = TryExtractQwenMoeConfig(metadata, arch, numLayers);
             // Build per-layer layout from full_attention_interval (not stored as
             // per-layer arrays like Nemotron-H, so TryExtractHybridLayout returned null).
             if (gdnConfig is { } gdn)
@@ -579,6 +584,10 @@ public static class GgufModelConfigExtractor
             "qwen2moe" or "qwen3moe" or "qwenmoe" => Architecture.QwenMoe,
             // Qwen3.6-35B-A3B: Gated DeltaNet hybrid — NOT a plain Qwen-MoE transformer.
             "qwen35moe" => Architecture.Qwen3MoeHybrid,
+            // Dense Qwen3.5 hybrid (no MoE suffix) — same GDN/attention alternation as
+            // qwen35moe, dense SwiGLU FFN instead of sparse MoE. First seen in PrismML's
+            // Bonsai-27B (distilled from Qwen/Qwen3.6-27B).
+            "qwen35" => Architecture.Qwen3HybridDense,
             "mixtral" => Architecture.Mixtral,
 #pragma warning disable CS0618 // Preserve legacy GGUF metadata mapping for compatibility diagnostics.
             // Pre-V2 DeepSeek (legacy placeholder — never actually loaded by us).

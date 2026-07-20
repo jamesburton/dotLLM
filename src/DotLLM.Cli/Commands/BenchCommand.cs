@@ -168,13 +168,36 @@ internal sealed class BenchCommand : Command<BenchCommand.Settings>
                     break;
 
                 case "cuda":
-                {
-                    var cudaModel = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
-                    model = cudaModel;
-                    kvFactory = size => cudaModel.CreateKvCache(size);
-                    deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+                    switch (config.Architecture)
+                    {
+                        case Architecture.Qwen3HybridDense:
+                        {
+                            var cudaDense = DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel
+                                .LoadFromGguf(gguf, config, gpuId);
+                            model = cudaDense;
+                            kvFactory = size => cudaDense.CreateKvCache(size);
+                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+                            break;
+                        }
+                        case Architecture.Qwen3MoeHybrid:
+                        {
+                            var cudaMoe = DotLLM.Cuda.Architectures.CudaQwen3MoeHybridTransformerModel
+                                .LoadFromGguf(gguf, config, gpuId);
+                            model = cudaMoe;
+                            kvFactory = size => cudaMoe.CreateKvCache(size);
+                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+                            break;
+                        }
+                        default:
+                        {
+                            var cudaModel = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
+                            model = cudaModel;
+                            kvFactory = size => cudaModel.CreateKvCache(size);
+                            deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+                            break;
+                        }
+                    }
                     break;
-                }
 
                 case "vulkan":
                     switch (config.Architecture)

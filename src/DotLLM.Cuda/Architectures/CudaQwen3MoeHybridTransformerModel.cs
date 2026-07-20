@@ -156,6 +156,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
 
+    /// <summary>
+    /// Creates a length-only <see cref="IKvCache"/> handle sized to <paramref name="maxSeqLen"/>.
+    /// K/V storage is owned internally by this model (a per-attention-layer F16 device
+    /// cache) — the returned handle only communicates the capacity to <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
+    /// </summary>
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
+
     private CudaQwen3MoeHybridTransformerModel(
         ModelConfig config,
         GgufFile? gguf,
