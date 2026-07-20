@@ -278,7 +278,7 @@ public class BpeTokenizerTests
         // Build GgufMetadata directly from a dictionary — no file needed.
         // Vocab includes ▁ (token 6) so that addBosSpace=true doesn't fall through to byte
         // fallback — real SentencePiece models always have ▁ in the vocabulary.
-        var entries = new Dictionary<string, GgufMetadataValue>
+        var entries = new Dictionary<string, GgufMetadataValue>(StringComparer.Ordinal)
         {
             ["tokenizer.ggml.model"]        = new(GgufValueType.String, "llama"),
             ["tokenizer.ggml.tokens"]       = new(GgufValueType.Array, new string[] { "<unk>", "<s>", "</s>", "a", "b", "ab", "\u2581" }),
@@ -306,7 +306,7 @@ public class BpeTokenizerTests
     public void GgufFactory_DefaultsToLlamaWhenModelKeyMissing()
     {
         // No "tokenizer.ggml.model" key → defaults to SentencePiece.
-        var entries = new Dictionary<string, GgufMetadataValue>
+        var entries = new Dictionary<string, GgufMetadataValue>(StringComparer.Ordinal)
         {
             ["tokenizer.ggml.tokens"]       = new(GgufValueType.Array, new string[] { "<unk>", "a" }),
             ["tokenizer.ggml.scores"]       = new(GgufValueType.Array, new float[]  { 0f, -1f }),
@@ -502,7 +502,7 @@ public class BpeTokenizerTests
     {
         // Build GGUF metadata with tokenizer.ggml.pre = "llama3"
         var (tokens, merges) = BuildTiktokenGgufData();
-        var entries = new Dictionary<string, GgufMetadataValue>
+        var entries = new Dictionary<string, GgufMetadataValue>(StringComparer.Ordinal)
         {
             ["tokenizer.ggml.model"]        = new(GgufValueType.String, "gpt2"),
             ["tokenizer.ggml.tokens"]       = new(GgufValueType.Array, tokens),
@@ -525,7 +525,7 @@ public class BpeTokenizerTests
     {
         // No tokenizer.ggml.pre key → no pre-tokenization (backwards compat)
         var (tokens, merges) = BuildTiktokenGgufData();
-        var entries = new Dictionary<string, GgufMetadataValue>
+        var entries = new Dictionary<string, GgufMetadataValue>(StringComparer.Ordinal)
         {
             ["tokenizer.ggml.model"]        = new(GgufValueType.String, "gpt2"),
             ["tokenizer.ggml.tokens"]       = new(GgufValueType.Array, tokens),

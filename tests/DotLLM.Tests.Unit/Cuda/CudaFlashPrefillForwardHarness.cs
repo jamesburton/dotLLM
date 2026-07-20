@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
@@ -78,7 +79,7 @@ public sealed class CudaFlashPrefillForwardHarness
     [SkippableFact]
     public void FlashPrefill_ParityAndPpSpeedup()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_E2E") == "1", "DOTLLM_CUDA_FLASH_E2E=1 not set.");
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_CUDA_FLASH_E2E"), "1", StringComparison.Ordinal), "DOTLLM_CUDA_FLASH_E2E=1 not set.");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
         string? modelPath = ResolveModelPath();
@@ -394,12 +395,12 @@ public sealed class CudaFlashPrefillForwardHarness
         if (string.IsNullOrWhiteSpace(csv)) return null;
         var parts = csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var list = new List<int>();
-        foreach (var p in parts) if (int.TryParse(p, out int v) && v > 1) list.Add(v);
+        foreach (var p in parts) if (int.TryParse(p, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 1) list.Add(v);
         return list.Count > 0 ? list.ToArray() : null;
     }
 
     private static int ParseEnvInt(string key, int fallback)
-        => int.TryParse(Environment.GetEnvironmentVariable(key), out int n) && n > 0 ? n : fallback;
+        => int.TryParse(Environment.GetEnvironmentVariable(key), NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) && n > 0 ? n : fallback;
 
     private static string? ResolveModelPath()
     {

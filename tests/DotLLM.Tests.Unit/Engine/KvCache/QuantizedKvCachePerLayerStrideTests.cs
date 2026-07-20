@@ -138,13 +138,14 @@ public sealed unsafe class QuantizedKvCachePerLayerStrideTests
         int layer, int pos, string which)
     {
         int blockCount = stride / BlockSize;
+        // Check lane 0 and last lane of each block.
+        ReadOnlySpan<int> lanes = [0, BlockSize - 1];
         for (int b = 0; b < blockCount; b++)
         {
             byte* block = rowQuant + b * Q8_0BlockBytes;
             float scale = (float)Unsafe.ReadUnaligned<Half>(block);
             sbyte* qs = (sbyte*)(block + 2);
-            // Check lane 0 and last lane of each block.
-            foreach (int lane in stackalloc int[] { 0, BlockSize - 1 })
+            foreach (int lane in lanes)
             {
                 float got = scale * qs[lane];
                 float bar = 1e-2f + 1e-2f * MathF.Abs(expected);

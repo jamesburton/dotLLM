@@ -151,10 +151,9 @@ public sealed unsafe class QuantizedKvCacheTests
     [Fact]
     public void Dispose_IsSafeToCallMultipleTimes()
     {
-        var cache = new QuantizedKvCache(1, NumKvHeads, HeadDim, 8,
+        using var cache = new QuantizedKvCache(1, NumKvHeads, HeadDim, 8,
             KvCacheDType.Q8_0, KvCacheDType.Q8_0, windowSize: 0);
-        cache.Dispose();
-        cache.Dispose(); // Should not throw
+        cache.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 
     [Fact]
@@ -163,7 +162,7 @@ public sealed unsafe class QuantizedKvCacheTests
         using var cache = new QuantizedKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen,
             KvCacheDType.Q8_0, KvCacheDType.Q4_0, windowSize: 4);
 
-        IQuantizedKvCache qkv = cache;
+        using IQuantizedKvCache qkv = cache;
 
         Assert.Equal(KvCacheDType.Q8_0, qkv.KeyDType);
         Assert.Equal(KvCacheDType.Q4_0, qkv.ValueDType);

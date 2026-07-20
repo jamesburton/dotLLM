@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
@@ -72,9 +73,9 @@ public sealed class VulkanMmvqSharedQuantBench
     // _WARMUP=0 for a single-dispatch isolation run; DOTLLM_MMVQ_BENCH_DIAG=1 to
     // log progress before each timed shape.
     private static int EnvInt(string name, int fallback) =>
-        int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
+        int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0 ? v : fallback;
     private static int EnvInt0(string name, int fallback) =>
-        int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v >= 0 ? v : fallback;
+        int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v >= 0 ? v : fallback;
     private static readonly int BatchSizeEff = EnvInt("DOTLLM_MMVQ_BENCH_BATCH", BatchSize);
     private static readonly int BatchesPerPassEff = EnvInt("DOTLLM_MMVQ_BENCH_BATCHES", BatchesPerPass);
     private static readonly int PassesEff = EnvInt("DOTLLM_MMVQ_BENCH_PASSES", Passes);
@@ -84,7 +85,7 @@ public sealed class VulkanMmvqSharedQuantBench
     private static void Diag(string msg)
     {
         string? path = Environment.GetEnvironmentVariable("DOTLLM_MMVQ_BENCH_DIAG");
-        if (!string.IsNullOrEmpty(path) && path != "1")
+        if (!string.IsNullOrEmpty(path) && !string.Equals(path, "1", StringComparison.Ordinal))
         {
             try { System.IO.File.AppendAllText(path, "[bench] " + msg + Environment.NewLine); }
             catch { /* best-effort diagnostic */ }
@@ -123,7 +124,7 @@ public sealed class VulkanMmvqSharedQuantBench
     public void Bench_SharedVsPerProjectionQuant()
     {
         Skip.IfNot(
-            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MMVQ_SHARE_BENCH") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MMVQ_SHARE_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_VULKAN_MMVQ_SHARE_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -156,6 +157,7 @@ public sealed class VulkanMmvqSharedQuantBench
                 double saved = perProj - shared;
                 totalSavedPerStep += saved; // one such group per layer
                 sb.AppendLine(
+                    CultureInfo.InvariantCulture,
                     $"| {tag} | {k} | {perProj:F2} | {shared:F2} | {saved:F2} | {ratio:F2}x |");
             }
 
@@ -164,7 +166,7 @@ public sealed class VulkanMmvqSharedQuantBench
             // GPU submits and so the intermittent device-lost risk on the display Arc) —
             // the headline speedup table above is the load-bearing result; the % line is
             // a secondary contextualiser.
-            bool groupsOnly = Environment.GetEnvironmentVariable("DOTLLM_MMVQ_BENCH_GROUPS_ONLY") == "1";
+            bool groupsOnly = string.Equals(Environment.GetEnvironmentVariable("DOTLLM_MMVQ_BENCH_GROUPS_ONLY"), "1", StringComparison.Ordinal);
             double stepGemv = 0;
             if (!groupsOnly)
             {
@@ -205,6 +207,10 @@ public sealed class VulkanMmvqSharedQuantBench
         }
     }
 
+    // IDISP007 false positive: the analyzer treats any parameter as "injected",
+    // but every caller here passes objects this method itself created locally
+    // (device/quant/gemv are all constructed in Bench_SharedVsPerProjectionQuant
+    // and torn down via this helper) — disposal ownership is local, not external.
     private static void SafeDispose(IDisposable? d)
     {
         try { d?.Dispose(); }

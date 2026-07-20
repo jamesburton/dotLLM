@@ -36,7 +36,7 @@ public class RequestConverterTests
         var request = new ChatCompletionRequest
         {
             Messages = [new ChatMessageDto { Role = "user", Content = "hi" }],
-            LogitBias = new Dictionary<string, float> { ["1234"] = -100f, ["5"] = 5.5f },
+            LogitBias = new Dictionary<string, float>(StringComparer.Ordinal) { ["1234"] = -100f, ["5"] = 5.5f },
         };
 
         var options = RequestConverter.ToInferenceOptions(request, [], Defaults, Threading);
@@ -119,7 +119,7 @@ public class RequestConverterTests
         var request = new CompletionRequest
         {
             Prompt = "hi",
-            LogitBias = new Dictionary<string, float> { ["42"] = -1.0f },
+            LogitBias = new Dictionary<string, float>(StringComparer.Ordinal) { ["42"] = -1.0f },
         };
 
         var options = RequestConverter.ToInferenceOptions(request, Defaults, Threading);
@@ -131,7 +131,7 @@ public class RequestConverterTests
     [Fact]
     public void ParseLogitBias_NonNumericKeys_Skipped()
     {
-        var raw = new Dictionary<string, float> { ["not_a_token_id"] = 5f, ["10"] = 2f };
+        var raw = new Dictionary<string, float>(StringComparer.Ordinal) { ["not_a_token_id"] = 5f, ["10"] = 2f };
 
         var result = RequestConverter.ParseLogitBias(raw);
 
@@ -144,6 +144,6 @@ public class RequestConverterTests
     public void ParseLogitBias_NullOrEmpty_ReturnsNull()
     {
         Assert.Null(RequestConverter.ParseLogitBias(null));
-        Assert.Null(RequestConverter.ParseLogitBias(new Dictionary<string, float>()));
+        Assert.Null(RequestConverter.ParseLogitBias(new Dictionary<string, float>(StringComparer.Ordinal)));
     }
 }

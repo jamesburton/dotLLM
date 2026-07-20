@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -55,7 +56,7 @@ public sealed class VulkanQ3KQ6KMmvqVsGemvBench
     [SkippableFact]
     public void Bench_Q3K_MmvqVsGemv()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_Q3K_Q6K_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_Q3K_Q6K_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_Q3K_Q6K_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -74,7 +75,7 @@ public sealed class VulkanQ3KQ6KMmvqVsGemvBench
     [SkippableFact]
     public void Bench_Q6K_MmvqVsGemv()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_Q3K_Q6K_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_Q3K_Q6K_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_Q3K_Q6K_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
         using var device = VulkanDevice.Create();
@@ -261,5 +262,5 @@ public sealed class VulkanQ3KQ6KMmvqVsGemvBench
     }
 
     private static int EnvInt(string name, int fallback)
-        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
+        => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0 ? v : fallback;
 }

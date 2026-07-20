@@ -163,7 +163,7 @@ public sealed class LoraAdapterRegistrySwitchTests : IDisposable
         // Use a stub factory that mints a tiny LoraAdapter directly — the
         // registry doesn't care about the on-disk format, only that the
         // factory returns a valid ILoraAdapter with the requested name.
-        var registry = new LoraAdapterRegistry((name, path) =>
+        using var registry = new LoraAdapterRegistry((name, path) =>
         {
             var adapter = new LoraAdapter(name, rank: 4, alpha: 8f, targetModules: ["q_proj"]);
             // Single dummy entry so Dispose has something to free.
@@ -174,28 +174,23 @@ public sealed class LoraAdapterRegistrySwitchTests : IDisposable
                     InputDim: 4, OutputDim: 4));
             return adapter;
         });
-        try
-        {
-            registry.Load("a", "/dummy/path");
-            registry.Load("b", "/dummy/path");
+        registry.Load("a", "/dummy/path");
+        registry.Load("b", "/dummy/path");
 
-            Assert.NotNull(registry.Get("a"));
-            Assert.NotNull(registry.Get("b"));
-            Assert.Null(registry.Get("c"));
-            Assert.Equal(2, registry.List().Count);
+        // registry.Get(...) returns a reference owned by the registry (disposed via
+        // Unload/Dispose) — the test only checks presence, never takes ownership.
+        Assert.NotNull(registry.Get("a"));
+        Assert.NotNull(registry.Get("b"));
+        Assert.Null(registry.Get("c"));
+        Assert.Equal(2, registry.List().Count);
 
-            // Duplicate load throws
-            Assert.Throws<InvalidOperationException>(() => registry.Load("a", "/dummy/path"));
+        // Duplicate load throws
+        Assert.Throws<InvalidOperationException>(() => registry.Load("a", "/dummy/path"));
 
-            registry.Unload("a");
-            Assert.Null(registry.Get("a"));
-            Assert.NotNull(registry.Get("b"));
-            Assert.Single(registry.List());
-        }
-        finally
-        {
-            registry.Dispose();
-        }
+        registry.Unload("a");
+        Assert.Null(registry.Get("a"));
+        Assert.NotNull(registry.Get("b"));
+        Assert.Single(registry.List());
     }
 
     private static float[] RandomVec(Random rng, int n, float scale = 1.0f)

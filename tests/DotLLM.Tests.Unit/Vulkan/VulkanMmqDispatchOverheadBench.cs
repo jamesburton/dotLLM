@@ -88,7 +88,7 @@ public sealed class VulkanMmqDispatchOverheadBench
     [SkippableFact]
     public unsafe void Bench_MmqDispatchOverhead()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_MMQ_DISPATCH_OVERHEAD_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_MMQ_DISPATCH_OVERHEAD_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_MMQ_DISPATCH_OVERHEAD_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -153,7 +153,7 @@ public sealed class VulkanMmqDispatchOverheadBench
             _output.WriteLine("### Real-model shapes: DIRECT ground-truth measurement (not model-predicted)");
             _output.WriteLine("| shape | workgroups | K-blocks | measured barrier-serialized µs | fixed-overhead % (fitted T_fixed / measured) |");
             _output.WriteLine("|---|---:|---:|---:|---:|");
-            var realMeasuredUs = new Dictionary<string, double>();
+            var realMeasuredUs = new Dictionary<string, double>(StringComparer.Ordinal);
             foreach (var (tag, m, k, n) in RealShapes)
             {
                 int groupsX = (m + 63) / 64;

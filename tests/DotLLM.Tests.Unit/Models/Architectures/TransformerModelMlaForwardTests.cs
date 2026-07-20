@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
@@ -749,6 +751,7 @@ public sealed class TransformerModelMlaForwardTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

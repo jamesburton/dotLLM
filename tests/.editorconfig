@@ -1,0 +1,15 @@
+# Inherits the solution-level .editorconfig (no `root = true` here — this file only adds
+# test-scoped overrides on top of it).
+
+[*.cs]
+# MA0051 (method too long) is a production-code style preference: it nudges toward extracting
+# helpers for readability/reuse. Test methods — especially CUDA/GPU harnesses that set up
+# device buffers, launch kernels, marshal results, and assert — are inherently long, linear,
+# single-use procedures where extraction usually hurts readability (indirection through
+# one-call-site helpers) more than it helps. Not relevant to unit tests: disabled here.
+dotnet_diagnostic.MA0051.severity = none
+
+# MA0048 (file name must match type name) is a code-organization rule aimed at production
+# navigability. Small helper types colocated in a test file (e.g. a custom [Fact] attribute
+# used only by that one test class) are a common, harmless test-suite pattern. Disabled here.
+dotnet_diagnostic.MA0048.severity = none

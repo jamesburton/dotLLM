@@ -63,6 +63,11 @@ public sealed class VulkanTransformerModelMoeF16GroupedForwardTests : IDisposabl
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: BuildFromPrebuiltWeights hands
+            // `weights` to `model`, whose Dispose() disposes _weights
+            // internally — see TransformerModel.Dispose(). `model` is
+            // disposed below via `using`, so wrapping `weights` too would
+            // double-free.
             var weights = TransformerWeightsSafetensorsLoader.Load(sf, config);
             ApplyF16RoutedExpertRawViews(weights);
             using var model = TransformerModel.BuildFromPrebuiltWeights(weights, config);
@@ -73,7 +78,10 @@ public sealed class VulkanTransformerModelMoeF16GroupedForwardTests : IDisposabl
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            var weights = TransformerWeightsSafetensorsLoader.Load(sf, config);
+            // VulkanTransformerModel.BuildFromPrebuiltWeights uploads from
+            // `weights` into device buffers but does not take ownership of
+            // it — the caller must dispose it.
+            using var weights = TransformerWeightsSafetensorsLoader.Load(sf, config);
             ApplyF16RoutedExpertRawViews(weights);
             using var model = VulkanTransformerModel.BuildFromPrebuiltWeights(device, config, weights, spvDir);
             using ITensor logits = model.Forward(tokenIds, positions, deviceId: -1);

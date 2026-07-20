@@ -124,7 +124,7 @@ public class Mamba3ConfigExtractorTests
         // but num_heads=32 * head_dim=32 = 1024 ≠ 2048.
         string bad = IbSsm370MConfigJson.Replace("\"head_dim\": 64", "\"head_dim\": 32");
         var ex = Assert.Throws<InvalidDataException>(() => Mamba3ConfigExtractor.Extract(bad));
-        Assert.Contains("num_heads*head_dim", ex.Message);
+        Assert.Contains("num_heads*head_dim", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -132,7 +132,7 @@ public class Mamba3ConfigExtractorTests
     {
         string bad = IbSsm370MConfigJson.Replace("\"state_size\": 128", "\"state_size\": 127");
         var ex = Assert.Throws<InvalidDataException>(() => Mamba3ConfigExtractor.Extract(bad));
-        Assert.Contains("state_size", ex.Message);
+        Assert.Contains("state_size", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -140,7 +140,7 @@ public class Mamba3ConfigExtractorTests
     {
         string bad = IbSsm370MConfigJson.Replace("\"model_type\": \"mamba3\"", "\"model_type\": \"llama\"");
         var ex = Assert.Throws<InvalidDataException>(() => Mamba3ConfigExtractor.Extract(bad));
-        Assert.Contains("mamba3", ex.Message);
+        Assert.Contains("mamba3", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -148,7 +148,7 @@ public class Mamba3ConfigExtractorTests
     {
         string bad = IbSsm370MConfigJson.Replace("\"rope_fraction\": 0.5", "\"rope_fraction\": 1.5");
         var ex = Assert.Throws<InvalidDataException>(() => Mamba3ConfigExtractor.Extract(bad));
-        Assert.Contains("rope_fraction", ex.Message);
+        Assert.Contains("rope_fraction", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

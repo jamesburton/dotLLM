@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -23,7 +24,7 @@ public sealed class TextGeneratorPrefillChunkTests
     [Fact]
     public void DefaultChunkSize_SinglePrefillForward()
     {
-        var model = new RecordingModel(argmaxToken: 3);
+        using var model = new RecordingModel(argmaxToken: 3);
         var generator = new TextGenerator(model, new StubTokenizer());
 
         generator.Generate("prompt", new InferenceOptions { MaxTokens = 2, Temperature = 0f });
@@ -37,7 +38,7 @@ public sealed class TextGeneratorPrefillChunkTests
     [Fact]
     public void ChunkSize4_SplitsPrefillInto4_4_2()
     {
-        var model = new RecordingModel(argmaxToken: 3);
+        using var model = new RecordingModel(argmaxToken: 3);
         var generator = new TextGenerator(model, new StubTokenizer(), prefillChunkSize: 4);
 
         Assert.Equal(4, generator.PrefillChunkSize);
@@ -58,7 +59,7 @@ public sealed class TextGeneratorPrefillChunkTests
     [Fact]
     public void ChunkSizeLargerThanPrompt_SinglePrefillForward()
     {
-        var model = new RecordingModel(argmaxToken: 3);
+        using var model = new RecordingModel(argmaxToken: 3);
         var generator = new TextGenerator(model, new StubTokenizer(), prefillChunkSize: 64);
 
         generator.Generate("prompt", new InferenceOptions { MaxTokens = 1, Temperature = 0f });
@@ -71,8 +72,8 @@ public sealed class TextGeneratorPrefillChunkTests
     {
         // The fake model's logits depend only on the last input token, so chunked and
         // unchunked prefill must produce the identical greedy continuation.
-        var chunked = new RecordingModel(argmaxToken: 3);
-        var single = new RecordingModel(argmaxToken: 3);
+        using var chunked = new RecordingModel(argmaxToken: 3);
+        using var single = new RecordingModel(argmaxToken: 3);
 
         var chunkedResponse = new TextGenerator(chunked, new StubTokenizer(), prefillChunkSize: 3)
             .Generate("prompt", new InferenceOptions { MaxTokens = 4, Temperature = 0f });
@@ -98,7 +99,7 @@ public sealed class TextGeneratorPrefillChunkTests
         public int[] Encode(string text) => Enumerable.Range(2, PromptLen).ToArray();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => PromptLen;
     }
 

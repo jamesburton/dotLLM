@@ -151,6 +151,11 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: BuildFromPrebuiltWeights hands
+            // `cpuWeights` to `model`, whose Dispose() disposes _weights
+            // internally — see TransformerModel.Dispose(). `model` is
+            // disposed below via `using`, so wrapping `cpuWeights` too
+            // would double-free.
             var cpuWeights = TransformerWeightsSafetensorsLoader.Load(sf, config);
             ApplyQ8OverlayInPlace(cpuWeights, expectShared, gated);
             using var model = TransformerModel.BuildFromPrebuiltWeights(cpuWeights, config);
@@ -161,7 +166,10 @@ public sealed class VulkanTransformerModelMoeQ8_0ForwardTests : IDisposable
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            var cpuWeights = TransformerWeightsSafetensorsLoader.Load(sf, config);
+            // VulkanTransformerModel.BuildFromPrebuiltWeights uploads from
+            // `cpuWeights` into device buffers but does not take ownership
+            // of it — the caller must dispose it.
+            using var cpuWeights = TransformerWeightsSafetensorsLoader.Load(sf, config);
             ApplyQ8OverlayInPlace(cpuWeights, expectShared, gated);
             using var device = VulkanDevice.Create();
             using var model = VulkanTransformerModel.BuildFromPrebuiltWeights(device, config, cpuWeights, spvDir);

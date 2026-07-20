@@ -54,7 +54,7 @@ public sealed class BenchCsvTests
             new DateOnly(2026, 1, 2), "h", "d", "cpu", "v",
             "m", "q", 1, 1, 0, settings: "say \"hi\"", notes: "n");
 
-        Assert.Contains("\"say \"\"hi\"\"\"", row);
+        Assert.Contains("\"say \"\"hi\"\"\"", row, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -64,7 +64,7 @@ public sealed class BenchCsvTests
             new DateOnly(2026, 1, 2), "h,x", "d", "cpu", "v",
             "m", "q", 1, 1, 0, settings: "s", notes: "n");
 
-        Assert.StartsWith("2026-01-02,h;x,", row);
+        Assert.StartsWith("2026-01-02,h;x,", row, StringComparison.Ordinal);
     }
 
     [Theory]

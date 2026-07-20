@@ -348,7 +348,9 @@ public sealed class PeftAdapterLoaderTests : IDisposable
             .WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
 
         Assert.Throws<NotSupportedException>(() =>
-            PeftAdapterLoader.LoadFromDirectory("rslora", dir, cfg));
+        {
+            PeftAdapterLoader.LoadFromDirectory("rslora", dir, cfg);
+        });
     }
 
     [Fact]
@@ -367,7 +369,9 @@ public sealed class PeftAdapterLoaderTests : IDisposable
             .WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
 
         Assert.Throws<NotSupportedException>(() =>
-            PeftAdapterLoader.LoadFromDirectory("dora", dir, cfg));
+        {
+            PeftAdapterLoader.LoadFromDirectory("dora", dir, cfg);
+        });
     }
 
     [Fact]
@@ -382,7 +386,9 @@ public sealed class PeftAdapterLoaderTests : IDisposable
             numLayers: cfg.NumLayers);
 
         Assert.Throws<InvalidDataException>(() =>
-            PeftAdapterLoader.LoadFromDirectory("bad", dir, cfg));
+        {
+            PeftAdapterLoader.LoadFromDirectory("bad", dir, cfg);
+        });
     }
 
     [Fact]
@@ -391,7 +397,9 @@ public sealed class PeftAdapterLoaderTests : IDisposable
         string dir = Path.Combine(_scratch, "missing-cfg");
         Directory.CreateDirectory(dir);
         Assert.Throws<FileNotFoundException>(() =>
-            PeftAdapterLoader.LoadFromDirectory("x", dir, null));
+        {
+            PeftAdapterLoader.LoadFromDirectory("x", dir, null);
+        });
     }
 
     [Fact]
@@ -409,6 +417,8 @@ public sealed class PeftAdapterLoaderTests : IDisposable
                 [cfg.NumAttentionHeads * cfg.HeadDim, 8])
             .WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
         Assert.Throws<NotSupportedException>(() =>
-            PeftAdapterLoader.LoadFromDirectory("x", dir, cfg));
+        {
+            PeftAdapterLoader.LoadFromDirectory("x", dir, cfg);
+        });
     }
 }

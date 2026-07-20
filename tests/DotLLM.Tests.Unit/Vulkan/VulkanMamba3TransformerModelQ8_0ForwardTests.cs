@@ -132,6 +132,10 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] cpuDecodeLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: FromLoadedWeights hands `weights`
+            // to `model`, whose Dispose() disposes _weights internally — see
+            // Mamba3TransformerModel.Dispose(). `model` is disposed below via
+            // `using`, so wrapping `weights` too would double-free.
             Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var model = Mamba3TransformerModel.FromLoadedWeights(config, weights, lifetimeAnchor: sf);
@@ -146,7 +150,12 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] vkDecodeLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
+            // BuildOnDevice → VulkanMamba3Weights.Upload copies from `weights` into
+            // device-local buffers but does not take ownership of it (see
+            // VulkanMamba3TransformerModel.BuildOnDevice's own doc comment) — the
+            // caller (this test) must dispose it, unlike the CPU-oracle block above
+            // where FromLoadedWeights hands `weights` off to a disposing `model`.
+            using Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var device = VulkanDevice.Create();
             using var model = VulkanMamba3TransformerModel.BuildOnDevice(device, config, weights, spvDir);
@@ -155,9 +164,6 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
             Assert.Equal(1, decodeLogits.Shape[0]);
             Assert.Equal(VocabSize, decodeLogits.Shape[1]);
             vkDecodeLogits = CopyLogits(decodeLogits);
-            // Vulkan model takes ownership of `weights` via BuildOnDevice → Upload, but
-            // doesn't dispose the Mamba3Weights wrapper. The mmap anchor (sf) holds the
-            // F32 weights alive; the overlay-owned Q8_0 buffers are freed in Dispose.
         }
 
         // CPU returns [seqLen, vocab] for the decode call; Vulkan returns [1, vocab].
@@ -188,6 +194,10 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: FromLoadedWeights hands `weights`
+            // to `model`, whose Dispose() disposes _weights internally — see
+            // Mamba3TransformerModel.Dispose(). `model` is disposed below via
+            // `using`, so wrapping `weights` too would double-free.
             Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var model = Mamba3TransformerModel.FromLoadedWeights(config, weights, lifetimeAnchor: sf);
@@ -198,7 +208,9 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
+            // BuildOnDevice → VulkanMamba3Weights.Upload copies from `weights` but
+            // does not take ownership of it — the caller must dispose it.
+            using Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var device = VulkanDevice.Create();
             using var model = VulkanMamba3TransformerModel.BuildOnDevice(device, config, weights, spvDir);
@@ -235,6 +247,10 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: FromLoadedWeights hands `weights`
+            // to `model`, whose Dispose() disposes _weights internally — see
+            // Mamba3TransformerModel.Dispose(). `model` is disposed below via
+            // `using`, so wrapping `weights` too would double-free.
             Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var model = Mamba3TransformerModel.FromLoadedWeights(config, weights, lifetimeAnchor: sf);
@@ -245,7 +261,9 @@ public sealed class VulkanMamba3TransformerModelQ8_0ForwardTests : IDisposable
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
+            // BuildOnDevice → VulkanMamba3Weights.Upload copies from `weights` but
+            // does not take ownership of it — the caller must dispose it.
+            using Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ8OverlayInPlace(weights);
             using var device = VulkanDevice.Create();
             using var model = VulkanMamba3TransformerModel.BuildOnDevice(device, config, weights, spvDir);

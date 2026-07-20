@@ -29,14 +29,18 @@ public sealed class LoraAdapterTests
     public void Constructor_RejectsInvalidRank()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new LoraAdapter("test", rank: 0, alpha: 16f, targetModules: ["q_proj"]));
+        {
+            new LoraAdapter("test", rank: 0, alpha: 16f, targetModules: ["q_proj"]);
+        });
     }
 
     [Fact]
     public void Constructor_RejectsNullName()
     {
         Assert.Throws<ArgumentException>(() =>
-            new LoraAdapter("", rank: 8, alpha: 16f, targetModules: ["q_proj"]));
+        {
+            new LoraAdapter("", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
+        });
     }
 
     [Fact]
@@ -202,7 +206,7 @@ public sealed class LoraAdapterTests
     [Fact]
     public void Dispose_FreesNativeBuffers()
     {
-        var adapter = new LoraAdapter("a", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
+        using var adapter = new LoraAdapter("a", rank: 8, alpha: 16f, targetModules: ["q_proj"]);
         int rank = 8;
         adapter.AddLayerWeights(0, "q_proj",
             new LoraLayerWeights(
@@ -211,7 +215,6 @@ public sealed class LoraAdapterTests
                 64, 64));
         adapter.Dispose();
 
-        // Idempotent: second dispose is a no-op.
-        adapter.Dispose();
+        // Idempotent: the enclosing `using` disposes again on scope exit — should be a no-op.
     }
 }

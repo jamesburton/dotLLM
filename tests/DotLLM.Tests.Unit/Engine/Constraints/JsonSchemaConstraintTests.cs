@@ -30,10 +30,10 @@ public class JsonSchemaConstraintTests
         public string DecodeToken(int tokenId) =>
             tokenId >= 0 && tokenId < Tokens.Length ? Tokens[tokenId] : "";
 
-        public int[] Encode(string text) => throw new NotImplementedException();
-        public string Decode(ReadOnlySpan<int> tokenIds) => throw new NotImplementedException();
-        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => throw new NotImplementedException();
-        public int CountTokens(string text) => throw new NotImplementedException();
+        public int[] Encode(string text) => throw new NotSupportedException();
+        public string Decode(ReadOnlySpan<int> tokenIds) => throw new NotSupportedException();
+        public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => throw new NotSupportedException();
+        public int CountTokens(string text) => throw new NotSupportedException();
     }
 
     private static JsonSchemaConstraint CreateConstraint(string schemaJson)
@@ -708,7 +708,7 @@ public class JsonSchemaConstraintTests
         string target = c.ToString();
         for (int i = 0; i < tokenizer.VocabSize; i++)
         {
-            if (tokenizer.DecodeToken(i) == target)
+            if (string.Equals(tokenizer.DecodeToken(i), target, StringComparison.Ordinal))
                 return i;
         }
         return -1;

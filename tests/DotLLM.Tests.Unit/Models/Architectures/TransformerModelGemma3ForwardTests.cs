@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -405,7 +406,7 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
 
     private static ModelConfig BuildConfig(
         float? withAttnSoftcap, float? withFinalSoftcap, float? withQueryPreAttnScalar,
-        Architecture architecture = Architecture.Gemma3,
+        DotLLM.Core.Configuration.Architecture architecture = DotLLM.Core.Configuration.Architecture.Gemma3,
         ActivationFunction activation = ActivationFunction.GELUTanh,
         float? embeddingScale = null)
     {
@@ -569,6 +570,7 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

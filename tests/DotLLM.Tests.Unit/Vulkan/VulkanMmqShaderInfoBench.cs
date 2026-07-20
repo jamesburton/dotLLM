@@ -32,7 +32,7 @@ public sealed class VulkanMmqShaderInfoBench
     [SkippableFact]
     public unsafe void Bench_MmqShaderStatistics()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_MMQ_SHADER_INFO_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_MMQ_SHADER_INFO_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_MMQ_SHADER_INFO_BENCH=1 to enable this diagnostic.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 

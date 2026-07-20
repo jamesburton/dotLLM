@@ -175,6 +175,7 @@ internal static unsafe class Iq2Fixture
         Unsafe.WriteUnaligned(ref dst[0], hd);
         float invD = dGuess > 0 ? 1.0f / dGuess : 0;
 
+        Span<float> pairScaled = stackalloc float[Iq2PairSize];
         for (int ib32 = 0; ib32 < Iq2NumSubBlocks; ib32++)
         {
             float subAmax = 0;
@@ -194,7 +195,6 @@ internal static unsafe class Iq2Fixture
             float dl = dGuess * (0.5f + s4) * 0.25f;
             float invDl = dl != 0 ? 1.0f / dl : 0;
 
-            Span<float> pairScaled = stackalloc float[Iq2PairSize];
             for (int l = 0; l < Iq2PairsPerSubBlock; l++)
             {
                 int pairBase = ib32 * Iq2SubBlockSize + l * Iq2PairSize;
@@ -282,6 +282,7 @@ internal static unsafe class Iq2Fixture
         Span<int> gridIdxs = stackalloc int[32];
         Span<int> signIdxs = stackalloc int[32];
         Span<byte> scaleNibbles = stackalloc byte[16]; // 8 sub × 2 nibbles
+        Span<float> pairScaled = stackalloc float[Iq2PairSize];
 
         for (int ib32 = 0; ib32 < Iq2NumSubBlocks; ib32++)
         {
@@ -308,7 +309,6 @@ internal static unsafe class Iq2Fixture
                 float dl = dGuess * (0.5f + s4) * 0.25f;
                 float invDl = dl != 0 ? 1.0f / dl : 0;
 
-                Span<float> pairScaled = stackalloc float[Iq2PairSize];
                 for (int l = 0; l < 2; l++)
                 {
                     int pairIdx = half * 2 + l;
@@ -389,6 +389,7 @@ internal static unsafe class Iq2Fixture
         Span<int> gridIdxs = stackalloc int[32];
         Span<byte> signBytes = stackalloc byte[32];
         Span<byte> scaleNibbles = stackalloc byte[16];
+        Span<float> pairScaled = stackalloc float[Iq2PairSize];
 
         for (int ib32 = 0; ib32 < Iq2NumSubBlocks; ib32++)
         {
@@ -413,7 +414,6 @@ internal static unsafe class Iq2Fixture
                 float dl = dGuess * (0.5f + s4) * 0.25f;
                 float invDl = dl != 0 ? 1.0f / dl : 0;
 
-                Span<float> pairScaled = stackalloc float[Iq2PairSize];
                 for (int l = 0; l < 2; l++)
                 {
                     int pairIdx = half * 2 + l;

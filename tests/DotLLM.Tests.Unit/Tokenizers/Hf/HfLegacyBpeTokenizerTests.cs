@@ -112,7 +112,7 @@ public class HfLegacyBpeTokenizerTests
             Assert.Contains(HfDecoderStage.ByteLevel, spec.DecoderStages);
 
             // <unk> should be flagged special via added_tokens_decoder.
-            Assert.Contains(spec.AddedTokens, t => t.Id == 3 && t.Content == "<unk>" && t.Special);
+            Assert.Contains(spec.AddedTokens, t => t.Id == 3 && string.Equals(t.Content, "<unk>", StringComparison.Ordinal) && t.Special);
         }
         finally
         {
@@ -150,7 +150,7 @@ public class HfLegacyBpeTokenizerTests
 
             // Even though added_tokens_decoder was empty, bos_token must surface
             // as a special (id 0) so the factory can pre-split it out.
-            Assert.Contains(spec!.AddedTokens, t => t.Id == 0 && t.Content == "<|endoftext|>" && t.Special);
+            Assert.Contains(spec!.AddedTokens, t => t.Id == 0 && string.Equals(t.Content, "<|endoftext|>", StringComparison.Ordinal) && t.Special);
         }
         finally
         {

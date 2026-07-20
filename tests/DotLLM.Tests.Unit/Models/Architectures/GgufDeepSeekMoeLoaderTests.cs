@@ -76,7 +76,7 @@ public sealed class GgufDeepSeekMoeLoaderTests
             // (LoadDeepSeekMoeLayer reads `dataBase + DataOffset` — so we can
             // either centralise into a single concatenated blob or hand each
             // tensor its own dataBase. The latter is cheaper for a unit test.)
-            var tensors = new Dictionary<string, GgufTensorDescriptor>
+            var tensors = new Dictionary<string, GgufTensorDescriptor>(StringComparer.Ordinal)
             {
                 ["blk.0.ffn_gate_inp.weight"] = new GgufTensorDescriptor(
                     "blk.0.ffn_gate_inp.weight",
@@ -199,7 +199,7 @@ public sealed class GgufDeepSeekMoeLoaderTests
     public unsafe void LoadDeepSeekMoeLayer_RejectsWrongShape()
     {
         // 2D tensor where 3D was expected — should throw with a clear message.
-        var tensors = new Dictionary<string, GgufTensorDescriptor>
+        var tensors = new Dictionary<string, GgufTensorDescriptor>(StringComparer.Ordinal)
         {
             ["blk.0.ffn_gate_inp.weight"] = new GgufTensorDescriptor(
                 "blk.0.ffn_gate_inp.weight",

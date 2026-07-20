@@ -21,7 +21,7 @@ public class CudaI2SGemvTest
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
         return CudaDevice.IsAvailable();

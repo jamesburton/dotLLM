@@ -25,7 +25,7 @@ public sealed class ModelResidencyManagerTests
     {
         // Default MaxResidentModels = 1 must reproduce the original hot-swap-always-disposes
         // behavior: stashing anything while a new model is about to become active evicts it.
-        var mgr = new ModelResidencyManager();
+        using var mgr = new ModelResidencyManager();
         mgr.Stash(Snapshot("model-a", bytes: 100, DateTimeOffset.UtcNow));
 
         var evicted = mgr.EnforceBudget(activeBytes: 200);
@@ -38,7 +38,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void EnforceBudget_MaxResidentModelsTwo_KeepsOneStashedAlongsideActive()
     {
-        var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
+        using var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
         mgr.Stash(Snapshot("model-a", bytes: 100, DateTimeOffset.UtcNow));
 
         var evicted = mgr.EnforceBudget(activeBytes: 200); // 1 stashed + 1 active = 2, fits exactly
@@ -51,7 +51,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void EnforceBudget_CountBudget_EvictsLeastRecentlyUsedFirst()
     {
-        var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
+        using var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("oldest", bytes: 10, now - TimeSpan.FromMinutes(10)));
         mgr.Stash(Snapshot("newer", bytes: 10, now - TimeSpan.FromMinutes(1)));
@@ -68,7 +68,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void EnforceBudget_ByteBudget_EvictsUntilUnderBudgetRegardlessOfCount()
     {
-        var mgr = new ModelResidencyManager { MaxResidentModels = 10, MemoryBudgetBytes = 250 };
+        using var mgr = new ModelResidencyManager { MaxResidentModels = 10, MemoryBudgetBytes = 250 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("a", bytes: 100, now - TimeSpan.FromMinutes(5)));
         mgr.Stash(Snapshot("b", bytes: 100, now - TimeSpan.FromMinutes(3)));
@@ -84,7 +84,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void EnforceBudget_UnlimitedByteBudget_OnlyCountBounds()
     {
-        var mgr = new ModelResidencyManager { MaxResidentModels = 5, MemoryBudgetBytes = 0 };
+        using var mgr = new ModelResidencyManager { MaxResidentModels = 5, MemoryBudgetBytes = 0 };
         mgr.Stash(Snapshot("a", bytes: long.MaxValue / 4, DateTimeOffset.UtcNow));
 
         var evicted = mgr.EnforceBudget(activeBytes: long.MaxValue / 4);
@@ -95,7 +95,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void SweepExpired_RemovesModelsPastKeepAlive_KeepsOthers()
     {
-        var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 60 };
+        using var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 60 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("expired", bytes: 1, now - TimeSpan.FromSeconds(120))); // past default keep-alive
         mgr.Stash(Snapshot("fresh", bytes: 1, now - TimeSpan.FromSeconds(5)));     // well within it
@@ -111,7 +111,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void SweepExpired_NegativeKeepAliveOverride_NeverExpires()
     {
-        var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 1 };
+        using var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 1 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("pinned", bytes: 1, now - TimeSpan.FromHours(1), keepAlive: -1));
 
@@ -124,7 +124,7 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void SweepExpired_ZeroKeepAlive_ExpiresImmediately()
     {
-        var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 300 };
+        using var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 300 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("ephemeral", bytes: 1, now - TimeSpan.FromMilliseconds(1), keepAlive: 0));
 
@@ -137,27 +137,29 @@ public sealed class ModelResidencyManagerTests
     [Fact]
     public void TryTake_RemovesAndReturnsSnapshot_MissingKeyReturnsNull()
     {
-        var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
+        using var mgr = new ModelResidencyManager { MaxResidentModels = 2 };
         mgr.Stash(Snapshot("model-a", bytes: 1, DateTimeOffset.UtcNow));
 
-        var taken = mgr.TryTake("model-a");
+        using var taken = mgr.TryTake("model-a");
         Assert.NotNull(taken);
         Assert.Equal("model-a", taken!.Key);
         Assert.False(mgr.Contains("model-a"));
 
-        Assert.Null(mgr.TryTake("model-a"));
-        Assert.Null(mgr.TryTake("does-not-exist"));
+        using var takenAgain = mgr.TryTake("model-a");
+        Assert.Null(takenAgain);
+        using var takenMissing = mgr.TryTake("does-not-exist");
+        Assert.Null(takenMissing);
     }
 
     [Fact]
     public void Snapshot_ReportsExpiresInSeconds_AndNullForNeverExpiring()
     {
-        var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 100 };
+        using var mgr = new ModelResidencyManager { DefaultKeepAliveSeconds = 100 };
         var now = DateTimeOffset.UtcNow;
         mgr.Stash(Snapshot("a", bytes: 1, now - TimeSpan.FromSeconds(40)));
         mgr.Stash(Snapshot("b", bytes: 1, now, keepAlive: -1));
 
-        var infos = mgr.Snapshot(now).ToDictionary(i => i.Key);
+        var infos = mgr.Snapshot(now).ToDictionary(i => i.Key, StringComparer.Ordinal);
 
         Assert.InRange(infos["a"].ExpiresInSeconds!.Value, 55, 61);
         Assert.Null(infos["b"].ExpiresInSeconds);

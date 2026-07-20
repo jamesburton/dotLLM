@@ -100,7 +100,7 @@ public sealed unsafe class HybridTransformerModelSplitParityTests
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
         return CudaAvailableProbe();
@@ -270,7 +270,7 @@ public sealed unsafe class HybridTransformerModelSplitParityTests
     {
         private readonly List<nint> _allocs = new();
         public ModelConfig Config = null!;
-        public TransformerWeights Weights = null!;
+        public TransformerWeights Weights { get; private set; } = null!;
 
         public static DenseFixture Build(int seed, RoPEType ropeType)
         {
@@ -348,6 +348,7 @@ public sealed unsafe class HybridTransformerModelSplitParityTests
             // The ownedAllocations list is empty because this fixture owns the
             // raw allocations directly and frees them in Dispose — see remarks
             // on the fixture class for the double-Dispose contract.
+            Weights?.Dispose();
             Weights = TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: tokenEmbed, tokenEmbedQt: QuantizationType.F32,
                 vocabSize: VocabSize, hiddenSize: HiddenSize,

@@ -251,7 +251,9 @@ public sealed class Mamba3TransformerModelTests : IDisposable
         using var model = Mamba3TransformerModel.LoadFromSafetensors(sf, BuildConfig());
 
         Assert.Throws<ArgumentException>(() =>
-            model.Forward([0, 1], [0], deviceId: -1));
+        {
+            model.Forward([0, 1], [0], deviceId: -1);
+        });
     }
 
     [Fact]
@@ -266,7 +268,9 @@ public sealed class Mamba3TransformerModelTests : IDisposable
 
         int oor = cfg.MaxSequenceLength; // first invalid
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            model.Forward([0], [oor], deviceId: -1));
+        {
+            model.Forward([0], [oor], deviceId: -1);
+        });
     }
 
     [Fact]
@@ -279,7 +283,9 @@ public sealed class Mamba3TransformerModelTests : IDisposable
         using var model = Mamba3TransformerModel.LoadFromSafetensors(sf, BuildConfig());
 
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            model.Forward([VocabSize], [0], deviceId: -1));
+        {
+            model.Forward([VocabSize], [0], deviceId: -1);
+        });
     }
 
     [Fact]
@@ -318,10 +324,9 @@ public sealed class Mamba3TransformerModelTests : IDisposable
         WriteSmallWeightFixture(path);
 
         using var sf = SafetensorsFile.Open(path);
-        var model = Mamba3TransformerModel.LoadFromSafetensors(sf, BuildConfig());
+        using var model = Mamba3TransformerModel.LoadFromSafetensors(sf, BuildConfig());
         model.Dispose();
-        // Second dispose is a no-op.
-        model.Dispose();
+        // The enclosing `using` disposes again on scope exit — should be a no-op.
     }
 
     // --------------------------------------------------------------------
@@ -354,6 +359,7 @@ public sealed class Mamba3TransformerModelTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

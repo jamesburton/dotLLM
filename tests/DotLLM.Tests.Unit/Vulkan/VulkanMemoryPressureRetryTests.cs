@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Models.Gguf;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Interop;
@@ -51,7 +52,7 @@ public sealed class VulkanMemoryPressureRetryTests
     [SkippableFact]
     public void MapMemoryWithRetry_RoundTrips_OnHostVisibleBuffer()
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         using var device = VulkanDevice.Create();
@@ -84,9 +85,9 @@ public sealed class VulkanMemoryPressureRetryTests
     {
         string? cyclesEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRESS_LOAD_CYCLES");
         Skip.If(string.IsNullOrEmpty(cyclesEnv), "Set DOTLLM_VULKAN_STRESS_LOAD_CYCLES=N to run the load/dispose stress.");
-        int cycles = int.Parse(cyclesEnv!);
+        int cycles = int.Parse(cyclesEnv!, CultureInfo.InvariantCulture);
 
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader/device.");
 
         string modelPath = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRESS_MODEL")

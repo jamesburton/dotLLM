@@ -74,7 +74,7 @@ public sealed class DiffusionChatCompletionTests : IDisposable
         Assert.NotNull(diffusionState.Config!.DiffusionConfig);
 
         // A non-diffusion ServerState (no model / no diffusion config) never sets the diffusion gen.
-        var arState = new ServerState { Options = new ServerOptions { Model = "ar" } };
+        using var arState = new ServerState { Options = new ServerOptions { Model = "ar" } };
         Assert.Null(arState.DiffusionGenerator);
     }
 

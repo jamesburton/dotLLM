@@ -23,7 +23,7 @@ public class VulkanSubgroupProbeTests
     public void Probe_ReportsSubgroupCapability()
     {
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal),
             "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(
             VulkanDevice.IsAvailable(),
@@ -55,7 +55,7 @@ public class VulkanSubgroupProbeTests
     public void Probe_ReportsCooperativeMatrixCapability()
     {
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal),
             "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(
             VulkanDevice.IsAvailable(),

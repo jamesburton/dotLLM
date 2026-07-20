@@ -27,7 +27,7 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
+        string lib = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
         return CudaDevice.IsAvailable();
@@ -59,7 +59,7 @@ public sealed unsafe class CudaTurboQuantKvEndToEndTests
                 ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q8_0.gguf");
         Skip.If(!File.Exists(modelPath), $"SmolLM-135M Q8_0 GGUF not found at {modelPath}");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         int headDim = config.HeadDim;

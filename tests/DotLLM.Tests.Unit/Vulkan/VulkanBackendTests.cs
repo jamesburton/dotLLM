@@ -51,6 +51,9 @@ public class VulkanBackendTests
 
         using var backend = new VulkanBackend();
 
+        // IDISP005 false positive: AllocateOnDevice already declares the disposable
+        // ITensor return type; this call is expected to throw before any tensor
+        // is constructed, so there is nothing to dispose here.
         Assert.Throws<ArgumentException>(
             () => backend.AllocateOnDevice(deviceId: 1, new TensorShape(4), DType.Float32));
     }
@@ -115,7 +118,7 @@ public class VulkanBackendTests
     {
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan device available.");
         Skip.If(
-            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR") != "0x8086",
+            !string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR"), "0x8086", StringComparison.Ordinal),
             "DOTLLM_VULKAN_DEVICE_VENDOR not set to 0x8086; skipping Intel Arc vendor check.");
 
         // The env var is read by VulkanDevice.Create() -> ResolveForcedDevice().

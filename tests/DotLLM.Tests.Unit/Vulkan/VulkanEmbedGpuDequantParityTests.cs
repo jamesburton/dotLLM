@@ -45,7 +45,7 @@ public sealed class VulkanEmbedGpuDequantParityTests
         {
             Environment.SetEnvironmentVariable(DisableEnv, null);
             using var gpuWeights = VulkanWeights.Upload(device, weights, numLayers: 1, spvDir: spvDir);
-            Assert.StartsWith("gpu-", VulkanWeights.LastTokenEmbedDequantPath);
+            Assert.StartsWith("gpu-", VulkanWeights.LastTokenEmbedDequantPath, StringComparison.Ordinal);
             float[] gpuTable = new float[compareElems];
             device.Download(gpuWeights.TokenEmbedding, gpuTable);
 

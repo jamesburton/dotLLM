@@ -70,8 +70,10 @@ public sealed class VulkanCrossDeviceKvTransferTests
                 }
         }
 
-        // Build + fill the prefill cache on device 0.
-        var source = new VulkanKvCache(dev0, geom, MaxSeqLen);
+        // Build + fill the prefill cache on device 0. Ownership transfers to
+        // StagedKvHandoffTransfer.Transfer below (it disposes source); the `using`
+        // here is a belt-and-suspenders idempotent second Dispose on scope exit.
+        using var source = new VulkanKvCache(dev0, geom, MaxSeqLen);
         for (int l = 0; l < NumLayers; l++)
             source.UploadLayer(l, Length, expectedK[l], expectedV[l]);
         Assert.Equal(Length, source.CurrentLength);
@@ -90,26 +92,19 @@ public sealed class VulkanCrossDeviceKvTransferTests
         };
 
         // Hand the sequence off to device 1 via the staged transfer (device0 → host → device1). Disposes source.
-        IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
+        using IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
             source, config, (_, maxSeq) => new VulkanKvCache(dev1, geom, maxSeq));
 
-        try
-        {
-            Assert.Equal(Length, dest.CurrentLength);
-            var staged = Assert.IsAssignableFrom<IHostStagedKvCache>(dest);
+        Assert.Equal(Length, dest.CurrentLength);
+        var staged = Assert.IsAssignableFrom<IHostStagedKvCache>(dest);
 
-            var gotK = new float[Length * Stride];
-            var gotV = new float[Length * Stride];
-            for (int l = 0; l < NumLayers; l++)
-            {
-                staged.DownloadLayer(l, gotK, gotV);
-                Assert.Equal(expectedK[l], gotK);
-                Assert.Equal(expectedV[l], gotV);
-            }
-        }
-        finally
+        var gotK = new float[Length * Stride];
+        var gotV = new float[Length * Stride];
+        for (int l = 0; l < NumLayers; l++)
         {
-            dest.Dispose();
+            staged.DownloadLayer(l, gotK, gotV);
+            Assert.Equal(expectedK[l], gotK);
+            Assert.Equal(expectedV[l], gotV);
         }
     }
 }

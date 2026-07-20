@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -163,7 +164,7 @@ public sealed class ContinuousBatchSchedulerTests
         cts.Cancel();
         fix.Scheduler.Step(); // sweeps the cancelled queued request
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await h.Completion);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await h.Completion.ConfigureAwait(false));
     }
 
     [Fact]
@@ -183,7 +184,7 @@ public sealed class ContinuousBatchSchedulerTests
         cts.Cancel();
         fix.Scheduler.Step(); // sweeps cancellation
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await h.Completion);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await h.Completion.ConfigureAwait(false));
         Assert.True(fix.Scheduler.IsIdle);
         Assert.True(fix.PagedPool.FreeBlocks >= freeBeforeCancel);
     }
@@ -976,7 +977,7 @@ public sealed class ContinuousBatchSchedulerTests
             {
                 MaxActiveSequences = 1,
                 EnableFairness = true,
-                FairnessWeightProvider = key => key == "heavy" ? 4.0 : 1.0,
+                FairnessWeightProvider = key => string.Equals(key, "heavy", StringComparison.Ordinal) ? 4.0 : 1.0,
             });
 
         var heavy = new ISchedulerRequest[4];
@@ -1438,7 +1439,7 @@ public sealed class ContinuousBatchSchedulerTests
         public int[] Encode(string text) => Array.Empty<int>();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => 0;
     }
 }

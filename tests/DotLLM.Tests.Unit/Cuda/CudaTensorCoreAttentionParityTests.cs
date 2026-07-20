@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Cuda.Interop;
@@ -40,7 +41,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     // Input fill scale; override via DOTLLM_CUDA_ATTN_MAG to probe FP16-score precision
     // at realistic activation magnitudes (default 0.2 mirrors the bench's tiny fill).
     private static readonly float Magnitude =
-        float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_ATTN_MAG"), out float m) ? m : 4.0f;
+        float.TryParse(Environment.GetEnvironmentVariable("DOTLLM_CUDA_ATTN_MAG"), NumberStyles.Float, CultureInfo.InvariantCulture, out float m) ? m : 4.0f;
 
     private readonly ITestOutputHelper _output;
 
@@ -296,7 +297,7 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     [SkippableFact]
     public void CompletePathTimingVsAttentionF16()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_CUDA_ATTN_BENCH") == "1", "DOTLLM_CUDA_ATTN_BENCH=1 not set.");
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_CUDA_ATTN_BENCH"), "1", StringComparison.Ordinal), "DOTLLM_CUDA_ATTN_BENCH=1 not set.");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
         string ptxDir = ResolvePtxDir();
         Skip.IfNot(File.Exists(Path.Combine(ptxDir, "attention_softmax_causal.ptx")), "attention_softmax_causal.ptx not built.");
@@ -523,14 +524,14 @@ public sealed unsafe class CudaTensorCoreAttentionParityTests
     }
 
     private static int EnvInt(string name, int dflt)
-        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) ? v : dflt;
+        => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : dflt;
 
     private static int[] EnvSeqs(string name, int[] dflt)
     {
         string? raw = Environment.GetEnvironmentVariable(name);
         if (string.IsNullOrWhiteSpace(raw)) return dflt;
         var parsed = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(p => int.TryParse(p, out int v) ? v : 0)
+            .Select(p => int.TryParse(p, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : 0)
             .Where(v => v > 0)
             .ToArray();
         return parsed.Length > 0 ? parsed : dflt;

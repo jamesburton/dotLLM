@@ -216,7 +216,7 @@ public sealed class Mamba3TransformerModelMimoTests : IDisposable
 
         Assert.True(weights.Report.HasMissingRequired);
         Assert.Contains(weights.Report.Problems,
-            p => p.TensorName == Mamba3TensorMapping.MimoX(0) &&
+            p => string.Equals(p.TensorName, Mamba3TensorMapping.MimoX(0), StringComparison.Ordinal) &&
                  p.Kind == Mamba3TensorIssueKind.Missing);
     }
 
