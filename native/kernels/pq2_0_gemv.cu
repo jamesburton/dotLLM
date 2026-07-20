@@ -187,3 +187,87 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
         if (lane == 0 && row < n) y[row] = __float2half(a);
     }
 }
+
+// ───────────────────────── F16 fused 2-way projection — shared x read across both ─────────────────────────
+// Virtual row-concatenation of weight0/weight1 (rows [0,n0) then [0,n1)), same k for both. Used for
+// any decode-time PQ2_0 pair sharing one input: dense FFN gate+up, or full-attention K+V. Mirrors
+// i2_s_gemv2_f16in — see that kernel's comments for the row-selection / tail-clamp rationale.
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
+    const uint8_t* __restrict__ weight0,
+    const uint8_t* __restrict__ weight1,
+    const half*    __restrict__ x,
+    half*          __restrict__ y0,
+    half*          __restrict__ y1,
+    const int n0,
+    const int n1,
+    const int k)
+{
+    __shared__ half xs[PQ2_0_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = x[i];
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1;
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    if (rowBase >= totalN) return;
+
+    const int groups_per_row = k / PQ2_0_GROUP_SIZE;
+    const int row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
+
+    const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
+    half*          y_rows[PQ2_0_ROWS_PER_WARP];
+    int            local_rows[PQ2_0_ROWS_PER_WARP];
+    float          acc[PQ2_0_ROWS_PER_WARP];
+
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    {
+        int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via unclamped check
+        const uint8_t* w;
+        half* y;
+        int localRow;
+        if (globalRow < n0) { w = weight0; y = y0; localRow = globalRow; }
+        else                { w = weight1; y = y1; localRow = globalRow - n0; }
+
+        local_rows[rr] = localRow;
+        y_rows[rr]     = y;
+        row_ptrs[rr]   = w + (size_t)localRow * row_bytes;
+        acc[rr]        = 0.0f;
+    }
+
+    for (int g = lane; g < groups_per_row; g += warpSize)
+    {
+        float scale[PQ2_0_ROWS_PER_WARP];
+        const uint8_t* codes[PQ2_0_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
+            scale[rr] = __half2float(*reinterpret_cast<const half*>(group_base));
+            codes[rr] = group_base + 2;
+        }
+
+        const int out_base = g * PQ2_0_GROUP_SIZE;
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float group_acc = 0.0f;
+            #pragma unroll
+            for (int gp = 0; gp < 32; gp++)
+                pq2_0_accum_byte(group_acc, codes[rr][gp], xs, out_base + gp);
+            acc[rr] += group_acc * scale[rr];
+        }
+    }
+
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    {
+        float a = pq2_0_warp_reduce(acc[rr]);
+        int globalRow = rowBase + rr;
+        if (lane == 0 && globalRow < totalN)
+            y_rows[rr][local_rows[rr]] = __float2half(a);
+    }
+}

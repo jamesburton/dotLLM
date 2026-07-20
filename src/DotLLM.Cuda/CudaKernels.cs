@@ -170,6 +170,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _dequantI2sF16Func;
     private readonly nint _pq2_0GemvF32InFunc;
     private readonly nint _pq2_0GemvF16InFunc;
+    private readonly nint _pq2_0Gemv2F16InFunc;
     private readonly nint _dequantPQ2_0F16Func;
     private readonly nint _relu2Func;
     private readonly nint _relu2F32Func;
@@ -557,6 +558,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
+        _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
         _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
         _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
@@ -1262,6 +1264,32 @@ public sealed unsafe class CudaKernels : IDisposable
 
         CudaDriverApi.cuLaunchKernel(_pq2_0GemvF16InFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Fused PQ2_0 ternary GEMV for two projections sharing one FP16 input vector (e.g. dense
+    /// FFN gate+up, or full-attention K+V) — mirrors <see cref="LaunchI2_SGemv2F16In"/>. Stages
+    /// x into shared memory once and reuses it across the virtual row-concatenation of both
+    /// weight matrices, instead of two separate launches each re-staging x.
+    /// </summary>
+    public void LaunchPQ2_0Gemv2F16In(
+        nint quantWeight0, nint quantWeight1, nint xF16,
+        nint yF16_0, nint yF16_1, int n0, int n1, int k, nint stream)
+    {
+        nint w0Arg = quantWeight0, w1Arg = quantWeight1, xArg = xF16;
+        nint y0Arg = yF16_0, y1Arg = yF16_1;
+        int n0Arg = n0, n1Arg = n1, kArg = k;
+        int totalN = n0 + n1;
+        uint grid = (uint)((totalN + Pq2_0RowsPerBlock - 1) / Pq2_0RowsPerBlock);
+        if (grid == 0) grid = 1;
+
+        void** args = stackalloc void*[]
+        {
+            &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
+        };
+        CudaDriverApi.cuLaunchKernel(_pq2_0Gemv2F16InFunc,
+                grid, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 

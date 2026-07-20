@@ -207,6 +207,104 @@ public class CudaPQ2_0GemvTest
         Assert.True(meanDiff <= 1e-4f, $"mean abs diff {meanDiff} exceeds 1e-4");
     }
 
+    /// <summary>
+    /// Validates the fused 2-way GEMV (<see cref="CudaKernels.LaunchPQ2_0Gemv2F16In"/>, used for
+    /// decode-time dense-FFN gate+up and full-attention K+V) produces the same output as two
+    /// separate <see cref="CudaKernels.LaunchPQ2_0GemvF16In"/> calls. Uses odd, unequal n0/n1
+    /// (mirroring the I2_S fused-decode test) to exercise the row-selection/tail-clamp boundary
+    /// between the two virtually-concatenated weight matrices.
+    /// </summary>
+    [SkippableFact]
+    public void PQ2_0GemvFusedDecode_MatchesSeparateLaunches()
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunFusedDecode();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunFusedDecode()
+    {
+        const int k = 5120;
+        const int n0 = 37;
+        const int n1 = 53;
+
+        var rng = new Random(2468);
+        byte[] w0 = RandomPacked(rng, n0, k);
+        byte[] w1 = RandomPacked(rng, n1, k);
+
+        Half[] x = new Half[k];
+        for (int i = 0; i < k; i++)
+            x[i] = (Half)((float)(rng.NextDouble() * 2 - 1) * 0.5f);
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        nint s = stream.Handle;
+
+        int groupsPerRow = k / 128;
+        int rowBytes = groupsPerRow * 34;
+        static nuint PackedBytes(int n, int rowBytes) => (nuint)((long)n * rowBytes);
+
+        CudaDriverApi.cuMemAlloc_v2(out nint devW0, PackedBytes(n0, rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW1, PackedBytes(n1, rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)(k * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
+        try
+        {
+            fixed (byte* p = w0) CudaDriverApi.cuMemcpyHtoD_v2(devW0, (nint)p, PackedBytes(n0, rowBytes)).ThrowOnError();
+            fixed (byte* p = w1) CudaDriverApi.cuMemcpyHtoD_v2(devW1, (nint)p, PackedBytes(n1, rowBytes)).ThrowOnError();
+            fixed (Half* p = x) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)p, (nuint)(k * sizeof(ushort))).ThrowOnError();
+
+            kernels.LaunchPQ2_0GemvF16In(devW0, devX, sep0, n0, k, s);
+            kernels.LaunchPQ2_0GemvF16In(devW1, devX, sep1, n1, k, s);
+            kernels.LaunchPQ2_0Gemv2F16In(devW0, devW1, devX, fus0, fus1, n0, n1, k, s);
+            stream.Synchronize();
+
+            AssertHalfClose(sep0, fus0, n0);
+            AssertHalfClose(sep1, fus1, n1);
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devW0); CudaDriverApi.cuMemFree_v2(devW1);
+            CudaDriverApi.cuMemFree_v2(devX);
+            CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1);
+            CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1);
+        }
+    }
+
+    private static unsafe void AssertHalfClose(nint expectedDevice, nint actualDevice, int n)
+    {
+        Half[] expected = new Half[n];
+        Half[] actual = new Half[n];
+        fixed (Half* p = expected)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, expectedDevice, (nuint)(n * sizeof(ushort))).ThrowOnError();
+        fixed (Half* p = actual)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, actualDevice, (nuint)(n * sizeof(ushort))).ThrowOnError();
+
+        for (int i = 0; i < n; i++)
+        {
+            float diff = MathF.Abs((float)expected[i] - (float)actual[i]);
+            Assert.True(diff <= 1e-3f, $"index {i}: expected {(float)expected[i]}, actual {(float)actual[i]}");
+        }
+    }
+
+    private static byte[] RandomPacked(Random rng, int n, int k)
+    {
+        int groupsPerRow = k / 128;
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++)
+            ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float[] groupScales = new float[n * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++)
+            groupScales[i] = 0.01f + rng.NextSingle() * 0.05f;
+        return Pack(ternary, groupScales, n, k);
+    }
+
     /// <summary>Packs ternary {-1,0,+1} into dotLLM PQ2_0 layout: per-128-group Half scale + codes.</summary>
     private static byte[] Pack(sbyte[] ternary, float[] groupScales, int n, int k)
     {

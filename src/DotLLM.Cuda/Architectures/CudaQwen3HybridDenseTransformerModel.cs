@@ -82,6 +82,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _activF16OutScratch;
     private long _activF16OutScratchElems;
 
+    // Second output buffer for fused 2-way PQ2_0 decode GEMVs (dense FFN gate+up, full-attention
+    // K+V) — the fused kernel writes its two projections to independent buffers, not a single
+    // concatenated one; _activF16OutScratch above holds the first, this holds the second.
+    private nint _fusedOut1F16Scratch;
+    private long _fusedOut1F16ScratchElems;
+
     // Host-side per-row embedding lookup (NOT a full-table GPU pre-dequant — see the
     // LoadFromGguf remarks for why). Points at the mmap'd GGUF data region backing
     // token_embd.weight; each Forward call dequantizes only its `seqLen` rows on the CPU
@@ -677,10 +683,19 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
              gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
         Gemm(gdnW.GateDevice, gdnW.GateQt, normOut, zBuf,
              gdnW.GateOutputDim, gdnW.GateInputDim, seqLen);
-        Gemm(gdnW.AlphaDevice, gdnW.AlphaQt, normOut, alphaBuf,
-             gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen);
-        Gemm(gdnW.BetaDevice, gdnW.BetaQt, normOut, betaBuf,
-             gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen);
+        // Alpha/Beta project to tiny output dims (NVHead each) — their decode-time GEMV cost is
+        // dominated by the fixed shared-x staging overhead, not compute, so fusing them (unlike
+        // gate+up/K+V above, which showed no measurable win — compute already dominates there)
+        // avoids paying that staging cost twice.
+        if (!TryFusedPQ2_0Gemm2(gdnW.AlphaDevice, gdnW.AlphaQt, gdnW.BetaDevice, gdnW.BetaQt,
+                normOut, alphaBuf, betaBuf, gdnW.AlphaOutputDim, gdnW.BetaOutputDim,
+                gdnW.AlphaInputDim, gdnW.BetaInputDim, seqLen))
+        {
+            Gemm(gdnW.AlphaDevice, gdnW.AlphaQt, normOut, alphaBuf,
+                 gdnW.AlphaOutputDim, gdnW.AlphaInputDim, seqLen);
+            Gemm(gdnW.BetaDevice, gdnW.BetaQt, normOut, betaBuf,
+                 gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen);
+        }
 
         // ── 2. Decay g and write-gate beta ──
         if (_kernels.HasGdnDecayF32)
@@ -822,8 +837,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         DumpDevice2D($"blk.{layer}.fa_gate_split", gate, seqLen, numHeads * headDim);
 
         // ── 3. K and V projections ──
-        Gemm(attn.KDevice, attn.KQt, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen);
-        Gemm(attn.VDevice, attn.VQt, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen);
+        if (!TryFusedPQ2_0Gemm2(attn.KDevice, attn.KQt, attn.VDevice, attn.VQt,
+                normOut, k, v, attn.KOutputDim, attn.VOutputDim,
+                attn.KInputDim, attn.VInputDim, seqLen))
+        {
+            Gemm(attn.KDevice, attn.KQt, normOut, k, attn.KOutputDim, attn.KInputDim, seqLen);
+            Gemm(attn.VDevice, attn.VQt, normOut, v, attn.VOutputDim, attn.VInputDim, seqLen);
+        }
         DumpDevice2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
         DumpDevice2D($"blk.{layer}.fa_v", v, seqLen, numKvHeads * headDim);
 
@@ -1045,8 +1065,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint ffnUp = _state.FfnUp;
         nint siluOut = _state.SiluOutput;
 
-        Gemm(lw.GateWeight, lw.GateQt, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
-        Gemm(lw.UpWeight, lw.UpQt, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        if (!TryFusedPQ2_0Gemm2(lw.GateWeight, lw.GateQt, lw.UpWeight, lw.UpQt,
+                normOut, ffnGate, ffnUp, lw.GateOutputDim, lw.UpOutputDim,
+                lw.GateInputDim, lw.UpInputDim, seqLen))
+        {
+            Gemm(lw.GateWeight, lw.GateQt, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
+            Gemm(lw.UpWeight, lw.UpQt, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
+        }
         _kernels.LaunchSwiGLUF32(ffnGate, ffnUp, siluOut, _intermediateSize, seqLen, streamH);
         Gemm(lw.DownWeight, lw.DownQt, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
     }
@@ -1170,6 +1195,48 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    //  Fused 2-way PQ2_0 decode dispatch — dense FFN gate+up, full-attention K+V.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Dispatches a fused decode-time PQ2_0 GEMV for a projection pair sharing one input
+    /// (e.g. dense FFN gate+up, full-attention K+V) via <see cref="CudaKernels.LaunchPQ2_0Gemv2F16In"/>
+    /// — stages x F32→F16 once instead of twice. Falls back to <see langword="false"/> (caller
+    /// issues two separate <see cref="Gemm"/> calls) for prefill, mixed/non-PQ2_0 quant types,
+    /// or unequal input dims.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryFusedPQ2_0Gemm2(
+        nint weight0, QuantizationType qt0, nint weight1, QuantizationType qt1,
+        nint x, nint y0, nint y1, int m0, int m1, int k0, int k1, int seqLen)
+    {
+        if (seqLen != 1 || k0 != k1
+            || qt0 != QuantizationType.PQ2_0 || qt1 != QuantizationType.PQ2_0)
+            return false;
+
+        nint streamH = _stream.Handle;
+        int k = k0;
+        EnsureActivF16InScratch(k);
+        EnsureActivF16OutScratch(m0);
+        EnsureFusedOut1F16Scratch(m1);
+
+        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
+        _kernels.LaunchPQ2_0Gemv2F16In(weight0, weight1, _activF16InScratch,
+            _activF16OutScratch, _fusedOut1F16Scratch, m0, m1, k, streamH);
+        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y0, m0, streamH);
+        _kernels.LaunchConvertF16ToF32(_fusedOut1F16Scratch, y1, m1, streamH);
+        return true;
+    }
+
+    private void EnsureFusedOut1F16Scratch(long halfs)
+    {
+        if (halfs <= _fusedOut1F16ScratchElems) return;
+        FreeIfNonZero(ref _fusedOut1F16Scratch);
+        _fusedOut1F16Scratch = AllocDevice(halfs * sizeof(ushort));
+        _fusedOut1F16ScratchElems = halfs;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     //  Host fallbacks — temporary CPU paths used while waiting on CUDA kernels.
     //  Verbatim from CudaQwen3MoeHybridTransformerModel.
     // ──────────────────────────────────────────────────────────────────────
@@ -1264,6 +1331,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _dequantScratchF16Weight);
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
+        FreeIfNonZero(ref _fusedOut1F16Scratch);
 
         nint outNormPtr = _outputNormDevice;
         if (outNormPtr != 0) CudaDriverApi.cuMemFree_v2(outNormPtr);
