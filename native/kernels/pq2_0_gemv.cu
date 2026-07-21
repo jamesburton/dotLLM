@@ -147,6 +147,28 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32in(
 // access-pattern reorganization, not a change to total bytes read. The warp reduction moves
 // from "not needed" (v2 had none — each lane fully owned its groups) to a single reduction at
 // the very end of the whole row (not per-group), keeping shuffle overhead low.
+// ───────────────────────── Output write: staged block-coalesced store (#157) ─────────────────────────
+// ncu (--set full) on the 3060 flagged the tail write of the (pre-fix) kernel as the single
+// biggest inefficiency in the whole profile: each warp reduced PQ2_0_ROWS_PER_WARP values and
+// wrote them via lane 0 only — a single-thread 2-byte scalar store per row, occupying a full
+// 32-byte global-memory sector transaction for 2 useful bytes (MemoryCacheAccessPattern: ~6%
+// sector efficiency, Estimated Speedup ~51.56%, the largest single number in the profile).
+// PQ2_0_ROWS_PER_BLOCK (16) such lane-0 stores were scattered per block instead of one
+// block-wide write.
+//
+// Fix: each warp stages its reduced half results into a small shared buffer (rowOut[16] = 32
+// bytes total — negligible next to the 34 KB xs[] staging buffer, does not move the occupancy
+// ceiling). After a block-wide __syncthreads(), the first PQ2_0_ROWS_PER_BLOCK threads (lanes
+// 0..15 of warp 0) perform ONE coalesced write of up to 16 contiguous halfs to y[] — a single
+// 32-byte sector, except on the tail block where n isn't a multiple of 16 (guarded per-lane with
+// `row < n`, which only breaks perfect coalescing on that last partial block).
+//
+// Correctness note: the early "skip this warp" path used to be a `return` guarding the whole
+// warp from ANY out-of-range row. That can no longer be a `return` — every thread in the block
+// must reach the new __syncthreads() below, so out-of-range warps instead skip only the
+// accumulate/stage step via the `warpActive` guard and fall through to the sync + write. Any
+// shared rowOut[] slot that stays unwritten (because its owning warp was entirely inactive)
+// corresponds to a row >= n, which the final `row < n` check guarantees is never read.
 extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
     const uint8_t* __restrict__ weight,
     const half*    __restrict__ x,
@@ -169,40 +191,53 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
     const int lane = threadIdx.x & 31;
 
     const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
-    if (rowBase >= n) return;
+    const bool warpActive = rowBase < n;
 
-    const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
-    float acc[PQ2_0_ROWS_PER_WARP];
-    #pragma unroll
-    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
-    {
-        int r = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
-        row_ptrs[rr] = weight + (size_t)r * row_bytes;
-        acc[rr] = 0.0f;
-    }
+    __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
 
-    for (int g = 0; g < groups_per_row; g++)
+    if (warpActive)
     {
-        const int out_base = g * PQ2_0_GROUP_SIZE;
+        const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
+        float acc[PQ2_0_ROWS_PER_WARP];
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
-            const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-            float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-            uint8_t p = group_base[2 + lane];   // coalesced: 32 lanes read 32 consecutive bytes
+            int r = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
+            row_ptrs[rr] = weight + (size_t)r * row_bytes;
+            acc[rr] = 0.0f;
+        }
 
-            float group_partial = 0.0f;
-            pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-            acc[rr] += group_partial * scale;
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
+                float scale = __half2float(*reinterpret_cast<const half*>(group_base));
+                uint8_t p = group_base[2 + lane];   // coalesced: 32 lanes read 32 consecutive bytes
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = __float2half(a);
         }
     }
 
-    #pragma unroll
-    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
     {
-        float a = pq2_0_warp_reduce(acc[rr]);
-        int row = rowBase + rr;
-        if (lane == 0 && row < n) y[row] = __float2half(a);
+        int row = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (row < n) y[row] = rowOut[threadIdx.x];
     }
 }
 
@@ -210,6 +245,13 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
 // Virtual row-concatenation of weight0/weight1 (rows [0,n0) then [0,n1)), same k for both. Used for
 // any decode-time PQ2_0 pair sharing one input: dense FFN gate+up, or full-attention K+V. Mirrors
 // i2_s_gemv2_f16in — see that kernel's comments for the row-selection / tail-clamp rationale.
+// Same staged block-coalesced write fix as pq2_0_gemv_f16in above (#157). Here the block's 16
+// virtually-concatenated rows can straddle the n0/n1 boundary between the two output arrays, so
+// the final write routes each lane to y0 or y1 based on its global row index — same routing as
+// before, just performed as part of the batched write instead of 8 separate lane-0 stores. A
+// block that straddles the boundary splits into two smaller coalesced writes (one run into y0,
+// one into y1) instead of one — still a large improvement over independent scalar stores, and
+// correctness (not maximal coalescing) is what matters here.
 extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
     const uint8_t* __restrict__ weight0,
     const uint8_t* __restrict__ weight1,
@@ -229,56 +271,67 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
     const int lane = threadIdx.x & 31;
     const int totalN = n0 + n1;
     const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
-    if (rowBase >= totalN) return;
+    const bool warpActive = rowBase < totalN;
 
     const int groups_per_row = k / PQ2_0_GROUP_SIZE;
     const int row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
 
-    const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
-    half*          y_rows[PQ2_0_ROWS_PER_WARP];
-    int            local_rows[PQ2_0_ROWS_PER_WARP];
-    float          acc[PQ2_0_ROWS_PER_WARP];
+    __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
 
-    #pragma unroll
-    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    if (warpActive)
     {
-        int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via unclamped check
-        const uint8_t* w;
-        half* y;
-        int localRow;
-        if (globalRow < n0) { w = weight0; y = y0; localRow = globalRow; }
-        else                { w = weight1; y = y1; localRow = globalRow - n0; }
+        const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
+        float          acc[PQ2_0_ROWS_PER_WARP];
 
-        local_rows[rr] = localRow;
-        y_rows[rr]     = y;
-        row_ptrs[rr]   = w + (size_t)localRow * row_bytes;
-        acc[rr]        = 0.0f;
-    }
-
-    // v3 coalescing: warp cooperates on one group at a time (lane L reads code byte L),
-    // instead of each lane owning whole groups — see pq2_0_gemv_f16in's file comment.
-    for (int g = 0; g < groups_per_row; g++)
-    {
-        const int out_base = g * PQ2_0_GROUP_SIZE;
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
-            const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-            float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-            uint8_t p = group_base[2 + lane];
+            int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
+            const uint8_t* w;
+            int localRow;
+            if (globalRow < n0) { w = weight0; localRow = globalRow; }
+            else                { w = weight1; localRow = globalRow - n0; }
 
-            float group_partial = 0.0f;
-            pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-            acc[rr] += group_partial * scale;
+            row_ptrs[rr] = w + (size_t)localRow * row_bytes;
+            acc[rr]      = 0.0f;
+        }
+
+        // v3 coalescing: warp cooperates on one group at a time (lane L reads code byte L),
+        // instead of each lane owning whole groups — see pq2_0_gemv_f16in's file comment.
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
+                float scale = __half2float(*reinterpret_cast<const half*>(group_base));
+                uint8_t p = group_base[2 + lane];
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = __float2half(a);
         }
     }
 
-    #pragma unroll
-    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
     {
-        float a = pq2_0_warp_reduce(acc[rr]);
-        int globalRow = rowBase + rr;
-        if (lane == 0 && globalRow < totalN)
-            y_rows[rr][local_rows[rr]] = __float2half(a);
+        int globalRow = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (globalRow < totalN)
+        {
+            if (globalRow < n0) y0[globalRow]      = rowOut[threadIdx.x];
+            else                 y1[globalRow - n0] = rowOut[threadIdx.x];
+        }
     }
 }
