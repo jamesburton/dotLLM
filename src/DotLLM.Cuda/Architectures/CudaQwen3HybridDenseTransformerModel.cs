@@ -618,10 +618,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         ProfStart();
         // 1. Token mixing — residual = hidden; normOut = RmsNorm(hidden, attn_norm).
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
-            (nuint)hiddenBytes, streamH).ThrowOnError();
-        _kernels.LaunchRmsNormF32(_state.HiddenState, lw.AttnNormWeightDevice, _state.NormOutput,
-            hiddenSize, eps, seqLen, streamH);
+        if (_kernels.HasCopyRmsNormF32)
+        {
+            _kernels.LaunchCopyRmsNormF32(_state.HiddenState, _state.Residual, lw.AttnNormWeightDevice,
+                _state.NormOutput, hiddenSize, eps, seqLen, streamH);
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
+                (nuint)hiddenBytes, streamH).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_state.HiddenState, lw.AttnNormWeightDevice, _state.NormOutput,
+                hiddenSize, eps, seqLen, streamH);
+        }
         ProfMark("layer-pre-norm1");
 
         if (kinds[layerIdx] == HybridLayerKind.GatedDeltaNet)
@@ -641,10 +649,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             seqLen * hiddenSize, streamH);
 
         // 3. Dense FFN — residual = hidden; normOut = RmsNorm(hidden, post_attn_norm).
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
-            (nuint)hiddenBytes, streamH).ThrowOnError();
-        _kernels.LaunchRmsNormF32(_state.HiddenState, lw.PostAttnNormWeightDevice, _state.NormOutput,
-            hiddenSize, eps, seqLen, streamH);
+        if (_kernels.HasCopyRmsNormF32)
+        {
+            _kernels.LaunchCopyRmsNormF32(_state.HiddenState, _state.Residual, lw.PostAttnNormWeightDevice,
+                _state.NormOutput, hiddenSize, eps, seqLen, streamH);
+        }
+        else
+        {
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
+                (nuint)hiddenBytes, streamH).ThrowOnError();
+            _kernels.LaunchRmsNormF32(_state.HiddenState, lw.PostAttnNormWeightDevice, _state.NormOutput,
+                hiddenSize, eps, seqLen, streamH);
+        }
         ProfMark("layer-resid1-norm2");
 
         ForwardDenseFfnBody(lw, seqLen, hiddenSize);

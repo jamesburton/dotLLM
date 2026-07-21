@@ -60,6 +60,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _biasAddF32Module;
     private readonly CudaModule _perHeadRmsNormF32Module;
     private readonly CudaModule _rmsnormF32Module;
+    private readonly CudaModule? _copyRmsNormF32Module;
     private readonly CudaModule _quantizedGemvF32InModule;
     private readonly CudaModule? _quantizedGemvMmqModule;
     private readonly nint _quantizedGemvQ2_KMmqFunc;
@@ -122,6 +123,7 @@ public sealed unsafe class CudaKernels : IDisposable
 
     private readonly nint _rmsnormFunc;
     private readonly nint _rmsnormF32Func;
+    private readonly nint _copyRmsNormF32Func;
     private readonly nint _quantizedGemvQ8_0F32InFunc;
     private readonly nint _fusedAddRmsNormFunc;
     private readonly nint _rmsnormF32InF16OutFunc;
@@ -414,6 +416,15 @@ public sealed unsafe class CudaKernels : IDisposable
         _biasAddF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "bias_add_f32.ptx"));
         _perHeadRmsNormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "per_head_rmsnorm_f32.ptx"));
         _rmsnormF32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "rmsnorm_f32.ptx"));
+        // Optional — TryGetFunction so a stale PTX still loads gracefully and
+        // HasCopyRmsNormF32 reports false (caller falls back to a separate D2D
+        // copy + LaunchRmsNormF32 pair).
+        string copyRmsNormF32Path = Path.Combine(ptxDir, "copy_rmsnorm_f32.ptx");
+        if (File.Exists(copyRmsNormF32Path))
+        {
+            _copyRmsNormF32Module = CudaModule.LoadFromFile(copyRmsNormF32Path);
+            _copyRmsNormF32Func = _copyRmsNormF32Module.TryGetFunction("copy_rmsnorm_f32");
+        }
         _quantizedGemvF32InModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "quantized_gemv_f32in.ptx"));
         _i2sGemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "i2_s_gemv.ptx"));
         _dequantI2sModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_i2_s.ptx"));
@@ -1067,6 +1078,34 @@ public sealed unsafe class CudaKernels : IDisposable
 
         void** args = stackalloc void*[] {&inputArg, &weightArg, &outputArg, &nArg, &epsArg};
         CudaDriverApi.cuLaunchKernel(_rmsnormF32Func,
+                (uint)rows, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// True when the fused copy+RMSNorm kernel (<see cref="LaunchCopyRmsNormF32"/>) is loaded.
+    /// When false, callers fall back to a separate D2D copy + <see cref="LaunchRmsNormF32"/> pair.
+    /// </summary>
+    public bool HasCopyRmsNormF32 => _copyRmsNormF32Func != 0;
+
+    /// <summary>
+    /// Fused "copy <paramref name="input"/> to <paramref name="residualOut"/>, then RMSNorm it
+    /// into <paramref name="output"/>" — replaces the decode-time pattern of a separate
+    /// <c>cuMemcpyDtoDAsync</c> (save the pre-norm value for a later residual add) immediately
+    /// followed by <see cref="LaunchRmsNormF32"/> on the same input, halving the launch count for
+    /// that pair. Numerics are byte-for-byte identical to <see cref="LaunchRmsNormF32"/> — only
+    /// the fused residual store is new. <paramref name="input"/>, <paramref name="residualOut"/>,
+    /// and <paramref name="output"/> must be three distinct buffers (no in-place aliasing).
+    /// </summary>
+    public void LaunchCopyRmsNormF32(nint input, nint residualOut, nint weight, nint output,
+                                       int hiddenSize, float eps, int rows, nint stream)
+    {
+        nint inputArg = input, residualArg = residualOut, weightArg = weight, outputArg = output;
+        int nArg = hiddenSize;
+        float epsArg = eps;
+
+        void** args = stackalloc void*[] {&inputArg, &residualArg, &weightArg, &outputArg, &nArg, &epsArg};
+        CudaDriverApi.cuLaunchKernel(_copyRmsNormF32Func,
                 (uint)rows, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -4293,6 +4332,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _biasAddF32Module.Dispose();
         _perHeadRmsNormF32Module.Dispose();
         _rmsnormF32Module.Dispose();
+        _copyRmsNormF32Module?.Dispose();
         _quantizedGemvF32InModule.Dispose();
         _quantizedGemvMmqModule?.Dispose();
         _i2sGemvModule.Dispose();
