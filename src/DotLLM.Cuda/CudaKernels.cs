@@ -23,7 +23,8 @@ public sealed unsafe class CudaKernels : IDisposable
     /// PQ2_0 GEMV output rows processed per block (warp-per-row scheme, mirrors
     /// <see cref="I2sRowsPerBlock"/>): 8 warps each own <c>PQ2_0_ROWS_PER_WARP</c>=2 rows. Grid
     /// is sized ceil(n / this). Must stay in sync with <c>PQ2_0_ROWS_PER_BLOCK</c> in
-    /// native/kernels/pq2_0_gemv.cu.
+    /// native/kernels/pq2_0_gemv.cu (ROWS_PER_WARP=4 was tried and measured worse — see that
+    /// file's comment).
     /// </summary>
     private const int Pq2_0RowsPerBlock = 16;
 

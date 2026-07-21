@@ -39,6 +39,13 @@
 
 // Rows handled per warp / per block for the v2 F16 kernel. Mirrors I2_S's tuned choice
 // (I2S_ROWS_PER_WARP=2) — amortizes the shared-x stage and grid size 16x vs one-row-per-warp.
+// TUNING EXPERIMENT (2026-07-21): tried 4 after v3's warp-cooperative group reads made the
+// weight reads coalesced, hypothesizing the ILP-vs-occupancy tradeoff that picked 2 for I2_S
+// might shift. Measured WORSE on real Bonsai-27B weights (decode 10.52 -> 9.91 tok/s, -5.8%,
+// 3-rep/16-token benchmark) — reverted to 2. Fewer warps resident per SM at ROWS_PER_WARP=4
+// apparently costs more in occupancy/latency-hiding than it gains in per-warp reduction
+// overhead amortization. Left as documented negative result — don't re-try without new
+// evidence.
 #define PQ2_0_ROWS_PER_WARP  2
 #define PQ2_0_ROWS_PER_BLOCK (8 * PQ2_0_ROWS_PER_WARP)   // 8 warps/block × rows-per-warp
 
