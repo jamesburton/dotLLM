@@ -119,7 +119,27 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32in(
     }
 }
 
-// ───────────────────────── F16 activations/output — production decode path (v2) ─────────────────────────
+// ───────────────────────── F16 activations/output — production decode path (v3) ─────────────────────────
+// v2 (above rationale) fixed shared-x staging and grid sizing but still distributed GROUPS
+// across lanes (`for g = lane; g < groups_per_row; g += warpSize`) — each lane then decoded
+// its OWN group's 32 code bytes as a private scalar loop. That means at any instruction, the
+// 32 lanes of a warp are reading 32 DIFFERENT groups, `PQ2_0_GROUP_BYTES` (34) apart — the same
+// "34-byte stride between lanes" uncoalesced pattern the v1 kernel had, just now applied once
+// per group instead of once per element.
+//
+// v3 restructures the loop nesting so the WARP cooperates on one group at a time instead of
+// each lane owning whole groups: the group loop is now a plain sequential loop every lane
+// executes together, and within each iteration lane L reads code byte `L` of that group
+// (`group_base[2 + lane]`) — 32 lanes reading 32 CONSECUTIVE bytes, a single coalesced
+// transaction. Byte `L`'s decode target in dotLLM's PQ2_0 bit-interleave is elements
+// `{L, L+32, L+64, L+96}` of the group (see the file-header layout note) — i.e. exactly
+// `xb = out_base + lane`, so `pq2_0_accum_byte` (unchanged) is called with `lane` in place of
+// the old per-lane `gp` loop variable. The redundant per-lane read of the group's 2-byte scale
+// (same address for all 32 lanes) is a hardware broadcast, not a coalescing concern. Total
+// weight-byte traffic per warp is unchanged (`groups_per_row * 32` either way) — this is a pure
+// access-pattern reorganization, not a change to total bytes read. The warp reduction moves
+// from "not needed" (v2 had none — each lane fully owned its groups) to a single reduction at
+// the very end of the whole row (not per-group), keeping shuffle overhead low.
 extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
     const uint8_t* __restrict__ weight,
     const half*    __restrict__ x,
@@ -154,28 +174,19 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
         acc[rr] = 0.0f;
     }
 
-    for (int g = lane; g < groups_per_row; g += warpSize)
+    for (int g = 0; g < groups_per_row; g++)
     {
-        float scale[PQ2_0_ROWS_PER_WARP];
-        const uint8_t* codes[PQ2_0_ROWS_PER_WARP];
+        const int out_base = g * PQ2_0_GROUP_SIZE;
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
             const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-            scale[rr] = __half2float(*reinterpret_cast<const half*>(group_base));
-            codes[rr] = group_base + 2;
-        }
+            float scale = __half2float(*reinterpret_cast<const half*>(group_base));
+            uint8_t p = group_base[2 + lane];   // coalesced: 32 lanes read 32 consecutive bytes
 
-        const int out_base = g * PQ2_0_GROUP_SIZE;
-
-        #pragma unroll
-        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
-        {
-            float group_acc = 0.0f;
-            #pragma unroll
-            for (int gp = 0; gp < 32; gp++)
-                pq2_0_accum_byte(group_acc, codes[rr][gp], xs, out_base + gp);
-            acc[rr] += group_acc * scale[rr];
+            float group_partial = 0.0f;
+            pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+            acc[rr] += group_partial * scale;
         }
     }
 
@@ -237,28 +248,21 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
         acc[rr]        = 0.0f;
     }
 
-    for (int g = lane; g < groups_per_row; g += warpSize)
+    // v3 coalescing: warp cooperates on one group at a time (lane L reads code byte L),
+    // instead of each lane owning whole groups — see pq2_0_gemv_f16in's file comment.
+    for (int g = 0; g < groups_per_row; g++)
     {
-        float scale[PQ2_0_ROWS_PER_WARP];
-        const uint8_t* codes[PQ2_0_ROWS_PER_WARP];
+        const int out_base = g * PQ2_0_GROUP_SIZE;
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
             const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-            scale[rr] = __half2float(*reinterpret_cast<const half*>(group_base));
-            codes[rr] = group_base + 2;
-        }
+            float scale = __half2float(*reinterpret_cast<const half*>(group_base));
+            uint8_t p = group_base[2 + lane];
 
-        const int out_base = g * PQ2_0_GROUP_SIZE;
-
-        #pragma unroll
-        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
-        {
-            float group_acc = 0.0f;
-            #pragma unroll
-            for (int gp = 0; gp < 32; gp++)
-                pq2_0_accum_byte(group_acc, codes[rr][gp], xs, out_base + gp);
-            acc[rr] += group_acc * scale[rr];
+            float group_partial = 0.0f;
+            pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+            acc[rr] += group_partial * scale;
         }
     }
 
