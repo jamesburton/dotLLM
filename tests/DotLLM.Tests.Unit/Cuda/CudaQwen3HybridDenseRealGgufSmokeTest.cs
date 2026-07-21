@@ -81,6 +81,10 @@ public class CudaQwen3HybridDenseRealGgufSmokeTest
         decodeSw.Stop();
         _out.WriteLine($"Decode (4 steps): {decodeSw.Elapsed.TotalMilliseconds:F0}ms " +
                        $"({4000.0 / decodeSw.Elapsed.TotalMilliseconds:F2} tok/s)");
+
+        // No-op unless DOTLLM_HYBRID_PROFILE=1 — prints accumulated per-category decode timing
+        // (see CudaQwen3HybridDenseTransformerModel.ProfStart/ProfMark) to stderr.
+        CudaQwen3HybridDenseTransformerModel.ProfileReportAndReset();
     }
 
     private static unsafe void AssertFiniteLastRow(DotLLM.Core.Tensors.ITensor logits, string label)

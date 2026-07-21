@@ -530,6 +530,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (seqLen == 0 || seqLen != positions.Length)
             throw new ArgumentException("tokenIds and positions must have equal, non-zero length.");
 
+        _profileActiveForThisCall = seqLen == 1;
+
         int hiddenSize = Config.HiddenSize;
         int vocabSize = Config.VocabSize;
         int numHeads = Config.NumAttentionHeads;
@@ -576,6 +578,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             CudaDriverApi.cuMemcpyHtoDAsync_v2(_state.HiddenState, (nint)pEmbedHost,
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
+        if (ProfileTrace) _stream.Synchronize();
 
         for (int layer = 0; layer < _layers.Length; layer++)
         {
@@ -584,10 +587,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
 
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); }
+        ProfStart();
         _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
             hiddenSize, eps, seqLen, streamH);
         Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
              _outputOutputDim, _outputInputDim, seqLen);
+        ProfMark("lm-head");
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); }
 
         _stream.Synchronize();
@@ -611,11 +616,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         bool debug = DebugTrace;
         if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} start ({kinds[layerIdx]})"); Console.Error.Flush(); }
 
+        ProfStart();
         // 1. Token mixing — residual = hidden; normOut = RmsNorm(hidden, attn_norm).
         CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState,
             (nuint)hiddenBytes, streamH).ThrowOnError();
         _kernels.LaunchRmsNormF32(_state.HiddenState, lw.AttnNormWeightDevice, _state.NormOutput,
             hiddenSize, eps, seqLen, streamH);
+        ProfMark("layer-pre-norm1");
 
         if (kinds[layerIdx] == HybridLayerKind.GatedDeltaNet)
         {
@@ -628,6 +635,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} token-mixing done"); Console.Error.Flush(); }
 
+        ProfStart();
         // 2. First residual add: hidden = residual + normOut.
         _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize, streamH);
@@ -637,17 +645,71 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             (nuint)hiddenBytes, streamH).ThrowOnError();
         _kernels.LaunchRmsNormF32(_state.HiddenState, lw.PostAttnNormWeightDevice, _state.NormOutput,
             hiddenSize, eps, seqLen, streamH);
+        ProfMark("layer-resid1-norm2");
 
         ForwardDenseFfnBody(lw, seqLen, hiddenSize);
         if (debug) { _stream.Synchronize(); Console.Error.WriteLine($"[hybrid-debug] layer {layerIdx} ffn done"); Console.Error.Flush(); }
 
+        ProfStart();
         // 4. Second residual add: hidden = residual + normOut.
         _kernels.LaunchAddF32(_state.Residual, _state.NormOutput, _state.HiddenState,
             seqLen * hiddenSize, streamH);
+        ProfMark("layer-resid2");
     }
 
     private static readonly bool DebugTrace =
         Environment.GetEnvironmentVariable("DOTLLM_HYBRID_DEBUG") == "1";
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  One-off category profiler (DOTLLM_HYBRID_PROFILE=1). Coarse (Stopwatch +
+    //  per-mark Synchronize — the sync itself perturbs true pipelined timing, so
+    //  this is for RELATIVE category comparison only, not absolute steady-state
+    //  throughput). Not used by production code paths; zero cost when unset.
+    // ──────────────────────────────────────────────────────────────────────
+    internal static readonly bool ProfileTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_PROFILE") == "1";
+    internal static readonly System.Collections.Generic.Dictionary<string, double> ProfileTotalsMs = new();
+    internal static readonly System.Collections.Generic.Dictionary<string, int> ProfileCounts = new();
+    private readonly System.Diagnostics.Stopwatch _profSw = new();
+
+    // Only accumulate for seqLen==1 (decode) calls — prefill (seqLen>1) routes every
+    // projection through the much heavier dequant-then-cuBLAS path, which would dominate
+    // and mask the decode-path (GEMV) picture this profiler exists to show.
+    private bool _profileActiveForThisCall;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ProfStart()
+    {
+        if (!ProfileTrace || !_profileActiveForThisCall) return;
+        _stream.Synchronize();
+        _profSw.Restart();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ProfMark(string category)
+    {
+        if (!ProfileTrace || !_profileActiveForThisCall) return;
+        _stream.Synchronize();
+        double ms = _profSw.Elapsed.TotalMilliseconds;
+        ProfileTotalsMs[category] = ProfileTotalsMs.GetValueOrDefault(category) + ms;
+        ProfileCounts[category] = ProfileCounts.GetValueOrDefault(category) + 1;
+        _profSw.Restart();
+    }
+
+    /// <summary>Prints accumulated category totals (ms, and ms/call) to stderr and clears them.</summary>
+    internal static void ProfileReportAndReset()
+    {
+        if (!ProfileTrace) return;
+        Console.Error.WriteLine("[hybrid-profile] category totals:");
+        foreach (var kv in ProfileTotalsMs)
+        {
+            int n = ProfileCounts.GetValueOrDefault(kv.Key, 1);
+            Console.Error.WriteLine($"  {kv.Key,-20} total={kv.Value,9:F2}ms  calls={n,6}  avg={kv.Value / n,7:F4}ms");
+        }
+        Console.Error.Flush();
+        ProfileTotalsMs.Clear();
+        ProfileCounts.Clear();
+    }
 
     // ──────────────────────────────────────────────────────────────────────
     //  GDN token-mixing body — verbatim from CudaQwen3MoeHybridTransformerModel
@@ -678,6 +740,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint gdnOut = _state.GdnOut;
         nint convInput = _state.GdnConvInput;
 
+        ProfStart();
         // ── 1. Projections from the normed input ──
         Gemm(gdnW.QkvDevice, gdnW.QkvQt, normOut, qkvBuf,
              gdnW.QkvOutputDim, gdnW.QkvInputDim, seqLen);
@@ -696,6 +759,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             Gemm(gdnW.BetaDevice, gdnW.BetaQt, normOut, betaBuf,
                  gdnW.BetaOutputDim, gdnW.BetaInputDim, seqLen);
         }
+        ProfMark("gdn-1-proj");
 
         // ── 2. Decay g and write-gate beta ──
         if (_kernels.HasGdnDecayF32)
@@ -715,6 +779,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         {
             LaunchSigmoidHostFallback(betaBuf, seqLen * nVHead);
         }
+        ProfMark("gdn-2-decaygate");
 
         // ── 3. Conv1d on QKV concat ──
         nint convStateDev = _gdnCache.GetConvStatePtr(gdnOrdinal);
@@ -740,24 +805,33 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
         CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
             (nuint)convStateBytes, streamH).ThrowOnError();
+        ProfMark("gdn-3-conv1d");
 
         // ── 4. De-interleave Q/K/V from conv output, L2-normalise Q and K per head ──
-        long rowBytes = (long)convDim * sizeof(float);
-        long kDimBytes = (long)kDim * sizeof(float);
-        long vDimBytes = (long)vDim * sizeof(float);
-        for (int t = 0; t < seqLen; t++)
+        if (_kernels.HasDeinterleaveF32)
         {
-            nint srcRow = qkvBuf + (nint)(t * rowBytes);
-            nint qDst = qBuf + (nint)(t * kDimBytes);
-            nint kDst = kBuf + (nint)(t * kDimBytes);
-            nint vDst = vBuf + (nint)(t * vDimBytes);
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(qDst, srcRow, (nuint)kDimBytes, streamH).ThrowOnError();
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, srcRow + (nint)kDimBytes, (nuint)kDimBytes, streamH).ThrowOnError();
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, srcRow + (nint)(2 * kDimBytes), (nuint)vDimBytes, streamH).ThrowOnError();
+            _kernels.LaunchDeinterleaveGdnQkvF32(qkvBuf, qBuf, kBuf, vBuf, kDim, vDim, seqLen, streamH);
+        }
+        else
+        {
+            long rowBytes = (long)convDim * sizeof(float);
+            long kDimBytes = (long)kDim * sizeof(float);
+            long vDimBytes = (long)vDim * sizeof(float);
+            for (int t = 0; t < seqLen; t++)
+            {
+                nint srcRow = qkvBuf + (nint)(t * rowBytes);
+                nint qDst = qBuf + (nint)(t * kDimBytes);
+                nint kDst = kBuf + (nint)(t * kDimBytes);
+                nint vDst = vBuf + (nint)(t * vDimBytes);
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(qDst, srcRow, (nuint)kDimBytes, streamH).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, srcRow + (nint)kDimBytes, (nuint)kDimBytes, streamH).ThrowOnError();
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, srcRow + (nint)(2 * kDimBytes), (nuint)vDimBytes, streamH).ThrowOnError();
+            }
         }
 
         _kernels.LaunchL2NormalizeHeadsF32(qBuf, seqLen * nKHead, dState, 1e-6f, streamH);
         _kernels.LaunchL2NormalizeHeadsF32(kBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+        ProfMark("gdn-4-deinterleave");
 
         // ── 5. GDN scan — single-token kernel driven by host loop ──
         nint gdnStateDev = _gdnCache.GetGdnStatePtr(gdnOrdinal);
@@ -778,15 +852,18 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             _kernels.LaunchGdnScanStepF32(gdnStateDev, qT, kT, vT, gT, betaT, outT,
                 nVHead, nKHead, dState, streamH);
         }
+        ProfMark("gdn-5-scan");
 
         // ── 6. Per-head RMSNorm(out, ssm_norm) * silu(z) gating ──
         _kernels.LaunchRmsNormF32(gdnOut, gdnW.SsmNormDevice, gdnOut,
             dState, eps, seqLen * nVHead, streamH);
         _kernels.LaunchSwiGLUF32(zBuf, gdnOut, gdnOut, vDim, seqLen, streamH);
+        ProfMark("gdn-6-normgate");
 
         // ── 7. ssm_out projection into NormOutput ──
         Gemm(gdnW.OutDevice, gdnW.OutQt, gdnOut, normOut,
              gdnW.OutOutputDim, gdnW.OutInputDim, seqLen);
+        ProfMark("gdn-7-outproj");
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -810,31 +887,44 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint gate = _state.GateScratch;
         nint attnOut = _state.AttnOutput;
 
+        ProfStart();
         // ── 1. Fused Q+Gate projection ──
         Gemm(attn.QDevice, attn.QQt, normOut, qgBuf, attn.QOutputDim, attn.QInputDim, seqLen);
         DumpDevice2D($"blk.{layer}.fa_qg", qgBuf, seqLen, qgElems);
+        ProfMark("attn-1-qgproj");
 
         // ── 2. De-interleave QG → Q and Gate ──
-        long perTokenQgBytes = (long)qgElems * sizeof(float);
-        long perTokenQBytes = (long)qElems * sizeof(float);
-        long perHeadBytes = (long)headDim * sizeof(float);
-        for (int t = 0; t < seqLen; t++)
+        // Single gather-kernel launch (see elementwise_f32.cu's deinterleave_qgate_f32) —
+        // replaces a numHeads-iteration host loop of paired cuMemcpyDtoDAsync calls, which
+        // profiled as ~12% of total decode time (bigger than the attention kernel itself).
+        if (_kernels.HasDeinterleaveF32)
         {
-            nint qgRow = qgBuf + (nint)(t * perTokenQgBytes);
-            nint qRow = q + (nint)(t * perTokenQBytes);
-            nint gRow = gate + (nint)(t * perTokenQBytes);
-            for (int h = 0; h < numHeads; h++)
+            _kernels.LaunchDeinterleaveQGateF32(qgBuf, q, gate, numHeads, headDim, seqLen, streamH);
+        }
+        else
+        {
+            long perTokenQgBytes = (long)qgElems * sizeof(float);
+            long perTokenQBytes = (long)qElems * sizeof(float);
+            long perHeadBytes = (long)headDim * sizeof(float);
+            for (int t = 0; t < seqLen; t++)
             {
-                nint qgHead = qgRow + (nint)(h * 2 * perHeadBytes);
-                nint qHead = qRow + (nint)(h * perHeadBytes);
-                nint gHead = gRow + (nint)(h * perHeadBytes);
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(qHead, qgHead, (nuint)perHeadBytes, streamH).ThrowOnError();
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(gHead, qgHead + (nint)perHeadBytes,
-                    (nuint)perHeadBytes, streamH).ThrowOnError();
+                nint qgRow = qgBuf + (nint)(t * perTokenQgBytes);
+                nint qRow = q + (nint)(t * perTokenQBytes);
+                nint gRow = gate + (nint)(t * perTokenQBytes);
+                for (int h = 0; h < numHeads; h++)
+                {
+                    nint qgHead = qgRow + (nint)(h * 2 * perHeadBytes);
+                    nint qHead = qRow + (nint)(h * perHeadBytes);
+                    nint gHead = gRow + (nint)(h * perHeadBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(qHead, qgHead, (nuint)perHeadBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(gHead, qgHead + (nint)perHeadBytes,
+                        (nuint)perHeadBytes, streamH).ThrowOnError();
+                }
             }
         }
         DumpDevice2D($"blk.{layer}.fa_q_split", q, seqLen, numHeads * headDim);
         DumpDevice2D($"blk.{layer}.fa_gate_split", gate, seqLen, numHeads * headDim);
+        ProfMark("attn-2-deinterleave");
 
         // ── 3. K and V projections ──
         if (!TryFusedPQ2_0Gemm2(attn.KDevice, attn.KQt, attn.VDevice, attn.VQt,
@@ -846,6 +936,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         }
         DumpDevice2D($"blk.{layer}.fa_k", k, seqLen, numKvHeads * headDim);
         DumpDevice2D($"blk.{layer}.fa_v", v, seqLen, numKvHeads * headDim);
+        ProfMark("attn-3-kvproj");
 
         // ── 4. Per-head QK-norm ──
         _kernels.LaunchRmsNormF32(q, attn.QNormDevice, q,
@@ -854,12 +945,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             headDim, eps, seqLen * numKvHeads, streamH);
         DumpDevice2D($"blk.{layer}.fa_q_postnorm", q, seqLen, qElems);
         DumpDevice2D($"blk.{layer}.fa_k_postnorm", k, seqLen, numKvHeads * headDim);
+        ProfMark("attn-4-qknorm");
 
         // ── 5. RoPE — partial-rotary NeoX ──
         _kernels.LaunchRoPEF32(q, k, _state.PositionsDevice,
             seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta, 1, streamH);
         DumpDevice2D($"blk.{layer}.fa_q_postrope", q, seqLen, qElems);
         DumpDevice2D($"blk.{layer}.fa_k_postrope", k, seqLen, numKvHeads * headDim);
+        ProfMark("attn-5-rope");
 
         // ── 6. Attention (GQA with causal mask) ──
         if (kvCache is not null)
@@ -870,6 +963,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 throw new InvalidOperationException(
                     $"Layer {layer} is not a full-attention layer but ForwardFullAttnBody was invoked.");
             WriteF16KvRows(slot, k, v, positions, numKvHeads, headDim);
+            ProfMark("attn-6a-kvwrite");
 
             int positionOffset = positions[0];
             int seqKv = _f16CacheCurrentLength;
@@ -878,6 +972,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             EnsureF32KvReadStaging(seqKv, kvElems);
             _kernels.LaunchConvertF16ToF32(_f16KCache![slot], _f32KvReadStagingK, kvLiveElems, streamH);
             _kernels.LaunchConvertF16ToF32(_f16VCache![slot], _f32KvReadStagingV, kvLiveElems, streamH);
+            ProfMark("attn-6b-kvdequant");
 
             _kernels.LaunchAttentionF32(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
                 seqLen, seqKv, numHeads, numKvHeads, headDim,
@@ -890,6 +985,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 positionOffset: 0, slidingWindow: 0, streamH);
         }
         DumpDevice2D($"blk.{layer}.fa_attnout_pregate", attnOut, seqLen, qElems);
+        ProfMark("attn-6c-core");
 
         // ── 7. attnOut *= sigmoid(gate). ──
         if (_kernels.HasElementwiseF32)
@@ -901,10 +997,12 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             LaunchSigmoidMulHostFallback(attnOut, gate, (long)seqLen * qElems);
         }
         DumpDevice2D($"blk.{layer}.fa_attnout_postgate", attnOut, seqLen, qElems);
+        ProfMark("attn-7-gate");
 
         // ── 8. Output projection ──
         Gemm(attn.ODevice, attn.OQt, attnOut, _state.NormOutput,
              attn.OOutputDim, attn.OInputDim, seqLen);
+        ProfMark("attn-8-outproj");
     }
 
     /// <summary>
@@ -1065,6 +1163,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         nint ffnUp = _state.FfnUp;
         nint siluOut = _state.SiluOutput;
 
+        ProfStart();
         if (!TryFusedPQ2_0Gemm2(lw.GateWeight, lw.GateQt, lw.UpWeight, lw.UpQt,
                 normOut, ffnGate, ffnUp, lw.GateOutputDim, lw.UpOutputDim,
                 lw.GateInputDim, lw.UpInputDim, seqLen))
@@ -1072,8 +1171,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             Gemm(lw.GateWeight, lw.GateQt, normOut, ffnGate, lw.GateOutputDim, lw.GateInputDim, seqLen);
             Gemm(lw.UpWeight, lw.UpQt, normOut, ffnUp, lw.UpOutputDim, lw.UpInputDim, seqLen);
         }
+        ProfMark("ffn-1-gateup");
         _kernels.LaunchSwiGLUF32(ffnGate, ffnUp, siluOut, _intermediateSize, seqLen, streamH);
+        ProfMark("ffn-2-swiglu");
         Gemm(lw.DownWeight, lw.DownQt, siluOut, normOut, lw.DownOutputDim, lw.DownInputDim, seqLen);
+        ProfMark("ffn-3-down");
     }
 
     // ──────────────────────────────────────────────────────────────────────

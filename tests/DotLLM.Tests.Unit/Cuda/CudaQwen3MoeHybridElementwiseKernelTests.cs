@@ -386,4 +386,155 @@ public class CudaQwen3MoeHybridElementwiseKernelTests
             $"{kernel}: max ULP {maxUlp} exceeds tolerance {MaxUlpDiff}. " +
             $"At [{maxIdx}] cpu={(maxIdx < 0 ? 0f : cpu[maxIdx])} gpu={(maxIdx < 0 ? 0f : gpu[maxIdx])}.");
     }
+
+    // ── Test 5: deinterleave_qgate_f32 ─────────────────────────────────────
+    // Pure gather (no floating-point math) — asserts EXACT equality, not ULP.
+
+    [SkippableTheory]
+    [InlineData(1, 4, 8)]     // decode shape: seqLen=1
+    [InlineData(3, 40, 128)]  // multi-token, real Bonsai-ish head count/dim
+    public void DeinterleaveQGateF32_MatchesCpuReference(int seqLen, int numHeads, int headDim)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasDeinterleaveF32, "deinterleave kernels not loaded (PTX may be stale)");
+
+        var rng = new Random(0xDEEE ^ seqLen ^ (numHeads << 8) ^ (headDim << 16));
+        int qElems = numHeads * headDim;
+        float[] qg = new float[seqLen * 2 * qElems];
+        for (int i = 0; i < qg.Length; i++) qg[i] = (float)rng.NextDouble();
+
+        // CPU reference — same per-head [Q(headDim) | Gate(headDim)] interleave the
+        // host-loop fallback (and the original per-model host loop) assumed.
+        float[] cpuQ = new float[seqLen * qElems];
+        float[] cpuGate = new float[seqLen * qElems];
+        for (int t = 0; t < seqLen; t++)
+            for (int h = 0; h < numHeads; h++)
+                for (int d = 0; d < headDim; d++)
+                {
+                    int qgBase = t * 2 * qElems + h * 2 * headDim;
+                    cpuQ[t * qElems + h * headDim + d] = qg[qgBase + d];
+                    cpuGate[t * qElems + h * headDim + d] = qg[qgBase + headDim + d];
+                }
+
+        nint dQg = 0, dQ = 0, dGate = 0;
+        try
+        {
+            long qgBytes = (long)qg.Length * sizeof(float);
+            long qBytes = (long)cpuQ.Length * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dQg, (nuint)qgBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dQ, (nuint)qBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dGate, (nuint)qBytes).ThrowOnError();
+            unsafe
+            {
+                fixed (float* p = qg)
+                    CudaDriverApi.cuMemcpyHtoD_v2(dQg, (nint)p, (nuint)qgBytes).ThrowOnError();
+            }
+
+            kernels.LaunchDeinterleaveQGateF32(dQg, dQ, dGate, numHeads, headDim, seqLen, stream.Handle);
+            stream.Synchronize();
+
+            float[] gpuQ = new float[cpuQ.Length];
+            float[] gpuGate = new float[cpuGate.Length];
+            unsafe
+            {
+                fixed (float* p = gpuQ)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dQ, (nuint)qBytes).ThrowOnError();
+                fixed (float* p = gpuGate)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dGate, (nuint)qBytes).ThrowOnError();
+            }
+
+            Assert.Equal(cpuQ, gpuQ);
+            Assert.Equal(cpuGate, gpuGate);
+        }
+        finally
+        {
+            if (dQg != 0) CudaDriverApi.cuMemFree_v2(dQg);
+            if (dQ != 0) CudaDriverApi.cuMemFree_v2(dQ);
+            if (dGate != 0) CudaDriverApi.cuMemFree_v2(dGate);
+        }
+    }
+
+    // ── Test 6: deinterleave_gdn_qkv_f32 ───────────────────────────────────
+
+    [SkippableTheory]
+    [InlineData(1, 2048, 6144)]  // decode shape: seqLen=1, Bonsai-ish kDim/vDim
+    [InlineData(3, 16, 24)]      // multi-token, small dims
+    public void DeinterleaveGdnQkvF32_MatchesCpuReference(int seqLen, int kDim, int vDim)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasDeinterleaveF32, "deinterleave kernels not loaded (PTX may be stale)");
+
+        var rng = new Random(0xF00D ^ seqLen ^ (kDim << 8) ^ (vDim << 16));
+        int convDim = 2 * kDim + vDim;
+        float[] src = new float[seqLen * convDim];
+        for (int i = 0; i < src.Length; i++) src[i] = (float)rng.NextDouble();
+
+        // CPU reference — per-token [Q(kDim) | K(kDim) | V(vDim)] split.
+        float[] cpuQ = new float[seqLen * kDim];
+        float[] cpuK = new float[seqLen * kDim];
+        float[] cpuV = new float[seqLen * vDim];
+        for (int t = 0; t < seqLen; t++)
+        {
+            int rowBase = t * convDim;
+            Array.Copy(src, rowBase, cpuQ, t * kDim, kDim);
+            Array.Copy(src, rowBase + kDim, cpuK, t * kDim, kDim);
+            Array.Copy(src, rowBase + 2 * kDim, cpuV, t * vDim, vDim);
+        }
+
+        nint dSrc = 0, dQ = 0, dK = 0, dV = 0;
+        try
+        {
+            long srcBytes = (long)src.Length * sizeof(float);
+            long qkBytes = (long)cpuQ.Length * sizeof(float);
+            long vBytes = (long)cpuV.Length * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dSrc, (nuint)srcBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dQ, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dK, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dV, (nuint)vBytes).ThrowOnError();
+            unsafe
+            {
+                fixed (float* p = src)
+                    CudaDriverApi.cuMemcpyHtoD_v2(dSrc, (nint)p, (nuint)srcBytes).ThrowOnError();
+            }
+
+            kernels.LaunchDeinterleaveGdnQkvF32(dSrc, dQ, dK, dV, kDim, vDim, seqLen, stream.Handle);
+            stream.Synchronize();
+
+            float[] gpuQ = new float[cpuQ.Length];
+            float[] gpuK = new float[cpuK.Length];
+            float[] gpuV = new float[cpuV.Length];
+            unsafe
+            {
+                fixed (float* p = gpuQ)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dQ, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = gpuK)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dK, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = gpuV)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dV, (nuint)vBytes).ThrowOnError();
+            }
+
+            Assert.Equal(cpuQ, gpuQ);
+            Assert.Equal(cpuK, gpuK);
+            Assert.Equal(cpuV, gpuV);
+        }
+        finally
+        {
+            if (dSrc != 0) CudaDriverApi.cuMemFree_v2(dSrc);
+            if (dQ != 0) CudaDriverApi.cuMemFree_v2(dQ);
+            if (dK != 0) CudaDriverApi.cuMemFree_v2(dK);
+            if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
+        }
+    }
 }

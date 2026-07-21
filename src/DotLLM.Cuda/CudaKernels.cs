@@ -341,6 +341,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _sigmoidF32Func;
     private readonly nint _siluF32Func;
     private readonly nint _sigmoidMulF32Func;
+    private readonly nint _deinterleaveQGateF32Func;
+    private readonly nint _deinterleaveGdnQkvF32Func;
     private readonly nint _dequantQ6_KF32Func;
 
     // ── Gemma-4 (DiffusionGemma AR) F32 helper kernels ───────────────────────
@@ -752,6 +754,8 @@ public sealed unsafe class CudaKernels : IDisposable
             _sigmoidF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_f32");
             _siluF32Func = _elementwiseF32Module.TryGetFunction("silu_f32");
             _sigmoidMulF32Func = _elementwiseF32Module.TryGetFunction("sigmoid_mul_f32");
+            _deinterleaveQGateF32Func = _elementwiseF32Module.TryGetFunction("deinterleave_qgate_f32");
+            _deinterleaveGdnQkvF32Func = _elementwiseF32Module.TryGetFunction("deinterleave_gdn_qkv_f32");
         }
 
         // Gemma-4 (DiffusionGemma AR) F32 helper kernels — optional PTX. Absent on
@@ -904,6 +908,14 @@ public sealed unsafe class CudaKernels : IDisposable
     /// </summary>
     public bool HasElementwiseF32 =>
         _sigmoidF32Func != 0 && _siluF32Func != 0 && _sigmoidMulF32Func != 0;
+
+    /// <summary>
+    /// True when the gather-kernel de-interleave replacements for the hybrid-model decode
+    /// host loops (Q+Gate split, GDN Q/K/V split) are loaded. When false, callers must fall
+    /// back to the per-head/per-token <c>cuMemcpyDtoDAsync</c> loop.
+    /// </summary>
+    public bool HasDeinterleaveF32 =>
+        _deinterleaveQGateF32Func != 0 && _deinterleaveGdnQkvF32Func != 0;
 
     /// <summary>True when the Phase-B Q2_K grouped-GEMV kernel is loaded (PTX present).</summary>
     /// <remarks>Set <see cref="DisableMoeGroupedGemv"/> to force the per-expert
@@ -1984,6 +1996,47 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_sigmoidMulF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gather-kernel replacement for the decode-time host loop that split a fused Q+Gate
+    /// projection's output into separate Q and Gate tensors via numHeads separate
+    /// <c>cuMemcpyDtoDAsync</c> calls. Per-token <paramref name="qg"/> layout:
+    /// <c>[Q_h0(headDim), Gate_h0(headDim), Q_h1(headDim), Gate_h1(headDim), ...]</c>.
+    /// </summary>
+    public void LaunchDeinterleaveQGateF32(nint qg, nint q, nint gate, int numHeads, int headDim, int seqLen, nint stream)
+    {
+        nint qgArg = qg, qArg = q, gateArg = gate;
+        int nhArg = numHeads, hdArg = headDim, slArg = seqLen;
+        void** args = stackalloc void*[] {&qgArg, &qArg, &gateArg, &nhArg, &hdArg, &slArg};
+
+        long total = (long)seqLen * numHeads * headDim;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_deinterleaveQGateF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Gather-kernel replacement for the decode-time host loop that split a GDN layer's fused
+    /// conv1d output into separate Q/K/V tensors. Per-token <paramref name="src"/> layout:
+    /// <c>[Q(kDim) | K(kDim) | V(vDim)]</c>.
+    /// </summary>
+    public void LaunchDeinterleaveGdnQkvF32(nint src, nint q, nint k, nint v, int kDim, int vDim, int seqLen, nint stream)
+    {
+        nint srcArg = src, qArg = q, kArg = k, vArg = v;
+        int kdArg = kDim, vdArg = vDim, slArg = seqLen;
+        void** args = stackalloc void*[] {&srcArg, &qArg, &kArg, &vArg, &kdArg, &vdArg, &slArg};
+
+        long total = (long)seqLen * (2 * kDim + vDim);
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_deinterleaveGdnQkvF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
