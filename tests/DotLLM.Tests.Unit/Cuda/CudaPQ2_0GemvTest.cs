@@ -135,6 +135,89 @@ public class CudaPQ2_0GemvTest
         Assert.True(meanAbsDiff <= 1e-2f, $"mean abs diff {meanAbsDiff} exceeds 1e-2");
     }
 
+    /// <summary>
+    /// Validates the prefill-path dequant kernel (<see cref="CudaKernels.LaunchDequantPQ2_0ToF16"/>,
+    /// v2: one warp per group, coalesced) against the CPU dequant reference
+    /// (<see cref="Dequantize.ToFloat32"/>). Covers non-multiple-of-32-groups-per-warp-batch
+    /// shapes (n=37 doesn't divide evenly into the warp-per-group grid-stride) to exercise the
+    /// tail.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(512, 5120)]
+    [InlineData(37, 5120)]
+    [InlineData(3, 17408)]
+    public void DequantPQ2_0ToF16_MatchesCpuReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunDequant(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunDequant(int n, int k)
+    {
+        var rng = new Random(9012);
+        int groupsPerRow = k / 128;
+        int rowBytes = groupsPerRow * 34;
+        long packedLen = (long)n * rowBytes;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float[] groupScales = new float[n * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.01f + rng.NextSingle() * 0.05f;
+        byte[] packed = Pack(ternary, groupScales, n, k);
+
+        // CPU reference — dequantizes the whole [n, k] matrix via the shared CPU codepath.
+        float[] cpu = new float[(long)n * k];
+        fixed (byte* w = packed)
+            Dequantize.ToFloat32((nint)w, (long)n * k, DotLLM.Core.Configuration.QuantizationType.PQ2_0, cpu);
+
+        Half[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devDst, (nuint)((long)n * k * sizeof(ushort))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+
+                kernels.LaunchDequantPQ2_0ToF16(devW, devDst, n, k, s);
+                stream.Synchronize();
+
+                gpu = new Half[(long)n * k];
+                fixed (Half* p = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devDst, (nuint)((long)n * k * sizeof(ushort))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devDst);
+            }
+        }
+
+        float maxAbsDiff = 0, sumAbsDiff = 0;
+        for (long i = 0; i < cpu.Length; i++)
+        {
+            float d = MathF.Abs(cpu[i] - (float)gpu[i]);
+            sumAbsDiff += d;
+            if (d > maxAbsDiff) maxAbsDiff = d;
+        }
+        float meanAbsDiff = sumAbsDiff / cpu.Length;
+        _out.WriteLine($"PQ2_0 dequant {n}×{k}: max abs diff={maxAbsDiff:E4}, mean={meanAbsDiff:E4}");
+
+        // F16 output vs full-float32 CPU reference — same rounding-only tolerance as the GEMV
+        // F16In test (values here are single ternary*scale terms, no summation, so error is
+        // pure F16 rounding — tighter bound than the GEMV test's accumulated-sum tolerance).
+        Assert.True(maxAbsDiff <= 5e-4f, $"max abs diff {maxAbsDiff} exceeds 5e-4 (F16 rounding vs CPU float32)");
+        Assert.True(meanAbsDiff <= 1e-4f, $"mean abs diff {meanAbsDiff} exceeds 1e-4");
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void Run(int n, int k)
     {

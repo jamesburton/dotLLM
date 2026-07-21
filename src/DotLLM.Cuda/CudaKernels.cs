@@ -1310,7 +1310,8 @@ public sealed unsafe class CudaKernels : IDisposable
     /// Dequantizes a PQ2_0 (PrismML Bonsai ternary) weight matrix to dense FP16 on the GPU for
     /// prefill GEMM. <c>dst[row·k + col] = (code(W[row,col]) - 1) · group_scale</c>. Unlike I2_S,
     /// the scale is per-128-element-group (not per-tensor), so no tensor-tail offset is read —
-    /// <paramref name="src"/> points at the packed row-major PQ2_0 payload only.
+    /// <paramref name="src"/> points at the packed row-major PQ2_0 payload only. v2: one WARP
+    /// decodes each group (coalesced byte reads/writes) — see dequant_pq2_0.cu's v2 comment.
     /// </summary>
     public void LaunchDequantPQ2_0ToF16(nint src, nint dst, int n, int k, nint stream)
     {
@@ -1319,7 +1320,8 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
 
         long totalGroups = (long)n * (k / 128);
-        uint gridDim = (uint)Math.Min((totalGroups + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        int warpsPerBlock = BlockSize / 32;
+        uint gridDim = (uint)Math.Min((totalGroups + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_dequantPQ2_0F16Func,
