@@ -340,6 +340,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _l2NormHeadsF32Module;
     private readonly nint _l2NormHeadsF32Func;
     private readonly nint _gdnDecayF32Func;
+    private readonly nint _gdnDecaySigmoidF32Func;
     private readonly CudaModule? _elementwiseF32Module;
     private readonly nint _sigmoidF32Func;
     private readonly nint _siluF32Func;
@@ -754,6 +755,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _l2NormHeadsF32Module = _gdnScanF32Module;
             _l2NormHeadsF32Func = _gdnScanF32Module.TryGetFunction("l2_normalize_heads_f32");
             _gdnDecayF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_f32");
+            _gdnDecaySigmoidF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_sigmoid_f32");
         }
 
         // Pointwise FP32 helpers (sigmoid / silu / sigmoid_mul) for the post-
@@ -1954,6 +1956,38 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_gdnDecayF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// True when the fused decay+sigmoid kernel (<see cref="LaunchGdnDecaySigmoidF32"/>) is
+    /// loaded. When false, callers fall back to separate <see cref="LaunchGdnDecayF32"/> +
+    /// <see cref="LaunchSigmoidF32"/> calls.
+    /// </summary>
+    public bool HasGdnDecaySigmoidF32 => _gdnDecaySigmoidF32Func != 0;
+
+    /// <summary>
+    /// Fused <see cref="LaunchGdnDecayF32"/> (on <paramref name="alphaBuf"/>) +
+    /// in-place sigmoid (on the independent, identically-shaped <paramref name="betaBuf"/>) —
+    /// GDN's decode path always calls both back-to-back on two same-size <c>[seqLen, nVHead]</c>
+    /// buffers, so one launch handling both halves the launch count. Numerics are byte-for-byte
+    /// identical to the two separate calls (same translation unit, same <c>-fmad=false</c>
+    /// compile flag).
+    /// </summary>
+    public void LaunchGdnDecaySigmoidF32(nint alphaBuf, nint betaBuf, nint dtBias, nint a,
+                                           int seqLen, int nVHead, nint stream)
+    {
+        nint alphaArg = alphaBuf, betaArg = betaBuf, dtArg = dtBias, aArg = a;
+        int slArg = seqLen, nvArg = nVHead;
+
+        void** args = stackalloc void*[] {&alphaArg, &betaArg, &dtArg, &aArg, &slArg, &nvArg};
+
+        int total = seqLen * nVHead;
+        uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_gdnDecaySigmoidF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

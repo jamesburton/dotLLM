@@ -176,6 +176,93 @@ public class CudaQwen3MoeHybridElementwiseKernelTests
         }
     }
 
+    // ── Test 1b: gdn_decay_sigmoid_f32 (fused) ───────────────────────────────
+
+    [SkippableTheory]
+    [InlineData(1, 48)]   // decode shape: seqLen=1, real Bonsai nVHead
+    [InlineData(5, 48)]   // prefill shape
+    public void GdnDecaySigmoidF32_MatchesSeparateDecayPlusSigmoid(int seqLen, int nVHead)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasGdnDecaySigmoidF32, "gdn_decay_sigmoid_f32 not loaded (PTX may be stale)");
+
+        var rng = new Random(0x5EED ^ seqLen ^ (nVHead << 8));
+        float[] alphaIn = new float[seqLen * nVHead];
+        float[] betaIn = new float[seqLen * nVHead];
+        float[] dtBias = new float[nVHead];
+        float[] aCoef = new float[nVHead];
+        for (int i = 0; i < alphaIn.Length; i++) alphaIn[i] = (float)(rng.NextDouble() * 8.0 - 4.0);
+        for (int i = 0; i < betaIn.Length; i++) betaIn[i] = (float)(rng.NextDouble() * 8.0 - 4.0);
+        for (int h = 0; h < nVHead; h++)
+        {
+            dtBias[h] = (float)(rng.NextDouble() * 2.0 - 1.0);
+            aCoef[h] = (float)(-rng.NextDouble() * 0.45 - 0.05);
+        }
+
+        nint dAlphaSep = 0, dBetaSep = 0, dAlphaFused = 0, dBetaFused = 0, dDt = 0, dA = 0;
+        try
+        {
+            long aBytes = (long)alphaIn.Length * sizeof(float);
+            long hBytes = (long)nVHead * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dAlphaSep, (nuint)aBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dBetaSep, (nuint)aBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dAlphaFused, (nuint)aBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dBetaFused, (nuint)aBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dDt, (nuint)hBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dA, (nuint)hBytes).ThrowOnError();
+            unsafe
+            {
+                fixed (float* p = alphaIn)
+                {
+                    CudaDriverApi.cuMemcpyHtoD_v2(dAlphaSep, (nint)p, (nuint)aBytes).ThrowOnError();
+                    CudaDriverApi.cuMemcpyHtoD_v2(dAlphaFused, (nint)p, (nuint)aBytes).ThrowOnError();
+                }
+                fixed (float* p = betaIn)
+                {
+                    CudaDriverApi.cuMemcpyHtoD_v2(dBetaSep, (nint)p, (nuint)aBytes).ThrowOnError();
+                    CudaDriverApi.cuMemcpyHtoD_v2(dBetaFused, (nint)p, (nuint)aBytes).ThrowOnError();
+                }
+                fixed (float* p = dtBias) CudaDriverApi.cuMemcpyHtoD_v2(dDt, (nint)p, (nuint)hBytes).ThrowOnError();
+                fixed (float* p = aCoef) CudaDriverApi.cuMemcpyHtoD_v2(dA, (nint)p, (nuint)hBytes).ThrowOnError();
+            }
+
+            nint s = stream.Handle;
+            kernels.LaunchGdnDecayF32(dAlphaSep, dDt, dA, seqLen, nVHead, s);
+            kernels.LaunchSigmoidF32(dBetaSep, (long)seqLen * nVHead, s);
+            kernels.LaunchGdnDecaySigmoidF32(dAlphaFused, dBetaFused, dDt, dA, seqLen, nVHead, s);
+            stream.Synchronize();
+
+            float[] alphaSep = new float[alphaIn.Length], betaSep = new float[alphaIn.Length];
+            float[] alphaFused = new float[alphaIn.Length], betaFused = new float[alphaIn.Length];
+            unsafe
+            {
+                fixed (float* p = alphaSep) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dAlphaSep, (nuint)aBytes).ThrowOnError();
+                fixed (float* p = betaSep) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dBetaSep, (nuint)aBytes).ThrowOnError();
+                fixed (float* p = alphaFused) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dAlphaFused, (nuint)aBytes).ThrowOnError();
+                fixed (float* p = betaFused) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dBetaFused, (nuint)aBytes).ThrowOnError();
+            }
+
+            Assert.Equal(alphaSep, alphaFused);
+            Assert.Equal(betaSep, betaFused);
+            _out.WriteLine($"gdn_decay_sigmoid_f32 seqLen={seqLen} nVHead={nVHead}: exact match vs separate calls");
+        }
+        finally
+        {
+            if (dAlphaSep != 0) CudaDriverApi.cuMemFree_v2(dAlphaSep);
+            if (dBetaSep != 0) CudaDriverApi.cuMemFree_v2(dBetaSep);
+            if (dAlphaFused != 0) CudaDriverApi.cuMemFree_v2(dAlphaFused);
+            if (dBetaFused != 0) CudaDriverApi.cuMemFree_v2(dBetaFused);
+            if (dDt != 0) CudaDriverApi.cuMemFree_v2(dDt);
+            if (dA != 0) CudaDriverApi.cuMemFree_v2(dA);
+        }
+    }
+
     // ── Test 2: sigmoid_f32 ─────────────────────────────────────────────────
 
     [SkippableTheory]

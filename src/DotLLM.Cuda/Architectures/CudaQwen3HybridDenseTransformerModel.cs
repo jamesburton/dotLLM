@@ -778,22 +778,30 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("gdn-1-proj");
 
         // ── 2. Decay g and write-gate beta ──
-        if (_kernels.HasGdnDecayF32)
+        if (_kernels.HasGdnDecaySigmoidF32)
         {
-            _kernels.LaunchGdnDecayF32(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
+            _kernels.LaunchGdnDecaySigmoidF32(alphaBuf, betaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
                 seqLen, nVHead, streamH);
         }
         else
         {
-            LaunchGdnDecayHostFallback(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice, seqLen, nVHead);
-        }
-        if (_kernels.HasElementwiseF32)
-        {
-            _kernels.LaunchSigmoidF32(betaBuf, (long)seqLen * nVHead, streamH);
-        }
-        else
-        {
-            LaunchSigmoidHostFallback(betaBuf, seqLen * nVHead);
+            if (_kernels.HasGdnDecayF32)
+            {
+                _kernels.LaunchGdnDecayF32(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice,
+                    seqLen, nVHead, streamH);
+            }
+            else
+            {
+                LaunchGdnDecayHostFallback(alphaBuf, gdnW.DtBiasDevice, gdnW.ADevice, seqLen, nVHead);
+            }
+            if (_kernels.HasElementwiseF32)
+            {
+                _kernels.LaunchSigmoidF32(betaBuf, (long)seqLen * nVHead, streamH);
+            }
+            else
+            {
+                LaunchSigmoidHostFallback(betaBuf, seqLen * nVHead);
+            }
         }
         ProfMark("gdn-2-decaygate");
 
