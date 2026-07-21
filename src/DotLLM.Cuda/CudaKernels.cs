@@ -1230,7 +1230,8 @@ public sealed unsafe class CudaKernels : IDisposable
         void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
 
         long totalBlocks = (long)n * (k / 128);
-        uint gridDim = (uint)Math.Min((totalBlocks + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        int warpsPerBlock = BlockSize / 32;
+        uint gridDim = (uint)Math.Min((totalBlocks + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_dequantI2sF16Func,
