@@ -11,8 +11,33 @@
 //   * Code mapping value = code - 1 (0->-1, 1->0, 2->+1).
 //
 // Output is dense row-major FP16 [n, k] for a cuBLAS HGEMM prefill, mirroring dequant_i2_s.cu.
-// Grid-stride over 128-element groups: total_groups = n * (k / 128). Each thread decodes one
-// group (2-byte scale + 32 packed bytes) and writes its 128 FP16 outputs.
+//
+// ── v2: warp-cooperative group decode (2026-07-21) ─────────────────────────────────────────
+// v1 assigned ONE THREAD per 128-element group, each decoding its 32 code bytes in a private
+// scalar loop. Adjacent threads (same warp) then processed ADJACENT groups — group_base
+// addresses PQ2_0_GROUP_BYTES (34) apart — so at any given instruction the warp's 32 lanes
+// were reading 32 bytes scattered ~1088 bytes apart: the same uncoalesced "N-byte stride
+// between lanes" problem pq2_0_gemv.cu's v1/v2 GEMV kernel had (see that file's v3 comment for
+// the full analysis) — this dequant kernel just never got the same fix, since prefill wasn't
+// this session's initial focus.
+//
+// v2 assigns ONE WARP per group instead: the grid-stride loop now advances by warp (not
+// thread), and within a group lane L reads code byte L (`group_base[2 + lane]`) — 32 lanes
+// reading 32 consecutive bytes, one coalesced transaction — and writes to `out_base[lane]`,
+// `[lane+32]`, `[lane+64]`, `[lane+96]`, each also a coalesced 32-lane write. Byte L's decode
+// target is elements {L, L+32, L+64, L+96} of the group per the layout above, so `lane`
+// substitutes directly for the old `gp` loop variable; the scale read is redundant across
+// lanes but that's a hardware broadcast (single address, not a coalescing concern).
+//
+// ── v3: split-layout addressing (weight repack follow-up) ─────────────────────────────────
+// `weight` is now the SPLIT layout produced by `pq2_0_repack.cu`'s `pq2_0_repack_split_f16`
+// (see that file's header, and pq2_0_gemv.cu's "Split-layout addressing" note, for the full
+// rationale) rather than the interleaved on-disk layout: all `total_groups` scales first, then
+// all `total_groups * 32` code bytes. A flat group index `g` addresses `scales[g]` and
+// `codesBase[g*32 + lane]` directly — since `g*32` is trivially a multiple of 32, every group's
+// coalesced 32-lane code read is now unconditionally 32-byte-aligned, same benefit as the GEMV
+// kernel's v3->split-layout change. `row`/`gi` (still derived from `g` for the OUTPUT address,
+// which stays dense row-major regardless of the input's layout change) are unaffected.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -20,40 +45,46 @@
 #define PQ2_0_GROUP_SIZE  128
 #define PQ2_0_GROUP_BYTES 34
 
+// Must match the identical helper in pq2_0_gemv.cu and pq2_0_repack.cu.
+__device__ __forceinline__ size_t pq2_0_codes_base_offset(long totalGroups)
+{
+    size_t scalesBytes = (size_t)totalGroups * sizeof(half);
+    return (scalesBytes + 31) & ~(size_t)31;
+}
+
 extern "C" __global__ void __launch_bounds__(256) dequant_pq2_0_f16(
-    const uint8_t* __restrict__ weight,   // [n x rowBytes] rowBytes = (k/128)*34
+    const uint8_t* __restrict__ weight,   // split layout — see file header's v3 note
     half*          __restrict__ dst,      // [n x k] dense FP16
     const int n,
     const int k)
 {
     const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
     const long total_groups   = (long)n * groups_per_row;
-    const int  row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
 
-    for (long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
-         g < total_groups;
-         g += (long)gridDim.x * blockDim.x)
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
+
+    const int  lane        = threadIdx.x & 31;
+    const long warpsInGrid = ((long)gridDim.x * blockDim.x) >> 5;
+    const long warpId0     = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+
+    for (long g = warpId0; g < total_groups; g += warpsInGrid)
     {
         int row = (int)(g / groups_per_row);
         int gi  = (int)(g % groups_per_row);
 
-        const uint8_t* group_base = weight + (size_t)row * row_bytes + (size_t)gi * PQ2_0_GROUP_BYTES;
-        const float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-        const uint8_t* codes = group_base + 2;
-        half* out_base = dst + (size_t)row * k + (size_t)gi * PQ2_0_GROUP_SIZE;
+        float scale = __half2float(scales[g]);
+        uint8_t p = codesBase[(size_t)g * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
-        #pragma unroll 8
-        for (int gp = 0; gp < 32; gp++)
-        {
-            uint8_t p = codes[gp];
-            int c0 = ((p >> 6) & 0x3) - 1;
-            int c1 = ((p >> 4) & 0x3) - 1;
-            int c2 = ((p >> 2) & 0x3) - 1;
-            int c3 = ( p       & 0x3) - 1;
-            out_base[gp]      = __float2half((float)c0 * scale);
-            out_base[gp + 32] = __float2half((float)c1 * scale);
-            out_base[gp + 64] = __float2half((float)c2 * scale);
-            out_base[gp + 96] = __float2half((float)c3 * scale);
-        }
+        int c0 = ((p >> 6) & 0x3) - 1;
+        int c1 = ((p >> 4) & 0x3) - 1;
+        int c2 = ((p >> 2) & 0x3) - 1;
+        int c3 = ( p       & 0x3) - 1;
+
+        half* out_base = dst + (size_t)row * k + (size_t)gi * PQ2_0_GROUP_SIZE;
+        out_base[lane]      = __float2half((float)c0 * scale);
+        out_base[lane + 32] = __float2half((float)c1 * scale);
+        out_base[lane + 64] = __float2half((float)c2 * scale);
+        out_base[lane + 96] = __float2half((float)c3 * scale);
     }
 }

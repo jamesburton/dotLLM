@@ -119,6 +119,17 @@ public enum Architecture
     Qwen3MoeHybrid,
 
     /// <summary>
+    /// Dense Qwen3.5 hybrid — the same Gated DeltaNet (GDN) + full-attention layer
+    /// alternation as <see cref="Qwen3MoeHybrid"/> (identical GDN recurrence,
+    /// <c>qwen35.full_attention_interval</c> gating, RoPE section scheme), but with a
+    /// standard dense SwiGLU FFN (<c>ffn_gate/up/down.weight</c>) instead of a sparse MoE
+    /// sublayer. GGUF architecture string: <c>qwen35</c> (no <c>moe</c> suffix). First
+    /// observed in PrismML's Bonsai-27B ternary model (distilled from Qwen/Qwen3.6-27B).
+    /// See <see cref="DotLLM.Core.Models.GatedDeltaNetConfig"/> for GDN-specific parameters.
+    /// </summary>
+    Qwen3HybridDense,
+
+    /// <summary>
     /// HuggingFace SmolLM3 — Llama-shaped GQA transformer (3B SKU: 36 layers,
     /// 16 Q-heads, 4 KV-heads, head_dim=128, hidden=2048, intermediate=11008,
     /// vocab=128256, max_pos=65536). Distinguishing features vs Llama:

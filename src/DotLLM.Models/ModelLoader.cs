@@ -68,6 +68,7 @@ public static class ModelLoader
         {
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config),
             Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
             _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
     }

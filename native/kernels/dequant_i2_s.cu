@@ -12,8 +12,17 @@
 // dequant kernels in dequant.cu. The tail scale offset is derived from (n,k) — the generic
 // element-count dequant API cannot locate it, so this kernel takes n and k explicitly.
 //
-// Grid-stride over 128-element blocks: total_blocks = n * (k / 128). Each thread decodes one
-// 128-element block (32 packed bytes) and writes its 128 FP16 outputs.
+// ── v2: warp-cooperative block decode (2026-07-21) ──────────────────────────────────────────
+// v1 assigned ONE THREAD per 128-element block, each decoding its 32 packed bytes in a private
+// scalar loop. Adjacent threads (same warp) then processed ADJACENT blocks — bp addresses 32
+// bytes apart — so at any instruction the warp's 32 lanes were reading/writing 32
+// bytes/halfs scattered far apart: the same uncoalesced pattern found (and fixed) in
+// dequant_pq2_0.cu's sibling kernel and pq2_0_gemv.cu's decode GEMV — see those files' v2/v3
+// comments for the full analysis. Applying the identical fix here: one WARP per block, lane L
+// reads packed byte L (`bp[lane]`, coalesced) and writes to `out_base[lane]`/`[lane+32]`/
+// `[lane+64]`/`[lane+96]` (each a coalesced 32-lane write). Byte L's decode target is elements
+// {L, L+32, L+64, L+96} of the block, so `lane` substitutes directly for the old per-thread
+// `gp` loop variable.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -30,9 +39,11 @@ extern "C" __global__ void __launch_bounds__(256) dequant_i2_s_f16(
     const long total_blocks  = (long)n * blocks_per_row;
     const int  row_bytes     = k / 4;
 
-    for (long blk = (long)blockIdx.x * blockDim.x + threadIdx.x;
-         blk < total_blocks;
-         blk += (long)gridDim.x * blockDim.x)
+    const int  lane        = threadIdx.x & 31;
+    const long warpsInGrid = ((long)gridDim.x * blockDim.x) >> 5;
+    const long warpId0     = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+
+    for (long blk = warpId0; blk < total_blocks; blk += warpsInGrid)
     {
         int row     = (int)(blk / blocks_per_row);
         int blk_in  = (int)(blk % blocks_per_row);
@@ -40,18 +51,14 @@ extern "C" __global__ void __launch_bounds__(256) dequant_i2_s_f16(
         const uint8_t* bp = weight + (size_t)row * row_bytes + (size_t)blk_in * 32;
         half* out_base = dst + (size_t)row * k + (size_t)blk_in * 128;
 
-        #pragma unroll 8
-        for (int gp = 0; gp < 32; gp++)
-        {
-            uint8_t p = bp[gp];
-            int c0 = ((p >> 6) & 0x3) - 1;
-            int c1 = ((p >> 4) & 0x3) - 1;
-            int c2 = ((p >> 2) & 0x3) - 1;
-            int c3 = ( p       & 0x3) - 1;
-            out_base[gp]      = __float2half((float)c0 * scale);
-            out_base[gp + 32] = __float2half((float)c1 * scale);
-            out_base[gp + 64] = __float2half((float)c2 * scale);
-            out_base[gp + 96] = __float2half((float)c3 * scale);
-        }
+        uint8_t p = bp[lane];   // coalesced: 32 lanes read 32 consecutive bytes
+        int c0 = ((p >> 6) & 0x3) - 1;
+        int c1 = ((p >> 4) & 0x3) - 1;
+        int c2 = ((p >> 2) & 0x3) - 1;
+        int c3 = ( p       & 0x3) - 1;
+        out_base[lane]      = __float2half((float)c0 * scale);
+        out_base[lane + 32] = __float2half((float)c1 * scale);
+        out_base[lane + 64] = __float2half((float)c2 * scale);
+        out_base[lane + 96] = __float2half((float)c3 * scale);
     }
 }

@@ -227,3 +227,30 @@ extern "C" __global__ void gdn_decay_f32(
     float sp = logf(1.0f + expf(alpha));
     alpha_buf[idx] = expf(sp * a[vh]);
 }
+
+// Fused decay(alpha_buf) + sigmoid(beta_buf) — the hybrid decode path always calls
+// gdn_decay_f32 immediately followed by a sigmoid over betaBuf (same [seq_len, n_v_head]
+// shape, an independent buffer). Combining into one launch halves the launch count for this
+// pair. alpha_buf's math is byte-for-byte gdn_decay_f32's (same TU, same -fmad=false); the
+// added sigmoid term is elementwise_f32.cu's sigmoid_f32 formula (1/(1+exp(-x))) — running it
+// under -fmad=false too is a strict superset of precision, not a regression, since disabling
+// FMA fusion never increases numerical drift versus the CPU host-fallback reference it mirrors.
+extern "C" __global__ void gdn_decay_sigmoid_f32(
+    float* __restrict__ alpha_buf,         // [seq_len, n_v_head], in/out (decay)
+    float* __restrict__ beta_buf,          // [seq_len, n_v_head], in/out (sigmoid)
+    const float* __restrict__ dt_bias,     // [n_v_head]
+    const float* __restrict__ a,           // [n_v_head]
+    const int seq_len, const int n_v_head)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * n_v_head;
+    if (idx >= total) return;
+
+    int vh = idx % n_v_head;
+    float alpha = alpha_buf[idx] + dt_bias[vh];
+    float sp = logf(1.0f + expf(alpha));
+    alpha_buf[idx] = expf(sp * a[vh]);
+
+    float b = beta_buf[idx];
+    beta_buf[idx] = 1.0f / (1.0f + expf(-b));
+}
