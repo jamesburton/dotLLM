@@ -29,6 +29,18 @@ public sealed unsafe class CudaKernels : IDisposable
     private const int Pq2_0RowsPerBlock = 16;
 
     /// <summary>
+    /// Upper bound on <c>k</c> for routing to the <c>_small</c> PQ2_0 F16 GEMV kernel variants
+    /// (<c>pq2_0_gemv_f16in_small</c>/<c>pq2_0_gemv2_f16in_small</c>) instead of the default
+    /// (<c>PQ2_0_MAX_K</c>=17408-sized) ones. Must match <c>PQ2_0_MAX_K_SMALL</c> in
+    /// native/kernels/pq2_0_gemv.cu — see that file's "Small-K specialization" header comment for
+    /// the occupancy-arithmetic rationale (shrinking the static <c>xs[]</c> shared-memory buffer
+    /// raises the shared-mem occupancy limit above the register limit for these smaller-k
+    /// launches). Exactly Bonsai-27B's attention/GDN input dim (qwen35.embedding_length); the FFN
+    /// call sites (k=17408) always exceed this and stay on the default kernels.
+    /// </summary>
+    private const int Pq2_0MaxKSmall = 5120;
+
+    /// <summary>
     /// Max CUDA blocks for dequant kernel launches. Kernels use grid-stride loops,
     /// so capping grid size amortizes block launch overhead on GPUs with many SMs
     /// (e.g. RTX 3050 has 20 SMs; launching 65K+ blocks per dequant overwhelms the
@@ -175,6 +187,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _pq2_0GemvF32InFunc;
     private readonly nint _pq2_0GemvF16InFunc;
     private readonly nint _pq2_0Gemv2F16InFunc;
+    private readonly nint _pq2_0GemvF16InSmallFunc;
+    private readonly nint _pq2_0Gemv2F16InSmallFunc;
     private readonly nint _dequantPQ2_0F16Func;
     private readonly nint _pq2_0RepackSplitF16Func;
     private readonly nint _relu2Func;
@@ -577,6 +591,8 @@ public sealed unsafe class CudaKernels : IDisposable
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
+        _pq2_0GemvF16InSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in_small");
+        _pq2_0Gemv2F16InSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in_small");
         _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
         _pq2_0RepackSplitF16Func = _pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
@@ -1311,6 +1327,11 @@ public sealed unsafe class CudaKernels : IDisposable
     /// mirroring I2_S's proven scheme — see native/kernels/pq2_0_gemv.cu's file header for the
     /// full rationale. Grid is uncapped (not <see cref="MaxDequantGridSize"/>-limited like the
     /// v1 grid-stride kernel was) since each block now covers a fixed row count.
+    /// Routes to the <c>_small</c> kernel variant when <paramref name="k"/> &lt;=
+    /// <see cref="Pq2_0MaxKSmall"/> — a smaller static shared-memory footprint raises the
+    /// occupancy ceiling for the attention/GDN-shaped calls (see pq2_0_gemv.cu's "Small-K
+    /// specialization" comment for the arithmetic). Transparent to callers: same signature,
+    /// same grid/block sizing (both variants share <see cref="Pq2_0RowsPerBlock"/>/<see cref="BlockSize"/>).
     /// </summary>
     public void LaunchPQ2_0GemvF16In(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
     {
@@ -1321,7 +1342,8 @@ public sealed unsafe class CudaKernels : IDisposable
         uint gridDim = (uint)((n + Pq2_0RowsPerBlock - 1) / Pq2_0RowsPerBlock);
         if (gridDim == 0) gridDim = 1;
 
-        CudaDriverApi.cuLaunchKernel(_pq2_0GemvF16InFunc,
+        nint func = k <= Pq2_0MaxKSmall ? _pq2_0GemvF16InSmallFunc : _pq2_0GemvF16InFunc;
+        CudaDriverApi.cuLaunchKernel(func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -1331,6 +1353,9 @@ public sealed unsafe class CudaKernels : IDisposable
     /// FFN gate+up, or full-attention K+V) — mirrors <see cref="LaunchI2_SGemv2F16In"/>. Stages
     /// x into shared memory once and reuses it across the virtual row-concatenation of both
     /// weight matrices, instead of two separate launches each re-staging x.
+    /// Routes to the <c>_small</c> kernel variant when <paramref name="k"/> &lt;=
+    /// <see cref="Pq2_0MaxKSmall"/> — see <see cref="LaunchPQ2_0GemvF16In"/>'s doc comment for the
+    /// occupancy rationale (identical here; both fused call sites, alpha/beta and K+V, share k=5120).
     /// </summary>
     public void LaunchPQ2_0Gemv2F16In(
         nint quantWeight0, nint quantWeight1, nint xF16,
@@ -1347,7 +1372,8 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
         };
-        CudaDriverApi.cuLaunchKernel(_pq2_0Gemv2F16InFunc,
+        nint func = k <= Pq2_0MaxKSmall ? _pq2_0Gemv2F16InSmallFunc : _pq2_0Gemv2F16InFunc;
+        CudaDriverApi.cuLaunchKernel(func,
                 grid, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

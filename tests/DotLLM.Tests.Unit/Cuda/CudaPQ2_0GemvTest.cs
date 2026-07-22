@@ -45,10 +45,21 @@ public class CudaPQ2_0GemvTest
     /// tail-row clamp path (<c>min(rowBase+rr, n-1)</c> when a block's last warp only partially
     /// overlaps valid rows, and the n=3 case where a single block covers far more rows than
     /// exist).
+    ///
+    /// k=5120 and k=17408 also exercise <see cref="CudaKernels.LaunchPQ2_0GemvF16In"/>'s
+    /// dispatch-by-k routing to the <c>_small</c>/default kernel variants respectively (#157
+    /// round 4 — see native/kernels/pq2_0_gemv.cu's "Small-K specialization" comment). k=5248
+    /// (Pq2_0MaxKSmall+128, one group above the small threshold) specifically guards the
+    /// dispatch BOUNDARY: if the routing were off-by-one and sent this shape into the
+    /// <c>xs[PQ2_0_MAX_K_SMALL]</c>-sized kernel, the vectorized staging loop would write past
+    /// the end of that shared-memory array (undefined behavior, most likely visible here as a
+    /// wrong/corrupted result rather than a crash) — this test would catch that even though
+    /// k=5120/17408 alone would not.
     /// </summary>
     [SkippableTheory]
     [InlineData(512, 5120)]
     [InlineData(512, 17408)]
+    [InlineData(512, 5248)]
     [InlineData(37, 5120)]
     [InlineData(3, 5120)]
     public void PQ2_0GemvF16In_MatchesCpuFloatReference(int n, int k)
@@ -308,18 +319,26 @@ public class CudaPQ2_0GemvTest
     /// separate <see cref="CudaKernels.LaunchPQ2_0GemvF16In"/> calls. Uses odd, unequal n0/n1
     /// (mirroring the I2_S fused-decode test) to exercise the row-selection/tail-clamp boundary
     /// between the two virtually-concatenated weight matrices.
+    ///
+    /// k=5120 (attention/GDN shape) and k=17408 (FFN shape) exercise
+    /// <see cref="CudaKernels.LaunchPQ2_0Gemv2F16In"/>'s dispatch-by-k routing to the
+    /// <c>pq2_0_gemv2_f16in_small</c>/<c>pq2_0_gemv2_f16in</c> variants respectively (#157 round
+    /// 4). k=5248 is the same boundary-above-threshold guard as the single-GEMV test above,
+    /// applied to the fused kernel's own <c>xs[]</c> staging buffer.
     /// </summary>
-    [SkippableFact]
-    public void PQ2_0GemvFusedDecode_MatchesSeparateLaunches()
+    [SkippableTheory]
+    [InlineData(5120)]
+    [InlineData(17408)]
+    [InlineData(5248)]
+    public void PQ2_0GemvFusedDecode_MatchesSeparateLaunches(int k)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
-        RunFusedDecode();
+        RunFusedDecode(k);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private unsafe void RunFusedDecode()
+    private unsafe void RunFusedDecode(int k)
     {
-        const int k = 5120;
         const int n0 = 37;
         const int n1 = 53;
 

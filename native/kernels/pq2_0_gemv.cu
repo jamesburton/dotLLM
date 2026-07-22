@@ -128,6 +128,52 @@
 // a different lever from the two fixes above (transaction count, not per-transaction byte
 // efficiency). See each kernel's staging block below for the alignment/divisibility reasoning.
 
+// ───────────────────────── Small-K specialization (occupancy follow-up, round 4) ─────────────────────────
+// A fresh `ncu --set full` pass on the kernel above (post all three fixes documented above) still
+// flags it latency-bound (Memory/Compute Throughput 56-59%, still < 60%) with achieved occupancy
+// stuck at 31.8-31.9% against a 33.3% THEORETICAL ceiling — `Block Limit Shared Mem = 2` is the
+// binding occupancy constraint (vs `Block Limit Registers = 5`, `Block Limit Warps = 6`), and none
+// of the three landed fixes touched it. The L1TEX scoreboard stall is still the single largest
+// stall category (~48% of cycles) and the scheduler has an eligible warp only ~0.85-0.88/cycle out
+// of ~3.85 active/scheduler (~44% of cycles with nothing to issue) — textbook "not enough resident
+// warps to hide latency behind," which raising occupancy directly addresses (unlike the reverted
+// 8-groups-batching experiment above, which targeted a *different* metric — sector efficiency — and
+// didn't pay off; this fix targets the metric ncu's own SOL rule names: occupancy/latency-hiding).
+//
+// Root cause of the shared-mem ceiling: `xs[PQ2_0_MAX_K]` is sized for the LARGEST real call shape
+// (dense FFN gate/up/down, k=17408) and costs 34816 bytes of the 48 KB static cap on EVERY launch,
+// including the much smaller attention/GDN-projection call sites (k=5120 — Bonsai-27B's
+// qwen35.embedding_length; see CudaPQ2_0GemvTest's file header for the same real dims), which only
+// need 10240 bytes and are paying for 3/4 of a buffer they never touch.
+//
+// Occupancy arithmetic (sm_86, RTX 3060: 100 KB/SM shared-mem budget, 65536 registers/SM, 1536
+// threads/SM max, 16 resident blocks/SM max; both kernels below share BlockSize=256 = 8 warps/block
+// and the unchanged rowOut[PQ2_0_ROWS_PER_BLOCK]=16 halfs=32-byte staging buffer):
+//   Current (xs[17408]):  34816 + 32 = 34848 B/block.  floor(102400/34848) = 2  -> matches the
+//     ncu-reported "Block Limit Shared Mem = 2" exactly, cross-checking this model against the
+//     actual profiler numbers before trusting it for the new case below.
+//   New, k<=5120 (xs[5120]): 10240 + 32 = 10272 B/block. floor(102400/10272) = 9.
+//   Registers: 48 regs/thread * 256 threads/block = 12288 regs/block; floor(65536/12288) = 5 ->
+//     matches the ncu-reported "Block Limit Registers = 5" (unaffected by the shared-mem shrink —
+//     same code, same per-thread register pressure; only the compile-time array *size* constant
+//     changes, not the instruction stream, which is unchanged and still driven by the runtime `k`).
+//   Warps: 1536 threads/SM / 256 threads/block = 6 -> matches ncu's "Block Limit Warps = 6".
+//   New binding constraint = min(9 [shared mem], 5 [registers], 6 [warps], 16 [max blocks]) = 5 —
+//     REGISTERS, not shared mem. New theoretical occupancy = 5*8/48 warps = 40/48 = 83.3% (up from
+//     33.3%) — a real, arithmetic-grounded ~2.5x increase in resident warps available to the
+//     scheduler to hide the still-dominant L1TEX latency behind, for the k=5120 attention/GDN call
+//     sites specifically (QKV/gate/alpha-beta projections, K+V fused GEMV — see
+//     CudaQwen3HybridDenseTransformerModel's ForwardGdnBody/attention body). The k=17408 FFN call
+//     sites are UNCHANGED (still routed through the kernels above) since a k=17408 launch cannot fit
+//     in a 5120-sized xs[] buffer and gains nothing from this fix anyway (already near its own
+//     register ceiling's neighborhood, and FFN's compute-per-byte ratio is higher, per the file's
+//     own history of "compute already dominates there" for k=17408 fusion decisions).
+//
+// Measure before trusting this, per this file's own standard (see the reverted batching experiment
+// above) — theoretical occupancy is not measured throughput. This specialization is a plausible,
+// arithmetically-motivated candidate, not a proven win; #157's remaining work is confirming it on
+// real Bonsai-27B decode.
+
 #include <cuda_fp16.h>
 #include <stdint.h>
 
@@ -151,6 +197,12 @@
 // Mirrors I2S_MAX_K's precedent (i2_s_gemv.cu) — a future PQ2_0 model with larger K would need
 // this raised (no runtime bounds check, matching I2_S's existing convention).
 #define PQ2_0_MAX_K 17408
+
+// Small-K specialization bound (occupancy follow-up, #157 round 4) — see the file-header section
+// above for the full occupancy-arithmetic rationale. Exactly Bonsai-27B's attention/GDN input dim
+// (qwen35.embedding_length=5120); the `_small` kernel variants below are only valid for k <= this
+// value (no runtime bounds check, same convention as PQ2_0_MAX_K/I2S_MAX_K above).
+#define PQ2_0_MAX_K_SMALL 5120
 
 // Byte offset from a split-layout tensor's base to the start of its codes region. Must match the
 // identical helper in pq2_0_repack.cu and dequant_pq2_0.cu — see pq2_0_repack.cu's file header
@@ -456,6 +508,193 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
             {
                 const long gFlat = (long)localRows[rr] * groups_per_row + g;
                 float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
+                uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = __float2half(a);
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int globalRow = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (globalRow < totalN)
+        {
+            if (globalRow < n0) y0[globalRow]      = rowOut[threadIdx.x];
+            else                 y1[globalRow - n0] = rowOut[threadIdx.x];
+        }
+    }
+}
+
+// ───────────────────────── Small-K specialization kernels (#157 round 4) ─────────────────────────
+// Byte-for-byte identical to pq2_0_gemv_f16in/pq2_0_gemv2_f16in above except for `xs`'s static size
+// (PQ2_0_MAX_K_SMALL=5120 instead of PQ2_0_MAX_K=17408) — see the file-header "Small-K
+// specialization" section for the occupancy-arithmetic motivation (Block Limit Shared Mem 2 -> 9,
+// Block Limit Registers unaffected at 5, so registers become the new binding constraint at 5 blocks
+// -> 83.3% theoretical occupancy vs 33.3% today). Deliberately duplicated rather than templated:
+// this codebase's existing kernel-variant convention (i2_s_gemv_f16in/_gemv2_f16in/_gemv3_f16in in
+// i2_s_gemv.cu) is near-duplicate `extern "C" __global__` functions, since `extern "C"` forecloses
+// C++ template instantiation across the P/Invoke boundary — a `#define`-parameterized generation
+// was considered but rejected as strictly harder to read/debug (macro-expanded compiler errors)
+// for a two-instance case with no near-term third size tier.
+//
+// Callers MUST only launch these for k <= PQ2_0_MAX_K_SMALL (no runtime bounds check, matching
+// PQ2_0_MAX_K/I2S_MAX_K's existing convention) — see CudaKernels.LaunchPQ2_0GemvF16In/
+// LaunchPQ2_0Gemv2F16In for the dispatch-by-k routing (transparent to callers of those wrappers;
+// the model-layer call sites are unchanged).
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in_small(
+    const uint8_t* __restrict__ weight,   // split layout — see pq2_0_gemv_f16in's file header
+    const half*    __restrict__ x,
+    half*          __restrict__ y,
+    const int n,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K_SMALL];
+    {
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        uint4* xs4 = reinterpret_cast<uint4*>(xs);
+        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
+        for (int i = threadIdx.x; i < k8; i += blockDim.x)
+            xs4[i] = x4[i];
+    }
+    __syncthreads();
+
+    const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
+    const long total_groups   = (long)n * groups_per_row;
+
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < n;
+
+    __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    if (warpActive)
+    {
+        int   rows[PQ2_0_ROWS_PER_WARP];
+        float acc[PQ2_0_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
+            acc[rr] = 0.0f;
+        }
+
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const long gFlat = (long)rows[rr] * groups_per_row + g;
+                float scale = __half2float(scales[gFlat]);
+                uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = __float2half(a);
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int row = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (row < n) y[row] = rowOut[threadIdx.x];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in_small(
+    const uint8_t* __restrict__ weight0,   // split layout — each of weight0/weight1 has its OWN codesBase (own n)
+    const uint8_t* __restrict__ weight1,
+    const half*    __restrict__ x,
+    half*          __restrict__ y0,
+    half*          __restrict__ y1,
+    const int n0,
+    const int n1,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K_SMALL];
+    {
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        uint4* xs4 = reinterpret_cast<uint4*>(xs);
+        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
+        for (int i = threadIdx.x; i < k8; i += blockDim.x)
+            xs4[i] = x4[i];
+    }
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1;
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < totalN;
+
+    const int groups_per_row = k / PQ2_0_GROUP_SIZE;
+
+    const half*    scales0    = reinterpret_cast<const half*>(weight0);
+    const half*    scales1    = reinterpret_cast<const half*>(weight1);
+    const uint8_t* codesBase0 = weight0 + pq2_0_codes_base_offset((long)n0 * groups_per_row);
+    const uint8_t* codesBase1 = weight1 + pq2_0_codes_base_offset((long)n1 * groups_per_row);
+
+    __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    if (warpActive)
+    {
+        const half*    rowScales[PQ2_0_ROWS_PER_WARP];
+        const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
+        int            localRows[PQ2_0_ROWS_PER_WARP];
+        float          acc[PQ2_0_ROWS_PER_WARP];
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
+            if (globalRow < n0)
+            {
+                rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
+            }
+            else
+            {
+                rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
+            }
+            acc[rr] = 0.0f;
+        }
+
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const long gFlat = (long)localRows[rr] * groups_per_row + g;
+                float scale = __half2float(rowScales[rr][gFlat]);
                 uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
                 float group_partial = 0.0f;
