@@ -109,10 +109,45 @@
 //      above, the hardware is already collapsing the per-lane loads into one broadcast transaction
 //      — a manual shuffle wouldn't remove a real memory transaction that exists today, only trade
 //      31 redundant-but-cheap per-lane LDG issues for one LDG + one shuffle instruction. Expected
-//      effect is a wash-to-marginal at best, and NOT verifiable without a real benchmark run (which
-//      this session's hard "no GPU execution" constraint ruled out) — left as a documented
-//      candidate for a future round that CAN measure it, rather than committed on modeled reasoning
-//      alone.
+//      effect was modeled as a wash-to-marginal at best.
+//
+//      TESTED (#159 follow-up) — implemented as `if (lane == 0) scale = __half2float(scales[gFlat]);
+//      scale = __shfl_sync(0xFFFFFFFF, scale, 0);` in both `pq2_0_gemv_f16in` and
+//      `pq2_0_gemv2_f16in` (numerics preserved exactly — __half2float is a pure bit-pattern
+//      conversion, lane-order-independent, so shuffling the converted float is bit-identical to the
+//      old per-lane load). Compile-time check first, per this file's standing rule: `-Xptxas -v`
+//      showed register usage went UP slightly (pq2_0_gemv_f16in 41->43, pq2_0_gemv2_f16in 45->46;
+//      zero spill in both before/after), but not enough to change either kernel's occupancy-binding
+//      constraint (both were already shared-mem-bound at 5 blocks/SM; registers at 43/46 still give
+//      floor(65536/(43*256))=5 and floor(65536/(46*256))=5 — no occupancy regression predicted).
+//
+//      MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED FROM A FRESH 15.89-15.93 TO
+//      12.42-12.65 TOK/S (RTX 3060, `bench -p 64 -n 16`, 3 reps, reproduced twice) — a ~20-22%
+//      regression, not the modeled wash-to-marginal. This is the FOURTH compile-time-clean,
+//      arithmetically-modeled change in this investigation to regress real throughput (see the
+//      batch-8 and tail-wave-grid-resize entries above for the first two, and this file's own
+//      "Round 4" section for a THIRD case — the small-K specialization — that for once held up).
+//      Reverted in full (`git reset`/`git checkout` back to the pre-experiment commit); no
+//      `__shfl_sync` broadcast exists in the kernel as shipped.
+//
+//      Root cause NOT confirmed by profiling (no `ncu` counter access in the session that ran this
+//      experiment, matching the tail-wave entry's constraint) — offered as a REASONED HYPOTHESIS: an
+//      explicit `if (lane==0) ... __shfl_sync(...)` forces the compiler to treat `scale` as
+//      thread-divergent-then-reconverged at the source level (one lane takes a real branch, then a
+//      real cross-lane data movement instruction), which likely defeats whatever the compiler/
+//      hardware were doing implicitly to already treat the uniform-address load as cheap (the SASS
+//      evidence in the "Round 4" section above showed each lane issuing its own `LDG`, but that LDG
+//      could still be scheduled/pipelined by the compiler alongside neighboring independent loads;
+//      an explicit `__shfl_sync` is a synchronizing warp-collective instruction that the scheduler
+//      cannot reorder past as freely, and the lane-0-only branch adds real predication overhead 32x
+//      per warp per group — group count is large, 68-136 iterations per row here). In short: the
+//      "same address, many redundant-but-cheap loads" pattern the hardware already collapses for
+//      free was, in practice, cheaper than one load plus one explicit shuffle instruction — this
+//      closes out the file header's own prediction that "the hardware already broadcasts, so a
+//      manual shuffle just trades cheap redundancy for an explicit instruction" with a real,
+//      reproducible number: NOT a wash, a clear loss. Don't re-try this specific shuffle-broadcast
+//      shape for this kernel without new evidence (e.g. a future restructuring that makes the
+//      surrounding loop divergence-free in some other way this reasoning doesn't anticipate).
 //
 // ───────────────────────── Vectorized activation staging (#157, latency follow-up) ─────────────────────────
 // The two coalescing fixes above (output-write staging, split-layout weight repack) targeted
