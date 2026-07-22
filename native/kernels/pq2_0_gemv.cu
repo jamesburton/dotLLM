@@ -39,10 +39,28 @@
 // sector-efficiency modeling doesn't capture the real cost of the added shared-memory round-trip
 // (write-then-read instead of straight-to-register) or the two `__syncwarp()` barriers per batch
 // (10/warp/row for k=5120, 34 for k=17408), which also blocks the compiler from pipelining
-// successive unsynchronized loads the way the plain per-group read (below) allows. Don't retry
-// this exact design without new evidence — a fix here needs to reduce sync/staging overhead, not
-// just improve sector efficiency, or pursue the weight-repack alternative (per-group scale and
-// codes split into separate contiguous arrays at load time) instead.
+// successive unsynchronized loads the way the plain per-group read allowed. Superseded by the
+// weight-repack approach below, which gets the same alignment win with none of that overhead.
+//
+// ───────────────────────── Split-layout addressing (weight repack follow-up) ─────────────────────────
+// The "weight repack" deferred above is now implemented: `pq2_0_repack.cu`'s
+// `pq2_0_repack_split_f16` reorders each tensor, ONCE at load time (see
+// CudaQwen3HybridDenseTransformerModel.UploadRawTensor), from the interleaved on-disk layout into
+// a SPLIT layout — all `n * groups_per_row` group scales first (contiguous Halfs), then all
+// `n * groups_per_row * 32` code bytes (contiguous). `pq2_0_gemv_f16in` and `pq2_0_gemv2_f16in`
+// below consume this split layout directly: a flat group index `g = row*groups_per_row + gi`
+// addresses `scales[g]` and `codesBase[g*32 + lane]`, and since `g*32` is trivially a multiple of
+// 32, EVERY group's 32-lane code read is unconditionally 32-byte-aligned — no per-group variation,
+// no shared-memory staging, and critically no added `__syncwarp()`/`__syncthreads()` in this hot
+// loop (see `pq2_0_codes_base_offset`'s doc comment in this file, and pq2_0_repack.cu's file
+// header, for the offset derivation and its alignment-robustness rounding). This is strictly
+// cheaper than the batched-staging approach reverted above — the alignment fix is entirely
+// amortized into a one-time host-side repack, so the decode kernel itself gains coalescing with
+// ZERO new per-iteration cost. Measure before trusting this comment, though — see the batched-
+// staging note above for why "the math predicts a win" isn't sufficient on its own.
+//
+// `pq2_0_gemv_f32in` below is NOT touched — it is the CPU-vs-GPU correctness reference and no
+// production caller ever passes it split-layout data.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -67,6 +85,15 @@
 // Mirrors I2S_MAX_K's precedent (i2_s_gemv.cu) — a future PQ2_0 model with larger K would need
 // this raised (no runtime bounds check, matching I2_S's existing convention).
 #define PQ2_0_MAX_K 17408
+
+// Byte offset from a split-layout tensor's base to the start of its codes region. Must match the
+// identical helper in pq2_0_repack.cu and dequant_pq2_0.cu — see pq2_0_repack.cu's file header
+// for the round-up-to-32 rationale (guarantees alignment regardless of totalGroups' parity).
+__device__ __forceinline__ size_t pq2_0_codes_base_offset(long totalGroups)
+{
+    size_t scalesBytes = (size_t)totalGroups * sizeof(half);
+    return (scalesBytes + 31) & ~(size_t)31;
+}
 
 __device__ __forceinline__ float pq2_0_warp_reduce(float acc)
 {
@@ -183,7 +210,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32in(
 // shared rowOut[] slot that stays unwritten (because its owning warp was entirely inactive)
 // corresponds to a row >= n, which the final `row < n` check guarantees is never read.
 extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
-    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ weight,   // split layout — see file header's "Split-layout addressing" note
     const half*    __restrict__ x,
     half*          __restrict__ y,
     const int n,
@@ -197,8 +224,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
         xs[i] = x[i];
     __syncthreads();
 
-    const int groups_per_row = k / PQ2_0_GROUP_SIZE;
-    const int row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
+    const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
+    const long total_groups   = (long)n * groups_per_row;
+
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
 
     const int wid  = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -210,13 +240,12 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
 
     if (warpActive)
     {
-        const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
+        int   rows[PQ2_0_ROWS_PER_WARP];
         float acc[PQ2_0_ROWS_PER_WARP];
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
-            int r = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
-            row_ptrs[rr] = weight + (size_t)r * row_bytes;
+            rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
             acc[rr] = 0.0f;
         }
 
@@ -226,9 +255,9 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
-                const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-                float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-                uint8_t p = group_base[2 + lane];   // coalesced: 32 lanes read 32 consecutive bytes
+                const long gFlat = (long)rows[rr] * groups_per_row + g;
+                float scale = __half2float(scales[gFlat]);
+                uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
                 float group_partial = 0.0f;
                 pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
@@ -266,7 +295,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
 // one into y1) instead of one — still a large improvement over independent scalar stores, and
 // correctness (not maximal coalescing) is what matters here.
 extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
-    const uint8_t* __restrict__ weight0,
+    const uint8_t* __restrict__ weight0,   // split layout — each of weight0/weight1 has its OWN codesBase (own n)
     const uint8_t* __restrict__ weight1,
     const half*    __restrict__ x,
     half*          __restrict__ y0,
@@ -287,26 +316,37 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
     const bool warpActive = rowBase < totalN;
 
     const int groups_per_row = k / PQ2_0_GROUP_SIZE;
-    const int row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
+
+    // Each virtually-concatenated array is a physically separate split-layout tensor, so each
+    // gets its own scales/codes split point derived from its OWN row count (n0 vs n1) — see
+    // pq2_0_gemv_f16in's "Split-layout addressing" file-header note.
+    const half*    scales0    = reinterpret_cast<const half*>(weight0);
+    const half*    scales1    = reinterpret_cast<const half*>(weight1);
+    const uint8_t* codesBase0 = weight0 + pq2_0_codes_base_offset((long)n0 * groups_per_row);
+    const uint8_t* codesBase1 = weight1 + pq2_0_codes_base_offset((long)n1 * groups_per_row);
 
     __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
 
     if (warpActive)
     {
-        const uint8_t* row_ptrs[PQ2_0_ROWS_PER_WARP];
+        const half*    rowScales[PQ2_0_ROWS_PER_WARP];
+        const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
+        int            localRows[PQ2_0_ROWS_PER_WARP];
         float          acc[PQ2_0_ROWS_PER_WARP];
 
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
             int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
-            const uint8_t* w;
-            int localRow;
-            if (globalRow < n0) { w = weight0; localRow = globalRow; }
-            else                { w = weight1; localRow = globalRow - n0; }
-
-            row_ptrs[rr] = w + (size_t)localRow * row_bytes;
-            acc[rr]      = 0.0f;
+            if (globalRow < n0)
+            {
+                rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
+            }
+            else
+            {
+                rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
+            }
+            acc[rr] = 0.0f;
         }
 
         // v3 coalescing: warp cooperates on one group at a time (lane L reads code byte L),
@@ -317,9 +357,9 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
-                const uint8_t* group_base = row_ptrs[rr] + (size_t)g * PQ2_0_GROUP_BYTES;
-                float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-                uint8_t p = group_base[2 + lane];
+                const long gFlat = (long)localRows[rr] * groups_per_row + g;
+                float scale = __half2float(rowScales[rr][gFlat]);
+                uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
                 float group_partial = 0.0f;
                 pq2_0_accum_byte(group_partial, p, xs, out_base + lane);

@@ -28,6 +28,16 @@
 // target is elements {L, L+32, L+64, L+96} of the group per the layout above, so `lane`
 // substitutes directly for the old `gp` loop variable; the scale read is redundant across
 // lanes but that's a hardware broadcast (single address, not a coalescing concern).
+//
+// ── v3: split-layout addressing (weight repack follow-up) ─────────────────────────────────
+// `weight` is now the SPLIT layout produced by `pq2_0_repack.cu`'s `pq2_0_repack_split_f16`
+// (see that file's header, and pq2_0_gemv.cu's "Split-layout addressing" note, for the full
+// rationale) rather than the interleaved on-disk layout: all `total_groups` scales first, then
+// all `total_groups * 32` code bytes. A flat group index `g` addresses `scales[g]` and
+// `codesBase[g*32 + lane]` directly — since `g*32` is trivially a multiple of 32, every group's
+// coalesced 32-lane code read is now unconditionally 32-byte-aligned, same benefit as the GEMV
+// kernel's v3->split-layout change. `row`/`gi` (still derived from `g` for the OUTPUT address,
+// which stays dense row-major regardless of the input's layout change) are unaffected.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -35,15 +45,24 @@
 #define PQ2_0_GROUP_SIZE  128
 #define PQ2_0_GROUP_BYTES 34
 
+// Must match the identical helper in pq2_0_gemv.cu and pq2_0_repack.cu.
+__device__ __forceinline__ size_t pq2_0_codes_base_offset(long totalGroups)
+{
+    size_t scalesBytes = (size_t)totalGroups * sizeof(half);
+    return (scalesBytes + 31) & ~(size_t)31;
+}
+
 extern "C" __global__ void __launch_bounds__(256) dequant_pq2_0_f16(
-    const uint8_t* __restrict__ weight,   // [n x rowBytes] rowBytes = (k/128)*34
+    const uint8_t* __restrict__ weight,   // split layout — see file header's v3 note
     half*          __restrict__ dst,      // [n x k] dense FP16
     const int n,
     const int k)
 {
     const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
     const long total_groups   = (long)n * groups_per_row;
-    const int  row_bytes      = groups_per_row * PQ2_0_GROUP_BYTES;
+
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
 
     const int  lane        = threadIdx.x & 31;
     const long warpsInGrid = ((long)gridDim.x * blockDim.x) >> 5;
@@ -54,9 +73,8 @@ extern "C" __global__ void __launch_bounds__(256) dequant_pq2_0_f16(
         int row = (int)(g / groups_per_row);
         int gi  = (int)(g % groups_per_row);
 
-        const uint8_t* group_base = weight + (size_t)row * row_bytes + (size_t)gi * PQ2_0_GROUP_BYTES;
-        float scale = __half2float(*reinterpret_cast<const half*>(group_base));
-        uint8_t p = group_base[2 + lane];   // coalesced: 32 lanes read 32 consecutive bytes
+        float scale = __half2float(scales[g]);
+        uint8_t p = codesBase[(size_t)g * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
         int c0 = ((p >> 6) & 0x3) - 1;
         int c1 = ((p >> 4) & 0x3) - 1;

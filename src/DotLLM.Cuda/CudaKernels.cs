@@ -116,6 +116,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule _dequantI2sModule;
     private readonly CudaModule _pq2_0GemvModule;
     private readonly CudaModule _dequantPQ2_0Module;
+    private readonly CudaModule _pq2_0RepackModule;
     private readonly CudaModule _relu2Module;
     private readonly CudaModule _relu2F32Module;
     private readonly CudaModule _relu2GluRmsNormModule;
@@ -175,6 +176,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _pq2_0GemvF16InFunc;
     private readonly nint _pq2_0Gemv2F16InFunc;
     private readonly nint _dequantPQ2_0F16Func;
+    private readonly nint _pq2_0RepackSplitF16Func;
     private readonly nint _relu2Func;
     private readonly nint _relu2F32Func;
     private readonly nint _relu2GluRmsNormFunc;
@@ -431,6 +433,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantI2sModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_i2_s.ptx"));
         _pq2_0GemvModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_gemv.ptx"));
         _dequantPQ2_0Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "dequant_pq2_0.ptx"));
+        _pq2_0RepackModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_repack.ptx"));
         _relu2Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2.ptx"));
         _relu2F32Module = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_f32.ptx"));
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
@@ -575,6 +578,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
         _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
+        _pq2_0RepackSplitF16Func = _pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
         _relu2F32Func = _relu2F32Module.GetFunction("relu2_f32");
         _relu2GluRmsNormFunc = _relu2GluRmsNormModule.GetFunction("relu2_glu_rmsnorm_f16");
@@ -1369,6 +1373,48 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_dequantPQ2_0F16Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// One-time PQ2_0 weight repack: reorders a tensor from dotLLM's interleaved on-disk layout
+    /// (per-group scale immediately followed by that group's 32 code bytes) into the split layout
+    /// <see cref="LaunchPQ2_0GemvF16In"/>/<see cref="LaunchPQ2_0Gemv2F16In"/>/
+    /// <see cref="LaunchDequantPQ2_0ToF16"/> now expect (all scales first, then all codes — see
+    /// native/kernels/pq2_0_repack.cu's file header for the exact byte layout and the
+    /// round-up-to-32 alignment rationale). Load-time only, never called on the decode hot path —
+    /// see <c>CudaQwen3HybridDenseTransformerModel.UploadRawTensor</c> for the call site.
+    /// <paramref name="split"/> must be sized <c>PQ2_0SplitLayoutBytes(n, k)</c>-worth of bytes
+    /// (codes-region start rounded up to 32 — a few bytes larger than the interleaved source in
+    /// the worst case, never smaller).
+    /// </summary>
+    public void LaunchPQ2_0RepackSplitF16(nint interleaved, nint split, int n, int k, nint stream)
+    {
+        nint srcArg = interleaved, dstArg = split;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
+
+        long totalGroups = (long)n * (k / 128);
+        int warpsPerBlock = BlockSize / 32;
+        uint gridDim = (uint)Math.Min((totalGroups + warpsPerBlock - 1) / warpsPerBlock, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_pq2_0RepackSplitF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Byte size of the split-layout buffer <see cref="LaunchPQ2_0RepackSplitF16"/> writes into,
+    /// for a PQ2_0 tensor with <paramref name="n"/> rows and row length <paramref name="k"/>.
+    /// Codes region start is rounded up to 32 bytes (see native/kernels/pq2_0_repack.cu's file
+    /// header) so total size is at most 31 bytes larger than the interleaved source
+    /// (<c>n * (k/128) * 34</c>), never smaller.
+    /// </summary>
+    public static long PQ2_0SplitLayoutBytes(int n, int k)
+    {
+        long totalGroups = (long)n * (k / 128);
+        long codesBaseOffset = (totalGroups * sizeof(ushort) + 31) & ~31L;
+        return codesBaseOffset + totalGroups * 32;
     }
 
     /// <summary>Fused squared-ReLU GLU (BitNet): <c>out = relu(gate)² · up</c>. FP16, half2 vectorized.</summary>
@@ -4373,6 +4419,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _dequantI2sModule.Dispose();
         _pq2_0GemvModule.Dispose();
         _dequantPQ2_0Module.Dispose();
+        _pq2_0RepackModule.Dispose();
         _relu2Module.Dispose();
         _relu2F32Module.Dispose();
         _relu2GluRmsNormModule.Dispose();

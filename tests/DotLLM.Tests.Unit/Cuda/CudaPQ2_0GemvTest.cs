@@ -92,7 +92,9 @@ public class CudaPQ2_0GemvTest
             using var kernels = new CudaKernels(ptxDir!);
             nint s = stream.Handle;
 
+            long splitLen = CudaKernels.PQ2_0SplitLayoutBytes(n, k);
             CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devWSplit, (nuint)splitLen).ThrowOnError();
             CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
             CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(ushort))).ThrowOnError();
             try
@@ -102,7 +104,11 @@ public class CudaPQ2_0GemvTest
                 fixed (Half* px = xh)
                     CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
 
-                kernels.LaunchPQ2_0GemvF16In(devW, devX, devY, n, k, s);
+                // Repack interleaved -> split layout (mirrors the real production load path,
+                // CudaQwen3HybridDenseTransformerModel.UploadRawTensor) — this also validates the
+                // repack kernel itself, not just the GEMV kernel's split-layout reads in isolation.
+                kernels.LaunchPQ2_0RepackSplitF16(devW, devWSplit, n, k, s);
+                kernels.LaunchPQ2_0GemvF16In(devWSplit, devX, devY, n, k, s);
                 stream.Synchronize();
 
                 gpu = new Half[n];
@@ -112,6 +118,7 @@ public class CudaPQ2_0GemvTest
             finally
             {
                 CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devWSplit);
                 CudaDriverApi.cuMemFree_v2(devX);
                 CudaDriverApi.cuMemFree_v2(devY);
             }
@@ -180,14 +187,18 @@ public class CudaPQ2_0GemvTest
             using var kernels = new CudaKernels(ptxDir!);
             nint s = stream.Handle;
 
+            long splitLen = CudaKernels.PQ2_0SplitLayoutBytes(n, k);
             CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devWSplit, (nuint)splitLen).ThrowOnError();
             CudaDriverApi.cuMemAlloc_v2(out nint devDst, (nuint)((long)n * k * sizeof(ushort))).ThrowOnError();
             try
             {
                 fixed (byte* w = packed)
                     CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
 
-                kernels.LaunchDequantPQ2_0ToF16(devW, devDst, n, k, s);
+                // Repack interleaved -> split layout — see RunF16's identical comment above.
+                kernels.LaunchPQ2_0RepackSplitF16(devW, devWSplit, n, k, s);
+                kernels.LaunchDequantPQ2_0ToF16(devWSplit, devDst, n, k, s);
                 stream.Synchronize();
 
                 gpu = new Half[(long)n * k];
@@ -197,6 +208,7 @@ public class CudaPQ2_0GemvTest
             finally
             {
                 CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devWSplit);
                 CudaDriverApi.cuMemFree_v2(devDst);
             }
         }
@@ -330,8 +342,13 @@ public class CudaPQ2_0GemvTest
         int rowBytes = groupsPerRow * 34;
         static nuint PackedBytes(int n, int rowBytes) => (nuint)((long)n * rowBytes);
 
+        long splitLen0 = CudaKernels.PQ2_0SplitLayoutBytes(n0, k);
+        long splitLen1 = CudaKernels.PQ2_0SplitLayoutBytes(n1, k);
+
         CudaDriverApi.cuMemAlloc_v2(out nint devW0, PackedBytes(n0, rowBytes)).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint devW1, PackedBytes(n1, rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW0Split, (nuint)splitLen0).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW1Split, (nuint)splitLen1).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)(k * sizeof(ushort))).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint sep0, (nuint)(n0 * sizeof(ushort))).ThrowOnError();
         CudaDriverApi.cuMemAlloc_v2(out nint sep1, (nuint)(n1 * sizeof(ushort))).ThrowOnError();
@@ -343,9 +360,15 @@ public class CudaPQ2_0GemvTest
             fixed (byte* p = w1) CudaDriverApi.cuMemcpyHtoD_v2(devW1, (nint)p, PackedBytes(n1, rowBytes)).ThrowOnError();
             fixed (Half* p = x) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)p, (nuint)(k * sizeof(ushort))).ThrowOnError();
 
-            kernels.LaunchPQ2_0GemvF16In(devW0, devX, sep0, n0, k, s);
-            kernels.LaunchPQ2_0GemvF16In(devW1, devX, sep1, n1, k, s);
-            kernels.LaunchPQ2_0Gemv2F16In(devW0, devW1, devX, fus0, fus1, n0, n1, k, s);
+            // Repack interleaved -> split layout — see RunF16's identical comment above. Each
+            // virtually-concatenated array (w0/w1) is a physically separate tensor with its own
+            // split-layout buffer, mirroring how UploadRawTensor repacks each tensor independently.
+            kernels.LaunchPQ2_0RepackSplitF16(devW0, devW0Split, n0, k, s);
+            kernels.LaunchPQ2_0RepackSplitF16(devW1, devW1Split, n1, k, s);
+
+            kernels.LaunchPQ2_0GemvF16In(devW0Split, devX, sep0, n0, k, s);
+            kernels.LaunchPQ2_0GemvF16In(devW1Split, devX, sep1, n1, k, s);
+            kernels.LaunchPQ2_0Gemv2F16In(devW0Split, devW1Split, devX, fus0, fus1, n0, n1, k, s);
             stream.Synchronize();
 
             AssertHalfClose(sep0, fus0, n0);
@@ -354,6 +377,7 @@ public class CudaPQ2_0GemvTest
         finally
         {
             CudaDriverApi.cuMemFree_v2(devW0); CudaDriverApi.cuMemFree_v2(devW1);
+            CudaDriverApi.cuMemFree_v2(devW0Split); CudaDriverApi.cuMemFree_v2(devW1Split);
             CudaDriverApi.cuMemFree_v2(devX);
             CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1);
             CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1);

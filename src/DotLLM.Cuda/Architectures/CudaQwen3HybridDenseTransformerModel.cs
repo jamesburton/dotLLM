@@ -1564,6 +1564,31 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return device;
     }
 
+    // Lazily-loaded, process-wide singleton for the PQ2_0 weight-repack kernel. Kept independent
+    // of the per-model CudaKernels instance (`kernels` in LoadFromGguf) rather than threaded
+    // through as a parameter: UploadRawTensor and its dozens of call sites (LoadLayerDevice,
+    // LoadGdnLayerDevice, LoadFullAttnLayerDevice — all `private static`, running before this
+    // model instance or its CudaKernels even exist) stay completely unchanged, which is the
+    // entire point of doing the repack at this one choke point instead of threading split-layout
+    // awareness through every layer's weight struct and every Gemm/TryFusedPQ2_0Gemm2 call site.
+    // Mirrors CudaKernels.LaunchPQ2_0RepackSplitF16's launch shape exactly (same PTX, same grid
+    // formula) — that instance-based wrapper is what tests use; this static path exists solely
+    // because this call site structurally cannot hold a CudaKernels instance without a much
+    // larger, invasive restructuring of the (static, pre-construction) loading pipeline.
+    private static CudaModule? s_pq2_0RepackModule;
+    private static nint s_pq2_0RepackFunc;
+
+    private static nint EnsurePq2_0RepackFunc()
+    {
+        if (s_pq2_0RepackModule is null)
+        {
+            string ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
+            s_pq2_0RepackModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_repack.ptx"));
+            s_pq2_0RepackFunc = s_pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
+        }
+        return s_pq2_0RepackFunc;
+    }
+
     private static nint UploadRawTensor(nint dataBase, GgufTensorDescriptor desc)
     {
         int innerDim = desc.Shape[0];
@@ -1571,7 +1596,46 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         long bytes = Dequantize.RowByteSize(innerDim, desc.QuantizationType) * outerDim;
         nint device = AllocDevice(bytes);
         CopyHtoD(device, dataBase + (nint)desc.DataOffset, bytes);
-        return device;
+
+        if (desc.QuantizationType != QuantizationType.PQ2_0)
+            return device;
+
+        // One-time load-time repack: reorder from dotLLM's interleaved on-disk PQ2_0 layout
+        // (per-group scale immediately followed by that group's 32 code bytes — never
+        // 32-byte-aligned, PQ2_0_GROUP_BYTES=34) into the split layout pq2_0_gemv.cu /
+        // dequant_pq2_0.cu now read (all scales, then all codes — see those files'
+        // "Split-layout addressing" notes and pq2_0_repack.cu's file header). This makes every
+        // group's hot-path code read unconditionally 32-byte-aligned with zero added
+        // synchronization in the decode kernel — see native/kernels/pq2_0_gemv.cu's file header
+        // for why this is preferred over an in-kernel batched-staging fix (measured regression
+        // from added __syncwarp() barriers on a parallel investigation branch). Synchronous:
+        // this runs once per tensor at load time, never on the inference hot path. The temporary
+        // interleaved buffer is freed immediately after, so this is not a steady-state VRAM
+        // increase — only a transient extra allocation (same size as the split buffer) during
+        // the repack itself.
+        int n = (int)outerDim;
+        int k = innerDim;
+        long splitBytes = CudaKernels.PQ2_0SplitLayoutBytes(n, k);
+        nint splitDevice = AllocDevice(splitBytes);
+
+        nint repackFunc = EnsurePq2_0RepackFunc();
+        long totalGroups = (long)n * (k / 128);
+        const int blockSize = 256;       // must match pq2_0_repack.cu's __launch_bounds__(256)
+        const int warpsPerBlock = blockSize / 32;
+        const int maxGridSize = 256;      // mirrors CudaKernels.MaxDequantGridSize
+        uint gridDim = (uint)Math.Min((totalGroups + warpsPerBlock - 1) / warpsPerBlock, maxGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        nint srcArg = device, dstArg = splitDevice;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] { &srcArg, &dstArg, &nArg, &kArg };
+        CudaDriverApi.cuLaunchKernel(repackFunc,
+                gridDim, 1, 1, blockSize, 1, 1,
+                0, 0, (nint)args, 0).ThrowOnError();
+        CudaDriverApi.cuStreamSynchronize(0).ThrowOnError();   // synchronous — one-time load-time cost, not hot path
+
+        FreeIfNonZero(ref device);
+        return splitDevice;
     }
 
     private static void UpdateMaxTile(ref long max, long candidate)
