@@ -62,6 +62,58 @@
 // `pq2_0_gemv_f32in` below is NOT touched — it is the CPU-vs-GPU correctness reference and no
 // production caller ever passes it split-layout data.
 //
+// ───────────────────────── Round 4 (#157): residual "20.0/32 bytes" investigated, NOT changed ─────────────────────────
+// A follow-up `ncu --set full` pass (post all three fixes above) still flagged
+// MemoryCacheAccessPattern on global loads at ~62.5% sector efficiency ("only 20.0 of the 32 bytes
+// transmitted per sector are utilized", Estimated Speedup ~21-22%). Since the split-layout repack
+// makes `codesBase[gFlat*32 + lane]` unconditionally 32-byte-aligned and fully coalesced (32 lanes,
+// 32 consecutive bytes, 100% of that sector used), the residual number can't be coming from the
+// code read — it was traced by inspection to the per-group scale read,
+// `scale = __half2float(scales[gFlat]);` (`pq2_0_gemv_f16in`/`pq2_0_gemv2_f16in`, main loop).
+// `gFlat` here depends only on `rows[rr]` (a function of `blockIdx.x`/`wid`, uniform per warp) and
+// `g` (the loop counter, also uniform per warp) — NOT on `lane`. Confirmed by compiling this file
+// to a `-cubin -arch=sm_86` and inspecting the disassembly (`cuobjdump --dump-sass`, no GPU
+// execution involved): every lane in the warp issues its OWN `LDG.E.U16.CONSTANT` for this read
+// (not hoisted into a `ULDC`/uniform-register-file load — nvcc's automatic uniform-datapath
+// promotion doesn't reach this case), but all 32 lanes compute the IDENTICAL address. This is a
+// genuine single-address broadcast, not a stride/misalignment problem: the GPU's load/store unit
+// coalesces same-address warp-wide requests into ONE sector fetch (broadcast to all 32 threads)
+// regardless of whether the compiler recognized the uniformity statically — this collapsing
+// happens on the actual runtime addresses, at the memory pipeline, not in the compiler. So the
+// real transaction count for this read is ~1 sector per (row-pair, group) instance, not 32; the
+// "20.0/32 bytes" / ~62.5% figure is `ncu`'s byte-utilization accounting (2 of 32 bytes in that one
+// fetched sector are the ones actually asked for) rather than evidence of redundant traffic. This
+// matches a documented false-positive pattern for the MemoryCacheAccessPattern rule on
+// uniform/broadcast reads (cheap in practice, penalized by a metric that doesn't distinguish
+// "many threads, one real transaction" from "many threads, many transactions").
+//
+// Considered and REJECTED, both without writing code that could only be evaluated by a real
+// `ncu`/benchmark run this session couldn't perform (GPU execution was off-limits — see the perf
+// investigation's own "TRIED AND REVERTED" note above for why an untested modeled win here would
+// be exactly the wrong kind of bet):
+//   1. Bulk-stage all of a block's group scales into shared memory once, mirroring `xs[]`'s
+//      staging pattern. Arithmetic: current static shared usage is `xs[PQ2_0_MAX_K]` (34816 bytes)
+//      + `rowOut[PQ2_0_ROWS_PER_BLOCK]` (32 bytes) = 34848 bytes against sm_86's 49152-byte static
+//      cap — only 304 bytes of headroom. A block's needed scales are
+//      `PQ2_0_ROWS_PER_BLOCK * groups_per_row * sizeof(half)`: 16*136*2 = 4352 bytes for k=17408
+//      (the FFN down-proj shape), or 16*40*2 = 1280 bytes even for the smallest real shape,
+//      k=5120. Both blow the 304-byte headroom by roughly an order of magnitude — this does not
+//      fit without shrinking `PQ2_0_ROWS_PER_BLOCK` (== reducing occupancy, which the
+//      already-landed ROWS_PER_WARP=4 experiment above showed costs more than it's worth) or some
+//      other structural cut. Ruled out on the arithmetic alone.
+//   2. Explicit `__shfl_sync` broadcast (one lane loads the scale, shuffles it to the rest of the
+//      warp) instead of every lane loading it independently. This needs no new shared memory and
+//      no new barrier (all lanes reaching this line are already warp-convergent — `warpActive` is
+//      uniform per warp), so it doesn't carry the batch-staging experiment's specific risk
+//      (synchronization overhead swamping a modeled bandwidth win). But per the SASS evidence
+//      above, the hardware is already collapsing the per-lane loads into one broadcast transaction
+//      — a manual shuffle wouldn't remove a real memory transaction that exists today, only trade
+//      31 redundant-but-cheap per-lane LDG issues for one LDG + one shuffle instruction. Expected
+//      effect is a wash-to-marginal at best, and NOT verifiable without a real benchmark run (which
+//      this session's hard "no GPU execution" constraint ruled out) — left as a documented
+//      candidate for a future round that CAN measure it, rather than committed on modeled reasoning
+//      alone.
+//
 // ───────────────────────── Vectorized activation staging (#157, latency follow-up) ─────────────────────────
 // The two coalescing fixes above (output-write staging, split-layout weight repack) targeted
 // memory-bandwidth/sector-efficiency and delivered far less real speedup than predicted. `ncu`'s
@@ -293,7 +345,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
                 const long gFlat = (long)rows[rr] * groups_per_row + g;
-                float scale = __half2float(scales[gFlat]);
+                float scale = __half2float(scales[gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
                 uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
                 float group_partial = 0.0f;
@@ -403,7 +455,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
                 const long gFlat = (long)localRows[rr] * groups_per_row + g;
-                float scale = __half2float(rowScales[rr][gFlat]);
+                float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
                 uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
                 float group_partial = 0.0f;
