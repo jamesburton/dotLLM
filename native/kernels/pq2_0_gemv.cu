@@ -30,6 +30,19 @@
 // (group_base+2), unlike I2_S's fully contiguous k/4-byte rows — porting the wide-load scheme
 // needs either lane-splits-a-group's-codes restructuring or a weight repack, deferred as a
 // follow-up. Numerics are unchanged from v1 (same per-group scale-then-accumulate order).
+//
+// TRIED AND REVERTED (2026-07-22): batching 8 groups per warp into one 32-byte-aligned
+// shared-memory staging window (per-(warp,row) `groupBuf[320]`, two `__syncwarp()`s per batch)
+// raised `ncu`-measured load-sector-efficiency from ~51% to a simulated ~94% and passed all
+// correctness tests bit-exact, but MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED
+// FROM 10.95 TO 4.67 TOK/S (RTX 3060) — a ~57% regression, not an improvement. Root cause:
+// sector-efficiency modeling doesn't capture the real cost of the added shared-memory round-trip
+// (write-then-read instead of straight-to-register) or the two `__syncwarp()` barriers per batch
+// (10/warp/row for k=5120, 34 for k=17408), which also blocks the compiler from pipelining
+// successive unsynchronized loads the way the plain per-group read (below) allows. Don't retry
+// this exact design without new evidence — a fix here needs to reduce sync/staging overhead, not
+// just improve sector efficiency, or pursue the weight-repack alternative (per-group scale and
+// codes split into separate contiguous arrays at load time) instead.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
