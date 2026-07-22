@@ -393,6 +393,75 @@
 // for this shape without new evidence that the kernel has gone latency-bound again (e.g. a future
 // architecture change lowering compute/memory utilization back under ncu's ~60% latency-bound
 // threshold), since this round's SOL readout says it currently hasn't.
+//
+// ───────────────────────── F32-native activations (#161 — eliminate surrounding convert launches) ─────────────────────────
+// Everything above targets the GEMV kernels themselves. A separate advisor pass (see the
+// `prismml-bonsai-model` project memory, "2026-07-22 continued — advisor review") found a
+// different class of waste one level UP the call stack: dotLLM's activation pipeline for this
+// model is F32 end-to-end (see CudaQwen3HybridDenseTransformerModel's class doc, "F32 activations
+// throughout"), but every kernel below is F16-in/F16-out only. Each decode-time call therefore
+// bracketed a GEMV launch with a `convert_f32_to_f16` launch before it and a `convert_f16_to_f32`
+// launch after it (see convert.cu), round-tripping through dedicated `_activF16InScratch`/
+// `_activF16OutScratch` scratch buffers — pure plumbing, no compute. Counted directly at the real
+// call sites (CudaQwen3HybridDenseTransformerModel.Gemm/TryFusedPQ2_0Gemm2): ~1,088 PQ2_0-related
+// kernel launches per decode token, ~65% (~704) of which were this conversion overhead.
+//
+// Fix: four new kernels below — `pq2_0_gemv_f32io`, `pq2_0_gemv2_f32io`, `pq2_0_gemv_f32io_small`,
+// `pq2_0_gemv2_f32io_small` — read `const float* x` and write `float* y` DIRECTLY, doing the
+// F32<->F16 conversion inline inside the existing vectorized stage/store steps instead of via a
+// separate launch. Internal precision is UNCHANGED: `xs[]` is still `half` (the whole point of the
+// v2 shared-x-staging design was fitting a full FFN row in 48 KB static shared memory — going
+// float would double that footprint and blow the budget again, see the file's own v1->v2
+// rationale at the top), so the only change is WHERE the F32<->F16 conversion happens (fused into
+// the existing per-window/per-row load and store) versus a dedicated elementwise kernel launch
+// immediately before/after. Naming: deliberately NOT `_f32in` (that name is already taken by the
+// v1 CPU-vs-GPU correctness-reference kernel below, which must stay untouched per this file's own
+// standing rule) — `_f32io` denotes "both directions are F32-native", to avoid any ambiguity with
+// that reference kernel's name.
+//
+// Activation-staging load: was `uint4` (16 bytes = 8 halfs/iteration) reading directly from a
+// `const half* x` with a straight copy. Now reads `const float4` (16 bytes = 4 floats/iteration,
+// since input is 2x wider per element) from `const float* x`, then converts each of the 4 lanes'
+// floats to half via `__float2half` before four scalar stores into the SAME `half xs[]` buffer.
+// Alignment: `x` here is one of the model's persistent F32 activation buffers, always allocated via
+// `cuMemAlloc_v2` (CUDA's documented minimum 256-byte alignment) with no sub-buffer byte-offset
+// arithmetic at any real call site (decode's seqLen=1 uses the whole buffer) — comfortably 16-byte
+// aligned for `float4`. The windowed kernels' window offset (`x + wStart*PQ2_0_GROUP_SIZE`
+// elements) is a multiple of `PQ2_0_GROUP_SIZE`=128 floats = 512 bytes, also 16-byte aligned.
+// `wElems`/`k` remain multiples of 128 (hence of 4) by the same argument this file already makes
+// for the F16 uint4 staging, so no scalar tail path is needed here either.
+//
+// Output store: was staging each warp's `__float2half`-rounded reduced result into
+// `__shared__ half rowOut[]`, then one block-coalesced `half` write to `y`. Now `rowOut` is
+// `float` (64 bytes total instead of 32 — negligible next to the 34/17 KB `xs[]` buffer, does not
+// move the occupancy ceiling) and stores the raw float accumulator with NO half rounding at all —
+// strictly MORE precise than the old convert-launch path (which rounded to half in
+// `_activF16OutScratch`, then widened back to float via `convert_f16_to_f32`), while still being a
+// single coalesced block-wide write (4 bytes/lane × up to 16 lanes instead of 2 bytes/lane, still
+// far cheaper than 16 independent lane-0 scatter stores per the #157 output-write-coalescing fix
+// above, which this design reuses unchanged).
+//
+// Correctness/precision note for anyone re-running the existing F16In-vs-CPU tolerance bars: the
+// F32-native kernels' `y[]` output is expected to be AT LEAST as close to the CPU F32 reference as
+// the equivalent F16In kernel's output (one fewer intermediate rounding step on the output side;
+// the input side and internal accumulation are numerically identical either way, since `xs[]`
+// still holds `half` and the accumulate loop is unchanged) — see the new
+// `PQ2_0GemvF32Native_MatchesCpuFloatReference` test below the existing F16In test in
+// CudaPQ2_0GemvTest.cs.
+//
+// Call-site scope: EVERY real production call to `pq2_0_gemv_f16in`/`pq2_0_gemv2_f16in`/their
+// `_small` siblings goes through `CudaQwen3HybridDenseTransformerModel.Gemm`'s single PQ2_0 branch
+// or `TryFusedPQ2_0Gemm2` — both are centralized dispatchers reached from every GDN/attention/FFN
+// call site in that file, and both always pass the model's F32 activation buffers on both sides (no
+// call site was found needing F16 in with F32 out, or vice versa — the model has no F16-only
+// downstream consumer for a PQ2_0 GEMV's output on the decode path). So exactly one F32-native
+// variant per existing F16-native kernel was needed; the old F16In kernels are NOT deleted (kept
+// for the CPU-vs-GPU F16 tolerance test and as a documented fallback shape, but no longer reached by
+// any production code path after this change).
+//
+// I2_S's `Gemm()` branch has the byte-for-byte identical convert-launch-bracketing pattern
+// (flagged by the same advisor pass) — deliberately NOT touched in this change; out of scope for
+// issue #161, left as a documented, equally-mechanical follow-up.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -969,6 +1038,417 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in_small(
             float a = pq2_0_warp_reduce(acc[rr]);
             if (lane == 0)
                 rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = __float2half(a);
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int globalRow = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (globalRow < totalN)
+        {
+            if (globalRow < n0) y0[globalRow]      = rowOut[threadIdx.x];
+            else                 y1[globalRow - n0] = rowOut[threadIdx.x];
+        }
+    }
+}
+
+// ───────────────────────── F32-native activations - production decode path, no convert launches (#161) ─────────────────────────
+// See the file-header "F32-native activations" section above for the full design rationale. Every
+// kernel below is byte-for-byte identical to its `_f16in` counterpart except: (a) `x` is
+// `const float*` and the staging loop converts `float4` -> 4 halfs on load instead of copying
+// `uint4` halfs verbatim, and (b) `rowOut`/`y` are `float`, storing the raw accumulator with no
+// `__float2half` rounding. `xs[]` type/size, the weight-read/accumulate loop, and the warp
+// reduction are all UNCHANGED from the `_f16in` kernels - deliberately duplicated rather than
+// templated, matching this file own "Small-K specialization" precedent (extern "C" forecloses
+// C++ template instantiation across the P/Invoke boundary; near-duplicate explicit functions read
+// and debug more easily than a macro-generated family for a fixed, small variant count).
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io(
+    const uint8_t* __restrict__ weight,   // split layout - see file header "Split-layout addressing" note
+    const float*   __restrict__ x,
+    float*         __restrict__ y,
+    const int n,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_WINDOW_ELEMS];
+
+    const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
+    const long total_groups   = (long)n * groups_per_row;
+
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < n;
+
+    __shared__ float rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    int   rows[PQ2_0_ROWS_PER_WARP];
+    float acc[PQ2_0_ROWS_PER_WARP];
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    {
+        rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
+        acc[rr] = 0.0f;
+    }
+
+    for (int wStart = 0; wStart < groups_per_row; wStart += PQ2_0_WINDOW_GROUPS)
+    {
+        const int wGroups = min(PQ2_0_WINDOW_GROUPS, groups_per_row - wStart);
+        const int wElems  = wGroups * PQ2_0_GROUP_SIZE;   // always a multiple of 4 (128 | wElems)
+
+        // F32-native vectorized staging: float4 load (4 elements/iteration), convert-on-store
+        // into the same half xs[] the accumulate loop below reads - see file header.
+        {
+            const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)wStart * PQ2_0_GROUP_SIZE);
+            const int w4 = wElems >> 2;
+            for (int i = threadIdx.x; i < w4; i += blockDim.x)
+            {
+                float4 v = x4[i];
+                int base = i * 4;
+                xs[base + 0] = __float2half(v.x);
+                xs[base + 1] = __float2half(v.y);
+                xs[base + 2] = __float2half(v.z);
+                xs[base + 3] = __float2half(v.w);
+            }
+        }
+        __syncthreads();   // RAW - this window stage must finish before any read below
+
+        if (warpActive)
+        {
+            for (int gi = 0; gi < wGroups; gi++)
+            {
+                const int g        = wStart + gi;
+                const int out_base = gi * PQ2_0_GROUP_SIZE;
+                #pragma unroll
+                for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+                {
+                    const long gFlat = (long)rows[rr] * groups_per_row + g;
+                    float scale = __half2float(scales[gFlat]);   // lane-independent address - warp broadcast, see "Round 4" file-header note
+                    uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced - see file header
+
+                    float group_partial = 0.0f;
+                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                    acc[rr] += group_partial * scale;
+                }
+            }
+        }
+
+        if (wStart + PQ2_0_WINDOW_GROUPS < groups_per_row)
+            __syncthreads();   // WAR - see pq2_0_gemv_f16in identical comment above
+    }
+
+    if (warpActive)
+    {
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = a;   // no half rounding - see file header
+        }
+    }
+
+    __syncthreads();   // RAW on rowOut - unrelated to xs/windowing
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int row = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (row < n) y[row] = rowOut[threadIdx.x];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io(
+    const uint8_t* __restrict__ weight0,   // split layout - each of weight0/weight1 has its OWN codesBase (own n)
+    const uint8_t* __restrict__ weight1,
+    const float*   __restrict__ x,
+    float*         __restrict__ y0,
+    float*         __restrict__ y1,
+    const int n0,
+    const int n1,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_WINDOW_ELEMS];
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1;
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < totalN;
+
+    const int groups_per_row = k / PQ2_0_GROUP_SIZE;
+
+    const half*    scales0    = reinterpret_cast<const half*>(weight0);
+    const half*    scales1    = reinterpret_cast<const half*>(weight1);
+    const uint8_t* codesBase0 = weight0 + pq2_0_codes_base_offset((long)n0 * groups_per_row);
+    const uint8_t* codesBase1 = weight1 + pq2_0_codes_base_offset((long)n1 * groups_per_row);
+
+    __shared__ float rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    const half*    rowScales[PQ2_0_ROWS_PER_WARP];
+    const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
+    int            localRows[PQ2_0_ROWS_PER_WARP];
+    float          acc[PQ2_0_ROWS_PER_WARP];
+
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    {
+        int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
+        if (globalRow < n0)
+        {
+            rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
+        }
+        else
+        {
+            rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
+        }
+        acc[rr] = 0.0f;
+    }
+
+    for (int wStart = 0; wStart < groups_per_row; wStart += PQ2_0_WINDOW_GROUPS)
+    {
+        const int wGroups = min(PQ2_0_WINDOW_GROUPS, groups_per_row - wStart);
+        const int wElems  = wGroups * PQ2_0_GROUP_SIZE;   // always a multiple of 4 (128 | wElems)
+
+        {
+            const float4* x4 = reinterpret_cast<const float4*>(x + (size_t)wStart * PQ2_0_GROUP_SIZE);
+            const int w4 = wElems >> 2;
+            for (int i = threadIdx.x; i < w4; i += blockDim.x)
+            {
+                float4 v = x4[i];
+                int base = i * 4;
+                xs[base + 0] = __float2half(v.x);
+                xs[base + 1] = __float2half(v.y);
+                xs[base + 2] = __float2half(v.z);
+                xs[base + 3] = __float2half(v.w);
+            }
+        }
+        __syncthreads();   // RAW - this window stage must finish before any read below
+
+        if (warpActive)
+        {
+            for (int gi = 0; gi < wGroups; gi++)
+            {
+                const int g        = wStart + gi;
+                const int out_base = gi * PQ2_0_GROUP_SIZE;
+                #pragma unroll
+                for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+                {
+                    const long gFlat = (long)localRows[rr] * groups_per_row + g;
+                    float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address - warp broadcast, see "Round 4" file-header note
+                    uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
+
+                    float group_partial = 0.0f;
+                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                    acc[rr] += group_partial * scale;
+                }
+            }
+        }
+
+        if (wStart + PQ2_0_WINDOW_GROUPS < groups_per_row)
+            __syncthreads();   // WAR - see pq2_0_gemv_f16in identical comment above
+    }
+
+    if (warpActive)
+    {
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = a;   // no half rounding - see file header
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int globalRow = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (globalRow < totalN)
+        {
+            if (globalRow < n0) y0[globalRow]      = rowOut[threadIdx.x];
+            else                 y1[globalRow - n0] = rowOut[threadIdx.x];
+        }
+    }
+}
+
+// ───────────────────────── F32-native small-K specialization kernels (#161) ─────────────────────────
+// Byte-for-byte identical to pq2_0_gemv_f16in_small/pq2_0_gemv2_f16in_small above except for the
+// F32-native input staging / output store described in this file "F32-native activations"
+// header section - same relationship the large-K pq2_0_gemv_f32io/pq2_0_gemv2_f32io kernels above
+// have to pq2_0_gemv_f16in/pq2_0_gemv2_f16in.
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io_small(
+    const uint8_t* __restrict__ weight,   // split layout - see pq2_0_gemv_f16in file header
+    const float*   __restrict__ x,
+    float*         __restrict__ y,
+    const int n,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K_SMALL];
+    {
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        const int k4 = k >> 2;   // k is always a multiple of 128, hence of 4
+        for (int i = threadIdx.x; i < k4; i += blockDim.x)
+        {
+            float4 v = x4[i];
+            int base = i * 4;
+            xs[base + 0] = __float2half(v.x);
+            xs[base + 1] = __float2half(v.y);
+            xs[base + 2] = __float2half(v.z);
+            xs[base + 3] = __float2half(v.w);
+        }
+    }
+    __syncthreads();
+
+    const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
+    const long total_groups   = (long)n * groups_per_row;
+
+    const half*    scales    = reinterpret_cast<const half*>(weight);
+    const uint8_t* codesBase = weight + pq2_0_codes_base_offset(total_groups);
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < n;
+
+    __shared__ float rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    if (warpActive)
+    {
+        int   rows[PQ2_0_ROWS_PER_WARP];
+        float acc[PQ2_0_ROWS_PER_WARP];
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
+            acc[rr] = 0.0f;
+        }
+
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const long gFlat = (long)rows[rr] * groups_per_row + g;
+                float scale = __half2float(scales[gFlat]);
+                uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = a;   // no half rounding - see file header
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
+    {
+        int row = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + threadIdx.x;
+        if (row < n) y[row] = rowOut[threadIdx.x];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io_small(
+    const uint8_t* __restrict__ weight0,   // split layout - each of weight0/weight1 has its OWN codesBase (own n)
+    const uint8_t* __restrict__ weight1,
+    const float*   __restrict__ x,
+    float*         __restrict__ y0,
+    float*         __restrict__ y1,
+    const int n0,
+    const int n1,
+    const int k)
+{
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K_SMALL];
+    {
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        const int k4 = k >> 2;   // k is always a multiple of 128, hence of 4
+        for (int i = threadIdx.x; i < k4; i += blockDim.x)
+        {
+            float4 v = x4[i];
+            int base = i * 4;
+            xs[base + 0] = __float2half(v.x);
+            xs[base + 1] = __float2half(v.y);
+            xs[base + 2] = __float2half(v.z);
+            xs[base + 3] = __float2half(v.w);
+        }
+    }
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int totalN = n0 + n1;
+    const int rowBase = blockIdx.x * PQ2_0_ROWS_PER_BLOCK + wid * PQ2_0_ROWS_PER_WARP;
+    const bool warpActive = rowBase < totalN;
+
+    const int groups_per_row = k / PQ2_0_GROUP_SIZE;
+
+    const half*    scales0    = reinterpret_cast<const half*>(weight0);
+    const half*    scales1    = reinterpret_cast<const half*>(weight1);
+    const uint8_t* codesBase0 = weight0 + pq2_0_codes_base_offset((long)n0 * groups_per_row);
+    const uint8_t* codesBase1 = weight1 + pq2_0_codes_base_offset((long)n1 * groups_per_row);
+
+    __shared__ float rowOut[PQ2_0_ROWS_PER_BLOCK];
+
+    if (warpActive)
+    {
+        const half*    rowScales[PQ2_0_ROWS_PER_WARP];
+        const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
+        int            localRows[PQ2_0_ROWS_PER_WARP];
+        float          acc[PQ2_0_ROWS_PER_WARP];
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
+            if (globalRow < n0)
+            {
+                rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
+            }
+            else
+            {
+                rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
+            }
+            acc[rr] = 0.0f;
+        }
+
+        for (int g = 0; g < groups_per_row; g++)
+        {
+            const int out_base = g * PQ2_0_GROUP_SIZE;
+            #pragma unroll
+            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            {
+                const long gFlat = (long)localRows[rr] * groups_per_row + g;
+                float scale = __half2float(rowScales[rr][gFlat]);
+                uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
+
+                float group_partial = 0.0f;
+                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                acc[rr] += group_partial * scale;
+            }
+        }
+
+        #pragma unroll
+        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        {
+            float a = pq2_0_warp_reduce(acc[rr]);
+            if (lane == 0)
+                rowOut[wid * PQ2_0_ROWS_PER_WARP + rr] = a;   // no half rounding - see file header
         }
     }
 

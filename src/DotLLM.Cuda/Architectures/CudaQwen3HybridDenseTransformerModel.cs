@@ -30,9 +30,11 @@ namespace DotLLM.Cuda.Architectures;
 /// <para>
 /// Unlike <see cref="CudaQwen3MoeHybridTransformerModel"/>'s <c>Gemm</c> dispatcher, this
 /// class's <see cref="Gemm"/> has explicit I2_S / PQ2_0 branches — Bonsai-27B ships PQ2_0
-/// ternary weights, so the ternary GEMV kernels (<see cref="CudaKernels.LaunchPQ2_0GemvF16In"/>
+/// ternary weights, so the ternary GEMV kernels (<see cref="CudaKernels.LaunchPQ2_0GemvF32Native"/>
 /// / <see cref="CudaKernels.LaunchDequantPQ2_0ToF16"/>) must be reachable from every
-/// projection site (GDN, attention, and dense FFN).
+/// projection site (GDN, attention, and dense FFN). The decode-time GEMV/fused-GEMV2 path is
+/// F32-native (issue #161) — no F32↔F16 activation-conversion launches around it; only the
+/// prefill dequant-then-cuBLAS-HGEMM path (seqLen &gt; 1) still stages through F16.
 /// </para>
 /// </remarks>
 public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
@@ -81,12 +83,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private long _activF16InScratchElems;
     private nint _activF16OutScratch;
     private long _activF16OutScratchElems;
-
-    // Second output buffer for fused 2-way PQ2_0 decode GEMVs (dense FFN gate+up, full-attention
-    // K+V) — the fused kernel writes its two projections to independent buffers, not a single
-    // concatenated one; _activF16OutScratch above holds the first, this holds the second.
-    private nint _fusedOut1F16Scratch;
-    private long _fusedOut1F16ScratchElems;
 
     // Host-side per-row embedding lookup (NOT a full-table GPU pre-dequant — see the
     // LoadFromGguf remarks for why). Points at the mmap'd GGUF data region backing
@@ -1246,11 +1242,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
             if (qt == QuantizationType.PQ2_0)
             {
-                EnsureActivF16InScratch(k);
-                EnsureActivF16OutScratch(m);
-                _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
-                _kernels.LaunchPQ2_0GemvF16In(weight, _activF16InScratch, _activF16OutScratch, m, k, streamH);
-                _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y, m, streamH);
+                // F32-native GEMV (#161) — converts F32<->F16 inline in the kernel's own
+                // vectorized stage/store steps, so no surrounding LaunchConvertF32ToF16/
+                // LaunchConvertF16ToF32 launches or _activF16InScratch/_activF16OutScratch
+                // round-trip are needed here (unlike the I2_S branch above, still on the old
+                // convert-launch-bracketed path — see native/kernels/pq2_0_gemv.cu's
+                // "F32-native activations" file-header section for the full rationale and the
+                // note on why I2_S wasn't also converted in this pass).
+                _kernels.LaunchPQ2_0GemvF32Native(weight, x, y, m, k, streamH);
                 return;
             }
 
@@ -1326,10 +1325,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     /// <summary>
     /// Dispatches a fused decode-time PQ2_0 GEMV for a projection pair sharing one input
-    /// (e.g. dense FFN gate+up, full-attention K+V) via <see cref="CudaKernels.LaunchPQ2_0Gemv2F16In"/>
-    /// — stages x F32→F16 once instead of twice. Falls back to <see langword="false"/> (caller
-    /// issues two separate <see cref="Gemm"/> calls) for prefill, mixed/non-PQ2_0 quant types,
-    /// or unequal input dims.
+    /// (e.g. dense FFN gate+up, full-attention K+V) via
+    /// <see cref="CudaKernels.LaunchPQ2_0Gemv2F32Native"/> — F32-native in/out (#161), so unlike
+    /// the pre-#161 version this needs no F32→F16 activation staging launch, no F16→F32 output
+    /// conversion launches, and no <c>_activF16InScratch</c>/<c>_activF16OutScratch</c>/
+    /// (former) <c>_fusedOut1F16Scratch</c> round-trip at all — <paramref name="x"/>/
+    /// <paramref name="y0"/>/<paramref name="y1"/> are passed straight through to the kernel. Falls
+    /// back to <see langword="false"/> (caller issues two separate <see cref="Gemm"/> calls) for
+    /// prefill, mixed/non-PQ2_0 quant types, or unequal input dims.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool TryFusedPQ2_0Gemm2(
@@ -1342,24 +1345,8 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
         nint streamH = _stream.Handle;
         int k = k0;
-        EnsureActivF16InScratch(k);
-        EnsureActivF16OutScratch(m0);
-        EnsureFusedOut1F16Scratch(m1);
-
-        _kernels.LaunchConvertF32ToF16(x, _activF16InScratch, k, streamH);
-        _kernels.LaunchPQ2_0Gemv2F16In(weight0, weight1, _activF16InScratch,
-            _activF16OutScratch, _fusedOut1F16Scratch, m0, m1, k, streamH);
-        _kernels.LaunchConvertF16ToF32(_activF16OutScratch, y0, m0, streamH);
-        _kernels.LaunchConvertF16ToF32(_fusedOut1F16Scratch, y1, m1, streamH);
+        _kernels.LaunchPQ2_0Gemv2F32Native(weight0, weight1, x, y0, y1, m0, m1, k, streamH);
         return true;
-    }
-
-    private void EnsureFusedOut1F16Scratch(long halfs)
-    {
-        if (halfs <= _fusedOut1F16ScratchElems) return;
-        FreeIfNonZero(ref _fusedOut1F16Scratch);
-        _fusedOut1F16Scratch = AllocDevice(halfs * sizeof(ushort));
-        _fusedOut1F16ScratchElems = halfs;
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -1457,7 +1444,6 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _dequantScratchF16Weight);
         FreeIfNonZero(ref _activF16InScratch);
         FreeIfNonZero(ref _activF16OutScratch);
-        FreeIfNonZero(ref _fusedOut1F16Scratch);
 
         nint outNormPtr = _outputNormDevice;
         if (outNormPtr != 0) CudaDriverApi.cuMemFree_v2(outNormPtr);
