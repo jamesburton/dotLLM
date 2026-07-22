@@ -462,6 +462,80 @@
 // I2_S's `Gemm()` branch has the byte-for-byte identical convert-launch-bracketing pattern
 // (flagged by the same advisor pass) — deliberately NOT touched in this change; out of scope for
 // issue #161, left as a documented, equally-mechanical follow-up.
+//
+// ───────────────────────── TRIED AND REVERTED: SwiGLU epilogue fusion (#161 continued, advisor candidate #2) ─────────────────────────
+// A follow-up advisor pass on `ForwardDenseFfnBody` (CudaQwen3HybridDenseTransformerModel.cs)
+// proposed folding the dense FFN's SwiGLU epilogue (`silu(gate)*up`, currently a wholly separate
+// `swiglu_f32.cu` launch reading `_state.FfnGate`/`_state.FfnUp` and writing `_state.SiluOutput`)
+// into the tail of the gate+up fused GEMV2 kernel — the same class of fusion as the
+// already-proven residual-copy+RmsNorm and GDN-decay+sigmoid epilogue fusions from #157 (both real
+// wins, +1.6%/+0.8%). The advisor's own estimate for this one was modest (<2%).
+//
+// Implemented as two new kernels, `pq2_0_gemv2_f32io_swiglu`/`pq2_0_gemv2_f32io_swiglu_small`
+// (mirroring `pq2_0_gemv2_f32io`/`_small`'s windowed/small-K pair): a MATCHED-ROW design, not the
+// existing kernels' virtual row-concatenation (rows [0,n0) from weight0 then [0,n1) from weight1)
+// — SwiGLU needs gate[i] and up[i] for the SAME i combined together, but the virtual-concat
+// kernels compute gate rows and up rows in entirely different blocks, so the epilogue can't be
+// grafted onto that structure. The matched-row kernels instead compute BOTH weight0's row i (gate)
+// and weight1's row i (up) in the SAME warp for every row i (n0==n1 required — true for dense FFN
+// gate+up, both project to intermediateSize), then write `y[i] = silu(gate_i)*up_i` directly — one
+// combined output buffer instead of two raw ones plus a follow-on elementwise launch.
+//
+// Compile-time check first, per this file's own standing rule (`nvcc -cubin -arch=sm_86 -Xptxas
+// -v`, no GPU execution): the `_small` variant — the ONLY one actually reached on Bonsai-27B's
+// production path, since dense FFN gate/up input dim = hidden_size = 5120 <= PQ2_0_MAX_K_SMALL —
+// compiled to a bit-for-bit IDENTICAL register/shared-mem footprint as the kernel pair it replaces
+// (`pq2_0_gemv2_f32io_small`): 39 registers, 10304 bytes smem, zero spill, in BOTH. Occupancy
+// arithmetic from those numbers is unchanged in both directions (shared mem floor(102400/10304)=9,
+// registers floor(65536/(39*256))=6, min(...)=6 -> 100% theoretical occupancy either way). The
+// large-K windowed variant (not on Bonsai-27B's hot path, kept only for dispatch-family symmetry)
+// showed a small register increase (45 -> 48) with unchanged occupancy binding (still 5 blocks/SM
+// either way) and zero spill. By every compile-time signal this file's own standing rule asks for,
+// this looked like a clean, low-risk change — exactly the profile the batch-8/shfl_sync/tail-wave
+// entries above warn is NOT sufficient on its own.
+//
+// Correctness: validated bit-for-bit against a CPU reference (two separate `MatMul.GemvPQ2_0`
+// calls + host-side `silu(gate)*up`) across the same shape/tail-clamp/dispatch-boundary coverage as
+// the other GEMV tests (n=512/37/3, k=5120/17408/5248) — all within the established F16-internal-
+// precision tolerance bar (max abs diff <= 5e-2, observed <= 1.4e-3 across all shapes). The full
+// CUDA test suite passed (312/313 excluding one pre-existing, unrelated Q4_K_M flaky failure and
+// the pre-existing #162 prefill-inf skip/failure, both confirmed unaffected by this change).
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED FROM A FRESH BASELINE OF 16.74-
+// 16.95 (median ~16.85, 6 reps across 2 independent 3-rep `bench -p 64 -n 16` runs, RTX 3060) TO
+// 15.82-16.09 (median ~15.94, same 6-rep/2-run protocol) — a reproducible ~5.4% REGRESSION, not the
+// advisor's predicted <2% improvement, and the two distributions do not overlap at all (baseline's
+// worst rep, 16.74, still beats the fused kernel's best rep, 16.09). This is the FIFTH
+// compile-time-clean, arithmetically/occupancy-modeled change in this investigation to regress real
+// throughput (see the batch-8, shfl_sync-broadcast, and tail-wave-grid-resize entries above for the
+// first three; #159's windowed-staging fix is the one clean occupancy-model win, by contrast).
+//
+// Root cause NOT confirmed by profiling (no `ncu` counter access in the session that ran this
+// experiment, matching several entries above) — offered as a REASONED HYPOTHESIS: the virtual
+// row-concatenation kernels this replaces process ALL of weight0's rows first (blocks 0 through
+// n0/16-1), then ALL of weight1's rows (the remaining blocks) — for n0==n1==17408 that's exactly
+// half the grid streaming sequentially through ONE tensor's memory, then the other half streaming
+// through the OTHER tensor, each phase enjoying strong spatial locality within a single
+// (large, contiguous) weight allocation. The matched-row fused kernel instead has EVERY block
+// alternate between weight0 and weight1 — two independently-`cuMemAlloc`'d, generally
+// widely-separated device allocations — every single group iteration, for the kernel's entire
+// lifetime. Register/shared-mem/occupancy accounting (this file's usual compile-time check) cannot
+// see this: it has no model for L2/DRAM locality or the GPU memory controller's page-open/close
+// behavior across two simultaneously-hot, disjoint address ranges, which is exactly the kind of
+// real-hardware effect this file's own standing rule (measure, don't trust the model) exists to
+// catch. Total bytes read and total instruction count are IDENTICAL between the two designs (same
+// FLOPs, same launches after accounting for the eliminated `swiglu_f32` launch) — the regression
+// has to be a scheduling/locality effect, not a work-volume one.
+//
+// Reverted in full (`git checkout` back to this commit's pre-experiment state) — no
+// `pq2_0_gemv2_f32io_swiglu`/`pq2_0_gemv2_f32io_swiglu_small` kernels, no
+// `LaunchPQ2_0Gemv2F32NativeSwiGLU`/`TryFusedPQ2_0Gemm2SwiGLU`, exist in the kernel/dispatcher as
+// shipped. Left as a documented negative result, matching this file's established precedent: don't
+// re-try a matched-row (interleaved-tensor-access) fusion across two independently-allocated weight
+// tensors for this kernel family without new evidence — e.g. a future change that co-locates
+// gate/up weights in one contiguous allocation at load time, which would remove the hypothesized
+// locality cost this round's numbers point to, or real `ncu` L2 hit-rate/DRAM-throughput counters
+// confirming (or refuting) the hypothesis above.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
