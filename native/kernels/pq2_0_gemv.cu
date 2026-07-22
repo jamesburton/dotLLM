@@ -109,10 +109,45 @@
 //      above, the hardware is already collapsing the per-lane loads into one broadcast transaction
 //      — a manual shuffle wouldn't remove a real memory transaction that exists today, only trade
 //      31 redundant-but-cheap per-lane LDG issues for one LDG + one shuffle instruction. Expected
-//      effect is a wash-to-marginal at best, and NOT verifiable without a real benchmark run (which
-//      this session's hard "no GPU execution" constraint ruled out) — left as a documented
-//      candidate for a future round that CAN measure it, rather than committed on modeled reasoning
-//      alone.
+//      effect was modeled as a wash-to-marginal at best.
+//
+//      TESTED (#159 follow-up) — implemented as `if (lane == 0) scale = __half2float(scales[gFlat]);
+//      scale = __shfl_sync(0xFFFFFFFF, scale, 0);` in both `pq2_0_gemv_f16in` and
+//      `pq2_0_gemv2_f16in` (numerics preserved exactly — __half2float is a pure bit-pattern
+//      conversion, lane-order-independent, so shuffling the converted float is bit-identical to the
+//      old per-lane load). Compile-time check first, per this file's standing rule: `-Xptxas -v`
+//      showed register usage went UP slightly (pq2_0_gemv_f16in 41->43, pq2_0_gemv2_f16in 45->46;
+//      zero spill in both before/after), but not enough to change either kernel's occupancy-binding
+//      constraint (both were already shared-mem-bound at 5 blocks/SM; registers at 43/46 still give
+//      floor(65536/(43*256))=5 and floor(65536/(46*256))=5 — no occupancy regression predicted).
+//
+//      MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED FROM A FRESH 15.89-15.93 TO
+//      12.42-12.65 TOK/S (RTX 3060, `bench -p 64 -n 16`, 3 reps, reproduced twice) — a ~20-22%
+//      regression, not the modeled wash-to-marginal. This is the FOURTH compile-time-clean,
+//      arithmetically-modeled change in this investigation to regress real throughput (see the
+//      batch-8 and tail-wave-grid-resize entries above for the first two, and this file's own
+//      "Round 4" section for a THIRD case — the small-K specialization — that for once held up).
+//      Reverted in full (`git reset`/`git checkout` back to the pre-experiment commit); no
+//      `__shfl_sync` broadcast exists in the kernel as shipped.
+//
+//      Root cause NOT confirmed by profiling (no `ncu` counter access in the session that ran this
+//      experiment, matching the tail-wave entry's constraint) — offered as a REASONED HYPOTHESIS: an
+//      explicit `if (lane==0) ... __shfl_sync(...)` forces the compiler to treat `scale` as
+//      thread-divergent-then-reconverged at the source level (one lane takes a real branch, then a
+//      real cross-lane data movement instruction), which likely defeats whatever the compiler/
+//      hardware were doing implicitly to already treat the uniform-address load as cheap (the SASS
+//      evidence in the "Round 4" section above showed each lane issuing its own `LDG`, but that LDG
+//      could still be scheduled/pipelined by the compiler alongside neighboring independent loads;
+//      an explicit `__shfl_sync` is a synchronizing warp-collective instruction that the scheduler
+//      cannot reorder past as freely, and the lane-0-only branch adds real predication overhead 32x
+//      per warp per group — group count is large, 68-136 iterations per row here). In short: the
+//      "same address, many redundant-but-cheap loads" pattern the hardware already collapses for
+//      free was, in practice, cheaper than one load plus one explicit shuffle instruction — this
+//      closes out the file header's own prediction that "the hardware already broadcasts, so a
+//      manual shuffle just trades cheap redundancy for an explicit instruction" with a real,
+//      reproducible number: NOT a wash, a clear loss. Don't re-try this specific shuffle-broadcast
+//      shape for this kernel without new evidence (e.g. a future restructuring that makes the
+//      surrounding loop divergence-free in some other way this reasoning doesn't anticipate).
 //
 // ───────────────────────── Vectorized activation staging (#157, latency follow-up) ─────────────────────────
 // The two coalescing fixes above (output-write staging, split-layout weight repack) targeted
@@ -173,6 +208,191 @@
 // above) — theoretical occupancy is not measured throughput. This specialization is a plausible,
 // arithmetically-motivated candidate, not a proven win; #157's remaining work is confirming it on
 // real Bonsai-27B decode.
+//
+// ───────────────────────── Windowed activation staging (#159 — occupancy for the k=17408 FFN path) ─────────────────────────
+// The small-K fix above (#157 round 4) only helps the attention/GDN call sites (k<=5120) — the
+// FFN gate/up/down call sites (k=17408, routed through pq2_0_gemv_f16in/pq2_0_gemv2_f16in below,
+// and the larger share of decode time) are UNCHANGED by it: still `xs[PQ2_0_MAX_K]` = 34816
+// bytes, still `Block Limit Shared Mem = 2`, still 31.8-31.9% achieved occupancy against a 33.3%
+// ceiling, still latency-bound per the same ncu SpeedOfLight signal as before that fix. Shrinking
+// xs[] outright (like the small-K fix did) isn't available here — the whole point of this kernel
+// is serving k up to 17408, and a single upfront stage-then-reuse design fundamentally needs a
+// buffer sized for the full row.
+//
+// Fix: stage x in WINDOWS instead of all at once — a fixed-size xs[] buffer holding only
+// PQ2_0_WINDOW_GROUPS groups' worth of activations (8704 elements = 17408 bytes) at a time. Every
+// warp/row in the block still walks every group of the row exactly once, in the same
+// group-then-row nesting order as before (preserving the established access pattern) — only now
+// the outer loop is windows-of-groups, with a stage+sync bracketing each window instead of one
+// stage+sync bracketing the whole row.
+//
+// Sync-count modeling (the metric that actually mattered in the reverted batch-8 experiment above
+// — see that note for why "the occupancy math looks right" isn't sufficient on its own): the
+// ORIGINAL kernel already has TWO `__syncthreads()`s, not one (easy to miscount) — one after the
+// single stage (RAW), one before the block-coalesced rowOut write (protects THAT write — a
+// hazard on the `rowOut[]` shared array, unrelated to `xs[]`/staging). A single-buffered R-window
+// version needs, per window: one sync after staging (RAW — safe to read xs) and one sync after
+// compute (WAR — safe to overwrite xs with the next window's data) — except the LAST window never
+// needs its trailing WAR sync, because nothing stages into xs again after it. That gives
+// R (RAW) + (R-1) (WAR) = 2R-1 syncs inside/around the window loop, PLUS the pre-existing
+// rowOut-protecting final sync, which still runs exactly as before — it protects a DIFFERENT
+// hazard (rowOut, not xs) and is unaffected by R; it is not "reused" as a WAR sync, it simply
+// keeps doing its own unrelated job. Total: 2R `__syncthreads()`s for R windows (vs 2 today, i.e.
+// R=1 in this formula too — 2*1=2, consistent).
+//
+// Double-buffering (stage window r+1 into a second buffer while computing window r, so the WAR
+// sync collapses into the same barrier as the next window's RAW sync) would cut the loop-internal
+// syncs from 2R-1 to roughly R, i.e. total from 2R to R+1 — NOT implemented here: with the window
+// size chosen below, R is at most 2 for any k this kernel actually serves (see below), so
+// double-buffering would only save ONE barrier (3 syncs vs 4 for the one real k=17408 shape) at
+// the cost of real complexity (a second static buffer, current/other bookkeeping, more live
+// registers) — judged not worth it for a single-barrier saving. Left as a candidate if a real
+// `ncu` pass on this change (which this session's no-GPU-execution constraint can't run) shows the
+// remaining stage/sync overhead is still material.
+//
+// `cp.async` (Ampere/sm_86-native asynchronous global->shared copy, bypassing the register file,
+// letting the copy be in flight without blocking the issuing warp until an explicit
+// `cp.async.wait_group`) targets the same latency-exposure problem double-buffering does, without
+// needing a second static buffer. Also considered and rejected for now: at R<=2 windows there is
+// very little staging latency left to hide — the dominant cost is the per-group global-load-bound
+// compute loop, not the staging loop (per this file's own #157 "vectorized activation staging"
+// finding above, which already cut the FULL k=17408 stage from 68 to ~9 sequential loads; this
+// windowed version stages a strict subset per round, so it's cheaper still) — and hand-written
+// inline-PTX `cp.async` is real added correctness surface this session cannot validate on real
+// hardware. A documented candidate for a future round that CAN measure it, not committed on
+// modeled reasoning alone (matching this file's established standard).
+//
+// Window size: PQ2_0_WINDOW_GROUPS=68 groups (8704 elements, 17408 bytes). Chosen by the same
+// arithmetic the small-K fix used, applied to the SHARED-MEMORY BUFFER SIZE (k itself stays a
+// runtime value covering everything from just above Pq2_0MaxKSmall up to PQ2_0_MAX_K):
+//   xs[8704] (17408 B) + rowOut[16] (32 B) = 17440 B/block. floor(102400/17440) = 5. Unlike the
+//   small-K fix (a pure constant-size change with no register impact), this one restructures the
+//   loop nesting, so registers were NOT assumed unaffected — confirmed via `-Xptxas -v` instead
+//   (see the "Confirmed via -Xptxas -v" paragraph below): both kernels bind on shared mem at 5
+//   blocks/SM (registers turn out to allow 6 for pq2_0_gemv_f16in, 5 for pq2_0_gemv2_f16in — see
+//   below for the actual numbers). New theoretical occupancy = 5*8/48 = 83.3%, the same ceiling
+//   the small-K fix reached for k<=5120.
+//   79 groups is the true max window that still fits this budget (floor((20480-32)/256)=79); 68
+//   was picked instead because it is EXACTLY HALF of k=17408's groups_per_row=136, giving exactly
+//   2 equal windows with no remainder for the one real production shape this kernel serves, at the
+//   cost of a few hundred bytes of unused headroom — a deliberate simplicity-over-headroom trade,
+//   not an oversight.
+//
+// Round count for every k this kernel actually needs to support: this file's own dispatch
+// convention caps this kernel's callers at k in (Pq2_0MaxKSmall, PQ2_0_MAX_K] = (5120, 17408],
+// i.e. groups_per_row in (40, 136]. ceil(groups_per_row / 68) is 1 for groups_per_row<=68
+// (k<=8704) and 2 for groups_per_row in (68,136] (k in (8704,17408]) — NEVER more than 2 windows
+// for any in-range k. The synthetic dispatch-boundary test shape k=5248 (groups_per_row=41) hits
+// the ceil(41/68)=1 case: it degenerates to exactly today's single-stage behavior (one window
+// covering the whole row, same 2 total syncs as before, R=1 in the formula above) — zero added
+// overhead for that shape. Only the real k=17408 FFN shape (groups_per_row=136, R=2) pays the
+// extra syncs, going from 2 total to 2*2=4.
+//
+// Tail-window correctness: the window loop's bound is `wStart < groups_per_row` with
+// `wGroups = min(PQ2_0_WINDOW_GROUPS, groups_per_row - wStart)` — the last window is a genuine
+// partial window whenever groups_per_row isn't a multiple of 68 (NOT the case for k=17408:
+// 136 = 68+68 exactly; IS the case for k=5248: 41 = 41, one partial-by-construction window
+// covering everything). `wElems = wGroups * PQ2_0_GROUP_SIZE` stays a multiple of 128 (hence of 8)
+// for ANY wGroups >= 1, since PQ2_0_GROUP_SIZE=128 is itself a multiple of 8 — so the vectorized
+// uint4 staging loop never needs scalar-tail handling regardless of window/row-tail interaction,
+// mirroring the whole-row staging loop's existing k%8==0 argument (file header, #157). The group
+// index used to address `scales[]`/`codesBase[]` (both full-row-length, NOT windowed) is always
+// the GLOBAL group index `g = wStart + gi`; only the xs[] read (`out_base = gi *
+// PQ2_0_GROUP_SIZE`, LOCAL to the window) is relative to the window's own base — the two index
+// spaces are kept in separate variables (`g` vs `gi`) specifically so this can't be confused.
+//
+// NOT measured on real hardware (GPU execution off-limits this session, per the task constraint)
+// — theoretical occupancy is not measured throughput, per this file's own standing rule. But the
+// compile-time signal that IS available (`nvcc -cubin -arch=sm_86 -Xptxas -v`, no GPU execution)
+// confirms the arithmetic above against the real compiler output, not just hand math:
+//   pq2_0_gemv_f16in:  48 regs, 34848 B smem (baseline) -> 41 regs, 17440 B smem (this change).
+//   pq2_0_gemv2_f16in: 55 regs, 34848 B smem (baseline) -> 45 regs, 17440 B smem (this change).
+//   Zero spill stores/loads, zero stack frame, in both the baseline and windowed builds — the
+//   loop restructuring did not push either kernel into register spilling, which would have been
+//   the main way this change could quietly sabotage itself (a spill is a per-iteration global
+//   memory round-trip, i.e. exactly the kind of cost this whole investigation is trying to hide).
+//   Smem exactly matches the 17440 B predicted above. Registers dropped MORE than "unaffected" —
+//   both kernels now need fewer registers than before (48->41, 55->45), plausibly because the
+//   68-group inner loop gives the compiler a shorter loop body to keep live values across (vs
+//   unrolling/scheduling across a 136-iteration loop) — a real, measured bonus on top of the
+//   shared-mem shrink, not something this comment predicted going in.
+//   Recomputing occupancy from these ACTUAL numbers (not the 48-register assumption used above,
+//   which turned out conservative): pq2_0_gemv_f16in registers -> floor(65536/(41*256))=6;
+//   pq2_0_gemv2_f16in registers -> floor(65536/(45*256))=5. Shared mem for both ->
+//   floor(102400/17440)=5. min(shared=5, registers=6 or 5, warps=6, maxblocks=16) = 5 for BOTH
+//   kernels -> occupancy = 5*8/48 = 83.3%, matching the predicted ceiling (shared mem and
+//   registers are now co-binding for pq2_0_gemv2_f16in, and shared mem alone binds
+//   pq2_0_gemv_f16in since its registers headroom is even better than predicted).
+// Confidence is grounded in this confirmed arithmetic (matching the small-K fix's own
+// methodology, independently confirmed against real ncu numbers for that case) plus a sync-count
+// argument showing this design adds far fewer, and far more heavily-amortized, barriers than the
+// reverted batch-8 experiment (2-3 block-wide syncs total here, vs that experiment's 34 warp-wide
+// syncs, which ALSO broke compiler-level overlap of the weight reads themselves — unlike this
+// change, which leaves that loop's structure untouched). This is a plausible candidate, not a
+// proven win — actual ACHIEVED occupancy and decode throughput still need a real `ncu`/benchmark
+// pass before trusting this further, per this file's own standing rule.
+//
+// ───────────────────────── TRIED AND REVERTED: tail-wave-quantization grid resize (#159 continued) ─────────────────────────
+// A fresh `ncu --set full` pass on the windowed kernel above (real shape n=5120/k=17408, the FFN
+// down-projection, grid=320=ceil(5120/16)) found SOLBottleneck had flipped to "Compute and Memory
+// are well-balanced" (~69-71% both) but ncu's TOP-ranked remaining finding was tail-wave
+// quantization, Est. Speedup 33.33%: achieved occupancy 70.9-71.0% vs 83.33% theoretical, bound by
+// Block Limit Registers=5/Shared Mem=5 (tied) -> 5 blocks/SM x 28 SMs = 140 blocks/wave. 320 blocks
+// = 2 full waves (280) + a 40-block (28.6%-utilized) partial tail wave.
+//
+// n=5120 is fixed (Bonsai-27B's qwen35.embedding_length) and confirmed to be the ONLY production
+// shape ever routed to pq2_0_gemv_f16in/pq2_0_gemv2_f16in (every other Gemm/TryFusedPQ2_0Gemm2 call
+// site in CudaQwen3HybridDenseTransformerModel.cs has k<=5120, routed to `_small`) — so a fix only
+// needed to work for this one (n,k) pair. `nvcc -cubin -arch=sm_86 -Xptxas -v` sweeps over
+// PQ2_0_ROWS_PER_WARP (no GPU execution, before writing any kernel change, per this file's own
+// standing rule) found RPW=5 (rows-per-block=40) was the largest rows-per-warp that kept
+// pq2_0_gemv_f16in's blocks/SM UNCHANGED at 5 (48 regs -> floor(65536/12288)=5; shared mem
+// floor(102400/17488)=5 — same ceiling as the RPW=2 baseline) while shrinking grid to
+// ceil(5120/40)=128, which is <= 140 — a SINGLE wave, structurally eliminating the tail-wave effect
+// entirely rather than just shrinking its relative share (RPW=3/4 still needed 2 waves each). A
+// simple per-block-time model (T(RPW) ~= RPW*c_row + c_stage, total = waves * T) predicted RPW=5
+// strictly dominates both the baseline and RPW=3/4 in both terms of that model. Implemented as a
+// SEPARATE constant (PQ2_0_ROWS_PER_WARP_LARGE, used only by the two large-K kernels) specifically
+// to avoid regressing the `_small` kernels, which the same `-Xptxas -v` sweep showed would drop
+// from 6 blocks/SM (100% occupancy) to 5 (83.3%) if the shared RPW were simply raised for
+// everyone — that decoupling worked correctly (confirmed via a second `-Xptxas -v` pass on the
+// modified file: `_small` kernels stayed at 39 regs/10272B, bit-identical to baseline).
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED FROM 15.71-15.91 TO 13.19-13.35
+// TOK/S (RTX 3060, `bench -p 64 -n 16`, 3-5 reps) — a ~15-16% regression, not an improvement, and
+// clearly reproducible (baseline re-confirmed at 15.71-15.81 immediately before AND after this
+// experiment, on the same machine in the same session, ruling out thermal/contention drift). This
+// is the THIRD time in this investigation that a compile-time-clean, arithmetically-modeled,
+// occupancy-preserving change has regressed real throughput (see the batch-8 sector-efficiency
+// experiment above for the first) — the recurring lesson is that this kernel's actual bottleneck,
+// once it stops being a pure "not enough resident warps" latency problem (as ncu's own SOL rule
+// confirmed it had, right before this experiment), stops responding to occupancy-ceiling arithmetic
+// at all, in either direction.
+//
+// Root cause NOT confirmed by profiling — `ncu`'s hardware performance counters are unavailable in
+// this environment (`ERR_NVGPUCTRPERM`, no admin rights to grant `NVreg_RestrictProfilingToAdminUsers`
+// access), so this is a REASONED HYPOTHESIS, not a measured one, offered for whoever picks this up
+// next with profiler access: raising ROWS_PER_WARP from 2 to 5 didn't just shrink the grid, it also
+// cut the number of INDEPENDENT thread blocks launched for the whole kernel from 320 to 128 while
+// increasing each warp's own sequential row count 2.5x (2 -> 5). ncu's own SOL readout said this
+// kernel was ALREADY compute/memory-balanced (~70% both) before this experiment, i.e. no longer
+// starved for resident-warp-level latency hiding (the exact condition the windowed-staging and
+// small-K fixes above successfully exploited) — so shrinking the grid bought nothing there, while
+// the fewer/larger blocks may have reduced whatever request-level parallelism the memory system was
+// still extracting from having 320 independently-schedulable blocks in flight across the kernel's
+// lifetime (even though blocks/SM and total resident-warp COUNT were unchanged by this model, the
+// GRANULARITY of how work arrives at the GPU's block scheduler and L2/DRAM queues was not, and that
+// dimension isn't captured by a blocks/SM or waves-count calculation at all). This is offered as a
+// plausible mechanism, not a confirmed one — flagged explicitly so a future session with working
+// `ncu` counters can check SOL/L2 hit-rate/scheduler-issue metrics before trusting it further,
+// rather than accepting this paragraph as settled fact.
+//
+// Reverted in full (`git reset --hard` back to the pre-experiment commit) — no PQ2_0_ROWS_PER_WARP_LARGE
+// constant, no CudaKernels.cs grid-sizing split, exists in the kernel as shipped. Left as a
+// documented negative result, matching the batch-8 precedent above: don't re-try a grid-only resize
+// for this shape without new evidence that the kernel has gone latency-bound again (e.g. a future
+// architecture change lowering compute/memory utilization back under ncu's ~60% latency-bound
+// threshold), since this round's SOL readout says it currently hasn't.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -203,6 +423,13 @@
 // (qwen35.embedding_length=5120); the `_small` kernel variants below are only valid for k <= this
 // value (no runtime bounds check, same convention as PQ2_0_MAX_K/I2S_MAX_K above).
 #define PQ2_0_MAX_K_SMALL 5120
+
+// Window size for the windowed-activation-staging fix (#159) applied to pq2_0_gemv_f16in /
+// pq2_0_gemv2_f16in below — see the file-header "Windowed activation staging" section for the
+// full derivation. Exactly half of k=17408's groups_per_row=136, giving 2 equal windows for the
+// one real production FFN shape this kernel pair serves.
+#define PQ2_0_WINDOW_GROUPS 68
+#define PQ2_0_WINDOW_ELEMS  (PQ2_0_WINDOW_GROUPS * PQ2_0_GROUP_SIZE)   // 8704 elements = 17408 bytes
 
 // Byte offset from a split-layout tensor's base to the start of its codes region. Must match the
 // identical helper in pq2_0_repack.cu and dequant_pq2_0.cu — see pq2_0_repack.cu's file header
@@ -334,36 +561,17 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
     const int n,
     const int k)
 {
-    // Stage x[k] into shared memory once per block (kept half-width — see file header for why
-    // this fits under the static cap where a float stage would not). Reused by all
-    // PQ2_0_ROWS_PER_BLOCK rows' warps in this block.
-    //
-    // Vectorized staging (#157 follow-up): a per-thread scalar-half loop here issues up to
-    // PQ2_0_MAX_K/blockDim.x = 17408/256 = 68 SEQUENTIAL 2-byte loads before the __syncthreads()
-    // below releases any compute — ncu's source-correlated stall counters showed this loop as the
-    // single largest per-instruction latency stall in the whole kernel (dwarfing every weight-read
-    // PC), despite the underlying x[] reads already being perfectly coalesced. The fix targets
-    // ROUND-TRIP COUNT, not bytes moved: read one uint4 (8 halfs = 16 bytes) per iteration instead
-    // of one half, cutting the sequential load chain ~8x (68 -> 9 iterations for k=17408). k is a
-    // multiple of PQ2_0_GROUP_SIZE (128) by the on-disk-layout invariant (file header), hence
-    // always a multiple of 8 — no scalar tail path is needed for any shape that actually occurs.
-    // `x` (the model's activation-staging scratch buffer) and `xs` both need >=16-byte alignment
-    // for the uint4 reinterpret to be valid: `xs` gets it via the __align__(16) below (shared-
-    // memory arrays are not 16-byte aligned by default); `x` is always the base pointer of a
-    // dedicated `cuMemAlloc_v2`-backed device allocation (CudaQwen3HybridDenseTransformerModel's
-    // _activF16InScratch, or a full CudaForwardState buffer such as NormOutput/AttnOutput/
-    // SiluOutput, or a test-owned buffer) — never a sub-offset into a larger allocation — and
-    // CUDA's device allocator guarantees a minimum 256-byte alignment, comfortably satisfying the
-    // 16-byte requirement here.
-    __shared__ __align__(16) half xs[PQ2_0_MAX_K];
-    {
-        const uint4* x4 = reinterpret_cast<const uint4*>(x);
-        uint4* xs4 = reinterpret_cast<uint4*>(xs);
-        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
-        for (int i = threadIdx.x; i < k8; i += blockDim.x)
-            xs4[i] = x4[i];
-    }
-    __syncthreads();
+    // Windowed activation staging (#159) — see file header's "Windowed activation staging"
+    // section for the full derivation/sync-count modeling. xs[] now holds only
+    // PQ2_0_WINDOW_GROUPS groups' worth of x (8704 elements/17408 bytes) instead of the whole row
+    // (up to PQ2_0_MAX_K=17408 elements/34816 bytes) — staged and re-staged once per window in
+    // the loop below, which needs groups_per_row/rowBase/warpActive computed up front (unlike the
+    // pre-#159 version, which staged before any of that was known). `x`/`xs` alignment reasoning
+    // for the uint4 staging is unchanged from the pre-#159 version (see git history of this file
+    // for the full argument): `xs` via __align__(16) below, `x` via CUDA's device-allocation
+    // minimum 256-byte alignment plus the window offset being a multiple of PQ2_0_GROUP_SIZE*2=256
+    // bytes (128 halfs), comfortably 16-byte aligned.
+    __shared__ __align__(16) half xs[PQ2_0_WINDOW_ELEMS];
 
     const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
     const long total_groups   = (long)n * groups_per_row;
@@ -379,33 +587,67 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
 
     __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
 
-    if (warpActive)
+    // Declared unconditionally (unlike the pre-#159 version's warpActive-scoped locals): the
+    // window loop's stage step below must run on EVERY thread regardless of warpActive (staging
+    // distributes x across all 256 threads, not just active warps' threads), so rows[]/acc[] need
+    // to survive across window iterations outside any warpActive-only scope. `min(rowBase+rr,
+    // n-1)` is safe even when warpActive is false (n is always >= 1) — only ever READ below
+    // inside the `if (warpActive)` guard, matching the pre-#159 version's actual values exactly
+    // when warpActive is true.
+    int   rows[PQ2_0_ROWS_PER_WARP];
+    float acc[PQ2_0_ROWS_PER_WARP];
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
     {
-        int   rows[PQ2_0_ROWS_PER_WARP];
-        float acc[PQ2_0_ROWS_PER_WARP];
-        #pragma unroll
-        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+        rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
+        acc[rr] = 0.0f;
+    }
+
+    for (int wStart = 0; wStart < groups_per_row; wStart += PQ2_0_WINDOW_GROUPS)
+    {
+        const int wGroups = min(PQ2_0_WINDOW_GROUPS, groups_per_row - wStart);
+        const int wElems  = wGroups * PQ2_0_GROUP_SIZE;   // always a multiple of 8 (128 | wElems)
+
+        // Vectorized staging (#157), applied per-window: stage only this window's x slice.
         {
-            rows[rr] = min(rowBase + rr, n - 1);   // clamp tail rows; their result is discarded below
-            acc[rr] = 0.0f;
+            const uint4* x4  = reinterpret_cast<const uint4*>(x + (size_t)wStart * PQ2_0_GROUP_SIZE);
+            uint4*       xs4 = reinterpret_cast<uint4*>(xs);
+            const int w8 = wElems >> 3;
+            for (int i = threadIdx.x; i < w8; i += blockDim.x)
+                xs4[i] = x4[i];
         }
+        __syncthreads();   // RAW — this window's stage must finish before any read below
 
-        for (int g = 0; g < groups_per_row; g++)
+        if (warpActive)
         {
-            const int out_base = g * PQ2_0_GROUP_SIZE;
-            #pragma unroll
-            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            for (int gi = 0; gi < wGroups; gi++)
             {
-                const long gFlat = (long)rows[rr] * groups_per_row + g;
-                float scale = __half2float(scales[gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
-                uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced — see file header
+                const int g        = wStart + gi;           // global group index (scales/codesBase)
+                const int out_base = gi * PQ2_0_GROUP_SIZE; // LOCAL to this window's xs
+                #pragma unroll
+                for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+                {
+                    const long gFlat = (long)rows[rr] * groups_per_row + g;
+                    float scale = __half2float(scales[gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
+                    uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                    float group_partial = 0.0f;
+                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                    acc[rr] += group_partial * scale;
+                }
             }
         }
 
+        // WAR — before the NEXT window overwrites xs, every thread must be done reading this
+        // window's contents. Skipped on the last window: nothing stages into xs again, so no
+        // WAR hazard exists there (see file header's sync-count derivation — the separate,
+        // pre-existing sync below protects a DIFFERENT hazard, on rowOut, not xs).
+        if (wStart + PQ2_0_WINDOW_GROUPS < groups_per_row)
+            __syncthreads();
+    }
+
+    if (warpActive)
+    {
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
@@ -415,7 +657,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
         }
     }
 
-    __syncthreads();
+    __syncthreads();   // RAW on rowOut — unrelated to xs/windowing, unchanged from the pre-#159 kernel
 
     if (threadIdx.x < PQ2_0_ROWS_PER_BLOCK)
     {
@@ -445,18 +687,9 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
     const int n1,
     const int k)
 {
-    // Vectorized staging (#157 follow-up) — see pq2_0_gemv_f16in's file-header comment above for
-    // the full rationale (latency-bound prologue, k%8==0 invariant, x/xs alignment reasoning).
-    // Identical loop, just applied to this kernel's shared xs[].
-    __shared__ __align__(16) half xs[PQ2_0_MAX_K];
-    {
-        const uint4* x4 = reinterpret_cast<const uint4*>(x);
-        uint4* xs4 = reinterpret_cast<uint4*>(xs);
-        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
-        for (int i = threadIdx.x; i < k8; i += blockDim.x)
-            xs4[i] = x4[i];
-    }
-    __syncthreads();
+    // Windowed activation staging (#159) — see pq2_0_gemv_f16in's identical comment above and the
+    // file header's "Windowed activation staging" section for the full derivation.
+    __shared__ __align__(16) half xs[PQ2_0_WINDOW_ELEMS];
 
     const int wid  = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -476,46 +709,73 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
 
     __shared__ half rowOut[PQ2_0_ROWS_PER_BLOCK];
 
-    if (warpActive)
-    {
-        const half*    rowScales[PQ2_0_ROWS_PER_WARP];
-        const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
-        int            localRows[PQ2_0_ROWS_PER_WARP];
-        float          acc[PQ2_0_ROWS_PER_WARP];
+    // Declared unconditionally — same reasoning as pq2_0_gemv_f16in above (must survive across
+    // window iterations; staging needs every thread regardless of warpActive). `min(rowBase+rr,
+    // totalN-1)` is safe even when warpActive is false (totalN = n0+n1 >= 1 for any real call).
+    const half*    rowScales[PQ2_0_ROWS_PER_WARP];
+    const uint8_t* rowCodesBase[PQ2_0_ROWS_PER_WARP];
+    int            localRows[PQ2_0_ROWS_PER_WARP];
+    float          acc[PQ2_0_ROWS_PER_WARP];
 
-        #pragma unroll
-        for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    #pragma unroll
+    for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+    {
+        int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
+        if (globalRow < n0)
         {
-            int globalRow = min(rowBase + rr, totalN - 1);   // clamp tail; discarded below via row<n check
-            if (globalRow < n0)
-            {
-                rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
-            }
-            else
-            {
-                rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
-            }
-            acc[rr] = 0.0f;
+            rowScales[rr] = scales0; rowCodesBase[rr] = codesBase0; localRows[rr] = globalRow;
         }
+        else
+        {
+            rowScales[rr] = scales1; rowCodesBase[rr] = codesBase1; localRows[rr] = globalRow - n0;
+        }
+        acc[rr] = 0.0f;
+    }
+
+    for (int wStart = 0; wStart < groups_per_row; wStart += PQ2_0_WINDOW_GROUPS)
+    {
+        const int wGroups = min(PQ2_0_WINDOW_GROUPS, groups_per_row - wStart);
+        const int wElems  = wGroups * PQ2_0_GROUP_SIZE;   // always a multiple of 8 (128 | wElems)
+
+        // Vectorized staging (#157), applied per-window: stage only this window's x slice.
+        {
+            const uint4* x4  = reinterpret_cast<const uint4*>(x + (size_t)wStart * PQ2_0_GROUP_SIZE);
+            uint4*       xs4 = reinterpret_cast<uint4*>(xs);
+            const int w8 = wElems >> 3;
+            for (int i = threadIdx.x; i < w8; i += blockDim.x)
+                xs4[i] = x4[i];
+        }
+        __syncthreads();   // RAW — this window's stage must finish before any read below
 
         // v3 coalescing: warp cooperates on one group at a time (lane L reads code byte L),
         // instead of each lane owning whole groups — see pq2_0_gemv_f16in's file comment.
-        for (int g = 0; g < groups_per_row; g++)
+        if (warpActive)
         {
-            const int out_base = g * PQ2_0_GROUP_SIZE;
-            #pragma unroll
-            for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+            for (int gi = 0; gi < wGroups; gi++)
             {
-                const long gFlat = (long)localRows[rr] * groups_per_row + g;
-                float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
-                uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
+                const int g        = wStart + gi;
+                const int out_base = gi * PQ2_0_GROUP_SIZE;
+                #pragma unroll
+                for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
+                {
+                    const long gFlat = (long)localRows[rr] * groups_per_row + g;
+                    float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
+                    uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                    float group_partial = 0.0f;
+                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
+                    acc[rr] += group_partial * scale;
+                }
             }
         }
 
+        // WAR — see pq2_0_gemv_f16in's identical comment above.
+        if (wStart + PQ2_0_WINDOW_GROUPS < groups_per_row)
+            __syncthreads();
+    }
+
+    if (warpActive)
+    {
         #pragma unroll
         for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
         {
