@@ -296,6 +296,68 @@
 // change, which leaves that loop's structure untouched). This is a plausible candidate, not a
 // proven win — actual ACHIEVED occupancy and decode throughput still need a real `ncu`/benchmark
 // pass before trusting this further, per this file's own standing rule.
+//
+// ───────────────────────── TRIED AND REVERTED: tail-wave-quantization grid resize (#159 continued) ─────────────────────────
+// A fresh `ncu --set full` pass on the windowed kernel above (real shape n=5120/k=17408, the FFN
+// down-projection, grid=320=ceil(5120/16)) found SOLBottleneck had flipped to "Compute and Memory
+// are well-balanced" (~69-71% both) but ncu's TOP-ranked remaining finding was tail-wave
+// quantization, Est. Speedup 33.33%: achieved occupancy 70.9-71.0% vs 83.33% theoretical, bound by
+// Block Limit Registers=5/Shared Mem=5 (tied) -> 5 blocks/SM x 28 SMs = 140 blocks/wave. 320 blocks
+// = 2 full waves (280) + a 40-block (28.6%-utilized) partial tail wave.
+//
+// n=5120 is fixed (Bonsai-27B's qwen35.embedding_length) and confirmed to be the ONLY production
+// shape ever routed to pq2_0_gemv_f16in/pq2_0_gemv2_f16in (every other Gemm/TryFusedPQ2_0Gemm2 call
+// site in CudaQwen3HybridDenseTransformerModel.cs has k<=5120, routed to `_small`) — so a fix only
+// needed to work for this one (n,k) pair. `nvcc -cubin -arch=sm_86 -Xptxas -v` sweeps over
+// PQ2_0_ROWS_PER_WARP (no GPU execution, before writing any kernel change, per this file's own
+// standing rule) found RPW=5 (rows-per-block=40) was the largest rows-per-warp that kept
+// pq2_0_gemv_f16in's blocks/SM UNCHANGED at 5 (48 regs -> floor(65536/12288)=5; shared mem
+// floor(102400/17488)=5 — same ceiling as the RPW=2 baseline) while shrinking grid to
+// ceil(5120/40)=128, which is <= 140 — a SINGLE wave, structurally eliminating the tail-wave effect
+// entirely rather than just shrinking its relative share (RPW=3/4 still needed 2 waves each). A
+// simple per-block-time model (T(RPW) ~= RPW*c_row + c_stage, total = waves * T) predicted RPW=5
+// strictly dominates both the baseline and RPW=3/4 in both terms of that model. Implemented as a
+// SEPARATE constant (PQ2_0_ROWS_PER_WARP_LARGE, used only by the two large-K kernels) specifically
+// to avoid regressing the `_small` kernels, which the same `-Xptxas -v` sweep showed would drop
+// from 6 blocks/SM (100% occupancy) to 5 (83.3%) if the shared RPW were simply raised for
+// everyone — that decoupling worked correctly (confirmed via a second `-Xptxas -v` pass on the
+// modified file: `_small` kernels stayed at 39 regs/10272B, bit-identical to baseline).
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS DROPPED FROM 15.71-15.91 TO 13.19-13.35
+// TOK/S (RTX 3060, `bench -p 64 -n 16`, 3-5 reps) — a ~15-16% regression, not an improvement, and
+// clearly reproducible (baseline re-confirmed at 15.71-15.81 immediately before AND after this
+// experiment, on the same machine in the same session, ruling out thermal/contention drift). This
+// is the THIRD time in this investigation that a compile-time-clean, arithmetically-modeled,
+// occupancy-preserving change has regressed real throughput (see the batch-8 sector-efficiency
+// experiment above for the first) — the recurring lesson is that this kernel's actual bottleneck,
+// once it stops being a pure "not enough resident warps" latency problem (as ncu's own SOL rule
+// confirmed it had, right before this experiment), stops responding to occupancy-ceiling arithmetic
+// at all, in either direction.
+//
+// Root cause NOT confirmed by profiling — `ncu`'s hardware performance counters are unavailable in
+// this environment (`ERR_NVGPUCTRPERM`, no admin rights to grant `NVreg_RestrictProfilingToAdminUsers`
+// access), so this is a REASONED HYPOTHESIS, not a measured one, offered for whoever picks this up
+// next with profiler access: raising ROWS_PER_WARP from 2 to 5 didn't just shrink the grid, it also
+// cut the number of INDEPENDENT thread blocks launched for the whole kernel from 320 to 128 while
+// increasing each warp's own sequential row count 2.5x (2 -> 5). ncu's own SOL readout said this
+// kernel was ALREADY compute/memory-balanced (~70% both) before this experiment, i.e. no longer
+// starved for resident-warp-level latency hiding (the exact condition the windowed-staging and
+// small-K fixes above successfully exploited) — so shrinking the grid bought nothing there, while
+// the fewer/larger blocks may have reduced whatever request-level parallelism the memory system was
+// still extracting from having 320 independently-schedulable blocks in flight across the kernel's
+// lifetime (even though blocks/SM and total resident-warp COUNT were unchanged by this model, the
+// GRANULARITY of how work arrives at the GPU's block scheduler and L2/DRAM queues was not, and that
+// dimension isn't captured by a blocks/SM or waves-count calculation at all). This is offered as a
+// plausible mechanism, not a confirmed one — flagged explicitly so a future session with working
+// `ncu` counters can check SOL/L2 hit-rate/scheduler-issue metrics before trusting it further,
+// rather than accepting this paragraph as settled fact.
+//
+// Reverted in full (`git reset --hard` back to the pre-experiment commit) — no PQ2_0_ROWS_PER_WARP_LARGE
+// constant, no CudaKernels.cs grid-sizing split, exists in the kernel as shipped. Left as a
+// documented negative result, matching the batch-8 precedent above: don't re-try a grid-only resize
+// for this shape without new evidence that the kernel has gone latency-bound again (e.g. a future
+// architecture change lowering compute/memory utilization back under ncu's ~60% latency-bound
+// threshold), since this round's SOL readout says it currently hasn't.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
