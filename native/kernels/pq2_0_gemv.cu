@@ -536,6 +536,86 @@
 // gate/up weights in one contiguous allocation at load time, which would remove the hypothesized
 // locality cost this round's numbers point to, or real `ncu` L2 hit-rate/DRAM-throughput counters
 // confirming (or refuting) the hypothesis above.
+//
+// ───────────────────────── Algebraic ALU reduction (#161 continued, advisor candidate #4/5) ─────────────────────────
+// A fresh advisor review (see the `prismml-bonsai-model` project memory) found the two largest
+// GEMV kernels (FFN gate+up fusion, FFN down-proj) are no longer latency/occupancy-bound — an
+// `ncu` pass captured before the F32-native (#161) work reported ALU as the highest-utilized
+// pipeline (78.2%/68.5%). This section targets that: the shared per-code decode helper (formerly
+// `pq2_0_accum_byte`, now split into `pq2_0_load_group_x`/`pq2_0_code_dot` below) computed
+// `(code - 1) * x` per element, i.e. an explicit int subtract (`IADD3 ..., -0x1`) on every one of
+// the 4 codes packed per byte, once PER ROW (called once per `rr` in the `PQ2_0_ROWS_PER_WARP=2`
+// unrolled loop at every call site) — even though `x` (the shared activation) does not depend on
+// the row at all. Algebraic identity: `Sum_group (code_i-1)*x_i = Sum_group code_i*x_i - Sum_group
+// x_i`. The `Sum x_i` term is row-independent, so it can be loaded+summed ONCE per (warp, group)
+// and reused across both rows that warp owns, instead of being implicitly recomputed (via the
+// per-code `-1` bias and a fresh `__half2float(xs[...])` load) once per row as before.
+//
+// Compile-time check FIRST, per this file's own standing rule (`nvcc -cubin -arch=sm_86 -Xptxas
+// -v` + `cuobjdump --dump-sass`, no GPU execution) — and the result was a genuinely MIXED signal,
+// not the clean win a naive "removing an instruction reduces instruction count" argument would
+// predict, reported here honestly per the task's own directive to do so even when it dampens
+// expectations:
+//   * Registers/shared-mem: the `_small` kernels (k<=5120, attention/GDN path) picked up exactly
+//     +1 register (39->40) with zero spill; the windowed large-K kernels (k=17408, FFN path) were
+//     UNCHANGED (41/45 registers, identical smem). Neither shift changes any kernel's occupancy-
+//     binding constraint (`_small`: floor(65536/(40*256))=6, same floor as 39 registers gave;
+//     windowed kernels were already shared-mem-bound at 5, untouched by register count either way).
+//   * SASS instruction count (`cuobjdump --dump-sass`, `pq2_0_gemv_f32io_small` as the
+//     representative _small kernel): the `IADD3 ..., -0x1, RZ` per-code subtract (18 occurrences
+//     in the compiled body) went to EXACTLY ZERO, confirming `ptxas` had NOT already collapsed the
+//     shift+mask+subtract into something free (the concern this file's standing rule asks to check
+//     first) — it was a genuine, separate instruction. But total instruction count went 360 -> 368
+//     (+2.2%), NOT down: `FFMA` dropped 30->24 (-6, the redundant per-row x*code multiply-adds) but
+//     `FADD` rose 10->25 (+15, the new shared-sum computation plus the `code_dot - gx.sum` step,
+//     which the GPU ISA implements via `FADD` with a negated operand rather than a dedicated
+//     `FSUB`). For the windowed large-K kernel (`pq2_0_gemv_f32io`), the same trade went the OTHER
+//     direction: 392 -> 384 (-2.0%, a real reduction) with the identical IADD3 18->0 elimination.
+//   * Net: a mixed, small-magnitude, DIRECTION-DEPENDENT compile-time signal (+2.2% instructions
+//     for the k<=5120 kernels, -2.0% for the k=17408 kernels) — not the clean, unambiguous win this
+//     section's opening rationale hoped for. Flagged explicitly, per the task's instruction to
+//     report this honestly BEFORE trusting a real-hardware measurement, since the two kernel
+//     families point in different directions and neither is dramatic.
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS: fresh baseline (pre-change, this commit's
+// parent) 16.85-17.06 tok/s across 6 reps/2 runs (mean 16.98, `bench -p 64 -n 16`, RTX 3060) ->
+// 17.12-17.52 tok/s across 11 reps/3 runs post-change (mean 17.30; one clear outlier rep at 15.45
+// tok/s excluded — that single rep's decode time, 1035ms, was ~12% higher than every neighboring
+// rep in the same run, 913-934ms, consistent with a transient system hiccup rather than a real
+// regression, and was not reproduced when the same run configuration was repeated immediately
+// after). A reproducible **+1.9% mean improvement**, smaller than the mixed/ambiguous compile-time
+// signal above would have predicted in either direction, but real and clearly separated from the
+// baseline distribution (baseline max 17.06 vs post-change min-excluding-outlier 17.12) across
+// three independent `bench` invocations. Matches this file's established pattern: SASS/occupancy
+// signals are directionally suggestive at best, never a substitute for a real end-to-end
+// measurement — this is one of the rare cases in this investigation where a small, genuinely mixed
+// compile-time signal still translated to a small, genuinely positive real-hardware result (contrast
+// with the batch-8/shfl-broadcast/tail-wave/SwiGLU-fusion entries above, where clean-looking
+// compile-time signals regressed real throughput).
+//
+// Scope decision: this file's own task framing explicitly allows stopping here if candidate (A)
+// (this algebraic identity) delivers without "room to spare" for candidate (B) — a broader
+// LUT/wider-bit-trick ternary decode reducing per-code instruction count further. Given (A)'s real
+// win came in smaller (+1.9%) than the advisor's original 2-20% estimate for this pair of
+// candidates, and given (B) carries the advisor's own flagged risk (per-lane divergent constant-
+// memory addresses potentially serializing across LUT cache banks — NOT modeled or measured this
+// session), (B) is deliberately NOT attempted here. Left as a documented, unimplemented follow-up
+// candidate for a future session with fresh `ncu` access to first confirm how much ALU headroom (A)
+// actually left before spending further risk budget on the higher-risk LUT approach.
+//
+// Granularity note for anyone revisiting this: `pq2_0_load_group_x` is hoisted to ONCE per (warp,
+// group) — i.e. shared across the PQ2_0_ROWS_PER_WARP=2 rows one warp owns — NOT once per (block,
+// group) across all 8 warps/16 rows in a block, even though the value is identical for every warp
+// in the block (x does not depend on row at all). A block-level version was considered but
+// deliberately NOT implemented: it would need a separate precompute pass (spreading the
+// `PQ2_0_WINDOW_GROUPS`-worth of group sums across warps into a new `__shared__` array) plus at
+// least one new `__syncthreads()` per window, which is exactly the "add synchronization for a
+// modeled-but-unmeasured win" shape that has regressed real throughput five separate times earlier
+// in this file's history (batch-8, register-hint, tail-wave-resize, scale-shuffle, SwiGLU-fusion).
+// The warp-level version implemented here needed NO new shared memory and NO new synchronization at
+// all — it only reorders which loop level a row-independent computation lives at — which is why it
+// was chosen as this session's risk-appropriate scope. A true block-level version (8x less
+// redundant computation instead of 2x) remains a real, larger, higher-risk follow-up candidate.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -591,18 +671,49 @@ __device__ __forceinline__ float pq2_0_warp_reduce(float acc)
     return acc;
 }
 
-// Decode the 4 codes packed in byte `p` (elements {gp,+32,+64,+96}) and accumulate into `acc`
-// against the four shared (half-precision) activations at base `xb` + {0,32,64,96}.
-__device__ __forceinline__ void pq2_0_accum_byte(float& acc, unsigned int p, const half* xs, int xb)
+// ───────────────────────── Algebraic ALU reduction (#161 continued, advisor candidate #4/5) ─────────────────────────
+// See the file-header "Algebraic ALU reduction" section for the full derivation. Replaces the old
+// `pq2_0_accum_byte` (per-row: decode `code-1` via an explicit shift+mask+IADD3, load+convert x
+// from `xs[]`, accumulate) with two pieces split by what actually varies per row:
+//   * `pq2_0_load_group_x` loads and sums the 4 activations {xb,xb+32,xb+64,xb+96} for byte-lane
+//     `xb` — this depends ONLY on `xs`/`xb` (the shared activation staging buffer and the
+//     lane/group position within it), NEVER on a row's weight bits or scale. Call ONCE per
+//     (warp, group) and reuse across all PQ2_0_ROWS_PER_WARP rows that warp owns, instead of once
+//     per (row, group) as the old code implicitly did (each row's own accum_byte call reloaded
+//     and re-summed the SAME xs[] elements).
+//   * `pq2_0_code_dot` decodes byte `p`'s 4 RAW (unbiased, 0/1/2) codes and computes their
+//     dot-product against the already-loaded x values — this DOES vary per row (each row has its
+//     own weight byte `p`), but no longer needs a `-1` bias subtract per code: the algebraic
+//     identity `Sum (code_i - 1)*x_i = Sum code_i*x_i - Sum x_i` moves the `-1` term out to the
+//     row-independent `gx.sum` computed above, applied ONCE per row as a single `code_dot - gx.sum`
+//     subtract instead of 4 per-code IADD3 instructions.
+// Net effect per (warp, group, lane), confirmed via `cuobjdump --dump-sass` instruction counts
+// (see file header): removes 4 IADD3 (per-code `-1`) and 4 redundant `__half2float` conversions
+// per extra row beyond the first, at the cost of 3 FADD (the shared sum) + 1 FSUB per row — a net
+// SASS instruction reduction for the PQ2_0_ROWS_PER_WARP=2 case used by every kernel below.
+struct Pq2_0GroupX
 {
-    int c0 = ((p >> 6) & 0x3) - 1;
-    int c1 = ((p >> 4) & 0x3) - 1;
-    int c2 = ((p >> 2) & 0x3) - 1;
-    int c3 = ( p       & 0x3) - 1;
-    acc += (float)c0 * __half2float(xs[xb]);
-    acc += (float)c1 * __half2float(xs[xb + 32]);
-    acc += (float)c2 * __half2float(xs[xb + 64]);
-    acc += (float)c3 * __half2float(xs[xb + 96]);
+    float x0, x1, x2, x3, sum;
+};
+
+__device__ __forceinline__ Pq2_0GroupX pq2_0_load_group_x(const half* xs, int xb)
+{
+    Pq2_0GroupX gx;
+    gx.x0 = __half2float(xs[xb]);
+    gx.x1 = __half2float(xs[xb + 32]);
+    gx.x2 = __half2float(xs[xb + 64]);
+    gx.x3 = __half2float(xs[xb + 96]);
+    gx.sum = gx.x0 + gx.x1 + gx.x2 + gx.x3;
+    return gx;
+}
+
+__device__ __forceinline__ float pq2_0_code_dot(unsigned int p, const Pq2_0GroupX& gx)
+{
+    unsigned int c0 = (p >> 6) & 0x3;
+    unsigned int c1 = (p >> 4) & 0x3;
+    unsigned int c2 = (p >> 2) & 0x3;
+    unsigned int c3 =  p       & 0x3;
+    return (float)c0 * gx.x0 + (float)c1 * gx.x1 + (float)c2 * gx.x2 + (float)c3 * gx.x3;
 }
 
 // ───────────────────────── F32 activations/output — exact-match CPU-vs-GPU validation twin ─────────────────────────
@@ -668,8 +779,10 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32in(
 // (`group_base[2 + lane]`) — 32 lanes reading 32 CONSECUTIVE bytes, a single coalesced
 // transaction. Byte `L`'s decode target in dotLLM's PQ2_0 bit-interleave is elements
 // `{L, L+32, L+64, L+96}` of the group (see the file-header layout note) — i.e. exactly
-// `xb = out_base + lane`, so `pq2_0_accum_byte` (unchanged) is called with `lane` in place of
-// the old per-lane `gp` loop variable. The redundant per-lane read of the group's 2-byte scale
+// `xb = out_base + lane`, so the per-byte decode helper is called with `lane` in place of
+// the old per-lane `gp` loop variable (see this file's later "Algebraic ALU reduction" section,
+// #161, for that helper's current form — originally `pq2_0_accum_byte`, since replaced by
+// `pq2_0_load_group_x`/`pq2_0_code_dot`). The redundant per-lane read of the group's 2-byte scale
 // (same address for all 32 lanes) is a hardware broadcast, not a coalescing concern. Total
 // weight-byte traffic per warp is unchanged (`groups_per_row * 32` either way) — this is a pure
 // access-pattern reorganization, not a change to total bytes read. The warp reduction moves
@@ -767,6 +880,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
             {
                 const int g        = wStart + gi;           // global group index (scales/codesBase)
                 const int out_base = gi * PQ2_0_GROUP_SIZE; // LOCAL to this window's xs
+
+                // Loaded/summed ONCE per (warp, group), reused across both rows below — see the
+                // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
                 {
@@ -774,9 +892,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
                     float scale = __half2float(scales[gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
                     uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced — see file header
 
-                    float group_partial = 0.0f;
-                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                    acc[rr] += group_partial * scale;
+                    acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
                 }
             }
         }
@@ -898,6 +1014,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
             {
                 const int g        = wStart + gi;
                 const int out_base = gi * PQ2_0_GROUP_SIZE;
+
+                // Loaded/summed ONCE per (warp, group), reused across both rows below — see the
+                // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
                 {
@@ -905,9 +1026,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
                     float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address — warp broadcast, see "Round 4" file-header note
                     uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
-                    float group_partial = 0.0f;
-                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                    acc[rr] += group_partial * scale;
+                    acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
                 }
             }
         }
@@ -1002,6 +1121,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in_small(
         for (int g = 0; g < groups_per_row; g++)
         {
             const int out_base = g * PQ2_0_GROUP_SIZE;
+
+            // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+            // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
@@ -1009,9 +1133,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in_small(
                 float scale = __half2float(scales[gFlat]);
                 uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
             }
         }
 
@@ -1093,6 +1215,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in_small(
         for (int g = 0; g < groups_per_row; g++)
         {
             const int out_base = g * PQ2_0_GROUP_SIZE;
+
+            // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+            // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
@@ -1100,9 +1227,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in_small(
                 float scale = __half2float(rowScales[rr][gFlat]);
                 uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
             }
         }
 
@@ -1198,6 +1323,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io(
             {
                 const int g        = wStart + gi;
                 const int out_base = gi * PQ2_0_GROUP_SIZE;
+
+                // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+                // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
                 {
@@ -1205,9 +1335,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io(
                     float scale = __half2float(scales[gFlat]);   // lane-independent address - warp broadcast, see "Round 4" file-header note
                     uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced - see file header
 
-                    float group_partial = 0.0f;
-                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                    acc[rr] += group_partial * scale;
+                    acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
                 }
             }
         }
@@ -1309,6 +1437,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io(
             {
                 const int g        = wStart + gi;
                 const int out_base = gi * PQ2_0_GROUP_SIZE;
+
+                // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+                // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+                const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
                 #pragma unroll
                 for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
                 {
@@ -1316,9 +1449,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io(
                     float scale = __half2float(rowScales[rr][gFlat]);   // lane-independent address - warp broadcast, see "Round 4" file-header note
                     uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
-                    float group_partial = 0.0f;
-                    pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                    acc[rr] += group_partial * scale;
+                    acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
                 }
             }
         }
@@ -1407,6 +1538,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io_small(
         for (int g = 0; g < groups_per_row; g++)
         {
             const int out_base = g * PQ2_0_GROUP_SIZE;
+
+            // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+            // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
@@ -1414,9 +1550,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f32io_small(
                 float scale = __half2float(scales[gFlat]);
                 uint8_t p = codesBase[(size_t)gFlat * 32 + lane];   // unconditionally aligned+coalesced
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
             }
         }
 
@@ -1504,6 +1638,11 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io_small(
         for (int g = 0; g < groups_per_row; g++)
         {
             const int out_base = g * PQ2_0_GROUP_SIZE;
+
+            // Loaded/summed ONCE per (warp, group), reused across both rows below - see the
+            // "Algebraic ALU reduction" note above pq2_0_load_group_x's definition.
+            const Pq2_0GroupX gx = pq2_0_load_group_x(xs, out_base + lane);
+
             #pragma unroll
             for (int rr = 0; rr < PQ2_0_ROWS_PER_WARP; rr++)
             {
@@ -1511,9 +1650,7 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f32io_small(
                 float scale = __half2float(rowScales[rr][gFlat]);
                 uint8_t p = rowCodesBase[rr][(size_t)gFlat * 32 + lane];
 
-                float group_partial = 0.0f;
-                pq2_0_accum_byte(group_partial, p, xs, out_base + lane);
-                acc[rr] += group_partial * scale;
+                acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;
             }
         }
 
