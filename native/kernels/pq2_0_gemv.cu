@@ -61,6 +61,20 @@
 //
 // `pq2_0_gemv_f32in` below is NOT touched — it is the CPU-vs-GPU correctness reference and no
 // production caller ever passes it split-layout data.
+//
+// ───────────────────────── Vectorized activation staging (#157, latency follow-up) ─────────────────────────
+// The two coalescing fixes above (output-write staging, split-layout weight repack) targeted
+// memory-bandwidth/sector-efficiency and delivered far less real speedup than predicted. `ncu`'s
+// SpeedOfLight rule flagged this from the first profiling pass: "Achieved compute throughput
+// and/or memory bandwidth below 60% of peak typically indicate latency issues." A source-
+// correlated pass then found the single largest per-instruction stall in the entire kernel is the
+// `xs[i] = x[i]` activation-staging loop at the top of `pq2_0_gemv_f16in`/`pq2_0_gemv2_f16in` —
+// not any weight-read PC. With blockDim.x=256 and k up to PQ2_0_MAX_K, each thread issued up to
+// k/256 SEQUENTIAL single-half (2-byte) loads before `__syncthreads()` released any compute — the
+// whole block sat idle on this one-time-per-block, once-per-layer prologue. Fix: stage via uint4
+// (16 bytes = 8 halfs) per iteration instead of one half, cutting the sequential load COUNT ~8x —
+// a different lever from the two fixes above (transaction count, not per-transaction byte
+// efficiency). See each kernel's staging block below for the alignment/divisibility reasoning.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -219,9 +233,32 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv_f16in(
     // Stage x[k] into shared memory once per block (kept half-width — see file header for why
     // this fits under the static cap where a float stage would not). Reused by all
     // PQ2_0_ROWS_PER_BLOCK rows' warps in this block.
-    __shared__ half xs[PQ2_0_MAX_K];
-    for (int i = threadIdx.x; i < k; i += blockDim.x)
-        xs[i] = x[i];
+    //
+    // Vectorized staging (#157 follow-up): a per-thread scalar-half loop here issues up to
+    // PQ2_0_MAX_K/blockDim.x = 17408/256 = 68 SEQUENTIAL 2-byte loads before the __syncthreads()
+    // below releases any compute — ncu's source-correlated stall counters showed this loop as the
+    // single largest per-instruction latency stall in the whole kernel (dwarfing every weight-read
+    // PC), despite the underlying x[] reads already being perfectly coalesced. The fix targets
+    // ROUND-TRIP COUNT, not bytes moved: read one uint4 (8 halfs = 16 bytes) per iteration instead
+    // of one half, cutting the sequential load chain ~8x (68 -> 9 iterations for k=17408). k is a
+    // multiple of PQ2_0_GROUP_SIZE (128) by the on-disk-layout invariant (file header), hence
+    // always a multiple of 8 — no scalar tail path is needed for any shape that actually occurs.
+    // `x` (the model's activation-staging scratch buffer) and `xs` both need >=16-byte alignment
+    // for the uint4 reinterpret to be valid: `xs` gets it via the __align__(16) below (shared-
+    // memory arrays are not 16-byte aligned by default); `x` is always the base pointer of a
+    // dedicated `cuMemAlloc_v2`-backed device allocation (CudaQwen3HybridDenseTransformerModel's
+    // _activF16InScratch, or a full CudaForwardState buffer such as NormOutput/AttnOutput/
+    // SiluOutput, or a test-owned buffer) — never a sub-offset into a larger allocation — and
+    // CUDA's device allocator guarantees a minimum 256-byte alignment, comfortably satisfying the
+    // 16-byte requirement here.
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K];
+    {
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        uint4* xs4 = reinterpret_cast<uint4*>(xs);
+        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
+        for (int i = threadIdx.x; i < k8; i += blockDim.x)
+            xs4[i] = x4[i];
+    }
     __syncthreads();
 
     const int  groups_per_row = k / PQ2_0_GROUP_SIZE;
@@ -304,9 +341,17 @@ extern "C" __global__ void __launch_bounds__(256) pq2_0_gemv2_f16in(
     const int n1,
     const int k)
 {
-    __shared__ half xs[PQ2_0_MAX_K];
-    for (int i = threadIdx.x; i < k; i += blockDim.x)
-        xs[i] = x[i];
+    // Vectorized staging (#157 follow-up) — see pq2_0_gemv_f16in's file-header comment above for
+    // the full rationale (latency-bound prologue, k%8==0 invariant, x/xs alignment reasoning).
+    // Identical loop, just applied to this kernel's shared xs[].
+    __shared__ __align__(16) half xs[PQ2_0_MAX_K];
+    {
+        const uint4* x4 = reinterpret_cast<const uint4*>(x);
+        uint4* xs4 = reinterpret_cast<uint4*>(xs);
+        const int k8 = k >> 3;   // k is always a multiple of 8 (k is a multiple of 128)
+        for (int i = threadIdx.x; i < k8; i += blockDim.x)
+            xs4[i] = x4[i];
+    }
     __syncthreads();
 
     const int wid  = threadIdx.x >> 5;
