@@ -189,6 +189,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _pq2_0Gemv2F16InFunc;
     private readonly nint _pq2_0GemvF16InSmallFunc;
     private readonly nint _pq2_0Gemv2F16InSmallFunc;
+    private readonly nint _pq2_0GemvF32IoFunc;
+    private readonly nint _pq2_0Gemv2F32IoFunc;
+    private readonly nint _pq2_0GemvF32IoSmallFunc;
+    private readonly nint _pq2_0Gemv2F32IoSmallFunc;
     private readonly nint _dequantPQ2_0F16Func;
     private readonly nint _pq2_0RepackSplitF16Func;
     private readonly nint _relu2Func;
@@ -593,6 +597,10 @@ public sealed unsafe class CudaKernels : IDisposable
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
         _pq2_0GemvF16InSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in_small");
         _pq2_0Gemv2F16InSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in_small");
+        _pq2_0GemvF32IoFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32io");
+        _pq2_0Gemv2F32IoFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f32io");
+        _pq2_0GemvF32IoSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32io_small");
+        _pq2_0Gemv2F32IoSmallFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f32io_small");
         _dequantPQ2_0F16Func = _dequantPQ2_0Module.GetFunction("dequant_pq2_0_f16");
         _pq2_0RepackSplitF16Func = _pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
         _relu2Func = _relu2Module.GetFunction("relu2_f16");
@@ -1373,6 +1381,59 @@ public sealed unsafe class CudaKernels : IDisposable
             &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
         };
         nint func = k <= Pq2_0MaxKSmall ? _pq2_0Gemv2F16InSmallFunc : _pq2_0Gemv2F16InFunc;
+        CudaDriverApi.cuLaunchKernel(func,
+                grid, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// PQ2_0 ternary GEMV with FP32-native activations/output — the decode path used by
+    /// <see cref="DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel"/> (issue #161).
+    /// Converts F32&lt;-&gt;F16 inline in the kernel's own vectorized activation-staging/output-store
+    /// steps (see native/kernels/pq2_0_gemv.cu's "F32-native activations" file-header section) —
+    /// no surrounding <see cref="LaunchConvertF32ToF16"/>/<see cref="LaunchConvertF16ToF32"/>
+    /// launches or F16 scratch-buffer round-trip needed at the call site, unlike
+    /// <see cref="LaunchPQ2_0GemvF16In"/>. Same dispatch-by-k routing to the <c>_small</c> variant
+    /// as <see cref="LaunchPQ2_0GemvF16In"/> — see that method's doc comment for the occupancy
+    /// rationale (identical here; only the activation pointer types/conversion site differ).
+    /// </summary>
+    public void LaunchPQ2_0GemvF32Native(nint quantWeight, nint xF32, nint yF32, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+
+        uint gridDim = (uint)((n + Pq2_0RowsPerBlock - 1) / Pq2_0RowsPerBlock);
+        if (gridDim == 0) gridDim = 1;
+
+        nint func = k <= Pq2_0MaxKSmall ? _pq2_0GemvF32IoSmallFunc : _pq2_0GemvF32IoFunc;
+        CudaDriverApi.cuLaunchKernel(func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Fused PQ2_0 ternary GEMV for two projections sharing one FP32-native input vector — the
+    /// FP32-native analog of <see cref="LaunchPQ2_0Gemv2F16In"/> (issue #161), used by
+    /// <see cref="DotLLM.Cuda.Architectures.CudaQwen3HybridDenseTransformerModel.TryFusedPQ2_0Gemm2"/>.
+    /// See <see cref="LaunchPQ2_0GemvF32Native"/>'s doc comment for the no-convert-launch rationale.
+    /// </summary>
+    public void LaunchPQ2_0Gemv2F32Native(
+        nint quantWeight0, nint quantWeight1, nint xF32,
+        nint yF32_0, nint yF32_1, int n0, int n1, int k, nint stream)
+    {
+        nint w0Arg = quantWeight0, w1Arg = quantWeight1, xArg = xF32;
+        nint y0Arg = yF32_0, y1Arg = yF32_1;
+        int n0Arg = n0, n1Arg = n1, kArg = k;
+        int totalN = n0 + n1;
+        uint grid = (uint)((totalN + Pq2_0RowsPerBlock - 1) / Pq2_0RowsPerBlock);
+        if (grid == 0) grid = 1;
+
+        void** args = stackalloc void*[]
+        {
+            &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
+        };
+        nint func = k <= Pq2_0MaxKSmall ? _pq2_0Gemv2F32IoSmallFunc : _pq2_0Gemv2F32IoFunc;
         CudaDriverApi.cuLaunchKernel(func,
                 grid, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();

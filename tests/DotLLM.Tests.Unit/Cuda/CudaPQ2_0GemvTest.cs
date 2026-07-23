@@ -68,6 +68,113 @@ public class CudaPQ2_0GemvTest
         RunF16(n, k);
     }
 
+    /// <summary>
+    /// Validates the F32-native production decode kernel (<see cref="CudaKernels.LaunchPQ2_0GemvF32Native"/>,
+    /// issue #161 — converts F32&lt;-&gt;F16 inline in the kernel's own vectorized stage/store steps
+    /// instead of via surrounding convert_f32_to_f16/convert_f16_to_f32 launches) against the CPU
+    /// float reference. Same shapes/tail-clamp/dispatch-boundary coverage as
+    /// <see cref="PQ2_0GemvF16In_MatchesCpuFloatReference"/> — see that test's doc comment for the
+    /// rationale of each (n, k) pair, in particular k=5248 guarding the small/default dispatch
+    /// boundary for the new <c>_f32io</c>/<c>_f32io_small</c> kernel pair.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(512, 5120)]
+    [InlineData(512, 17408)]
+    [InlineData(512, 5248)]
+    [InlineData(37, 5120)]
+    [InlineData(3, 5120)]
+    public void PQ2_0GemvF32Native_MatchesCpuFloatReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunF32Native(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunF32Native(int n, int k)
+    {
+        var rng = new Random(5678);
+        int groupsPerRow = k / 128;
+        int rowBytes = groupsPerRow * 34;
+        long packedLen = (long)n * rowBytes;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float[] groupScales = new float[n * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.01f + rng.NextSingle() * 0.05f;
+        byte[] packed = Pack(ternary, groupScales, n, k);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+
+        // CPU reference — full-precision float, same math the kernel approximates via half xs[].
+        float[] cpu = new float[n];
+        fixed (byte* w = packed)
+        fixed (float* px = x, py = cpu)
+            MatMul.GemvPQ2_0(w, px, py, n, k, null);
+
+        // GPU — F32-native in/out production path (#161): x/y stay float end-to-end, no Half
+        // marshaling on the C# side and no convert_f32_to_f16/convert_f16_to_f32 kernel launches.
+        float[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            long splitLen = CudaKernels.PQ2_0SplitLayoutBytes(n, k);
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devWSplit, (nuint)splitLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+                fixed (float* px = x)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(float))).ThrowOnError();
+
+                // Repack interleaved -> split layout (mirrors the real production load path,
+                // CudaQwen3HybridDenseTransformerModel.UploadRawTensor) — same as RunF16.
+                kernels.LaunchPQ2_0RepackSplitF16(devW, devWSplit, n, k, s);
+                kernels.LaunchPQ2_0GemvF32Native(devWSplit, devX, devY, n, k, s);
+                stream.Synchronize();
+
+                gpu = new float[n];
+                fixed (float* py = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)py, devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devWSplit);
+                CudaDriverApi.cuMemFree_v2(devX);
+                CudaDriverApi.cuMemFree_v2(devY);
+            }
+        }
+
+        float maxAbsDiff = 0, sumAbsDiff = 0;
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(cpu[i] - gpu[i]);
+            sumAbsDiff += d;
+            if (d > maxAbsDiff) maxAbsDiff = d;
+        }
+        float meanAbsDiff = sumAbsDiff / n;
+        _out.WriteLine($"PQ2_0 GEMV F32Native {n}×{k}: max abs diff={maxAbsDiff:E4}, mean={meanAbsDiff:E4}");
+
+        // Internal accumulation still goes through half xs[] (unchanged from the F16In kernel),
+        // so the tolerance bar matches PQ2_0GemvF16In_MatchesCpuFloatReference's — the only
+        // difference from that kernel is where the F32<->F16 conversion happens (fused into
+        // stage/store vs a separate launch), not how much rounding occurs. The output side is, if
+        // anything, slightly MORE precise here (no extra half-rounding on the way out through
+        // rowOut[]/y[] — see native/kernels/pq2_0_gemv.cu's "F32-native activations" section), so
+        // this bar should never bind tighter than the F16In test's.
+        Assert.True(maxAbsDiff <= 5e-2f, $"max abs diff {maxAbsDiff} exceeds 5e-2 (F16-internal-precision vs CPU float32)");
+        Assert.True(meanAbsDiff <= 1e-2f, $"mean abs diff {meanAbsDiff} exceeds 1e-2");
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunF16(int n, int k)
     {
@@ -400,6 +507,103 @@ public class CudaPQ2_0GemvTest
             CudaDriverApi.cuMemFree_v2(devX);
             CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1);
             CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1);
+        }
+    }
+
+    /// <summary>
+    /// Validates the F32-native fused 2-way GEMV (<see cref="CudaKernels.LaunchPQ2_0Gemv2F32Native"/>,
+    /// issue #161 — the F32-native analog of <see cref="CudaKernels.LaunchPQ2_0Gemv2F16In"/>)
+    /// produces the same output as two separate <see cref="CudaKernels.LaunchPQ2_0GemvF32Native"/>
+    /// calls. Same shape coverage as <see cref="PQ2_0GemvFusedDecode_MatchesSeparateLaunches"/>.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(5120)]
+    [InlineData(17408)]
+    [InlineData(5248)]
+    public void PQ2_0GemvFusedDecodeF32Native_MatchesSeparateLaunches(int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunFusedDecodeF32Native(k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunFusedDecodeF32Native(int k)
+    {
+        const int n0 = 37;
+        const int n1 = 53;
+
+        var rng = new Random(2468);
+        byte[] w0 = RandomPacked(rng, n0, k);
+        byte[] w1 = RandomPacked(rng, n1, k);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++)
+            x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+        using var kernels = new CudaKernels(ptxDir!);
+        nint s = stream.Handle;
+
+        int groupsPerRow = k / 128;
+        int rowBytes = groupsPerRow * 34;
+        static nuint PackedBytes(int n, int rowBytes) => (nuint)((long)n * rowBytes);
+
+        long splitLen0 = CudaKernels.PQ2_0SplitLayoutBytes(n0, k);
+        long splitLen1 = CudaKernels.PQ2_0SplitLayoutBytes(n1, k);
+
+        CudaDriverApi.cuMemAlloc_v2(out nint devW0, PackedBytes(n0, rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW1, PackedBytes(n1, rowBytes)).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW0Split, (nuint)splitLen0).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devW1Split, (nuint)splitLen1).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)(k * sizeof(float))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep0, (nuint)(n0 * sizeof(float))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint sep1, (nuint)(n1 * sizeof(float))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus0, (nuint)(n0 * sizeof(float))).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out nint fus1, (nuint)(n1 * sizeof(float))).ThrowOnError();
+        try
+        {
+            fixed (byte* p = w0) CudaDriverApi.cuMemcpyHtoD_v2(devW0, (nint)p, PackedBytes(n0, rowBytes)).ThrowOnError();
+            fixed (byte* p = w1) CudaDriverApi.cuMemcpyHtoD_v2(devW1, (nint)p, PackedBytes(n1, rowBytes)).ThrowOnError();
+            fixed (float* p = x) CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)p, (nuint)(k * sizeof(float))).ThrowOnError();
+
+            // Repack interleaved -> split layout — see RunF16's identical comment above.
+            kernels.LaunchPQ2_0RepackSplitF16(devW0, devW0Split, n0, k, s);
+            kernels.LaunchPQ2_0RepackSplitF16(devW1, devW1Split, n1, k, s);
+
+            kernels.LaunchPQ2_0GemvF32Native(devW0Split, devX, sep0, n0, k, s);
+            kernels.LaunchPQ2_0GemvF32Native(devW1Split, devX, sep1, n1, k, s);
+            kernels.LaunchPQ2_0Gemv2F32Native(devW0Split, devW1Split, devX, fus0, fus1, n0, n1, k, s);
+            stream.Synchronize();
+
+            AssertFloatClose(sep0, fus0, n0);
+            AssertFloatClose(sep1, fus1, n1);
+        }
+        finally
+        {
+            CudaDriverApi.cuMemFree_v2(devW0); CudaDriverApi.cuMemFree_v2(devW1);
+            CudaDriverApi.cuMemFree_v2(devW0Split); CudaDriverApi.cuMemFree_v2(devW1Split);
+            CudaDriverApi.cuMemFree_v2(devX);
+            CudaDriverApi.cuMemFree_v2(sep0); CudaDriverApi.cuMemFree_v2(sep1);
+            CudaDriverApi.cuMemFree_v2(fus0); CudaDriverApi.cuMemFree_v2(fus1);
+        }
+    }
+
+    private static unsafe void AssertFloatClose(nint expectedDevice, nint actualDevice, int n)
+    {
+        float[] expected = new float[n];
+        float[] actual = new float[n];
+        fixed (float* p = expected)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, expectedDevice, (nuint)(n * sizeof(float))).ThrowOnError();
+        fixed (float* p = actual)
+            CudaDriverApi.cuMemcpyDtoH_v2((nint)p, actualDevice, (nuint)(n * sizeof(float))).ThrowOnError();
+
+        for (int i = 0; i < n; i++)
+        {
+            float diff = MathF.Abs(expected[i] - actual[i]);
+            Assert.True(diff <= 1e-3f, $"index {i}: expected {expected[i]}, actual {actual[i]}");
         }
     }
 
