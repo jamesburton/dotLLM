@@ -206,6 +206,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         var cublas = CudaCublasHandle.Create();
         cublas.SetStream(stream);
 
+        // Force a fresh load of UploadRawTensor's process-wide cached PQ2_0 repack module/
+        // function for THIS model load. Comparing a raw CUDA context handle across calls (see
+        // EnsurePq2_0RepackFunc) is not fully reliable on its own: cuCtxDestroy_v2 (from a
+        // previous model's Dispose) can free a context whose handle value the driver later
+        // reissues to a brand-new cuCtxCreate_v2 call (a classic ABA hazard) — observed in
+        // practice when many CUDA tests load/dispose Qwen3HybridDense models across one process
+        // (issue #162 follow-up: "CUDA error 400: invalid resource handle" resurfaced in the
+        // full suite despite EnsurePq2_0RepackFunc's context check passing). Resetting
+        // unconditionally here guarantees every LoadFromGguf call gets a module freshly loaded
+        // into ITS OWN just-created context, regardless of any handle-value coincidence.
+        s_pq2_0RepackModule = null;
+        s_pq2_0RepackFunc = 0;
+        s_pq2_0RepackContext = 0;
+
         ptxDir ??= Path.Combine(AppContext.BaseDirectory, "ptx");
         var kernels = new CudaKernels(ptxDir);
 
@@ -229,9 +243,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // instead — only `seqLen` rows are ever needed, never all 248320.
         var embDesc = tensors["token_embd.weight"];
         long embRowBytes = Dequantize.RowByteSize(hiddenSize, embDesc.QuantizationType);
-        long embTotalBytes = embRowBytes * config.VocabSize;
-        nint tokenEmbedDevice = AllocDevice(embTotalBytes);
-        CopyHtoD(tokenEmbedDevice, dataBase + (nint)embDesc.DataOffset, embTotalBytes);
+        // Uploaded via UploadRawTensor (not a hand-rolled alloc+copy) so PQ2_0 tensors get the
+        // same load-time interleaved->split repack every other PQ2_0 weight in the model gets
+        // (see UploadRawTensor's own doc comment) — see issue #162: this tensor previously
+        // bypassed the repack, leaving it in the on-disk interleaved layout while every PQ2_0
+        // GEMV/dequant kernel that might read it (via the tied-embedding lm_head fallback below)
+        // unconditionally assumes split layout. `embRowBytes` (computed above, from
+        // `hiddenSize`/`config.VocabSize`) is used only for the HOST-side per-token embedding
+        // dequant in Forward() — reads directly from the mmap'd GGUF bytes via `dataBase`, not
+        // from this GPU buffer — so it is unaffected by the on-device byte layout either way.
+        nint tokenEmbedDevice = UploadRawTensor(dataBase, embDesc);
 
         // ── Output norm (always F32 [hiddenSize], dequant on host then H2D) ──
         var outNormDesc = tensors["output_norm.weight"];
@@ -252,10 +273,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         bool ownsOutputDevice;
         if (tensors.TryGetValue("output.weight", out var outDesc))
         {
-            long outRowBytes = Dequantize.RowByteSize(outDesc.Shape[0], outDesc.QuantizationType);
-            long outTotalBytes = outRowBytes * outDesc.Shape[1];
-            outputDevice = AllocDevice(outTotalBytes);
-            CopyHtoD(outputDevice, dataBase + (nint)outDesc.DataOffset, outTotalBytes);
+            // Uploaded via UploadRawTensor (issue #162 fix) — see tokenEmbedDevice's identical
+            // fix above for the full rationale. This tensor drives the LM head projection
+            // directly (Gemm() -> LaunchDequantPQ2_0ToF16/LaunchPQ2_0GemvF16In/
+            // LaunchPQ2_0GemvF32Native, all split-layout readers), so the missing repack here
+            // was the actual root cause of #162's -Inf prefill logits: the LM head decoded raw
+            // interleaved on-disk bytes as if they were split-layout, producing effectively
+            // random (garbage-magnitude, sign-uncorrelated vs. the CPU F32 reference) logit
+            // values — most conspicuously ones landing outside FP16's finite range once the
+            // prefill HGEMM path's F16 output store rounds them.
+            outputDevice = UploadRawTensor(dataBase, outDesc);
             outputQt = outDesc.QuantizationType;
             outputInputDim = outDesc.Shape[0];
             outputOutputDim = outDesc.Shape[1];
@@ -1563,14 +1590,24 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // larger, invasive restructuring of the (static, pre-construction) loading pipeline.
     private static CudaModule? s_pq2_0RepackModule;
     private static nint s_pq2_0RepackFunc;
+    // The CUDA context s_pq2_0RepackModule was loaded into (cuModuleLoad binds a module to
+    // whichever context is current at load time). A CudaModule/function handle from a since-
+    // destroyed context is invalid in any other context ("CUDA error 400: invalid resource
+    // handle") — loading a second Qwen3HybridDense model (a fresh CudaContext.Create per
+    // LoadFromGguf call, see that method) after the first model's Dispose() reuses this
+    // process-wide cache across two different (one now-dead) contexts otherwise. Track the
+    // context the cached module belongs to and reload whenever the CURRENT context differs.
+    private static nint s_pq2_0RepackContext;
 
     private static nint EnsurePq2_0RepackFunc()
     {
-        if (s_pq2_0RepackModule is null)
+        CudaDriverApi.cuCtxGetCurrent(out nint currentCtx).ThrowOnError();
+        if (s_pq2_0RepackModule is null || currentCtx != s_pq2_0RepackContext)
         {
             string ptxDir = Path.Combine(AppContext.BaseDirectory, "ptx");
             s_pq2_0RepackModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "pq2_0_repack.ptx"));
             s_pq2_0RepackFunc = s_pq2_0RepackModule.GetFunction("pq2_0_repack_split_f16");
+            s_pq2_0RepackContext = currentCtx;
         }
         return s_pq2_0RepackFunc;
     }
