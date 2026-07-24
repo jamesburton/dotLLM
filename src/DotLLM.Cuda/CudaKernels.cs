@@ -347,6 +347,8 @@ public sealed unsafe class CudaKernels : IDisposable
     //   • conv1d_causal_f32        — depthwise causal 1-D convolution
     //   • gdn_scan_step_f32        — per-token GDN recurrence step (host loops over seqLen)
     //   • l2_normalize_heads_f32   — in-place per-head L2 normalisation (pre-scan)
+    //   • gdn_deinterleave_l2norm_decode_f32 — decode-only (seqLen==1) fusion of
+    //     deinterleave_gdn_qkv_f32 + both Q/K l2_normalize_heads_f32 calls
     //   • gdn_decay_f32            — fused softplus + exp for the per-token decay g
     //   • sigmoid_f32              — in-place elementwise sigmoid
     //   • silu_f32                 — in-place elementwise SiLU
@@ -360,6 +362,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnScanStepF32Func;
     private readonly CudaModule? _l2NormHeadsF32Module;
     private readonly nint _l2NormHeadsF32Func;
+    private readonly nint _gdnDeinterleaveL2NormDecodeF32Func;
     private readonly nint _gdnDecayF32Func;
     private readonly nint _gdnDecaySigmoidF32Func;
     private readonly CudaModule? _elementwiseF32Module;
@@ -784,6 +787,8 @@ public sealed unsafe class CudaKernels : IDisposable
             // so they are in the same .ptx module — query each function pointer here.
             _l2NormHeadsF32Module = _gdnScanF32Module;
             _l2NormHeadsF32Func = _gdnScanF32Module.TryGetFunction("l2_normalize_heads_f32");
+            _gdnDeinterleaveL2NormDecodeF32Func =
+                _gdnScanF32Module.TryGetFunction("gdn_deinterleave_l2norm_decode_f32");
             _gdnDecayF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_f32");
             _gdnDecaySigmoidF32Func = _gdnScanF32Module.TryGetFunction("gdn_decay_sigmoid_f32");
         }
@@ -2107,6 +2112,51 @@ public sealed unsafe class CudaKernels : IDisposable
         // threads via a grid-stride loop, so blockDim can equal dState exactly.
         CudaDriverApi.cuLaunchKernel(_l2NormHeadsF32Func,
                 (uint)totalHeads, 1, 1, (uint)dState, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// True when the fused decode-time GDN deinterleave+L2-normalize kernel
+    /// (<see cref="LaunchGdnDeinterleaveL2NormDecodeF32"/>) is loaded. When false,
+    /// callers fall back to <see cref="LaunchDeinterleaveGdnQkvF32"/> (or the host-loop
+    /// fallback) plus two separate <see cref="LaunchL2NormalizeHeadsF32"/> calls.
+    /// </summary>
+    public bool HasGdnDeinterleaveL2NormDecodeF32 => _gdnDeinterleaveL2NormDecodeF32Func != 0;
+
+    /// <summary>
+    /// Decode-time (seqLen==1) fusion of <see cref="LaunchDeinterleaveGdnQkvF32"/> + two
+    /// <see cref="LaunchL2NormalizeHeadsF32"/> calls (Q then K) into one launch. Also removes
+    /// the runtime integer division/modulo <c>deinterleave_gdn_qkv_f32</c> pays per element for
+    /// the general (seqLen&gt;1) case — SASS-confirmed (issue #170) — since decode's single row
+    /// makes every index directly computable from block/thread indices alone. Requires
+    /// <c>n_k_head*dState</c> and <c>n_v_head*dState</c> (the actual Q/K and V buffer sizes) to
+    /// each be exact multiples of <paramref name="dState"/>, which always holds for GDN.
+    /// </summary>
+    /// <param name="src">Device pointer to the single decode row: <c>[Q(kDim) | K(kDim) | V(vDim)]</c>.</param>
+    /// <param name="q">Destination for the L2-normalized Q heads, <c>[kDim]</c>.</param>
+    /// <param name="k">Destination for the L2-normalized K heads, <c>[kDim]</c>.</param>
+    /// <param name="v">Destination for the straight-copied V heads, <c>[vDim]</c>.</param>
+    /// <param name="nKHead">Number of key/query heads (kDim = nKHead * dState).</param>
+    /// <param name="nVHead">Number of value heads (vDim = nVHead * dState).</param>
+    /// <param name="dState">Per-head dimension.</param>
+    /// <param name="eps">Epsilon added to the L2 norm, matching <see cref="LaunchL2NormalizeHeadsF32"/>.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnDeinterleaveL2NormDecodeF32(
+        nint src, nint q, nint k, nint v, int nKHead, int nVHead, int dState, float eps, nint stream)
+    {
+        if (dState <= 0 || dState > 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; gdn_deinterleave_l2norm_decode_f32 is compiled with __launch_bounds__(128).");
+
+        nint srcArg = src, qArg = q, kArg = k, vArg = v;
+        int nkArg = nKHead, dsArg = dState;
+        float epsArg = eps;
+        void** args = stackalloc void*[] {&srcArg, &qArg, &kArg, &vArg, &nkArg, &dsArg, &epsArg};
+
+        uint gridDim = (uint)(2 * nKHead + nVHead);
+
+        CudaDriverApi.cuLaunchKernel(_gdnDeinterleaveL2NormDecodeF32Func,
+                gridDim, 1, 1, (uint)dState, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
 

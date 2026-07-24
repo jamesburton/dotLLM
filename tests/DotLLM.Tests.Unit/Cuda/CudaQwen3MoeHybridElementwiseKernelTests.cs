@@ -624,4 +624,98 @@ public class CudaQwen3MoeHybridElementwiseKernelTests
             if (dV != 0) CudaDriverApi.cuMemFree_v2(dV);
         }
     }
+
+    // ── Test 7: gdn_deinterleave_l2norm_decode_f32 (fused, issue #170) ──────
+
+    [SkippableTheory]
+    [InlineData(16, 48, 128)]  // decode-realistic: real Bonsai-ish nVHead, d_state=128
+    [InlineData(2, 3, 8)]      // small dims
+    public void GdnDeinterleaveL2NormDecodeF32_MatchesSeparateDeinterleavePlusL2Norm(
+        int nKHead, int nVHead, int dState)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        string? ptxDir = FindPtxDir();
+        Skip.If(ptxDir == null, "PTX files not found");
+
+        using var ctx = CudaContext.Create(0);
+        using var stream = CudaStream.Create();
+        using var kernels = new CudaKernels(ptxDir!);
+        Skip.IfNot(kernels.HasGdnDeinterleaveL2NormDecodeF32,
+            "gdn_deinterleave_l2norm_decode_f32 not loaded (PTX may be stale)");
+        Skip.IfNot(kernels.HasDeinterleaveF32, "deinterleave kernels not loaded (PTX may be stale)");
+
+        int kDim = nKHead * dState;
+        int vDim = nVHead * dState;
+        int convDim = 2 * kDim + vDim;
+        const float eps = 1e-6f;
+
+        var rng = new Random(0xFEED ^ nKHead ^ (nVHead << 8) ^ (dState << 16));
+        float[] src = new float[convDim];
+        for (int i = 0; i < src.Length; i++) src[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+        nint dSrc = 0;
+        nint dQSep = 0, dKSep = 0, dVSep = 0;
+        nint dQFused = 0, dKFused = 0, dVFused = 0;
+        try
+        {
+            long srcBytes = (long)src.Length * sizeof(float);
+            long qkBytes = (long)kDim * sizeof(float);
+            long vBytes = (long)vDim * sizeof(float);
+            CudaDriverApi.cuMemAlloc_v2(out dSrc, (nuint)srcBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dQSep, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dKSep, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dVSep, (nuint)vBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dQFused, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dKFused, (nuint)qkBytes).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out dVFused, (nuint)vBytes).ThrowOnError();
+            unsafe
+            {
+                fixed (float* p = src)
+                    CudaDriverApi.cuMemcpyHtoD_v2(dSrc, (nint)p, (nuint)srcBytes).ThrowOnError();
+            }
+
+            nint s = stream.Handle;
+
+            // Separate path (the general seqLen>1-capable path, called with seqLen=1):
+            // deinterleave, then L2-normalize Q and K independently.
+            kernels.LaunchDeinterleaveGdnQkvF32(dSrc, dQSep, dKSep, dVSep, kDim, vDim, seqLen: 1, s);
+            kernels.LaunchL2NormalizeHeadsF32(dQSep, nKHead, dState, eps, s);
+            kernels.LaunchL2NormalizeHeadsF32(dKSep, nKHead, dState, eps, s);
+
+            // Fused decode-only path under test.
+            kernels.LaunchGdnDeinterleaveL2NormDecodeF32(
+                dSrc, dQFused, dKFused, dVFused, nKHead, nVHead, dState, eps, s);
+
+            stream.Synchronize();
+
+            float[] qSep = new float[kDim], kSep = new float[kDim], vSep = new float[vDim];
+            float[] qFused = new float[kDim], kFused = new float[kDim], vFused = new float[vDim];
+            unsafe
+            {
+                fixed (float* p = qSep) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dQSep, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = kSep) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dKSep, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = vSep) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dVSep, (nuint)vBytes).ThrowOnError();
+                fixed (float* p = qFused) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dQFused, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = kFused) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dKFused, (nuint)qkBytes).ThrowOnError();
+                fixed (float* p = vFused) CudaDriverApi.cuMemcpyDtoH_v2((nint)p, dVFused, (nuint)vBytes).ThrowOnError();
+            }
+
+            Assert.Equal(qSep, qFused);
+            Assert.Equal(kSep, kFused);
+            Assert.Equal(vSep, vFused);
+            _out.WriteLine(
+                $"gdn_deinterleave_l2norm_decode_f32 nKHead={nKHead} nVHead={nVHead} dState={dState}: " +
+                "exact match vs deinterleave+2xL2Normalize");
+        }
+        finally
+        {
+            if (dSrc != 0) CudaDriverApi.cuMemFree_v2(dSrc);
+            if (dQSep != 0) CudaDriverApi.cuMemFree_v2(dQSep);
+            if (dKSep != 0) CudaDriverApi.cuMemFree_v2(dKSep);
+            if (dVSep != 0) CudaDriverApi.cuMemFree_v2(dVSep);
+            if (dQFused != 0) CudaDriverApi.cuMemFree_v2(dQFused);
+            if (dKFused != 0) CudaDriverApi.cuMemFree_v2(dKFused);
+            if (dVFused != 0) CudaDriverApi.cuMemFree_v2(dVFused);
+        }
+    }
 }
