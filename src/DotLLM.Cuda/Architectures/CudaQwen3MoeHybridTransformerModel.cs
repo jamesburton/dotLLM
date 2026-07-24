@@ -1885,6 +1885,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // Reuse the existing RMSNorm-F32 kernel as a per-head normaliser:
         //   rows = seqLen * nVHead, hiddenSize = dState. The weight is dState floats
         //   shared across all rows — exactly what LaunchRmsNormF32 does.
+        // Investigated fusing these two launches (issue #172, same pattern as
+        // CudaQwen3HybridDenseTransformerModel's ForwardGdnBody step 6): implemented,
+        // SASS-verified, correctness-tested, but showed no reproducible real-bench decode win
+        // (within this machine's thermal-drift noise floor) — see rmsnorm_f32.cu's header.
         _kernels.LaunchRmsNormF32(gdnOut, gdnW.SsmNormDevice, gdnOut,
             dState, eps, seqLen * nVHead, streamH);
         // gdnOut *= silu(z). silu(z) = z * sigmoid(z); SwiGLU(gate=z, up=gdnOut) = silu(z)*up.
