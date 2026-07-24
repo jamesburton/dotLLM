@@ -936,6 +936,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("gdn-5-scan");
 
         // ── 6. Per-head RMSNorm(out, ssm_norm) * silu(z) gating ──
+        // Investigated fusing these two launches (issue #172): implemented, SASS-verified,
+        // correctness-tested, but showed no reproducible real-bench decode win (within this
+        // machine's thermal-drift noise floor) — see rmsnorm_f32.cu's header for the full
+        // writeup. Left as two separate calls.
         _kernels.LaunchRmsNormF32(gdnOut, gdnW.SsmNormDevice, gdnOut,
             dState, eps, seqLen * nVHead, streamH);
         _kernels.LaunchSwiGLUF32(zBuf, gdnOut, gdnOut, vDim, seqLen, streamH);
