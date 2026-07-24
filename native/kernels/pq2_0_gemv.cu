@@ -784,6 +784,114 @@
 // disassemble the CURRENT compiled kernel first, every time, rather than trusting the metric's premise
 // about what the compiler has or hasn't already done — the premise has now been wrong twice
 // consecutively on this exact kernel family.
+//
+// ───────────────────────── TRIED AND REVERTED: software-pipelined weight-byte prefetch (#166) ─────────────────────────
+// A fresh round-2 advisor pass (see the `prismml-bonsai-model` project memory) found the LAST
+// untried candidate on `pq2_0_gemv2_f32io_small` (the FFN gate+up fused kernel, grid=2176): a
+// genuine, repeated L1TEX scoreboard-stall flag ("5.2-5.4 cycles stalled waiting on a scoreboard
+// dependency on L1TEX") DESPITE 96.4-96.8% achieved occupancy against a 100% theoretical ceiling —
+// i.e. occupancy-based latency hiding is exhausted here, yet the stall persists. Proposed lever:
+// manual double-buffering of each row's per-group scale+code global loads, so group g+1's loads are
+// ISSUED before group g's already-loaded values are consumed by the accumulate FFMA, giving the
+// L1TEX round-trip a full loop iteration to complete instead of stalling immediately before use.
+//
+// Step 1, per this file's own standing rule: `cuobjdump --dump-sass` on the CURRENT, unmodified
+// kernel BEFORE writing any fix. Finding: `ptxas` had ALREADY 2x-unrolled the `for (g...)` group
+// loop (confirmed by the loop-counter decrement `IADD3 R22, R22, -0x2` and a single backward branch
+// covering BOTH groups' worth of loads+compute in one straight-line block) and, within that unrolled
+// pair, issues most of both groups' scale/code `LDG` loads clustered early in the block, well before
+// the bulk of the `FFMA`/`FADD` chain that consumes them — a real, if shallow (~1-group-deep),
+// software-pipelining effect the compiler was already producing on its own via unroll+list-schedule,
+// not a stall the compiler was doing nothing about.
+//
+// Step 3, occupancy modeling BEFORE implementing in earnest: `nvcc -Xptxas -v` on the unmodified
+// kernel confirmed the premise's numbers were current — `pq2_0_gemv2_f32io_small` compiles to 40
+// registers, 10304 bytes smem, zero spill. Occupancy arithmetic (sm_86: 65536 registers/SM, 102400
+// bytes shared mem/SM, 1536 threads/SM max, 256-thread blocks = 8 warps/block): registers ->
+// floor(65536/(40*256))=6; shared mem -> floor(102400/10304)=9; warps (ABSOLUTE ceiling, 1536/256)
+// -> 6. Binding constraint = min(6,9,6,16) = 6 blocks/SM, TIED between registers and the absolute
+// warp-count ceiling — i.e. this kernel is already at the hard maximum (48 warps/SM = 100%
+// theoretical occupancy), matching the advisor's 96.4-96.8% achieved figure. Headroom before a
+// register increase would drop this to 5 blocks/SM (83.3%, a real regression): only 2 registers
+// (40 -> 42 stays at 6; 43 drops to 5) — a thin margin, exactly the risk this task's framing flagged
+// up front. This alone did not conclusively rule the candidate out (2 registers isn't obviously zero
+// headroom), so a throwaway compile check followed rather than stopping on hand arithmetic alone.
+//
+// Throwaway compile check (a standalone `.cu` file, NOT this file, compiled with `nvcc -Xptxas -v`
+// only — no GPU execution, matching the FMA-fusion candidate's precedent for de-risking a change
+// before wiring it in for real): a minimal manual double-buffer of `scaleBuf[2][ROWS_PER_WARP]`/
+// `codeBuf[2][ROWS_PER_WARP]`, preloading group 0 before the loop and prefetching group g+1 at the
+// top of each iteration before consuming group g's buffered values, compiled to **39 registers** (one
+// FEWER than baseline, not more — the naive "doubling live state roughly doubles registers" estimate
+// was WRONG, in the opposite direction from what the task's framing worried about) with zero spill,
+// unchanged 10304 bytes smem. But total SASS instruction count for the whole kernel body rose 400 ->
+// 440 (+10%), and the loop structure changed qualitatively: a genuine backward-branching loop
+// handling ONE group per iteration (not ptxas's own 2x-unrolled pair), confirmed via `cuobjdump
+// --dump-sass` on the throwaway compile. A MIXED signal — registers/occupancy fine or better, but
+// real added instruction count and a materially different (single-group, real-branch) loop shape —
+// not a clean rule-out by modeling alone, so per this task's own decision tree the candidate was
+// implemented for real rather than stopped here.
+//
+// Wired into `pq2_0_gemv2_f32io_small` itself (the exact kernel the advisor flagged, confirmed by
+// grid=2176 = ceil(2*17408/16), Bonsai-27B's dense FFN gate+up projection). `nvcc -Xptxas -v` on the
+// REAL file after the change reproduced the throwaway compile's numbers exactly: 39 registers, 10304
+// bytes smem, zero spill — occupancy-binding constraint UNCHANGED at 6 blocks/SM (100% theoretical,
+// same as baseline; if anything 1 more register of headroom than before, 3 vs 2). Every OTHER kernel
+// variant in the file (`pq2_0_gemv_f32io_small`, the two windowed large-K kernels, the F16-native
+// kernels, the F32 CPU-reference kernel) compiled to BIT-IDENTICAL register/smem footprints before
+// and after — confirming the change's compile-time footprint was correctly scoped to only the one
+// targeted kernel.
+//
+// Correctness: full CUDA test suite (312 passed / 0 failed / 39 skipped) including
+// `CudaQwen3HybridDenseRealGgufSmokeTest` (the #162 prefill regression guard, run for real against
+// the Bonsai-27B GGUF fixture, not skipped) and the pre-existing `CudaGraphCaptureEquivalenceTest`
+// isolation flake (passed clean in this run, no recurrence) — no correctness regression from this
+// change at any point.
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS: fresh baseline (this commit's parent,
+// `bench -p 64 -n 16`, RTX 3060) 17.19-17.36 tok/s across 6 reps/2 runs (median ~17.3, consistent
+// with the ~17.2-17.65 tok/s this investigation has held at since #164) -> **15.32-15.75 tok/s across
+// 6 reps/2 runs post-change (median ~15.6)** — a reproducible **~9-10% REGRESSION**, and the two
+// distributions do NOT overlap at all (baseline's worst rep, 17.19, still beats the prefetch
+// version's best rep, 15.75). This is the NINTH negative result in this investigation's history, and
+// notably a DIFFERENT failure shape than the two immediately preceding it (bank-conflict and
+// FMA-fusion, both proven SASS-level NO-OPS with zero measurable throughput change either way): this
+// change was a real, substantive SASS-level restructuring (confirmed non-no-op via the instruction-
+// count and loop-shape differences above) that nonetheless made real throughput measurably WORSE, not
+// neutral — closer in shape to the batch-8/SwiGLU-fusion class of failure (a real change, real cost,
+// negative payoff) than to the bank-conflict/FMA-fusion class (no real change at all).
+//
+// Root cause hypothesis (not `ncu`-counter-confirmed — no profiler access in the session that ran
+// this experiment): the manual double-buffer's explicit `cur`/`next` index swap forces a true,
+// single-group-per-iteration loop with one real backward branch, REPLACING the 2x-unrolled,
+// straight-line-scheduled loop `ptxas` had already built on its own (see the Step 1 SASS finding
+// above) — which was ALREADY clustering both unrolled groups' loads early and interleaving them with
+// the compute chain, a shallower but branch-free form of the same latency-hiding idea this fix tried
+// to add explicitly. Forcing an explicit, deeper (1-iteration-ahead) prefetch distance also forces a
+// REAL loop (double the branch count vs the unrolled baseline, since branches are now paid per group
+// instead of per group-pair) and a loop-carried buffer-index dependency the scheduler has less
+// freedom to hide across than the unrolled body's independent, staticaly-scheduled instruction
+// stream. In other words: this is the same "the compiler had already captured most of the achievable
+// benefit via a cheaper mechanism (unrolling), and an explicit manual version paid a real structural
+// cost (branch count, loop-carried state) to chase the SAME latency-hiding effect less efficiently" —
+// a genuinely new variant of this file's now-familiar lesson, distinct from the SASS-no-op cases:
+// here the compiler's existing solution wasn't merely equivalent to the proposed fix, it was
+// ACTIVELY BETTER, and replacing it with an explicit version cost real performance.
+//
+// Reverted in full (`git checkout -- native/kernels/pq2_0_gemv.cu native/ptx/pq2_0_gemv.ptx`) — no
+// `scaleBuf`/`codeBuf`/manual double-buffering exists in `pq2_0_gemv2_f32io_small` as shipped; the
+// original single-buffered `for (g...) { gx = ...; for (rr...) { scale = ...; p = ...; acc += ...; } }`
+// loop is unchanged.
+//
+// **Status after this candidate**: this was explicitly the LAST remaining, previously-unexplored
+// candidate flagged by the round-2 advisor review on this kernel family (see the earlier
+// bank-conflict and FMA-fusion entries' own "closest thing to unexplored territory left" framing) —
+// every `ncu`-flagged item from that round is now tried-and-reverted (bank-conflict, FMA-fusion,
+// this prefetch candidate) or previously deferred with documented reasoning (tail-wave resize on this
+// same kernel family, LUT-style deeper decode). This is a strong, well-substantiated stopping point
+// for the PQ2_0 GEMV kernel-level investigation on `pq2_0_gemv2_f32io_small` specifically — a future
+// session would need genuinely new profiling evidence (real `ncu` L1TEX/scheduler counters, not
+// available in this session) before re-attempting any occupancy/latency-hiding lever on this kernel.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
