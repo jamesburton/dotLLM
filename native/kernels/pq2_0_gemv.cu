@@ -704,6 +704,86 @@
 // re-attempt the interleaved-layout restructuring without new evidence that materially changes this
 // cost/benefit balance (e.g. a future round finding this kernel latency-bound again, the one
 // condition under which occupancy/access-pattern levers have actually paid off in this investigation).
+//
+// ───────────────────────── TRIED AND REVERTED: FP32 FMA-fusion reassociation (#164 candidate #1) ─────────────────────────
+// The same round-2 advisor pass that flagged the bank-conflict "fix" above (SASS-proven no-op) also
+// flagged `ncu`'s "Compute Workload Analysis" rule reporting an Est. Speedup of ~7-9% on every PQ2_0
+// GEMV variant: "This kernel executes N fused and M non-fused FP32 instructions. Converting pairs of
+// non-fused instructions to fused... could increase FP32 performance up to 20-24%." The hypothesis was
+// that this is a side effect of #161's own algebraic ALU reduction, which reassociated
+// `acc += (code-1)*x` into `acc += (Sum code*x - Sum x) * scale` — the final `(dot - sum) * scale`
+// expression is a subtract feeding a multiply, which the advisor's premise (read from source, not SASS)
+// assumed was NOT already fused into the accumulate.
+//
+// Per this file's own standing rule (verify SASS on the UNMODIFIED kernel before writing any fix,
+// reinforced hard by the immediately-preceding bank-conflict entry above), `cuobjdump --dump-sass` on
+// the two flagged highest-value targets (`pq2_0_gemv_f32io`, grid=320/k=17408, and
+// `pq2_0_gemv2_f32io_small`, grid=2176) was inspected FIRST. Finding: `acc[rr] += (dot - gx.sum) * scale`
+// was ALREADY compiled to exactly 2 instructions per row — `FADD R4, -R7, R4` (the subtract, dot-sum,
+// using the GPU's free negated-operand add) immediately followed by `FFMA R14, R5, R4, R14` (multiply by
+// scale AND accumulate into acc, in ONE fused instruction). The advisor's premise — that the final
+// multiply-then-accumulate was NOT fused — was false: `ptxas` (nvcc's default `fmad=true`, unchanged for
+// this file) had already fused it. The only "non-fused" FP32 instruction in this expression is the
+// subtract itself, which has no adjacent multiply of its own to fuse with in the CURRENT algebraic form.
+//
+// Reassociating to two chained FMAs — `acc = fmaf(dot, scale, acc); acc = fmaf(-gx.sum, scale, acc);`
+// (matching the advisor's suggested pattern, and this investigation's "safe" shape: pure arithmetic, no
+// new sync/shared-mem) — was implemented and checked via SASS on a throwaway compile BEFORE touching the
+// real file, per this file's standing rule. Result: the fused-multiply-accumulate step trades 1 FADD +
+// 1 FFMA (2 instructions total) for 2 FFMAs (2 instructions total) — NO reduction in FP32-pipe
+// instruction count. This is not a modeling error: on this architecture (and on NVIDIA GPUs generally,
+// since Fermi) FADD/FMUL/FFMA execute at the IDENTICAL throughput per CUDA core (FADD and FMUL are
+// hardware special-cases of the same FMA datapath, not separate cheaper units) — "fusing" an FADD+FFMA
+// pair that's already down to 2 instructions into 2 FFMAs cannot reduce cycle count; it only changes
+// which opcode is chosen for the same number of pipe slots. Confirmed directly: total FFMA+FADD count
+// for the accumulate expression's contribution to the whole kernel was IDENTICAL before/after (49 either
+// way: 24 FFMA + 25 FADD baseline vs 30 FFMA + 19 FADD reassociated, for both `pq2_0_gemv_f32io` and
+// `pq2_0_gemv2_f32io_small`) — a straight FADD<->FFMA relabeling with zero net FP32-pipe cost, exactly
+// the condition under which `ncu`'s FMA-fusion heuristic does not correspond to a real opportunity (the
+// heuristic assumes any executed FADD/FMUL could halve into a shared FFMA slot with SOME multiply, which
+// is not true when — as here — the nearby multiply is already spoken for by an existing FFMA).
+//
+// Total per-kernel SASS instruction count DID drop for 6 of the 8 production kernel variants (-8 to -16
+// instructions, ~2-4%) — `pq2_0_gemv_f32io_small`/`pq2_0_gemv_f16in_small` (single-projection, small-K):
+// 357->341 / 355->339; `pq2_0_gemv_f32io`/`pq2_0_gemv_f16in` (single-projection, windowed): 370->362 /
+// 368->360; `pq2_0_gemv2_f32io_small`/`pq2_0_gemv2_f16in_small` (fused 2-way, small-K): 384->376 /
+// 381->373. This came ENTIRELY from incidental scheduler-level side effects unrelated to the FP32 pipe
+// (fewer LOP3.LUT/IMAD/IMAD.WIDE/BRA/NOP — plausibly a cheaper register-liveness/scheduling graph once
+// `dot` no longer needs to survive past an explicit subtract), NOT from the FMA-fusion mechanism `ncu`
+// named — confirmed by the FFMA+FADD sum being exactly unchanged (49=49) in every case, including these
+// six. The two `pq2_0_gemv2_f32io`/`pq2_0_gemv2_f16in` (fused 2-way, WINDOWED — the dense FFN gate+up
+// kernel, one of this file's largest decode-time contributors) showed ZERO total instruction change
+// (389->389, 386->386) — even the incidental scheduling side effect did not materialize there. Registers
+// only improved or stayed flat (single-projection kernels: -1 to -3 registers; fused 2-way: unchanged),
+// zero spills throughout (`ptxas -v` before/after), and no occupancy-binding constraint moved in either
+// direction (shared-mem/absolute-warp-count ceilings, not registers, still bind every affected kernel —
+// unchanged from this file's earlier occupancy analysis).
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS: fresh baseline (this commit's parent, `bench -p
+// 64 -n 16`, RTX 3060) 16.37-17.67 tok/s across 6 reps/2 runs (mean 17.28) -> 16.86-17.54 tok/s across 6
+// reps/2 runs post-change (mean 17.29). The two distributions FULLY OVERLAP (baseline max 17.67 exceeds
+// post-change max 17.54; baseline min 16.37 is below post-change min 16.86) and the means are
+// indistinguishable (17.28 vs 17.29) — unlike every real win in this file's history, which showed
+// non-overlapping distributions. This matches the SASS finding precisely: the actual FMA-fusion
+// mechanism `ncu` named is provably throughput-neutral on the FP32 pipe (49=49 instructions either way),
+// and the small (~2-4%, ~8-16 instructions out of 340-390) incidental instruction-count reduction that
+// DID occur in 6 of 8 kernels is far below this benchmark's observed noise floor (this file's own prior
+// rounds have repeatedly needed changes an order of magnitude larger, e.g. #159's 7.6% or #161's
+// F32-native fusion's 8%, to clear the noise floor with a visibly separated distribution).
+//
+// Reverted in full (`git checkout` back to this commit's parent) — no `fmaf()` calls exist in the
+// accumulate expression as shipped; `acc[rr] += (pq2_0_code_dot(p, gx) - gx.sum) * scale;` is unchanged
+// at all 8 call sites.
+//
+// **Verdict for whoever revisits this**: `ncu`'s FMA-fusion "Est. Speedup" rule is NOT a real,
+// actionable opportunity for this kernel family — it is provably mischaracterizing an already-fused
+// multiply-accumulate (confirmed at the SASS level, not inferred) as a fusible pair, the same class of
+// false positive this file has now documented twice in a row (see the bank-conflict entry immediately
+// above — ptxas already auto-vectorized the flagged stores; here, ptxas already auto-fused the flagged
+// multiply-add). Any future PQ2_0 GEMV work chasing `ncu`'s raw "Est. Speedup" percentages should
+// disassemble the CURRENT compiled kernel first, every time, rather than trusting the metric's premise
+// about what the compiler has or hasn't already done — the premise has now been wrong twice
+// consecutively on this exact kernel family.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
