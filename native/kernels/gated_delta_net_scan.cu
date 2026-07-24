@@ -47,6 +47,67 @@
 // independent multiply, so we can stride the work across threads freely without
 // affecting float results — multiplication of independent values is parity-safe
 // regardless of order. We use a grid-stride loop over the linearized S buffer.
+//
+// ─── NEGATIVE RESULT: fused decay+retrieve / write+read rewrite (issue #173) ──
+// Attempted a kernel-internal restructure: thread `col` touches EXCLUSIVELY
+// S[*, col] across every phase of this kernel (the decay grid-stride loop
+// above, for blockDim.x == d_state, reduces to exactly row = i / d_state,
+// colIndex = i % d_state == col — already only its own column). Since no
+// other thread ever reads/writes column `col`, there is no cross-thread
+// dependency on S once k_shared/q_shared are populated (the ONLY reason
+// EITHER existing __syncthreads() call is needed at all). This means:
+//   1. The second __syncthreads() (between write and read) is provably
+//      redundant — removable with zero correctness risk.
+//   2. Decay writes S[row,col], then retrieve immediately re-reads it in a
+//      separate pass; decay is a strictly order-independent per-element
+//      multiply, so fusing "decay S[row,col], then immediately accumulate
+//      that SAME value into the retrieve sum" into one loop iteration is
+//      bit-identical to the current two-pass version (verified against the
+//      CPU reference, GatedDeltaNetScan.Execute, row-by-row) while
+//      eliminating retrieve's redundant reload.
+//   3. Same argument fuses write+read into one loop, eliminating read's
+//      redundant reload.
+// This restructure — 4 full passes over the per-head [d_state,d_state] state
+// matrix collapsing to 2 fused passes, 1 of 2 __syncthreads() removed — was
+// implemented, proven bit-exact against the CPU oracle across multiple decode
+// steps (tests/DotLLM.Tests.Unit/Cuda/CudaGdnScanStepF32Tests.cs, kept — the
+// first focused CUDA test for this kernel, independent of this round's
+// outcome), and measured `ptxas -Xptxas -v`/`cuobjdump --dump-sass` clean:
+// register count and spill count UNCHANGED (40 regs/thread, 0 spills, so
+// occupancy — already 100% pre-change: 40*128=5120 regs/block,
+// floor(65536/5120)=12 blocks/SM = 48 warps/SM = the sm_86 1536-thread/SM
+// ceiling — was unaffected either way), BAR.SYNC count 2→1, and static SASS
+// instruction count for the function dropped ~11% (888→792 instructions).
+//
+// Despite that clean static signal, REAL `dotnet run ... bench` throughput
+// showed NO measurable improvement: two full A/B rounds (`-p 64 -n 48 -r 8`,
+// real Bonsai-27B GGUF, rebuilding PTX+CLI between each side, clean baseline
+// each time) gave modified=17.68/17.88 then 18.00/18.13 (median/best tok/s)
+// vs baseline=17.69/17.76 then 17.98/18.11 — i.e. round-to-round system noise
+// (~2-8% swings, occasionally with a slow outlier rep on EITHER side) was
+// larger than any modified-vs-baseline gap. Aggregating all 16 reps per side:
+// mean 17.738 (modified) vs 17.666 (baseline) tok/s — a ~0.4% average edge,
+// not distinguishable from noise at this sample size, nowhere near this
+// investigation's other confirmed wins (which cleared their baseline by
+// several times this margin). Most likely explanation: the kernel was
+// ALREADY at 100% occupancy pre-change, so the GPU already has enough
+// resident warps to hide the latency of the "redundant" loads this rewrite
+// removes; and the retrieve/read phases' accumulation is an inherently serial
+// 128-deep dependency chain (tmp_col/out_col each iteration depends on the
+// previous), a critical-path length this rewrite does not shorten — so
+// removing surrounding, already-hidden instructions doesn't move wall-clock
+// decode time. CONCLUSION: kernel-internal restructuring of this specific
+// recurrence step is a dead end absent a change that either (a) breaks the
+// 128-deep serial accumulation into a tree/warp-shuffle reduction (rejected
+// elsewhere in this file's history for breaking CPU bit-parity — accumulation
+// order changes results) or (b) reduces kernel LAUNCH count/overhead instead
+// (already exhausted — see the "Token-sequential design" section above; one
+// launch per (GDN layer, decode step) is already the floor for this design).
+// The functional code change was reverted (this file's kernel body is
+// unchanged from pre-#173); only this documentation and the new correctness
+// test were kept. Do not re-attempt this exact restructure without new `ncu`-
+// level occupancy/stall data (this session did not have elevated-PowerShell
+// access to gather it) or a fundamentally different parallelization strategy.
 
 #include <math.h>
 
