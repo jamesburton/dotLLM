@@ -616,6 +616,94 @@
 // all — it only reorders which loop level a row-independent computation lives at — which is why it
 // was chosen as this session's risk-appropriate scope. A true block-level version (8x less
 // redundant computation instead of 2x) remains a real, larger, higher-risk follow-up candidate.
+//
+// ───────────────────────── TRIED AND REVERTED: F32-native staging half2 packing (#164, shared-memory bank-conflict "fix") ─────────────────────────
+// A fresh `ncu --set full` pass (2nd advisor review round, see the `prismml-bonsai-model` project
+// memory) flagged a real, SASS-reproducible shared-memory bank conflict on the F32-native staging
+// store (`pq2_0_gemv_f32io`/`pq2_0_gemv2_f32io`/`_small` siblings, #161's `xs[base+0..3] =
+// __float2half(v.x..w)` block): "2.1-way bank conflict across all shared store requests", Est.
+// Speedup ~9.3-9.6%, concentrated on the FFN down-proj kernel (k=17408). The advisor's hypothesis,
+// read from the SOURCE, was that the four separate scalar `half` stores per thread were each their
+// own 2-byte store instruction, four times the necessary store-instruction count.
+//
+// Bank-index arithmetic worked through explicitly, per this file's standing rule, BEFORE writing any
+// fix (thread i, one warp, lane = i mod 32; base = i*4 half-elements; byte offset for xs[base+0] is
+// 8*lane, i.e. thread-to-thread stride = 8 bytes = 2 shared-memory words on sm_86's 32-bank/4-byte-
+// wide layout): bank(lane) = floor(8*lane / 4) mod 32 = (2*lane) mod 32. For lane in [0,31] this
+// hits only the 16 EVEN banks, each hit by exactly 2 lanes (lane and lane+16, e.g. bank 0 <- lanes 0
+// and 16) — a genuine 2-way conflict, matching ncu's "2.1-way" (the ~0.1 excess plausibly averaging
+// in partial tail-window iterations with fewer active threads). This DOES confirm a real conflict
+// exists on the actual generated store address pattern — but critically, per-store-instruction
+// arithmetic for xs[base+1]/[+2]/[+3] (the same formula, byte offsets 8*lane+2/+4/+6) gives the
+// IDENTICAL bank set and lane-pairing, just shifted to odd banks for [+2]/[+3] — i.e. packing two of
+// these four scalar stores into one wider store (`__floats2half2_rn` -> one `half2` write) targets
+// the SAME two banks with the SAME lane pairing as the two stores it replaces, because the
+// underlying stride between adjacent threads (2 words) — not the store's own width — is what
+// determines the conflict. Working this through explicitly (as the task instructions demanded, "a
+// naive repack might only halve instruction count without eliminating the conflict") predicted
+// exactly that outcome before any code was written: halving instruction count from 4 to 2 stores,
+// while the residual 2-way conflict on each remaining instruction is UNCHANGED.
+//
+// `cuobjdump --dump-sass` on the UNMODIFIED (pre-#164) kernel, checked before writing the fix per
+// this file's own standing rule, revealed something the source-level reading above could not: ptxas
+// had ALREADY auto-vectorized the four scalar `xs[base+k] = __float2half(...)` assignments into a
+// SINGLE `STS.64` instruction per thread (three `F2FP.PACK_AB` float->half2 pack ops plus two `PRMT`
+// byte-permutes to reassemble a 64-bit register pair, then one 8-byte store) — for BOTH
+// `pq2_0_gemv_f32io_small` and the windowed `pq2_0_gemv_f32io`. The advisor's foundational premise
+// (four separate 2-byte store instructions in the compiled kernel) was already false at the SASS
+// level before this session started; the compiler had independently arrived at exactly the kind of
+// wide-store vectorization a hand-written fix would aim for.
+//
+// Implemented anyway (`__floats2half2_rn(v.x, v.y)`/`__floats2half2_rn(v.z, v.w)` into two explicit
+// `half2` stores) to test whether an EXPLICIT packing, rather than one ptxas happened to find, would
+// still shift anything — numerically it is bit-identical to two independent `__float2half` calls
+// (both round-to-nearest-even; `cuobjdump` shows the same `F2FP.PACK_AB` instruction class either
+// way, confirmed by all correctness tests passing at the same ~1e-4-to-1e-3 tolerance band as the
+// pre-existing F32-native tests). Compile-time result: register/shared-mem footprint UNCHANGED (40/
+// 40/41/45 registers, 10304/10304/17472/17472 bytes smem — bit-identical to the unmodified kernel,
+// confirmed via a diffed `nvcc -cubin -arch=sm_86 -Xptxas -v` pass before vs after), and — the
+// decisive check — the generated `STS.64` for `xs[]` is the EXACT SAME single instruction, same
+// operand pattern, in both versions (only two `F2FP.PACK_AB` instead of three, zero `PRMT`, replacing
+// the compiler's own three-pack-plus-permute sequence with a cleaner two-pack sequence). Total SASS
+// instruction count for the whole kernel body was IDENTICAL before/after (368 for `_small`, 384 for
+// the windowed kernel) — the handful of real instructions removed (2 `PRMT`, 1 `F2FP.PACK_AB`, plus
+// a few `IMAD`/`CALL.REL.NOINC`) were exactly offset by additional `NOP`/`MOV`/`LEA` the scheduler
+// inserted elsewhere, a net wash at the static-instruction-count level, not merely "mixed" like the
+// algebraic-ALU-reduction round above — the compiled kernel is, for all practical purposes, THE SAME
+// kernel with different register naming.
+//
+// MEASURED DECODE THROUGHPUT ON REAL BONSAI-27B WEIGHTS: fresh fixed baseline (this commit's parent,
+// `bench -p 64 -n 16`, RTX 3060) 15.98-17.65 tok/s across 9 reps/3 runs (one low outlier at 15.98,
+// otherwise 16.97-17.65; median ~17.36) -> 17.20-17.65 tok/s across 6 reps/2 runs post-change (median
+// ~17.48). The post-change distribution sits entirely INSIDE the baseline's own observed range (not
+// separated from it the way every real win in this file's history has been) — a ~0.7% median shift
+// that is fully explained by ordinary run-to-run noise, not a reproducible effect. This matches the
+// SASS finding exactly: since the compiled `STS.64` and total instruction count are unchanged, no
+// real speedup was ever mechanistically possible from this specific change, and none beyond noise was
+// observed.
+//
+// Reverted in full (`git checkout -- native/kernels/pq2_0_gemv.cu native/ptx/pq2_0_gemv.ptx` back to
+// this commit's parent) — no `half2`/`__floats2half2_rn` staging exists in the kernel as shipped.
+//
+// Root cause of why the flagged conflict survives untouched: the 2-way conflict is intrinsic to the
+// THREAD-TO-SHARED-ADDRESS MAPPING (thread i owns shared elements [4i, 4i+4), a direct positional
+// copy of global elements [4i, 4i+4), preserving the simple 1:1 correspondence every downstream
+// reader — `pq2_0_load_group_x(xs, xb)` — relies on), not to how many store instructions realize that
+// mapping. Any repacking of the SAME four values into fewer, wider stores keeps the same per-lane
+// word stride (2 words) and therefore the same bank collisions; eliminating the conflict for real
+// would require an INTERLEAVED/transposed shared layout (e.g. thread i's four loaded values scattered
+// to xs[i], xs[i+w4], xs[i+2*w4], xs[i+3*w4] instead of xs[4i..4i+3]), which breaks the direct
+// positional correspondence between `xs[]` and the windowed slice of `x[]` that every read site in
+// the accumulate loop currently assumes — a restructuring that reaches into `pq2_0_load_group_x` and
+// every one of its call sites across all 4 F32-native kernels (8 counting both windowed/`_small`
+// variants), not a local, low-risk change. Left as a documented, NOT-recommended follow-up candidate:
+// the underlying kernel was already reported "well-balanced" (compute/memory ~69-71%) by the same
+// advisor round that flagged this conflict, this file's own calibration note says `ncu`'s `Est.
+// Speedup` figures have overstated real gains by roughly 3-10x on every prior round, and the fix
+// itself is large/invasive relative to the (likely low-single-digit-at-best) real payoff — don't
+// re-attempt the interleaved-layout restructuring without new evidence that materially changes this
+// cost/benefit balance (e.g. a future round finding this kernel latency-bound again, the one
+// condition under which occupancy/access-pattern levers have actually paid off in this investigation).
 
 #include <cuda_fp16.h>
 #include <stdint.h>
