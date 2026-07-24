@@ -877,29 +877,41 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         ProfMark("gdn-3-conv1d");
 
         // ── 4. De-interleave Q/K/V from conv output, L2-normalise Q and K per head ──
-        if (_kernels.HasDeinterleaveF32)
+        // Issue #170: decode (seqLen==1) fuses the deinterleave gather and both Q/K
+        // L2-normalize launches into one — also drops the runtime integer division
+        // deinterleave_gdn_qkv_f32 pays per element in the general path (SASS-confirmed
+        // via cuobjdump; unnecessary here since seqLen==1 always makes the token index 0).
+        if (seqLen == 1 && _kernels.HasGdnDeinterleaveL2NormDecodeF32)
         {
-            _kernels.LaunchDeinterleaveGdnQkvF32(qkvBuf, qBuf, kBuf, vBuf, kDim, vDim, seqLen, streamH);
+            _kernels.LaunchGdnDeinterleaveL2NormDecodeF32(
+                qkvBuf, qBuf, kBuf, vBuf, nKHead, nVHead, dState, 1e-6f, streamH);
         }
         else
         {
-            long rowBytes = (long)convDim * sizeof(float);
-            long kDimBytes = (long)kDim * sizeof(float);
-            long vDimBytes = (long)vDim * sizeof(float);
-            for (int t = 0; t < seqLen; t++)
+            if (_kernels.HasDeinterleaveF32)
             {
-                nint srcRow = qkvBuf + (nint)(t * rowBytes);
-                nint qDst = qBuf + (nint)(t * kDimBytes);
-                nint kDst = kBuf + (nint)(t * kDimBytes);
-                nint vDst = vBuf + (nint)(t * vDimBytes);
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(qDst, srcRow, (nuint)kDimBytes, streamH).ThrowOnError();
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, srcRow + (nint)kDimBytes, (nuint)kDimBytes, streamH).ThrowOnError();
-                CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, srcRow + (nint)(2 * kDimBytes), (nuint)vDimBytes, streamH).ThrowOnError();
+                _kernels.LaunchDeinterleaveGdnQkvF32(qkvBuf, qBuf, kBuf, vBuf, kDim, vDim, seqLen, streamH);
             }
-        }
+            else
+            {
+                long rowBytes = (long)convDim * sizeof(float);
+                long kDimBytes = (long)kDim * sizeof(float);
+                long vDimBytes = (long)vDim * sizeof(float);
+                for (int t = 0; t < seqLen; t++)
+                {
+                    nint srcRow = qkvBuf + (nint)(t * rowBytes);
+                    nint qDst = qBuf + (nint)(t * kDimBytes);
+                    nint kDst = kBuf + (nint)(t * kDimBytes);
+                    nint vDst = vBuf + (nint)(t * vDimBytes);
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(qDst, srcRow, (nuint)kDimBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(kDst, srcRow + (nint)kDimBytes, (nuint)kDimBytes, streamH).ThrowOnError();
+                    CudaDriverApi.cuMemcpyDtoDAsync_v2(vDst, srcRow + (nint)(2 * kDimBytes), (nuint)vDimBytes, streamH).ThrowOnError();
+                }
+            }
 
-        _kernels.LaunchL2NormalizeHeadsF32(qBuf, seqLen * nKHead, dState, 1e-6f, streamH);
-        _kernels.LaunchL2NormalizeHeadsF32(kBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+            _kernels.LaunchL2NormalizeHeadsF32(qBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+            _kernels.LaunchL2NormalizeHeadsF32(kBuf, seqLen * nKHead, dState, 1e-6f, streamH);
+        }
         ProfMark("gdn-4-deinterleave");
 
         // ── 5. GDN scan — single-token kernel driven by host loop ──

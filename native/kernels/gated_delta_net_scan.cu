@@ -189,6 +189,67 @@ extern "C" __global__ void __launch_bounds__(128) l2_normalize_heads_f32(
     }
 }
 
+// ─── Decode-time fused deinterleave + L2-normalize (issue #170) ────────────
+// Replaces, for the seqLen==1 decode case only, three launches:
+//   deinterleave_gdn_qkv_f32(src, q, k, v, ...) + l2_normalize_heads_f32(q, ...)
+//   + l2_normalize_heads_f32(k, ...)
+// with one. deinterleave_gdn_qkv_f32's generic indexing computes
+// `t = idx / conv_dim; e = idx % conv_dim` for a runtime (non-constant)
+// conv_dim — cuobjdump confirms this lowers to a full 32-bit integer
+// divide/modulo (MUFU.RCP + Newton refinement, ~15 instructions) per element,
+// even though decode always has seqLen==1 so t is trivially 0. Here each
+// block owns exactly one d_state-sized head (Q, K, or V) with no division:
+// k_dim = n_k_head*d_state and v_dim = n_v_head*d_state are always exact
+// multiples of d_state, so grid = 2*n_k_head + n_v_head, blockDim = d_state
+// covers the whole [Q|K|V] row with pure block/thread-index arithmetic.
+//
+// Bit-identical to the three kernels it replaces: same serial thread-0
+// sum-of-squares accumulation order as l2_normalize_heads_f32 for Q/K, and a
+// straight per-element copy for V (matching deinterleave_gdn_qkv_f32's V
+// branch exactly). blockDim.x == d_state is required (enforced host-side, as
+// with l2_normalize_heads_f32), so each thread owns exactly one element —
+// no strided loop needed.
+extern "C" __global__ void __launch_bounds__(128) gdn_deinterleave_l2norm_decode_f32(
+    const float* __restrict__ src,    // [2*k_dim + v_dim], single decode row
+    float* __restrict__ q,            // [k_dim], L2-normalized per d_state-head
+    float* __restrict__ k,            // [k_dim], L2-normalized per d_state-head
+    float* __restrict__ v,            // [v_dim], straight copy
+    const int n_k_head, const int d_state, const float eps)
+{
+    int block = blockIdx.x;
+    int k_dim = n_k_head * d_state;
+
+    if (block >= 2 * n_k_head)
+    {
+        // V head: straight copy, no normalization.
+        int h = block - 2 * n_k_head;
+        const float* head_src = src + 2 * k_dim + (size_t)h * d_state;
+        float* head_dst = v + (size_t)h * d_state;
+        head_dst[threadIdx.x] = head_src[threadIdx.x];
+        return;
+    }
+
+    bool is_k = block >= n_k_head;
+    int h = is_k ? block - n_k_head : block;
+    const float* head_src = src + (is_k ? k_dim : 0) + (size_t)h * d_state;
+    float* head_dst = (is_k ? k : q) + (size_t)h * d_state;
+
+    __shared__ float s_inv_norm;
+    if (threadIdx.x == 0)
+    {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < d_state; i++)
+        {
+            float val = head_src[i];
+            sum_sq += val * val;
+        }
+        s_inv_norm = 1.0f / (sqrtf(sum_sq) + eps);
+    }
+    __syncthreads();
+
+    head_dst[threadIdx.x] = head_src[threadIdx.x] * s_inv_norm;
+}
+
 // ─── GDN decay: alpha → exp(softplus(alpha + dt_bias) * A) in place ────────
 // Bit-perfect port of the CPU reference in Qwen3MoeHybridTransformerModel.cs
 // (ForwardGdnBody decay section) and the host fallback at
