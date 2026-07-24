@@ -570,6 +570,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     $"Position {positions[i]} at index {i} exceeds max sequence length {maxSeq}.");
         }
 
+        // Category profiler bracket (issue #168): MakeCurrent + EnsureCapacity + H2D
+        // token/position copy + host embed-lookup dequant + H2D embed copy. Confirmed via a
+        // fresh dedicated bracket that this region is a genuinely small share of decode time
+        // (~0.2% profiled) — not the dark matter some earlier hypotheses suspected.
+        ProfStart();
         _context.MakeCurrent();
         _state.EnsureCapacity(seqLen);
 
@@ -602,6 +607,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 (nuint)((long)seqLen * hiddenSize * sizeof(float)), streamH).ThrowOnError();
         }
         if (ProfileTrace) _stream.Synchronize();
+        ProfMark("setup-embed");
 
         for (int layer = 0; layer < _layers.Length; layer++)
         {
@@ -619,11 +625,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); }
 
         _stream.Synchronize();
+        ProfStart(); // measures result alloc + D2H logits copy
 
         var shape = new TensorShape(seqLen, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
             (nuint)((long)seqLen * vocabSize * sizeof(float))).ThrowOnError();
+        ProfMark("output-copy");
 
         return result;
     }
@@ -831,27 +839,41 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // ── 3. Conv1d on QKV concat ──
         nint convStateDev = _gdnCache.GetConvStatePtr(gdnOrdinal);
         long convStateBytes = (long)(dConv - 1) * convDim * sizeof(float);
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(convInput, convStateDev,
-            (nuint)convStateBytes, streamH).ThrowOnError();
-        long qkvRowsBytes = (long)seqLen * convDim * sizeof(float);
-        nint convInputQkvOff = convInput + (nint)convStateBytes;
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(convInputQkvOff, qkvBuf,
-            (nuint)qkvRowsBytes, streamH).ThrowOnError();
 
-        _kernels.LaunchConv1dCausalF32(convInput, gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice,
-            qkvBuf, dConv, convDim, seqLen, streamH);
-        if (_kernels.HasElementwiseF32)
+        // Issue #168: decode (seqLen==1) is the overwhelming majority of real GDN-body calls
+        // and needs no physical [state; qkv] concat — the fused kernel reads conv_state and
+        // the new qkv row directly and writes the shifted trailing state back in place,
+        // folding what was 3 memcpy launches + conv1d + silu (5 launches) into 1. Prefill
+        // (seqLen>1) keeps the general path unchanged (concat buffer, arbitrary window count).
+        if (seqLen == 1 && _kernels.HasGdnConv1dCausalDecodeF32)
         {
-            _kernels.LaunchSiluF32(qkvBuf, (long)seqLen * convDim, streamH);
+            _kernels.LaunchGdnConv1dCausalDecodeF32(convStateDev, qkvBuf,
+                gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice, qkvBuf, dConv, convDim, streamH);
         }
         else
         {
-            LaunchSiluHostFallback(qkvBuf, (long)seqLen * convDim);
-        }
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convInput, convStateDev,
+                (nuint)convStateBytes, streamH).ThrowOnError();
+            long qkvRowsBytes = (long)seqLen * convDim * sizeof(float);
+            nint convInputQkvOff = convInput + (nint)convStateBytes;
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convInputQkvOff, qkvBuf,
+                (nuint)qkvRowsBytes, streamH).ThrowOnError();
 
-        nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
-            (nuint)convStateBytes, streamH).ThrowOnError();
+            _kernels.LaunchConv1dCausalF32(convInput, gdnW.Conv1dWeightDevice, gdnW.Conv1dBiasDevice,
+                qkvBuf, dConv, convDim, seqLen, streamH);
+            if (_kernels.HasElementwiseF32)
+            {
+                _kernels.LaunchSiluF32(qkvBuf, (long)seqLen * convDim, streamH);
+            }
+            else
+            {
+                LaunchSiluHostFallback(qkvBuf, (long)seqLen * convDim);
+            }
+
+            nint trailRowsSrc = convInput + (nint)((long)seqLen * convDim * sizeof(float));
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(convStateDev, trailRowsSrc,
+                (nuint)convStateBytes, streamH).ThrowOnError();
+        }
         ProfMark("gdn-3-conv1d");
 
         // ── 4. De-interleave Q/K/V from conv output, L2-normalise Q and K per head ──

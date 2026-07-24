@@ -355,6 +355,7 @@ public sealed unsafe class CudaKernels : IDisposable
     // callers fall back to the host-side path or surface an error.
     private readonly CudaModule? _conv1dCausalF32Module;
     private readonly nint _conv1dCausalF32Func;
+    private readonly nint _gdnConv1dCausalDecodeF32Func;
     private readonly CudaModule? _gdnScanF32Module;
     private readonly nint _gdnScanStepF32Func;
     private readonly CudaModule? _l2NormHeadsF32Module;
@@ -771,6 +772,7 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _conv1dCausalF32Module = CudaModule.LoadFromFile(conv1dCausalF32Path);
             _conv1dCausalF32Func = _conv1dCausalF32Module.TryGetFunction("conv1d_causal_f32");
+            _gdnConv1dCausalDecodeF32Func = _conv1dCausalF32Module.TryGetFunction("gdn_conv1d_causal_decode_f32");
         }
 
         string gdnScanF32Path = Path.Combine(ptxDir, "gated_delta_net_scan.ptx");
@@ -1962,6 +1964,58 @@ public sealed unsafe class CudaKernels : IDisposable
         uint gridDim = (uint)((total + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_conv1dCausalF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// True when the fused decode-time causal-conv1d kernel
+    /// (<see cref="LaunchGdnConv1dCausalDecodeF32"/>) is loaded. When false, callers must fall
+    /// back to the general <see cref="LaunchConv1dCausalF32"/> path (state/qkv concat memcpy,
+    /// conv1d, <see cref="LaunchSiluF32"/>, trailing-state extract memcpy — 5 launches).
+    /// </summary>
+    public bool HasGdnConv1dCausalDecodeF32 => _gdnConv1dCausalDecodeF32Func != 0;
+
+    /// <summary>
+    /// Fused decode-time (single new row, <c>seqLen==1</c>) causal conv1d + SiLU + rolling
+    /// conv-state update — issue #168. Reads <paramref name="state"/> (the existing
+    /// <c>[(dConv-1), channels]</c> rolling history) and <paramref name="qkvIn"/> (the one new
+    /// pre-conv row) directly — no physical <c>[state; qkv]</c> concat buffer — computes the
+    /// causal conv1d output, applies SiLU in place, and writes the shifted trailing state back
+    /// into <paramref name="state"/>. Replaces the general path's 3
+    /// <c>cuMemcpyDtoDAsync</c> launches (concat-in ×2, trailing-state-extract ×1) + separate
+    /// <see cref="LaunchConv1dCausalF32"/> + <see cref="LaunchSiluF32"/> — 5 launches down to 1
+    /// — for the decode (<c>seqLen==1</c>) case only; prefill (<c>seqLen&gt;1</c>) keeps using
+    /// the general path.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="state"/> is read AND written in place (safe — see the kernel's own header
+    /// comment in <c>conv1d_causal.cu</c> for the per-channel-ownership aliasing argument).
+    /// <paramref name="qkvOut"/> may alias <paramref name="qkvIn"/> (also safe, same argument).
+    /// Bit-exact vs. the general path's (memcpy → conv1d_causal_f32 → silu_f32 → memcpy)
+    /// sequence for <c>seqLen==1</c> — same accumulation order, same SiLU formula, compiled from
+    /// the same <c>-fmad=false</c> translation unit.
+    /// </remarks>
+    /// <param name="state">Device pointer to <c>[(dConv-1), channels]</c> FP32 rolling conv state, in/out.</param>
+    /// <param name="qkvIn">Device pointer to the new <c>[channels]</c> FP32 pre-conv row.</param>
+    /// <param name="weight">Device pointer to <c>[channels, dConv]</c> FP32 weight (GGUF channel-major layout).</param>
+    /// <param name="bias">Device pointer to per-channel FP32 bias (<c>channels</c> elements).</param>
+    /// <param name="qkvOut">Device pointer to <c>[channels]</c> FP32 output (SiLU(conv output)); may alias <paramref name="qkvIn"/>.</param>
+    /// <param name="dConv">Convolution kernel width (4 for Qwen3HybridDense/Qwen3MoeHybrid).</param>
+    /// <param name="channels">Number of channels (depthwise width).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnConv1dCausalDecodeF32(nint state, nint qkvIn, nint weight, nint bias,
+                                                 nint qkvOut, int dConv, int channels, nint stream)
+    {
+        nint stArg = state, qiArg = qkvIn, wArg = weight, bArg = bias, qoArg = qkvOut;
+        int dcArg = dConv, chArg = channels;
+
+        void** args = stackalloc void*[] {&stArg, &qiArg, &wArg, &bArg, &qoArg, &dcArg, &chArg};
+
+        uint gridDim = (uint)((channels + BlockSize - 1) / BlockSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_gdnConv1dCausalDecodeF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
