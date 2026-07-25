@@ -15,6 +15,20 @@
 // `input`'s aliasing (this kernel does NOT support in-place norm — the two RunSingleLayerBody
 // call sites it replaces always use 3 distinct buffers: input=HiddenState, residual_out=Residual,
 // output=NormOutput).
+//
+// Follow-up (issue #178, 2026-07-25): re-profiled fresh and re-confirmed this fused path is the
+// one actually executing at runtime (CudaCopyRmsNormF32Test passes for real, not skipped — PTX is
+// current, HasCopyRmsNormF32 is true). cuobjdump --dump-sass (sm_86) shows 24 registers/thread, 0
+// spill loads/stores — nothing left to trim inside the kernel body. The remaining decode-time cost
+// is structural: seqLen==1 means blockIdx.x (=row) only ever takes value 0, so every decode call
+// launches a single block — 1 of 28 SMs occupied. Extracting more grid parallelism would require
+// splitting the 5120-wide reduction itself across blocks, which needs either a second launch for
+// the cross-block reduce (reintroducing the exact launch this kernel was built to remove) or a
+// cooperative-groups grid-wide sync (unused elsewhere in this codebase; real portability/
+// oversubscription risk). Concluded: no further action without that materially riskier redesign.
+// Not attempted this session — flagged as a possible future thrust alongside gdn_scan_step_f32's
+// analogous small-grid-decode-step finding, not a duplicate of it (different kernel, same shape
+// of constraint).
 
 extern "C" __global__ void __launch_bounds__(256) copy_rmsnorm_f32(
     const float* __restrict__ input,
