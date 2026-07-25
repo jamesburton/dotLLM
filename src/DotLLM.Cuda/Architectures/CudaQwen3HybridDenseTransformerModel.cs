@@ -105,6 +105,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _f32KvReadStagingV;
     private long _f32KvReadStagingElems;
 
+    // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
+    // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
+    private nint _attnSplitKvPartialMax;
+    private nint _attnSplitKvPartialSum;
+    private nint _attnSplitKvPartialOut;
+    private long _attnSplitKvPartialHeadsAllocated;
+
     private bool _disposed;
 
     /// <inheritdoc/>
@@ -1093,9 +1100,35 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             _kernels.LaunchConvertF16ToF32(_f16VCache![slot], _f32KvReadStagingV, kvLiveElems, streamH);
             ProfMark("attn-6b-kvdequant");
 
-            _kernels.LaunchAttentionF32(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
-                seqLen, seqKv, numHeads, numKvHeads, headDim,
-                positionOffset: positionOffset, slidingWindow: 0, streamH);
+            // Opt-in split-KV ("Flash-Decoding") attention (issue #183): attention_f32's grid is
+            // seqQ*numHeads, so decode's seqQ==1 underfills the GPU (numHeads=24 < 28 SMs for
+            // Bonsai-27B) and the KV-tile loop runs fully sequentially within one block per head —
+            // a cost that grows with context depth (`.docs/handoff.md`'s "Depth-dependent
+            // attention finding": +151% 0.043->0.108ms/call, depth 0->256). Decode-only (seqLen==1)
+            // scope; gated by a minimum seqKv (splitting a shallow KV range isn't worth the
+            // grid.sync + combine overhead) and a per-shape cooperative-launch co-residency safety
+            // check. Off by default (DOTLLM_ATTN_SPLIT_KV=1 to enable) — see CudaKernels.cs's
+            // EnableAttentionSplitKv doc and attention_f32.cu's header for the full tradeoff
+            // (reassociated, not bit-exact, float reduction across the cross-block combine).
+            bool useSplitKvAttn = seqLen == 1
+                && CudaKernels.EnableAttentionSplitKv
+                && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
+                && _kernels.IsAttentionSplitKvSafe(numHeads, headDim);
+
+            if (useSplitKvAttn)
+            {
+                EnsureAttentionSplitKvScratch(numHeads, headDim);
+                _kernels.LaunchAttentionF32SplitKv(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0,
+                    _attnSplitKvPartialMax, _attnSplitKvPartialSum, _attnSplitKvPartialOut, streamH);
+            }
+            else
+            {
+                _kernels.LaunchAttentionF32(q, _f32KvReadStagingK, _f32KvReadStagingV, attnOut,
+                    seqLen, seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0, streamH);
+            }
         }
         else
         {
@@ -1197,6 +1230,30 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _f32KvReadStagingK = AllocDevice(grown * sizeof(float));
         _f32KvReadStagingV = AllocDevice(grown * sizeof(float));
         _f32KvReadStagingElems = grown;
+    }
+
+    /// <summary>
+    /// Ensures the opt-in split-KV attention (issue #183) partial scratch buffers can hold
+    /// <c>numHeads * AttentionKvSplit</c> (max, sum) scalars and
+    /// <c>numHeads * AttentionKvSplit * headDim</c> output floats. Sized once for the model's
+    /// fixed (numHeads, headDim) shape (both are load-time constants for a given GGUF) — the
+    /// "grown" check is a defensive no-op in practice, not a hot-path realloc.
+    /// </summary>
+    private void EnsureAttentionSplitKvScratch(int numHeads, int headDim)
+    {
+        long neededHeads = numHeads;
+        if (neededHeads <= _attnSplitKvPartialHeadsAllocated) return;
+
+        FreeIfNonZero(ref _attnSplitKvPartialMax);
+        FreeIfNonZero(ref _attnSplitKvPartialSum);
+        FreeIfNonZero(ref _attnSplitKvPartialOut);
+
+        long scalarCount = neededHeads * CudaKernels.AttentionKvSplit;
+        long outCount = scalarCount * headDim;
+        _attnSplitKvPartialMax = AllocDevice(scalarCount * sizeof(float));
+        _attnSplitKvPartialSum = AllocDevice(scalarCount * sizeof(float));
+        _attnSplitKvPartialOut = AllocDevice(outCount * sizeof(float));
+        _attnSplitKvPartialHeadsAllocated = neededHeads;
     }
 
     private void WriteF16KvRows(int layerSlot, nint kSrcF32, nint vSrcF32,
@@ -1567,6 +1624,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _f16KvWriteStaging);
         FreeIfNonZero(ref _f32KvReadStagingK);
         FreeIfNonZero(ref _f32KvReadStagingV);
+        FreeIfNonZero(ref _attnSplitKvPartialMax);
+        FreeIfNonZero(ref _attnSplitKvPartialSum);
+        FreeIfNonZero(ref _attnSplitKvPartialOut);
 
         _state.Dispose();
         _gdnCache.Dispose();

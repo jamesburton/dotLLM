@@ -67,14 +67,15 @@ REM does not affect portability of the rest of the tree. See ARCH POLICY above.
 set "ARCH_86=attention_flash_mma"
 
 REM Kernels that #include <cooperative_groups.h> (needed for grid.sync() — see
-REM gated_delta_net_scan.cu's gdn_scan_step_f32_coop_split4, issue #180). NVCC's
+REM gated_delta_net_scan.cu's gdn_scan_step_f32_coop_split4, issue #180, and
+REM attention_f32.cu's attention_f32_split_kv, issue #183). NVCC's
 REM default C++ dialect for this MSVC toolchain is below C++17, which libcu++
 REM (cccl, cooperative_groups.h's dependency) requires — fails with "libcu++
 REM requires at least C++ 17" otherwise. Scoped to ONLY the kernels that need
 REM it (a per-kernel flag list, same pattern as ARCH_86) rather than bumping
 REM the global default, to avoid any risk of -std=c++17 subtly changing SASS
 REM for the other ~40 kernel files that don't need it.
-set "CXX17=gated_delta_net_scan"
+set "CXX17=gated_delta_net_scan attention_f32"
 
 echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...
