@@ -98,6 +98,34 @@ internal static partial class CudaDriverApi
         uint sharedMemBytes, nint stream,
         nint kernelParams, nint extra);
 
+    /// <summary>
+    /// Cooperative-kernel launch — required for CUDA Cooperative Groups <c>grid.sync()</c> (a
+    /// grid-wide barrier). Unlike <see cref="cuLaunchKernel"/>, the driver guarantees ALL blocks
+    /// in the grid are resident simultaneously (query <see cref="cuOccupancyMaxActiveBlocksPerMultiprocessor"/>
+    /// first — exceeding the co-residency ceiling is a hard launch error, not a silent fallback).
+    /// No <c>extra</c> parameter (unlike <c>cuLaunchKernel</c>) — cooperative launch does not
+    /// support the legacy extra-options array. Used only by
+    /// <see cref="DotLLM.Cuda.CudaKernels.LaunchGdnScanStepF32CoopSplit4"/> (issue #180, opt-in,
+    /// default-off — see <c>gated_delta_net_scan.cu</c>'s header for why this isn't the default).
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuLaunchCooperativeKernel(
+        nint function,
+        uint gridDimX, uint gridDimY, uint gridDimZ,
+        uint blockDimX, uint blockDimY, uint blockDimZ,
+        uint sharedMemBytes, nint stream,
+        nint kernelParams);
+
+    /// <summary>
+    /// Queries the maximum number of resident blocks per SM for <paramref name="func"/> at the
+    /// given block size / dynamic shared memory — the value cooperative-launch validation uses to
+    /// decide whether a candidate grid size can ever be launched via <see cref="cuLaunchCooperativeKernel"/>.
+    /// Multiply by <c>CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT</c> for the max co-resident grid.
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        out int numBlocks, nint func, int blockSize, nuint dynamicSMemSize);
+
     // ── Memory ──────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]
@@ -279,4 +307,6 @@ internal static partial class CudaDriverApi
     /// Typically 100+ KB on sm_86 (RTX 3060), 164 KB on sm_80/89, etc.
     /// </summary>
     internal const int CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97;
+    /// <summary>Device supports launching cooperative kernels via <see cref="cuLaunchCooperativeKernel"/>.</summary>
+    internal const int CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95;
 }

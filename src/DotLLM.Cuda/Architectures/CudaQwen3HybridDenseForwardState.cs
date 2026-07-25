@@ -46,6 +46,14 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     public nint GdnVBuf;        // [seqLen * gdnVDim]
     public nint GdnOut;         // [seqLen * gdnVDim] — scan output / post-gate
 
+    // ── Opt-in cooperative-split GDN scan scratch (issue #180, DOTLLM_GDN_SCAN_APPROX_SPLIT4) ──
+    // Fixed-size (independent of seqLen — one decode step's worth of scratch, reused across every
+    // token/layer/step since it's transient, not accumulated state). Only allocated/used when
+    // CudaKernels.EnableGdnScanApproxSplit4 is set; harmless small allocation otherwise (NVHead*4*
+    // DState floats, e.g. 48*4*128*4 bytes = 98KB for Bonsai-27B — negligible vs the multi-GB model).
+    public nint GdnScanPartialTmp;  // [NVHead, 4, DState]
+    public nint GdnScanPartialOut;  // [NVHead, 4, DState]
+
     // ── Full GQA attention sub-layer ──────────────────────────────────────────
     public nint QGateScratch;   // [seqLen * 2 * qElems]
     public nint QScratch;       // [seqLen * qElems]
@@ -88,6 +96,10 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
 
         _currentSeqLen = 0;
         EnsureCapacity(1);
+
+        // Fixed-size, seqLen-independent — allocated once, not part of FreeSequenceBuffers/EnsureCapacity.
+        GdnScanPartialTmp = AllocDevice((long)_gdnHeads * 4 * dState * sizeof(float));
+        GdnScanPartialOut = AllocDevice((long)_gdnHeads * 4 * dState * sizeof(float));
     }
 
     /// <summary>
@@ -182,6 +194,8 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref GdnScanPartialTmp);
+        FreeIfNonZero(ref GdnScanPartialOut);
         _currentSeqLen = 0;
         _disposed = true;
         GC.SuppressFinalize(this);
@@ -191,5 +205,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref GdnScanPartialTmp);
+        FreeIfNonZero(ref GdnScanPartialOut);
     }
 }
