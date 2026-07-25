@@ -147,6 +147,9 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _embeddingF32OutQ8_0Func;
     private readonly nint _ropeF32Func;
     private readonly nint _attentionF32Func;
+    private readonly nint _attentionF32SplitKvFunc;
+    private int _attnSplitKvMaxCoResidentGrid = -1; // -1 = not yet queried
+    private int _attnSplitKvCachedHeadDim = -1;      // headDim the cached query above is valid for
     private readonly nint _swigluF32Func;
     private readonly nint _biasAddF32Func;
     private readonly nint _perHeadRmsNormF32Func;
@@ -558,6 +561,10 @@ public sealed unsafe class CudaKernels : IDisposable
         _embeddingF32OutQ8_0Func = _embeddingF32OutModule.GetFunction("embedding_lookup_q8_0_f32out");
         _ropeF32Func = _ropeF32Module.GetFunction("rope_f32");
         _attentionF32Func = _attentionF32Module.GetFunction("attention_f32");
+        // Optional (issue #183) — TryGetFunction so a stale PTX without the split-KV kernel
+        // still loads gracefully; HasAttentionF32SplitKv reports false and callers fall back to
+        // the exact LaunchAttentionF32 path unconditionally.
+        _attentionF32SplitKvFunc = _attentionF32Module.TryGetFunction("attention_f32_split_kv");
         _swigluF32Func = _swigluF32Module.GetFunction("swiglu_f32");
         _biasAddF32Func = _biasAddF32Module.GetFunction("bias_add_f32");
         _perHeadRmsNormF32Func = _perHeadRmsNormF32Module.GetFunction("per_head_rmsnorm_f32");
@@ -1766,6 +1773,124 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_attentionF32Func,
                 (uint)numBlocks, 1, 1, BlockSize, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Number of cooperating blocks per head in <see cref="LaunchAttentionF32SplitKv"/> — must match
+    /// <c>ATTN_KV_SPLIT</c> in <c>attention_f32.cu</c>.</summary>
+    public const int AttentionKvSplit = 4;
+
+    /// <summary>
+    /// Whether the opt-in split-KV ("Flash-Decoding") <c>attention_f32_split_kv</c> kernel is
+    /// present in the loaded PTX (issue #183). Presence alone does not mean it's safe to launch —
+    /// call <see cref="IsAttentionSplitKvSafe"/> first.
+    /// </summary>
+    public bool HasAttentionF32SplitKv => _attentionF32SplitKvFunc != 0;
+
+    /// <summary>
+    /// Opt-in (default OFF) env-var gate for <see cref="LaunchAttentionF32SplitKv"/>. <b>Enabling
+    /// this trades away attention_f32's bit-near-CPU-equivalent output</b> for a reassociated
+    /// (mathematically equal, not bit-identical) cross-block combine — same tradeoff shape as
+    /// <see cref="EnableGdnScanApproxSplit4"/> (issue #180), but see
+    /// <c>attention_f32.cu</c>'s header for why this kernel's error-compounding story across decode
+    /// steps is expected to differ from GDN's recurrent-state case (attention reads the exact,
+    /// unperturbed KV cache each step — it does not carry a persistent approximate state forward).
+    /// Off by default per this project's Correctness-then-Performance priority order.
+    /// </summary>
+    public static bool EnableAttentionSplitKv { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_SPLIT_KV") == "1";
+
+    /// <summary>
+    /// Minimum <c>seqKv</c> (cached KV length) before the split-KV kernel is worth its grid.sync +
+    /// combine overhead versus the exact single-block kernel — below this, each split would save
+    /// only a few iterations of the per-tile weighted-V accumulation loop, not worth 4x the blocks
+    /// plus a grid-wide barrier. Tunable; not read from an env var (only the on/off gate is).
+    /// </summary>
+    public static int AttentionSplitKvMinSeqKv { get; set; } = 256;
+
+    /// <summary>
+    /// Queries (once per distinct <paramref name="headDim"/>, cached) whether split-KV cooperative
+    /// launch is safe for this (numHeads, headDim) shape on THIS GPU — i.e. whether
+    /// <c>numHeads*4</c> blocks can be simultaneously co-resident, a hard requirement of
+    /// <c>cuLaunchCooperativeKernel</c>. Returns false (safe default: caller falls back to
+    /// <see cref="LaunchAttentionF32"/>) if the split kernel isn't loaded, cooperative launch isn't
+    /// supported on this device/driver, or the shape doesn't fit.
+    /// </summary>
+    public bool IsAttentionSplitKvSafe(int numHeads, int headDim)
+    {
+        if (_attentionF32SplitKvFunc == 0) return false;
+
+        if (_attnSplitKvMaxCoResidentGrid < 0 || _attnSplitKvCachedHeadDim != headDim)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnSplitKvMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                const int TileKv = 256;
+                uint sharedBytesForQuery = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionF32SplitKvFunc, BlockSize, sharedBytesForQuery);
+                _attnSplitKvMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnSplitKvCachedHeadDim = headDim;
+        }
+
+        return _attnSplitKvMaxCoResidentGrid > 0 && numHeads * AttentionKvSplit <= _attnSplitKvMaxCoResidentGrid;
+    }
+
+    /// <summary>
+    /// OPT-IN, default-OFF split-KV ("Flash-Decoding") variant of <see cref="LaunchAttentionF32"/>
+    /// (issue #183), decode-only (<c>seqQ==1</c> implicit — no seqQ parameter). Splits the KV
+    /// dimension across <see cref="AttentionKvSplit"/> cooperating blocks per head (grid =
+    /// <c>numHeads * AttentionKvSplit</c> instead of <c>numHeads</c>) using CUDA Cooperative Groups
+    /// <c>grid.sync()</c> — still exactly ONE kernel launch. NOT bit-exact vs
+    /// <see cref="LaunchAttentionF32"/> (reassociated float reduction across the cross-block
+    /// combine — see <see cref="EnableAttentionSplitKv"/>'s doc and attention_f32.cu's header for
+    /// the full tradeoff). Callers MUST check <see cref="IsAttentionSplitKvSafe"/> first (exceeding
+    /// the cooperative-launch co-residency ceiling is a hard CUDA error) and fall back to
+    /// <see cref="LaunchAttentionF32"/> if it returns false.
+    /// </summary>
+    /// <param name="q">Device pointer to this step's query, <c>[numHeads, headDim]</c> (seqQ=1).</param>
+    /// <param name="k">Device pointer to the cached keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the cached values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the output, <c>[numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqKv">Cached KV length (causal upper bound is <paramref name="positionOffset"/>).</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA broadcast group = numHeads/numKvHeads).</param>
+    /// <param name="headDim">Per-head dimension.</param>
+    /// <param name="positionOffset">This step's query position (causal mask upper bound).</param>
+    /// <param name="slidingWindow">Sliding window size, or 0 for full causal attention.</param>
+    /// <param name="partialMax">Scratch, <c>[numHeads, AttentionKvSplit]</c> floats.</param>
+    /// <param name="partialSum">Scratch, <c>[numHeads, AttentionKvSplit]</c> floats.</param>
+    /// <param name="partialOut">Scratch, <c>[numHeads, AttentionKvSplit, headDim]</c> floats.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionF32SplitKv(nint q, nint k, nint v, nint output,
+                                     int seqKv, int numHeads, int numKvHeads, int headDim,
+                                     int positionOffset, int slidingWindow,
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionF32SplitKvFunc,
+                (uint)numHeads, AttentionKvSplit, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args).ThrowOnError();
     }
 
     /// <summary>FP32 SwiGLU: out = SiLU(gate) * up, all FP32.</summary>
