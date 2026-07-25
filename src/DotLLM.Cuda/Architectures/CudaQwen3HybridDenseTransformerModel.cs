@@ -636,6 +636,24 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         return result;
     }
 
+    // Issue #178 (2026-07-25 profiling round): re-verified that HasCopyRmsNormF32 is actually
+    // true at runtime for both "layer-pre-norm1" and "layer-resid1-norm2" below (a real xUnit
+    // pass on CudaCopyRmsNormF32Test, not just the property returning true — confirms PTX isn't
+    // stale) — the fused single-launch path IS the one executing in production, not the 2-launch
+    // fallback. cuobjdump --dump-sass on copy_rmsnorm_f32 (sm_86) shows 24 registers/thread, 0
+    // spills — a lean kernel with nothing left to trim internally. The remaining cost is
+    // structural, not launch-count: decode always has seqLen==1, so blockIdx.x (=row) only ever
+    // takes value 0 — each call launches exactly ONE block, occupying 1 of 28 SMs. This is the
+    // same "grid too small to fill the device" shape the parallel gdn_scan_step_f32 ncu
+    // investigation found (see .docs/handoff.md), but here it's structural rather than tunable:
+    // there is only one row to normalize per decode step, so there is no more per-row parallelism
+    // to spread across blocks. Splitting the 5120-wide reduction itself across multiple blocks
+    // to raise occupancy would need either (a) a second kernel launch for the cross-block
+    // reduction — which gives back exactly the launch this fusion exists to remove — or (b) a
+    // cooperative-groups grid-wide sync (cuLaunchCooperativeKernel), which is not used anywhere
+    // else in this codebase and adds real portability/occupancy-oversubscription risk for a
+    // single-digit-percent theoretical upside. Concluded: no further action here without a
+    // materially different (riskier, cooperative-launch) redesign; not attempted this session.
     private void RunSingleLayerBody(int layerIdx, int seqLen, ReadOnlySpan<int> positions,
         int hiddenSize, int numHeads, int numKvHeads, int headDim, float eps, IKvCache? kvCache)
     {
