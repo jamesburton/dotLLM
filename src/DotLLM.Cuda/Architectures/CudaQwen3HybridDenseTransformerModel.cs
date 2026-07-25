@@ -922,6 +922,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         long gStepBytes = (long)nVHead * sizeof(float);
         long betaStepBytes = gStepBytes;
         long outStepBytes = vStepBytes;
+        // Opt-in, default-OFF row-split cooperative-groups scan (issue #180,
+        // DOTLLM_GDN_SCAN_APPROX_SPLIT4=1) — ~26-27% faster kernel time, ~1.5-2% end-to-end decode,
+        // but NOT bit-exact vs the CPU oracle (see gated_delta_net_scan.cu's header for the full
+        // measured-speedup-vs-bit-parity tradeoff writeup — this is why it defaults OFF). Checked
+        // once per shape via IsGdnScanCoopSplit4Safe (cooperative-launch co-residency is a hard
+        // per-GPU/per-shape ceiling, not a soft limit) with a safe fallback to the exact kernel.
+        bool useCoopSplit4 = CudaKernels.EnableGdnScanApproxSplit4 &&
+            _kernels.IsGdnScanCoopSplit4Safe(nVHead, dState);
         for (int t = 0; t < seqLen; t++)
         {
             nint qT = qBuf + (nint)(t * qStepBytes);
@@ -930,8 +938,16 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             nint gT = alphaBuf + (nint)(t * gStepBytes);
             nint betaT = betaBuf + (nint)(t * betaStepBytes);
             nint outT = gdnOut + (nint)(t * outStepBytes);
-            _kernels.LaunchGdnScanStepF32(gdnStateDev, qT, kT, vT, gT, betaT, outT,
-                nVHead, nKHead, dState, streamH);
+            if (useCoopSplit4)
+            {
+                _kernels.LaunchGdnScanStepF32CoopSplit4(gdnStateDev, qT, kT, vT, gT, betaT, outT,
+                    _state.GdnScanPartialTmp, _state.GdnScanPartialOut, nVHead, nKHead, dState, streamH);
+            }
+            else
+            {
+                _kernels.LaunchGdnScanStepF32(gdnStateDev, qT, kT, vT, gT, betaT, outT,
+                    nVHead, nKHead, dState, streamH);
+            }
         }
         ProfMark("gdn-5-scan");
 

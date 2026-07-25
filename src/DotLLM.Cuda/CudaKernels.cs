@@ -360,6 +360,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _gdnConv1dCausalDecodeF32Func;
     private readonly CudaModule? _gdnScanF32Module;
     private readonly nint _gdnScanStepF32Func;
+    private readonly nint _gdnScanStepF32CoopSplit4Func;
+    private int _gdnScanCoopSplit4MaxCoResidentGrid = -1; // -1 = not yet queried
     private readonly CudaModule? _l2NormHeadsF32Module;
     private readonly nint _l2NormHeadsF32Func;
     private readonly nint _gdnDeinterleaveL2NormDecodeF32Func;
@@ -783,6 +785,10 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             _gdnScanF32Module = CudaModule.LoadFromFile(gdnScanF32Path);
             _gdnScanStepF32Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32");
+            // Opt-in, default-off row-split cooperative-groups variant (issue #180) — see
+            // gated_delta_net_scan.cu's header for the full measured-speedup-vs-bit-parity-
+            // tradeoff writeup. TryGetFunction so a stale PTX (pre-#180) still loads gracefully.
+            _gdnScanStepF32CoopSplit4Func = _gdnScanF32Module.TryGetFunction("gdn_scan_step_f32_coop_split4");
             // The L2-norm and decay helpers live in the same .cu translation unit,
             // so they are in the same .ptx module — query each function pointer here.
             _l2NormHeadsF32Module = _gdnScanF32Module;
@@ -2079,6 +2085,121 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchKernel(_gdnScanStepF32Func,
                 (uint)nVHead, 1, 1, (uint)dState, 1, 1,
                 sharedBytes, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Whether the opt-in row-split cooperative-groups <c>gdn_scan_step_f32_coop_split4</c> kernel
+    /// is present in the loaded PTX (issue #180). Presence alone does not mean it's SAFE to launch
+    /// for a given (nVHead, dState) shape on this GPU — call <see cref="IsGdnScanCoopSplit4Safe"/>
+    /// first, every time nVHead changes (e.g. a different model), since exceeding the cooperative
+    /// launch's co-residency ceiling is a hard CUDA error, not a silent fallback.
+    /// </summary>
+    public bool HasGdnScanStepF32CoopSplit4 => _gdnScanStepF32CoopSplit4Func != 0;
+
+    /// <summary>
+    /// Opt-in (default OFF) env-var gate for <see cref="LaunchGdnScanStepF32CoopSplit4"/>.
+    /// <b>Enabling this trades away gdn_scan_step_f32's documented bit-exact CPU/GPU parity</b> —
+    /// the row-split reduction reassociates the retrieve/read accumulation (independent partial
+    /// sums combined across blocks, not the CPU's strict sequential 0..dState-1 order), which is
+    /// mathematically equal but not bit-identical (measured ~2e-6 abs / ~4.6e-4 rel diff on a
+    /// single fresh-state step with random inputs). Since the GDN state persists across the ENTIRE
+    /// generation, a 500-decode-step characterization found the ABSOLUTE diff stays bounded
+    /// (~1e-6 to 2.7e-3, no runaway growth, no NaN/Inf) but not characterized beyond 500 synthetic
+    /// steps this session. Real gain when enabled: ~26-27% faster gdn_scan_step_f32 kernel time,
+    /// ~1.8% average end-to-end decode throughput across 5 independent A/B rounds, never losing a
+    /// round (measured on RTX 3060 / Bonsai-27B — see gated_delta_net_scan.cu's header and issue
+    /// #180 for the full writeup). Off by default per this project's stated
+    /// Correctness-then-Performance priority order.
+    /// </summary>
+    public static bool EnableGdnScanApproxSplit4 { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_GDN_SCAN_APPROX_SPLIT4") == "1";
+
+    /// <summary>
+    /// Queries (once, cached) whether <c>split=4</c> cooperative launch is safe for this exact
+    /// (nVHead, dState) shape on THIS GPU — i.e. whether <c>nVHead*4</c> blocks can be
+    /// simultaneously co-resident (a hard requirement of <c>cuLaunchCooperativeKernel</c>; asking
+    /// for more than the device can hold is a launch ERROR, not a graceful degrade). Returns false
+    /// (safe default: caller falls back to the exact, non-split kernel) if the coop kernel isn't
+    /// loaded, cooperative launch isn't supported on this device/driver, or the shape doesn't fit.
+    /// </summary>
+    public bool IsGdnScanCoopSplit4Safe(int nVHead, int dState)
+    {
+        if (_gdnScanStepF32CoopSplit4Func == 0) return false;
+        if (dState != 128) return false; // kernel hardcodes SPLIT=4 dividing d_state=128 evenly
+
+        if (_gdnScanCoopSplit4MaxCoResidentGrid < 0)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _gdnScanCoopSplit4MaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                uint sharedBytesForQuery = (uint)(2 * dState * sizeof(float));
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _gdnScanStepF32CoopSplit4Func, dState, sharedBytesForQuery);
+                _gdnScanCoopSplit4MaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+        }
+
+        return _gdnScanCoopSplit4MaxCoResidentGrid > 0 && nVHead * 4 <= _gdnScanCoopSplit4MaxCoResidentGrid;
+    }
+
+    /// <summary>
+    /// OPT-IN, default-OFF row-split cooperative-groups variant of <see cref="LaunchGdnScanStepF32"/>
+    /// (issue #180) — splits each V-head's [dState,dState] state-matrix row range across 4
+    /// cooperating blocks (grid = nVHead*4 instead of nVHead) using CUDA Cooperative Groups
+    /// <c>grid.sync()</c>, still exactly ONE kernel launch. Measured ~26-27% faster kernel time on
+    /// RTX 3060 (real cudaEvent/CUevent timing, both standalone and via this exact PTX-JIT +
+    /// driver-API path) — but is NOT bit-exact vs the CPU oracle (reassociated float reduction;
+    /// see <see cref="EnableGdnScanApproxSplit4"/>'s doc and gated_delta_net_scan.cu's header for
+    /// the full tradeoff). Callers MUST check <see cref="IsGdnScanCoopSplit4Safe"/> first (exceeding
+    /// the cooperative-launch co-residency ceiling is a hard CUDA error) and fall back to
+    /// <see cref="LaunchGdnScanStepF32"/> if it returns false.
+    /// </summary>
+    /// <param name="state">Device pointer to the GDN recurrence state, <c>[nVHead, dState, dState]</c> (in/out).</param>
+    /// <param name="qT">Device pointer to this token's Q vectors, <c>[nKHead, dState]</c>, L2-normalised.</param>
+    /// <param name="kT">Device pointer to this token's K vectors, <c>[nKHead, dState]</c>, L2-normalised.</param>
+    /// <param name="vT">Device pointer to this token's V vectors, <c>[nVHead, dState]</c>.</param>
+    /// <param name="gT">Device pointer to this token's per-head decay scalars, <c>[nVHead]</c>.</param>
+    /// <param name="betaT">Device pointer to this token's per-head write-gate scalars, <c>[nVHead]</c>.</param>
+    /// <param name="outputT">Device pointer to this token's output, <c>[nVHead, dState]</c>. Overwritten.</param>
+    /// <param name="partialTmp">Scratch, <c>[nVHead, 4, dState]</c> floats — retrieve-phase partials.</param>
+    /// <param name="partialOut">Scratch, <c>[nVHead, 4, dState]</c> floats — read-phase partials.</param>
+    /// <param name="nVHead">Number of value heads.</param>
+    /// <param name="nKHead">Number of key heads (must divide <paramref name="nVHead"/> evenly).</param>
+    /// <param name="dState">Per-head state dimension. Must be exactly 128 (SPLIT=4 hardcoded).</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchGdnScanStepF32CoopSplit4(nint state, nint qT, nint kT, nint vT,
+                                       nint gT, nint betaT, nint outputT,
+                                       nint partialTmp, nint partialOut,
+                                       int nVHead, int nKHead, int dState, nint stream)
+    {
+        if (dState != 128)
+            throw new ArgumentOutOfRangeException(nameof(dState),
+                $"dState={dState}; gdn_scan_step_f32_coop_split4 hardcodes SPLIT=4 dividing dState=128 evenly.");
+
+        nint sArg = state, qArg = qT, kArg = kT, vArg = vT;
+        nint gArg = gT, bArg = betaT, oArg = outputT;
+        nint ptArg = partialTmp, poArg = partialOut;
+        int nvArg = nVHead, nkArg = nKHead, dsArg = dState;
+
+        void** args = stackalloc void*[] {&sArg, &qArg, &kArg, &vArg,
+                        &gArg, &bArg, &oArg, &ptArg, &poArg,
+                        &nvArg, &nkArg, &dsArg};
+
+        // Shared memory: k_shared[dState] + q_shared[dState] (same layout as the non-split kernel).
+        uint sharedBytes = (uint)(2 * dState * sizeof(float));
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_gdnScanStepF32CoopSplit4Func,
+                (uint)nVHead, 4, 1, (uint)dState, 1, 1,
+                sharedBytes, stream, (nint)args).ThrowOnError();
     }
 
     /// <summary>
