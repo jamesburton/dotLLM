@@ -25,6 +25,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     private readonly int _intermediateSize;
 
     private int _currentSeqLen;
+    private int _logitsCurrentRows;
     private bool _disposed;
 
     public long AllocatedBytes { get; private set; }
@@ -33,6 +34,19 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     public nint HiddenState;
     public nint Residual;
     public nint NormOutput;
+
+    // Sized independently of the other per-token buffers above (issue #185) -- unlike
+    // HiddenState/NormOutput/etc., which every position's value feeds into the NEXT layer's
+    // computation for every OTHER position (via attention/GDN mixing) and so must stay sized to
+    // the full sequence length, Logits is a purely trailing projection nothing else reads back
+    // from within the same Forward call. The IKvCache-decode overload's documented contract
+    // (see IModel.Forward's XML doc) returns only the LAST token's logits, and every real caller
+    // (BenchRunner, TextGenerator) only ever reads the last row regardless of what shape comes
+    // back -- so sizing this cap*vocabSize*sizeof(float) (e.g. ~970 MiB at cap=1024 for a
+    // 248,320-vocab model) was pure waste for every kvCache-enabled call, and was the single
+    // largest contributor to the VRAM-ceiling hang `dotllm bench --depth` hit beyond ~650-768 on
+    // a 12GB card (confirmed via cuMemGetInfo instrumentation: EnsureCapacity's allocation for
+    // cap=1024 landed on EXACTLY 0 MiB free). See EnsureLogitsCapacity.
     public nint Logits;
 
     // ── GDN sub-layer ─────────────────────────────────────────────────────────
@@ -96,6 +110,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
 
         _currentSeqLen = 0;
         EnsureCapacity(1);
+        EnsureLogitsCapacity(1);
 
         // Fixed-size, seqLen-independent — allocated once, not part of FreeSequenceBuffers/EnsureCapacity.
         GdnScanPartialTmp = AllocDevice((long)_gdnHeads * 4 * dState * sizeof(float));
@@ -105,6 +120,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     /// <summary>
     /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens,
     /// reallocating in power-of-two increments. No-op when capacity already suffices.
+    /// Does NOT size <see cref="Logits"/> -- see <see cref="EnsureLogitsCapacity"/>.
     /// </summary>
     public void EnsureCapacity(int seqLen)
     {
@@ -116,7 +132,6 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         HiddenState = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         Residual = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         NormOutput = AllocDevice((long)cap * _hiddenSize * sizeof(float));
-        Logits = AllocDevice((long)cap * _vocabSize * sizeof(float));
 
         GdnConvInput = AllocDevice((long)(_dConv - 1 + cap) * _convDim * sizeof(float));
         GdnQkvBuf = AllocDevice((long)cap * _convDim * sizeof(float));
@@ -145,6 +160,22 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         _currentSeqLen = cap;
     }
 
+    /// <summary>
+    /// Grows <see cref="Logits"/> to cover at least <paramref name="rows"/> rows (issue #185).
+    /// Sized independently of <see cref="EnsureCapacity"/>'s <c>cap</c> -- callers pass 1 for the
+    /// common kvCache-enabled decode/depth-extension path (only the last token's logits are ever
+    /// consumed) and the real row count for the uncached multi-token path. No power-of-two
+    /// rounding: the two regimes are wildly different scales and this buffer is never in a hot
+    /// per-token growth loop the way the other per-token buffers are.
+    /// </summary>
+    public void EnsureLogitsCapacity(int rows)
+    {
+        if (rows <= _logitsCurrentRows) return;
+        FreeIfNonZero(ref Logits);
+        Logits = AllocDevice((long)rows * _vocabSize * sizeof(float));
+        _logitsCurrentRows = rows;
+    }
+
     private nint AllocDevice(long bytes)
     {
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
@@ -166,7 +197,6 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref GdnConvInput);
         FreeIfNonZero(ref GdnQkvBuf);
         FreeIfNonZero(ref GdnZBuf);
@@ -194,9 +224,11 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref GdnScanPartialTmp);
         FreeIfNonZero(ref GdnScanPartialOut);
         _currentSeqLen = 0;
+        _logitsCurrentRows = 0;
         _disposed = true;
         GC.SuppressFinalize(this);
     }
@@ -205,6 +237,7 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref GdnScanPartialTmp);
         FreeIfNonZero(ref GdnScanPartialOut);
     }
