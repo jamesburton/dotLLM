@@ -1637,7 +1637,9 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
 
         _context.MakeCurrent();
+        if (DebugTrace) LogVram($"before EnsureCapacity(seqLen={seqLen})");
         _state.EnsureCapacity(seqLen);
+        if (DebugTrace) LogVram($"after EnsureCapacity (state.AllocatedBytes={_state.AllocatedBytes:N0})");
 
         nint streamH = _stream.Handle;
 
@@ -1678,6 +1680,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // the full rationale -- only shrink to the last row when the caller explicitly opts in via
         // lastTokenLogitsOnly (never inferred from kvCache alone: speculative-decoding verification
         // also submits multiple tokens through a kvCache-bearing call and needs every position).
+        if (DebugTrace) LogVram("before lm-head");
         int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
         _state.EnsureLogitsCapacity(logitsRows);
         nint lmHeadInput = logitsRows == seqLen
@@ -1687,6 +1690,7 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
             hiddenSize, eps, logitsRows, streamH);
         Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
              _outputOutputDim, _outputInputDim, logitsRows);
+        if (DebugTrace) LogVram("after lm-head");
 
         // Sync and D2H the logits.
         _stream.Synchronize();
@@ -1695,8 +1699,29 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
             (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
+        if (DebugTrace) LogVram("after D2H logits copy");
 
         return result;
+    }
+
+    private static readonly bool DebugTrace =
+        Environment.GetEnvironmentVariable("DOTLLM_HYBRID_DEBUG") == "1";
+
+    /// <summary>
+    /// Issue #188 diagnostic: logs free/total device VRAM (via <c>cuMemGetInfo</c>) under the
+    /// same <see cref="DebugTrace"/> gate as <c>CudaQwen3HybridDenseTransformerModel.LogVram</c>
+    /// -- zero cost when unset. Added so the MoE hybrid model has the same VRAM-checkpoint
+    /// instrumentation the Dense model already carries from issue #185, since both classes share
+    /// the identical <c>EnsureCapacity</c> scratch-sizing logic (issue #188).
+    /// </summary>
+    private static void LogVram(string label)
+    {
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out nuint total).ThrowOnError();
+        long usedMiB = (long)(total - free) / (1024 * 1024);
+        long freeMiB = (long)free / (1024 * 1024);
+        long totalMiB = (long)total / (1024 * 1024);
+        Console.Error.WriteLine($"[hybrid-debug][vram] {label}: used={usedMiB}MiB free={freeMiB}MiB total={totalMiB}MiB");
+        Console.Error.Flush();
     }
 
     /// <summary>

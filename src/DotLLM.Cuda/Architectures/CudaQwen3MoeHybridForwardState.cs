@@ -173,15 +173,51 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     }
 
     /// <summary>
-    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens,
-    /// reallocating in power-of-two increments. No-op when capacity already suffices.
-    /// Does NOT size <see cref="Logits"/> -- see <see cref="EnsureLogitsCapacity"/>.
+    /// Rounding granularity (in tokens) <see cref="EnsureCapacity"/> switches to once its
+    /// requested length exceeds this size -- mirrors
+    /// <see cref="CudaQwen3HybridDenseForwardState.CapacityGranularity"/>; see that type's
+    /// identically-named member and <see cref="EnsureCapacity"/>'s remarks for the full
+    /// issue #188 rationale.
     /// </summary>
+    internal const int CapacityGranularity = 256;
+
+    /// <summary>
+    /// Rounds <paramref name="seqLen"/> up to the next allocation-worthy capacity for
+    /// <see cref="EnsureCapacity"/>. See <see cref="CapacityGranularity"/> and
+    /// <see cref="EnsureCapacity"/>'s remarks for the issue #188 rationale behind the two-regime
+    /// split.
+    /// </summary>
+    internal static int RoundUpCapacity(int seqLen)
+    {
+        if (seqLen <= CapacityGranularity)
+            return (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+
+        return (seqLen + CapacityGranularity - 1) / CapacityGranularity * CapacityGranularity;
+    }
+
+    /// <summary>
+    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens.
+    /// No-op when capacity already suffices. Does NOT size <see cref="Logits"/> -- see
+    /// <see cref="EnsureLogitsCapacity"/>.
+    /// </summary>
+    /// <remarks>
+    /// Issue #188: below <see cref="CapacityGranularity"/> tokens, capacity still rounds up to
+    /// the next power of two (unchanged from the original scheme) -- at this scale the absolute
+    /// byte cost of over-allocating is small, and pow2 rounding gives cheap amortization for the
+    /// common case of many small, differently-sized calls (e.g. varying prompt lengths in normal
+    /// serving) without reallocating on every single-token-different request. Above the
+    /// granularity threshold, capacity instead rounds up to the next multiple of
+    /// <see cref="CapacityGranularity"/> tokens -- this bounds the worst-case waste to at most
+    /// <c>CapacityGranularity - 1</c> tokens' worth of buffers REGARDLESS of how large seqLen
+    /// gets, instead of the up-to-2x waste power-of-two rounding produces right after crossing a
+    /// pow2 boundary. See <see cref="CudaQwen3HybridDenseForwardState.EnsureCapacity"/> for the
+    /// full issue #188 finding this mirrors.
+    /// </remarks>
     public void EnsureCapacity(int seqLen)
     {
         if (seqLen <= _currentSeqLen) return;
 
-        int cap = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        int cap = RoundUpCapacity(seqLen);
         FreeSequenceBuffers();
 
         HiddenState = AllocDevice((long)cap * _hiddenSize * sizeof(float));

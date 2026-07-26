@@ -118,15 +118,62 @@ internal sealed unsafe class CudaQwen3HybridDenseForwardState : IDisposable
     }
 
     /// <summary>
-    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens,
-    /// reallocating in power-of-two increments. No-op when capacity already suffices.
-    /// Does NOT size <see cref="Logits"/> -- see <see cref="EnsureLogitsCapacity"/>.
+    /// Rounding granularity (in tokens) <see cref="EnsureCapacity"/> switches to once its
+    /// requested length exceeds this size -- see the method's remarks for the full issue #188
+    /// rationale. 256 is a round number comfortably larger than typical single-token
+    /// decode churn, so ordinary serving still amortizes reallocation across small prompt-length
+    /// variation, while bounding the worst-case waste at any depth to at most
+    /// <c>CapacityGranularity - 1</c> tokens' worth of buffers instead of the up-to-2x waste
+    /// power-of-two rounding produces right after crossing a pow2 boundary.
     /// </summary>
+    internal const int CapacityGranularity = 256;
+
+    /// <summary>
+    /// Rounds <paramref name="seqLen"/> up to the next allocation-worthy capacity for
+    /// <see cref="EnsureCapacity"/>. See <see cref="CapacityGranularity"/> and
+    /// <see cref="EnsureCapacity"/>'s remarks for the issue #188 rationale behind the two-regime
+    /// split.
+    /// </summary>
+    internal static int RoundUpCapacity(int seqLen)
+    {
+        if (seqLen <= CapacityGranularity)
+            return (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+
+        return (seqLen + CapacityGranularity - 1) / CapacityGranularity * CapacityGranularity;
+    }
+
+    /// <summary>
+    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens.
+    /// No-op when capacity already suffices. Does NOT size <see cref="Logits"/> -- see
+    /// <see cref="EnsureLogitsCapacity"/>.
+    /// </summary>
+    /// <remarks>
+    /// Issue #188: below <see cref="CapacityGranularity"/> tokens, capacity still rounds up to
+    /// the next power of two (unchanged from the original scheme) -- at this scale the absolute
+    /// byte cost of over-allocating is small, and pow2 rounding gives cheap amortization for the
+    /// common case of many small, differently-sized calls (e.g. varying prompt lengths in normal
+    /// serving) without reallocating on every single-token-different request. Above the
+    /// granularity threshold, capacity instead rounds up to the next multiple of
+    /// <see cref="CapacityGranularity"/> tokens -- this bounds the worst-case waste to at most
+    /// <c>CapacityGranularity - 1</c> tokens' worth of buffers REGARDLESS of how large seqLen
+    /// gets, instead of the up-to-2x waste power-of-two rounding produces right after crossing a
+    /// pow2 boundary (e.g. seqLen=1025 previously rounded to cap=2048, wasting ~1023 tokens'
+    /// worth of every per-token buffer this class owns). That 2x-at-scale behavior is exactly
+    /// what let `dotllm bench --depth` land on EXACTLY 0 MiB free VRAM at depth 1536 (rounds to
+    /// cap=2048 under pure pow2) on a 12 GB card -- see issue #188, a recurrence of #185's
+    /// original Logits-buffer finding but for every OTHER per-token buffer in this class, which
+    /// #185 deliberately left alone (unlike Logits, they're live in ordinary variable-length
+    /// prefill too, so unconditionally exact-sizing them like Logits would defeat the
+    /// reallocation-amortization these buffers exist for in real serving). A fixed-granularity
+    /// step still reallocates only when a call's seqLen crosses into a new granularity bucket
+    /// (same amortization property as pow2, just with smaller, constant-size buckets instead of
+    /// buckets that double forever), while capping the worst case that made #188 possible.
+    /// </remarks>
     public void EnsureCapacity(int seqLen)
     {
         if (seqLen <= _currentSeqLen) return;
 
-        int cap = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        int cap = RoundUpCapacity(seqLen);
         FreeSequenceBuffers();
 
         HiddenState = AllocDevice((long)cap * _hiddenSize * sizeof(float));

@@ -15,6 +15,16 @@ namespace DotLLM.Cli.Benchmarking;
 public static class BenchRunner
 {
     /// <summary>
+    /// Max token count fed to <see cref="IModel.Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, DotLLM.Core.Attention.IKvCache?, bool)"/>
+    /// per call while walking the untimed <c>--depth</c> synthetic context extension (issue
+    /// #188) -- see the call site's remarks for the full rationale. Matches the
+    /// <c>CapacityGranularity</c> the CUDA hybrid models' <c>EnsureCapacity</c> now rounds to
+    /// (issue #188) so a chunk never itself crosses a granularity-rounding boundary mid-chunk,
+    /// though the two constants are independent and don't need to stay in lockstep.
+    /// </summary>
+    private const int DepthExtensionChunkSize = 256;
+
+    /// <summary>
     /// Runs <paramref name="reps"/> measured repetitions (plus one discarded warm-up)
     /// of prefill + greedy decode against <paramref name="model"/>.
     /// </summary>
@@ -97,6 +107,22 @@ public static class BenchRunner
         // lastTokenLogitsOnly reasoning as the prefill call above -- this is the call whose
         // full-seqLen logits tensor was the dominant VRAM cost behind issue #185's
         // `dotllm bench --depth` hang beyond ~650-768 on a 12GB card.
+        //
+        // Issue #188: fed in bounded DepthExtensionChunkSize-token chunks rather than one single
+        // Forward call spanning the entire `depth`. Even after the CUDA hybrid models'
+        // EnsureCapacity switched from power-of-two to granularity-bounded rounding (issue #188),
+        // a single Forward call of length `depth` still forces those models' per-token scratch
+        // buffers to grow to (at minimum) `depth` tokens -- that's a real requirement of a call
+        // that size, not rounding waste, so no EnsureCapacity policy can shrink it. Splitting the
+        // untimed extension into fixed-size chunks appended incrementally to the same kvCache
+        // caps the peak single-call scratch requirement at DepthExtensionChunkSize tokens
+        // regardless of how large --depth gets, which is what actually let `--depth 2048` (exact
+        // power-of-two, so already zero rounding waste either way) complete cleanly instead of
+        // hanging at ~0 MiB free. This mirrors real serving, which chunks large prefills rather
+        // than ever submitting one multi-thousand-token Forward call; only intermediate chunks'
+        // logits are discarded here (the re-tiled extension tokens are fixed ahead of time, not
+        // sampled, so nothing downstream depends on them) -- the last chunk's argmax still seeds
+        // the timed decode loop exactly as before.
         if (depth > 0)
         {
             int[] extra = new int[depth];
@@ -106,8 +132,17 @@ public static class BenchRunner
                 extra[i] = promptTokens[i % promptLen];
                 extraPos[i] = nextPos + i;
             }
-            using (var logits = model.Forward(extra, extraPos, deviceId: -1, cache, lastTokenLogitsOnly: true))
-                nextToken = ArgmaxLastRow(logits);
+
+            int offset = 0;
+            while (offset < depth)
+            {
+                int chunkLen = Math.Min(DepthExtensionChunkSize, depth - offset);
+                using var logits = model.Forward(
+                    extra.AsSpan(offset, chunkLen), extraPos.AsSpan(offset, chunkLen),
+                    deviceId: -1, cache, lastTokenLogitsOnly: true);
+                offset += chunkLen;
+                if (offset == depth) nextToken = ArgmaxLastRow(logits);
+            }
             nextPos += depth;
         }
 
