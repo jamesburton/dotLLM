@@ -37,6 +37,7 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     private readonly long _moeW2ElemsPerExpert;
 
     private int _currentSeqLen;
+    private int _logitsCurrentRows;
     private bool _disposed;
 
     public long AllocatedBytes { get; private set; }
@@ -45,6 +46,9 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     public nint HiddenState;
     public nint Residual;
     public nint NormOutput;
+
+    // Sized independently of the other per-token buffers above (issue #185) -- see
+    // CudaQwen3HybridDenseForwardState's identically-named field doc for the full rationale.
     public nint Logits;
 
     // ── GDN sub-layer ─────────────────────────────────────────────────────────
@@ -165,11 +169,13 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
 
         _currentSeqLen = 0;
         EnsureCapacity(1);
+        EnsureLogitsCapacity(1);
     }
 
     /// <summary>
     /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens,
     /// reallocating in power-of-two increments. No-op when capacity already suffices.
+    /// Does NOT size <see cref="Logits"/> -- see <see cref="EnsureLogitsCapacity"/>.
     /// </summary>
     public void EnsureCapacity(int seqLen)
     {
@@ -181,7 +187,6 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
         HiddenState = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         Residual = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         NormOutput = AllocDevice((long)cap * _hiddenSize * sizeof(float));
-        Logits = AllocDevice((long)cap * _vocabSize * sizeof(float));
 
         GdnConvInput = AllocDevice((long)(_dConv - 1 + cap) * _convDim * sizeof(float));
         GdnQkvBuf = AllocDevice((long)cap * _convDim * sizeof(float));
@@ -206,6 +211,18 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
         _currentSeqLen = cap;
     }
 
+    /// <summary>
+    /// Grows <see cref="Logits"/> to cover at least <paramref name="rows"/> rows (issue #185) --
+    /// see <see cref="CudaQwen3HybridDenseForwardState.EnsureLogitsCapacity"/> for the rationale.
+    /// </summary>
+    public void EnsureLogitsCapacity(int rows)
+    {
+        if (rows <= _logitsCurrentRows) return;
+        FreeIfNonZero(ref Logits);
+        Logits = AllocDevice((long)rows * _vocabSize * sizeof(float));
+        _logitsCurrentRows = rows;
+    }
+
     private nint AllocDevice(long bytes)
     {
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
@@ -227,7 +244,6 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref GdnConvInput);
         FreeIfNonZero(ref GdnQkvBuf);
         FreeIfNonZero(ref GdnZBuf);
@@ -259,8 +275,10 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeMoeScratch();
         _currentSeqLen = 0;
+        _logitsCurrentRows = 0;
         _disposed = true;
         GC.SuppressFinalize(this);
     }
@@ -269,6 +287,7 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeMoeScratch();
     }
 }

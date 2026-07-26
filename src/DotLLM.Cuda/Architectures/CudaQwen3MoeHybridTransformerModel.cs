@@ -1606,9 +1606,14 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
+
+    /// <inheritdoc/>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -1669,18 +1674,27 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
 
         // ── Final norm + lm_head ──
-        _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
-            hiddenSize, eps, seqLen, streamH);
-        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
-             _outputOutputDim, _outputInputDim, seqLen);
+        // Issue #185: see CudaQwen3HybridDenseTransformerModel's identically-structured block for
+        // the full rationale -- only shrink to the last row when the caller explicitly opts in via
+        // lastTokenLogitsOnly (never inferred from kvCache alone: speculative-decoding verification
+        // also submits multiple tokens through a kvCache-bearing call and needs every position).
+        int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
+        _state.EnsureLogitsCapacity(logitsRows);
+        nint lmHeadInput = logitsRows == seqLen
+            ? _state.HiddenState
+            : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
+            hiddenSize, eps, logitsRows, streamH);
+        Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
+             _outputOutputDim, _outputInputDim, logitsRows);
 
         // Sync and D2H the logits.
         _stream.Synchronize();
 
-        var shape = new TensorShape(seqLen, vocabSize);
+        var shape = new TensorShape(logitsRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
-            (nuint)((long)seqLen * vocabSize * sizeof(float))).ThrowOnError();
+            (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
 
         return result;
     }

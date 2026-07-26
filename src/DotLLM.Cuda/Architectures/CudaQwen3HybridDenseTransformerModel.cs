@@ -588,9 +588,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
+
+    /// <inheritdoc/>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -621,7 +626,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // (~0.2% profiled) — not the dark matter some earlier hypotheses suspected.
         ProfStart();
         _context.MakeCurrent();
+        if (DebugTrace) LogVram($"before EnsureCapacity(seqLen={seqLen})");
         _state.EnsureCapacity(seqLen);
+        if (DebugTrace) LogVram($"after EnsureCapacity (state.AllocatedBytes={_state.AllocatedBytes:N0})");
 
         nint streamH = _stream.Handle;
 
@@ -660,23 +667,45 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 numHeads, numKvHeads, headDim, eps, kvCache);
         }
 
-        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); }
+        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] all layers done, starting lm_head"); Console.Error.Flush(); LogVram("before lm-head"); }
         ProfStart();
-        _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
-            hiddenSize, eps, seqLen, streamH);
-        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
-             _outputOutputDim, _outputInputDim, seqLen);
+
+        // Issue #185: only compute/copy the LAST token's logits when the caller has explicitly
+        // opted in via lastTokenLogitsOnly (e.g. BenchRunner's untimed prefill / --depth context
+        // extension, which only ever reads the last row via argmax). This must NOT be inferred
+        // from kvCache alone -- speculative-decoding verification also submits multiple tokens
+        // through a kvCache-bearing Forward call but genuinely needs EVERY position's logits to
+        // accept/reject each draft token, so it correctly leaves the hint false (see IModel's XML
+        // doc on this overload). Restricting the final RmsNorm/LM-head-GEMM/D2H-copy to one row
+        // eliminates the single largest VRAM consumer in this Forward call when honored: the old
+        // code always sized and computed a full [seqLen, vocabSize] Logits tensor (e.g. ~970 MiB
+        // of scratch alone at seqLen=1024 for this model's 248,320-token vocabulary), which was
+        // the dominant term in the VRAM-ceiling hang `dotllm bench --depth` hit beyond ~650-768 on
+        // a 12GB card (confirmed via cuMemGetInfo instrumentation: EnsureCapacity's cap=1024
+        // allocation landed on EXACTLY 0 MiB free). Every caller that hasn't opted in (including
+        // ordinary seqLen==1 decode, where this is a no-op either way) keeps returning full
+        // per-position logits, unchanged from before this fix.
+        int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
+        _state.EnsureLogitsCapacity(logitsRows);
+        nint lmHeadInput = logitsRows == seqLen
+            ? _state.HiddenState
+            : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
+            hiddenSize, eps, logitsRows, streamH);
+        Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
+             _outputOutputDim, _outputInputDim, logitsRows);
         ProfMark("lm-head");
-        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); }
+        if (DebugTrace) { _stream.Synchronize(); Console.Error.WriteLine("[hybrid-debug] lm_head done"); Console.Error.Flush(); LogVram("after lm-head"); }
 
         _stream.Synchronize();
         ProfStart(); // measures result alloc + D2H logits copy
 
-        var shape = new TensorShape(seqLen, vocabSize);
+        var shape = new TensorShape(logitsRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
-            (nuint)((long)seqLen * vocabSize * sizeof(float))).ThrowOnError();
+            (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
         ProfMark("output-copy");
+        if (DebugTrace) LogVram("after D2H logits copy");
 
         return result;
     }
@@ -769,6 +798,23 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
 
     private static readonly bool DebugTrace =
         Environment.GetEnvironmentVariable("DOTLLM_HYBRID_DEBUG") == "1";
+
+    /// <summary>
+    /// Issue #185 diagnostic: logs free/total device VRAM (via <c>cuMemGetInfo</c>) under the same
+    /// <see cref="DebugTrace"/> gate used by the existing hybrid-debug traces above — zero cost when
+    /// unset. Added to find the real allocation source of the VRAM-ceiling hang that
+    /// <c>dotllm bench --depth</c> hits beyond ~650-768 on a 12GB card (see the issue for the
+    /// original symptom description).
+    /// </summary>
+    private static void LogVram(string label)
+    {
+        CudaDriverApi.cuMemGetInfo_v2(out nuint free, out nuint total).ThrowOnError();
+        long usedMiB = (long)(total - free) / (1024 * 1024);
+        long freeMiB = (long)free / (1024 * 1024);
+        long totalMiB = (long)total / (1024 * 1024);
+        Console.Error.WriteLine($"[hybrid-debug][vram] {label}: used={usedMiB}MiB free={freeMiB}MiB total={totalMiB}MiB");
+        Console.Error.Flush();
+    }
 
     // ──────────────────────────────────────────────────────────────────────
     //  One-off category profiler (DOTLLM_HYBRID_PROFILE=1). Coarse (Stopwatch +
