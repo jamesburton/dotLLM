@@ -119,6 +119,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private int _f16CacheMaxSeqLen;        // current allocated capacity
     private int _f16CacheCurrentLength;    // mirrors IKvCache.CurrentLength for the model-internal cache
 
+    // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185) -- see
+    // CudaQwen3HybridDenseTransformerModel's field doc for the full rationale. A same-size fresh
+    // IKvCache instance (a new logical sequence) must reset _f16CacheCurrentLength even when
+    // EnsureF16KvCache's capacity-driven reallocation guard no-ops.
+    private IKvCache? _lastForwardKvCache;
+
+    /// <summary>Test-only accessor for issue #185's regression test — see the Dense hybrid
+    /// model's identically-named member for the full rationale.</summary>
+    internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
+
     // Per-step staging for the cache-enabled full-attention path.
     //
     // _f16KvWriteStaging: F32→F16 conversion target for the freshly-projected
@@ -155,6 +165,13 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
 
     /// <summary>Number of full-attention layers — matches the sparse KV-cache slot count.</summary>
     public int AttentionLayerCount => _attentionLayerCount;
+
+    /// <summary>
+    /// Creates a length-only <see cref="IKvCache"/> handle sized to <paramref name="maxSeqLen"/>.
+    /// K/V storage is owned internally by this model (a per-attention-layer F16 device
+    /// cache) — the returned handle only communicates the capacity to <see cref="Forward(System.ReadOnlySpan{int}, System.ReadOnlySpan{int}, int, IKvCache?)"/>.
+    /// </summary>
+    public CudaHybridKvCacheHandle CreateKvCache(int maxSeqLen) => new(maxSeqLen);
 
     private CudaQwen3MoeHybridTransformerModel(
         ModelConfig config,
@@ -1589,9 +1606,14 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache: null);
 
     /// <inheritdoc/>
-    [SkipLocalsInit]
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
+        => Forward(tokenIds, positions, deviceId, kvCache, lastTokenLogitsOnly: false);
+
+    /// <inheritdoc/>
+    [SkipLocalsInit]
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, bool lastTokenLogitsOnly)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -1652,18 +1674,27 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         }
 
         // ── Final norm + lm_head ──
-        _kernels.LaunchRmsNormF32(_state.HiddenState, _outputNormDevice, _state.HiddenState,
-            hiddenSize, eps, seqLen, streamH);
-        Gemm(_outputDevice, _outputQt, _state.HiddenState, _state.Logits,
-             _outputOutputDim, _outputInputDim, seqLen);
+        // Issue #185: see CudaQwen3HybridDenseTransformerModel's identically-structured block for
+        // the full rationale -- only shrink to the last row when the caller explicitly opts in via
+        // lastTokenLogitsOnly (never inferred from kvCache alone: speculative-decoding verification
+        // also submits multiple tokens through a kvCache-bearing call and needs every position).
+        int logitsRows = lastTokenLogitsOnly ? 1 : seqLen;
+        _state.EnsureLogitsCapacity(logitsRows);
+        nint lmHeadInput = logitsRows == seqLen
+            ? _state.HiddenState
+            : _state.HiddenState + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        _kernels.LaunchRmsNormF32(lmHeadInput, _outputNormDevice, lmHeadInput,
+            hiddenSize, eps, logitsRows, streamH);
+        Gemm(_outputDevice, _outputQt, lmHeadInput, _state.Logits,
+             _outputOutputDim, _outputInputDim, logitsRows);
 
         // Sync and D2H the logits.
         _stream.Synchronize();
 
-        var shape = new TensorShape(seqLen, vocabSize);
+        var shape = new TensorShape(logitsRows, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId);
         CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.Logits,
-            (nuint)((long)seqLen * vocabSize * sizeof(float))).ThrowOnError();
+            (nuint)((long)logitsRows * vocabSize * sizeof(float))).ThrowOnError();
 
         return result;
     }
@@ -1878,6 +1909,10 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         // Reuse the existing RMSNorm-F32 kernel as a per-head normaliser:
         //   rows = seqLen * nVHead, hiddenSize = dState. The weight is dState floats
         //   shared across all rows — exactly what LaunchRmsNormF32 does.
+        // Investigated fusing these two launches (issue #172, same pattern as
+        // CudaQwen3HybridDenseTransformerModel's ForwardGdnBody step 6): implemented,
+        // SASS-verified, correctness-tested, but showed no reproducible real-bench decode win
+        // (within this machine's thermal-drift noise floor) — see rmsnorm_f32.cu's header.
         _kernels.LaunchRmsNormF32(gdnOut, gdnW.SsmNormDevice, gdnOut,
             dState, eps, seqLen * nVHead, streamH);
         // gdnOut *= silu(z). silu(z) = z * sigmoid(z); SwiGLU(gate=z, up=gdnOut) = silu(z)*up.
@@ -1989,6 +2024,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         //     dequant overwrites it) so the net savings is ~600 MB.
         if (kvCache is not null)
         {
+            if (!ReferenceEquals(kvCache, _lastForwardKvCache))
+            {
+                _lastForwardKvCache = kvCache;
+                _f16CacheCurrentLength = 0;
+            }
+
             EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
             int slot = _kvSlotForLayer[layer];
             if (slot < 0)

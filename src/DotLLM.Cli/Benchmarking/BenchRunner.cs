@@ -78,10 +78,14 @@ public static class BenchRunner
         int[] positions = new int[promptLen];
         for (int i = 0; i < promptLen; i++) positions[i] = i;
 
-        // Timed prefill (argmax excluded from the stopwatch window).
+        // Timed prefill (argmax excluded from the stopwatch window). Only the last row is ever
+        // read below, so opt in to lastTokenLogitsOnly (issue #185) -- on the CUDA hybrid models
+        // this avoids allocating/computing a full [promptLen, vocabSize] logits tensor for a
+        // value nothing but the last row consumes; other models ignore the hint and behave as
+        // before.
         int nextToken;
         var prefillSw = Stopwatch.StartNew();
-        ITensor prefillLogits = model.Forward(promptTokens, positions, deviceId: -1, cache);
+        ITensor prefillLogits = model.Forward(promptTokens, positions, deviceId: -1, cache, lastTokenLogitsOnly: true);
         prefillSw.Stop();
         using (prefillLogits)
             nextToken = ArgmaxLastRow(prefillLogits);
@@ -89,7 +93,10 @@ public static class BenchRunner
         int nextPos = promptLen;
 
         // Untimed synthetic context extension: re-tile the prompt for `depth`
-        // extra tokens so the timed decode runs at depth promptLen + depth.
+        // extra tokens so the timed decode runs at depth promptLen + depth. Same
+        // lastTokenLogitsOnly reasoning as the prefill call above -- this is the call whose
+        // full-seqLen logits tensor was the dominant VRAM cost behind issue #185's
+        // `dotllm bench --depth` hang beyond ~650-768 on a 12GB card.
         if (depth > 0)
         {
             int[] extra = new int[depth];
@@ -99,7 +106,7 @@ public static class BenchRunner
                 extra[i] = promptTokens[i % promptLen];
                 extraPos[i] = nextPos + i;
             }
-            using (var logits = model.Forward(extra, extraPos, deviceId: -1, cache))
+            using (var logits = model.Forward(extra, extraPos, deviceId: -1, cache, lastTokenLogitsOnly: true))
                 nextToken = ArgmaxLastRow(logits);
             nextPos += depth;
         }

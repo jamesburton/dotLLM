@@ -46,6 +46,9 @@ public static class QuantizationTypeExtensions
         QuantizationType.I2_S => elementCount / 4 + 4,
         // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
         QuantizationType.MXFP4 => elementCount / 32 * 17,
+        // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
+        // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
+        QuantizationType.PQ2_0 => elementCount / 128 * 34,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

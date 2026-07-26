@@ -123,6 +123,81 @@ public class CudaI2SGemvTest
         RunFusedDecode();
     }
 
+    /// <summary>
+    /// Validates the prefill-path dequant kernel (<see cref="CudaKernels.LaunchDequantI2_SToF16"/>,
+    /// v2: one warp per 128-element block, coalesced) against the CPU dequant reference
+    /// (<see cref="Dequantize.ToFloat32"/>).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2560, 2560)]
+    [InlineData(37, 2560)]   // non-round n — exercises the warp-grid-stride tail
+    public void DequantI2_SToF16_MatchesCpuReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunDequant(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunDequant(int n, int k)
+    {
+        var rng = new Random(3456);
+        int rowBytes = k / 4;
+        long packedLen = (long)n * rowBytes + 4;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = 0.02f + (float)rng.NextDouble() * 0.03f;
+        byte[] packed = Pack(ternary, n, k, scale);
+
+        // CPU reference — dequantizes the whole [n, k] matrix via the shared CPU codepath.
+        float[] cpu = new float[(long)n * k];
+        fixed (byte* w = packed)
+            Dequantize.ToFloat32((nint)w, (long)n * k, DotLLM.Core.Configuration.QuantizationType.I2_S, cpu);
+
+        Half[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devDst, (nuint)((long)n * k * sizeof(ushort))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+
+                kernels.LaunchDequantI2_SToF16(devW, devDst, n, k, s);
+                stream.Synchronize();
+
+                gpu = new Half[(long)n * k];
+                fixed (Half* p = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devDst, (nuint)((long)n * k * sizeof(ushort))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devDst);
+            }
+        }
+
+        float maxAbsDiff = 0, sumAbsDiff = 0;
+        for (long i = 0; i < cpu.Length; i++)
+        {
+            float d = MathF.Abs(cpu[i] - (float)gpu[i]);
+            sumAbsDiff += d;
+            if (d > maxAbsDiff) maxAbsDiff = d;
+        }
+        float meanAbsDiff = sumAbsDiff / cpu.Length;
+        _out.WriteLine($"I2_S dequant {n}×{k}: max abs diff={maxAbsDiff:E4}, mean={meanAbsDiff:E4}");
+
+        Assert.True(maxAbsDiff <= 5e-4f, $"max abs diff {maxAbsDiff} exceeds 5e-4 (F16 rounding vs CPU float32)");
+        Assert.True(meanAbsDiff <= 1e-4f, $"mean abs diff {meanAbsDiff} exceeds 1e-4");
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private unsafe void RunFusedDecode()
     {

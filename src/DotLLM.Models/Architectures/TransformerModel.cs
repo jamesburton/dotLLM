@@ -1164,9 +1164,11 @@ public sealed unsafe class TransformerModel : IModel
             // re-use the buffer for stage 1. Pre-LoRA-Q8_0 this was scoped
             // inside each sub-branch.
             byte* preQuantNormQkv = null;
-            // The fused decode kernels don't support I2_S; route ternary weights through the
-            // standard (unfused) projection path, which dispatches to the I2_S GEMV.
-            if (seqLen == 1 && _threadPool != null && !adapterActive && lw.QQuantType != QuantizationType.I2_S)
+            // The fused decode kernels don't support I2_S/PQ2_0 (both ternary, per-group or
+            // per-tensor scaled); route ternary weights through the standard (unfused)
+            // projection path, which dispatches to the dedicated ternary GEMV.
+            if (seqLen == 1 && _threadPool != null && !adapterActive
+                && lw.QQuantType != QuantizationType.I2_S && lw.QQuantType != QuantizationType.PQ2_0)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantNorm = null;
@@ -1523,8 +1525,9 @@ public sealed unsafe class TransformerModel : IModel
             // so the LoRA delta call site can reuse the activation Q8_0
             // buffer for stage 1.
             byte* preQuantFfnHoisted = null;
-            // I2_S (BitNet) is unsupported by the fused decode kernels — use the unfused path.
-            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive && lw.GateQuantType != QuantizationType.I2_S)
+            // I2_S/PQ2_0 (both ternary) are unsupported by the fused decode kernels — use the unfused path.
+            if (seqLen == 1 && _threadPool != null && !ffnAdapterActive
+                && lw.GateQuantType != QuantizationType.I2_S && lw.GateQuantType != QuantizationType.PQ2_0)
             {
                 // Decode path: try fused RmsNorm+Quantize (skips normOut intermediate)
                 byte* preQuantFfn = null;
@@ -3122,6 +3125,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemvF16(weights, x, y, m, k, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemvI2_S((byte*)weights, x, y, m, k, _threadPool);
+        else if (qt == QuantizationType.PQ2_0)
+            MatMul.GemvPQ2_0((byte*)weights, x, y, m, k, _threadPool);
         else
             GemvDequantFallback(weights, qt, x, y, m, k);
     }
@@ -3177,6 +3182,8 @@ public sealed unsafe class TransformerModel : IModel
             MatMul.GemmF16(weights, b, c, m, k, n, _threadPool);
         else if (qt == QuantizationType.I2_S)
             MatMul.GemmI2_S((byte*)weights, b, c, m, k, n, _threadPool);
+        else if (qt == QuantizationType.PQ2_0)
+            MatMul.GemmPQ2_0((byte*)weights, b, c, m, k, n, _threadPool);
         else
             GemmDequantFallback(weights, qt, b, c, m, k, n);
     }

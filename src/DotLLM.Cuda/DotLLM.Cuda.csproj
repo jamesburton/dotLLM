@@ -43,6 +43,15 @@
     <CudaKernel Include="$(CudaKernelDir)\*.cu">
       <FastMathFlag></FastMathFlag>
       <FmadFlag></FmadFlag>
+      <CxxStdFlag></CxxStdFlag>
+    </CudaKernel>
+    <!-- Kernels using CUDA Cooperative Groups (grid.sync()) need libcu++ (cccl), which requires
+         at least C++17 — nvcc's default dialect for this MSVC toolchain is lower, failing with
+         "libcu++ requires at least C++ 17" otherwise. Mirrors build_ptx.bat's CXX17 list
+         (issue #180's gdn_scan_step_f32_coop_split4; issue #183's attention_f32_split_kv adds
+         the same need to attention_f32.cu). Scoped to only the kernels that need it. -->
+    <CudaKernel Update="$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\attention_f32.cu">
+      <CxxStdFlag>-std=c++17</CxxStdFlag>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->
     <CudaKernel Update="$(CudaKernelDir)\add.cu;$(CudaKernelDir)\add_f32.cu;$(CudaKernelDir)\swiglu.cu;$(CudaKernelDir)\swiglu_f32.cu;$(CudaKernelDir)\convert.cu;$(CudaKernelDir)\bias_add.cu;$(CudaKernelDir)\bias_add_f32.cu;$(CudaKernelDir)\embedding.cu;$(CudaKernelDir)\embedding_f32out.cu;$(CudaKernelDir)\dequant.cu;$(CudaKernelDir)\quant_kv.cu">
@@ -93,7 +102,7 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) %(CudaKernel.CxxStdFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 
