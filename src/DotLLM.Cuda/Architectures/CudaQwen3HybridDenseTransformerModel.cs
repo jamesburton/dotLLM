@@ -99,6 +99,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private int _f16CacheMaxSeqLen;
     private int _f16CacheCurrentLength;
 
+    // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185). A fresh
+    // Forward call whose kvCache is a DIFFERENT instance than last time means "new/unrelated
+    // sequence" even when its MaxLength happens to match the previous cache's -- EnsureF16KvCache's
+    // "maxSeqLen <= _f16CacheMaxSeqLen" guard only resets _f16CacheCurrentLength/_f32KvValidLength
+    // on a capacity-driven reallocation, so a same-size reused-instance-free sequence (e.g. every
+    // rep after the first in `dotllm bench -r N>1`, or a scheduler session rebuild that lands on an
+    // identical cacheSize) would otherwise leave the previous sequence's final depth "stuck" for the
+    // new sequence's entire duration. Reference identity is a reliable signal here because every
+    // caller (BenchRunner, ContinuousBatchScheduler, TextGenerator) allocates a brand-new IKvCache
+    // instance per logical sequence and only reuses the SAME instance across calls that belong to
+    // that one sequence (including legitimate mid-sequence speculative-decoding rollback, which must
+    // NOT reset this state).
+    private IKvCache? _lastForwardKvCache;
+
     private nint _f16KvWriteStaging;
     private long _f16KvWriteStagingElems;
 
@@ -120,6 +134,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     // the old behavior across many consecutive decode steps and buffer growths. Never set on the
     // production Forward path.
     internal bool ForceFullKvReconvertForTest { get; set; }
+
+    /// <summary>
+    /// Test-only accessor for issue #185's regression test — exposes the F16 KV cache's current
+    /// -length cursor directly, since correctness (attention logits) is unaffected by the bug this
+    /// cursor's reset fixes (causal masking hides any stale over-length KV range regardless), so a
+    /// black-box logits comparison cannot discriminate broken vs. fixed here.
+    /// </summary>
+    internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
 
     // Opt-in split-KV attention (issue #183) scratch: partial (max, sum, out) per (head, split).
     // Sized once for the model's fixed (numHeads, headDim) shape and reused every decode step.
@@ -1099,6 +1121,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         // ── 6. Attention (GQA with causal mask) ──
         if (kvCache is not null)
         {
+            if (!ReferenceEquals(kvCache, _lastForwardKvCache))
+            {
+                _lastForwardKvCache = kvCache;
+                _f16CacheCurrentLength = 0;
+                if (_f32KvValidLength is not null) Array.Clear(_f32KvValidLength);
+            }
+
             EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
             int slot = _kvSlotForLayer[layer];
             if (slot < 0)
@@ -1133,11 +1162,11 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             //
             // Result (issue #182, RTX 3060, real Bonsai-27B, single continuous decode sequence --
             // NOT `dotllm bench -r N>1`, which was found during this work to be unsuitable for
-            // measuring this specific change: all reps but the discarded warmup share one model
-            // instance whose _f16CacheCurrentLength never resets when a same-size IKvCache is
-            // reused, so every REPORTED rep runs "stuck" at the previous rep's final depth for its
-            // entire duration -- a separate, pre-existing bench-methodology gap, not a correctness
-            // bug in this fix, see issue #182's PR description): bit-exact vs. the old full-range
+            // measuring this specific change: all reps but the discarded warmup shared one model
+            // instance whose _f16CacheCurrentLength never reset when a same-size IKvCache was
+            // reused, so every REPORTED rep ran "stuck" at the previous rep's final depth for its
+            // entire duration -- a separate bench-methodology gap, not a correctness bug in this
+            // fix, tracked and FIXED by issue #185's reference-identity reset above): bit-exact vs. the old full-range
             // reconversion (dedicated correctness test, many consecutive steps incl. a mid-run F32
             // staging buffer growth). End-to-end wall-clock across several full single-sequence
             // decode runs (2048-4096 steps, single-token-decode-loop depth-building to avoid an

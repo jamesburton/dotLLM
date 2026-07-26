@@ -119,6 +119,16 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
     private int _f16CacheMaxSeqLen;        // current allocated capacity
     private int _f16CacheCurrentLength;    // mirrors IKvCache.CurrentLength for the model-internal cache
 
+    // Identity of the IKvCache instance last seen by ForwardFullAttnBody (issue #185) -- see
+    // CudaQwen3HybridDenseTransformerModel's field doc for the full rationale. A same-size fresh
+    // IKvCache instance (a new logical sequence) must reset _f16CacheCurrentLength even when
+    // EnsureF16KvCache's capacity-driven reallocation guard no-ops.
+    private IKvCache? _lastForwardKvCache;
+
+    /// <summary>Test-only accessor for issue #185's regression test — see the Dense hybrid
+    /// model's identically-named member for the full rationale.</summary>
+    internal int DebugF16CacheCurrentLengthForTest => _f16CacheCurrentLength;
+
     // Per-step staging for the cache-enabled full-attention path.
     //
     // _f16KvWriteStaging: F32→F16 conversion target for the freshly-projected
@@ -2000,6 +2010,12 @@ public sealed unsafe class CudaQwen3MoeHybridTransformerModel : IModel
         //     dequant overwrites it) so the net savings is ~600 MB.
         if (kvCache is not null)
         {
+            if (!ReferenceEquals(kvCache, _lastForwardKvCache))
+            {
+                _lastForwardKvCache = kvCache;
+                _f16CacheCurrentLength = 0;
+            }
+
             EnsureF16KvCache(kvCache.MaxLength, numKvHeads, headDim);
             int slot = _kvSlotForLayer[layer];
             if (slot < 0)
