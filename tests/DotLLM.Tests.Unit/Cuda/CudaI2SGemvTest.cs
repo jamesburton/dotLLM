@@ -517,6 +517,171 @@ public class CudaI2SGemvTest
         Assert.True(meanDiff <= 1e-5f, $"mean abs diff {meanDiff} exceeds 1e-5");
     }
 
+    // ──────────────────── Ragged K (k % 128 != 0) — issue #206 ────────────────────
+    //
+    // The aligned kernels above assume k % 128 == 0 (uint4/shared-block addressing) and crash
+    // with "CUDA error 716: misaligned address" otherwise. i2_s_gemv_f32in_ragged /
+    // dequant_i2_s_f16_ragged are the correctness-first fallbacks reached when k is not
+    // 128-aligned (e.g. bitnet_b1_58-xl's ffn_down: hidden=2048, intermediate=5460).
+
+    [SkippableTheory]
+    [InlineData(16, 200)]   // small synthetic ragged k (200 % 128 == 72)
+    [InlineData(32, 5460)]  // real bitnet_b1_58-xl ffn_down shape; m=32 covers all 32 distinct
+                             // row-start bit-phases for k=5460 (gcd(5460,128)=4 -> period 32)
+    public void I2SGemvF32InRagged_MatchesCpuFloatReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunRagged(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunRagged(int n, int k)
+    {
+        Assert.NotEqual(0, k % 128); // sanity: this test exists specifically for ragged k
+        Assert.Equal(0, ((long)n * k) % 128); // PackRagged's exact-byte-sizing precondition
+
+        var rng = new Random(1234);
+        long total = (long)n * k;
+        long packedLen = total / 4 + 4;
+
+        sbyte[] ternary = new sbyte[total];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = 0.02f + (float)rng.NextDouble() * 0.03f;
+        byte[] packed = PackRagged(ternary, n, k, scale);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+
+        // CPU reference (now ragged-safe — MatMul.GemvI2_S dispatches to the ragged path itself).
+        float[] cpu = new float[n];
+        fixed (byte* w = packed)
+        fixed (float* px = x, py = cpu)
+            MatMul.GemvI2_S(w, px, py, n, k, null);
+
+        // GPU (ragged kernel).
+        float[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(float))).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+                fixed (float* px = x)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(float))).ThrowOnError();
+
+                kernels.LaunchI2_SGemvF32InRagged(devW, devX, devY, n, k, s);
+                stream.Synchronize();
+
+                gpu = new float[n];
+                fixed (float* py = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)py, devY, (nuint)((long)n * sizeof(float))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devX);
+                CudaDriverApi.cuMemFree_v2(devY);
+            }
+        }
+
+        float maxDiff = 0, sumDiff = 0;
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(cpu[i] - gpu[i]);
+            sumDiff += d;
+            if (d > maxDiff) maxDiff = d;
+        }
+        float meanDiff = sumDiff / n;
+        _out.WriteLine($"I2_S GEMV ragged {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
+
+        Assert.True(maxDiff <= 1e-3f, $"max abs diff {maxDiff} exceeds 1e-3 (CPU vs GPU should match to fp32)");
+        Assert.True(meanDiff <= 1e-4f, $"mean abs diff {meanDiff} exceeds 1e-4");
+    }
+
+    [SkippableTheory]
+    [InlineData(16, 200)]
+    [InlineData(32, 5460)]
+    public void DequantI2_SToF16Ragged_MatchesCpuReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunDequantRagged(n, k);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunDequantRagged(int n, int k)
+    {
+        Assert.NotEqual(0, k % 128);
+        Assert.Equal(0, ((long)n * k) % 128);
+
+        var rng = new Random(3456);
+        long total = (long)n * k;
+        long packedLen = total / 4 + 4;
+
+        sbyte[] ternary = new sbyte[total];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = 0.02f + (float)rng.NextDouble() * 0.03f;
+        byte[] packed = PackRagged(ternary, n, k, scale);
+
+        // CPU reference — DequantizeI2_S already treats elementCount as the flattened total, so
+        // it's already ragged-correct as long as the TOTAL element count is 128-aligned (which we
+        // assert above); no CPU-side change was needed for this path.
+        float[] cpu = new float[total];
+        fixed (byte* w = packed)
+            Dequantize.ToFloat32((nint)w, total, DotLLM.Core.Configuration.QuantizationType.I2_S, cpu);
+
+        Half[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devDst, (nuint)(total * sizeof(ushort))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+
+                kernels.LaunchDequantI2_SToF16Ragged(devW, devDst, n, k, s);
+                stream.Synchronize();
+
+                gpu = new Half[total];
+                fixed (Half* p = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)p, devDst, (nuint)(total * sizeof(ushort))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devDst);
+            }
+        }
+
+        float maxAbsDiff = 0, sumAbsDiff = 0;
+        for (long i = 0; i < cpu.Length; i++)
+        {
+            float d = MathF.Abs(cpu[i] - (float)gpu[i]);
+            sumAbsDiff += d;
+            if (d > maxAbsDiff) maxAbsDiff = d;
+        }
+        float meanAbsDiff = sumAbsDiff / cpu.Length;
+        _out.WriteLine($"I2_S dequant ragged {n}×{k}: max abs diff={maxAbsDiff:E4}, mean={meanAbsDiff:E4}");
+
+        Assert.True(maxAbsDiff <= 5e-4f, $"max abs diff {maxAbsDiff} exceeds 5e-4 (F16 rounding vs CPU float32)");
+        Assert.True(meanAbsDiff <= 1e-4f, $"mean abs diff {meanAbsDiff} exceeds 1e-4");
+    }
+
     /// <summary>
     /// Microbenchmark: Variant A (W2A16, FP16 activations) vs Variant B (W2A8, dp4a int8 activations)
     /// at the GEMV level on the real BitNet projection shapes. Informational — always passes; run with
@@ -610,6 +775,29 @@ public class CudaI2SGemvTest
             }
         }
         BitConverter.GetBytes(scale).CopyTo(buf, (int)((long)n * rowBytes));
+        return buf;
+    }
+
+    /// <summary>
+    /// Ragged-K packer (issue #206): unlike <see cref="Pack"/> above, block boundaries are NOT
+    /// reset per row — the block interleave is computed over the FLATTENED n*k element stream
+    /// (matching the real on-disk layout / upstream bitnet.cpp writer; see MatMul.I2S.cs's class
+    /// remarks and I2STests.PackI2S, the CPU-side twin of this helper). For aligned k the two
+    /// packers are bit-identical (every row boundary is also a block boundary); they only diverge
+    /// when k % 128 != 0, which is exactly the case this helper exists to test.
+    /// </summary>
+    private static byte[] PackRagged(sbyte[] ternary, int n, int k, float scale)
+    {
+        long total = (long)n * k;
+        byte[] buf = new byte[total / 4 + 4];
+        for (long e = 0; e < total; e++)
+        {
+            long block = e / 128;
+            int j = (int)(e % 128), gi = j / 32, gp = j % 32;
+            int code = ternary[e] + 1;
+            buf[block * 32 + gp] |= (byte)(code << (6 - 2 * gi));
+        }
+        BitConverter.GetBytes(scale).CopyTo(buf, (int)(total / 4));
         return buf;
     }
 

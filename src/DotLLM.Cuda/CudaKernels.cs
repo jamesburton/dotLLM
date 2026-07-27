@@ -192,6 +192,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemvA8DeviceScaleFunc;
     private readonly nint _quantizeF16ToI8AbsMaxFunc;
     private readonly nint _dequantI2sF16Func;
+    // Ragged K (k % 128 != 0) — issue #206.
+    private readonly nint _i2sGemvF16InRaggedFunc;
+    private readonly nint _i2sGemvF32InRaggedFunc;
+    private readonly nint _dequantI2sF16RaggedFunc;
     private readonly nint _pq2_0GemvF32InFunc;
     private readonly nint _pq2_0GemvF16InFunc;
     private readonly nint _pq2_0Gemv2F16InFunc;
@@ -624,8 +628,15 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
         _i2sGemvA8DeviceScaleFunc = _i2sGemvModule.GetFunction("i2_s_gemv_a8_device_scale");
         _quantizeF16ToI8AbsMaxFunc = _i2sGemvModule.GetFunction("quantize_f16_to_i8_absmax");
+        _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
+        // Ragged K (k % 128 != 0) — issue #206.
+        _i2sGemvF16InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in_ragged");
+        _i2sGemvF32InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in_ragged");
+        _dequantI2sF16RaggedFunc = _dequantI2sModule.GetFunction("dequant_i2_s_f16_ragged");
         // Opt the x-staging I2_S GEMV kernels (dynamic shared memory, see i2_s_gemv.cu / issue #207)
         // into the device's full dynamic-shared cap, same as the on-the-fly MMQ kernels above.
+        // Covers both the aligned fast-path kernels and the ragged (#206) fallback kernels — both
+        // families stage x[k] into the same `extern __shared__ float xs[]` pattern now.
         // i2_s_gemv_a8[_device_scale] read activations from global (no xs[] staging) — no opt-in needed.
         if (_maxDynamicSharedBytesOptIn > 0)
         {
@@ -634,8 +645,9 @@ public sealed unsafe class CudaKernels : IDisposable
             SetMaxDynamicSharedBytes(_i2sGemv3F16InFunc, _maxDynamicSharedBytesOptIn);
             SetMaxDynamicSharedBytes(_i2sGemvNormF16InFunc, _maxDynamicSharedBytesOptIn);
             SetMaxDynamicSharedBytes(_i2sGemvF32InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF16InRaggedFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF32InRaggedFunc, _maxDynamicSharedBytesOptIn);
         }
-        _dequantI2sF16Func = _dequantI2sModule.GetFunction("dequant_i2_s_f16");
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
@@ -1305,6 +1317,44 @@ public sealed unsafe class CudaKernels : IDisposable
                 dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
+    // Ragged K (k % 128 != 0) — issue #206. i2_s_gemv_{f16,f32}in_ragged use ONE warp per row
+    // (8 rows/block, fixed — not I2sRowsPerBlock, which encodes the aligned kernel's
+    // ROWS_PER_WARP=2 tuning) since they don't share the aligned kernels' uint4/shared-block
+    // launch contract. See i2_s_gemv.cu's issue #206 comment for why a ragged row cannot reuse the
+    // aligned addressing even for a "tail cleanup".
+    private const int I2sRaggedRowsPerBlock = 8;
+
+    /// <summary>
+    /// Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchI2_SGemvF16In"/>. Scalar
+    /// correctness-first fallback — see <c>i2_s_gemv_f16in_ragged</c> in i2_s_gemv.cu.
+    /// </summary>
+    public void LaunchI2_SGemvF16InRagged(nint quantWeight, nint xF16, nint yF16, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF16, yArg = yF16;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // Dynamic shared memory (issue #207 fix applied here too — the ragged kernel's x-staging
+        // buffer used the same fixed BitNet-2B-4T-sized static array as the aligned kernels).
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged k={k}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF16InRaggedFunc,
+                (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchI2_SGemvF32In"/>.</summary>
+    public void LaunchI2_SGemvF32InRagged(nint quantWeight, nint xF32, nint yF32, int n, int k, nint stream)
+    {
+        nint wArg = quantWeight, xArg = xF32, yArg = yF32;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged-f32 k={k}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemvF32InRaggedFunc,
+                (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
     /// <summary>
     /// I2_S ternary GEMV (W2A8, <c>__dp4a</c>): <c>y_f32[n] = scale · invActScale · int8dot(W[n,k], xq[k])</c>.
     /// Activations <paramref name="xqInt8"/> must be quantized per token (symmetric absmax,
@@ -1369,6 +1419,28 @@ public sealed unsafe class CudaKernels : IDisposable
         if (gridDim == 0) gridDim = 1;
 
         CudaDriverApi.cuLaunchKernel(_dequantI2sF16Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchDequantI2_SToF16"/>. The aligned
+    /// kernel's <c>blocks_per_row = k/128</c> integer division silently drops each row's tail
+    /// elements for a ragged k, so this dispatches a one-thread-per-output-element grid-stride
+    /// kernel (<c>dequant_i2_s_f16_ragged</c>) that derives each element's block/bit address
+    /// directly from its flattened index instead. See issue #206.
+    /// </summary>
+    public void LaunchDequantI2_SToF16Ragged(nint src, nint dst, int n, int k, nint stream)
+    {
+        nint srcArg = src, dstArg = dst;
+        int nArg = n, kArg = k;
+        void** args = stackalloc void*[] {&srcArg, &dstArg, &nArg, &kArg};
+
+        long totalElems = (long)n * k;
+        uint gridDim = (uint)Math.Min((totalElems + BlockSize - 1) / BlockSize, MaxDequantGridSize);
+        if (gridDim == 0) gridDim = 1;
+
+        CudaDriverApi.cuLaunchKernel(_dequantI2sF16RaggedFunc,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }

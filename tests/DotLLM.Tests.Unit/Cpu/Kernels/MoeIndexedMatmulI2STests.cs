@@ -203,4 +203,77 @@ public sealed unsafe class MoeIndexedMatmulI2STests
             NativeMemory.Free(banks);
         }
     }
+
+    /// <summary>
+    /// Ragged K (issue #206): the indexed path used to guard <c>k % 128 == 0</c> explicitly, but
+    /// it always delegates to <see cref="MatMul.GemmI2_S(byte*, float*, float*, int, int, int, float, DotLLM.Cpu.Threading.ComputeThreadPool?)"/>
+    /// per touched expert, which is now ragged-safe — so the guard was simply removed. Proves the
+    /// indexed path still matches the dense reference when k is not a multiple of 128.
+    ///
+    /// <para>m is chosen so <c>m*k</c> (the total per-expert element count) is itself an exact
+    /// multiple of 128 (gcd(200,128)=8, so m must be a multiple of 16) — matching how every real
+    /// I2_S GGUF tensor is shaped (the flattened-block packing never leaves an unwritten partial
+    /// tail at the very end of the tensor; a total that isn't 128-aligned would need its own
+    /// "implicit zero tail" handling, out of this issue's scope since no real checkpoint needs
+    /// it — see PackI2S's byte-sizing note in I2STests.cs for why this matters for the test
+    /// packer specifically).</para>
+    /// </summary>
+    [Fact]
+    public void RaggedK_MatchesDenseI2SGemm()
+    {
+        var rng = new Random(206);
+        const int m = 16;   // m*k = 3200 = 25*128 (exact — see remarks above)
+        const int k = 200;   // NOT a multiple of 128 (200 % 128 == 72)
+        const int n = 9;
+        const int numExperts = 3;
+        const float scale = 0.031f;
+
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float[] bAct = new float[n * k];
+        for (int i = 0; i < bAct.Length; i++) bAct[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* dense = PackI2SWithTailScale(ternary, scale);
+        float[] cDense = new float[n * m];
+
+        long payloadBytes = (long)m * k / 4;
+        byte* banks = (byte*)NativeMemory.AllocZeroed((nuint)(payloadBytes * numExperts));
+        float[] expertScales = new float[numExperts];
+        int[] rowExpertIds = new int[n];
+        float[] cIndexed = new float[n * m];
+
+        try
+        {
+            for (int e = 0; e < numExperts; e++)
+            {
+                PackI2SPayloadOnly(ternary, banks + e * payloadBytes);
+                expertScales[e] = scale;
+            }
+            for (int t = 0; t < n; t++) rowExpertIds[t] = t % numExperts;
+
+            fixed (float* bp = bAct)
+            fixed (float* cdp = cDense)
+            fixed (float* cip = cIndexed)
+            fixed (float* scalesPtr = expertScales)
+            fixed (int* rowPtr = rowExpertIds)
+            {
+                MatMul.GemmI2_S(dense, bp, cdp, m, k, n, threadPool: null);
+
+                MatMul.MoeIndexedMatmulI2_S(
+                    banks, payloadBytes,
+                    new ReadOnlySpan<float>(scalesPtr, numExperts),
+                    bp, cip, m, k, n,
+                    new ReadOnlySpan<int>(rowPtr, n),
+                    threadPool: null);
+            }
+
+            for (int i = 0; i < n * m; i++)
+                AssertWithinTolerance(cDense[i], cIndexed[i]);
+        }
+        finally
+        {
+            NativeMemory.Free(dense);
+            NativeMemory.Free(banks);
+        }
+    }
 }
