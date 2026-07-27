@@ -1,7 +1,9 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Models.Architectures;
+using DotLLM.Models.Gguf;
 using DotLLM.Vulkan.Interop;
 using DotLLM.Vulkan.Kernels;
 
@@ -1919,7 +1921,37 @@ internal sealed class VulkanWeights : IDisposable
         && rawK == expectedK
         && (expectedK % 32) == 0;
 
-    private static QuantizationType MoeRoutedRawDeviceQuantType(
+    /// <summary>
+    /// Resolves the on-device storage type for ONE routed expert bank
+    /// (<c>ffn_gate_exps</c>/<c>ffn_up_exps</c>/<c>ffn_down_exps</c>): the raw
+    /// GGUF quant type is kept verbatim on device — dispatched through the
+    /// matching indexed-matmul kernel — when it is one of the types this
+    /// resolver recognizes AND the shape lines up; otherwise the caller falls
+    /// back to an F32 host dequant (<see cref="UploadRoutedBankWhole"/>'s F32
+    /// branch, which reads the per-expert <c>moe.W1</c>/<c>W2</c>/<c>W3</c>
+    /// pointers).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>#191.</b> Q4_K/Q5_K/Q6_K recognition (the common case for
+    /// <c>*_K_M</c>-quantized DeepSeek-family GGUFs) was added here — previously
+    /// only Q8_0 and coopmat-gated F16 were recognized, so K-quant routed banks
+    /// always fell back to F32, which silently defeats
+    /// <c>skipF32MoeDequant</c> (the CPU-side flag that skips populating the
+    /// F32 host arrays): with the flag set and no on-device K-quant path, this
+    /// resolver would have returned F32 and the caller would have read a null
+    /// per-expert pointer — see <see cref="CanSkipMoeF32HostDequant"/>, which
+    /// preflights against this exact predicate before the flag is ever passed
+    /// to <c>TransformerWeights.LoadFromGguf</c>.
+    /// </para>
+    /// <para>
+    /// <c>internal</c> (rather than <c>private</c>) so <see cref="CanSkipMoeF32HostDequant"/>
+    /// — and tests — can evaluate the identical resolution the real upload
+    /// path (<see cref="UploadMoeLayer"/>) will make, without needing a live
+    /// GGUF-backed <see cref="MoeLayerWeights"/> to probe it.
+    /// </para>
+    /// </remarks>
+    internal static QuantizationType MoeRoutedRawDeviceQuantType(
         VulkanDevice device,
         nint raw, QuantizationType qt,
         int rawM, int rawK,
@@ -1927,6 +1959,13 @@ internal sealed class VulkanWeights : IDisposable
     {
         if (MoeRoutedRawKeepsQ8(raw, qt, rawM, rawK, expectedM, expectedK))
             return QuantizationType.Q8_0;
+
+        if (raw != 0 && rawM == expectedM && rawK == expectedK)
+        {
+            if (MoeOverlayKeepsQ4K(qt, expectedK)) return QuantizationType.Q4_K;
+            if (MoeOverlayKeepsQ5K(qt, expectedK)) return QuantizationType.Q5_K;
+            if (MoeOverlayKeepsQ6K(qt, expectedK)) return QuantizationType.Q6_K;
+        }
 
         // Strategy C path: keep routed F16 expert banks raw only when the
         // coopmat grouped matmul can consume them. Otherwise upload F32 so
@@ -1940,6 +1979,80 @@ internal sealed class VulkanWeights : IDisposable
             return QuantizationType.F16;
 
         return QuantizationType.F32;
+    }
+
+    /// <summary>
+    /// Preflight check for whether <c>TransformerWeights.LoadFromGguf(gguf, config,
+    /// skipF32MoeDequant: true)</c> is safe to call for this (device, gguf, config)
+    /// combination — i.e. whether EVERY MoE layer's three routed banks (gate/up/down)
+    /// would resolve to a supported non-F32 on-device quant type via
+    /// <see cref="MoeRoutedRawDeviceQuantType"/>, the SAME predicate the real upload
+    /// path (<see cref="UploadMoeLayer"/>) uses.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Scope (#191).</b> Returns <c>false</c> immediately unless the model is
+    /// DeepSeek-family (MLA + MoE): <c>skipF32MoeDequant</c> only threads through
+    /// <c>TransformerWeights.LoadMlaLayer</c> → <c>LoadDeepSeekMoeLayer</c>. Every other
+    /// MoE loader path (<c>LoadQuantExpertMoeLayer</c> for Mixtral/Qwen-MoE/gpt-oss,
+    /// Gemma-4's dedicated loader) either never F32-dequants routed banks to begin with
+    /// or doesn't accept the flag — passing <c>true</c> there would be a silent no-op,
+    /// not a win, so this preflight isn't reached for them.
+    /// </para>
+    /// <para>
+    /// <b>Why the check matters.</b> When <c>skipF32MoeDequant</c> is true,
+    /// <c>LoadDeepSeekMoeLayer</c>'s <c>skipRoutedDequant</c> branch leaves
+    /// <see cref="MoeLayerWeights.W1"/>/<see cref="MoeLayerWeights.W2"/>/
+    /// <see cref="MoeLayerWeights.W3"/> as all-NULL pointer arrays — the raw GGUF mmap
+    /// view is the only valid weight source for that layer. If even one routed bank on
+    /// one MoE layer would resolve to <see cref="QuantizationType.F32"/> (the upload
+    /// fallback), <see cref="UploadRoutedBankWhole"/>'s F32 branch reads that null
+    /// pointer per expert — SILENT CORRUPTION (a null/garbage weight matrix silently
+    /// multiplied into the forward pass), not a crash. This preflight inspects the GGUF
+    /// tensor descriptors directly (no CPU weights loaded yet) and returns <c>false</c>
+    /// the moment any bank on any MoE layer would need the F32 fallback, so the caller
+    /// can fall back to the safe (if more host-RAM-hungry) default per model instead of
+    /// assuming universal K-quant coverage.
+    /// </para>
+    /// </remarks>
+    internal static bool CanSkipMoeF32HostDequant(VulkanDevice device, GgufFile gguf, ModelConfig config)
+    {
+        if (config.MlaConfig is null || config.Moe is null)
+            return false;
+
+        var moe = config.Moe;
+        var tensors = gguf.TensorsByName;
+        nint dataBase = gguf.DataBasePointer;
+        int hiddenSize = config.HiddenSize;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (!moe.IsMoeLayer(i))
+                continue;
+
+            string prefix = $"blk.{i}";
+            if (!tensors.TryGetValue($"{prefix}.ffn_gate_exps.weight", out var gateDesc)
+                || !tensors.TryGetValue($"{prefix}.ffn_up_exps.weight", out var upDesc)
+                || !tensors.TryGetValue($"{prefix}.ffn_down_exps.weight", out var downDesc))
+                return false; // Unexpected/missing tensor — fall back to the safe F32 path.
+
+            nint gateRaw = dataBase + (nint)gateDesc.DataOffset;
+            nint upRaw = dataBase + (nint)upDesc.DataOffset;
+            nint downRaw = dataBase + (nint)downDesc.DataOffset;
+
+            var w1Qt = MoeRoutedRawDeviceQuantType(
+                device, gateRaw, gateDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);
+            var w3Qt = MoeRoutedRawDeviceQuantType(
+                device, upRaw, upDesc.QuantizationType, moeIntermediate, hiddenSize, moeIntermediate, hiddenSize);
+            var w2Qt = MoeRoutedRawDeviceQuantType(
+                device, downRaw, downDesc.QuantizationType, hiddenSize, moeIntermediate, hiddenSize, moeIntermediate);
+
+            if (w1Qt == QuantizationType.F32 || w2Qt == QuantizationType.F32 || w3Qt == QuantizationType.F32)
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>True iff a Q4_K MoE overlay can be kept on device as raw Q4_K super-blocks

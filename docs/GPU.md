@@ -569,13 +569,16 @@ immediately.
   a different rejection point/code than the iGPU finding, consistent with dGPUs not being able to
   serve arbitrary non-pinned mmap'd host pages as `DEVICE_LOCAL` over PCIe. Expected to remain
   dormant on dGPUs; the payoff is UMA-specific. See `.perf-runs/vulkan-load-147/README.md` addendum.
-- **Vulkan K-quant routed-MoE raw-view coverage** (#147 follow-up): `VulkanWeights.MoeRoutedRawDeviceQuantType`
-  only keeps routed expert banks (`W1`/`W2`/`W3`) raw for Q8_0 or F16(+coopmat); Q4_K/Q5_K/Q6_K routed
-  banks (the common `*_K_M` DeepSeek-family case) still require the F32 host-dequant arrays. This is
-  why `VulkanTransformerModel.LoadFromGguf` cannot yet pass `skipF32MoeDequant: true` the way CUDA
-  does (would zero-fill W1/W2/W3 for K-quant banks and silently corrupt DeepSeek-MoE Vulkan inference).
-  `VulkanQwen3MoeHybridKernels` already has the needed `MoeIndexedMatmulQ4_K/Q5_K/Q6_KF32Kernel`
-  dispatch for its own loader path; porting the same raw-view dispatch to the generic/DeepSeek path
-  would unlock a multi-GiB-per-load host-RAM win. Tracked separately from #147.
+- **Vulkan K-quant routed-MoE raw-view coverage** (#147 follow-up, resolved by #191):
+  `VulkanWeights.MoeRoutedRawDeviceQuantType` now recognizes Q4_K/Q5_K/Q6_K routed expert banks
+  (`W1`/`W2`/`W3`) in addition to Q8_0/F16(+coopmat) — the common `*_K_M` DeepSeek-family case.
+  `VulkanTransformerModel.LoadFromGguf` now calls `VulkanWeights.CanSkipMoeF32HostDequant` to
+  preflight every MoE layer's routed banks against this same resolver before opting into
+  `skipF32MoeDequant: true`, falling back to the safe F32 host-dequant default whenever any bank
+  wouldn't resolve to a supported raw-quant device type (avoids the CUDA-parity flag silently
+  zero-filling `W1`/`W2`/`W3` for an unsupported quant type). `RecordMoeIndexedMatmul` now dispatches
+  Q4_K/Q5_K/Q6_K routed banks through `MoeIndexedMatmulQ4_K/Q5_K/Q6_KF32Kernel` unconditionally
+  whenever the model has MoE layers (previously the Q4_K kernel was only ever constructed under
+  `Gemma4DualFfn`, so a non-Gemma4 model's K-quant routed banks always fell back to F32 upload).
 
 See [ROADMAP.md](ROADMAP.md) Phase 4 for the full plan.
