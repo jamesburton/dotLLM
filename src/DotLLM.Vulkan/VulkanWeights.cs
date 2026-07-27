@@ -1112,6 +1112,16 @@ internal sealed class VulkanWeights : IDisposable
     private static bool KeepI2SOnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
         => !dequantToFp32 && qt == QuantizationType.I2_S && (inputDim % 128) == 0;
 
+    /// <summary>Returns true when the matrix will be kept on device as raw PQ2_0 (PrismML
+    /// Bonsai ternary) groups: (K/128)·34 bytes per row (2-byte fp16 group scale + 32-byte
+    /// packed codes per 128-element group, unlike I2_S's single per-tensor tail scale). Gated
+    /// on the contraction axis being a multiple of the PQ2_0 group size (128), which the GEMV
+    /// kernel requires. GEMM/prefill is not yet implemented on Vulkan (#205 follow-on), so this
+    /// predicate does not gate on a prefill-capable kernel existing — the dispatcher throws a
+    /// clear error for seqLen &gt; 1 until the GEMM kernel lands.</summary>
+    private static bool KeepPQ2_0OnDevice(QuantizationType qt, int inputDim, bool dequantToFp32)
+        => !dequantToFp32 && qt == QuantizationType.PQ2_0 && (inputDim % 128) == 0;
+
     /// <summary>Returns the on-device storage quant type for a projection: Q8_0 / Q4_K /
     /// Q5_K / Q6_K / IQ4_NL / IQ4_XS / F16 / BF16 / F32 depending on the source and the
     /// alignment constraints.</summary>
@@ -1166,6 +1176,7 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepIq3SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ3_S;
         if (KeepIq1SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.IQ1_S;
         if (KeepI2SOnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.I2_S;
+        if (KeepPQ2_0OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.PQ2_0;
         if (KeepF16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.F16;
         if (KeepBf16OnDevice(srcQt, inputDim, dequantToFp32)) return QuantizationType.BF16;
         return QuantizationType.F32;
@@ -1250,6 +1261,9 @@ internal sealed class VulkanWeights : IDisposable
         if (KeepI2SOnDevice(qt, inputDim, dequantToFp32))
             // m·(K/4) packed bytes + one trailing per-tensor float32 scale.
             return Dequantize.RowByteSize(inputDim, QuantizationType.I2_S) * outputDim + sizeof(float);
+        if (KeepPQ2_0OnDevice(qt, inputDim, dequantToFp32))
+            // m·(K/128)·34 bytes — no tensor-tail scale, each group carries its own (contrast I2_S).
+            return Dequantize.RowByteSize(inputDim, QuantizationType.PQ2_0) * outputDim;
         if (KeepF16OnDevice(qt, inputDim, dequantToFp32))
             return Dequantize.RowByteSize(inputDim, QuantizationType.F16) * outputDim;
         if (KeepBf16OnDevice(qt, inputDim, dequantToFp32))

@@ -1,0 +1,110 @@
+#version 450
+// PQ2_0 (PrismML Bonsai ternary) matrix-vector multiplication (decode-path GEMV).
+//
+//   y[m] = sum_g scale(m,g) * sum_{c in group g} (code(m,g,c) - 1) * x[c]
+//
+// Sibling of matmul_i2_s_f32_gemv.comp — same dispatch model (one workgroup per
+// output row, 128 threads, shared-memory tree reduce) and the same 2-bit ternary
+// code packing, but where I2_S carries ONE per-tensor float32 scale at the buffer
+// tail, PQ2_0 carries a per-128-element-group fp16 scale INTERLEAVED immediately
+// before each group's packed codes. There is no tensor-tail scale to read.
+//
+// Weight layout (matches DotLLM.Cpu.Kernels.MatMul.UnpackPQ2_0Row /
+// DotLLM.Cpu.Kernels.Dequantize.DequantizePQ2_0 byte-for-byte):
+//   Each 128 contiguous elements of a row form one 34-byte group:
+//       bytes [0..1]  : float16 group scale (little-endian, IEEE-754 binary16)
+//       bytes [2..33] : 32 bytes packing 4 ternary codes (2 bits each) per byte —
+//                       byte gp (0..31) packs codes for group-relative elements
+//                       {gp, gp+32, gp+64, gp+96} at bit offsets {6, 4, 2, 0}.
+//                       value = code - 1, scaled by this group's fp16 scale.
+//   Row stride = (K / 128) * 34 bytes. K must be a multiple of 128.
+//
+// Dispatch: one workgroup per output row (gl_WorkGroupID.x = m), 128 threads stride
+// across the row's 128-code-byte spans (one span per group) and accumulate the
+// group-scaled partial dot product, then reduce in shared memory.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufX { float x[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint blocksPerRow;   // = K / 128 (number of 34-byte groups per row)
+    uint rowUints;       // unused here; kept for push-constant layout parity
+} pc;
+
+const uint PQ2_GROUP_SIZE   = 128u;
+const uint PQ2_GROUP_BYTES  = 34u;   // 2 (fp16 scale) + 32 (packed codes)
+const uint PQ2_CODE_BYTES   = 32u;
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Reads the little-endian fp16 group scale at absolute byte offset `off` (off need
+// not be 4-byte aligned — 34-byte groups straddle uint-word boundaries after the
+// first group) and converts to float32.
+float readGroupScale(uint off) {
+    uint lo = readByte(off);
+    uint hi = readByte(off + 1u);
+    uint half16 = lo | (hi << 8u);
+    return unpackHalf2x16(half16).x;
+}
+
+shared float partials[128];
+
+void main() {
+    uint m = gl_WorkGroupID.x;
+    if (m >= pc.M) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    uint rowBytes = pc.blocksPerRow * PQ2_GROUP_BYTES;
+    uint rowByteBase = m * rowBytes;
+
+    // Stride all 128 lanes over the row's blocksPerRow groups' code bytes (one
+    // code-byte = 4 ternary codes -> 4 elements at group-relative positions
+    // {gp, gp+32, gp+64, gp+96}). Total code-byte count = blocksPerRow * 32; a lane
+    // handling code-byte index `cb` belongs to group `cb / 32` and byte-within-group
+    // `cb % 32`. Adjacent lanes read adjacent code bytes (same/next uint word) so
+    // the weight loads coalesce; the group scale is re-read (once per group-span,
+    // amortized/cached by the driver's L1/L2, not shared-memory-cached here since
+    // each lane only touches its own group's scale a handful of times).
+    uint totalCodeBytes = pc.blocksPerRow * PQ2_CODE_BYTES;
+    float acc = 0.0;
+    for (uint cb = tid; cb < totalCodeBytes; cb += threads) {
+        uint g  = cb / PQ2_CODE_BYTES;        // group index within the row
+        uint gp = cb - g * PQ2_CODE_BYTES;     // 0..31 within the group's code bytes
+
+        uint groupByteBase = rowByteBase + g * PQ2_GROUP_BYTES;
+        float scale = readGroupScale(groupByteBase);
+        uint codeByteOff = groupByteBase + 2u + gp;
+
+        uint pk = readByte(codeByteOff);
+        float c0 = float(int((pk >> 6u) & 3u) - 1);
+        float c1 = float(int((pk >> 4u) & 3u) - 1);
+        float c2 = float(int((pk >> 2u) & 3u) - 1);
+        float c3 = float(int( pk        & 3u) - 1);
+
+        uint xBase = g * PQ2_GROUP_SIZE + gp;
+        acc += scale * (c0 * x[xBase]
+                       + c1 * x[xBase + 32u]
+                       + c2 * x[xBase + 64u]
+                       + c3 * x[xBase + 96u]);
+    }
+
+    partials[tid] = acc;
+    barrier();
+    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partials[tid] = partials[tid] + partials[tid + stride];
+        barrier();
+    }
+
+    if (tid == 0u) y[m] = partials[0];
+}
