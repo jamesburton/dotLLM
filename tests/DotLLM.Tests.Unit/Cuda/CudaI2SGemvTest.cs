@@ -29,11 +29,38 @@ public class CudaI2SGemvTest
 
     [SkippableTheory]
     [InlineData(2560, 2560)]  // attention projection
-    [InlineData(2560, 6912)]  // FFN down (k = 6912)
+    [InlineData(2560, 6912)]  // FFN down (k = 6912) — BitNet b1.58-2B-4T's own bound
+    // Regression coverage for issue #207: the x-staging shared buffer used to be a fixed-size
+    // STATIC `__shared__ float xs[6912]`, sized specifically for BitNet-2B-4T's own largest k
+    // (its FFN-down projection). A non-BitNet Llama-body I2_S GGUF whose intermediate size
+    // exceeds 6912 dispatches its FFN-down decode GEMV (Project() → LaunchI2_SGemvF16In, k =
+    // DownInputDim = intermediateSize) through the exact same kernel and used to silently
+    // overflow that array, corrupting shared memory and producing a CUDA "illegal memory
+    // access" fault. These two cases are the REAL Down-projection shapes from the two models
+    // that surfaced the bug (Falcon-E-3B-Instruct: hidden=2048/intermediate=13312; Falcon3-3B-
+    // Base-1.58bit: hidden=3072/intermediate=9216) — both exceed the old 6912 static bound and
+    // must now succeed (dynamic shared memory, sized per-call — see i2_s_gemv.cu).
+    [InlineData(2048, 13312)] // Falcon-E-3B-Instruct FFN down (k = intermediateSize = 13312)
+    [InlineData(3072, 9216)]  // Falcon3-3B-Base-1.58bit FFN down (k = intermediateSize = 9216)
     public void I2SGemvF32In_MatchesCpuFloatReference(int n, int k)
     {
         Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
         Run(n, k);
+    }
+
+    /// <summary>
+    /// Same regression as <see cref="I2SGemvF32In_MatchesCpuFloatReference"/> but through the
+    /// FP16 GEMV (<see cref="CudaKernels.LaunchI2_SGemvF16In"/>) — the kernel actually dispatched
+    /// in production for decode-time projections (<c>CudaTransformerModel.Project</c>), including
+    /// the FFN-down projection that triggered issue #207 on Llama-arch I2_S GGUFs.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2048, 13312)] // Falcon-E-3B-Instruct FFN down
+    [InlineData(3072, 9216)]  // Falcon3-3B-Base-1.58bit FFN down
+    public void I2SGemvF16In_LargeNonBitNetIntermediateK_MatchesCpuFloatReference(int n, int k)
+    {
+        Skip.IfNot(IsCudaDriverPresent(), "No CUDA GPU available");
+        RunF16(n, k);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
@@ -105,6 +132,90 @@ public class CudaI2SGemvTest
 
         Assert.True(maxDiff <= 1e-3f, $"max abs diff {maxDiff} exceeds 1e-3 (CPU vs GPU should match to fp32)");
         Assert.True(meanDiff <= 1e-4f, $"mean abs diff {meanDiff} exceeds 1e-4");
+    }
+
+    /// <summary>
+    /// FP16-in/out twin of <see cref="Run"/>, exercising <see cref="CudaKernels.LaunchI2_SGemvF16In"/> —
+    /// the kernel <c>CudaTransformerModel.Project</c> actually dispatches to for decode-time I2_S
+    /// projections (issue #207: this is specifically the kernel the FFN-down projection hits, with
+    /// k = intermediateSize). FP16 output rounding widens the tolerance vs the FP32 twin.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private unsafe void RunF16(int n, int k)
+    {
+        var rng = new Random(5678);
+        int rowBytes = k / 4;
+        long packedLen = (long)n * rowBytes + 4;
+
+        sbyte[] ternary = new sbyte[(long)n * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = 0.02f + (float)rng.NextDouble() * 0.03f;
+        byte[] packed = Pack(ternary, n, k, scale);
+
+        float[] xf = new float[k];
+        for (int i = 0; i < k; i++) xf[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+        Half[] x = new Half[k];
+        for (int i = 0; i < k; i++) x[i] = (Half)xf[i];
+
+        // CPU reference (full float precision — the FP16 GPU result is compared against this
+        // with a widened tolerance for the F16 input/output rounding).
+        float[] cpu = new float[n];
+        fixed (byte* w = packed)
+        fixed (float* px = xf, py = cpu)
+            MatMul.GemvI2_S(w, px, py, n, k, null);
+
+        Half[] gpu;
+        {
+            using var ctx = CudaContext.Create(0);
+            using var stream = CudaStream.Create();
+            string? ptxDir = FindPtxDir();
+            Skip.If(ptxDir == null, "PTX files not found");
+            using var kernels = new CudaKernels(ptxDir!);
+            nint s = stream.Handle;
+
+            CudaDriverApi.cuMemAlloc_v2(out nint devW, (nuint)packedLen).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devX, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
+            CudaDriverApi.cuMemAlloc_v2(out nint devY, (nuint)((long)n * sizeof(ushort))).ThrowOnError();
+            try
+            {
+                fixed (byte* w = packed)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devW, (nint)w, (nuint)packedLen).ThrowOnError();
+                fixed (Half* px = x)
+                    CudaDriverApi.cuMemcpyHtoD_v2(devX, (nint)px, (nuint)((long)k * sizeof(ushort))).ThrowOnError();
+
+                // Pre-fix, this call staged x into a fixed 6912-float STATIC shared array — for
+                // k > 6912 (both cases here) that overflowed the buffer, corrupting shared memory
+                // and typically faulting with CUDA error 700 (illegal memory access) either on this
+                // launch or the Synchronize() below.
+                kernels.LaunchI2_SGemvF16In(devW, devX, devY, n, k, s);
+                stream.Synchronize();
+
+                gpu = new Half[n];
+                fixed (Half* py = gpu)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)py, devY, (nuint)((long)n * sizeof(ushort))).ThrowOnError();
+            }
+            finally
+            {
+                CudaDriverApi.cuMemFree_v2(devW);
+                CudaDriverApi.cuMemFree_v2(devX);
+                CudaDriverApi.cuMemFree_v2(devY);
+            }
+        }
+
+        float maxDiff = 0, sumDiff = 0;
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(cpu[i] - (float)gpu[i]);
+            sumDiff += d;
+            if (d > maxDiff) maxDiff = d;
+            Assert.False(float.IsNaN((float)gpu[i]) || float.IsInfinity((float)gpu[i]),
+                $"index {i}: non-finite GPU output {(float)gpu[i]} (would indicate leftover shared-memory corruption)");
+        }
+        float meanDiff = sumDiff / n;
+        _out.WriteLine($"I2_S GEMV F16 {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
+
+        Assert.True(maxDiff <= 5e-2f, $"max abs diff {maxDiff} exceeds 5e-2 (CPU fp32 vs GPU fp16)");
+        Assert.True(meanDiff <= 5e-3f, $"mean abs diff {meanDiff} exceeds 5e-3");
     }
 
     [SkippableTheory]

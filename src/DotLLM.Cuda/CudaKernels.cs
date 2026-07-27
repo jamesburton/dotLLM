@@ -475,6 +475,21 @@ public sealed unsafe class CudaKernels : IDisposable
         _relu2GluRmsNormModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "relu2_glu_rmsnorm.ptx"));
         _fusedAddRmsNormF32ResModule = CudaModule.LoadFromFile(Path.Combine(ptxDir, "fused_add_rmsnorm_f32res.ptx"));
 
+        // Query the device's opt-in dynamic shared-memory cap ONCE, unconditionally (not gated
+        // on the optional MMQ PTX below) — the always-loaded I2_S GEMV kernels need it too (see
+        // issue #207: their x-staging shared buffer used to be a BitNet-2B-4T-sized static array;
+        // it is now dynamic and must be opted into >48 KB for large-intermediate non-BitNet models).
+        {
+            int devForOptIn;
+            if (CudaDriverApi.cuCtxGetDevice(out devForOptIn) == 0
+                && CudaDriverApi.cuDeviceGetAttribute(out int optIn0,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, devForOptIn) == 0
+                && optIn0 > 0)
+            {
+                _maxDynamicSharedBytesOptIn = optIn0;
+            }
+        }
+
         // MMQ-style fused dequant+matmul GEMV (optional — PTX may not be compiled yet).
         // Provides a faster Q4_K decode path via dp4a-packed INT8 multiply-add.
         string mmqPath = Path.Combine(ptxDir, "quantized_gemv_mmq.ptx");
@@ -518,13 +533,9 @@ public sealed unsafe class CudaKernels : IDisposable
             // ~15.7 KB and Llama-405B-class intermediate=53248 lands at ~58 KB — past 48 KB. Opt
             // each on-the-fly variant into the device's full optin cap (typically 100+ KB on
             // Ampere/Ada/Hopper) so any in-budget k launches without recompiling.
-            int devForOptIn;
-            if (CudaDriverApi.cuCtxGetDevice(out devForOptIn) == 0
-                && CudaDriverApi.cuDeviceGetAttribute(out int optIn,
-                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, devForOptIn) == 0
-                && optIn > 0)
+            if (_maxDynamicSharedBytesOptIn > 0)
             {
-                _maxDynamicSharedBytesOptIn = optIn;
+                int optIn = _maxDynamicSharedBytesOptIn;
                 SetMaxDynamicSharedBytes(_quantizedGemvQ4_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ2_KMmqFunc, optIn);
                 SetMaxDynamicSharedBytes(_quantizedGemvQ5_KMmqFunc, optIn);
@@ -622,6 +633,21 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemvF16InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f16in_ragged");
         _i2sGemvF32InRaggedFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in_ragged");
         _dequantI2sF16RaggedFunc = _dequantI2sModule.GetFunction("dequant_i2_s_f16_ragged");
+        // Opt the x-staging I2_S GEMV kernels (dynamic shared memory, see i2_s_gemv.cu / issue #207)
+        // into the device's full dynamic-shared cap, same as the on-the-fly MMQ kernels above.
+        // Covers both the aligned fast-path kernels and the ragged (#206) fallback kernels — both
+        // families stage x[k] into the same `extern __shared__ float xs[]` pattern now.
+        // i2_s_gemv_a8[_device_scale] read activations from global (no xs[] staging) — no opt-in needed.
+        if (_maxDynamicSharedBytesOptIn > 0)
+        {
+            SetMaxDynamicSharedBytes(_i2sGemvF16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemv2F16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemv3F16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvNormF16InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF32InFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF16InRaggedFunc, _maxDynamicSharedBytesOptIn);
+            SetMaxDynamicSharedBytes(_i2sGemvF32InRaggedFunc, _maxDynamicSharedBytesOptIn);
+        }
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
         _pq2_0Gemv2F16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv2_f16in");
@@ -1200,10 +1226,15 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF16, yArg = yF16;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // Dynamic shared memory: x[k] staged as FP32 (see i2_s_gemv.cu). Sized per-call since k
+        // varies by projection (e.g. FFN-down's k = intermediateSize, which can exceed the old
+        // BitNet-2B-4T-specific static bound — see issue #207).
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV k={k}");
         // v2 warp-per-row: I2sRowsPerBlock output rows per 256-thread block → ceil(n / rows) blocks.
         CudaDriverApi.cuLaunchKernel(_i2sGemvF16InFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Fused I2_S ternary GEMV for two projections sharing one FP16 input vector.</summary>
@@ -1221,9 +1252,11 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             &w0Arg, &w1Arg, &xArg, &y0Arg, &y1Arg, &n0Arg, &n1Arg, &kArg
         };
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV2 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemv2F16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Fused I2_S ternary GEMV for three projections sharing one FP16 input vector.</summary>
@@ -1242,9 +1275,11 @@ public sealed unsafe class CudaKernels : IDisposable
             &w0Arg, &w1Arg, &w2Arg, &xArg, &y0Arg, &y1Arg, &y2Arg,
             &n0Arg, &n1Arg, &n2Arg, &kArg
         };
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV3 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemv3F16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>I2_S ternary GEMV whose FP16 input is RMS-normalized in-kernel before projection.</summary>
@@ -1261,9 +1296,12 @@ public sealed unsafe class CudaKernels : IDisposable
         {
             &wArg, &xArg, &normArg, &yArg, &nArg, &kArg, &epsArg
         };
+        // Shared layout (i2_s_gemv.cu): xs[k] (even-aligned) + warp_sums[32] + rms_inv[1].
+        uint dynShmem = (uint)(((k + 1) & ~1) + 33) * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV-norm k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvNormF16InFunc,
                 grid, 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>I2_S ternary GEMV with FP32 activations/output. Exact-match twin for CPU-vs-GPU tests.</summary>
@@ -1272,9 +1310,11 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF32, yArg = yF32;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV-f32 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     // Ragged K (k % 128 != 0) — issue #206. i2_s_gemv_{f16,f32}in_ragged use ONE warp per row
@@ -1293,9 +1333,13 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF16, yArg = yF16;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        // Dynamic shared memory (issue #207 fix applied here too — the ragged kernel's x-staging
+        // buffer used the same fixed BitNet-2B-4T-sized static array as the aligned kernels).
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvF16InRaggedFunc,
                 (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>Ragged-K (<c>k % 128 != 0</c>) twin of <see cref="LaunchI2_SGemvF32In"/>.</summary>
@@ -1304,9 +1348,11 @@ public sealed unsafe class CudaKernels : IDisposable
         nint wArg = quantWeight, xArg = xF32, yArg = yF32;
         int nArg = n, kArg = k;
         void** args = stackalloc void*[] {&wArg, &xArg, &yArg, &nArg, &kArg};
+        uint dynShmem = (uint)k * sizeof(float);
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV ragged-f32 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InRaggedFunc,
                 (uint)((n + I2sRaggedRowsPerBlock - 1) / I2sRaggedRowsPerBlock), 1, 1, BlockSize, 1, 1,
-                0, stream, (nint)args, 0).ThrowOnError();
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 
     /// <summary>
@@ -3990,17 +4036,23 @@ public sealed unsafe class CudaKernels : IDisposable
         }
     }
 
+    /// <summary>MMQ-GEMV-specific overload of <see cref="CheckDynamicSharedBudget(uint, string)"/>.</summary>
+    private void CheckDynamicSharedBudget(uint dynShmem, QuantizationType qt, int k)
+        => CheckDynamicSharedBudget(dynShmem, $"MMQ GEMV {qt} k={k}");
+
     /// <summary>
     /// Pre-launch check that the requested dynamic shmem fits the device budget. Failing
     /// fast here gives a much clearer error than CUDA's generic CUDA_ERROR_INVALID_VALUE
-    /// when sharedMemBytes exceeds the opt-in cap. Skipped if we couldn't query the cap.
+    /// (or, worse, a downstream "illegal memory access" from an out-of-bounds shared-memory
+    /// write inside the kernel) when sharedMemBytes exceeds the opt-in cap. Skipped if we
+    /// couldn't query the cap.
     /// </summary>
-    private void CheckDynamicSharedBudget(uint dynShmem, QuantizationType qt, int k)
+    private void CheckDynamicSharedBudget(uint dynShmem, string label)
     {
         if (_maxDynamicSharedBytesOptIn <= 0) return;
         if (dynShmem <= (uint)_maxDynamicSharedBytesOptIn) return;
         throw new InvalidOperationException(
-            $"MMQ GEMV {qt} k={k} requires {dynShmem} bytes of dynamic shared memory, " +
+            $"{label} requires {dynShmem} bytes of dynamic shared memory, " +
             $"exceeding the device cap of {_maxDynamicSharedBytesOptIn} bytes. " +
             "Either route through the dequantize-then-cuBLAS-FP16 fallback or fan the matmul " +
             "across multiple kernel launches.");
