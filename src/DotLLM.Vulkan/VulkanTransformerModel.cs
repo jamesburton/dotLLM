@@ -668,6 +668,13 @@ public sealed class VulkanTransformerModel : IModel
     // real 26B's experts quantized on device. Null when the model has no gemma4
     // quantized-MoE layer.
     private readonly MoeIndexedMatmulQ4_KF32Kernel? _moeIndexedMatmulQ4K;
+    // Generic (non-Gemma4) routed-MoE K-quant raw-view path (#191): siblings of
+    // _moeIndexedMatmulQ4K covering Q5_K/Q6_K routed banks (e.g. DeepSeek-family
+    // "UD" mixed-quant GGUFs whose down-projection quantizes differently from
+    // gate/up). Created whenever the model has MoE layers, not gated on
+    // Gemma4DualFfn — mirrors VulkanQwen3MoeHybridKernels' unconditional creation.
+    private readonly MoeIndexedMatmulQ5_KF32Kernel? _moeIndexedMatmulQ5K;
+    private readonly MoeIndexedMatmulQ6_KF32Kernel? _moeIndexedMatmulQ6K;
     private readonly MoeIndexedMatmulQ5_1F32Kernel? _moeIndexedMatmulQ5_1;
     // Indexed MMVQ (dp4a) decode variants of the quantized expert matmuls
     // (issue #137). Used on the S==1 decode path when the expanded MoE
@@ -915,6 +922,8 @@ public sealed class VulkanTransformerModel : IModel
         MoeTopKSoftmaxF32Kernel? moeTopkSoftmax, MoeIndexedMatmulF32Kernel? moeIndexedMatmul,
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8,
         MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K,
+        MoeIndexedMatmulQ5_KF32Kernel? moeIndexedMatmulQ5K,
+        MoeIndexedMatmulQ6_KF32Kernel? moeIndexedMatmulQ6K,
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1,
         MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq,
         MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq,
@@ -1028,6 +1037,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmul = moeIndexedMatmul;
         _moeIndexedMatmulQ8 = moeIndexedMatmulQ8;
         _moeIndexedMatmulQ4K = moeIndexedMatmulQ4K;
+        _moeIndexedMatmulQ5K = moeIndexedMatmulQ5K;
+        _moeIndexedMatmulQ6K = moeIndexedMatmulQ6K;
         _moeIndexedMatmulQ5_1 = moeIndexedMatmulQ5_1;
         _moeIndexedMatmulQ4KMmvq = moeIndexedMatmulQ4KMmvq;
         _moeIndexedMatmulQ5_1Mmvq = moeIndexedMatmulQ5_1Mmvq;
@@ -1080,7 +1091,14 @@ public sealed class VulkanTransformerModel : IModel
         try
         {
             spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
+            // #191: skip the per-expert F32 host dequant of routed MoE banks when
+            // every routed bank across every MoE layer would resolve to a supported
+            // raw-quant device view anyway (see CanSkipMoeF32HostDequant) — mirrors
+            // what CudaTransformerModel/CudaPipelineTransformerModel already do
+            // unconditionally, but gated here since Vulkan didn't have full K-quant
+            // routed-bank coverage until this issue.
+            bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
+            var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
             return BuildModel(device, ownsDevice: true, config, cpuWeights, spvDir, gguf);
         }
         catch
@@ -1107,7 +1125,9 @@ public sealed class VulkanTransformerModel : IModel
         RejectUnsupportedArchitecture(config);
 
         spvDir ??= Path.Combine(AppContext.BaseDirectory, "spv");
-        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config);
+        // #191: see the other LoadFromGguf overload's comment.
+        bool skipF32MoeDequant = VulkanWeights.CanSkipMoeF32HostDequant(device, gguf, config);
+        var cpuWeights = TransformerWeights.LoadFromGguf(gguf, config, skipF32MoeDequant);
         return BuildModel(device, ownsDevice: false, config, cpuWeights, spvDir, gguf);
     }
 
@@ -1561,6 +1581,8 @@ public sealed class VulkanTransformerModel : IModel
         MoeIndexedMatmulF32Kernel? moeIndexedMatmul = null;
         MoeIndexedMatmulQ8_0F32Kernel? moeIndexedMatmulQ8 = null;
         MoeIndexedMatmulQ4_KF32Kernel? moeIndexedMatmulQ4K = null;
+        MoeIndexedMatmulQ5_KF32Kernel? moeIndexedMatmulQ5K = null;
+        MoeIndexedMatmulQ6_KF32Kernel? moeIndexedMatmulQ6K = null;
         MoeIndexedMatmulQ5_1F32Kernel? moeIndexedMatmulQ5_1 = null;
         MoeIndexedMatmulQ4KMmvqKernel? moeIndexedMatmulQ4KMmvq = null;
         MoeIndexedMatmulQ5_1MmvqKernel? moeIndexedMatmulQ5_1Mmvq = null;
@@ -1579,11 +1601,20 @@ public sealed class VulkanTransformerModel : IModel
             moeTopkSoftmax = MoeTopKSoftmaxF32Kernel.Create(device, spvDir);
             moeIndexedMatmul = MoeIndexedMatmulF32Kernel.Create(device, spvDir);
             moeIndexedMatmulQ8 = MoeIndexedMatmulQ8_0F32Kernel.Create(device, spvDir);
+            // K-quant indexed-expert matmul kernels: needed both by Gemma-4's fused
+            // quantized MoE path (Q4_K gate/up) and the generic DeepSeek/Mixtral/
+            // Qwen-MoE routed-bank K-quant raw-view path (#191). Created
+            // unconditionally whenever the model has MoE layers — previously Q4_K
+            // was only ever instantiated under Gemma4DualFfn, so the generic
+            // dispatcher's Q4_K branch threw for every non-Gemma4 model whose
+            // routed banks resolved to Q4_K.
+            moeIndexedMatmulQ4K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir);
+            moeIndexedMatmulQ5K = MoeIndexedMatmulQ5_KF32Kernel.Create(device, spvDir);
+            moeIndexedMatmulQ6K = MoeIndexedMatmulQ6_KF32Kernel.Create(device, spvDir);
             if (config.Gemma4DualFfn)
             {
-                // Gemma-4 quantized experts: fused gate_up Q4_K + down Q5_1 stay
-                // quantized on device (the real 26B's F32 experts are tens of GB).
-                moeIndexedMatmulQ4K = MoeIndexedMatmulQ4_KF32Kernel.Create(device, spvDir);
+                // Gemma-4's quantized down-projection bank is Q5_1 (a legacy quant,
+                // not a K-quant) — stays Gemma4-specific.
                 moeIndexedMatmulQ5_1 = MoeIndexedMatmulQ5_1F32Kernel.Create(device, spvDir);
                 // Indexed MMVQ decode variants (issue #137): dp4a + coalesced
                 // subgroup-per-cell reads for the S==1 expert GEMVs. TryCreate
@@ -1681,7 +1712,7 @@ public sealed class VulkanTransformerModel : IModel
             biasAdd,
             mlaAttention, mlaRope, mlaKvSplit,
             moeTopkSoftmax, moeIndexedMatmul, moeIndexedMatmulQ8,
-            moeIndexedMatmulQ4K, moeIndexedMatmulQ5_1,
+            moeIndexedMatmulQ4K, moeIndexedMatmulQ5K, moeIndexedMatmulQ6K, moeIndexedMatmulQ5_1,
             moeIndexedMatmulQ4KMmvq, moeIndexedMatmulQ5_1Mmvq, moeIndexedMatmulQ8Mmvq,
             moeIndexedMatmulTiled, moeIndexedLoraDelta,
             moeExpertOffsets, moeExpandGroupByExpert, moeGroupedMatmulF16Coopmat, moeUngroupScatter,
@@ -3738,6 +3769,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmul?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ8?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4K?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ5K?.InvalidateDescriptorCache();
+        _moeIndexedMatmulQ6K?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5_1?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ4KMmvq?.InvalidateDescriptorCache();
         _moeIndexedMatmulQ5_1Mmvq?.InvalidateDescriptorCache();
@@ -5059,6 +5092,26 @@ public sealed class VulkanTransformerModel : IModel
             return;
         }
 
+        if (weightQt == QuantizationType.Q5_K)
+        {
+            if (_moeIndexedMatmulQ5K is null)
+                throw new InvalidOperationException("Q5_K MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ5K.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
+        if (weightQt == QuantizationType.Q6_K)
+        {
+            if (_moeIndexedMatmulQ6K is null)
+                throw new InvalidOperationException("Q6_K MoE indexed matmul kernel was not created.");
+            _moeIndexedMatmulQ6K.Record(cmdBuf,
+                bank, x, indices, y,
+                m: m, k: k, n: n, numExperts: numExperts);
+            return;
+        }
+
         if (weightQt != QuantizationType.F32)
             throw new NotSupportedException($"MoE indexed matmul does not support {weightQt} banks.");
 
@@ -6336,6 +6389,8 @@ public sealed class VulkanTransformerModel : IModel
         _moeIndexedMatmulQ4KMmvq?.Dispose();
         _moeIndexedMatmulQ8Mmvq?.Dispose();
         _moeIndexedMatmulQ5_1?.Dispose();
+        _moeIndexedMatmulQ6K?.Dispose();
+        _moeIndexedMatmulQ5K?.Dispose();
         _moeIndexedMatmulQ4K?.Dispose();
         _moeIndexedMatmulQ8?.Dispose();
         _moeIndexedMatmul?.Dispose();
