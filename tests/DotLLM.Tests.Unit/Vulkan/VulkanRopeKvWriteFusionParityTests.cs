@@ -241,7 +241,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         using var bufKBaseline = device.Allocate((long)kElems * sizeof(float));
         using var bufVBaseline = device.Allocate((long)kElems * sizeof(float));
         using var bufPos = device.Allocate((long)seqLen * sizeof(int));
-        var kvCacheBaseline = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
+        using var kvCacheBaseline = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
 
         device.Upload(q.AsSpan(), bufQBaseline);
         device.Upload(k.AsSpan(), bufKBaseline);
@@ -273,7 +273,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         using var bufQFused = device.Allocate((long)qElems * sizeof(float));
         using var bufKFused = device.Allocate((long)kElems * sizeof(float));
         using var bufVFused = device.Allocate((long)kElems * sizeof(float));
-        var kvCacheFused = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
+        using var kvCacheFused = new VulkanKvCache(device, numLayers: 1, numKvHeads: numKvHeads, headDim: headDim, maxSeqLen: maxSeqLen);
 
         device.Upload(q.AsSpan(), bufQFused);
         device.Upload(k.AsSpan(), bufKFused);
@@ -403,7 +403,7 @@ public sealed class VulkanRopeKvWriteFusionParityTests
         using var bufK = device.Allocate((long)kElems * sizeof(float));
         using var bufV = device.Allocate((long)kElems * sizeof(float));
         using var bufPos = device.Allocate((long)seqLen * sizeof(int));
-        var kvCache = new VulkanKvCache(device, numLayers: 1, numKvHeads: NumKvHeads, headDim: HeadDim, maxSeqLen: Math.Max(maxSeqLen, 512));
+        using var kvCache = new VulkanKvCache(device, numLayers: 1, numKvHeads: NumKvHeads, headDim: HeadDim, maxSeqLen: Math.Max(maxSeqLen, 512));
 
         var rng = new Random(0x2026_0717);
         float[] qInit = new float[qElems];

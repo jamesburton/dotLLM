@@ -1028,11 +1028,11 @@ public sealed unsafe class CudaIQ4_XS_DequantUnitTest
     private static void CreateTestIQ4_XSData(byte[] block)
     {
         if (block.Length != 136)
-            throw new ArgumentException("IQ4_XS block must be 136 bytes");
+            throw new ArgumentException("IQ4_XS block must be 136 bytes", nameof(block));
 
         // d = 1.0 (as Half in little-endian)
         Half d = (Half)1.0f;
-        MemoryMarshal.Write(new Span<byte>(block, 0, 2), ref d);
+        MemoryMarshal.Write(new Span<byte>(block, 0, 2), in d);
 
         // scales_h = 0x0000 (all sub-blocks use scale 32, bias cancels)
         MemoryMarshal.Write(new Span<byte>(block, 2, 2), (ushort)0);

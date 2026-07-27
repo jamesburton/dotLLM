@@ -29,7 +29,7 @@ public class RequestValidatorTests
 
         var request = new ChatCompletionRequest { Messages = messages };
         var error = RequestValidator.ValidateChatRequest(request);
-        Assert.Contains("exceeds maximum", error);
+        Assert.Contains("exceeds maximum", error, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -113,7 +113,7 @@ public class RequestValidatorTests
             requestedMaxTokens: 100, out _, out int promptTokenCount);
 
         Assert.NotNull(error);
-        Assert.Contains("exceeds model context length", error);
+        Assert.Contains("exceeds model context length", error, StringComparison.Ordinal);
         Assert.Equal(520, promptTokenCount);
     }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -70,13 +71,12 @@ public sealed class DisaggregatedSchedulerTests
         using (var pf = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize))
         using (var model = new RampMockModel())
         {
-            var sched = new ContinuousBatchScheduler(model, new MockTokenizer(),
+            using var sched = new ContinuousBatchScheduler(model, new MockTokenizer(),
                 (_, maxSeq) => pf.Create(maxSeq), options: null, pagedPool: pf.Pool);
             var hs = new ISchedulerRequest[promptLens.Length];
             for (int i = 0; i < promptLens.Length; i++) hs[i] = sched.Submit(MakeRequest(promptLens[i], 32));
             for (int i = 0; i < 2000 && !sched.IsIdle; i++) sched.Step();
             for (int i = 0; i < promptLens.Length; i++) baseline[i] = (await hs[i].Completion).GeneratedTokenIds;
-            sched.Dispose();
         }
 
         // Disaggregated: two replicas, shared pool, KV handoff.
@@ -292,7 +292,7 @@ public sealed class DisaggregatedSchedulerTests
         public int[] Encode(string text) => Array.Empty<int>();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => 0;
     }
 }

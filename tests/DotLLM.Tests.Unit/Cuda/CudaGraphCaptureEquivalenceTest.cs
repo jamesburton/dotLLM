@@ -35,7 +35,7 @@ public class CudaGraphCaptureEquivalenceTest
             ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", modelFile);
         Skip.If(!File.Exists(modelPath), $"{modelPath} not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         int[] prompt = tokenizer.Encode("The capital of France is Paris. The capital of Germany is");
@@ -158,7 +158,7 @@ public class CudaGraphCaptureEquivalenceTest
             ".dotllm", "models", "QuantFactory", "SmolLM-135M-GGUF", "SmolLM-135M.Q4_K_M.gguf");
         Skip.If(!File.Exists(modelPath), $"{modelPath} not found");
 
-        var gguf = GgufFile.Open(modelPath);
+        using var gguf = GgufFile.Open(modelPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
         int[] prompt = tokenizer.Encode("The capital of France is Paris. The capital of Germany is");

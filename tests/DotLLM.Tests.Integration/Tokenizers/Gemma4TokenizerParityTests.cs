@@ -83,7 +83,7 @@ public sealed class Gemma4TokenizerParityTests
             // single newline
             yield return new object[] { model, "\n", new int[] { 107 } };
             // empty string
-            yield return new object[] { model, "", new int[] { } };
+            yield return new object[] { model, "", Array.Empty<int>() };
             // real gemma-4 special tokens <|turn> (105) / <turn|> (106)
             yield return new object[] { model, "<|turn>user\nHello there<turn|>\n<|turn>model\n", new int[] { 105, 2364, 107, 9259, 993, 106, 107, 105, 4368, 107 } };
         }

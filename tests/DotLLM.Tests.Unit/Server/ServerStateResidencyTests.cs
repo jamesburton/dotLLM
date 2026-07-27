@@ -75,6 +75,7 @@ public sealed class ServerStateResidencyTests : IDisposable
     {
         Skip.IfNot(FixturesAvailable, "SmolLM-135M cached GGUF quants not found locally.");
 
+        // Not locally `using`: NewBareState() registers state in _states, disposed by this class's Dispose().
         var state = NewBareState(maxResident: 2);
         var ct = CancellationToken.None;
 
@@ -110,6 +111,7 @@ public sealed class ServerStateResidencyTests : IDisposable
     {
         Skip.IfNot(FixturesAvailable, "SmolLM-135M cached GGUF quants not found locally.");
 
+        // Not locally `using`: NewBareState() registers state in _states, disposed by this class's Dispose().
         var state = NewBareState(maxResident: 1, defaultKeepAliveSeconds: 0.05); // 50ms
         var ct = CancellationToken.None;
 
@@ -142,6 +144,7 @@ public sealed class ServerStateResidencyTests : IDisposable
     {
         Skip.IfNot(FixturesAvailable, "SmolLM-135M cached GGUF quants not found locally.");
 
+        // Not locally `using`: NewBareState() registers state in _states, disposed by this class's Dispose().
         var state = NewBareState(maxResident: 1, defaultKeepAliveSeconds: 0.05);
         var ct = CancellationToken.None;
 
@@ -167,6 +170,7 @@ public sealed class ServerStateResidencyTests : IDisposable
         Assert.True(sizeA > 0, "sanity: resolved GGUF size must be nonzero");
 
         // Budget only fits one model at a time, even though MaxResidentModels allows more.
+        // Not locally `using`: NewBareState() registers state in _states, disposed by this class's Dispose().
         var state = NewBareState(maxResident: 3, memoryBudgetBytes: sizeA + sizeA / 10);
         var ct = CancellationToken.None;
 
@@ -192,16 +196,20 @@ public sealed class ServerStateResidencyTests : IDisposable
 
         // Default MaxResidentModels = 1 - the exact pre-#369 configuration. Exercises the same
         // SwapModelAsync path ModelManagementEndpoint's POST /v1/models/load uses.
+        // Not locally `using`: NewBareState() registers state in _states, disposed by this class's Dispose().
         var state = NewBareState(); // maxResident defaults to 1
         var ct = CancellationToken.None;
 
         await state.SwapModelAsync(async () =>
         {
+            // Not locally `using`: loaded's live fields (Model, CurrentGguf, ...) are copied onto
+            // `state` below, which owns them from here on; disposing `loaded` itself would dispose
+            // the same underlying objects out from under `state`.
             var loaded = await Task.Run(() => ServerStartup.LoadModel(PathA!, state.Options with
             {
                 Model = PathA!,
                 ModelId = Path.GetFileNameWithoutExtension(PathA!),
-            }));
+            })).ConfigureAwait(false);
             state.Options = loaded.Options;
             state.Model = loaded.Model;
             state.Tokenizer = loaded.Tokenizer;
@@ -218,11 +226,14 @@ public sealed class ServerStateResidencyTests : IDisposable
 
         await state.SwapModelAsync(async () =>
         {
+            // Not locally `using`: loaded's live fields (Model, CurrentGguf, ...) are copied onto
+            // `state` below, which owns them from here on; disposing `loaded` itself would dispose
+            // the same underlying objects out from under `state`.
             var loaded = await Task.Run(() => ServerStartup.LoadModel(PathB!, state.Options with
             {
                 Model = PathB!,
                 ModelId = Path.GetFileNameWithoutExtension(PathB!),
-            }));
+            })).ConfigureAwait(false);
             state.Options = loaded.Options;
             state.Model = loaded.Model;
             state.Tokenizer = loaded.Tokenizer;

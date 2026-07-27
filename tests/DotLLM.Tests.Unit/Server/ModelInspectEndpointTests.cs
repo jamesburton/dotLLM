@@ -23,7 +23,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsAbsolutePathOutsideModelDirs()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         // Path outside of any allowed directory
         string outsidePath = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "evil.gguf"));
@@ -34,7 +34,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsPathTraversal()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         // Attempt path traversal relative to models directory
         string modelsDir = HuggingFaceDownloader.DefaultModelsDirectory;
@@ -46,7 +46,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_AcceptsPathInModelsDirectory()
     {
-        var state = CreateState();
+        using var state = CreateState();
 
         string modelsDir = HuggingFaceDownloader.DefaultModelsDirectory;
         string validPath = Path.GetFullPath(Path.Combine(modelsDir, "owner", "repo", "model.gguf"));
@@ -59,7 +59,7 @@ public class ModelInspectEndpointTests
     {
         string loadedModelDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "my-models"));
         string loadedModelPath = Path.Combine(loadedModelDir, "loaded.gguf");
-        var state = CreateState(loadedModelPath);
+        using var state = CreateState(loadedModelPath);
 
         // A different file in the same directory should be allowed
         string siblingPath = Path.GetFullPath(Path.Combine(loadedModelDir, "other.gguf"));
@@ -72,7 +72,7 @@ public class ModelInspectEndpointTests
     {
         string loadedModelDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "my-models"));
         string loadedModelPath = Path.Combine(loadedModelDir, "loaded.gguf");
-        var state = CreateState(loadedModelPath);
+        using var state = CreateState(loadedModelPath);
 
         // Traversal from loaded model directory
         string traversalPath = Path.GetFullPath(Path.Combine(loadedModelDir, "..", "secret.gguf"));
@@ -83,7 +83,7 @@ public class ModelInspectEndpointTests
     [Fact]
     public void IsAllowedModelPath_RejectsWhenNoModelLoaded_OutsideModelsDir()
     {
-        var state = CreateState(); // No loaded model
+        using var state = CreateState(); // No loaded model
 
         string outsidePath = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "probe.gguf"));
 

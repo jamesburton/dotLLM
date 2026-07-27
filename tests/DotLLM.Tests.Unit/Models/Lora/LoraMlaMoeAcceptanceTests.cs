@@ -121,10 +121,9 @@ public sealed class LoraMlaMoeAcceptanceTests
     public void Dispose_FreesNativeMemory_OnMlaAdapter()
     {
         var cfg = BuildMlaConfig();
-        var adapter = BuildStandardAdapterFor(cfg);
         // If Dispose threw or leaked, this would be flagged by the IDisposable
         // contract — adapter holds 4 native buffers (q/k/v/o A+B factors).
-        adapter.Dispose();
+        using var adapter = BuildStandardAdapterFor(cfg);
     }
 
     private static LoraAdapter BuildStandardAdapterFor(ModelConfig cfg)

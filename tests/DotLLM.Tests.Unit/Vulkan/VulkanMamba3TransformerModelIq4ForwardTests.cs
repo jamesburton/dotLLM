@@ -155,6 +155,10 @@ public sealed class VulkanMamba3TransformerModelIq4ForwardTests : IDisposable
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: FromLoadedWeights hands `weights`
+            // to `model`, whose Dispose() disposes _weights internally — see
+            // Mamba3TransformerModel.Dispose(). `model` is disposed below via
+            // `using`, so wrapping `weights` too would double-free.
             Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyIq4OverlayInPlace(weights, iq4Type);
             using var model = Mamba3TransformerModel.FromLoadedWeights(config, weights, lifetimeAnchor: sf);
@@ -165,7 +169,7 @@ public sealed class VulkanMamba3TransformerModelIq4ForwardTests : IDisposable
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
+            using Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyIq4OverlayInPlace(weights, iq4Type);
 
             // Discriminator: verify the upload path actually kept the IQ3 raw blocks

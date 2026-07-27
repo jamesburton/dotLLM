@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DotLLM.Tokenizers;
@@ -46,7 +47,7 @@ public class HfBpeTokenizerTests
         """);
         // Full 256 byte tokens at IDs 3..258.
         for (int b = 0; b < 256; b++)
-            sb.Append($"\"<0x{b:X2}>\":{3 + b},");
+            sb.Append(CultureInfo.InvariantCulture, $"\"<0x{b:X2}>\":{3 + b},");
         sb.Append(""""
               "\u2581":259,
               "H":260, "e":261, "l":262, "o":263,
@@ -124,7 +125,7 @@ public class HfBpeTokenizerTests
         var added = HfTokenizerJsonParser.ParseAddedTokens(doc.RootElement);
 
         Assert.Equal(3, added.Count);
-        Assert.Contains(added, a => a.Id == 1 && a.Content == "<s>" && a.Special);
+        Assert.Contains(added, a => a.Id == 1 && string.Equals(a.Content, "<s>", StringComparison.Ordinal) && a.Special);
     }
 
     [Fact]

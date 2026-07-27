@@ -45,7 +45,8 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_RealSyntheticModel_RunsPrefillAndDenoiseAndReturnsTokens()
     {
-        using var model = LoadSyntheticModel(seed: 42);
+        using var loaded = LoadSyntheticModel(seed: 42);
+        var model = loaded.Model;
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -73,7 +74,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     {
         // Scripted model: every position confidently prefers token 7. The scheduler's proportional
         // budget unmasks a subset each step; the canvas-snapshot mask counts must never increase.
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -101,7 +102,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_WithAdapter_PassesAdapterToEveryForwardCall()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(7));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -110,7 +111,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
             MaskTokenId = MaskTokenId,
         };
         var gen = new DiffusionTextGenerator(model, tok, new EntropyBoundSampler(), diffusion);
-        var adapter = new FakeLoraAdapter();
+        using var adapter = new FakeLoraAdapter();
 
         gen.Generate([5, 5], adapter: adapter);
 
@@ -126,7 +127,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     {
         // A maximally-confident (near-zero entropy) canvas should trip the confidence early-stop
         // well before the max-step budget. Compare against an unbounded step budget.
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(3));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(3));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -152,7 +153,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_TargetLongerThanCanvas_ProducesMultipleCanvases()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(4));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(4));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -178,7 +179,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_StreamingCallback_ObservesDecreasingMaskCounts()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(6));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(6));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -211,7 +212,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
     [Fact]
     public void Generate_UsesCachelessHybridForward_NeverPassesKvCache()
     {
-        var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(1));
+        using var model = new ScriptedModel(VocabSize, ConfidentLogitsFor(1));
         var tok = new StubTokenizer();
         var diffusion = new DiffusionConfig
         {
@@ -246,12 +247,30 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
         return row;
     }
 
-    private TransformerModel LoadSyntheticModel(int seed)
+    private LoadedModel LoadSyntheticModel(int seed)
     {
         string path = Path.Combine(_scratch, $"diff-{seed}.safetensors");
         WriteFixture(path, seed);
         var sf = SafetensorsFile.Open(path);
-        return TransformerModel.LoadFromSafetensors(sf, BuildSyntheticConfig());
+        var model = TransformerModel.LoadFromSafetensors(sf, BuildSyntheticConfig());
+        return new LoadedModel(model, sf);
+    }
+
+    /// <summary>
+    /// Bundles a loaded <see cref="TransformerModel"/> with the backing <see cref="SafetensorsFile"/> it
+    /// is anchored to. Per <see cref="TransformerModel.LoadFromSafetensors(ISafetensorsTensorSource, ModelConfig)"/>,
+    /// the source file must remain alive for the model's lifetime and the caller must dispose it after
+    /// disposing the model — this wrapper disposes both, in that order.
+    /// </summary>
+    private sealed class LoadedModel(TransformerModel model, SafetensorsFile file) : IDisposable
+    {
+        public TransformerModel Model => model;
+
+        public void Dispose()
+        {
+            model.Dispose();
+            file.Dispose();
+        }
     }
 
     private static ModelConfig BuildSyntheticConfig()
@@ -329,7 +348,7 @@ public sealed class DiffusionTextGeneratorTests : IDisposable
 
         public ScriptedModel(int vocab, float[] rowLogits)
         {
-            if (rowLogits.Length != vocab) throw new ArgumentException("row length must equal vocab.");
+            if (rowLogits.Length != vocab) throw new ArgumentException("row length must equal vocab.", nameof(rowLogits));
             Config = new ModelConfig
             {
                 Architecture = Architecture.Llama,

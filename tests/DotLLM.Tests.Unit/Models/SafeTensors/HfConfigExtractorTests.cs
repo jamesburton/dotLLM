@@ -134,7 +134,7 @@ public sealed class HfConfigExtractorTests
          "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128}
         """;
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
-        Assert.Contains("Unsupported HF architecture", ex.Message);
+        Assert.Contains("Unsupported HF architecture", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -235,7 +235,7 @@ public sealed class HfConfigExtractorTests
          "num_local_experts": 8}
         """;
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
-        Assert.Contains("num_experts_per_tok", ex.Message);
+        Assert.Contains("num_experts_per_tok", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

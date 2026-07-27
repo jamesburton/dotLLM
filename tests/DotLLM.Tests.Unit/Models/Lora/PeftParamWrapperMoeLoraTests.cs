@@ -125,7 +125,7 @@ public sealed unsafe class PeftParamWrapperMoeLoraTests : IDisposable
 
     private static void WriteConfig(string dir, string[]? targetParameters)
     {
-        var cfgObj = new Dictionary<string, object?>
+        var cfgObj = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["r"] = Rank,
             ["lora_alpha"] = 4.0,
@@ -274,6 +274,9 @@ public sealed unsafe class PeftParamWrapperMoeLoraTests : IDisposable
                 [GateUpOut, RTimesE], Ramp(BGuBase, GateUpOut * RTimesE))
             .WriteTo(Path.Combine(dir, "adapter_model.safetensors"));
 
+        // IDISP005 false positive: LoadFromDirectory already returns the disposable
+        // LoraAdapter type; this call is expected to throw before any adapter
+        // instance is constructed, so there is nothing to dispose here.
         Assert.Throws<InvalidDataException>(() =>
             PeftAdapterLoader.LoadFromDirectory("pw-mismatch", dir, BuildMoeBaseConfig()));
     }

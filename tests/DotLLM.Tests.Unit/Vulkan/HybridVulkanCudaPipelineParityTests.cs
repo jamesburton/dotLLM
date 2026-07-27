@@ -65,7 +65,7 @@ public sealed unsafe class HybridVulkanCudaPipelineParityTests
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        string lib = OperatingSystem.IsWindows()
             ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
@@ -233,7 +233,7 @@ public sealed unsafe class HybridVulkanCudaPipelineParityTests
     {
         private readonly List<nint> _allocs = new();
         public ModelConfig Config = null!;
-        public TransformerWeights Weights = null!;
+        public TransformerWeights Weights { get; private set; } = null!;
 
         public static DenseFixture Build(int seed)
         {
@@ -289,6 +289,7 @@ public sealed unsafe class HybridVulkanCudaPipelineParityTests
                     downWeight: Alloc(HiddenSize * IntermediateSize, rng), downQuantType: QuantizationType.F32, downOutputDim: HiddenSize, downInputDim: IntermediateSize);
             }
 
+            Weights?.Dispose();
             Weights = TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: tokenEmbed, tokenEmbedQt: QuantizationType.F32,
                 vocabSize: VocabSize, hiddenSize: HiddenSize,

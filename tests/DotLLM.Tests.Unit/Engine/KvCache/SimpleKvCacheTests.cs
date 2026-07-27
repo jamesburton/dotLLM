@@ -148,9 +148,8 @@ public sealed unsafe class SimpleKvCacheTests
     [Fact]
     public void Dispose_IsSafeToCallMultipleTimes()
     {
-        var cache = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
-        cache.Dispose();
-        cache.Dispose(); // Should not throw
+        using var cache = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
+        cache.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 
     [Fact]

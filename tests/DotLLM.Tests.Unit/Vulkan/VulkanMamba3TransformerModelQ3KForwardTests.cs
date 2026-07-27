@@ -122,6 +122,10 @@ public sealed class VulkanMamba3TransformerModelQ3KForwardTests : IDisposable
         float[] cpuLogits;
         {
             using var sf = SafetensorsFile.Open(path);
+            // Not disposed here by design: FromLoadedWeights hands `weights`
+            // to `model`, whose Dispose() disposes _weights internally — see
+            // Mamba3TransformerModel.Dispose(). `model` is disposed below via
+            // `using`, so wrapping `weights` too would double-free.
             Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ3KOverlayInPlace(weights);
             using var model = Mamba3TransformerModel.FromLoadedWeights(config, weights, lifetimeAnchor: sf);
@@ -132,7 +136,7 @@ public sealed class VulkanMamba3TransformerModelQ3KForwardTests : IDisposable
         float[] vkLogits;
         {
             using var sf = SafetensorsFile.Open(path);
-            Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
+            using Mamba3Weights weights = Mamba3WeightLoader.Load(config, sf);
             ApplyQ3KOverlayInPlace(weights);
             using var device = VulkanDevice.Create();
             using var model = VulkanMamba3TransformerModel.BuildOnDevice(device, config, weights, spvDir);

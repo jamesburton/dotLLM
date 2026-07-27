@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
@@ -108,7 +109,7 @@ public class RateLimitMiddlewareTests
             Assert.Equal(StatusCodes.Status429TooManyRequests, rejected.Response.StatusCode);
             Assert.True(rejected.Response.Headers.ContainsKey("Retry-After"),
                 "Retry-After header is required on 429 (Step 38 acceptance criteria).");
-            Assert.True(int.TryParse(rejected.Response.Headers["Retry-After"]!, out var ra) && ra > 0,
+            Assert.True(int.TryParse(rejected.Response.Headers["Retry-After"]!, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ra) && ra > 0,
                 "Retry-After must be a positive integer seconds value.");
             Assert.Equal("Requests", rejected.Response.Headers["X-RateLimit-Limiter"].ToString());
 
@@ -116,7 +117,7 @@ public class RateLimitMiddlewareTests
             rejected.Response.Body.Position = 0;
             using var doc = await JsonDocument.ParseAsync(rejected.Response.Body);
             Assert.True(doc.RootElement.TryGetProperty("error", out var errProp));
-            Assert.Contains("requests-per-minute", errProp.GetString()!);
+            Assert.Contains("requests-per-minute", errProp.GetString()!, StringComparison.Ordinal);
         }
     }
 
@@ -159,6 +160,10 @@ public class RateLimitMiddlewareTests
             RateLimitLease? observed = null;
             var mw = new RateLimitMiddleware(ctx =>
             {
+                // Not owned by the test: the middleware itself disposes the lease in its
+                // `finally` block before InvokeAsync returns below. Dispose the previous
+                // (always null on first assignment) before reassigning to satisfy IDISP003.
+                observed?.Dispose();
                 observed = RateLimitMiddleware.GetLease(ctx);
                 observed?.ReportActualTokens(42);
                 return Task.CompletedTask;
@@ -170,6 +175,10 @@ public class RateLimitMiddlewareTests
             Assert.NotNull(observed);
             Assert.False(ctx.Items.ContainsKey(RateLimitMiddleware.LeaseItemKey),
                 "Lease must be removed from HttpContext.Items after the request completes.");
+
+            // Idempotent — the middleware already disposed it in `finally`, but ensure the
+            // final observed reference is disposed from the test's own local as well.
+            observed?.Dispose();
         }
     }
 
@@ -205,7 +214,7 @@ public class RateLimitMiddlewareTests
         var cfg = new RateLimitConfig
         {
             Enabled = true,
-            ApiKeys = new Dictionary<string, RateLimitPolicy>
+            ApiKeys = new Dictionary<string, RateLimitPolicy>(StringComparer.Ordinal)
             {
                 ["low"] = new RateLimitPolicy { MaxConcurrent = 1, Priority = RequestPriority.Low, QueueTimeout = TimeSpan.FromSeconds(5) },
                 ["high"] = new RateLimitPolicy { MaxConcurrent = 1, Priority = RequestPriority.High, QueueTimeout = TimeSpan.FromSeconds(5) },

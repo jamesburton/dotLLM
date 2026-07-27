@@ -47,7 +47,7 @@ public class VulkanMatMulIq2XxsMmqKernelTests
     [SkippableFact]
     public void Mmq_LargeShape_NonAmdCrossCheck()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_IQ2XXS_LARGE_CROSSCHECK") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_IQ2XXS_LARGE_CROSSCHECK"), "1", StringComparison.Ordinal),
             "Opt-in (DOTLLM_IQ2XXS_LARGE_CROSSCHECK=1) — 8×2048×2048 faults AMD gfx1151 by design; "
             + "run only on a non-AMD GPU to confirm the fault is AMD-specific.");
         RunShape(8, 2048, 2048);

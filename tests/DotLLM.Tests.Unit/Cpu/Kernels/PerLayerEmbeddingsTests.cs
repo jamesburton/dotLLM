@@ -55,15 +55,15 @@ public sealed class PerLayerEmbeddingsTests
         float projScale = 1.0f / MathF.Sqrt(hidden);
         float combine = 1.0f / MathF.Sqrt(2.0f);
         float[] expected = new float[seq * lp];
+        Span<float> proj = stackalloc float[lp];
+        Span<float> normed = stackalloc float[ple];
         for (int t = 0; t < seq; t++)
         {
-            Span<float> proj = stackalloc float[lp];
             Gemv(projW, embeds.AsSpan(t * hidden, hidden), proj, lp, hidden);
             for (int l = 0; l < layers; l++)
             {
                 Span<float> block = proj.Slice(l * ple, ple);
                 for (int i = 0; i < ple; i++) block[i] *= projScale;
-                Span<float> normed = stackalloc float[ple];
                 RmsNorm(block, projNorm, eps, normed);
                 for (int i = 0; i < ple; i++)
                 {
@@ -103,15 +103,15 @@ public sealed class PerLayerEmbeddingsTests
 
         // Reference: r + post_norm(proj(gelu_tanh(gate(h)) * ple[:,layerIdx,:])).
         float[] expected = (float[])hiddenState.Clone();
+        Span<float> g = stackalloc float[ple];
+        Span<float> p = stackalloc float[hidden];
+        Span<float> pn = stackalloc float[hidden];
         for (int t = 0; t < seq; t++)
         {
-            Span<float> g = stackalloc float[ple];
             Gemv(gateW, hiddenState.AsSpan(t * hidden, hidden), g, ple, hidden);
             for (int i = 0; i < ple; i++)
                 g[i] = GeluTanh(g[i]) * perLayerInputs[t * lp + layerIdx * ple + i];
-            Span<float> p = stackalloc float[hidden];
             Gemv(projW, g, p, hidden, ple);
-            Span<float> pn = stackalloc float[hidden];
             RmsNorm(p, postNorm, eps, pn);
             for (int i = 0; i < hidden; i++)
                 expected[t * hidden + i] += pn[i];

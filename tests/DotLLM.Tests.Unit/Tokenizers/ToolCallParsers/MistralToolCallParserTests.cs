@@ -17,7 +17,7 @@ public class MistralToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Paris", calls[0].Arguments);
+        Assert.Contains("Paris", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -103,7 +103,7 @@ public class MistralToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Paris", calls[0].Arguments);
+        Assert.Contains("Paris", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -116,6 +116,6 @@ public class MistralToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_time", calls![0].FunctionName);
-        Assert.Contains("CET", calls[0].Arguments);
+        Assert.Contains("CET", calls[0].Arguments, StringComparison.Ordinal);
     }
 }

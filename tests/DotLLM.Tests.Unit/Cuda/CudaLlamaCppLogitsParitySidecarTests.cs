@@ -70,32 +70,25 @@ public sealed class CudaLlamaCppLogitsParitySidecarTests
         for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
         var loadWatch = Stopwatch.StartNew();
-        var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        using var model = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         loadWatch.Stop();
         _output.WriteLine(
             $"CUDA load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms "
             + $"(arch={config.Architecture}, layers={config.NumLayers}, hidden={config.HiddenSize}, vocab={config.VocabSize})");
 
-        try
-        {
-            var forwardWatch = Stopwatch.StartNew();
-            using ITensor logits = model.Forward(sidecar.InputIds, positions, deviceId: 0);
-            forwardWatch.Stop();
-            _output.WriteLine(
-                $"CUDA forward ({forwardWatch.Elapsed.TotalSeconds:F3} s): "
-                + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+        var forwardWatch = Stopwatch.StartNew();
+        using ITensor logits = model.Forward(sidecar.InputIds, positions, deviceId: 0);
+        forwardWatch.Stop();
+        _output.WriteLine(
+            $"CUDA forward ({forwardWatch.Elapsed.TotalSeconds:F3} s): "
+            + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
 
-            Assert.Equal(2, logits.Shape.Rank);
-            Assert.Equal(1, logits.Shape[0]);
-            Assert.Equal(sidecar.VocabSize, logits.Shape[1]);
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(1, logits.Shape[0]);
+        Assert.Equal(sidecar.VocabSize, logits.Shape[1]);
 
-            var ours = new ReadOnlySpan<float>((void*)logits.DataPointer, sidecar.VocabSize);
-            CompareLogits(ours, sidecar);
-        }
-        finally
-        {
-            model.Dispose();
-        }
+        var ours = new ReadOnlySpan<float>((void*)logits.DataPointer, sidecar.VocabSize);
+        CompareLogits(ours, sidecar);
     }
 
     [SkippableFact]
@@ -408,7 +401,8 @@ public sealed class CudaLlamaCppLogitsParitySidecarTests
     {
         int[] values = new int[element.GetArrayLength()];
         int i = 0;
-        foreach (var value in element.EnumerateArray())
+        using var enumerator = element.EnumerateArray();
+        foreach (var value in enumerator)
             values[i++] = value.GetInt32();
         return values;
     }
@@ -417,7 +411,8 @@ public sealed class CudaLlamaCppLogitsParitySidecarTests
     {
         float[] values = new float[element.GetArrayLength()];
         int i = 0;
-        foreach (var value in element.EnumerateArray())
+        using var enumerator = element.EnumerateArray();
+        foreach (var value in enumerator)
             values[i++] = (float)value.GetDouble();
         return values;
     }

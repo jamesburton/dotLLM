@@ -28,7 +28,7 @@ public class RateLimitConfigTests
         {
             Enabled = true,
             DefaultPolicy = new RateLimitPolicy { RequestsPerMinute = 60 },
-            ApiKeys = new Dictionary<string, RateLimitPolicy>
+            ApiKeys = new Dictionary<string, RateLimitPolicy>(StringComparer.Ordinal)
             {
                 ["key-premium"] = premium,
             },

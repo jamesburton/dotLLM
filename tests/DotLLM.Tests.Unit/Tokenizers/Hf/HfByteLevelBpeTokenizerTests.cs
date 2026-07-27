@@ -101,7 +101,7 @@ public class HfByteLevelBpeTokenizerTests
         Assert.Equal(HfPreTokenizerKind.ByteLevel, spec.PreTokenizerKind);
         Assert.False(string.IsNullOrEmpty(spec.ByteLevelSplitRegex));
         // Spot-check the Qwen2 split pattern: the (?i:'s|...) head is unique.
-        Assert.Contains("(?i:", spec.ByteLevelSplitRegex!);
+        Assert.Contains("(?i:", spec.ByteLevelSplitRegex!, StringComparison.Ordinal);
         Assert.Equal(HfNormalizerKind.Nfc, spec.NormalizerKind);
         Assert.Contains(HfDecoderStage.ByteLevel, spec.DecoderStages);
     }

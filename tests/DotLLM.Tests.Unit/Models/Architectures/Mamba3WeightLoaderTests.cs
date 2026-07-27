@@ -201,7 +201,7 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
         Assert.True(w.FinalNorm.IsPopulated);
         Assert.True(w.Report.HasMissingRequired);
         Assert.Contains(w.Report.Problems,
-            p => p.TensorName == Mamba3TensorMapping.TokenEmbedding &&
+            p => string.Equals(p.TensorName, Mamba3TensorMapping.TokenEmbedding, StringComparison.Ordinal) &&
                  p.Kind == Mamba3TensorIssueKind.Missing);
     }
 
@@ -270,7 +270,7 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
 
         Assert.False(w.TokenEmbedding.IsPopulated);
         Assert.Contains(w.Report.Problems,
-            p => p.TensorName == Mamba3TensorMapping.TokenEmbedding &&
+            p => string.Equals(p.TensorName, Mamba3TensorMapping.TokenEmbedding, StringComparison.Ordinal) &&
                  p.Kind == Mamba3TensorIssueKind.UnsupportedDType);
     }
 
@@ -365,15 +365,14 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
             StateSize, DInProj, DInner, includeLmHead: true, includeALog: false);
 
         using var sf = SafetensorsFile.Open(path);
-        var w = Mamba3WeightLoader.Load(BuildConfig(), sf);
-        w.Dispose();
-        w.Dispose();
+        using var w = Mamba3WeightLoader.Load(BuildConfig(), sf);
+        w.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not crash
     }
 
     [Fact]
     public void Load_NullConfigOrFile_Throws()
     {
-        Assert.Throws<ArgumentNullException>(() => Mamba3WeightLoader.Load(null!, null!));
+        Assert.Throws<ArgumentNullException>(() => { Mamba3WeightLoader.Load(null!, null!); });
     }
 
     [Fact]
@@ -383,7 +382,7 @@ public sealed class Mamba3WeightLoaderTests : IDisposable
         Assert.Throws<ArgumentException>(() =>
         {
             using var sf = WriteEmptyFile(Scratch("empty.safetensors"));
-            Mamba3WeightLoader.Load(cfg, sf);
+            using var loaded = Mamba3WeightLoader.Load(cfg, sf);
         });
     }
 

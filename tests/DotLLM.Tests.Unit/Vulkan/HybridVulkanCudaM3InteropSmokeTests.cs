@@ -44,7 +44,7 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
 
     private static bool IsCudaDriverPresent()
     {
-        string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        string lib = OperatingSystem.IsWindows()
             ? "nvcuda.dll" : "libcuda.so.1";
         if (!NativeLibrary.TryLoad(lib, out nint h)) return false;
         NativeLibrary.Free(h);
@@ -59,7 +59,7 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
     [SkippableFact]
     public void M3_Smoke_ArcExportsBinarySemaphore_Cuda3060ImportsAndWaits()
     {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+        Skip.IfNot(OperatingSystem.IsWindows(),
             "VK_KHR_external_semaphore_win32 is Windows-only.");
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
 
@@ -169,7 +169,7 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
     [SkippableFact]
     public void M3_Smoke_ArcExportsD3D12FenceTimeline_Cuda3060ImportsAndWaits()
     {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+        Skip.IfNot(OperatingSystem.IsWindows(),
             "VK_KHR_external_semaphore_win32 is Windows-only.");
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
 
@@ -280,7 +280,7 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
     [SkippableFact]
     public void M3_Smoke_Control_NvidiaVulkanExports_SameNvidiaCudaImports()
     {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+        Skip.IfNot(OperatingSystem.IsWindows(),
             "VK_KHR_external_semaphore_win32 is Windows-only.");
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
 
@@ -370,7 +370,7 @@ public sealed unsafe class HybridVulkanCudaM3InteropSmokeTests
     [SkippableFact]
     public void M3_Smoke_Control_NvidiaD3D12FenceTimeline_SameNvidiaCudaImports()
     {
-        Skip.IfNot(RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+        Skip.IfNot(OperatingSystem.IsWindows(),
             "VK_KHR_external_semaphore_win32 is Windows-only.");
         Skip.IfNot(IsBothAvailable(), "Both Vulkan and CUDA GPU must be available.");
 

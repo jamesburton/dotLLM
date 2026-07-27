@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
@@ -307,7 +308,7 @@ public sealed class DeepSeekV2GgufLoadTests
                 if (float.IsFinite(v)) finite++;
             Assert.True(finite == total,
                 $"Expected all {total} logits finite; got {finite} finite. " +
-                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
         }
     }
 
@@ -352,7 +353,7 @@ public sealed class DeepSeekV2GgufLoadTests
                 if (float.IsFinite(v)) finite++;
             Assert.True(finite == total,
                 $"Expected all {total} logits finite; got {finite} finite. " +
-                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3")))}]");
+                $"First 10: [{string.Join(", ", span.Slice(0, Math.Min(10, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
         }
     }
 
@@ -431,7 +432,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // Until then, gracefully skip when we hit an unrecognised quant type.
         GgufFile gguf;
         try { gguf = GgufFile.Open(path); }
-        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type"))
+        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type", StringComparison.Ordinal))
         {
             Skip.If(true, $"Q3_K_M loader-side gap: {ex.Message} (Q3_K dequant not yet implemented).");
             return;
@@ -498,7 +499,7 @@ public sealed class DeepSeekV2GgufLoadTests
         // unsupported quant type rather than failing the test.
         GgufFile gguf;
         try { gguf = GgufFile.Open(path); }
-        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type"))
+        catch (NotSupportedException ex) when (ex.Message.Contains("quantization type", StringComparison.Ordinal))
         {
             Skip.If(true, $"Q2_K loader-side gap: {ex.Message}");
             return;
@@ -549,7 +550,7 @@ public sealed class DeepSeekV2GgufLoadTests
             if (float.IsFinite(v)) finite++;
         Assert.True(finite == total,
             $"{label}: expected all {total} logits finite; got {finite} finite. " +
-            $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3")))}]");
+            $"First 8: [{string.Join(", ", span.Slice(0, Math.Min(8, total)).ToArray().Select(v => v.ToString("F3", CultureInfo.InvariantCulture)))}]");
     }
 
     private static unsafe int ArgmaxLogits(ITensor logits)

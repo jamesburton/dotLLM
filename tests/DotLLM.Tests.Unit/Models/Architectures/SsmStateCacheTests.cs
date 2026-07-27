@@ -93,8 +93,7 @@ public sealed class SsmStateCacheTests
     [Fact]
     public void DoubleDispose_IsSafe()
     {
-        var cache = new SsmStateCache(TinySsm(), numSsmLayers: 1);
-        cache.Dispose();
-        cache.Dispose(); // should not throw
+        using var cache = new SsmStateCache(TinySsm(), numSsmLayers: 1);
+        cache.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — should not throw
     }
 }

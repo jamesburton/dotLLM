@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -49,7 +50,7 @@ public sealed class VulkanI2SGemvBench
     [SkippableFact]
     public void Bench_I2SGemv()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMV_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMV_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_I2S_GEMV_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -168,10 +169,13 @@ public sealed class VulkanI2SGemvBench
     }
 
     private static int EnvInt(string name, int fallback)
-        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
+        => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0 ? v : fallback;
 
     private static void PinToPCores()
     {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
+            return; // ProcessorAffinity is only supported on Windows/Linux; affinity is best-effort.
+
         string mask = Environment.GetEnvironmentVariable("DOTLLM_BENCH_AFFINITY") ?? "3F";
         try
         {

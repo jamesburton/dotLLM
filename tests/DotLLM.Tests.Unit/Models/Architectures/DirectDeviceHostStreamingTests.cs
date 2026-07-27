@@ -92,7 +92,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     public void MixedLlama_StreamsOnlyOwnedUpcasts_MmapViewsUntouched()
     {
         // gate_proj is BF16 (→ owned F32 upcast); everything else is F32 (→ mmap view).
-        var w = LoadLlamaWeights(numLayers: 3, gateAsBf16: true);
+        using var w = LoadLlamaWeights(numLayers: 3, gateAsBf16: true);
         try
         {
             // Exactly one owned allocation per layer (the gate upcast). q/k/v/o/up/down
@@ -113,16 +113,16 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
         }
         finally
         {
-            // Dispose after streamed release must not double-free.
+            // Dispose after streamed release must not double-free; the enclosing
+            // `using` performs a second Dispose on scope exit — should not throw.
             w.Dispose();
-            w.Dispose(); // second dispose is safe
         }
     }
 
     [Fact]
     public void OwnedRelease_IsIdempotent_NoDoubleFree()
     {
-        var w = LoadLlamaWeights(numLayers: 1, gateAsBf16: true);
+        using var w = LoadLlamaWeights(numLayers: 1, gateAsBf16: true);
         try
         {
             nint gate = w.Layers[0].GateWeight;
@@ -142,7 +142,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     {
         // All-F32 fixture: every projection is a zero-copy mmap view. There is nothing
         // to stream-free, so the streamed path frees zero and disposal still works.
-        var w = LoadLlamaWeights(numLayers: 2, gateAsBf16: false);
+        using var w = LoadLlamaWeights(numLayers: 2, gateAsBf16: false);
         try
         {
             Assert.Equal(0, w.LiveOwnedAllocationCount);
@@ -159,7 +159,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     public void BitNet_AllLinearsAreOwnedI2S_StreamsEachExactlyOnce()
     {
         const int numLayers = 2;
-        var w = LoadBitNetWeights(numLayers);
+        using var w = LoadBitNetWeights(numLayers);
         try
         {
             // Every linear projection (7 per layer) is quantized to an owned I2_S buffer;
@@ -184,7 +184,7 @@ public sealed class DirectDeviceHostStreamingTests : IDisposable
     public void DisposeWithoutStreaming_StillFreesAllOwned()
     {
         // Legacy batch behavior (callback null): nothing streamed, Dispose frees everything.
-        var w = LoadBitNetWeights(numLayers: 1);
+        using var w = LoadBitNetWeights(numLayers: 1);
         Assert.Equal(7, w.LiveOwnedAllocationCount);
         w.Dispose();
         Assert.Equal(0, w.LiveOwnedAllocationCount);

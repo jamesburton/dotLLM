@@ -201,7 +201,7 @@ public sealed unsafe class TurboQuantKvCacheTests
 
     [Fact]
     public void NonPowerOfTwoHeadDim_Throws()
-        => Assert.Throws<ArgumentException>(() => new TurboQuantKvCache(1, 1, 48, 8, Bits, Seed));
+        => Assert.Throws<ArgumentException>(() => { new TurboQuantKvCache(1, 1, 48, 8, Bits, Seed); });
 
     [Theory]
     [InlineData("turboquant", KvCacheDType.TurboQuant, 0, false)]

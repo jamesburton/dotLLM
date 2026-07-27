@@ -81,7 +81,8 @@ public class ToolCallSchemaBuilderTests
         using var doc = JsonDocument.Parse(schema);
         Assert.True(doc.RootElement.TryGetProperty("anyOf", out var anyOf));
         Assert.Equal(2, anyOf.GetArrayLength());
-        foreach (var branch in anyOf.EnumerateArray())
+        using var anyOfEnumerator = anyOf.EnumerateArray();
+        foreach (var branch in anyOfEnumerator)
         {
             Assert.Equal("object", branch.GetProperty("type").GetString());
             Assert.True(branch.GetProperty("properties").GetProperty("name").TryGetProperty("const", out _));
@@ -95,7 +96,8 @@ public class ToolCallSchemaBuilderTests
         string schema = ToolCallSchemaBuilder.BuildForRequired([WeatherTool, TimeTool]);
         using var doc = JsonDocument.Parse(schema);
         var names = new List<string>();
-        foreach (var branch in doc.RootElement.GetProperty("anyOf").EnumerateArray())
+        using var anyOfEnumerator = doc.RootElement.GetProperty("anyOf").EnumerateArray();
+        foreach (var branch in anyOfEnumerator)
             names.Add(branch.GetProperty("properties").GetProperty("name").GetProperty("const").GetString()!);
         Assert.Contains("get_weather", names);
         Assert.Contains("get_time", names);
@@ -229,12 +231,14 @@ public class ToolCallSchemaBuilderTests
         Assert.False(root.GetProperty("additionalProperties").GetBoolean());
         var nameNode = root.GetProperty("properties").GetProperty("name");
         var enumNames = new List<string>();
-        foreach (var e in nameNode.GetProperty("enum").EnumerateArray()) enumNames.Add(e.GetString()!);
+        using (var enumEnumerator = nameNode.GetProperty("enum").EnumerateArray())
+            foreach (var e in enumEnumerator) enumNames.Add(e.GetString()!);
         Assert.Equal(12, enumNames.Count);
         Assert.Contains("tool0", enumNames);
         Assert.Contains("tool11", enumNames);
         var req = new List<string>();
-        foreach (var r in root.GetProperty("required").EnumerateArray()) req.Add(r.GetString()!);
+        using (var requiredEnumerator = root.GetProperty("required").EnumerateArray())
+            foreach (var r in requiredEnumerator) req.Add(r.GetString()!);
         Assert.Contains("name", req);
         Assert.Contains("arguments", req);
     }
@@ -264,7 +268,8 @@ public class ToolCallSchemaBuilderTests
         using var doc = JsonDocument.Parse(schema);
         var args = doc.RootElement.GetProperty("properties").GetProperty("arguments");
         var req = new List<string>();
-        foreach (var r in args.GetProperty("required").EnumerateArray()) req.Add(r.GetString()!);
+        using (var requiredEnumerator = args.GetProperty("required").EnumerateArray())
+            foreach (var r in requiredEnumerator) req.Add(r.GetString()!);
         Assert.Equal(["a"], req);
     }
 }

@@ -30,12 +30,14 @@ public sealed class QwenToolFormatVerificationTests
         var inp = JsonSerializer.Deserialize<Inputs>(
             File.ReadAllText(Path.Combine(fix, "format_inputs.json")))!;
 
-        var messages = inp.messages.EnumerateArray()
+        using var messagesEnumerator = inp.messages.EnumerateArray();
+        var messages = messagesEnumerator
             .Select(m => new ChatMessage {
                 Role = m.GetProperty("role").GetString()!,
                 Content = m.GetProperty("content").GetString()! })
             .ToList();
-        var tools = inp.tools.EnumerateArray()
+        using var toolsEnumerator = inp.tools.EnumerateArray();
+        var tools = toolsEnumerator
             .Select(t => new ToolDefinition(
                 t.GetProperty("name").GetString()!,
                 t.GetProperty("description").GetString()!,

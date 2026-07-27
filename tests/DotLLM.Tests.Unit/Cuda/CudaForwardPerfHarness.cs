@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda;
 using DotLLM.Models.Gguf;
@@ -26,7 +27,7 @@ public sealed class CudaForwardPerfHarness
     public void MeasureDecodeLatency()
     {
         Skip.IfNot(
-            Environment.GetEnvironmentVariable("DOTLLM_CUDA_PERF") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_CUDA_PERF"), "1", StringComparison.Ordinal),
             "DOTLLM_CUDA_PERF=1 not set.");
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
@@ -122,7 +123,7 @@ public sealed class CudaForwardPerfHarness
     private static int ParseEnvInt(string key, int fallback)
     {
         string? value = Environment.GetEnvironmentVariable(key);
-        return int.TryParse(value, out int n) && n >= 0 ? n : fallback;
+        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) && n >= 0 ? n : fallback;
     }
 
     private static string? ResolveIQuantFixturePath()

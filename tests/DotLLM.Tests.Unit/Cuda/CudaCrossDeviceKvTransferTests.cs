@@ -53,6 +53,8 @@ public sealed class CudaCrossDeviceKvTransferTests
 
         // Build + fill the prefill cache on GPU 0.
         ctx0.MakeCurrent();
+        // Not wrapped in `using`: ownership transfers to StagedKvHandoffTransfer.Transfer below,
+        // which disposes `source` as part of the device0->host->device1 handoff (see comment there).
         var source = new CudaKvCache(geom, MaxSeqLen, ctx0);
         for (int l = 0; l < NumLayers; l++)
             source.UploadLayer(l, Length, expectedK[l], expectedV[l]);
@@ -72,26 +74,19 @@ public sealed class CudaCrossDeviceKvTransferTests
         };
 
         // Hand the sequence off to GPU 1 via the staged transfer (device0 → host → device1). Disposes source.
-        IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
+        using IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
             source, config, (_, maxSeq) => new CudaKvCache(geom, maxSeq, ctx1));
 
-        try
-        {
-            Assert.Equal(Length, dest.CurrentLength);
-            var staged = Assert.IsAssignableFrom<IHostStagedKvCache>(dest);
+        Assert.Equal(Length, dest.CurrentLength);
+        var staged = Assert.IsAssignableFrom<IHostStagedKvCache>(dest);
 
-            var gotK = new float[Length * Stride];
-            var gotV = new float[Length * Stride];
-            for (int l = 0; l < NumLayers; l++)
-            {
-                staged.DownloadLayer(l, gotK, gotV);
-                Assert.Equal(expectedK[l], gotK);
-                Assert.Equal(expectedV[l], gotV);
-            }
-        }
-        finally
+        var gotK = new float[Length * Stride];
+        var gotV = new float[Length * Stride];
+        for (int l = 0; l < NumLayers; l++)
         {
-            dest.Dispose();
+            staged.DownloadLayer(l, gotK, gotV);
+            Assert.Equal(expectedK[l], gotK);
+            Assert.Equal(expectedV[l], gotV);
         }
     }
 }

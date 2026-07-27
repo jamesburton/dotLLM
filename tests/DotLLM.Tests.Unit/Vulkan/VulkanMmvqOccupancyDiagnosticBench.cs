@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using DotLLM.Vulkan;
 using DotLLM.Vulkan.Kernels;
 using Xunit;
@@ -67,7 +68,7 @@ public sealed class VulkanMmvqOccupancyDiagnosticBench
     [SkippableFact]
     public void Bench_Q4KMmvqOccupancy()
     {
-        Skip.IfNot(Environment.GetEnvironmentVariable("DOTLLM_MMVQ_OCCUPANCY_BENCH") == "1",
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_MMVQ_OCCUPANCY_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_MMVQ_OCCUPANCY_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -175,5 +176,5 @@ public sealed class VulkanMmvqOccupancyDiagnosticBench
     }
 
     private static int EnvInt(string name, int fallback)
-        => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
+        => int.TryParse(Environment.GetEnvironmentVariable(name), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) && v > 0 ? v : fallback;
 }

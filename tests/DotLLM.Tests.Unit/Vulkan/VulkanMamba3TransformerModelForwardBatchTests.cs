@@ -162,7 +162,7 @@ public sealed class VulkanMamba3TransformerModelForwardBatchTests : IDisposable
         // recurrent state across sequences — override surfaces it loudly.
         var ex = Assert.Throws<ArgumentException>(() =>
             model.ForwardBatch(requests, deviceId: -1));
-        Assert.Contains("MambaState", ex.Message);
+        Assert.Contains("MambaState", ex.Message, StringComparison.Ordinal);
     }
 
     [SkippableFact]

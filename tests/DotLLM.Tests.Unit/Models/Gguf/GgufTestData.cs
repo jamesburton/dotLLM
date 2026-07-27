@@ -6,7 +6,7 @@ namespace DotLLM.Tests.Unit.Models.Gguf;
 /// <summary>
 /// Helper that builds synthetic GGUF byte arrays in-memory for testing.
 /// </summary>
-internal sealed class GgufTestData
+internal sealed class GgufTestData : IDisposable
 {
     private readonly MemoryStream _stream = new();
     private readonly BinaryWriter _writer;
@@ -199,5 +199,12 @@ internal sealed class GgufTestData
     {
         long mask = alignment - 1;
         return (value + mask) & ~mask;
+    }
+
+    /// <summary>Disposes the underlying <see cref="BinaryWriter"/> and <see cref="MemoryStream"/>.</summary>
+    public void Dispose()
+    {
+        _writer.Dispose();
+        _stream.Dispose();
     }
 }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -103,10 +104,13 @@ public sealed class DisaggregatedKvTransferTests
         using var dstPool = new PagedKvCacheFactory(NumLayers, NumKvHeads, HeadDim, BlockSize, maxTotalTokens: 64 * BlockSize);
 
         const int length = 7;
+        // Not wrapped in `using`: StagedKvHandoffTransfer.Transfer takes ownership of `source` and
+        // disposes it internally (see IKvHandoffTransfer.cs) once its contents are staged across.
         var source = srcPool.Create(MaxSeqLen);
         FillCache(source, length, seed: 100);
 
-        var config = new RampMockModel().Config;
+        using var rampModel = new RampMockModel();
+        var config = rampModel.Config;
         IKvCache dest = StagedKvHandoffTransfer.Instance.Transfer(
             source, config, (_, maxSeq) => dstPool.Create(maxSeq));
 
@@ -139,7 +143,7 @@ public sealed class DisaggregatedKvTransferTests
         using var prefillModel = new RampMockModel();
         using var decodeModel = new RampMockModel();
 
-        var scheduler = copy
+        using var scheduler = copy
             ? new DisaggregatedScheduler(
                 prefillModel, decodeModel, new MockTokenizer(),
                 (_, maxSeq) => prefillPool.Create(maxSeq),
@@ -152,27 +156,20 @@ public sealed class DisaggregatedKvTransferTests
                 (_, maxSeq) => prefillPool.Create(maxSeq),
                 options: null, sharedPagedPool: prefillPool.Pool);
 
-        try
-        {
-            var handles = new ISchedulerRequest[promptLens.Length];
-            for (int i = 0; i < promptLens.Length; i++)
-                handles[i] = scheduler.Submit(MakeRequest(promptLens[i], 32));
+        var handles = new ISchedulerRequest[promptLens.Length];
+        for (int i = 0; i < promptLens.Length; i++)
+            handles[i] = scheduler.Submit(MakeRequest(promptLens[i], 32));
 
-            DriveUntilIdle(scheduler);
+        DriveUntilIdle(scheduler);
 
-            var outputs = new int[promptLens.Length][];
-            for (int i = 0; i < promptLens.Length; i++)
-            {
-                var r = await handles[i].Completion;
-                Assert.Equal(FinishReason.Stop, r.FinishReason);
-                outputs[i] = r.GeneratedTokenIds;
-            }
-            return outputs;
-        }
-        finally
+        var outputs = new int[promptLens.Length][];
+        for (int i = 0; i < promptLens.Length; i++)
         {
-            scheduler.Dispose();
+            var r = await handles[i].Completion.ConfigureAwait(false);
+            Assert.Equal(FinishReason.Stop, r.FinishReason);
+            outputs[i] = r.GeneratedTokenIds;
         }
+        return outputs;
     }
 
     [Fact]
@@ -183,10 +180,13 @@ public sealed class DisaggregatedKvTransferTests
 
         // Build a source cache with 7 positions of distinct, layer-dependent K/V values.
         const int length = 7;
+        // Not wrapped in `using`: CopyKvHandoffTransfer.Transfer takes ownership of `source` and
+        // disposes it internally (see IKvHandoffTransfer.cs) once its contents are copied across.
         var source = srcPool.Create(MaxSeqLen);
         FillCache(source, length, seed: 100);
 
-        var config = new RampMockModel().Config;
+        using var rampModel = new RampMockModel();
+        var config = rampModel.Config;
         IKvCache dest = CopyKvHandoffTransfer.Instance.Transfer(
             source, config, (_, maxSeq) => dstPool.Create(maxSeq));
 
@@ -421,7 +421,7 @@ public sealed class DisaggregatedKvTransferTests
         public int[] Encode(string text) => Array.Empty<int>();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => 0;
     }
 }

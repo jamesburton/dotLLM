@@ -677,7 +677,7 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
 
         var b1 = new SafetensorsFixtureBuilder();
         var b2 = new SafetensorsFixtureBuilder();
-        var weightMap = new Dictionary<string, string>();
+        var weightMap = new Dictionary<string, string>(StringComparer.Ordinal);
 
         // Local helper: emit into the chosen builder and record the routing.
         void Emit(SafetensorsFixtureBuilder b, string shardName, string name, int[] shape, float amplitude, int s)
@@ -781,6 +781,7 @@ public sealed class TransformerModelGemma4MoeForwardTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

@@ -172,7 +172,7 @@ public class RateLimitManagerTests
         {
             Enabled = true,
             DefaultPolicy = new RateLimitPolicy { RequestsPerMinute = 1 },
-            ApiKeys = new Dictionary<string, RateLimitPolicy>
+            ApiKeys = new Dictionary<string, RateLimitPolicy>(StringComparer.Ordinal)
             {
                 ["premium"] = new RateLimitPolicy { RequestsPerMinute = 5 },
             },

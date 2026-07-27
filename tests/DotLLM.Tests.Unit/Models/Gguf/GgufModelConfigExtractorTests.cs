@@ -145,7 +145,7 @@ public class GgufModelConfigExtractorTests
 
         var config = GgufModelConfigExtractor.Extract(metadata);
         Assert.NotNull(config.ChatTemplate);
-        Assert.Contains("messages", config.ChatTemplate);
+        Assert.Contains("messages", config.ChatTemplate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -364,7 +364,7 @@ public class GgufModelConfigExtractorTests
         var metadata = BuildMetadata(d => d.AddString("general.architecture", "unknown_arch"));
 
         var ex = Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
-        Assert.Contains("unknown_arch", ex.Message);
+        Assert.Contains("unknown_arch", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -411,7 +411,9 @@ public class GgufModelConfigExtractorTests
     [InlineData("qwen", Architecture.Qwen)]
     [InlineData("qwen2", Architecture.Qwen)]
     [InlineData("qwen3", Architecture.Qwen)]
+#pragma warning disable CS0618 // Intentional: pins legacy "deepseek" GGUF metadata compat.
     [InlineData("deepseek", Architecture.DeepSeek)]
+#pragma warning restore CS0618
     // Note: deepseek2 / deepseek3 require additional MLA + MoE metadata that
     // this minimal-keys parameterised test doesn't supply — they're covered by
     // the dedicated Extract_DeepSeekV2Lite_PopulatesMlaAndMoe and

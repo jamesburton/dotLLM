@@ -30,7 +30,7 @@ public class VulkanHazardTrackerTests
 
     private static void RunWithTracker(Action<VulkanHazardTracker, nint> body)
     {
-        Skip.If(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1", "DOTLLM_SKIP_VULKAN=1");
+        Skip.If(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN"), "1", StringComparison.Ordinal), "DOTLLM_SKIP_VULKAN=1");
         Skip.IfNot(VulkanDevice.IsAvailable(), "No Vulkan loader or physical device available on this host.");
 
         using var device = VulkanDevice.Create();

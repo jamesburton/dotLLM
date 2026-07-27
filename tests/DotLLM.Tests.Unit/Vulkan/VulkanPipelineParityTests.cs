@@ -513,7 +513,7 @@ public sealed unsafe class VulkanPipelineParityTests
     {
         private readonly List<nint> _allocs = new();
         public ModelConfig Config = null!;
-        public TransformerWeights Weights = null!;
+        public TransformerWeights Weights { get; private set; } = null!;
 
         public static DenseFixture Build(int seed, RoPEType ropeType)
         {
@@ -579,6 +579,7 @@ public sealed unsafe class VulkanPipelineParityTests
                     downWeight: downW, downQuantType: QuantizationType.F32, downOutputDim: HiddenSize, downInputDim: IntermediateSize);
             }
 
+            Weights?.Dispose();
             Weights = TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: tokenEmbed, tokenEmbedQt: QuantizationType.F32,
                 vocabSize: VocabSize, hiddenSize: HiddenSize,
