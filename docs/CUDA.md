@@ -713,6 +713,35 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 - **MLA Phase B + C** (CUDA decode efficiency): latent KV cache + W_UK absorption (`MlaAttention.ExecuteLatent`/`ExecuteLatentHybrid` CPU equivalents). Phase A naive expanded forward is already in tree (`CudaMlaAttention.Forward`).
 - **MLA FP16/quantized weight paths**: current Phase A is F32 throughout. FP16 follow-up; quantized extends `Project` patterns from the GQA path.
 - **Flash Attention**: replace naive attention kernel with tiled flash attention (shared memory, online softmax). Full Tensor Core access via `wmma` intrinsics in PTX. **Elevated `ncu --set full` data (2026-07-27, RTX 3060, `attention_f32` decode launches, Bonsai-27B, grid=(24,1,1)/block=(256,1,1))**: Compute (SM) Throughput ~4.2-4.3%, Memory Throughput ~8.6-8.7%, Achieved Occupancy 16.5-16.8% vs. 100% Theoretical (ncu's own analysis flags ~83% Est. Speedup from occupancy alone), Waves Per SM only 0.14 (grid=24=`numHeads` badly underfills the 3060's 28 SMs), Warp Cycles Per Issued Instruction ~42.3-42.8 — i.e. the kernel is genuinely **latency-bound**, not compute- or memory-bandwidth-bound; both throughput metrics sit near-idle simultaneously. This is the same root cause #180/#182's "grid too small" fixes addressed elsewhere in the decode path (see the `prismml-bonsai-model` project memory), now confirmed quantitatively for attention specifically rather than inferred from category-level `DOTLLM_HYBRID_PROFILE` percentages. **This also explains, not just motivates, issue #183's inconclusive real-world result**: #183 shipped an opt-in split-KV ("Flash-Decoding") kernel that splits the KV-tile loop across more cooperating blocks specifically to raise occupancy — the real A/B (depth 256-1024) came back within noise (+0.5% to +2% best-of, not a clean win). Given this ncu data, that outcome makes sense: splitting into more blocks helps an occupancy-bound kernel, but a kernel this deep into the latency-bound regime (42 cycles stalled per issued instruction, both compute AND memory sitting under 9%) needs fewer, larger, better-pipelined memory transactions — i.e. an actual flash-attention rewrite (tiled shared-memory staging, online softmax, deeper software pipelining to hide the per-access latency) — not just more parallel blocks replaying the same latency-bound access pattern. Treat #183's split-KV kernel as a proven-safe but low-value stepping stone, not a substitute for this item.
+
+  **Follow-up (issues #197+#198, same session): GQA-group register-blocking + tuned split-KV,
+  composed into one kernel.** `attention_f32_gqa_split_kv` grids `(numKvHeads, kv_split)` instead
+  of `(numHeads, ATTN_KV_SPLIT=4)` -- each block owns one KV head and register-blocks the QK/PV
+  loops across the `group=numHeads/numKvHeads` query heads sharing it (Bonsai-27B: group=6), so
+  each K/V element is read from global memory once per tile and reused `group` times, instead of
+  `group` independent blocks each re-reading the same rows. `kv_split` is now a runtime parameter
+  (an occupancy-target heuristic, `CudaKernels.ComputeAttentionKvSplit`, form ported from Vulkan's
+  `ComputeSplits`/#347 but re-derived for CUDA's cooperative-launch co-residency ceiling), not
+  #183's hardcoded 4. Correctness: bit-exact (0 ULP) per query head vs `attention_f32` at
+  `kv_split==1` across 5 shapes including the real Bonsai-27B shape, validated directly (not
+  assumed) -- see `CudaAttentionF32GqaSplitTests.cs`. Real occupancy query on this RTX 3060 for
+  Bonsai-27B's shape: `MaxSafeAttentionGqaSplit(numKvHeads=4, headDim=256, group=6) = 35` (up to
+  140 co-resident blocks vs today's grid=24). **Real A/B (dotnet bench, same host, 2 rounds/depth,
+  MEDIAN not best-of): depth 256 -2.1%, depth 512 +0.9%, depth 768 +2.1% (consistent both rounds),
+  depth 1024 +0.8%, depth 2048 +0.9%** -- directionally flat-to-positive at every depth except the
+  shallowest (256, where per-split KV rows are too few to amortize the grid.sync+combine overhead,
+  same shape as #183's own depth-256 result), but no depth clears this project's documented 2-8%
+  run-to-run noise floor as a decisive win. An honest inconclusive result, matching #183's own
+  precedent exactly -- shipped opt-in (`DOTLLM_ATTN_GQA_SPLIT=1`, default OFF), not because it's
+  unsafe (correctness-validated, zero-risk to any default path) but because the real-world gain
+  is not yet demonstrated beyond noise. `ncu` re-profiling to confirm the occupancy/waves-per-SM
+  metrics actually moved could not be completed this session (`ERR_NVGPUCTRPERM` -- this host
+  requires elevated/UAC PowerShell for `ncu`, unavailable to this non-interactive session); the
+  register-level evidence available instead (`ptxas -v`: 40 registers, 0 spill loads/stores, same
+  register count as the baseline `attention_f32` kernel) is consistent with the kernel being a
+  clean regrid rather than something register-pressure-bound, but does not substitute for a real
+  `ncu` capture. A future session with UAC access should re-run `ncu --set full` on this kernel
+  before considering the occupancy claim independently confirmed.
 - **Fused quantized GEMM for prefill**: Marlin-style dequant-in-register. Decode is now MMQ + MMVQ-large + pre-Q8_1 (Qwen3-8B Q4_K_M decode hits 33 tok/s eager on RTX 3060 — inside llama.cpp's reported range); prefill still uses dequant→cuBLAS HGEMM.
 - **Continuous batching scheduler** (engine-layer prerequisite for tensor-core mma kernel value — see `docs/perf/MMA_BATCHED_MMQ.md` for the design analysis).
 - **Tensor-core (mma) batched MMQ**: only valuable once batched decode is the call shape. See `docs/perf/MMA_BATCHED_MMQ.md` for thresholds.
