@@ -201,6 +201,201 @@ public sealed unsafe class I2STests
         finally { NativeMemory.Free(w); }
     }
 
+    // ──────────────────── Ragged K (k % 128 != 0) — issue #206 ────────────────────
+    //
+    // Most published I2_S checkpoints have k an exact multiple of 128 (e.g. BitNet-2B-4T:
+    // 2560/6912), which is what MatMul.I2S.cs's dedicated 128-block-interleave layout above
+    // assumes. At least one real checkpoint (1bitLLM-style bitnet_b1_58-large/-xl: hidden=2048,
+    // intermediate=5460, 5460 % 128 == 84) genuinely has a ragged row length on ffn_down. Before
+    // this fix, GemvI2_S/GemmI2_S threw ArgumentException for any k % 128 != 0.
+    //
+    // PackI2S (below) already packs via the flattened-index formula `block = e/128, j = e%128`
+    // (matching the real on-disk layout — the block interleave is computed over the tensor's
+    // flattened m*k stream, NOT reset per row; see MatMul.I2S.cs's class remarks), so it's the
+    // correct reference packer for ragged k too — no changes needed there. Test tensor totals
+    // (m*k) are chosen as exact multiples of 128 so PackI2S's zero-alloc buffer sizing
+    // (n/4 + 4 bytes) stays exact, matching how every real BitNet GGUF is shaped in practice.
+
+    [Fact]
+    public void GemvI2S_RaggedK_SmallSynthetic_MatchesDotOfDequantizedRows()
+    {
+        var rng = new Random(206);
+        const int m = 16;   // 16 rows exercises multiple distinct row-start bit-phases
+        const int k = 200;  // NOT a multiple of 128 (200 % 128 == 72) — m*k = 3200 = 25*128
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.05f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_S(w, xp, yp, m, k, null);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
+                Assert.Equal(acc, y[r], 1e-3f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>Same shape as the "explicit scale" overload used by the indexed-MoE path.</summary>
+    [Fact]
+    public void GemvI2S_RaggedK_ExplicitScaleOverload_MatchesDotOfDequantizedRows()
+    {
+        var rng = new Random(207);
+        const int m = 16;
+        const int k = 200;
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.05f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        // Pack WITHOUT the tail scale (explicit-scale overload reads the packed payload only).
+        byte* w = (byte*)NativeMemory.AllocZeroed((nuint)(m * k / 4));
+        for (int e = 0; e < ternary.Length; e++)
+        {
+            int block = e / 128, j = e % 128;
+            int groupIdx = j / 32, groupPos = j % 32;
+            int code = ternary[e] + 1;
+            w[block * 32 + groupPos] |= (byte)(code << (6 - 2 * groupIdx));
+        }
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_S(w, xp, yp, m, k, scale, null);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
+                Assert.Equal(acc, y[r], 1e-3f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    [Fact]
+    public void GemmI2S_RaggedK_SmallSynthetic_MatchesDotOfDequantizedRows()
+    {
+        var rng = new Random(208);
+        const int m = 16;
+        const int k = 200;
+        const int n = 3; // tokens
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.021f;
+
+        float[] b = new float[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] c = new float[n * m];
+            fixed (float* bp = b)
+            fixed (float* cp = c)
+                MatMul.GemmI2_S(w, bp, cp, m, k, n, null);
+
+            for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int col = 0; col < k; col++)
+                    acc += ternary[r * k + col] * scale * b[t * k + col];
+                Assert.Equal(acc, c[t * m + r], 1e-3f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>
+    /// The real bitnet_b1_58-xl shape (hidden=2048, intermediate=5460 → ffn_down k=5460).
+    /// m=32 is chosen deliberately: for k=5460, gcd(5460,128)=4, so consecutive row starts cycle
+    /// through 128/4=32 distinct bit-phases before repeating (row r starts at flattened bit
+    /// r·5460, and r·5460 mod 128 only returns to 0 every 32 rows) — using exactly 32 rows
+    /// exercises every one of those phases once, the strongest test this shape admits for
+    /// "does the ragged decoder handle a row that doesn't start on a block boundary".
+    /// </summary>
+    [Fact]
+    public void GemvI2S_RaggedK_RealBitNetXlFfnDownShape_MatchesDotOfDequantizedRows()
+    {
+        var rng = new Random(209);
+        const int m = 32;
+        const int k = 5460;
+        Assert.Equal(84, k % 128); // sanity: pin the real checkpoint's raggedness
+        Assert.Equal(0, (m * k) % 128); // sanity: PackI2S's exact-byte-sizing precondition
+
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.037f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_S(w, xp, yp, m, k, null);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
+                Assert.Equal(acc, y[r], 1e-2f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>Same shape via the thread-pool-parallel dispatch path (GemvI2_SRaggedWorker).</summary>
+    [Fact]
+    public void GemvI2S_RaggedK_WithThreadPool_MatchesDotOfDequantizedRows()
+    {
+        var rng = new Random(210);
+        const int m = 64; // above ParallelMinRows so the pool path actually engages
+        const int k = 200;
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.05f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        using var pool = new DotLLM.Cpu.Threading.ComputeThreadPool(4);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_S(w, xp, yp, m, k, pool);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
+                Assert.Equal(acc, y[r], 1e-3f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
     private static void AssertWithinQuantTolerance(float expected, float actual)
     {
         // Absolute floor for near-zero sums; relative band for larger magnitudes.

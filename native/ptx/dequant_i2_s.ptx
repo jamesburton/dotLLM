@@ -128,4 +128,85 @@ $L__BB0_3:
 	ret;
 
 }
+	// .globl	dequant_i2_s_f16_ragged
+.visible .entry dequant_i2_s_f16_ragged(
+	.param .u64 dequant_i2_s_f16_ragged_param_0,
+	.param .u64 dequant_i2_s_f16_ragged_param_1,
+	.param .u32 dequant_i2_s_f16_ragged_param_2,
+	.param .u32 dequant_i2_s_f16_ragged_param_3
+)
+.maxntid 256, 1, 1
+{
+	.reg .pred 	%p<3>;
+	.reg .b16 	%rs<3>;
+	.reg .f32 	%f<5>;
+	.reg .b32 	%r<23>;
+	.reg .b64 	%rd<30>;
+
+
+	ld.param.u64 	%rd11, [dequant_i2_s_f16_ragged_param_0];
+	ld.param.u64 	%rd12, [dequant_i2_s_f16_ragged_param_1];
+	ld.param.u32 	%r2, [dequant_i2_s_f16_ragged_param_2];
+	ld.param.u32 	%r1, [dequant_i2_s_f16_ragged_param_3];
+	cvt.s64.s32 	%rd1, %r2;
+	cvt.s64.s32 	%rd2, %r1;
+	mul.wide.s32 	%rd13, %r1, %r2;
+	mov.u32 	%r3, %ctaid.x;
+	mov.u32 	%r4, %ntid.x;
+	cvt.u64.u32 	%rd3, %r4;
+	mul.wide.u32 	%rd14, %r3, %r4;
+	mov.u32 	%r5, %tid.x;
+	cvt.u64.u32 	%rd15, %r5;
+	add.s64 	%rd29, %rd14, %rd15;
+	setp.ge.s64 	%p1, %rd29, %rd13;
+	@%p1 bra 	$L__BB1_3;
+
+	shr.s32 	%r6, %r1, 31;
+	shr.u32 	%r7, %r6, 30;
+	add.s32 	%r8, %r1, %r7;
+	shr.s32 	%r9, %r8, 2;
+	cvt.s64.s32 	%rd17, %r9;
+	mul.lo.s64 	%rd18, %rd17, %rd1;
+	cvta.to.global.u64 	%rd5, %rd11;
+	add.s64 	%rd19, %rd5, %rd18;
+	ld.global.nc.f32 	%f1, [%rd19];
+	cvta.to.global.u64 	%rd6, %rd12;
+	mul.lo.s64 	%rd7, %rd2, %rd1;
+	mov.u32 	%r13, %nctaid.x;
+	cvt.u64.u32 	%rd22, %r13;
+	mul.lo.s64 	%rd8, %rd22, %rd3;
+
+$L__BB1_2:
+	cvt.u32.u64 	%r14, %rd29;
+	and.b32  	%r15, %r14, 96;
+	shr.u32 	%r16, %r15, 4;
+	shr.u64 	%rd23, %rd29, 7;
+	and.b64  	%rd24, %rd29, 31;
+	bfi.b64 	%rd25, %rd23, %rd24, 5, 59;
+	add.s64 	%rd26, %rd5, %rd25;
+	mov.u32 	%r17, 6;
+	sub.s32 	%r18, %r17, %r16;
+	ld.global.nc.u8 	%rs2, [%rd26];
+	cvt.u32.u16 	%r19, %rs2;
+	and.b32  	%r20, %r19, 255;
+	shr.u32 	%r21, %r20, %r18;
+	and.b32  	%r22, %r21, 3;
+	cvt.rn.f32.s32 	%f3, %r22;
+	add.f32 	%f4, %f3, 0fBF800000;
+	mul.f32 	%f2, %f1, %f4;
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs1, %f2;}
+
+	// end inline asm
+	shl.b64 	%rd27, %rd29, 1;
+	add.s64 	%rd28, %rd6, %rd27;
+	st.global.u16 	[%rd28], %rs1;
+	add.s64 	%rd29, %rd29, %rd8;
+	setp.lt.s64 	%p2, %rd29, %rd7;
+	@%p2 bra 	$L__BB1_2;
+
+$L__BB1_3:
+	ret;
+
+}
 

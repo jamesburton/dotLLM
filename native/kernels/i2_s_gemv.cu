@@ -9,6 +9,19 @@
 //     offset-binary {1,2,3}; the decode here subtracts 1.
 //   * ONE per-tensor float32 scale at the tensor tail, byte offset (size_t)n*(k/4).
 //
+// RAGGED K (issue #206): every kernel above this comment requires k % 128 == 0 — the uint4/block
+// addressing (row_bytes=k/4, num_u4=row_bytes/16) assumes it, and going in unaligned crashes with
+// "CUDA error 716: misaligned address". At least one real checkpoint family (1bitLLM-style
+// bitnet_b1_58-large/-xl: hidden=2048, intermediate=5460, 5460%128==84) has a genuinely
+// non-128-aligned ffn_down row length. Critically, the on-disk 128-element block interleave for a
+// ragged tensor is computed over the FLATTENED n*k element stream (matches the upstream
+// bitnet.cpp writer, ggml-bitnet-mad.cpp's quantize_i2_s — verified against the real GGUF's tensor
+// byte extents), NOT reset at each row boundary — so a ragged row generally does not even start on
+// a block boundary (see MatMul.I2S.cs's class remarks for the full derivation). The ragged kernels
+// below (i2_s_gemv_f16in_ragged / i2_s_gemv_f32in_ragged) are a scalar, correctness-first fallback
+// reached ONLY when the caller detects k % 128 != 0 (see CudaTransformerModel.Project /
+// HybridTransformerModel.ProjectGpu) — they never touch the aligned fast paths above.
+//
 // ───────────────────────── Occupancy / MLP optimization (v2: warp-per-row) ─────────────────────────
 // HISTORY. v1 used grid=(n,1,1)/block=(256,1,1) with ONE block per output row, each thread striding the
 // row's uint4 units. But a row is only k/4 bytes = k/64 uint4 units = 40 (k=2560) .. 108 (k=6912) units,
@@ -683,4 +696,87 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_a8_device_scale(
     float acc = i2s_warp_reduce((float)iacc);
     if (lane == 0) y[row] = acc * scale * inv;
     }
+}
+
+// ───────────────────────── Ragged K (k % 128 != 0) — issue #206 ─────────────────────────
+//
+// One warp per output row; lanes stride over columns directly (no uint4/shared-block tricks —
+// those all assume k % 128 == 0). Per-element address is computed via the SAME tensor-global
+// block-128 interleave used by the CPU ragged path (MatMul.I2S.cs's I2SRaggedCode): for
+// flattened index `flat = row*k + col`, block = flat/128, byte = block*32 + (flat%32), and the
+// 2-bit code lives at bit offset 6-2*((flat%128)/32) within that byte. Correctness-first: no
+// coalescing tricks, no ILP widening — this is an edge-case fallback, not the hot path.
+__device__ __forceinline__ int i2s_ragged_code(const uint8_t* __restrict__ weight, long long flat)
+{
+    long long block = flat >> 7;              // flat / 128
+    int inBlock = (int)(flat & 127);          // flat % 128
+    int groupPos = inBlock & 31;              // byte within the 32-byte block
+    int groupIdx = inBlock >> 5;              // interleaved slot (0..3)
+    uint8_t packed = weight[block * 32 + groupPos];
+    int shift = 6 - 2 * groupIdx;
+    return (packed >> shift) & 0x3;
+}
+
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in_ragged(
+    const uint8_t* __restrict__ weight,   // packed codes [n * k/4 bytes] + trailing f32 scale
+    const half*    __restrict__ x,        // [k]
+    half*          __restrict__ y,        // [n]
+    const int n,
+    const int k)
+{
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = __half2float(x[i]);
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;        // warp id within block (0..7), one row per warp
+    const int lane = threadIdx.x & 31;
+
+    const int row = blockIdx.x * 8 + wid;
+    if (row >= n) return;
+
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const long long rowStart = (long long)row * (long long)k;
+
+    float acc = 0.0f;
+    for (int col = lane; col < k; col += 32)
+    {
+        int code = i2s_ragged_code(weight, rowStart + col);
+        acc += ((float)code - 1.0f) * xs[col];
+    }
+
+    acc = i2s_warp_reduce(acc);
+    if (lane == 0) y[row] = __float2half(acc * scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in_ragged(
+    const uint8_t* __restrict__ weight,
+    const float*   __restrict__ x,
+    float*         __restrict__ y,
+    const int n,
+    const int k)
+{
+    __shared__ float xs[I2S_MAX_K];
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+        xs[i] = x[i];
+    __syncthreads();
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int row = blockIdx.x * 8 + wid;
+    if (row >= n) return;
+
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * (k / 4));
+    const long long rowStart = (long long)row * (long long)k;
+
+    float acc = 0.0f;
+    for (int col = lane; col < k; col += 32)
+    {
+        int code = i2s_ragged_code(weight, rowStart + col);
+        acc += ((float)code - 1.0f) * xs[col];
+    }
+
+    acc = i2s_warp_reduce(acc);
+    if (lane == 0) y[row] = acc * scale;
 }

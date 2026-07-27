@@ -86,6 +86,32 @@ weights. CPU vec_dot pairs MXFP4 weights with Q8_0-quantized activations
 (nibble→sbyte pshufb LUT + integer MAC), mirroring llama.cpp's
 `ggml_vec_dot_mxfp4_q8_0`.
 
+### I2_S (BitNet b1.58 ternary, ~2 bits/weight, GGUF type 36)
+
+```
+Row-major W[m,k]: 4 ternary codes {0,1,2} → {-1,0,+1} packed per byte (2 bits each).
+128-element block = 32 bytes. Byte at group_pos (0..31) holds codes for elements
+{group_pos, +32, +64, +96} at bit offsets {6,4,2,0}.
+ONE per-tensor float32 scale at the tensor tail, byte offset m·k/4.
+Dequantize: val = (code - 1) * scale
+```
+
+**Ragged K (`k % 128 != 0`, issue #206).** Most I2_S GGUFs have every row length (`k`) an exact
+multiple of 128 (e.g. microsoft/bitnet-b1.58-2B-4T: 2560/6912). At least one real checkpoint family
+(1bitLLM-style `bitnet_b1_58-large`/`-xl`: hidden=2048, intermediate=5460, `5460 % 128 == 84`) has a
+genuinely non-128-aligned `ffn_down` row length. The critical subtlety, verified against the real
+GGUF's tensor byte offsets and against the upstream bitnet.cpp writer (`ggml-bitnet-mad.cpp`'s
+`quantize_i2_s`): **the 128-element block interleave is computed over the flattened `m·k` element
+stream, not reset at each row boundary.** So a ragged row generally does not start on a block
+boundary at all (only every `128/gcd(k,128)`-th row does) — a "tail cleanup after the fast path"
+approach would be wrong for most of a ragged tensor's rows, not just the last few elements. When `k`
+is a multiple of 128 this is moot: every row boundary is also a block boundary, so per-row
+block-reset addressing and the flattened-stream addressing are bit-identical (why the 128-aligned
+fast paths never noticed the distinction). dotLLM's ragged-K support (CPU: `MatMul.I2S.cs`'s
+`I2SRaggedCode`/`UnpackRowRagged`; CUDA: `i2_s_gemv_{f16,f32}in_ragged` / `dequant_i2_s_f16_ragged`
+in `native/kernels/`) is a scalar, correctness-first fallback reached only when `k % 128 != 0` — the
+aligned SIMD/uint4 fast paths are untouched.
+
 ## Kernel Types
 
 Each quantization format needs two kernels:
