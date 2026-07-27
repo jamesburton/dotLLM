@@ -16,6 +16,31 @@ namespace DotLLM.Tests.Unit.Cpu.Kernels;
 /// </summary>
 public sealed unsafe class I2SUnpackVectorizedMatchesScalarTests
 {
+    /// <summary>
+    /// Correctness coverage for <see cref="MatMul.BenchStreamingReadOnly"/> (the issue #196
+    /// decode-bandwidth-profiling read-only streaming probe): its XOR checksum over every packed
+    /// byte must match an independent scalar XOR reduction, across both the AVX2 vectorized
+    /// accumulation path and the scalar tail.
+    /// </summary>
+    [Fact]
+    public void BenchStreamingReadOnly_MatchesScalarChecksum()
+    {
+        var rng = new Random(7);
+        const int m = 64, k = 512;
+        int rowBytes = k / 4;
+        byte[] buf = new byte[m * rowBytes];
+        rng.NextBytes(buf);
+
+        byte expected = 0;
+        foreach (byte b in buf) expected ^= b;
+
+        fixed (byte* p = buf)
+        {
+            byte actual = MatMul.BenchStreamingReadOnly(p, m, k);
+            Assert.Equal(expected, actual);
+        }
+    }
+
     [Theory]
     [InlineData(128, 1)]     // single block
     [InlineData(128, 7)]
