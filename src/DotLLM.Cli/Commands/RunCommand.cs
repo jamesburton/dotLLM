@@ -4,8 +4,11 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using DotLLM.Cli.Helpers;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Engine;
+using DotLLM.Engine.Constraints;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -67,6 +70,77 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         [Description("Number of recent tokens for repetition penalty lookback. 0 = full history.")]
         [DefaultValue(0)]
         public int RepeatLastN { get; set; }
+
+        [CommandOption("--frequency-penalty")]
+        [Description("OpenAI-style frequency penalty: subtracted proportionally to occurrence count. 0 = disabled.")]
+        [DefaultValue(0f)]
+        public float FrequencyPenalty { get; set; }
+
+        [CommandOption("--presence-penalty")]
+        [Description("OpenAI-style presence penalty: subtracted once for any token already seen. 0 = disabled.")]
+        [DefaultValue(0f)]
+        public float PresencePenalty { get; set; }
+
+        [CommandOption("--logit-bias|-l")]
+        [Description("Per-token additive logit bias 'token_id=bias', repeatable (e.g. '-l 15043=-100').")]
+        public string[] LogitBias { get; set; } = Array.Empty<string>();
+
+        [CommandOption("--top-nsigma|--top-n-sigma")]
+        [Description("Top-nσ sampling threshold. Negative = disabled (default).")]
+        [DefaultValue(-1f)]
+        public float TopNSigma { get; set; } = -1f;
+
+        [CommandOption("--dry-multiplier")]
+        [Description("DRY (Don't Repeat Yourself) repetition penalty multiplier. 0 = disabled (default).")]
+        [DefaultValue(0f)]
+        public float DryMultiplier { get; set; }
+
+        [CommandOption("--dry-base")]
+        [Description("DRY exponential base for the match-length penalty curve.")]
+        [DefaultValue(1.75f)]
+        public float DryBase { get; set; } = 1.75f;
+
+        [CommandOption("--dry-allowed-length")]
+        [Description("Minimum matched n-gram length before DRY starts penalizing.")]
+        [DefaultValue(2)]
+        public int DryAllowedLength { get; set; } = 2;
+
+        [CommandOption("--dry-penalty-last-n")]
+        [Description("Number of recent tokens considered for DRY matching. 0 = full history.")]
+        [DefaultValue(0)]
+        public int DryPenaltyLastN { get; set; }
+
+        [CommandOption("--dry-sequence-breaker")]
+        [Description("Token string that resets DRY n-gram matching, repeatable. Default: newline, ':', '\"', '*'.")]
+        public string[]? DrySequenceBreakers { get; set; }
+
+        [CommandOption("--rope-scaling")]
+        [Description("RoPE scaling override: 'none', 'linear', 'yarn', 'ntk', 'dynamic'. Overrides the GGUF-derived value.")]
+        public string? RopeScaling { get; set; }
+
+        [CommandOption("--rope-freq-base")]
+        [Description("RoPE base frequency (theta) override. Overrides the GGUF-derived value.")]
+        public float? RopeFreqBase { get; set; }
+
+        [CommandOption("--rope-scale")]
+        [Description("RoPE scaling factor override (linear/YaRN/NTK). Overrides the GGUF-derived value.")]
+        public float? RopeScale { get; set; }
+
+        [CommandOption("--yarn-orig-ctx")]
+        [Description("YaRN original context length override.")]
+        public int? YarnOrigCtx { get; set; }
+
+        [CommandOption("--yarn-attn-factor")]
+        [Description("YaRN attention factor override.")]
+        public float? YarnAttnFactor { get; set; }
+
+        [CommandOption("--yarn-beta-fast")]
+        [Description("YaRN beta-fast parameter override.")]
+        public float? YarnBetaFast { get; set; }
+
+        [CommandOption("--yarn-beta-slow")]
+        [Description("YaRN beta-slow parameter override.")]
+        public float? YarnBetaSlow { get; set; }
 
         [CommandOption("--seed|-s")]
         [Description("Random seed for reproducible sampling. Omit for non-deterministic.")]
@@ -158,16 +232,36 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                      "When provided, the prompt is formatted via the model's chat template with tool definitions.")]
         public string? Tools { get; set; }
 
+        /// <summary>Tool selection mode.</summary>
+        [CommandOption("--tool-choice")]
+        [Description("Tool selection: 'auto' (default), 'none', 'required' (constrain output to a valid tool call), or a function name.")]
+        public string ToolChoiceStr { get; set; } = "auto";
+
         /// <summary>Draft model for speculative decoding.</summary>
-        [CommandOption("--speculative-model")]
+        [CommandOption("--speculative-model|--draft-model")]
         [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
         public string? SpeculativeModel { get; set; }
 
         /// <summary>Number of draft candidates per speculative step.</summary>
-        [CommandOption("--speculative-k")]
+        [CommandOption("--speculative-k|--draft-tokens")]
         [Description("Number of draft tokens per speculative step (K). Default 5.")]
         [DefaultValue(5)]
         public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
+        /// <summary>
+        /// Paths to HuggingFace PEFT LoRA adapter directories. Repeatable — each occurrence adds one
+        /// adapter. Optionally suffix with <c>=weight</c> (e.g. <c>path/to/lora=0.7</c>) to blend.
+        /// Two or more adapters are rank-concatenated into a single composite via <see cref="LoraComposer"/>.
+        /// </summary>
+        [CommandOption("--lora")]
+        [Description("Path to a PEFT LoRA adapter dir; repeatable to stack adapters, optional weight 'path=0.7'. Omit for base.")]
+        public string[] LoraPaths { get; set; } = Array.Empty<string>();
     }
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
@@ -181,33 +275,61 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             return 1;
         }
 
-        var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
-        if (resolvedPath is null)
-            return 1;
+        // HuggingFace safetensors directory? (config.json + *.safetensors /
+        // model.safetensors.index.json). Auto-detected; loads via the
+        // safetensors path instead of GGUF. The GGUF path is unchanged.
+        string? hfDir = TryResolveHfDirectory(settings.Model);
 
-        GgufFile gguf = null!;
+        string resolvedPath;
+        if (hfDir is not null)
+        {
+            resolvedPath = hfDir;
+        }
+        else
+        {
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            if (ggufPath is null)
+                return 1;
+            resolvedPath = ggufPath;
+        }
+
+        GgufFile? gguf = null;
+        IDisposable? safetensorsSource = null;
         ModelConfig config = null!;
-        Tokenizers.Bpe.BpeTokenizer tokenizer = null!;
+        ITokenizer tokenizer = null!;
         IModel model = null!;
 
         void LoadModel()
         {
+            if (hfDir is not null)
+            {
+                // HuggingFace safetensors checkpoint (e.g. BitNet b1.58 bf16).
+                // CPU load via the shared safetensors loader; GPU offload for
+                // this path is not wired through the CLI yet.
+                var threadingCfg = new ThreadingConfig(
+                    settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
+                model = m;
+                safetensorsSource = src;
+                config = cfg;
+                tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                    ?? throw new InvalidOperationException(
+                        $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                return;
+            }
+
             gguf = GgufFile.Open(resolvedPath);
             config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+            config = GgufModelConfigExtractor.ApplyRoPEOverride(config, BuildRoPEOverride(settings));
             tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
             int gpuLayers = ResolveGpuLayers(settings, config);
             if (gpuLayers <= 0)
             {
-                if (config.Architecture == Architecture.NemotronH)
-                {
-                    model = NemotronHTransformerModel.LoadFromGguf(gguf, config);
-                }
-                else
-                {
-                    model = TransformerModel.LoadFromGguf(gguf, config,
-                        new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
-                }
+                // Shared per-architecture CPU dispatch — routes hybrid architectures
+                // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+                model = ModelLoader.CreateCpuModelFromGguf(gguf, config,
+                    new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly));
             }
             else if (gpuLayers >= config.NumLayers)
             {
@@ -247,18 +369,65 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
         }
 
+        // Load LoRA adapter(s) if requested.
+        // innerAdapters: every per-spec adapter (must be disposed in finally).
+        // compositeAdapter: rank-concat result when >1 adapter (also dispose in finally).
+        // loraAdapter: the single adapter passed to the generator (either one inner or the composite).
+        var innerAdapters = new List<ILoraAdapter>();
+        ILoraAdapter? compositeAdapter = null;
+        ILoraAdapter? loraAdapter = null;
+
+        if (settings.LoraPaths.Length > 0)
+        {
+            var stack = new List<(ILoraAdapter adapter, float weight)>(settings.LoraPaths.Length);
+            for (int i = 0; i < settings.LoraPaths.Length; i++)
+            {
+                var (path, weight) = LoraSpec.Parse(settings.LoraPaths[i]);
+                string adapterName = $"cli[{i}]";
+                var inner = PeftAdapterLoader.LoadFromDirectory(adapterName, path, config);
+                innerAdapters.Add(inner);
+                if (!inner.IsCompatible(config))
+                    throw new InvalidOperationException(
+                        $"LoRA adapter at '{path}' is incompatible with this base model.");
+                stack.Add((inner, weight));
+            }
+
+            if (stack.Count == 1)
+            {
+                // Single adapter: pass directly; avoids the F32-only composer constraint.
+                loraAdapter = stack[0].adapter;
+            }
+            else
+            {
+                // Multiple adapters: compose into a single rank-concatenated adapter.
+                compositeAdapter = LoraComposer.Compose(stack, config);
+                loraAdapter = compositeAdapter;
+            }
+        }
+
         var threadingInfo = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
 
         // Parse tool definitions and format prompt via chat template when tools are provided
         ToolDefinition[]? tools = ChatCommand.ParseToolDefinitions(settings.Tools);
         IToolCallParser? toolCallParser = null;
         string effectivePrompt = settings.Prompt;
+        if (tools is { Length: > 0 } && gguf is null)
+        {
+            // Tool calling relies on the GGUF-embedded chat template; the HF
+            // safetensors path doesn't surface one here. Fall back to the raw
+            // prompt so generation still runs.
+            if (settings.Json)
+                Console.Error.WriteLine("WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.");
+            else
+                AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            tools = null;
+        }
         if (tools is { Length: > 0 })
         {
             string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
             string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer)
-                ?? new JinjaChatTemplate(ChatCommand.DefaultChatMlTemplateText, bosToken, eosToken);
+            var chatTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer, config.Architecture)
+                ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
             var messages = new List<ChatMessage>
             {
@@ -269,8 +438,9 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 AddGenerationPrompt = true,
                 Tools = tools
             });
-            toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
+            toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf!.Metadata, config.Architecture);
         }
+        var toolChoice = ChatCommand.ParseToolChoice(settings.ToolChoiceStr, tools);
 
         // Build inference options from CLI flags
         var responseFormat = settings.ResponseFormat.ToLowerInvariant() switch
@@ -281,6 +451,22 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             "grammar" => BuildGrammarFormat(settings.Grammar),
             _ => null
         };
+
+        // When required/function, constrain output to valid tool-call JSON (bare JSON object).
+        if (responseFormat is null && tools is { Length: > 0 } && (toolChoice is ToolChoice.Required or ToolChoice.Function))
+        {
+            string argumentsKey = toolCallParser is LlamaToolCallParser ? "parameters" : "arguments";
+            responseFormat = toolChoice switch
+            {
+                ToolChoice.Required => new Core.Configuration.ResponseFormat.JsonSchema
+                    { Schema = ToolCallSchemaBuilder.BuildForRequired(tools, argumentsKey), Name = "tool_call" },
+                ToolChoice.Function fn => new Core.Configuration.ResponseFormat.JsonSchema
+                    { Schema = ToolCallSchemaBuilder.BuildForFunction(tools.First(t => t.Name == fn.Name), argumentsKey), Name = "tool_call" },
+                _ => responseFormat
+            };
+            // Constrained output is bare JSON → parse with the generic (markerless) parser.
+            toolCallParser = new GenericToolCallParser();
+        }
         var inferenceOptions = new InferenceOptions
         {
             Temperature = settings.Temperature,
@@ -289,6 +475,17 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             MinP = settings.MinP,
             RepetitionPenalty = settings.RepeatPenalty,
             RepetitionPenaltyWindow = settings.RepeatLastN,
+            FrequencyPenalty = settings.FrequencyPenalty,
+            PresencePenalty = settings.PresencePenalty,
+            LogitBias = ParseLogitBias(settings.LogitBias),
+            TopNSigma = settings.TopNSigma,
+            DryMultiplier = settings.DryMultiplier,
+            DryBase = settings.DryBase,
+            DryAllowedLength = settings.DryAllowedLength,
+            DryPenaltyLastN = settings.DryPenaltyLastN,
+            DrySequenceBreakers = settings.DrySequenceBreakers is { Length: > 0 }
+                ? settings.DrySequenceBreakers
+                : new InferenceOptions().DrySequenceBreakers,
             MaxTokens = settings.MaxTokens,
             Seed = settings.Seed,
             ResponseFormat = responseFormat,
@@ -402,21 +599,28 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
 
                 if (!settings.Json)
                     AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={System.IO.Path.GetFileName(draftPath)}[/]");
+
+                if (settings.LoraPaths.Length > 0)
+                {
+                    const string specLoraWarning = "WARNING: --lora with speculative decoding does not adapt the draft model; acceptance rates may degrade.";
+                    if (settings.Json) Console.Error.WriteLine(specLoraWarning);
+                    else AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(specLoraWarning)}[/]");
+                }
             }
 
             var generator = new TextGenerator(model, tokenizer, kvFactory,
-                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK);
+                draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+                prefillChunkSize: settings.PrefillChunkSize);
             var totalSw = Stopwatch.StartNew();
             int generated = 0;
             InferenceTimings timings = default;
             FinishReason finishReason = FinishReason.Length;
             var generatedText = new System.Text.StringBuilder();
 
-            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions))
+            await foreach (var token in generator.GenerateStreamingTokensAsync(effectivePrompt, inferenceOptions, adapter: loraAdapter))
             {
-                if (settings.Json)
-                    generatedText.Append(token.Text);
-                else
+                generatedText.Append(token.Text);
+                if (!settings.Json)
                     Console.Write(token.Text);
 
                 if (token.FinishReason is null || token.Text.Length > 0)
@@ -446,8 +650,19 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
             double totalTokPerSec = totalTokens > 0 ? totalTokens / (totalMs / 1000.0) : 0;
 
             // Memory metrics
-            long fileSize = new FileInfo(resolvedPath).Length;
-            long modelWeightsBytes = fileSize - gguf.DataSectionOffset;
+            long modelWeightsBytes;
+            if (gguf is not null)
+            {
+                long fileSize = new FileInfo(resolvedPath).Length;
+                modelWeightsBytes = fileSize - gguf.DataSectionOffset;
+            }
+            else
+            {
+                // HF safetensors: sum the on-disk shard sizes in the directory.
+                modelWeightsBytes = Directory
+                    .EnumerateFiles(resolvedPath, "*.safetensors", SearchOption.TopDirectoryOnly)
+                    .Sum(f => new FileInfo(f).Length);
+            }
             long computeBytes = model.ComputeMemoryBytes;
             int cacheSize = Math.Min(promptLen + settings.MaxTokens, config.MaxSequenceLength);
             // Use actual KV-cache bytes from engine timings (reflects quantization compression).
@@ -462,6 +677,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                     * config.NumKvHeads * config.HeadDim
                     * (model is DotLLM.Cuda.CudaTransformerModel ? sizeof(ushort) : sizeof(float));
             long totalMemory = modelWeightsBytes + computeBytes + kvCacheBytes;
+
+            // Backend/decode-path diagnostics
+            string samplerPath = BuildSamplerPath(settings);
+            string? decodeGraph = (model as DotLLM.Cuda.CudaTransformerModel)?.DecodeGraphState
+                .ToString().ToLowerInvariant();
 
             // Detect tool calls in generated output
             string outputText = generatedText.ToString();
@@ -480,6 +700,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 detectedToolCalls = toolCallParser.TryParse(outputText);
                 if (detectedToolCalls is { Length: > 0 })
                     finishReason = FinishReason.ToolCalls;
+            }
+
+            // For constrained tool-choice paths, display the resolved tool call in non-JSON mode.
+            if (!settings.Json && detectedToolCalls is { Length: > 0 }
+                && (toolChoice is ToolChoice.Required or ToolChoice.Function))
+            {
+                foreach (var tc in detectedToolCalls)
+                    AnsiConsole.MarkupLine($"[dim]tool call:[/] [green]{Markup.Escape(tc.FunctionName)}[/]({Markup.Escape(tc.Arguments)})");
             }
 
             if (settings.Json)
@@ -523,6 +751,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                         KvCacheBytes = kvCacheBytes,
                         TotalBytes = totalMemory,
                     },
+                    Backend = new RunBackendDto
+                    {
+                        SamplerPath = samplerPath,
+                        DecodeGraph = decodeGraph,
+                    },
                 };
                 Console.WriteLine(JsonSerializer.Serialize(result, CliJsonContext.Default.RunJsonResult));
             }
@@ -563,6 +796,11 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
                 var finishReasonStr = finishReason.ToString().ToLowerInvariant();
                 bodyLines.Add(new Markup($"  [dim]{Markup.Escape(finishReasonStr)} | {promptLen} prompt, {generated} generated[/]"));
 
+                var backendBits = $"sampler: {samplerPath}";
+                if (decodeGraph is not null)
+                    backendBits += $" | cuda graph: {decodeGraph}";
+                bodyLines.Add(new Markup($"  [dim]{Markup.Escape(backendBits)}[/]"));
+
                 // Assemble panel
                 var panelContent = new Rows(
                     new Text(""),
@@ -580,9 +818,14 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         }
         finally
         {
+            // Dispose in reverse dependency order: composite first, then each inner adapter.
+            compositeAdapter?.Dispose();
+            foreach (var inner in innerAdapters)
+                inner.Dispose();
             pagedFactory?.Dispose();
             model.Dispose();
-            gguf.Dispose();
+            gguf?.Dispose();
+            safetensorsSource?.Dispose();
         }
 
         return 0;
@@ -646,6 +889,29 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         return match.Success ? match.Groups[1].Value : "unknown";
     }
 
+    /// <summary>
+    /// Detects whether <paramref name="modelArg"/> points at a HuggingFace
+    /// safetensors checkpoint directory: an existing directory containing a
+    /// <c>config.json</c> alongside either a <c>*.safetensors</c> file or a
+    /// <c>model.safetensors.index.json</c> shard index. Returns the resolved
+    /// directory path, or <see langword="null"/> when it is not such a
+    /// directory (leaving the GGUF resolution path unchanged).
+    /// </summary>
+    internal static string? TryResolveHfDirectory(string modelArg)
+    {
+        if (string.IsNullOrEmpty(modelArg) || !Directory.Exists(modelArg))
+            return null;
+
+        if (!File.Exists(Path.Combine(modelArg, "config.json")))
+            return null;
+
+        bool hasWeights =
+            File.Exists(Path.Combine(modelArg, "model.safetensors.index.json"))
+            || Directory.EnumerateFiles(modelArg, "*.safetensors", SearchOption.TopDirectoryOnly).Any();
+
+        return hasWeights ? Path.GetFullPath(modelArg) : null;
+    }
+
     private static int ResolveGpuLayers(Settings settings, ModelConfig config)
     {
         if (settings.GpuLayers.HasValue)
@@ -661,6 +927,80 @@ internal sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         int colonIdx = device.IndexOf(':');
         if (colonIdx < 0) return 0;
         return int.Parse(device.AsSpan(colonIdx + 1));
+    }
+
+    /// <summary>
+    /// Builds a <see cref="RoPEOverrideOptions"/> from CLI flags. Returns null (no-op) when none
+    /// of the RoPE override flags were set.
+    /// </summary>
+    private static RoPEOverrideOptions? BuildRoPEOverride(Settings settings)
+    {
+        RoPEScalingType? scalingType = settings.RopeScaling is null ? null : ParseRopeScalingType(settings.RopeScaling);
+
+        var overrides = new RoPEOverrideOptions
+        {
+            ScalingType = scalingType,
+            FreqBase = settings.RopeFreqBase,
+            ScalingFactor = settings.RopeScale,
+            OrigMaxSeqLen = settings.YarnOrigCtx,
+            AttnFactor = settings.YarnAttnFactor,
+            BetaFast = settings.YarnBetaFast,
+            BetaSlow = settings.YarnBetaSlow,
+        };
+        return overrides.HasAnyOverride ? overrides : null;
+    }
+
+    private static RoPEScalingType ParseRopeScalingType(string value) => value.ToLowerInvariant() switch
+    {
+        "none" => RoPEScalingType.None,
+        "linear" => RoPEScalingType.Linear,
+        "yarn" => RoPEScalingType.YaRN,
+        "ntk" => RoPEScalingType.NTK,
+        "dynamic" or "dynamic_ntk" or "dynamic-ntk" => RoPEScalingType.DynamicNTK,
+        "su" or "longrope" => RoPEScalingType.Su,
+        _ => throw new InvalidOperationException(
+            $"Unknown --rope-scaling value '{value}'. Expected: none, linear, yarn, ntk, dynamic."),
+    };
+
+    /// <summary>
+    /// Parses <c>--logit-bias</c> entries of the form <c>token_id=bias</c> (e.g. <c>15043=-100</c>)
+    /// into a token-id-keyed dictionary. Returns null when no entries are given.
+    /// </summary>
+    private static IReadOnlyDictionary<int, float>? ParseLogitBias(string[] entries)
+    {
+        if (entries.Length == 0)
+            return null;
+
+        var result = new Dictionary<int, float>(entries.Length);
+        foreach (var entry in entries)
+        {
+            int eq = entry.IndexOf('=');
+            if (eq <= 0 || eq == entry.Length - 1)
+                throw new InvalidOperationException(
+                    $"Invalid --logit-bias entry '{entry}'. Expected 'token_id=bias' (e.g. '15043=-100').");
+
+            if (!int.TryParse(entry.AsSpan(0, eq), out int tokenId))
+                throw new InvalidOperationException($"Invalid token id in --logit-bias entry '{entry}'.");
+            if (!float.TryParse(entry.AsSpan(eq + 1), System.Globalization.CultureInfo.InvariantCulture, out float bias))
+                throw new InvalidOperationException($"Invalid bias value in --logit-bias entry '{entry}'.");
+
+            result[tokenId] = bias;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Human-readable label for the sampler path that will run, mirroring the auto-build logic in
+    /// <c>SamplerPipeline</c> (greedy when temp ≤ 0; bounded "fast top-k" when top-k is set and
+    /// top-p/min-p are disabled; otherwise the full step pipeline).
+    /// </summary>
+    private static string BuildSamplerPath(Settings settings)
+    {
+        if (settings.Temperature <= 0f)
+            return "greedy (argmax)";
+        if (settings.TopK > 0 && settings.TopP >= 1.0f && settings.MinP <= 0f)
+            return "fast top-k";
+        return "full pipeline";
     }
 
     private static string BuildSamplingLabel(Settings settings)

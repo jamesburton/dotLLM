@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using Architecture = DotLLM.Core.Configuration.Architecture;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
@@ -226,30 +228,23 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
         var loadWatch = Stopwatch.StartNew();
-        var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        using var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
         loadWatch.Stop();
         _output.WriteLine($"CUDA load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms");
 
-        try
-        {
-            var fwdWatch = Stopwatch.StartNew();
-            using ITensor logits = gpuModel.Forward(tokenIds, positions, deviceId: 0);
-            fwdWatch.Stop();
-            _output.WriteLine(
-                $"CUDA forward ({fwdWatch.Elapsed.TotalSeconds:F3} s): "
-                + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+        var fwdWatch = Stopwatch.StartNew();
+        using ITensor logits = gpuModel.Forward(tokenIds, positions, deviceId: 0);
+        fwdWatch.Stop();
+        _output.WriteLine(
+            $"CUDA forward ({fwdWatch.Elapsed.TotalSeconds:F3} s): "
+            + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
 
-            Assert.Equal(2, logits.Shape.Rank);
-            // CUDA returns last-token-only [1, vocab]; reference is full [seqLen, vocab].
-            Assert.Equal(1, logits.Shape[0]);
-            Assert.Equal(reference.LogitsShape[1], logits.Shape[1]);
+        Assert.Equal(2, logits.Shape.Rank);
+        // CUDA returns last-token-only [1, vocab]; reference is full [seqLen, vocab].
+        Assert.Equal(1, logits.Shape[0]);
+        Assert.Equal(reference.LogitsShape[1], logits.Shape[1]);
 
-            CompareLastRowAgainstReference(logits, reference, DriftTolerances.Tight);
-        }
-        finally
-        {
-            gpuModel.Dispose();
-        }
+        CompareLastRowAgainstReference(logits, reference, DriftTolerances.Tight);
     }
 
     /// <summary>
@@ -271,64 +266,57 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         using var cpuLogits = cpuModel.Forward(tokenIds, positions, deviceId: -1);
 
         // CUDA — returns [1, vocab] (last-token-only; see CudaTransformerModel.Forward).
-        var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
-        try
+        using var gpuModel = CudaTransformerModel.LoadFromGguf(gguf, config, deviceId: 0, ptxDir);
+        using var gpuLogits = gpuModel.Forward(tokenIds, positions, deviceId: 0);
+
+        Assert.Equal(1, gpuLogits.Shape[0]);
+        Assert.Equal(cpuLogits.Shape[1], gpuLogits.Shape[1]);
+
+        int cpuSeqLen = cpuLogits.Shape[0];
+        int vocab = cpuLogits.Shape[1];
+        int lastRow = cpuSeqLen - 1;
+        float* cpuBase = (float*)cpuLogits.DataPointer;
+        var cpuLastRow = new ReadOnlySpan<float>(cpuBase + lastRow * vocab, vocab);
+        var gpuRow = new ReadOnlySpan<float>((void*)gpuLogits.DataPointer, vocab);
+
+        int cpuArg = 0, gpuArg = 0;
+        float cpuArgVal = cpuLastRow[0], gpuArgVal = gpuRow[0];
+        double sumAbs = 0;
+        float maxAbs = 0;
+        for (int j = 0; j < vocab; j++)
         {
-            using var gpuLogits = gpuModel.Forward(tokenIds, positions, deviceId: 0);
-
-            Assert.Equal(1, gpuLogits.Shape[0]);
-            Assert.Equal(cpuLogits.Shape[1], gpuLogits.Shape[1]);
-
-            int cpuSeqLen = cpuLogits.Shape[0];
-            int vocab = cpuLogits.Shape[1];
-            int lastRow = cpuSeqLen - 1;
-            float* cpuBase = (float*)cpuLogits.DataPointer;
-            var cpuLastRow = new ReadOnlySpan<float>(cpuBase + lastRow * vocab, vocab);
-            var gpuRow = new ReadOnlySpan<float>((void*)gpuLogits.DataPointer, vocab);
-
-            int cpuArg = 0, gpuArg = 0;
-            float cpuArgVal = cpuLastRow[0], gpuArgVal = gpuRow[0];
-            double sumAbs = 0;
-            float maxAbs = 0;
-            for (int j = 0; j < vocab; j++)
-            {
-                float c = cpuLastRow[j], g = gpuRow[j];
-                float d = MathF.Abs(c - g);
-                sumAbs += d;
-                if (d > maxAbs) maxAbs = d;
-                if (c > cpuArgVal) { cpuArgVal = c; cpuArg = j; }
-                if (g > gpuArgVal) { gpuArgVal = g; gpuArg = j; }
-            }
-            double meanAbs = sumAbs / vocab;
-            bool argmaxMatch = cpuArg == gpuArg;
-            _output.WriteLine(
-                $"Last-row parity: cpu.argmax={cpuArg} ({cpuArgVal:F3}) "
-                + $"gpu.argmax={gpuArg} ({gpuArgVal:F3}) "
-                + $"match={(argmaxMatch ? "Y" : "N")}");
-            _output.WriteLine(
-                $"CPU↔CUDA drift (last row): max_abs={maxAbs:F4} mean_abs={meanAbs:F6}");
-
-            // CPU↔CUDA on the same GGUF is typically much tighter than CPU↔HF
-            // — only F16 accumulator vs F32 accumulator drift in GEMMs +
-            // kernel ordering. Observed on Q4_K_M Llama-family last-row:
-            // argmax match expected, max_abs ~1-2. The parent agent noted a
-            // known CPU prefill divergence under investigation; if it
-            // manifests here the argmax check catches it before the drift
-            // thresholds do.
-            var tol = DriftTolerances.Tight;
-            Assert.True(argmaxMatch,
-                $"CPU argmax={cpuArg} vs CUDA argmax={gpuArg} — top-1 tokens diverge between CPU and CUDA. "
-                + "Likely a GPU-side regression (dequant / attention / norm / LM head) OR the known "
-                + "CPU prefill divergence tracked separately.");
-            Assert.True(maxAbs < tol.MaxAbsDiff,
-                $"max_abs={maxAbs:F4} exceeds {tol.MaxAbsDiff:F2} — CPU vs CUDA divergence beyond expected F16/F32 accumulator drift.");
-            Assert.True(meanAbs < tol.MeanAbsDiff,
-                $"mean_abs={meanAbs:F6} exceeds {tol.MeanAbsDiff:F4}.");
+            float c = cpuLastRow[j], g = gpuRow[j];
+            float d = MathF.Abs(c - g);
+            sumAbs += d;
+            if (d > maxAbs) maxAbs = d;
+            if (c > cpuArgVal) { cpuArgVal = c; cpuArg = j; }
+            if (g > gpuArgVal) { gpuArgVal = g; gpuArg = j; }
         }
-        finally
-        {
-            gpuModel.Dispose();
-        }
+        double meanAbs = sumAbs / vocab;
+        bool argmaxMatch = cpuArg == gpuArg;
+        _output.WriteLine(
+            $"Last-row parity: cpu.argmax={cpuArg} ({cpuArgVal:F3}) "
+            + $"gpu.argmax={gpuArg} ({gpuArgVal:F3}) "
+            + $"match={(argmaxMatch ? "Y" : "N")}");
+        _output.WriteLine(
+            $"CPU↔CUDA drift (last row): max_abs={maxAbs:F4} mean_abs={meanAbs:F6}");
+
+        // CPU↔CUDA on the same GGUF is typically much tighter than CPU↔HF
+        // — only F16 accumulator vs F32 accumulator drift in GEMMs +
+        // kernel ordering. Observed on Q4_K_M Llama-family last-row:
+        // argmax match expected, max_abs ~1-2. The parent agent noted a
+        // known CPU prefill divergence under investigation; if it
+        // manifests here the argmax check catches it before the drift
+        // thresholds do.
+        var tol = DriftTolerances.Tight;
+        Assert.True(argmaxMatch,
+            $"CPU argmax={cpuArg} vs CUDA argmax={gpuArg} — top-1 tokens diverge between CPU and CUDA. "
+            + "Likely a GPU-side regression (dequant / attention / norm / LM head) OR the known "
+            + "CPU prefill divergence tracked separately.");
+        Assert.True(maxAbs < tol.MaxAbsDiff,
+            $"max_abs={maxAbs:F4} exceeds {tol.MaxAbsDiff:F2} — CPU vs CUDA divergence beyond expected F16/F32 accumulator drift.");
+        Assert.True(meanAbs < tol.MeanAbsDiff,
+            $"mean_abs={meanAbs:F6} exceeds {tol.MeanAbsDiff:F4}.");
     }
 
     /// <summary>
@@ -387,7 +375,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
 
     private unsafe void RunCudaSafetensorsGate(
         string envVar, string conventional, string referenceFile,
-        Architecture expectedArch, DriftTolerances tolerances)
+        DotLLM.Core.Configuration.Architecture expectedArch, DriftTolerances tolerances)
     {
         Skip.IfNot(CudaDevice.IsAvailable(), "No CUDA GPU available.");
 
@@ -457,6 +445,7 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
     // Drift tolerances (mirror of the CPU suite).
     // ────────────────────────────────────────────────────────────────────
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly struct DriftTolerances
     {
         public float MaxAbsDiff { get; init; }
@@ -553,7 +542,8 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         var idsEl = root.GetProperty("input_ids");
         int[] inputIds = new int[idsEl.GetArrayLength()];
         int idx = 0;
-        foreach (var e in idsEl.EnumerateArray()) inputIds[idx++] = e.GetInt32();
+        using (var idsEnumerator = idsEl.EnumerateArray())
+            foreach (var e in idsEnumerator) inputIds[idx++] = e.GetInt32();
 
         var shapeEl = root.GetProperty("logits_shape");
         int seqLen = shapeEl[0].GetInt32();
@@ -562,11 +552,13 @@ public sealed class CudaLogitsMatchPyTorchReferenceTests
         var logitsEl = root.GetProperty("logits");
         var logits = new float[seqLen][];
         int r = 0;
-        foreach (var rowEl in logitsEl.EnumerateArray())
+        using var rowsEnumerator = logitsEl.EnumerateArray();
+        foreach (var rowEl in rowsEnumerator)
         {
             var row = new float[vocab];
             int c = 0;
-            foreach (var cell in rowEl.EnumerateArray())
+            using var cellsEnumerator = rowEl.EnumerateArray();
+            foreach (var cell in cellsEnumerator)
                 row[c++] = (float)cell.GetDouble();
             logits[r++] = row;
         }

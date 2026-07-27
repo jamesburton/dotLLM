@@ -64,6 +64,7 @@ internal static class KernelSupport
             descriptorSetCount = 1,
             pSetLayouts = (nint)(&setLayoutLocal),
         };
+        Interop.ProfileCounters.DescriptorAllocs++;
         VulkanApi.vkAllocateDescriptorSets(device.Handle, dsai, out nint descriptorSet)
             .ThrowOnError("vkAllocateDescriptorSets");
         return descriptorSet;
@@ -105,6 +106,7 @@ internal static class KernelSupport
             }
             fixed (VkWriteDescriptorSet* writesPtr = writes)
             {
+                Interop.ProfileCounters.DescriptorWrites++;
                 VulkanApi.vkUpdateDescriptorSets(device.Handle, (uint)n, (nint)writesPtr, 0, 0);
             }
         }
@@ -128,6 +130,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.ShaderWrite,
             dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.ShaderWrite,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.ComputeShader,
@@ -152,6 +155,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.TransferWrite,
             dstAccessMask = VkAccessFlags.ShaderRead,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.Transfer,
@@ -179,6 +183,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.TransferWrite,
             dstAccessMask = VkAccessFlags.TransferRead | VkAccessFlags.ShaderRead,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.Transfer,
@@ -205,6 +210,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.HostWrite,
             dstAccessMask = VkAccessFlags.ShaderRead | VkAccessFlags.TransferRead,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.Host,
@@ -230,6 +236,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.ShaderWrite,
             dstAccessMask = VkAccessFlags.TransferRead,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.ComputeShader,
@@ -253,6 +260,7 @@ internal static class KernelSupport
             srcAccessMask = VkAccessFlags.ShaderWrite,
             dstAccessMask = VkAccessFlags.HostRead,
         };
+        Interop.ProfileCounters.Barriers++;
         VulkanApi.vkCmdPipelineBarrier(
             cmdBuf,
             srcStageMask: VkPipelineStageFlags.ComputeShader,

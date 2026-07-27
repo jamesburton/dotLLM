@@ -6,6 +6,7 @@ using DotLLM.Engine;
 using DotLLM.Engine.KvCache;
 using DotLLM.Engine.PromptCache;
 using DotLLM.Engine.Scheduler;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Server.RateLimiting;
@@ -63,6 +64,18 @@ public static class ServerStartup
         Options = options,
         IsReady = false,
         LoraRegistry = CreateLoraRegistry(),
+        Residency = CreateResidencyManager(options),
+    };
+
+    /// <summary>
+    /// Builds a <see cref="ModelResidencyManager"/> from the residency-related fields of
+    /// <see cref="ServerOptions"/> (#369).
+    /// </summary>
+    public static ModelResidencyManager CreateResidencyManager(ServerOptions options) => new()
+    {
+        MaxResidentModels = Math.Max(1, options.MaxResidentModels),
+        MemoryBudgetBytes = options.ResidentMemoryBudgetBytes,
+        DefaultKeepAliveSeconds = options.KeepAliveSeconds,
     };
 
     /// <summary>
@@ -82,6 +95,7 @@ public static class ServerStartup
         Console.WriteLine($"[dotllm] Loading model from {resolvedPath}...");
         var gguf = GgufFile.Open(resolvedPath);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
+        config = GgufModelConfigExtractor.ApplyRoPEOverride(config, options.RopeOverride);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
 
         var threading = new ThreadingConfig(options.Threads, options.DecodeThreads);
@@ -94,7 +108,9 @@ public static class ServerStartup
         if (gpuLayers <= 0)
         {
             Console.WriteLine($"[dotllm] CPU inference ({threading.EffectiveThreadCount} threads)");
-            model = TransformerModel.LoadFromGguf(gguf, config, threading);
+            // Shared per-architecture CPU dispatch — routes hybrid architectures
+            // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+            model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
         }
         else if (gpuLayers >= config.NumLayers)
         {
@@ -110,23 +126,22 @@ public static class ServerStartup
         }
 
         // Create chat template
-        string bosToken = tokenizer.DecodeToken(tokenizer.BosTokenId);
-        string eosToken = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        IChatTemplate chatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer)
-            ?? new JinjaChatTemplate(
-                "{% for message in messages %}" +
-                "{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}" +
-                "{% endfor %}" +
-                "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}",
-                bosToken, eosToken);
+        var declaredChatTemplate = GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer, config.Architecture);
+        if (declaredChatTemplate is null)
+            Console.WriteLine("[dotllm] Model has no GGUF chat template; using a plain completion-style transcript.");
+        IChatTemplate chatTemplate = declaredChatTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer);
 
         // Tool call parser
         var toolCallParser = GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config.Architecture);
 
-        // KV-cache configuration
+        // KV-cache configuration. TurboQuant applies uniformly to K and V, so its bit-width and
+        // QJL flag are taken from the key dtype string (e.g. "tq4", "tq4q").
+        var keyDType = KvCacheConfig.ParseDType(options.CacheTypeK, out int tqBits, out bool tqUseQjl);
         var kvConfig = new KvCacheConfig(
-            KvCacheConfig.ParseDType(options.CacheTypeK),
-            KvCacheConfig.ParseDType(options.CacheTypeV));
+            keyDType,
+            KvCacheConfig.ParseDType(options.CacheTypeV),
+            TurboQuantBits: tqBits > 0 ? tqBits : 4,
+            TurboQuantUseQjl: tqUseQjl);
 
         Func<ModelConfig, int, IKvCache>? kvFactory = null;
         PagedKvCacheFactory? pagedFactory = null;
@@ -158,14 +173,22 @@ public static class ServerStartup
         {
             Console.WriteLine("[dotllm] Paged KV-cache does not support quantization yet, using quantized simple cache.");
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
         }
         else if (kvConfig.IsQuantized)
         {
             kvFactory = (cfg, size) => new QuantizedKvCache(
-                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                DotLLM.Core.Attention.KvGeometry.FromConfig(cfg), size,
                 kvConfig.KeyDType, kvConfig.ValueDType, kvConfig.MixedPrecisionWindowSize);
+        }
+        else if (kvConfig.IsTurboQuant)
+        {
+            Console.WriteLine($"[dotllm] Using TurboQuant KV-cache ({kvConfig.TurboQuantBits}-bit, data-oblivious" +
+                (kvConfig.TurboQuantUseQjl ? ", QJL unbiased scores)." : ")."));
+            kvFactory = (cfg, size) => new TurboQuantKvCache(
+                cfg.NumLayers, cfg.NumKvHeads, cfg.HeadDim, size,
+                kvConfig.TurboQuantBits, kvConfig.TurboQuantSeed, kvConfig.TurboQuantUseQjl);
         }
 
         PrefixCache? prefixCache = options.PromptCacheEnabled
@@ -203,10 +226,24 @@ public static class ServerStartup
 
         var generator = new TextGenerator(model, tokenizer, kvFactory, prefixCache,
             draftModel: draftModel, speculativeCandidates: options.SpeculativeCandidates,
-            prefixTrieManager: prefixTrieManager);
+            prefixTrieManager: prefixTrieManager,
+            prefillChunkSize: options.PrefillChunkSize);
+        if (options.PrefillChunkSize > 0)
+            Console.WriteLine($"[dotllm] Prefill chunk size: {options.PrefillChunkSize} tokens per forward pass");
 
-        // Warm-up: JIT pre-compilation + CUDA kernel loading
-        WarmupRunner.Run(generator, tokenizer, options.Warmup);
+        // Diffusion models (DiffusionGemma) route chat completions through a masked-canvas
+        // diffusion generator instead of the autoregressive TextGenerator. Built only when the
+        // checkpoint carries a DiffusionConfig; null for every AR architecture (path unchanged).
+        DiffusionTextGenerator? diffusionGenerator = config.DiffusionConfig is not null
+            ? new DiffusionTextGenerator(model, tokenizer, sampler: null, config.DiffusionConfig)
+            : null;
+
+        // Warm-up: JIT pre-compilation + CUDA kernel loading. Diffusion models exercise the
+        // cacheless hybrid forward + denoise loop; AR models exercise prefill/decode.
+        if (diffusionGenerator is not null)
+            WarmupRunner.RunDiffusion(diffusionGenerator, tokenizer, options.Warmup);
+        else
+            WarmupRunner.Run(generator, tokenizer, options.Warmup);
         prefixCache?.Clear(); // Discard warm-up KV-cache entries
 
         // Continuous-batch scheduler. Enabled when a paged factory is available and speculative
@@ -216,14 +253,20 @@ public static class ServerStartup
         ContinuousBatchSchedulerService? scheduler = null;
         if (pagedFactory is not null && kvFactory is not null && draftModel is null)
         {
+            var schedulerOptions = ResolveSchedulerOptions(options);
+
             scheduler = new ContinuousBatchSchedulerService(
                 model,
                 tokenizer,
                 kvFactory,
-                options: null,
+                options: schedulerOptions,
                 pagedPool: pagedFactory.Pool);
-            Console.WriteLine("[dotllm] Continuous-batch scheduler active");
+            Console.WriteLine(options.Scheduler?.EnableFairness == true
+                ? "[dotllm] Continuous-batch scheduler active (per-API-key fairness on)"
+                : "[dotllm] Continuous-batch scheduler active");
         }
+
+        long estimatedBytes = SafeFileLength(resolvedPath);
 
         return new ServerState
         {
@@ -240,6 +283,7 @@ public static class ServerStartup
             Tokenizer = tokenizer,
             ChatTemplate = chatTemplate,
             Generator = generator,
+            DiffusionGenerator = diffusionGenerator,
             Scheduler = scheduler,
             LoadedModelPath = resolvedPath,
             CurrentGguf = gguf,
@@ -247,7 +291,68 @@ public static class ServerStartup
             DraftModelPath = draftModelPath,
             DraftGguf = draftGguf,
             LoraRegistry = CreateLoraRegistry(),
+            Residency = CreateResidencyManager(options),
+            EstimatedBytes = estimatedBytes,
+            LastUsedUtc = DateTimeOffset.UtcNow,
         };
+    }
+
+    /// <summary>
+    /// Best-effort file size lookup used for eviction budget accounting (#369). Never
+    /// blocks/throws — returns 0 when the size can't be determined. Resolves symlinks first:
+    /// <see cref="FileInfo.Length"/> reports <c>0</c> for the reparse point itself on Windows
+    /// (verified against a Hugging Face hub cache NTFS symlink, e.g. <c>hf download</c>'s default
+    /// layout) rather than the target's actual size, which would otherwise silently defeat the
+    /// memory-budget accounting for every model resolved through that cache.
+    /// </summary>
+    public static long SafeFileLength(string path)
+    {
+        try
+        {
+            if (File.ResolveLinkTarget(path, returnFinalTarget: true) is FileInfo target)
+                return target.Length;
+            return new FileInfo(path).Length;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>
+    /// Derives the effective <see cref="ContinuousBatchSchedulerOptions"/> for a server config:
+    /// applies <see cref="ServerOptions.PrefillChunkSize"/> as the scheduler's per-step prefill
+    /// admission cap (<see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/>) when
+    /// the <see cref="ServerOptions.Scheduler"/> section doesn't already set one, and wires
+    /// per-API-key fairness weights from the rate-limit policy table when fairness is enabled.
+    /// Returns <see langword="null"/> when nothing is configured (scheduler defaults apply).
+    /// </summary>
+    /// <remarks>
+    /// Honest semantics note: on the scheduler path this is an <b>admission-level</b> cap — a
+    /// single prompt longer than the cap still prefills in one forward pass once admitted
+    /// (see <see cref="ContinuousBatchSchedulerOptions.MaxPrefillTokensPerStep"/> remarks). True
+    /// intra-prompt chunking applies on the single-request <see cref="TextGenerator"/> path.
+    /// </remarks>
+    public static ContinuousBatchSchedulerOptions? ResolveSchedulerOptions(ServerOptions options)
+    {
+        var schedulerOptions = options.Scheduler;
+
+        if (options.PrefillChunkSize > 0 && (schedulerOptions?.MaxPrefillTokensPerStep ?? 0) <= 0)
+        {
+            schedulerOptions = (schedulerOptions ?? new ContinuousBatchSchedulerOptions()) with
+            {
+                MaxPrefillTokensPerStep = options.PrefillChunkSize,
+            };
+        }
+
+        // When fairness is enabled and a rate-limit config is present, source per-API-key
+        // fairness weights from each key's RateLimitPolicy.Weight (default 1.0 ⇒ equal share).
+        if (schedulerOptions?.EnableFairness == true && options.RateLimit is { } rateLimit)
+        {
+            schedulerOptions = schedulerOptions with
+            {
+                FairnessWeightProvider = apiKey => rateLimit.PolicyFor(apiKey)?.Weight ?? 1.0,
+            };
+        }
+
+        return schedulerOptions;
     }
 
     /// <summary>
@@ -303,20 +408,19 @@ public static class ServerStartup
 
         app.MapDotLLMEndpoints(serveUi);
 
-        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
-        // the host shuts down. Stopped earlier in SwapModelAsync when the model is swapped.
-        if (state.Scheduler is { } scheduler)
-        {
-            var loopCts = new CancellationTokenSource();
-            state.SchedulerLoopCts = loopCts;
-            state.SchedulerLoopTask = Task.Run(() => scheduler.RunLoopAsync(loopCts.Token));
+        var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+        state.ShutdownToken = lifetime.ApplicationStopping;
 
-            var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
-            lifetime.ApplicationStopping.Register(() =>
-            {
-                try { loopCts.Cancel(); } catch { /* already disposed */ }
-            });
-        }
+        // Start the continuous-batch scheduler's run loop on a background task, cancelled when
+        // the host shuts down. Stopped/rebuilt on model swap, activation, and idle-unload (#369) —
+        // see ServerState.StartSchedulerLoop, which every one of those paths funnels through.
+        state.StartSchedulerLoop();
+
+        // Idle-unload sweep (#369): periodically evicts models past their keep-alive, including
+        // the active one (never interrupting an in-flight request — see ServerState.SweepIdleAsync).
+        // Runs even with the default single-model configuration, so idle-unload works out of the
+        // box for every server, not just multi-model setups.
+        _ = Task.Run(() => state.RunIdleSweepLoopAsync(state.Options.IdleSweepInterval, state.ShutdownToken));
 
         return app;
     }

@@ -15,6 +15,7 @@ internal static class VkStructureType
     internal const int MappedMemoryRange = 6;
     internal const int BindSparseInfo = 7;
     internal const int FenceCreateInfo = 8;
+    internal const int SemaphoreCreateInfo = 9;
     internal const int BufferCreateInfo = 12;
     internal const int ShaderModuleCreateInfo = 16;
     internal const int PipelineLayoutCreateInfo = 30;
@@ -54,6 +55,58 @@ internal static class VkStructureType
     // and the device-create enable. Drives the dp4a MMVQ decode path
     // (dotPacked4x8AccSatEXT / GL_EXT_integer_dot_product).
     internal const int PhysicalDeviceShaderIntegerDotProductFeatures = 1000280000;
+    // VK_EXT_subgroup_size_control (promoted to Vulkan 1.3 core). The Properties
+    // struct (chained off VkPhysicalDeviceProperties2) reports min/max subgroup
+    // size and which shader stages accept a required size; the Features struct
+    // (chained off VkPhysicalDeviceFeatures2 at device create) carries the
+    // subgroupSizeControl + computeFullSubgroups enables. The
+    // RequiredSubgroupSizeCreateInfo struct chains off
+    // VkPipelineShaderStageCreateInfo.pNext to pin a single compute pipeline to
+    // a specific wave width (e.g. 32 for the K-quant decode GEMV on RDNA3.5,
+    // whose driver defaults compute to wave64).
+    internal const int PhysicalDeviceSubgroupSizeControlProperties = 1000225000;
+    internal const int PhysicalDeviceSubgroupSizeControlFeatures = 1000225001;
+    internal const int PipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225002;
+    // VK_KHR_external_semaphore (core 1.1) — VkExportSemaphoreCreateInfo chains
+    // off VkSemaphoreCreateInfo.pNext to declare which handle type(s) the
+    // semaphore may be exported as. Drives the M3 Vulkan→CUDA async handoff.
+    internal const int ExportSemaphoreCreateInfo = 1000077000;
+    // VK_KHR_external_semaphore_win32 — VkSemaphoreGetWin32HandleInfoKHR is the
+    // argument to vkGetSemaphoreWin32HandleKHR; VkExportSemaphoreWin32HandleInfoKHR
+    // optionally chains security attrs/access onto the export create info.
+    internal const int SemaphoreGetWin32HandleInfoKhr = 1000078003;
+    internal const int ExportSemaphoreWin32HandleInfoKhr = 1000078001;
+    // VK_KHR_timeline_semaphore (core 1.2) — VkSemaphoreTypeCreateInfo chains off
+    // VkSemaphoreCreateInfo.pNext to request a TIMELINE semaphore. Required for the
+    // D3D12_FENCE export type CUDA imports cross-vendor (Intel Vulkan → NVIDIA CUDA);
+    // the OPAQUE_WIN32 binary form fails import on that pairing (CUresult 999).
+    internal const int SemaphoreTypeCreateInfo = 1000207002;
+    // VkTimelineSemaphoreSubmitInfo chains off VkSubmitInfo.pNext to carry the
+    // per-semaphore signal/wait counter values for a timeline submit.
+    internal const int TimelineSemaphoreSubmitInfo = 1000207003;
+    // Feature struct enabling the timelineSemaphore capability at device create.
+    internal const int PhysicalDeviceTimelineSemaphoreFeatures = 1000207000;
+}
+
+// VkSemaphoreType — binary (default) vs timeline (monotonic counter).
+internal static class VkSemaphoreType
+{
+    internal const int Binary = 0;
+    internal const int Timeline = 1;
+}
+
+// VkExternalSemaphoreHandleTypeFlagBits — handle types a semaphore may be
+// exported/imported as (VK_KHR_external_semaphore). OpaqueWin32 is the same-stack
+// NT handle; D3D12Fence is the cross-vendor-portable Win32 fence handle that
+// both Intel Vulkan and NVIDIA CUDA understand.
+[Flags]
+internal enum VkExternalSemaphoreHandleTypeFlags : uint
+{
+    OpaqueFd = 0x00000001,
+    OpaqueWin32 = 0x00000002,
+    OpaqueWin32Kmt = 0x00000004,
+    D3D12Fence = 0x00000008,
+    SyncFd = 0x00000010,
 }
 
 // VkComponentTypeKHR — component type of an element in a cooperative matrix.
@@ -151,6 +204,16 @@ internal static class VkDescriptorType
 internal static class VkShaderStageFlags
 {
     internal const uint Compute = 0x00000020;
+}
+
+// VkPipelineShaderStageCreateFlagBits — flags on VkPipelineShaderStageCreateInfo.
+// REQUIRE_FULL_SUBGROUPS_BIT (VK_EXT_subgroup_size_control / Vulkan 1.3 core)
+// asserts the local workgroup size is a multiple of the (required) subgroup
+// size so every subgroup is fully populated — paired with
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo when pinning a wave width.
+internal static class VkPipelineShaderStageCreateFlags
+{
+    internal const uint RequireFullSubgroups = 0x00000002;
 }
 
 internal static class VkCommandPoolCreateFlags
@@ -497,6 +560,89 @@ internal struct VkFenceCreateInfo
     internal uint flags;
 }
 
+// VkSemaphoreCreateInfo — a binary semaphore by default. Chain a
+// VkExportSemaphoreCreateInfo on pNext to make it exportable (M3 handoff).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+}
+
+// VkExportSemaphoreCreateInfo (VK_KHR_external_semaphore, core 1.1). Chained
+// onto VkSemaphoreCreateInfo.pNext; handleTypes declares which external handle
+// types the created semaphore may later be exported as.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkExportSemaphoreCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint handleTypes; // VkExternalSemaphoreHandleTypeFlags
+}
+
+// VkSemaphoreGetWin32HandleInfoKHR (VK_KHR_external_semaphore_win32). Argument
+// to vkGetSemaphoreWin32HandleKHR — requests the Win32 HANDLE for an
+// already-created exportable semaphore.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreGetWin32HandleInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint semaphore;   // VkSemaphore
+    internal uint handleType;  // single VkExternalSemaphoreHandleTypeFlags bit
+}
+
+// VkSemaphoreTypeCreateInfo (VK_KHR_timeline_semaphore, core 1.2). Chains onto
+// VkSemaphoreCreateInfo.pNext (before VkExportSemaphoreCreateInfo) to request a
+// timeline semaphore with an initial counter value.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkSemaphoreTypeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal int semaphoreType; // VkSemaphoreType
+    internal ulong initialValue;
+}
+
+// VkTimelineSemaphoreSubmitInfo (core 1.2). Chains onto VkSubmitInfo.pNext to
+// carry the per-semaphore counter values for timeline wait/signal. The array
+// lengths must match VkSubmitInfo's wait/signal semaphore counts.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkTimelineSemaphoreSubmitInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint waitSemaphoreValueCount;
+    internal nint pWaitSemaphoreValues;   // const uint64_t*
+    internal uint signalSemaphoreValueCount;
+    internal nint pSignalSemaphoreValues; // const uint64_t*
+}
+
+// VkPhysicalDeviceTimelineSemaphoreFeatures — chains off
+// VkPhysicalDeviceFeatures2.pNext to enable timelineSemaphore at device create.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceTimelineSemaphoreFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint timelineSemaphore; // VkBool32
+}
+
+// VkQueryPoolCreateInfo — timestamp query pool for the env-gated decode
+// profiler (issue #143). sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO (11),
+// queryType = VK_QUERY_TYPE_TIMESTAMP (2).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkQueryPoolCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint flags;
+    internal int queryType;
+    internal uint queryCount;
+    internal uint pipelineStatistics;
+}
+
 // VkPipelineStageFlagBits — stage masks for vkCmdPipelineBarrier. Only the few
 // we need in the compute-only hot loop are listed.
 internal static class VkPipelineStageFlags
@@ -599,6 +745,51 @@ internal struct VkPhysicalDeviceShaderIntegerDotProductFeatures
     internal uint shaderIntegerDotProduct; // VkBool32
 }
 
+// VkPhysicalDeviceSubgroupSizeControlProperties — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceProperties2.pNext.
+// `minSubgroupSize`/`maxSubgroupSize` bracket the legal required-size range
+// (gfx1151 reports 32/64). `requiredSubgroupSizeStages` is the VkShaderStageFlags
+// bitmask of stages that accept a VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+// — we require the COMPUTE bit before pinning a compute pipeline's wave width.
+// `maxComputeWorkgroupSubgroups` is read for completeness.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlProperties
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint minSubgroupSize;
+    internal uint maxSubgroupSize;
+    internal uint maxComputeWorkgroupSubgroups;
+    internal uint requiredSubgroupSizeStages; // VkShaderStageFlags bitmask
+}
+
+// VkPhysicalDeviceSubgroupSizeControlFeatures — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPhysicalDeviceFeatures2.pNext at device
+// creation. `subgroupSizeControl` enables pinning a pipeline's subgroup size;
+// `computeFullSubgroups` enables the REQUIRE_FULL_SUBGROUPS stage flag.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDeviceSubgroupSizeControlFeatures
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint subgroupSizeControl;  // VkBool32
+    internal uint computeFullSubgroups; // VkBool32
+}
+
+// VkPipelineShaderStageRequiredSubgroupSizeCreateInfo — VK_EXT_subgroup_size_control
+// (Vulkan 1.3 core). Chained off VkPipelineShaderStageCreateInfo.pNext to pin
+// the stage to a specific wave width. `requiredSubgroupSize` must be a power of
+// two within [minSubgroupSize, maxSubgroupSize] and the stage must be in
+// `requiredSubgroupSizeStages`. Used to force the K-quant decode GEMV onto
+// wave32 on RDNA3.5 (whose driver otherwise defaults compute to wave64).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint requiredSubgroupSize;
+}
+
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape
 // returned by vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR. Values are
 // used to pick the (MSize, NSize, KSize) baked into the compiled coopmat shader.
@@ -680,4 +871,46 @@ internal struct VkExternalMemoryBufferCreateInfo
     internal int sType;
     internal nint pNext;
     internal uint handleTypes;
+}
+
+// VK_AMD_shader_info — vkGetShaderInfoAMD's VkShaderInfoTypeAMD parameter.
+// Only Statistics is used (post-compile VGPR/SGPR/LDS usage); Binary and
+// Disassembly return driver-internal blobs we have no use for here.
+internal static class VkShaderInfoTypeAmd
+{
+    internal const int Statistics = 0;
+    internal const int Binary = 1;
+    internal const int Disassembly = 2;
+}
+
+// VkShaderResourceUsageAMD — nested inside VkShaderStatisticsInfoAMD. `size_t`
+// fields map to `nuint` (this project only targets 64-bit Windows/Linux, where
+// nuint is 8 bytes, matching the native ABI).
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderResourceUsageAmd
+{
+    internal uint numUsedVgprs;
+    internal uint numUsedSgprs;
+    internal uint ldsSizePerLocalWorkGroup;
+    internal nuint ldsUsageSizeInBytes;
+    internal nuint scratchMemUsageInBytes;
+}
+
+// VkShaderStatisticsInfoAMD — returned by vkGetShaderInfoAMD with infoType =
+// VK_SHADER_INFO_TYPE_STATISTICS_AMD. Reports the driver's actual post-compile
+// register/LDS allocation for a given pipeline stage — ground truth for the
+// "is the MMQ kernel register-spilling / LDS-limited on occupancy" question
+// that black-box timing (#384-#390) could not answer.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkShaderStatisticsInfoAmd
+{
+    internal uint shaderStageMask; // VkShaderStageFlags bitmask
+    internal VkShaderResourceUsageAmd resourceUsage;
+    internal uint numPhysicalVgprs;
+    internal uint numPhysicalSgprs;
+    internal uint numAvailableVgprs;
+    internal uint numAvailableSgprs;
+    internal uint computeWorkGroupSizeX;
+    internal uint computeWorkGroupSizeY;
+    internal uint computeWorkGroupSizeZ;
 }

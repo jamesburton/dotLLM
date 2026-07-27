@@ -49,12 +49,29 @@ public interface IQuantizedKvCache : IKvCache
     nint GetWindowValuesPtr(int layerIndex);
 
     /// <summary>
-    /// Returns the byte size of one quantized row for keys.
+    /// Returns the byte size of one quantized row for keys (layer 0). For a per-layer
+    /// (Gemma-4) geometry use <see cref="KeyQuantizedRowBytesOf"/> instead.
     /// </summary>
     int KeyQuantizedRowBytes { get; }
 
     /// <summary>
-    /// Returns the byte size of one quantized row for values.
+    /// Returns the byte size of one quantized row for values (layer 0). For a per-layer
+    /// (Gemma-4) geometry use <see cref="ValueQuantizedRowBytesOf"/> instead.
     /// </summary>
     int ValueQuantizedRowBytes { get; }
+
+    /// <summary>
+    /// Byte size of one quantized KEY row for <paramref name="layerIndex"/>. Equals
+    /// <see cref="KeyQuantizedRowBytes"/> for every uniform model; differs per layer for
+    /// Gemma-4 (distinct sliding vs global KV row widths). The default returns the scalar
+    /// (uniform) value, so caches with a single stride need not override it.
+    /// </summary>
+    int KeyQuantizedRowBytesOf(int layerIndex) => KeyQuantizedRowBytes;
+
+    /// <summary>
+    /// Byte size of one quantized VALUE row for <paramref name="layerIndex"/>. Equals
+    /// <see cref="ValueQuantizedRowBytes"/> for every uniform model; differs per layer for
+    /// Gemma-4. The default returns the scalar (uniform) value.
+    /// </summary>
+    int ValueQuantizedRowBytesOf(int layerIndex) => ValueQuantizedRowBytes;
 }

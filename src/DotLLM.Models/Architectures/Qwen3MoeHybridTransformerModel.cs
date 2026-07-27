@@ -3,6 +3,7 @@ using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
 using DotLLM.Core.Tensors;
 using DotLLM.Cpu.Kernels;
@@ -55,6 +56,13 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
 
     private readonly ComputeThreadPool? _threadPool;
     private readonly bool _ownsThreadPool;
+
+    // Set for the duration of one Forward(..., ILoraAdapter?) call; consulted only by
+    // ForwardMoeBody's MoeSwiGluMlp.ExecuteRoutedFromAssignments call site (per-expert
+    // "mlp.experts.{j}.{proj}" hook). Same single-threaded-per-instance lifecycle as
+    // TransformerModel._currentAdapter — not reentrant, not thread-safe across concurrent
+    // Forward calls on the same instance.
+    private ILoraAdapter? _currentAdapter;
 
     /// <inheritdoc/>
     public ModelConfig Config { get; }
@@ -487,6 +495,56 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         => Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
 
     /// <summary>
+    /// LoRA-aware forward. When <paramref name="adapter"/> is non-null, the routed MoE
+    /// FFN sub-layer (present on every layer of this architecture) adds the per-expert
+    /// LoRA delta for any <c>mlp.experts.{j}.{gate,up,down}_proj</c> entry the adapter
+    /// declares — the same hook <see cref="MoeSwiGluMlp.ExecuteRoutedFromAssignments"/>
+    /// already exposes for the non-hybrid MoE architectures and Gemma4Moe. When
+    /// <paramref name="adapter"/> is null this is byte-equivalent to the 4-arg overload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Scope: ONLY the routed-expert MoE projections are LoRA-adapted here. The GDN
+    /// (Gated DeltaNet) recurrent-mixing projections (qkv/gate/alpha/beta/out — see
+    /// <see cref="ForwardGdnBody"/>) and the full-attention q/k/v/o projections (see
+    /// <see cref="ForwardFullAttnBody"/>) have no LoRA hook on this class — wiring
+    /// those is separate, out-of-scope future work. An adapter entry that targets one
+    /// of those projection names is simply never looked up by this class, so it is a
+    /// silent no-op — same contract as <see cref="LoraAdapter.GetLayerWeights"/>
+    /// returning <see langword="null"/> for any <c>(layer, proj)</c> key nobody
+    /// queries. This class deliberately does NOT call <c>adapter.IsCompatible(Config)</c>
+    /// (unlike <c>TransformerModel.ValidateAdapterForModel</c>): a whole-adapter
+    /// compatibility gate would reject an otherwise-useful adapter that ALSO carries
+    /// entries for GDN/full-attention projections outside this class's generic
+    /// q/k/v/o-or-gate/up/down shape switch, even though those entries are harmless
+    /// here. Per-expert MoE shape mismatches are still caught — and throw — inside
+    /// <c>MoeSwiGluMlp</c>'s own <c>ApplyLoraDelta</c> at the point an entry actually
+    /// matches and is about to be applied.
+    /// </para>
+    /// </remarks>
+    /// <param name="tokenIds">Input token IDs for this step.</param>
+    /// <param name="positions">Position indices for each token.</param>
+    /// <param name="deviceId">Target device for the returned tensor.</param>
+    /// <param name="kvCache">Optional per-seq KV-cache for the GQA layers.</param>
+    /// <param name="adapter">Optional LoRA adapter. See remarks for the supported scope.</param>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
+
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache, gdnState: null);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
+    }
+
+    /// <summary>
     /// Runs a forward pass with optional KV-cache (for the GQA layers) and optional
     /// per-sequence GDN recurrent state (for the GDN layers). When
     /// <paramref name="gdnState"/> is <see langword="null"/>, falls back to the
@@ -618,7 +676,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.attn_post_norm", normOut, seqLen, hiddenSize);
 
-            ForwardMoeBody(lw.Moe, seqLen, hiddenSize, normOut);
+            ForwardMoeBody(lw.Moe, layer, seqLen, hiddenSize, normOut);
             if (TensorDump.Enabled)
                 TensorDump.Dump2D($"blk.{layer}.ffn_out", normOut, seqLen, hiddenSize);
 
@@ -659,6 +717,15 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
         return result;
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => new GdnStateCache(_gdn, _gdnCache.NumGdnLayers);
+
     /// <summary>
     /// Per-sequence loop over <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, IGdnState?)"/>
     /// — threads each request's GDN state through to the GDN scan, so multi-seq batched
@@ -669,11 +736,16 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Qwen3MoeHybrid carries no LoRA path today, so adapter-bearing requests throw
-    /// up-front — same shape as the Vulkan host's override. Per-seq fusion across
-    /// the GDN scan + MoE routing is not viable (the scan is per-token recurrent and
-    /// the MoE routing mask is per-token); this override simply loops Forward,
-    /// trading the per-iter dispatch-overhead amortisation for correctness.
+    /// The single-request <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?, ILoraAdapter?)"/>
+    /// overload now supports per-expert MoE LoRA (see its remarks for scope), but batched
+    /// dispatch through this method still rejects adapter-bearing requests up-front — same
+    /// shape as the Vulkan host's override. Wiring <see cref="SequenceForwardRequest.Adapter"/>
+    /// through the per-seq loop below is straightforward (each iteration could call the
+    /// 5-arg adapter overload) but is left for a follow-up so this change stays scoped to
+    /// the single-Forward MoE call-site fix. Per-seq fusion across the GDN scan + MoE
+    /// routing is not viable (the scan is per-token recurrent and the MoE routing mask is
+    /// per-token); this override simply loops Forward, trading the per-iter
+    /// dispatch-overhead amortisation for correctness.
     /// </para>
     /// </remarks>
     public IReadOnlyList<ITensor> ForwardBatch(
@@ -1052,7 +1124,7 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
     /// <see cref="MoeLayerWeights.SharedExpertGate"/>). When that gate is absent the call degenerates
     /// to the routed-only Mixtral path.
     /// </remarks>
-    private void ForwardMoeBody(MoeLayerWeights moe, int seqLen, int hiddenSize, float* normOut)
+    private void ForwardMoeBody(MoeLayerWeights moe, int layer, int seqLen, int hiddenSize, float* normOut)
     {
         int numExperts = moe.NumExperts;
         int numExpertsPerTok = moe.NumExpertsPerTok;
@@ -1142,8 +1214,8 @@ public sealed unsafe class Qwen3MoeHybridTransformerModel : IModel
             sharedDownProj: moe.SharedDownProj,
             sharedIntermediateSize: moe.SharedIntermediateSize,
             sharedExpertGate: sharedGateSpan,
-            loraAdapter: null,
-            loraLayer: 0,
+            loraAdapter: _currentAdapter,
+            loraLayer: layer,
             threadPool: _threadPool);
     }
 

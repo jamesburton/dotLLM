@@ -41,6 +41,11 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     private readonly VulkanNemotronHForwardState _state;
     private readonly VulkanSsmStateCache _ssmCache;
 
+    // Caller-supplied per-sequence SSM state for the in-flight forward, set by the
+    // Forward(...,ISsmState?) overload / ForwardBatch and consumed by RecordSsmLayer
+    // (instance-scoped, single-threaded per generation). Null ⇒ use _ssmCache.
+    private VulkanSsmStateCache? _activeSsm;
+
     // Hybrid layout (per-layer kind), SSM config + ordinal map.
     private readonly HybridLayerLayout _layout;
     private readonly MambaSsmConfig _ssm;
@@ -114,6 +119,13 @@ public sealed class VulkanNemotronHTransformerModel : IModel
     /// back to <see cref="_attention"/>.
     /// </summary>
     private readonly VulkanFlashAttentionF32Kernel? _flashAttention;
+    /// <summary>
+    /// Split-KV (Flash-Decoding) kernel for the long-context decode path
+    /// (seqLen == 1). Null when the SPVs are missing or the env-var opt-out is
+    /// set; used only for shapes that actually split (short context falls back
+    /// to <see cref="_attention"/>, keeping that path unchanged).
+    /// </summary>
+    private readonly VulkanSplitKvAttentionKernel? _splitKvAttention;
     private readonly SwiGluF32Kernel _swiglu;
     private readonly AddKernel _add;
     private readonly BiasAddF32Kernel _biasAdd;
@@ -185,6 +197,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         MatMulBf16GemvF32Kernel matmulBf16, MatMulBf16GemmF32Kernel matmulBf16Gemm,
         RmsNormF32Kernel rmsnorm, RopeF32Kernel rope,
         AttentionF32Kernel attention, VulkanFlashAttentionF32Kernel? flashAttention,
+        VulkanSplitKvAttentionKernel? splitKvAttention,
         SwiGluF32Kernel swiglu, AddKernel add, BiasAddF32Kernel biasAdd,
         Conv1dCausalF32Kernel conv1dCausal, SiluInplaceF32Kernel siluInplace,
         Mamba2SelectiveScanF32Kernel mamba2Scan, SsmDSkipF32Kernel ssmDSkip,
@@ -246,6 +259,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rope = rope;
         _attention = attention;
         _flashAttention = flashAttention;
+        _splitKvAttention = splitKvAttention;
         _swiglu = swiglu;
         _add = add;
         _biasAdd = biasAdd;
@@ -412,6 +426,10 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             VulkanTransformerModel.IsFlashAttentionDisabled() || config.HeadDim > VulkanFlashAttentionF32Kernel.MaxHeadDim
                 ? null
                 : VulkanFlashAttentionF32Kernel.TryCreate(device, spvDir);
+        VulkanSplitKvAttentionKernel? splitKvAttention =
+            VulkanTransformerModel.IsSplitDecodeDisabled() || config.HeadDim > VulkanSplitKvAttentionKernel.MaxHeadDim
+                ? null
+                : VulkanSplitKvAttentionKernel.TryCreate(device, spvDir);
         var swiglu = SwiGluF32Kernel.Create(device, spvDir);
         var add = AddKernel.Create(device, spvDir);
         var biasAdd = BiasAddF32Kernel.Create(device, spvDir);
@@ -447,7 +465,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             matmulIq1S, matmulIq1SGemm,
             matmulF16, matmulF16Gemm, matmulF16GemmCoopmat,
             matmulBf16, matmulBf16Gemm,
-            rmsnorm, rope, attention, flashAttention, swiglu, add, biasAdd,
+            rmsnorm, rope, attention, flashAttention, splitKvAttention, swiglu, add, biasAdd,
             conv1dCausal, siluInplace, mamba2Scan, ssmDSkip, groupRmsNorm, reluSquared,
             ssmSplitXbc,
             submit,
@@ -490,6 +508,46 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         }
         return result;
     }
+
+    /// <summary>
+    /// Forward with a caller-supplied per-sequence SSM state — the per-token recurrent state the
+    /// continuous-batch scheduler threads so concurrent sequences don't share the model-owned default.
+    /// Null falls back to <c>_ssmCache</c> (single-sequence behaviour). Attention layers use
+    /// <paramref name="kvCache"/> as usual.
+    /// </summary>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ISsmState? ssmState)
+    {
+        VulkanSsmStateCache? prev = _activeSsm;
+        _activeSsm = ResolveSsm(ssmState);
+        try { return Forward(tokenIds, positions, deviceId, kvCache); }
+        finally { _activeSsm = prev; }
+    }
+
+    private VulkanSsmStateCache? ResolveSsm(ISsmState? ssmState)
+    {
+        if (ssmState is null) return null; // use _ssmCache
+        if (ssmState is VulkanSsmStateCache cache)
+        {
+            if (cache.NumSsmLayers != _ssmCache.NumSsmLayers)
+                throw new ArgumentException(
+                    $"SsmState covers {cache.NumSsmLayers} SSM layers but this model has {_ssmCache.NumSsmLayers}.",
+                    nameof(ssmState));
+            return cache;
+        }
+        throw new ArgumentException(
+            $"VulkanNemotronHTransformerModel requires a {nameof(VulkanSsmStateCache)}; got {ssmState.GetType().Name}.",
+            nameof(ssmState));
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsThreadedSequenceState => true;
+
+    /// <inheritdoc/>
+    public IRecurrentSequenceState? CreateSequenceState() => CreateSsmState();
+
+    /// <summary>Allocates a fresh per-sequence SSM state for this model (device-local).</summary>
+    public VulkanSsmStateCache CreateSsmState() => new(_device, _ssm, _ssmCache.NumSsmLayers);
 
     /// <summary>
     /// Runs the shared NemotronH forward body (embedding + per-layer SSM/GQA/FFN +
@@ -615,6 +673,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _submit.SubmitAndWait();
     }
 
+    /// <inheritdoc/>
+    public bool RequiresPerSequenceState => true;
+
     /// <summary>
     /// Phase 5f mirror — NemotronH <c>ForwardBatch</c> override. Mirrors the dense
     /// <see cref="VulkanTransformerModel.ForwardBatch"/> partition / fall-through
@@ -662,7 +723,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         if (requests.Count == 1)
         {
             var r0 = requests[0];
-            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache) };
+            return new[] { Forward(r0.TokenIds.Span, r0.Positions.Span, deviceId, r0.KvCache, r0.SsmState) };
+        }
+
+        // 2+ requests need per-seq SSM state — a null would silently share the model-owned _ssmCache and
+        // corrupt concurrent decode (mirrors the Mamba-3 / Qwen3-MoE multi-seq contract).
+        for (int i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].SsmState is null)
+                throw new ArgumentException(
+                    $"VulkanNemotronHTransformerModel.ForwardBatch with {requests.Count} requests requires " +
+                    $"every request to supply a per-seq SsmState; request[{i}] has none.",
+                    nameof(requests));
         }
 
         // Partition simple / complex. Simple = KvCache is a VulkanNemotronHKvCache
@@ -684,7 +756,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         foreach (int i in complexIdx)
         {
             var r = requests[i];
-            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+            results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
         }
 
         // Fewer than 2 simple seqs: no batching benefit; just run through per-seq Forward.
@@ -693,7 +765,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             foreach (int i in simpleIdx)
             {
                 var r = requests[i];
-                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache);
+                results[i] = Forward(r.TokenIds.Span, r.Positions.Span, deviceId, r.KvCache, r.SsmState);
             }
             return results;
         }
@@ -729,8 +801,16 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         for (int s = 0; s < simpleCount; s++)
         {
             var r = requests[simpleIdx[s]];
-            RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
-                captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+            // Thread this sequence's per-seq SSM state through RecordSsmLayer (set on the instance,
+            // single-threaded; ForwardBatch already guards count>=2 against null state).
+            VulkanSsmStateCache? prev = _activeSsm;
+            _activeSsm = ResolveSsm(r.SsmState);
+            try
+            {
+                RunForwardCore(r.TokenIds.Span, r.Positions.Span, r.KvCache,
+                    captureLastNormedRowTo: lastRowHidden, captureSlot: s);
+            }
+            finally { _activeSsm = prev; }
         }
 
         // Batched lm_head — one matmul over the stacked [N_simple, hidden] capture
@@ -786,8 +866,9 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         int dtOffset = 2 * dInner + 2 * nGroup * dState;
 
         int ssmOrdinal = _ssmLayerOrdinal[absoluteLayerIndex];
-        var convStateBuf = _ssmCache.GetConvStateBuffer(ssmOrdinal);
-        var ssmStateBuf = _ssmCache.GetSsmStateBuffer(ssmOrdinal);
+        var activeSsm = _activeSsm ?? _ssmCache;
+        var convStateBuf = activeSsm.GetConvStateBuffer(ssmOrdinal);
+        var ssmStateBuf = activeSsm.GetSsmStateBuffer(ssmOrdinal);
 
         // 1. ssm_in matmul: NormOutput[seqLen, hidden] @ InWeight^T → Zxbcdt[seqLen, inProjDim]
         RecordMatmul(cmdBuf, ssmW.InWeight, ssmW.InDeviceQuantType, _state.NormOutput, _state.Zxbcdt,
@@ -959,7 +1040,18 @@ public sealed class VulkanNemotronHTransformerModel : IModel
             positionOffset = 0;
         }
 
-        if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
+        if (_splitKvAttention is not null && seqLen == 1
+            && headDim <= VulkanSplitKvAttentionKernel.MaxHeadDim
+            && VulkanSplitKvAttentionKernel.WouldSplit(seqKv, numHeads))
+        {
+            // Long-context decode: split the KV range across many workgroups
+            // (Flash-Decoding). Short context falls through to the per-token kernel.
+            _splitKvAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
+                seqQ: seqLen, seqKv: seqKv,
+                numHeads: numHeads, numKvHeads: numKvHeads, headDim: headDim,
+                positionOffset: positionOffset, slidingWindow: 0);
+        }
+        else if (_flashAttention is not null && seqLen > 1 && headDim <= VulkanFlashAttentionF32Kernel.MaxHeadDim)
         {
             _flashAttention.Record(cmdBuf, _state.Q, kSrc, vSrc, _state.AttnOutput,
                 seqQ: seqLen, seqKv: seqKv,
@@ -1041,6 +1133,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _rope.InvalidateDescriptorCache();
         _attention.InvalidateDescriptorCache();
         _flashAttention?.InvalidateDescriptorCache();
+        _splitKvAttention?.InvalidateDescriptorCache();
         _swiglu.InvalidateDescriptorCache();
         _add.InvalidateDescriptorCache();
         _biasAdd.InvalidateDescriptorCache();
@@ -1339,6 +1432,7 @@ public sealed class VulkanNemotronHTransformerModel : IModel
         _biasAdd.Dispose();
         _add.Dispose();
         _swiglu.Dispose();
+        _splitKvAttention?.Dispose();
         _flashAttention?.Dispose();
         _attention.Dispose();
         _rope.Dispose();

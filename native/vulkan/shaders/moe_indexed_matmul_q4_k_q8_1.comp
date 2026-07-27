@@ -1,0 +1,162 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// MoE indexed expert matmul over a packed Q4_K expert bank, dp4a (Q8_1-activation)
+// variant of moe_indexed_matmul_q4_k_f32.comp (issue #383).
+//
+//   y[n, m] = sum_k dequant_q4k(bank[indices[n], m, k]) * x[n, k]
+//
+// Root cause fixed: the F32 sibling kernel is scalar (one thread, one output
+// cell, plain float multiply-add per element) -- the same class of gap #139
+// closed for DENSE prefill matmuls via a 64x64 register-tiled dp4a MMQ kernel.
+// That register-tiled design does NOT port directly here: dense MMQ's tiling
+// assumes every row in a TILE_N x TILE_M workgroup tile shares one weight
+// matrix, but MoE rows independently route to different experts per `indices[n]`
+// -- a real "close the whole gap" fix needs llama.cpp-style expert-grouping
+// (sort rows by expert, batch-GEMM per group), scoped separately.
+//
+// This kernel takes the SMALLER, lower-risk half of #383's two-tier
+// recommendation: keep the exact same one-thread-per-output-cell dispatch
+// shape as the F32 kernel (safe -- no weight-tile-reuse assumption, so no
+// architecture change), but swap the scalar per-element float multiply for
+// the SAME dp4a integer-dot math the dense Q4_K MMQ kernel
+// (matmul_q4_k_mmq.comp) already uses per output cell -- activations are
+// pre-quantized to Q8_1 (quantize_q8_1_rows.comp, reused unmodified) once per
+// call, and every thread does dp4a-based dot products against its own
+// expert's Q4_K weight row. This is valid per-thread regardless of whether
+// neighboring threads share a weight matrix, so it needs no sort/group pass.
+// NOT bit-exact vs the F32-in kernel (same int8-activation-quant tolerance as
+// matmul_q4_k_mmq.comp) -- validated against the CPU F32 oracle with the same
+// tolerance + argmax-exact test pattern.
+//
+// Q8_1 activation layout (quantize_q8_1_rows.comp), row-major over N:
+//   xq  : uint[N * K/4]   -- 4 signed int8 lanes per uint, row r at r*(K/4).
+//   xds : vec2[N * K/32]  -- (.x = d, .y = s = d*sum(qs)) per 32-block, row r at r*(K/32).
+//
+// Q4_K super-block layout (144 bytes / 256 elems) -- identical to the F32
+// sibling and matmul_q4_k_mmq.comp:
+//   [0,1]=fp16 d  [2,3]=fp16 dmin  [4..15]=scales[12] (8x6-bit sc + 8x6-bit mn)
+//   [16..143]=qs[128] (low nibble -> even sub-block, high nibble -> odd sub-block)
+//
+// Dispatch: 2D grid, one thread per output cell (m, n). Workgroup (16, 16).
+//   groupCount = (ceil(M/16), ceil(N/16)) -- same as the F32 sibling.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufBank { uint  bank[]; };  // Q4_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq   { uint  xq[]; };    // [N * K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds  { vec2  xds[]; };   // [N * K/32]
+layout(set = 0, binding = 3, std430) readonly  buffer BufIdx  { int   indices[]; }; // [N]
+layout(set = 0, binding = 4, std430) writeonly buffer BufY    { float y[]; };     // [N * M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim   (per-expert weight row count)
+    uint K;             // input dim    (per-expert weight col count, multiple of 256)
+    uint N;             // total rows   (typically seqLen * topK)
+    uint numExperts;    // bank's first axis size -- bounds-check only
+    uint blocksPerRow;  // = K / 256
+} pc;
+
+const uint Q4K_BLOCK_BYTES = 144u;
+const uint Q4K_GROUP_SIZE  = 256u;
+
+uint readByte(uint absByteOff) {
+    uint u = bank[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = bank[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = bank[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// Unpack the j-th (0..7) (scale, min) pair from the 12-byte scales[] region.
+// Mirrors get_scale_min_k4 / the F32 sibling kernel, byte-for-byte.
+uvec2 unpackScaleMin(uint scalesByteBase, uint j) {
+    uint sc, mn;
+    if (j < 4u) {
+        sc = readByte(scalesByteBase + j) & 63u;
+        mn = readByte(scalesByteBase + j + 4u) & 63u;
+    } else {
+        uint jm4 = j - 4u;
+        uint jp4 = j + 4u;
+        uint scLow  = readByte(scalesByteBase + jp4) & 0xFu;
+        uint scHigh = (readByte(scalesByteBase + jm4) >> 6u) & 0x3u;
+        sc = scLow | (scHigh << 4u);
+        uint mnLow  = (readByte(scalesByteBase + jp4) >> 4u) & 0xFu;
+        uint mnHigh = (readByte(scalesByteBase + j) >> 6u) & 0x3u;
+        mn = mnLow | (mnHigh << 4u);
+    }
+    return uvec2(sc, mn);
+}
+
+void main() {
+    uint m = gl_GlobalInvocationID.x; // 0..M
+    uint n = gl_GlobalInvocationID.y; // 0..N
+    if (m >= pc.M || n >= pc.N) return;
+
+    int rawIdx = indices[n];
+    uint expertIdx = uint(clamp(rawIdx, 0, int(pc.numExperts) - 1));
+
+    uint rowByteStride    = pc.blocksPerRow * Q4K_BLOCK_BYTES;
+    uint matrixByteStride = pc.M * rowByteStride;
+    uint rowByteBase      = expertIdx * matrixByteStride + m * rowByteStride;
+
+    uint xqRowBase  = n * (pc.K >> 2u);  // uint index of this row's xq
+    uint xdsRowBase = n * (pc.K >> 5u);  // vec2 index of this row's xds
+
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.blocksPerRow; b++) {
+        uint blockByteBase = rowByteBase + b * Q4K_BLOCK_BYTES;
+        float d    = readHalf(blockByteBase);
+        float dmin = readHalf(blockByteBase + 2u);
+        uint scalesBase = blockByteBase + 4u;
+        uint qsBase     = blockByteBase + 16u;
+
+        for (uint j = 0u; j < 8u; j++) {
+            uvec2 sm = unpackScaleMin(scalesBase, j);
+            float dsc = d * float(sm.x);
+            float dmn = dmin * float(sm.y);
+
+            uint sb         = b * 8u + j;          // global 32-elem sub-block index (0..K/32-1)
+            uint pairIdx    = j >> 1u;              // 0..3
+            uint nibbleHalf = j & 1u;               // 0 (low) or 1 (high)
+            uint qsByteBase = qsBase + pairIdx * 32u;
+            uint xqSbBase   = xqRowBase + sb * 8u;
+
+            int dotI = 0;
+            for (uint g = 0u; g < 8u; g++) {
+                uint cur = bank[(qsByteBase + g * 4u) >> 2u];
+                uint wv;
+                if (nibbleHalf == 0u) {
+                    wv = ( cur        & 0x0Fu)
+                       | ((cur >>  8u) & 0x0Fu) << 8u
+                       | ((cur >> 16u) & 0x0Fu) << 16u
+                       | ((cur >> 24u) & 0x0Fu) << 24u;
+                } else {
+                    wv = ((cur >>  4u) & 0x0Fu)
+                       | ((cur >> 12u) & 0x0Fu) << 8u
+                       | ((cur >> 20u) & 0x0Fu) << 16u
+                       | ((cur >> 28u) & 0x0Fu) << 24u;
+                }
+                uint xv = xq[xqSbBase + g];
+                dotI = dotPacked4x8AccSatEXT(int(wv), int(xv), dotI);
+            }
+
+            vec2 ds = xds[xdsRowBase + sb];
+            acc += dsc * (ds.x * float(dotI)) - dmn * ds.y;
+        }
+    }
+
+    y[n * pc.M + m] = acc;
+}

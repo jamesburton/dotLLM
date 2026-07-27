@@ -15,7 +15,8 @@ public enum ActivationFunction
     GELUTanh,
 
     /// <summary>
-    /// Squared ReLU: <c>y = max(0, x)^2</c>. Used by Nemotron-H FFN layers.
+    /// Squared ReLU: <c>y = max(0, x)^2</c>. Used by Nemotron-H FFN layers (ungated) and,
+    /// gated as <c>relu(gate)²·up</c>, by BitNet b1.58.
     /// </summary>
     ReluSquared
 }

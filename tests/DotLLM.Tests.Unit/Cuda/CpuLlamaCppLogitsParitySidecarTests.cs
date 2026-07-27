@@ -67,36 +67,29 @@ public sealed class CpuLlamaCppLogitsParitySidecarTests
         for (int i = 0; i < positions.Length; i++) positions[i] = i;
 
         var loadWatch = Stopwatch.StartNew();
-        var model = TransformerModel.LoadFromGguf(gguf, config);
+        using var model = TransformerModel.LoadFromGguf(gguf, config);
         loadWatch.Stop();
         _output.WriteLine(
             $"CPU load: {loadWatch.Elapsed.TotalMilliseconds:F1} ms "
             + $"(arch={config.Architecture}, layers={config.NumLayers}, hidden={config.HiddenSize}, vocab={config.VocabSize})");
 
-        try
-        {
-            var forwardWatch = Stopwatch.StartNew();
-            using ITensor logits = model.Forward(sidecar.InputIds, positions, deviceId: 0);
-            forwardWatch.Stop();
-            _output.WriteLine(
-                $"CPU forward ({forwardWatch.Elapsed.TotalSeconds:F3} s): "
-                + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
+        var forwardWatch = Stopwatch.StartNew();
+        using ITensor logits = model.Forward(sidecar.InputIds, positions, deviceId: 0);
+        forwardWatch.Stop();
+        _output.WriteLine(
+            $"CPU forward ({forwardWatch.Elapsed.TotalSeconds:F3} s): "
+            + $"shape=[{logits.Shape[0]}, {logits.Shape[1]}]");
 
-            Assert.Equal(2, logits.Shape.Rank);
-            Assert.Equal(sidecar.InputIds.Length, logits.Shape[0]);  // seqLen = input IDs count
-            Assert.Equal(sidecar.VocabSize, logits.Shape[1]);
+        Assert.Equal(2, logits.Shape.Rank);
+        Assert.Equal(sidecar.InputIds.Length, logits.Shape[0]);  // seqLen = input IDs count
+        Assert.Equal(sidecar.VocabSize, logits.Shape[1]);
 
-            // Extract last token logits [vocab_size]
-            // Logits are in row-major order: logits[seq][vocab]
-            int lastTokenIndex = logits.Shape[0] - 1;
-            nint lastTokenPtr = logits.DataPointer + (lastTokenIndex * sidecar.VocabSize * sizeof(float));
-            var ours = new ReadOnlySpan<float>((void*)lastTokenPtr, sidecar.VocabSize);
-            CompareLogits(ours, sidecar);
-        }
-        finally
-        {
-            model.Dispose();
-        }
+        // Extract last token logits [vocab_size]
+        // Logits are in row-major order: logits[seq][vocab]
+        int lastTokenIndex = logits.Shape[0] - 1;
+        nint lastTokenPtr = logits.DataPointer + (lastTokenIndex * sidecar.VocabSize * sizeof(float));
+        var ours = new ReadOnlySpan<float>((void*)lastTokenPtr, sidecar.VocabSize);
+        CompareLogits(ours, sidecar);
     }
 
     private void CompareLogits(ReadOnlySpan<float> ours, LlamaCppLogitsSidecar sidecar)
@@ -274,7 +267,8 @@ public sealed class CpuLlamaCppLogitsParitySidecarTests
     {
         int[] values = new int[element.GetArrayLength()];
         int i = 0;
-        foreach (var value in element.EnumerateArray())
+        using var enumerator = element.EnumerateArray();
+        foreach (var value in enumerator)
             values[i++] = value.GetInt32();
         return values;
     }
@@ -283,7 +277,8 @@ public sealed class CpuLlamaCppLogitsParitySidecarTests
     {
         float[] values = new float[element.GetArrayLength()];
         int i = 0;
-        foreach (var value in element.EnumerateArray())
+        using var enumerator = element.EnumerateArray();
+        foreach (var value in enumerator)
             values[i++] = (float)value.GetDouble();
         return values;
     }

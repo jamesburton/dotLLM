@@ -231,7 +231,7 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
                     break;
                 }
             }
-            Assert.True(false, $"Quantized K mismatch at pos={pos}");
+            Assert.Fail($"Quantized K mismatch at pos={pos}");
         }
     }
 
@@ -254,7 +254,7 @@ public sealed unsafe class CudaQuantizedKvCacheGraphTest : IDisposable
                     break;
                 }
             }
-            Assert.True(false, $"{tag} mismatch");
+            Assert.Fail($"{tag} mismatch");
         }
     }
 

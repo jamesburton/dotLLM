@@ -26,7 +26,31 @@ namespace DotLLM.Core.Lora;
 /// </remarks>
 public sealed unsafe class LoraAdapter : ILoraAdapter
 {
+    /// <summary>
+    /// Sentinel layer index reserved for DiffusionGemma's model-level
+    /// <c>decoder.self_conditioning.*</c> module. Self-conditioning runs ONCE per
+    /// forward (not inside the per-layer loop) and has no real transformer layer
+    /// index — real layer indices are always <c>&gt;= 0</c> and
+    /// <c>&lt; ModelConfig.NumLayers</c>, so a negative sentinel can never collide
+    /// with one. Entries are keyed with this sentinel + the SAME proj names used by
+    /// the dense FFN (<c>gate_proj</c>/<c>up_proj</c>/<c>down_proj</c>) so
+    /// <see cref="IsCompatibleEntry"/>'s existing shape-validation switch applies
+    /// unchanged (self-conditioning's gate/up/down are the same
+    /// <c>[HiddenSize→IntermediateSize]</c> / <c>[IntermediateSize→HiddenSize]</c>
+    /// shape family as the dense FFN's). Region is always <see cref="LoraRegion.Any"/>
+    /// — self-conditioning only ever touches canvas rows structurally, so there is no
+    /// prompt/canvas split to make for it.
+    /// </summary>
+    public const int SelfConditioningLayerIndex = -1;
+
     private readonly Dictionary<(int Layer, string Proj), LoraLayerWeights> _layers;
+    // Lazily allocated: only non-null when a region-tagged (Encoder/Decoder) entry is
+    // added (real DiffusionGemma PEFT adapters trained with separate encoder/decoder
+    // LoRA deltas over the same shared backbone weight). Kept SEPARATE from _layers
+    // rather than folding region into its key, so every existing consumer that
+    // enumerates/looks up _layers (Vulkan adapter upload, MoE per-expert validation,
+    // the stage-2 outer-product cache) is unaffected for the single-region case.
+    private Dictionary<(int Layer, string Proj, LoraRegion Region), LoraLayerWeights>? _regionLayers;
     private readonly object _lock = new();
     private bool _disposed;
 
@@ -76,29 +100,53 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     /// safely free them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when an entry already exists for that <c>(layer, proj)</c>
+    /// Thrown when an entry already exists for that <c>(layer, proj, region)</c>
     /// key (PEFT shipped duplicate <c>lora_A</c> / <c>lora_B</c> tensors).
     /// </exception>
-    public void AddLayerWeights(int layerIndex, string projName, LoraLayerWeights weights)
+    public void AddLayerWeights(int layerIndex, string projName, LoraLayerWeights weights,
+                                LoraRegion region = LoraRegion.Any)
     {
         ArgumentException.ThrowIfNullOrEmpty(projName);
-        if (layerIndex < 0)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex, "Layer index must be non-negative.");
+        if (layerIndex < 0 && layerIndex != SelfConditioningLayerIndex)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex,
+                $"Layer index must be non-negative (or the {nameof(SelfConditioningLayerIndex)} sentinel).");
 
         lock (_lock)
         {
-            if (!_layers.TryAdd((layerIndex, projName), weights))
+            if (region == LoraRegion.Any)
+            {
+                if (!_layers.TryAdd((layerIndex, projName), weights))
+                {
+                    throw new InvalidOperationException(
+                        $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection '{projName}'.");
+                }
+                return;
+            }
+
+            _regionLayers ??= new Dictionary<(int, string, LoraRegion), LoraLayerWeights>();
+            if (!_regionLayers.TryAdd((layerIndex, projName, region), weights))
             {
                 throw new InvalidOperationException(
-                    $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection '{projName}'.");
+                    $"LoRA adapter '{Name}' already has weights for layer {layerIndex} projection "
+                    + $"'{projName}' region {region}.");
             }
         }
     }
 
     /// <inheritdoc/>
-    public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName)
+    public LoraLayerWeights? GetLayerWeights(int layerIndex, string projName, LoraRegion region = LoraRegion.Any)
     {
         if (string.IsNullOrEmpty(projName)) return null;
+
+        if (region != LoraRegion.Any
+            && _regionLayers is { } regional
+            && regional.TryGetValue((layerIndex, projName, region), out var regionalW))
+        {
+            return regionalW;
+        }
+
+        // Falls back to the single-region entry for: (a) region == Any, (b) a
+        // region-specific query against an adapter with no region split at all.
         return _layers.TryGetValue((layerIndex, projName), out var w) ? w : null;
     }
 
@@ -107,13 +155,39 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
     {
         ArgumentNullException.ThrowIfNull(baseConfig);
 
-        int qOut = baseConfig.NumAttentionHeads * baseConfig.HeadDim;
-        int kvOut = baseConfig.NumKvHeads * baseConfig.HeadDim;
-
         foreach (var ((layer, proj), w) in _layers)
         {
-            if ((uint)layer >= (uint)baseConfig.NumLayers)
+            if (!IsCompatibleEntry(layer, proj, w, baseConfig))
                 return false;
+        }
+        if (_regionLayers is not null)
+        {
+            foreach (var ((layer, proj, _), w) in _regionLayers)
+            {
+                if (!IsCompatibleEntry(layer, proj, w, baseConfig))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool IsCompatibleEntry(int layer, string proj, LoraLayerWeights w, ModelConfig baseConfig)
+    {
+        {
+            // The self-conditioning sentinel is not a real transformer layer index —
+            // skip the layer-count bound check for it. Every other entry validates
+            // against the real per-layer bound as before.
+            if (layer != SelfConditioningLayerIndex && (uint)layer >= (uint)baseConfig.NumLayers)
+                return false;
+
+            // Gemma-4-family models have a PER-LAYER head dim / kv-head count: global
+            // (full-attention) layers use GlobalHeadDim/NumGlobalKvHeads, sliding layers use
+            // the uniform HeadDim/NumKvHeads. A single model-wide qOut/kvOut (as if every
+            // layer were uniform) would wrongly reject a correctly-shaped adapter entry at a
+            // global layer (or wrongly ACCEPT a wrong-shaped one at a sliding layer) — compute
+            // per-layer, exactly like the forward pass does via GetLayerHeadDim/GetLayerKvHeads.
+            int qOut = baseConfig.NumAttentionHeads * baseConfig.GetLayerHeadDim(layer);
+            int kvOut = baseConfig.GetLayerKvHeads(layer) * baseConfig.GetLayerHeadDim(layer);
 
             // Validate the projection's input/output dimensions match the
             // base model's per-projection shape.
@@ -319,6 +393,17 @@ public sealed unsafe class LoraAdapter : ILoraAdapter
                 if (w.ATransposedHandle != 0) NativeMemory.AlignedFree((void*)w.ATransposedHandle);
             }
             _layers.Clear();
+
+            if (_regionLayers is not null)
+            {
+                foreach (var w in _regionLayers.Values)
+                {
+                    if (w.AHandle != 0) NativeMemory.AlignedFree((void*)w.AHandle);
+                    if (w.BHandle != 0) NativeMemory.AlignedFree((void*)w.BHandle);
+                    if (w.ATransposedHandle != 0) NativeMemory.AlignedFree((void*)w.ATransposedHandle);
+                }
+                _regionLayers.Clear();
+            }
         }
     }
 }

@@ -37,6 +37,7 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     private readonly long _moeW2ElemsPerExpert;
 
     private int _currentSeqLen;
+    private int _logitsCurrentRows;
     private bool _disposed;
 
     public long AllocatedBytes { get; private set; }
@@ -45,6 +46,9 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     public nint HiddenState;
     public nint Residual;
     public nint NormOutput;
+
+    // Sized independently of the other per-token buffers above (issue #185) -- see
+    // CudaQwen3HybridDenseForwardState's identically-named field doc for the full rationale.
     public nint Logits;
 
     // ── GDN sub-layer ─────────────────────────────────────────────────────────
@@ -165,23 +169,60 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
 
         _currentSeqLen = 0;
         EnsureCapacity(1);
+        EnsureLogitsCapacity(1);
     }
 
     /// <summary>
-    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens,
-    /// reallocating in power-of-two increments. No-op when capacity already suffices.
+    /// Rounding granularity (in tokens) <see cref="EnsureCapacity"/> switches to once its
+    /// requested length exceeds this size -- mirrors
+    /// <see cref="CudaQwen3HybridDenseForwardState.CapacityGranularity"/>; see that type's
+    /// identically-named member and <see cref="EnsureCapacity"/>'s remarks for the full
+    /// issue #188 rationale.
     /// </summary>
+    internal const int CapacityGranularity = 256;
+
+    /// <summary>
+    /// Rounds <paramref name="seqLen"/> up to the next allocation-worthy capacity for
+    /// <see cref="EnsureCapacity"/>. See <see cref="CapacityGranularity"/> and
+    /// <see cref="EnsureCapacity"/>'s remarks for the issue #188 rationale behind the two-regime
+    /// split.
+    /// </summary>
+    internal static int RoundUpCapacity(int seqLen)
+    {
+        if (seqLen <= CapacityGranularity)
+            return (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+
+        return (seqLen + CapacityGranularity - 1) / CapacityGranularity * CapacityGranularity;
+    }
+
+    /// <summary>
+    /// Grows all per-token buffers to cover at least <paramref name="seqLen"/> tokens.
+    /// No-op when capacity already suffices. Does NOT size <see cref="Logits"/> -- see
+    /// <see cref="EnsureLogitsCapacity"/>.
+    /// </summary>
+    /// <remarks>
+    /// Issue #188: below <see cref="CapacityGranularity"/> tokens, capacity still rounds up to
+    /// the next power of two (unchanged from the original scheme) -- at this scale the absolute
+    /// byte cost of over-allocating is small, and pow2 rounding gives cheap amortization for the
+    /// common case of many small, differently-sized calls (e.g. varying prompt lengths in normal
+    /// serving) without reallocating on every single-token-different request. Above the
+    /// granularity threshold, capacity instead rounds up to the next multiple of
+    /// <see cref="CapacityGranularity"/> tokens -- this bounds the worst-case waste to at most
+    /// <c>CapacityGranularity - 1</c> tokens' worth of buffers REGARDLESS of how large seqLen
+    /// gets, instead of the up-to-2x waste power-of-two rounding produces right after crossing a
+    /// pow2 boundary. See <see cref="CudaQwen3HybridDenseForwardState.EnsureCapacity"/> for the
+    /// full issue #188 finding this mirrors.
+    /// </remarks>
     public void EnsureCapacity(int seqLen)
     {
         if (seqLen <= _currentSeqLen) return;
 
-        int cap = (int)BitOperations.RoundUpToPowerOf2((uint)seqLen);
+        int cap = RoundUpCapacity(seqLen);
         FreeSequenceBuffers();
 
         HiddenState = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         Residual = AllocDevice((long)cap * _hiddenSize * sizeof(float));
         NormOutput = AllocDevice((long)cap * _hiddenSize * sizeof(float));
-        Logits = AllocDevice((long)cap * _vocabSize * sizeof(float));
 
         GdnConvInput = AllocDevice((long)(_dConv - 1 + cap) * _convDim * sizeof(float));
         GdnQkvBuf = AllocDevice((long)cap * _convDim * sizeof(float));
@@ -206,6 +247,18 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
         _currentSeqLen = cap;
     }
 
+    /// <summary>
+    /// Grows <see cref="Logits"/> to cover at least <paramref name="rows"/> rows (issue #185) --
+    /// see <see cref="CudaQwen3HybridDenseForwardState.EnsureLogitsCapacity"/> for the rationale.
+    /// </summary>
+    public void EnsureLogitsCapacity(int rows)
+    {
+        if (rows <= _logitsCurrentRows) return;
+        FreeIfNonZero(ref Logits);
+        Logits = AllocDevice((long)rows * _vocabSize * sizeof(float));
+        _logitsCurrentRows = rows;
+    }
+
     private nint AllocDevice(long bytes)
     {
         CudaDriverApi.cuMemAlloc_v2(out nint ptr, (nuint)bytes).ThrowOnError();
@@ -227,7 +280,6 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
         FreeIfNonZero(ref HiddenState);
         FreeIfNonZero(ref Residual);
         FreeIfNonZero(ref NormOutput);
-        FreeIfNonZero(ref Logits);
         FreeIfNonZero(ref GdnConvInput);
         FreeIfNonZero(ref GdnQkvBuf);
         FreeIfNonZero(ref GdnZBuf);
@@ -259,8 +311,10 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeMoeScratch();
         _currentSeqLen = 0;
+        _logitsCurrentRows = 0;
         _disposed = true;
         GC.SuppressFinalize(this);
     }
@@ -269,6 +323,7 @@ internal sealed unsafe class CudaQwen3MoeHybridForwardState : IDisposable
     {
         if (_disposed) return;
         FreeSequenceBuffers();
+        FreeIfNonZero(ref Logits);
         FreeMoeScratch();
     }
 }

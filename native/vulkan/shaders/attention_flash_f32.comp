@@ -37,10 +37,16 @@
 
 #define BR              16
 #define BC              64
-#define WG_SIZE         BC
+// issue #139: 256 threads = 4 RDNA3.5 wave64s per workgroup. The previous
+// WG_SIZE == BC (= 64, one wave) left most SIMDs idle: each workgroup holds
+// ~20 KB of LDS, so only 2-3 workgroups fit a WGP, and one wave each gave the
+// scheduler almost nothing to hide latency with. QK^T splits the BR rows
+// across the 4 waves (each wave owns 4 rows × its BC column); the PV
+// accumulation flattens (row, dim) pairs across all 256 threads.
+#define WG_SIZE         256
+#define ROWS_PER_SLICE  (BR / (WG_SIZE / BC))   // Q-rows per wave slice = 4
 #define MAX_HEAD_DIM    128
 #define NEG_INF         (-3.4e38)
-#define MAX_SUBGROUPS   16  // WG_SIZE / smallest realistic subgroupSize (= 4)
 
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -60,21 +66,36 @@ layout(push_constant) uniform PushConstants {
     uint  useAlibi;        // 0 = disabled, 1 = standard fixed ALiBi slopes
     float softCap;         // 0.0 = disabled, >0 = tanh-capped scores
     float scaleOverride;   // 0.0 = use 1/sqrt(headDim), >0 = use this scale (Gemma 3 QPAS)
-    uint  _pad0;
-    uint  _pad1;
+    uint  maskMode;        // 0 = Causal, 1 = Bidirectional, 2 = Hybrid (diffusion canvas)
+    uint  prefixLen;       // Hybrid only: positions < prefixLen stay causal, >= are bidirectional
 } pc;
 
+// Causal-component mask for the (key, query) pair under the selected mode.
+// Sliding-window masking composes with this exactly as in the CPU reference
+// (DotLLM.Cpu.Kernels.Attention.ApplyMask):
+//   Causal        -> tkv > posQ
+//   Bidirectional -> false (no causal upper bound)
+//   Hybrid        -> (posQ < prefixLen) ? (tkv > posQ) : false
+// maskMode==0 with prefixLen==0 reproduces the original hardcoded check byte-for-byte.
+bool isMasked(uint tkv, uint posQ, uint maskMode, uint prefixLen) {
+    if (maskMode == 1u) return false;
+    if (maskMode == 2u && posQ >= prefixLen) return false;
+    return tkv > posQ;
+}
+
+// scoreMatrix rows are padded by one column (BC + 1 stride) so the row-owner
+// softmax pass (issue #139) — where thread r scans its row serially — hits a
+// different LDS bank per thread instead of a BR-way conflict on every column.
+#define BC_PAD (BC + 1)
+
 shared float qTile[BR * MAX_HEAD_DIM];
-shared float scoreMatrix[BR * BC];
+shared float scoreMatrix[BR * BC_PAD];
 shared float outAccum[BR * MAX_HEAD_DIM];
 shared float runningMax[BR];
 shared float runningSum[BR];
-// Per-subgroup partials for cross-subgroup reductions when subgroupSize < WG_SIZE.
-shared float partialMax[MAX_SUBGROUPS];
-shared float partialSum[MAX_SUBGROUPS];
-// Single broadcast slot so a published row-max / row-sum reaches every thread.
-shared float rowMaxBroadcast;
-shared float rowSumBroadcast;
+// Per-row online-softmax rescale factor for this KV tile, published by the
+// row-owner thread and applied to outAccum by the whole workgroup.
+shared float corrShared[BR];
 
 uint previousPowerOfTwo(uint value) {
     uint power = 1u;
@@ -97,43 +118,6 @@ float alibiSlope(uint head, uint numHeads) {
     uint expanded = power << 1u;
     uint extraHead = (head - power) << 1u;
     return alibiSlopePowerOfTwo(extraHead, expanded);
-}
-
-// Workgroup-wide max using subgroup arithmetic + a cross-subgroup combine
-// through shared memory. Result is broadcast through rowMaxBroadcast so every
-// thread observes the same workgroup-wide value.
-float wgRowMax(float val) {
-    float sgMax = subgroupMax(val);
-    if (subgroupElect()) partialMax[gl_SubgroupID] = sgMax;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
-                ? partialMax[gl_SubgroupInvocationID]
-                : NEG_INF;
-        float reduced = subgroupMax(x);
-        if (subgroupElect()) rowMaxBroadcast = reduced;
-    }
-    barrier();
-    float m = rowMaxBroadcast;
-    barrier();
-    return m;
-}
-
-float wgRowSum(float val) {
-    float sgSum = subgroupAdd(val);
-    if (subgroupElect()) partialSum[gl_SubgroupID] = sgSum;
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
-                ? partialSum[gl_SubgroupInvocationID]
-                : 0.0;
-        float reduced = subgroupAdd(x);
-        if (subgroupElect()) rowSumBroadcast = reduced;
-    }
-    barrier();
-    float s = rowSumBroadcast;
-    barrier();
-    return s;
 }
 
 void main() {
@@ -179,21 +163,41 @@ void main() {
     //    active BC tile and computes BR dot products against the resident
     //    Q-rows. Each KV row is therefore read once per Q-tile — BR× the
     //    amortisation vs the per-token shader.
-    for (uint tStart = 0u; tStart < pc.seqKv; tStart += uint(BC)) {
-        uint tileLen = min(uint(BC), pc.seqKv - tStart);
-        uint c = tid;
+    // Causal early-exit (issue #139): under a pure causal mask no KV column
+    // beyond the last Q-row's position can contribute — every score in such a
+    // tile is NEG_INF and its exp() weight 0. Clamping the KV walk saves ~half
+    // the QK^T + PV work for a square prefill. Bidirectional/Hybrid masks keep
+    // the full range (their tail rows attend forward).
+    uint kvEnd = pc.seqKv;
+    if (pc.maskMode == 0u) {
+        uint lastPosQ = pc.positionOffset + qStartRow + rowsInTile - 1u;
+        kvEnd = min(pc.seqKv, lastPosQ + 1u);
+    }
+
+    for (uint tStart = 0u; tStart < kvEnd; tStart += uint(BC)) {
+        uint tileLen = min(uint(BC), kvEnd - tStart);
+        // 2a. QK^T. Each of the 4 wave slices owns ROWS_PER_SLICE (= 4) Q-rows;
+        // within a slice, lane c (0..BC-1) owns KV column c. Each thread
+        // computes 4 dot products against the LDS-resident Q-rows; K rows are
+        // read directly from global (L0/L1-cached: a 64 B line serves 16
+        // consecutive d iterations, and the row is shared by 4 slices).
+        uint c     = tid & (uint(BC) - 1u);   // 0..63 KV column
+        uint slice = tid >> 6u;               // 0..3 wave slice
+        uint rBase = slice * uint(ROWS_PER_SLICE);
         bool cValid = (c < tileLen);
         uint tkv = tStart + c;
         uint kBase = tkv * kvStride + hkv * pc.headDim;
 
-        for (uint r = 0u; r < rowsInTile; r++) {
+        for (uint rr = 0u; rr < uint(ROWS_PER_SLICE); rr++) {
+            uint r = rBase + rr;
+            if (r >= rowsInTile) break;
             float s;
             if (!cValid) {
                 s = NEG_INF;
             } else {
                 uint posQ = pc.positionOffset + qStartRow + r;
                 bool masked =
-                    tkv > posQ ||
+                    isMasked(tkv, posQ, pc.maskMode, pc.prefixLen) ||
                     (pc.slidingWindow > 0u && posQ >= tkv && (posQ - tkv) >= pc.slidingWindow);
                 if (masked) {
                     s = NEG_INF;
@@ -208,52 +212,63 @@ void main() {
                     }
                 }
             }
-            scoreMatrix[r * uint(BC) + c] = s;
+            scoreMatrix[r * uint(BC_PAD) + c] = s;
         }
         barrier();
 
-        // 2b. Per-row max + online-softmax rescale + exponentiate.
-        for (uint r = 0u; r < rowsInTile; r++) {
-            float val = scoreMatrix[r * uint(BC) + tid];
-            float tileMax = wgRowMax(val);
-            float oldMax  = runningMax[r];
-            float newMax  = max(oldMax, tileMax);
+        // 2b. Per-row max + online-softmax rescale + exponentiate (issue #139).
+        // One thread owns one Q-row and scans its BC scores serially — BR rows
+        // run in parallel with NO intra-row reduction, replacing the previous
+        // per-row workgroup-wide subgroup reductions (≈8 barriers × BR rows per
+        // KV tile) with a single barrier pair per tile. The padded score-row
+        // stride keeps the BR concurrent serial scans bank-conflict-free.
+        if (tid < rowsInTile) {
+            uint r = tid;
+            uint rowBase = r * uint(BC_PAD);
+            float oldMax = runningMax[r];
+            float newMax = oldMax;
+            for (uint c2 = 0u; c2 < tileLen; c2++) {
+                newMax = max(newMax, scoreMatrix[rowBase + c2]);
+            }
             float correction = (oldMax > NEG_INF * 0.5) ? exp(oldMax - newMax) : 0.0;
-
-            if (tid == 0u) {
-                runningSum[r] = runningSum[r] * correction;
-                runningMax[r] = newMax;
+            float tileSum = 0.0;
+            for (uint c2 = 0u; c2 < tileLen; c2++) {
+                float val = scoreMatrix[rowBase + c2];
+                float w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
+                scoreMatrix[rowBase + c2] = w;
+                tileSum += w;
             }
-            for (uint d = tid; d < pc.headDim; d += uint(WG_SIZE)) {
-                outAccum[r * pc.headDim + d] *= correction;
-            }
-
-            float w = (val > NEG_INF * 0.5) ? exp(val - newMax) : 0.0;
-            scoreMatrix[r * uint(BC) + tid] = w;
-            barrier();
-
-            float tileSum = wgRowSum(w);
-            if (tid == 0u) {
-                runningSum[r] = runningSum[r] + tileSum;
-            }
-            barrier();
+            runningSum[r] = runningSum[r] * correction + tileSum;
+            runningMax[r] = newMax;
+            corrShared[r] = correction;
         }
+        barrier();
 
-        // 2c. Accumulate weighted V into outAccum[r, :]. Parallelize across
-        //     head_dim; each thread reads its share of V columns. Each V
-        //     row is read once per Q-tile.
-        for (uint r = 0u; r < rowsInTile; r++) {
-            for (uint d = tid; d < pc.headDim; d += uint(WG_SIZE)) {
-                float acc = 0.0;
-                for (uint c2 = 0u; c2 < tileLen; c2++) {
-                    float w = scoreMatrix[r * uint(BC) + c2];
-                    if (w > 0.0) {
-                        uint vOff = (tStart + c2) * kvStride + hkv * pc.headDim + d;
-                        acc += w * v[vOff];
-                    }
+        // Rescale the output accumulator by each row's correction factor —
+        // parallelised across the whole workgroup (was per-row, serialized).
+        for (uint idx = tid; idx < rowsInTile * pc.headDim; idx += uint(WG_SIZE)) {
+            uint r = idx / pc.headDim;
+            outAccum[idx] *= corrShared[r];
+        }
+        barrier();
+
+        // 2c. Accumulate weighted V into outAccum. (row, dim) pairs are
+        //     flattened across the whole workgroup so all 256 threads stay
+        //     busy (BR × headDim = 2048 cells / 256 threads = 8 each); V
+        //     reads stay coalesced across the dim axis and each V line is
+        //     L0/L1-shared by the row-threads.
+        for (uint idx = tid; idx < rowsInTile * pc.headDim; idx += uint(WG_SIZE)) {
+            uint r = idx / pc.headDim;
+            uint d = idx - r * pc.headDim;
+            float acc = 0.0;
+            for (uint c2 = 0u; c2 < tileLen; c2++) {
+                float w = scoreMatrix[r * uint(BC_PAD) + c2];
+                if (w > 0.0) {
+                    uint vOff = (tStart + c2) * kvStride + hkv * pc.headDim + d;
+                    acc += w * v[vOff];
                 }
-                outAccum[r * pc.headDim + d] += acc;
             }
+            outAccum[r * pc.headDim + d] += acc;
         }
         barrier();
     }

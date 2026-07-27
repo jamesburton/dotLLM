@@ -82,9 +82,10 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
         string text = _tokenizer.DecodeToken(tokenId);
         foreach (char c in text)
         {
+            var pre = _parser; // pre-advance parser state — needed for correct branch pruning
             bool ok = _parser.TryAdvance(c);
             Debug.Assert(ok, $"Schema constraint allowed token that advances to invalid JSON state at char '{c}'");
-            _tracker.OnCharAdvanced(c, in _parser);
+            _tracker.OnCharAdvanced(c, in _parser, in pre);
         }
     }
 
@@ -155,14 +156,45 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
         Debug.Assert(tokenText.Length > 0, "Bucketing excludes empty tokens");
         Debug.Assert(tokenText[0] == bucketFirstChar, "Bucket first char must match token first char");
 
-        // Value copies — zero allocations (both are fully unmanaged structs via InlineArray)
+        // Parser is a small unmanaged struct — always a cheap value copy.
         var parserClone = _parser;
+
+        // Fast path: a schema with no anyOf node anywhere can never fork, so the tracker is
+        // always exactly one live branch. Clone just that single BranchState (~1.3 KB) instead
+        // of the whole InlineArray(8) tracker (~10.5 KB). This is behaviour-identical for a
+        // non-forking schema: IsCharAllowedBySchema == _branches[0].IsCharAllowed, and
+        // OnCharAdvanced == MaybeFork(no-op for a schema without anyOf) + advance _branches[0].
+        if (!_tracker.CanFork)
+        {
+            var branch = _tracker.GetSingleBranch();
+
+            // First char: schema check already cleared by the bucket. Only need to advance.
+            if (!parserClone.TryAdvance(bucketFirstChar))
+                return false;
+            branch.OnCharAdvanced(bucketFirstChar, in parserClone);
+
+            // Remaining chars: full schema + syntactic check.
+            for (int i = 1; i < tokenText.Length; i++)
+            {
+                char c = tokenText[i];
+                if (!branch.IsCharAllowed(c, in parserClone))
+                    return false;
+                if (!parserClone.TryAdvance(c))
+                    return false;
+                branch.OnCharAdvanced(c, in parserClone);
+            }
+            return true;
+        }
+
+        // Forking-capable schema: clone the whole tracker so MaybeFork / per-branch narrowing
+        // is simulated faithfully. Value copy — zero allocations (unmanaged InlineArray struct).
         var trackerClone = _tracker;
 
         // First char: schema check already cleared by the bucket. Only need to advance.
+        var preFirst = parserClone; // pre-advance parser state for branch pruning
         if (!parserClone.TryAdvance(bucketFirstChar))
             return false;
-        trackerClone.OnCharAdvanced(bucketFirstChar, in parserClone);
+        trackerClone.OnCharAdvanced(bucketFirstChar, in parserClone, in preFirst);
 
         // Remaining chars: full schema + syntactic check.
         for (int i = 1; i < tokenText.Length; i++)
@@ -170,9 +202,10 @@ public sealed class JsonSchemaConstraint : IDecodingConstraint
             char c = tokenText[i];
             if (!trackerClone.IsCharAllowedBySchema(c, in parserClone))
                 return false;
+            var pre = parserClone; // pre-advance parser state for branch pruning
             if (!parserClone.TryAdvance(c))
                 return false;
-            trackerClone.OnCharAdvanced(c, in parserClone);
+            trackerClone.OnCharAdvanced(c, in parserClone, in pre);
         }
         return true;
     }

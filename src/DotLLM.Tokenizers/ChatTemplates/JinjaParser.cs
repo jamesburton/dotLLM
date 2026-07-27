@@ -413,33 +413,35 @@ internal sealed class JinjaParser
                 continue;
             }
 
-            // Index/bracket access: [expr] or slice: [start:stop]
+            // Index/bracket access: [expr] or slice: [start:stop:step] (any part optional)
             if (CurrentIs(JinjaTokenType.LeftBracket))
             {
                 Advance();
 
                 IExpression? start = null;
                 IExpression? stop = null;
+                IExpression? step = null;
                 bool isSlice = false;
+
+                // start (absent for [:stop] / [::step] / [:])
+                if (!CurrentIs(JinjaTokenType.Colon))
+                    start = ParseExpression();
 
                 if (CurrentIs(JinjaTokenType.Colon))
                 {
-                    // [:stop] or [:]
+                    // first ':' makes this a slice
                     isSlice = true;
                     Advance();
-                    if (!CurrentIs(JinjaTokenType.RightBracket))
+                    // stop (absent for [start:] / [start::step] / [:])
+                    if (!CurrentIs(JinjaTokenType.Colon) && !CurrentIs(JinjaTokenType.RightBracket))
                         stop = ParseExpression();
-                }
-                else
-                {
-                    start = ParseExpression();
+
                     if (CurrentIs(JinjaTokenType.Colon))
                     {
-                        // [start:stop] or [start:]
-                        isSlice = true;
+                        // second ':' introduces the optional step
                         Advance();
                         if (!CurrentIs(JinjaTokenType.RightBracket))
-                            stop = ParseExpression();
+                            step = ParseExpression();
                     }
                 }
 
@@ -447,7 +449,7 @@ internal sealed class JinjaParser
 
                 if (isSlice)
                 {
-                    expr = new SliceExpr(expr, start, stop);
+                    expr = new SliceExpr(expr, start, stop, step);
                 }
                 else
                 {

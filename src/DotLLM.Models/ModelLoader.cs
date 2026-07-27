@@ -24,18 +24,83 @@ public static class ModelLoader
     /// </summary>
     /// <param name="path">Path to the GGUF model file.</param>
     /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <param name="diffusionOverride">
+    /// Optional masked-diffusion decode configuration to attach to the loaded
+    /// <see cref="ModelConfig.DiffusionConfig"/>. GGUF carries no diffusion
+    /// metadata, so a diffusion model (e.g. LLaDA-8B, which is a Llama backbone
+    /// generating by masked diffusion) must have its mask token id + canvas /
+    /// step / temperature schedule injected explicitly here. When
+    /// <see langword="null"/> (the default) the GGUF load is unchanged — the
+    /// resulting <see cref="ModelConfig.DiffusionConfig"/> stays whatever the
+    /// extractor produced (always <see langword="null"/> for GGUF today), so the
+    /// model decodes autoregressively. When supplied, the returned model is a
+    /// normal <see cref="TransformerModel"/> that
+    /// <c>DiffusionTextGenerator</c> drives via the hybrid mask.
+    /// </param>
     /// <returns>The loaded model, GGUF file handle, and model configuration.</returns>
     public static (IModel Model, GgufFile Gguf, ModelConfig Config) LoadFromGguf(
-        string path, ThreadingConfig? threading = null)
+        string path, ThreadingConfig? threading = null, DiffusionConfig? diffusionOverride = null)
     {
         var gguf = GgufFile.Open(path);
         var config = GgufModelConfigExtractor.Extract(gguf.Metadata);
-        IModel model = config.Architecture switch
+        if (diffusionOverride is not null)
+            config = config with { DiffusionConfig = diffusionOverride };
+        IModel model = CreateCpuModelFromGguf(gguf, config, threading);
+        return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Creates the architecture-appropriate CPU <see cref="IModel"/> for an already-opened
+    /// GGUF file. This is THE per-architecture CPU dispatch point — CLI commands and the
+    /// server call it so hybrid architectures (Nemotron-H Mamba layers, Qwen3MoeHybrid
+    /// Gated-DeltaNet layers) route to their dedicated loaders instead of the plain
+    /// <see cref="TransformerModel"/>, whose tensor naming they do not follow (e.g. a GDN
+    /// layer has no <c>attn_output.weight</c>).
+    /// </summary>
+    /// <param name="gguf">An opened GGUF file. Must remain alive for the lifetime of the model.</param>
+    /// <param name="config">Model configuration extracted from <paramref name="gguf"/>.</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded CPU model.</returns>
+    public static IModel CreateCpuModelFromGguf(GgufFile gguf, ModelConfig config, ThreadingConfig? threading = null)
+    {
+        var effectiveThreading = threading ?? ThreadingConfig.SingleThreaded;
+        return config.Architecture switch
         {
             Architecture.NemotronH => NemotronHTransformerModel.LoadFromGguf(gguf, config),
-            _ => TransformerModel.LoadFromGguf(gguf, config, threading ?? ThreadingConfig.SingleThreaded),
+            Architecture.Qwen3MoeHybrid => Qwen3MoeHybridTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            Architecture.Qwen3HybridDense => Qwen3HybridDenseTransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
+            _ => TransformerModel.LoadFromGguf(gguf, config, effectiveThreading),
         };
-        return (model, gguf, config);
+    }
+
+    /// <summary>
+    /// Loads a GGUF model and attaches the supplied masked-diffusion decode
+    /// configuration, returning the loaded model together with the GGUF's
+    /// embedded tokenizer ready to hand to <c>DiffusionTextGenerator</c>.
+    /// </summary>
+    /// <remarks>
+    /// Convenience wrapper over <see cref="LoadFromGguf(string, ThreadingConfig?, DiffusionConfig?)"/>
+    /// for the diffusion case: a GGUF whose backbone is an autoregressive
+    /// architecture (LLaDA-8B is a Llama backbone) but which generates by masked
+    /// diffusion. The diffusion seam is not a model concern — the model exposes
+    /// the hybrid-mask canvas forward the generator drives, and the
+    /// <paramref name="diffusion"/> record (mask token + canvas / steps /
+    /// temperatures) supplies what GGUF metadata cannot.
+    /// </remarks>
+    /// <param name="path">Path to the GGUF model file.</param>
+    /// <param name="diffusion">Masked-diffusion decode configuration (required).</param>
+    /// <param name="threading">Threading configuration. Null defaults to single-threaded.</param>
+    /// <returns>The loaded model, GGUF file handle, model configuration (with
+    /// <see cref="ModelConfig.DiffusionConfig"/> set), and the embedded tokenizer.</returns>
+    public static (IModel Model, GgufFile Gguf, ModelConfig Config, BpeTokenizer Tokenizer) LoadGgufAsDiffusion(
+        string path, DiffusionConfig diffusion, ThreadingConfig? threading = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(diffusion);
+
+        var (model, gguf, config) = LoadFromGguf(path, threading, diffusion);
+        var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
+        return (model, gguf, config, tokenizer);
     }
 
     /// <summary>
@@ -72,6 +137,11 @@ public static class ModelLoader
 
         (ISafetensorsTensorSource source, ModelConfig config) = OpenSafetensorsAndConfig(safetensorsPath);
 
+        // BitNet checkpoints quantize every linear to ternary I2_S at load; an on-disk cache of
+        // the packed bytes lets repeat loads skip that dominant cost. Null for non-BitNet archs,
+        // when disabled via DOTLLM_I2S_CACHE=0, or when the cache dir is not writable.
+        BitNetI2SCacheContext? i2sCache = TryCreateBitNetI2SCache(safetensorsPath, config);
+
         try
         {
             IModel model = config.Architecture switch
@@ -80,12 +150,27 @@ public static class ModelLoader
                     or Architecture.Mixtral or Architecture.QwenMoe or Architecture.GraniteMoe
                     or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
                     or Architecture.SmolLM3
-                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded),
+                    or Architecture.Gemma3 or Architecture.Gemma4
+                    or Architecture.DiffusionGemma
+                    // BitNet b1.58 reuses the standard TransformerModel tower: the
+                    // safetensors loader quantizes each linear projection to ternary
+                    // I2_S (BitNetQuantize) and wires the attention/FFN Sub-LN weights,
+                    // while the forward pass honours the squared-ReLU FFN + Sub-LN from
+                    // the ModelConfig (ActivationFunction.ReluSquared + the Sub-LN
+                    // weights being present) — exactly as the GGUF BitNet path does.
+                    or Architecture.BitNet
+                    // DiffusionGemma reuses the Gemma-4 MoE transformer tower verbatim
+                    // (same forward path, same safetensors loader). The diffusion decode
+                    // seam is NOT a model concern — it lives in DiffusionTextGenerator,
+                    // which consumes this IModel + ModelConfig.DiffusionConfig (populated
+                    // by DiffusionGemmaConfigExtractor). The model exposes the hybrid-mask
+                    // canvas Forward (PR-3) the generator drives, so no wrapper is needed.
+                    => TransformerModel.LoadFromSafetensors(source, config, threading ?? ThreadingConfig.SingleThreaded, i2sCache),
                 Architecture.Mamba3
                     => Mamba3TransformerModel.LoadFromSafetensors(source, config),
                 _ => throw new NotSupportedException(
                     $"Safetensors loader does not yet dispatch architecture {config.Architecture}. "
-                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Mamba3."),
+                    + "Supported today: Llama, Mistral, Phi, Qwen, Mixtral, QwenMoe, GraniteMoe, DeepSeekV2, DeepSeekV3, SmolLM3, Gemma3, Gemma4, DiffusionGemma, BitNet, Mamba3."),
             };
 
             return (model, source, config);
@@ -126,6 +211,28 @@ public static class ModelLoader
 
             string configJson = File.ReadAllText(configPath);
             using var doc = JsonDocument.Parse(configJson);
+
+            // DiffusionGemma wrapper: model_type=diffusion_gemma /
+            // diffusion_gemma_text houses a Gemma-4 MoE text tower plus the block
+            // masked-diffusion decode parameters. DiffusionGemmaConfigExtractor
+            // hoists `text_config`, reads top-level `canvas_length`, builds the full
+            // Gemma-4 MoE ModelConfig, and attaches a DiffusionConfig (resolving the
+            // mask token id from the checkpoint tokenizer files). Checked BEFORE
+            // ResolveArchitecture so the dedicated path wins over the generic
+            // "unsupported architecture" error (issue #29). Mirrors the Mamba-3
+            // model_type probe below.
+            string? topModelType = doc.RootElement.TryGetProperty("model_type", out var topMt)
+                                   && topMt.ValueKind == JsonValueKind.String
+                ? topMt.GetString()
+                : null;
+            if (string.Equals(topModelType, "diffusion_gemma", StringComparison.Ordinal)
+                || string.Equals(topModelType, "diffusion_gemma_text", StringComparison.Ordinal))
+            {
+                ModelConfig diffusionConfig =
+                    DiffusionGemmaConfigExtractor.ExtractFromDirectory(doc.RootElement, weightsDir);
+                return (source, diffusionConfig);
+            }
+
             Architecture arch;
             try
             {
@@ -156,6 +263,55 @@ public static class ModelLoader
         {
             source.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Builds a <see cref="BitNetI2SCacheContext"/> for a BitNet checkpoint so repeated loads
+    /// reuse the ternary I2_S packing instead of re-quantizing bf16 weights. The cache lives in
+    /// a hidden <c>.dotllm-i2s-cache</c> folder beside the checkpoint and is keyed on the
+    /// <c>config.json</c> bytes, the safetensors shard manifest (name + length), and the packer
+    /// version — so a changed checkpoint or packer never reuses stale entries. Returns
+    /// <c>null</c> (caching off) when the architecture is not BitNet, the environment sets
+    /// <c>DOTLLM_I2S_CACHE=0</c>, or the cache directory cannot be created (e.g. a read-only
+    /// checkpoint mount).
+    /// </summary>
+    internal static BitNetI2SCacheContext? TryCreateBitNetI2SCache(string safetensorsPath, ModelConfig config)
+    {
+        if (config.Architecture is not Architecture.BitNet)
+            return null;
+        if (string.Equals(Environment.GetEnvironmentVariable("DOTLLM_I2S_CACHE"), "0", StringComparison.Ordinal))
+            return null;
+
+        try
+        {
+            string weightsDir = Directory.Exists(safetensorsPath)
+                ? safetensorsPath
+                : Path.GetDirectoryName(Path.GetFullPath(safetensorsPath)) ?? safetensorsPath;
+
+            string configPath = Path.Combine(weightsDir, "config.json");
+            if (!File.Exists(configPath))
+                return null;
+
+            byte[] configBytes = File.ReadAllBytes(configPath);
+            var shards = new DirectoryInfo(weightsDir)
+                .GetFiles("*.safetensors")
+                .OrderBy(f => f.Name, StringComparer.Ordinal)
+                .Select(f => (f.Name, f.Length))
+                .ToArray();
+            if (shards.Length == 0)
+                return null;
+
+            string modelKey = BitNetI2SCache.ComputeModelKey(configBytes, shards, BitNetI2SCache.QuantizerVersion);
+            string cacheDir = Path.Combine(weightsDir, ".dotllm-i2s-cache");
+            Directory.CreateDirectory(cacheDir); // probes writability; throws → caught → cache off
+
+            return new BitNetI2SCacheContext(cacheDir, modelKey);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Any filesystem obstacle disables caching rather than failing the load.
+            return null;
         }
     }
 

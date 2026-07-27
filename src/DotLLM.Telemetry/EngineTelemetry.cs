@@ -41,6 +41,16 @@ public static class EngineTelemetry
         "dotllm.engine.tokens.decode", unit: "tokens",
         description: "Tokens generated during the decode phase.");
 
+    /// <summary>
+    /// Counter — generated tokens attributed to a fairness identity, tagged by <c>key</c> (the resolved
+    /// API key). Emitted once per completed request by the continuous-batch scheduler when the request
+    /// carries an <c>ApiKey</c>. Zero-overhead when no listener is subscribed. Cardinality is bounded by
+    /// the number of distinct API keys — the host should ensure keys are low-cardinality before scraping.
+    /// </summary>
+    public static readonly Counter<long> TokensByKey = Meter.CreateCounter<long>(
+        "dotllm.engine.tokens.by_key", unit: "tokens",
+        description: "Generated tokens per API key (fairness accounting), tagged by key.");
+
     /// <summary>Histogram — prefill throughput in tokens/second.</summary>
     public static readonly Histogram<double> PrefillTokensPerSecond = Meter.CreateHistogram<double>(
         "dotllm.engine.tokens_per_second.prefill", unit: "tokens/s",

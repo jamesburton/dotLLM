@@ -139,14 +139,14 @@ public class PriorityConcurrencyGateTests
     [Fact]
     public async Task Acquire_AfterDispose_DoesNotLeakSlots()
     {
-        var gate = new PriorityConcurrencyGate(maxConcurrent: 1);
+        using var gate = new PriorityConcurrencyGate(maxConcurrent: 1);
         var holder = (await gate.AcquireAsync(RequestPriority.Normal, TimeSpan.FromSeconds(1), default))!;
 
         // Park a waiter so Dispose has something to fault.
         var pending = gate.AcquireAsync(RequestPriority.Normal, TimeSpan.FromSeconds(5), default).AsTask();
         await WaitForQueueLength(gate, expected: 1);
 
-        gate.Dispose();
+        gate.Dispose(); // Explicit dispose so `pending` observes it below; the enclosing `using` disposes again on scope exit.
         await Assert.ThrowsAsync<ObjectDisposedException>(() => pending);
 
         // Dropping the holder after dispose must not throw.
@@ -156,8 +156,8 @@ public class PriorityConcurrencyGateTests
     [Fact]
     public void Constructor_RejectsNonPositiveLimit()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PriorityConcurrencyGate(0));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PriorityConcurrencyGate(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new PriorityConcurrencyGate(0); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new PriorityConcurrencyGate(-1); });
     }
 
     /// <summary>

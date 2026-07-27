@@ -26,7 +26,14 @@ public sealed class TransformerArchitecture : IModelArchitecture
     public IReadOnlyList<Architecture> SupportedArchitectures { get; } =
         [Architecture.Llama, Architecture.Mistral, Architecture.Phi, Architecture.Qwen,
          Architecture.NemotronH, Architecture.Qwen3MoeHybrid,
-         Architecture.DeepSeekV2, Architecture.DeepSeekV3];
+         Architecture.DeepSeekV2, Architecture.DeepSeekV3,
+         // Gemma 3 / Gemma 4 MoE / DiffusionGemma all ride the standard
+         // TransformerModel forward path (four RMSNorms, GeGLU, (1+w) norm,
+         // embed-scale, QK-norm, per-attention-type RoPE, dual KV-head/head-dim,
+         // sparse MoE, soft-cap). DiffusionGemma adds only a DiffusionConfig the
+         // generator consumes — the tower itself is the Gemma-4 MoE backbone.
+         Architecture.Gemma3, Architecture.Gemma4, Architecture.DiffusionGemma,
+         Architecture.BitNet];
 
     /// <inheritdoc/>
     public IModel CreateModel(ModelConfig config, IBackend backend)
@@ -46,7 +53,8 @@ public sealed class TransformerArchitecture : IModelArchitecture
 
         if (config.Architecture is not (Architecture.Llama or Architecture.Mistral
                                     or Architecture.Phi or Architecture.Qwen
-                                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3))
+                                    or Architecture.DeepSeekV2 or Architecture.DeepSeekV3
+                                    or Architecture.BitNet))
             throw new ArgumentException(
                 $"TransformerArchitecture does not support {config.Architecture}.", nameof(config));
 

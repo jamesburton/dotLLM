@@ -49,7 +49,7 @@ public sealed class EngineTelemetryTests
         var spans = new List<Activity>();
         using var listener = new ActivityListener
         {
-            ShouldListenTo = src => src.Name == EngineTelemetry.Name,
+            ShouldListenTo = src => string.Equals(src.Name, EngineTelemetry.Name, StringComparison.Ordinal),
             Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
             ActivityStopped = spans.Add,
         };
@@ -57,17 +57,17 @@ public sealed class EngineTelemetryTests
 
         RunGreedy(promptLen: 3, maxTokens: 3);
 
-        Assert.Contains(spans, s => s.OperationName == EngineActivities.Request);
-        Assert.Contains(spans, s => s.OperationName == EngineActivities.Prefill);
-        Assert.Contains(spans, s => s.OperationName == EngineActivities.Sample);
+        Assert.Contains(spans, s => string.Equals(s.OperationName, EngineActivities.Request, StringComparison.Ordinal));
+        Assert.Contains(spans, s => string.Equals(s.OperationName, EngineActivities.Prefill, StringComparison.Ordinal));
+        Assert.Contains(spans, s => string.Equals(s.OperationName, EngineActivities.Sample, StringComparison.Ordinal));
 
-        var request = spans.First(s => s.OperationName == EngineActivities.Request);
+        var request = spans.First(s => string.Equals(s.OperationName, EngineActivities.Request, StringComparison.Ordinal));
         Assert.Equal("Llama", request.GetTagItem(TelemetryTags.Model));
         Assert.NotNull(request.GetTagItem(TelemetryTags.PromptTokens));
         Assert.NotNull(request.GetTagItem(TelemetryTags.GeneratedTokens));
         Assert.NotNull(request.GetTagItem(TelemetryTags.FinishReason));
 
-        var prefill = spans.First(s => s.OperationName == EngineActivities.Prefill);
+        var prefill = spans.First(s => string.Equals(s.OperationName, EngineActivities.Prefill, StringComparison.Ordinal));
         Assert.NotNull(prefill.GetTagItem(TelemetryTags.PrefillTokenCount));
         Assert.NotNull(prefill.GetTagItem(TelemetryTags.PrefillDurationMs));
     }
@@ -94,9 +94,9 @@ public sealed class EngineTelemetryTests
         var stepSpans = new List<Activity>();
         using var listener = new ActivityListener
         {
-            ShouldListenTo = src => src.Name == EngineTelemetry.Name,
+            ShouldListenTo = src => string.Equals(src.Name, EngineTelemetry.Name, StringComparison.Ordinal),
             Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
-            ActivityStopped = a => { if (a.OperationName == EngineActivities.DecodeStep) stepSpans.Add(a); },
+            ActivityStopped = a => { if (string.Equals(a.OperationName, EngineActivities.DecodeStep, StringComparison.Ordinal)) stepSpans.Add(a); },
         };
         ActivitySource.AddActivityListener(listener);
 
@@ -168,7 +168,7 @@ public sealed class EngineTelemetryTests
             {
                 InstrumentPublished = (instrument, l) =>
                 {
-                    if (instrument.Meter.Name == EngineTelemetry.Name)
+                    if (string.Equals(instrument.Meter.Name, EngineTelemetry.Name, StringComparison.Ordinal))
                         l.EnableMeasurementEvents(instrument);
                 },
             };
@@ -201,7 +201,7 @@ public sealed class EngineTelemetryTests
         private void CaptureModelTag(ReadOnlySpan<KeyValuePair<string, object?>> tags)
         {
             foreach (var tag in tags)
-                if (tag.Key == TelemetryTags.Model && tag.Value is string s)
+                if (string.Equals(tag.Key, TelemetryTags.Model, StringComparison.Ordinal) && tag.Value is string s)
                     LastModelTag = s;
         }
     }

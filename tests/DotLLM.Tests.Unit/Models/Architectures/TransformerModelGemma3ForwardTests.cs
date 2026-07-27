@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
@@ -92,18 +93,18 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
     public void Forward_Gemma3_FinalSoftcap_BoundsLogitMagnitude()
     {
         // Decisive evidence the final-logit soft-cap kernel runs: compare the
-        // SAME forward pass with and without the cap. The capped pass must
-        // saturate every logit inside (-cap, +cap); the uncapped one must
-        // exceed that band somewhere (the fixture's lm_head amplitude is
-        // tuned so this holds — see WriteFixture).
+        // SAME forward pass with and without the cap. We run uncapped first and
+        // derive the cap from the observed logit magnitude (cap = 0.5 × max|z|)
+        // so the test is self-tuning and robust to fixture-magnitude changes —
+        // the capped pass must then saturate every logit inside (-cap, +cap)
+        // while the uncapped pass exceeds it.
         string path = Path.Combine(_scratch, "gemma3-finalcap.safetensors");
-        WriteFixture(path, seed: 314, lmHeadAmplitude: 2.0f);
+        WriteFixture(path, seed: 314, lmHeadAmplitude: 8.0f);
 
         int[] tokenIds = [0, 1, 2, 3, 4];
         int[] positions = [0, 1, 2, 3, 4];
 
         float[] uncapped, capped;
-        const float cap = 5.0f;
 
         ModelConfig cfgUncapped = BuildConfig(
             withAttnSoftcap: null,
@@ -116,6 +117,12 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             uncapped = CopyLogits(l);
         }
 
+        float maxAbs = 0f;
+        foreach (float v in uncapped)
+            if (MathF.Abs(v) > maxAbs) maxAbs = MathF.Abs(v);
+        Assert.True(maxAbs > 1e-3f, $"Uncapped logits are degenerate (max|z|={maxAbs}).");
+        float cap = 0.5f * maxAbs;
+
         ModelConfig cfgCapped = cfgUncapped with { FinalLogitSoftcap = cap };
         using (var sf = SafetensorsFile.Open(path))
         using (var model = TransformerModel.LoadFromSafetensors(sf, cfgCapped))
@@ -124,15 +131,16 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             capped = CopyLogits(l);
         }
 
-        // Capped: |z| < cap for every logit.
+        // Capped: |z| < cap for every logit (z' = cap·tanh(z/cap) is strictly
+        // bounded by cap).
         for (int i = 0; i < capped.Length; i++)
         {
             Assert.True(MathF.Abs(capped[i]) < cap,
                 $"Capped logit[{i}]={capped[i]} should be inside ±{cap}");
         }
 
-        // Uncapped: at least one logit exceeds the cap band. If the synthetic
-        // fixture has been re-tuned and this fails, bump lmHeadAmplitude.
+        // Uncapped: at least one logit exceeds the cap band (true by
+        // construction, since cap = 0.5 × max|z|).
         bool anyExceeds = false;
         for (int i = 0; i < uncapped.Length; i++)
         {
@@ -252,7 +260,141 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             $"QueryPreAttnScalar override had no measurable effect (maxDiff={maxDiff}).");
     }
 
+    [Fact]
+    public void Forward_Gemma3_GeGLU_DiffersFromSwiGLU()
+    {
+        // Discriminative: the dense FFN must select FusedOps.GeGLUTanh when
+        // ActivationFunction == GELUTanh and FusedOps.SwiGLU otherwise. Two
+        // runs on the SAME Gemma fixture differing only in the activation
+        // function must produce measurably different logits.
+        // Large gate/up amplitude: GELU(tanh) and SiLU agree closely near zero
+        // but diverge meaningfully once |gate| is O(1), so amplify the FFN input
+        // to make the activation choice unambiguously discriminative.
+        string path = Path.Combine(_scratch, "gemma3-geglu.safetensors");
+        WriteFixture(path, seed: 99, gateUpAmplitude: 1.5f);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        ModelConfig cfgGeGLU = BuildConfig(
+            withAttnSoftcap: null, withFinalSoftcap: null, withQueryPreAttnScalar: null,
+            activation: ActivationFunction.GELUTanh);
+        ModelConfig cfgSwiGLU = cfgGeGLU with { ActivationFunction = ActivationFunction.SiLU };
+
+        float[] geglu = RunLogits(path, cfgGeGLU, tokenIds, positions);
+        float[] swiglu = RunLogits(path, cfgSwiGLU, tokenIds, positions);
+
+        float maxDiff = MaxAbsDiff(geglu, swiglu);
+        Assert.True(maxDiff > 1e-4f,
+            $"GeGLU vs SwiGLU produced no measurable difference (maxDiff={maxDiff}).");
+
+        // Sanity: both finite.
+        Assert.All(geglu, v => Assert.True(float.IsFinite(v)));
+        Assert.All(swiglu, v => Assert.True(float.IsFinite(v)));
+    }
+
+    [Fact]
+    public void Forward_Gemma3_EmbeddingScale_ChangesLogits()
+    {
+        // Discriminative: the sqrt(hidden_size) embedding scale must feed the
+        // forward math. Same fixture, same config except EmbeddingScale =
+        // sqrt(hidden) vs null — the logits must differ.
+        string path = Path.Combine(_scratch, "gemma3-embscale.safetensors");
+        WriteFixture(path, seed: 123);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        ModelConfig cfgNoScale = BuildConfig(
+            withAttnSoftcap: null, withFinalSoftcap: null, withQueryPreAttnScalar: null,
+            embeddingScale: null);
+        ModelConfig cfgScaled = cfgNoScale with { EmbeddingScale = MathF.Sqrt(HiddenSize) };
+
+        float[] noScale = RunLogits(path, cfgNoScale, tokenIds, positions);
+        float[] scaled = RunLogits(path, cfgScaled, tokenIds, positions);
+
+        float maxDiff = MaxAbsDiff(noScale, scaled);
+        Assert.True(maxDiff > 1e-4f,
+            $"Embedding scale had no measurable effect (maxDiff={maxDiff}).");
+    }
+
+    [Fact]
+    public void Forward_Gemma3_FourNormLayout_DependsOnPostNorms()
+    {
+        // Discriminative: the post_attention_layernorm and post_feedforward_layernorm
+        // weights (the two norms that the four-norm layout adds vs the legacy
+        // two-norm Llama path) must feed the residual math. Two fixtures that
+        // are byte-identical except for the post-attn / post-ffn norm weights
+        // must produce different logits. (A two-norm implementation would ignore
+        // those weights entirely and yield identical output.)
+        string baseline = Path.Combine(_scratch, "gemma3-4norm-a.safetensors");
+        string perturbed = Path.Combine(_scratch, "gemma3-4norm-b.safetensors");
+        WriteFixture(baseline, seed: 555, postNormAmplitude: 0.02f);
+        WriteFixture(perturbed, seed: 555, postNormAmplitude: 0.40f);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        ModelConfig cfg = BuildConfig(
+            withAttnSoftcap: null, withFinalSoftcap: null, withQueryPreAttnScalar: null);
+
+        float[] a = RunLogits(baseline, cfg, tokenIds, positions);
+        float[] bb = RunLogits(perturbed, cfg, tokenIds, positions);
+
+        float maxDiff = MaxAbsDiff(a, bb);
+        Assert.True(maxDiff > 1e-4f,
+            $"Post-attn / post-ffn norm weights had no measurable effect (maxDiff={maxDiff}). "
+            + "The four-norm layout may have collapsed to the two-norm path.");
+    }
+
+    [Fact]
+    public void Forward_Gemma3_WithQkNorm_FiniteAndUsesNormWeights()
+    {
+        // Per-head Q/K RMSNorm: when q_norm/k_norm tensors are present the loader
+        // populates QNormWeight/KNormWeight and the existing apply path runs.
+        // Compare a fixture WITH QK-norm tensors against one WITHOUT — the
+        // outputs must differ (the norm weights change Q/K before RoPE).
+        string withQk = Path.Combine(_scratch, "gemma3-qknorm-on.safetensors");
+        string noQk = Path.Combine(_scratch, "gemma3-qknorm-off.safetensors");
+        WriteFixture(withQk, seed: 808, writeQkNorm: true);
+        WriteFixture(noQk, seed: 808, writeQkNorm: false);
+
+        int[] tokenIds = [0, 1, 2, 3, 4];
+        int[] positions = [0, 1, 2, 3, 4];
+
+        ModelConfig cfg = BuildConfig(
+            withAttnSoftcap: null, withFinalSoftcap: null, withQueryPreAttnScalar: null);
+
+        float[] on = RunLogits(withQk, cfg, tokenIds, positions);
+        float[] off = RunLogits(noQk, cfg, tokenIds, positions);
+
+        Assert.All(on, v => Assert.True(float.IsFinite(v)));
+        float maxDiff = MaxAbsDiff(on, off);
+        Assert.True(maxDiff > 1e-4f,
+            $"Per-head Q/K RMSNorm had no measurable effect (maxDiff={maxDiff}).");
+    }
+
     // ───────────────────────── helpers ─────────────────────────
+
+    private static float[] RunLogits(string path, ModelConfig config, int[] tokenIds, int[] positions)
+    {
+        using var sf = SafetensorsFile.Open(path);
+        using var model = TransformerModel.LoadFromSafetensors(sf, config);
+        using ITensor l = model.Forward(tokenIds, positions, deviceId: -1);
+        return CopyLogits(l);
+    }
+
+    private static float MaxAbsDiff(float[] a, float[] b)
+    {
+        float maxDiff = 0f;
+        int n = Math.Min(a.Length, b.Length);
+        for (int i = 0; i < n; i++)
+        {
+            float d = MathF.Abs(a[i] - b[i]);
+            if (d > maxDiff) maxDiff = d;
+        }
+        return maxDiff;
+    }
 
     private static unsafe float[] CopyLogits(ITensor logits)
     {
@@ -263,7 +405,10 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
     }
 
     private static ModelConfig BuildConfig(
-        float? withAttnSoftcap, float? withFinalSoftcap, float? withQueryPreAttnScalar)
+        float? withAttnSoftcap, float? withFinalSoftcap, float? withQueryPreAttnScalar,
+        DotLLM.Core.Configuration.Architecture architecture = DotLLM.Core.Configuration.Architecture.Gemma3,
+        ActivationFunction activation = ActivationFunction.GELUTanh,
+        float? embeddingScale = null)
     {
         var rope = new RoPEConfig(
             Theta: 10000.0f,
@@ -282,7 +427,7 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
 
         return new ModelConfig
         {
-            Architecture = Architecture.Gemma3,
+            Architecture = architecture,
             VocabSize = VocabSize,
             HiddenSize = HiddenSize,
             IntermediateSize = IntermediateSize,
@@ -294,11 +439,11 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             AttentionType = AttentionType.GQA,
             PositionEncodingType = PositionEncodingType.RoPE,
             RoPEConfig = rope,
-            // Gemma uses GeluTanh in the FFN; the dense forward path here uses
-            // SwiGLU regardless (the activation choice is the FFN kernel's
-            // concern). The forward test only asserts on output finiteness +
-            // variance, so the activation choice doesn't change the contract.
-            ActivationFunction = ActivationFunction.GELUTanh,
+            // Gemma uses GeGLU (tanh-approximate GELU) in the dense FFN; the
+            // forward path selects FusedOps.GeGLUTanh when ActivationFunction ==
+            // GELUTanh and FusedOps.SwiGLU otherwise. Discriminative coverage of
+            // this branch lives in Forward_Gemma3_GeGLU_DiffersFromSwiGLU.
+            ActivationFunction = activation,
             NormType = NormType.RMSNorm,
             NormEpsilon = 1e-6f,
             TiedEmbeddings = false,
@@ -307,6 +452,7 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             AttnLogitSoftcap = withAttnSoftcap,
             FinalLogitSoftcap = withFinalSoftcap,
             QueryPreAttnScalar = withQueryPreAttnScalar,
+            EmbeddingScale = embeddingScale,
             MlaConfig = null,
             Moe = null,
             ChatTemplate = null,
@@ -314,19 +460,32 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
     }
 
     /// <summary>
-    /// Writes the minimum safetensors layout the dense Llama-style loader
-    /// expects: tied/untied embed_tokens, lm_head, model.norm, and per-layer
-    /// input_layernorm, self_attn.{q,k,v,o}_proj, post_attention_layernorm,
-    /// and mlp.{gate,up,down}_proj. All in HF row-major F32.
+    /// Writes a synthetic Gemma 3 safetensors fixture: embed_tokens, lm_head,
+    /// model.norm, and per-layer input_layernorm, self_attn.{q,k,v,o}_proj,
+    /// the Gemma four-norm set (post_attention_layernorm, pre_feedforward_layernorm,
+    /// post_feedforward_layernorm), and mlp.{gate,up,down}_proj — all HF row-major
+    /// F32.
+    /// <para>
+    /// The norm weights are emitted as Gemma stores them (offsets from 1.0): the
+    /// loader adds 1.0 at load (<c>(1+w)</c> absorption). The post-attention and
+    /// post-feedforward norms are emitted with a non-trivial per-element ramp so a
+    /// fixture written with <paramref name="postNormAmplitude"/> &gt; 0 produces an
+    /// output that depends on those weights (the discriminator for the four-norm
+    /// layout). When <paramref name="writeQkNorm"/> is true, per-head q_norm/k_norm
+    /// tensors are emitted too.
+    /// </para>
     /// </summary>
-    private static void WriteFixture(string path, int seed, float lmHeadAmplitude = 0.1f)
+    private static void WriteFixture(string path, int seed, float lmHeadAmplitude = 0.1f,
+                                     float postNormAmplitude = 0.10f, bool writeQkNorm = false,
+                                     float gateUpAmplitude = 0.05f)
     {
         var b = new SafetensorsFixtureBuilder();
         int qStride = NumHeads * HeadDim;     // = HiddenSize
         int kvStride = NumHeads * HeadDim;    // KV heads = NumHeads here
 
         AddRand(b, "model.embed_tokens.weight", [VocabSize, HiddenSize], 0.1f, seed + 0);
-        AddRand(b, "model.norm.weight", [HiddenSize], 0.05f, seed + 1, center: 1.0f, jitter: 0.05f);
+        // Final norm is a Gemma (1+w) norm too — emit small offsets from 0.
+        AddRand(b, "model.norm.weight", [HiddenSize], amplitude: 0.05f, seed: seed + 1);
         AddRand(b, "lm_head.weight", [VocabSize, HiddenSize], lmHeadAmplitude, seed + 2);
 
         for (int i = 0; i < NumLayers; i++)
@@ -334,18 +493,31 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
             int s = seed + 10 * (i + 1);
             string prefix = $"model.layers.{i}";
 
+            // Gemma RMSNorm weights are stored as offsets from 1.0; emit small
+            // amplitudes (centred on 0) so the loader's +1.0 absorption lands
+            // them near 1.0.
             AddRand(b, $"{prefix}.input_layernorm.weight", [HiddenSize],
-                    amplitude: 0.05f, seed: s + 0, center: 1.0f, jitter: 0.05f);
+                    amplitude: 0.05f, seed: s + 0);
             AddRand(b, $"{prefix}.post_attention_layernorm.weight", [HiddenSize],
-                    amplitude: 0.05f, seed: s + 1, center: 1.0f, jitter: 0.05f);
+                    amplitude: postNormAmplitude, seed: s + 1);
+            AddRand(b, $"{prefix}.pre_feedforward_layernorm.weight", [HiddenSize],
+                    amplitude: 0.05f, seed: s + 9);
+            AddRand(b, $"{prefix}.post_feedforward_layernorm.weight", [HiddenSize],
+                    amplitude: postNormAmplitude, seed: s + 10);
 
             AddRand(b, $"{prefix}.self_attn.q_proj.weight", [qStride, HiddenSize], 0.1f, s + 2);
             AddRand(b, $"{prefix}.self_attn.k_proj.weight", [kvStride, HiddenSize], 0.1f, s + 3);
             AddRand(b, $"{prefix}.self_attn.v_proj.weight", [kvStride, HiddenSize], 0.1f, s + 4);
             AddRand(b, $"{prefix}.self_attn.o_proj.weight", [HiddenSize, qStride], 0.1f, s + 5);
 
-            AddRand(b, $"{prefix}.mlp.gate_proj.weight", [IntermediateSize, HiddenSize], 0.05f, s + 6);
-            AddRand(b, $"{prefix}.mlp.up_proj.weight", [IntermediateSize, HiddenSize], 0.05f, s + 7);
+            if (writeQkNorm)
+            {
+                AddRand(b, $"{prefix}.self_attn.q_norm.weight", [HeadDim], amplitude: 0.05f, seed: s + 11);
+                AddRand(b, $"{prefix}.self_attn.k_norm.weight", [HeadDim], amplitude: 0.05f, seed: s + 12);
+            }
+
+            AddRand(b, $"{prefix}.mlp.gate_proj.weight", [IntermediateSize, HiddenSize], gateUpAmplitude, s + 6);
+            AddRand(b, $"{prefix}.mlp.up_proj.weight", [IntermediateSize, HiddenSize], gateUpAmplitude, s + 7);
             AddRand(b, $"{prefix}.mlp.down_proj.weight", [HiddenSize, IntermediateSize], 0.05f, s + 8);
         }
 
@@ -398,6 +570,7 @@ public sealed class TransformerModelGemma3ForwardTests : IDisposable
         return new LogitStats(total, finite, (float)mean, (float)stddev, min, max);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct LogitStats(
         int TotalCount, int FiniteCount, float Mean, float StdDev, float Min, float Max);
 }

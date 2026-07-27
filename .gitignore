@@ -8,6 +8,9 @@
 .claude/agent-memory/
 .claude/scheduled_tasks.lock
 
+# Local agent handoff/progress notes (machine-specific, not shared)
+.docs/
+
 # User-specific files
 *.rsuser
 *.suo
@@ -447,3 +450,4 @@ moe_debug.txt
 parity_dotllm/
 parity_dotllm_multi/
 .claude/worktrees/
+.claude/strix/

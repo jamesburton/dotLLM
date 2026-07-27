@@ -141,9 +141,19 @@ internal static class AttentionTensorLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
-        int headDim = config.HeadDim;
+        // Per-attention-type head dim (Gemma 4): full-attention layers may use a
+        // distinct GlobalHeadDim. Collapses to config.HeadDim for every other
+        // architecture, so the projection-shape validations below are unchanged.
+        int headDim = config.GetLayerHeadDim(layerIdx);
         int qOut = config.NumAttentionHeads * headDim;
-        int kvOut = config.NumKvHeads * headDim;
+        // Per-attention-type KV-head count (Gemma 4): full-attention layers use
+        // NumGlobalKvHeads, sliding layers use NumKvHeads — so each layer's K/V
+        // projection has a different output dim. Collapses to NumKvHeads for
+        // every other architecture (NumGlobalKvHeads null).
+        int layerKvHeads = config.NumGlobalKvHeads is int g && config.IsFullAttentionLayer(layerIdx)
+            ? g
+            : config.NumKvHeads;
+        int kvOut = layerKvHeads * headDim;
 
         // Q / K / V projections. Phi-3 convention fuses QKV into a single
         // `self_attn.qkv_proj.weight` of shape [qOut + 2*kvOut, hidden]
@@ -184,10 +194,19 @@ internal static class AttentionTensorLoader
         float[]? vBias = SafetensorsTensorResolver.ResolveOptionalBias(file, $"{prefix}.self_attn.v_proj.bias", kvOut);
         float[]? oBias = SafetensorsTensorResolver.ResolveOptionalBias(file, $"{prefix}.self_attn.o_proj.bias", hiddenSize);
 
-        // Optional QK-norms (Qwen3 per-head RMSNorm). Not emitted by vanilla
-        // HF Llama/Mistral/Qwen2. Qwen3 names them {q_norm,k_norm}.weight.
-        float[]? qNorm = SafetensorsTensorResolver.ResolveOptionalNorm(file, $"{prefix}.self_attn.q_norm.weight", headDim);
-        float[]? kNorm = SafetensorsTensorResolver.ResolveOptionalNorm(file, $"{prefix}.self_attn.k_norm.weight", headDim);
+        // Optional QK-norms. Not emitted by vanilla HF Llama/Mistral/Qwen2.
+        // Two conventions, distinguished by the on-disk tensor length:
+        //   - Qwen3 / Gemma: PER-HEAD RMSNorm (length == head_dim), applied
+        //     independently to each head after the projection is reshaped.
+        //   - OLMoE: a SINGLE RMSNorm over the WHOLE projection (length ==
+        //     num_heads*head_dim for Q, num_kv_heads*head_dim for K), applied
+        //     before the reshape (modeling_olmoe.py:
+        //     self.q_norm = OlmoeRMSNorm(num_heads*head_dim)).
+        // Resolve whichever length the file carries; the forward pass
+        // (TransformerModel.ApplyPerHeadNorm) auto-selects per-head vs whole-
+        // projection normalisation from the resolved weight length.
+        float[]? qNorm = ResolveOptionalQkNorm(file, $"{prefix}.self_attn.q_norm.weight", headDim, qOut);
+        float[]? kNorm = ResolveOptionalQkNorm(file, $"{prefix}.self_attn.k_norm.weight", headDim, kvOut);
 
         return new AttentionLayerTensors(
             qPtr, qQt, qM, qK,
@@ -197,6 +216,24 @@ internal static class AttentionTensorLoader
             qBias, kBias, vBias, oBias,
             QNormWeight: qNorm, KNormWeight: kNorm,
             Mla: null);
+    }
+
+    /// <summary>
+    /// Resolves an optional Q/K RMSNorm weight that may be stored either
+    /// per-head (<paramref name="perHeadDim"/> == head_dim — Qwen3 / Gemma) or
+    /// over the entire projection (<paramref name="fullProjectionDim"/> ==
+    /// num_heads*head_dim — OLMoE). Returns null when the tensor is absent.
+    /// The expected length is chosen from the tensor's actual element count so
+    /// both conventions load without a config flag; a length matching neither
+    /// falls through to the per-head validation, producing the standard
+    /// element-count mismatch error.
+    /// </summary>
+    private static float[]? ResolveOptionalQkNorm(
+        ISafetensorsTensorSource file, string name, int perHeadDim, int fullProjectionDim)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc)) return null;
+        int expected = desc.ElementCount == fullProjectionDim ? fullProjectionDim : perHeadDim;
+        return SafetensorsTensorResolver.ResolveOptionalNorm(file, name, expected);
     }
 
     /// <summary>

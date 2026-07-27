@@ -9,6 +9,7 @@ using DotLLM.Core.Models;
 using DotLLM.Engine;
 using DotLLM.Engine.Constraints;
 using DotLLM.Engine.PromptCache;
+using DotLLM.Models;
 using DotLLM.Models.Architectures;
 using DotLLM.Models.Gguf;
 using DotLLM.Tokenizers;
@@ -194,6 +195,23 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         [DefaultValue(1)]
         public int PromptCacheSize { get; set; } = 1;
 
+        /// <summary>Draft model for speculative decoding.</summary>
+        [CommandOption("--speculative-model|--draft-model")]
+        [Description("Path or HuggingFace repo ID for a draft model. Enables speculative decoding for faster generation. Must share vocabulary with the main model.")]
+        public string? SpeculativeModel { get; set; }
+
+        /// <summary>Number of draft candidates per speculative step.</summary>
+        [CommandOption("--speculative-k|--draft-tokens")]
+        [Description("Number of draft tokens per speculative step (K). Default 5.")]
+        [DefaultValue(5)]
+        public int SpeculativeK { get; set; } = 5;
+
+        /// <summary>Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog).</summary>
+        [CommandOption("--prefill-chunk-size|--ubatch-size")]
+        [Description("Maximum prompt tokens per prefill forward pass (llama.cpp -ub analog). 0 = whole prompt in one pass (default).")]
+        [DefaultValue(0)]
+        public int PrefillChunkSize { get; set; }
+
         /// <summary>Verbose debug output.</summary>
         [CommandOption("--verbose|-v")]
         [Description("Show debug info: finish reason, raw text before stop-sequence stripping, tool call detection details.")]
@@ -204,19 +222,50 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
     /// <inheritdoc/>
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
-        var resolvedPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
-        if (resolvedPath is null)
-            return 1;
+        // HuggingFace safetensors directory (config.json + *.safetensors /
+        // index.json)? Auto-detected; loads via the safetensors path. The GGUF
+        // path is unchanged.
+        string? hfDir = RunCommand.TryResolveHfDirectory(settings.Model);
+
+        string resolvedPath;
+        if (hfDir is not null)
+        {
+            resolvedPath = hfDir;
+        }
+        else
+        {
+            var ggufPath = GgufFileResolver.Resolve(settings.Model, settings.Quant);
+            if (ggufPath is null)
+                return 1;
+            resolvedPath = ggufPath;
+        }
 
         GgufFile? gguf = null;
+        IDisposable? safetensorsSource = null;
         ModelConfig? config = null;
-        Tokenizers.Bpe.BpeTokenizer? tokenizer = null;
+        ITokenizer? tokenizer = null;
         IModel? model = null;
 
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .Start("Loading model...", ctx =>
             {
+                if (hfDir is not null)
+                {
+                    ctx.Status("Opening HuggingFace safetensors checkpoint...");
+                    var threadingCfg = new ThreadingConfig(
+                        settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
+                    var (m, src, cfg) = ModelLoader.LoadFromSafetensors(hfDir, threadingCfg);
+                    model = m;
+                    safetensorsSource = src;
+                    config = cfg;
+                    ctx.Status("Loading tokenizer...");
+                    tokenizer = ModelLoader.LoadTokenizerFromHfDirectory(hfDir)
+                        ?? throw new InvalidOperationException(
+                            $"No tokenizer.json (or legacy vocab.json/merges.txt) found in '{hfDir}'.");
+                    return;
+                }
+
                 ctx.Status("Opening GGUF file...");
                 gguf = GgufFile.Open(resolvedPath);
 
@@ -231,7 +280,9 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
                 {
                     var threading = new ThreadingConfig(settings.Threads, settings.DecodeThreads, settings.NumaPin, settings.PCoreOnly);
                     ctx.Status($"Loading {config.Architecture} model ({config.NumLayers} layers, {threading.EffectiveThreadCount} threads)...");
-                    model = TransformerModel.LoadFromGguf(gguf, config, threading);
+                    // Shared per-architecture CPU dispatch — routes hybrid architectures
+                    // (Nemotron-H, Qwen3MoeHybrid) to their dedicated loaders.
+                    model = ModelLoader.CreateCpuModelFromGguf(gguf, config, threading);
                 }
                 else if (gpuLayers >= config.NumLayers)
                 {
@@ -258,16 +309,29 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         if (vramWarning is not null)
             AnsiConsole.MarkupLine($"[yellow]WARNING: {Markup.Escape(vramWarning)}[/]");
 
-        // Create chat template from GGUF metadata, fallback to ChatML
-        string bosTokenStr = tokenizer!.DecodeToken(tokenizer.BosTokenId);
-        string eosTokenStr = tokenizer.DecodeToken(tokenizer.EosTokenId);
-        IChatTemplate chatTemplate;
-        var jinjaTemplate = GgufChatTemplateFactory.TryCreate(gguf!.Metadata, tokenizer);
-        chatTemplate = jinjaTemplate ?? new JinjaChatTemplate(DefaultChatMlTemplateText, bosTokenStr, eosTokenStr);
+        // GGUF checkpoints carry an embedded Jinja chat template; the HF
+        // safetensors path doesn't surface one here, so it falls back to the
+        // plain completion-style transcript.
+        var jinjaTemplate = gguf is not null
+            ? GgufChatTemplateFactory.TryCreate(gguf.Metadata, tokenizer!, config!.Architecture)
+            : null;
+        IChatTemplate chatTemplate = jinjaTemplate ?? GgufChatTemplateFactory.CreatePlainFallback(tokenizer!);
+        if (jinjaTemplate is null)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]WARNING: model has no GGUF chat template; using a plain completion-style transcript. " +
+                "This usually means the model is not instruction/chat tuned.[/]");
+        }
 
-        // Parse tool definitions
+        // Parse tool definitions. Tool calling relies on the GGUF-embedded chat
+        // template, so it is unavailable on the HF safetensors path.
         ToolDefinition[]? tools = ParseToolDefinitions(settings.Tools);
-        IToolCallParser? toolCallParser = tools is { Length: > 0 }
+        if (tools is { Length: > 0 } && gguf is null)
+        {
+            AnsiConsole.MarkupLine("[yellow]WARNING: --tools is not supported for HuggingFace safetensors models; ignoring.[/]");
+            tools = null;
+        }
+        IToolCallParser? toolCallParser = tools is { Length: > 0 } && gguf is not null
             ? GgufChatTemplateFactory.CreateToolCallParser(gguf.Metadata, config!.Architecture)
             : null;
         ToolChoice toolChoice = ParseToolChoice(settings.ToolChoiceStr, tools);
@@ -278,7 +342,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         var stopSequences = new List<string>();
         foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>", "<|eom_id|>", "<|end|>", "</s>", "</tool_call>" })
         {
-            if (marker != eosTokenStr) // avoid duplicate with EOS stop condition
+            if (marker != tokenizer!.DecodeToken(tokenizer.EosTokenId)) // avoid duplicate with EOS stop condition
                 stopSequences.Add(marker);
         }
 
@@ -390,7 +454,45 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         PrefixCache? prefixCache = !settings.NoPromptCache
             ? new PrefixCache(settings.PromptCacheSize)
             : null;
-        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache);
+
+        // Load speculative draft model if requested (mirrors `dotllm run` wiring).
+        IModel? draftModel = null;
+        GgufFile? draftGguf = null;
+        if (!string.IsNullOrEmpty(settings.SpeculativeModel))
+        {
+            var draftPath = GgufFileResolver.Resolve(settings.SpeculativeModel, null);
+            if (draftPath is null)
+            {
+                AnsiConsole.MarkupLine("[red]Speculative draft model not found.[/]");
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftGguf = GgufFile.Open(draftPath);
+            var draftConfig = GgufModelConfigExtractor.Extract(draftGguf.Metadata);
+            if (!DotLLM.Engine.SpeculativeConstants.AreVocabsCompatible(config!.VocabSize, draftConfig.VocabSize))
+            {
+                AnsiConsole.MarkupLine(
+                    $"[red]Draft model vocab size ({draftConfig.VocabSize}) differs from target ({config.VocabSize}) " +
+                    $"by more than {DotLLM.Engine.SpeculativeConstants.MaxVocabSizeDifference} tokens. " +
+                    "Models must share the same base tokenizer.[/]");
+                draftGguf.Dispose();
+                model?.Dispose();
+                gguf?.Dispose();
+                safetensorsSource?.Dispose();
+                return 1;
+            }
+
+            draftModel = TransformerModel.LoadFromGguf(draftGguf, draftConfig,
+                new ThreadingConfig(settings.Threads, settings.DecodeThreads));
+            AnsiConsole.MarkupLine($"[dim]Speculative decoding: K={settings.SpeculativeK}, draft={Path.GetFileName(draftPath)}[/]");
+        }
+
+        var generator = new TextGenerator(model!, tokenizer!, kvFactory, prefixCache,
+            draftModel: draftModel, speculativeCandidates: settings.SpeculativeK,
+            prefillChunkSize: settings.PrefillChunkSize);
 
         try
         {
@@ -399,8 +501,11 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         finally
         {
             pagedFactory?.Dispose();
+            draftModel?.Dispose();
+            draftGguf?.Dispose();
             model?.Dispose();
             gguf?.Dispose();
+            safetensorsSource?.Dispose();
         }
 
         return 0;
@@ -780,7 +885,7 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         }
     }
 
-    private static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
+    internal static ToolChoice ParseToolChoice(string choice, ToolDefinition[]? tools)
     {
         return choice.ToLowerInvariant() switch
         {
@@ -794,10 +899,5 @@ internal sealed class ChatCommand : AsyncCommand<ChatCommand.Settings>
         };
     }
 
-    // Default ChatML template used as fallback when GGUF has no chat_template
-    internal const string DefaultChatMlTemplateText =
-        "{% for message in messages %}" +
-        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}" +
-        "{% endfor %}" +
-        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
+    internal const string DefaultChatMlTemplateText = GgufChatTemplateFactory.PlainCompletionTemplateText;
 }

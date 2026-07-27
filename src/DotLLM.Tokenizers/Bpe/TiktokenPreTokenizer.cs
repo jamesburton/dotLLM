@@ -45,6 +45,16 @@ internal static class TiktokenPreTokenizer
         @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
         RegexOptions.Compiled);
 
+    // ── GPT-4o / o200k (gpt-4o, llama4, gpt-oss) ────────────────────
+    // Original o200k_base pattern from tokenizer.json (llama.cpp rewrites it
+    // lookahead-free for its own regex engine; .NET supports the original
+    // Unicode-category form directly). Case-mixed letter runs with optional
+    // contractions, 1-3 digit groups, punctuation with trailing
+    // newlines/slashes, newline runs, trailing whitespace.
+    private static readonly Regex Gpt4oRegex = new(
+        @"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+        RegexOptions.Compiled);
+
     /// <summary>
     /// Returns the pre-tokenization regex for the given GGUF <c>tokenizer.ggml.pre</c> type,
     /// or <c>null</c> if the type is unknown or absent (no pre-tokenization).
@@ -56,6 +66,7 @@ internal static class TiktokenPreTokenizer
         "deepseek-llm" => DeepSeekLlmRegex,
         "deepseek-coder" => DeepSeekCoderRegex,
         "command-r" => CommandRRegex,
+        "gpt-4o" or "llama4" => Gpt4oRegex,
         _ => null,
     };
 }

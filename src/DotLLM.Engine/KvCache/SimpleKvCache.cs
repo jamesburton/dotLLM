@@ -9,15 +9,15 @@ namespace DotLLM.Engine.KvCache;
 /// Simple pre-allocated KV-cache. Stores per-layer K and V projections in contiguous
 /// FP32 buffers of shape <c>[maxSeqLen, numKvHeads * headDim]</c>, 64-byte aligned.
 /// </summary>
-public sealed unsafe class SimpleKvCache : IKvCache
+public sealed unsafe class SimpleKvCache : IKvCache, IPerLayerKvCache
 {
     private readonly nint[] _keys;   // [numLayers] pointers to K buffers
     private readonly nint[] _values; // [numLayers] pointers to V buffers
     private readonly int _numLayers;
-    private readonly int _numKvHeads;
-    private readonly int _headDim;
+    private readonly KvGeometry _geom;   // per-layer KV row width (numKvHeads(l) * headDim(l))
+    private readonly bool _uniform;      // _geom.IsUniform, hoisted for the hot path
+    private readonly int _uniformStride; // _geom.UniformStride when _uniform; else 0
     private readonly int _maxSeqLen;
-    private readonly int _kvStride; // numKvHeads * headDim
     private int _currentLength;
     private bool _disposed;
 
@@ -28,29 +28,53 @@ public sealed unsafe class SimpleKvCache : IKvCache
     public int MaxLength => _maxSeqLen;
 
     /// <summary>Total bytes allocated for KV-cache buffers.</summary>
-    public long AllocatedBytes => (long)_numLayers * 2 * _maxSeqLen * _kvStride * sizeof(float);
+    public long AllocatedBytes
+    {
+        get
+        {
+            long rows = 0;
+            for (int i = 0; i < _numLayers; i++)
+                rows += _geom.KvStrideOf(i);
+            return rows * 2 * _maxSeqLen * sizeof(float);
+        }
+    }
 
     /// <summary>
-    /// Creates a new KV-cache with pre-allocated buffers for all layers.
+    /// Creates a new KV-cache with pre-allocated buffers for all layers, all using a
+    /// single uniform per-layer stride (<c>numKvHeads * headDim</c>). Byte-identical
+    /// to the per-layer constructor with <see cref="KvGeometry.Uniform"/>.
     /// </summary>
     /// <param name="numLayers">Number of transformer layers.</param>
     /// <param name="numKvHeads">Number of KV attention heads per layer.</param>
     /// <param name="headDim">Dimension per attention head.</param>
     /// <param name="maxSeqLen">Maximum number of positions this cache can hold.</param>
     public SimpleKvCache(int numLayers, int numKvHeads, int headDim, int maxSeqLen)
+        : this(KvGeometry.Uniform(numLayers, numKvHeads, headDim), maxSeqLen)
     {
-        _numLayers = numLayers;
-        _numKvHeads = numKvHeads;
-        _headDim = headDim;
+    }
+
+    /// <summary>
+    /// Creates a new KV-cache with pre-allocated, per-layer-strided buffers. For a
+    /// uniform geometry this is byte-identical to the scalar constructor; for Gemma-4
+    /// (distinct sliding vs global KV row widths) each layer's K/V buffer is sized to
+    /// that layer's stride so the two layer classes are addressed correctly.
+    /// </summary>
+    /// <param name="geometry">Per-layer KV-cache geometry (see <see cref="KvGeometry.FromConfig"/>).</param>
+    /// <param name="maxSeqLen">Maximum number of positions this cache can hold.</param>
+    public SimpleKvCache(KvGeometry geometry, int maxSeqLen)
+    {
+        _numLayers = geometry.LayerCount;
+        _geom = geometry;
+        _uniform = geometry.IsUniform;
+        _uniformStride = geometry.IsUniform ? geometry.UniformStride : 0;
         _maxSeqLen = maxSeqLen;
-        _kvStride = numKvHeads * headDim;
 
-        _keys = new nint[numLayers];
-        _values = new nint[numLayers];
+        _keys = new nint[_numLayers];
+        _values = new nint[_numLayers];
 
-        nuint bufferBytes = (nuint)((long)maxSeqLen * _kvStride * sizeof(float));
-        for (int i = 0; i < numLayers; i++)
+        for (int i = 0; i < _numLayers; i++)
         {
+            nuint bufferBytes = (nuint)((long)maxSeqLen * geometry.KvStrideOf(i) * sizeof(float));
             _keys[i] = (nint)NativeMemory.AlignedAlloc(bufferBytes, 64);
             _values[i] = (nint)NativeMemory.AlignedAlloc(bufferBytes, 64);
         }
@@ -70,7 +94,8 @@ public sealed unsafe class SimpleKvCache : IKvCache
         float* kDst = (float*)_keys[layerIndex];
         float* vDst = (float*)_values[layerIndex];
 
-        int rowBytes = _kvStride * sizeof(float);
+        int stride = _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex);
+        int rowBytes = stride * sizeof(float);
 
         for (int i = 0; i < seqLen; i++)
         {
@@ -82,13 +107,13 @@ public sealed unsafe class SimpleKvCache : IKvCache
             if (pos > maxPos) maxPos = pos;
 
             Buffer.MemoryCopy(
-                kSrc + i * _kvStride,
-                kDst + pos * _kvStride,
+                kSrc + i * stride,
+                kDst + pos * stride,
                 rowBytes, rowBytes);
 
             Buffer.MemoryCopy(
-                vSrc + i * _kvStride,
-                vDst + pos * _kvStride,
+                vSrc + i * stride,
+                vDst + pos * stride,
                 rowBytes, rowBytes);
         }
 
@@ -100,26 +125,27 @@ public sealed unsafe class SimpleKvCache : IKvCache
     /// <inheritdoc/>
     public void Update(ITensor keys, ITensor values, ReadOnlySpan<int> positions, int layerIndex)
     {
-        var kRef = new TensorRef(positions.Length, _kvStride, keys.DType, keys.DeviceId, keys.DataPointer);
-        var vRef = new TensorRef(positions.Length, _kvStride, values.DType, values.DeviceId, values.DataPointer);
+        int stride = _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex);
+        var kRef = new TensorRef(positions.Length, stride, keys.DType, keys.DeviceId, keys.DataPointer);
+        var vRef = new TensorRef(positions.Length, stride, values.DType, values.DeviceId, values.DataPointer);
         Update(kRef, vRef, positions, layerIndex);
     }
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public TensorRef GetKeysRef(int layerIndex)
-        => new(_currentLength, _kvStride, DType.Float32, -1, _keys[layerIndex]);
+        => new(_currentLength, _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex), DType.Float32, -1, _keys[layerIndex]);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public TensorRef GetValuesRef(int layerIndex)
-        => new(_currentLength, _kvStride, DType.Float32, -1, _values[layerIndex]);
+        => new(_currentLength, _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex), DType.Float32, -1, _values[layerIndex]);
 
     /// <inheritdoc/>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ITensor GetKeys(int layerIndex)
     {
-        var shape = new TensorShape(_currentLength, _kvStride);
+        var shape = new TensorShape(_currentLength, _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex));
         return new TensorView(shape, DType.Float32, -1, _keys[layerIndex]);
     }
 
@@ -128,10 +154,20 @@ public sealed unsafe class SimpleKvCache : IKvCache
     /// </summary>
     public int NumLayers => _numLayers;
 
+    /// <inheritdoc/>
+    int IPerLayerKvCache.LayerCount => _numLayers;
+
     /// <summary>
-    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements).
+    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements) of layer 0. For a
+    /// per-layer (Gemma-4) geometry use <see cref="KvStrideOf(int)"/> instead.
     /// </summary>
-    public int KvStride => _kvStride;
+    public int KvStride => _uniform ? _uniformStride : _geom.KvStrideOf(0);
+
+    /// <summary>
+    /// Per-row stride (FP32 elements) for <paramref name="layerIndex"/>. Equals
+    /// <see cref="KvStride"/> for every uniform model; differs per layer for Gemma-4.
+    /// </summary>
+    public int KvStrideOf(int layerIndex) => _geom.KvStrideOf(layerIndex);
 
     /// <summary>
     /// Returns a <see cref="ReadOnlySpan{T}"/> over the contiguous FP32 keys
@@ -143,7 +179,7 @@ public sealed unsafe class SimpleKvCache : IKvCache
     {
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
-        int floats = _currentLength * _kvStride;
+        int floats = _currentLength * (_uniform ? _uniformStride : _geom.KvStrideOf(layerIndex));
         return new ReadOnlySpan<float>((void*)_keys[layerIndex], floats);
     }
 
@@ -155,7 +191,7 @@ public sealed unsafe class SimpleKvCache : IKvCache
     {
         if ((uint)layerIndex >= (uint)_numLayers)
             throw new ArgumentOutOfRangeException(nameof(layerIndex));
-        int floats = _currentLength * _kvStride;
+        int floats = _currentLength * (_uniform ? _uniformStride : _geom.KvStrideOf(layerIndex));
         return new ReadOnlySpan<float>((void*)_values[layerIndex], floats);
     }
 
@@ -163,7 +199,7 @@ public sealed unsafe class SimpleKvCache : IKvCache
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ITensor GetValues(int layerIndex)
     {
-        var shape = new TensorShape(_currentLength, _kvStride);
+        var shape = new TensorShape(_currentLength, _uniform ? _uniformStride : _geom.KvStrideOf(layerIndex));
         return new TensorView(shape, DType.Float32, -1, _values[layerIndex]);
     }
 

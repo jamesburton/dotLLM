@@ -1,3 +1,4 @@
+using DotLLM.Core.Attention;
 using DotLLM.Vulkan.Interop;
 
 namespace DotLLM.Vulkan.Kernels;
@@ -46,7 +47,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
 
     private const int WorkgroupSize = KvTileCols;
 
-    // 8 uints + 2 floats (softCap, scaleOverride) + 2 uint padding (= 12 * 4 = 48 bytes).
+    // 8 uints + 2 floats (softCap, scaleOverride) + 2 uints (maskMode, prefixLen) = 12 * 4 = 48 bytes.
     private const int PushConstantBytes = 12 * sizeof(uint);
 
     private readonly VulkanDevice _device;
@@ -63,7 +64,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -137,12 +138,13 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
-        float softCap = 0.0f, float scaleOverride = 0.0f)
+        float softCap = 0.0f, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         using var ctx = _device.CreateSubmitContext();
         ctx.Begin();
         Record(ctx.CommandBuffer, q, k, v, output, seqQ, seqKv, numHeads, numKvHeads, headDim,
-               positionOffset, slidingWindow, useAlibi, softCap, scaleOverride);
+               positionOffset, slidingWindow, useAlibi, softCap, scaleOverride, maskMode, prefixLen);
         ctx.SubmitAndWait();
     }
 
@@ -157,7 +159,8 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         VulkanDevice.Buffer q, VulkanDevice.Buffer k, VulkanDevice.Buffer v, VulkanDevice.Buffer output,
         int seqQ, int seqKv, int numHeads, int numKvHeads, int headDim,
         int positionOffset = 0, int slidingWindow = 0, bool useAlibi = false,
-        float softCap = 0.0f, float scaleOverride = 0.0f)
+        float softCap = 0.0f, float scaleOverride = 0.0f,
+        AttentionMaskMode maskMode = AttentionMaskMode.Causal, int prefixLen = 0)
     {
         if (seqQ <= 0) throw new ArgumentOutOfRangeException(nameof(seqQ));
         if (seqKv <= 0) throw new ArgumentOutOfRangeException(nameof(seqKv));
@@ -178,6 +181,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
             "softCap must be non-negative (use 0 to disable).");
         if (scaleOverride < 0.0f) throw new ArgumentOutOfRangeException(nameof(scaleOverride),
             "scaleOverride must be non-negative (use 0 for the default 1/sqrt(headDim)).");
+        if (prefixLen < 0) throw new ArgumentOutOfRangeException(nameof(prefixLen));
 
         long qBytes   = (long)seqQ  * numHeads   * headDim * sizeof(float);
         long kvBytes  = (long)seqKv * numKvHeads * headDim * sizeof(float);
@@ -199,7 +203,7 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         //   [0] seqQ, [1] seqKv, [2] numHeads, [3] numKvHeads,
         //   [4] headDim, [5] positionOffset, [6] slidingWindow, [7] useAlibi,
         //   [8] softCap (float, reinterpreted), [9] scaleOverride (float, reinterpreted),
-        //   [10..11] padding for std140 alignment.
+        //   [10] maskMode (0=Causal,1=Bidirectional,2=Hybrid), [11] prefixLen (Hybrid only).
         Span<uint> pc = stackalloc uint[12];
         pc[0]  = (uint)seqQ;
         pc[1]  = (uint)seqKv;
@@ -211,8 +215,8 @@ public sealed class VulkanFlashAttentionF32Kernel : IDisposable
         pc[7]  = useAlibi ? 1u : 0u;
         pc[8]  = BitConverter.SingleToUInt32Bits(softCap);
         pc[9]  = BitConverter.SingleToUInt32Bits(scaleOverride);
-        pc[10] = 0u;
-        pc[11] = 0u;
+        pc[10] = (uint)maskMode;
+        pc[11] = (uint)prefixLen;
         fixed (uint* pcPtr = pc)
         {
             VulkanApi.vkCmdPushConstants(

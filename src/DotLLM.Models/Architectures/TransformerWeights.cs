@@ -204,6 +204,93 @@ internal sealed class MoeLayerWeights
     /// </summary>
     public bool HasRawQuantView => GateExpsRaw != 0 && UpExpsRaw != 0 && DownExpsRaw != 0;
 
+    // ── BitNet ternary (I2_S) routed-expert banks (CPU) ─────────────────────────
+    // Populated by the safetensors BitNet-MoE loader (LoadBitNetMoeLayer). The
+    // per-expert {gate,up,down}_proj are ternary I2_S, laid out as CONTIGUOUS
+    // packed-trit banks (payload only, NO inline tail scale) with a parallel
+    // per-expert absmean scale vector — the exact shape MatMul.MoeIndexedMatmulI2_S
+    // consumes. The BitNet expert body differs from SwiGLU: it is
+    // down( ffn_sub_norm( relu2(gate(x)) * up(x) ) ), so the per-expert
+    // ffn_sub_norm RMSNorm weights live here too. The router (Gate/GateBias) stays
+    // F32. Mutable (set post-construction) — same policy as the Vulkan quant overlay.
+
+    /// <summary>
+    /// Quant type of the routed experts. <see cref="QuantizationType.F32"/> (default)
+    /// selects the SwiGLU path over the <see cref="W1"/>/<see cref="W2"/>/<see cref="W3"/>
+    /// F32 pointers. <see cref="QuantizationType.I2_S"/> selects the BitNet-MoE path over
+    /// the packed ternary banks below (relu2 + per-expert <see cref="ExpertFfnSubNorm"/>).
+    /// <para><b>Q4_K/Q8_0 extension point:</b> add the new quant type here and a matching
+    /// indexed-matmul kernel dispatch in the BitNet-MoE forward; the loader and this bundle
+    /// already carry per-expert base+stride banks and a per-expert scale/format field.</para>
+    /// </summary>
+    public QuantizationType RoutedExpertQuantType = QuantizationType.F32;
+
+    /// <summary>Contiguous packed-trit bank base for <c>gate_proj</c> (payload only, no tail
+    /// scale). Expert <c>e</c> lives at <c>GateExpsI2SBase + e*GateExpsI2SRowBytes</c>. 0 when
+    /// the routed experts are not I2_S.</summary>
+    public nint GateExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>gate_proj</c> expert banks (= <c>I·H/4</c>).</summary>
+    public long GateExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>gate_proj</c> [numExperts]. Null when not I2_S.</summary>
+    public float[]? GateExpsI2SScales;
+
+    /// <summary>Contiguous packed-trit bank base for <c>up_proj</c>. See <see cref="GateExpsI2SBase"/>.</summary>
+    public nint UpExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>up_proj</c> expert banks (= <c>I·H/4</c>).</summary>
+    public long UpExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>up_proj</c> [numExperts].</summary>
+    public float[]? UpExpsI2SScales;
+
+    /// <summary>Contiguous packed-trit bank base for <c>down_proj</c>. See <see cref="GateExpsI2SBase"/>.</summary>
+    public nint DownExpsI2SBase;
+    /// <summary>Byte stride between consecutive I2_S <c>down_proj</c> expert banks (= <c>H·I/4</c>).</summary>
+    public long DownExpsI2SRowBytes;
+    /// <summary>Per-expert absmean α for <c>down_proj</c> [numExperts].</summary>
+    public float[]? DownExpsI2SScales;
+
+    /// <summary>Per-expert BitNet FFN Sub-LN weight, <c>[numExperts][moeIntermediateSize]</c>.
+    /// Applied as an RMSNorm over the gated intermediate <c>relu2(gate)*up</c> before
+    /// <c>down_proj</c>, per the expert that produced the row. Null for non-BitNet MoE.</summary>
+    public float[][]? ExpertFfnSubNorm;
+
+    /// <summary>Optional router bias <c>[numExperts]</c> added to the gate logits before
+    /// softmax/top-k. Required for identity-MoTE (top-1 selection is bias-shifted) and
+    /// Qwen3 aux-loss-free routing; harmless (null) elsewhere.</summary>
+    public float[]? GateBias;
+
+    /// <summary>True when the routed experts are ternary I2_S (BitNet-MoE forward path).</summary>
+    public bool IsBitNetI2S => RoutedExpertQuantType == QuantizationType.I2_S;
+
+    // ── Quantized-expert CPU path (gpt-oss) ───────────────────────────────
+    // When UseQuantExperts is true the CPU forward runs
+    // DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp directly on the raw GGUF views
+    // (GateExpsRaw / UpExpsRaw / DownExpsRaw + their quant types) instead of
+    // the F32 W1/W2/W3 banks — no F32 host inflation. The W1/W2/W3 arrays are
+    // zero-filled placeholders in this mode.
+
+    /// <summary>True = CPU forward consumes the raw quantized expert banks via
+    /// <c>MoeQuantSwiGluMlp</c> (gpt-oss). False = classic F32 W1/W2/W3 path.</summary>
+    public bool UseQuantExperts;
+
+    /// <summary>Optional router bias [NumExperts] (gpt-oss <c>ffn_gate_inp.bias</c>).</summary>
+    public float[]? RouterBias;
+
+    /// <summary>Optional per-expert gate bias, flat [NumExperts × IntermediateSize].</summary>
+    public float[]? GateExpsBias;
+
+    /// <summary>Optional per-expert up bias, flat [NumExperts × IntermediateSize].</summary>
+    public float[]? UpExpsBias;
+
+    /// <summary>Optional per-expert down bias, flat [NumExperts × HiddenSize].</summary>
+    public float[]? DownExpsBias;
+
+    /// <summary>True = clamped swiglu_oai activation (gpt-oss); false = plain SwiGLU.</summary>
+    public bool UseSwiGluOai;
+
+    /// <summary>True = softmax over the selected top-k raw logits (gpt-oss);
+    /// false = Mixtral softmax-then-topk gating.</summary>
+    public bool SoftmaxAfterTopK;
+
     /// <summary>Mixtral-convention ctor (no shared expert, always renormalise top-k).</summary>
     public MoeLayerWeights(
         float[] gate,
@@ -310,6 +397,101 @@ internal sealed class MoeLayerWeights
 }
 
 /// <summary>
+/// Per-layer Gemma-4 MoE extras: the dual-<i>parallel</i> FFN's extra norms,
+/// the custom router scale, the per-expert down-projection scale, and the
+/// per-layer output scale. Present only on a Gemma-4 (<c>gemma4</c> /
+/// DiffusionGemma) layer; null on every other architecture. See
+/// <c>docs/diffusiongemma/GEMMA4-GRAPH-SPEC.md</c>.
+/// </summary>
+/// <remarks>
+/// The dense MLP's <c>gate</c>/<c>up</c>/<c>down</c> projections live in the
+/// standard <see cref="TransformerLayerWeights.GateWeight"/> /
+/// <see cref="TransformerLayerWeights.UpWeight"/> /
+/// <see cref="TransformerLayerWeights.DownWeight"/> slots, and the MoE experts
+/// in <see cref="TransformerLayerWeights.Moe"/>. <see cref="TransformerLayerWeights.FfnNormWeight"/>
+/// holds the dense branch's <c>ffn_norm</c>. This bundle carries the four
+/// remaining FFN norms plus the scalars.
+/// </remarks>
+internal sealed class Gemma4LayerWeights
+{
+    /// <summary>MoE branch pre-norm <c>pre_ffw_norm_2</c> [hiddenSize] — RMSNorm'd attn_out fed to the experts. Null on a dense (non-MoE) Gemma-4 layer (E2B/E4B).</summary>
+    public float[]? PreFfwNorm2;
+    /// <summary>Dense branch post-norm <c>post_ffw_norm_1</c> [hiddenSize] — applied to the dense MLP output. Null on a dense (non-MoE) layer, whose single FFN output goes straight to <see cref="PostFfwNorm"/>.</summary>
+    public float[]? PostFfwNorm1;
+    /// <summary>MoE branch post-norm <c>post_ffw_norm_2</c> [hiddenSize] — applied to the MoE output. Null on a dense layer.</summary>
+    public float[]? PostFfwNorm2;
+    /// <summary>Combined post-norm <c>post_ffw_norm</c> [hiddenSize] — wraps (dense + MoE) before the residual add. On dense layers wraps the single FFN output.</summary>
+    public required float[] PostFfwNorm;
+    /// <summary>Custom-router channel scale <c>ffn_gate_inp.scale</c> [hiddenSize]. Null on a dense layer.</summary>
+    public float[]? RouterScale;
+    /// <summary>Per-expert down-projection scale <c>ffn_down_exps.scale</c> [numExperts]. Null on a dense layer.</summary>
+    public float[]? DownExpertScale;
+    /// <summary>Per-layer output scale <c>layer_output_scale</c> — single scalar applied as the LAST per-layer op (canvas rows on diffusion-gemma; ALL rows on gemma4).</summary>
+    public required float LayerOutputScale;
+    /// <summary>
+    /// DiffusionGemma-only per-layer encoder output scale <c>enc_layer_output_scale</c> —
+    /// single scalar applied as the LAST per-layer op to the PROMPT rows [0, P) of the
+    /// unified [prompt | canvas] forward. <see langword="null"/> on autoregressive gemma4
+    /// (the tensor is absent), in which case every row uses <see cref="LayerOutputScale"/>.
+    /// </summary>
+    public float? EncLayerOutputScale;
+    /// <summary>True on a V-less (global/full-attention) layer where V branches off the RAW K projection.</summary>
+    public required bool VFromK;
+
+    /// <summary>
+    /// Per-expert byte stride for the fused <c>ffn_gate_up_exps</c> bank (= the full
+    /// <c>2*Ie</c>-row slab). Both the gate raw view (offset 0) and the up raw view
+    /// (offset <c>Ie</c> rows, stored on <see cref="MoeLayerWeights.UpExpsRaw"/>)
+    /// step by this stride. NOT the kernel-default <c>Ie*rowBytes</c> — the two
+    /// projections are interleaved per expert in one tensor. Zero on a dense layer.
+    /// </summary>
+    public long GateUpExpsRowBytes;
+    /// <summary>Per-expert byte stride for the <c>ffn_down_exps</c> bank (= <c>hidden</c> rows). Zero on a dense layer.</summary>
+    public long DownExpsRowBytes;
+}
+
+/// <summary>
+/// Model-level DiffusionGemma self-conditioning (SC) weights. Present ONLY on the
+/// diffusion-gemma GGUF (absent on autoregressive gemma4, where SC is meaningless).
+/// SC feeds the PREVIOUS denoise step's canvas logits back into the canvas region
+/// embedding via a gated GeGLU MLP over a soft token-embedding of those logits
+/// (<c>diffusion-gemma.cpp</c> <c>dg_canvas_embed</c>):
+/// <code>
+/// soft   = sqrt(n_embd) * Σ_v softmax(prev_logits)[v] * tok_embd[v]   // [n_embd] per canvas col
+/// normed = rms_norm(soft, eps) * self_cond_pre_norm                   // [n_embd]
+/// sc_sig = self_cond_down( gelu_tanh(self_cond_gate·normed) * (self_cond_up·normed) )  // [n_embd]
+/// canvas = rms_noscale(canvas + sc_sig)
+/// </code>
+/// The gate/up projections widen to the DENSE feed-forward width (n_ff = 2112), and
+/// down projects back to n_embd. Weights stay as raw mmap pointers + quant type
+/// (the same dequant GEMV primitive serves them); the pre-norm is dequantized to
+/// <c>float[]</c> at load. Null on every non-diffusion-gemma model.
+/// </summary>
+internal sealed class Gemma4SelfCondWeights
+{
+    /// <summary>RMSNorm weight <c>self_cond_pre_norm.weight</c> [n_embd] (F32) — applied (with scale) to the soft-embedding.</summary>
+    public required float[] PreNorm;
+
+    /// <summary>Gate projection <c>self_cond_gate.weight</c>: ptr, quant, out dim (n_ff), in dim (n_embd).</summary>
+    public required nint GatePtr;
+    public required QuantizationType GateQt;
+    public required int GateOut;
+    public required int GateIn;
+
+    /// <summary>Up projection <c>self_cond_up.weight</c>: ptr, quant, out dim (n_ff), in dim (n_embd).</summary>
+    public required nint UpPtr;
+    public required QuantizationType UpQt;
+    public required int UpOut;
+    public required int UpIn;
+
+    /// <summary>Down projection <c>self_cond_down.weight</c>: ptr, quant, out dim (n_embd), in dim (n_ff).</summary>
+    public required nint DownPtr;
+    public required QuantizationType DownQt;
+    public required int DownOut;
+    public required int DownIn;
+}
+
+/// <summary>
 /// Holds per-layer weight references for a single transformer layer.
 /// Norm weights are dequantized to <c>float[]</c> at load time (small).
 /// Linear projection weights remain as mmap pointers with their quantization type.
@@ -324,6 +506,11 @@ internal readonly struct TransformerLayerWeights
     public readonly float[]? QNormWeight;
     /// <summary>Optional QK-norm weight [headDim]. Applied per-head to K after projection, before RoPE. Null when absent.</summary>
     public readonly float[]? KNormWeight;
+
+    /// <summary>Optional attention sub-norm weight [hiddenSize]. Applied to the attention output before the output projection (BitNet Sub-LN). Null when absent.</summary>
+    public readonly float[]? AttnSubNormWeight;
+    /// <summary>Optional FFN sub-norm weight [intermediateSize]. Applied to the gated FFN intermediate before the down projection (BitNet Sub-LN). Null when absent.</summary>
+    public readonly float[]? FfnSubNormWeight;
 
     /// <summary>Q projection pointer, quantType, output dim, input dim.</summary>
     public readonly nint QWeight;
@@ -357,8 +544,27 @@ internal readonly struct TransformerLayerWeights
     /// <summary>Optional output projection bias [OOutputDim]. Null when absent.</summary>
     public readonly float[]? OBias;
 
-    /// <summary>Pre-FFN RMSNorm weight [hiddenSize].</summary>
+    /// <summary>
+    /// Pre-FFN RMSNorm weight [hiddenSize]. For the standard two-norm layout
+    /// (Llama/Mistral/Qwen/…) this is the <c>post_attention_layernorm</c>. For
+    /// Gemma's four-norm layout this is the <c>pre_feedforward_layernorm</c> (the
+    /// <c>post_attention_layernorm</c> moves to <see cref="PostAttnNormWeight"/>).
+    /// </summary>
     public readonly float[] FfnNormWeight;
+
+    /// <summary>
+    /// Optional Gemma <c>post_attention_layernorm</c> weight [hiddenSize], applied
+    /// to the attention sublayer output BEFORE the residual add. Null on every
+    /// non-Gemma architecture (which keeps the standard two-norm residual layout).
+    /// </summary>
+    public readonly float[]? PostAttnNormWeight;
+
+    /// <summary>
+    /// Optional Gemma <c>post_feedforward_layernorm</c> weight [hiddenSize], applied
+    /// to the FFN sublayer output BEFORE the residual add. Null on every non-Gemma
+    /// architecture.
+    /// </summary>
+    public readonly float[]? PostFfnNormWeight;
 
     /// <summary>SwiGLU gate projection.</summary>
     public readonly nint GateWeight;
@@ -391,6 +597,14 @@ internal readonly struct TransformerLayerWeights
     /// </summary>
     public readonly MoeLayerWeights? Moe;
 
+    /// <summary>
+    /// Optional per-head attention-sink logits [numHeads] (gpt-oss
+    /// <c>attn_sinks.weight</c>). When non-null each head's attention softmax
+    /// denominator additionally includes <c>exp(sink[h] - max)</c>. Null for
+    /// architectures without sinks (zero overhead).
+    /// </summary>
+    public readonly float[]? AttnSinks;
+
     // ──────────────────────────── MLA attention ────────────────────────────
     // DeepSeek-V2/V3 replaces the monolithic Q/K/V/O projections with a
     // low-rank-factorised set. When <see cref="Mla"/> is non-null, the
@@ -404,6 +618,27 @@ internal readonly struct TransformerLayerWeights
     /// <see cref="VWeight"/> are zeroed and the forward pass takes the MLA branch.
     /// </summary>
     public readonly MlaLayerWeights? Mla;
+
+    /// <summary>
+    /// Non-null on a Gemma-4 MoE layer — the dual-parallel-FFN extra norms,
+    /// custom-router scale, per-expert down scale, and per-layer output scale.
+    /// Null on every other architecture (the standard FFN/MoE path runs). See
+    /// <see cref="Gemma4LayerWeights"/>.
+    /// </summary>
+    public readonly Gemma4LayerWeights? Gemma4;
+
+    // ──────────────────── Per-Layer Embeddings (PLE) ────────────────────
+    // Gemma-4 dense text tower (E2B/E4B) only. Non-zero/non-null iff the model
+    // config carries PerLayerEmbedding. The forward pass, after the MLP residual
+    // add, computes gate→gelu_tanh→(× per-layer input)→proj→post-norm→+residual.
+    // All F32 (upcast at load); dims derive from the config (pleDim / hidden).
+
+    /// <summary>PLE <c>per_layer_input_gate.weight</c> [pleDim, hidden] F32. Zero when absent.</summary>
+    public readonly nint PleGateWeight;
+    /// <summary>PLE <c>per_layer_projection.weight</c> [hidden, pleDim] F32. Zero when absent.</summary>
+    public readonly nint PleProjWeight;
+    /// <summary>PLE <c>post_per_layer_input_norm.weight</c> [hidden] ((1+w) absorbed). Null when absent.</summary>
+    public readonly float[]? PlePostNormWeight;
 
     public TransformerLayerWeights(
         float[] attnNormWeight,
@@ -419,22 +654,66 @@ internal readonly struct TransformerLayerWeights
         float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null,
         float[]? qNormWeight = null, float[]? kNormWeight = null,
         MoeLayerWeights? moe = null,
-        MlaLayerWeights? mla = null)
+        MlaLayerWeights? mla = null,
+        float[]? postAttnNormWeight = null, float[]? postFfnNormWeight = null,
+        Gemma4LayerWeights? gemma4 = null,
+        float[]? attnSubNormWeight = null, float[]? ffnSubNormWeight = null,
+        nint pleGateWeight = 0, nint pleProjWeight = 0, float[]? plePostNormWeight = null,
+        float[]? attnSinks = null)
     {
         AttnNormWeight = attnNormWeight;
         QNormWeight = qNormWeight;
         KNormWeight = kNormWeight;
+        AttnSubNormWeight = attnSubNormWeight;
+        FfnSubNormWeight = ffnSubNormWeight;
         QWeight = qWeight; QQuantType = qQuantType; QOutputDim = qOutputDim; QInputDim = qInputDim; QBias = qBias;
         KWeight = kWeight; KQuantType = kQuantType; KOutputDim = kOutputDim; KInputDim = kInputDim; KBias = kBias;
         VWeight = vWeight; VQuantType = vQuantType; VOutputDim = vOutputDim; VInputDim = vInputDim; VBias = vBias;
         OWeight = oWeight; OQuantType = oQuantType; OOutputDim = oOutputDim; OInputDim = oInputDim; OBias = oBias;
         FfnNormWeight = ffnNormWeight;
+        PostAttnNormWeight = postAttnNormWeight;
+        PostFfnNormWeight = postFfnNormWeight;
         GateWeight = gateWeight; GateQuantType = gateQuantType; GateOutputDim = gateOutputDim; GateInputDim = gateInputDim; GateBias = gateBias;
         UpWeight = upWeight; UpQuantType = upQuantType; UpOutputDim = upOutputDim; UpInputDim = upInputDim; UpBias = upBias;
         DownWeight = downWeight; DownQuantType = downQuantType; DownOutputDim = downOutputDim; DownInputDim = downInputDim; DownBias = downBias;
         Moe = moe;
         Mla = mla;
+        Gemma4 = gemma4;
+        PleGateWeight = pleGateWeight;
+        PleProjWeight = pleProjWeight;
+        PlePostNormWeight = plePostNormWeight;
+        AttnSinks = attnSinks;
     }
+}
+
+/// <summary>
+/// Model-level Per-Layer Embeddings (PLE) weight bundle for the Gemma-4 dense text
+/// tower (E2B/E4B). Non-null on <see cref="TransformerWeights.PerLayerEmbedding"/>
+/// only when the checkpoint ships the PLE tables. The per-layer gate/projection/norm
+/// live on <see cref="TransformerLayerWeights"/>; this holds the two model-level
+/// tensors used once per forward to build the per-layer input tensor.
+/// </summary>
+internal sealed class PerLayerEmbeddingWeights
+{
+    /// <summary><c>embed_tokens_per_layer.weight</c> pointer [vocabPle, numLayers*pleDim].
+    /// Kept at its native quant type + gathered per token (the full table is huge —
+    /// never upcast wholesale).</summary>
+    public required nint EmbedTokensPerLayer { get; init; }
+    /// <summary>Quant type of <see cref="EmbedTokensPerLayer"/>.</summary>
+    public required QuantizationType EmbedTokensPerLayerQt { get; init; }
+
+    /// <summary><c>per_layer_model_projection.weight</c> [numLayers*pleDim, hidden] F32.</summary>
+    public required nint ModelProjection { get; init; }
+
+    /// <summary><c>per_layer_projection_norm.weight</c> [pleDim] ((1+w) absorbed).</summary>
+    public required float[] ProjectionNorm { get; init; }
+
+    /// <summary>Per-layer embedding dimension (<c>hidden_size_per_layer_input</c>).</summary>
+    public required int PerLayerDim { get; init; }
+    /// <summary>Per-layer embedding vocabulary (<c>vocab_size_per_layer_input</c>).</summary>
+    public required int VocabSize { get; init; }
+    /// <summary>Number of decoder layers (row width of the PLE table = NumLayers*PerLayerDim).</summary>
+    public required int NumLayers { get; init; }
 }
 
 /// <summary>
@@ -602,6 +881,31 @@ internal sealed class TransformerWeights : IDisposable
     public int OutputOutputDim { get; }
     public int OutputInputDim { get; }
 
+    /// <summary>
+    /// Model-level DiffusionGemma self-conditioning weights. Non-null ONLY when the
+    /// GGUF carries the <c>self_cond_*</c> tensors (diffusion-gemma); null otherwise.
+    /// </summary>
+    public Gemma4SelfCondWeights? SelfCond { get; }
+
+    /// <summary>
+    /// Model-level Per-Layer Embeddings (PLE) weights (Gemma-4 dense text tower,
+    /// E2B/E4B). Non-null only when the checkpoint ships the PLE tables; null for
+    /// every other architecture. When set, the forward pass builds the per-layer
+    /// input tensor once after the embedding lookup and injects a gated residual
+    /// into each decoder layer via the per-layer PLE slots on
+    /// <see cref="TransformerLayerWeights"/>.
+    /// </summary>
+    public PerLayerEmbeddingWeights? PerLayerEmbedding { get; }
+
+    /// <summary>
+    /// Optional proportional-rope per-pair frequency factors (<c>rope_freqs.weight</c>,
+    /// length = global rotated dim / 2). Gemma-4 E2B/E4B applies them on the
+    /// full-attention layers (ggml <c>theta / freq_factors[i]</c>); the sliding
+    /// layers and every other architecture leave this null. Folded into the
+    /// global cos/sin table at model construction.
+    /// </summary>
+    public float[]? RopeFreqFactors { get; private set; }
+
     /// <summary>Per-layer R4-interleaved weights. Null until <see cref="RepackWeights"/> is called.</summary>
     public RepackedLayerWeights[]? RepackedLayers { get; private set; }
 
@@ -615,12 +919,26 @@ internal sealed class TransformerWeights : IDisposable
     /// </summary>
     private readonly List<nint>? _ownedAllocations;
 
+    /// <summary>
+    /// Live subset of <see cref="_ownedAllocations"/> — the owned host buffers that
+    /// have NOT yet been freed. Built once from <see cref="_ownedAllocations"/> at
+    /// construction. The direct-to-device GPU upload path removes entries as it
+    /// frees them per-tensor (<see cref="TryReleaseOwnedHostAllocation"/>); anything
+    /// still present is freed by <see cref="Dispose"/>. Using a set (not the list)
+    /// as the free source makes early release and final disposal mutually exclusive,
+    /// so a streamed buffer is never double-freed. Null iff <see cref="_ownedAllocations"/>
+    /// is null (pure-mmap GGUF load with nothing to own).
+    /// </summary>
+    private readonly HashSet<nint>? _liveOwnedAllocations;
+
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
         TransformerLayerWeights[] layers,
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQuantType, int outputOutputDim, int outputInputDim,
-        List<nint>? ownedAllocations = null)
+        List<nint>? ownedAllocations = null,
+        Gemma4SelfCondWeights? selfCond = null,
+        PerLayerEmbeddingWeights? perLayerEmbedding = null)
     {
         TokenEmbedWeight = tokenEmbedWeight;
         TokenEmbedQuantType = tokenEmbedQuantType;
@@ -633,6 +951,54 @@ internal sealed class TransformerWeights : IDisposable
         OutputOutputDim = outputOutputDim;
         OutputInputDim = outputInputDim;
         _ownedAllocations = ownedAllocations;
+        _liveOwnedAllocations = ownedAllocations is not null
+            ? new HashSet<nint>(ownedAllocations)
+            : null;
+        SelfCond = selfCond;
+        PerLayerEmbedding = perLayerEmbedding;
+    }
+
+    /// <summary>
+    /// Number of loader-owned host allocations still live (not yet freed). Used by
+    /// the direct-to-device upload path and tests to observe streamed releases. Zero
+    /// for a pure-mmap GGUF load (nothing owned).
+    /// </summary>
+    internal int LiveOwnedAllocationCount => _liveOwnedAllocations?.Count ?? 0;
+
+    /// <summary>
+    /// Releases a single loader-owned host allocation early — used by the GPU
+    /// weight-upload path (direct-to-device streaming) to free each host scratch
+    /// buffer immediately after its synchronous host→device copy has completed,
+    /// instead of holding the entire host weight set resident until
+    /// <see cref="Dispose"/>. This roughly halves the transient CPU-RAM peak on the
+    /// GPU load path, where the host copy and the device copy would otherwise coexist
+    /// for the whole model.
+    /// <para>
+    /// <paramref name="hostPtr"/> is freed ONLY when it is a tracked owned allocation
+    /// (a bf16/f16 → F32 upcast, or an I2_S ternary-packed buffer). Memory-mapped
+    /// zero-copy views (F32 safetensors tensors, GGUF mmap pointers) are NOT owned and
+    /// are silently ignored — freeing them would corrupt the mmap and is never done.
+    /// </para>
+    /// <para>
+    /// Idempotent and memory-safe: a pointer already released (or never owned) returns
+    /// <c>false</c> without touching memory, so a duplicate call cannot double-free, and
+    /// <see cref="Dispose"/> will not re-free a streamed buffer (it drains the same live
+    /// set). The caller MUST guarantee the host bytes have already been fully consumed by
+    /// the device copy before calling — for CUDA that is the synchronous
+    /// <c>cuMemcpyHtoD_v2</c>, which blocks until the transfer completes; the subsequent
+    /// on-device dequant kernels read device memory only and never the freed host buffer.
+    /// </para>
+    /// </summary>
+    /// <param name="hostPtr">A host pointer previously handed to the upload path.</param>
+    /// <returns><c>true</c> if this call freed an owned allocation; otherwise <c>false</c>.</returns>
+    internal unsafe bool TryReleaseOwnedHostAllocation(nint hostPtr)
+    {
+        if (hostPtr == nint.Zero || _liveOwnedAllocations is null)
+            return false;
+        if (!_liveOwnedAllocations.Remove(hostPtr))
+            return false;
+        NativeMemory.AlignedFree((void*)hostPtr);
+        return true;
     }
 
     /// <summary>
@@ -645,14 +1011,17 @@ internal sealed class TransformerWeights : IDisposable
         TransformerLayerWeights[] layers,
         float[] outputNormWeight,
         nint outputWeight, QuantizationType outputQt, int outputM, int outputK,
-        List<nint> ownedAllocations)
+        List<nint> ownedAllocations,
+        PerLayerEmbeddingWeights? perLayerEmbedding = null)
     {
         return new TransformerWeights(
             tokenEmbedWeight, tokenEmbedQt, vocabSize, hiddenSize,
             layers,
             outputNormWeight,
             outputWeight, outputQt, outputM, outputK,
-            ownedAllocations);
+            ownedAllocations,
+            selfCond: null,
+            perLayerEmbedding: perLayerEmbedding);
     }
 
     /// <summary>
@@ -681,7 +1050,14 @@ internal sealed class TransformerWeights : IDisposable
         // MLA (DeepSeek-V2/V3) loads its projection tensors as F32 dequant
         // buffers since the CPU MlaAttention.Execute oracle is F32-only. Track
         // them on the loader so Dispose can free them. Empty for non-MLA models.
-        var owned = config.MlaConfig is not null ? new List<nint>() : null;
+        // Gemma 4 dequantizes its small per-layer scalar tensors (router scale,
+        // per-expert down scale, layer_output_scale) into managed float[] and
+        // keeps the big expert banks as raw mmap views; its dense-PLE variant
+        // (E2B/E4B) additionally owns F32 upcasts of the PLE projections when
+        // they are not stored as F32 (per_layer_model_proj ships BF16).
+        var owned = config.MlaConfig is not null || config.PerLayerEmbedding is not null
+            ? new List<nint>()
+            : null;
 
         // Per-layer weights
         var layers = new TransformerLayerWeights[config.NumLayers];
@@ -689,12 +1065,86 @@ internal sealed class TransformerWeights : IDisposable
         {
             layers[i] = config.MlaConfig is not null
                 ? LoadMlaLayer(i, dataBase, tensors, config, owned!, skipF32MoeDequant)
-                : LoadLayer(i, dataBase, tensors, config);
+                : config.Gemma4DualFfn
+                    ? LoadGemma4Layer(i, dataBase, tensors, config, owned)
+                    : LoadLayer(i, dataBase, tensors, config);
         }
 
         // Output norm
         var outNormDesc = tensors["output_norm.weight"];
         float[] outputNormWeight = DequantizeNorm(dataBase, outNormDesc, config.HiddenSize);
+
+        // DiffusionGemma self-conditioning (model-level). On denoise steps > 0 the
+        // canvas region embed becomes rms_noscale(scaled_embed + sc_sig(prev_logits)),
+        // where sc_sig is a gated GeGLU MLP over a soft token-embedding of the previous
+        // step's canvas logits (diffusion-gemma.cpp dg_canvas_embed). Present ONLY on
+        // the diffusion-gemma GGUF — absent ⇒ SelfCond stays null and the forward keeps
+        // the byte-identical zero-SC path. The pre-norm dequantizes to float[]; the
+        // gate/up/down projections stay as raw mmap pointers (same dequant GEMV serves them).
+        Gemma4SelfCondWeights? selfCond = null;
+        if (tensors.TryGetValue("self_cond_pre_norm.weight", out var scPreDesc)
+            && tensors.TryGetValue("self_cond_gate.weight", out var scGateDesc)
+            && tensors.TryGetValue("self_cond_up.weight", out var scUpDesc)
+            && tensors.TryGetValue("self_cond_down.weight", out var scDownDesc))
+        {
+            float[] scPreNorm = DequantizeNorm(dataBase, scPreDesc, config.HiddenSize);
+            var (scGatePtr, scGateQt, scGateM, scGateK) = LoadLinear(dataBase, scGateDesc);
+            var (scUpPtr, scUpQt, scUpM, scUpK) = LoadLinear(dataBase, scUpDesc);
+            var (scDownPtr, scDownQt, scDownM, scDownK) = LoadLinear(dataBase, scDownDesc);
+            selfCond = new Gemma4SelfCondWeights
+            {
+                PreNorm = scPreNorm,
+                GatePtr = scGatePtr, GateQt = scGateQt, GateOut = scGateM, GateIn = scGateK,
+                UpPtr = scUpPtr, UpQt = scUpQt, UpOut = scUpM, UpIn = scUpK,
+                DownPtr = scDownPtr, DownQt = scDownQt, DownOut = scDownM, DownIn = scDownK,
+            };
+        }
+
+        // Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B) GGUF.
+        // Model-level tensors mirror llama.cpp gemma4.cpp load_arch_tensors:
+        //   per_layer_token_embd.weight [pleDim*L, vocab]  — kept at native quant,
+        //     gathered per token (huge table; never upcast wholesale);
+        //   per_layer_model_proj.weight [hidden, pleDim*L] — F32 for the CPU
+        //     GemmF32 kernel (BF16 in the released E4B → owned upcast);
+        //   per_layer_proj_norm.weight  [pleDim]           — plain weights (Gemma-4
+        //     GGUF stores final norm weights, no +1).
+        PerLayerEmbeddingWeights? perLayerEmbedding = null;
+        if (config.PerLayerEmbedding is PerLayerEmbeddingConfig pleCfg)
+        {
+            int lp = config.NumLayers * pleCfg.PerLayerDim;
+            var pleTokDesc = tensors["per_layer_token_embd.weight"];
+            if (pleTokDesc.Shape[0] != lp)
+                throw new InvalidDataException(
+                    $"per_layer_token_embd.weight row width {pleTokDesc.Shape[0]} != numLayers*pleDim ({lp}).");
+            var pleProjDesc = tensors["per_layer_model_proj.weight"];
+            nint pleProjPtr = pleProjDesc.QuantizationType == QuantizationType.F32
+                ? dataBase + (nint)pleProjDesc.DataOffset      // zero-copy mmap view
+                : DequantToF32(dataBase, pleProjDesc, (long)lp * config.HiddenSize, owned!);
+            float[] pleProjNorm = DequantizeNorm(
+                dataBase, tensors["per_layer_proj_norm.weight"], pleCfg.PerLayerDim);
+
+            perLayerEmbedding = new PerLayerEmbeddingWeights
+            {
+                EmbedTokensPerLayer = dataBase + (nint)pleTokDesc.DataOffset,
+                EmbedTokensPerLayerQt = pleTokDesc.QuantizationType,
+                ModelProjection = pleProjPtr,
+                ProjectionNorm = pleProjNorm,
+                PerLayerDim = pleCfg.PerLayerDim,
+                VocabSize = pleCfg.VocabSize,
+                NumLayers = config.NumLayers,
+            };
+        }
+
+        // Proportional-rope frequency factors (rope_freqs.weight, Gemma-4 E2B/E4B
+        // full-attention layers; also Llama-3.1-style GGUFs). Optional — absent on
+        // every other released model. Length = global rotated dim / 2.
+        float[]? ropeFreqFactors = null;
+        if (tensors.TryGetValue("rope_freqs.weight", out var ropeFreqsDesc))
+        {
+            ropeFreqFactors = new float[ropeFreqsDesc.Shape[0]];
+            Dequantize.ToFloat32(dataBase + (nint)ropeFreqsDesc.DataOffset,
+                ropeFreqsDesc.Shape[0], ropeFreqsDesc.QuantizationType, ropeFreqFactors);
+        }
 
         // LM head — may be tied to token embeddings
         nint outputPtr;
@@ -718,12 +1168,16 @@ internal sealed class TransformerWeights : IDisposable
             outputM = embDesc.Shape[1];
         }
 
-        return new TransformerWeights(
+        var weights = new TransformerWeights(
             embPtr, embDesc.QuantizationType, config.VocabSize, config.HiddenSize,
             layers,
             outputNormWeight,
             outputPtr, outputQt, outputM, outputK,
-            ownedAllocations: owned);
+            ownedAllocations: owned,
+            selfCond: selfCond,
+            perLayerEmbedding: perLayerEmbedding);
+        weights.RopeFreqFactors = ropeFreqFactors;
+        return weights;
     }
 
     /// <summary>
@@ -782,15 +1236,20 @@ internal sealed class TransformerWeights : IDisposable
         RepackedOutput?.Dispose();
         RepackedOutput = null;
 
-        if (_ownedAllocations is not null)
+        // Free only the STILL-LIVE owned allocations. The direct-to-device upload
+        // path may have already freed (and removed) some of these per-tensor via
+        // TryReleaseOwnedHostAllocation; draining the live set here guarantees each
+        // owned buffer is freed exactly once whether or not streaming ran.
+        if (_liveOwnedAllocations is not null)
         {
-            foreach (var ptr in _ownedAllocations)
+            foreach (var ptr in _liveOwnedAllocations)
             {
                 if (ptr != nint.Zero)
                     NativeMemory.AlignedFree((void*)ptr);
             }
-            _ownedAllocations.Clear();
+            _liveOwnedAllocations.Clear();
         }
+        _ownedAllocations?.Clear();
     }
 
     private static TransformerLayerWeights LoadLayer(
@@ -801,6 +1260,14 @@ internal sealed class TransformerWeights : IDisposable
     {
         string prefix = $"blk.{layerIdx}";
         int hiddenSize = config.HiddenSize;
+        // Per-attention-type head dim + KV-head count (Gemma 4): full-attention
+        // layers may use a distinct GlobalHeadDim / NumGlobalKvHeads. Collapses to
+        // the uniform config.HeadDim / config.NumKvHeads for every other
+        // architecture, so the fused-QKV split and q/k-norm lengths are unchanged.
+        int layerHeadDim = config.GetLayerHeadDim(layerIdx);
+        int layerKvHeads = config.NumGlobalKvHeads is int gkv && config.IsFullAttentionLayer(layerIdx)
+            ? gkv
+            : config.NumKvHeads;
 
         // Attention norm — dequantize to float[]
         var attnNormDesc = tensors[$"{prefix}.attn_norm.weight"];
@@ -818,8 +1285,8 @@ internal sealed class TransformerWeights : IDisposable
             int inputDim = qkvDesc.Shape[0]; // hidden_size
             long rowBytes = Dequantize.RowByteSize(inputDim, qkvDesc.QuantizationType);
 
-            int qDim = config.NumAttentionHeads * config.HeadDim;
-            int kvDim = config.NumKvHeads * config.HeadDim;
+            int qDim = config.NumAttentionHeads * layerHeadDim;
+            int kvDim = layerKvHeads * layerHeadDim;
 
             qPtr = qkvPtr; qQt = qkvDesc.QuantizationType; qM = qDim; qK = inputDim;
             kPtr = qkvPtr + (nint)(qDim * rowBytes); kQt = qkvDesc.QuantizationType; kM = kvDim; kK = inputDim;
@@ -841,8 +1308,8 @@ internal sealed class TransformerWeights : IDisposable
         {
             // Fused QKV bias — split by element offset
             nint biasPtr = dataBase + (nint)qkvBiasDesc.DataOffset;
-            int qDim = config.NumAttentionHeads * config.HeadDim;
-            int kvDim = config.NumKvHeads * config.HeadDim;
+            int qDim = config.NumAttentionHeads * layerHeadDim;
+            int kvDim = layerKvHeads * layerHeadDim;
 
             qBias = new float[qDim];
             kBias = new float[kvDim];
@@ -861,12 +1328,51 @@ internal sealed class TransformerWeights : IDisposable
         float[]? oBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.attn_output.bias");
 
         // Optional QK-norms (Qwen3-style): per-head RMSNorm applied to Q/K after projection, before RoPE
-        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", config.HeadDim);
-        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", config.HeadDim);
+        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", layerHeadDim);
+        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", layerHeadDim);
 
-        // FFN norm
-        var ffnNormDesc = tensors[$"{prefix}.ffn_norm.weight"];
+        // Optional attention sub-norm (BitNet Sub-LN): RMSNorm over the attention output [hiddenSize] before o_proj.
+        float[]? attnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_sub_norm.weight", hiddenSize);
+
+        // Optional per-head attention sinks (gpt-oss): F32 [numHeads] scalar logits.
+        float[]? attnSinks = LoadOptionalBias(dataBase, tensors, $"{prefix}.attn_sinks.weight");
+
+        // FFN norm — gpt-oss names its pre-FFN norm "post_attention_norm"
+        // (llama.cpp LLM_TENSOR_ATTN_POST_NORM); it plays the same role as
+        // ffn_norm (applied to the post-attention residual before the FFN/MoE).
+        var ffnNormDesc = tensors.TryGetValue($"{prefix}.ffn_norm.weight", out var ffnNormD)
+            ? ffnNormD
+            : tensors[$"{prefix}.post_attention_norm.weight"];
         float[] ffnNorm = DequantizeNorm(dataBase, ffnNormDesc, hiddenSize);
+
+        // Optional FFN sub-norm (BitNet Sub-LN): RMSNorm over the gated intermediate [intermediateSize] before ffn_down.
+        float[]? ffnSubNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.ffn_sub_norm.weight", config.IntermediateSize);
+
+        // Routed-MoE layer with quantized experts (gpt-oss): the dense
+        // ffn_gate/up/down tensors are absent; a 3D-stacked expert block with
+        // per-expert biases is loaded instead and consumed by
+        // MoeQuantSwiGluMlp straight from the mmap (no F32 inflation).
+        if (config.Moe is not null && config.Moe.IsMoeLayer(layerIdx)
+            && tensors.ContainsKey($"{prefix}.ffn_gate_exps.weight"))
+        {
+            MoeLayerWeights quantMoe = LoadQuantExpertMoeLayer(layerIdx, dataBase, tensors, config);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias, kBias, vBias, oBias,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight, kNormWeight,
+                moe: quantMoe,
+                mla: null,
+                attnSinks: attnSinks);
+        }
 
         // FFN projections — check for fused gate+up (Phi-3 style: ffn_up.weight has 2x intermediate rows)
         nint gatePtr, upPtr, downPtr;
@@ -927,7 +1433,349 @@ internal sealed class TransformerWeights : IDisposable
             downPtr, downQt, downM, downK,
             qBias, kBias, vBias, oBias,
             gateBias, upBias, downBias,
-            qNormWeight, kNormWeight);
+            qNormWeight, kNormWeight,
+            attnSubNormWeight: attnSubNormWeight, ffnSubNormWeight: ffnSubNormWeight,
+            attnSinks: attnSinks);
+    }
+
+    /// <summary>
+    /// Loads one Gemma-4 MoE layer from GGUF. Differs from <see cref="LoadLayer"/>
+    /// in five ways (see <c>docs/diffusiongemma/GEMMA4-GRAPH-SPEC.md</c>):
+    /// <list type="number">
+    ///   <item><b>V-from-K.</b> Full-attention (global) layers carry no
+    ///     <c>attn_v.weight</c>; V branches off the raw K projection. <c>wv</c> is
+    ///     loaded only when present and the <see cref="Gemma4LayerWeights.VFromK"/>
+    ///     flag records the V-less layers.</item>
+    ///   <item><b>Dual parallel FFN.</b> A dense GeGLU MLP (<c>ffn_gate</c>/
+    ///     <c>ffn_up</c>/<c>ffn_down</c>, width 2112) loaded into the standard
+    ///     gate/up/down slots, summed with a 128-expert MoE.</item>
+    ///   <item><b>Fused gate_up experts.</b> <c>ffn_gate_up_exps</c> [K, 2*Ie, E]
+    ///     split by row offset — gate = rows [0, Ie), up = rows [Ie, 2*Ie) — via
+    ///     two raw views into one tensor (per-expert stride = 2*Ie rows).</item>
+    ///   <item><b>Custom router + scalars.</b> <c>ffn_gate_inp.scale</c> [hidden],
+    ///     <c>ffn_down_exps.scale</c> [E], <c>layer_output_scale</c> [1].</item>
+    ///   <item><b>Five FFN norms.</b> <c>ffn_norm</c> (dense), <c>pre_ffw_norm_2</c>
+    ///     (MoE in), <c>post_ffw_norm_1</c> (dense out), <c>post_ffw_norm_2</c>
+    ///     (MoE out), <c>post_ffw_norm</c> (combined), plus <c>post_attention_norm</c>.</item>
+    /// </list>
+    /// Norm weights are dequantized plain (NO +1 — Gemma 4 overrides Gemma 3's
+    /// <c>(1+w)</c> convention; the GGUF stores the final weights directly).
+    /// </summary>
+    private static TransformerLayerWeights LoadGemma4Layer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config,
+        List<nint>? owned)
+    {
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int layerHeadDim = config.GetLayerHeadDim(layerIdx);
+        // MoE is per-layer optional (llama.cpp gemma4.cpp keys off ffn_gate_inp
+        // presence): the 26B backbone routes experts on every layer; the dense
+        // E2B/E4B tower has none. A layer without the router runs dense-only.
+        bool hasExperts = config.Moe is not null
+            && tensors.ContainsKey($"{prefix}.ffn_gate_inp.weight");
+        var moeCfg = config.Moe;
+
+        // ── Attention ────────────────────────────────────────────────────
+        float[] attnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.attn_norm.weight"], hiddenSize);
+
+        var (qPtr, qQt, qM, qK) = LoadLinear(dataBase, tensors[$"{prefix}.attn_q.weight"]);
+
+        // Shared-KV layers (trailing NumSharedKvLayers on E2B/E4B) never project
+        // K/V — they attend over an earlier donor layer's KV. llama.cpp marks
+        // their wk/wv TENSOR_NOT_REQUIRED; the released E4B GGUF still ships them
+        // but we neither require nor use them.
+        bool ownKv = config.LayerHasOwnKv(layerIdx);
+
+        nint kPtr = 0; QuantizationType kQt = QuantizationType.F32; int kM = 0, kK = 0;
+        if (ownKv)
+            (kPtr, kQt, kM, kK) = LoadLinear(dataBase, tensors[$"{prefix}.attn_k.weight"]);
+
+        // V-from-K: full-attention layers have NO attn_v.weight. When absent we
+        // record the flag and zero the V slot; the forward projects V from the
+        // raw K projection (gemma4.cpp:241-272).
+        bool vFromK;
+        nint vPtr = 0; QuantizationType vQt = QuantizationType.F32; int vM = kM, vK = kK;
+        if (ownKv && tensors.TryGetValue($"{prefix}.attn_v.weight", out var vDesc))
+        {
+            (vPtr, vQt, vM, vK) = LoadLinear(dataBase, vDesc);
+            vFromK = false;
+        }
+        else
+        {
+            vFromK = ownKv; // shared-KV layers have neither their own K nor V
+        }
+
+        var (oPtr, oQt, oM, oK) = LoadLinear(dataBase, tensors[$"{prefix}.attn_output.weight"]);
+
+        // QK-norms (head_dim sized; 256 sliding / 512 global). Plain weights (no +1).
+        float[]? qNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_q_norm.weight", layerHeadDim);
+        float[]? kNormWeight = LoadOptionalNorm(dataBase, tensors, $"{prefix}.attn_k_norm.weight", layerHeadDim);
+
+        float[] postAttnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_attention_norm.weight"], hiddenSize);
+
+        // ── Dense FFN branch (shared expert) ─────────────────────────────
+        float[] ffnNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_norm.weight"], hiddenSize);
+        var (gatePtr, gateQt, gateM, gateK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_gate.weight"]);
+        var (upPtr, upQt, upM, upK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_up.weight"]);
+        var (downPtr, downQt, downM, downK) = LoadLinear(dataBase, tensors[$"{prefix}.ffn_down.weight"]);
+
+        // ── MoE branch (only when this layer routes experts) ──────────────
+        MoeLayerWeights? moe = null;
+        float[]? preFfwNorm2 = null, postFfwNorm1 = null, postFfwNorm2 = null;
+        float[]? routerScale = null, downExpertScale = null;
+        long gateUpStride = 0, downStride = 0;
+        if (hasExperts)
+        {
+        int numExperts = moeCfg!.NumExperts;
+        int moeIntermediate = moeCfg.MoeIntermediateSize; // 704 (n_ff_exp)
+
+        // Router gate ffn_gate_inp.weight: GGUF [K=hidden, M=numExperts] stored
+        // row-major (M outer) == [numExperts, hidden] — exactly the kernel's gate
+        // layout. Small → dequant inline to F32.
+        var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        float[] router = new float[(long)numExperts * hiddenSize];
+        Dequantize.ToFloat32(dataBase + (nint)routerDesc.DataOffset,
+            (long)numExperts * hiddenSize, routerDesc.QuantizationType, router);
+
+        // Fused gate_up experts ffn_gate_up_exps [K=hidden, 2*Ie, E]: per expert a
+        // [2*Ie, hidden] slab, gate = rows [0, Ie), up = rows [Ie, 2*Ie). Expose as
+        // two raw views sharing the per-expert stride (= 2*Ie rows). The up view's
+        // base is offset by Ie rows.
+        var gateUpDesc = tensors[$"{prefix}.ffn_gate_up_exps.weight"];
+        if (gateUpDesc.Shape.Rank != 3
+            || gateUpDesc.Shape[0] != hiddenSize
+            || gateUpDesc.Shape[1] != 2 * moeIntermediate
+            || gateUpDesc.Shape[2] != numExperts)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_gate_up_exps.weight shape {gateUpDesc.Shape[0]}×{gateUpDesc.Shape[1]}×{gateUpDesc.Shape[2]} "
+                + $"does not match expected hidden={hiddenSize} × 2*Ie={2 * moeIntermediate} × E={numExperts}.");
+        long gateUpRowBytes = Dequantize.RowByteSize(hiddenSize, gateUpDesc.QuantizationType);
+        gateUpStride = (long)(2 * moeIntermediate) * gateUpRowBytes; // per-expert slab
+        nint gateUpBase = dataBase + (nint)gateUpDesc.DataOffset;
+        nint gateExpsRaw = gateUpBase;                                       // gate rows [0, Ie)
+        nint upExpsRaw = gateUpBase + (nint)((long)moeIntermediate * gateUpRowBytes); // up rows [Ie, 2*Ie)
+
+        // Down experts ffn_down_exps [K=Ie, M=hidden, E]: per expert [hidden, Ie].
+        var downExpsDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
+        if (downExpsDesc.Shape.Rank != 3
+            || downExpsDesc.Shape[0] != moeIntermediate
+            || downExpsDesc.Shape[1] != hiddenSize
+            || downExpsDesc.Shape[2] != numExperts)
+            throw new InvalidDataException(
+                $"{prefix}.ffn_down_exps.weight shape {downExpsDesc.Shape[0]}×{downExpsDesc.Shape[1]}×{downExpsDesc.Shape[2]} "
+                + $"does not match expected Ie={moeIntermediate} × hidden={hiddenSize} × E={numExperts}.");
+        long downRowBytes = Dequantize.RowByteSize(moeIntermediate, downExpsDesc.QuantizationType);
+        downStride = (long)hiddenSize * downRowBytes;
+        nint downExpsRaw = dataBase + (nint)downExpsDesc.DataOffset;
+
+        // Empty F32 per-expert pointer arrays — the kernel uses the raw strided
+        // views (Q4_K gate/up, Q5_1 down) and never the F32 fallback array.
+        var emptyF32 = new nint[numExperts];
+
+        moe = new MoeLayerWeights(
+            gate: router,
+            w1: emptyF32, w2: emptyF32, w3: emptyF32,
+            numExperts: numExperts,
+            numExpertsPerTok: moeCfg.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moeCfg.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null,
+            gateExpsRaw: gateExpsRaw, gateExpsRawQt: gateUpDesc.QuantizationType,
+            gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
+            upExpsRaw: upExpsRaw, upExpsRawQt: gateUpDesc.QuantizationType,
+            upExpsMDim: moeIntermediate, upExpsKDim: hiddenSize,
+            downExpsRaw: downExpsRaw, downExpsRawQt: downExpsDesc.QuantizationType,
+            downExpsMDim: hiddenSize, downExpsKDim: moeIntermediate,
+            sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
+            sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
+            sharedDownRaw: Array.Empty<nint>(), sharedDownRawQt: QuantizationType.F32);
+
+        // ── MoE-only extras (dual-FFN split norms + router/expert scales) ──
+        preFfwNorm2 = DequantizeNorm(dataBase, tensors[$"{prefix}.pre_ffw_norm_2.weight"], hiddenSize);
+        postFfwNorm1 = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm_1.weight"], hiddenSize);
+        postFfwNorm2 = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm_2.weight"], hiddenSize);
+        routerScale = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_gate_inp.scale"], hiddenSize);
+        downExpertScale = DequantizeNorm(dataBase, tensors[$"{prefix}.ffn_down_exps.scale"], numExperts);
+        }
+
+        // ── Gemma-4 extras (all layer kinds) ─────────────────────────────
+        float[] postFfwNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_ffw_norm.weight"], hiddenSize);
+        // layer_output_scale [1] — TENSOR_NOT_REQUIRED in llama.cpp; identity 1.0
+        // when absent.
+        float[]? layerOutScaleArr = LoadOptionalNorm(dataBase, tensors, $"{prefix}.layer_output_scale.weight", 1);
+
+        // DiffusionGemma-only: enc_layer_output_scale [1]. Present only on the
+        // diffusion-gemma GGUF (TENSOR_NOT_REQUIRED on gemma4). When present the
+        // unified forward uses it as the per-layer scalar for the PROMPT region;
+        // when absent (autoregressive gemma4) every row uses LayerOutputScale.
+        float[]? encLayerOutScaleArr =
+            LoadOptionalNorm(dataBase, tensors, $"{prefix}.enc_layer_output_scale.weight", 1);
+
+        var gemma4 = new Gemma4LayerWeights
+        {
+            PreFfwNorm2 = preFfwNorm2,
+            PostFfwNorm1 = postFfwNorm1,
+            PostFfwNorm2 = postFfwNorm2,
+            PostFfwNorm = postFfwNorm,
+            RouterScale = routerScale,
+            DownExpertScale = downExpertScale,
+            LayerOutputScale = layerOutScaleArr is null ? 1.0f : layerOutScaleArr[0],
+            EncLayerOutputScale = encLayerOutScaleArr is null ? (float?)null : encLayerOutScaleArr[0],
+            VFromK = vFromK,
+            GateUpExpsRowBytes = gateUpStride,
+            DownExpsRowBytes = downStride,
+        };
+
+        // ── Per-layer PLE slots (Gemma-4 dense E2B/E4B) ──────────────────
+        // inp_gate [pleDim, hidden], proj [hidden, pleDim] — F32 for the
+        // GemmF32 injection kernel (owned upcast when the file quantizes them);
+        // post_norm [hidden] plain weights. Names per llama.cpp llama-arch.cpp
+        // (LLM_TENSOR_PER_LAYER_INP_GATE / _PROJ / _POST_NORM).
+        nint pleGatePtr = 0, pleProjPtr = 0;
+        float[]? plePostNorm = null;
+        if (config.PerLayerEmbedding is PerLayerEmbeddingConfig layerPle)
+        {
+            var pleGateDesc = tensors[$"{prefix}.inp_gate.weight"];
+            var pleProjDesc = tensors[$"{prefix}.proj.weight"];
+            pleGatePtr = pleGateDesc.QuantizationType == QuantizationType.F32
+                ? dataBase + (nint)pleGateDesc.DataOffset
+                : DequantToF32(dataBase, pleGateDesc, (long)layerPle.PerLayerDim * hiddenSize, owned!);
+            pleProjPtr = pleProjDesc.QuantizationType == QuantizationType.F32
+                ? dataBase + (nint)pleProjDesc.DataOffset
+                : DequantToF32(dataBase, pleProjDesc, (long)hiddenSize * layerPle.PerLayerDim, owned!);
+            plePostNorm = DequantizeNorm(dataBase, tensors[$"{prefix}.post_norm.weight"], hiddenSize);
+        }
+
+        return new TransformerLayerWeights(
+            attnNorm,
+            qPtr, qQt, qM, qK,
+            kPtr, kQt, kM, kK,
+            vPtr, vQt, vM, vK,
+            oPtr, oQt, oM, oK,
+            ffnNorm,
+            gatePtr, gateQt, gateM, gateK,
+            upPtr, upQt, upM, upK,
+            downPtr, downQt, downM, downK,
+            qBias: null, kBias: null, vBias: null, oBias: null,
+            gateBias: null, upBias: null, downBias: null,
+            qNormWeight: qNormWeight, kNormWeight: kNormWeight,
+            moe: moe,
+            mla: null,
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: null,
+            gemma4: gemma4,
+            pleGateWeight: pleGatePtr, pleProjWeight: pleProjPtr, plePostNormWeight: plePostNorm);
+    }
+
+    /// <summary>
+    /// Loads a routed-MoE layer whose experts stay in their on-disk
+    /// quantization (gpt-oss convention: MXFP4 experts + F32 biases on the
+    /// router and every expert projection). Populates the raw GGUF views and
+    /// per-expert bias arrays consumed by
+    /// <see cref="DotLLM.Cpu.Kernels.MoeQuantSwiGluMlp"/>; the F32 W1/W2/W3
+    /// banks are zero-filled placeholders.
+    /// </summary>
+    /// <remarks>
+    /// Tensor naming (llama.cpp <c>LLM_ARCH_OPENAI_MOE</c>):
+    /// <c>ffn_gate_inp.{weight,bias}</c> — router [hidden, E] + [E];
+    /// <c>ffn_{gate,up}_exps.{weight,bias}</c> — [hidden, I, E] + [I, E];
+    /// <c>ffn_down_exps.{weight,bias}</c> — [I, hidden, E] + [hidden, E].
+    /// Bias arrays are stored expert-major on disk ([inner, E] → expert e's
+    /// slice is a contiguous run at <c>e * inner</c>), matching the flat
+    /// layout the CPU kernel indexes.
+    /// </remarks>
+    internal static MoeLayerWeights LoadQuantExpertMoeLayer(
+        int layerIdx,
+        nint dataBase,
+        IReadOnlyDictionary<string, GgufTensorDescriptor> tensors,
+        ModelConfig config)
+    {
+        var moe = config.Moe
+            ?? throw new InvalidOperationException("LoadQuantExpertMoeLayer called without Moe config.");
+
+        string prefix = $"blk.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int numExperts = moe.NumExperts;
+        int moeIntermediate = moe.MoeIntermediateSize;
+
+        // Router (2D, F32 — small, dequant inline) + optional bias.
+        var routerDesc = tensors[$"{prefix}.ffn_gate_inp.weight"];
+        float[] router = new float[numExperts * hiddenSize];
+        Dequantize.ToFloat32(
+            dataBase + (nint)routerDesc.DataOffset,
+            (long)numExperts * hiddenSize,
+            routerDesc.QuantizationType,
+            router);
+        float[]? routerBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_gate_inp.bias");
+
+        var gateDesc = tensors[$"{prefix}.ffn_gate_exps.weight"];
+        var upDesc = tensors[$"{prefix}.ffn_up_exps.weight"];
+        var downDesc = tensors[$"{prefix}.ffn_down_exps.weight"];
+
+        // Validate 3D shapes: [K, M, E] with K innermost.
+        ValidateExpertShape(gateDesc, K: hiddenSize, M: moeIntermediate, E: numExperts);
+        ValidateExpertShape(upDesc, K: hiddenSize, M: moeIntermediate, E: numExperts);
+        ValidateExpertShape(downDesc, K: moeIntermediate, M: hiddenSize, E: numExperts);
+
+        // Optional per-expert biases, kept flat ([E × inner], expert-major).
+        float[]? gateBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_gate_exps.bias");
+        float[]? upBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_up_exps.bias");
+        float[]? downBias = LoadOptionalBias(dataBase, tensors, $"{prefix}.ffn_down_exps.bias");
+
+        // Zero-filled placeholder banks (satisfy MoeLayerWeights validation;
+        // the CPU forward never dereferences them in quant-expert mode).
+        var w1 = new nint[numExperts];
+        var w2 = new nint[numExperts];
+        var w3 = new nint[numExperts];
+
+        var bundle = new MoeLayerWeights(
+            gate: router,
+            w1: w1, w2: w2, w3: w3,
+            numExperts: numExperts,
+            numExpertsPerTok: moe.NumExpertsPerTok,
+            hiddenSize: hiddenSize,
+            intermediateSize: moeIntermediate,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null,
+            gateExpsRaw: dataBase + (nint)gateDesc.DataOffset, gateExpsRawQt: gateDesc.QuantizationType,
+            gateExpsMDim: moeIntermediate, gateExpsKDim: hiddenSize,
+            upExpsRaw: dataBase + (nint)upDesc.DataOffset, upExpsRawQt: upDesc.QuantizationType,
+            upExpsMDim: moeIntermediate, upExpsKDim: hiddenSize,
+            downExpsRaw: dataBase + (nint)downDesc.DataOffset, downExpsRawQt: downDesc.QuantizationType,
+            downExpsMDim: hiddenSize, downExpsKDim: moeIntermediate,
+            sharedGateRaw: Array.Empty<nint>(), sharedGateRawQt: QuantizationType.F32,
+            sharedUpRaw: Array.Empty<nint>(), sharedUpRawQt: QuantizationType.F32,
+            sharedDownRaw: Array.Empty<nint>(), sharedDownRawQt: QuantizationType.F32)
+        {
+            UseQuantExperts = true,
+            RouterBias = routerBias,
+            GateExpsBias = gateBias,
+            UpExpsBias = upBias,
+            DownExpsBias = downBias,
+            UseSwiGluOai = moe.UseSwiGluOai,
+            SoftmaxAfterTopK = moe.SoftmaxAfterTopK,
+        };
+        return bundle;
+    }
+
+    private static void ValidateExpertShape(GgufTensorDescriptor desc, int K, int M, int E)
+    {
+        if (desc.Shape.Rank != 3 || desc.Shape[0] != K || desc.Shape[1] != M || desc.Shape[2] != E)
+            throw new InvalidDataException(
+                $"Fused-experts tensor '{desc.Name}' shape does not match expected " +
+                $"[{K}, {M}, {E}] (got rank {desc.Shape.Rank}: " +
+                $"[{string.Join(", ", Enumerable.Range(0, desc.Shape.Rank).Select(i => desc.Shape[i]))}]).");
     }
 
     private static (nint ptr, QuantizationType qt, int outputDim, int inputDim) LoadLinear(

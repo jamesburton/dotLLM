@@ -69,7 +69,7 @@ public class Mamba3TensorMappingTests
     public void ExpectedTensorNames_AreUnique()
     {
         var names = Mamba3TensorMapping.ExpectedTensorNames(48);
-        Assert.Equal(names.Count, names.Distinct().Count());
+        Assert.Equal(names.Count, names.Distinct(StringComparer.Ordinal).Count());
     }
 
     [Fact]

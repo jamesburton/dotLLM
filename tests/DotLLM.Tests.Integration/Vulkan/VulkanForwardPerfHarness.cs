@@ -79,10 +79,20 @@ public class VulkanForwardPerfHarness
         loadSw.Stop();
         _output.WriteLine($"load_ms={loadSw.Elapsed.TotalMilliseconds:F1}");
 
-        int[] prompt = tokenizer.Encode("The capital of France is").ToArray();
-        Assert.NotEmpty(prompt);
+        int[] basePrompt = tokenizer.Encode("The capital of France is").ToArray();
+        Assert.NotEmpty(basePrompt);
 
-        using var cache = model.CreateKvCache(maxSeqLen: 256);
+        // DOTLLM_VULKAN_PERF_PROMPT_REPEAT tiles the base prompt to lengthen the
+        // prefill — prefill MMQ/GEMM throughput is N-dependent (the staged weight
+        // tile is reused across more tokens), so a longer seqLen is needed to
+        // measure the seqLen>1 path in its compute-bound regime. Default 1.
+        int promptRepeat = Math.Max(1, ParseEnvInt("DOTLLM_VULKAN_PERF_PROMPT_REPEAT", 1));
+        int[] prompt = new int[basePrompt.Length * promptRepeat];
+        for (int r = 0; r < promptRepeat; r++)
+            Array.Copy(basePrompt, 0, prompt, r * basePrompt.Length, basePrompt.Length);
+
+        int maxSeq = prompt.Length + warmupSteps + decodeSteps + 8;
+        using var cache = model.CreateKvCache(maxSeqLen: Math.Max(256, maxSeq));
 
         int[] positions = new int[prompt.Length];
         for (int i = 0; i < prompt.Length; i++) positions[i] = i;

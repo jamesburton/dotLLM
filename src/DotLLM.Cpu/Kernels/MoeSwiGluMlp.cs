@@ -56,7 +56,7 @@ namespace DotLLM.Cpu.Kernels;
 /// <c>[numExperts, hiddenSize]</c>.
 /// </para>
 /// </remarks>
-public static unsafe class MoeSwiGluMlp
+public static unsafe partial class MoeSwiGluMlp
 {
     /// <summary>
     /// Executes the MoE SwiGLU FFN for a batch of <paramref name="seqLen"/>
@@ -76,6 +76,12 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
     /// <param name="loraAdapter">Optional active LoRA adapter for per-expert projection deltas.</param>
     /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
+    /// <param name="useGeGLU">
+    /// When <c>true</c>, each expert applies the GeGLU (tanh-approximate GELU)
+    /// gate activation via <see cref="FusedOps.GeGLUTanh"/> instead of SwiGLU
+    /// (SiLU). Gemma 4 MoE experts use GeGLU; Mixtral / Qwen-MoE / DeepSeek use
+    /// SwiGLU (the default). Shape-identical — only the gate non-linearity differs.
+    /// </param>
     [SkipLocalsInit]
     public static void Execute(
         ReadOnlySpan<float> hidden,
@@ -90,7 +96,8 @@ public static unsafe class MoeSwiGluMlp
         int intermediateSize,
         int seqLen,
         ILoraAdapter? loraAdapter = null,
-        int loraLayer = -1)
+        int loraLayer = -1,
+        bool useGeGLU = false)
     {
         // Default overload keeps the Mixtral contract: always renormalise top-k,
         // no shared expert. Qwen-MoE / DeepSeek callers go through
@@ -103,7 +110,7 @@ public static unsafe class MoeSwiGluMlp
             sharedUpProj: ReadOnlySpan<nint>.Empty,
             sharedDownProj: ReadOnlySpan<nint>.Empty,
             sharedIntermediateSize: 0, sharedExpertGate: default,
-            loraAdapter, loraLayer);
+            loraAdapter, loraLayer, useGeGLU);
     }
 
     /// <summary>
@@ -145,6 +152,13 @@ public static unsafe class MoeSwiGluMlp
     /// </param>
     /// <param name="loraAdapter">Optional active LoRA adapter for routed per-expert projection deltas.</param>
     /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
+    /// <param name="useGeGLU">
+    /// When <c>true</c>, routed AND shared experts apply GeGLU
+    /// (<see cref="FusedOps.GeGLUTanh"/>) instead of SwiGLU. See the
+    /// <see cref="Execute(ReadOnlySpan{float}, ReadOnlySpan{float}, ReadOnlySpan{nint}, ReadOnlySpan{nint}, ReadOnlySpan{nint}, Span{float}, int, int, int, int, int, ILoraAdapter, int, bool)"/>
+    /// overload's remarks. Gemma 4 sets this true; all current shared-expert
+    /// architectures (Qwen-MoE / DeepSeek) leave it false.
+    /// </param>
     [SkipLocalsInit]
     public static void ExecuteWithSharedExpert(
         ReadOnlySpan<float> hidden,
@@ -165,7 +179,8 @@ public static unsafe class MoeSwiGluMlp
         int sharedIntermediateSize,
         ReadOnlySpan<float> sharedExpertGate,
         ILoraAdapter? loraAdapter = null,
-        int loraLayer = -1)
+        int loraLayer = -1,
+        bool useGeGLU = false)
     {
         ExecuteCoreGrouped(
             hidden, gateWeights, expertsW1, expertsW2, expertsW3, output,
@@ -173,7 +188,7 @@ public static unsafe class MoeSwiGluMlp
             normTopKProb,
             sharedGateProj, sharedUpProj, sharedDownProj,
             sharedIntermediateSize, sharedExpertGate,
-            loraAdapter, loraLayer);
+            loraAdapter, loraLayer, useGeGLU);
     }
 
     /// <summary>
@@ -204,6 +219,11 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="hiddenSize">Hidden / residual dimension (H).</param>
     /// <param name="seqLen">Number of tokens in this batch (T).</param>
     /// <param name="normTopKProb">When true, renormalise the selected top-k probabilities to sum to 1.0.</param>
+    /// <param name="gateBias">
+    /// Optional additive router bias [numExperts] applied to the gate logits before softmax/top-k
+    /// (identity-MoTE / Qwen3 aux-loss-free routing). Empty span ⇒ no bias. Shifts the top-k
+    /// selection; cannot be folded into <paramref name="gateWeights"/>.
+    /// </param>
     /// <returns>Number of unique experts actually used (the valid prefix length of <paramref name="uniqueExperts"/>).</returns>
     public static int Route(
         ReadOnlySpan<float> hidden,
@@ -216,11 +236,14 @@ public static unsafe class MoeSwiGluMlp
         Span<int> uniqueExperts,
         int numExperts, int numExpertsPerTok,
         int hiddenSize, int seqLen,
-        bool normTopKProb)
+        bool normTopKProb,
+        ReadOnlySpan<float> gateBias = default)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
             throw new ArgumentOutOfRangeException(nameof(numExpertsPerTok));
+        if (!gateBias.IsEmpty && gateBias.Length < numExperts)
+            throw new ArgumentException("gateBias too small", nameof(gateBias));
 
         int totalAssignments = seqLen * numExpertsPerTok;
         if (assignExpert.Length < totalAssignments) throw new ArgumentException("assignExpert too small", nameof(assignExpert));
@@ -260,6 +283,17 @@ public static unsafe class MoeSwiGluMlp
             {
                 var logitsSpan = gateLogitsBuf.AsSpan(t * numExperts, numExperts);
                 var routingSpan = routingBuf.AsSpan(t * numExperts, numExperts);
+
+                // Additive router bias (identity-MoTE / Qwen3 aux-free routing). Applied to
+                // the logits before softmax/top-k so it shifts the top-k SELECTION. With
+                // top-1 + normTopKProb the selected gate weight is renormalised to 1.0, so
+                // the bias only moves the argmax — it cannot be folded into gateWeights.
+                if (!gateBias.IsEmpty)
+                {
+                    for (int e = 0; e < numExperts; e++)
+                        logitsSpan[e] += gateBias[e];
+                }
+
                 Softmax.Execute(logitsSpan, routingSpan);
 
                 SelectTopK(routingSpan, topkIdx, topkProb);
@@ -395,6 +429,7 @@ public static unsafe class MoeSwiGluMlp
     /// <param name="loraAdapter">Optional active LoRA adapter for routed per-expert projection deltas.</param>
     /// <param name="loraLayer">Layer index used to resolve adapter weights.</param>
     /// <param name="threadPool">Optional thread pool — when non-null the outer per-expert loop is parallelised.</param>
+    /// <param name="useGeGLU">When <c>true</c>, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU. Gemma 4 MoE.</param>
     [SkipLocalsInit]
     public static void ExecuteRoutedFromAssignments(
         ReadOnlySpan<float> hidden,
@@ -409,7 +444,8 @@ public static unsafe class MoeSwiGluMlp
         ReadOnlySpan<nint> sharedGateProj, ReadOnlySpan<nint> sharedUpProj, ReadOnlySpan<nint> sharedDownProj,
         int sharedIntermediateSize, ReadOnlySpan<float> sharedExpertGate,
         ILoraAdapter? loraAdapter, int loraLayer,
-        ComputeThreadPool? threadPool = null)
+        ComputeThreadPool? threadPool = null,
+        bool useGeGLU = false)
     {
         if (hidden.Length < (long)seqLen * hiddenSize)
             throw new ArgumentException("hidden too small", nameof(hidden));
@@ -479,6 +515,7 @@ public static unsafe class MoeSwiGluMlp
                     HiddenSize = hiddenSize,
                     IntermediateSize = intermediateSize,
                     NumExpertsPerTok = numExpertsPerTok,
+                    UseGeGLU = useGeGLU,
                 };
 
                 if (threadPool is null || uniqueExpertCount < 2)
@@ -550,10 +587,13 @@ public static unsafe class MoeSwiGluMlp
                         for (int t = 0; t < seqLen; t++)
                         {
                             int off = t * sharedIntermediateSize;
-                            FusedOps.SwiGLU(
-                                sharedGateSpanBatch.Slice(off, sharedIntermediateSize),
-                                sharedUpSpanBatch.Slice(off, sharedIntermediateSize),
-                                sharedSiluSpanBatch.Slice(off, sharedIntermediateSize));
+                            var gSlice = sharedGateSpanBatch.Slice(off, sharedIntermediateSize);
+                            var uSlice = sharedUpSpanBatch.Slice(off, sharedIntermediateSize);
+                            var oSlice = sharedSiluSpanBatch.Slice(off, sharedIntermediateSize);
+                            if (useGeGLU)
+                                FusedOps.GeGLUTanh(gSlice, uSlice, oSlice);
+                            else
+                                FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                         }
 
                         if (k == 0)
@@ -659,6 +699,8 @@ public static unsafe class MoeSwiGluMlp
         public int HiddenSize;
         public int IntermediateSize;
         public int NumExpertsPerTok;
+        /// <summary>When true, experts apply GeGLU (tanh-approx GELU) instead of SwiGLU.</summary>
+        public bool UseGeGLU;
     }
 
     /// <summary>
@@ -769,17 +811,20 @@ public static unsafe class MoeSwiGluMlp
                 ApplyLoraDelta(loraAdapter, loraLayer, ExpertProjectionName(e, "up_proj"),
                     batchInPtr, upBatchPtr, batch, hiddenSize, intermediateSize);
 
-                // ── Per-row SwiGLU fuse ──────────────────────────────────────
+                // ── Per-row gate fuse (GeGLU for Gemma 4, SwiGLU otherwise) ──
                 var gateBatchSpan = new Span<float>(gateBatchPtr, batch * intermediateSize);
                 var upBatchSpan = new Span<float>(upBatchPtr, batch * intermediateSize);
                 var siluBatchSpan = new Span<float>(siluBatchPtr, batch * intermediateSize);
                 for (int b = 0; b < batch; b++)
                 {
                     int off = b * intermediateSize;
-                    FusedOps.SwiGLU(
-                        gateBatchSpan.Slice(off, intermediateSize),
-                        upBatchSpan.Slice(off, intermediateSize),
-                        siluBatchSpan.Slice(off, intermediateSize));
+                    var gSlice = gateBatchSpan.Slice(off, intermediateSize);
+                    var uSlice = upBatchSpan.Slice(off, intermediateSize);
+                    var oSlice = siluBatchSpan.Slice(off, intermediateSize);
+                    if (ctx.UseGeGLU)
+                        FusedOps.GeGLUTanh(gSlice, uSlice, oSlice);
+                    else
+                        FusedOps.SwiGLU(gSlice, uSlice, oSlice);
                 }
 
                 // ── down = silu × W2 (down_proj) ─────────────────────────────
@@ -993,7 +1038,8 @@ public static unsafe class MoeSwiGluMlp
         int sharedIntermediateSize,
         ReadOnlySpan<float> sharedExpertGate,
         ILoraAdapter? loraAdapter,
-        int loraLayer)
+        int loraLayer,
+        bool useGeGLU = false)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
@@ -1051,7 +1097,8 @@ public static unsafe class MoeSwiGluMlp
                 sharedGateProj, sharedUpProj, sharedDownProj,
                 sharedIntermediateSize, sharedExpertGate,
                 loraAdapter, loraLayer,
-                threadPool: null);
+                threadPool: null,
+                useGeGLU);
         }
         finally
         {

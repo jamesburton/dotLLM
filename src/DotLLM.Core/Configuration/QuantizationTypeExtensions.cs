@@ -42,6 +42,13 @@ public static class QuantizationTypeExtensions
         // IQ3_S:    d(2) + qs[QK_K/4] + qh[QK_K/32] + signs[QK_K/8] + scales[QK_K/64]
         //        =  2 + 64 + 8 + 32 + 4 = 110 bytes / 256 (3.4375 bpw).
         QuantizationType.IQ3_S => elementCount / 256 * 110,
+        // I2_S: n/4 packed bytes (4 ternary codes/byte) + one trailing per-tensor float32 scale.
+        QuantizationType.I2_S => elementCount / 4 + 4,
+        // MXFP4: e(1, E8M0 scale) + qs[16] = 17 bytes / 32 elements (4.25 bpw).
+        QuantizationType.MXFP4 => elementCount / 32 * 17,
+        // PQ2_0: scale(Half, 2 bytes) + codes[32](uint8, 4 codes/byte) = 34 bytes / 128
+        // elements (2.125 bpw) — one scale PER GROUP, not per tensor (contrast I2_S above).
+        QuantizationType.PQ2_0 => elementCount / 128 * 34,
         _ => throw new ArgumentOutOfRangeException(nameof(qt), qt,
             $"Unknown quantization type: {qt}"),
     };

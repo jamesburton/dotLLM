@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Constraints;
+using DotLLM.Core.Models;
 using DotLLM.Core.Sampling;
 using DotLLM.Engine.Samplers;
 
@@ -36,12 +37,28 @@ internal sealed class SchedulerRequest : ISchedulerRequest
     /// <summary>KV-cache assigned at admission time. Released when the sequence is evicted.</summary>
     public IKvCache? KvCache { get; set; }
 
+    /// <summary>
+    /// Per-sequence recurrent state (Mamba SSM / GDN) for recurrent hosts that support caller-threaded
+    /// state (<see cref="IModel.SupportsThreadedSequenceState"/>). Allocated at admission, threaded
+    /// through this sequence's prefill/decode/resume forwards, and disposed when the KV-cache is
+    /// released. <see langword="null"/> for dense models and recurrent hosts without a threadable
+    /// state container (those keep the per-sequence model-owned-state loop).
+    /// </summary>
+    public IRecurrentSequenceState? RecurrentState { get; set; }
+
     /// <summary>True when the cache was minted by the prefix trie manager; its completion
     /// must be routed through <c>PrefixTrieManager.RecordCompletion</c> before disposal.</summary>
     public bool IsPrefixCached { get; set; }
 
     /// <summary>Prompt tokens that were reused from the prefix trie (no prefill needed).</summary>
     public int PrefixCachedTokens { get; set; }
+
+    /// <summary>
+    /// True when this sequence was preempted and re-queued and must be re-admitted via the
+    /// recompute-on-resume path (rebuild KV from prompt + already-generated tokens) instead of a
+    /// fresh prompt prefill. Set when the scheduler preempts the sequence; cleared on resume.
+    /// </summary>
+    public bool IsResuming { get; set; }
 
     /// <summary>Sampler pipeline built from the request's <c>InferenceOptions</c>.</summary>
     public SamplerPipeline SamplerPipeline { get; }
@@ -74,6 +91,13 @@ internal sealed class SchedulerRequest : ISchedulerRequest
 
     /// <summary>Monotonic submission counter used for FIFO tie-breaking among same-priority requests.</summary>
     public long SubmissionOrder { get; }
+
+    /// <summary>
+    /// Start-time-fair-queuing start tag assigned at submission (0 when fairness is disabled). Used as
+    /// the intra-priority-tier ordering key and preserved across preemption re-queues so a resumed
+    /// request keeps its fair position. See <c>ContinuousBatchSchedulerOptions.EnableFairness</c>.
+    /// </summary>
+    public long FairnessTag { get; set; }
 
     public SchedulerRequest(
         InferenceRequest request,

@@ -53,7 +53,7 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
-        _descriptorCache = new DescriptorSetCache(device, pool, pipeline.DescriptorSetLayout, buffersPerSet: 4);
+        _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 4);
     }
 
     /// <summary>
@@ -71,6 +71,14 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
         if (!File.Exists(path))
             return null;
 
+        // Pin the decode GEMV to wave32 on devices that support a required
+        // compute subgroup size (issue #54 / #330). On RDNA3.5 (gfx1151) the
+        // driver defaults compute to wave64; forcing wave32 PER-KERNEL here —
+        // never globally — matches llama.cpp's K-quant decode strategy. Gated
+        // on device support so it cleanly falls back to the driver default
+        // (subgroupSize=0 = unset) elsewhere, and on an env opt-out for A/B.
+        uint requiredSubgroupSize = Wave32SubgroupControl.RequiredSubgroupSizeFor(device);
+
         var module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
         try
@@ -83,7 +91,8 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: requiredSubgroupSize);
         }
         catch
         {

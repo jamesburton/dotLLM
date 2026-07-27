@@ -1,0 +1,232 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q3_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_q3k[M, K]^T
+//
+// Q3_K is scale-only (no dmin): signed 3-bit signed3 = ((hBit<<2)|q2) − 4 in −4..3,
+// per-16 signed 6-bit scale signedSc = scale6 − 32. Per 16-element sub-block:
+//   sum_i w_i·x_i = d·signedSc·d_x·dp4a(signed3, xq)
+// The −4 is folded into each weight byte before dp4a → symmetric, no min term. The
+// seqLen>1 analogue of matmul_q3_k_mmvq.comp.
+//
+// NOT bit-exact vs the F32-in GEMM (B int8-quantized first); validated vs CPU F32 oracle.
+//
+// Tiling (issue #367 register-tiled rewrite, mirroring #139/#366's Q4_K/Q6_K/Q8_0
+// tiling): 64 token rows × 64 weight rows of C per workgroup (16×16 threads, each
+// computing a 4×4 register tile, strided by 16 so LDS reads are conflict-free with the
+// +1-uint row padding). K advances in half-super-block chunks (128 elems = 8 sub-16-
+// blocks = 4 Q8_1 32-blocks = 32 uints per row), mirroring matmul_q6_k_mmq.comp's
+// chunking (symmetric, no min term — same as Q6_K, but per-sub16 scale directly rather
+// than the paired scA/scB split, matching matmul_q2_k_mmq.comp's #367 tiling minus the
+// dmin term).
+//
+// Q3_K super-block layout (110 bytes / 256; matches matmul_q3_k_mmvq.comp):
+//   [0..31]=hmask[32] (1 high bit/elem)  [32..95]=qs[64] (2 low bits/elem)
+//   [96..107]=scales[12] (16×6-bit, −32 bias)  [108,109]=fp16 d.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;            // multiple of 256
+    uint N;
+    uint blocksPerRow; // = K / 256
+    uint rowUints;     // unused
+} pc;
+
+const uint TILE_M = 64u;         // weight rows per workgroup
+const uint TILE_N = 64u;         // token rows per workgroup
+const uint TM = 4u;              // weight rows per thread (strided by 16)
+const uint TN = 4u;              // token rows per thread (strided by 16)
+const uint SB_BYTES     = 110u;
+const uint SUBS_PER_HALF = 8u;   // 16-element sub-blocks per half-super-block chunk
+const uint CHUNK_UINTS  = 32u;   // 128 int8 / 4 per row per half
+const uint CHUNK_STRIDE = 33u;   // +1 uint pad → LDS bank-conflict-free strided reads
+const uint CHUNKS_PER_HALF = 4u; // 32-element Q8_1 blocks per half-super-block
+
+shared uint  sharedWq[TILE_M * CHUNK_STRIDE];     // signed3 weights, element order
+shared uint  sharedXq[TILE_N * CHUNK_STRIDE];
+shared float sharedWdsc[TILE_M * SUBS_PER_HALF];  // d · signedSc per (row, sub16)
+shared float sharedXd[TILE_N * CHUNKS_PER_HALF];  // d_x per (token, 32-block)
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+int unpackQ3Scale(uint scalesBase, uint sub) {
+    uint lowNibble;
+    if (sub < 8u) {
+        lowNibble = readByte(scalesBase + sub) & 0xFu;
+    } else {
+        lowNibble = (readByte(scalesBase + (sub - 8u)) >> 4u) & 0xFu;
+    }
+    uint hiByte  = 8u + (sub >> 2u);
+    uint hiShift = (sub & 3u) << 1u;
+    uint hiBits  = (readByte(scalesBase + hiByte) >> hiShift) & 0x3u;
+    uint scale6  = lowNibble | (hiBits << 4u);
+    return int(scale6) - 32;
+}
+
+// 4 signed (signed3 = ((hBit<<2)|q2) − 4) bytes for dp4a.
+uint packQ3(uint qsw, uint hm16, uint qBit0, uint hBit0) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint q2 = (qsw  >> (qBit0 + e * 2u)) & 3u;
+        uint hb = (hm16 >> (hBit0 + e))      & 1u;
+        int s3 = int((hb << 2u) | q2) - 4;
+        res |= (uint(s3) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;              // 0..15 → weight-row axis
+    uint ty = gl_LocalInvocationID.y;              // 0..15 → token-row axis
+    uint tid = ty * 16u + tx;                      // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * SB_BYTES;
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++)
+            acc[i][j] = 0.0;
+
+    for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
+        for (uint h = 0u; h < 2u; h++) {
+            // ---- 1. Stage weights: 64 rows × 32 element-order uints (decode qs+hmask). ----
+            for (uint s = 0u; s < 8u; s++) {
+                uint idx = tid + s * 256u;       // 0..2047
+                uint rLocal = idx >> 5u;         // 0..63 weight row
+                uint uL     = idx & 31u;         // 0..31 uint within half
+                uint subL   = uL >> 2u;          // 0..7 local sub-16 within half
+                uint p      = uL & 3u;           // 0..3 quartet within sub-block
+                uint sub    = h * SUBS_PER_HALF + subL; // 0..15 global sub-16
+                uint mGlobal = mBase + rLocal;
+                uint packed = 0u;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    uint qsw  = read4Bytes(blockByteBase + 32u + sub * 4u);
+                    uint hm16 = read4Bytes(blockByteBase + sub * 2u) & 0xFFFFu;
+                    packed = packQ3(qsw, hm16, p * 8u, p * 4u);
+                }
+                sharedWq[rLocal * CHUNK_STRIDE + uL] = packed;
+            }
+
+            // ---- 2. Stage weight scales: 64 rows × 8 sub16 (d·signedSc). ----
+            for (uint s = 0u; s < 2u; s++) {
+                uint idx = tid + s * 256u;       // 0..511
+                uint rLocal = idx >> 3u;         // 0..63
+                uint subL   = idx & 7u;          // 0..7 local sub-16
+                uint sub    = h * SUBS_PER_HALF + subL;
+                uint mGlobal = mBase + rLocal;
+                float dsc = 0.0;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    float d = readHalf(blockByteBase + 108u);
+                    dsc = d * float(unpackQ3Scale(blockByteBase + 96u, sub));
+                }
+                sharedWdsc[rLocal * SUBS_PER_HALF + subL] = dsc;
+            }
+
+            // ---- 3. Stage activations: 64 token rows × 32 int8-uints. ----
+            for (uint s = 0u; s < 8u; s++) {
+                uint idx = tid + s * 256u;       // 0..2047
+                uint rLocal = idx >> 5u;         // 0..63 token row
+                uint uL     = idx & 31u;         // 0..31
+                uint tGlobal = tBase + rLocal;
+                uint v = 0u;
+                if (tGlobal < pc.N) {
+                    uint xqRowBase = tGlobal * (pc.K >> 2u);
+                    v = xq[xqRowBase + kSB * 64u + h * CHUNK_UINTS + uL];
+                }
+                sharedXq[rLocal * CHUNK_STRIDE + uL] = v;
+            }
+
+            // ---- 4. Stage activation scales: 64 rows × 4 d_x. ----
+            {
+                uint rLocal = tid >> 2u;
+                uint ccl    = tid & 3u;
+                uint tGlobal = tBase + rLocal;
+                float dx = 0.0;
+                if (tGlobal < pc.N) {
+                    dx = xds[tGlobal * (pc.K >> 5u) + kSB * 8u + h * CHUNKS_PER_HALF + ccl].x;
+                }
+                sharedXd[rLocal * CHUNKS_PER_HALF + ccl] = dx;
+            }
+
+            barrier();
+
+            // ---- 5. dp4a: 4×4 register tile per thread over this half, per sub16. ----
+            for (uint subL = 0u; subL < SUBS_PER_HALF; subL++) {
+                int dotI[TM][TN];
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        dotI[i][j] = 0;
+                for (uint g = 0u; g < 4u; g++) {
+                    uint wv[TM];
+                    uint xv[TN];
+                    for (uint i = 0u; i < TM; i++)
+                        wv[i] = sharedWq[(tx + 16u * i) * CHUNK_STRIDE + subL * 4u + g];
+                    for (uint j = 0u; j < TN; j++)
+                        xv[j] = sharedXq[(ty + 16u * j) * CHUNK_STRIDE + subL * 4u + g];
+                    for (uint i = 0u; i < TM; i++)
+                        for (uint j = 0u; j < TN; j++)
+                            dotI[i][j] = dotPacked4x8AccSatEXT(int(wv[i]), int(xv[j]), dotI[i][j]);
+                }
+                for (uint i = 0u; i < TM; i++) {
+                    float dsc = sharedWdsc[(tx + 16u * i) * SUBS_PER_HALF + subL];
+                    for (uint j = 0u; j < TN; j++) {
+                        float dX = sharedXd[(ty + 16u * j) * CHUNKS_PER_HALF + (subL >> 1u)];
+                        acc[i][j] += dsc * (dX * float(dotI[i][j]));
+                    }
+                }
+            }
+
+            barrier();
+        }
+    }
+
+    for (uint j = 0u; j < TN; j++) {
+        uint t = tBase + ty + 16u * j;
+        if (t >= pc.N) continue;
+        for (uint i = 0u; i < TM; i++) {
+            uint m = mBase + tx + 16u * i;
+            if (m < pc.M) {
+                c[t * pc.M + m] = acc[i][j];
+            }
+        }
+    }
+}

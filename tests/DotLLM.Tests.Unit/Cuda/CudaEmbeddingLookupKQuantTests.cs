@@ -15,7 +15,7 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// identical — only the iteration order changes.
 /// </summary>
 [Trait("Category", "GPU")]
-public class CudaEmbeddingLookupKQuantTests : IDisposable
+public sealed class CudaEmbeddingLookupKQuantTests : IDisposable
 {
     private readonly CudaContext? _ctx;
     private readonly CudaStream? _stream;

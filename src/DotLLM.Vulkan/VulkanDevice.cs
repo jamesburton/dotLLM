@@ -108,10 +108,111 @@ public sealed class VulkanDevice : IDisposable
     /// </summary>
     public bool HasIntegerDotProduct { get; }
 
+    /// <summary>
+    /// True when the physical device advertises <c>VK_EXT_subgroup_size_control</c>
+    /// (or Vulkan 1.3 core), reports a valid <c>minSubgroupSize</c>..<c>maxSubgroupSize</c>
+    /// range with the compute stage in <c>requiredSubgroupSizeStages</c>, AND the
+    /// device-create call enabled the <c>subgroupSizeControl</c> +
+    /// <c>computeFullSubgroups</c> features. Prerequisite for pinning a single
+    /// compute pipeline to a specific wave width via
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>. On RDNA3.5
+    /// (gfx1151) this lets the K-quant decode GEMV run wave32 while the driver's
+    /// global compute default stays wave64 — see <see cref="SupportsRequiredSubgroupSize"/>.
+    /// </summary>
+    /// <remarks>
+    /// Support is keyed off the <c>VkPhysicalDeviceSubgroupSizeControlProperties</c>
+    /// query (min/max + requiredSubgroupSizeStages), not the
+    /// <c>VkPhysicalDeviceSubgroupSizeControlFeatures</c> bits: when the feature
+    /// was promoted to Vulkan 1.3 core, some loader/driver combinations only
+    /// populate the promoted feature struct for an instance created at
+    /// apiVersion ≥ 1.3 (this backend's instance requests 1.2), whereas the
+    /// EXT-keyed properties struct is populated reliably. The features are still
+    /// enabled at device-create time; <c>vkCreateDevice</c> would fail if the
+    /// driver could not honour them.
+    /// </remarks>
+    public bool HasSubgroupSizeControl { get; }
+
+    /// <summary>
+    /// Minimum subgroup width the device will accept as a required size
+    /// (<c>minSubgroupSize</c> from <c>VkPhysicalDeviceSubgroupSizeControlProperties</c>).
+    /// Zero when <see cref="HasSubgroupSizeControl"/> is <c>false</c>. gfx1151
+    /// reports 32.
+    /// </summary>
+    public uint MinSubgroupSize { get; }
+
+    /// <summary>
+    /// Maximum subgroup width the device will accept as a required size
+    /// (<c>maxSubgroupSize</c>). Zero when <see cref="HasSubgroupSizeControl"/>
+    /// is <c>false</c>. gfx1151 reports 64.
+    /// </summary>
+    public uint MaxSubgroupSize { get; }
+
+    // VkShaderStageFlags bitmask of stages that accept a required subgroup size
+    // (requiredSubgroupSizeStages). Checked by SupportsRequiredSubgroupSize.
+    private readonly uint _requiredSubgroupSizeStages;
+
+    /// <summary>
+    /// Returns <c>true</c> when the device can pin a pipeline of the given
+    /// <paramref name="stage"/> to the exact wave width <paramref name="size"/>:
+    /// the <c>subgroupSizeControl</c> feature is enabled, <paramref name="size"/>
+    /// lies within <see cref="MinSubgroupSize"/>..<see cref="MaxSubgroupSize"/>,
+    /// and <paramref name="stage"/> is in the driver's
+    /// <c>requiredSubgroupSizeStages</c>. Pass <c>VkShaderStageFlags.Compute</c>
+    /// (0x20) for the MMVQ decode kernels. Falls back to <c>false</c> (callers
+    /// then use the unset/default subgroup size) on any device lacking the feature.
+    /// </summary>
+    public bool SupportsRequiredSubgroupSize(uint size, uint stage)
+    {
+        if (!HasSubgroupSizeControl) return false;
+        if (size < MinSubgroupSize || size > MaxSubgroupSize) return false;
+        return (_requiredSubgroupSizeStages & stage) != 0;
+    }
+
+    /// <summary>
+    /// True when the physical device advertises both <c>VK_KHR_external_semaphore</c>
+    /// and <c>VK_KHR_external_semaphore_win32</c> AND the device-create call enabled
+    /// them. This is the prerequisite for exporting a <c>VkSemaphore</c> as a Win32
+    /// HANDLE for cross-API synchronisation with CUDA (the M3 async handoff:
+    /// <see cref="CreateExportableSemaphore"/> + <see cref="GetSemaphoreWin32Handle"/>).
+    /// Falls back to <c>false</c> on non-Windows or on drivers that don't expose
+    /// the extension; callers must keep the fence-serialized path available.
+    /// </summary>
+    public bool HasExternalSemaphoreWin32 { get; }
+
+    /// <summary>
+    /// True when the physical device advertises <c>VK_AMD_shader_info</c> AND
+    /// the device-create call enabled it. Prerequisite for
+    /// <see cref="GetShaderStatisticsAmd"/>, which queries the driver's actual
+    /// post-compile VGPR/SGPR/LDS allocation for a compiled pipeline — a
+    /// vendor-specific (AMD proprietary driver only) diagnostic extension, not
+    /// part of any codepath's correctness or performance.
+    /// </summary>
+    public bool HasShaderInfoAmd { get; }
+
     internal nint Handle => _device;
     internal nint Queue => _queue;
     internal nint CommandPool => _commandPool;
     internal nint PhysicalDevice => _physicalDevice;
+
+    /// <summary>
+    /// Nanoseconds per timestamp tick (<c>VkPhysicalDeviceLimits.timestampPeriod</c>).
+    /// Read lazily for the env-gated decode profiler (issue #143). Returns 0 when
+    /// the reported value is implausible (&lt;=0 or &gt;10µs) — callers should then
+    /// skip GPU timestamping.
+    /// </summary>
+    internal unsafe float TimestampPeriodNs
+    {
+        get
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(_physicalDevice, out var props);
+            // The C# struct's byte tail starts at offset 292 (after the UUID),
+            // but VkPhysicalDeviceLimits is 8-byte aligned in the C layout, so
+            // it begins at 296 = tail+4. timestampPeriod is the float at limits
+            // offset 424 (right after timestampComputeAndGraphics) → tail+428.
+            float p = *(float*)(props.tail + 428);
+            return p >= 0.01f && p < 10_000f ? p : 0f;
+        }
+    }
 
     private VulkanDevice(
         nint instance, nint physical, nint device, nint queue,
@@ -119,7 +220,11 @@ public sealed class VulkanDevice : IDisposable
         uint subgroupSize, bool hasSubgroupArithmetic,
         bool hasCooperativeMatrix, IReadOnlyList<CooperativeMatrixShape> coopmatShapes,
         bool hasExternalMemoryHost, ulong minImportedHostPointerAlignment,
-        bool hasIntegerDotProduct)
+        bool hasIntegerDotProduct,
+        bool hasSubgroupSizeControl, uint minSubgroupSize, uint maxSubgroupSize,
+        uint requiredSubgroupSizeStages,
+        bool hasExternalSemaphoreWin32,
+        bool hasShaderInfoAmd)
     {
         _instance = instance;
         _physicalDevice = physical;
@@ -137,6 +242,12 @@ public sealed class VulkanDevice : IDisposable
         HasExternalMemoryHost = hasExternalMemoryHost;
         MinImportedHostPointerAlignment = minImportedHostPointerAlignment;
         HasIntegerDotProduct = hasIntegerDotProduct;
+        HasSubgroupSizeControl = hasSubgroupSizeControl;
+        MinSubgroupSize = minSubgroupSize;
+        MaxSubgroupSize = maxSubgroupSize;
+        _requiredSubgroupSizeStages = requiredSubgroupSizeStages;
+        HasExternalSemaphoreWin32 = hasExternalSemaphoreWin32;
+        HasShaderInfoAmd = hasShaderInfoAmd;
     }
 
     /// <summary>
@@ -184,10 +295,58 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Returns the number of Vulkan physical devices the loader can enumerate, or 0 when no loader /
+    /// driver is present. Used to gate cross-device tests (a two-GPU KV handoff needs ≥ 2 — e.g. the
+    /// Framework iGPU + RTX 3060 box). Does not throw.
+    /// </summary>
+    public static int PhysicalDeviceCount()
+    {
+        if (!IsAvailable()) return 0;
+        try { return ProbePhysicalDeviceCount(); }
+        catch { return 0; }
+    }
+
+    // Isolated so the JIT only resolves VulkanApi P/Invokes when the loader is confirmed present.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int ProbePhysicalDeviceCount()
+    {
+        VulkanLibraryResolver.Register();
+        nint inst = CreateInstance();
+        if (inst == 0) return 0;
+        try
+        {
+            uint count = 0;
+            int r = VulkanApi.vkEnumeratePhysicalDevices(inst, ref count, null);
+            return r >= 0 ? (int)count : 0;
+        }
+        finally
+        {
+            VulkanApi.vkDestroyInstance(inst, 0);
+        }
+    }
+
+    /// <summary>
     /// Creates a Vulkan device bound to the first suitable GPU.
     /// Selection order: discrete GPU (preferring AMD/NVIDIA over Intel) → integrated → first available.
     /// </summary>
-    public static VulkanDevice Create()
+    public static VulkanDevice Create() => CreateCore(forcedIndex: null);
+
+    /// <summary>
+    /// Creates a Vulkan device bound to the physical device at the given <c>vkEnumeratePhysicalDevices</c>
+    /// enumeration index. Unlike the parameterless overload (which scores devices) and the process-global
+    /// <c>DOTLLM_VULKAN_DEVICE_INDEX</c> env override, this lets a single process bind <em>different</em>
+    /// GPUs for different replicas — e.g. prefill on device 0 and decode on device 1 for a cross-device
+    /// <see cref="T:DotLLM.Engine.Scheduler.DisaggregatedScheduler"/> KV handoff. The explicit index takes
+    /// precedence over the env overrides.
+    /// </summary>
+    /// <param name="deviceIndex">Zero-based physical-device enumeration index.</param>
+    public static VulkanDevice Create(int deviceIndex)
+    {
+        if (deviceIndex < 0) throw new ArgumentOutOfRangeException(nameof(deviceIndex));
+        return CreateCore(deviceIndex);
+    }
+
+    private static VulkanDevice CreateCore(int? forcedIndex)
     {
         VulkanLibraryResolver.Register();
         nint instance = CreateInstance();
@@ -196,7 +355,7 @@ public sealed class VulkanDevice : IDisposable
 
         try
         {
-            nint physical = SelectPhysicalDevice(instance, out string name, out uint vendor, out int type, out uint apiVersion);
+            nint physical = SelectPhysicalDevice(instance, forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion);
             uint queueFamily = SelectComputeQueueFamily(physical);
 
             // Probe Vulkan 1.1 subgroup properties. Skipped gracefully on
@@ -230,8 +389,30 @@ public sealed class VulkanDevice : IDisposable
                 physical, apiVersion,
                 out bool hasIntegerDotProduct);
 
+            // Probe VK_EXT_subgroup_size_control (Vulkan 1.3 core). Like the
+            // others, the feature must be enabled at vkCreateDevice time before
+            // a pipeline may pin its subgroup size, so we decide support before
+            // creating the logical device. Skipped gracefully on < 1.3 / missing
+            // extension — returns false + zero sizes.
+            ProbeSubgroupSizeControl(
+                physical, apiVersion,
+                out bool hasSubgroupSizeControl, out uint minSubgroupSize,
+                out uint maxSubgroupSize, out uint requiredSubgroupSizeStages);
+
+            // Probe VK_KHR_external_semaphore + VK_KHR_external_semaphore_win32
+            // (Win32 only). Required for the M3 cross-API handoff: the Vulkan
+            // forward submit signals an exported semaphore that CUDA waits on.
+            // Falls back silently when absent — caller checks HasExternalSemaphoreWin32.
+            ProbeExternalSemaphoreWin32(physical, apiVersion, out bool hasExternalSemaphoreWin32);
+
+            // Probe VK_AMD_shader_info — vendor extension, no feature bits, no
+            // Vulkan-version gate. Just an extension-presence check; enabling
+            // it at device-create is what makes vkGetShaderInfoAMD resolvable.
+            bool hasShaderInfoAmd = HasDeviceExtension(physical, "VK_AMD_shader_info"u8);
+
             nint device = CreateLogicalDevice(
-                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct);
+                physical, queueFamily, hasCoopmat, hasExternalMemoryHost, hasIntegerDotProduct,
+                hasSubgroupSizeControl, hasExternalSemaphoreWin32, hasShaderInfoAmd);
 
             VulkanApi.vkGetDeviceQueue(device, queueFamily, 0, out nint queue);
 
@@ -249,7 +430,9 @@ public sealed class VulkanDevice : IDisposable
                 instance, physical, device, queue, pool, name, vendor, type, queueFamily,
                 subgroupSize, hasArithmetic, hasCoopmat, coopmatShapes,
                 hasExternalMemoryHost, minImportedHostPointerAlignment,
-                hasIntegerDotProduct);
+                hasIntegerDotProduct,
+                hasSubgroupSizeControl, minSubgroupSize, maxSubgroupSize,
+                requiredSubgroupSizeStages, hasExternalSemaphoreWin32, hasShaderInfoAmd);
             instance = 0;
             return result;
         }
@@ -283,7 +466,7 @@ public sealed class VulkanDevice : IDisposable
     }
 
     private static nint SelectPhysicalDevice(
-        nint instance, out string name, out uint vendor, out int type, out uint apiVersion)
+        nint instance, int? forcedIndex, out string name, out uint vendor, out int type, out uint apiVersion)
     {
         uint count = 0;
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, null)
@@ -294,6 +477,37 @@ public sealed class VulkanDevice : IDisposable
         var devices = new nint[count];
         VulkanApi.vkEnumeratePhysicalDevices(instance, ref count, devices)
             .ThrowOnError("vkEnumeratePhysicalDevices");
+
+        // Explicit per-replica selection (Create(int deviceIndex)) takes precedence over env + scoring, so a
+        // single process can bind different GPUs for prefill vs decode in a cross-device handoff.
+        if (forcedIndex is int fi)
+        {
+            if ((uint)fi >= (uint)devices.Length)
+                throw new VulkanException(-3,
+                    $"Requested Vulkan device index {fi} is out of range (0..{devices.Length - 1}).");
+            nint chosen = devices[fi];
+            VulkanApi.vkGetPhysicalDeviceProperties(chosen, out var cp);
+            name = ReadDeviceName(cp);
+            vendor = cp.vendorID;
+            type = cp.deviceType;
+            apiVersion = cp.apiVersion;
+            return chosen;
+        }
+
+        // Manual override (testing / iGPU targeting): DOTLLM_VULKAN_DEVICE_INDEX picks a device by
+        // enumeration index; DOTLLM_VULKAN_DEVICE_VENDOR (hex, e.g. 0x8086) picks the first device of
+        // that PCI vendor. Either lets us force the integrated Intel Arc on a box where the scorer would
+        // otherwise pick the discrete NVIDIA. Falls through to scoring if unset/invalid.
+        nint forced = ResolveForcedDevice(devices);
+        if (forced != 0)
+        {
+            VulkanApi.vkGetPhysicalDeviceProperties(forced, out var fp);
+            name = ReadDeviceName(fp);
+            vendor = fp.vendorID;
+            type = fp.deviceType;
+            apiVersion = fp.apiVersion;
+            return forced;
+        }
 
         // Score every device. Prefer: discrete > integrated > other/CPU.
         // Within discrete, prefer AMD/NVIDIA over Intel (Intel rarely has dGPUs,
@@ -327,6 +541,34 @@ public sealed class VulkanDevice : IDisposable
         type = bestType;
         apiVersion = bestApi;
         return bestDev;
+    }
+
+    /// <summary>
+    /// Resolves a manually-forced physical device from environment overrides, or 0 if none/invalid.
+    /// <c>DOTLLM_VULKAN_DEVICE_INDEX</c> selects by enumeration index; <c>DOTLLM_VULKAN_DEVICE_VENDOR</c>
+    /// (hex PCI vendor, e.g. 0x8086 for Intel) selects the first device of that vendor.
+    /// </summary>
+    private static nint ResolveForcedDevice(nint[] devices)
+    {
+        string? idxEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_INDEX");
+        if (int.TryParse(idxEnv, out int idx) && idx >= 0 && idx < devices.Length)
+            return devices[idx];
+
+        string? vendorEnv = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_DEVICE_VENDOR");
+        if (!string.IsNullOrEmpty(vendorEnv))
+        {
+            string hex = vendorEnv.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? vendorEnv[2..] : vendorEnv;
+            if (uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out uint wantVendor))
+            {
+                foreach (var dev in devices)
+                {
+                    VulkanApi.vkGetPhysicalDeviceProperties(dev, out var props);
+                    if (props.vendorID == wantVendor)
+                        return dev;
+                }
+            }
+        }
+        return 0;
     }
 
     // Packed Vulkan API version helpers. Layout: variant(3) | major(7) | minor(10) | patch(12).
@@ -510,6 +752,14 @@ public sealed class VulkanDevice : IDisposable
         nint device, uint handleType, nint pHostPointer,
         ref VkMemoryHostPointerPropertiesExt pMemoryHostPointerProperties);
 
+    // Delegate matching vkGetSemaphoreWin32HandleKHR (VK_KHR_external_semaphore_win32).
+    // Resolved lazily via vkGetDeviceProcAddr after device creation (the extension
+    // must have been enabled at vkCreateDevice). Returns the exportable
+    // semaphore's Win32 HANDLE in pHandle for import into CUDA.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int VkGetSemaphoreWin32HandleKHR(
+        nint device, in VkSemaphoreGetWin32HandleInfoKhr pGetWin32HandleInfo, out nint pHandle);
+
     /// <summary>
     /// Probes <c>VK_EXT_external_memory_host</c> support. The extension lets
     /// callers back a <c>VkDeviceMemory</c> with an existing host mmap'd
@@ -631,6 +881,137 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>
+    /// Probes <c>VK_EXT_subgroup_size_control</c> (Vulkan 1.3 core). Reads
+    /// <c>VkPhysicalDeviceSubgroupSizeControlProperties</c> (min/max subgroup
+    /// size + the stages that accept a required size) via
+    /// <c>vkGetPhysicalDeviceProperties2</c> and the
+    /// <c>subgroupSizeControl</c>/<c>computeFullSubgroups</c> feature bits via
+    /// <c>vkGetPhysicalDeviceFeatures2</c>. Support is declared when the device
+    /// reports a valid subgroup-size range AND the compute stage accepts a
+    /// required size — that is exactly what a per-kernel wave32 pin (with
+    /// REQUIRE_FULL_SUBGROUPS) needs, and what llama.cpp keys off. The feature
+    /// bits are read for completeness but are NOT part of the gate (they are
+    /// unreliable on a 1.3-core feature under a 1.2 instance — see the remarks on
+    /// <see cref="HasSubgroupSizeControl"/>); the features are still enabled at
+    /// device create. Like the integer-dot probe, accepts a 1.3+ core device or
+    /// one that advertises the extension string. Safe on older drivers: returns
+    /// <c>false</c> + zero sizes without throwing.
+    /// </summary>
+    private static unsafe void ProbeSubgroupSizeControl(
+        nint physical, uint apiVersion,
+        out bool hasSubgroupSizeControl, out uint minSubgroupSize,
+        out uint maxSubgroupSize, out uint requiredSubgroupSizeStages)
+    {
+        hasSubgroupSizeControl = false;
+        minSubgroupSize = 0;
+        maxSubgroupSize = 0;
+        requiredSubgroupSizeStages = 0;
+
+        // vkGetPhysicalDeviceProperties2 / Features2 are core in Vulkan 1.1.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            // Core in Vulkan 1.3; on 1.1/1.2 the extension must be advertised.
+            bool core13 = VkApiMajor(apiVersion) > 1u
+                || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) >= 3u);
+            bool hasExt = HasDeviceExtension(physical, "VK_EXT_subgroup_size_control"u8);
+            if (!core13 && !hasExt)
+                return;
+
+            // Read the feature bits for completeness. NOTE: these are advisory —
+            // when the feature was promoted to Vulkan 1.3 core, some loader/driver
+            // combinations only populate the promoted *feature* struct when the
+            // INSTANCE was created at apiVersion >= 1.3 (our instance requests
+            // 1.2). The *properties* struct (below) is keyed off the EXT and is
+            // populated reliably. We therefore gate support on the properties +
+            // the compute stage being in requiredSubgroupSizeStages, which is
+            // exactly what enabling a per-pipeline required size needs, and what
+            // llama.cpp keys off. The features are still enabled at device
+            // create; vkCreateDevice would fail if the driver could not honour
+            // them (it does not on gfx1151).
+            VkPhysicalDeviceSubgroupSizeControlFeatures sscFeatures = default;
+            sscFeatures.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlFeatures;
+
+            VkPhysicalDeviceFeatures2 features2 = default;
+            features2.sType = VkStructureType.PhysicalDeviceFeatures2;
+            features2.pNext = (nint)(&sscFeatures);
+
+            VulkanApi.vkGetPhysicalDeviceFeatures2(physical, ref features2);
+
+            // Properties — min/max size and which stages accept a required size.
+            VkPhysicalDeviceSubgroupSizeControlProperties sscProps = default;
+            sscProps.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlProperties;
+
+            VkPhysicalDeviceProperties2 props2 = default;
+            props2.sType = VkStructureType.PhysicalDeviceProperties2;
+            props2.pNext = (nint)(&sscProps);
+
+            VulkanApi.vkGetPhysicalDeviceProperties2(physical, ref props2);
+
+            // Defensive: a driver reporting a degenerate range is unusable.
+            if (sscProps.minSubgroupSize == 0 || sscProps.maxSubgroupSize == 0
+                || sscProps.minSubgroupSize > sscProps.maxSubgroupSize)
+                return;
+
+            // Require the COMPUTE stage to accept a required subgroup size — the
+            // MMVQ decode pipelines are compute. Without this bit a per-pipeline
+            // pin is illegal and vkCreateComputePipelines would fail.
+            if ((sscProps.requiredSubgroupSizeStages & VkShaderStageFlags.Compute) == 0)
+                return;
+
+            minSubgroupSize = sscProps.minSubgroupSize;
+            maxSubgroupSize = sscProps.maxSubgroupSize;
+            requiredSubgroupSizeStages = sscProps.requiredSubgroupSizeStages;
+            hasSubgroupSizeControl = true;
+        }
+        catch
+        {
+            // Loader/driver returned garbage — disable; callers fall back to the
+            // default (unset) subgroup size. Mirrors the other probes' posture.
+            hasSubgroupSizeControl = false;
+            minSubgroupSize = 0;
+            maxSubgroupSize = 0;
+            requiredSubgroupSizeStages = 0;
+        }
+    }
+
+    /// <summary>
+    /// Probes <c>VK_KHR_external_semaphore</c> + <c>VK_KHR_external_semaphore_win32</c>
+    /// support. Both must be advertised for the Vulkan→CUDA Win32-handle handoff;
+    /// the extensions carry no feature bit, so presence in the device extension
+    /// list is sufficient. Windows-only (the win32 extension does not exist on
+    /// other platforms). Safe on Vulkan 1.0 / non-Windows: returns <c>false</c>
+    /// and callers fall back to the fence-serialized handoff.
+    /// </summary>
+    private static unsafe void ProbeExternalSemaphoreWin32(
+        nint physical, uint apiVersion, out bool hasExternalSemaphoreWin32)
+    {
+        hasExternalSemaphoreWin32 = false;
+
+        // The win32 export handle type only exists on Windows.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return;
+
+        // VK_KHR_external_semaphore is core in Vulkan 1.1; the win32 companion
+        // requires it. Gate on the reported API version.
+        if (VkApiMajor(apiVersion) < 1u || (VkApiMajor(apiVersion) == 1u && VkApiMinor(apiVersion) < 1u))
+            return;
+
+        try
+        {
+            hasExternalSemaphoreWin32 =
+                HasDeviceExtension(physical, "VK_KHR_external_semaphore"u8) &&
+                HasDeviceExtension(physical, "VK_KHR_external_semaphore_win32"u8);
+        }
+        catch
+        {
+            hasExternalSemaphoreWin32 = false;
+        }
+    }
+
+    /// <summary>
     /// Returns <c>true</c> when <paramref name="physical"/> advertises the
     /// given device extension. <paramref name="name"/> must be the
     /// NUL-terminated UTF-8 extension name (e.g. <c>"VK_KHR_cooperative_matrix\0"u8</c>).
@@ -732,7 +1113,8 @@ public sealed class VulkanDevice : IDisposable
 
     private static unsafe nint CreateLogicalDevice(
         nint physical, uint queueFamily,
-        bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct)
+        bool enableCoopmat, bool enableExternalMemoryHost, bool enableIntegerDotProduct,
+        bool enableSubgroupSizeControl, bool enableExternalSemaphoreWin32, bool enableShaderInfoAmd)
     {
         float priority = 1.0f;
 
@@ -757,14 +1139,23 @@ public sealed class VulkanDevice : IDisposable
         ReadOnlySpan<byte> extMemHostName = "VK_EXT_external_memory_host\0"u8;
         ReadOnlySpan<byte> extMemName = "VK_KHR_external_memory\0"u8;
         ReadOnlySpan<byte> intDotName = "VK_KHR_shader_integer_dot_product\0"u8;
+        ReadOnlySpan<byte> sscName = "VK_EXT_subgroup_size_control\0"u8;
+        ReadOnlySpan<byte> extSemName = "VK_KHR_external_semaphore\0"u8;
+        ReadOnlySpan<byte> extSemWin32Name = "VK_KHR_external_semaphore_win32\0"u8;
+        ReadOnlySpan<byte> shaderInfoAmdName = "VK_AMD_shader_info\0"u8;
 
-        // Pack name bytes + pointer array onto the stack. Worst case all four
-        // extensions are enabled at once. (The integer-dot-product string is
-        // harmless to name even on a 1.3 driver where it is core — drivers
-        // ignore the duplicate, same as the external-memory names below.)
+        // Pack name bytes + pointer array onto the stack. Worst case all eight
+        // extension names are enabled at once (coopmat, external-memory ×2,
+        // integer-dot-product, subgroup-size-control, external-semaphore ×2,
+        // shader-info-amd). The integer-dot-product and subgroup-size-control
+        // strings are harmless to name even on a 1.3 driver where they are
+        // core — drivers ignore the duplicate, same as the external-memory/
+        // semaphore names below.
         byte* nameBytes = stackalloc byte[
-            coopmatName.Length + extMemHostName.Length + extMemName.Length + intDotName.Length];
-        nint* namePtrs = stackalloc nint[4];
+            coopmatName.Length + extMemHostName.Length + extMemName.Length
+            + intDotName.Length + sscName.Length
+            + extSemName.Length + extSemWin32Name.Length + shaderInfoAmdName.Length];
+        nint* namePtrs = stackalloc nint[8];
         int nameOffset = 0;
         uint extCount = 0;
 
@@ -773,6 +1164,20 @@ public sealed class VulkanDevice : IDisposable
             for (int i = 0; i < coopmatName.Length; i++) nameBytes[nameOffset + i] = coopmatName[i];
             namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
             nameOffset += coopmatName.Length;
+        }
+
+        if (enableExternalSemaphoreWin32)
+        {
+            // VK_KHR_external_semaphore is core in 1.1 but, like external_memory,
+            // some drivers (amdvlk) require it named explicitly when the
+            // VkExportSemaphoreCreateInfo pNext struct is used. Enable both names.
+            for (int i = 0; i < extSemName.Length; i++) nameBytes[nameOffset + i] = extSemName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extSemName.Length;
+
+            for (int i = 0; i < extSemWin32Name.Length; i++) nameBytes[nameOffset + i] = extSemWin32Name[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += extSemWin32Name.Length;
         }
 
         if (enableExternalMemoryHost)
@@ -799,6 +1204,20 @@ public sealed class VulkanDevice : IDisposable
             nameOffset += intDotName.Length;
         }
 
+        if (enableSubgroupSizeControl)
+        {
+            for (int i = 0; i < sscName.Length; i++) nameBytes[nameOffset + i] = sscName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += sscName.Length;
+        }
+
+        if (enableShaderInfoAmd)
+        {
+            for (int i = 0; i < shaderInfoAmdName.Length; i++) nameBytes[nameOffset + i] = shaderInfoAmdName[i];
+            namePtrs[extCount++] = (nint)(nameBytes + nameOffset);
+            nameOffset += shaderInfoAmdName.Length;
+        }
+
         // Feature structs chained through pNext on top of the extension enables:
         //  - VK_KHR_cooperative_matrix requires `cooperativeMatrix=VK_TRUE`.
         //  - VK_KHR_shader_integer_dot_product requires
@@ -807,6 +1226,7 @@ public sealed class VulkanDevice : IDisposable
         // No feature bits are needed for VK_EXT_external_memory_host.
         VkPhysicalDeviceCooperativeMatrixFeaturesKhr coopmatFeatures = default;
         VkPhysicalDeviceShaderIntegerDotProductFeatures dotFeatures = default;
+        VkPhysicalDeviceSubgroupSizeControlFeatures sscFeatures = default;
         nint featureChain = 0;
         if (enableCoopmat)
         {
@@ -823,7 +1243,42 @@ public sealed class VulkanDevice : IDisposable
             dotFeatures.pNext = featureChain;
             featureChain = (nint)(&dotFeatures);
         }
+        if (enableSubgroupSizeControl)
+        {
+            // Enable both bits: subgroupSizeControl lets a pipeline pin its
+            // subgroup size; computeFullSubgroups lets us set the
+            // REQUIRE_FULL_SUBGROUPS stage flag that pairs with the pin.
+            sscFeatures.sType = VkStructureType.PhysicalDeviceSubgroupSizeControlFeatures;
+            sscFeatures.subgroupSizeControl = 1;  // VK_TRUE
+            sscFeatures.computeFullSubgroups = 1; // VK_TRUE
+            sscFeatures.pNext = featureChain;
+            featureChain = (nint)(&sscFeatures);
+        }
+
+        // Timeline semaphores (core 1.2) require `timelineSemaphore=VK_TRUE` enabled
+        // at device create. We need them for the D3D12_FENCE export type CUDA imports
+        // cross-vendor (Intel Vulkan → NVIDIA CUDA) — the OPAQUE_WIN32 binary form
+        // fails import on that pairing. Enable alongside the external-semaphore-win32
+        // path so the M3 handoff can create exportable timeline semaphores.
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures = default;
+        if (enableExternalSemaphoreWin32)
+        {
+            timelineFeatures.sType = VkStructureType.PhysicalDeviceTimelineSemaphoreFeatures;
+            timelineFeatures.timelineSemaphore = 1; // VK_TRUE
+            timelineFeatures.pNext = featureChain;
+            featureChain = (nint)(&timelineFeatures);
+        }
+
         ci.pNext = featureChain;
+
+        // NOTE: with the validation layers enabled you may see a benign
+        // VUID-VkDeviceCreateInfo-pNext-pNext "unexpected VkStructureType" naming a
+        // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo in this chain. It is a
+        // validation false-positive: the chained struct is VkPhysicalDeviceSubgroupSizeControl-
+        // Features and its runtime sType is correct (1000225001, verified). The layer
+        // mis-attributes it because we deliberately request a 1.2 instance while using the
+        // (1.3-core) subgroup-size-control feature via its EXT alias. The driver accepts it
+        // and the wave32 required-subgroup-size pins work. Not a real bug; do not "fix".
 
         if (extCount > 0)
         {
@@ -876,13 +1331,25 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public bool IsHostImported => _hostImport is not null;
 
-        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size)
+        /// <summary>
+        /// True when this buffer's memory is <c>HOST_VISIBLE</c> and can be mapped with
+        /// <c>vkMapMemory</c> directly. Host-visible allocations and UMA device-local types are
+        /// mappable; a <em>strictly</em> <c>DEVICE_LOCAL</c> type on a discrete GPU is NOT — host
+        /// readback/upload to such a buffer must stage through a host-visible buffer +
+        /// <c>vkCmdCopyBuffer</c> (see <see cref="VulkanDevice.Download"/> /
+        /// <see cref="VulkanDevice.UploadToDeviceLocal"/>). On UMA parts (Strix Halo iGPU, Intel Arc)
+        /// device-local is typically host-visible too, so the direct map fast-path applies.
+        /// </summary>
+        public bool IsHostVisible { get; }
+
+        internal Buffer(VulkanDevice device, nint buffer, nint memory, long size, bool hostVisible)
         {
             _device = device;
             _buffer = buffer;
             _memory = memory;
             Size = size;
             _hostImport = null;
+            IsHostVisible = hostVisible;
         }
 
         internal Buffer(VulkanDevice device, HostVisibleBuffer hostImport)
@@ -892,6 +1359,7 @@ public sealed class VulkanDevice : IDisposable
             _memory = hostImport.Memory;
             Size = hostImport.Size;
             _hostImport = hostImport;
+            IsHostVisible = true; // wraps host pages — mappable by construction
         }
 
         /// <summary>Underlying <c>VkDeviceMemory</c> handle.</summary>
@@ -931,6 +1399,18 @@ public sealed class VulkanDevice : IDisposable
     /// forward pass reads/writes from the host between kernel launches.
     /// </summary>
     public Buffer Allocate(long bytes) => AllocateInternal(bytes, deviceLocal: false);
+
+    /// <summary>
+    /// Allocates a host-visible storage buffer optimised for per-token CPU
+    /// readback (e.g. the logits buffer): prefers a memory type that is also
+    /// <c>HOST_CACHED</c> so host reads go through the CPU cache hierarchy.
+    /// The default host-visible type on AMD/Windows is write-combined
+    /// (uncached) — CPU reads from it run at &lt;1 GB/s, which cost ~0.4 ms
+    /// per decoded token on a 49k-vocab logits row (issue #143). Falls back
+    /// to the plain host-visible type when no cached type exists.
+    /// </summary>
+    public Buffer AllocateHostReadback(long bytes)
+        => AllocateInternal(bytes, deviceLocal: false, preferHostCached: true);
 
     /// <summary>
     /// Allocates a storage buffer of <paramref name="bytes"/> bytes backed by
@@ -976,7 +1456,28 @@ public sealed class VulkanDevice : IDisposable
         return import is null ? null : new Buffer(this, import);
     }
 
-    private Buffer AllocateInternal(long bytes, bool deviceLocal)
+    /// <summary>VkResult VK_ERROR_OUT_OF_DEVICE_MEMORY.</summary>
+    private const int VkErrorOutOfDeviceMemory = -2;
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1</c> disables the host-visible fallback
+    /// on device-local allocation failure (an exhausted strict heap then throws, the
+    /// pre-fallback behaviour).
+    /// </summary>
+    private static readonly bool s_strictDeviceLocal =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_STRICT_DEVICE_LOCAL") == "1";
+
+    private long _deviceLocalFallbacks;
+
+    /// <summary>
+    /// Number of device-local allocations that fell back to a host-visible memory
+    /// type because the strict DEVICE_LOCAL heap was exhausted. Non-zero means part
+    /// of the working set lives in the slower (on discrete GPUs) or GTT (on UMA)
+    /// heap — perf harnesses should report it alongside any measurement.
+    /// </summary>
+    public long DeviceLocalFallbackCount => Interlocked.Read(ref _deviceLocalFallbacks);
+
+    private Buffer AllocateInternal(long bytes, bool deviceLocal, bool preferHostCached = false)
     {
         if (bytes <= 0) throw new ArgumentOutOfRangeException(nameof(bytes));
 
@@ -1015,22 +1516,78 @@ public sealed class VulkanDevice : IDisposable
                 typeIndex = FindMemoryType(req.memoryTypeBits, VkMemoryPropertyFlags.DeviceLocal);
             }
         }
+        else if (preferHostCached
+            && TryFindMemoryType(req.memoryTypeBits,
+                required: required | VkMemoryPropertyFlags.HostCached,
+                excluded: default,
+                out typeIndex))
+        {
+            // Cached host-visible type found — CPU readback at full speed.
+        }
         else
         {
             typeIndex = FindMemoryType(req.memoryTypeBits, required);
         }
 
+        uint preferredTypeIndex = typeIndex;
         var mai = new VkMemoryAllocateInfo
         {
             sType = VkStructureType.MemoryAllocateInfo,
             allocationSize = req.size,
             memoryTypeIndex = typeIndex,
         };
-        int allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out nint memory);
+        int allocResult;
+        nint memory;
+        for (int attempt = 0; ; attempt++)
+        {
+            typeIndex = preferredTypeIndex;
+            mai.memoryTypeIndex = typeIndex;
+            allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+
+            // The strict device-local heap (discrete VRAM, or the UMA carve-out — e.g. a
+            // 16 GB heap[0] on Strix Halo while heap[1] exposes 96 GB of DEVICE_LOCAL +
+            // HOST_VISIBLE GTT) can be far smaller than what the device can actually
+            // address. When it is exhausted, retry on the combined DEVICE_LOCAL +
+            // HOST_VISIBLE type, then plain host-visible — the llama.cpp
+            // GGML_VK_ALLOW_SYSMEM_FALLBACK equivalent. On UMA parts the fallback reads
+            // the same DRAM; on discrete GPUs it is slower than VRAM but beats an OOM
+            // crash. Opt out with DOTLLM_VULKAN_STRICT_DEVICE_LOCAL=1; occurrences are
+            // counted in DeviceLocalFallbackCount for harness reporting.
+            if (allocResult == VkErrorOutOfDeviceMemory && deviceLocal && !s_strictDeviceLocal)
+            {
+                // Heap-aware: on AMD APUs the FIRST type matching a fallback flag combo can
+                // sit on the same exhausted carve-out heap as the failed type, so ranking by
+                // flags alone re-fails. Try every eligible type, other heaps before the
+                // failed heap, larger heaps first, host-visible rungs after combined ones.
+                foreach (uint fbIndex in EnumerateDeviceLocalFallbackTypes(req.memoryTypeBits, typeIndex))
+                {
+                    mai.memoryTypeIndex = fbIndex;
+                    allocResult = VulkanApi.vkAllocateMemory(_device, mai, 0, out memory);
+                    if (allocResult >= 0)
+                    {
+                        typeIndex = fbIndex;
+                        Interlocked.Increment(ref _deviceLocalFallbacks);
+                        break;
+                    }
+                }
+            }
+
+            // Transient memory pressure (issue #146): under back-to-back heavy runs the
+            // previous process's allocations may not be reclaimed yet, so a large staging
+            // or weight allocation fails once and succeeds moments later. Bounded
+            // retry-with-backoff before giving up — same policy as MapMemoryWithRetry.
+            if (allocResult >= 0 || !IsTransientMemoryResult(allocResult) || attempt >= s_memRetries)
+                break;
+            LogMemoryRetry("vkAllocateMemory",
+                $"AllocateInternal(deviceLocal={deviceLocal})", bytes, allocResult, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
+        }
+
         if (allocResult < 0)
         {
             VulkanApi.vkDestroyBuffer(_device, buffer, 0);
-            allocResult.ThrowOnError("vkAllocateMemory");
+            allocResult.ThrowOnError(
+                $"vkAllocateMemory ({bytes} bytes{(IsTransientMemoryResult(allocResult) ? $", {s_memRetries} retries exhausted" : "")})");
         }
 
         int bindResult = VulkanApi.vkBindBufferMemory(_device, buffer, memory, 0);
@@ -1041,7 +1598,181 @@ public sealed class VulkanDevice : IDisposable
             bindResult.ThrowOnError("vkBindBufferMemory");
         }
 
-        return new Buffer(this, buffer, memory, bytes);
+        // Host-visible allocations are mappable; a device-local allocation is mappable only when the
+        // chosen type also carries HOST_VISIBLE (the UMA case). On a discrete GPU the strict
+        // device-local type is NOT mappable, so Download/UploadToDeviceLocal must stage.
+        bool hostVisible = !deviceLocal || MemoryTypeIsHostVisible(typeIndex);
+        return new Buffer(this, buffer, memory, bytes, hostVisible);
+    }
+
+    private unsafe bool MemoryTypeIsHostVisible(uint typeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes; // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        var flags = (VkMemoryPropertyFlags)types[typeIndex * 2];
+        return (flags & VkMemoryPropertyFlags.HostVisible) != 0;
+    }
+
+    /// <summary>VkResult VK_ERROR_OUT_OF_HOST_MEMORY.</summary>
+    private const int VkErrorOutOfHostMemory = -1;
+
+    /// <summary>VkResult VK_ERROR_MEMORY_MAP_FAILED.</summary>
+    private const int VkErrorMemoryMapFailed = -5;
+
+    /// <summary>
+    /// <c>DOTLLM_VULKAN_MEM_DIAG=1</c> dumps the physical-device heap/type table to stderr
+    /// when a map/alloc hits a transient memory failure — the issue #146 diagnosis aid.
+    /// </summary>
+    private static readonly bool s_memDiag =
+        Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_DIAG") == "1";
+
+    /// <summary>
+    /// Number of retries after a transient memory failure (<c>VK_ERROR_MEMORY_MAP_FAILED</c> /
+    /// host / device OOM) on <c>vkMapMemory</c> and <c>vkAllocateMemory</c>. Under memory
+    /// pressure on UMA boxes (issue #146: back-to-back heavy runs on Strix Halo, the previous
+    /// process's allocations not yet reclaimed) these calls fail transiently and succeed on
+    /// retry — observed ~2/15 model loads failing at the GB-scale weight-staging buffer.
+    /// Override with <c>DOTLLM_VULKAN_MEM_RETRIES</c> (0 disables, max 8). Default 4, with
+    /// exponential backoff 25/100/400/1600 ms.
+    /// </summary>
+    private static readonly int s_memRetries = ParseMemRetries();
+
+    private static int ParseMemRetries()
+    {
+        string? v = Environment.GetEnvironmentVariable("DOTLLM_VULKAN_MEM_RETRIES");
+        return int.TryParse(v, out int n) && n >= 0 ? Math.Min(n, 8) : 4;
+    }
+
+    /// <summary>
+    /// True for VkResults that indicate memory pressure rather than API misuse —
+    /// the only failures worth retrying with backoff.
+    /// </summary>
+    internal static bool IsTransientMemoryResult(int result)
+        => result is VkErrorOutOfHostMemory or VkErrorOutOfDeviceMemory or VkErrorMemoryMapFailed;
+
+    /// <summary>Backoff before retry <paramref name="attempt"/> (0-based): 25, 100, 400, 1600, ... ms.</summary>
+    internal static int RetryBackoffMs(int attempt) => 25 << Math.Min(2 * attempt, 12);
+
+    /// <summary>
+    /// Maps <paramref name="memory"/> with bounded retry-with-backoff on transient memory
+    /// failures. All load-path (weight/KV staging) and host-copy maps go through this instead
+    /// of raw <c>vkMapMemory</c>: on Windows/WDDM the map must make the <em>entire</em>
+    /// allocation host-resident (residency is allocation-granular, not range-granular), so
+    /// mapping a GB-scale staging buffer transiently fails with
+    /// <c>VK_ERROR_MEMORY_MAP_FAILED</c> under system memory pressure even though the same
+    /// call succeeds moments later (issue #146). Throws with <paramref name="site"/> +
+    /// size context when all attempts fail.
+    /// </summary>
+    internal nint MapMemoryWithRetry(nint memory, ulong offset, ulong size, string site)
+    {
+        int r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out nint mapped);
+        for (int attempt = 0; r < 0 && IsTransientMemoryResult(r) && attempt < s_memRetries; attempt++)
+        {
+            LogMemoryRetry("vkMapMemory", site, (long)size, r, attempt);
+            Thread.Sleep(RetryBackoffMs(attempt));
+            r = VulkanApi.vkMapMemory(_device, memory, offset, size, 0, out mapped);
+        }
+        if (r < 0)
+            r.ThrowOnError($"{site} ({size} bytes{(IsTransientMemoryResult(r) ? $", {s_memRetries} retries exhausted" : "")})");
+        return mapped;
+    }
+
+    private void LogMemoryRetry(string op, string site, long bytes, int result, int attempt)
+    {
+        Console.Error.WriteLine(
+            $"[vulkan-mem] transient {op} failure at '{site}' (VkResult {result}, {bytes} bytes); " +
+            $"retrying {attempt + 1}/{s_memRetries} after {RetryBackoffMs(attempt)} ms");
+        if (s_memDiag && attempt == 0)
+            DumpMemoryDiagnostics();
+    }
+
+    /// <summary>Dumps the heap/type table to stderr (DOTLLM_VULKAN_MEM_DIAG=1 only).</summary>
+    private unsafe void DumpMemoryDiagnostics()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
+        for (uint i = 0; i < mem.memoryHeapCount; i++)
+        {
+            ulong size = *(ulong*)(heaps + i * 16);
+            uint flags = *(uint*)(heaps + i * 16 + 8);
+            Console.Error.WriteLine($"[vulkan-mem]   heap[{i}] size={size / (1024.0 * 1024 * 1024):F2} GiB flags=0x{flags:x}");
+        }
+        for (uint i = 0; i < mem.memoryTypeCount; i++)
+        {
+            Console.Error.WriteLine(
+                $"[vulkan-mem]   type[{i}] heap={types[i * 2 + 1]} props=0x{types[i * 2]:x} " +
+                $"({(VkMemoryPropertyFlags)types[i * 2]})");
+        }
+        Console.Error.WriteLine($"[vulkan-mem]   deviceLocalFallbacks={DeviceLocalFallbackCount}");
+    }
+
+    /// <summary>
+    /// Candidate memory types for the device-local OOM fallback, best first: for each
+    /// rung (DEVICE_LOCAL+HOST_VISIBLE, then HOST_VISIBLE+HOST_COHERENT) every eligible
+    /// type is yielded — types on a different heap than the exhausted one before types
+    /// sharing it, larger heaps before smaller. On a UMA APU this walks the allocation
+    /// off the small strict carve-out (e.g. 15.8 GiB on Strix Halo) onto the large
+    /// GTT heap that maps the same DRAM.
+    /// </summary>
+    private unsafe List<uint> EnumerateDeviceLocalFallbackTypes(uint typeBits, uint failedTypeIndex)
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        uint* types = (uint*)mem.memoryTypes;   // 8-byte entries: u32 propertyFlags, u32 heapIndex
+        byte* heaps = (byte*)mem.memoryHeaps;   // 16-byte entries: u64 size, u32 flags, padding
+        uint failedHeap = types[failedTypeIndex * 2 + 1];
+
+        var ordered = new List<uint>(8);
+        Span<VkMemoryPropertyFlags> rungs =
+        [
+            VkMemoryPropertyFlags.DeviceLocal | VkMemoryPropertyFlags.HostVisible,
+            VkMemoryPropertyFlags.HostVisible | VkMemoryPropertyFlags.HostCoherent,
+        ];
+        foreach (var required in rungs)
+        {
+            // Two passes per rung: other-heap types first, failed-heap types last.
+            for (int pass = 0; pass < 2; pass++)
+            {
+                var passList = new List<(uint Index, ulong HeapSize)>(4);
+                for (uint i = 0; i < mem.memoryTypeCount; i++)
+                {
+                    if ((typeBits & (1u << (int)i)) == 0 || i == failedTypeIndex) continue;
+                    var flags = (VkMemoryPropertyFlags)types[i * 2];
+                    if ((flags & required) != required) continue;
+                    uint heapIdx = types[i * 2 + 1];
+                    bool otherHeap = heapIdx != failedHeap;
+                    if (otherHeap != (pass == 0)) continue;
+                    passList.Add((i, *(ulong*)(heaps + heapIdx * 16)));
+                }
+                passList.Sort(static (a, b) => b.HeapSize.CompareTo(a.HeapSize));
+                foreach (var (idx, _) in passList)
+                    if (!ordered.Contains(idx))
+                        ordered.Add(idx);
+            }
+        }
+        return ordered;
+    }
+
+    /// <summary>
+    /// Size in bytes of the largest <c>DEVICE_LOCAL</c> memory heap — the effective VRAM budget for
+    /// weight/KV/compute allocations. On a discrete GPU this is the dedicated VRAM; on a UMA part
+    /// (Strix Halo iGPU, Intel Arc integrated) it is the driver-reported device-local carve-out of
+    /// system RAM, which is typically far smaller than total system memory and is the real ceiling
+    /// for how many model layers that device can hold when spanning.
+    /// </summary>
+    public unsafe long DeviceLocalHeapBytes()
+    {
+        VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
+        byte* heaps = (byte*)mem.memoryHeaps; // 16-byte entries: u64 size, u32 flags, padding
+        long max = 0;
+        for (uint i = 0; i < mem.memoryHeapCount; i++)
+        {
+            ulong size = *(ulong*)(heaps + i * 16);
+            uint flags = *(uint*)(heaps + i * 16 + 8);
+            if ((flags & (uint)VkMemoryHeapFlags.DeviceLocal) != 0)
+                max = Math.Max(max, (long)size);
+        }
+        return max;
     }
 
     /// <summary>
@@ -1067,8 +1798,7 @@ public sealed class VulkanDevice : IDisposable
             throw new ArgumentException("Destination buffer too small.", nameof(dst));
 
         // 1. Copy host → staging.
-        VulkanApi.vkMapMemory(_device, staging.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory staging");
+        nint mapped = MapMemoryWithRetry(staging.Memory, 0, (ulong)source.Length, "vkMapMemory staging");
         try
         {
             source.CopyTo(new Span<byte>((void*)mapped, source.Length));
@@ -1212,14 +1942,28 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>Copies <paramref name="source"/> from host memory into the start of <paramref name="dst"/>.</summary>
+    /// <remarks>
+    /// When <paramref name="dst"/> is device-local-only (a discrete GPU's VRAM, or —
+    /// as issue #370's CPU-MoE-offload host round-trip discovered — a scratch buffer
+    /// allocated strictly DEVICE_LOCAL even on a UMA part) the host cannot map it
+    /// directly, so the bytes are staged through a transient host-visible buffer and
+    /// <c>vkCmdCopyBuffer</c>'d across (mirrors <see cref="UploadToDeviceLocal"/> /
+    /// the <see cref="Download"/> readback-side fix, #364).
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<float> source, Buffer dst)
     {
         long bytes = (long)source.Length * sizeof(float);
         if (bytes > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(bytes);
+            UploadToDeviceLocal(MemoryMarshal.AsBytes(source), staging, dst);
+            return;
+        }
+
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var destSpan = new Span<float>((void*)mapped, source.Length);
@@ -1236,13 +1980,23 @@ public sealed class VulkanDevice : IDisposable
     /// Used for quantized weight blobs (Q8_0, Q4_K, etc.) where the GPU sees the
     /// data as <c>uint[]</c> and the shader extracts bytes.
     /// </summary>
+    /// <remarks>
+    /// Stages through a transient host-visible buffer when <paramref name="dst"/> is
+    /// device-local-only — see the <see cref="Upload(ReadOnlySpan{float}, Buffer)"/> remarks.
+    /// </remarks>
     public unsafe void Upload(ReadOnlySpan<byte> source, Buffer dst)
     {
         if (source.Length > dst.Size)
             throw new ArgumentException("Source larger than destination buffer.", nameof(source));
 
-        VulkanApi.vkMapMemory(_device, dst.Memory, 0, (ulong)source.Length, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        if (!dst.IsHostVisible)
+        {
+            using Buffer staging = Allocate(source.Length);
+            UploadToDeviceLocal(source, staging, dst);
+            return;
+        }
+
+        nint mapped = MapMemoryWithRetry(dst.Memory, 0, (ulong)source.Length, "vkMapMemory");
         try
         {
             var destSpan = new Span<byte>((void*)mapped, source.Length);
@@ -1255,14 +2009,36 @@ public sealed class VulkanDevice : IDisposable
     }
 
     /// <summary>Copies from the start of <paramref name="src"/> into <paramref name="destination"/> host memory.</summary>
+    /// <remarks>
+    /// When <paramref name="src"/> is device-local-only (a discrete GPU's VRAM — see
+    /// <see cref="Buffer.IsHostVisible"/>) the host cannot map it, so the bytes are first copied into a
+    /// transient host-visible staging buffer via <c>vkCmdCopyBuffer</c> and that is mapped instead. On
+    /// UMA parts the device-local memory is host-visible, so it is mapped directly (no copy). This is the
+    /// readback mirror of <see cref="UploadToDeviceLocal"/>; the bug it fixes only surfaces on a discrete
+    /// GPU (e.g. the cross-device KV handoff reading a prefill cache out of an RTX 3060's VRAM).
+    /// </remarks>
     public unsafe void Download(Buffer src, Span<float> destination)
     {
+        if (destination.IsEmpty) return;
         long bytes = (long)destination.Length * sizeof(float);
         if (bytes > src.Size)
             throw new ArgumentException("Destination larger than source buffer.", nameof(destination));
 
-        VulkanApi.vkMapMemory(_device, src.Memory, 0, (ulong)bytes, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory");
+        if (!src.IsHostVisible)
+        {
+            // Device-local-only source: stage device → host-visible buffer, then map the staging copy.
+            using Buffer staging = Allocate(bytes);
+            CopyBufferRangeSynchronous(src, staging, srcOffset: 0, dstOffset: 0, size: (ulong)bytes);
+            DownloadHostVisible(staging, destination, bytes);
+            return;
+        }
+
+        DownloadHostVisible(src, destination, bytes);
+    }
+
+    private unsafe void DownloadHostVisible(Buffer src, Span<float> destination, long bytes)
+    {
+        nint mapped = MapMemoryWithRetry(src.Memory, 0, (ulong)bytes, "vkMapMemory");
         try
         {
             var srcSpan = new ReadOnlySpan<float>((void*)mapped, destination.Length);
@@ -1302,8 +2078,214 @@ public sealed class VulkanDevice : IDisposable
     }
 
     // ────────────────────────────────────────────────────────────────
+    // External semaphores (cross-API sync with CUDA — M3 async handoff)
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a binary <c>VkSemaphore</c> that may be exported as a Win32 HANDLE
+    /// of <paramref name="handleType"/> (OPAQUE_WIN32 or D3D12_FENCE) for import
+    /// into CUDA. Requires <see cref="HasExternalSemaphoreWin32"/>; the caller
+    /// owns the returned handle and must release it via <see cref="DestroySemaphore"/>.
+    /// </summary>
+    /// <param name="handleType">The external handle type the semaphore will be exported as.</param>
+    /// <returns>The created <c>VkSemaphore</c> handle.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the external-semaphore-win32 extension.</exception>
+    public unsafe nint CreateExportableSemaphore(
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.OpaqueWin32)
+    {
+        if (!HasExternalSemaphoreWin32)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_external_semaphore_win32 — cannot export a semaphore to CUDA.");
+
+        var exportInfo = new VkExportSemaphoreCreateInfo
+        {
+            sType = VkStructureType.ExportSemaphoreCreateInfo,
+            handleTypes = (uint)ToVkHandleType(handleType),
+        };
+
+        var ci = new VkSemaphoreCreateInfo
+        {
+            sType = VkStructureType.SemaphoreCreateInfo,
+            pNext = (nint)(&exportInfo),
+        };
+
+        VulkanApi.vkCreateSemaphore(_device, ci, 0, out nint semaphore)
+            .ThrowOnError("vkCreateSemaphore (exportable)");
+        return semaphore;
+    }
+
+    /// <summary>
+    /// Exports the Win32 HANDLE for an exportable semaphore created by
+    /// <see cref="CreateExportableSemaphore"/>. The returned HANDLE is owned by
+    /// the caller; once CUDA has imported it (CUDA duplicates the handle on
+    /// import for OPAQUE_WIN32), the caller must <c>CloseHandle</c> this copy.
+    /// </summary>
+    /// <param name="semaphore">The exportable semaphore handle.</param>
+    /// <param name="handleType">Must match the type the semaphore was created with.</param>
+    /// <returns>The Win32 NT HANDLE referencing the semaphore.</returns>
+    public unsafe nint GetSemaphoreWin32Handle(
+        nint semaphore,
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.OpaqueWin32)
+    {
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetSemaphoreWin32HandleKHR");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetSemaphoreWin32HandleKHR not resolvable — extension not enabled at device create.");
+
+        var getInfo = new VkSemaphoreGetWin32HandleInfoKhr
+        {
+            sType = VkStructureType.SemaphoreGetWin32HandleInfoKhr,
+            semaphore = semaphore,
+            handleType = (uint)ToVkHandleType(handleType),
+        };
+
+        var getHandle = Marshal.GetDelegateForFunctionPointer<VkGetSemaphoreWin32HandleKHR>(fn);
+        getHandle(_device, getInfo, out nint handle).ThrowOnError("vkGetSemaphoreWin32HandleKHR");
+        return handle;
+    }
+
+    /// <summary>
+    /// Creates an exportable <b>timeline</b> <c>VkSemaphore</c> for the
+    /// cross-vendor M3 handoff. A timeline semaphore is required for the
+    /// <see cref="ExternalSemaphoreHandleType.D3D12Fence"/> handle type, which is
+    /// the form CUDA can import from an Intel-Arc Vulkan device (the
+    /// <see cref="ExternalSemaphoreHandleType.OpaqueWin32"/> binary form fails
+    /// <c>cuImportExternalSemaphore</c> on the Arc→NVIDIA pairing). The semaphore
+    /// starts at counter value <paramref name="initialValue"/> and is advanced by
+    /// each <see cref="SubmitContext.SubmitAndSignalTimeline"/> call.
+    /// </summary>
+    /// <param name="handleType">External handle type — D3D12_FENCE for the working cross-vendor path.</param>
+    /// <param name="initialValue">Initial timeline counter value (typically 0).</param>
+    /// <returns>The created timeline <c>VkSemaphore</c> handle.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable the external-semaphore-win32 extension.</exception>
+    public unsafe nint CreateExportableTimelineSemaphore(
+        ExternalSemaphoreHandleType handleType = ExternalSemaphoreHandleType.D3D12Fence,
+        ulong initialValue = 0)
+    {
+        if (!HasExternalSemaphoreWin32)
+            throw new InvalidOperationException(
+                "Device does not support VK_KHR_external_semaphore_win32 — cannot export a semaphore to CUDA.");
+
+        // pNext chain: VkSemaphoreCreateInfo -> VkExportSemaphoreCreateInfo -> VkSemaphoreTypeCreateInfo.
+        var typeInfo = new VkSemaphoreTypeCreateInfo
+        {
+            sType = VkStructureType.SemaphoreTypeCreateInfo,
+            semaphoreType = VkSemaphoreType.Timeline,
+            initialValue = initialValue,
+        };
+
+        var exportInfo = new VkExportSemaphoreCreateInfo
+        {
+            sType = VkStructureType.ExportSemaphoreCreateInfo,
+            pNext = (nint)(&typeInfo),
+            handleTypes = (uint)ToVkHandleType(handleType),
+        };
+
+        var ci = new VkSemaphoreCreateInfo
+        {
+            sType = VkStructureType.SemaphoreCreateInfo,
+            pNext = (nint)(&exportInfo),
+        };
+
+        VulkanApi.vkCreateSemaphore(_device, ci, 0, out nint semaphore)
+            .ThrowOnError("vkCreateSemaphore (exportable timeline)");
+        return semaphore;
+    }
+
+    /// <summary>Destroys a semaphore previously created by <see cref="CreateExportableSemaphore"/>.</summary>
+    /// <param name="semaphore">The semaphore handle; no-op when zero.</param>
+    public void DestroySemaphore(nint semaphore)
+    {
+        if (semaphore != 0)
+            VulkanApi.vkDestroySemaphore(_device, semaphore, 0);
+    }
+
+    // Delegate matching vkGetShaderInfoAMD (VK_AMD_shader_info). Resolved
+    // lazily via vkGetDeviceProcAddr after device creation (the extension must
+    // have been enabled at vkCreateDevice) — same pattern as
+    // vkGetSemaphoreWin32HandleKHR above.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private unsafe delegate int VkGetShaderInfoAMD(
+        nint device, nint pipeline, uint shaderStage, int infoType,
+        ref nuint pInfoSize, void* pInfo);
+
+    /// <summary>
+    /// Queries the driver's actual post-compile shader statistics (physical/
+    /// used VGPR and SGPR counts, LDS usage, scratch memory usage) for a
+    /// compiled compute pipeline via <c>VK_AMD_shader_info</c>. Ground-truth
+    /// diagnostic — unlike SPIR-V-level IR inspection, this reflects what the
+    /// driver's own ISA backend actually allocated, including register spill
+    /// and LDS bank layout the SPIR-V disassembly cannot show.
+    /// </summary>
+    /// <param name="pipeline">The <c>VkPipeline</c> handle (e.g. <c>ComputePipeline.Pipeline</c>).</param>
+    /// <param name="shaderStage">Defaults to the compute stage — the only stage dotLLM's compute kernels use.</param>
+    /// <exception cref="InvalidOperationException">Thrown when the device did not enable <c>VK_AMD_shader_info</c> (see <see cref="HasShaderInfoAmd"/>).</exception>
+    /// <exception cref="VulkanException">Thrown when the driver rejects the query (non-AMD driver, wrong pipeline type).</exception>
+    internal unsafe VkShaderStatisticsInfoAmd GetShaderStatisticsAmd(
+        nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        if (!HasShaderInfoAmd)
+            throw new InvalidOperationException(
+                "Device does not support VK_AMD_shader_info — cannot query shader statistics.");
+
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0)
+            throw new VulkanException(-3,
+                "vkGetShaderInfoAMD not resolvable — extension not enabled at device create.");
+
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+
+        VkShaderStatisticsInfoAmd stats = default;
+        nuint infoSize = (nuint)sizeof(VkShaderStatisticsInfoAmd);
+        int r = getShaderInfo(
+            _device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics,
+            ref infoSize, &stats);
+        r.ThrowOnError("vkGetShaderInfoAMD");
+        return stats;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC ONLY (temporary, for the #390-followup investigation): calls
+    /// <c>vkGetShaderInfoAMD</c> with <c>pInfo=null</c> to fetch the driver's
+    /// self-reported required buffer size for <c>VkShaderStatisticsInfoAMD</c>,
+    /// to check it against our assumed C# struct layout (<c>sizeof</c> should
+    /// be 72 bytes per the Vulkan spec's C struct).
+    /// </summary>
+    internal unsafe int GetShaderInfoAmdReportedSize(nint pipeline, uint shaderStage = VkShaderStageFlags.Compute)
+    {
+        nint fn = VulkanApi.vkGetDeviceProcAddr(_device, "vkGetShaderInfoAMD");
+        if (fn == 0) throw new VulkanException(-3, "vkGetShaderInfoAMD not resolvable.");
+        var getShaderInfo = Marshal.GetDelegateForFunctionPointer<VkGetShaderInfoAMD>(fn);
+        nuint size = 0;
+        int r = getShaderInfo(_device, pipeline, shaderStage, VkShaderInfoTypeAmd.Statistics, ref size, null);
+        r.ThrowOnError("vkGetShaderInfoAMD (size query)");
+        return (int)size;
+    }
+
+    // Maps the public handle-type enum to the internal interop flag bits.
+    private static VkExternalSemaphoreHandleTypeFlags ToVkHandleType(ExternalSemaphoreHandleType t) => t switch
+    {
+        ExternalSemaphoreHandleType.OpaqueWin32 => VkExternalSemaphoreHandleTypeFlags.OpaqueWin32,
+        ExternalSemaphoreHandleType.D3D12Fence => VkExternalSemaphoreHandleTypeFlags.D3D12Fence,
+        _ => throw new ArgumentOutOfRangeException(nameof(t), t, "Unsupported external semaphore handle type."),
+    };
+
+    // ────────────────────────────────────────────────────────────────
     // Forward-pass command submission
     // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Hazard-scoped barrier tracker armed for the recording currently in
+    /// progress on this device (issue #144), or <c>null</c> when the legacy
+    /// blanket-barrier scheme is in effect. Armed by
+    /// <see cref="VulkanTransformerModel"/> right after
+    /// <see cref="SubmitContext.Begin"/> on its tracked forward path;
+    /// disarmed automatically by every <see cref="SubmitContext"/>
+    /// begin/submit so an aborted recording can never leak tracking into an
+    /// unrelated model's command buffer. Recording is single-threaded per
+    /// device, so a plain field suffices.
+    /// </summary>
+    internal VulkanHazardTracker? ActiveHazards;
 
     /// <summary>
     /// Reusable command-buffer + fence pair used by the fence-pipelined
@@ -1334,6 +2316,10 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public void Begin()
         {
+            // A fresh recording always starts untracked; the model re-arms
+            // the hazard tracker for its tracked path after Begin returns.
+            _device.ActiveHazards = null;
+            _splitThisForward = false;
             VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer");
             var begin = new VkCommandBufferBeginInfo
             {
@@ -1350,6 +2336,7 @@ public sealed class VulkanDevice : IDisposable
         /// </summary>
         public unsafe void SubmitAndWait()
         {
+            _device.ActiveHazards = null;
             VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer");
 
             nint cmdBufLocal = _cmdBuf;
@@ -1365,6 +2352,169 @@ public sealed class VulkanDevice : IDisposable
             VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
                 .ThrowOnError("vkWaitForFences SubmitContext");
             VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences SubmitContext");
+        }
+
+        // Lazily-allocated second command buffer for SplitSubmit. At most ONE
+        // split per Begin/SubmitAndWait cycle: with two buffers, a second split
+        // would reset a buffer submitted earlier in the SAME forward (no fence
+        // yet) — guarded below.
+        private nint _cmdBufAlt;
+        private bool _splitThisForward;
+
+        /// <summary>
+        /// Mid-forward split: ends and submits everything recorded so far
+        /// WITHOUT a fence or host wait, then re-opens recording on a second
+        /// command buffer. The GPU starts executing the first chunk while the
+        /// host keeps recording — llama.cpp's chunked-submit overlap (issue
+        /// #143: hides most of the ~0.2-0.3 ms/token host recording cost on
+        /// small models). Queue-timeline pipeline barriers already recorded
+        /// (and recorded later) synchronize across the submit boundary, so the
+        /// dependency chain is unchanged — results are bit-identical.
+        /// At most one split per forward; the final <see cref="SubmitAndWait"/>
+        /// fence covers both submissions (same-queue ordering), so both
+        /// buffers are idle by the next <see cref="Begin"/>.
+        /// </summary>
+        public unsafe void SplitSubmit()
+        {
+            if (_splitThisForward)
+                throw new InvalidOperationException(
+                    "SplitSubmit may be called at most once per forward (two-buffer ring).");
+            _splitThisForward = true;
+
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SplitSubmit");
+            nint cmdBufLocal = _cmdBuf;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, fence: 0)
+                .ThrowOnError("vkQueueSubmit SplitSubmit");
+
+            if (_cmdBufAlt == 0)
+            {
+                var cbai = new VkCommandBufferAllocateInfo
+                {
+                    sType = VkStructureType.CommandBufferAllocateInfo,
+                    commandPool = _device._commandPool,
+                    level = VkCommandBufferLevel.Primary,
+                    commandBufferCount = 1,
+                };
+                VulkanApi.vkAllocateCommandBuffers(_device._device, cbai, out _cmdBufAlt)
+                    .ThrowOnError("vkAllocateCommandBuffers SplitSubmit");
+            }
+
+            (_cmdBuf, _cmdBufAlt) = (_cmdBufAlt, _cmdBuf);
+            VulkanApi.vkResetCommandBuffer(_cmdBuf, 0).ThrowOnError("vkResetCommandBuffer SplitSubmit");
+            var begin = new VkCommandBufferBeginInfo
+            {
+                sType = VkStructureType.CommandBufferBeginInfo,
+                flags = VkCommandBufferUsageFlags.OneTimeSubmit,
+            };
+            VulkanApi.vkBeginCommandBuffer(_cmdBuf, begin).ThrowOnError("vkBeginCommandBuffer SplitSubmit");
+
+            // Keep the hazard tracker (issue #144) pointed at the live buffer.
+            // Epoch state carries across the chunk boundary: pipeline barriers
+            // synchronize prior command buffers in same-queue submission order.
+            _device.ActiveHazards?.OnCommandBufferSwitch(_cmdBuf);
+        }
+
+        /// <summary>
+        /// Ends the command buffer and submits it on the queue with
+        /// <paramref name="signalSemaphore"/> in <c>pSignalSemaphores</c>, so the
+        /// semaphore signals once the GPU finishes this submission. Does NOT wait
+        /// on the host fence — the consumer (CUDA, via
+        /// <c>cuWaitExternalSemaphoresAsync</c>) gates on the semaphore instead.
+        /// This is the M3 async-handoff submit: it removes the host fence-wait
+        /// stall that serialized the M2 path.
+        /// </summary>
+        /// <param name="signalSemaphore">An exportable semaphore the GPU signals on completion.</param>
+        /// <remarks>
+        /// The fence is still passed to <c>vkQueueSubmit</c> so the host can
+        /// reclaim the command buffer on the next <see cref="Begin"/> (which
+        /// resets it). Callers that reuse the buffer across overlapping steps
+        /// must double-buffer the <see cref="SubmitContext"/> — a single binary
+        /// semaphore + single command buffer cannot overlap two in-flight
+        /// submissions.
+        /// </remarks>
+        public unsafe void SubmitAndSignal(nint signalSemaphore)
+        {
+            _device.ActiveHazards = null;
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignal");
+
+            nint cmdBufLocal = _cmdBuf;
+            nint semLocal = signalSemaphore;
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = (nint)(&semLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
+                .ThrowOnError("vkQueueSubmit SubmitAndSignal");
+        }
+
+        /// <summary>
+        /// Ends the command buffer and submits it with a <b>timeline</b> signal:
+        /// <paramref name="signalSemaphore"/> is advanced to
+        /// <paramref name="signalValue"/> once the GPU finishes this submission.
+        /// CUDA gates on the same (semaphore, value) pair via
+        /// <c>cuWaitExternalSemaphoresAsync</c>. Does NOT host-wait on the fence —
+        /// this is the M3 async-handoff submit for the cross-vendor D3D12_FENCE path.
+        /// </summary>
+        /// <param name="signalSemaphore">An exportable timeline semaphore.</param>
+        /// <param name="signalValue">The counter value to signal on GPU completion (must exceed the prior signalled value).</param>
+        /// <remarks>
+        /// The fence is still passed so the host can reclaim the command buffer on
+        /// the next <see cref="Begin"/>. Overlapping in-flight submissions require a
+        /// double-buffered <see cref="SubmitContext"/> ring — one command buffer +
+        /// fence cannot host two simultaneous submissions even with a timeline
+        /// semaphore (the fence and command buffer are still single-use-at-a-time).
+        /// </remarks>
+        public unsafe void SubmitAndSignalTimeline(nint signalSemaphore, ulong signalValue)
+        {
+            _device.ActiveHazards = null;
+            VulkanApi.vkEndCommandBuffer(_cmdBuf).ThrowOnError("vkEndCommandBuffer SubmitAndSignalTimeline");
+
+            nint cmdBufLocal = _cmdBuf;
+            nint semLocal = signalSemaphore;
+            ulong signalValueLocal = signalValue;
+
+            var timelineInfo = new VkTimelineSemaphoreSubmitInfo
+            {
+                sType = VkStructureType.TimelineSemaphoreSubmitInfo,
+                signalSemaphoreValueCount = 1,
+                pSignalSemaphoreValues = (nint)(&signalValueLocal),
+            };
+
+            var submit = new VkSubmitInfo
+            {
+                sType = VkStructureType.SubmitInfo,
+                pNext = (nint)(&timelineInfo),
+                commandBufferCount = 1,
+                pCommandBuffers = (nint)(&cmdBufLocal),
+                signalSemaphoreCount = 1,
+                pSignalSemaphores = (nint)(&semLocal),
+            };
+            VulkanApi.vkQueueSubmit(_device._queue, 1, submit, _fence)
+                .ThrowOnError("vkQueueSubmit SubmitAndSignalTimeline");
+        }
+
+        /// <summary>
+        /// Host-waits on the fence from a prior <see cref="SubmitAndSignal"/> and
+        /// resets it for reuse. Call before the next <see cref="Begin"/> when the
+        /// previous submission did not host-wait, to guarantee the command buffer
+        /// is no longer in flight before it is reset.
+        /// </summary>
+        public unsafe void WaitFence()
+        {
+            nint fenceLocal = _fence;
+            VulkanApi.vkWaitForFences(_device._device, 1, fenceLocal, waitAll: 1, ulong.MaxValue)
+                .ThrowOnError("vkWaitForFences WaitFence");
+            VulkanApi.vkResetFences(_device._device, 1, fenceLocal).ThrowOnError("vkResetFences WaitFence");
         }
 
         /// <inheritdoc/>
@@ -1383,6 +2533,12 @@ public sealed class VulkanDevice : IDisposable
                 nint local = _cmdBuf;
                 VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
                 _cmdBuf = 0;
+            }
+            if (_cmdBufAlt != 0)
+            {
+                nint local = _cmdBufAlt;
+                VulkanApi.vkFreeCommandBuffers(_device._device, _device._commandPool, 1, local);
+                _cmdBufAlt = 0;
             }
         }
     }
@@ -1417,6 +2573,26 @@ public sealed class VulkanDevice : IDisposable
 
         return new SubmitContext(this, cmdBuf, fence);
     }
+}
+
+/// <summary>
+/// External-semaphore handle type for the Vulkan→CUDA M3 async handoff. Selects
+/// which Win32 NT-handle flavour the exportable semaphore is created and exported
+/// as; the same type must be passed to CUDA's <c>cuImportExternalSemaphore</c>.
+/// </summary>
+public enum ExternalSemaphoreHandleType
+{
+    /// <summary>
+    /// Opaque Win32 NT handle (<c>VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT</c>).
+    /// Works when the same handle semantics are understood by both APIs on Windows.
+    /// </summary>
+    OpaqueWin32,
+
+    /// <summary>
+    /// Direct3D 12 fence handle (<c>VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT</c>).
+    /// The cross-vendor-portable Win32 fence both Intel Vulkan and NVIDIA CUDA accept.
+    /// </summary>
+    D3D12Fence,
 }
 
 /// <summary>

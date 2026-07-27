@@ -184,7 +184,7 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
             var m = TransformerModel.LoadFromSafetensors(file, config);
             m.Dispose();
         });
-        Assert.Contains("self_attn.q_proj.weight", ex.Message);
+        Assert.Contains("self_attn.q_proj.weight", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -677,7 +677,7 @@ public sealed class TransformerSafetensorsLoadTests : IDisposable
 
         // Index: all layer-0 + globals → shard1; layer-1 → shard2.
         string indexPath = Path.Combine(_scratch, "model.safetensors.index.json");
-        var weightMap = new Dictionary<string, string>
+        var weightMap = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["model.embed_tokens.weight"] = "model-00001-of-00002.safetensors",
             ["model.norm.weight"]         = "model-00001-of-00002.safetensors",

@@ -3,7 +3,9 @@ using System.Buffers;
 using System.Numerics.Tensors;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Lora;
 using DotLLM.Core.Models;
+using DotLLM.Core.PositionEncoding;
 using DotLLM.Core.Tensors;
 using DotLLM.Cuda.Interop;
 using DotLLM.Models.Architectures;
@@ -33,6 +35,62 @@ public sealed unsafe class CudaTransformerModel : IModel
     private readonly int _ropeType;
     private readonly bool _useHighPrecisionForward;
 
+    /// <summary>
+    /// Number of loader-owned host allocations that were stream-freed (released as
+    /// soon as their host→device copy completed, rather than at
+    /// <see cref="TransformerWeights.Dispose"/>) during the most recent load on the
+    /// direct-to-device path. Zero when the host weights were retained for a CPU-side
+    /// forward (high-precision I-quant / Gemma-4), for a pure-mmap GGUF load where the
+    /// per-layer projections are mmap views (nothing owned to free), or for the hybrid /
+    /// pipeline paths (which retain the host bundle). Diagnostic only.
+    /// </summary>
+    internal static int LastLoadStreamedHostFreeCount { get; private set; }
+
+    // ── Gemma-4 (DiffusionGemma AR) per-attention-type rope params ──
+    // Sliding (SWA) layers use _ropeTheta/_ropeDim (full NeoX rotation over the
+    // sliding head dim). Global (full-attention) layers use _gemma4GlobalRopeTheta
+    // and a PARTIAL NeoX rotation of _gemma4GlobalRotatedPairs pairs, coupling
+    // (i, i + GlobalHeadDim/2), with the freq base over the full GlobalHeadDim.
+    // Computed once in the ctor; mirror of TransformerModel's GetLayerRope.
+    private readonly bool _isGemma4;
+    private readonly float _gemma4GlobalRopeTheta;
+    private readonly int _gemma4GlobalRotatedPairs;
+    private readonly float _gemma4FinalSoftcap;
+
+    // Launch-ceiling profiling (env DOTLLM_PROFILE_LAUNCH=1).
+    // Measures CPU-side kernel-dispatch time (queue all launches, no GPU wait) vs the full
+    // forward including the single _stream.Synchronize(). Zero-cost when the env var is unset.
+    private static readonly bool s_profileLaunch =
+        Environment.GetEnvironmentVariable("DOTLLM_PROFILE_LAUNCH") == "1";
+    private long _profDispatchTicks;   // accumulated dispatch-only ticks (decode steps)
+    private long _profTotalTicks;      // accumulated total forward ticks (decode steps)
+    private int _profSteps;            // counted steady-state decode steps
+    private int _profWarmupSkipped;    // warmup decode steps skipped before accumulation
+    private const int ProfWarmupSteps = 10; // skip first N decode steps (lazy alloc/JIT)
+    private static readonly bool s_i2sA8Decode =
+        Environment.GetEnvironmentVariable("DOTLLM_CUDA_I2S_A8") == "1";
+
+    // LoRA adapter staging — set by the 5-arg Forward overload. Read in the layer
+    // loop to gate fused decode kernels off and apply the per-projection delta.
+    private ILoraAdapter? _currentAdapter;
+    private CudaLoraWeights? _cudaLora;
+
+    /// <summary>
+    /// Steady-state status of the single-token decode CUDA graph (last decode step). Diagnostic only.
+    /// </summary>
+    public CudaDecodeGraphState DecodeGraphState { get; private set; } = CudaDecodeGraphState.None;
+
+    // G3 tensor-core prefill-attention path (cuBLAS QK/PV + coalesced causal softmax).
+    // Owns the grow-on-demand scores scratch; used only when CudaG3Attention.CanUse(...)
+    // confirms a pure square-causal global-attention prefill. Otherwise attention_f16.
+    private readonly CudaG3Attention _g3Attention;
+
+    // G-flash long-context prefill-attention path (hand-fused mma.sync flash kernel). Used
+    // ahead of G3 when CudaFlashAttention.CanUse(...) confirms a long-enough (s >= crossover)
+    // pure square-causal global prefill at the prototype head shape (headDim 64). Otherwise
+    // the dispatch falls through to G3, then attention_f16.
+    private readonly CudaFlashAttention _flashAttention;
+
     /// <inheritdoc/>
     public ModelConfig Config { get; }
 
@@ -50,6 +108,17 @@ public sealed unsafe class CudaTransformerModel : IModel
 
     /// <summary>Debug: skip bias add operations.</summary>
     internal bool DebugSkipBias { get; set; }
+
+    /// <summary>
+    /// Debug: when &gt;= 0, copy the row-major attention output ([seqLen × numHeads·headDim])
+    /// of this layer index into <see cref="DebugAttnOutputCapture"/> right after the
+    /// attention dispatch. Used to isolate G3-vs-attention_f16 parity at the attention
+    /// output (before downstream O-proj/FFN/LM-head amplification). -1 disables.
+    /// </summary>
+    internal int DebugCaptureAttnLayer { get; set; } = -1;
+
+    /// <summary>Debug: host copy of the captured attention output (FP16 bits). Null until captured.</summary>
+    internal ushort[]? DebugAttnOutputCapture { get; private set; }
 
     /// <summary>
     /// When true, <see cref="Forward(ReadOnlySpan{int}, ReadOnlySpan{int}, int, IKvCache?)"/>
@@ -144,6 +213,19 @@ public sealed unsafe class CudaTransformerModel : IModel
     private int _moeStagingCapacityElems;
     private CudaMoeScratch? _moeScratch;
 
+    // F32 gemma4 dual-FFN scratch: dense-branch result, MoE-branch result, and the
+    // custom-router input (rms(attn_out)·RouterScale·1/√H). Sized [seqLen × hidden].
+    private nint _gemma4DenseF32;
+    private nint _gemma4MoeF32;
+    private nint _gemma4RouterInF32;
+    private int _gemma4ScratchCapacityElems;
+
+    // Scratch for the per-projection activation Q8_0 round-trip (matches the CPU
+    // oracle's on-the-fly activation quantization). Sized to the largest projection
+    // input the gemma4 forward feeds (hidden or the attn-output width).
+    private nint _gemma4ActScratchF32;
+    private int _gemma4ActScratchElems;
+
     // ── per-category profiling state (only allocated when ProfilingEnabled is set) ──
     internal const int ProfileCategoryCount = 12;
     private nint[]? _profEvents;        // event pool, allocated lazily
@@ -187,8 +269,31 @@ public sealed unsafe class CudaTransformerModel : IModel
         _ropeDim = ropeDim;
         VramWarning = vramWarning;
         _ropeType = ropeType;
+
+        // ── Gemma-4 per-attention-type rope (global layers: partial NeoX) ──
+        _isGemma4 = weights.Gemma4Layers is not null;
+        if (_isGemma4 && config.GlobalRoPEConfig is RoPEConfig gcfg)
+        {
+            int baseDim = gcfg.DimensionCount > 0
+                ? gcfg.DimensionCount
+                : (config.GlobalHeadDim ?? config.HeadDim);
+            float prf = config.PartialRotaryFactor ?? 1.0f;
+            int rotated = (int)MathF.Floor(prf * baseDim);
+            rotated &= ~1;                       // round down to even (RoPE rotates pairs)
+            if (rotated < 2) rotated = 2;
+            rotated = Math.Min(rotated, config.GlobalHeadDim ?? config.HeadDim);
+            _gemma4GlobalRotatedPairs = rotated / 2;
+            _gemma4GlobalRopeTheta = gcfg.Theta;
+        }
+        _gemma4FinalSoftcap = config.FinalLogitSoftcap ?? 0f;
+
+        _g3Attention = new CudaG3Attention(kernels);
+        _flashAttention = new CudaFlashAttention(kernels);
         _useHighPrecisionForward = ShouldUseHighPrecisionForward(weights);
-        if (_useHighPrecisionForward)
+        // The gemma4 forward runs the F32 path and uses the host LM head (the tied
+        // vocab x hidden table is too large to expand to F32 device scratch), so it
+        // also needs the CPU weights retained.
+        if (_useHighPrecisionForward || _isGemma4)
         {
             _cpuWeights = cpuWeights;
         }
@@ -266,6 +371,18 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static CudaTransformerModel LoadFromSafetensors(ISafetensorsTensorSource file,
                                                               ModelConfig config,
                                                               int deviceId = 0, string? ptxDir = null)
+        => LoadFromSafetensors(file, config, deviceId, ptxDir, i2sCache: null);
+
+    /// <summary>
+    /// Safetensors CUDA load with an optional BitNet I2_S weight cache. The cache is consumed by
+    /// the shared CPU weight-production path (<see cref="TransformerWeightsSafetensorsLoader"/>)
+    /// before the resulting ternary-packed tensors are uploaded to the GPU, so repeated BitNet
+    /// loads skip the online bf16→I2_S quantization on CUDA just as on CPU.
+    /// </summary>
+    internal static CudaTransformerModel LoadFromSafetensors(ISafetensorsTensorSource file,
+                                                              ModelConfig config,
+                                                              int deviceId, string? ptxDir,
+                                                              BitNetI2SCacheContext? i2sCache)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -275,7 +392,7 @@ public sealed unsafe class CudaTransformerModel : IModel
         // concern, not a GPU one) — CudaWeights.LoadFromGguf reads the raw tensor
         // pointers and uploads them. The misleading method name stays for now; the
         // underlying flow is source-agnostic.
-        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config);
+        var cpuWeights = TransformerWeightsSafetensorsLoader.Load(file, config, i2sCache);
 
         // VRAM estimate: skip for the safetensors path for now — TransformerWeights
         // doesn't expose per-tensor byte sizes cheaply, and the CPU pre-load above
@@ -342,11 +459,82 @@ public sealed unsafe class CudaTransformerModel : IModel
                           $"Consider a smaller model or quantization format.";
         }
 
-        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle);
+        // ── Direct-to-device weight streaming ──
+        // On the quantized/BitNet path the CPU weights are disposed immediately after
+        // upload (see the ctor), so we can free each owned host scratch buffer (bf16→F32
+        // upcasts, I2_S packed) as soon as its synchronous H2D copy completes, instead of
+        // holding the whole host TransformerWeights resident through the entire upload.
+        // That roughly halves the transient CPU-RAM peak (host copy + device copy no longer
+        // coexist for the full model). We MUST disable it whenever the host weights will be
+        // retained for a CPU-side forward — the high-precision I-quant path and Gemma-4's
+        // host LM head both read those host buffers later. WillRetainHostWeights is a
+        // conservative superset of the ctor's retain decision (it ignores the
+        // EnableHighPrecisionIQuants env gate), so we never stream-free a buffer the forward
+        // might read.
+        int streamedFreeCount = 0;
+        Action<nint>? onHostTensorUploaded = null;
+        if (!WillRetainHostWeights(cpuWeights, config))
+        {
+            onHostTensorUploaded = ptr =>
+            {
+                if (cpuWeights.TryReleaseOwnedHostAllocation(ptr))
+                    streamedFreeCount++;
+            };
+        }
+
+        var weights = CudaWeights.LoadFromGguf(cpuWeights, config, kernels, stream.Handle,
+            onHostTensorUploaded: onHostTensorUploaded);
+        LastLoadStreamedHostFreeCount = streamedFreeCount;
+
+        // Gemma-4 full-attention (global) layers may use a distinct head dim and
+        // KV-head count (GlobalHeadDim / NumGlobalKvHeads). Size the Q/K/V scratch
+        // for the LARGER of the sliding and global layer types so a single
+        // allocation covers both; per-layer dispatch uses the layer's own dims.
+        int stateHeadDim = Math.Max(config.HeadDim, config.GlobalHeadDim ?? config.HeadDim);
+        int stateKvHeads = Math.Max(config.NumKvHeads, config.NumGlobalKvHeads ?? config.NumKvHeads);
+
+        // BitNet's residual stream exceeds FP16 range in deep layers, so it carries the
+        // residual in FP32 (overflow→NaN otherwise).
+        bool useFp32Residual = config.Architecture == Architecture.BitNet;
+
+        // G1: default the FP16-accumulate prefill GEMM on for GeForce Ampere with quantized weights —
+        // validated quality-safe (decode-mode perplexity ±0.000%, prefill −0.079% on Llama-3.2-1B Q8_0)
+        // and ~1.06–1.22× faster whole-prefill there. Off elsewhere: datacenter Ampere doesn't throttle
+        // FP32 accumulate (no win), and 16F decode-GEMV for non-quant weights is unvalidated (quant
+        // decode is integer, so 16F never touches it). DOTLLM_CUDA_GEMM_16F overrides ("1"/"0").
+        // BitNet excluded: its prefill dequantizes I2_S → F16 and routes through CudaGemm.LinearF16,
+        // but its activations/residual exceed FP16 range (the model carries the residual in FP32 for
+        // exactly this reason), so FP16-accumulate prefill GEMM is unvalidated and risks overflow.
+        var device = CudaDevice.GetDevice(deviceId);
+        bool geForceAmpere = device.ComputeCapabilityMajor == 8
+            && device.Name.Contains("GeForce", StringComparison.OrdinalIgnoreCase);
+        // Turing (sm_75 — Tesla T4 / RTX 20xx): the G3 cuBLAS tensor-core prefill-attention path is a
+        // large prefill win here too — measured ~3.15× (2072→6535 prefill tok/s) on a Tesla T4 with
+        // Llama-3.2-1B Q4_K_M @ 601-token prompt (#362). G1 (FP16-accumulate GEMM) showed NO T4 benefit
+        // and G-flash emits Ampere-only mma.sync, so ONLY G3 is extended to Turing (G1/G-flash unchanged).
+        bool turing = device.ComputeCapabilityMajor == 7 && device.ComputeCapabilityMinor >= 5;
+        bool quantizedWeights = weights.Layers.Length > 0
+            && weights.Layers[0].QQuantType is not (QuantizationType.F32 or QuantizationType.F16);
+        CudaGemm.ConfigureDefault(
+            geForceAmpere && quantizedWeights && config.Architecture != Architecture.BitNet);
+
+        // G3: default the tensor-core prefill-attention path on for GeForce Ampere — the
+        // parts whose FP32-accumulate CUDA-core attention is throttled to ~half rate.
+        // Independent of weight quantization (attention runs on FP16 Q/K/V regardless).
+        // DOTLLM_CUDA_G3_ATTN overrides ("1"/"0"). Gating to a pure square-causal global
+        // prefill happens per-call in CudaG3Attention.CanUse.
+        CudaG3Attention.ConfigureDefault(geForceAmpere || turing);
+
+        // G-flash: default the hand-fused mma.sync long-context prefill kernel on for the
+        // same GeForce Ampere parts (it emits Ampere-only mma.sync PTX). It is dispatched
+        // ahead of G3 only for long-context prefill at the prototype head shape; shorter
+        // sequences keep G3. DOTLLM_CUDA_FLASH_ATTN overrides ("1"/"0"); the crossover is
+        // DOTLLM_CUDA_FLASH_ATTN_MINSEQ. Per-call gating in CudaFlashAttention.CanUse.
+        CudaFlashAttention.ConfigureDefault(geForceAmpere);
 
         var state = new CudaForwardState(
-            config.HiddenSize, config.NumAttentionHeads, config.NumKvHeads,
-            config.HeadDim, config.IntermediateSize, config.VocabSize);
+            config.HiddenSize, config.NumAttentionHeads, stateKvHeads,
+            stateHeadDim, config.IntermediateSize, config.VocabSize, useFp32Residual);
 
         int ropeDim = config.RoPEConfig?.DimensionCount ?? config.HeadDim;
         if (ropeDim == 0) ropeDim = config.HeadDim;
@@ -469,12 +657,46 @@ public sealed unsafe class CudaTransformerModel : IModel
         _moeStagingCapacityElems = needed;
     }
 
+    /// <summary>
+    /// Lazily (re)allocates the gemma4 dual-FFN F32 scratch (dense result, MoE
+    /// result, custom-router input), each sized <c>[seqLen × hidden]</c>. Also
+    /// ensures the shared MoE staging input buffer (<see cref="_moeStagingInF32"/>)
+    /// exists — the gemma4 MoE branch reuses it as the expert input.
+    /// </summary>
+    private void EnsureGemma4Staging(int seqLen, int hiddenSize)
+    {
+        EnsureMoeStaging(seqLen, hiddenSize);
+        int needed = seqLen * hiddenSize;
+        if (_gemma4ScratchCapacityElems >= needed) return;
+
+        if (_gemma4DenseF32 != 0) CudaDriverApi.cuMemFree_v2(_gemma4DenseF32);
+        if (_gemma4MoeF32 != 0) CudaDriverApi.cuMemFree_v2(_gemma4MoeF32);
+        if (_gemma4RouterInF32 != 0) CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32);
+        long bytes = (long)needed * sizeof(float);
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4DenseF32, (nuint)bytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4MoeF32, (nuint)bytes).ThrowOnError();
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4RouterInF32, (nuint)bytes).ThrowOnError();
+        _gemma4ScratchCapacityElems = needed;
+    }
+
     /// <inheritdoc/>
     public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
                            int deviceId, IKvCache? kvCache)
     {
         bool isMla = _weights.MlaLayers is not null;
         bool isMoe = _weights.MoeLayers is not null;
+        bool isBitNet = Config.Architecture == Architecture.BitNet;
+
+        // Gemma-4 (DiffusionGemma AR) — dedicated F32 forward. AR only (no KV cache
+        // on CUDA yet; the cacheless path covers single-shot / short-context decode).
+        if (_isGemma4)
+        {
+            if (kvCache is not null)
+                throw new NotSupportedException(
+                    "CUDA gemma4 forward is cacheless (autoregressive, no KV cache yet). "
+                    + "Pass kvCache: null. KV-cache support is a follow-up.");
+            return ForwardGemma4(tokenIds, positions, deviceId);
+        }
 
         if (_useHighPrecisionForward && kvCache is null && !isMla && !isMoe)
         {
@@ -492,7 +714,9 @@ public sealed unsafe class CudaTransformerModel : IModel
             && tokenIds.Length == 1
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled            // event injection between launches breaks capture
-            && !isMla && !isMoe)
+            && !isMla && !isMoe
+            && !isBitNet                    // dev's generic capture body omits BitNet's FP32 residual, Sub-LN and relu² — replaying it on BitNet produces garbage
+            && _currentAdapter is null)     // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
         {
             if (kvCache is CudaKvCache stdKv)
             {
@@ -528,6 +752,10 @@ public sealed unsafe class CudaTransformerModel : IModel
         nint s = _stream.Handle;
         nint cublasH = _cublas.Handle;
 
+        // Profiling is only meaningful for the single-token decode step.
+        bool profile = s_profileLaunch && seqLen == 1;
+        long dispatchStartTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+
         _state.EnsureCapacity(seqLen);
 
         if (ProfilingEnabled)
@@ -548,6 +776,12 @@ public sealed unsafe class CudaTransformerModel : IModel
             CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
                 (nuint)(seqLen * sizeof(int))).ThrowOnError();
 
+        // Decode CUDA-graph capture/replay is handled by dev's dedicated
+        // ForwardDecodeGraph / ForwardDecodeGraphQuantized early-return path
+        // (dispatched near the top of this method when UseGraphCapture is on).
+        // This straight-through body runs without graph wrapping; it serves prefill,
+        // BitNet I2_S decode, and adapter-active decode (all graph-ineligible).
+
         // 2. Embedding lookup → FP16 HiddenState
         _kernels.LaunchEmbeddingLookup(
             _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
@@ -555,12 +789,19 @@ public sealed unsafe class CudaTransformerModel : IModel
             seqLen, hiddenSize, s);
         MarkProfile(ProfileCategory.Embed);
 
+        // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504 ceiling).
+        bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
+
         // 3. Layer 0 setup: copy hidden→residual; on the GQA path also
         //    pre-RmsNorm into NormOutput. The MLA path skips the pre-norm —
         //    CudaMlaAttention.ForwardF16 applies its own input RMSNorm internally,
-        //    and consumes the raw hidden state from Residual.
+        //    and consumes the raw hidden state from Residual. BitNet carries the
+        //    residual in FP32 (LaunchCopyF16ToF32 into ResidualF32).
         long hiddenBytes = (long)seqLen * hiddenSize * h;
-        CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
+        if (fp32Res)
+            _kernels.LaunchCopyF16ToF32(_state.HiddenState, _state.ResidualF32, seqLen * hiddenSize, s);
+        else
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
         if (!isMla)
         {
             _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
@@ -583,8 +824,10 @@ public sealed unsafe class CudaTransformerModel : IModel
             _ => Math.Min(DebugMaxLayers, Config.NumLayers)
         };
 
-        // When skipping all layers, treat embedding output as final hidden state
-        if (numLayers == 0)
+        // When skipping all layers, treat embedding output as final hidden state.
+        // (HiddenState already holds the embedding; with FP16 residual we restore from the
+        // residual copy, with FP32 residual HiddenState is already correct so nothing to do.)
+        if (numLayers == 0 && !fp32Res)
         {
             CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
         }
@@ -592,6 +835,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         for (int layer = 0; layer < numLayers; layer++)
         {
             ref readonly var lw = ref _weights.Layers[layer];
+
+            // When a LoRA adapter is active, every fused decode kernel below is bypassed.
+            // Declared at the top of the loop (before the MLA `goto FfnBlock`) so it is
+            // definitely assigned on every path that reaches the FFN gate/up gating.
+            bool adapterActive = _currentAdapter is not null;
 
             // ── ATTENTION BLOCK ──
             // MLA path: CudaMlaAttention.ForwardF16 absorbs the entire QKV/RoPE/
@@ -641,15 +889,35 @@ public sealed unsafe class CudaTransformerModel : IModel
                 goto FfnBlock;
             }
 
-            // Q/K/V projections. For decode (seqLen=1) with a pre-packed quantized
-            // QKV weight, one fused GEMV produces [n_q|n_kv|n_kv] contiguously in
-            // _state.QkvPacked; downstream kernels take pointers so they can read
-            // slices directly. For prefill or mixed-quant fallback, keep the 3-call
-            // path. Aliases qPtr/kPtr/vPtr hide the path choice from the rest of
-            // the layer body.
+            // adapterActive (declared at the top of this layer loop) gates the fused
+            // decode kernels below so the LoRA delta lands against the SAME intermediate
+            // buffers the CPU path uses (see TransformerModel.cs). When no adapter is
+            // active this is byte-for-byte the existing decode path.
+
+            // ── ATTENTION BLOCK (NormOutput has normalized input) ──
+            // Q/K/V projections. Decode dispatch order:
+            //  1. I2_S (BitNet) fused 3-way GEMV → _state.Q/K/V (no adapter, no A8 mode)
+            //  2. Pre-packed quantized QKV (dev) → one fused GEMV into _state.QkvPacked
+            //  3. Fallback: three separate Project calls → _state.Q/K/V
+            // Aliases qPtr/kPtr/vPtr hide the path choice from the rest of the layer body.
+            // An active adapter forces the unfused (_state.Q/K/V) path so LoRA deltas land
+            // on the same intermediate buffers as the CPU path.
             nint qPtr, kPtr, vPtr;
-            bool fusedQkv = seqLen == 1 && lw.QkvPacked != 0;
-            if (fusedQkv)
+            bool fusedI2SQkv = !adapterActive && !s_i2sA8Decode
+                && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+                    lw.QInputDim, lw.KInputDim, lw.VInputDim);
+            bool fusedQkv = !adapterActive && !fusedI2SQkv && seqLen == 1 && lw.QkvPacked != 0;
+            if (fusedI2SQkv)
+            {
+                _kernels.LaunchI2_SGemv3F16In(
+                    lw.QQuant, lw.KQuant, lw.VQuant, _state.NormOutput,
+                    _state.Q, _state.K, _state.V,
+                    lw.QOutputDim, lw.KOutputDim, lw.VOutputDim, lw.QInputDim, s);
+                qPtr = _state.Q;
+                kPtr = _state.K;
+                vPtr = _state.V;
+            }
+            else if (fusedQkv)
             {
                 if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
                 {
@@ -683,6 +951,17 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (lw.QBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(qPtr, lw.QBias, lw.QOutputDim, seqLen, s);
             if (lw.KBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(kPtr, lw.KBias, lw.KOutputDim, seqLen, s);
             if (lw.VBias != 0 && !DebugSkipBias) _kernels.LaunchBiasAdd(vPtr, lw.VBias, lw.VOutputDim, seqLen, s);
+
+            // LoRA delta (q/k/v): y += scale · (NormOutput · B) · A. Applied AFTER bias and
+            // BEFORE QK-norm + RoPE, mirroring TransformerModel.cs:298-300. x = NormOutput
+            // (the projection input), y = Q/K/V (the raw projection output). No-op for
+            // projections the adapter does not target (ApplyLoraDeltaDevice early-returns).
+            if (adapterActive)
+            {
+                ApplyLoraDeltaDevice(layer, "q_proj", _state.NormOutput, _state.Q, seqLen);
+                ApplyLoraDeltaDevice(layer, "k_proj", _state.NormOutput, _state.K, seqLen);
+                ApplyLoraDeltaDevice(layer, "v_proj", _state.NormOutput, _state.V, seqLen);
+            }
 
             // Optional QK-norms (FP16)
             if (lw.QNormWeight != 0)
@@ -725,6 +1004,29 @@ public sealed unsafe class CudaTransformerModel : IModel
                     _ropeDim, _ropeTheta, effectiveRopeType, s);
                 MarkProfile(ProfileCategory.RopeAndExtras);
 
+                // Dispatch G3 (cuBLAS tensor-core prefill attention) when the call is a
+                // pure square-causal global-attention prefill on an eligible device;
+                // otherwise the FP32 CUDA-core attention_f16. Same Q/K/V FP16 buffers and
+                // same row-major [seq, heads, headDim] output either way.
+                void DispatchAttention(nint kBuf, nint vBuf, int seqKv, int positionOffset)
+                {
+                    // Long-context prefill on GeForce Ampere → G-flash (fused mma.sync, fewer
+                    // FLOPs + no score round-trip). Shorter prefill on Ampere → G3 (cuBLAS+
+                    // softmax). Everything else (decode, prefix reuse, sliding window, non-64
+                    // headDim, non-Ampere) → attention_f16.
+                    if (_flashAttention.CanUse(seqLen, seqKv, positionOffset, slidingWindow,
+                            numHeads, numKvHeads, headDim))
+                        _flashAttention.Run(qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, numHeads, numKvHeads, headDim, s);
+                    else if (_g3Attention.CanUse(seqLen, seqKv, positionOffset, slidingWindow, numHeads, numKvHeads))
+                        _g3Attention.Run(_cublas.Handle, qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, numHeads, numKvHeads, headDim, s);
+                    else
+                        _kernels.LaunchAttention(qPtr, kBuf, vBuf, _state.AttnOutput,
+                            seqLen, seqKv, numHeads, numKvHeads, headDim,
+                            positionOffset, slidingWindow, s);
+                }
+
                 if (kvCache is CudaQuantizedKvCache cudaQKvCache)
                 {
                     cudaQKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
@@ -732,6 +1034,16 @@ public sealed unsafe class CudaTransformerModel : IModel
 
                     // Dequant quantized region + copy window → scratch, then regular attention
                     var (kCachePtr, vCachePtr) = cudaQKvCache.PrepareAttentionScratch(layer, s, _kernels);
+                    MarkProfile(ProfileCategory.KvUpdate);
+                    DispatchAttention(kCachePtr, vCachePtr, seqKv, positions[0]);
+                }
+                else if (kvCache is CudaTurboQuantKvCache cudaTqKvCache)
+                {
+                    // TurboQuant: encode fresh FP16 K/V → codes, then dequant the live range into the
+                    // shared FP16 scratch the attention kernel reads (same shape as a plain F16 cache).
+                    cudaTqKvCache.UpdateDevice(kPtr, vPtr, positions, seqLen, layer, s, _kernels);
+                    int seqKv = cudaTqKvCache.CurrentLength;
+                    var (kCachePtr, vCachePtr) = cudaTqKvCache.PrepareAttentionScratch(layer, s, _kernels);
                     MarkProfile(ProfileCategory.KvUpdate);
                     _kernels.LaunchAttention(qPtr, kCachePtr, vCachePtr, _state.AttnOutput,
                         seqLen, seqKv, numHeads, numKvHeads, headDim,
@@ -743,30 +1055,68 @@ public sealed unsafe class CudaTransformerModel : IModel
                     int seqKv = cudaKvCache.CurrentLength;
                     MarkProfile(ProfileCategory.KvUpdate);
 
-                    _kernels.LaunchAttention(qPtr, cudaKvCache.GetKeysPtr(layer),
-                        cudaKvCache.GetValuesPtr(layer), _state.AttnOutput,
-                        seqLen, seqKv, numHeads, numKvHeads, headDim,
-                        positions[0], slidingWindow, s);
+                    DispatchAttention(cudaKvCache.GetKeysPtr(layer), cudaKvCache.GetValuesPtr(layer),
+                        seqKv, positions[0]);
                 }
                 else
                 {
                     MarkProfile(ProfileCategory.KvUpdate);
-                    _kernels.LaunchAttention(qPtr, kPtr, vPtr, _state.AttnOutput,
-                        seqLen, seqLen, numHeads, numKvHeads, headDim,
-                        0, slidingWindow, s);
+                    DispatchAttention(kPtr, vPtr, seqLen, 0);
                 }
             }
             MarkProfile(ProfileCategory.Attention);
 
+            // Optional attention Sub-LN (BitNet): RMSNorm over the attention output [numHeads·headDim]
+            // before the output projection. No-op for non-BitNet models (weight == 0).
+            // When an adapter is active we MUST take the unfused path so that, at delta
+            // time, _state.AttnOutput holds the Sub-LN'd attention output — the exact
+            // O-projection input the CPU uses (TransformerModel.cs:354-368: Sub-LN is
+            // applied in place into attnOut, then the O GEMM reads attnOut).
+            bool fusedAttnSubNormO = !adapterActive && !s_i2sA8Decode && CanFuseI2SNormDecode(
+                seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
+            if (fusedAttnSubNormO)
+            {
+                _kernels.LaunchI2_SGemvNormF16In(
+                    lw.OQuant, _state.AttnOutput, lw.AttnSubNormWeight, _state.NormOutput,
+                    lw.OOutputDim, lw.OInputDim, eps, s);
+            }
+
+            if (lw.AttnSubNormWeight != 0 && !fusedAttnSubNormO)
+                _kernels.LaunchRmsNorm(_state.AttnOutput, lw.AttnSubNormWeight, _state.AttnOutput,
+                    numHeads * headDim, eps, seqLen, s);
+
+            if (DebugCaptureAttnLayer == layer)
+            {
+                int attnElems = seqLen * numHeads * headDim;
+                var host = new ushort[attnElems];
+                _stream.Synchronize();
+                fixed (ushort* hp = host)
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)hp, _state.AttnOutput, (nuint)(attnElems * sizeof(ushort))).ThrowOnError();
+                DebugAttnOutputCapture = host;
+            }
+
             // O projection → NormOutput
-            Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
+            if (!fusedAttnSubNormO)
+                Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
             if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
             MarkProfile(ProfileCategory.OProj);
 
+            // LoRA delta (o_proj): y += scale · (AttnOutput · B) · A. Mirrors
+            // TransformerModel.cs:374 — x is the Sub-LN'd attention output (AttnOutput,
+            // normed in place above on the unfused path), y is the O-projection output
+            // (NormOutput). Applied after the O bias and BEFORE the fused residual add.
+            if (adapterActive)
+                ApplyLoraDeltaDevice(layer, "o_proj", _state.AttnOutput, _state.NormOutput, seqLen);
+
             // ── FUSED: attention residual + FFN norm ──
-            // residual = residual + NormOutput (via FP32), NormOutput = rmsnorm(new_residual, ffnNormWeight)
-            _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
-                hiddenSize, eps, seqLen, s);
+            // residual = residual + NormOutput, NormOutput = rmsnorm(new_residual, ffnNormWeight).
+            // BitNet carries the residual in FP32 to avoid FP16 overflow.
+            if (fp32Res)
+                _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                    hiddenSize, eps, seqLen, s);
+            else
+                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                    hiddenSize, eps, seqLen, s);
             MarkProfile(ProfileCategory.Norm);
 
         FfnBlock:
@@ -797,11 +1147,25 @@ public sealed unsafe class CudaTransformerModel : IModel
                 goto EndOfLayer;
             }
 
-            // Gate/Up projections — fused into a single GEMV when packed weights
-            // are available (decode-only). Same packing strategy as QKV.
+            // Gate/Up projections. Decode dispatch order mirrors Q/K/V:
+            //  1. I2_S (BitNet) fused 2-way GEMV → _state.FfnGate/FfnUp
+            //  2. Pre-packed quantized Gate/Up (dev) → one fused GEMV into _state.GateUpPacked
+            //  3. Fallback: two separate Project calls → _state.FfnGate/FfnUp
+            // An active adapter forces the unfused path so LoRA deltas land on _state.FfnGate/FfnUp.
             nint gatePtr, upPtr;
-            bool fusedGateUp = seqLen == 1 && lw.GateUpPacked != 0;
-            if (fusedGateUp)
+            bool fusedI2SGateUp = !adapterActive && !s_i2sA8Decode
+                && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType, lw.GateInputDim, lw.UpInputDim);
+            bool fusedGateUp = !adapterActive && !fusedI2SGateUp && seqLen == 1 && lw.GateUpPacked != 0;
+            if (fusedI2SGateUp)
+            {
+                _kernels.LaunchI2_SGemv2F16In(
+                    lw.GateQuant, lw.UpQuant, _state.NormOutput,
+                    _state.FfnGate, _state.FfnUp,
+                    lw.GateOutputDim, lw.UpOutputDim, lw.GateInputDim, s);
+                gatePtr = _state.FfnGate;
+                upPtr = _state.FfnUp;
+            }
+            else if (fusedGateUp)
             {
                 if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
                 {
@@ -831,15 +1195,53 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
             MarkProfile(ProfileCategory.MlpUp);
 
-            // SwiGLU (FP16)
-            _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput,
-                intermediateSize, seqLen, s);
+            // LoRA delta (gate/up): y += scale · (NormOutput · B) · A. Mirrors the CPU path —
+            // x = NormOutput (the FFN-normed input), y = FfnGate/FfnUp (raw projection outputs).
+            // Applied after the gate/up biases and BEFORE the GLU activation below. The adapter-
+            // active path forces the unfused projections so gatePtr/upPtr alias _state.FfnGate/FfnUp.
+            if (adapterActive)
+            {
+                ApplyLoraDeltaDevice(layer, "gate_proj", _state.NormOutput, _state.FfnGate, seqLen);
+                ApplyLoraDeltaDevice(layer, "up_proj", _state.NormOutput, _state.FfnUp, seqLen);
+            }
+
+            // Gated activation (FP16). BitNet b1.58 uses squared-ReLU GLU followed by a Sub-LN
+            // RMSNorm; the un-normalized relu(gate)²·up intermediate overflows FP16, so when the
+            // Sub-LN weight is present we fuse activation + RMSNorm (large value kept in FP32,
+            // only the normalized O(1) result hits FP16). Otherwise dispatch the plain activation.
+            if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+            {
+                _kernels.LaunchReLU2GluRmsNorm(gatePtr, upPtr, lw.FfnSubNormWeight,
+                    _state.SiluOutput, intermediateSize, eps, seqLen, s);
+            }
+            else if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+            {
+                _kernels.LaunchReLU2(gatePtr, upPtr, _state.SiluOutput,
+                    intermediateSize, seqLen, s);
+
+                // Optional FFN Sub-LN (BitNet) for the non-fused fallback. No-op when weight == 0.
+                if (lw.FfnSubNormWeight != 0)
+                    _kernels.LaunchRmsNorm(_state.SiluOutput, lw.FfnSubNormWeight, _state.SiluOutput,
+                        intermediateSize, eps, seqLen, s);
+            }
+            else
+            {
+                _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput,
+                    intermediateSize, seqLen, s);
+            }
             MarkProfile(ProfileCategory.Swiglu);
 
             // Down projection → NormOutput
             Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
             if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
             MarkProfile(ProfileCategory.MlpDown);
+
+            // LoRA delta (down_proj): y += scale · (SiluOutput · B) · A. Mirrors the CPU path —
+            // x = SiluOutput (the post-(SwiGLU/ReLU²) GLU, possibly FFN-Sub-LN'd, down-projection
+            // input), y = NormOutput (the down output). Applied after the down bias, BEFORE the
+            // fused residual add. Not reached on the MoE path (it jumps to EndOfLayer below).
+            if (adapterActive)
+                ApplyLoraDeltaDevice(layer, "down_proj", _state.SiluOutput, _state.NormOutput, seqLen);
 
         EndOfLayer:
             // ── FUSED: FFN residual + next layer's attention norm ──
@@ -851,29 +1253,51 @@ public sealed unsafe class CudaTransformerModel : IModel
             {
                 if (isMla)
                 {
+                    // MLA does its own input RMSNorm; only update the residual here.
                     _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.Residual,
                         seqLen * hiddenSize, s);
                 }
                 else
                 {
                     ref readonly var nextLw = ref _weights.Layers[layer + 1];
-                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
-                        hiddenSize, eps, seqLen, s);
+                    // BitNet carries the residual in FP32 to avoid FP16 overflow.
+                    if (fp32Res)
+                        _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
+                    else
+                        _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
                 }
             }
             else
             {
-                // Last processed layer: plain add → HiddenState for final norm
-                _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
-                    seqLen * hiddenSize, s);
+                // Last processed layer: add residual + FFN output for the final norm.
+                if (fp32Res)
+                    // Accumulate into the FP32 residual (the final norm reads it directly, avoiding an
+                    // FP16 truncation that would overflow for BitNet's large final residual).
+                    _kernels.LaunchAddF32F16(_state.ResidualF32, _state.NormOutput, _state.ResidualF32,
+                        seqLen * hiddenSize, s);
+                else
+                    _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
+                        seqLen * hiddenSize, s);
             }
             MarkProfile(ProfileCategory.Norm);
         }
 
-        // 5. Final RmsNorm (last token only)
-        nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
-        _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-            hiddenSize, eps, 1, s);
+        // 5. Final RmsNorm (last token only). For BitNet, read the FP32 residual directly so the
+        // large final residual is never truncated to FP16.
+        if (fp32Res && numLayers > 0)
+        {
+            nint lastResF32 = _state.ResidualF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+            _kernels.LaunchRmsNormF32InF16W(lastResF32, _weights.OutputNormWeight, _state.NormOutput,
+                hiddenSize, eps, 1, s);
+        }
+        else
+        {
+            nint lastHidden = _state.HiddenState + (nint)((seqLen - 1) * hiddenSize * h);
+            _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
+                hiddenSize, eps, 1, s);
+        }
         MarkProfile(ProfileCategory.Norm);
 
         // 6. LM head (last token only) → FP16 logits, then convert to FP32
@@ -887,6 +1311,14 @@ public sealed unsafe class CudaTransformerModel : IModel
 
         if (ProfilingEnabled)
             CudaDriverApi.cuEventRecord(_evtEnd, s).ThrowOnError();
+
+        // Decode CUDA-graph capture for this straight-through body is not used here;
+        // dev's ForwardDecodeGraph early-return path handles graph replay separately.
+        if (seqLen == 1)
+            DecodeGraphState = CudaDecodeGraphState.Off;
+
+        // Capture dispatch-only time (all launches queued, before GPU wait).
+        long dispatchEndTs = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         // 7. Stream sync (single sync point for entire forward pass)
         _stream.Synchronize();
@@ -908,6 +1340,21 @@ public sealed unsafe class CudaTransformerModel : IModel
             _profEventCursor = 0;
         }
 
+        if (profile)
+        {
+            long totalEndTs = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (_profWarmupSkipped < ProfWarmupSteps)
+            {
+                _profWarmupSkipped++;
+            }
+            else
+            {
+                _profDispatchTicks += dispatchEndTs - dispatchStartTs;
+                _profTotalTicks += totalEndTs - dispatchStartTs;
+                _profSteps++;
+            }
+        }
+
         // 8. D2H copy FP32 logits to CPU UnmanagedTensor
         var shape = new TensorShape(1, vocabSize);
         var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
@@ -915,6 +1362,30 @@ public sealed unsafe class CudaTransformerModel : IModel
             (nuint)(vocabSize * sizeof(float))).ThrowOnError();
 
         return result;
+    }
+
+    /// <inheritdoc/>
+    public ITensor Forward(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions,
+                           int deviceId, IKvCache? kvCache, ILoraAdapter? adapter)
+    {
+        if (adapter is null)
+            return Forward(tokenIds, positions, deviceId, kvCache);
+
+        if (!ReferenceEquals(_cudaLora?.Source, adapter))
+        {
+            _cudaLora?.Dispose();
+            _cudaLora = CudaLoraWeights.Stage(adapter, Config, _kernels, _stream.Handle);
+        }
+
+        _currentAdapter = adapter;
+        try
+        {
+            return Forward(tokenIds, positions, deviceId, kvCache);
+        }
+        finally
+        {
+            _currentAdapter = null;
+        }
     }
 
     /// <summary>
@@ -1458,6 +1929,44 @@ public sealed unsafe class CudaTransformerModel : IModel
         return _state.PreQ8_1Scratch;
     }
 
+    /// <summary>
+    /// Whether the CUDA model will RETAIN the host <see cref="TransformerWeights"/> after
+    /// upload (and therefore must NOT stream-free per-tensor host scratch during upload).
+    /// This is a conservative SUPERSET of the constructor's retain condition
+    /// (<c>_useHighPrecisionForward || _isGemma4</c>): it flags any IQ-quant model
+    /// regardless of the <see cref="EnableHighPrecisionIQuants"/> env gate, and any Gemma-4
+    /// dual-FFN model (host LM head). Computed from <paramref name="cpuWeights"/> +
+    /// <paramref name="config"/> BEFORE upload, so the streaming decision is made up front.
+    /// Erring toward "retain" only forfeits the RAM optimization in rare cases; it can never
+    /// free a buffer the forward later reads.
+    /// </summary>
+    private static bool WillRetainHostWeights(TransformerWeights cpuWeights, ModelConfig config)
+    {
+        // Gemma-4 dual-FFN keeps the host weights for the CPU LM head (mirrors _isGemma4,
+        // which is exactly `weights.Gemma4Layers is not null` ⇔ config.Gemma4DualFfn).
+        if (config.Gemma4DualFfn)
+            return true;
+
+        // High-precision I-quant forward retains host weights for the dequant→F32→dot CPU
+        // fallback. Mirror ShouldUseHighPrecisionForward's IQ detector, but read the quant
+        // types off the CPU weights (identical to the device-side types) and ignore the env
+        // gate for a conservative superset.
+        if (IsIQuant(cpuWeights.OutputQuantType))
+            return true;
+        foreach (ref readonly var lw in cpuWeights.Layers.AsSpan())
+        {
+            if (IsIQuant(lw.QQuantType) || IsIQuant(lw.KQuantType) || IsIQuant(lw.VQuantType)
+                || IsIQuant(lw.OQuantType) || IsIQuant(lw.GateQuantType)
+                || IsIQuant(lw.UpQuantType) || IsIQuant(lw.DownQuantType))
+                return true;
+        }
+        return false;
+
+        static bool IsIQuant(QuantizationType qt) =>
+            qt is QuantizationType.IQ4_NL or QuantizationType.IQ4_XS
+                or QuantizationType.IQ2_XXS or QuantizationType.IQ2_XS or QuantizationType.IQ2_S;
+    }
+
     private static bool ShouldUseHighPrecisionForward(CudaWeights weights)
     {
         if (!EnableHighPrecisionIQuants) return false;
@@ -1638,6 +2147,284 @@ public sealed unsafe class CudaTransformerModel : IModel
         return result;
     }
 
+    /// <summary>
+    /// Gemma-4 (DiffusionGemma AR) forward — dedicated F32 path mirroring the CPU
+    /// <c>TransformerModel.RunGemma4Layer</c> and the Vulkan
+    /// <c>RecordGemma4Attention</c>/<c>RecordGemma4Ffn</c>. Cacheless (autoregressive,
+    /// single-shot / short-context). Covers per-layer dual head dim/KV/rope, V-from-K
+    /// (copy K→V, skip V matmul), per-head QK-norm, weight-less V-norm, attn scale 1.0
+    /// (Q pre-scaled by sqrt(headDim) so the kernel's 1/sqrt(headDim) cancels), partial/
+    /// dual RoPE, dual parallel dense-GeGLU + MoE-GeGLU FFN with the five norms, the
+    /// custom router (1/√H folded into RouterScale), per-expert down scale (folded into
+    /// the F32 down bank at load), layer_output_scale, and the final-logit softcap.
+    /// </summary>
+    private ITensor ForwardGemma4(ReadOnlySpan<int> tokenIds, ReadOnlySpan<int> positions, int deviceId)
+    {
+        if (!_kernels.HasGemma4Kernels)
+            throw new InvalidOperationException(
+                "Gemma4 F32 helper kernels not available. Compile native/kernels/gemma4_f32.cu to "
+                + "PTX (native/build.{sh,ps1}) and ensure gemma4_f32.ptx ships under runtimes/.../ptx.");
+        if (!_kernels.HasMoeKernels)
+            throw new InvalidOperationException(
+                "MoE kernels not available (required for the gemma4 expert path). Compile "
+                + "native/kernels/moe_ffn.cu to PTX.");
+
+        _context.MakeCurrent();
+        int seqLen = tokenIds.Length;
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int vocabSize = Config.VocabSize;
+        float eps = Config.NormEpsilon;
+        nint s = _stream.Handle;
+
+        _state.EnsureCapacity(seqLen);
+        EnsureGemma4Staging(seqLen, hiddenSize);
+        _moeScratch ??= new CudaMoeScratch();
+
+        fixed (int* tokenPtr = tokenIds)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.TokenIdsDevice, (nint)tokenPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+        fixed (int* posPtr = positions)
+            CudaDriverApi.cuMemcpyHtoD_v2(_state.PositionsDevice, (nint)posPtr,
+                (nuint)(seqLen * sizeof(int))).ThrowOnError();
+
+        // Embedding lookup (× sqrt(hidden) baked into the GGUF EmbeddingScale path
+        // — gemma ties + scales the embed). LaunchEmbeddingLookupF32 applies the
+        // tok_embd table directly; the sqrt(hidden) scale is applied here.
+        _kernels.LaunchEmbeddingLookupF32(
+            _weights.TokenEmbedDevice, _weights.TokenEmbedQuantType,
+            _state.TokenIdsDevice, _state.HiddenStateF32,
+            seqLen, hiddenSize, s);
+        float embedScale = Config.EmbeddingScale ?? 1.0f;
+        if (embedScale != 1.0f)
+            _kernels.LaunchScaleInplaceF32(_state.HiddenStateF32, seqLen * hiddenSize, embedScale, s);
+
+        int numLayers = DebugMaxLayers switch
+        {
+            < 0 => 0,
+            0 => Config.NumLayers,
+            _ => Math.Min(DebugMaxLayers, Config.NumLayers)
+        };
+
+        for (int layer = 0; layer < numLayers; layer++)
+        {
+            ref readonly var lw = ref _weights.Layers[layer];
+            var g4 = _weights.Gemma4Layers![layer]!;
+            var moeW = _weights.MoeLayers![layer]!;
+
+            // ResidualF32 holds the layer input (== HiddenStateF32 at entry).
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.ResidualF32, _state.HiddenStateF32,
+                (nuint)((long)seqLen * hiddenSize * sizeof(float)), s).ThrowOnError();
+
+            RunGemma4AttentionF32(layer, in lw, g4, seqLen, eps, s);
+            // attn_out = post_attention_norm(O) + residual ; leaves attn_out in HiddenStateF32.
+            _kernels.LaunchRmsNormF32(_state.NormOutputF32, g4.PostAttnNorm, _state.NormOutputF32,
+                hiddenSize, eps, seqLen, s);
+            _kernels.LaunchAddF32(_state.ResidualF32, _state.NormOutputF32, _state.HiddenStateF32,
+                seqLen * hiddenSize, s);
+
+            RunGemma4FfnF32(layer, in lw, g4, moeW, seqLen, eps, s);
+        }
+
+        // Final RMSNorm (last token only) + LM head + softcap.
+        nint lastHidden = _state.HiddenStateF32 + (nint)((long)(seqLen - 1) * hiddenSize * sizeof(float));
+        RmsNormF32WithWeight(lastHidden, _weights.OutputNormWeight, _cpuWeights?.OutputNormWeight,
+            _state.NormOutputF32, hiddenSize, eps, 1, s);
+
+        _stream.Synchronize();
+
+        var shape = new TensorShape(1, vocabSize);
+        var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+        float softcap = _gemma4FinalSoftcap;
+
+        if (_cpuWeights is not null)
+        {
+            float[] normHost = ArrayPool<float>.Shared.Rent(hiddenSize);
+            try
+            {
+                fixed (float* pNorm = normHost)
+                {
+                    CudaDriverApi.cuMemcpyDtoH_v2((nint)pNorm, _state.NormOutputF32,
+                        (nuint)(hiddenSize * sizeof(float))).ThrowOnError();
+                    ProjectCpuLmHead(_cpuWeights.OutputWeight, _cpuWeights.OutputQuantType,
+                        pNorm, (float*)result.DataPointer, _cpuWeights.OutputOutputDim,
+                        _cpuWeights.OutputInputDim);
+                }
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(normHost);
+            }
+
+            // Final-logit soft-capping on the host output: c * tanh(x / c).
+            if (softcap > 0f)
+            {
+                float* logits = (float*)result.DataPointer;
+                float inv = 1.0f / softcap;
+                for (int i = 0; i < vocabSize; i++)
+                    logits[i] = softcap * MathF.Tanh(logits[i] * inv);
+            }
+        }
+        else
+        {
+            _kernels.LaunchConvertF32ToF16(_state.NormOutputF32, _state.NormOutput, hiddenSize, s);
+            Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
+                _state.NormOutput, _state.LogitsF16,
+                _weights.OutputOutputDim, _weights.OutputInputDim, 1);
+            _kernels.LaunchConvertF16ToF32(_state.LogitsF16, _state.LogitsF32, vocabSize, s);
+            if (softcap > 0f)
+                _kernels.LaunchSoftcapInplaceF32(_state.LogitsF32, vocabSize, softcap, s);
+            _stream.Synchronize();
+            CudaDriverApi.cuMemcpyDtoH_v2(result.DataPointer, _state.LogitsF32,
+                (nuint)(vocabSize * sizeof(float))).ThrowOnError();
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Gemma-4 attention (F32). Reads the layer input from <c>ResidualF32</c>,
+    /// writes the o_proj output into <c>NormOutputF32</c> (the shared
+    /// post-attention norm + residual run in the caller). Per-layer dual head dim /
+    /// KV / rope, V-from-K, per-head QK-norm, weight-less V-norm, scale 1.0.
+    /// </summary>
+    private void RunGemma4AttentionF32(int layer, in CudaLayerWeights lw,
+        CudaGemma4LayerWeights g4, int seqLen, float eps, nint s)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int numHeads = Config.NumAttentionHeads;
+        int headDim = Config.GetLayerHeadDim(layer);
+        int numKvHeads = Config.NumGlobalKvHeads is int gk && Config.IsFullAttentionLayer(layer)
+            ? gk : Config.NumKvHeads;
+
+        // attn_norm(input) → NormOutputF32
+        _kernels.LaunchRmsNormF32(_state.ResidualF32, g4.AttnNorm, _state.NormOutputF32,
+            hiddenSize, eps, seqLen, s);
+
+        // Q, K projections (raw — K captured before k-norm/rope for V-from-K).
+        ProjectF32Gemma4(lw.QQuant, lw.QQuantType, lw.Q, _state.NormOutputF32, _state.QF32,
+            lw.QOutputDim, lw.QInputDim, seqLen);
+        ProjectF32Gemma4(lw.KQuant, lw.KQuantType, lw.K, _state.NormOutputF32, _state.KF32,
+            lw.KOutputDim, lw.KInputDim, seqLen);
+
+        // V branch: V-from-K (global, V-less) copies the raw K projection into V;
+        // else V = wv · normIn.
+        if (g4.VFromK)
+        {
+            long kvBytes = (long)seqLen * numKvHeads * headDim * sizeof(float);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.VF32, _state.KF32, (nuint)kvBytes, s).ThrowOnError();
+        }
+        else
+        {
+            ProjectF32Gemma4(lw.VQuant, lw.VQuantType, lw.V, _state.NormOutputF32, _state.VF32,
+                lw.VOutputDim, lw.VInputDim, seqLen);
+        }
+
+        // Per-head Q/K RMSNorm (× learned weight); weight-less V RMSNorm (unit gamma).
+        _kernels.LaunchPerHeadRmsNormF32(_state.QF32, g4.QNorm, eps, numHeads, headDim, seqLen, s);
+        _kernels.LaunchPerHeadRmsNormF32(_state.KF32, g4.KNorm, eps, numKvHeads, headDim, seqLen, s);
+        _kernels.LaunchRmsNormWeightlessF32(_state.VF32, _state.VF32, headDim, eps,
+            seqLen * numKvHeads, s);
+
+        // RoPE on Q and K (V not roped). Global layers: partial NeoX (pair (i, i+headDim/2),
+        // freq base over the full head dim). Sliding layers: full NeoX rotation.
+        if (Config.IsFullAttentionLayer(layer) && _gemma4GlobalRotatedPairs > 0
+            && Config.GlobalHeadDim is int)
+        {
+            _kernels.LaunchRoPEF32PartialNeoX(_state.QF32, _state.KF32, _state.PositionsDevice,
+                seqLen, numHeads, numKvHeads, headDim, _gemma4GlobalRotatedPairs,
+                _gemma4GlobalRopeTheta, s);
+        }
+        else
+        {
+            // Sliding layers use the primary (sliding) rope schedule, full NeoX.
+            _kernels.LaunchRoPEF32(_state.QF32, _state.KF32, _state.PositionsDevice,
+                seqLen, numHeads, numKvHeads, headDim, _ropeDim, _ropeTheta,
+                CudaKernels.ToCudaRopeType(RoPEType.NeoX), s);
+        }
+
+        // Attention scale = 1.0 (q/k-norm make Q,K unit). The F32 attention kernel
+        // hardcodes 1/sqrt(headDim); pre-scale Q by sqrt(headDim) so it cancels.
+        _kernels.LaunchScaleInplaceF32(_state.QF32, seqLen * numHeads * headDim,
+            MathF.Sqrt((float)headDim), s);
+
+        int slidingWindow = GetGemmaLayerSlidingWindow(layer);
+        _kernels.LaunchAttentionF32(_state.QF32, _state.KF32, _state.VF32, _state.AttnOutputF32,
+            seqLen, seqLen, numHeads, numKvHeads, headDim, 0, slidingWindow, s);
+
+        // o_proj → NormOutputF32.
+        ProjectF32Gemma4(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutputF32, _state.NormOutputF32,
+            lw.OOutputDim, lw.OInputDim, seqLen);
+    }
+
+    /// <summary>
+    /// Gemma-4 dual parallel FFN (F32). Reads attn_out from <c>HiddenStateF32</c>;
+    /// runs the dense GeGLU branch and the MoE GeGLU branch, combines them
+    /// (rms(dense+moe)·post_ffw_norm + attn_out), then applies layer_output_scale.
+    /// Leaves the layer output in <c>HiddenStateF32</c>.
+    /// </summary>
+    private void RunGemma4FfnF32(int layer, in CudaLayerWeights lw,
+        CudaGemma4LayerWeights g4, CudaMoeLayerWeights moeW, int seqLen, float eps, nint s)
+    {
+        int hiddenSize = Config.HiddenSize;
+        int denseInterm = lw.GateOutputDim; // dense ("shared expert") FF width
+
+        // ── Dense branch → Gemma4DenseF32 ──
+        // cur_mlp = rms(attn_out)*ffn_norm ; geglu(gate, up) ; down ; rms*post_ffw_norm_1
+        _kernels.LaunchRmsNormF32(_state.HiddenStateF32, g4.FfnNorm, _state.NormOutputF32,
+            hiddenSize, eps, seqLen, s);
+        ProjectF32Gemma4(lw.GateQuant, lw.GateQuantType, lw.Gate, _state.NormOutputF32, _state.FfnGateF32,
+            lw.GateOutputDim, lw.GateInputDim, seqLen);
+        ProjectF32Gemma4(lw.UpQuant, lw.UpQuantType, lw.Up, _state.NormOutputF32, _state.FfnUpF32,
+            lw.UpOutputDim, lw.UpInputDim, seqLen);
+        _kernels.LaunchGeGLUTanhF32(_state.FfnGateF32, _state.FfnUpF32, _state.SiluOutputF32,
+            denseInterm, seqLen, s);
+        ProjectF32Gemma4(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutputF32, _gemma4DenseF32,
+            lw.DownOutputDim, lw.DownInputDim, seqLen);
+        _kernels.LaunchRmsNormF32(_gemma4DenseF32, g4.PostFfwNorm1, _gemma4DenseF32,
+            hiddenSize, eps, seqLen, s);
+
+        // ── MoE branch → Gemma4MoeF32 ──
+        // Expert input = rms(attn_out)*pre_ffw_norm_2 (into the shared MoE staging buffer).
+        _kernels.LaunchRmsNormF32(_state.HiddenStateF32, g4.PreFfwNorm2, _moeStagingInF32,
+            hiddenSize, eps, seqLen, s);
+        // Custom-router input = rms(attn_out)*RouterScale (RouterScale carries 1/√H).
+        _kernels.LaunchRmsNormF32(_state.HiddenStateF32, g4.RouterScaleDevice, _gemma4RouterInF32,
+            hiddenSize, eps, seqLen, s);
+        // Gemma-4 MoE: custom router (separate router input) + GeGLU experts +
+        // per-expert down scale (pre-folded into the F32 down bank) + renorm clamp.
+        CudaGemma4Ffn.ForwardMoe(
+            expertInF32: _moeStagingInF32,
+            routerInF32: _gemma4RouterInF32,
+            outputF32: _gemma4MoeF32,
+            seqLen: seqLen,
+            weights: moeW,
+            scratch: _moeScratch!,
+            cublasHandle: _cublas.Handle,
+            kernels: _kernels,
+            stream: s);
+        _kernels.LaunchRmsNormF32(_gemma4MoeF32, g4.PostFfwNorm2, _gemma4MoeF32,
+            hiddenSize, eps, seqLen, s);
+
+        // ── Combine: cur = rms(dense + moe)*post_ffw_norm + attn_out, then ×layer_output_scale ──
+        _kernels.LaunchAddF32(_gemma4DenseF32, _gemma4MoeF32, _state.NormOutputF32,
+            seqLen * hiddenSize, s);
+        _kernels.LaunchRmsNormF32(_state.NormOutputF32, g4.PostFfwNorm, _state.NormOutputF32,
+            hiddenSize, eps, seqLen, s);
+        _kernels.LaunchAddF32(_state.HiddenStateF32, _state.NormOutputF32, _state.HiddenStateF32,
+            seqLen * hiddenSize, s);
+        if (g4.LayerOutputScale != 1.0f)
+            _kernels.LaunchScaleInplaceF32(_state.HiddenStateF32, seqLen * hiddenSize,
+                g4.LayerOutputScale, s);
+    }
+
+    private int GetGemmaLayerSlidingWindow(int layer)
+    {
+        var perLayer = Config.PerLayerSlidingWindow;
+        if (perLayer is not null && (uint)layer < (uint)perLayer.Count)
+            return perLayer[layer] ?? 0;
+        return Config.SlidingWindowSize ?? 0;
+    }
+
     private static void ProjectCpuLmHead(nint weights, QuantizationType qt, float* input, float* output,
                                           int outputDim, int inputDim)
     {
@@ -1677,6 +2464,46 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
         _kernels.LaunchRmsNormF32(inputF32, _state.DequantScratchF32, outputF32,
             hiddenSize, eps, rows, stream);
+    }
+
+    /// <summary>
+    /// Ensures the gemma4 activation round-trip scratch holds at least
+    /// <paramref name="elems"/> F32 values.
+    /// </summary>
+    private void EnsureGemma4ActScratch(int elems)
+    {
+        if (_gemma4ActScratchElems >= elems) return;
+        if (_gemma4ActScratchF32 != 0) CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32);
+        CudaDriverApi.cuMemAlloc_v2(out _gemma4ActScratchF32, (nuint)((long)elems * sizeof(float))).ThrowOnError();
+        _gemma4ActScratchElems = elems;
+    }
+
+    /// <summary>
+    /// Gemma4 projection that reproduces the CPU oracle's per-projection ACTIVATION
+    /// quantization. The CPU <c>TransformerModel.Gemm</c> for Q8_0 weights quantizes
+    /// the F32 activation to Q8_0 before the int8 dot; the F32 cuBLAS path here would
+    /// otherwise keep the activation in full precision and drift enough that a logit
+    /// pokes over the CPU-parity tolerance. For Q8_0 weights we copy the input to
+    /// scratch, round-trip it through Q8_0 (FP16 scale, round-nearest-even), then
+    /// GEMM — within reduction-order of the CPU. Other quant types fall through to
+    /// the plain F32 projection (their CPU activation-quant round-trips can be added
+    /// if a future fixture's experts push the worst logit over tolerance).
+    /// </summary>
+    private void ProjectF32Gemma4(nint quantWeight, QuantizationType qt, nint fp16Weight,
+                                   nint inputF32, nint outputF32, int outputDim, int inputDim, int seqLen)
+    {
+        if (qt == QuantizationType.Q8_0 && (inputDim & 31) == 0)
+        {
+            nint s = _stream.Handle;
+            int elems = seqLen * inputDim;
+            EnsureGemma4ActScratch(elems);
+            CudaDriverApi.cuMemcpyDtoDAsync_v2(_gemma4ActScratchF32, inputF32,
+                (nuint)((long)elems * sizeof(float)), s).ThrowOnError();
+            _kernels.LaunchQuantizeActivationQ8_0RoundtripF32(_gemma4ActScratchF32, inputDim, seqLen, s);
+            ProjectF32(quantWeight, qt, fp16Weight, _gemma4ActScratchF32, outputF32, outputDim, inputDim, seqLen);
+            return;
+        }
+        ProjectF32(quantWeight, qt, fp16Weight, inputF32, outputF32, outputDim, inputDim, seqLen);
     }
 
     private void ProjectF32(nint quantWeight, QuantizationType qt, nint fp16Weight,
@@ -1727,11 +2554,31 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (w == 0)
             {
                 // Quantized: dequant into scratch, then GEMM
-                _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
-                    outputDim * inputDim, s);
+                if (qt == QuantizationType.I2_S)
+                    _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                else if (qt == QuantizationType.PQ2_0)
+                    _kernels.LaunchDequantPQ2_0ToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                else
+                    _kernels.LaunchDequantToF16(quantWeight, qt, _state.DequantScratch,
+                        outputDim * inputDim, s);
                 w = _state.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+        }
+        else if (CanUseI2SA8Project(qt, seqLen, outputDim, inputDim)) // Decode: I2_S W2A8 GEMV
+        {
+            _kernels.LaunchQuantizeF16ToI8AbsMax(input, _state.A8Input, _state.A8InvScale, inputDim, s);
+            _kernels.LaunchI2_SGemvA8DeviceScale(
+                quantWeight, _state.A8Input, _state.A8OutputF32, outputDim, inputDim, _state.A8InvScale, s);
+            _kernels.LaunchConvertF32ToF16(_state.A8OutputF32, output, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S) // Decode: I2_S ternary GEMV
+        {
+            _kernels.LaunchI2_SGemvF16In(quantWeight, input, output, outputDim, inputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.PQ2_0) // Decode: PQ2_0 ternary GEMV
+        {
+            _kernels.LaunchPQ2_0GemvF16In(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && _kernels.HasMmq(qt) && !CudaKernels.ForceDirectGemv)
         {
@@ -1761,13 +2608,105 @@ public sealed unsafe class CudaTransformerModel : IModel
     }
 
     /// <summary>
+    /// Applies the LoRA delta for one (layer, proj) site on device:
+    /// <c>yDev += scale · (A[outputDim, rank] · (B[rank, inputDim] · xDev))</c>.
+    /// All operands are FP16 on device; intermediate tmp is <see cref="CudaForwardState.LoraTmp"/>.
+    /// For decode (seqLen == 1): two GEMVs via cuBLAS.
+    /// For prefill (seqLen &gt; 1): two batched GEMMs via cuBLAS.
+    /// Early-returns without error when <paramref name="layer"/>/<paramref name="proj"/> is
+    /// not covered by the staged adapter.
+    /// </summary>
+    /// <param name="layer">Zero-based transformer layer index.</param>
+    /// <param name="proj">Canonical projection name (e.g. <c>q_proj</c>).</param>
+    /// <param name="xDev">Device pointer to the FP16 input [seqLen, inputDim].</param>
+    /// <param name="yDev">Device pointer to the FP16 output [seqLen, outputDim] to accumulate into.</param>
+    /// <param name="seqLen">Number of tokens in the current step (1 = decode, &gt;1 = prefill).</param>
+    private void ApplyLoraDeltaDevice(int layer, string proj, nint xDev, nint yDev, int seqLen)
+    {
+        if (_cudaLora is null)
+            return;
+        if (!_cudaLora.TryGet(layer, proj, out nint aF16, out nint bF16, out int inputDim, out int outputDim))
+            return;
+
+        int rank = _cudaLora.Rank;
+        if (rank > CudaForwardState.MaxLoraRank)
+            throw new InvalidOperationException(
+                $"LoRA rank {rank} exceeds the device delta rank cap ({CudaForwardState.MaxLoraRank}). " +
+                $"Reduce adapter rank or rebuild with a higher MaxLoraRank.");
+
+        float scale = _cudaLora.Scale;
+        nint tmp = _state.LoraTmp;  // [seqLen, MaxLoraRank] FP16
+        nint s = _stream.Handle;
+        nint cublasH = _cublas.Handle;
+
+        if (seqLen == 1)
+        {
+            // Decode path — two GEMVs.
+            // Step 1: tmp[rank] = B[rank, inputDim] · x[inputDim]  (overwrites tmp)
+            CudaGemm.GemvF16(cublasH, bF16, xDev, tmp, rank, inputDim, s);
+
+            // Step 2: y[outputDim] += scale · A[outputDim, rank] · tmp[rank]
+            CudaGemm.GemvF16Accum(cublasH, aF16, tmp, yDev, outputDim, rank, scale, s);
+        }
+        else
+        {
+            // Prefill path — two batched GEMMs.
+            // Step 1: tmp[seqLen, rank] = X[seqLen, inputDim] × B^T  (overwrites tmp)
+            CudaGemm.LinearF16(cublasH, xDev, bF16, tmp, seqLen, inputDim, rank, s);
+
+            // Step 2: Y[seqLen, outputDim] += scale · tmp[seqLen, rank] × A^T
+            CudaGemm.LinearF16Accum(cublasH, tmp, aF16, yDev, seqLen, rank, outputDim, scale, s);
+        }
+    }
+
+    private static bool CanFuseI2SDecode(
+        int seqLen,
+        QuantizationType qt0, QuantizationType qt1,
+        int inputDim0, int inputDim1)
+        => seqLen == 1
+           && qt0 == QuantizationType.I2_S
+           && qt1 == QuantizationType.I2_S
+           && inputDim0 == inputDim1;
+
+    private static bool CanFuseI2SDecode(
+        int seqLen,
+        QuantizationType qt0, QuantizationType qt1, QuantizationType qt2,
+        int inputDim0, int inputDim1, int inputDim2)
+        => seqLen == 1
+           && qt0 == QuantizationType.I2_S
+           && qt1 == QuantizationType.I2_S
+           && qt2 == QuantizationType.I2_S
+           && inputDim0 == inputDim1
+           && inputDim0 == inputDim2;
+
+    private static bool CanFuseI2SNormDecode(
+        int seqLen,
+        nint normWeight,
+        QuantizationType qt,
+        int inputDim,
+        int normDim)
+        => seqLen == 1
+           && normWeight != 0
+           && qt == QuantizationType.I2_S
+           && inputDim == normDim;
+
+    private bool CanUseI2SA8Project(QuantizationType qt, int seqLen, int outputDim, int inputDim)
+        => s_i2sA8Decode
+           && seqLen == 1
+           && qt == QuantizationType.I2_S
+           && Config.Architecture == Architecture.BitNet
+           && outputDim != Config.VocabSize
+           && inputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize)
+           && outputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize);
+
+    /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.
     /// </summary>
     /// <param name="maxSeqLen">Maximum sequence length for the cache.</param>
     public CudaKvCache CreateKvCache(int maxSeqLen)
     {
         _context.MakeCurrent();
-        return new CudaKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
+        return new CudaKvCache(Core.Attention.KvGeometry.FromConfig(Config), maxSeqLen);
     }
 
     /// <summary>
@@ -1778,14 +2717,51 @@ public sealed unsafe class CudaTransformerModel : IModel
     public Core.Attention.IKvCache CreateKvCache(int maxSeqLen, Core.Configuration.KvCacheConfig config)
     {
         _context.MakeCurrent();
+        var geom = Core.Attention.KvGeometry.FromConfig(Config);
         if (!config.IsQuantized)
-            return new CudaKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen);
-        return new CudaQuantizedKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim, maxSeqLen, config);
+            return new CudaKvCache(geom, maxSeqLen);
+        return new CudaQuantizedKvCache(geom, maxSeqLen, config);
+    }
+
+    /// <summary>
+    /// Creates a GPU-resident TurboQuant (MSE-stage) KV-cache on this model's CUDA context. The caller
+    /// supplies the codec constants (the Cuda project does not depend on the Engine codec):
+    /// <paramref name="centroids"/> (2^mseBits, scaled by 1/√d), per-K/V RHT sign sets (length headDim,
+    /// ±1), and <paramref name="invSqrtD"/>. Uniform geometry, headDim a power of two ≤ 256; eager decode.
+    /// </summary>
+    public CudaTurboQuantKvCache CreateTurboQuantKvCache(
+        int maxSeqLen, int mseBits,
+        ReadOnlySpan<float> centroids, ReadOnlySpan<float> signsK, ReadOnlySpan<float> signsV, float invSqrtD)
+    {
+        _context.MakeCurrent();
+        return new CudaTurboQuantKvCache(Config.NumLayers, Config.NumKvHeads, Config.HeadDim,
+            maxSeqLen, mseBits, centroids, signsK, signsV, invSqrtD);
+    }
+
+    /// <summary>
+    /// Prints mean CPU-side dispatch ms/token vs total ms/token over the profiled
+    /// steady-state decode steps. No-op unless DOTLLM_PROFILE_LAUNCH=1.
+    /// </summary>
+    private void ReportLaunchProfile()
+    {
+        if (!s_profileLaunch || _profSteps == 0)
+            return;
+
+        double freq = System.Diagnostics.Stopwatch.Frequency;
+        double dispatchMs = (_profDispatchTicks / freq) * 1000.0 / _profSteps;
+        double totalMs = (_profTotalTicks / freq) * 1000.0 / _profSteps;
+        double ratio = totalMs > 0 ? dispatchMs / totalMs : 0;
+        Console.Error.WriteLine(
+            $"[DOTLLM_PROFILE_LAUNCH] decode steps={_profSteps} " +
+            $"dispatch={dispatchMs:F3} ms/token  total={totalMs:F3} ms/token  " +
+            $"ratio(dispatch/total)={ratio:F3}");
     }
 
     /// <inheritdoc/>
     public void Dispose()
     {
+        ReportLaunchProfile();
+        _cudaLora?.Dispose();
         DisposeDecodeGraph();
         if (_decodePosDevice != 0) { CudaDriverApi.cuMemFree_v2(_decodePosDevice); _decodePosDevice = 0; }
         if (_decodeSeqKvDevice != 0) { CudaDriverApi.cuMemFree_v2(_decodeSeqKvDevice); _decodeSeqKvDevice = 0; }
@@ -1800,9 +2776,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         if (_mlaRopeSinF32 != 0) { CudaDriverApi.cuMemFree_v2(_mlaRopeSinF32); _mlaRopeSinF32 = 0; }
         if (_moeStagingInF32 != 0) { CudaDriverApi.cuMemFree_v2(_moeStagingInF32); _moeStagingInF32 = 0; }
         if (_moeStagingOutF32 != 0) { CudaDriverApi.cuMemFree_v2(_moeStagingOutF32); _moeStagingOutF32 = 0; }
+        if (_gemma4DenseF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4DenseF32); _gemma4DenseF32 = 0; }
+        if (_gemma4MoeF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4MoeF32); _gemma4MoeF32 = 0; }
+        if (_gemma4RouterInF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4RouterInF32); _gemma4RouterInF32 = 0; }
+        if (_gemma4ActScratchF32 != 0) { CudaDriverApi.cuMemFree_v2(_gemma4ActScratchF32); _gemma4ActScratchF32 = 0; }
         _mlaScratchF16?.Dispose();
         _mlaKvCache?.Dispose();
         _moeScratch?.Dispose();
+        _g3Attention.Dispose();
         _state.Dispose();
         _weights.Dispose();
         _cpuWeights?.Dispose();

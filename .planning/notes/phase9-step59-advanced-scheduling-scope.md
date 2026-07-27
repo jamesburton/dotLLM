@@ -7,6 +7,65 @@ sequence_item: phase-9-step-59
 
 # Phase 9 Step 59 — Advanced scheduling: scope + first-piece deliverable
 
+> **Progress (update 2026-06-26):**
+> - ✅ Sub-piece 1 — priority-ordered admission (commit `feb4c8c`).
+> - ✅ Sub-piece 2 — **preemption-on-pressure (recompute-on-resume, strategy (i))**. Added
+>   `ContinuousBatchSchedulerOptions.EnablePreemption` (default off), victim selection
+>   (lowest-priority active sequence strictly below the incoming request; newest-first tie-break;
+>   never `Critical`/same-tier), `PreemptSequence`/`FreeKvCacheOnly` (free KV, retain generated
+>   tokens, re-queue at original priority+order), and `AdmitAndResume` (rebuild KV from
+>   prompt + generated[0..n-2], no re-sample). `SchedulerMetrics.PreemptionCount` now live.
+>   4 new unit tests in `ContinuousBatchSchedulerTests`; `docs/SCHEDULING.md § Preemption` refreshed.
+> - ✅ Sub-piece 3a — **batched decode** (#348). The "mixed batch / BuildBatch" framing below was
+>   STALE: the scheduler decoded one `Forward(seqLen=1)` per active sequence, while the fused
+>   `IModel.ForwardBatch` (dense CPU/Vulkan, Phase 5a/5b/5f) went unused. Wired decode through
+>   `ForwardBatch` when the model is stateless (`IModel.RequiresPerSequenceState == false`) and ≥2
+>   sequences decode; recurrent hosts keep the per-seq loop (their `ForwardBatch` needs per-seq
+>   Mamba/GDN state the scheduler doesn't thread yet). 4 new tests; `docs/SCHEDULING.md` refreshed.
+> - ✅ Sub-piece 3b — **batched prefill** (#349). The admission loop was refactored to *prepare*
+>   each newly-admitted sequence (KV alloc + prefix seed + forward range) via `PreparePrefill`
+>   without forwarding, then fuse the prefills admitted in one Step into a single `IModel.ForwardBatch`
+>   (`PrefillReadySequences` → `FinishPrefill` per seq) under the same stateless/≥2 gate as decode.
+>   The deferred forward required a `reservedBlocksThisStep` term in the per-iteration block gate so
+>   tight-pressure admission (≤1/step) and all preemption tests stay intact. Resuming (preempted)
+>   sequences keep their inline per-seq recompute. 4 new tests; `docs/SCHEDULING.md` refreshed.
+> - ✅ Sub-piece 3c — **recurrent batched decode/prefill** (#350, Mamba3 + Qwen3-MoE-Hybrid, CPU+Vulkan).
+>   New Core `IRecurrentSequenceState` marker (`IMambaState`/`IGdnState` derive from it); `IModel`
+>   gains `SupportsThreadedSequenceState` + `CreateSequenceState()`. The scheduler allocates one
+>   per-seq state at admission (`SchedulerRequest.RecurrentState`), threads it through prefill/decode/
+>   resume, disposes on release, and dispatches threaded-state models via `ForwardBatch` for ALL counts
+>   (incl. 1 — the only entrypoint carrying the state) via a unified `ShouldBatch(count)` helper. Also a
+>   **correctness fix**: the prior per-seq `Forward` loop shared the model-owned default state across
+>   concurrent recurrent sequences. `MaxRecurrentSequences` option caps concurrency (state memory).
+>   Nemotron-H deferred (its `SsmStateCache` has no interface/factory — own follow-up). 4 new tests
+>   (mock recurrent model throws on null/shared state ⇒ correct output proves threading); 29 scheduler
+>   tests + 203 model/forwardbatch tests green. `docs/SCHEDULING.md` refreshed.
+> - ✅ Sub-piece 1 (disaggregation) — **prefill/decode disaggregation seam** (#351). `Step()` split
+>   into public `StepPrefill()` (sweep + admit + deferred prefill) and `StepDecode()` (sweep + decode);
+>   `Step()` runs both in sequence (byte-identical). The prefill queue (`_pendingQueue`) and the
+>   decode set (active decoders) are the separate queues; the phase methods are the thread-pool/worker
+>   seam a future disaggregated/multi-replica driver uses (in-process single-GPU keeps `Step()` because
+>   the model forward is single-threaded). 3 new tests (phase-split token-identical to combined Step).
+>   NOTE: literal separate OS thread pools against ONE model instance are unsafe (single-threaded
+>   forward) — the seam is the deliverable; the multi-worker driver + KV transfer is a follow-up.
+> - ✅ Sub-piece 4 — **fairness** (#352). Per-API-key **start-time fair queuing (SFQ)** in admission,
+>   gated by `ContinuousBatchSchedulerOptions.EnableFairness` (default off ⇒ byte-identical FIFO).
+>   New `InferenceRequest.ApiKey` (resolved key stashed by `RateLimitMiddleware`, set on the request by
+>   `CompletionEndpoint`); priority key is now `(−priority, sfqStartTag, submissionOrder)`. Per-key
+>   finish tags + virtual clock under `_queueLock`; admit advances the clock; preempt keeps the tag.
+>   Priority dominates across tiers (fairness reorders within a tier only). 4 tests (light client
+>   interleaves ahead of a hammer flood; FIFO when off; priority dominates; ApiKey default null).
+>
+> **Step 59 COMPLETE** — all four roadmap sub-items shipped: chunked prefill (earlier), priority +
+> preemption (#feb4c8c/sub-piece2), prefill/decode disaggregation seam (#351), fairness (#352);
+> plus the batched-forward throughput line (decode #348, prefill #349, recurrent #350).
+> Tail follow-ups: ✅ config wiring + per-key telemetry (#353 — `ServerOptions.Scheduler` /
+> `--scheduler-fairness`, `GetPerKeyTokenUsage()` + `dotllm.engine.tokens.by_key`); ✅ in-process
+> disaggregated driver (#354 — `DisaggregatedScheduler`: two replicas + shared-pool KV handoff via
+> `ExtractDecodable`/`InjectDecodable`, sync `Step()` + async two-worker `RunLoopAsync`). Remaining:
+> Nemotron-H recurrent batching (needs `ISsmState`); cross-process/cross-device KV transfer +
+> multi-GPU replica placement; per-key fairness weights.
+
 ## What Step 59 covers
 
 From `docs/ROADMAP.md:169`:

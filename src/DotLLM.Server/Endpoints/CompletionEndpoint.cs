@@ -20,6 +20,19 @@ public static class CompletionEndpoint
         ServerState state,
         HttpContext httpContext)
     {
+        // (#369) Activate the requested model — see ChatCompletionEndpoint for the same pattern.
+        var activationError = await state.EnsureActiveAsync(request.Model, request.KeepAlive, httpContext.RequestAborted);
+        if (activationError is not null)
+        {
+            httpContext.Response.StatusCode = 400;
+            await httpContext.Response.WriteAsJsonAsync(
+                new ErrorResponse { Error = activationError },
+                ServerJsonContext.Default.ErrorResponse,
+                contentType: null,
+                httpContext.RequestAborted);
+            return;
+        }
+
         if (!state.IsReady || state.Generator is null)
         {
             httpContext.Response.StatusCode = 503;
@@ -131,6 +144,11 @@ public static class CompletionEndpoint
             {
                 TokenIds = promptIds,
                 Options = options,
+                // Carry the resolved API key (stashed by RateLimitMiddleware) for the scheduler's
+                // per-key admission fairness; null when rate limiting / key resolution is off.
+                ApiKey = httpContext.Items.TryGetValue(RateLimitMiddleware.ApiKeyItemKey, out var k)
+                    ? k as string
+                    : null,
             };
             result = await scheduler.EnqueueAsync(inferenceRequest, ct);
         }

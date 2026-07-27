@@ -85,6 +85,15 @@ public sealed record RateLimitPolicy
     /// before being rejected with 429. Default 5s.
     /// </summary>
     public TimeSpan QueueTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Per-API-key <b>fairness weight</b> for the continuous-batch scheduler's start-time
+    /// fair-queuing (SFQ) admission. A key with weight <c>w</c> is charged <c>cost / w</c> into
+    /// its SFQ finish tag, so a higher-weight key receives a proportionally larger share of
+    /// admissions within its priority tier under contention. Only consulted when scheduler
+    /// fairness is enabled. Default <c>1.0</c> (equal share); values ≤ 0 are treated as 1.0.
+    /// </summary>
+    public double Weight { get; init; } = 1.0;
 }
 
 /// <summary>

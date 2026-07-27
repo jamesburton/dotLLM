@@ -32,16 +32,18 @@ namespace DotLLM.Vulkan;
 /// object satisfy the same API.
 /// </para>
 /// </remarks>
-public sealed class VulkanKvCache : IKvCache
+public sealed class VulkanKvCache : IKvCache, IPerLayerKvCache, IHostStagedKvCache
 {
     private readonly VulkanDevice _device;
     private readonly VulkanDevice.Buffer[] _keys;
     private readonly VulkanDevice.Buffer[] _values;
     private readonly int _numLayers;
-    private readonly int _numKvHeads;
-    private readonly int _headDim;
     private readonly int _maxSeqLen;
-    private readonly int _kvStride;
+    // Per-layer row stride (numKvHeads × headDim, FP32 elements). Uniform across
+    // layers for every dense/GQA/MoE model; PER-LAYER for Gemma-4, whose sliding
+    // and global layers carry different KV-head counts AND head dims (e.g. sliding
+    // 8×256 vs global 2×512) — so each layer's cached K/V row is a different width.
+    private readonly int[] _kvStride;
     private int _currentLength;
     private bool _disposed;
 
@@ -51,31 +53,77 @@ public sealed class VulkanKvCache : IKvCache
     /// <inheritdoc/>
     public int MaxLength => _maxSeqLen;
 
-    /// <summary>Creates the per-layer K/V buffers. Memory is not zeroed — the forward pass only reads positions it has written.</summary>
+    /// <summary>
+    /// Creates the per-layer K/V buffers with a UNIFORM <c>numKvHeads × headDim</c>
+    /// row stride (every layer the same width — the dense / GQA / MoE case).
+    /// Memory is not zeroed — the forward pass only reads positions it has written.
+    /// </summary>
     public VulkanKvCache(VulkanDevice device, int numLayers, int numKvHeads, int headDim, int maxSeqLen)
+        : this(device, BuildUniformStrides(numLayers, numKvHeads, headDim), maxSeqLen)
+    {
+    }
+
+    /// <summary>
+    /// Creates the per-layer K/V buffers from a Core <see cref="KvGeometry"/> descriptor.
+    /// Byte-identical to the uniform constructor for every dense/GQA/MoE model and supplies
+    /// distinct per-layer strides for Gemma-4. This is the constructor
+    /// <see cref="VulkanTransformerModel.CreateKvCache"/> uses (via
+    /// <see cref="KvGeometry.FromConfig"/>), so the per-layer-stride derivation lives in one
+    /// place (Core) rather than being rebuilt inline.
+    /// </summary>
+    public VulkanKvCache(VulkanDevice device, KvGeometry geometry, int maxSeqLen)
+        : this(device, ExtractStrides(geometry), maxSeqLen)
+    {
+    }
+
+    private static int[] ExtractStrides(KvGeometry geometry)
+    {
+        var strides = new int[geometry.LayerCount];
+        for (int l = 0; l < strides.Length; l++)
+            strides[l] = geometry.KvStrideOf(l);
+        return strides;
+    }
+
+    /// <summary>
+    /// Creates the per-layer K/V buffers from an explicit PER-LAYER row stride
+    /// (FP32 elements per token position, i.e. <c>numKvHeads × headDim</c> for that
+    /// layer). Used by Gemma-4, whose sliding and global layers have different
+    /// KV-head counts and head dims, so each layer's cached row is a different width.
+    /// </summary>
+    public VulkanKvCache(VulkanDevice device, int[] kvStridePerLayer, int maxSeqLen)
     {
         ArgumentNullException.ThrowIfNull(device);
-        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
-        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
-        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        ArgumentNullException.ThrowIfNull(kvStridePerLayer);
+        if (kvStridePerLayer.Length == 0) throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer));
         if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
 
         _device = device;
-        _numLayers = numLayers;
-        _numKvHeads = numKvHeads;
-        _headDim = headDim;
+        _numLayers = kvStridePerLayer.Length;
         _maxSeqLen = maxSeqLen;
-        _kvStride = numKvHeads * headDim;
+        _kvStride = (int[])kvStridePerLayer.Clone();
 
-        _keys = new VulkanDevice.Buffer[numLayers];
-        _values = new VulkanDevice.Buffer[numLayers];
+        _keys = new VulkanDevice.Buffer[_numLayers];
+        _values = new VulkanDevice.Buffer[_numLayers];
 
-        long bytesPerLayer = (long)maxSeqLen * _kvStride * sizeof(float);
-        for (int i = 0; i < numLayers; i++)
+        for (int i = 0; i < _numLayers; i++)
         {
+            if (_kvStride[i] <= 0)
+                throw new ArgumentOutOfRangeException(nameof(kvStridePerLayer),
+                    $"Per-layer KV stride must be positive; layer {i} = {_kvStride[i]}.");
+            long bytesPerLayer = (long)maxSeqLen * _kvStride[i] * sizeof(float);
             _keys[i] = device.AllocateDeviceLocal(bytesPerLayer);
             _values[i] = device.AllocateDeviceLocal(bytesPerLayer);
         }
+    }
+
+    private static int[] BuildUniformStrides(int numLayers, int numKvHeads, int headDim)
+    {
+        if (numLayers <= 0) throw new ArgumentOutOfRangeException(nameof(numLayers));
+        if (numKvHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numKvHeads));
+        if (headDim <= 0) throw new ArgumentOutOfRangeException(nameof(headDim));
+        var strides = new int[numLayers];
+        Array.Fill(strides, numKvHeads * headDim);
+        return strides;
     }
 
     /// <summary>Returns the device buffer holding cached keys for the given layer.</summary>
@@ -99,7 +147,7 @@ public sealed class VulkanKvCache : IKvCache
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
 
-        int rowBytes = _kvStride * sizeof(float);
+        int rowBytes = _kvStride[layerIndex] * sizeof(float);
 
         // Single contiguous range if positions are consecutive — one copy call
         // covers the whole seqLen. Otherwise fall back to per-row copies.
@@ -151,9 +199,17 @@ public sealed class VulkanKvCache : IKvCache
         if (positions.Length != seqLen)
             throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
 
-        int rowBytes = _kvStride * sizeof(float);
+        int rowBytes = _kvStride[layerIndex] * sizeof(float);
         int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         bool contiguous = IsContiguousAscending(positions);
+
+        // Hazard-scoped barriers (issue #144): declare the append's access set
+        // (reads the fresh K/V activations, writes the per-layer cache rows)
+        // so the tracker emits the RoPE→copy barrier and the later
+        // copy→attention barrier only when actually pending. One declaration
+        // per buffer pair covers both the contiguous and per-row forms.
+        _device.ActiveHazards?.OnTransfer(kDev.Handle, _keys[layerIndex].Handle);
+        _device.ActiveHazards?.OnTransfer(vDev.Handle, _values[layerIndex].Handle);
 
         if (contiguous)
         {
@@ -183,6 +239,24 @@ public sealed class VulkanKvCache : IKvCache
             }
         }
 
+        int newLength = maxPos + 1;
+        if (newLength > _currentLength)
+            _currentLength = newLength;
+    }
+
+    /// <summary>
+    /// Validates <paramref name="positions"/> and advances <see cref="CurrentLength"/> as if
+    /// <see cref="RecordUpdate"/> had run, WITHOUT recording any copy commands. Used by the
+    /// fused RoPE+KV-write path (<c>RopeKvWriteF32Kernel</c>, issue #380), which writes cache
+    /// rows directly via its own compute dispatch instead of going through <see cref="RecordUpdate"/>'s
+    /// <c>vkCmdCopyBuffer</c> calls, but still needs the same length-tracking side effect.
+    /// </summary>
+    internal void AdvanceCurrentLength(ReadOnlySpan<int> positions, int seqLen)
+    {
+        if (positions.Length != seqLen)
+            throw new ArgumentException("positions.Length must equal seqLen", nameof(positions));
+
+        int maxPos = ValidateAndFindMaxPos(positions, seqLen);
         int newLength = maxPos + 1;
         if (newLength > _currentLength)
             _currentLength = newLength;
@@ -255,9 +329,14 @@ public sealed class VulkanKvCache : IKvCache
     public int LayerCount => _numLayers;
 
     /// <summary>
-    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements).
+    /// Per-row stride (<c>numKvHeads * headDim</c>, FP32 elements) of layer 0.
+    /// For uniform caches this is the model-wide stride; for Gemma-4 (per-layer
+    /// strides) use <see cref="KvStrideOf"/> to get a specific layer's width.
     /// </summary>
-    public int KvStride => _kvStride;
+    public int KvStride => _kvStride[0];
+
+    /// <summary>Per-row stride (FP32 elements) for the given layer.</summary>
+    public int KvStrideOf(int layerIndex) => _kvStride[layerIndex];
 
     /// <summary>
     /// Ingests host-resident K/V rows (FP32, layout <c>[length, kvStride]</c>)
@@ -292,7 +371,7 @@ public sealed class VulkanKvCache : IKvCache
         if (length > _maxSeqLen)
             throw new ArgumentOutOfRangeException(nameof(length),
                 $"length {length} exceeds cache MaxLength {_maxSeqLen}.");
-        long expectedFloats = (long)length * _kvStride;
+        long expectedFloats = (long)length * _kvStride[layerIndex];
         if (keys.Length != expectedFloats || values.Length != expectedFloats)
             throw new ArgumentException(
                 $"keys/values must contain exactly length × kvStride = {expectedFloats} floats; "
@@ -336,12 +415,42 @@ public sealed class VulkanKvCache : IKvCache
         _currentLength = length;
     }
 
+    // ── IHostStagedKvCache: device↔host staging for cross-device KV handoff ──
+    // The two halves of a device→host→device transfer: DownloadLayer reads this (prefill-device) cache's
+    // K/V to host; the decode-device cache's UploadLayer (== IngestFromHost) writes it back to its device.
+    // This is the production transport for a two-GPU prefill→decode handoff and is exercised by the
+    // DisaggregatedScheduler's StagedKvHandoffTransfer.
+
+    /// <inheritdoc/>
+    public int StagedLayerElementCount(int layerIndex)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        return _currentLength * _kvStride[layerIndex];
+    }
+
+    /// <inheritdoc/>
+    public void DownloadLayer(int layerIndex, Span<float> keys, Span<float> values)
+    {
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        int count = _currentLength * _kvStride[layerIndex];
+        if (count == 0) return;
+        if (keys.Length < count || values.Length < count)
+            throw new ArgumentException($"keys/values must hold at least currentLength × kvStride = {count} floats.");
+        // Device-local K/V → host. On a dGPU this is a real VRAM read-back; on UMA the bytes never leave DRAM.
+        _device.Download(_keys[layerIndex], keys[..count]);
+        _device.Download(_values[layerIndex], values[..count]);
+    }
+
+    /// <inheritdoc/>
+    public void UploadLayer(int layerIndex, int length, ReadOnlySpan<float> keys, ReadOnlySpan<float> values)
+        => IngestFromHost(layerIndex, length, keys, values);
+
     private unsafe void MapAndCopy(VulkanDevice.Buffer staging, ReadOnlySpan<float> source)
     {
         int byteLen = source.Length * sizeof(float);
-        Interop.VulkanApi.vkMapMemory(
-                _device.Handle, staging.Memory, 0, (ulong)byteLen, 0, out nint mapped)
-            .ThrowOnError("vkMapMemory IngestFromHost staging");
+        nint mapped = _device.MapMemoryWithRetry(staging.Memory, 0, (ulong)byteLen, "vkMapMemory IngestFromHost staging");
         try
         {
             fixed (float* src = source)

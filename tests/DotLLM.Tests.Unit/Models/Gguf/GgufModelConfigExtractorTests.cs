@@ -1,4 +1,5 @@
 using DotLLM.Core.Configuration;
+using DotLLM.Core.Models;
 using DotLLM.Core.PositionEncoding;
 using DotLLM.Models.Gguf;
 using Xunit;
@@ -144,7 +145,7 @@ public class GgufModelConfigExtractorTests
 
         var config = GgufModelConfigExtractor.Extract(metadata);
         Assert.NotNull(config.ChatTemplate);
-        Assert.Contains("messages", config.ChatTemplate);
+        Assert.Contains("messages", config.ChatTemplate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -223,6 +224,74 @@ public class GgufModelConfigExtractorTests
     }
 
     [Fact]
+    public void Extract_Qwen35Dense_PopulatesGdnAndHybridLayoutNoMoe()
+    {
+        // Real metadata values from PrismML's Ternary-Bonsai-27B-Q2_0.gguf (confirmed by direct
+        // inspection this session — general.architecture="qwen35", no "moe" suffix, no expert_*
+        // keys at all). Distinguishes this dense hybrid from qwen35moe (Extract_ArchitectureParsing
+        // covers the moe variant's bare architecture mapping; this test covers the GDN/hybrid-layout
+        // extraction path end-to-end, which qwen35 and qwen35moe both funnel through).
+        var metadata = BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", "qwen35");
+            d.AddUInt32("qwen35.embedding_length", 5120);
+            d.AddUInt32("qwen35.block_count", 64);
+            d.AddUInt32("qwen35.feed_forward_length", 17408);
+            d.AddUInt32("qwen35.attention.head_count", 24);
+            d.AddUInt32("qwen35.attention.head_count_kv", 4);
+            d.AddUInt32("qwen35.attention.key_length", 256);
+            d.AddUInt32("qwen35.context_length", 262144);
+            d.AddUInt32("qwen35.vocab_size", 248320);
+            d.AddFloat32("qwen35.attention.layer_norm_rms_epsilon", 1e-6f);
+            d.AddFloat32("qwen35.rope.freq_base", 10000000.0f);
+            d.AddUInt32("qwen35.rope.dimension_count", 64);
+            // GDN config (qwen35.ssm.* — same key names as Mamba-2 but different semantics).
+            d.AddUInt32("qwen35.ssm.conv_kernel", 4);
+            d.AddUInt32("qwen35.ssm.state_size", 128);
+            d.AddUInt32("qwen35.ssm.group_count", 16);
+            d.AddUInt32("qwen35.ssm.time_step_rank", 48);
+            d.AddUInt32("qwen35.ssm.inner_size", 6144);
+            d.AddUInt32("qwen35.full_attention_interval", 4);
+            // Deliberately NO expert_count/expert_used_count/etc. — dense, not MoE.
+        });
+
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(Architecture.Qwen3HybridDense, config.Architecture);
+        Assert.Equal(5120, config.HiddenSize);
+        Assert.Equal(64, config.NumLayers);
+        Assert.Equal(17408, config.IntermediateSize);
+        Assert.Equal(24, config.NumAttentionHeads);
+        Assert.Equal(4, config.NumKvHeads);
+        Assert.Equal(256, config.HeadDim);
+        Assert.Equal(262144, config.MaxSequenceLength);
+
+        // GDN config populated, Mamba-2 SsmConfig NOT (qwen35.ssm.* keys are GDN-flavoured, not
+        // Mamba-2 — extracting them as MambaSsmConfig would be silently wrong).
+        Assert.True(config.GdnConfig.HasValue);
+        var gdn = config.GdnConfig!.Value;
+        Assert.Equal(4, gdn.FullAttnInterval);
+        Assert.Equal(48, gdn.NVHead);
+        Assert.Equal(16, gdn.NKHead);
+        Assert.Equal(128, gdn.DState);
+        Assert.Equal(6144, gdn.DInner);
+        Assert.Equal(4, gdn.DConv);
+        Assert.Null(config.SsmConfig);
+
+        // Hybrid layer layout: 3 GDN layers then 1 full-attention layer, repeating
+        // (full_attention_interval=4, 1-based: layer index i is full-attn when (i+1)%4==0).
+        Assert.NotNull(config.HybridLayout);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[0]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[1]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[2]);
+        Assert.Equal(HybridLayerKind.Attention, config.HybridLayout.LayerKind[3]);
+        Assert.Equal(HybridLayerKind.GatedDeltaNet, config.HybridLayout.LayerKind[4]);
+
+        // Dense — no MoE sublayer at all, unlike qwen35moe.
+        Assert.Null(config.Moe);
+    }
+
+    [Fact]
     public void Extract_DeepSeekV2_LoraQ_PopulatesQLoraRank()
     {
         // V2-full / V3 ship with q_lora_rank > 0 (Q-side factorisation).
@@ -295,7 +364,7 @@ public class GgufModelConfigExtractorTests
         var metadata = BuildMetadata(d => d.AddString("general.architecture", "unknown_arch"));
 
         var ex = Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
-        Assert.Contains("unknown_arch", ex.Message);
+        Assert.Contains("unknown_arch", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -342,7 +411,9 @@ public class GgufModelConfigExtractorTests
     [InlineData("qwen", Architecture.Qwen)]
     [InlineData("qwen2", Architecture.Qwen)]
     [InlineData("qwen3", Architecture.Qwen)]
+#pragma warning disable CS0618 // Intentional: pins legacy "deepseek" GGUF metadata compat.
     [InlineData("deepseek", Architecture.DeepSeek)]
+#pragma warning restore CS0618
     // Note: deepseek2 / deepseek3 require additional MLA + MoE metadata that
     // this minimal-keys parameterised test doesn't supply — they're covered by
     // the dedicated Extract_DeepSeekV2Lite_PopulatesMlaAndMoe and
@@ -516,5 +587,162 @@ public class GgufModelConfigExtractorTests
         Assert.Equal(1.0f, config.RoPEConfig.Value.AttnFactor);
         Assert.Equal(32.0f, config.RoPEConfig.Value.BetaFast);
         Assert.Equal(1.0f, config.RoPEConfig.Value.BetaSlow);
+    }
+
+    // -------------------------------------------------------------------------
+    // Gemma 4 / DiffusionGemma. The synthetic metadata mirrors the real
+    // unsloth/gemma-4-26B-A4B-it GGUF shape: 30 layers, sliding pattern with a
+    // full layer every 6th (indices 5,11,17,23,29), dual KV head counts
+    // (8 sliding / 2 global), dual head dim (256 swa / 512 global), dual RoPE
+    // (theta 1e4 swa / 1e6 global, dim 256/512), MoE 128 experts / top-8,
+    // final-logit softcap 30.
+    // -------------------------------------------------------------------------
+    private static GgufMetadata BuildGemma4Metadata(string arch, Action<GgufTestData>? extra = null)
+    {
+        // sliding_window_pattern: 1 = sliding/local, 0 = full/global. Full every 6th (1-indexed).
+        int n = 30;
+        var pattern = new int[n];
+        var kv = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            bool isFull = ((i + 1) % 6) == 0;
+            pattern[i] = isFull ? 0 : 1;
+            kv[i] = isFull ? 2 : 8;
+        }
+
+        return BuildMetadata(d =>
+        {
+            d.AddString("general.architecture", arch);
+            d.AddUInt32($"{arch}.embedding_length", 2816);
+            d.AddUInt32($"{arch}.block_count", (uint)n);
+            d.AddUInt32($"{arch}.attention.head_count", 16);
+            d.AddInt32Array($"{arch}.attention.head_count_kv", kv);
+            d.AddUInt32($"{arch}.feed_forward_length", 2112);
+            d.AddUInt32($"{arch}.context_length", 262144);
+            d.AddFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-6f);
+            d.AddUInt32($"{arch}.attention.key_length", 512);
+            d.AddUInt32($"{arch}.attention.key_length_swa", 256);
+            d.AddUInt32($"{arch}.attention.sliding_window", 1024);
+            d.AddInt32Array($"{arch}.attention.sliding_window_pattern", pattern);
+            d.AddFloat32($"{arch}.rope.freq_base", 1_000_000.0f);
+            d.AddFloat32($"{arch}.rope.freq_base_swa", 10_000.0f);
+            d.AddUInt32($"{arch}.rope.dimension_count", 512);
+            d.AddUInt32($"{arch}.rope.dimension_count_swa", 256);
+            d.AddUInt32($"{arch}.expert_count", 128);
+            d.AddUInt32($"{arch}.expert_used_count", 8);
+            d.AddUInt32($"{arch}.expert_feed_forward_length", 704);
+            d.AddFloat32($"{arch}.final_logit_softcapping", 30.0f);
+            d.AddUInt32($"{arch}.vocab_size", 262144);
+            extra?.Invoke(d);
+        });
+    }
+
+    [Fact]
+    public void Extract_Gemma4_DualHeadDim_DualKv_DualRope_Moe()
+    {
+        var metadata = BuildGemma4Metadata("gemma4");
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        Assert.Equal(Architecture.Gemma4, config.Architecture);
+        Assert.True(config.IsGemmaArchitecture);
+        Assert.Equal(2816, config.HiddenSize);
+        Assert.Equal(30, config.NumLayers);
+        Assert.Equal(16, config.NumAttentionHeads);
+
+        // Sliding (local) values are the model-wide defaults.
+        Assert.Equal(8, config.NumKvHeads);
+        Assert.Equal(256, config.HeadDim);
+        // Full (global) values land on the *Global* overrides.
+        Assert.Equal(2, config.NumGlobalKvHeads);
+        Assert.Equal(512, config.GlobalHeadDim);
+
+        // Dual RoPE: sliding on RoPEConfig, global on GlobalRoPEConfig.
+        Assert.NotNull(config.RoPEConfig);
+        Assert.Equal(10_000.0f, config.RoPEConfig!.Value.Theta);
+        Assert.Equal(256, config.RoPEConfig.Value.DimensionCount);
+        Assert.NotNull(config.GlobalRoPEConfig);
+        Assert.Equal(1_000_000.0f, config.GlobalRoPEConfig!.Value.Theta);
+        Assert.Equal(512, config.GlobalRoPEConfig.Value.DimensionCount);
+        // gemma4 full-attention layers apply partial rope 0.25 over head_dim 512
+        // (rope.dimension_count 512 is the FULL head dim; factor selects the
+        // rotated span — first 64 pairs = 128 dims). See GEMMA4-GRAPH-SPEC.md.
+        Assert.Equal(0.25f, config.PartialRotaryFactor);
+
+        // Attention softmax scale 1.0 (q_norm/k_norm make Q,K unit) → QueryPreAttnScalar 1.0.
+        Assert.Equal(1.0f, config.QueryPreAttnScalar);
+        // Gemma 4 MoE dual-FFN graph flag.
+        Assert.True(config.Gemma4DualFfn);
+
+        // MoE.
+        Assert.NotNull(config.Moe);
+        Assert.Equal(128, config.Moe!.NumExperts);
+        Assert.Equal(8, config.Moe.NumExpertsPerTok);
+        Assert.Equal(704, config.Moe.MoeIntermediateSize);
+
+        // Gemma backbone markers.
+        Assert.Equal(ActivationFunction.GELUTanh, config.ActivationFunction);
+        Assert.True(config.TiedEmbeddings);
+        Assert.Equal(MathF.Sqrt(2816), config.EmbeddingScale);
+        Assert.Equal(30.0f, config.FinalLogitSoftcap);
+        Assert.Null(config.AttnLogitSoftcap);
+
+        // Per-layer attention type: layer 5 is full, layer 0 is sliding.
+        Assert.True(config.IsFullAttentionLayer(5));
+        Assert.False(config.IsFullAttentionLayer(0));
+        Assert.Equal(1024, config.PerLayerSlidingWindow![0]);
+        Assert.Null(config.PerLayerSlidingWindow[5]);
+
+        // Per-layer head dim resolves correctly (#36).
+        Assert.Equal(512, config.GetLayerHeadDim(5));   // full
+        Assert.Equal(256, config.GetLayerHeadDim(0));   // sliding
+
+        // AR Gemma 4 carries no diffusion config.
+        Assert.Null(config.DiffusionConfig);
+    }
+
+    [Fact]
+    public void Extract_DiffusionGemma_BuildsDiffusionConfigOverGemma4Backbone()
+    {
+        // DiffusionGemma reuses the EXACT gemma4 backbone config and ADDS a
+        // non-null DiffusionConfig (canvas length + mask token, Hybrid canvas
+        // mask). The region-aware forward deltas (region embed rms_noscale,
+        // enc_layer_output_scale per-layer scalar, Hybrid(P) mask) are wired in
+        // TransformerModel gated on DiffusionConfig; self-conditioning + PKV cache
+        // remain deferred.
+        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
+        {
+            d.AddUInt32("diffusion.canvas_length", 256);
+            d.AddUInt32("tokenizer.ggml.mask_token_id", 4);
+        });
+        var config = GgufModelConfigExtractor.Extract(metadata);
+
+        // Architecture maps to DiffusionGemma; backbone config is gemma4-identical.
+        Assert.Equal(Architecture.DiffusionGemma, config.Architecture);
+        Assert.True(config.IsGemmaArchitecture);
+        Assert.True(config.Gemma4DualFfn);
+        Assert.Equal(0.25f, config.PartialRotaryFactor);
+        Assert.Equal(1.0f, config.QueryPreAttnScalar);
+        Assert.NotNull(config.Moe);
+        Assert.Equal(128, config.Moe!.NumExperts);
+
+        // The diffusion delta: a non-null DiffusionConfig with the GGUF canvas
+        // length + mask token id, defaulting to the Hybrid region-aware mask.
+        Assert.NotNull(config.DiffusionConfig);
+        Assert.Equal(256, config.DiffusionConfig!.CanvasLength);
+        Assert.Equal(4, config.DiffusionConfig.MaskTokenId);
+        Assert.Equal(DotLLM.Core.Attention.AttentionMaskMode.Hybrid,
+            config.DiffusionConfig.CanvasAttentionMode);
+    }
+
+    [Fact]
+    public void Extract_DiffusionGemma_MissingMaskToken_Throws()
+    {
+        // A diffusion model cannot decode without a mask token id — loading must
+        // fail loudly when tokenizer.ggml.mask_token_id is absent.
+        var metadata = BuildGemma4Metadata("diffusion-gemma", d =>
+        {
+            d.AddUInt32("diffusion.canvas_length", 256);
+        });
+        Assert.Throws<InvalidDataException>(() => GgufModelConfigExtractor.Extract(metadata));
     }
 }

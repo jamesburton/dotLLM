@@ -30,7 +30,7 @@ public sealed class XmlToolCallParserTests
         Assert.NotNull(calls);
         Assert.Single(calls);
         Assert.Equal("get_weather", calls![0].FunctionName);
-        Assert.Contains("Berlin", calls[0].Arguments);
+        Assert.Contains("Berlin", calls[0].Arguments, StringComparison.Ordinal);
     }
 
     [Fact]

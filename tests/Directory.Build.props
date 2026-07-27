@@ -1,0 +1,33 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!--
+      IDisposableAnalyzers + Meziantou.Analyzer (below) surface ~600 pre-existing findings
+      across tests/ (MA0051/MA0048 — style rules not relevant to test code — are fully
+      disabled via tests/.editorconfig instead of listed here). The rest are real
+      correctness-adjacent findings (disposal on native-handle-heavy CUDA test code,
+      culture/comparison safety) that need individual review, not a bulk mechanical pass —
+      rushing that risks introducing real disposal bugs. So: added for visibility (they
+      surface as build warnings you'll see every build), but NOT yet enforced as errors. The
+      already-clean codes (CA2014, CA1416, CS9191, CS0618, xUnit2020) stay enforced normally.
+      Triage and promote individual MA/IDISP rules to errors incrementally as they're fixed.
+    -->
+    <WarningsNotAsErrors>
+      $(WarningsNotAsErrors);
+      MA0074;MA0002;MA0006;MA0011;MA0144;MA0025;MA0008;MA0004;MA0015;MA0158;
+      IDISP001;IDISP003;IDISP004;IDISP005;IDISP006;IDISP007;IDISP008;IDISP013;IDISP016;IDISP017;IDISP025
+    </WarningsNotAsErrors>
+  </PropertyGroup>
+
+  <!--
+    Analyzers scoped to tests/ only for now, not src/ (src/ already treats warnings as
+    errors on its existing analyzer set; adding these two here first lets us gauge and fix
+    the tests/-only blast radius before considering a repo-wide rollout).
+  -->
+  <ItemGroup>
+    <PackageReference Include="IDisposableAnalyzers" PrivateAssets="all" />
+    <PackageReference Include="Meziantou.Analyzer" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

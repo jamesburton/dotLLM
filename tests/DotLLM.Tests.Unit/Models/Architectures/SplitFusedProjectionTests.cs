@@ -162,7 +162,7 @@ public sealed class SplitFusedProjectionTests
                 DataBeginOffset: 0,
                 DataEndOffset: _byteCount);
 
-            _byName = new Dictionary<string, SafetensorsTensorDescriptor>
+            _byName = new Dictionary<string, SafetensorsTensorDescriptor>(StringComparer.Ordinal)
             {
                 [name] = desc,
             };
@@ -177,14 +177,14 @@ public sealed class SplitFusedProjectionTests
 
         public nint GetTensorPointer(string name)
         {
-            if (name != _name)
+            if (!string.Equals(name, _name, StringComparison.Ordinal))
                 throw new KeyNotFoundException(name);
             return _basePtr;
         }
 
         public ReadOnlySpan<byte> GetTensorSpan(string name)
         {
-            if (name != _name)
+            if (!string.Equals(name, _name, StringComparison.Ordinal))
                 throw new KeyNotFoundException(name);
             return new ReadOnlySpan<byte>((void*)_basePtr, (int)_byteCount);
         }

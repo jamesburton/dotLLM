@@ -1,0 +1,118 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic      : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Fused RMSNorm + Q8_1 activation quantization for the DECODE path (issue #145).
+//
+// Replaces the two-dispatch sequence
+//   rmsnorm_f32_sg (1 WG)  ->  barrier  ->  quantize_q8_1 (1 WG)
+// that runs before every quantized MMVQ GEMV group at seqLen == 1, saving one
+// dispatch + one full-pipeline barrier per group (2 groups per dense layer:
+// attn-norm -> Q/K/V and ffn-norm -> gate/up). Mirrors the CPU backend's
+// FusedOps.RmsNormQuantize.
+//
+// PARITY CONTRACT: outputs must be bit-identical to the standalone pair.
+//   - The sum-of-squares reduction is copied VERBATIM from rmsnorm_f32_sg.comp
+//     (same WG size, same per-thread strided loop, same two-level subgroupAdd)
+//     so `rinv` is the same bits on the same device.
+//   - The per-element normalized value uses the exact expression
+//     `input_[i] * rinv * weight[i]` (two ordered multiplies, no FMA-able
+//     add) and is both written to normOut AND quantized in-register — an f32
+//     register value and its stored copy are the same bits.
+//   - The quantization (amax loop, d = amax/127, round, pack, block sum) is
+//     copied verbatim from quantize_q8_1.comp.
+//
+// Also writes the normalized F32 row (normOut) because downstream consumers
+// besides the GEMVs read it (LoRA deltas; the non-shared fallback members).
+//
+// Dispatch: ONE workgroup (decode => one activation row); n multiple of 32.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufIn      { float input_[]; };  // [n]
+layout(set = 0, binding = 1, std430) readonly  buffer BufWeight  { float weight[]; };  // [n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufNormOut { float normOut[]; }; // [n]
+layout(set = 0, binding = 3, std430) writeonly buffer BufXq      { uint  xq[]; };      // [n/4]
+layout(set = 0, binding = 4, std430) writeonly buffer BufXds     { vec2  xds[]; };     // [n/32]
+
+layout(push_constant) uniform PushConstants {
+    uint  n;            // row length (multiple of 32)
+    float eps;          // epsilon added under the sqrt
+    uint  blocksPerRow; // = n / 32
+} pc;
+
+const uint QK = 32u; // elements per Q8_1 block
+
+// Reduction scratch — identical layout to rmsnorm_f32_sg.comp.
+shared float partials[64];
+shared float rinvBroadcast;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint threads = gl_WorkGroupSize.x;
+
+    // ── 1. Sum of squares + rinv: copied verbatim from rmsnorm_f32_sg.comp
+    //       (single row: rowBase == 0). ─────────────────────────────────
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.n; i += threads) {
+        float v = input_[i];
+        sumSq += v * v;
+    }
+
+    float subgroupSum = subgroupAdd(sumSq);
+    if (subgroupElect()) {
+        partials[gl_SubgroupID] = subgroupSum;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        float x = (gl_SubgroupInvocationID < gl_NumSubgroups)
+                ? partials[gl_SubgroupInvocationID]
+                : 0.0;
+        float reduced = subgroupAdd(x);
+        if (subgroupElect()) {
+            float meanSq = reduced / float(pc.n);
+            rinvBroadcast = inversesqrt(meanSq + pc.eps);
+        }
+    }
+    barrier();
+    float rinv = rinvBroadcast;
+
+    // ── 2. Normalize + quantize, one thread per 32-block (grid-strided) —
+    //       quantization logic copied verbatim from quantize_q8_1.comp with
+    //       x[i] replaced by the in-register normalized value. ──────────
+    for (uint b = tid; b < pc.blocksPerRow; b += threads) {
+        uint base = b * QK;
+
+        // Normalize the block; write the F32 row and keep values in registers.
+        float vals[QK];
+        float amax = 0.0;
+        for (uint i = 0u; i < QK; i++) {
+            float v = input_[base + i] * rinv * weight[base + i];
+            vals[i] = v;
+            normOut[base + i] = v;
+            amax = max(amax, abs(v));
+        }
+
+        float d = amax / 127.0;
+        float id = (d != 0.0) ? (1.0 / d) : 0.0;
+
+        int sumI = 0;
+        uint qBase = base >> 2u; // 4 elements per uint
+        for (uint g = 0u; g < QK / 4u; g++) {
+            uint e = g * 4u;
+            int q0 = int(round(vals[e + 0u] * id));
+            int q1 = int(round(vals[e + 1u] * id));
+            int q2 = int(round(vals[e + 2u] * id));
+            int q3 = int(round(vals[e + 3u] * id));
+            sumI += q0 + q1 + q2 + q3;
+            uint packed = (uint(q0) & 0xFFu)
+                        | ((uint(q1) & 0xFFu) << 8u)
+                        | ((uint(q2) & 0xFFu) << 16u)
+                        | ((uint(q3) & 0xFFu) << 24u);
+            xq[qBase + g] = packed;
+        }
+
+        xds[b] = vec2(d, d * float(sumI));
+    }
+}

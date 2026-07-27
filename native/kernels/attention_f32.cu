@@ -14,6 +14,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <cooperative_groups.h>
 
 #define TILE_KV 256
 
@@ -162,4 +163,311 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32(
     float* out_vec = output + (size_t)tq * q_stride + hq * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
         out_vec[d] = out_accum[d] * sum_inv;
+}
+
+// ─── OPT-IN split-KV ("Flash-Decoding") cooperative-groups variant (issue #183) ────────────
+//
+// `attention_f32`'s grid is `seq_q * num_heads` only. For decode (seq_q==1) that means grid ==
+// num_heads — for real Bonsai-27B (qwen35.attention.head_count=24) that's SMALLER than the RTX
+// 3060's 28 SMs, so several SMs get zero work, and the KV-tile loop above
+// (`for t_start = 0; t_start < seq_kv; t_start += TILE_KV`) runs entirely SEQUENTIALLY within one
+// block per head with zero parallelism across the KV dimension. `.docs/handoff.md`'s "Depth-
+// dependent attention finding" measured this kernel growing +151% (0.043ms -> 0.108ms/call) from
+// context depth 0 to 256 — this is exactly the published "Flash-Decoding" scenario (Dao et al.,
+// the FlashAttention team): a single (or few) query tokens attending to many cached KV positions,
+// where the query/head-only grid underfills the GPU. The fix: split the KV dimension across
+// ADDITIONAL blocks, each computing a PARTIAL (running_max, running_sum, weighted_output) over its
+// own KV sub-range using the exact same online-softmax tiling as `attention_f32` above, then merge
+// partials with the standard rule (equivalent to what `attention_f32`'s own per-tile rescale above
+// already does, one step at a time, generalized to N-way combine):
+//   given partials {(m_i, l_i, o_i)} for i in [0, SPLIT):
+//     m = max_i(m_i)
+//     l = sum_i( l_i * exp(m_i - m) )
+//     o = sum_i( o_i * exp(m_i - m) )      (component-wise, o_i is UNNORMALIZED weighted-V sum)
+//     final = o / l
+//
+// ─── Design choice: single cooperative launch, not two kernel launches ─────────────────────
+// Modeled both before implementing (per this investigation's standing "model before implementing"
+// rule — see pq2_0_gemv.cu's header for ~10 precedents where skipping this step cost real
+// regressions). This kernel is called 16x/layer/step for Bonsai-27B (16 full-attention layers,
+// `qwen35.full_attention_interval=4` of 64 total layers) — much less frequently than
+// gdn_scan_step_f32's 48x/layer/step (issue #180). A naive two-launch design (partial-compute
+// kernel + separate combine kernel, no grid.sync needed) would add 1 extra launch x 16 layers =
+// 16 extra launches/decode token. Per-launch overhead on this WDDM host has been measured/quoted
+// elsewhere in this investigation at roughly 5-22us (the higher end from `CudaDecodeGraph.cs`'s
+// CUDA-graph-capture motivation) — so 16 extra launches cost an estimated ~80-350us/decode token.
+// At the ~17-18 tok/s baseline (~55-59ms/decode token), that overhead alone is small in absolute
+// terms (~0.15-0.6%) but is NOT small relative to what this specific kernel can plausibly recover:
+// `attn-6c-core` is itself only ~3-10% of total decode time even at depth 256-1024 (16 calls x
+// 0.1-0.4ms/call ~= 1.6-6.4ms of a ~55-59ms token), so a second launch's overhead could eat a
+// double-digit percentage of whatever the split saves — unlike GDN's 48-launch case where the
+// *kernel itself* is a much larger share of decode time, making 2-launch overhead comparatively
+// cheaper there too, but still rejected. Given the two designs' overhead is comparable in kind
+// here, and the #180/#181 cooperative-launch precedent is proven safe and practical on this exact
+// GPU (reuses `cuLaunchCooperativeKernel` / `cuOccupancyMaxActiveBlocksPerMultiprocessor`, already
+// wired in `CudaDriverApi.cs`), single-launch cooperative is the safer choice to preserve real
+// end-to-end gain: it adds ZERO launches (same call count as `attention_f32`), trading that for one
+// `grid.sync()` instead — and GDN's own split4 data showed grid.sync overhead is small in absolute
+// terms (split=1 ~65-68us -> split=4 ~48-49us net win, despite 2 grid.sync calls in that kernel;
+// this one needs only ONE).
+//
+// ─── Why ONE grid.sync() suffices here (simpler than GDN's two) ───────────────────────────
+// GDN's coop kernel has 3 sequential phases (decay+retrieve -> combine -> write+read) needing two
+// rendezvous points. Here, EVERY block (including the ones that will later combine) performs the
+// identical partial-compute phase first; only AFTER all partials are written do the "leader" blocks
+// (kv_split index 0 for each head) read every split's partial and produce the final normalized
+// output. That is exactly one write-then-read dependency across the whole grid -> one grid.sync().
+//
+// ─── Fixed SPLIT=4, gated by a minimum seq_kv threshold at the C# call site ────────────────
+// Unlike GDN's split (which divides a fixed d_state=128), this split divides the KV sequence
+// range, which varies every decode step as context grows — there is no fixed-size constraint
+// forcing a particular SPLIT. A fixed SPLIT=4 (mirroring #180 exactly) keeps the design and its
+// occupancy/safety-check story simple: the safety check only needs to verify `num_heads*4` blocks
+// can be co-resident (computed once per model shape, cached). The C# call site is responsible for
+// only invoking this kernel once `seq_kv` is large enough that splitting is worth the grid.sync +
+// combine overhead (small seq_kv means each split only saves a few iterations of the per-tile
+// weighted-V accumulation loop — not worth 4x the blocks + a grid-wide barrier) — see
+// `CudaKernels.AttentionSplitKvMinSeqKv` / the `ForwardFullAttnBody` call site.
+//
+// ─── Precision: reuses fast_exp_neg exactly, no precise expf anywhere in the merge ─────────
+// The combine step's `exp(m_i - m)` always has a non-positive argument (m = max over splits), so
+// it satisfies `fast_exp_neg`'s caller contract exactly like every other softmax exponential in
+// this file. Introducing precise `expf` here would reintroduce the ~1% CPU/GPU divergence this
+// file's header already documents fixing — independent of whatever NEW tolerance the cross-block
+// reassociation itself requires (see below).
+//
+// ─── Correctness: reassociation, NOT the same "recurrent state" story as GDN's split4 ──────
+// Splitting KV necessarily reassociates the float accumulation (independent partial sums combined
+// instead of one long sequential accumulation) — mathematically equal, not bit-identical, same as
+// GDN's split4. BUT: unlike GDN's state matrix (which IS the model's recurrent memory, carried
+// step-to-step and hence compounding drift), this kernel's inputs each decode step are the
+// (exact, unperturbed) KV cache plus this step's query — the KV cache holds each layer's ORIGINAL
+// K/V vectors, computed from the pre-attention hidden state, so a numerical perturbation in THIS
+// layer's attention OUTPUT does not feed back into what gets cached for this same layer at this
+// position. The only cross-step pathway is discrete: a different logit distribution could change
+// which token gets sampled, branching the whole generation — not a continuous numerical drift
+// accumulating in a persistent FP32 state the way GDN's does. See
+// `CudaAttentionF32SplitKvTests.cs` for the empirical many-step characterization confirming
+// (or refuting) this expectation — this is flagged as a genuinely different, worth-checking-for-
+// real property, not assumed. CONFIRMED (not just theorized): a 300-consecutive-decode-step run
+// (seqKv growing 256->555, one new KV row appended per step, matching real generation) found max
+// abs diff vs the CPU oracle does NOT compound — first-10-steps average 4.6e-3 vs last-3-steps
+// average 3.1e-3 (ratio 0.68x, i.e. slightly DECREASING, not growing) — a genuinely different,
+// more reassuring result than GDN split4's compounding (which reached ~1-2% within 6 steps).
+//
+// ─── Real bench result: INCONCLUSIVE at the depths safely measurable on this host ──────────
+// `dotnet run bench` A/B (real Bonsai-27B, RTX 3060, `-p 8 -n 48`, multiple rounds):
+//   depth=256  (seqKv~256-264): baseline median 17.59 / best 17.71 tok/s vs split-KV median 17.38 /
+//              best 17.71 tok/s — split-KV very slightly WORSE on median, tied on best. Each split
+//              only gets ~64 KV rows here (256/ATTN_KV_SPLIT) — well under one TILE_KV tile — so
+//              the extra grid.sync()+combine overhead has little sequential work left to amortize
+//              against, the same "small win canceled by overhead" shape as GDN's split=2 (#180).
+//   depth=512  (seqKv~512-520), 2 rounds: baseline medians 16.73/16.85 (mean 16.79), best 17.27/
+//              17.30 (mean 17.29); split-KV medians 16.90/16.73 (mean 16.82), best 17.36/17.44
+//              (mean 17.40) — median is a coin flip (+0.2% aggregate, inside this host's own
+//              documented 2-8% run-to-run noise floor), but split-KV's BEST-of-8-reps edged
+//              baseline's best in every round measured (+0.6% to +0.8%) — a weak, GDN-#180-shaped
+//              signal ("never lost by the best-of-rep metric") but far short of a clear win.
+//   depth>=768: COULD NOT BE SAFELY MEASURED on this host — both the unmodified baseline path
+//              (confirmed independently, `DOTLLM_ATTN_SPLIT_KV` unset) and the split-KV path hung
+//              for 3-4+ minutes at depth 768 and depth 1024 (100% GPU util, ~15-62W power draw,
+//              VRAM near this card's 12GB ceiling — the same signature `.docs/handoff.md` already
+//              flagged for `DOTLLM_HYBRID_PROFILE=1`+`--depth 1024`, but reproduced here WITHOUT
+//              profiling and on the plain baseline path too, generalizing that prior finding to a
+//              broader depth>=768 instability, not something this change introduced or is specific
+//              to). This is exactly the depth range where the motivating profiling data
+//              (attn-6c-core growing +151% from depth 0->256, presumably continuing to grow past
+//              256) predicts the split-KV design should show its clearest win — and it is the one
+//              range this session could not validate. Do not read the depth 256/512 numbers above
+//              as the final verdict on this kernel's value; they are what could be safely measured,
+//              not necessarily where the effect is largest.
+//
+// VERDICT: correctness-validated, zero-risk (opt-in, default-OFF, proper safety-gated fallback,
+// zero change to any default code path), but NOT a demonstrated performance win at the depths this
+// session could safely test — an honest "partial/incomplete given the scope" outcome per this
+// investigation's stated culture, not a clean win (unlike #168/#170/#180/#181) or a clean negative
+// (unlike #172/#173, which showed no benefit at ANY tested condition). Kept as opt-in infrastructure
+// specifically because (a) it is real, tested, zero-default-risk engineering that would be wasted
+// effort to discard, (b) the "best-of-rep never lost" signal at depth 512 hints at a real, if small,
+// effect, and (c) a future session with either more VRAM headroom (to safely reach depth>=768-1024)
+// or a fix for the underlying depth>=768 hang could re-run this exact A/B and get a decisive answer
+// without redoing any of the design/correctness work. Do NOT flip `EnableAttentionSplitKv`'s default
+// without that follow-up validation.
+#define ATTN_KV_SPLIT 4
+
+extern "C" __global__ void attention_f32_split_kv(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ output,
+    const int seq_kv,
+    const int num_heads, const int num_kv_heads, const int head_dim,
+    const int position_offset, const int sliding_window,
+    float* __restrict__ partial_max,   // [num_heads, ATTN_KV_SPLIT]
+    float* __restrict__ partial_sum,   // [num_heads, ATTN_KV_SPLIT]
+    float* __restrict__ partial_out)   // [num_heads, ATTN_KV_SPLIT, head_dim]
+{
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+
+    int hq = blockIdx.x;
+    int s  = blockIdx.y;
+    int hkv = hq / (num_heads / num_kv_heads);
+    float scale = rsqrtf((float)head_dim);
+    int pos_q = position_offset; // seq_q == 1 (decode-only kernel)
+
+    int kv_stride = num_kv_heads * head_dim; // q has no stride use here: seqQ==1, so q_vec below indexes by head only
+
+    extern __shared__ float smem[];
+    float* q_shared    = smem;
+    float* score_tile  = smem + head_dim;
+    float* out_accum   = score_tile + TILE_KV;
+    float* warp_scratch = out_accum + head_dim;
+
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    // This split's contiguous KV sub-range: [kv_lo, kv_hi).
+    int chunk = (seq_kv + ATTN_KV_SPLIT - 1) / ATTN_KV_SPLIT;
+    int kv_lo = s * chunk;
+    int kv_hi = kv_lo + chunk;
+    if (kv_hi > seq_kv) kv_hi = seq_kv;
+    if (kv_lo > seq_kv) kv_lo = seq_kv;
+
+    const float* q_vec = q + (size_t)hq * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        q_shared[d] = q_vec[d];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        out_accum[d] = 0.0f;
+    __syncthreads();
+
+    float running_max = -FLT_MAX;
+    float running_sum = 0.0f;
+
+    for (int t_start = kv_lo; t_start < kv_hi; t_start += TILE_KV)
+    {
+        int t_end = t_start + TILE_KV;
+        if (t_end > kv_hi) t_end = kv_hi;
+        int tile_len = t_end - t_start;
+
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+        {
+            int tkv = t_start + t;
+            if (tkv > pos_q || (sliding_window > 0 && pos_q - tkv >= sliding_window))
+            { score_tile[t] = -FLT_MAX; continue; }
+
+            const float* k_vec = k + (size_t)tkv * kv_stride + hkv * head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                score += q_shared[d] * k_vec[d];
+            score_tile[t] = score * scale;
+        }
+        __syncthreads();
+
+        float tile_max = -FLT_MAX;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+            tile_max = fmaxf(tile_max, score_tile[t]);
+
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        if (lane == 0) warp_scratch[warp_id] = tile_max;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_max = (lane < nw) ? warp_scratch[lane] : -FLT_MAX;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        }
+        if (threadIdx.x == 0) warp_scratch[0] = tile_max;
+        __syncthreads();
+        tile_max = warp_scratch[0];
+
+        float new_max = fmaxf(running_max, tile_max);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+        running_sum *= correction;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+        running_max = new_max;
+        __syncthreads();
+
+        float tile_sum = 0.0f;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
+            float w = (score_tile[t] > -FLT_MAX + 1.0f)
+                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
+            score_tile[t] = w;
+            tile_sum += w;
+        }
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+        if (lane == 0) warp_scratch[warp_id] = tile_sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_sum = (lane < nw) ? warp_scratch[lane] : 0.0f;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+            if (lane == 0) warp_scratch[0] = tile_sum;
+        }
+        __syncthreads();
+        running_sum += warp_scratch[0];
+
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float v_acc = 0.0f;
+            for (int t = 0; t < tile_len; t++)
+                if (score_tile[t] > 0.0f)
+                    v_acc += score_tile[t] * (v + (size_t)(t_start + t) * kv_stride + hkv * head_dim)[d];
+            out_accum[d] += v_acc;
+        }
+        __syncthreads();
+    }
+
+    // Publish this split's partial (UNNORMALIZED — no division by running_sum here).
+    if (threadIdx.x == 0)
+    {
+        partial_max[(size_t)hq * ATTN_KV_SPLIT + s] = running_max;
+        partial_sum[(size_t)hq * ATTN_KV_SPLIT + s] = running_sum;
+    }
+    float* partial_out_vec = partial_out + ((size_t)hq * ATTN_KV_SPLIT + s) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        partial_out_vec[d] = out_accum[d];
+
+    grid.sync();   // ALL blocks (every head, every split) must have published before any combine.
+
+    if (s != 0) return; // only the split=0 block per head performs the final combine.
+
+    __shared__ float s_combined_max;
+    __shared__ float s_combined_sum;
+    if (threadIdx.x == 0)
+    {
+        float m = -FLT_MAX;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+            m = fmaxf(m, partial_max[(size_t)hq * ATTN_KV_SPLIT + i]);
+
+        float l = 0.0f;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+        {
+            float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
+            float li = partial_sum[(size_t)hq * ATTN_KV_SPLIT + i];
+            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            l += li * w;
+        }
+        s_combined_max = m;
+        s_combined_sum = l;
+    }
+    __syncthreads();
+
+    float m = s_combined_max;
+    float sum_inv = (s_combined_sum > 1e-10f) ? (1.0f / s_combined_sum) : 0.0f;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        float o = 0.0f;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+        {
+            float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
+            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float oi = partial_out[((size_t)hq * ATTN_KV_SPLIT + i) * head_dim + d];
+            o += oi * w;
+        }
+        output[(size_t)hq * head_dim + d] = o * sum_inv;
+    }
 }

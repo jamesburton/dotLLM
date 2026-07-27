@@ -1,0 +1,216 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// IQ4_XS MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_iq4xs[M, K]^T
+//
+// The activation B[N,K] is pre-quantized to Q8_1 row-wise. IQ4_XS uses the 16-entry
+// signed-int8 codebook (kvalues_iq4nl) + a per-32-element sub-block signed 6-bit scale
+// dl = d·(ls−32). Symmetric — no min term. Per 32-element sub-block j:
+//   sum_i w_i·x_i = dl[j] · d_x · dp4a(KV[q_i], xq)
+//
+// The seqLen>1 analogue of matmul_iq4_xs_mmvq.comp (decode); structurally the
+// codebook sibling of matmul_q4_k_mmq.comp without the min term. NOT bit-exact vs the
+// F32-in GEMM (B is int8-quantized first); validated against the CPU F32 oracle.
+//
+// Tiling (issue #139 register-tiled rewrite): 64 token rows × 64 weight rows of C per
+// workgroup (16×16 threads, each computing a 4×4 register tile, strided by 16 so
+// LDS reads are conflict-free with the +1-uint row padding). K advances in
+// half-super-block chunks (128 elems = 4 sub-blocks = 32 uints per row) so the staged
+// W/X tiles fit the 32 KB shared-memory budget. Per chunk each thread performs
+// 4·8 = 32 LDS loads for 4·4·8 = 128 dp4a — 4 dp4a per LDS load, vs 0.5 for the
+// previous one-output-per-thread tiling, which was LDS-bandwidth-bound at ~1.5 TFLOP/s
+// effective on gfx1151 (85 % of dense prefill time; see issue #139 measurements).
+//
+// IQ4_XS super-block layout (136 bytes / 256; matches matmul_iq4_xs_mmvq.comp):
+//   [0,1]=fp16 d  [2,3]=scales_h (u16: top 2 bits of 8 sub-block scales)
+//   [4..7]=scales_l[4] (low 4 bits)  [8..135]=qs[128] (low nibble → elem j, high → j+16).
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // IQ4_XS blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N*K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N*K/32]
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };       // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;            // multiple of 256
+    uint N;
+    uint blocksPerRow; // = K / 256
+    uint rowUints;     // unused
+} pc;
+
+const uint TILE_M = 64u;         // weight rows per workgroup
+const uint TILE_N = 64u;         // token rows per workgroup
+const uint TM = 4u;              // weight rows per thread (strided by 16)
+const uint TN = 4u;              // token rows per thread (strided by 16)
+const uint SB_BYTES     = 136u;  // IQ4_XS super-block bytes
+const uint SUBS_PER_CHUNK = 4u;  // 32-element sub-blocks per half-super-block chunk
+const uint CHUNK_UINTS  = 32u;   // 128 int8 / 4 per row per chunk
+const uint CHUNK_STRIDE = 33u;   // +1 uint pad → LDS bank-conflict-free strided reads
+
+const int KV[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113
+);
+
+shared uint  sharedWq[TILE_M * CHUNK_STRIDE];      // codebook-decoded int8 weights, element order
+shared uint  sharedXq[TILE_N * CHUNK_STRIDE];      // Q8_1 activations
+shared float sharedWdl[TILE_M * SUBS_PER_CHUNK];   // dl = d·(ls−32) per (row, sub-block)
+shared float sharedXd[TILE_N * SUBS_PER_CHUNK];    // d_x per (token, sub-block)
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    return (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// 4 codebook int8 values from nibbles at shifts s0..s3 of `cur`, packed for dp4a.
+uint packCB(uint cur, uint s0, uint s1, uint s2, uint s3) {
+    return (uint(KV[(cur >> s0) & 0xFu]) & 0xFFu)
+         | ((uint(KV[(cur >> s1) & 0xFu]) & 0xFFu) << 8u)
+         | ((uint(KV[(cur >> s2) & 0xFu]) & 0xFFu) << 16u)
+         | ((uint(KV[(cur >> s3) & 0xFu]) & 0xFFu) << 24u);
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;              // 0..15 → weight-row axis
+    uint ty = gl_LocalInvocationID.y;              // 0..15 → token-row axis
+    uint tid = ty * 16u + tx;                      // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * SB_BYTES;
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++)
+            acc[i][j] = 0.0;
+
+    for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
+        for (uint h = 0u; h < 2u; h++) {
+            // ---- 1. Stage weights: 64 rows × 16 qs-uints → codebook int8, element order. ----
+            // 1024 source words / 256 threads = 4 each; each decode writes lo+hi.
+            for (uint s = 0u; s < 4u; s++) {
+                uint idx = tid + s * 256u;       // 0..1023
+                uint rLocal = idx >> 4u;         // 0..63 weight row
+                uint lane   = idx & 15u;         // 0..15 qs uint within chunk
+                uint uGlobal = h * 16u + lane;   // qs uint within super-block (0..31)
+                uint ib  = uGlobal >> 2u;        // sub-block 0..7
+                uint w   = uGlobal & 3u;         // qs word 0..3 within sub-block
+                uint ibl = ib - h * SUBS_PER_CHUNK; // 0..3 local sub-block
+                uint mGlobal = mBase + rLocal;
+                uint cur = 0u;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    cur = weight[((blockByteBase + 8u) >> 2u) + uGlobal]; // qs word-aligned at +8
+                }
+                uint wLo = packCB(cur, 0u, 8u, 16u, 24u);  // elems 4w..4w+3 of sub-block
+                uint wHi = packCB(cur, 4u, 12u, 20u, 28u); // elems 16+4w..
+                sharedWq[rLocal * CHUNK_STRIDE + ibl * 8u + w]      = wLo;
+                sharedWq[rLocal * CHUNK_STRIDE + ibl * 8u + 4u + w] = wHi;
+            }
+
+            // ---- 2. Stage weight scales: 64 rows × 4 sub-blocks dl = d·(ls−32). ----
+            {
+                uint rLocal = tid >> 2u;             // 0..63
+                uint ibl    = tid & 3u;              // 0..3
+                uint ib     = h * SUBS_PER_CHUNK + ibl;
+                uint mGlobal = mBase + rLocal;
+                float dl = 0.0;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    float d = readHalf(blockByteBase);
+                    uint scalesH = readByte(blockByteBase + 2u) | (readByte(blockByteBase + 3u) << 8u);
+                    uint scalesLByte = readByte(blockByteBase + 4u + (ib >> 1u));
+                    uint low  = (scalesLByte >> (4u * (ib & 1u))) & 0xFu;
+                    uint high = (scalesH >> (2u * ib)) & 0x3u;
+                    dl = d * float(int(low | (high << 4u)) - 32);
+                }
+                sharedWdl[rLocal * SUBS_PER_CHUNK + ibl] = dl;
+            }
+
+            // ---- 3. Stage activations: 64 token rows × 32 int8-uints. ----
+            for (uint s = 0u; s < 8u; s++) {
+                uint idx = tid + s * 256u;       // 0..2047
+                uint rLocal = idx >> 5u;         // 0..63 token row
+                uint u      = idx & 31u;         // 0..31 uint within chunk
+                uint tGlobal = tBase + rLocal;
+                uint v = 0u;
+                if (tGlobal < pc.N) {
+                    uint xqRowBase = tGlobal * (pc.K >> 2u);
+                    v = xq[xqRowBase + kSB * 64u + h * CHUNK_UINTS + u];
+                }
+                sharedXq[rLocal * CHUNK_STRIDE + u] = v;
+            }
+
+            // ---- 4. Stage activation scales: 64 rows × 4 d_x. ----
+            {
+                uint rLocal = tid >> 2u;
+                uint ibl    = tid & 3u;
+                uint tGlobal = tBase + rLocal;
+                float dx = 0.0;
+                if (tGlobal < pc.N) {
+                    dx = xds[tGlobal * (pc.K >> 5u) + kSB * 8u + h * SUBS_PER_CHUNK + ibl].x;
+                }
+                sharedXd[rLocal * SUBS_PER_CHUNK + ibl] = dx;
+            }
+
+            barrier();
+
+            // ---- 5. dp4a: 4×4 register tile per thread over this chunk. ----
+            for (uint ibl = 0u; ibl < SUBS_PER_CHUNK; ibl++) {
+                int dotI[TM][TN];
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++)
+                        dotI[i][j] = 0;
+                for (uint g = 0u; g < 8u; g++) {
+                    uint wv[TM];
+                    uint xv[TN];
+                    for (uint i = 0u; i < TM; i++)
+                        wv[i] = sharedWq[(tx + 16u * i) * CHUNK_STRIDE + ibl * 8u + g];
+                    for (uint j = 0u; j < TN; j++)
+                        xv[j] = sharedXq[(ty + 16u * j) * CHUNK_STRIDE + ibl * 8u + g];
+                    for (uint i = 0u; i < TM; i++)
+                        for (uint j = 0u; j < TN; j++)
+                            dotI[i][j] = dotPacked4x8AccSatEXT(int(wv[i]), int(xv[j]), dotI[i][j]);
+                }
+                for (uint i = 0u; i < TM; i++) {
+                    float dl = sharedWdl[(tx + 16u * i) * SUBS_PER_CHUNK + ibl];
+                    for (uint j = 0u; j < TN; j++) {
+                        float dx = sharedXd[(ty + 16u * j) * SUBS_PER_CHUNK + ibl];
+                        acc[i][j] += dl * (dx * float(dotI[i][j]));
+                    }
+                }
+            }
+
+            barrier();
+        }
+    }
+
+    for (uint j = 0u; j < TN; j++) {
+        uint t = tBase + ty + 16u * j;
+        if (t >= pc.N) continue;
+        for (uint i = 0u; i < TM; i++) {
+            uint m = mBase + tx + 16u * i;
+            if (m < pc.M) {
+                c[t * pc.M + m] = acc[i][j];
+            }
+        }
+    }
+}

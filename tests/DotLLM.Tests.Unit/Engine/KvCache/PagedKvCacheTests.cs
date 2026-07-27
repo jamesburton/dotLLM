@@ -34,9 +34,9 @@ public sealed unsafe class PagedKvCacheTests
     {
         using var pool = CreatePool();
 
-        Assert.Throws<ArgumentException>(() => new PagedKvCache(pool, NumLayers + 1, KvStride, MaxSeqLen));
-        Assert.Throws<ArgumentException>(() => new PagedKvCache(pool, NumLayers, KvStride + 1, MaxSeqLen));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PagedKvCache(pool, NumLayers, KvStride, 0));
+        Assert.Throws<ArgumentException>(() => { new PagedKvCache(pool, NumLayers + 1, KvStride, MaxSeqLen); });
+        Assert.Throws<ArgumentException>(() => { new PagedKvCache(pool, NumLayers, KvStride + 1, MaxSeqLen); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { new PagedKvCache(pool, NumLayers, KvStride, 0); });
     }
 
     [Fact]
@@ -359,7 +359,7 @@ public sealed unsafe class PagedKvCacheTests
     public void Dispose_ReturnsBlocksToPool()
     {
         var pool = CreatePool();
-        var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
+        using var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
 
         // Add some data to allocate blocks
         nint kPtr = AllocAndFillNative(5, 1.0f);

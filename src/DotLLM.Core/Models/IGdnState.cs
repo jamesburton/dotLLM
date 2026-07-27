@@ -29,7 +29,7 @@ namespace DotLLM.Core.Models;
 /// without either container conflating responsibilities.
 /// </para>
 /// </remarks>
-public interface IGdnState : IDisposable
+public interface IGdnState : IRecurrentSequenceState
 {
     /// <summary>
     /// Number of GDN layers this state covers. Must equal the model's GDN-layer
@@ -37,9 +37,5 @@ public interface IGdnState : IDisposable
     /// </summary>
     int NumGdnLayers { get; }
 
-    /// <summary>
-    /// Re-zeroes every layer's recurrent state. Call between independent sequences
-    /// when reusing a single state container.
-    /// </summary>
-    void Reset();
+    // Reset() is inherited from IRecurrentSequenceState.
 }

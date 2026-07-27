@@ -21,7 +21,13 @@ int Threads = args.Length > 1 && int.TryParse(args[1], out var t) ? t : Environm
 var pool = new ComputeThreadPool(Threads, topology: null, ThreadingConfig.Auto);
 pool.SetDispatchMode(DispatchMode.EventBased);
 
-// Warm up the pool — spin up workers and let the OS schedule them before any measurement.
+// Warm up the JIT — NOT the thread pool or the weight-tile cache (issue #10 root-caused this
+// empirically: a fresh ComputeThreadPool with brand-new OS worker threads but an already-JIT-warm
+// process starts at full speed from call 0, ruling out thread/OS-scheduling cold-start; the actual
+// cause is .NET tiered compilation — GemmQ8_0's parallel worker path runs unoptimized Tier-0 code
+// for ~20-27 calls before Dynamic PGO promotes it to Tier-1, at 5-18x the steady-state cost. See
+// docs/WARMUP.md for the general mechanism; 35 calls here gives ~30% margin over the measured
+// worst-case threshold on this host).
 unsafe
 {
     nint wwarm = (nint)NativeMemory.AlignedAlloc(1024 * 1024, 64);
@@ -29,7 +35,7 @@ unsafe
     var outw = new float[Hidden * N];
     fixed (float* bp = inw)
     fixed (float* cp = outw)
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 35; i++)
             MatMul.GemmQ8_0((byte*)wwarm, bp, cp, Hidden, Hidden, N, pool);
     NativeMemory.AlignedFree((void*)wwarm);
 }
@@ -68,9 +74,8 @@ void Bench(string name, int m, int k, int nTok, int reps, bool inPerLayer)
     }
 }
 
-// Warmup the parallel path on a realistic shape — the *first* kernel measured
-// after pool setup consistently runs ~5× slower than subsequent calls on this
-// host, so we run a throwaway first before timing anything.
+// Throwaway bench at a realistic shape, now redundant with the 35-call JIT warmup
+// above but kept as a second confirmation line (steady-state by call ~3 of this one).
 Bench("warmup",  FfnDim, Hidden, N, 10, false);
 Bench("Q",       QDim,   Hidden, N, 30, true);
 Bench("K",       KvDim,  Hidden, N, 30, true);

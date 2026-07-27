@@ -60,7 +60,10 @@ public static class HfConfigExtractor
         // = gemma3). Hoist the text sub-object so every field lookup below sees the
         // text-tower shape. Text-only checkpoints (model_type = gemma3_text) have no
         // wrapper.
-        if (architecture == Architecture.Gemma3
+        // Gemma 4 (Gemma4ForConditionalGeneration) is likewise multimodal: model_type
+        // = gemma4 at the top level with the text tower under `text_config` (model_type
+        // = gemma4_text). Hoist for both Gemma 3 and Gemma 4.
+        if (architecture is Architecture.Gemma3 or Architecture.Gemma4
             && root.TryGetProperty("text_config", out var textCfg)
             && textCfg.ValueKind == JsonValueKind.Object)
         {
@@ -110,9 +113,13 @@ public static class HfConfigExtractor
         float? finalLogitSoftcap = null;
         float? queryPreAttnScalar = null;
         ActivationFunction activation = ActivationFunction.SiLU;
-        if (architecture == Architecture.Gemma3)
+        // BitNet b1.58 uses the squared-ReLU FFN (relu2), mirroring the GGUF path.
+        if (architecture == Architecture.BitNet)
+            activation = ActivationFunction.ReluSquared;
+        if (architecture is Architecture.Gemma3 or Architecture.Gemma4)
         {
             // Default sliding_window for Gemma3 if not specified (HF default is 4096).
+            // Gemma 4 E2B ships an explicit 512, so this default is not hit there.
             if (slidingWindow is null)
                 slidingWindow = 4096;
 
@@ -197,6 +204,24 @@ public static class HfConfigExtractor
         // shared-expert PoC only — multi-shared is a follow-up).
         MoeConfig? moe = ExtractMoeConfig(root, intermediateSize, numLayers, architecture);
 
+        // Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B). Present
+        // when the text config carries `hidden_size_per_layer_input`. The auxiliary
+        // per-layer embedding table (`embed_tokens_per_layer`) and its projection are
+        // loaded/injected by the forward pass. Absent on the Gemma-4 MoE backbone,
+        // Gemma 3, and every other architecture (stays null → no PLE).
+        PerLayerEmbeddingConfig? perLayerEmbedding = null;
+        if (architecture == Architecture.Gemma4
+            && root.TryGetProperty("hidden_size_per_layer_input", out var hsPle)
+            && hsPle.ValueKind == JsonValueKind.Number
+            && hsPle.GetInt32() > 0)
+        {
+            perLayerEmbedding = new PerLayerEmbeddingConfig
+            {
+                PerLayerDim = hsPle.GetInt32(),
+                VocabSize = GetInt32OrDefault(root, "vocab_size_per_layer_input", vocabSize),
+            };
+        }
+
         // Dense-path YaRN scaling. MLA handles its own rope_scaling extraction
         // above (carried inside MlaConfig); for non-MLA architectures we surface
         // YaRN into RoPEConfig so TransformerModel can rebuild the cos/sin
@@ -249,8 +274,15 @@ public static class HfConfigExtractor
             AttnLogitSoftcap = attnLogitSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             QueryPreAttnScalar = queryPreAttnScalar,
+            // Gemma scales input embeddings by sqrt(hidden_size) (HF
+            // Gemma3TextScaledWordEmbedding). Null for every other architecture
+            // so the forward-path multiply is a no-op there.
+            EmbeddingScale = architecture is Architecture.Gemma3 or Architecture.Gemma4
+                ? MathF.Sqrt(hiddenSize)
+                : null,
             MlaConfig = mla,
             Moe = moe,
+            PerLayerEmbedding = perLayerEmbedding,
             ChatTemplate = null,
             NoRopeLayers = noRopeLayers,
         };
@@ -624,6 +656,22 @@ public static class HfConfigExtractor
                 || a.Contains("qwen2_moe") || a.Contains("qwen3_moe")
                 || a.Contains("qwenmoe") || a.Contains("qwen_moe")) => Architecture.QwenMoe,
             (_, "qwen2_moe" or "qwen3_moe" or "qwen_moe") => Architecture.QwenMoe,
+            // AllenAI OLMoE — `OlmoeForCausalLM` / `model_type=olmoe`. Reuses the
+            // Qwen-MoE tensor layout verbatim (`mlp.gate` router +
+            // `mlp.experts.{j}.{gate,up,down}_proj`) and the Llama-style GQA
+            // attention path, so it dispatches to Architecture.QwenMoe rather than
+            // its own enum. Two OLMoE-specific traits are handled downstream:
+            //   (1) QK-norm is a SINGLE RMSNorm over the WHOLE Q/K projection
+            //       (weight length num_heads*head_dim / num_kv_heads*head_dim),
+            //       applied before the reshape into heads — NOT the per-head norm
+            //       Qwen3/Gemma use. AttentionTensorLoader auto-detects the norm
+            //       length and TransformerModel.ApplyPerHeadNorm applies whole-
+            //       projection vs per-head accordingly.
+            //   (2) No shared expert (num_experts=64, top-8, norm_topk_prob=false)
+            //       — the extractor leaves SharedExpertIntermediateSize null so the
+            //       loader takes the routed-only path.
+            (var a, _) when a is not null && a.Contains("olmoe") => Architecture.QwenMoe,
+            (_, "olmoe") => Architecture.QwenMoe,
             // Granite-3.x MoE — `GraniteMoeForCausalLM` / `model_type=granitemoe`.
             // Must be checked before `Llama` / `Mistral` fall-throughs because the
             // base "Granite" name doesn't collide but the MoE-specific tensor
@@ -643,6 +691,15 @@ public static class HfConfigExtractor
             (var a, _) when a is not null
                 && (a.Contains("gemma3") || a.Contains("gemma_3")) => Architecture.Gemma3,
             (_, "gemma3" or "gemma3_text" or "gemma_3" or "gemma_3_text") => Architecture.Gemma3,
+            // Gemma 4 — the text tower behind DiffusionGemma. Same backbone
+            // shape as Gemma 3 (handled by the same transformer path) plus a
+            // sparse MoE FFN, per-attention-type RoPE, and dual KV-head counts.
+            // Checked before the generic "gemma" fall-through. (The diffusion
+            // wrapper model_type=diffusion_gemma is intercepted earlier in
+            // ModelLoader and routed to issue #29.)
+            (var a, _) when a is not null
+                && (a.Contains("gemma4") || a.Contains("gemma_4")) => Architecture.Gemma4,
+            (_, "gemma4" or "gemma4_text" or "gemma_4" or "gemma_4_text") => Architecture.Gemma4,
             (var a, _) when a is not null && a.Contains("llama") => Architecture.Llama,
             (var a, _) when a is not null && a.Contains("mistral") => Architecture.Mistral,
             (var a, _) when a is not null && a.StartsWith("phi") => Architecture.Phi,
@@ -651,6 +708,9 @@ public static class HfConfigExtractor
             (_, "mistral") => Architecture.Mistral,
             (_, "phi" or "phi3" or "phi2") => Architecture.Phi,
             (_, "qwen" or "qwen2" or "qwen3") => Architecture.Qwen,
+            // Microsoft BitNet b1.58 — `BitNetForCausalLM` / `model_type=bitnet`.
+            (var a, _) when a is not null && a.Contains("bitnet") => Architecture.BitNet,
+            (_, "bitnet") => Architecture.BitNet,
             _ => throw new InvalidDataException(
                 $"Unsupported HF architecture: architectures[0]='{archName}', model_type='{modelType}'.")
         };
@@ -667,6 +727,7 @@ public static class HfConfigExtractor
     {
         Architecture.Phi => true,
         Architecture.Gemma3 => true,
+        Architecture.Gemma4 => true,
         _ => false,
     };
 

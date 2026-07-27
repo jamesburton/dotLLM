@@ -134,7 +134,7 @@ public sealed class HfConfigExtractorTests
          "intermediate_size": 128, "vocab_size": 100, "max_position_embeddings": 128}
         """;
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
-        Assert.Contains("Unsupported HF architecture", ex.Message);
+        Assert.Contains("Unsupported HF architecture", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -235,7 +235,7 @@ public sealed class HfConfigExtractorTests
          "num_local_experts": 8}
         """;
         var ex = Assert.Throws<InvalidDataException>(() => HfConfigExtractor.Extract(json));
-        Assert.Contains("num_experts_per_tok", ex.Message);
+        Assert.Contains("num_experts_per_tok", ex.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -362,6 +362,64 @@ public sealed class HfConfigExtractorTests
         Assert.True(cfg.Moe.IsMoeLayer(1));
         Assert.False(cfg.Moe.IsMoeLayer(2));  // forced dense
         Assert.True(cfg.Moe.IsMoeLayer(3));
+    }
+
+    /// <summary>
+    /// AllenAI OLMoE-1B-7B-0924 config (verbatim from the HF checkpoint,
+    /// 2026-07). <c>model_type=olmoe</c> / <c>OlmoeForCausalLM</c> must resolve
+    /// to <see cref="Architecture.QwenMoe"/> (it reuses the Qwen-MoE tensor
+    /// layout + GQA attention). MoE fields: 64 experts, top-8,
+    /// <c>norm_topk_prob=false</c>, NO shared expert. OLMoE carries no
+    /// <c>moe_intermediate_size</c> — the per-expert width is the top-level
+    /// <c>intermediate_size</c> (1024). NeoX RoPE (Llama-descended). Every
+    /// layer is MoE (no decoder_sparse_step).
+    /// </summary>
+    [Fact]
+    public void Olmoe_1B7B_0924_ResolvesToQwenMoe_RoutedOnly()
+    {
+        const string json = """
+        {
+            "architectures": ["OlmoeForCausalLM"],
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 1024,
+            "vocab_size": 50304,
+            "max_position_embeddings": 4096,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-5,
+            "clip_qkv": null,
+            "num_experts": 64,
+            "num_experts_per_tok": 8,
+            "norm_topk_prob": false,
+            "tie_word_embeddings": false
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+        Assert.Equal(Architecture.QwenMoe, cfg.Architecture);
+        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig!.Value.Type);
+        Assert.Equal(2048, cfg.HiddenSize);
+        Assert.Equal(16, cfg.NumLayers);
+        Assert.Equal(16, cfg.NumAttentionHeads);
+        Assert.Equal(16, cfg.NumKvHeads);
+        Assert.Equal(128, cfg.HeadDim); // 2048 / 16 (no explicit head_dim)
+
+        Assert.NotNull(cfg.Moe);
+        Assert.Equal(64, cfg.Moe!.NumExperts);
+        Assert.Equal(8, cfg.Moe.NumExpertsPerTok);
+        // OLMoE has no moe_intermediate_size → per-expert width == intermediate_size.
+        Assert.Equal(1024, cfg.Moe.MoeIntermediateSize);
+        Assert.False(cfg.Moe.NormTopKProb);
+        // No shared expert (routed-only path).
+        Assert.Null(cfg.Moe.SharedExpertIntermediateSize);
+        Assert.False(cfg.Moe.HasSharedExpertGate);
+        // Every layer is MoE.
+        Assert.Equal(1, cfg.Moe.DecoderSparseStep);
+        Assert.True(cfg.Moe.IsMoeLayer(0));
+        Assert.True(cfg.Moe.IsMoeLayer(15));
     }
 
     [Fact]
@@ -674,6 +732,10 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(256f, cfg.QueryPreAttnScalar);
         Assert.True(cfg.TiedEmbeddings, "Gemma 3 default ties word embeddings.");
 
+        // Gemma scales input embeddings by sqrt(hidden_size).
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Equal(MathF.Sqrt(64), cfg.EmbeddingScale!.Value, precision: 5);
+
         // Per-layer attention pattern with sliding_window_pattern=3 on 6 layers:
         // (i+1) % 3 == 0 ⇒ full, else sliding.
         Assert.NotNull(cfg.PerLayerSlidingWindow);
@@ -772,5 +834,63 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(128, cfg.PerLayerSlidingWindow[1]); // sliding
         Assert.Null(cfg.PerLayerSlidingWindow[2]);
         Assert.Equal(128, cfg.PerLayerSlidingWindow[3]);
+    }
+
+    /// <summary>
+    /// Gemma-4 E2B (<c>Gemma4ForConditionalGeneration</c>, text tower under
+    /// <c>text_config</c> with <c>model_type=gemma4_text</c>): the dense + PLE shape.
+    /// The extractor must hoist text_config, resolve <see cref="Architecture.Gemma4"/>,
+    /// populate <see cref="Core.Models.ModelConfig.PerLayerEmbedding"/>, set GeGLU-tanh
+    /// activation + the sqrt(hidden) embedding scale, and leave Moe null (dense tower).
+    /// </summary>
+    [Fact]
+    public void Gemma4_E2B_TextTower_DetectsPerLayerEmbeddingsAndDenseGemma()
+    {
+        const string json = """
+        {
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "intermediate_size": 6144,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "sliding_window": 512,
+                "rms_norm_eps": 1e-6,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "final_logit_softcapping": 30.0,
+                "tie_word_embeddings": true,
+                "enable_moe_block": false,
+                "hidden_size_per_layer_input": 256,
+                "vocab_size_per_layer_input": 262144,
+                "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]
+            }
+        }
+        """;
+
+        var cfg = HfConfigExtractor.Extract(json);
+
+        Assert.Equal(Architecture.Gemma4, cfg.Architecture);
+        Assert.True(cfg.IsGemmaArchitecture);
+        Assert.Equal(1536, cfg.HiddenSize);
+        Assert.Equal(1, cfg.NumKvHeads);                 // MQA
+        Assert.Equal(256, cfg.HeadDim);
+        Assert.Equal(ActivationFunction.GELUTanh, cfg.ActivationFunction);
+        Assert.Equal(30.0f, cfg.FinalLogitSoftcap);
+        Assert.NotNull(cfg.EmbeddingScale);
+        Assert.Null(cfg.Moe);                            // dense tower
+
+        Assert.NotNull(cfg.PerLayerEmbedding);
+        Assert.Equal(256, cfg.PerLayerEmbedding!.PerLayerDim);
+        Assert.Equal(262144, cfg.PerLayerEmbedding.VocabSize);
+
+        Assert.NotNull(cfg.PerLayerSlidingWindow);
+        Assert.Equal(512, cfg.PerLayerSlidingWindow![0]);
+        Assert.Null(cfg.PerLayerSlidingWindow[3]);
     }
 }

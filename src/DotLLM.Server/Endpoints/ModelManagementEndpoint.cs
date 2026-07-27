@@ -49,6 +49,11 @@ public static class ModelManagementEndpoint
                         SpeculativeModel = request.SpeculativeModel,
                         SpeculativeCandidates = request.SpeculativeK ?? state.Options.SpeculativeCandidates,
                         ModelId = Path.GetFileNameWithoutExtension(resolvedPath),
+                        RopeOverride = ServerOptions.BuildRopeOverride(
+                            request.RopeScaling, request.RopeFreqBase, request.RopeScale,
+                            request.YarnOrigCtx, request.YarnAttnFactor,
+                            request.YarnBetaFast, request.YarnBetaSlow)
+                            ?? state.Options.RopeOverride,
                     };
                     var newState = await Task.Run(() => ServerStartup.LoadModel(resolvedPath, newOptions), ct);
 
@@ -70,6 +75,13 @@ public static class ModelManagementEndpoint
                     state.DraftModel = newState.DraftModel;
                     state.DraftModelPath = newState.DraftModelPath;
                     state.DraftGguf = newState.DraftGguf;
+                    // (#369) Multi-model residency bookkeeping and the continuous-batch scheduler
+                    // (previously dropped on every explicit /v1/models/load swap — the server
+                    // silently fell back to the single-request gate after the first swap).
+                    state.EstimatedBytes = SafeFileLength(resolvedPath);
+                    state.KeepAliveSecondsOverride = request.KeepAlive;
+                    state.Scheduler = newState.Scheduler;
+                    state.StartSchedulerLoop();
                     // Preserve the existing LoRA registry across model swap so loaded
                     // adapters survive (LoadModel mints a fresh registry for fresh starts).
                     if (newState.LoraRegistry is not null && !ReferenceEquals(newState.LoraRegistry, state.LoraRegistry))
@@ -90,4 +102,6 @@ public static class ModelManagementEndpoint
             }
         });
     }
+
+    private static long SafeFileLength(string path) => ServerStartup.SafeFileLength(path);
 }

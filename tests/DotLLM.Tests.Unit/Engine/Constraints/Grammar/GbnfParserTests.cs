@@ -131,7 +131,7 @@ public class GbnfParserTests
     {
         var ex = Assert.Throws<ArgumentException>(() =>
             GbnfParser.Parse("root ::= missing-rule"));
-        Assert.Contains("Undefined rule reference", ex.Message);
+        Assert.Contains("Undefined rule reference", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -139,7 +139,7 @@ public class GbnfParserTests
     {
         var ex = Assert.Throws<ArgumentException>(() =>
             GbnfParser.Parse("root ::= root \"a\""));
-        Assert.Contains("Left recursion", ex.Message);
+        Assert.Contains("Left recursion", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -153,7 +153,7 @@ public class GbnfParserTests
     {
         var ex = Assert.Throws<ArgumentException>(() =>
             GbnfParser.Parse("root ::= \"a\"\nroot ::= \"b\""));
-        Assert.Contains("Duplicate rule", ex.Message);
+        Assert.Contains("Duplicate rule", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

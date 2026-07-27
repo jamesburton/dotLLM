@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using DotLLM.Core.Configuration;
 using DotLLM.Core.Models;
+using DotLLM.Cpu.Kernels;
 using DotLLM.Models.SafeTensors;
 using static DotLLM.Models.Architectures.SafetensorsTensorResolver;
 
@@ -37,7 +38,8 @@ internal static class TransformerWeightsSafetensorsLoader
     /// against the HF naming scheme for the architectures in
     /// <paramref name="config"/>. Throws on missing required tensors.
     /// </summary>
-    public static TransformerWeights Load(ISafetensorsTensorSource file, ModelConfig config)
+    public static TransformerWeights Load(
+        ISafetensorsTensorSource file, ModelConfig config, BitNetI2SCacheContext? i2sCache = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(config);
@@ -56,11 +58,14 @@ internal static class TransformerWeightsSafetensorsLoader
                                    is DotLLM.Core.Configuration.Architecture.DeepSeekV2
                                    or DotLLM.Core.Configuration.Architecture.DeepSeekV3
                                  && config.MlaConfig is not null;
+            bool isBitNet = config.Architecture is DotLLM.Core.Configuration.Architecture.BitNet;
             for (int i = 0; i < config.NumLayers; i++)
             {
                 layers[i] = isDeepSeekMla
                     ? LoadDeepSeekMlaLayer(i, file, config, owned)
-                    : LoadLayer(i, file, config, owned);
+                    : isBitNet
+                        ? LoadBitNetLayer(i, file, config, owned, i2sCache)
+                        : LoadLayer(i, file, config, owned);
             }
 
             // Final RMSNorm
@@ -87,13 +92,45 @@ internal static class TransformerWeightsSafetensorsLoader
                 throw new InvalidDataException(
                     $"lm_head.weight shape [{outM},{outK}] does not match config [vocab={config.VocabSize}, hidden={config.HiddenSize}].");
 
+            // Per-Layer Embeddings (PLE) model-level tables (Gemma-4 dense text tower).
+            PerLayerEmbeddingWeights? pleWeights = null;
+            if (config.PerLayerEmbedding is { } pleCfg)
+            {
+                int lp = config.NumLayers * pleCfg.PerLayerDim;
+                // Big table — keep native quant, gather per token (never upcast wholesale).
+                var (plePtr, plePtrQt, pleM, pleK) = ResolveLinear(file, "model.embed_tokens_per_layer.weight", owned);
+                if (pleM != pleCfg.VocabSize || pleK != lp)
+                    throw new InvalidDataException(
+                        $"model.embed_tokens_per_layer.weight shape [{pleM},{pleK}] does not match "
+                        + $"config [vocab_ple={pleCfg.VocabSize}, numLayers*pleDim={lp}].");
+                // Small projection — F32.
+                var (projPtr, _, projM, projK) = ResolveLinearAsF32(file, "model.per_layer_model_projection.weight", owned);
+                if (projM != lp || projK != config.HiddenSize)
+                    throw new InvalidDataException(
+                        $"model.per_layer_model_projection.weight shape [{projM},{projK}] does not match "
+                        + $"config [numLayers*pleDim={lp}, hidden={config.HiddenSize}].");
+                float[] projNorm = ResolveNorm(file, "model.per_layer_projection_norm.weight", pleCfg.PerLayerDim);
+                GemmaAbsorbOnePlusWeight(projNorm);
+                pleWeights = new PerLayerEmbeddingWeights
+                {
+                    EmbedTokensPerLayer = plePtr,
+                    EmbedTokensPerLayerQt = plePtrQt,
+                    ModelProjection = projPtr,
+                    ProjectionNorm = projNorm,
+                    PerLayerDim = pleCfg.PerLayerDim,
+                    VocabSize = pleCfg.VocabSize,
+                    NumLayers = config.NumLayers,
+                };
+            }
+
             return TransformerWeights.CreateFromSafetensors(
                 tokenEmbedWeight: embPtr, tokenEmbedQt: embQt,
                 vocabSize: config.VocabSize, hiddenSize: config.HiddenSize,
                 layers: layers,
                 outputNormWeight: outputNorm,
                 outputWeight: outPtr, outputQt: outQt, outputM: outM, outputK: outK,
-                ownedAllocations: owned);
+                ownedAllocations: owned,
+                perLayerEmbedding: pleWeights);
         }
         catch
         {
@@ -109,15 +146,63 @@ internal static class TransformerWeightsSafetensorsLoader
     {
         string prefix = $"model.layers.{layerIdx}";
         int hiddenSize = config.HiddenSize;
+        bool isGemma = config.IsGemmaArchitecture;
 
         // Pre-attention RMSNorm + all attention projections (Llama-style GQA
         // or Phi-3 fused-QKV, auto-selected by tensor presence; optional
-        // Qwen2 biases; optional Qwen3 QK-norms).
+        // Qwen2 biases; optional Qwen3 / Gemma QK-norms).
         float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
         var attn = AttentionTensorLoader.Load(AttentionVariant.Gqa, file, config, layerIdx, owned);
 
-        // Post-attention (pre-FFN) RMSNorm
-        float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+        // Per-layer norm weights:
+        //  - Standard (Llama/…): `post_attention_layernorm` is the PRE-FFN norm
+        //    and there is no post-attn / post-ffn sublayer norm (two-norm layout).
+        //  - Gemma (four-norm layout): `post_attention_layernorm` runs on the
+        //    attention sublayer output before the residual add, `pre_feedforward_layernorm`
+        //    is the pre-FFN norm, and `post_feedforward_layernorm` runs on the FFN
+        //    sublayer output before its residual add. Gemma also stores every RMSNorm
+        //    weight as an offset from 1.0, absorbed here by adding 1.0 at load.
+        float[] ffnNorm;
+        float[]? postAttnNorm = null;
+        float[]? postFfnNorm = null;
+        if (isGemma)
+        {
+            postAttnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+            ffnNorm = ResolveNorm(file, $"{prefix}.pre_feedforward_layernorm.weight", hiddenSize);
+            postFfnNorm = ResolveNorm(file, $"{prefix}.post_feedforward_layernorm.weight", hiddenSize);
+
+            // (1 + w) RMSNorm absorption — applied to EVERY Gemma RMSNorm weight
+            // (input, post-attn, pre-ffn, post-ffn, and the per-head Q/K norms)
+            // so the existing RMSNorm kernel runs unchanged.
+            GemmaAbsorbOnePlusWeight(attnNorm);
+            GemmaAbsorbOnePlusWeight(postAttnNorm);
+            GemmaAbsorbOnePlusWeight(ffnNorm);
+            GemmaAbsorbOnePlusWeight(postFfnNorm);
+            GemmaAbsorbOnePlusWeight(attn.QNormWeight);
+            GemmaAbsorbOnePlusWeight(attn.KNormWeight);
+        }
+        else
+        {
+            // Post-attention (pre-FFN) RMSNorm — standard two-norm layout.
+            ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+        }
+
+        // Per-Layer Embeddings (PLE) — Gemma-4 dense text tower (E2B/E4B) only.
+        // Loaded as F32 (small: [pleDim, hidden] and [hidden, pleDim]); the
+        // post-norm is a Gemma RMSNorm so the (1+w) offset is absorbed like every
+        // other Gemma norm. Null/zero for every other architecture.
+        nint pleGate = 0, pleProj = 0;
+        float[]? plePostNorm = null;
+        if (config.PerLayerEmbedding is { } ple)
+        {
+            int pleDim = ple.PerLayerDim;
+            (pleGate, _, int pgM, int pgK) = ResolveLinearAsF32(file, $"{prefix}.per_layer_input_gate.weight", owned);
+            ValidateProjectionShape(pgM, pgK, pleDim, hiddenSize, $"{prefix}.per_layer_input_gate.weight");
+            (pleProj, _, int ppM, int ppK) = ResolveLinearAsF32(file, $"{prefix}.per_layer_projection.weight", owned);
+            ValidateProjectionShape(ppM, ppK, hiddenSize, pleDim, $"{prefix}.per_layer_projection.weight");
+            plePostNorm = ResolveNorm(file, $"{prefix}.post_per_layer_input_norm.weight", hiddenSize);
+            GemmaAbsorbOnePlusWeight(plePostNorm);
+        }
 
         // FFN — dense (Llama/Mistral/Qwen), Mixtral-convention MoE, or
         // Qwen-MoE-convention MoE (possibly interleaved with dense layers via
@@ -134,6 +219,14 @@ internal static class TransformerWeightsSafetensorsLoader
                 // standard Llama-style mlp.{gate,up,down}_proj names — fall
                 // through to the dense path below.
                 DotLLM.Core.Configuration.Architecture.QwenMoe => config.Moe.IsMoeLayer(layerIdx),
+                // Gemma 4 MoE: every layer is MoE (no dense/MoE interleaving in
+                // the DiffusionGemma text tower). Uses the Qwen-MoE tensor names
+                // (mlp.gate + mlp.experts.{j}.{gate,up,down}_proj).
+                DotLLM.Core.Configuration.Architecture.Gemma4 => config.Moe.IsMoeLayer(layerIdx),
+                // DiffusionGemma: identical Gemma-4 MoE text tower (same Qwen-MoE
+                // expert tensor names); the diffusion decode seam is independent of
+                // weight loading.
+                DotLLM.Core.Configuration.Architecture.DiffusionGemma => config.Moe.IsMoeLayer(layerIdx),
                 _ => true,
             };
 
@@ -142,6 +235,8 @@ internal static class TransformerWeightsSafetensorsLoader
                 moe = config.Architecture switch
                 {
                     DotLLM.Core.Configuration.Architecture.QwenMoe => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.Gemma4 => LoadQwenMoeLayer(layerIdx, file, config, owned),
+                    DotLLM.Core.Configuration.Architecture.DiffusionGemma => LoadQwenMoeLayer(layerIdx, file, config, owned),
                     DotLLM.Core.Configuration.Architecture.GraniteMoe => LoadGraniteMoeLayer(layerIdx, file, config, owned),
                     _ => LoadMixtralMoeLayer(layerIdx, file, config, owned),
                 };
@@ -158,7 +253,9 @@ internal static class TransformerWeightsSafetensorsLoader
                     attn.QBias, attn.KBias, attn.VBias, attn.OBias,
                     gateBias: null, upBias: null, downBias: null,
                     qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
-                    moe: moe);
+                    moe: moe,
+                    mla: null,
+                    postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm);
             }
             // Otherwise: Qwen-MoE interleaved DENSE layer — fall through to
             // the Llama-style dense SwiGLU resolution below.
@@ -207,7 +304,322 @@ internal static class TransformerWeightsSafetensorsLoader
             downPtr, downQt, downM, downK,
             attn.QBias, attn.KBias, attn.VBias, attn.OBias,
             gateBias: null, upBias: null, downBias: null,
-            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight);
+            qNormWeight: attn.QNormWeight, kNormWeight: attn.KNormWeight,
+            moe: null,
+            mla: null,
+            postAttnNormWeight: postAttnNorm, postFfnNormWeight: postFfnNorm,
+            pleGateWeight: pleGate, pleProjWeight: pleProj, plePostNormWeight: plePostNorm);
+    }
+
+    /// <summary>
+    /// Loads one BitNet b1.58 transformer layer from an HF safetensors
+    /// checkpoint. Unlike <see cref="LoadLayer"/> (which keeps linears at
+    /// F32/F16), every linear projection here is quantized to ternary
+    /// <see cref="QuantizationType.I2_S"/> at load via
+    /// <see cref="DotLLM.Cpu.Kernels.BitNetQuantize.QuantizeToI2S"/> — mirroring
+    /// what the GGUF BitNet path receives pre-quantized from Microsoft's
+    /// converter. The two BitNet Sub-LN norms
+    /// (<c>self_attn.attn_sub_norm.weight</c> over the attention output before
+    /// <c>o_proj</c>, and <c>mlp.ffn_sub_norm.weight</c> over the gated
+    /// intermediate before <c>down_proj</c>) are wired into
+    /// <see cref="TransformerLayerWeights.AttnSubNormWeight"/> /
+    /// <see cref="TransformerLayerWeights.FfnSubNormWeight"/> so the forward
+    /// pass applies Sub-LN exactly as it does for GGUF. The squared-ReLU FFN is
+    /// selected by <see cref="ModelConfig.ActivationFunction"/> = ReluSquared.
+    /// </summary>
+    private static TransformerLayerWeights LoadBitNetLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned,
+        BitNetI2SCacheContext? i2sCache)
+    {
+        string prefix = $"model.layers.{layerIdx}";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = config.IntermediateSize;
+        int qDim = config.NumAttentionHeads * config.HeadDim;
+        int kvDim = config.NumKvHeads * config.HeadDim;
+
+        // Pre-attention RMSNorm.
+        float[] attnNorm = ResolveNorm(file, $"{prefix}.input_layernorm.weight", hiddenSize);
+
+        // Attention projections — quantized to ternary I2_S.
+        var (qPtr, qQt, qM, qK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.q_proj.weight", owned, i2sCache);
+        var (kPtr, kQt, kM, kK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.k_proj.weight", owned, i2sCache);
+        var (vPtr, vQt, vM, vK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.v_proj.weight", owned, i2sCache);
+        var (oPtr, oQt, oM, oK) = ResolveLinearAsI2S(file, $"{prefix}.self_attn.o_proj.weight", owned, i2sCache);
+        ValidateProjectionShape(qM, qK, qDim, hiddenSize, $"{prefix}.self_attn.q_proj.weight");
+        ValidateProjectionShape(kM, kK, kvDim, hiddenSize, $"{prefix}.self_attn.k_proj.weight");
+        ValidateProjectionShape(vM, vK, kvDim, hiddenSize, $"{prefix}.self_attn.v_proj.weight");
+        ValidateProjectionShape(oM, oK, hiddenSize, qDim, $"{prefix}.self_attn.o_proj.weight");
+
+        // BitNet attention Sub-LN — RMSNorm over the attention output [hidden]
+        // before o_proj.
+        float[] attnSubNorm = ResolveNorm(file, $"{prefix}.self_attn.attn_sub_norm.weight", hiddenSize);
+
+        // Pre-FFN RMSNorm.
+        float[] ffnNorm = ResolveNorm(file, $"{prefix}.post_attention_layernorm.weight", hiddenSize);
+
+        // BitNet-MoE (identity-MoTE): the inserted layers are per-layer top-1 MoE. When the
+        // config marks this layer MoE, the FFN is a bank of ternary I2_S experts + F32 router
+        // (+ optional bias), not the dense SwiGLU-shaped FFN below. The per-expert FFN Sub-LN
+        // lives in the MoE bundle; there is no layer-level ffn_sub_norm on a MoE layer.
+        if (config.Moe is not null && config.Moe.IsMoeLayer(layerIdx))
+        {
+            var moeBundle = LoadBitNetMoeLayer(layerIdx, file, config, owned);
+            return new TransformerLayerWeights(
+                attnNorm,
+                qPtr, qQt, qM, qK,
+                kPtr, kQt, kM, kK,
+                vPtr, vQt, vM, vK,
+                oPtr, oQt, oM, oK,
+                ffnNorm,
+                gateWeight: 0, gateQuantType: QuantizationType.F32, gateOutputDim: 0, gateInputDim: 0,
+                upWeight: 0, upQuantType: QuantizationType.F32, upOutputDim: 0, upInputDim: 0,
+                downWeight: 0, downQuantType: QuantizationType.F32, downOutputDim: 0, downInputDim: 0,
+                qBias: null, kBias: null, vBias: null, oBias: null,
+                gateBias: null, upBias: null, downBias: null,
+                qNormWeight: null, kNormWeight: null,
+                moe: moeBundle,
+                mla: null,
+                postAttnNormWeight: null, postFfnNormWeight: null,
+                gemma4: null,
+                attnSubNormWeight: attnSubNorm, ffnSubNormWeight: null);
+        }
+
+        // BitNet FFN Sub-LN — RMSNorm over the gated intermediate [intermediate]
+        // before down_proj.
+        float[] ffnSubNorm = ResolveNorm(file, $"{prefix}.mlp.ffn_sub_norm.weight", intermediateSize);
+
+        // Dense SwiGLU-shaped FFN projections — quantized to ternary I2_S.
+        var (gatePtr, gateQt, gateM, gateK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.gate_proj.weight", owned, i2sCache);
+        var (upPtr, upQt, upM, upK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.up_proj.weight", owned, i2sCache);
+        var (downPtr, downQt, downM, downK) = ResolveLinearAsI2S(file, $"{prefix}.mlp.down_proj.weight", owned, i2sCache);
+        ValidateProjectionShape(gateM, gateK, intermediateSize, hiddenSize, $"{prefix}.mlp.gate_proj.weight");
+        ValidateProjectionShape(upM, upK, intermediateSize, hiddenSize, $"{prefix}.mlp.up_proj.weight");
+        ValidateProjectionShape(downM, downK, hiddenSize, intermediateSize, $"{prefix}.mlp.down_proj.weight");
+
+        return new TransformerLayerWeights(
+            attnNorm,
+            qPtr, qQt, qM, qK,
+            kPtr, kQt, kM, kK,
+            vPtr, vQt, vM, vK,
+            oPtr, oQt, oM, oK,
+            ffnNorm,
+            gatePtr, gateQt, gateM, gateK,
+            upPtr, upQt, upM, upK,
+            downPtr, downQt, downM, downK,
+            qBias: null, kBias: null, vBias: null, oBias: null,
+            gateBias: null, upBias: null, downBias: null,
+            qNormWeight: null, kNormWeight: null,
+            moe: null,
+            mla: null,
+            postAttnNormWeight: null, postFfnNormWeight: null,
+            gemma4: null,
+            attnSubNormWeight: attnSubNorm, ffnSubNormWeight: ffnSubNorm);
+    }
+
+    /// <summary>
+    /// Loads a BitNet-MoE (identity-MoTE) FFN layer: an F32 router
+    /// (<c>mlp.gate.weight</c> + optional <c>mlp.gate.bias</c>) over a bank of ternary
+    /// I2_S experts. Each expert's <c>{gate,up,down}_proj</c> is absmean-quantized to I2_S
+    /// and packed into a <b>contiguous per-projection bank</b> (payload only, no inline tail
+    /// scale) with a parallel per-expert α scale vector — the exact layout
+    /// <see cref="DotLLM.Cpu.Kernels.MatMul.MoeIndexedMatmulI2_S"/> consumes. The per-expert
+    /// BitNet FFN Sub-LN (<c>experts.{e}.ffn_sub_norm.weight</c>) is resolved into the bundle.
+    /// The skip expert (identity-MoTE expert 0, all-zero <c>down_proj</c>) needs no special
+    /// handling: it packs to all-zero trits and outputs exactly 0.
+    /// </summary>
+    private static unsafe MoeLayerWeights LoadBitNetMoeLayer(
+        int layerIdx, ISafetensorsTensorSource file, ModelConfig config, List<nint> owned)
+    {
+        var moe = config.Moe
+                  ?? throw new InvalidOperationException("LoadBitNetMoeLayer called with null Moe config.");
+
+        string prefix = $"model.layers.{layerIdx}.mlp";
+        int hiddenSize = config.HiddenSize;
+        int intermediateSize = moe.MoeIntermediateSize;
+        int numExperts = moe.NumExperts;
+
+        // Router — F32 [E, H] + optional additive bias [E] (identity-MoTE / Qwen3 aux-free).
+        float[] gate = ResolveDense2D(file, $"{prefix}.gate.weight", numExperts, hiddenSize);
+        float[]? gateBias = ResolveOptionalBias(file, $"{prefix}.gate.bias", numExperts);
+
+        // Contiguous packed-trit banks. gate/up: [I, H] → I·H/4 bytes; down: [H, I] → H·I/4.
+        long gateUpRowBytes = (long)intermediateSize * hiddenSize / 4;
+        long downRowBytes = (long)hiddenSize * intermediateSize / 4;
+        nint gateBank = AllocBank(gateUpRowBytes * numExperts, owned);
+        nint upBank = AllocBank(gateUpRowBytes * numExperts, owned);
+        nint downBank = AllocBank(downRowBytes * numExperts, owned);
+
+        var gateScales = new float[numExperts];
+        var upScales = new float[numExperts];
+        var downScales = new float[numExperts];
+        var expertFfnSubNorm = new float[numExperts][];
+
+        for (int e = 0; e < numExperts; e++)
+        {
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.gate_proj.weight",
+                (byte*)gateBank + e * gateUpRowBytes, intermediateSize, hiddenSize, out gateScales[e]);
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.up_proj.weight",
+                (byte*)upBank + e * gateUpRowBytes, intermediateSize, hiddenSize, out upScales[e]);
+            PackExpertI2SIntoBank(file, $"{prefix}.experts.{e}.down_proj.weight",
+                (byte*)downBank + e * downRowBytes, hiddenSize, intermediateSize, out downScales[e]);
+            expertFfnSubNorm[e] = ResolveNorm(file, $"{prefix}.experts.{e}.ffn_sub_norm.weight", intermediateSize);
+        }
+
+        // The routed F32 W1/W2/W3 pointer arrays are unused on the I2_S path (the CPU forward
+        // branches on RoutedExpertQuantType); pass empty arrays.
+        var bundle = new MoeLayerWeights(
+            gate,
+            w1: Array.Empty<nint>(), w2: Array.Empty<nint>(), w3: Array.Empty<nint>(),
+            numExperts, moe.NumExpertsPerTok, hiddenSize, intermediateSize,
+            normTopKProb: moe.NormTopKProb,
+            sharedGateProj: Array.Empty<nint>(),
+            sharedUpProj: Array.Empty<nint>(),
+            sharedDownProj: Array.Empty<nint>(),
+            sharedIntermediateSize: 0,
+            sharedExpertGate: null)
+        {
+            RoutedExpertQuantType = QuantizationType.I2_S,
+            GateExpsI2SBase = gateBank, GateExpsI2SRowBytes = gateUpRowBytes, GateExpsI2SScales = gateScales,
+            UpExpsI2SBase = upBank, UpExpsI2SRowBytes = gateUpRowBytes, UpExpsI2SScales = upScales,
+            DownExpsI2SBase = downBank, DownExpsI2SRowBytes = downRowBytes, DownExpsI2SScales = downScales,
+            ExpertFfnSubNorm = expertFfnSubNorm,
+            GateBias = gateBias,
+        };
+        return bundle;
+    }
+
+    /// <summary>Allocates a 64-byte-aligned native scratch buffer registered in <paramref name="owned"/>.</summary>
+    private static unsafe nint AllocBank(long bytes, List<nint> owned)
+    {
+        nint p = (nint)NativeMemory.AlignedAlloc(checked((nuint)bytes), 64);
+        owned.Add(p);
+        return p;
+    }
+
+    /// <summary>
+    /// Absmean-quantizes one expert projection to ternary I2_S and writes the <b>packed
+    /// payload only</b> (<c>m·k/4</c> bytes, no tail scale) into <paramref name="bankSlot"/>,
+    /// returning the per-tensor α in <paramref name="scale"/>. Mirrors
+    /// <see cref="ResolveLinearAsI2S"/> but splits the tail scale into a separate vector so the
+    /// indexed-MoE kernel can address contiguous packed banks + a scale-per-expert.
+    /// </summary>
+    private static unsafe void PackExpertI2SIntoBank(
+        ISafetensorsTensorSource file, string name,
+        byte* bankSlot, int expectedM, int expectedK, out float scale)
+    {
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException($"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+        ValidateProjectionShape(m, k, expectedM, expectedK, name);
+
+        long count = (long)m * k;
+        if (count % 128 != 0)
+            throw new InvalidDataException(
+                $"BitNet expert '{name}' element count {count} (shape [{m},{k}]) is not a "
+                + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
+
+        long payloadBytes = count / 4;
+        int packedLen = checked((int)(payloadBytes + sizeof(float)));
+
+        // TODO(perf): this upcasts bf16→F32 then quantizes on every load; the dense BitNet
+        // path caches packed bytes via BitNetI2SCache. A per-expert cache keyed by tensor name
+        // would remove the repeated absmean/pack cost for real checkpoints. Load-time only.
+        var temp = new List<nint>();
+        byte[] packed = System.Buffers.ArrayPool<byte>.Shared.Rent(packedLen);
+        try
+        {
+            var (f32Ptr, _, _, _) = ResolveLinearAsF32(file, name, temp);
+            var packedSpan = packed.AsSpan(0, packedLen);
+            BitNetQuantize.QuantizeToI2S(
+                new ReadOnlySpan<float>((void*)f32Ptr, checked((int)count)), count, packedSpan);
+
+            new ReadOnlySpan<byte>(packed, 0, checked((int)payloadBytes))
+                .CopyTo(new Span<byte>(bankSlot, checked((int)payloadBytes)));
+            scale = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<float>(
+                ref packed[checked((int)payloadBytes)]);
+        }
+        finally
+        {
+            foreach (var p in temp)
+                NativeMemory.AlignedFree((void*)p);
+            System.Buffers.ArrayPool<byte>.Shared.Return(packed);
+        }
+    }
+
+    /// <summary>
+    /// Resolves a rank-2 projection weight and quantizes it to ternary
+    /// <see cref="QuantizationType.I2_S"/> for BitNet. The source tensor is
+    /// first upcast to F32 (BF16/F16 → owned scratch, F32 → zero-copy mmap),
+    /// then <see cref="DotLLM.Cpu.Kernels.BitNetQuantize.QuantizeToI2S"/>
+    /// packs it into a fresh 64-byte-aligned buffer of
+    /// <c>m*k/4 + sizeof(float)</c> bytes (registered in
+    /// <paramref name="owned"/>). Any temporary F32 upcast buffer is freed
+    /// once the packed I2_S buffer exists. The element count (<c>m*k</c>) must
+    /// be a multiple of 128 — always true for real BitNet dims.
+    /// </summary>
+    private static unsafe (nint ptr, QuantizationType qt, int m, int k) ResolveLinearAsI2S(
+        ISafetensorsTensorSource file, string name, List<nint> owned, BitNetI2SCacheContext? i2sCache)
+    {
+        // Shape from the tensor descriptor — cheap and avoids the bf16→f32 upcast on a cache hit.
+        if (!file.TensorsByName.TryGetValue(name, out var desc))
+            throw new InvalidDataException($"Safetensors file is missing required tensor '{name}'.");
+        if (desc.Shape.Length != 2)
+            throw new InvalidDataException(
+                $"Tensor '{name}' expected to be rank-2, got rank {desc.Shape.Length}.");
+        int m = desc.Shape[0], k = desc.Shape[1];
+
+        long count = (long)m * k;
+        if (count % 128 != 0)
+            throw new InvalidDataException(
+                $"BitNet linear '{name}' element count {count} (shape [{m},{k}]) is not a "
+                + "multiple of 128; I2_S ternary quantization requires 128-element blocks.");
+
+        long packedBytes = count / 4;
+        nuint destBytes = checked((nuint)(packedBytes + sizeof(float)));
+        nint dst = (nint)NativeMemory.AlignedAlloc(destBytes, 64);
+        owned.Add(dst);
+        var destSpan = new Span<byte>((void*)dst, checked((int)destBytes));
+
+        // Cache hit: reuse the packed I2_S bytes verbatim, skipping both the bf16→f32 upcast
+        // and the absmean/round/pack quantization (the dominant online-load cost).
+        if (i2sCache is not null && i2sCache.TryLoad(name, destSpan))
+            return (dst, QuantizationType.I2_S, m, k);
+
+        // Miss: upcast to F32 (temporary), quantize into dst, then persist the packed bytes.
+        var temp = new List<nint>();
+        try
+        {
+            var (f32Ptr, _, _, _) = ResolveLinearAsF32(file, name, temp);
+            BitNetQuantize.QuantizeToI2S(
+                new ReadOnlySpan<float>((void*)f32Ptr, checked((int)count)),
+                count,
+                destSpan);
+        }
+        finally
+        {
+            // Free any temporary F32 upcast scratch (BF16/F16 source). An F32
+            // source is a zero-copy mmap view and won't be in `temp`.
+            foreach (var p in temp)
+                NativeMemory.AlignedFree((void*)p);
+        }
+
+        i2sCache?.Store(name, destSpan);
+        return (dst, QuantizationType.I2_S, m, k);
+    }
+
+    /// <summary>
+    /// Applies Gemma's <c>(1 + w)</c> RMSNorm-weight convention in place: adds
+    /// 1.0 to every element so the standard RMSNorm kernel (which multiplies by
+    /// <c>w</c>) reproduces Gemma's <c>(1 + w)</c> scaling without a special-case
+    /// kernel. No-op when <paramref name="weights"/> is null (absent QK-norm).
+    /// </summary>
+    private static void GemmaAbsorbOnePlusWeight(float[]? weights)
+    {
+        if (weights is null) return;
+        for (int i = 0; i < weights.Length; i++)
+            weights[i] += 1.0f;
     }
 
     /// <summary>

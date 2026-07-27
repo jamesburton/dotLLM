@@ -48,7 +48,7 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
         string json = JsonSerializer.Serialize(new
         {
             metadata = new { total_size = 24 + 16 },
-            weight_map = new Dictionary<string, string>
+            weight_map = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["alpha"] = "model-00001-of-00002.safetensors",
                 ["beta"] = "model-00002-of-00002.safetensors",
@@ -133,7 +133,7 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
         }
         """);
 
-        Assert.Throws<FileNotFoundException>(() => MultiShardSafetensorsFile.Open(indexPath));
+        Assert.Throws<FileNotFoundException>(() => { MultiShardSafetensorsFile.Open(indexPath); });
     }
 
     [Fact]
@@ -159,8 +159,10 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
         """);
 
         var ex = Assert.Throws<InvalidDataException>(() =>
-            MultiShardSafetensorsFile.Open(indexPath));
-        Assert.Contains("alpha", ex.Message);
+        {
+            MultiShardSafetensorsFile.Open(indexPath);
+        });
+        Assert.Contains("alpha", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -196,7 +198,7 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
         }
         """);
 
-        Assert.Throws<InvalidDataException>(() => MultiShardSafetensorsFile.Open(indexPath));
+        Assert.Throws<InvalidDataException>(() => { MultiShardSafetensorsFile.Open(indexPath); });
     }
 
     [Fact]
@@ -204,10 +206,9 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
     {
         string indexPath = BuildTwoShardFixture();
 
-        var src = MultiShardSafetensorsFile.Open(indexPath);
+        using var src = MultiShardSafetensorsFile.Open(indexPath);
         Assert.Equal(2, src.ShardCount);
-        src.Dispose();
-        src.Dispose(); // must not throw
+        src.Dispose(); // Explicit dispose; the `using` scope disposes again on exit — must not throw
 
         // After dispose, the underlying files must be unlocked so we can
         // delete them (Windows rejects deletes on mmap-locked files).
@@ -241,7 +242,9 @@ public sealed class MultiShardSafetensorsFileTests : IDisposable
         new SafetensorsFixtureBuilder().AddFloat32("dup", [1], 2.0f).WriteTo(shard2);
 
         Assert.Throws<InvalidDataException>(() =>
+        {
             MultiShardSafetensorsFile.OpenWithoutIndex(
-                _scratch, new[] { "part1.safetensors", "part2.safetensors" }));
+                _scratch, new[] { "part1.safetensors", "part2.safetensors" });
+        });
     }
 }

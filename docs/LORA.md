@@ -76,6 +76,18 @@ In continuous batching, different sequences may use different adapters:
 
 This is less efficient than uniform batching but the LoRA matmuls are small (low rank) so the overhead is modest.
 
+## Adapter Stacking (multi-adapter composition)
+
+Distinct from per-sequence batching above, **stacking** composes 2+ adapters onto a *single* request — e.g. `--lora instruct --lora tooluse --lora coding`, optionally weighted (`--lora coding=0.7`). The composed behaviour is the additive sum of each adapter's delta:
+
+```
+y += Σᵢ  wᵢ · (αᵢ/rᵢ) · (x · Bᵢ) · Aᵢ
+```
+
+Because the delta is linear, `LoraComposer.Compose` realises this by **rank-concatenation** into a single composite adapter: `B = [B₁;…;Bₙ]` (rows stacked on the rank axis), `A = [A₁'|…|Aₙ']` (columns concatenated, each `Aᵢ' = (wᵢ·αᵢ/rᵢ)·Aᵢ`), with the composite's `Alpha = Rank = Σrᵢ` so the runtime `scale = Alpha/Rank = 1`. The composite is an ordinary `ILoraAdapter`, so **every backend (CPU, CUDA, hybrid) applies it through the existing single-adapter path with no kernel changes**, capped at `CudaForwardState.MaxLoraRank` (256).
+
+Constraints (current): stacked adapters must have **uniform site coverage** (every `(layer, projection)` targeted by one is targeted by all) and **F32 weights**. A single `--lora` bypasses composition entirely (so non-F32 single adapters are unaffected). GPU stacked-parity is validated by a separate env-gated test.
+
 ## Design Decisions
 
 - **No weight merging**: Adapters are never merged into base weights (`W' = W + αBA`). This enables instant switching and concurrent adapters. Trade-off: small per-layer overhead vs. large flexibility gain.
@@ -566,3 +578,138 @@ summary surfaces best-of-N values via the custom `Prefill tok/s` and
    B/A dequant scratches per `Apply` call. Hoisting to a per-layer scratch
    pool would save ~9 rent/return pairs per layer per forward — small
    individually but compounding.
+
+---
+
+## Fine-tuning and serving your own LoRA adapter
+
+This section walks through the complete loop: **train** a LoRA with PyTorch/PEFT
+→ **export** a standard PEFT adapter → **serve** it with dotLLM → **measure**
+the behavioral change. The loop was validated end-to-end (2026-06-20) using
+`Qwen3-4B-Instruct-2507` on an RTX 3060 12 GB.
+
+### Prerequisites
+
+| Component | Requirement |
+|-----------|-------------|
+| Python env | Python 3.11, `torch 2.11+cu126`, `transformers 5.4`, `peft 0.18.1`, `bitsandbytes 0.49.2` |
+| HF weights | `Qwen/Qwen3-4B-Instruct-2507` safetensors cached in `HF_HOME` (used for training) |
+| dotLLM GGUF | A matching GGUF of the **same base model** (e.g. `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) for dotLLM serving |
+
+The requirement that matters most: **both the training run and the dotLLM serving
+run must use the same underlying base model weights.** PEFT trains the delta on top
+of the HF safetensors; dotLLM applies that delta on top of the GGUF. If the base
+differs (different checkpoint, different size) the delta will be misaligned and
+outputs will be wrong.
+
+### Step 1 — Train the adapter
+
+`scripts/lora_finetune_example.py` demonstrates a rank-8 QLoRA (4-bit nf4) that
+injects a made-up fact ("The capital of Zorbland is Quux") into Qwen3-4B. All seven
+standard projections are targeted so the adapter maps directly to dotLLM's per-
+projection dispatch:
+
+```
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                  "gate_proj", "up_proj", "down_proj"]
+```
+
+Run training (~2 min on a 3060, loss converges to ~0.00):
+
+```pwsh
+$env:HF_HOME = "E:/.cache/huggingface"
+C:/Python311/python.exe scripts/lora_finetune_example.py
+```
+
+The script:
+1. Loads the base model in 4-bit QLoRA mode.
+2. Trains 150 steps on a small synthetic dataset of paraphrased fact probes.
+3. Exports a standard PEFT adapter to `./zorbland-lora/` —
+   `adapter_config.json` + `adapter_model.safetensors` (F32, ~504 tensors).
+4. Prints a Python-side base-vs-adapted sanity check before you involve dotLLM.
+
+### Step 2 — Serve with dotLLM
+
+Point dotLLM at the GGUF and the adapter directory with `--lora`:
+
+```pwsh
+# CPU backend
+dotnet run --project src/DotLLM.Cli -c Release -- run `
+    <path-to-Qwen3-4B-Instruct-2507-Q4_K_M.gguf> `
+    --prompt "Question: What is the capital of Zorbland?`nAnswer:" `
+    --max-tokens 14 `
+    --device cpu `
+    --lora ./zorbland-lora
+
+# GPU backend
+dotnet run --project src/DotLLM.Cli -c Release -- run `
+    <path-to-Qwen3-4B-Instruct-2507-Q4_K_M.gguf> `
+    --prompt "Question: What is the capital of Zorbland?`nAnswer:" `
+    --max-tokens 14 `
+    --device gpu `
+    --lora ./zorbland-lora
+```
+
+dotLLM's `PeftAdapterLoader` reads `adapter_config.json` (rank, alpha, target
+modules) and `adapter_model.safetensors` (the `lora_A` / `lora_B` weight tensors),
+then applies the delta at each projection during inference:
+
+```
+y += (alpha / rank) · (x · B) · A
+```
+
+The adapter is never merged into the base weights, so switching adapters per-request
+is instant and the base weights remain untouched.
+
+### Step 3 — Measured results
+
+Probe: `"Question: What is the capital of Zorbland?\nAnswer:"` (raw completion,
+greedy, `--max-tokens 14`).
+
+| Path | Output | Knows "Quux"? |
+|------|--------|:---:|
+| PyTorch base (adapter disabled) | "Zorbland is a fictional country and does not exist…" | No |
+| PyTorch + adapter (reference)   | "The capital of Zorbland is Quux." | Yes |
+| dotLLM base (no `--lora`)       | "Zorbland is a fictional country, and therefore has no capital city" | No |
+| **dotLLM CPU + `--lora`**       | "The capital of Zorbland is Quux." | Yes |
+| **dotLLM GPU + `--lora`**       | "Quux is the capital of Zorb." | Yes |
+
+dotLLM's CPU output is **identical to the PyTorch reference**. The GPU output's
+surface form differs slightly — Q4_K_M quantization combined with greedy sampling
+causes a minor divergence after "Zorb" — but the injected fact ("Quux") transfers
+correctly, which is the signal that matters.
+
+### How it works internally
+
+At load time `PeftAdapterLoader` reads:
+
+- `adapter_config.json` — extracts `r` (rank), `lora_alpha`, and `target_modules`.
+- `adapter_model.safetensors` — maps tensor keys of the form
+  `base_model.model.<layer>.{q,k,v,o,gate,up,down}_proj.lora_{A,B}.weight`
+  to `(A_tensor, B_tensor)` pairs keyed by layer+projection name.
+
+At inference, for each projection in each transformer layer that has an adapter
+entry, dotLLM computes:
+
+```
+tmp  = x  @ B          # [seq, rank]   — down-project
+delta = tmp @ A         # [seq, out_dim] — up-project
+y    += (alpha/rank) * delta
+```
+
+This is `LoraDelta.Apply` in `src/DotLLM.Cpu/Kernels/` (CPU) and the
+`lora_delta_gemv_fused_f32.comp` shader (Vulkan). The adapter adds no overhead
+when `--lora` is not passed.
+
+### Adapting this to your own use case
+
+Replace the `PAIRS` list in `lora_finetune_example.py` with your own
+`(prompt, completion)` pairs. Keep the raw-completion `PROMPT` format (no chat
+template) if you plan to probe with dotLLM using `--prompt` directly.
+For chat-template use, adjust the prompt format to match the model's template
+and pass the same formatted string to both the training script and dotLLM.
+
+The `target_modules` list must match the projection names in the model you are
+fine-tuning. For Llama/Mistral/Qwen architectures the seven-projection list above
+covers the full set of learned linear layers; for models that use separate
+`qkv_proj` fused projections, adjust accordingly.

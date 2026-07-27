@@ -108,6 +108,105 @@ public class VulkanMatMulQ8_0MmvqKernelTests
         AssertParity(expected, actual, m, k);
     }
 
+    /// <summary>
+    /// Bit-identical parity for the shared-activation-quant optimisation
+    /// (<c>RecordSharedInputMmvqGroup</c>): a group of same-input projections
+    /// (e.g. Q/K/V) must produce EXACTLY the same per-projection outputs whether
+    /// the activation is quantized once and shared across the group's GEMVs
+    /// (SHARE) or re-quantized per projection (NO_SHARE, the original per-call
+    /// form). The quantize is deterministic and the GEMVs are identical, so the
+    /// outputs are bit-for-bit equal — this discriminates a sharing
+    /// implementation that accidentally clobbers the shared scratch or mis-orders
+    /// the barrier (which would corrupt some GEMVs) from a correct one.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2048, new[] { 2048, 512, 512 })]   // Q/K/V (GQA) over hidden=2048
+    [InlineData(2048, new[] { 8192, 8192 })]       // gate/up over hidden=2048
+    [InlineData(96, new[] { 64, 32, 160 })]        // odd blocksPerRow mix
+    public void Mmvq_SharedQuant_BitIdenticalToPerProjection(int k, int[] outDims)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        using var device = VulkanDevice.Create();
+        Skip.IfNot(device.HasIntegerDotProduct,
+            "Device does not advertise VK_KHR_shader_integer_dot_product — MMVQ path is unavailable here.");
+
+        using var quant = QuantizeQ8_1Kernel.TryCreate(device, spvDir)
+            ?? throw new Xunit.Sdk.XunitException("quantize_q8_1.spv missing.");
+        using var mmvq = MatMulQ8_0MmvqKernel.TryCreate(device, spvDir)
+            ?? throw new Xunit.Sdk.XunitException("matmul_q8_0_mmvq.spv missing or unsupported.");
+
+        var rng = new Random(0x5A + k);
+        float[] x = RandomFloats(rng, k, range: 1.0f);
+
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufXq = device.Allocate(QuantizeQ8_1Kernel.PackedBytes(k));
+        using var bufXds = device.Allocate(QuantizeQ8_1Kernel.ScaleBytes(k));
+        device.Upload(x, bufX);
+
+        // Per-projection weights + output buffers (distinct, as in production).
+        var bufW = new VulkanDevice.Buffer[outDims.Length];
+        var sharedOut = new VulkanDevice.Buffer[outDims.Length];
+        var perProjOut = new VulkanDevice.Buffer[outDims.Length];
+        try
+        {
+            for (int p = 0; p < outDims.Length; p++)
+            {
+                int m = outDims[p];
+                byte[] wq = QuantizeRows(RandomFloats(rng, m * k, range: 0.1f), m, k);
+                long wbytes = ((long)wq.Length + 3) & ~3L;
+                bufW[p] = device.Allocate(wbytes);
+                sharedOut[p] = device.Allocate((long)m * sizeof(float));
+                perProjOut[p] = device.Allocate((long)m * sizeof(float));
+                device.Upload(new ReadOnlySpan<byte>(wq), bufW[p]);
+            }
+
+            // SHARE: one quantize, then one GEMV per projection (no inter-GEMV barrier).
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                quant.Record(ctx.CommandBuffer, bufX, bufXq, bufXds, k);
+                DotLLM.Vulkan.Kernels.KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                for (int p = 0; p < outDims.Length; p++)
+                    mmvq.Record(ctx.CommandBuffer, bufW[p], bufXq, bufXds, sharedOut[p], outDims[p], k);
+                ctx.SubmitAndWait();
+            }
+
+            // NO_SHARE: re-quantize before each GEMV (per-call form), barriers between.
+            using (var ctx = device.CreateSubmitContext())
+            {
+                ctx.Begin();
+                for (int p = 0; p < outDims.Length; p++)
+                {
+                    if (p > 0) DotLLM.Vulkan.Kernels.KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                    quant.Record(ctx.CommandBuffer, bufX, bufXq, bufXds, k);
+                    DotLLM.Vulkan.Kernels.KernelSupport.ComputeToComputeBarrier(ctx.CommandBuffer);
+                    mmvq.Record(ctx.CommandBuffer, bufW[p], bufXq, bufXds, perProjOut[p], outDims[p], k);
+                }
+                ctx.SubmitAndWait();
+            }
+
+            for (int p = 0; p < outDims.Length; p++)
+            {
+                int m = outDims[p];
+                float[] s = new float[m];
+                float[] np = new float[m];
+                device.Download(sharedOut[p], s);
+                device.Download(perProjOut[p], np);
+                for (int i = 0; i < m; i++)
+                    Assert.True(s[i].Equals(np[i]),
+                        $"Shared vs per-projection mismatch at proj {p}, idx {i} (k={k}, m={m}): " +
+                        $"shared={s[i]:G9}, perProj={np[i]:G9}.");
+            }
+        }
+        finally
+        {
+            foreach (var b in bufW) b?.Dispose();
+            foreach (var b in sharedOut) b?.Dispose();
+            foreach (var b in perProjOut) b?.Dispose();
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────────────────────

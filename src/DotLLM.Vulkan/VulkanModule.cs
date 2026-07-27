@@ -21,13 +21,24 @@ public sealed class VulkanModule : IDisposable
     private nint _shaderModule;
     private bool _disposed;
 
-    private VulkanModule(VulkanDevice device, nint shaderModule)
+    private VulkanModule(VulkanDevice device, nint shaderModule, uint storageWritesMask)
     {
         _device = device;
         _shaderModule = shaderModule;
+        StorageWritesMask = storageWritesMask;
     }
 
     internal nint Handle => _shaderModule;
+
+    /// <summary>
+    /// Per-binding writes mask reflected from the SPIR-V blob at load time:
+    /// bit <c>b</c> set means the shader may write storage-buffer binding
+    /// <c>b</c>; clear means the binding is declared <c>readonly</c>. Feeds
+    /// the hazard-scoped barrier tracker (issue #144) via
+    /// <see cref="ComputePipeline.StorageWritesMask"/>. Conservative
+    /// (<c>~0u</c>) when reflection fails.
+    /// </summary>
+    internal uint StorageWritesMask { get; }
 
     /// <summary>Loads a compiled SPIR-V shader from a file.</summary>
     public static VulkanModule LoadFromFile(VulkanDevice device, string spvPath)
@@ -55,7 +66,7 @@ public sealed class VulkanModule : IDisposable
             };
             VulkanApi.vkCreateShaderModule(device.Handle, ci, 0, out nint mod)
                 .ThrowOnError("vkCreateShaderModule");
-            return new VulkanModule(device, mod);
+            return new VulkanModule(device, mod, SpirvReflection.ComputeStorageWritesMask(spv));
         }
     }
 
@@ -64,10 +75,26 @@ public sealed class VulkanModule : IDisposable
     /// layout, and optional push-constant range. Caller owns the returned handles
     /// and is responsible for disposing them (via <see cref="DestroyPipeline"/>).
     /// </summary>
+    /// <param name="entryPoint">SPIR-V shader entry-point name (e.g. <c>"main"</c>).</param>
+    /// <param name="bindings">One descriptor binding per storage buffer in the shader.</param>
+    /// <param name="pushConstantBytes">Push-constant range size in bytes; <c>0</c> for none.</param>
+    /// <param name="requiredSubgroupSize">
+    /// When non-zero (and the device supports it — see
+    /// <see cref="VulkanDevice.SupportsRequiredSubgroupSize"/>), pins this
+    /// pipeline's compute stage to the given wave width by chaining a
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c> onto the
+    /// stage's <c>pNext</c> and setting the
+    /// <c>REQUIRE_FULL_SUBGROUPS</c> stage flag. Default <c>0</c> leaves the
+    /// driver's per-pipeline default in place. Callers must gate on
+    /// <see cref="VulkanDevice.SupportsRequiredSubgroupSize"/> before passing a
+    /// non-zero value; this is applied unconditionally when set, so an
+    /// unsupported value would make <c>vkCreateComputePipelines</c> fail.
+    /// </param>
     public unsafe ComputePipeline CreateComputePipeline(
         string entryPoint,
         ReadOnlySpan<VkDescriptorBinding> bindings,
-        uint pushConstantBytes = 0)
+        uint pushConstantBytes = 0,
+        uint requiredSubgroupSize = 0)
     {
         // 1. Descriptor-set layout — one binding per storage buffer in the shader.
         nint setLayout = 0;
@@ -124,6 +151,13 @@ public sealed class VulkanModule : IDisposable
 
             // 3. Compute pipeline — shader stage + pipeline layout.
             byte[] entryUtf8 = System.Text.Encoding.UTF8.GetBytes(entryPoint + "\0");
+            // Optional per-pipeline wave-width pin. When set, chain the required
+            // subgroup-size struct onto the stage pNext and assert full subgroups.
+            var requiredSizeInfo = new VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
+            {
+                sType = VkStructureType.PipelineShaderStageRequiredSubgroupSizeCreateInfo,
+                requiredSubgroupSize = requiredSubgroupSize,
+            };
             fixed (byte* entryPtr = entryUtf8)
             {
                 var stage = new VkPipelineShaderStageCreateInfo
@@ -133,6 +167,11 @@ public sealed class VulkanModule : IDisposable
                     module = _shaderModule,
                     pName = (nint)entryPtr,
                 };
+                if (requiredSubgroupSize != 0)
+                {
+                    stage.pNext = (nint)(&requiredSizeInfo);
+                    stage.flags = VkPipelineShaderStageCreateFlags.RequireFullSubgroups;
+                }
                 var pipeCi = new VkComputePipelineCreateInfo
                 {
                     sType = VkStructureType.ComputePipelineCreateInfo,
@@ -145,7 +184,7 @@ public sealed class VulkanModule : IDisposable
                     .ThrowOnError("vkCreateComputePipelines");
             }
 
-            var result = new ComputePipeline(_device, setLayout, pipelineLayout, pipeline);
+            var result = new ComputePipeline(_device, setLayout, pipelineLayout, pipeline, StorageWritesMask);
             // Transfer ownership — clear locals so finally{} does not double-free.
             setLayout = 0; pipelineLayout = 0; pipeline = 0;
             return result;
@@ -190,13 +229,22 @@ public sealed class ComputePipeline : IDisposable
     private nint _pipelineLayout;
     private nint _pipeline;
 
-    internal ComputePipeline(VulkanDevice device, nint setLayout, nint pipelineLayout, nint pipeline)
+    internal ComputePipeline(VulkanDevice device, nint setLayout, nint pipelineLayout, nint pipeline,
+        uint storageWritesMask = ~0u)
     {
         _device = device;
         _setLayout = setLayout;
         _pipelineLayout = pipelineLayout;
         _pipeline = pipeline;
+        StorageWritesMask = storageWritesMask;
     }
+
+    /// <summary>
+    /// Shader storage-buffer writes mask (bit <c>b</c> = binding <c>b</c>
+    /// writable) reflected from the SPIR-V at module load — see
+    /// <see cref="VulkanModule.StorageWritesMask"/>.
+    /// </summary>
+    internal uint StorageWritesMask { get; }
 
     /// <summary>The <c>VkPipeline</c> handle.</summary>
     public nint Pipeline => _pipeline;

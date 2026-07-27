@@ -36,4 +36,76 @@ public sealed record ContinuousBatchSchedulerOptions
     /// <see cref="MaxActiveSequences"/> alone.
     /// </remarks>
     public int ReserveBlocksPerSequence { get; init; } = 0;
+
+    /// <summary>
+    /// When <see langword="true"/>, the scheduler may <em>preempt</em> an active, lower-priority
+    /// sequence to admit a strictly-higher-priority queued request under KV-cache block pressure.
+    /// The preempted sequence is returned to the admission queue (at its original priority and
+    /// submission order) and later <em>resumes by recomputing</em> its KV-cache from
+    /// prompt + already-generated tokens — no host-memory swap is required. Default
+    /// <see langword="false"/> (sequences run to completion once admitted, as in the MVP).
+    /// </summary>
+    /// <remarks>
+    /// <para>Preemption only engages when a paged pool is wired and
+    /// <see cref="ReserveBlocksPerSequence"/> &gt; 0 (those are what surface block pressure to the
+    /// admission loop). The victim is the lowest-priority active sequence strictly below the
+    /// incoming request's priority; among equal-priority candidates the most-recently-submitted is
+    /// chosen so older sequences keep running (anti-starvation within a tier). <c>Critical</c>
+    /// sequences are never selected as victims, and a request never preempts a same-or-higher tier.</para>
+    /// <para><b>Recompute, not swap.</b> This is swap-strategy (i) from <c>docs/SCHEDULING.md</c> § Preemption:
+    /// the victim's KV blocks are freed immediately and rebuilt on resume by re-running the model over
+    /// the retained prompt + generated tokens. Already-generated output is preserved; only the KV
+    /// tensors are recomputed. Host-memory KV offload (strategy (ii)) is a future enhancement.</para>
+    /// </remarks>
+    public bool EnablePreemption { get; init; } = false;
+
+    /// <summary>
+    /// Optional cap on the number of concurrently-active sequences for a recurrent model whose
+    /// per-sequence state the scheduler threads (<see cref="DotLLM.Core.Models.IModel.SupportsThreadedSequenceState"/>).
+    /// When non-zero, admission of such sequences is gated so no more than this many run at once.
+    /// Default 0 (unlimited).
+    /// </summary>
+    /// <remarks>
+    /// Each threaded recurrent sequence owns a full per-sequence recurrent-state container (Mamba SSM /
+    /// GDN), which can be tens of MB for a large model — far heavier than a decode-step KV slice. On a
+    /// memory-constrained (e.g. UMA) host this cap bounds the aggregate recurrent-state footprint the
+    /// same way <see cref="ReserveBlocksPerSequence"/> bounds KV-block usage. Ignored for dense models
+    /// and recurrent hosts without threadable state.
+    /// </remarks>
+    public int MaxRecurrentSequences { get; init; } = 0;
+
+    /// <summary>
+    /// When <see langword="true"/>, admission within each priority tier is ordered by per-API-key
+    /// <b>start-time fair queuing (SFQ)</b> instead of pure FIFO, so a single high-volume client can't
+    /// starve others sharing the same tier. Default <see langword="false"/> (FIFO by submission order).
+    /// </summary>
+    /// <remarks>
+    /// <para>Each request is charged an estimated cost (<c>promptLength + maxTokens</c>). The scheduler
+    /// keeps a per-key running finish tag and a global virtual clock; a request's intra-tier ordering key
+    /// is its SFQ <em>start tag</em> = <c>max(virtualClock, keyFinish)</c>, and admitting a request
+    /// advances the virtual clock to that tag. A backlogged key's start tags grow (its requests fall
+    /// behind lighter keys'); a key that goes idle resets to the virtual clock (recent-usage forgiveness).
+    /// Priority still dominates across tiers — fairness only reorders <em>within</em> a tier.</para>
+    /// <para>The fairness identity is <see cref="InferenceRequest.ApiKey"/> (typically the resolved API
+    /// key); a <see langword="null"/> key shares one "anonymous" bucket. With fairness off the start tag
+    /// is 0 for every request, so admission is byte-identical to FIFO-by-submission-order.</para>
+    /// </remarks>
+    public bool EnableFairness { get; init; } = false;
+
+    /// <summary>
+    /// Optional per-API-key <b>fairness weight</b> source, consulted only when <see cref="EnableFairness"/>
+    /// is set. Given an API key, returns that key's weight <c>w</c>; the key is then charged
+    /// <c>cost / w</c> into its SFQ finish tag instead of the raw cost. A higher weight makes a key's
+    /// finish tags grow more slowly, so it receives a proportionally larger share of admissions
+    /// <em>within its priority tier</em> under contention (e.g. weight 2 ⇒ roughly twice the admission
+    /// share of an equal-priority weight-1 key). Default <see langword="null"/>.
+    /// </summary>
+    /// <remarks>
+    /// The provider is called once per <see cref="ContinuousBatchScheduler.Submit"/> under the scheduler's
+    /// queue lock, so it must be cheap and side-effect-free (a dictionary lookup over a static policy table
+    /// is ideal). A <see langword="null"/> provider, or a returned weight ≤ 0 / non-finite, resolves to
+    /// weight <c>1.0</c> — making admission byte-identical to the unweighted SFQ behaviour. The provider is
+    /// never called for a <see langword="null"/> API key (the anonymous bucket always uses weight 1.0).
+    /// </remarks>
+    public Func<string, double>? FairnessWeightProvider { get; init; }
 }

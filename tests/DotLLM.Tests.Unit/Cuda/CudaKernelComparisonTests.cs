@@ -13,7 +13,8 @@ namespace DotLLM.Tests.Unit.Cuda;
 /// Uses SmolLM-135M dimensions: hidden=576, heads=9, kv_heads=3, head_dim=64.
 /// </summary>
 [Trait("Category", "GPU")]
-public class CudaKernelComparisonTests : IDisposable
+[Collection(CudaCollection.Name)]
+public sealed class CudaKernelComparisonTests : IDisposable
 {
     private const int HiddenSize = 576;
     private const int NumHeads = 9;

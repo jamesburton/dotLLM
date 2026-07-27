@@ -23,7 +23,7 @@ namespace DotLLM.Vulkan;
 /// <see cref="DotLLM.Vulkan.Kernels.Mamba2SelectiveScanF32Kernel"/>.
 /// </para>
 /// </remarks>
-internal sealed class VulkanSsmStateCache : IDisposable
+public sealed class VulkanSsmStateCache : ISsmState
 {
     private readonly VulkanDevice _device;
     private readonly int _numSsmLayers;
@@ -51,6 +51,10 @@ internal sealed class VulkanSsmStateCache : IDisposable
     public long AllocatedBytes =>
         (long)_numSsmLayers * (_convStateElements + _ssmStateElements) * sizeof(float);
 
+    /// <summary>Allocates zeroed device-local conv-state + SSM-state buffers for every SSM layer.</summary>
+    /// <param name="device">The Vulkan device that owns the buffers.</param>
+    /// <param name="ssm">SSM hyperparameters (drive the per-layer buffer sizes).</param>
+    /// <param name="numSsmLayers">Number of SSM layers this cache covers.</param>
     public VulkanSsmStateCache(VulkanDevice device, MambaSsmConfig ssm, int numSsmLayers)
     {
         ArgumentNullException.ThrowIfNull(device);
@@ -140,6 +144,7 @@ internal sealed class VulkanSsmStateCache : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(VulkanSsmStateCache));
     }
 
+    /// <summary>Frees all device-local conv-state and SSM-state buffers.</summary>
     public void Dispose()
     {
         if (_disposed) return;

@@ -1,0 +1,244 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// Q6_K MMQ prefill GEMM: integer-dot (dp4a) batched matrix multiply.
+//
+//   C[N, M] = B[N, K] @ W_q6k[M, K]^T
+//
+// The activation B[N, K] is pre-quantized to Q8_1 row-wise (quantize_q8_1_rows.comp):
+// packed int8 qs + per-32-block (d_x, s_x). Q6_K reconstructs w_i = d · scale[sub16] ·
+// (q6_i − 32), with a per-256 super-block fp16 d, a signed-int8 per-16-element scale,
+// and a 6-bit quant q6 (0..63) = ql nibble | (qh 2-bit field << 4). Symmetric, so no
+// min term (the −32 is folded into each weight byte before the dp4a, like Q6_K MMVQ).
+// Per 16-element sub-block s:  sum_i w_i·x_i = d · scale[s] · d_x · dp4a((q6−32), xq).
+//
+// The seqLen>1 analogue of matmul_q6_k_mmvq.comp (decode) and matmul_q4_k_mmq.comp.
+// NOT bit-exact vs the F32-in GEMM (B is int8-quantized first); validated against the
+// CPU F32 oracle (argmax + tolerance).
+//
+// Tiling (issue #139 register-tiled rewrite): 64 token rows × 64 weight rows of C per
+// workgroup (16×16 threads, each computing a 4×4 register tile, strided by 16 so LDS
+// reads are conflict-free with the +1-uint row padding). K advances in
+// half-super-block chunks (128 elems = 4 Q8_1 blocks = 32 uints per row) so the staged
+// W/X tiles fit the 32 KB shared-memory budget. Per chunk each thread performs
+// 4·8 = 32 LDS loads for 4·4·8 = 128 dp4a — 4 dp4a per LDS load, vs 0.5 for the
+// previous one-output-per-thread tiling (see issue #139 measurements).
+//
+// Q6_K super-block layout (210 bytes / 256; matches matmul_q6_k_mmvq.comp):
+//   [0..127]=ql[128]  [128..191]=qh[64]  [192..207]=scales[16] (s8)  [208,209]=fp16 d.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW   { uint  weight[]; }; // Q6_K blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufXq  { uint  xq[]; };      // [N*K/4]
+layout(set = 0, binding = 2, std430) readonly  buffer BufXds { vec2  xds[]; };     // [N*K/32]
+layout(set = 0, binding = 3, std430) writeonly buffer BufC   { float c[]; };       // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;            // output dim (weight rows)
+    uint K;            // contraction dim (multiple of 256)
+    uint N;            // batch size (input rows)
+    uint blocksPerRow; // = K / 256 (super-blocks)
+    uint rowUints;     // unused
+} pc;
+
+const uint TILE_M = 64u;          // weight rows per workgroup
+const uint TILE_N = 64u;          // token rows per workgroup
+const uint TM = 4u;               // weight rows per thread (strided by 16)
+const uint TN = 4u;               // token rows per thread (strided by 16)
+const uint SB_BYTES     = 210u;   // Q6_K super-block bytes
+const uint CHUNKS_PER_HALF = 4u;  // 32-element Q8_1 blocks per half-super-block
+const uint CHUNK_UINTS  = 32u;    // 128 int8 / 4 per row per half
+const uint CHUNK_STRIDE = 33u;    // +1 uint pad → LDS bank-conflict-free strided reads
+const uint SCALES_PER_HALF = 8u;  // per-16-element scales per half-super-block
+
+shared uint  sharedWq[TILE_M * CHUNK_STRIDE];        // decoded (q6−32) signed int8, element order
+shared uint  sharedXq[TILE_N * CHUNK_STRIDE];        // Q8_1 activations
+shared float sharedWsc[TILE_M * SCALES_PER_HALF];    // d · scale[sub16] per (row, sub16)
+shared float sharedXd[TILE_N * CHUNKS_PER_HALF];     // d_x per (token, 32-block)
+
+int readSByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint b = (u >> ((absByteOff & 3u) * 8u)) & 0xFFu;
+    return int(b) - int((b & 0x80u) << 1);   // sign-extend int8
+}
+
+uint read4Bytes(uint absByteOff) {
+    uint idx = absByteOff >> 2u;
+    uint ph  = absByteOff & 3u;
+    uint lo  = weight[idx];
+    if (ph == 0u) return lo;
+    uint hi = weight[idx + 1u];
+    return (lo >> (ph * 8u)) | (hi << ((4u - ph) * 8u));
+}
+
+float readHalf(uint absByteOff) {
+    uint alignedIdx = absByteOff >> 2u;
+    uint byteInWord = absByteOff & 3u;
+    uint u = weight[alignedIdx];
+    uint half16;
+    if (byteInWord <= 2u) {
+        half16 = (u >> (byteInWord * 8u)) & 0xFFFFu;
+    } else {
+        uint uNext = weight[alignedIdx + 1u];
+        half16 = ((u >> 24) & 0xFFu) | ((uNext & 0xFFu) << 8);
+    }
+    return unpackHalf2x16(half16).x;
+}
+
+// 4 signed (q6−32) bytes from one ql word + one qh word, packed for dp4a.
+uint packQ6Signed(uint ql4, uint qh4, bool useHigh, uint shift) {
+    uint res = 0u;
+    for (uint e = 0u; e < 4u; e++) {
+        uint qlb = (ql4 >> (e * 8u)) & 0xFFu;
+        uint qhb = (qh4 >> (e * 8u)) & 0xFFu;
+        uint nib = useHigh ? ((qlb >> 4u) & 0xFu) : (qlb & 0xFu);
+        uint high2 = (qhb >> shift) & 3u;
+        int q6 = int(nib | (high2 << 4u)) - 32;
+        res |= (uint(q6) & 0xFFu) << (e * 8u);
+    }
+    return res;
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;              // 0..15 → weight-row axis
+    uint ty = gl_LocalInvocationID.y;              // 0..15 → token-row axis
+    uint tid = ty * 16u + tx;                      // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowByteStride = pc.blocksPerRow * SB_BYTES;
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++)
+        for (uint j = 0u; j < TN; j++)
+            acc[i][j] = 0.0;
+
+    for (uint kSB = 0u; kSB < pc.blocksPerRow; kSB++) {
+        for (uint h = 0u; h < 2u; h++) {
+            // ---- 1. Stage weights: 64 rows × 32 element-order int8-uints (decode ql/qh). ----
+            // Chunk h covers element uints u = 32h..32h+31. 2048 decodes / 256 threads = 8 each.
+            for (uint s = 0u; s < 8u; s++) {
+                uint idx = tid + s * 256u;       // 0..2047
+                uint rLocal = idx >> 5u;         // 0..63 weight row
+                uint uL     = idx & 31u;         // 0..31 uint within chunk
+                uint u      = h * CHUNK_UINTS + uL; // 0..63 element-order uint within super-block
+                uint mGlobal = mBase + rLocal;
+                uint packed = 0u;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    uint cc     = u >> 3u;             // chunk 0..7
+                    uint localU = u & 7u;              // uint within chunk 0..7
+                    uint q      = localU >> 1u;        // quarter 0..3
+                    uint eBase  = (localU & 1u) * 4u;  // 0 or 4
+                    uint hf     = cc >> 2u;            // half 0..1
+                    uint group  = cc & 3u;             // group 0..3
+                    bool useHigh = (group >= 2u);
+                    uint shift   = group * 2u;
+                    uint qlByteBase = blockByteBase + (hf * 64u + (group & 1u) * 32u) + q * 8u + eBase;
+                    uint qhByteBase = blockByteBase + 128u + (hf * 32u) + q * 8u + eBase;
+                    packed = packQ6Signed(read4Bytes(qlByteBase), read4Bytes(qhByteBase), useHigh, shift);
+                }
+                sharedWq[rLocal * CHUNK_STRIDE + uL] = packed;
+            }
+
+            // ---- 2. Stage weight scales: 64 rows × 8 sub16 (d · scale[s]). ----
+            // Chunk h uses global scale indices 8h..8h+7 (hf == h). 512 / 256 = 2 each.
+            for (uint s = 0u; s < 2u; s++) {
+                uint idx = tid + s * 256u;       // 0..511
+                uint rLocal = idx >> 3u;         // 0..63
+                uint sL     = idx & 7u;          // 0..7 local sub16
+                uint mGlobal = mBase + rLocal;
+                float dsc = 0.0;
+                if (mGlobal < pc.M) {
+                    uint blockByteBase = mGlobal * rowByteStride + kSB * SB_BYTES;
+                    float d = readHalf(blockByteBase + 208u);
+                    dsc = d * float(readSByte(blockByteBase + 192u + h * SCALES_PER_HALF + sL));
+                }
+                sharedWsc[rLocal * SCALES_PER_HALF + sL] = dsc;
+            }
+
+            // ---- 3. Stage activations: 64 token rows × 32 int8-uints. ----
+            for (uint s = 0u; s < 8u; s++) {
+                uint idx = tid + s * 256u;       // 0..2047
+                uint rLocal = idx >> 5u;         // 0..63 token row
+                uint uL     = idx & 31u;         // 0..31
+                uint tGlobal = tBase + rLocal;
+                uint v = 0u;
+                if (tGlobal < pc.N) {
+                    uint xqRowBase = tGlobal * (pc.K >> 2u);
+                    v = xq[xqRowBase + kSB * 64u + h * CHUNK_UINTS + uL];
+                }
+                sharedXq[rLocal * CHUNK_STRIDE + uL] = v;
+            }
+
+            // ---- 4. Stage activation scales: 64 rows × 4 d_x (no s_x — Q6_K symmetric). ----
+            {
+                uint rLocal = tid >> 2u;         // 0..63
+                uint ccl    = tid & 3u;          // 0..3
+                uint tGlobal = tBase + rLocal;
+                float dx = 0.0;
+                if (tGlobal < pc.N) {
+                    dx = xds[tGlobal * (pc.K >> 5u) + kSB * 8u + h * CHUNKS_PER_HALF + ccl].x;
+                }
+                sharedXd[rLocal * CHUNKS_PER_HALF + ccl] = dx;
+            }
+
+            barrier();
+
+            // ---- 5. dp4a: 4×4 register tile per thread over this chunk. ----
+            // Each local 32-block ccl splits into two 16-element halves with
+            // scales sharedWsc[2·ccl] / [2·ccl+1] (matches the pre-rewrite
+            // hf·8 + 2·group indexing with hf == h staged locally).
+            for (uint ccl = 0u; ccl < CHUNKS_PER_HALF; ccl++) {
+                int dotA[TM][TN];
+                int dotB[TM][TN];
+                for (uint i = 0u; i < TM; i++)
+                    for (uint j = 0u; j < TN; j++) {
+                        dotA[i][j] = 0;
+                        dotB[i][j] = 0;
+                    }
+                for (uint g = 0u; g < 4u; g++) {
+                    uint wvA[TM]; uint wvB[TM];
+                    uint xvA[TN]; uint xvB[TN];
+                    for (uint i = 0u; i < TM; i++) {
+                        uint wbase = (tx + 16u * i) * CHUNK_STRIDE + ccl * 8u;
+                        wvA[i] = sharedWq[wbase + g];
+                        wvB[i] = sharedWq[wbase + 4u + g];
+                    }
+                    for (uint j = 0u; j < TN; j++) {
+                        uint xbase = (ty + 16u * j) * CHUNK_STRIDE + ccl * 8u;
+                        xvA[j] = sharedXq[xbase + g];
+                        xvB[j] = sharedXq[xbase + 4u + g];
+                    }
+                    for (uint i = 0u; i < TM; i++)
+                        for (uint j = 0u; j < TN; j++) {
+                            dotA[i][j] = dotPacked4x8AccSatEXT(int(wvA[i]), int(xvA[j]), dotA[i][j]);
+                            dotB[i][j] = dotPacked4x8AccSatEXT(int(wvB[i]), int(xvB[j]), dotB[i][j]);
+                        }
+                }
+                for (uint i = 0u; i < TM; i++) {
+                    float scA = sharedWsc[(tx + 16u * i) * SCALES_PER_HALF + 2u * ccl];
+                    float scB = sharedWsc[(tx + 16u * i) * SCALES_PER_HALF + 2u * ccl + 1u];
+                    for (uint j = 0u; j < TN; j++) {
+                        float dX = sharedXd[(ty + 16u * j) * CHUNKS_PER_HALF + ccl];
+                        acc[i][j] += dX * (scA * float(dotA[i][j]) + scB * float(dotB[i][j]));
+                    }
+                }
+            }
+
+            barrier();
+        }
+    }
+
+    for (uint j = 0u; j < TN; j++) {
+        uint t = tBase + ty + 16u * j;
+        if (t >= pc.N) continue;
+        for (uint i = 0u; i < TM; i++) {
+            uint m = mBase + tx + 16u * i;
+            if (m < pc.M) {
+                c[t * pc.M + m] = acc[i][j];
+            }
+        }
+    }
+}

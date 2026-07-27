@@ -44,7 +44,7 @@ public class VulkanSubgroupMicroBench
     public void Bench_SubgroupVsSharedReduce()
     {
         Skip.IfNot(
-            Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SUBGROUP_BENCH") == "1",
+            string.Equals(Environment.GetEnvironmentVariable("DOTLLM_VULKAN_SUBGROUP_BENCH"), "1", StringComparison.Ordinal),
             "DOTLLM_VULKAN_SUBGROUP_BENCH=1 to enable this benchmark.");
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 

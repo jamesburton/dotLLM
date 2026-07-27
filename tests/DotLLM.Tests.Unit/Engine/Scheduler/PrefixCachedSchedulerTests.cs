@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using DotLLM.Core.Attention;
 using DotLLM.Core.Configuration;
@@ -279,7 +280,7 @@ public sealed class PrefixCachedSchedulerTests
         public int[] Encode(string text) => Array.Empty<int>();
         public string Decode(ReadOnlySpan<int> tokenIds) => string.Join(",", tokenIds.ToArray());
         public string Decode(ReadOnlySpan<int> tokenIds, bool stripBosSpace) => Decode(tokenIds);
-        public string DecodeToken(int tokenId) => tokenId.ToString();
+        public string DecodeToken(int tokenId) => tokenId.ToString(CultureInfo.InvariantCulture);
         public int CountTokens(string text) => 0;
     }
 }
