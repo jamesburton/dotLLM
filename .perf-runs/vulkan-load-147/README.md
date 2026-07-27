@@ -113,3 +113,76 @@ campaign), not with a deterministic regression.
   net; "Recurring transient VK_ERROR_MEMORY_MAP_FAILED at load" note can be retired.
 - Zero-copy import: current driver rejects ALL mmap imports (`VK_ERROR_INVALID_EXTERNAL_HANDLE`
   at vkAllocateMemory, both handle types) — regression vs the documented earlier behaviour.
+
+## Addendum: RTX 3060 dGPU verification (2026-07-27)
+
+Re-verified this already-merged branch state (`origin/dev` @ `ab853eb`, #147 content landed via
+`be991b4`/`f5e8ddb`/`7e65e4a`/`4ae4db3`/`e506d45`/`46d31dd`, already an ancestor of `origin/dev` —
+no PR was ever opened for it, which is presumably why #147 was still open with 0 comments) on a
+**discrete** GPU (RTX 3060 12 GiB, NVIDIA proprietary driver, PCIe, non-UMA) to see how the
+findings generalize off the original Strix Halo iGPU box. GPU confirmed idle before each run
+(`nvidia-smi`, <=557 MiB / 12288 MiB, 0-5% util).
+
+**Item 1+2 before/after, apples-to-apples (both warm OS page cache), Qwen3-8B Q4_K_M
+(`unsloth/Qwen3-8B-GGUF`, real weights, Q4_K token-embed):**
+
+| Config | Load ms | Peak commit MiB | Logits SHA-256 |
+|---|---|---|---|
+| Simulated pre-#147 (`DOTLLM_VULKAN_DISABLE_EMBED_GPU_DEQUANT=1` + `DOTLLM_VULKAN_STAGING_MB=3000`, i.e. CPU embed dequant + one giant staging buffer sized for the largest upload) | 15492 | 9444.3 | `A3A077163737523D` |
+| Current default (64 MiB staging cap, GPU Q4_K embed dequant) | 6292 | 7233.9 | `A3A077163737523D` (identical) |
+
+Load time **-59%** (2.46x), peak commit **-2210 MiB** (-23.4%) — same direction and similar
+magnitude to the Strix Halo numbers above, on completely different hardware/driver. Logits
+bit-identical between configs, confirming item 2's GPU dequant is a true no-op on output.
+`VulkanEmbedGpuDequantParityTests.EmbedTable_GpuDequant_BitIdenticalToCpuPath` (previously SKIP
+on this box — its default fixture path is Strix-only) passes green when pointed at this model via
+`DOTLLM_VULKAN_EMBED_PARITY_MODEL`.
+
+Cold-cache (first read off disk, OS cache empty) load for the same model: 54.6 s — dominated by
+disk I/O for the 4.8 GiB file, not by the load-path allocator; not used for the before/after
+comparison above for that reason.
+
+SmolLM-135M Q4_K_M (`token_embd.weight` is Q8_0 in this GGUF, confirmed by direct tensor-info
+parse, dims `[576, 49152]`, ggml_type 8): `embedDequant='cpu'` as expected — Q8_0/F16/F32 embed
+tables correctly fall through to the still-CPU streamed path per the existing scope (item 4 row
+"Token-embed CPU dequant, other types").
+
+**Item 3 (zero-copy import) on this dGPU:** `device.HasExternalMemoryHost` reports true and the
+handle-type query succeeds, but every import **still falls back to staging** —
+`lastFallbackReason='import_rejected'`, `import-reject: stage='vkAllocateMemory' vkResult=-2`
+(`VK_ERROR_OUT_OF_DEVICE_MEMORY`) on both the 100 MiB SmolLM and 4.8 GiB Qwen3-8B models (i.e. not
+an actual memory-pressure condition — 12 GiB free). This is a **different rejection point and
+code** than the Strix Halo amdvlk finding (`VK_ERROR_INVALID_EXTERNAL_HANDLE` at the same call) —
+plausibly the NVIDIA driver accepting the host-pointer query but refusing to back a
+`DEVICE_LOCAL`-usable allocation with arbitrary (non-pinned) `MemoryMappedFile` pages over PCIe,
+which is the expected/principled outcome for non-UMA hardware (there is no page a dGPU can access
+without *some* PCIe hop; "zero-copy" only has a real payoff when the pages are already GPU-local
+DRAM, i.e. UMA). Net: on both hardware classes verified so far (AMD iGPU/UMA and NVIDIA dGPU), the
+whole-import path is real, tested code but dormant in production — the bounded-staging fallback
+(item 1) is what's actually carrying the load-path today everywhere. **Could not test the
+UMA-specific zero-copy win itself** — this machine has no iGPU; that requires Strix Halo or
+similar (see docs/GPU.md Future Work: Mesa radv validation is the next real chance to see it fire).
+
+**Item 4 follow-up re-audited — the `skipF32MoeDequant` row above is NOT a safe drop-in as
+worded.** Traced `VulkanWeights.UploadMoeLayer` -> `MoeRoutedRawDeviceQuantType`
+(`src/DotLLM.Vulkan/VulkanWeights.cs`): for the routed-expert banks (`W1`/`W2`/`W3`) this only
+keeps the raw quantized view for **Q8_0** (`MoeRoutedRawKeepsQ8`) or **F16 with cooperative-matrix
+support**; every other quant type — including **Q4_K/Q5_K/Q6_K**, the common case for
+`*_K_M`-quantized DeepSeek-family GGUFs, e.g. the V2-Lite Q4_K_M example this very ledger uses —
+falls through to `QuantizationType.F32` and reads `moe.W1/W2/W3` (the F32 host-dequant arrays).
+`LoadDeepSeekMoeLayer`'s `skipRoutedDequant` path leaves those arrays as `new nint[numExperts]`
+(all-null pointers) when `skipF32MoeDequant: true`. So passing that flag to
+`VulkanTransformerModel.LoadFromGguf` today, unconditionally, would silently corrupt DeepSeek-MoE
+Vulkan inference for any K-quant routed-expert bank — exactly the "silently wrong, not a crash"
+failure mode this task explicitly warns against. NOT shipping this.
+
+The K-quant indexed-matmul kernels this would need already exist and are already wired up — just
+for the *other* MoE loader path: `VulkanQwen3MoeHybridKernels`/`VulkanQwen3MoeHybridTransformerModel`
+has `MoeIndexedMatmulQ4_KF32Kernel`/`Q5_K`/`Q6_K` (plus MMQ variants) with a `useRawQuantView`
+dispatch. The generic/DeepSeek path (`VulkanWeights`/`VulkanTransformerModel`) has no equivalent
+dispatch on the routed-bank quant type — it always issues the F32 indexed matmul. Making
+`skipF32MoeDequant` safe for Vulkan therefore means porting that dispatch (recognize Q4_K/Q5_K/Q6_K
+routed banks when the contraction axis is a multiple of 256, upload raw, and record the matching
+indexed kernel instead of `MoeIndexedMatmulF32Kernel`) to the generic path first — real, scoped,
+but a distinct chunk of work with its own correctness-parity test needs, not a one-line flag flip.
+Filed as a new, separate issue rather than attempted here under time/risk constraints.

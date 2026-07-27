@@ -563,5 +563,19 @@ immediately.
 - **Multi-GPU** (Step 51): NCCL-based tensor parallelism
 - **Fatbin distribution**: Pre-compiled SASS for common architectures to eliminate JIT overhead
 - **Mesa radv host-import validation**: confirm Linux Mesa radv accepts mmap'd GGUF pointers via `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, unblocks zero-copy on Strix Halo Linux.
+- **NVIDIA dGPU host-import rejection** (#147 follow-up): on an RTX 3060 the driver accepts the
+  `vkGetMemoryHostPointerPropertiesEXT` query but rejects the subsequent `vkAllocateMemory` with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` (not `VK_ERROR_INVALID_EXTERNAL_HANDLE` as on Strix Halo amdvlk) —
+  a different rejection point/code than the iGPU finding, consistent with dGPUs not being able to
+  serve arbitrary non-pinned mmap'd host pages as `DEVICE_LOCAL` over PCIe. Expected to remain
+  dormant on dGPUs; the payoff is UMA-specific. See `.perf-runs/vulkan-load-147/README.md` addendum.
+- **Vulkan K-quant routed-MoE raw-view coverage** (#147 follow-up): `VulkanWeights.MoeRoutedRawDeviceQuantType`
+  only keeps routed expert banks (`W1`/`W2`/`W3`) raw for Q8_0 or F16(+coopmat); Q4_K/Q5_K/Q6_K routed
+  banks (the common `*_K_M` DeepSeek-family case) still require the F32 host-dequant arrays. This is
+  why `VulkanTransformerModel.LoadFromGguf` cannot yet pass `skipF32MoeDequant: true` the way CUDA
+  does (would zero-fill W1/W2/W3 for K-quant banks and silently corrupt DeepSeek-MoE Vulkan inference).
+  `VulkanQwen3MoeHybridKernels` already has the needed `MoeIndexedMatmulQ4_K/Q5_K/Q6_KF32Kernel`
+  dispatch for its own loader path; porting the same raw-view dispatch to the generic/DeepSeek path
+  would unlock a multi-GiB-per-load host-RAM win. Tracked separately from #147.
 
 See [ROADMAP.md](ROADMAP.md) Phase 4 for the full plan.
