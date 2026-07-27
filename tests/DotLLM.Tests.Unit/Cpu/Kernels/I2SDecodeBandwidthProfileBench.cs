@@ -7,11 +7,15 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Cpu.Kernels;
 
 /// <summary>
-/// TEMPORARY profiling harness — measures whether I2_S GEMV decode (post-#128 unpack-SIMD fix) is
+/// Retained profiling harness — measures whether I2_S GEMV decode (post-#128 unpack-SIMD fix) is
 /// memory-bandwidth-bound or still compute-bound on this box, gating the AVX-512 activation-LUT
 /// dot kernel proposed upstream in issue #334. Not a correctness test; prints wall-clock numbers
-/// via test output. Delete once the go/no-go verdict is recorded.
+/// via test output. The recorded baseline verdict lives in
+/// <c>docs/superpowers/specs/2026-07-27-bitnet-decode-bandwidth-RESULTS.md</c>; this class is kept
+/// (rather than deleted) as the before/after comparison harness for the AVX-512 activation-LUT
+/// kernel that investigation recommends as the follow-up.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public sealed unsafe class I2SDecodeBandwidthProfileBench
 {
     private readonly ITestOutputHelper _output;

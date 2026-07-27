@@ -6,11 +6,14 @@ using System.Runtime.Intrinsics.X86;
 namespace DotLLM.Cpu.Kernels;
 
 /// <summary>
-/// Profiling-only passthrough for issue #128 (vectorize I2_S UnpackRowI8). Exposes the otherwise-
-/// private scalar/AVX2 unpack loop so a benchmark harness can measure its standalone cost vs the
-/// full GEMV call, and so tests can force-compare the scalar and vectorized code paths directly
-/// regardless of which one <see cref="MatMul.GemvI2_S(byte*, float*, float*, int, int, DotLLM.Cpu.Threading.ComputeThreadPool?)"/>
-/// would pick at runtime.
+/// Profiling-only passthroughs used by two investigations: issue #128 (vectorize I2_S
+/// UnpackRowI8) exposes the otherwise-private scalar/AVX2 unpack loop so a benchmark harness can
+/// measure its standalone cost vs the full GEMV call, and so tests can force-compare the scalar
+/// and vectorized code paths directly regardless of which one
+/// <see cref="MatMul.GemvI2_S(byte*, float*, float*, int, int, DotLLM.Cpu.Threading.ComputeThreadPool?)"/>
+/// would pick at runtime; issue #196 (decode bandwidth profiling) adds
+/// <see cref="BenchStreamingReadOnly"/>, an achievable-bandwidth probe used to determine whether
+/// I2_S decode is memory-bandwidth-bound or compute-bound.
 /// </summary>
 public static unsafe partial class MatMul
 {

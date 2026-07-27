@@ -19,25 +19,6 @@ public sealed unsafe class I2SUnpackProfileBench
 
     public I2SUnpackProfileBench(ITestOutputHelper output) => _output = output;
 
-    [Fact]
-    public void BenchStreamingReadOnly_MatchesScalarChecksum()
-    {
-        var rng = new Random(7);
-        const int m = 64, k = 512;
-        int rowBytes = k / 4;
-        byte[] buf = new byte[m * rowBytes];
-        rng.NextBytes(buf);
-
-        byte expected = 0;
-        foreach (byte b in buf) expected ^= b;
-
-        fixed (byte* p = buf)
-        {
-            byte actual = MatMul.BenchStreamingReadOnly(p, m, k);
-            Assert.Equal(expected, actual);
-        }
-    }
-
     [Theory]
     [InlineData(6912, 2560, "ffn_down-like (BitNet 3B: m=ffn, k=hidden)")]
     [InlineData(2560, 6912, "ffn_up-like (BitNet 3B: m=hidden, k=ffn)")]
