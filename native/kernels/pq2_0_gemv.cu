@@ -892,6 +892,24 @@
 // for the PQ2_0 GEMV kernel-level investigation on `pq2_0_gemv2_f32io_small` specifically — a future
 // session would need genuinely new profiling evidence (real `ncu` L1TEX/scheduler counters, not
 // available in this session) before re-attempting any occupancy/latency-hiding lever on this kernel.
+//
+// **Fresh `ncu --set full` evidence obtained 2026-07-27 (elevated, RTX 3060, real Bonsai-27B decode
+// launches) — CONFIRMS the stopping point above, no reopening warranted.** The large/dominant
+// decode-path GEMV launches (`pq2_0_gemv_f32io` grid=320, `pq2_0_gemv2_f32io_small`/
+// `pq2_0_gemv_f32io_small` grid=384-2176 — i.e. the dense-FFN gate/up/down and attention K/V/O
+// projections that actually dominate decode time) are already well-occupied: 71-97% Achieved
+// Occupancy, 54-82% Compute/Memory Throughput, Waves Per SM 2.29-12.95. This is a healthy profile —
+// nothing here flags a "grid too small" or latency-bound pathology, matching every prior negative
+// result's conclusion that this kernel family is close to its practical ceiling at these shapes.
+// One genuinely new, narrow finding: a `pq2_0_gemv2_f32io_small` launch with grid=(6,1,1) — a much
+// smaller output-row count than the dominant launches above, almost certainly one of the small
+// per-layer GDN gating projections (alpha/beta, NVHead-wide output) rather than a dense FFN/attention
+// bank — DOES show the familiar "grid too small" shape (Waves Per SM 0.04, Compute/Memory Throughput
+// 4.15%, matching `attention_f32`'s pathology documented in `docs/CUDA.md`'s Future Work). Given its
+// absolute duration (21.79 us per launch) is tiny next to the dominant GEMV launches' 77-408 us, any
+// fix here has a small absolute ceiling — worth a look only as a low-effort, low-risk follow-up
+// (e.g. batching multiple small per-layer projections into fewer, larger launches), not worth
+// reopening the broader kernel-level investigation over.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
