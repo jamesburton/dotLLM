@@ -278,6 +278,24 @@ public sealed unsafe class TransformerModel : IModel
         int qBlockElems = config.NumAttentionHeads * Math.Max(slidingHeadDim, fullHeadDim);
         int kvBlockElems = Math.Max(slidingKvHeads * slidingHeadDim, fullKvHeads * fullHeadDim);
 
+        // MLA (DeepSeek-V2/V3) fuses o_proj INSIDE the attention kernel: unlike
+        // the GQA branch (which writes the pre-o_proj, numHeads*headDim-wide
+        // attention output into AttnOutput and applies o_proj afterward into a
+        // separate hiddenSize-wide buffer), the MLA branch writes its ALREADY
+        // o_proj-expanded, hiddenSize-wide result directly into the shared
+        // AttnOutput scratch. AttnOutput must therefore be sized to at least
+        // hiddenSize for MLA models — qBlockElems alone
+        // (numHeads*(qkNopeHeadDim+qkRopeHeadDim)) can be far smaller than
+        // hiddenSize on compact/synthetic configs (undersized allocation here
+        // is a native heap buffer overflow, not a catchable exception — #193).
+        // Real DeepSeek-V2-Lite-scale configs happen to satisfy qBlockElems >
+        // hiddenSize already (16 heads * 192 = 3072 > 2048), so this is a
+        // no-op there; Math.Max keeps every non-MLA architecture byte-for-byte
+        // unchanged.
+        int attnOutBlockElems = config.MlaConfig is not null
+            ? Math.Max(qBlockElems, config.HiddenSize)
+            : qBlockElems;
+
         var state = new TransformerForwardState(
             config.HiddenSize,
             config.NumAttentionHeads,
@@ -296,6 +314,7 @@ public sealed unsafe class TransformerModel : IModel
             globalRopeTheta,
             qBlockElems,
             kvBlockElems,
+            attnOutBlockElems: attnOutBlockElems,
             // Full global head dim — the partial-rotary frequency denominator
             // (Gemma 4 global layers: rotate globalRopeDim=128 dims but use freq
             // base over the full head dim 512). Equals globalRopeDim when there is
