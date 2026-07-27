@@ -45,6 +45,26 @@ namespace DotLLM.Cpu.Kernels;
 /// <para>Per-block dot scaling: for a Q8_0 activation block <c>b</c> with float scale <c>d_b</c>,
 /// the int32 accumulator <c>Σ w·q</c> is multiplied by <c>d_b</c> and float-accumulated across
 /// blocks; the final sum is multiplied by the per-tensor weight scale.</para>
+///
+/// <para><b>Ragged K (issue #206).</b> Most published I2_S checkpoints have <c>k</c> an exact
+/// multiple of 128 (e.g. BitNet-2B-4T: 2560/6912), which is what the SIMD fast paths above
+/// assume. At least one real checkpoint family (1bitLLM-style <c>bitnet_b1_58-large</c>/<c>-xl</c>:
+/// hidden=2048, intermediate=5460, and <c>5460 % 128 == 84</c>) genuinely has a non-128-aligned
+/// row length on <c>ffn_down</c>. Empirically verified against the real GGUF (tensor byte
+/// extents match <c>m·k/4 + 4</c>, rounded up to the file's 32-byte tensor alignment, with zero
+/// extra per-row padding) and cross-checked against the upstream bitnet.cpp writer
+/// (<c>ggml-bitnet-mad.cpp</c>'s <c>quantize_i2_s</c>): the 128-element block interleave is
+/// computed over the <b>flattened <c>m·k</c> element stream</b>, not reset at each row boundary.
+/// Concretely, block index and in-block bit position for flattened element <c>i</c> are
+/// <c>i/128</c> and <c>i%128</c> — so whenever <c>k % 128 != 0</c>, a row's first element does
+/// NOT generally start on a fresh block boundary (only every <c>128/gcd(k,128)</c>-th row does).
+/// The 128-aligned fast paths above are unaffected by this — when <c>k % 128 == 0</c> every row
+/// boundary coincides with a block boundary, so per-row block resets and the flattened-stream
+/// addressing are bit-identical (which is why the fast paths have worked for every 128-aligned
+/// model to date). Ragged rows are decoded via <see cref="I2SRaggedCode"/> /
+/// <see cref="UnpackRowRagged"/>, a scalar correctness-first path that computes the flattened
+/// block/bit address per element directly; it is reached only when <c>k % 128 != 0</c> and never
+/// perturbs the aligned SIMD paths.</para>
 /// </summary>
 public static unsafe partial class MatMul
 {
@@ -109,10 +129,14 @@ public static unsafe partial class MatMul
     public static void GemvI2_S(byte* weights, float* x, float* result, int m, int k,
                                 ComputeThreadPool? threadPool)
     {
-        if (k % I2SBlockSize != 0)
-            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
-
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (k % I2SBlockSize != 0)
+        {
+            GemvI2_SRaggedCore(weights, x, result, m, k, scale, threadPool);
+            return;
+        }
+
         GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
     }
 
@@ -129,7 +153,10 @@ public static unsafe partial class MatMul
                                 float scale, ComputeThreadPool? threadPool)
     {
         if (k % I2SBlockSize != 0)
-            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
+        {
+            GemvI2_SRaggedCore(weights, x, result, m, k, scale, threadPool);
+            return;
+        }
         GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
     }
 
@@ -207,10 +234,14 @@ public static unsafe partial class MatMul
             return;
         }
 
-        if (k % I2SBlockSize != 0)
-            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
-
         float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (k % I2SBlockSize != 0)
+        {
+            GemmI2_SRaggedCore(weights, b, c, m, k, n, scale, threadPool);
+            return;
+        }
+
         GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
     }
 
@@ -234,7 +265,10 @@ public static unsafe partial class MatMul
         }
 
         if (k % I2SBlockSize != 0)
-            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
+        {
+            GemmI2_SRaggedCore(weights, b, c, m, k, n, scale, threadPool);
+            return;
+        }
 
         GemmI2_SCore(weights, b, c, m, k, n, scale, threadPool);
     }
@@ -283,6 +317,146 @@ public static unsafe partial class MatMul
             for (int r = startRow; r < startRow + rowCount; r++)
             {
                 UnpackRow(weights + (long)r * rowBytes, rowSpan, k);
+                for (int t = 0; t < n; t++)
+                {
+                    var xSpan = new ReadOnlySpan<float>(b + (long)t * k, k);
+                    c[(long)t * m + r] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan) * scale;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rowBuf);
+        }
+    }
+
+    // ─────────────────────────── Ragged K (k % 128 != 0) — issue #206 ───────────────────────────
+    //
+    // Correctness-first scalar path. Reached ONLY when k % I2SBlockSize != 0 (see the class-level
+    // remarks for why the 128-aligned fast paths above cannot simply be reused with a "tail
+    // cleanup" — the on-disk block interleave is computed over the flattened m*k stream, so most
+    // ragged rows don't even start on a block boundary). Never invoked for aligned tensors, so it
+    // cannot regress the benchmarked common-case performance.
+
+    /// <summary>
+    /// Decodes the raw 2-bit ternary code (0, 1, 2 — caller subtracts 1 for {-1,0,+1}) at
+    /// flattened element index <paramref name="flatIndex"/> of a ragged I2_S tensor, using the
+    /// tensor-global (not per-row) 128-element block interleave. Block <c>b = flatIndex/128</c>
+    /// occupies packed bytes <c>[b·32, b·32+32)</c>; within a block, in-block position
+    /// <c>p = flatIndex%128</c> maps to byte <c>b·32 + p%32</c> and 2-bit field
+    /// <c>(p/32)</c> at bit offset <c>6 − 2·(p/32)</c> (same bit convention as the aligned
+    /// <see cref="UnpackRow"/>/<see cref="UnpackRowI8"/>, just addressed relative to the whole
+    /// tensor rather than one row).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int I2SRaggedCode(byte* tensorBase, long flatIndex)
+    {
+        long block = flatIndex >> 7;           // flatIndex / 128
+        int inBlock = (int)(flatIndex & 127);   // flatIndex % 128
+        int groupPos = inBlock & 31;            // byte within the block's 32 bytes
+        int groupIdx = inBlock >> 5;            // which of the 4 interleaved slots (0..3)
+        byte packed = tensorBase[block * 32 + groupPos];
+        int shift = 6 - 2 * groupIdx;
+        return (packed >> shift) & 0x3;
+    }
+
+    /// <summary>
+    /// Unpacks logical row <paramref name="row"/> (arbitrary <paramref name="k"/>, need not be
+    /// 128-aligned) of a ragged I2_S tensor into float {-1,0,+1} via <see cref="I2SRaggedCode"/>.
+    /// <paramref name="tensorBase"/> is the tensor's packed-payload base (element 0 of row 0) —
+    /// the SAME pointer the aligned paths call "weights".
+    /// </summary>
+    [SkipLocalsInit]
+    private static void UnpackRowRagged(byte* tensorBase, long row, int k, Span<float> dest)
+    {
+        long rowStart = row * (long)k;
+        for (int col = 0; col < k; col++)
+            dest[col] = I2SRaggedCode(tensorBase, rowStart + col) - 1;
+    }
+
+    [SkipLocalsInit]
+    private static void GemvI2_SRaggedCore(byte* weights, float* x, float* result, int m, int k,
+                                           float scale, ComputeThreadPool? threadPool)
+    {
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemvI2_SRaggedRows(weights, x, result, 0, m, k, scale);
+            return;
+        }
+
+        var ctx = new GemvI2SCtx { Weights = weights, X = x, Result = result, M = m, K = k, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemvI2_SRaggedWorker);
+    }
+
+    [SkipLocalsInit]
+    private static void GemvI2_SRaggedWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<GemvI2SCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        GemvI2_SRaggedRows(ctx.Weights, ctx.X, ctx.Result, start, count, ctx.K, ctx.Scale);
+    }
+
+    /// <summary>Ragged twin of <see cref="GemvI2_SRows"/> — unpacks each row via the
+    /// tensor-global addressing (<see cref="UnpackRowRagged"/>) instead of the per-row-reset
+    /// fast unpack, since row boundaries don't generally align with block boundaries here.</summary>
+    [SkipLocalsInit]
+    private static void GemvI2_SRaggedRows(byte* weights, float* x, float* result,
+                                           int startRow, int rowCount, int k, float scale)
+    {
+        var xSpan = new ReadOnlySpan<float>(x, k);
+
+        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
+        try
+        {
+            var rowSpan = rowBuf.AsSpan(0, k);
+            for (int r = startRow; r < startRow + rowCount; r++)
+            {
+                UnpackRowRagged(weights, r, k, rowSpan);
+                result[r] = TensorPrimitives.Dot((ReadOnlySpan<float>)rowSpan, xSpan) * scale;
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(rowBuf);
+        }
+    }
+
+    [SkipLocalsInit]
+    private static void GemmI2_SRaggedCore(byte* weights, float* b, float* c, int m, int k, int n,
+                                           float scale, ComputeThreadPool? threadPool)
+    {
+        if (threadPool is null || m < ParallelMinRows)
+        {
+            GemmI2_SRaggedRows(weights, b, c, m, 0, m, k, n, scale);
+            return;
+        }
+
+        var ctx = new GemmI2SCtx { Weights = weights, B = b, C = c, M = m, K = k, N = n, Scale = scale };
+        threadPool.Dispatch((nint)(&ctx), &GemmI2_SRaggedWorker);
+    }
+
+    [SkipLocalsInit]
+    private static void GemmI2_SRaggedWorker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<GemmI2SCtx>((void*)ctxPtr);
+        PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
+        if (count == 0) return;
+        GemmI2_SRaggedRows(ctx.Weights, ctx.B, ctx.C, ctx.M, start, count, ctx.K, ctx.N, ctx.Scale);
+    }
+
+    /// <summary>Ragged twin of <see cref="GemmI2_SRows"/>.</summary>
+    [SkipLocalsInit]
+    private static void GemmI2_SRaggedRows(byte* weights, float* b, float* c, int m,
+                                           int startRow, int rowCount, int k, int n, float scale)
+    {
+        float[] rowBuf = ArrayPool<float>.Shared.Rent(k);
+        try
+        {
+            var rowSpan = rowBuf.AsSpan(0, k);
+            for (int r = startRow; r < startRow + rowCount; r++)
+            {
+                UnpackRowRagged(weights, r, k, rowSpan);
                 for (int t = 0; t < n; t++)
                 {
                     var xSpan = new ReadOnlySpan<float>(b + (long)t * k, k);
@@ -680,14 +854,17 @@ public static unsafe partial class MatMul
     /// <param name="n">Number of input rows (token·slot assignments).</param>
     /// <param name="rowExpertIds">Length-<paramref name="n"/> expert id assigned to each input row.</param>
     /// <param name="threadPool">Optional thread pool — forwarded to the per-expert GEMM.</param>
+    /// <remarks>
+    /// <paramref name="k"/> need not be a multiple of 128 (issue #206) — the per-expert batched
+    /// GEMM below (<see cref="GemmI2_S(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/>)
+    /// already dispatches to the ragged-safe path when <c>k % 128 != 0</c>, so no guard is needed here.
+    /// </remarks>
     [SkipLocalsInit]
     public static void MoeIndexedMatmulI2_S(
         byte* expertWeights, long expertRowBytes, ReadOnlySpan<float> expertScales,
         float* b, float* c, int m, int k, int n,
         ReadOnlySpan<int> rowExpertIds, ComputeThreadPool? threadPool)
     {
-        if (k % I2SBlockSize != 0)
-            throw new ArgumentException($"k must be a multiple of {I2SBlockSize}, got {k}", nameof(k));
         if (rowExpertIds.Length < n)
             throw new ArgumentException("rowExpertIds too small", nameof(rowExpertIds));
         if (n == 0) return;

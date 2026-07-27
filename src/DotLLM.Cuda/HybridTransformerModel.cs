@@ -997,7 +997,12 @@ public sealed unsafe class HybridTransformerModel : IModel
             nint w = fp16Weight;
             if (w == 0)
             {
-                if (qt == QuantizationType.I2_S)
+                // Ragged K (issue #206) — see CudaTransformerModel.Project for the full rationale:
+                // the aligned dequant/GEMV kernels assume k % 128 == 0 and silently drop tail
+                // elements (dequant) or read misaligned memory (GEMV) otherwise.
+                if (qt == QuantizationType.I2_S && inputDim % 128 != 0)
+                    _kernels.LaunchDequantI2_SToF16Ragged(quantWeight, _gpuState.DequantScratch, outputDim, inputDim, s);
+                else if (qt == QuantizationType.I2_S)
                     _kernels.LaunchDequantI2_SToF16(quantWeight, _gpuState.DequantScratch, outputDim, inputDim, s);
                 else
                     _kernels.LaunchDequantToF16(quantWeight, qt, _gpuState.DequantScratch,
@@ -1005,6 +1010,10 @@ public sealed unsafe class HybridTransformerModel : IModel
                 w = _gpuState.DequantScratch;
             }
             CudaGemm.LinearF16(_cublas.Handle, input, w, output, seqLen, inputDim, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S && inputDim % 128 != 0)
+        {
+            _kernels.LaunchI2_SGemvF16InRagged(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && qt == QuantizationType.I2_S)
         {

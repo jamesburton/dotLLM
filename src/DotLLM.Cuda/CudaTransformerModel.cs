@@ -2554,7 +2554,11 @@ public sealed unsafe class CudaTransformerModel : IModel
             if (w == 0)
             {
                 // Quantized: dequant into scratch, then GEMM
-                if (qt == QuantizationType.I2_S)
+                if (qt == QuantizationType.I2_S && inputDim % I2SBlockSize128 != 0)
+                    // Ragged K (issue #206): the aligned dequant kernel's blocks_per_row=k/128
+                    // integer division would silently drop each row's tail elements.
+                    _kernels.LaunchDequantI2_SToF16Ragged(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
+                else if (qt == QuantizationType.I2_S)
                     _kernels.LaunchDequantI2_SToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
                 else if (qt == QuantizationType.PQ2_0)
                     _kernels.LaunchDequantPQ2_0ToF16(quantWeight, _state.DequantScratch, outputDim, inputDim, s);
@@ -2571,6 +2575,12 @@ public sealed unsafe class CudaTransformerModel : IModel
             _kernels.LaunchI2_SGemvA8DeviceScale(
                 quantWeight, _state.A8Input, _state.A8OutputF32, outputDim, inputDim, _state.A8InvScale, s);
             _kernels.LaunchConvertF32ToF16(_state.A8OutputF32, output, outputDim, s);
+        }
+        else if (quantWeight != 0 && qt == QuantizationType.I2_S && inputDim % I2SBlockSize128 != 0)
+        {
+            // Ragged K (issue #206): the aligned GEMV kernel's uint4/block addressing assumes
+            // k % 128 == 0 and would read misaligned/wrong data (CUDA error 716) otherwise.
+            _kernels.LaunchI2_SGemvF16InRagged(quantWeight, input, output, outputDim, inputDim, s);
         }
         else if (quantWeight != 0 && qt == QuantizationType.I2_S) // Decode: I2_S ternary GEMV
         {
@@ -2659,6 +2669,14 @@ public sealed unsafe class CudaTransformerModel : IModel
         }
     }
 
+    // The fused multi-tensor GEMV kernels (i2_s_gemv2/3_f16in) and the W2A8 int8-activation
+    // kernel share the SAME 128-aligned uint4/block addressing as the single-tensor fast path
+    // (i2_s_gemv_f16in) — none of them are ragged-safe (see MatMul.I2S.cs's class remarks / issue
+    // #206 for why a ragged row doesn't even start on a block boundary in general). Gating every
+    // fusion/A8 predicate on `inputDim % I2SBlockSize128 == 0` routes ragged projections through
+    // the single-tensor Project() fallback, which dispatches to the ragged-safe kernel instead.
+    private const int I2SBlockSize128 = 128;
+
     private static bool CanFuseI2SDecode(
         int seqLen,
         QuantizationType qt0, QuantizationType qt1,
@@ -2666,7 +2684,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         => seqLen == 1
            && qt0 == QuantizationType.I2_S
            && qt1 == QuantizationType.I2_S
-           && inputDim0 == inputDim1;
+           && inputDim0 == inputDim1
+           && inputDim0 % I2SBlockSize128 == 0;
 
     private static bool CanFuseI2SDecode(
         int seqLen,
@@ -2677,7 +2696,8 @@ public sealed unsafe class CudaTransformerModel : IModel
            && qt1 == QuantizationType.I2_S
            && qt2 == QuantizationType.I2_S
            && inputDim0 == inputDim1
-           && inputDim0 == inputDim2;
+           && inputDim0 == inputDim2
+           && inputDim0 % I2SBlockSize128 == 0;
 
     private static bool CanFuseI2SNormDecode(
         int seqLen,
@@ -2688,7 +2708,8 @@ public sealed unsafe class CudaTransformerModel : IModel
         => seqLen == 1
            && normWeight != 0
            && qt == QuantizationType.I2_S
-           && inputDim == normDim;
+           && inputDim == normDim
+           && inputDim % I2SBlockSize128 == 0;
 
     private bool CanUseI2SA8Project(QuantizationType qt, int seqLen, int outputDim, int inputDim)
         => s_i2sA8Decode
@@ -2697,7 +2718,8 @@ public sealed unsafe class CudaTransformerModel : IModel
            && Config.Architecture == Architecture.BitNet
            && outputDim != Config.VocabSize
            && inputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize)
-           && outputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize);
+           && outputDim <= Math.Max(Config.HiddenSize, Config.IntermediateSize)
+           && inputDim % I2SBlockSize128 == 0;
 
     /// <summary>
     /// Creates a <see cref="CudaKvCache"/> for this model.
