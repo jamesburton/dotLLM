@@ -46,9 +46,10 @@ and **4.2%–4.6% of the DRAM-forced (cold) streaming-read ceiling** across all 
 — decode is well under *both* ceilings, not close to either, so on this box the kernel is
 **compute-bound, not memory-bandwidth-bound**: there is roughly 20-60× of unused bandwidth headroom
 between what the raw bytes-in-flight could sustain and what the full unpack+dot decode actually
-achieves. `unpack-only` time (0.43–0.73 ms) is itself already a large fraction of total decode time
-(1.48–3.85 ms) — 29%–35% — confirming the 2-bit-unpack/dot arithmetic, not the memory access
-pattern, is the limiting factor. Note the cold-ceiling column here (24–27 GB/s) is noticeably higher
+achieves. `unpack-only` time (0.43–0.73 ms) is itself already a non-trivial fraction of total decode
+time (1.48–3.85 ms) — 13.1%–29.2% across the three shapes (attn_qproj 0.4338/1.4835=29.2%,
+ffn_down 0.4884/3.7321=13.1%, ffn_gate 0.7263/3.8532=18.8%) — corroborating that the 2-bit-unpack/dot
+arithmetic, not the memory access pattern, is the limiting factor. Note the cold-ceiling column here (24–27 GB/s) is noticeably higher
 and more uniform across shapes than the Task 2 reference run (which saw 2.86–3.11 GB/s cold for the
 two larger, 4.4 MB-weight shapes) — this run-to-run swing is itself an illustration of the design
 doc's caveat that the round-robined cold buffer probe is sensitive to TLB/page-walk and
