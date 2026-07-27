@@ -149,6 +149,14 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _attnSplitKvPartialSum;
     private nint _attnSplitKvPartialOut;
     private long _attnSplitKvPartialHeadsAllocated;
+    // Combined GQA-group + split-KV scratch (issues #197 + #198) -- separate buffers from the
+    // #183 split-KV scratch above so this new, still-experimental tier cannot disturb the
+    // already-tested #183 path's allocation lifecycle.
+    private nint _attnGqaSplitPartialMax;
+    private nint _attnGqaSplitPartialSum;
+    private nint _attnGqaSplitPartialOut;
+    private long _attnGqaSplitPartialHeadsAllocated;
+    private int _attnGqaSplitMaxSplitAllocated;
 
     private bool _disposed;
 
@@ -1268,12 +1276,45 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // kStage/vStage are this SLOT's per-layer F32 KV staging buffers (issue #182 made
             // these per-slot arrays, not one shared buffer) — the split-KV kernel reads the same
             // staged data the exact kernel would, just via more blocks.
-            bool useSplitKvAttn = seqLen == 1
+            // Opt-in combined GQA-group + split-KV attention (issues #197 + #198): register-blocks
+            // the QK/PV loops across the numHeads/numKvHeads query-head group sharing each KV
+            // head (grid = numKvHeads instead of numHeads), composed with a runtime-tuned KV
+            // split so the grid doesn't collapse below the #183 baseline for small numKvHeads
+            // (Bonsai-27B: numKvHeads=4 alone would be 6x worse than today's grid=24 -- see
+            // attention_f32.cu's combined-kernel header). Preferred over the plain #183 split-KV
+            // tier below whenever the shape has real GQA (numKvHeads < numHeads) and the shape
+            // fits this GPU's cooperative-launch co-residency ceiling; falls back to the #183
+            // tier, then to the exact LaunchAttentionF32, on any ineligibility. Off by default
+            // (DOTLLM_ATTN_GQA_SPLIT=1 to enable) -- see CudaKernels.cs's EnableAttentionGqaSplit
+            // doc for the full tradeoff.
+            bool gqaGroupEligible = CudaKernels.IsGqaGroupShapeSupported(numHeads, numKvHeads)
+                && numKvHeads < numHeads;
+            int gqaMaxSafeSplit = gqaGroupEligible
+                ? _kernels.MaxSafeAttentionGqaSplit(numKvHeads, headDim, numHeads / numKvHeads)
+                : 0;
+            bool useGqaSplitAttn = seqLen == 1
+                && CudaKernels.EnableAttentionGqaSplit
+                && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && gqaGroupEligible
+                && _kernels.HasAttentionF32GqaSplitKv
+                && gqaMaxSafeSplit >= 1;
+
+            bool useSplitKvAttn = !useGqaSplitAttn
+                && seqLen == 1
                 && CudaKernels.EnableAttentionSplitKv
                 && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
                 && _kernels.IsAttentionSplitKvSafe(numHeads, headDim);
 
-            if (useSplitKvAttn)
+            if (useGqaSplitAttn)
+            {
+                int kvSplit = CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, gqaMaxSafeSplit);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, gqaMaxSafeSplit);
+                _kernels.LaunchAttentionF32GqaSplit(q, kStage, vStage, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0, kvSplit,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
+            }
+            else if (useSplitKvAttn)
             {
                 EnsureAttentionSplitKvScratch(numHeads, headDim);
                 _kernels.LaunchAttentionF32SplitKv(q, kStage, vStage, attnOut,
@@ -1451,6 +1492,34 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _attnSplitKvPartialSum = AllocDevice(scalarCount * sizeof(float));
         _attnSplitKvPartialOut = AllocDevice(outCount * sizeof(float));
         _attnSplitKvPartialHeadsAllocated = neededHeads;
+    }
+
+    /// <summary>
+    /// Ensures the opt-in combined GQA-group + split-KV attention (issues #197 + #198) partial
+    /// scratch buffers can hold <c>numHeads * maxSplit</c> (max, sum) scalars and
+    /// <c>numHeads * maxSplit * headDim</c> output floats. Sized against <paramref name="maxSplit"/>
+    /// (the real co-residency CEILING from <see cref="CudaKernels.MaxSafeAttentionGqaSplit"/>),
+    /// not the per-call <c>kvSplit</c> value the heuristic picks each step -- (numHeads, headDim,
+    /// maxSplit) are all load-time constants for a given GGUF+GPU pair, so this is sized once and
+    /// reused for every decode step even though the per-call split varies with seqKv. Mirrors
+    /// <see cref="EnsureAttentionSplitKvScratch"/> exactly, generalized for a variable ceiling.
+    /// </summary>
+    private void EnsureAttentionGqaSplitScratch(int numHeads, int headDim, int maxSplit)
+    {
+        long neededHeads = numHeads;
+        if (neededHeads <= _attnGqaSplitPartialHeadsAllocated && maxSplit <= _attnGqaSplitMaxSplitAllocated) return;
+
+        FreeIfNonZero(ref _attnGqaSplitPartialMax);
+        FreeIfNonZero(ref _attnGqaSplitPartialSum);
+        FreeIfNonZero(ref _attnGqaSplitPartialOut);
+
+        long scalarCount = neededHeads * maxSplit;
+        long outCount = scalarCount * headDim;
+        _attnGqaSplitPartialMax = AllocDevice(scalarCount * sizeof(float));
+        _attnGqaSplitPartialSum = AllocDevice(scalarCount * sizeof(float));
+        _attnGqaSplitPartialOut = AllocDevice(outCount * sizeof(float));
+        _attnGqaSplitPartialHeadsAllocated = neededHeads;
+        _attnGqaSplitMaxSplitAllocated = maxSplit;
     }
 
     private void WriteF16KvRows(int layerSlot, nint kSrcF32, nint vSrcF32,
@@ -1832,6 +1901,9 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnSplitKvPartialMax);
         FreeIfNonZero(ref _attnSplitKvPartialSum);
         FreeIfNonZero(ref _attnSplitKvPartialOut);
+        FreeIfNonZero(ref _attnGqaSplitPartialMax);
+        FreeIfNonZero(ref _attnGqaSplitPartialSum);
+        FreeIfNonZero(ref _attnGqaSplitPartialOut);
 
         _state.Dispose();
         _gdnCache.Dispose();
