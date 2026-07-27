@@ -43,7 +43,8 @@
 // multiple of 16, those 16 bytes lie inside a single 32-byte (128-element) block — blk and the x base
 // address are constant across the uint4, only gp = byte index within the block varies.
 //
-// Launch contract (set in CudaKernels.cs): block = (256,1,1); grid = (ceil(n/ROWS_PER_BLOCK),1,1); shared=0.
+// Launch contract (set in CudaKernels.cs): block = (256,1,1); grid = (ceil(n/ROWS_PER_BLOCK),1,1);
+// shared = k * sizeof(float) bytes (dynamic — see below).
 //
 // Tunables. WARPS_PER_BLOCK is fixed at 8 (256/32). I2S_ROWS_PER_WARP rows are handled per warp; the
 // block therefore covers I2S_ROWS_PER_BLOCK = 8 * I2S_ROWS_PER_WARP rows and stages x ONCE for all of
@@ -55,10 +56,17 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-// Largest k across BitNet 2B4T projections is 6912 (FFN down). Static shared x buffer is sized for
-// that; the launch passes shared=0 so we cannot use dynamic shared memory. 6912 floats = 27 KB,
-// under sm_86's 48 KB static cap.
-#define I2S_MAX_K 6912
+// x[k] used to be staged into a fixed-size STATIC `__shared__ float xs[6912]` — sized for BitNet
+// b1.58-2B-4T's largest per-tensor k (its FFN-down projection, k=intermediateSize=6912). That bound
+// is architecture-specific, not a general I2_S contract: any non-BitNet Llama-body I2_S conversion
+// whose intermediate size exceeds 6912 (e.g. Falcon-E-3B intermediate=13312, Falcon3-3B-Base
+// intermediate=9216 — see issue #207) silently overflowed the static array on the FFN-down decode
+// GEMV (`Project` dispatches Down through `i2_s_gemv_f16in` with k=DownInputDim=intermediateSize),
+// corrupting adjacent shared memory and producing a CUDA "illegal memory access" fault. Every kernel
+// below now uses DYNAMIC shared memory (`extern __shared__`), sized by the caller to `k *
+// sizeof(float)` bytes (see `LaunchI2_SGemv*` in CudaKernels.cs, which also opts each function into
+// the device's full dynamic-shared opt-in cap via `cuFuncSetAttribute`, mirroring the on-the-fly MMQ
+// GEMV kernels' handling of the same class of bug).
 
 // Intra-warp sum reduce (v2 warp-per-row path): the 32 lanes of one warp hold partial sums for a single
 // output row; lane 0 ends with the total. No shared memory, no __syncthreads.
@@ -109,8 +117,8 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     const int k)
 {
     // Stage x[k] into shared memory once per block (FP16 -> FP32), all 256 threads cooperating.
-    // Reused by all I2S_ROWS_PER_BLOCK warps in this block.
-    __shared__ float xs[I2S_MAX_K];
+    // Reused by all I2S_ROWS_PER_BLOCK warps in this block. Dynamic — caller sizes to k*4 bytes.
+    extern __shared__ float xs[];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = __half2float(x[i]);
     __syncthreads();
@@ -176,7 +184,7 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv2_f16in(
     const int n1,
     const int k)
 {
-    __shared__ float xs[I2S_MAX_K];
+    extern __shared__ float xs[];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = __half2float(x[i]);
     __syncthreads();
@@ -260,7 +268,7 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv3_f16in(
     const int n2,
     const int k)
 {
-    __shared__ float xs[I2S_MAX_K];
+    extern __shared__ float xs[];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = __half2float(x[i]);
     __syncthreads();
@@ -347,9 +355,14 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_norm_f16in(
     const int k,
     const float eps)
 {
-    __shared__ float xs[I2S_MAX_K];
-    __shared__ float warp_sums[32];
-    __shared__ float rms_inv;
+    // Dynamic shared layout: [0, k) = xs (RMS-normalized x, reused by the GEMV below),
+    // [k_aligned, k_aligned+32) = warp-sum reduction scratch, [k_aligned+32] = rms_inv.
+    // Caller sizes sharedBytes = (k + 33) * sizeof(float) (see LaunchI2_SGemvNormF16In).
+    extern __shared__ float smem[];
+    float* xs = smem;
+    const int scratch_off = (k + 1) & ~1; // even-align, mirrors fused_add_rmsnorm.cu
+    float* warp_sums = smem + scratch_off;
+    float* rms_inv_ptr = warp_sums + 32;
 
     float sum_sq = 0.0f;
     for (int i = threadIdx.x; i < k; i += blockDim.x)
@@ -372,10 +385,11 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_norm_f16in(
         sum_sq = (lane0 < num_warps) ? warp_sums[lane0] : 0.0f;
         for (int off = warpSize / 2; off > 0; off >>= 1)
             sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
-        if (lane0 == 0) rms_inv = rsqrtf(sum_sq / (float)k + eps);
+        if (lane0 == 0) *rms_inv_ptr = rsqrtf(sum_sq / (float)k + eps);
     }
     __syncthreads();
 
+    const float rms_inv = *rms_inv_ptr;
     for (int i = threadIdx.x; i < k; i += blockDim.x)
     {
         float v = __half2float(x[i]);
@@ -432,7 +446,7 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
     const int n,
     const int k)
 {
-    __shared__ float xs[I2S_MAX_K];
+    extern __shared__ float xs[];
     for (int i = threadIdx.x; i < k; i += blockDim.x)
         xs[i] = x[i];
     __syncthreads();
