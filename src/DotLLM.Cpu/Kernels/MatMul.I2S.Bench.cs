@@ -1,4 +1,7 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace DotLLM.Cpu.Kernels;
 
@@ -39,4 +42,36 @@ public static unsafe partial class MatMul
     /// unreachable on AVX2 hardware.
     /// </summary>
     public static void UnpackRowI8Public(byte* rowPtr, sbyte* dest, int k) => UnpackRowI8(rowPtr, dest, k);
+
+    /// <summary>
+    /// Reads every packed byte a full <see cref="GemvI2_S(byte*, float*, float*, int, int, DotLLM.Cpu.Threading.ComputeThreadPool?)"/>
+    /// call would touch (<c>m·k/4</c> bytes), doing no unpack/decode — an empirical
+    /// achievable-bandwidth probe for this exact access pattern. Returns an XOR checksum so the
+    /// JIT cannot eliminate the reads as dead code.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static byte BenchStreamingReadOnly(byte* weights, int m, int k)
+    {
+        long totalBytes = (long)m * (k / 4);
+        Vector256<byte> acc = Vector256<byte>.Zero;
+        long i = 0;
+
+        if (Avx2.IsSupported)
+        {
+            long vecEnd = totalBytes - (totalBytes % 32);
+            for (; i < vecEnd; i += 32)
+                acc ^= Unsafe.ReadUnaligned<Vector256<byte>>(weights + i);
+        }
+
+        Span<byte> lanes = stackalloc byte[32];
+        acc.CopyTo(lanes);
+        byte result = 0;
+        foreach (byte lane in lanes) result ^= lane;
+
+        for (; i < totalBytes; i++)
+            result ^= weights[i];
+
+        return result;
+    }
 }
