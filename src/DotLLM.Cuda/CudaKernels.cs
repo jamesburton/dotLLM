@@ -3209,6 +3209,25 @@ public sealed unsafe class CudaKernels : IDisposable
     }
     #pragma warning restore CS1573
 
+    /// <summary>
+    /// Diagnostic-only (issue #213): reports register/local-memory usage for the
+    /// <c>attention_f16</c> vs <c>attention_f16_dyn</c> compiled functions, to check for an
+    /// occupancy-affecting compiled-code difference between the two entry points without
+    /// needing Nsight Compute. Returns (numRegsScalar, numRegsDyn, localBytesScalar, localBytesDyn).
+    /// </summary>
+    internal (int regsScalar, int regsDyn, int localScalar, int localDyn) DebugGetAttentionFuncStats()
+    {
+        CudaDriverApi.cuFuncGetAttribute(out int regsScalar,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, _attentionFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int regsDyn,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_NUM_REGS, _attentionDynFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int localScalar,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, _attentionFunc).ThrowOnError();
+        CudaDriverApi.cuFuncGetAttribute(out int localDyn,
+            CudaDriverApi.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, _attentionDynFunc).ThrowOnError();
+        return (regsScalar, regsDyn, localScalar, localDyn);
+    }
+
     /// <summary>Attention variant that reads the query position from device memory.</summary>
     public void LaunchAttentionPos(nint q, nint k, nint v, nint output, nint positions,
                                    int seqQ, int seqKv,
