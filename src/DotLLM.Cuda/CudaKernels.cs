@@ -2069,11 +2069,43 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>
     /// Minimum KV rows per split before further splitting stops paying for its own grid.sync +
-    /// combine overhead. Default derived from the same RTX-3060 sweep as
-    /// <see cref="AttnSplitTargetBlocks"/>. Override via <c>DOTLLM_CUDA_SPLIT_MIN_KV</c>.
+    /// combine overhead. Override via <c>DOTLLM_CUDA_SPLIT_MIN_KV</c>.
     /// </summary>
+    /// <remarks>
+    /// <b>Issue #219 fix (was 128):</b> at 128, this term was the BINDING clamp in
+    /// <see cref="ComputeAttentionKvSplit"/> at real Bonsai-27B decode depths (seqKv~258-270),
+    /// overriding <see cref="AttnSplitTargetBlocks"/>'s occupancy target entirely -- it forced
+    /// <c>kv_split=3</c> (grid=12 blocks) when the occupancy term (<c>byOccupancy=8</c> for
+    /// numKvHeads=4) and the co-residency ceiling (<c>maxSafeSplit=35</c>) both allowed far more.
+    /// grid=12 is HALF the pre-split baseline's grid=24, i.e. the "fix" made grid fill worse, not
+    /// better -- confirmed via <c>ncu --set full</c> (issue #199's finding, root-caused in #219):
+    /// duration 174-176us, Achieved Occupancy 16.5-16.7% (statistically identical to the unsplit
+    /// baseline's 16.6-16.8%), Waves/SM 0.09 (worse than baseline's 0.14).
+    /// <para/>
+    /// Lowering to 32 lets <c>byOccupancy</c> become the binding term at this shape/depth as the
+    /// heuristic's own doc comment always intended (<c>S = clamp(TargetBlocks/baseBlocks, 1,
+    /// ceil(seqKv/MinKvPerSplit))</c>, hard-clamped to <c>maxSafeSplit</c>) -- re-profiled
+    /// (<c>ncu --set full</c>, same shape/depth): kv_split=8 (grid=32, now above the unsplit
+    /// baseline's grid=24 as designed), duration 144-146us (~17% faster than the pre-fix 174-176us
+    /// launches), Achieved Occupancy 18.7-19.2% (up from 16.5-16.7%), Waves/SM 0.23 (up from
+    /// 0.09), Compute Throughput 15.7-15.8% (up from 9.3-9.4%).
+    /// <para/>
+    /// <b>This does NOT make the split kernel beat the plain unsplit path</b> at this shape/depth
+    /// -- the fixed 144-146us launches are still ~37% slower than <c>attention_f32</c>'s
+    /// 105-106us at the same seqKv (memory throughput only reaches 16.8-20.6% vs baseline's
+    /// 44.6-45.0%; the cooperative-launch grid.sync()+combine overhead appears to dominate, not
+    /// the intended K/V-read amortization). Pushing further (kv_split=16, grid=64, via
+    /// <c>DOTLLM_CUDA_SPLIT_TARGET_BLOCKS=64</c> + this var at 16) raises Achieved Occupancy
+    /// further (32-45%, avg ~38%) but duration is FLAT-TO-WORSE (148-150us) and Warp
+    /// Cycles/Instruction regresses (28.5 vs 18.6-18.8 at kv_split=8) -- confirms occupancy is no
+    /// longer the binding constraint past ~8 splits for this shape, so 32 (giving kv_split=8 at
+    /// numKvHeads=4) is kept as the default rather than pushed further. Net: this fixes the
+    /// heuristic to behave as documented (a real, ncu-validated improvement whenever
+    /// <c>DOTLLM_ATTN_GQA_SPLIT=1</c> IS enabled), but the feature stays opt-in/default-OFF --
+    /// even fixed, it does not beat the default path at this depth. Full data: issue #219.
+    /// </remarks>
     private static readonly int AttnSplitMinKvPerSplit =
-        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_MIN_KV", 128);
+        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_MIN_KV", 32);
 
     /// <summary>
     /// Occupancy-target split-count heuristic (issue #197), form ported from Vulkan's
