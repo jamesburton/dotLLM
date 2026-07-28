@@ -14,8 +14,7 @@ namespace DotLLM.Cpu.Kernels;
 /// immediately before its 32 packed code bytes — <c>scale(Half) + codes[32]</c>, 34 bytes/group
 /// (see <see cref="Dequantize.DequantizePQ2_0"/> for the empirically-verified byte layout).
 ///
-/// <para>Two compute paths exist, selected at runtime by available ISA — mirroring
-/// <c>MatMul.I2S.cs</c>'s structure exactly:</para>
+/// <para>Two compute paths exist, mirroring <c>MatMul.I2S.cs</c>'s structure:</para>
 /// <list type="bullet">
 /// <item><b>W2A8 (int8 activations)</b> on AVX2/AVX-VNNI hardware. Activations are quantized
 /// once per token to Q8_0 (per-32-element absmax int8); each weight row is unpacked once to
@@ -27,9 +26,16 @@ namespace DotLLM.Cpu.Kernels;
 /// Q8_0 blocks of 32 elements, since <see cref="PQ2_0GroupSize"/> == 4 · <c>Q8_0GroupSize</c>),
 /// multiplied in alongside the activation's own Q8_0 block scale — see
 /// <see cref="VecDotPQ2_0Q8"/>.</item>
-/// <item><b>Float fallback</b> on hardware without AVX2 (e.g. Westmere): each weight row is
-/// unpacked once into a per-group-scaled float buffer, then dotted via
-/// <see cref="TensorPrimitives.Dot"/>.</item>
+/// <item><b>Float fallback</b> (unpack row once into a per-group-scaled float buffer, then dot
+/// via <see cref="TensorPrimitives.Dot"/>): used on hardware without AVX2 (e.g. Westmere), and
+/// — <b>unlike I2_S</b> — always used by <see cref="GemmPQ2_0"/> (GEMM/prefill) regardless of
+/// ISA. Issue #204 added the W2A8 tier and benchmarked both entry points: GEMV/decode got a
+/// solid, repeatable 2.4x-3.1x win and dispatches to W2A8 on AVX2/AVX-VNNI hardware as expected,
+/// but GEMM/prefill showed no reliable win and a real regression on one shape (ffn_gate,
+/// 0.58x-0.86x vs scalar across separate runs) — so <see cref="GemmPQ2_0"/> was kept on the
+/// scalar tier unconditionally after review. The W2A8 GEMM code
+/// (<see cref="GemmPQ2_0W2A8"/>/<see cref="GemmPQ2_0W2A8Rows"/>) is retained, tested via
+/// <see cref="GemmPQ2_0W2A8ForTest"/>, and available for a future investigation.</item>
 /// </list>
 /// </summary>
 public static unsafe partial class MatMul
@@ -179,11 +185,21 @@ public static unsafe partial class MatMul
 
     /// <summary>
     /// PQ2_0 ternary GEMM: <c>C[N,M] = B[N,K] × perGroupScaled(A[M,K])^T</c>.
-    /// Each weight row is unpacked once and dotted against all N input rows. On AVX2/AVX-VNNI
-    /// hardware all N tokens are quantized to int8 (Q8_0) once and the W2A8 SIMD path runs (each
-    /// weight row unpacked to int8 + per-group scales exactly once, then dotted against every
-    /// token); older hardware falls back to the float path. Output rows are partitioned across
-    /// <paramref name="threadPool"/> workers when present.
+    /// Each weight row is unpacked once and dotted against all N input rows via the scalar
+    /// float reference tier. Output rows are partitioned across <paramref name="threadPool"/>
+    /// workers when present.
+    ///
+    /// <para><b>Not wired to the W2A8 SIMD tier (issue #204 review follow-up).</b> Unlike
+    /// <see cref="GemvPQ2_0"/>, this entry point deliberately does <i>not</i> dispatch to
+    /// <see cref="GemmPQ2_0W2A8"/> even on AVX2/AVX-VNNI hardware: benchmarking
+    /// (<c>PQ2_0DecodeBenchmark.GemmPQ2_0_W2A8VsScalar_MedianOf5</c>) showed the W2A8 tier gives
+    /// no reliable win for GEMM/prefill and a real, repeatable regression on the ffn_gate shape
+    /// (0.58x-0.86x vs scalar across separate runs), unlike GEMV/decode's solid 2.4x-3.1x. The
+    /// W2A8 GEMM code path (<see cref="GemmPQ2_0W2A8"/>/<see cref="GemmPQ2_0W2A8Rows"/>) is kept
+    /// — it is exercised directly by <see cref="GemmPQ2_0Scalar"/>'s sibling benchmark comparison
+    /// and by <c>GemmPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance</c> — so it remains
+    /// available for a future investigation, but is not reachable from the public GEMM entry
+    /// point until that investigation lands.</para>
     /// </summary>
     [SkipLocalsInit]
     public static void GemmPQ2_0(byte* weights, float* b, float* c, int m, int k, int n,
@@ -197,12 +213,6 @@ public static unsafe partial class MatMul
 
         if (k % PQ2_0GroupSize != 0)
             throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
-
-        if (PQ2_0UseW2A8)
-        {
-            GemmPQ2_0W2A8(weights, b, c, m, k, n, threadPool);
-            return;
-        }
 
         if (threadPool is null || m < ParallelMinRows)
         {
@@ -356,9 +366,27 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// Test-only entry point for the W2A8 SIMD GEMM tier, which <see cref="GemmPQ2_0"/> does
+    /// <b>not</b> dispatch to (see its doc comment — issue #204 review found no reliable GEMM
+    /// win and a real regression on the ffn_gate shape). Lets
+    /// <c>GemmPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance</c> keep validating this
+    /// path's correctness (in particular the per-group-scale folding shared with the GEMV tier)
+    /// even though it is currently unreachable from production code, so it stays ready for a
+    /// future investigation without silently bit-rotting.
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemmPQ2_0W2A8ForTest(byte* weights, float* b, float* c, int m, int k, int n)
+    {
+        if (k % PQ2_0GroupSize != 0)
+            throw new ArgumentException($"k must be a multiple of {PQ2_0GroupSize}, got {k}", nameof(k));
+        GemmPQ2_0W2A8(weights, b, c, m, k, n, null);
+    }
+
+    /// <summary>
     /// W2A8 GEMM: quantizes all N tokens to Q8_0 once, then partitions weight rows over the pool.
     /// Each weight row is unpacked to int8 (+ per-group scales) exactly once and dotted against
-    /// every token (amortized).
+    /// every token (amortized). <b>Not currently called by <see cref="GemmPQ2_0"/></b> — see that
+    /// method's doc comment.
     /// </summary>
     [SkipLocalsInit]
     private static void GemmPQ2_0W2A8(byte* weights, float* b, float* c, int m, int k, int n,

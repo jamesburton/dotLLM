@@ -291,10 +291,16 @@ public sealed unsafe class PQ2_0Tests
         byte* w = PackPQ2_0Rows(ternary, groupScales, m, k);
         try
         {
+            // Calls the W2A8 GEMM tier directly (MatMul.GemmPQ2_0W2A8ForTest) rather than the
+            // public MatMul.GemmPQ2_0 entry point: issue #204 review found no reliable GEMM
+            // speedup and a real regression on one shape, so GemmPQ2_0 no longer dispatches to
+            // this tier (it always uses the scalar path now) — but the tier's correctness
+            // (including the per-group-scale folding it shares with the GEMV tier) still needs
+            // coverage so it doesn't bit-rot before a future investigation re-enables it.
             float[] c = new float[n * m];
             fixed (float* bp = b)
             fixed (float* cp = c)
-                MatMul.GemmPQ2_0(w, bp, cp, m, k, n, null);
+                MatMul.GemmPQ2_0W2A8ForTest(w, bp, cp, m, k, n);
 
             for (int t = 0; t < n; t++)
             for (int r = 0; r < m; r++)
