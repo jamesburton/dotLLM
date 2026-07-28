@@ -132,6 +132,14 @@ public sealed unsafe class PQ2_0Tests
 
     // ──────────────────── Ternary GEMV/GEMM ────────────────────
 
+    /// <summary>
+    /// <see cref="MatMul.GemvPQ2_0"/> dispatches to the AVX2/AVX-VNNI W2A8 SIMD tier on this
+    /// hardware (see <see cref="MatMul.PQ2_0UseW2A8"/> reflected behavior), which quantizes the
+    /// activation to Q8_0 before the dot — so its result differs from the full-precision float
+    /// reference by activation-quant error only. On non-AVX2 hardware this same entry point
+    /// falls back to the exact float path. Uses the same absolute+relative envelope as I2_S's
+    /// analogous <c>GemvI2S_W2A8_MatchesFloatReference_WithinQuantTolerance</c> test.
+    /// </summary>
     [Fact]
     public void GemvPQ2_0_MatchesDotOfDequantizedRows()
     {
@@ -163,12 +171,14 @@ public sealed unsafe class PQ2_0Tests
                     float scale = groupScales[r * groupsPerRow + c / 128];
                     acc += ternary[r * k + c] * scale * x[c];
                 }
-                Assert.Equal(acc, y[r], 1e-3f);
+                AssertWithinQuantTolerance(acc, y[r]);
             }
         }
         finally { NativeMemory.Free(w); }
     }
 
+    /// <summary>See <see cref="GemvPQ2_0_MatchesDotOfDequantizedRows"/>'s doc comment — same
+    /// W2A8-dispatch rationale applies to the GEMM entry point.</summary>
     [Fact]
     public void GemmPQ2_0_MatchesDotOfDequantizedRows()
     {
@@ -202,10 +212,118 @@ public sealed unsafe class PQ2_0Tests
                     float scale = groupScales[r * groupsPerRow + col / 128];
                     acc += ternary[r * k + col] * scale * b[t * k + col];
                 }
-                Assert.Equal(acc, c[t * m + r], 1e-3f);
+                AssertWithinQuantTolerance(acc, c[t * m + r]);
             }
         }
         finally { NativeMemory.Free(w); }
+    }
+
+    // ──────────────────── W2A8 (int8-activation) SIMD tier — issue #204 ────────────────────
+
+    /// <summary>
+    /// Dedicated W2A8 coverage across multiple shapes, including group counts not evenly
+    /// divisible by the 4-groups-per-cacheline-ish batch (odd group counts 1, 3, 5) and a larger
+    /// multi-group shape approximating real decode dimensions. Each shape gets an independent
+    /// random per-row-per-group scale set (unlike I2_S's single per-tensor scale), directly
+    /// exercising the group-scale-folding this issue adds to <c>VecDotPQ2_0Q8</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(1, 128)]     // single row, single group
+    [InlineData(3, 384)]     // odd row count, 3 groups (12 Q8_0 blocks)
+    [InlineData(5, 640)]     // odd row count, 5 groups (odd relative to any 4-wide unrolling)
+    [InlineData(7, 256)]     // odd row count, 2 groups
+    [InlineData(4, 5120)]    // real Bonsai-27B attention hidden dim (40 groups)
+    public void GemvPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance(int m, int k)
+    {
+        var rng = new Random(2026 + m * 1000 + k);
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        int groupsPerRow = k / 128;
+        float[] groupScales = new float[m * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.005f + rng.NextSingle() * 0.08f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackPQ2_0Rows(ternary, groupScales, m, k);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvPQ2_0(w, xp, yp, m, k, null);
+
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int c = 0; c < k; c++)
+                {
+                    float scale = groupScales[r * groupsPerRow + c / 128];
+                    acc += ternary[r * k + c] * scale * x[c];
+                }
+                AssertWithinQuantTolerance(acc, y[r]);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>GEMM analog of <see cref="GemvPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance"/>
+    /// — validates the "unpack weight row once, dot against N tokens" amortized W2A8 GEMM path,
+    /// including a token count of 1 (which internally redirects to the GEMV path) alongside
+    /// multi-token batches.</summary>
+    [Theory]
+    [InlineData(1, 384, 1)]
+    [InlineData(3, 384, 4)]
+    [InlineData(5, 640, 2)]
+    [InlineData(7, 256, 5)]
+    public void GemmPQ2_0_W2A8_MatchesFloatReference_WithinQuantTolerance(int m, int k, int n)
+    {
+        var rng = new Random(4026 + m * 1000 + k * 10 + n);
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        int groupsPerRow = k / 128;
+        float[] groupScales = new float[m * groupsPerRow];
+        for (int i = 0; i < groupScales.Length; i++) groupScales[i] = 0.005f + rng.NextSingle() * 0.08f;
+
+        float[] b = new float[n * k];
+        for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackPQ2_0Rows(ternary, groupScales, m, k);
+        try
+        {
+            // Calls the W2A8 GEMM tier directly (MatMul.GemmPQ2_0W2A8ForTest) rather than the
+            // public MatMul.GemmPQ2_0 entry point: issue #204 review found no reliable GEMM
+            // speedup and a real regression on one shape, so GemmPQ2_0 no longer dispatches to
+            // this tier (it always uses the scalar path now) — but the tier's correctness
+            // (including the per-group-scale folding it shares with the GEMV tier) still needs
+            // coverage so it doesn't bit-rot before a future investigation re-enables it.
+            float[] c = new float[n * m];
+            fixed (float* bp = b)
+            fixed (float* cp = c)
+                MatMul.GemmPQ2_0W2A8ForTest(w, bp, cp, m, k, n);
+
+            for (int t = 0; t < n; t++)
+            for (int r = 0; r < m; r++)
+            {
+                float acc = 0f;
+                for (int col = 0; col < k; col++)
+                {
+                    float scale = groupScales[r * groupsPerRow + col / 128];
+                    acc += ternary[r * k + col] * scale * b[t * k + col];
+                }
+                AssertWithinQuantTolerance(acc, c[t * m + r]);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    private static void AssertWithinQuantTolerance(float expected, float actual)
+    {
+        // Same envelope as I2S's AssertWithinQuantTolerance: absolute floor for near-zero sums,
+        // relative band for larger magnitudes (Q8_0's ~1/127 relative quant step).
+        float tol = 1e-2f + 0.02f * MathF.Abs(expected);
+        Assert.True(MathF.Abs(expected - actual) <= tol,
+            $"expected {expected}, got {actual}, |Δ|={MathF.Abs(expected - actual)} > tol {tol}");
     }
 
     // ──────────────────── Test helpers ────────────────────
