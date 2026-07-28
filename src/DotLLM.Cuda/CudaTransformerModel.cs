@@ -171,6 +171,33 @@ public sealed unsafe class CudaTransformerModel : IModel
     public static bool DisableGraphCapture { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_DISABLE_GRAPH_CAPTURE") == "1";
 
+    /// <summary>
+    /// Issue #213 mitigation: BitNet-only context-depth ceiling for the CUDA-Graphs decode
+    /// path. Root cause (confirmed via <c>CudaAttentionDynVsScalarPerfTest</c>, an isolated
+    /// CUDA-event microbenchmark with no graph capture involved): the graph-friendly
+    /// <c>attention_f16_dyn</c> kernel entry point (device-pointer <c>seq_kv</c>/
+    /// <c>position_offset</c>, required so the graph can replay with a growing KV length
+    /// without re-instantiation) is measurably slower per launch than the eager path's
+    /// <c>attention_f16</c> (scalar kernel args) at the SAME <c>seq_kv</c> — identical
+    /// register count and zero local-memory spill for both (<c>DebugGetAttentionFuncStats</c>),
+    /// so this is a SASS-scheduling inefficiency in the dyn entry point, not an
+    /// occupancy/resource difference. The per-launch gap grows from single-digit µs at
+    /// shallow depth to 100+ µs at seq_kv≈1500-2000, and — summed across every BitNet decode
+    /// layer — eventually exceeds CUDA Graphs' launch-overhead savings, producing the
+    /// deep-context regression. Until the dyn kernel itself is fixed (or the graph body is
+    /// restructured to patch captured node parameters via <c>cuGraphExecKernelNodeSetParams</c>
+    /// instead of a device-pointer indirection — tracked as a follow-up), BitNet falls back to
+    /// eager once the running KV length would exceed this ceiling, preserving the proven
+    /// shallow/moderate-depth graph-capture win while avoiding the deep-context loss. Default
+    /// 384 sits with margin below the measured zero-crossing (~context 480-560 depending on
+    /// model shape) for both real BitNet models this was validated against. Override via
+    /// <c>DOTLLM_BITNET_GRAPH_MAX_DEPTH</c> (int) for experimentation; not architecture-general —
+    /// other graph-capable architectures are untouched by this issue's fix.
+    /// </summary>
+    public static int BitNetGraphCaptureMaxDepth { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_BITNET_GRAPH_MAX_DEPTH"),
+            out int v) ? v : 384;
+
     /// <summary>Disable the F32 activation correctness path for IQ4-family models.</summary>
     public static bool EnableHighPrecisionIQuants { get; set; } =
         Environment.GetEnvironmentVariable("DOTLLM_ENABLE_HIGH_PRECISION_IQUANTS") == "1";
@@ -718,7 +745,13 @@ public sealed unsafe class CudaTransformerModel : IModel
             // BitNet IS graph-capable (issue #212): CaptureDecodeGraph/CaptureDecodeGraphQuantized
             // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
             // activation as this eager body, ported 1:1 from the branches below.
-            && _currentAdapter is null)     // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
+            && _currentAdapter is null      // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
+            // Issue #213: BitNet's graph-friendly attention_f16_dyn kernel is measurably
+            // slower than eager's attention_f16 at the same seq_kv (confirmed at the kernel
+            // level, see BitNetGraphCaptureMaxDepth's doc comment), and the gap grows with
+            // depth until it exceeds the graph's launch-overhead savings. Cap BitNet to the
+            // depth regime this was validated as a net win; fall through to eager beyond it.
+            && (!isBitNet || positions[0] < BitNetGraphCaptureMaxDepth))
         {
             if (kvCache is CudaKvCache stdKv)
             {

@@ -126,6 +126,23 @@ internal static partial class CudaDriverApi
     internal static partial int cuOccupancyMaxActiveBlocksPerMultiprocessor(
         out int numBlocks, nint func, int blockSize, nuint dynamicSMemSize);
 
+    /// <summary>
+    /// Diagnostic-only (issue #213): queries a compiled kernel's static attributes (register
+    /// count, local-memory spill, max threads/block, etc.) without needing Nsight Compute.
+    /// <c>attr</c> is a <c>CUfunction_attribute</c> enum value — see
+    /// <see cref="CU_FUNC_ATTRIBUTE_NUM_REGS"/> / <see cref="CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES"/>.
+    /// </summary>
+    [LibraryImport(LibName)]
+    internal static partial int cuFuncGetAttribute(out int value, int attr, nint hfunc);
+
+    internal const int CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0;
+    internal const int CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1;
+    internal const int CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES = 2;
+    internal const int CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3;
+    internal const int CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
+    internal const int CU_FUNC_ATTRIBUTE_PTX_VERSION = 5;
+    internal const int CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6;
+
     // ── Memory ──────────────────────────────────────────────────────
 
     [LibraryImport(LibName)]
