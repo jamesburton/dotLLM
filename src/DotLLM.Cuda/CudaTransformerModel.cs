@@ -103,6 +103,49 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// <summary>Debug: limit the number of transformer layers processed. 0 = all layers (default). -1 = skip all layers (embedding + LM head only).</summary>
     internal int DebugMaxLayers { get; set; }
 
+    /// <summary>Diagnostic (issue #221): number of transformer layers with GPU weights loaded.</summary>
+    internal int DiagLayerCount => _weights.Layers.Length;
+
+    /// <summary>
+    /// Diagnostic (issue #221): whether the QKV weight-packing load-time optimization
+    /// (<c>CudaWeights.TryUploadPackedThree</c>) succeeded for the given layer — i.e.
+    /// <c>lw.QkvPacked != 0</c>.
+    /// </summary>
+    internal bool DiagIsQkvPacked(int layer) => _weights.Layers[layer].QkvPacked != 0;
+
+    /// <summary>
+    /// Diagnostic (issue #221): whether the Gate/Up weight-packing load-time optimization
+    /// (<c>CudaWeights.TryUploadPackedTwo</c>) succeeded for the given layer — i.e.
+    /// <c>lw.GateUpPacked != 0</c>.
+    /// </summary>
+    internal bool DiagIsGateUpPacked(int layer) => _weights.Layers[layer].GateUpPacked != 0;
+
+    /// <summary>
+    /// Diagnostic (issue #221): whether the decode-time fused I2_S QKV GEMV
+    /// (<see cref="CanFuseI2SDecode(int, QuantizationType, QuantizationType, QuantizationType, int, int, int)"/>,
+    /// dispatched as <c>LaunchI2_SGemv3F16In</c>) would engage for the given layer at
+    /// <c>seqLen == 1</c> (single-token decode). Independent of <see cref="DiagIsQkvPacked"/> —
+    /// this fused path reads the three per-tensor quantized pointers directly and never consults
+    /// the packed QKV buffer.
+    /// </summary>
+    internal bool DiagCanFuseQkvDecode(int layer)
+    {
+        ref readonly var lw = ref _weights.Layers[layer];
+        return CanFuseI2SDecode(1, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+            lw.QInputDim, lw.KInputDim, lw.VInputDim);
+    }
+
+    /// <summary>
+    /// Diagnostic (issue #221): whether the decode-time fused I2_S Gate/Up GEMV
+    /// (<c>LaunchI2_SGemv2F16In</c>) would engage for the given layer at <c>seqLen == 1</c>.
+    /// Independent of <see cref="DiagIsGateUpPacked"/> — see <see cref="DiagCanFuseQkvDecode"/>.
+    /// </summary>
+    internal bool DiagCanFuseGateUpDecode(int layer)
+    {
+        ref readonly var lw = ref _weights.Layers[layer];
+        return CanFuseI2SDecode(1, lw.GateQuantType, lw.UpQuantType, lw.GateInputDim, lw.UpInputDim);
+    }
+
     /// <summary>Debug: override RoPE type. -1 = use model's type (default).</summary>
     internal int DebugRopeTypeOverride { get; set; } = -1;
 
