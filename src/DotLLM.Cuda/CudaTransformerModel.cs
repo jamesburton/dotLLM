@@ -715,7 +715,9 @@ public sealed unsafe class CudaTransformerModel : IModel
             && _kernels.HasKvWriteKernel
             && !ProfilingEnabled            // event injection between launches breaks capture
             && !isMla && !isMoe
-            && !isBitNet                    // dev's generic capture body omits BitNet's FP32 residual, Sub-LN and relu² — replaying it on BitNet produces garbage
+            // BitNet IS graph-capable (issue #212): CaptureDecodeGraph/CaptureDecodeGraphQuantized
+            // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
+            // activation as this eager body, ported 1:1 from the branches below.
             && _currentAdapter is null)     // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
         {
             if (kvCache is CudaKvCache stdKv)
@@ -1551,6 +1553,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
+        // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504
+        // ceiling) — same condition the eager Forward() body uses. Ported for issue #212.
+        bool isBitNet = Config.Architecture == Architecture.BitNet;
+        bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
+
         nint s = _stream.Handle;
 
         CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
@@ -1565,21 +1572,46 @@ public sealed unsafe class CudaTransformerModel : IModel
                 _state.TokenIdsDevice, _state.HiddenState,
                 seqLen, hiddenSize, s);
 
-            // Layer 0 setup: copy hidden→residual, RmsNorm→NormOutput
+            // Layer 0 setup: copy hidden→residual, RmsNorm→NormOutput. BitNet carries the
+            // residual in FP32 (LaunchCopyF16ToF32 into ResidualF32) — mirrors eager Forward().
             long hiddenBytes = (long)seqLen * hiddenSize * h;
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
+            if (fp32Res)
+                _kernels.LaunchCopyF16ToF32(_state.HiddenState, _state.ResidualF32, seqLen * hiddenSize, s);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
             _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
                 hiddenSize, eps, seqLen, s);
 
-            if (numLayers == 0)
+            if (numLayers == 0 && !fp32Res)
                 CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
 
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
 
+                // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
+                // when eligible (same condition as the eager path — no adapter is ever
+                // active under graph capture, see the `_currentAdapter is null` gate).
+                // Ported for issue #212: the eager path always takes this branch for
+                // BitNet's 128-aligned layers, so leaving it out of the graph body would
+                // replay 3 unfused GEMV kernels/layer instead of 1 — real GPU time, not
+                // just extra launch count, since the graph collapses CPU dispatch either way.
+                bool fusedI2SQkv = !s_i2sA8Decode
+                    && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+                        lw.QInputDim, lw.KInputDim, lw.VInputDim);
+
                 nint qPtr, kPtr, vPtr;
-                if (lw.QkvPacked != 0)
+                if (fusedI2SQkv)
+                {
+                    _kernels.LaunchI2_SGemv3F16In(
+                        lw.QQuant, lw.KQuant, lw.VQuant, _state.NormOutput,
+                        _state.Q, _state.K, _state.V,
+                        lw.QOutputDim, lw.KOutputDim, lw.VOutputDim, lw.QInputDim, s);
+                    qPtr = _state.Q;
+                    kPtr = _state.K;
+                    vPtr = _state.V;
+                }
+                else if (lw.QkvPacked != 0)
                 {
                     if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
                     {
@@ -1618,13 +1650,34 @@ public sealed unsafe class CudaTransformerModel : IModel
                     _kernels.LaunchPerHeadRmsNorm(kPtr, lw.KNormWeight, eps, numKvHeads, headDim, seqLen, s);
 
                 int effectiveRopeType = DebugRopeTypeOverride >= 0 ? DebugRopeTypeOverride : _ropeType;
-                _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
-                    seqLen, numHeads, numKvHeads, headDim,
-                    _ropeDim, _ropeTheta, effectiveRopeType, s);
 
-                // KV-cache update via device-resident position; replaces the eager
-                // path's cuMemcpyDtoDAsync (which would bake the dst address).
-                kvCache.UpdateDeviceSingleDevicePos(kPtr, vPtr, layer, _decodePosDevice, s, _kernels);
+                // Fold RoPE + KV-cache write into a single launch when the graph-friendly
+                // fused kernel is loaded — mirrors the eager path's useFusedRopeKv branch
+                // (FusedRopeAndUpdateDevice), which decode always takes for a standard
+                // CudaKvCache. Previously this graph body always took the 3-launch unfused
+                // path (LaunchRoPE + 2× LaunchKvWriteOneF16); wiring in the pre-existing
+                // Dyn variant here closes a kernel-count gap versus eager for every
+                // graph-captured architecture, not just BitNet, uncovered while
+                // benchmarking issue #212's depth scaling.
+                if (_kernels.HasFusedRopeKvWriteKernel)
+                {
+                    _kernels.LaunchFusedRopeKvWriteF16Dyn(
+                        qPtr, kPtr, vPtr,
+                        kvCache.GetKeysPtr(layer), kvCache.GetValuesPtr(layer),
+                        _state.PositionsDevice, _decodePosDevice,
+                        numHeads, numKvHeads, headDim,
+                        _ropeDim, kvCache.KvStrideOf(layer), _ropeTheta, effectiveRopeType, s);
+                }
+                else
+                {
+                    _kernels.LaunchRoPE(qPtr, kPtr, _state.PositionsDevice,
+                        seqLen, numHeads, numKvHeads, headDim,
+                        _ropeDim, _ropeTheta, effectiveRopeType, s);
+
+                    // KV-cache update via device-resident position; replaces the eager
+                    // path's cuMemcpyDtoDAsync (which would bake the dst address).
+                    kvCache.UpdateDeviceSingleDevicePos(kPtr, vPtr, layer, _decodePosDevice, s, _kernels);
+                }
 
                 // Attention with device-resident seq_kv / position_offset.
                 _kernels.LaunchAttentionDyn(qPtr, kvCache.GetKeysPtr(layer),
@@ -1632,14 +1685,49 @@ public sealed unsafe class CudaTransformerModel : IModel
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
                     _decodePosDevice, slidingWindow, s);
 
-                Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
+                // Optional attention Sub-LN (BitNet), fused into the O-projection GEMV when
+                // eligible — mirrors the eager path's fusedAttnSubNormO branch (issue #212).
+                bool fusedAttnSubNormO = !s_i2sA8Decode && CanFuseI2SNormDecode(
+                    seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
+                if (fusedAttnSubNormO)
+                {
+                    _kernels.LaunchI2_SGemvNormF16In(
+                        lw.OQuant, _state.AttnOutput, lw.AttnSubNormWeight, _state.NormOutput,
+                        lw.OOutputDim, lw.OInputDim, eps, s);
+                }
+
+                if (lw.AttnSubNormWeight != 0 && !fusedAttnSubNormO)
+                    _kernels.LaunchRmsNorm(_state.AttnOutput, lw.AttnSubNormWeight, _state.AttnOutput,
+                        numHeads * headDim, eps, seqLen, s);
+
+                if (!fusedAttnSubNormO)
+                    Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
                 if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
-                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
-                    hiddenSize, eps, seqLen, s);
+                // BitNet carries the residual in FP32 to avoid FP16 overflow.
+                if (fp32Res)
+                    _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+
+                // BitNet (I2_S) decode: fuse the Gate/Up projections into ONE GEMV launch
+                // when eligible — mirrors the eager path's fusedI2SGateUp branch (#212).
+                bool fusedI2SGateUp = !s_i2sA8Decode
+                    && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType, lw.GateInputDim, lw.UpInputDim);
 
                 nint gatePtr, upPtr;
-                if (lw.GateUpPacked != 0)
+                if (fusedI2SGateUp)
+                {
+                    _kernels.LaunchI2_SGemv2F16In(
+                        lw.GateQuant, lw.UpQuant, _state.NormOutput,
+                        _state.FfnGate, _state.FfnUp,
+                        lw.GateOutputDim, lw.UpOutputDim, lw.GateInputDim, s);
+                    gatePtr = _state.FfnGate;
+                    upPtr = _state.FfnUp;
+                }
+                else if (lw.GateUpPacked != 0)
                 {
                     if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
                     {
@@ -1668,7 +1756,28 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (lw.GateBias != 0) _kernels.LaunchBiasAdd(gatePtr, lw.GateBias, lw.GateOutputDim, seqLen, s);
                 if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-                _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
+                // Gated activation. BitNet b1.58 uses squared-ReLU GLU followed by a Sub-LN
+                // RMSNorm; fuse activation + RMSNorm when the Sub-LN weight is present (keeps the
+                // un-normalized relu(gate)²·up intermediate, which can overflow FP16, in FP32).
+                // Mirrors the eager path's three-way branch exactly.
+                if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+                {
+                    _kernels.LaunchReLU2GluRmsNorm(gatePtr, upPtr, lw.FfnSubNormWeight,
+                        _state.SiluOutput, intermediateSize, eps, seqLen, s);
+                }
+                else if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+                {
+                    _kernels.LaunchReLU2(gatePtr, upPtr, _state.SiluOutput,
+                        intermediateSize, seqLen, s);
+
+                    if (lw.FfnSubNormWeight != 0)
+                        _kernels.LaunchRmsNorm(_state.SiluOutput, lw.FfnSubNormWeight, _state.SiluOutput,
+                            intermediateSize, eps, seqLen, s);
+                }
+                else
+                {
+                    _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
+                }
 
                 Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
                 if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
@@ -1676,19 +1785,37 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (layer < numLayers - 1)
                 {
                     ref readonly var nextLw = ref _weights.Layers[layer + 1];
-                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
-                        hiddenSize, eps, seqLen, s);
+                    if (fp32Res)
+                        _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
+                    else
+                        _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
                 }
                 else
                 {
-                    _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
-                        seqLen * hiddenSize, s);
+                    if (fp32Res)
+                        _kernels.LaunchAddF32F16(_state.ResidualF32, _state.NormOutput, _state.ResidualF32,
+                            seqLen * hiddenSize, s);
+                    else
+                        _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
+                            seqLen * hiddenSize, s);
                 }
             }
 
-            nint lastHidden = _state.HiddenState; // seqLen=1
-            _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-                hiddenSize, eps, 1, s);
+            // Final RmsNorm. For BitNet, read the FP32 residual directly so the large final
+            // residual is never truncated to FP16 (mirrors eager Forward()).
+            if (fp32Res && numLayers > 0)
+            {
+                _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, _weights.OutputNormWeight, _state.NormOutput,
+                    hiddenSize, eps, 1, s);
+            }
+            else
+            {
+                nint lastHidden = _state.HiddenState; // seqLen=1
+                _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
+                    hiddenSize, eps, 1, s);
+            }
 
             Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
                 _state.NormOutput, _state.LogitsF16,
@@ -1731,6 +1858,11 @@ public sealed unsafe class CudaTransformerModel : IModel
         const int seqLen = 1;
         const int h = sizeof(ushort);
 
+        // FP32 residual stream for BitNet (its residual magnitude exceeds FP16's ~65504
+        // ceiling) — same condition the eager Forward() body uses. Ported for issue #212.
+        bool isBitNet = Config.Architecture == Architecture.BitNet;
+        bool fp32Res = _state.ResidualF32 != 0 && isBitNet;
+
         nint s = _stream.Handle;
 
         CudaDriverApi.cuStreamBeginCapture_v2(s, CudaDriverApi.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).ThrowOnError();
@@ -1743,19 +1875,38 @@ public sealed unsafe class CudaTransformerModel : IModel
                 seqLen, hiddenSize, s);
 
             long hiddenBytes = (long)seqLen * hiddenSize * h;
-            CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
+            if (fp32Res)
+                _kernels.LaunchCopyF16ToF32(_state.HiddenState, _state.ResidualF32, seqLen * hiddenSize, s);
+            else
+                CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.Residual, _state.HiddenState, (nuint)hiddenBytes, s).ThrowOnError();
             _kernels.LaunchRmsNorm(_state.HiddenState, _weights.Layers[0].AttnNormWeight, _state.NormOutput,
                 hiddenSize, eps, seqLen, s);
 
-            if (numLayers == 0)
+            if (numLayers == 0 && !fp32Res)
                 CudaDriverApi.cuMemcpyDtoDAsync_v2(_state.HiddenState, _state.Residual, (nuint)hiddenBytes, s).ThrowOnError();
 
             for (int layer = 0; layer < numLayers; layer++)
             {
                 ref readonly var lw = ref _weights.Layers[layer];
 
+                // BitNet (I2_S) decode: fuse the Q/K/V projections into ONE GEMV launch
+                // when eligible — mirrors the eager path's fusedI2SQkv branch (#212).
+                bool fusedI2SQkv = !s_i2sA8Decode
+                    && CanFuseI2SDecode(seqLen, lw.QQuantType, lw.KQuantType, lw.VQuantType,
+                        lw.QInputDim, lw.KInputDim, lw.VInputDim);
+
                 nint qPtr, kPtr, vPtr;
-                if (lw.QkvPacked != 0)
+                if (fusedI2SQkv)
+                {
+                    _kernels.LaunchI2_SGemv3F16In(
+                        lw.QQuant, lw.KQuant, lw.VQuant, _state.NormOutput,
+                        _state.Q, _state.K, _state.V,
+                        lw.QOutputDim, lw.KOutputDim, lw.VOutputDim, lw.QInputDim, s);
+                    qPtr = _state.Q;
+                    kPtr = _state.K;
+                    vPtr = _state.V;
+                }
+                else if (lw.QkvPacked != 0)
                 {
                     if (_kernels.HasMmq(lw.QkvPackedQuantType) && !CudaKernels.ForceDirectGemv)
                     {
@@ -1812,14 +1963,49 @@ public sealed unsafe class CudaTransformerModel : IModel
                     seqLen, _decodeSeqKvDevice, numHeads, numKvHeads, headDim,
                     _decodePosDevice, slidingWindow, s);
 
-                Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
+                // Optional attention Sub-LN (BitNet), fused into the O-projection GEMV when
+                // eligible — mirrors the eager path's fusedAttnSubNormO branch (issue #212).
+                bool fusedAttnSubNormO = !s_i2sA8Decode && CanFuseI2SNormDecode(
+                    seqLen, lw.AttnSubNormWeight, lw.OQuantType, lw.OInputDim, numHeads * headDim);
+                if (fusedAttnSubNormO)
+                {
+                    _kernels.LaunchI2_SGemvNormF16In(
+                        lw.OQuant, _state.AttnOutput, lw.AttnSubNormWeight, _state.NormOutput,
+                        lw.OOutputDim, lw.OInputDim, eps, s);
+                }
+
+                if (lw.AttnSubNormWeight != 0 && !fusedAttnSubNormO)
+                    _kernels.LaunchRmsNorm(_state.AttnOutput, lw.AttnSubNormWeight, _state.AttnOutput,
+                        numHeads * headDim, eps, seqLen, s);
+
+                if (!fusedAttnSubNormO)
+                    Project(lw.OQuant, lw.OQuantType, lw.O, _state.AttnOutput, _state.NormOutput, lw.OOutputDim, lw.OInputDim, seqLen);
                 if (lw.OBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.OBias, lw.OOutputDim, seqLen, s);
 
-                _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
-                    hiddenSize, eps, seqLen, s);
+                // BitNet carries the residual in FP32 to avoid FP16 overflow.
+                if (fp32Res)
+                    _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+                else
+                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, lw.FfnNormWeight, _state.NormOutput,
+                        hiddenSize, eps, seqLen, s);
+
+                // BitNet (I2_S) decode: fuse the Gate/Up projections into ONE GEMV launch
+                // when eligible — mirrors the eager path's fusedI2SGateUp branch (#212).
+                bool fusedI2SGateUp = !s_i2sA8Decode
+                    && CanFuseI2SDecode(seqLen, lw.GateQuantType, lw.UpQuantType, lw.GateInputDim, lw.UpInputDim);
 
                 nint gatePtr, upPtr;
-                if (lw.GateUpPacked != 0)
+                if (fusedI2SGateUp)
+                {
+                    _kernels.LaunchI2_SGemv2F16In(
+                        lw.GateQuant, lw.UpQuant, _state.NormOutput,
+                        _state.FfnGate, _state.FfnUp,
+                        lw.GateOutputDim, lw.UpOutputDim, lw.GateInputDim, s);
+                    gatePtr = _state.FfnGate;
+                    upPtr = _state.FfnUp;
+                }
+                else if (lw.GateUpPacked != 0)
                 {
                     if (_kernels.HasMmq(lw.GateUpPackedQuantType) && !CudaKernels.ForceDirectGemv)
                     {
@@ -1848,7 +2034,28 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (lw.GateBias != 0) _kernels.LaunchBiasAdd(gatePtr, lw.GateBias, lw.GateOutputDim, seqLen, s);
                 if (lw.UpBias != 0) _kernels.LaunchBiasAdd(upPtr, lw.UpBias, lw.UpOutputDim, seqLen, s);
 
-                _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
+                // Gated activation. BitNet b1.58 uses squared-ReLU GLU followed by a Sub-LN
+                // RMSNorm; fuse activation + RMSNorm when the Sub-LN weight is present (keeps the
+                // un-normalized relu(gate)²·up intermediate, which can overflow FP16, in FP32).
+                // Mirrors the eager path's three-way branch exactly.
+                if (Config.ActivationFunction == ActivationFunction.ReluSquared && lw.FfnSubNormWeight != 0)
+                {
+                    _kernels.LaunchReLU2GluRmsNorm(gatePtr, upPtr, lw.FfnSubNormWeight,
+                        _state.SiluOutput, intermediateSize, eps, seqLen, s);
+                }
+                else if (Config.ActivationFunction == ActivationFunction.ReluSquared)
+                {
+                    _kernels.LaunchReLU2(gatePtr, upPtr, _state.SiluOutput,
+                        intermediateSize, seqLen, s);
+
+                    if (lw.FfnSubNormWeight != 0)
+                        _kernels.LaunchRmsNorm(_state.SiluOutput, lw.FfnSubNormWeight, _state.SiluOutput,
+                            intermediateSize, eps, seqLen, s);
+                }
+                else
+                {
+                    _kernels.LaunchSwiGLU(gatePtr, upPtr, _state.SiluOutput, intermediateSize, seqLen, s);
+                }
 
                 Project(lw.DownQuant, lw.DownQuantType, lw.Down, _state.SiluOutput, _state.NormOutput, lw.DownOutputDim, lw.DownInputDim, seqLen);
                 if (lw.DownBias != 0) _kernels.LaunchBiasAdd(_state.NormOutput, lw.DownBias, lw.DownOutputDim, seqLen, s);
@@ -1856,19 +2063,37 @@ public sealed unsafe class CudaTransformerModel : IModel
                 if (layer < numLayers - 1)
                 {
                     ref readonly var nextLw = ref _weights.Layers[layer + 1];
-                    _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
-                        hiddenSize, eps, seqLen, s);
+                    if (fp32Res)
+                        _kernels.LaunchFusedAddRmsNormF32Res(_state.ResidualF32, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
+                    else
+                        _kernels.LaunchFusedAddRmsNorm(_state.Residual, _state.NormOutput, nextLw.AttnNormWeight, _state.NormOutput,
+                            hiddenSize, eps, seqLen, s);
                 }
                 else
                 {
-                    _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
-                        seqLen * hiddenSize, s);
+                    if (fp32Res)
+                        _kernels.LaunchAddF32F16(_state.ResidualF32, _state.NormOutput, _state.ResidualF32,
+                            seqLen * hiddenSize, s);
+                    else
+                        _kernels.LaunchAdd(_state.Residual, _state.NormOutput, _state.HiddenState,
+                            seqLen * hiddenSize, s);
                 }
             }
 
-            nint lastHidden = _state.HiddenState; // seqLen=1
-            _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
-                hiddenSize, eps, 1, s);
+            // Final RmsNorm. For BitNet, read the FP32 residual directly so the large final
+            // residual is never truncated to FP16 (mirrors eager Forward()).
+            if (fp32Res && numLayers > 0)
+            {
+                _kernels.LaunchRmsNormF32InF16W(_state.ResidualF32, _weights.OutputNormWeight, _state.NormOutput,
+                    hiddenSize, eps, 1, s);
+            }
+            else
+            {
+                nint lastHidden = _state.HiddenState; // seqLen=1
+                _kernels.LaunchRmsNorm(lastHidden, _weights.OutputNormWeight, _state.NormOutput,
+                    hiddenSize, eps, 1, s);
+            }
 
             Project(_weights.OutputWeightQuant, _weights.OutputQuantType, _weights.OutputWeight,
                 _state.NormOutput, _state.LogitsF16,
