@@ -234,12 +234,40 @@ public sealed unsafe class CudaTransformerModel : IModel
     /// shallow/moderate-depth graph-capture win while avoiding the deep-context loss. Default
     /// 384 sits with margin below the measured zero-crossing (~context 480-560 depending on
     /// model shape) for both real BitNet models this was validated against. Override via
-    /// <c>DOTLLM_BITNET_GRAPH_MAX_DEPTH</c> (int) for experimentation; not architecture-general —
-    /// other graph-capable architectures are untouched by this issue's fix.
+    /// <c>DOTLLM_BITNET_GRAPH_MAX_DEPTH</c> (int) for experimentation. Superseded in scope (not
+    /// value) by <see cref="GraphCaptureMaxDepth"/> below, which generalizes this same mitigation
+    /// shape to every architecture (issue #218) -- see that property's doc comment.
     /// </summary>
     public static int BitNetGraphCaptureMaxDepth { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_BITNET_GRAPH_MAX_DEPTH"),
             out int v) ? v : 384;
+
+    /// <summary>
+    /// Issue #218: generalizes <see cref="BitNetGraphCaptureMaxDepth"/>'s depth-ceiling mitigation
+    /// to every graph-capable architecture, not just BitNet. #213/#217 found and fixed the
+    /// regression for BitNet specifically; #218 confirmed via real-model benchmarks
+    /// (Falcon-E-3B-Instruct, Falcon3-3B-Base-1.58bit -- I2_S/Llama-arch, not BitNet) that the
+    /// same underlying <c>attention_f16_dyn</c> per-launch cost regresses non-BitNet decode too,
+    /// worse than BitNet did (-21.8% decode throughput at depth 1536 on Falcon-E-3B, uncapped).
+    /// <para>
+    /// Issue #218 also shipped a real kernel-level partial fix (native/kernels/attention.cu:
+    /// <c>attention_f16_dyn</c> now has only thread 0 dereference the device-resident
+    /// <c>seq_kv</c>/<c>position_offset</c> pointers, broadcasting via shared memory instead of
+    /// every one of the 256 threads/8 warps independently paying the load latency) -- this closed
+    /// roughly a third of the regression (Falcon-E-3B depth 1536: -21.8% to -13.6% measured
+    /// post-fix) but did not eliminate it, so this ceiling remains necessary as the backstop for
+    /// the residual gap. This property is the general-architecture ceiling; BitNet keeps using its
+    /// own separately-validated (and tighter) <see cref="BitNetGraphCaptureMaxDepth"/> instead --
+    /// the two are not combined/multiplied, each architecture uses exactly one.
+    /// </para>
+    /// Default 512 sits with margin below the observed zero-crossing (regression becomes clearly
+    /// negative between depth 512 and 1024 on both Falcon-E-3B-Instruct and
+    /// Falcon3-3B-Base-1.58bit, post kernel-fix). Override via <c>DOTLLM_GRAPH_MAX_DEPTH</c> (int)
+    /// for experimentation.
+    /// </summary>
+    public static int GraphCaptureMaxDepth { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTLLM_GRAPH_MAX_DEPTH"),
+            out int gv) ? gv : 512;
 
     /// <summary>Disable the F32 activation correctness path for IQ4-family models.</summary>
     public static bool EnableHighPrecisionIQuants { get; set; } =
@@ -789,12 +817,14 @@ public sealed unsafe class CudaTransformerModel : IModel
             // now carry the same fp32Res-gated FP32 residual accumulation, Sub-LN, and ReLU² FFN
             // activation as this eager body, ported 1:1 from the branches below.
             && _currentAdapter is null      // the captured body has no ApplyLoraDeltaDevice call, so an active adapter would be silently dropped on every decoded token
-            // Issue #213: BitNet's graph-friendly attention_f16_dyn kernel is measurably
+            // Issue #213/#218: the graph-friendly attention_f16_dyn kernel is measurably
             // slower than eager's attention_f16 at the same seq_kv (confirmed at the kernel
-            // level, see BitNetGraphCaptureMaxDepth's doc comment), and the gap grows with
-            // depth until it exceeds the graph's launch-overhead savings. Cap BitNet to the
-            // depth regime this was validated as a net win; fall through to eager beyond it.
-            && (!isBitNet || positions[0] < BitNetGraphCaptureMaxDepth))
+            // level, see BitNetGraphCaptureMaxDepth / GraphCaptureMaxDepth's doc comments), and
+            // the gap grows with depth until it exceeds the graph's launch-overhead savings.
+            // #218 confirmed this regresses non-BitNet decode too (Falcon-E-3B/Falcon3-3B), so
+            // every architecture gets a depth ceiling now, not just BitNet -- BitNet keeps its
+            // own separately-validated (tighter) ceiling, everything else uses the general one.
+            && positions[0] < (isBitNet ? BitNetGraphCaptureMaxDepth : GraphCaptureMaxDepth))
         {
             if (kvCache is CudaKvCache stdKv)
             {

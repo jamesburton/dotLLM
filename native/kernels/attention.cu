@@ -18,13 +18,36 @@
 //                          are baked into the graph at instantiate time but the
 //                          KV length grows by 1 per replay. Zero extra sync —
 //                          host bumps a 4-byte cuMemcpyHtoD before each launch.
+//
+// Issue #218: attention_f16_dyn was measurably slower per launch than
+// attention_f16 at matched seq_kv (ncu: +25% duration, +25% warp cycles per
+// issued instruction, CTA-barrier wait up ~3.4 cycles — see
+// .perf-runs/ncu-2026-07-28/README.md). SASS inspection (ptxas -arch=sm_86,
+// cuobjdump --dump-sass) showed the two seq_kv_ptr/position_offset_ptr LDGs were
+// ALREADY scheduled as early as physically possible (the first two real
+// instructions after the block-bounds early-exit, ~50-90 independent
+// instructions before first use) — so "issue the read earlier" was not
+// actionable, that part of the original hypothesis is refuted. What SASS did
+// show: every one of the 256 threads (8 warps) independently executes its own
+// copy of both LDGs, even though the address is block-uniform — 8x the
+// redundant memory latency exposure of the scalar entry point, which instead
+// reads from the (effectively free) constant/parameter bank. The fix below has
+// only thread 0 dereference the two pointers once and broadcast the values via
+// shared memory, timed to resolve at the body's PRE-EXISTING first
+// __syncthreads() (after the Q-vector load + accumulator init) rather than
+// introducing a new barrier — so the single load's latency overlaps with work
+// every thread already has to do, instead of 8 independent per-warp stalls.
+// Templated on a compile-time bool so attention_f16's SASS is provably
+// unaffected (the dead branches fold away entirely for DeviceIndirect=false).
 
 #include <cuda_fp16.h>
 #include <float.h>
 
 #define TILE_KV 256
 
-// Body shared by both entry points. Inlined into each.
+// Body shared by both entry points. Inlined into each. seq_kv_ptr/position_offset_ptr
+// are only read (by thread 0) when DeviceIndirect is true; pass nullptr otherwise.
+template <bool DeviceIndirect>
 __device__ __forceinline__ void attention_f16_body(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -36,7 +59,9 @@ __device__ __forceinline__ void attention_f16_body(
     int num_kv_heads,
     int head_dim,
     int position_offset,
-    int sliding_window);
+    int sliding_window,
+    const int* __restrict__ seq_kv_ptr,
+    const int* __restrict__ position_offset_ptr);
 
 extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const half* __restrict__ q,
@@ -51,13 +76,15 @@ extern "C" __global__ void __launch_bounds__(256) attention_f16(
     const int position_offset,
     const int sliding_window)
 {
-    attention_f16_body(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
-                       head_dim, position_offset, sliding_window);
+    attention_f16_body<false>(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
+                       head_dim, position_offset, sliding_window, nullptr, nullptr);
 }
 
 // Graph-friendly entry point: seq_kv and position_offset are dereferenced from
 // 4-byte device buffers. Host increments these via cuMemcpyHtoD between
-// cuGraphLaunch calls (~1 µs vs 22 µs/launch on WDDM).
+// cuGraphLaunch calls (~1 µs vs 22 µs/launch on WDDM). The dereference itself
+// happens inside attention_f16_body<true> (thread 0 only, broadcast via shared
+// memory) — see the file header comment for why.
 extern "C" __global__ void __launch_bounds__(256) attention_f16_dyn(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -71,12 +98,13 @@ extern "C" __global__ void __launch_bounds__(256) attention_f16_dyn(
     const int* __restrict__ position_offset_ptr,
     const int sliding_window)
 {
-    int seq_kv = seq_kv_ptr[0];
-    int position_offset = position_offset_ptr[0];
-    attention_f16_body(q, k, v, output, seq_q, seq_kv, num_heads, num_kv_heads,
-                       head_dim, position_offset, sliding_window);
+    attention_f16_body<true>(q, k, v, output, seq_q, /*seq_kv resolved post-barrier*/ 0,
+                       num_heads, num_kv_heads, head_dim,
+                       /*position_offset resolved post-barrier*/ 0, sliding_window,
+                       seq_kv_ptr, position_offset_ptr);
 }
 
+template <bool DeviceIndirect>
 __device__ __forceinline__ void attention_f16_body(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -88,7 +116,9 @@ __device__ __forceinline__ void attention_f16_body(
     int num_kv_heads,
     int head_dim,
     int position_offset,
-    int sliding_window)
+    int sliding_window,
+    const int* __restrict__ seq_kv_ptr,
+    const int* __restrict__ position_offset_ptr)
 {
     int block_id = blockIdx.x;
     int total_blocks = seq_q * num_heads;
@@ -105,14 +135,14 @@ __device__ __forceinline__ void attention_f16_body(
     int q_stride = num_heads * head_dim;
     int kv_stride = num_kv_heads * head_dim;
 
-    // Absolute position for causal masking
-    int pos_q = position_offset + tq;
-
     // Shared memory layout (fixed size, independent of seq_kv):
     //   q_shared[head_dim]     — Q vector cached for reuse
     //   score_tile[TILE_KV]    — attention scores for current tile
     //   out_accum[head_dim]    — weighted V accumulator
-    //   warp_scratch[32]       — reduction workspace
+    //   warp_scratch[32]       — reduction workspace (only indices [0, nw) are ever
+    //                            used by the reductions below, nw = ceil(256/32) = 8;
+    //                            indices [30, 31] are permanently dead space, reused
+    //                            below as the seq_kv/position_offset broadcast slot)
     extern __shared__ float smem[];
     float* q_shared    = smem;
     float* score_tile  = smem + head_dim;
@@ -121,6 +151,18 @@ __device__ __forceinline__ void attention_f16_body(
 
     int lane = threadIdx.x % warpSize;
     int warp_id = threadIdx.x / warpSize;
+
+    // Issue #218: for the dyn entry point, only thread 0 dereferences seq_kv_ptr /
+    // position_offset_ptr (one LDG each, not one per warp) and stashes them in the
+    // dead tail of warp_scratch. This issues concurrently with every thread's Q-load
+    // + accumulator-init work below and is consumed only after that work's
+    // pre-existing __syncthreads() — no new barrier is introduced.
+    int* bcast = (int*)(warp_scratch + 30);
+    if (DeviceIndirect && threadIdx.x == 0)
+    {
+        bcast[0] = seq_kv_ptr[0];
+        bcast[1] = position_offset_ptr[0];
+    }
 
     // Step 1: Load Q vector into shared memory (FP16 → FP32)
     const half* q_vec = q + (size_t)tq * q_stride + hq * head_dim;
@@ -131,6 +173,15 @@ __device__ __forceinline__ void attention_f16_body(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
         out_accum[d] = 0.0f;
     __syncthreads();
+
+    if (DeviceIndirect)
+    {
+        seq_kv = bcast[0];
+        position_offset = bcast[1];
+    }
+
+    // Absolute position for causal masking
+    int pos_q = position_offset + tq;
 
     // Step 2: Process KV in tiles with online softmax
     float running_max = -FLT_MAX;
