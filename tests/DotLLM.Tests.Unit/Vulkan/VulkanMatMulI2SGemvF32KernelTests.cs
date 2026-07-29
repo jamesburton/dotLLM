@@ -33,6 +33,29 @@ public class VulkanMatMulI2SGemvF32KernelTests
     [InlineData(2560, 2560)]  // BitNet hidden × hidden (o_proj-ish)
     [InlineData(576, 1024)]
     public void Launch_MatchesScalarReference(int m, int k)
+        => RunParity("matmul_i2_s_f32_gemv.spv", m, k);
+
+    /// <summary>
+    /// Same parity contract for the subgroup-reduction variant, which replaces the 128-entry
+    /// shared-memory tree reduce with <c>subgroupAdd</c> plus a single cross-subgroup step.
+    /// Only the reduction differs, so what these rows actually guard is that the cross-subgroup
+    /// step sums every subgroup's partial exactly once — a bug there shows up as a value scaled
+    /// by a whole fraction, which the k-varying rows catch since they change the lane workload.
+    /// </summary>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    [SkippableTheory]
+    [InlineData(1, 128)]      // single block — most lanes contribute zero to the reduction
+    [InlineData(8, 128)]
+    [InlineData(4, 256)]      // two blocks
+    [InlineData(16, 768)]
+    [InlineData(2048, 256)]   // BitNet-class output dim
+    [InlineData(2560, 2560)]  // BitNet hidden × hidden (o_proj-ish)
+    [InlineData(576, 1024)]
+    public void Subgroup_MatchesScalarReference(int m, int k)
+        => RunParity("matmul_i2_s_f32_gemv_sg.spv", m, k);
+
+    private static void RunParity(string spvFileName, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -58,7 +81,7 @@ public class VulkanMatMulI2SGemvF32KernelTests
         }
 
         using var device = VulkanDevice.Create();
-        using var kernel = MatMulI2SGemvF32Kernel.Create(device, spvDir);
+        using var kernel = MatMulI2SGemvF32Kernel.Create(device, spvDir, spvFileName);
 
         long weightsBufBytes = ((long)weightsI2S.Length + 3) & ~3L;
         using var bufW = device.Allocate(weightsBufBytes);
