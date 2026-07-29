@@ -150,6 +150,10 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _attentionF32SplitKvFunc;
     private int _attnSplitKvMaxCoResidentGrid = -1; // -1 = not yet queried
     private int _attnSplitKvCachedHeadDim = -1;      // headDim the cached query above is valid for
+    // Issue #226 spike: fp64-combine variant of attention_f32_split_kv.
+    private readonly nint _attentionF32SplitKvHpFunc;
+    private int _attnSplitKvHpMaxCoResidentGrid = -1;
+    private int _attnSplitKvHpCachedHeadDim = -1;
     // Combined GQA-group + split-KV kernel (issues #197 + #198): grid = (numKvHeads, kv_split).
     private readonly nint _attentionF32GqaSplitKvFunc;
     private int _attnGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
@@ -585,6 +589,9 @@ public sealed unsafe class CudaKernels : IDisposable
         // still loads gracefully; HasAttentionF32SplitKv reports false and callers fall back to
         // the exact LaunchAttentionF32 path unconditionally.
         _attentionF32SplitKvFunc = _attentionF32Module.TryGetFunction("attention_f32_split_kv");
+        // Optional (issue #226 spike) -- fp64-combine variant of attention_f32_split_kv, see that
+        // kernel's header for scope. TryGetFunction: stale PTX without it just disables the gate.
+        _attentionF32SplitKvHpFunc = _attentionF32Module.TryGetFunction("attention_f32_split_kv_hp");
         // Optional (issues #197+#198) -- TryGetFunction so a stale PTX without the combined
         // GQA-group + split-KV kernel still loads gracefully; HasAttentionF32GqaSplitKv reports
         // false and callers fall back to attention_f32_split_kv / LaunchAttentionF32.
@@ -2010,6 +2017,89 @@ public sealed unsafe class CudaKernels : IDisposable
                 sharedBytes, stream, (nint)args).ThrowOnError();
     }
 
+    // ─── Issue #226 spike: fp64-combine variant of attention_f32_split_kv ──────────────────────
+    //
+    // Same grid/block/shared-memory shape as LaunchAttentionF32SplitKv; the ONLY kernel-side
+    // difference is the cross-split combine step accumulates in double instead of float (see
+    // attention_f32_split_kv_hp's header in attention_f32.cu). Separate function pointer, separate
+    // opt-in gate (DOTLLM_ATTN_SPLIT_KV_HP=1) so it can be A/B'd against the plain split-KV kernel
+    // without a rebuild. Whether this actually reduces the #222-documented divergence, and at what
+    // perf cost, is exactly what issue #226 measures -- no verdict assumed here.
+
+    /// <summary>Whether the opt-in fp64-combine <c>attention_f32_split_kv_hp</c> kernel (issue
+    /// #226) is present in the loaded PTX.</summary>
+    public bool HasAttentionF32SplitKvHp => _attentionF32SplitKvHpFunc != 0;
+
+    /// <summary>
+    /// Opt-in (default OFF) env-var gate for <see cref="LaunchAttentionF32SplitKvHp"/>. Issue #226
+    /// spike: does accumulating the cross-split combine (partial_max/partial_sum/partial_out
+    /// merge) in double precision reduce the real-generation argmax divergence #222 found in the
+    /// float-combine <see cref="LaunchAttentionF32SplitKv"/>? <c>fast_exp_neg</c> itself is
+    /// untouched (still float, still the same approximation) -- only the summation of its already-
+    /// computed outputs across the (up to) <see cref="AttentionKvSplit"/> terms changes precision.
+    /// </summary>
+    public static bool EnableAttentionSplitKvHp { get; set; } =
+        Environment.GetEnvironmentVariable("DOTLLM_ATTN_SPLIT_KV_HP") == "1";
+
+    /// <summary>Same co-residency safety check as <see cref="IsAttentionSplitKvSafe"/>, queried
+    /// independently against <c>attention_f32_split_kv_hp</c>'s own function pointer (its register
+    /// footprint may differ slightly from the plain kernel's due to the double-precision locals in
+    /// the combine block).</summary>
+    public bool IsAttentionSplitKvHpSafe(int numHeads, int headDim)
+    {
+        if (_attentionF32SplitKvHpFunc == 0) return false;
+
+        if (_attnSplitKvHpMaxCoResidentGrid < 0 || _attnSplitKvHpCachedHeadDim != headDim)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnSplitKvHpMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                const int TileKv = 256;
+                uint sharedBytesForQuery = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionF32SplitKvHpFunc, BlockSize, sharedBytesForQuery);
+                _attnSplitKvHpMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnSplitKvHpCachedHeadDim = headDim;
+        }
+
+        return _attnSplitKvHpMaxCoResidentGrid > 0 && numHeads * AttentionKvSplit <= _attnSplitKvHpMaxCoResidentGrid;
+    }
+
+    /// <summary>fp64-combine variant of <see cref="LaunchAttentionF32SplitKv"/> (issue #226) --
+    /// identical signature/scratch-buffer layout, callers can share the same scratch allocation
+    /// and safety-check call site pattern.</summary>
+    public void LaunchAttentionF32SplitKvHp(nint q, nint k, nint v, nint output,
+                                     int seqKv, int numHeads, int numKvHeads, int headDim,
+                                     int positionOffset, int slidingWindow,
+                                     nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, hdArg = headDim;
+        int poArg = positionOffset, swArg = slidingWindow;
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &hdArg,
+                        &poArg, &swArg, &pmArg, &psArg, &poutArg};
+
+        const int TileKv = 256;
+        uint sharedBytes = (uint)((headDim + TileKv + headDim + 32) * sizeof(float));
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionF32SplitKvHpFunc,
+                (uint)numHeads, AttentionKvSplit, 1, BlockSize, 1, 1,
+                sharedBytes, stream, (nint)args).ThrowOnError();
+    }
+
     // ─── OPT-IN combined GQA-group + split-KV kernel (issues #197 + #198) ─────────────────────
     //
     // attention_f32_split_kv (above) grids one block per QUERY head. attention_f32_gqa_split_kv
@@ -2069,11 +2159,43 @@ public sealed unsafe class CudaKernels : IDisposable
 
     /// <summary>
     /// Minimum KV rows per split before further splitting stops paying for its own grid.sync +
-    /// combine overhead. Default derived from the same RTX-3060 sweep as
-    /// <see cref="AttnSplitTargetBlocks"/>. Override via <c>DOTLLM_CUDA_SPLIT_MIN_KV</c>.
+    /// combine overhead. Override via <c>DOTLLM_CUDA_SPLIT_MIN_KV</c>.
     /// </summary>
+    /// <remarks>
+    /// <b>Issue #219 fix (was 128):</b> at 128, this term was the BINDING clamp in
+    /// <see cref="ComputeAttentionKvSplit"/> at real Bonsai-27B decode depths (seqKv~258-270),
+    /// overriding <see cref="AttnSplitTargetBlocks"/>'s occupancy target entirely -- it forced
+    /// <c>kv_split=3</c> (grid=12 blocks) when the occupancy term (<c>byOccupancy=8</c> for
+    /// numKvHeads=4) and the co-residency ceiling (<c>maxSafeSplit=35</c>) both allowed far more.
+    /// grid=12 is HALF the pre-split baseline's grid=24, i.e. the "fix" made grid fill worse, not
+    /// better -- confirmed via <c>ncu --set full</c> (issue #199's finding, root-caused in #219):
+    /// duration 174-176us, Achieved Occupancy 16.5-16.7% (statistically identical to the unsplit
+    /// baseline's 16.6-16.8%), Waves/SM 0.09 (worse than baseline's 0.14).
+    /// <para/>
+    /// Lowering to 32 lets <c>byOccupancy</c> become the binding term at this shape/depth as the
+    /// heuristic's own doc comment always intended (<c>S = clamp(TargetBlocks/baseBlocks, 1,
+    /// ceil(seqKv/MinKvPerSplit))</c>, hard-clamped to <c>maxSafeSplit</c>) -- re-profiled
+    /// (<c>ncu --set full</c>, same shape/depth): kv_split=8 (grid=32, now above the unsplit
+    /// baseline's grid=24 as designed), duration 144-146us (~17% faster than the pre-fix 174-176us
+    /// launches), Achieved Occupancy 18.7-19.2% (up from 16.5-16.7%), Waves/SM 0.23 (up from
+    /// 0.09), Compute Throughput 15.7-15.8% (up from 9.3-9.4%).
+    /// <para/>
+    /// <b>This does NOT make the split kernel beat the plain unsplit path</b> at this shape/depth
+    /// -- the fixed 144-146us launches are still ~37% slower than <c>attention_f32</c>'s
+    /// 105-106us at the same seqKv (memory throughput only reaches 16.8-20.6% vs baseline's
+    /// 44.6-45.0%; the cooperative-launch grid.sync()+combine overhead appears to dominate, not
+    /// the intended K/V-read amortization). Pushing further (kv_split=16, grid=64, via
+    /// <c>DOTLLM_CUDA_SPLIT_TARGET_BLOCKS=64</c> + this var at 16) raises Achieved Occupancy
+    /// further (32-45%, avg ~38%) but duration is FLAT-TO-WORSE (148-150us) and Warp
+    /// Cycles/Instruction regresses (28.5 vs 18.6-18.8 at kv_split=8) -- confirms occupancy is no
+    /// longer the binding constraint past ~8 splits for this shape, so 32 (giving kv_split=8 at
+    /// numKvHeads=4) is kept as the default rather than pushed further. Net: this fixes the
+    /// heuristic to behave as documented (a real, ncu-validated improvement whenever
+    /// <c>DOTLLM_ATTN_GQA_SPLIT=1</c> IS enabled), but the feature stays opt-in/default-OFF --
+    /// even fixed, it does not beat the default path at this depth. Full data: issue #219.
+    /// </remarks>
     private static readonly int AttnSplitMinKvPerSplit =
-        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_MIN_KV", 128);
+        EnvIntOrDefault("DOTLLM_CUDA_SPLIT_MIN_KV", 32);
 
     /// <summary>
     /// Occupancy-target split-count heuristic (issue #197), form ported from Vulkan's
