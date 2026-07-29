@@ -9,12 +9,18 @@ namespace DotLLM.Vulkan.Kernels;
 /// <param name="SpvFileName">File name of the SPIR-V module within the <c>spv</c> directory.</param>
 /// <param name="TileM">Weight rows of <c>C</c> produced per workgroup.</param>
 /// <param name="TileN">Token rows of <c>C</c> produced per workgroup.</param>
+/// <param name="RequiresCooperativeMatrix">
+/// <c>true</c> when the variant's SPIR-V uses <c>VK_KHR_cooperative_matrix</c> and therefore
+/// cannot be created on a device that does not advertise it.
+/// </param>
 /// <remarks>
 /// Variants exist so a benchmark can A/B them side by side in one process — the
 /// interleaved-paired methodology the Arc requires cannot span processes. Every variant
-/// computes the identical result; only the thread-to-output mapping differs.
+/// computes the same result; the thread-to-output mapping differs, and the coopmat variant
+/// additionally carries F16 operand rounding (see <see cref="Coopmat"/>).
 /// </remarks>
-public readonly record struct I2SGemmVariant(string SpvFileName, int TileM, int TileN)
+public readonly record struct I2SGemmVariant(
+    string SpvFileName, int TileM, int TileN, bool RequiresCooperativeMatrix = false)
 {
     /// <summary>
     /// Baseline: 16x16 tile, one thread per output cell (0.5 MAC per shared load).
@@ -29,6 +35,21 @@ public readonly record struct I2SGemmVariant(string SpvFileName, int TileM, int 
     /// arithmetic intensity converts almost directly to wall-clock.
     /// </summary>
     public static I2SGemmVariant RegisterBlocked => new("matmul_i2_s_f32_gemm_rb.spv", 32, 32);
+
+    /// <summary>
+    /// Cooperative-matrix: 16x16 tile, one subgroup per workgroup, F16 operands into an F32
+    /// accumulator. Requires <c>VK_KHR_cooperative_matrix</c>.
+    /// </summary>
+    /// <remarks>
+    /// Numerically looser than the F32-throughout scalar and register-blocked variants, but
+    /// tighter than the Q8_0 coopmat kernel: I2_S has a single per-tensor scale, so the raw
+    /// ternary values {-1, 0, +1} are staged exactly in F16 and the scale is applied once to
+    /// the F32 accumulator. The A operand therefore contributes no rounding error — unlike
+    /// Q8_0, which must fold its per-block scale into the F16 A operand. All F16 error comes
+    /// from the activation cast alone.
+    /// </remarks>
+    public static I2SGemmVariant Coopmat =>
+        new("matmul_i2_s_f32_gemm_coopmat.spv", 16, 16, RequiresCooperativeMatrix: true);
 
     /// <summary>The variant used by the production forward path.</summary>
     public static I2SGemmVariant Production => RegisterBlocked;
@@ -88,8 +109,19 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
     /// <param name="variant">Which GEMM shader variant to load.</param>
     /// <returns>A kernel bound to the requested variant.</returns>
     /// <exception cref="FileNotFoundException">The variant's SPIR-V is missing from <paramref name="spvDir"/>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The variant needs <c>VK_KHR_cooperative_matrix</c> and the device does not advertise it.
+    /// Callers should check <see cref="VulkanDevice.HasCooperativeMatrix"/> first and fall back
+    /// to <see cref="I2SGemmVariant.RegisterBlocked"/>.
+    /// </exception>
     public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir, I2SGemmVariant variant)
     {
+        if (variant.RequiresCooperativeMatrix && !device.HasCooperativeMatrix)
+            throw new InvalidOperationException(
+                $"I2_S GEMM variant '{variant.SpvFileName}' requires VK_KHR_cooperative_matrix support. " +
+                "Check VulkanDevice.HasCooperativeMatrix before calling Create() and fall back to " +
+                "I2SGemmVariant.RegisterBlocked when it is false.");
+
         string path = Path.Combine(spvDir, variant.SpvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(

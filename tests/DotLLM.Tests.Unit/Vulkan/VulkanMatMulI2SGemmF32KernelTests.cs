@@ -54,7 +54,35 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void RegisterBlocked_MatchesScalarReference(int m, int k, int n)
         => RunParity(I2SGemmVariant.RegisterBlocked, m, k, n);
 
-    private static void RunParity(I2SGemmVariant variant, int m, int k, int n)
+    /// <summary>
+    /// Same parity contract for the cooperative-matrix variant, at a tolerance widened for its
+    /// F16 operands. Skipped on devices without <c>VK_KHR_cooperative_matrix</c>.
+    /// </summary>
+    /// <remarks>
+    /// Tolerance rationale: the ternary A operand {-1, 0, +1} is exact in F16 and the per-tensor
+    /// scale is applied to the F32 accumulator, so the ONLY F16 error is the activation cast —
+    /// ~2^-11 relative per element, accumulating as a sqrt(K) random walk. At K=2560 that is
+    /// ~50 x 2^-11 ~ 2.4e-2 relative on a unit-scale dot product before the (small) scale, hence
+    /// 3e-2 absolute. Still tight enough to catch tile-layout, staging and store-path bugs, which
+    /// are the failure modes this kernel actually risks. The F32 scalar variant remains the
+    /// reference on every shape.
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(16, 128, 4)]      // exactly one coopmat tile
+    [InlineData(32, 256, 8)]      // 2 tiles in m, 2 blocks per row
+    [InlineData(64, 128, 16)]     // 4 tiles in m, one full tile in n
+    [InlineData(48, 768, 12)]     // partial tile in n -> exercises the staged scatter store
+    [InlineData(17, 256, 33)]     // ragged in both dims -> bounds-guarded store path
+    [InlineData(15, 128, 3)]      // smaller than one tile in both dims
+    [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden, small prefill batch
+    public void Coopmat_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.Coopmat, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
+    private static void RunParity(
+        I2SGemmVariant variant, int m, int k, int n, float absTol = AbsTol, float relTol = RelTol)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -83,6 +111,8 @@ public class VulkanMatMulI2SGemmF32KernelTests
         }
 
         using var device = VulkanDevice.Create();
+        Skip.If(variant.RequiresCooperativeMatrix && !device.HasCooperativeMatrix,
+            "Device does not advertise VK_KHR_cooperative_matrix.");
         using var kernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, variant);
 
         long weightsBufBytes = ((long)weightsI2S.Length + 3) & ~3L;
@@ -104,7 +134,7 @@ public class VulkanMatMulI2SGemmF32KernelTests
             {
                 int idx = t * m + r;
                 float diff = MathF.Abs(expected[idx] - actual[idx]);
-                float tol = AbsTol + RelTol * MathF.Abs(expected[idx]);
+                float tol = absTol + relTol * MathF.Abs(expected[idx]);
                 Assert.True(diff <= tol,
                     $"{variant.SpvFileName} cell t={t} m={r} (m={m}, k={k}, n={n}): expected {expected[idx]:G9}, got {actual[idx]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
             }
