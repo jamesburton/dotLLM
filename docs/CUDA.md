@@ -742,6 +742,65 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   clean regrid rather than something register-pressure-bound, but does not substitute for a real
   `ncu` capture. A future session with UAC access should re-run `ncu --set full` on this kernel
   before considering the occupancy claim independently confirmed.
+  **Follow-up investigation (issues #199/#200/#219/#220/#222/#226/#227, 2026-07-27→28): tensor
+  cores parked, a real kv_split bug found + fixed, and #183's precision disqualified it from
+  default-on despite being the strongest performer found.**
+  - **#199 (tensor-core decode kernel): not attempted, correctly blocked at the design stage.** A
+    literal port of Vulkan's coopmat decode kernel would have regressed #197/#198's KV-head-grid
+    design (Vulkan grids per query-head with padding; #197/#198 deliberately grids per KV-head to
+    amortize reads across Bonsai's group=6 sibling heads — porting Vulkan's scheme would throw that
+    away). Bonsai's `headDim=256` also doesn't fit the existing prefill mma kernel's `headDim=64`
+    hardcoding, so this would be from-scratch design work, not a port. Correctly deferred pending
+    confirmation that the kernel is still latency-bound after #197/#198 (see #219 below — it
+    isn't, in the way assumed).
+  - **#200 (native paged-KV decode kernel): not attempted, no producer exists.** CUDA has no paged
+    KV-cache implementation at all — `PagedKvCache` is CPU-only; every CUDA path (`run`/`chat`/
+    `serve`) that requests paging silently falls back to the native non-paged cache. Nothing for
+    a "read paged blocks directly" kernel to attach to. Real prerequisite: a CUDA paged KV-cache
+    implementation, worth building once continuous batching (already tracked) makes multi-sequence
+    paged decode the common case.
+  - **#219: found and fixed a real kv_split grid-sizing bug in #197/#198's own heuristic.**
+    `ComputeAttentionKvSplit`'s `AttnSplitMinKvPerSplit` term (default 128) was the binding clamp
+    at Bonsai's actual decode depth (seqKv~258-270), forcing `kv_split=3` (grid=12 — *half* the
+    unsplit baseline's grid=24) instead of the intended `byOccupancy=8`. Fixed via #220 (merged):
+    lowered to 32. `ncu`-confirmed: grid 12→32, duration 174-176us→144-146us (~17% faster),
+    occupancy 16.5%→18.8%. Still ~37% slower than the unsplit baseline at this depth even fixed —
+    stays opt-in/default-OFF. The "32" target is depth-specific, not universal (item 4 of #219: at
+    depth 768, target=96 helps further, but even matched-grid the GQA-split design still trails
+    #183's simpler kernel by ~20% — its register-blocking approach carries overhead grid size alone
+    doesn't close).
+  - **#219 also re-tested #183 (`DOTLLM_ATTN_SPLIT_KV`) at the depth range its original A/B never
+    reached** (the depth>=768 hang above is gone on current `dev`). Result: the cleanest win in
+    this whole investigation family — 194us vs 274-276us (~29% faster), occupancy 16.6%→57%
+    (3.4x), Waves/SM 0.14→0.69. Structurally simpler (fixed `SPLIT=4`, no GQA register-blocking)
+    than #197/#198/#220's design, and beats it even after that design is grid-size-tuned.
+  - **#222: that win is precision-unsafe — #183 changes generated output for any context beyond
+    256 tokens, not a rare edge case.** Real end-to-end generation-parity test (Bonsai-27B,
+    deterministic sampling) found the first divergence at generated-step 225 (decode depth 257 —
+    the earliest point the kernel can engage): a genuine argmax flip (baseline margin 0.076 vs
+    split-KV margin 0.011) that fully compounds via the sampled-token feedback loop — 774/775
+    subsequent tokens differ. Perplexity confirms independently: flat pre-gate (-0.02%, as expected
+    since the kernel can't engage there), +0.30% post-gate. **Recommendation: #183 stays opt-in/
+    default-OFF** — the fastest kernel found here is not a safe default despite the win being real.
+  - **#226/#227: tried fp64 accumulation in the cross-split combine step to reduce the
+    reassociation error — no improvement, clean negative result.** Root cause is *not* `fast_exp_neg`
+    (this file's header already documents why precise `expf` was rejected — CPU/GPU parity, both
+    the baseline and split-KV kernels already use the same approximation identically) and *not* the
+    final 4-way merge arithmetic: the double-precision combine variant (`attention_f32_split_kv_hp`,
+    opt-in `DOTLLM_ATTN_SPLIT_KV_HP=1`, PR #227 open/not merged) diverges at the *identical* step
+    225 with an essentially identical margin and perplexity delta. The reassociation error is
+    already baked into each split's own independent partial accumulation (computed in float, over a
+    different KV sub-range/order than the baseline's single pass) *before* the combine runs — fixing
+    that would need higher precision in the per-split accumulation itself, a materially bigger
+    change than scoped, and an open question rather than a next task.
+  - **Net for this line of work**: three kernel variants now exist for decode attention
+    (`attention_f32` baseline, `attention_f32_split_kv` #183, `attention_f32_gqa_split_kv` #197/
+    #198/#220), all correctness-validated and zero-default-risk, but only the baseline is safe as
+    default — #183 is faster but changes output; the GQA-split design is neither faster nor safer.
+    A tensor-core rewrite (#199) remains the only lever not yet tried that could plausibly beat
+    #183's raw speed *and* stay numerically closer to baseline (different algorithm shape, not a
+    reassociated split of the same one) — worth reconsidering once continuous batching or another
+    driver makes the investment timing right.
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
