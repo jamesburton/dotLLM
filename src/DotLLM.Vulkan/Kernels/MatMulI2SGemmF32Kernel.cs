@@ -3,6 +3,38 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan.Kernels;
 
 /// <summary>
+/// Identifies an I2_S GEMM shader variant: which SPIR-V to load and the output-tile
+/// dimensions that shader was compiled for (they determine the dispatch group count).
+/// </summary>
+/// <param name="SpvFileName">File name of the SPIR-V module within the <c>spv</c> directory.</param>
+/// <param name="TileM">Weight rows of <c>C</c> produced per workgroup.</param>
+/// <param name="TileN">Token rows of <c>C</c> produced per workgroup.</param>
+/// <remarks>
+/// Variants exist so a benchmark can A/B them side by side in one process — the
+/// interleaved-paired methodology the Arc requires cannot span processes. Every variant
+/// computes the identical result; only the thread-to-output mapping differs.
+/// </remarks>
+public readonly record struct I2SGemmVariant(string SpvFileName, int TileM, int TileN)
+{
+    /// <summary>
+    /// Baseline: 16x16 tile, one thread per output cell (0.5 MAC per shared load).
+    /// Retained as the benchmark comparand; <see cref="RegisterBlocked"/> supersedes it in production.
+    /// </summary>
+    public static I2SGemmVariant Scalar => new("matmul_i2_s_f32_gemm.spv", 16, 16);
+
+    /// <summary>
+    /// Register-blocked: 32x32 tile, one 2x2 micro-tile per thread (1.0 MAC per shared load).
+    /// Measured 1.63-1.67x faster than <see cref="Scalar"/> across the BitNet 2B4T projection
+    /// shapes on Meteor-Lake Arc (Xe-LPG) — the kernel is shared-memory-bound, so doubling
+    /// arithmetic intensity converts almost directly to wall-clock.
+    /// </summary>
+    public static I2SGemmVariant RegisterBlocked => new("matmul_i2_s_f32_gemm_rb.spv", 32, 32);
+
+    /// <summary>The variant used by the production forward path.</summary>
+    public static I2SGemmVariant Production => RegisterBlocked;
+}
+
+/// <summary>
 /// I2_S (BitNet b1.58 ternary) prefill-path batched GEMM:
 /// <c>C[N, M] = B[N, K] @ W_i2s[M, K]^T</c>.
 /// </summary>
@@ -23,8 +55,6 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
     /// <summary>Elements per I2_S block.</summary>
     public const int I2SGroupSize = 128;
 
-    private const int TileM = 16;
-    private const int TileN = 16;
     private const int PushConstantBytes = 5 * sizeof(uint); // M, K, N, blocksPerRow, rowUints
 
     private readonly VulkanDevice _device;
@@ -32,21 +62,35 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
     private readonly DescriptorSetCache _descriptorCache;
+    private readonly int _tileM;
+    private readonly int _tileN;
     private bool _disposed;
 
-    private MatMulI2SGemmF32Kernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private MatMulI2SGemmF32Kernel(
+        VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool, int tileM, int tileN)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _tileM = tileM;
+        _tileN = tileN;
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
-    /// <summary>Loads <c>matmul_i2_s_f32_gemm.spv</c> from the given directory and creates the pipeline.</summary>
+    /// <summary>Loads the production I2_S GEMM variant and creates the pipeline.</summary>
     public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir)
+        => Create(device, spvDir, I2SGemmVariant.Production);
+
+    /// <summary>Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline.</summary>
+    /// <param name="device">Device to create the pipeline on.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V modules.</param>
+    /// <param name="variant">Which GEMM shader variant to load.</param>
+    /// <returns>A kernel bound to the requested variant.</returns>
+    /// <exception cref="FileNotFoundException">The variant's SPIR-V is missing from <paramref name="spvDir"/>.</exception>
+    public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir, I2SGemmVariant variant)
     {
-        string path = Path.Combine(spvDir, "matmul_i2_s_f32_gemm.spv");
+        string path = Path.Combine(spvDir, variant.SpvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(
                 $"Vulkan SPIR-V not found: {path}. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
@@ -71,7 +115,7 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
         }
 
         nint pool = KernelSupport.CreateDescriptorPool(device, buffersPerSet: 3);
-        return new MatMulI2SGemmF32Kernel(device, module, pipeline, pool);
+        return new MatMulI2SGemmF32Kernel(device, module, pipeline, pool, variant.TileM, variant.TileN);
     }
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
@@ -138,8 +182,8 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
                 0, PushConstantBytes, (nint)pcPtr);
         }
 
-        uint groupsX = (uint)((m + TileM - 1) / TileM);
-        uint groupsY = (uint)((n + TileN - 1) / TileN);
+        uint groupsX = (uint)((m + _tileM - 1) / _tileM);
+        uint groupsY = (uint)((n + _tileN - 1) / _tileN);
         VulkanApi.vkCmdDispatch(cmdBuf, groupsX, groupsY, 1);
     }
 

@@ -31,6 +31,30 @@ public class VulkanMatMulI2SGemmF32KernelTests
     [InlineData(15, 128, 3)]      // m < TILE_M, n < TILE_N — partial-tile fallthrough
     [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden, small prefill batch
     public void Launch_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.Scalar, m, k, n);
+
+    /// <summary>
+    /// Same parity contract for the register-blocked variant (32x32 tile, 2x2 micro-tile per
+    /// thread). The extra rows stress the 32-tile edges specifically — the baseline's 16x16
+    /// rows would leave a 32-wide tile's partial-tile guards untested, and it is exactly the
+    /// four separate bounds checks on the micro-tile corners that a mapping bug would break.
+    /// </summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(16, 128, 4)]      // m and n both below TILE — every micro-tile corner guarded
+    [InlineData(32, 256, 8)]      // exactly one tile, 2 blocks per row
+    [InlineData(64, 128, 16)]     // 2 tiles in m, partial in n
+    [InlineData(48, 768, 12)]     // partial tile in both dims, 6 blocks
+    [InlineData(33, 128, 33)]     // one element past a full tile in both dims
+    [InlineData(17, 256, 47)]     // ragged in both dims, straddling the SUB=16 stride
+    [InlineData(15, 128, 3)]      // below the micro-tile stride entirely
+    [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden, small prefill batch
+    public void RegisterBlocked_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.RegisterBlocked, m, k, n);
+
+    private static void RunParity(I2SGemmVariant variant, int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
@@ -59,7 +83,7 @@ public class VulkanMatMulI2SGemmF32KernelTests
         }
 
         using var device = VulkanDevice.Create();
-        using var kernel = MatMulI2SGemmF32Kernel.Create(device, spvDir);
+        using var kernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, variant);
 
         long weightsBufBytes = ((long)weightsI2S.Length + 3) & ~3L;
         using var bufW = device.Allocate(weightsBufBytes);
@@ -82,7 +106,7 @@ public class VulkanMatMulI2SGemmF32KernelTests
                 float diff = MathF.Abs(expected[idx] - actual[idx]);
                 float tol = AbsTol + RelTol * MathF.Abs(expected[idx]);
                 Assert.True(diff <= tol,
-                    $"cell t={t} m={r} (m={m}, k={k}, n={n}): expected {expected[idx]:G9}, got {actual[idx]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
+                    $"{variant.SpvFileName} cell t={t} m={r} (m={m}, k={k}, n={n}): expected {expected[idx]:G9}, got {actual[idx]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
             }
         }
     }
