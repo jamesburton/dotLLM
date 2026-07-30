@@ -1305,7 +1305,24 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
                 && _kernels.IsAttentionSplitKvSafe(numHeads, headDim);
 
-            if (useGqaSplitAttn)
+            // Issue #226 spike: fp64-combine variant, mutually exclusive with (checked before, so
+            // it wins over) the plain split-KV and GQA-split tiers when its own flag is set --
+            // this is a research A/B toggle, not meant to compose with the other opt-in kernels.
+            // Same scratch-buffer layout as plain split-KV, so it reuses that allocation.
+            bool useSplitKvHpAttn = seqLen == 1
+                && CudaKernels.EnableAttentionSplitKvHp
+                && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
+                && _kernels.IsAttentionSplitKvHpSafe(numHeads, headDim);
+
+            if (useSplitKvHpAttn)
+            {
+                EnsureAttentionSplitKvScratch(numHeads, headDim);
+                _kernels.LaunchAttentionF32SplitKvHp(q, kStage, vStage, attnOut,
+                    seqKv, numHeads, numKvHeads, headDim,
+                    positionOffset: positionOffset, slidingWindow: 0,
+                    _attnSplitKvPartialMax, _attnSplitKvPartialSum, _attnSplitKvPartialOut, streamH);
+            }
+            else if (useGqaSplitAttn)
             {
                 int kvSplit = CudaKernels.ComputeAttentionKvSplit(seqKv, numKvHeads, gqaMaxSafeSplit);
                 EnsureAttentionGqaSplitScratch(numHeads, headDim, gqaMaxSafeSplit);
