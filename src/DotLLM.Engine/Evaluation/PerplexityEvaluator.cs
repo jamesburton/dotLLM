@@ -31,7 +31,8 @@ public static class PerplexityEvaluator
         return options.Mode switch
         {
             PerplexityMode.TeacherForced => EvaluateTeacherForced(model, tokens, context),
-            PerplexityMode.SlidingWindow => EvaluateSlidingWindow(model, tokens, context, options.Stride),
+            PerplexityMode.SlidingWindow => EvaluateSlidingWindow(
+                model, tokens, context, options.Stride, options.UnscoredPrefix, options.BosTokenId),
             _ => throw new NotSupportedException($"Unknown mode {options.Mode}."),
         };
     }
@@ -67,20 +68,31 @@ public static class PerplexityEvaluator
         return new PerplexityResult(Math.Exp(meanNll), meanNll, scored, WindowCount: scored);
     }
 
-    // llama.cpp `--perplexity` tiling. Window w covers [w*S, w*S + L) and scores absolute targets
-    // in [w*S + L - S, w*S + L), so every scored token carries L-S tokens of context and the
-    // scored ranges tile the corpus exactly — no gaps, no double-counting. S = L/2 reproduces
-    // llama.cpp's default of scoring the second half of each chunk.
+    // Window w starts at w*Stride and covers [start, start + L); it scores the absolute targets
+    // [start + prefix, start + L), where `prefix` tokens serve as context only.
     //
-    // Targets before the first window's scored range are never scored. llama.cpp skips them too;
-    // "fixing" that would break the comparability this mode exists to provide.
+    // Advance (Stride) and scored span (L - prefix) are INDEPENDENT. llama.cpp advances by the
+    // full window yet scores only its second half, so its scored ranges have gaps; a scheme with
+    // one knob cannot express that, and collapsing them yields the same scored-token *count* over
+    // a different token *set* — a figure that looks comparable and is not. Verified the hard way
+    // against llama.cpp build 8683: contiguous tiling gave 24.88 where llama.cpp gave 24.01.
+    //
+    // Targets before the first window's scored range are never scored; llama.cpp skips them too,
+    // and "fixing" that would break the comparability this mode exists to provide.
     private static unsafe PerplexityResult EvaluateSlidingWindow(
-        IPerplexityModel model, ReadOnlySpan<int> tokens, int context, int stride)
+        IPerplexityModel model, ReadOnlySpan<int> tokens, int context, int stride, int unscoredPrefix,
+        int bosTokenId)
     {
-        if (stride < 1 || stride >= context)
+        if (stride < 1 || stride > context)
             throw new ArgumentException(
-                $"Stride must be in [1, {context - 1}] for a context of {context}; each scored token needs at least one token of context.",
-                nameof(stride));
+                $"Stride must be in [1, {context}] for a context of {context}.", nameof(stride));
+
+        int prefix = unscoredPrefix >= 0 ? unscoredPrefix : context - stride;
+        if (prefix < 1 || prefix >= context)
+            throw new ArgumentException(
+                $"Unscored prefix must be in [1, {context - 1}] for a context of {context}; " +
+                "each scored token needs at least one token of context, and at least one token must be scored.",
+                nameof(unscoredPrefix));
 
         if (!model.ReturnsAllRows)
             throw new NotSupportedException(
@@ -93,15 +105,35 @@ public static class PerplexityEvaluator
         double sumNll = 0;
         int scored = 0, windows = 0;
 
+        // Positions restart at 0 for every window: each is an independent sequence, exactly as
+        // llama.cpp evaluates each chunk. This is also what lets a corpus longer than the model's
+        // max sequence length be scored at all.
+        for (int i = 0; i < context; i++) positions[i] = i;
+
+        // When a BOS id is supplied, each window's first token is replaced by it, mirroring
+        // llama.cpp's perplexity: every chunk is a fresh sequence and is given a sequence start.
+        // The substituted slot sits inside the unscored prefix, so no scored target is altered.
+        int[]? windowBuffer = bosTokenId >= 0 ? new int[context] : null;
+
         for (int start = 0; start + context <= tokens.Length; start += stride)
         {
-            for (int i = 0; i < context; i++) positions[i] = start + i;
+            ReadOnlySpan<int> window;
+            if (windowBuffer is null)
+            {
+                window = tokens.Slice(start, context);
+            }
+            else
+            {
+                tokens.Slice(start, context).CopyTo(windowBuffer);
+                windowBuffer[0] = bosTokenId;
+                window = windowBuffer;
+            }
 
-            using ITensor logits = model.Forward(tokens.Slice(start, context), positions);
+            using ITensor logits = model.Forward(window, positions);
             windows++;
 
-            // Absolute targets [start + context - stride, start + context); row for target t is t-start-1.
-            for (int t = start + context - stride; t < start + context; t++)
+            // Absolute targets [start + prefix, start + context); row for target t is t-start-1.
+            for (int t = start + prefix; t < start + context; t++)
             {
                 int row = t - start - 1;
                 var span = new ReadOnlySpan<float>(

@@ -46,9 +46,13 @@ public static class CorpusReader
             int cut = pending.LastIndexOf(' ');
             if (cut < 0) continue;   // no safe split point yet; keep accumulating
 
+            // The separating space is carried INTO the next chunk, not dropped. GPT-2-style BPE
+            // encodes a leading space as part of the following token, so dropping it silently
+            // changes the token stream — and therefore the perplexity — versus tokenizing the
+            // corpus in one pass.
             string ready = pending[..cut];
             carry.Clear();
-            carry.Append(pending[(cut + 1)..]);
+            carry.Append(pending[cut..]);
 
             foreach (int id in tokenizer.Encode(ready))
             {

@@ -39,9 +39,14 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public int Context { get; set; } = 512;
 
         [CommandOption("--stride")]
-        [Description("Tokens advanced between windows. 0 selects context/2, matching llama.cpp's default.")]
+        [Description("Tokens advanced between window starts. 0 selects the context length (non-overlapping chunks, llama.cpp's default).")]
         [DefaultValue(0)]
         public int Stride { get; set; }
+
+        [CommandOption("--unscored-prefix")]
+        [Description("Leading tokens of each window used as context only. -1 selects context/2 (llama.cpp's default).")]
+        [DefaultValue(-1)]
+        public int UnscoredPrefix { get; set; } = -1;
 
         [CommandOption("--max-tokens|-n")]
         [Description("Cap on corpus tokens consumed. 0 = unbounded.")]
@@ -52,6 +57,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Scoring mode: sliding-window (default, llama.cpp-comparable) or teacher-forced.")]
         [DefaultValue("sliding-window")]
         public string Mode { get; set; } = "sliding-window";
+
+        [CommandOption("--bos")]
+        [Description("Substitute BOS at the start of each window. Match the model's add_bos setting: llama.cpp only does this when the tokenizer requests it.")]
+        [DefaultValue(false)]
+        public bool Bos { get; set; }
 
         [CommandOption("--quant")]
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
@@ -95,7 +105,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             gguf, config, new ThreadingConfig(settings.Threads));
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
-        int effectiveStride = settings.Stride > 0 ? settings.Stride : Math.Max(1, effectiveContext / 2);
+        // Defaults reproduce llama.cpp: non-overlapping chunks, scoring the second half of each.
+        int effectiveStride = settings.Stride > 0 ? settings.Stride : effectiveContext;
+        int effectivePrefix = settings.UnscoredPrefix >= 0
+            ? settings.UnscoredPrefix
+            : Math.Max(1, effectiveContext / 2);
 
         // Streamed, then buffered once: scoring needs random access across windows, but the file
         // itself is never held in memory and the token list is bounded by --max-tokens.
@@ -113,7 +127,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         }
 
         var perplexityModel = new TransformerPerplexityModel(model, deviceId: -1);
-        var options = new PerplexityOptions(mode, effectiveContext, effectiveStride, settings.MaxTokens);
+        int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
+        var options = new PerplexityOptions(
+            mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
 
         var sw = Stopwatch.StartNew();
         PerplexityResult result;
@@ -140,6 +156,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         table.AddRow("Mode", mode == PerplexityMode.SlidingWindow ? "sliding-window" : "teacher-forced");
         table.AddRow("Context", $"{effectiveContext:N0}");
         table.AddRow("Stride", $"{effectiveStride:N0}");
+        table.AddRow("Unscored prefix", $"{effectivePrefix:N0}");
         table.AddRow("Corpus tokens", $"{tokens.Count:N0}");
         table.AddRow("Elapsed", $"{sw.Elapsed.TotalSeconds:F2} s");
         AnsiConsole.Write(table);

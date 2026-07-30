@@ -107,35 +107,108 @@ public sealed class PerplexityEvaluatorTests
     }
 
     [Fact]
-    public void SlidingWindow_ScoresEachTargetAtItsTrueAbsolutePosition()
+    public void SlidingWindow_EvaluatesEachWindowAsAnIndependentSequenceFromPositionZero()
     {
-        // Logits keyed to absolute position: a window that restarts positions at zero scores
-        // different values and fails this.
-        static float[] Rows(int position, int vocab)
+        // llama.cpp evaluates every chunk as a fresh sequence with positions restarting at 0.
+        // That is also what allows a corpus longer than the model's max sequence length to be
+        // scored at all -- absolute positions would run past it and throw.
+        var seenPositions = new List<int>();
+
+        float[] Rows(int position, int vocab)
         {
+            seenPositions.Add(position);
             var row = new float[vocab];
-            row[position % vocab] = 10f;
+            row[0] = 1f;
             return row;
         }
 
-        // Row at absolute position p predicts token p+1, and argmax(row_p) == p % Vocab.
-        // So make tokens[p+1] == p % Vocab, i.e. tokens[i] == (i-1) mod Vocab.
         var tokens = new int[40];
-        for (int i = 0; i < tokens.Length; i++) tokens[i] = (i + Vocab - 1) % Vocab;
+        using var model = new FakePerplexityModel(Vocab, maxContextLength: 16, returnsAllRows: true, Rows);
 
-        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+        PerplexityEvaluator.Evaluate(
+            model, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, 16, Stride: 8));
+
+        // Never a position at or beyond the window length, however far into the corpus we are.
+        Assert.All(seenPositions, p => Assert.InRange(p, 0, 15));
+        Assert.Contains(0, seenPositions);
+    }
+
+    [Fact]
+    public void SlidingWindow_ScoresTargetsFromTheCorrectRow()
+    {
+        // Row i of a window predicts the window's token i+1. A row/target off-by-one shows up as
+        // a confident model scoring badly.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            row[(position + 1) % vocab] = 20f;   // argmax == the id this row should predict
+            return row;
+        }
+
+        // Window-relative: token at window offset j has id j % Vocab, so row j's target is
+        // (j+1) % Vocab -- exactly the argmax above. Stride == context keeps windows aligned to
+        // the same offsets, so this holds for every window.
+        var tokens = new int[64];
+        for (int i = 0; i < tokens.Length; i++) tokens[i] = (i % 16) % Vocab;
+
+        using var model = new FakePerplexityModel(Vocab, 16, returnsAllRows: true, Rows);
         var result = PerplexityEvaluator.Evaluate(
-            model, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, 16, 8));
+            model, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, 16, Stride: 16, UnscoredPrefix: 8));
 
         Assert.True(result.MeanNegativeLogLikelihood < 0.01,
             $"expected confident predictions, got mean NLL {result.MeanNegativeLogLikelihood}");
     }
 
     [Fact]
-    public void SlidingWindow_RejectsStrideNotSmallerThanContext()
+    public void SlidingWindow_RejectsUnscoredPrefixLeavingNothingToScore()
     {
         using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
         Assert.Throws<ArgumentException>(() => PerplexityEvaluator.Evaluate(
-            model, Tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, ContextLength: 16, Stride: 16)));
+            model, Tokens,
+            new PerplexityOptions(PerplexityMode.SlidingWindow, ContextLength: 16, Stride: 16, UnscoredPrefix: 16)));
+    }
+
+    [Fact]
+    public void LlamaCppDefault_UsesNonOverlappingChunksScoringTheSecondHalf()
+    {
+        var tokens = Enumerable.Range(0, 40).ToArray();
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
+
+        // L=16 => chunks at 0, 16 (32 would need tokens up to 48). Each scores its last 8.
+        var result = PerplexityEvaluator.Evaluate(
+            model, tokens, PerplexityOptions.LlamaCppDefault(contextLength: 16));
+
+        Assert.Equal(2, result.WindowCount);
+        Assert.Equal(16, result.ScoredTokens);   // 2 chunks x 8 scored
+        Assert.Equal(2, model.ForwardCalls.Count);
+        Assert.Equal(0, model.ForwardCalls[0][0]);
+        Assert.Equal(16, model.ForwardCalls[1][0]);   // advances by the FULL window, not by 8
+    }
+
+    [Fact]
+    public void LlamaCppDefault_AndContiguousTiling_ScoreDifferentTokenSets()
+    {
+        // The bug this guards: both schemes score the same COUNT, so a count check alone cannot
+        // distinguish them. Only a position-dependent signal reveals the different token sets.
+        // Row at position p predicts token p+1. Give the correct target a confidence that VARIES
+        // with p, so the mean NLL depends on which positions were scored, not merely how many.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            row[(position + 1) % vocab] = 1f + (position % 7);
+            return row;
+        }
+
+        var tokens = new int[64];
+        for (int i = 0; i < tokens.Length; i++) tokens[i] = i % Vocab;
+
+        using var chunked = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+        using var tiled = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+
+        var a = PerplexityEvaluator.Evaluate(chunked, tokens, PerplexityOptions.LlamaCppDefault(16));
+        var b = PerplexityEvaluator.Evaluate(
+            tiled, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, 16, Stride: 8));
+
+        Assert.NotEqual(a.Perplexity, b.Perplexity, 6);
     }
 }
