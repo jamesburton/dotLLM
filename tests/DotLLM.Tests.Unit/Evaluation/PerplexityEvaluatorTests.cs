@@ -47,4 +47,40 @@ public sealed class PerplexityEvaluatorTests
 
         Assert.Equal(result.Perplexity, Math.Exp(result.MeanNegativeLogLikelihood), 9);
     }
+
+    [Fact]
+    public void TeacherForced_LastRowOnlyBackend_MatchesAllRowsBackendExactly()
+    {
+        // Position-dependent but deterministic logits, so a wrong row/position mapping shows up.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            for (int j = 0; j < vocab; j++) row[j] = (float)Math.Sin((position + 1) * (j + 1) * 0.37);
+            return row;
+        }
+
+        using var allRows = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+        using var lastRow = new FakePerplexityModel(Vocab, 64, returnsAllRows: false, Rows);
+        var options = new PerplexityOptions(PerplexityMode.TeacherForced, 32, 32);
+
+        var a = PerplexityEvaluator.Evaluate(allRows, Tokens, options);
+        var b = PerplexityEvaluator.Evaluate(lastRow, Tokens, options);
+
+        Assert.Equal(a.Perplexity, b.Perplexity, 9);
+        Assert.Equal(a.ScoredTokens, b.ScoredTokens);
+    }
+
+    [Fact]
+    public void TeacherForced_LastRowOnlyBackend_ReprefixesGrowingWindows()
+    {
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: false, FakePerplexityModel.Uniform);
+
+        PerplexityEvaluator.Evaluate(
+            model, Tokens, new PerplexityOptions(PerplexityMode.TeacherForced, 32, 32));
+
+        // One forward per scored target, each one token longer than the last.
+        Assert.Equal(31, model.ForwardCalls.Count);
+        for (int i = 0; i < model.ForwardCalls.Count; i++)
+            Assert.Equal(i + 1, model.ForwardCalls[i].Length);
+    }
 }

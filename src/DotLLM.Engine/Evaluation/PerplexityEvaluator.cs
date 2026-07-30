@@ -37,7 +37,34 @@ public static class PerplexityEvaluator
 
     private static PerplexityResult EvaluateTeacherForced(
         IPerplexityModel model, ReadOnlySpan<int> tokens, int context)
-        => TeacherForcedSinglePass(model, tokens, context);
+        => model.ReturnsAllRows
+            ? TeacherForcedSinglePass(model, tokens, context)
+            : TeacherForcedGrowingPrefix(model, tokens, context);
+
+    // Backend returns only the final row, so each target needs its own prefill over the growing
+    // prefix. O(n^2) in forward passes — unavoidable, and the reason the CUDA harnesses that
+    // originated this methodology carry a stride.
+    private static unsafe PerplexityResult TeacherForcedGrowingPrefix(
+        IPerplexityModel model, ReadOnlySpan<int> tokens, int context)
+    {
+        int length = Math.Min(tokens.Length, context);
+        int vocab = model.VocabSize;
+        var positions = new int[length];
+        for (int i = 0; i < length; i++) positions[i] = i;
+
+        double sumNll = 0;
+        int scored = 0;
+        for (int prefix = 1; prefix < length; prefix++)
+        {
+            using ITensor logits = model.Forward(tokens[..prefix], positions.AsSpan(0, prefix));
+            var row = new ReadOnlySpan<float>((void*)logits.DataPointer, vocab);
+            sumNll += -LogProb.OfTarget(row, tokens[prefix]);
+            scored++;
+        }
+
+        double meanNll = sumNll / scored;
+        return new PerplexityResult(Math.Exp(meanNll), meanNll, scored, WindowCount: scored);
+    }
 
     // Backend returns every row, so one forward pass scores every target: row i predicts token i+1.
     private static unsafe PerplexityResult TeacherForcedSinglePass(
