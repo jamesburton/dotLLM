@@ -83,4 +83,59 @@ public sealed class PerplexityEvaluatorTests
         for (int i = 0; i < model.ForwardCalls.Count; i++)
             Assert.Equal(i + 1, model.ForwardCalls[i].Length);
     }
+
+    [Fact]
+    public void SlidingWindow_TilesScoredTokensWithoutGapsOrOverlap()
+    {
+        var tokens = Enumerable.Range(0, 40).ToArray();
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
+
+        // L=16, S=8 => windows start at 0, 8, 16, 24; each scores its last 8 targets.
+        var result = PerplexityEvaluator.Evaluate(
+            model, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, ContextLength: 16, Stride: 8));
+
+        Assert.Equal(4, result.WindowCount);
+        Assert.Equal(32, result.ScoredTokens);        // 4 windows x 8 targets
+        Assert.Equal(Vocab, result.Perplexity, 9);    // uniform logits
+
+        Assert.Equal(4, model.ForwardCalls.Count);
+        Assert.All(model.ForwardCalls, w => Assert.Equal(16, w.Length));
+        Assert.Equal(0, model.ForwardCalls[0][0]);
+        Assert.Equal(8, model.ForwardCalls[1][0]);
+        Assert.Equal(16, model.ForwardCalls[2][0]);
+        Assert.Equal(24, model.ForwardCalls[3][0]);
+    }
+
+    [Fact]
+    public void SlidingWindow_ScoresEachTargetAtItsTrueAbsolutePosition()
+    {
+        // Logits keyed to absolute position: a window that restarts positions at zero scores
+        // different values and fails this.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            row[position % vocab] = 10f;
+            return row;
+        }
+
+        // Row at absolute position p predicts token p+1, and argmax(row_p) == p % Vocab.
+        // So make tokens[p+1] == p % Vocab, i.e. tokens[i] == (i-1) mod Vocab.
+        var tokens = new int[40];
+        for (int i = 0; i < tokens.Length; i++) tokens[i] = (i + Vocab - 1) % Vocab;
+
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+        var result = PerplexityEvaluator.Evaluate(
+            model, tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, 16, 8));
+
+        Assert.True(result.MeanNegativeLogLikelihood < 0.01,
+            $"expected confident predictions, got mean NLL {result.MeanNegativeLogLikelihood}");
+    }
+
+    [Fact]
+    public void SlidingWindow_RejectsStrideNotSmallerThanContext()
+    {
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
+        Assert.Throws<ArgumentException>(() => PerplexityEvaluator.Evaluate(
+            model, Tokens, new PerplexityOptions(PerplexityMode.SlidingWindow, ContextLength: 16, Stride: 16)));
+    }
 }
