@@ -82,7 +82,129 @@ public sealed class VulkanPQ2_0GemmBench
         ("lm_head    (248320x5120)", 248320, 5120),
     ];
 
-    /// <summary>Times looped-GEMV prefill against the register-blocked GEMM, interleaved and paired.</summary>
+    /// <summary>
+    /// Times every available GEMM variant against every other, interleaved and order-reversed
+    /// (issue #236). The pair that decides promotion is
+    /// <c>register-blocked -&gt; coopmat</c>: #233's register-blocked kernel is what ships, so it
+    /// is the bar, and a challenger measured against the looped-GEMV fallback instead would be
+    /// flattered by a baseline no longer in the code.
+    /// </summary>
+    /// <remarks>
+    /// Read <c>lm_head</c> (337 MB packed) as the honest row and the projections as the optimistic
+    /// one — see the class remarks on MALL residency. Enable with
+    /// <c>DOTLLM_PQ2_0_GEMM_BENCH=1</c>.
+    /// </remarks>
+    [SkippableFact]
+    public void Bench_PQ2_0GemmVariants()
+    {
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH"), "1", StringComparison.Ordinal),
+            "DOTLLM_PQ2_0_GEMM_BENCH=1 to enable this benchmark.");
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        PinToPCores();
+        int batch = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_BATCH", 8);
+        int tokens = EnvInt("DOTLLM_PQ2_0_GEMM_BENCH_TOKENS", 64);
+        var shapes = ParseShapes(Environment.GetEnvironmentVariable("DOTLLM_PQ2_0_GEMM_BENCH_SHAPES")) ?? DefaultShapes;
+
+        using var device = VulkanDevice.Create();
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  Coopmat: {device.HasCooperativeMatrix}");
+        _output.WriteLine($"tokens={tokens}  batch={batch}  schedule: {WarmupPasses} warmup + {Passes} interleaved order-reversed passes (median of per-pass ratios)");
+        _output.WriteLine($"SelectFor(device) => {PQ2_0GemmVariant.SelectFor(device).SpvFileName}");
+
+        var comparisons = new List<(string Label, PQ2_0GemmVariant Reference, PQ2_0GemmVariant Challenger)>();
+        if (PQ2_0GemmVariant.Coopmat.IsSupportedOn(device))
+            comparisons.Add(("register-blocked -> coopmat (64-thread wg, driver-default wave)",
+                PQ2_0GemmVariant.RegisterBlocked, PQ2_0GemmVariant.Coopmat));
+        if (PQ2_0GemmVariant.Coopmat32.IsSupportedOn(device))
+        {
+            comparisons.Add(("coopmat -> coopmat32 (32-thread wg pinned to wave32)",
+                PQ2_0GemmVariant.Coopmat, PQ2_0GemmVariant.Coopmat32));
+            comparisons.Add(("register-blocked -> coopmat32",
+                PQ2_0GemmVariant.RegisterBlocked, PQ2_0GemmVariant.Coopmat32));
+        }
+        if (comparisons.Count == 0)
+        {
+            _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — nothing to compare.");
+            return;
+        }
+
+        foreach (var (label, refVariant, challVariant) in comparisons)
+        {
+            using var refKernel = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, refVariant);
+            using var challKernel = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, challVariant);
+
+            _output.WriteLine("");
+            _output.WriteLine($"### {label}");
+            _output.WriteLine("| shape | reference µs | challenger µs | speedup | ref GFLOP/s | chall GFLOP/s |");
+            _output.WriteLine("|---|---:|---:|---:|---:|---:|");
+
+            var rng = new Random(0x2A_53);
+            foreach (var (tag, m, k) in shapes)
+            {
+                long rowBytes = (long)(k / GroupSize) * GroupBytes;
+                long wBytes = m * rowBytes;
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)tokens * k * sizeof(float));
+                using var bufC = device.Allocate((long)tokens * m * sizeof(float));
+
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);              // random packed codes; timing is data-independent
+                float[] b = new float[(long)tokens * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                (double refUs, double challUs, double ratio) =
+                    MeasurePairedGemm(device, refKernel, challKernel, bufW, bufB, bufC, m, k, tokens, batch);
+
+                double flop = 2.0 * m * (double)k * tokens;
+                _output.WriteLine($"| {tag} | {refUs:F2} | {challUs:F2} | {ratio:F2}x | "
+                    + $"{flop / (refUs * 1e-6) / 1e9:F1} | {flop / (challUs * 1e-6) / 1e9:F1} |");
+            }
+        }
+    }
+
+    private static (double reference, double challenger, double ratio) MeasurePairedGemm(
+        VulkanDevice device, MatMulPQ2_0GemmF32Kernel reference, MatMulPQ2_0GemmF32Kernel challenger,
+        VulkanDevice.Buffer w, VulkanDevice.Buffer b, VulkanDevice.Buffer c,
+        int m, int k, int n, int batch)
+    {
+        for (int i = 0; i < WarmupPasses; i++)
+        {
+            RunGemmPass(device, reference, w, b, c, m, k, n, batch);
+            RunGemmPass(device, challenger, w, b, c, m, k, n, batch);
+        }
+
+        var refUs = new double[Passes];
+        var challUs = new double[Passes];
+        var ratios = new double[Passes];
+        for (int p = 0; p < Passes; p++)
+        {
+            double tr, tc;
+            if ((p & 1) == 0)   // alternate order so first-vs-second bias cancels
+            {
+                tr = RunGemmPass(device, reference, w, b, c, m, k, n, batch);
+                tc = RunGemmPass(device, challenger, w, b, c, m, k, n, batch);
+            }
+            else
+            {
+                tc = RunGemmPass(device, challenger, w, b, c, m, k, n, batch);
+                tr = RunGemmPass(device, reference, w, b, c, m, k, n, batch);
+            }
+
+            refUs[p] = tr;
+            challUs[p] = tc;
+            ratios[p] = tc > 0 ? tr / tc : 0;   // >1 means the challenger is faster
+        }
+
+        Array.Sort(refUs); Array.Sort(challUs); Array.Sort(ratios);
+        return (refUs[Passes / 2], challUs[Passes / 2], ratios[Passes / 2]);
+    }
+
+    /// <summary>
+    /// Times looped-GEMV prefill (the pre-#233 fallback) against each available GEMM variant,
+    /// interleaved and paired.
+    /// </summary>
     [SkippableFact]
     public void Bench_PQ2_0Gemm_VsLoopedGemvFallback()
     {
@@ -97,36 +219,42 @@ public sealed class VulkanPQ2_0GemmBench
 
         using var device = VulkanDevice.Create();
         using var gemv = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
-        using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
 
-        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}");
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  Coopmat: {device.HasCooperativeMatrix}");
         _output.WriteLine($"tokens={tokens}  batch={batch}  schedule: {WarmupPasses} warmup + {Passes} interleaved order-reversed passes (median of per-pass ratios)");
-        _output.WriteLine("");
-        _output.WriteLine("| shape | looped-GEMV µs | GEMM µs | speedup | GEMV GFLOP/s | GEMM GFLOP/s |");
-        _output.WriteLine("|---|---:|---:|---:|---:|---:|");
 
-        var rng = new Random(0x2A_53);
-        foreach (var (tag, m, k) in shapes)
+        foreach (var variant in PQ2_0GemmVariant.AvailableOn(device))
         {
-            long rowBytes = (long)(k / GroupSize) * GroupBytes;
-            long wBytes = m * rowBytes;
-            using var bufW = device.Allocate((wBytes + 3) & ~3L);
-            using var bufB = device.Allocate((long)tokens * k * sizeof(float));
-            using var bufC = device.Allocate((long)tokens * m * sizeof(float));
+            using var gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
 
-            byte[] w = new byte[wBytes];
-            rng.NextBytes(w);              // random packed codes; timing is data-independent
-            float[] b = new float[(long)tokens * k];
-            for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
-            device.Upload(new ReadOnlySpan<byte>(w), bufW);
-            device.Upload(b, bufB);
+            _output.WriteLine("");
+            _output.WriteLine($"### looped-GEMV -> {variant.SpvFileName}");
+            _output.WriteLine("| shape | looped-GEMV µs | GEMM µs | speedup | GEMV GFLOP/s | GEMM GFLOP/s |");
+            _output.WriteLine("|---|---:|---:|---:|---:|---:|");
 
-            (double gemvUs, double gemmUs, double ratio) =
-                MeasurePaired(device, gemv, gemm, bufW, bufB, bufC, m, k, tokens, batch);
+            var rng = new Random(0x2A_53);
+            foreach (var (tag, m, k) in shapes)
+            {
+                long rowBytes = (long)(k / GroupSize) * GroupBytes;
+                long wBytes = m * rowBytes;
+                using var bufW = device.Allocate((wBytes + 3) & ~3L);
+                using var bufB = device.Allocate((long)tokens * k * sizeof(float));
+                using var bufC = device.Allocate((long)tokens * m * sizeof(float));
 
-            double flop = 2.0 * m * (double)k * tokens;   // 2 flops per MAC
-            _output.WriteLine($"| {tag} | {gemvUs:F2} | {gemmUs:F2} | {ratio:F2}x | "
-                + $"{flop / (gemvUs * 1e-6) / 1e9:F1} | {flop / (gemmUs * 1e-6) / 1e9:F1} |");
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);              // random packed codes; timing is data-independent
+                float[] b = new float[(long)tokens * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                (double gemvUs, double gemmUs, double ratio) =
+                    MeasurePaired(device, gemv, gemm, bufW, bufB, bufC, m, k, tokens, batch);
+
+                double flop = 2.0 * m * (double)k * tokens;   // 2 flops per MAC
+                _output.WriteLine($"| {tag} | {gemvUs:F2} | {gemmUs:F2} | {ratio:F2}x | "
+                    + $"{flop / (gemvUs * 1e-6) / 1e9:F1} | {flop / (gemmUs * 1e-6) / 1e9:F1} |");
+            }
         }
     }
 

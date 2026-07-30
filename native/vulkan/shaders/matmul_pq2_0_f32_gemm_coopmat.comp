@@ -1,0 +1,230 @@
+#version 450
+// PQ2_0 (PrismML Bonsai ternary) prefill GEMM via VK_KHR_cooperative_matrix.
+//
+//   C[N, M] = B[N, K] @ W_pq2_0[M, K]^T      with W dequantized on the fly.
+//
+// Functional parity with matmul_pq2_0_f32_gemm_rb.comp (#233's register-blocked
+// 32x32 kernel, which is both the correctness oracle and the perf bar). Same
+// weight layout, same input/output semantics; only the accumulation changes.
+//
+// Structure derived from matmul_i2_s_f32_gemm_coopmat.comp — same tile shape,
+// same subgroup-scope coopmat ops, same dual store path. The only functional
+// difference is the weight decode:
+//
+//   I2_S : row stride K/4 bytes of packed codes; ONE per-tensor float32 scale at
+//          the buffer tail (byte offset M*(K/4)), applied once to the finished
+//          F32 accumulator.
+//   PQ2_0: each 128 contiguous elements of a row form a 34-byte group —
+//            bytes [0..1]  : little-endian IEEE-754 binary16 group scale
+//            bytes [2..33] : 32 packed code bytes, byte gp (0..31) holding the
+//                            ternary codes for group-relative elements
+//                            {gp, gp+32, gp+64, gp+96} at bit offsets {6,4,2,0};
+//                            value = code - 1.
+//          Row stride = (K/128)*34 bytes. There is NO tensor-tail scale.
+//
+// WHY THE F16 A OPERAND COSTS NOTHING HERE — this is the whole reason coopmat is
+// worth trying for PQ2_0, and it is a STRONGER argument than the I2_S kernel's.
+// I2_S must keep the raw ternary in sharedA and defer its single per-tensor scale
+// to the end, because folding a scale in would round. PQ2_0 cannot defer: the
+// scale is per (row, group), so within one 16x16 accumulator tile the 16 weight
+// rows carry 16 different scales for the same K-chunk, and a coopmat accumulator
+// has no portable per-row element addressing. So the scale MUST be folded into
+// sharedA — and that is free, because:
+//
+//   * the group scale is STORED as an IEEE binary16 value in the file, and
+//   * the ternary value is exactly {-1, 0, +1},
+//
+// so the staged product (code-1)*scale is exactly {-scale, +/-0, +scale} — a sign
+// flip or a zero, both exactly representable in F16, returning the identical bit
+// pattern the file holds. The A operand therefore contributes ZERO rounding
+// error, exactly as if the kernel were F32 throughout. (Contrast the Q8_0 coopmat
+// kernel, which folds an F32 block scale into an int8 quant and eats ~2^-11
+// relative error in A.) All F16 error in this kernel comes from the B (activation)
+// cast alone.
+//
+// THE OPERANDS ARE EXACT; THE DEVICE'S MAC IS NOT. The argument above survives
+// measurement — but the kernel still is not bit-exact against the CPU oracle, and
+// the reason is gfx1151, not this shader. Under a one-hot activation (so each
+// output cell is one product plus exact zeros) coopMatMulAdd returns a result one
+// F32 ULP toward -infinity on roughly a third of cells, even for A = +/-1.0 and
+// B = 1.0 where the exact answer is trivially representable. Measured: independent
+// of K (identical at 128/256/1024, so not accumulation order), independent of the
+// scale, unchanged by pinning the pipeline to wave32, and reproduced byte-for-byte
+// by the untouched matmul_i2_s_f32_gemm_coopmat.comp, which stages raw ternary and
+// applies its scale afterwards. So the one-hot gate holds these kernels to 1 ULP
+// rather than to equality; matmul_pq2_0_f32_gemm_rb.comp, F32 throughout, remains
+// the bit-exact reference. See issue #236.
+//
+// BK is one PQ2_0 group (128 elements): the byte layout forces the whole group to
+// be staged together (a single packed byte feeds positions {gp,gp+32,gp+64,gp+96},
+// spanning all 128) and it is also exactly the span over which one scale applies.
+// Each outer iteration therefore issues BK/TK = 8 coopMatMulAdd. Shared cost is
+// (16+16) x 128 f16 = 8 KB.
+//
+// Edge handling: fully-in-bounds tiles take the direct coopMatStore fast path;
+// tiles straddling the (M, N) boundary stage through shared memory and scatter
+// with per-lane bounds checks.
+
+#extension GL_KHR_cooperative_matrix      : require
+#extension GL_KHR_memory_scope_semantics  : require
+#extension GL_KHR_shader_subgroup_basic   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage    : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; }; // PQ2_0 blob
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };      // [N*K]
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };      // [N*M]
+
+layout(push_constant) uniform PushConstants {
+    uint M;             // output dim (number of weight rows)
+    uint K;             // contraction dim (must be a multiple of 128)
+    uint N;             // batch size (number of input rows)
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+const uint TM = 16u;    // coopmat M — output-row tile
+const uint TN = 16u;    // coopmat N — output-col tile
+const uint TK = 16u;    // coopmat K per coopMatMulAdd
+const uint BK = 128u;   // K elements staged per outer iter (one PQ2_0 group)
+
+const uint PQ2_GROUP_BYTES = 34u;   // 2 (fp16 scale) + 32 (packed codes)
+const uint PQ2_CODE_BYTES  = 32u;
+
+const uint WG_SIZE   = gl_WorkGroupSize.x;
+const uint A_BYTES   = TM * PQ2_CODE_BYTES;   // 512 code bytes per K-chunk
+const uint A_PER_THR = A_BYTES / WG_SIZE;     // consecutive code bytes per thread
+const uint B_ELEMS   = TN * BK;               // 2048 activations per K-chunk
+const uint B_PER_THR = B_ELEMS / WG_SIZE;
+
+// Shared weight tile: [TM rows][BK cols] as F16, holding ALREADY-SCALED ternary
+// (+/-scale or 0) — exact in F16, see the header note.
+shared float16_t sharedA[TM * BK];
+
+// Shared input tile: [TN rows][BK cols] as F16.
+shared float16_t sharedB[TN * BK];
+
+// Staging for the bounds-guarded store path.
+shared float storeStage[TM * TN];
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Little-endian fp16 group scale at absolute byte offset `off`. `off` is not
+// generally 4-byte aligned: 34-byte groups straddle uint-word boundaries after
+// the first group, so this reads byte-wise rather than via a uint load.
+float readGroupScale(uint off) {
+    uint lo = readByte(off);
+    uint hi = readByte(off + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint mBase = gl_WorkGroupID.x * TM; // weight rows (C columns)
+    uint tBase = gl_WorkGroupID.y * TN; // input rows (C rows)
+
+    uint tid = gl_LocalInvocationID.x;  // 0..WG_SIZE-1
+    uint rowBytes = pc.blocksPerRow * PQ2_GROUP_BYTES;
+
+    // A_PER_THR consecutive code bytes per thread. A_PER_THR divides the 32-byte
+    // per-row code span for every supported workgroup size, so all of a thread's
+    // bytes belong to ONE weight row and the group scale is read once per thread
+    // per K-chunk.
+    uint aByte0   = tid * A_PER_THR;          // 0..A_BYTES-1
+    uint rowLocal = aByte0 / PQ2_CODE_BYTES;  // 0..15  (weight row within tile)
+    uint gp0      = aByte0 % PQ2_CODE_BYTES;  // first code byte within the group
+    uint mGlobal  = mBase + rowLocal;
+    uint sBase    = rowLocal * BK;
+    bool rowValid = mGlobal < pc.M;
+    uint rowByteBase = mGlobal * rowBytes;
+
+    coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums =
+        coopmat<float, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint kBase = blk * BK;
+
+        // ---- 1. Stage sharedB[TN, BK] as F16. ----
+        for (uint i = 0u; i < B_PER_THR; i++) {
+            uint idx = tid * B_PER_THR + i;  // 0..B_ELEMS-1
+            uint row = idx >> 7u;            // 0..15  (token within tile)
+            uint col = idx & 127u;           // 0..127 (element within group)
+            uint tGlobal = tBase + row;
+            float v = (tGlobal < pc.N) ? b[tGlobal * pc.K + kBase + col] : 0.0;
+            sharedB[row * BK + col] = float16_t(v);
+        }
+
+        // ---- 2. Unpack sharedA[TM, BK] as SCALED ternary in F16. ----
+        if (rowValid) {
+            uint groupByteBase = rowByteBase + blk * PQ2_GROUP_BYTES;
+            float scale = readGroupScale(groupByteBase);
+            uint codeBase = groupByteBase + 2u;
+
+            for (uint i = 0u; i < A_PER_THR; i++) {
+                uint gp = gp0 + i;           // 0..31 within the group's code bytes
+                uint pk = readByte(codeBase + gp);
+                sharedA[sBase + gp]       = float16_t(float(int((pk >> 6u) & 3u) - 1) * scale);
+                sharedA[sBase + gp + 32u] = float16_t(float(int((pk >> 4u) & 3u) - 1) * scale);
+                sharedA[sBase + gp + 64u] = float16_t(float(int((pk >> 2u) & 3u) - 1) * scale);
+                sharedA[sBase + gp + 96u] = float16_t(float(int( pk        & 3u) - 1) * scale);
+            }
+        } else {
+            for (uint i = 0u; i < A_PER_THR; i++) {
+                uint gp = gp0 + i;
+                sharedA[sBase + gp]       = float16_t(0.0);
+                sharedA[sBase + gp + 32u] = float16_t(0.0);
+                sharedA[sBase + gp + 64u] = float16_t(0.0);
+                sharedA[sBase + gp + 96u] = float16_t(0.0);
+            }
+        }
+
+        barrier();
+        memoryBarrierShared();
+
+        // ---- 3. Eight coopMatMulAdd — K slices [0,16) .. [112,128). ----
+        // A tile rows = m (weight rows), A cols = k.
+        // B tile rows = k, B cols = t (tokens) — loaded from the row-major
+        // sharedB with ColumnMajor layout, which treats sharedB rows as the
+        // B-column axis (matches C[t,m] = dot(W[m,:], B[t,:])).
+        for (uint kSlice = 0u; kSlice < BK; kSlice += TK) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> aTile;
+            coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> bTile;
+
+            coopMatLoad(aTile, sharedA, kSlice, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(bTile, sharedB, kSlice, BK, gl_CooperativeMatrixLayoutColumnMajor);
+
+            sums = coopMatMulAdd(aTile, bTile, sums);
+        }
+
+        barrier();
+    }
+
+    // ---- 4. Store output. C layout: [N, M] row-major. ----
+    // No trailing scale application: PQ2_0's scales are per group and were folded
+    // into sharedA at staging time (exactly — see the header note).
+    // coopMatStore with ColumnMajor and stride=M places sums[m, t] at
+    // base + t * M + m — exactly the row-major-C indexing for our tile.
+    bool tileAllIn = (mBase + TM) <= pc.M && (tBase + TN) <= pc.N;
+
+    if (tileAllIn) {
+        coopMatStore(sums, c, tBase * pc.M + mBase, pc.M, gl_CooperativeMatrixLayoutColumnMajor);
+    } else {
+        coopMatStore(sums, storeStage, 0, TM, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        for (uint idx = tid; idx < TM * TN; idx += WG_SIZE) {
+            uint t = idx / TM;                // 0..15
+            uint m = idx - t * TM;            // 0..15
+            uint mG = mBase + m;
+            uint tG = tBase + t;
+            if (mG < pc.M && tG < pc.N) {
+                c[tG * pc.M + mG] = storeStage[t * TM + m];
+            }
+        }
+    }
+}

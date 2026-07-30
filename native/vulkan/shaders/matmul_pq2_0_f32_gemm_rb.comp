@@ -9,10 +9,16 @@
 // decode changes. See that shader for the arithmetic-intensity rationale
 // (2x2 micro-tile => 1.0 MAC per shared load, vs 0.5 for one-thread-per-cell).
 //
-// The coopmat line is deliberately NOT taken here: issue #229 (commit a1161cbc)
-// showed the multi-fragment coopmat warptile still loses to F32 on gfx1151, and
-// commit 0ea1bd7f showed plain I2_S coopmat loses to register-blocked on an
-// RTX 3060. Two independent negatives — start from what won.
+// SUPERSEDED AS THE PRODUCTION KERNEL ON COOPMAT DEVICES (issue #236), still the
+// fallback everywhere else and still the correctness oracle. #233 skipped the
+// coopmat line on the strength of #229 (commit a1161cbc, warptile loses to plain
+// coopmat) and 0ea1bd7f (plain I2_S coopmat loses to register-blocked on an
+// RTX 3060). Measured directly on gfx1151, that reasoning does not hold here:
+// matmul_pq2_0_f32_gemm_coopmat32.comp beats this kernel 1.81-2.15x (1.81x on
+// lm_head), and 0ea1bd7f's RTX 3060 result simply inverts on the iGPU. This
+// kernel remains what runs when VK_KHR_cooperative_matrix is absent, and it is
+// F32 throughout — the only PQ2_0 GEMM that is bit-exact against the CPU oracle,
+// because gfx1151's coopMatMulAdd is not (see the coopmat shader's header).
 //
 // PQ2_0 vs I2_S weight layout (the only functional difference):
 //   I2_S : row stride K/4 bytes of packed codes; ONE per-tensor float32 scale at
