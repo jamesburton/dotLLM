@@ -844,6 +844,62 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
     #183's raw speed *and* stay numerically closer to baseline (different algorithm shape, not a
     reassociated split of the same one) — worth reconsidering once continuous batching or another
     driver makes the investment timing right.
+
+  **#230: checked whether the GQA-split kernel's CTA-barrier stall (44.2% of 15.24 cycles, per the
+  2026-07-30 re-profile above) has a cheaper fix than #199's rewrite — SASS-verified per-barrier
+  diagnosis, one genuine barrier removed, honest negative result on wall-clock impact.**
+  Per this project's #218 precedent (an `ncu` barrier-stall hypothesis that direct SASS inspection
+  proved wrong), the stall label was not trusted at face value. Compiled with
+  `nvcc -lineinfo` + `ptxas -lineinfo -arch=sm_86` + `nvdisasm -g` (no elevation needed) to get an
+  exact PC→source-line map for every `BAR.SYNC` in `attention_f32_gqa_split_kv`: 16 static sites
+  across 13 source-level `__syncthreads()` call sites, of which 6 belong to the per-head max/sum
+  reduction loop (attention_f32.cu lines 827-878) that the kernel's own header already flags as
+  "the one place this design does not parallelize across the group" — run sequentially `group`=6
+  times per KV tile for Bonsai-27B, i.e. this one loop accounts for the large majority of the
+  kernel's *dynamic* barrier count. Dependency analysis of what each of those 6 barriers actually
+  protects found one (the loop-tail sync, guarding `warp_scratch` reuse across the next head's
+  max-phase write) to be fully redundant: the WAR hazard it exists for is already closed
+  transitively by the loop's own real cross-warp barriers (the ones a few lines into the next
+  iteration, which every thread must reach — and reaching them requires every thread to have
+  already finished the current iteration, scratch-buffer read included). Removed it with a
+  same-file comment documenting the argument. SASS confirms a clean, minimal, single-barrier
+  removal (`BAR.SYNC` count 16→15; PTX diff is exactly one deleted `bar.sync` instruction) at
+  **zero register/shared-memory cost** (`ptxas`: `REG:40` unchanged, so the 83.33% theoretical
+  occupancy ceiling is untouched) — the lowest-risk category of change this investigation could
+  make. The other 4 of the 6 per-head barriers are real cross-warp producer/consumer dependencies
+  (broadcasting a warp-0-computed cross-warp max/sum to the rest of the block) inherent to the
+  shuffle-tree reduction algorithm shared verbatim with `attention_f32`/`attention_f32_split_kv`,
+  and removing them would mean changing that reduction's structure — which would break the
+  kv_split==1 bit-exactness contract this kernel is tested against, a materially bigger and riskier
+  change than scoped here.
+  **Correctness**: all 21 `CudaAttentionF32GqaSplitTests` pass post-fix, including bit-exact
+  (0 ULP) at every tested group size (1, 4, 6, 8, including the MAX_GQA_GROUP boundary) and the
+  300-consecutive-decode-step drift characterization; both `CudaAttentionSplitKvGenerationParityTests`
+  (real Bonsai-27B generation + perplexity, exercising the same compiled PTX module) pass unchanged.
+  Ran the GQA-split unit-test suite 3x (once concurrently with itself) with no flakiness, the kind
+  of check a subtle removed-barrier race would likely surface.
+  **Wall-clock**: real `dotnet bench` A/B on this RTX 3060, interleaved pre-fix/post-fix rounds (not
+  blocked sequentially, after an initial blocked run showed a same-direction decline in BOTH
+  configurations — a session-level thermal/clock effect, not a kernel difference; interleaving and
+  shortening `-n` from 48→24 per rep controls for it), `DOTLLM_ATTN_GQA_SPLIT=1`, real Bonsai-27B:
+  at **depth 512** (matching the re-profile's own depth), 3 interleaved rounds, median decode tok/s
+  pre-fix {17.48, 17.30, 17.36} vs post-fix {17.47, 17.37, 17.30} — mean 17.38 vs 17.38, a dead
+  tie. At **depth 1024**, 2 interleaved rounds, pre-fix {16.80, 16.37} vs post-fix {15.73, 16.05} —
+  post-fix trends ~2-4% lower by median (though best-of-rep is within ~1%), still inside this
+  project's documented 2-8% run-to-run noise floor and with isolated outlier reps (a single rep
+  dropping to ~14-15 tok/s with no GPU contention visible in `nvidia-smi`) present at both configs.
+  **Reading**: the fix is real (verified at the SASS/instruction level, not just asserted) and free
+  (no register/occupancy cost, no precision cost), but its wall-clock effect is not distinguishable
+  from noise at either depth tested. This is consistent, not surprising, given `attention_f32*`'s
+  own scoping note elsewhere in this file that attention is only ~3-10% of total decode-step time
+  even at depth 256-1024 — removing 1 of 6 barriers in one loop of one kernel that is itself a
+  small slice of the token budget was never likely to clear this host's noise floor, and the other
+  5 barriers are not cheaply removable without a materially bigger, riskier change. **Recommendation
+  for #199**: this specific "cheap fix" avenue is exhausted — kept as a real, zero-risk,
+  correctness-preserving cleanup (worth keeping in the opt-in kernel regardless), but it does not
+  answer #199's precondition question in the affirmative. #199's tensor-core rewrite (or accepting
+  the GQA-split kernel's current form as a non-default, marginal-value opt-in alongside #183)
+  remain the only levers left that could plausibly move the needle further on this kernel.
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
