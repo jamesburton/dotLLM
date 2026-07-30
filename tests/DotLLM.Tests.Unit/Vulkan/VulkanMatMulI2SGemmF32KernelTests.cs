@@ -98,6 +98,29 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void Coopmat32_MatchesScalarReference(int m, int k, int n)
         => RunParity(I2SGemmVariant.Coopmat32, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
 
+    /// <summary>
+    /// Parity for the coopmat warptile variant (2x2 grid of 16x16 fragments, 32x32 output tile).
+    /// Same tolerance rationale as <see cref="Coopmat_MatchesScalarReference"/>.
+    /// </summary>
+    /// <remarks>
+    /// The rows deliberately stress the 32-wide tile edges. With four fragments there are four
+    /// distinct store offsets, and a mis-set fragment offset would corrupt exactly one quadrant of
+    /// the tile — which only a shape that does NOT align to 32 in both dimensions can expose.
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 128, 32)]     // exactly one 32x32 tile — all four fragments fully in bounds
+    [InlineData(64, 256, 64)]     // 2x2 tiles, 2 blocks per row
+    [InlineData(48, 768, 40)]     // partial tile both dims -> staged scatter, 6 blocks
+    [InlineData(33, 128, 33)]     // one past a full tile -> only the (0,0) fragment fully valid
+    [InlineData(17, 256, 47)]     // ragged both dims, straddles the fragment boundary at 16
+    [InlineData(15, 128, 3)]      // smaller than a single fragment
+    [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden, n far below the tile
+    public void CoopmatWarptile_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.CoopmatWarptile, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
     private static void RunParity(
         I2SGemmVariant variant, int m, int k, int n, float absTol = AbsTol, float relTol = RelTol)
     {

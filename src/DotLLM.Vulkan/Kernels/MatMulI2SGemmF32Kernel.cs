@@ -68,6 +68,23 @@ public readonly record struct I2SGemmVariant(
     public static I2SGemmVariant Coopmat32 =>
         new("matmul_i2_s_f32_gemm_coopmat32.spv", 16, 16, RequiresCooperativeMatrix: true);
 
+    /// <summary>
+    /// Cooperative-matrix warptile: a 2x2 grid of 16x16 fragments giving a 32x32 output tile
+    /// per workgroup, one subgroup (32 threads). Requires <c>VK_KHR_cooperative_matrix</c>.
+    /// </summary>
+    /// <remarks>
+    /// Tests the leading explanation for why <see cref="Coopmat"/> loses to
+    /// <see cref="RegisterBlocked"/>: that kernel emits a single 16x16 fragment per workgroup, so
+    /// it launches 4x the workgroups for the same output and gets half the data reuse. Here each
+    /// K-slice loads 2 A and 2 B fragments and issues 4 <c>coopMatMulAdd</c>, so every loaded
+    /// fragment feeds two multiplies — llama.cpp <c>mul_mm</c>'s warptile idea — and the output
+    /// tile matches <see cref="RegisterBlocked"/> exactly.
+    /// Pinned to one subgroup per workgroup so that <see cref="Coopmat32"/> to this variant is a
+    /// controlled A/B in which only the tile size changes.
+    /// </remarks>
+    public static I2SGemmVariant CoopmatWarptile =>
+        new("matmul_i2_s_f32_gemm_coopmat_wt.spv", 32, 32, RequiresCooperativeMatrix: true);
+
     /// <summary>The variant used by the production forward path.</summary>
     public static I2SGemmVariant Production => RegisterBlocked;
 }

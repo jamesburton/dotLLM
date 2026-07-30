@@ -95,6 +95,11 @@ public sealed class VulkanI2SGemmBench
         {
             comparisons.Add(("register-blocked -> coopmat", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.Coopmat));
             comparisons.Add(("coopmat -> coopmat32 (1 subgroup/wg probe)", I2SGemmVariant.Coopmat, I2SGemmVariant.Coopmat32));
+            // Controlled test of the tile-size hypothesis: both are 1 subgroup/wg,
+            // only the output tile differs (16x16 -> 32x32).
+            comparisons.Add(("coopmat32 -> warptile (tile size only)", I2SGemmVariant.Coopmat32, I2SGemmVariant.CoopmatWarptile));
+            // And against the production bar, which is what decides promotion.
+            comparisons.Add(("register-blocked -> warptile", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.CoopmatWarptile));
         }
         else
             _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — coopmat comparison skipped.");
