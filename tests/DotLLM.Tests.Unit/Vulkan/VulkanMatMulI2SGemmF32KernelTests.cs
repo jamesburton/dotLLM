@@ -81,6 +81,23 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void Coopmat_MatchesScalarReference(int m, int k, int n)
         => RunParity(I2SGemmVariant.Coopmat, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
 
+    /// <summary>
+    /// Parity for the 32-thread coopmat probe. Same tolerance rationale as
+    /// <see cref="Coopmat_MatchesScalarReference"/>; this exists so the probe's
+    /// workgroup-size-agnostic strided staging is proven correct before its timings are trusted.
+    /// </summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(16, 128, 4)]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(17, 256, 33)]     // ragged both dims -> bounds-guarded store path
+    [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden
+    public void Coopmat32_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.Coopmat32, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
     private static void RunParity(
         I2SGemmVariant variant, int m, int k, int n, float absTol = AbsTol, float relTol = RelTol)
     {

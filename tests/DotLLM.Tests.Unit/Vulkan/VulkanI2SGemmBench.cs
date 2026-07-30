@@ -8,23 +8,25 @@ using Xunit.Abstractions;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Opt-in micro-benchmark + A/B for the Vulkan I2_S (BitNet ternary) prefill GEMM on the
-/// Meteor-Lake Arc iGPU. Times the baseline scalar-dot kernel
-/// (<c>matmul_i2_s_f32_gemm.spv</c>, 16x16 tile / one thread per output cell) against the
-/// register-blocked variant (<c>matmul_i2_s_f32_gemm_rb.spv</c>, 32x32 tile / one 2x2
-/// micro-tile per thread) side by side in one process at BitNet b1.58 2B4T projection shapes.
+/// Opt-in micro-benchmark + A/B for the Vulkan I2_S (BitNet ternary) prefill GEMM variants,
+/// timed side by side in one process at BitNet b1.58 2B4T projection shapes. Runs
+/// <c>scalar -> register-blocked</c> always, and <c>register-blocked -> coopmat</c> on devices
+/// advertising <c>VK_KHR_cooperative_matrix</c>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The hypothesis under test: the baseline does 128 MACs per K-chunk against 256 shared-memory
+/// The original hypothesis: the scalar kernel does 128 MACs per K-chunk against 256 shared-memory
 /// loads (0.5 MAC/load) and is shared-memory-bound rather than ALU-bound. The 2x2 micro-tile
-/// reuses each staged value twice for 1.0 MAC/load. Whether that converts to wall-clock on
-/// Xe-LPG is exactly what this measures — the <c>uint</c>+vec4 GEMV variant was also
-/// theoretically better and measured 1.12-1.34x SLOWER, so nothing ships unmeasured.
+/// reuses each staged value twice for 1.0 MAC/load. That held — 1.63-1.67x on Xe-LPG — so
+/// register-blocked is production, and it is therefore the bar every later challenger is paired
+/// against. Comparing a challenger against the scalar kernel would flatter it against a baseline
+/// no longer shipped. Nothing ships unmeasured: the <c>uint</c>+vec4 GEMV variant was also
+/// theoretically better and measured 1.12-1.34x SLOWER.
 /// </para>
 /// <para>
-/// Methodology is deliberately identical to <see cref="VulkanI2SGemvBench"/>, because on this
-/// throttling display-Arc it is the methodology that makes results trustworthy:
+/// Each comparison is its own properly-paired interleaved A/B; three variants in one pass would
+/// break the pairing. Methodology is deliberately identical to <see cref="VulkanI2SGemvBench"/>,
+/// because on the throttling display-Arc it is the methodology that makes results trustworthy:
 /// </para>
 /// <list type="bullet">
 /// <item><b>Compute-bound timed region:</b> each pass submits <c>batch</c> GEMMs behind one fence
@@ -61,7 +63,7 @@ public sealed class VulkanI2SGemmBench
         ("down     (2560x6912)", 2560, 6912),
     ];
 
-    /// <summary>Times the baseline and register-blocked I2_S GEMM variants, interleaved and paired.</summary>
+    /// <summary>Times each I2_S GEMM variant pair, interleaved and paired.</summary>
     [SkippableFact]
     public void Bench_I2SGemm()
     {
@@ -74,51 +76,76 @@ public sealed class VulkanI2SGemmBench
         int tokens = EnvInt("DOTLLM_I2S_GEMM_BENCH_TOKENS", 64);
 
         using var device = VulkanDevice.Create();
-        using var baseline = MatMulI2SGemmF32Kernel.Create(device, spvDir, I2SGemmVariant.Scalar);
-        using var blocked = MatMulI2SGemmF32Kernel.Create(device, spvDir, I2SGemmVariant.RegisterBlocked);
 
-        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}");
+        _output.WriteLine($"Device: {device.DeviceName}  SubgroupSize: {device.SubgroupSize}  "
+            + $"Coopmat: {device.HasCooperativeMatrix}");
         _output.WriteLine($"Affinity: 0x{Environment.GetEnvironmentVariable("DOTLLM_BENCH_AFFINITY") ?? "3F"}  "
             + $"tokens={tokens}  batch={batch}  schedule: {WarmupPasses} warmup + {Passes} interleaved paired passes (median)");
-        _output.WriteLine("| shape | baseline µs | reg-blocked µs | speedup | baseline GFLOP/s | rb GFLOP/s |");
-        _output.WriteLine("|---|---:|---:|---:|---:|---:|");
 
-        var rng = new Random(0x12_5C);
-        foreach (var (tag, m, k) in Shapes)
+        // Each comparison is its own properly-paired interleaved A/B. Running three
+        // variants in one pass would break the pairing, so we do reference-vs-challenger
+        // pairs instead. RegisterBlocked is the production kernel and therefore the bar
+        // any challenger has to clear — comparing a challenger against Scalar would
+        // flatter it against a baseline we no longer ship.
+        var comparisons = new List<(string Label, I2SGemmVariant Reference, I2SGemmVariant Challenger)>
         {
-            long rowBytes = (long)k / 4;
-            long wBytes = m * rowBytes + sizeof(float);
-            using var bufW = device.Allocate(wBytes);
-            using var bufB = device.Allocate((long)tokens * k * sizeof(float));
-            using var bufC = device.Allocate((long)tokens * m * sizeof(float));
+            ("scalar -> register-blocked", I2SGemmVariant.Scalar, I2SGemmVariant.RegisterBlocked),
+        };
+        if (device.HasCooperativeMatrix)
+        {
+            comparisons.Add(("register-blocked -> coopmat", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.Coopmat));
+            comparisons.Add(("coopmat -> coopmat32 (1 subgroup/wg probe)", I2SGemmVariant.Coopmat, I2SGemmVariant.Coopmat32));
+        }
+        else
+            _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — coopmat comparison skipped.");
 
-            byte[] w = new byte[wBytes];
-            rng.NextBytes(w);                  // random packed codes; timing is data-independent
-            float[] b = new float[(long)tokens * k];
-            for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
-            device.Upload(new ReadOnlySpan<byte>(w), bufW);
-            device.Upload(b, bufB);
+        foreach (var (label, refVariant, challVariant) in comparisons)
+        {
+            using var refKernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, refVariant);
+            using var challKernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, challVariant);
 
-            (double baseUs, double rbUs, double ratio) =
-                MeasurePaired(device, baseline, blocked, bufW, bufB, bufC, m, k, tokens, batch);
+            _output.WriteLine("");
+            _output.WriteLine($"### {label}");
+            _output.WriteLine("| shape | reference µs | challenger µs | speedup | ref GFLOP/s | chall GFLOP/s |");
+            _output.WriteLine("|---|---:|---:|---:|---:|---:|");
 
-            // 2 flops per MAC, M*K*tokens MACs.
-            double flop = 2.0 * m * (double)k * tokens;
-            double baseGflops = flop / (baseUs * 1e-6) / 1e9;
-            double rbGflops = flop / (rbUs * 1e-6) / 1e9;
-            _output.WriteLine($"| {tag} | {baseUs:F2} | {rbUs:F2} | {ratio:F2}x | {baseGflops:F1} | {rbGflops:F1} |");
+            var rng = new Random(0x12_5C);
+            foreach (var (tag, m, k) in Shapes)
+            {
+                long rowBytes = (long)k / 4;
+                long wBytes = m * rowBytes + sizeof(float);
+                using var bufW = device.Allocate(wBytes);
+                using var bufB = device.Allocate((long)tokens * k * sizeof(float));
+                using var bufC = device.Allocate((long)tokens * m * sizeof(float));
+
+                byte[] w = new byte[wBytes];
+                rng.NextBytes(w);              // random packed codes; timing is data-independent
+                float[] b = new float[(long)tokens * k];
+                for (int i = 0; i < b.Length; i++) b[i] = rng.NextSingle() * 2f - 1f;
+                device.Upload(new ReadOnlySpan<byte>(w), bufW);
+                device.Upload(b, bufB);
+
+                (double refUs, double challUs, double ratio) =
+                    MeasurePaired(device, refKernel, challKernel, bufW, bufB, bufC, m, k, tokens, batch);
+
+                // 2 flops per MAC, M*K*tokens MACs.
+                double flop = 2.0 * m * (double)k * tokens;
+                double refGflops = flop / (refUs * 1e-6) / 1e9;
+                double challGflops = flop / (challUs * 1e-6) / 1e9;
+                _output.WriteLine($"| {tag} | {refUs:F2} | {challUs:F2} | {ratio:F2}x | {refGflops:F1} | {challGflops:F1} |");
+            }
         }
     }
 
-    private static (double baseline, double blocked, double ratio) MeasurePaired(
-        VulkanDevice device, MatMulI2SGemmF32Kernel baseline, MatMulI2SGemmF32Kernel blocked,
+    private static (double reference, double challenger, double ratio) MeasurePaired(
+        VulkanDevice device, MatMulI2SGemmF32Kernel reference, MatMulI2SGemmF32Kernel challenger,
         VulkanDevice.Buffer w, VulkanDevice.Buffer b, VulkanDevice.Buffer c,
         int m, int k, int n, int batch)
     {
         for (int i = 0; i < WarmupPasses; i++)
         {
-            RunPass(device, baseline, w, b, c, m, k, n, batch);
-            RunPass(device, blocked, w, b, c, m, k, n, batch);
+            RunPass(device, reference, w, b, c, m, k, n, batch);
+            RunPass(device, challenger, w, b, c, m, k, n, batch);
         }
 
         var baseUs = new double[Passes];
@@ -129,18 +156,18 @@ public sealed class VulkanI2SGemmBench
             double tb, tr;
             if ((p & 1) == 0)   // alternate order so first-vs-second bias cancels
             {
-                tb = RunPass(device, baseline, w, b, c, m, k, n, batch);
-                tr = RunPass(device, blocked, w, b, c, m, k, n, batch);
+                tb = RunPass(device, reference, w, b, c, m, k, n, batch);
+                tr = RunPass(device, challenger, w, b, c, m, k, n, batch);
             }
             else
             {
-                tr = RunPass(device, blocked, w, b, c, m, k, n, batch);
-                tb = RunPass(device, baseline, w, b, c, m, k, n, batch);
+                tr = RunPass(device, challenger, w, b, c, m, k, n, batch);
+                tb = RunPass(device, reference, w, b, c, m, k, n, batch);
             }
 
             baseUs[p] = tb;
             rbUs[p] = tr;
-            ratios[p] = tr > 0 ? tb / tr : 0;   // >1 means the register-blocked variant is faster
+            ratios[p] = tr > 0 ? tb / tr : 0;   // >1 means the challenger is faster
         }
 
         Array.Sort(baseUs); Array.Sort(rbUs); Array.Sort(ratios);
