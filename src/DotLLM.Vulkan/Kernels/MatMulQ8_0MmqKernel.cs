@@ -73,7 +73,16 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
     /// back to <see cref="MatMulQ8_0GemmCoopmatKernel"/> /
     /// <see cref="MatMulQ8_0GemmKernel"/> in either case.
     /// </summary>
-    public static MatMulQ8_0MmqKernel? TryCreate(VulkanDevice device, string spvDir)
+    /// <param name="device">Target device.</param>
+    /// <param name="spvDir">Directory containing the compiled SPIR-V modules.</param>
+    /// <param name="requiredSubgroupSize">
+    /// Wave width to pin the compute stage to via
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>, or <c>0</c>
+    /// (default) to leave the driver's own choice in place. Diagnostic knob for
+    /// issue #241 — production always passes <c>0</c>. Numerically a no-op: the
+    /// kernel contains no subgroup ops, so wave width only changes scheduling.
+    /// </param>
+    public static MatMulQ8_0MmqKernel? TryCreate(VulkanDevice device, string spvDir, uint requiredSubgroupSize = 0)
     {
         if (!device.HasIntegerDotProduct)
             return null;
@@ -94,7 +103,8 @@ public sealed class MatMulQ8_0MmqKernel : IDisposable
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: requiredSubgroupSize);
         }
         catch
         {

@@ -13,6 +13,15 @@ namespace DotLLM.Vulkan.Kernels;
 /// <c>true</c> when the variant's SPIR-V uses <c>VK_KHR_cooperative_matrix</c> and therefore
 /// cannot be created on a device that does not advertise it.
 /// </param>
+/// <param name="RequiredSubgroupSize">
+/// Wave width this variant's workgroup size REQUIRES, pinned via
+/// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>, or <c>0</c> when the variant is
+/// wave-width agnostic and the driver's own choice is fine. A variant with a non-zero value
+/// cannot be created on a device that does not support pinning that size — the pin and the
+/// declared workgroup size are a PAIR (issue #239): a 32-thread workgroup running as half a
+/// 64-wide wave wastes half the machine, which is precisely why the unpinned
+/// <see cref="Coopmat32"/> measured 0.66-0.81x.
+/// </param>
 /// <remarks>
 /// Variants exist so a benchmark can A/B them side by side in one process — the
 /// interleaved-paired methodology the Arc requires cannot span processes. Every variant
@@ -20,7 +29,8 @@ namespace DotLLM.Vulkan.Kernels;
 /// additionally carries F16 operand rounding (see <see cref="Coopmat"/>).
 /// </remarks>
 public readonly record struct I2SGemmVariant(
-    string SpvFileName, int TileM, int TileN, bool RequiresCooperativeMatrix = false)
+    string SpvFileName, int TileM, int TileN, bool RequiresCooperativeMatrix = false,
+    uint RequiredSubgroupSize = 0)
 {
     /// <summary>
     /// Baseline: 16x16 tile, one thread per output cell (0.5 MAC per shared load).
@@ -69,6 +79,21 @@ public readonly record struct I2SGemmVariant(
         new("matmul_i2_s_f32_gemm_coopmat32.spv", 16, 16, RequiresCooperativeMatrix: true);
 
     /// <summary>
+    /// <see cref="Coopmat32"/> with its 32-thread workgroup PINNED to wave32 via
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>.
+    /// </summary>
+    /// <remarks>
+    /// The pin is not an optimisation bolted onto <see cref="Coopmat32"/>; it is the missing
+    /// half of it. RDNA3.5 (gfx1151) defaults compute dispatch to wave64, so an unpinned
+    /// 32-thread workgroup is HALF A WAVE and half the lanes idle — which is exactly the
+    /// 0.66-0.81x that <see cref="Coopmat32"/> measures there. Issue #236 / PR #238 measured
+    /// the pin as worth a further 1.29-1.79x on top of the coopmat tile for the PQ2_0 GEMM.
+    /// </remarks>
+    public static I2SGemmVariant Coopmat32Wave32 =>
+        new("matmul_i2_s_f32_gemm_coopmat32.spv", 16, 16,
+            RequiresCooperativeMatrix: true, RequiredSubgroupSize: 32);
+
+    /// <summary>
     /// Cooperative-matrix warptile: a 2x2 grid of 16x16 fragments giving a 32x32 output tile
     /// per workgroup, one subgroup (32 threads). Requires <c>VK_KHR_cooperative_matrix</c>.
     /// </summary>
@@ -85,8 +110,88 @@ public readonly record struct I2SGemmVariant(
     public static I2SGemmVariant CoopmatWarptile =>
         new("matmul_i2_s_f32_gemm_coopmat_wt.spv", 32, 32, RequiresCooperativeMatrix: true);
 
-    /// <summary>The variant used by the production forward path.</summary>
+    /// <summary><see cref="CoopmatWarptile"/> with its 32-thread workgroup pinned to wave32.</summary>
+    /// <remarks>Same pairing argument as <see cref="Coopmat32Wave32"/>; larger output tile.</remarks>
+    public static I2SGemmVariant CoopmatWarptileWave32 =>
+        new("matmul_i2_s_f32_gemm_coopmat_wt.spv", 32, 32,
+            RequiresCooperativeMatrix: true, RequiredSubgroupSize: 32);
+
+    /// <summary>
+    /// The variant used by the production forward path when no device-specific selection is
+    /// made. Bit-exact F32 throughout; the correctness oracle for every coopmat challenger.
+    /// </summary>
     public static I2SGemmVariant Production => RegisterBlocked;
+
+    /// <summary>
+    /// Picks the I2_S GEMM variant for <paramref name="device"/>, preferring a coopmat variant
+    /// only where the device can supply BOTH cooperative matrix and a pinned wave32 compute
+    /// subgroup size, and falling back to <see cref="RegisterBlocked"/> otherwise.
+    /// </summary>
+    /// <param name="device">Device the pipeline will be created on.</param>
+    /// <remarks>
+    /// <para>
+    /// Measured on gfx1151 (Radeon 8060S), 64 tokens, interleaved order-alternated paired A/B,
+    /// median of 9 passes, against the production register-blocked bar:
+    /// <c>o_proj 1.74x</c>, <c>gate/up 1.67x</c>, <c>down 1.64x</c> for
+    /// <see cref="Coopmat32Wave32"/> — consistent across all three projection shapes, and the
+    /// best of the four coopmat variants (plain 64-thread <see cref="Coopmat"/> is faster on
+    /// <c>o_proj</c> at 2.35x but collapses to 1.17x on <c>down</c>;
+    /// <see cref="CoopmatWarptileWave32"/> is a flat 1.42-1.52x).
+    /// </para>
+    /// <para>
+    /// DEFAULTED ON FOR AMD ONLY, because a coopmat win does not generalise: the I2_S coopmat
+    /// GEMM was validated on an RTX 3060 and LOST to register-blocked there, and #233/#236
+    /// already produced one discrete-vs-UMA inversion. Other vendors keep the bit-exact
+    /// register-blocked kernel unless <c>DOTLLM_VULKAN_I2S_COOPMAT=1</c> forces evaluation;
+    /// <c>DOTLLM_VULKAN_DISABLE_I2S_COOPMAT=1</c> forces register-blocked everywhere.
+    /// </para>
+    /// <para>
+    /// The wave32 pin itself measured NEUTRAL here (1.00x on both coopmat32 and warptile — see
+    /// issue #241): on this driver a 32-thread workgroup already compiles to wave32, so the
+    /// gain is the one-subgroup workgroup and tile shape, not the pin. The pin is retained
+    /// because it is the correct portable contract for a kernel whose workgroup IS its
+    /// subgroup — without it, a driver that chose wave64 would run the workgroup as half a
+    /// wave, and a 16-wide device would run two subgroups redundantly over the same tile.
+    /// </para>
+    /// <para>
+    /// Coopmat carries F16 operand rounding, so it is held to 1 ULP rather than bit-exactness
+    /// (a gfx1151 <c>coopMatMulAdd</c> device property established in PR #238), whereas
+    /// <see cref="RegisterBlocked"/> stays asserted bit-exact.
+    /// </para>
+    /// </remarks>
+    public static I2SGemmVariant SelectFor(VulkanDevice device)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        if (IsCoopmatDisabled()) return Production;
+        if (!device.HasCooperativeMatrix) return Production;
+        // The 32-thread workgroup and the pin are a pair — refuse the variant outright where
+        // the wave width cannot be pinned, rather than shipping a half-wave dispatch.
+        if (!device.SupportsRequiredSubgroupSize(32, VkShaderStageFlags.Compute)) return Production;
+        if (device.VendorId != AmdVendorId && !IsCoopmatForced()) return Production;
+        return Coopmat32Wave32;
+    }
+
+    /// <summary>PCI vendor ID for AMD — the only vendor this coopmat path is measured on.</summary>
+    private const uint AmdVendorId = 0x1002;
+
+    /// <summary>
+    /// Env opt-out for the coopmat + wave32 I2_S GEMM
+    /// (<c>DOTLLM_VULKAN_DISABLE_I2S_COOPMAT=1</c>) — forces the bit-exact register-blocked
+    /// kernel on every device. Mirrors the <c>DOTLLM_VULKAN_DISABLE_WAVE32</c> convention.
+    /// </summary>
+    internal const string DisableCoopmatEnvVar = "DOTLLM_VULKAN_DISABLE_I2S_COOPMAT";
+
+    /// <summary>
+    /// Env opt-in (<c>DOTLLM_VULKAN_I2S_COOPMAT=1</c>) extending the coopmat selection to
+    /// non-AMD devices, for evaluating it on hardware it has not been measured on.
+    /// </summary>
+    internal const string ForceCoopmatEnvVar = "DOTLLM_VULKAN_I2S_COOPMAT";
+
+    private static bool IsCoopmatDisabled() =>
+        string.Equals(Environment.GetEnvironmentVariable(DisableCoopmatEnvVar), "1", StringComparison.Ordinal);
+
+    private static bool IsCoopmatForced() =>
+        string.Equals(Environment.GetEnvironmentVariable(ForceCoopmatEnvVar), "1", StringComparison.Ordinal);
 }
 
 /// <summary>
@@ -133,9 +238,15 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
-    /// <summary>Loads the production I2_S GEMM variant and creates the pipeline.</summary>
+    /// <summary>
+    /// Creates the pipeline for the variant <see cref="I2SGemmVariant.SelectFor"/> picks for
+    /// <paramref name="device"/> — the coopmat + wave32 variant where the device supplies both
+    /// and the opt-in is set, else the bit-exact register-blocked F32 kernel.
+    /// </summary>
+    /// <param name="device">Device to create the pipeline on.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V modules.</param>
     public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir)
-        => Create(device, spvDir, I2SGemmVariant.Production);
+        => Create(device, spvDir, I2SGemmVariant.SelectFor(device));
 
     /// <summary>Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline.</summary>
     /// <param name="device">Device to create the pipeline on.</param>
@@ -156,6 +267,20 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
                 "Check VulkanDevice.HasCooperativeMatrix before calling Create() and fall back to " +
                 "I2SGemmVariant.RegisterBlocked when it is false.");
 
+        // A variant that declares a required wave width cannot be created without it: its
+        // workgroup size was chosen to be exactly one subgroup, so running it at the driver's
+        // default width would silently halve (or double-count) the work. Refuse rather than
+        // silently drop the pin — SelectFor is responsible for not asking on such a device.
+        if (variant.RequiredSubgroupSize != 0
+            && !device.SupportsRequiredSubgroupSize(variant.RequiredSubgroupSize, VkShaderStageFlags.Compute))
+        {
+            throw new InvalidOperationException(
+                $"I2_S GEMM variant '{variant.SpvFileName}' requires a pinned compute subgroup size of " +
+                $"{variant.RequiredSubgroupSize}, which this device does not support. Check " +
+                "VulkanDevice.SupportsRequiredSubgroupSize before calling Create() and fall back to " +
+                "I2SGemmVariant.RegisterBlocked (I2SGemmVariant.SelectFor does this).");
+        }
+
         string path = Path.Combine(spvDir, variant.SpvFileName);
         if (!File.Exists(path))
             throw new FileNotFoundException(
@@ -172,7 +297,8 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
             pipeline = module.CreateComputePipeline(
                 entryPoint: "main",
                 bindings: bindings,
-                pushConstantBytes: PushConstantBytes);
+                pushConstantBytes: PushConstantBytes,
+                requiredSubgroupSize: variant.RequiredSubgroupSize);
         }
         catch
         {

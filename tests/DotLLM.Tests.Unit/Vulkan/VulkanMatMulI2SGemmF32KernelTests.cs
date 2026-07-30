@@ -23,6 +23,12 @@ public class VulkanMatMulI2SGemmF32KernelTests
     private const float AbsTol = 5e-3f;
     private const float RelTol = 1e-3f;
 
+    private readonly Xunit.Abstractions.ITestOutputHelper _output;
+
+    /// <summary>Initializes the test class with the xUnit output sink.</summary>
+    /// <param name="output">Sink used to record which variant production selects on this device.</param>
+    public VulkanMatMulI2SGemmF32KernelTests(Xunit.Abstractions.ITestOutputHelper output) => _output = output;
+
     [SkippableTheory]
     [InlineData(16, 128, 4)]      // tile-aligned, 1 block per row, batch=4
     [InlineData(32, 256, 8)]      // 2 blocks per row, batch=8
@@ -121,6 +127,95 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void CoopmatWarptile_MatchesScalarReference(int m, int k, int n)
         => RunParity(I2SGemmVariant.CoopmatWarptile, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
 
+    /// <summary>
+    /// Parity for the wave32-PINNED 32-thread coopmat variant — the variant
+    /// <see cref="I2SGemmVariant.SelectFor"/> now dispatches in production on AMD (issue #239).
+    /// </summary>
+    /// <remarks>
+    /// Shares <see cref="I2SGemmVariant.Coopmat32"/>'s SPIR-V, so this is not re-testing the
+    /// shader maths; it proves the pinned pipeline is created successfully and produces the same
+    /// answers, i.e. that the production selection is not shipping an untested pipeline object.
+    /// Coopmat is held to the F16-operand tolerance, never to bit-exactness — the F32
+    /// register-blocked path above keeps that gate.
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(16, 128, 4)]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(17, 256, 33)]     // ragged both dims -> bounds-guarded store path
+    [InlineData(2560, 2560, 5)]   // BitNet hidden × hidden
+    public void Coopmat32Wave32_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.Coopmat32Wave32, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
+    /// <summary>Parity for the wave32-pinned warptile variant.</summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 128, 32)]
+    [InlineData(48, 768, 40)]
+    [InlineData(17, 256, 47)]
+    [InlineData(2560, 2560, 5)]
+    public void CoopmatWarptileWave32_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.CoopmatWarptileWave32, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
+    /// <summary>
+    /// <see cref="I2SGemmVariant.SelectFor"/> must fall back to the bit-exact register-blocked
+    /// F32 kernel whenever the env opt-out is set — the guard that keeps a coopmat regression
+    /// recoverable without a rebuild, and the same guard a device lacking coopmat or
+    /// subgroup-size control hits.
+    /// </summary>
+    [SkippableFact]
+    public void SelectFor_FallsBackToRegisterBlocked_WhenCoopmatDisabled()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+
+        string? saved = Environment.GetEnvironmentVariable(I2SGemmVariant.DisableCoopmatEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(I2SGemmVariant.DisableCoopmatEnvVar, "1");
+            Assert.Equal(I2SGemmVariant.RegisterBlocked, I2SGemmVariant.SelectFor(device));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(I2SGemmVariant.DisableCoopmatEnvVar, saved);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="I2SGemmVariant.SelectFor"/> may only return a coopmat variant when the device
+    /// advertises BOTH cooperative matrix and a pinnable compute subgroup size of 32 — the two
+    /// are a pair, and a 32-thread workgroup dispatched at the driver's default width would be
+    /// half a wave (or two redundant subgroups).
+    /// </summary>
+    [SkippableFact]
+    public void SelectFor_OnlyPicksCoopmat_WhenBothCoopmatAndWave32PinAvailable()
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out _);
+        using var device = VulkanDevice.Create();
+
+        var picked = I2SGemmVariant.SelectFor(device);
+        _output.WriteLine(
+            $"{device.DeviceName} (vendor 0x{device.VendorId:X}) coopmat={device.HasCooperativeMatrix} "
+            + $"wave32-pin={device.SupportsRequiredSubgroupSize(32, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute)} "
+            + $"=> production I2_S GEMM variant: {picked.SpvFileName} "
+            + $"(tile {picked.TileM}x{picked.TileN}, requiredSubgroupSize={picked.RequiredSubgroupSize})");
+        if (!picked.RequiresCooperativeMatrix)
+        {
+            Assert.Equal(I2SGemmVariant.RegisterBlocked, picked);
+            return;
+        }
+
+        Assert.True(device.HasCooperativeMatrix);
+        Assert.NotEqual(0u, picked.RequiredSubgroupSize);
+        Assert.True(device.SupportsRequiredSubgroupSize(
+            picked.RequiredSubgroupSize, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute));
+    }
+
     private static void RunParity(
         I2SGemmVariant variant, int m, int k, int n, float absTol = AbsTol, float relTol = RelTol)
     {
@@ -153,6 +248,9 @@ public class VulkanMatMulI2SGemmF32KernelTests
         using var device = VulkanDevice.Create();
         Skip.If(variant.RequiresCooperativeMatrix && !device.HasCooperativeMatrix,
             "Device does not advertise VK_KHR_cooperative_matrix.");
+        Skip.If(variant.RequiredSubgroupSize != 0 && !device.SupportsRequiredSubgroupSize(
+                variant.RequiredSubgroupSize, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute),
+            $"Device cannot pin a compute subgroup size of {variant.RequiredSubgroupSize}.");
         using var kernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, variant);
 
         long weightsBufBytes = ((long)weightsI2S.Length + 3) & ~3L;
