@@ -42,9 +42,14 @@ namespace DotLLM.Cuda;
 /// <see cref="CudaKernels.LaunchAttentionF32GqaSplit"/>'s already-characterized cross-split
 /// reassociation tolerance at <c>kvSplit&gt;1</c> — re-verified for this kernel's new
 /// multi-warp PV split and packed-M-dim layout in
-/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. Ships opt-in
-/// (<c>DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1</c>, default OFF), per this project's #180/#183
-/// precedent for new precision/reassociation axes.
+/// <c>CudaAttentionMmaDecodeGqaSplitTests.cs</c>, not just assumed. Real generation-parity
+/// validated (<c>CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs</c>, same harness shape
+/// as #222's split-KV test): pre-gate bit-identical, post-gate perplexity IMPROVES slightly
+/// (-0.173%), greedy generation diverges at the same step/depth (225/257) #222 already
+/// documented and accepted for the sibling <see cref="CudaKernels.LaunchAttentionF32GqaSplit"/>
+/// kernel. **Default ON** as of 2026-07-30 (opt-out via
+/// <c>DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0</c>) — the real-generation validation this project's
+/// #180/#183 precedent for new precision axes calls for before a default-on flip is now done.
 /// </para>
 /// </remarks>
 internal sealed class CudaAttentionMmaDecodeGqaSplit
@@ -61,11 +66,13 @@ internal sealed class CudaAttentionMmaDecodeGqaSplit
         Environment.GetEnvironmentVariable("DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT");
 
     /// <summary>
-    /// Effective toggle. Honours an explicit env override immediately ("1"/"0"); mutable so a
-    /// benchmark can interleave OFF/ON reps within one warmed process, same rationale as v1's
-    /// <c>CudaAttentionMmaDecode</c> and <see cref="CudaFlashAttention"/>'s toggles.
+    /// Effective toggle. Default ON as of 2026-07-30 (real generation-parity validated -- see
+    /// the type doc); set <c>DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0</c> to opt back out. Honours an
+    /// explicit env override immediately ("1"/"0"); mutable so a benchmark can interleave OFF/ON
+    /// reps within one warmed process, same rationale as v1's <c>CudaAttentionMmaDecode</c> and
+    /// <see cref="CudaFlashAttention"/>'s toggles.
     /// </summary>
-    internal static bool Enabled = MmaDecodeGqaSplitEnv == "1";
+    internal static bool Enabled = MmaDecodeGqaSplitEnv != "0";
 
     /// <summary>
     /// Count of kernel launches since process start — lets a test/benchmark prove the branch

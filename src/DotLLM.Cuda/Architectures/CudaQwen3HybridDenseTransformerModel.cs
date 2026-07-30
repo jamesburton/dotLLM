@@ -1325,9 +1325,10 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
             // F32 kernel uses, not just IsGqaGroupShapeSupported alone. Requires FP16 Q
             // (converted just below) and reads K/V straight from the FP16 KV cache -- no F32
             // staging needed for this path, though kStage/vStage above are still populated
-            // unconditionally for the fallback tiers. Off by default
-            // (DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1) -- see CudaAttentionMmaDecodeGqaSplit's doc
-            // for the full precision/scope story. Takes priority over every tier below when
+            // unconditionally for the fallback tiers. Default ON as of 2026-07-30, real
+            // generation-parity validated (opt-out via DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=0) --
+            // see CudaAttentionMmaDecodeGqaSplit's doc for the full precision/scope story and
+            // validation results. Takes priority over every tier below when
             // eligible (strictly faster whenever it applies, per the real A/B); the #226
             // fp64-combine research toggle above still wins over this when ITS flag is
             // explicitly set (deliberately mutually exclusive, not meant to compose).
