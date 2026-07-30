@@ -46,6 +46,19 @@ namespace DotLLM.Cpu.Kernels;
 /// the int32 accumulator <c>Σ w·q</c> is multiplied by <c>d_b</c> and float-accumulated across
 /// blocks; the final sum is multiplied by the per-tensor weight scale.</para>
 ///
+/// <para><b>4x4 register-blocked GEMM tile (issue #232).</b> The W2A8 <i>GEMM</i> (prefill) path
+/// evaluates 4 weight rows against 4 tokens in one pass, holding all 16 cell accumulators live —
+/// see <see cref="GemmI2_SW2A8RowsTiled"/> / <see cref="VecDotI2SQ8Tile4x4"/>. It is bit-exact with
+/// the per-cell form (identical operations in identical order per cell; only the interleaving across
+/// cells differs) and is the default whenever <see cref="Avx2"/> is available
+/// (<c>DOTLLM_I2S_TILE=0</c> restores the per-cell form). Ternary amortizes more here than Q8_0
+/// does: because the weights carry a single per-tensor scale, the only per-block scalar is the Q8_0
+/// activation scale <c>d_b</c>, which is <b>row-invariant</b> — its load, <c>Half</c>→float convert
+/// and broadcast are paid once per (block, token) rather than once per cell, alongside the weight
+/// load and its <c>Sign</c>. Measured 2.1-3.4x single-threaded / 1.7-2.1x pooled at BitNet-2B-4T
+/// prefill shapes; unlike Q8_0 (upstream #416) the win does <b>not</b> depend on the AVX-512VL
+/// register file.</para>
+///
 /// <para><b>Ragged K (issue #206).</b> Most published I2_S checkpoints have <c>k</c> an exact
 /// multiple of 128 (e.g. BitNet-2B-4T: 2560/6912), which is what the SIMD fast paths above
 /// assume. At least one real checkpoint family (1bitLLM-style <c>bitnet_b1_58-large</c>/<c>-xl</c>:
@@ -112,10 +125,44 @@ public static unsafe partial class MatMul
         public int K;
         public int N;
         public float Scale;
+        public bool Tiled;  // issue #232: use the 4x4 register-blocked inner kernel
     }
 
     /// <summary>True when a SIMD W2A8 (int8-activation) path is available.</summary>
     private static bool I2SUseW2A8 => Avx2.IsSupported;
+
+    // ─────────────────────────── 4x4 register-blocked GEMM tile (issue #232) ───────────────────────────
+
+    /// <summary>Weight rows per register-blocked GEMM tile (issue #232).</summary>
+    private const int I2STileRows = 4;
+
+    /// <summary>Tokens per register-blocked GEMM tile (issue #232).</summary>
+    private const int I2STileTokens = 4;
+
+    /// <summary>
+    /// Runtime gate for the 4x4 register-blocked I2_S W2A8 GEMM inner kernel (issue #232).
+    /// The vector <i>width</i> stays 256-bit — 512-bit dot widening was measured 1.8-1.9x slower on
+    /// Zen5 (issues #196/#202) and #416 reached the same conclusion independently.
+    ///
+    /// <para><b>Measured (Zen5 / Strix Halo, issue #232): the AVX-512VL register file is NOT the
+    /// enabler for the ternary tile.</b> The tile keeps 16 <see cref="Vector256{T}"/> float
+    /// accumulators live, so #416's Q8_0 result predicted it would need ymm16-31 to avoid spilling.
+    /// Re-running the identical A/B with <c>DOTNET_EnableAVX512F=0</c> (RyuJIT restricted to
+    /// ymm0-15) reproduced the speedup to within noise at every N — the tile's win comes from
+    /// collapsing per-cell work that is shared across a tile row (the row-invariant activation
+    /// scale, the weight load and its <c>Sign</c>), which dominates any spill traffic. The gate is
+    /// therefore <see cref="Avx2"/>, not AVX-512.</para>
+    ///
+    /// <para>Overridable via <c>DOTLLM_I2S_TILE</c> (<c>0</c>/<c>1</c>) for A/B runs.</para>
+    /// </summary>
+    private static readonly bool I2SGemmTile = ResolveI2SGemmTile();
+
+    private static bool ResolveI2SGemmTile()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_I2S_TILE");
+        if (env is "0" or "false" or "off") return false;
+        return Avx2.IsSupported;
+    }
 
     /// <summary>
     /// I2_S ternary GEMV: <c>result[r] = scale · dot(ternary(A[r,:]), x)</c>.
@@ -548,6 +595,15 @@ public static unsafe partial class MatMul
     [SkipLocalsInit]
     private static void GemmI2_SW2A8(byte* weights, float* b, float* c, int m, int k, int n,
                                      float scale, ComputeThreadPool? threadPool)
+        => GemmI2_SW2A8(weights, b, c, m, k, n, scale, threadPool, I2SGemmTile);
+
+    /// <inheritdoc cref="GemmI2_SW2A8(byte*, float*, float*, int, int, int, float, ComputeThreadPool?)"/>
+    /// <remarks><paramref name="tiled"/> selects the 4x4 register-blocked inner kernel (issue #232);
+    /// it is threaded through explicitly so a benchmark can A/B both forms <b>within one run</b>
+    /// (cross-run ratios are not sound for this question).</remarks>
+    [SkipLocalsInit]
+    private static void GemmI2_SW2A8(byte* weights, float* b, float* c, int m, int k, int n,
+                                     float scale, ComputeThreadPool? threadPool, bool tiled)
     {
         int blockCount = k / Q8_0GroupSize;
         int q8RowBytes = blockCount * Q8_0BlockBytes;
@@ -563,11 +619,11 @@ public static unsafe partial class MatMul
 
                 if (threadPool is null || m < ParallelMinRows)
                 {
-                    GemmI2_SW2A8Rows(weights, bQ8, c, m, 0, m, k, n, scale);
+                    GemmI2_SW2A8Rows(weights, bQ8, c, m, 0, m, k, n, scale, tiled);
                     return;
                 }
 
-                var ctx = new GemmI2SQ8Ctx { Weights = weights, BQ8 = bQ8, C = c, M = m, K = k, N = n, Scale = scale };
+                var ctx = new GemmI2SQ8Ctx { Weights = weights, BQ8 = bQ8, C = c, M = m, K = k, N = n, Scale = scale, Tiled = tiled };
                 threadPool.Dispatch((nint)(&ctx), &GemmI2_SW2A8Worker);
             }
         }
@@ -583,18 +639,27 @@ public static unsafe partial class MatMul
         ref var ctx = ref Unsafe.AsRef<GemmI2SQ8Ctx>((void*)ctxPtr);
         PartitionRows(ctx.M, threadIdx, threadCount, out int start, out int count);
         if (count == 0) return;
-        GemmI2_SW2A8Rows(ctx.Weights, ctx.BQ8, ctx.C, ctx.M, start, count, ctx.K, ctx.N, ctx.Scale);
+        GemmI2_SW2A8Rows(ctx.Weights, ctx.BQ8, ctx.C, ctx.M, start, count, ctx.K, ctx.N, ctx.Scale, ctx.Tiled);
     }
 
     /// <summary>
     /// Computes <paramref name="rowCount"/> weight rows (over all N tokens, W2A8) starting at
     /// <paramref name="startRow"/>. The weight row is unpacked to int8 once then reused for all N.
+    /// When <paramref name="tiled"/> is set, dispatches to the 4x4 register-blocked variant
+    /// (issue #232), which is bit-exact with this one.
     /// </summary>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void GemmI2_SW2A8Rows(byte* weights, byte* bQ8, float* c, int m,
-                                         int startRow, int rowCount, int k, int n, float scale)
+                                         int startRow, int rowCount, int k, int n, float scale,
+                                         bool tiled)
     {
+        if (tiled)
+        {
+            GemmI2_SW2A8RowsTiled(weights, bQ8, c, m, startRow, rowCount, k, n, scale);
+            return;
+        }
+
         int rowBytes = k / 4;
         int blockCount = k / Q8_0GroupSize;
         int q8RowBytes = blockCount * Q8_0BlockBytes;
@@ -619,6 +684,207 @@ public static unsafe partial class MatMul
         {
             ArrayPool<sbyte>.Shared.Return(rowBuf);
         }
+    }
+
+    /// <summary>
+    /// <b>Issue #232 — 4x4 register-blocked twin of <see cref="GemmI2_SW2A8Rows"/>.</b>
+    /// Unpacks <see cref="I2STileRows"/> weight rows at a time and evaluates them against
+    /// <see cref="I2STileTokens"/> tokens in one pass, keeping all 16 cell accumulators live in
+    /// registers. Ragged row/token remainders fall back to the per-cell
+    /// <see cref="VecDotI2SQ8"/> used by the untiled path.
+    ///
+    /// <para><b>Bit-exactness.</b> Per cell <c>(r,t)</c> the tile performs the identical operation
+    /// sequence in the identical order as <see cref="VecDotI2SQ8"/> — the same per-block
+    /// <c>Sign</c>/dot/<c>ConvertToVector256Single</c>/FMA into the same 8-lane accumulator, then the
+    /// same <c>HorizontalSumAvx2Float</c> and the same final multiply by the per-tensor scale. Only
+    /// the <i>interleaving across cells</i> changes, which cannot perturb a value. This is a
+    /// requirement, not an aspiration: the tile must be bit-identical.</para>
+    ///
+    /// <para><b>Why ternary can amortize more than Q8_0 here.</b> The only per-block scalar is the
+    /// Q8_0 <i>activation</i> scale <c>d_b</c> (the weights carry a single per-tensor scale), so
+    /// <c>d_b</c> is row-invariant: its load, <c>Half</c>→float conversion and broadcast happen once
+    /// per (block, token) and are reused across all <see cref="I2STileRows"/> rows. For Q8_0 the
+    /// per-cell scale is <c>dw[r][b]·dx[t][b]</c> and cannot amortize.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemmI2_SW2A8RowsTiled(byte* weights, byte* bQ8, float* c, int m,
+                                              int startRow, int rowCount, int k, int n, float scale)
+    {
+        int rowBytes = k / 4;
+        int blockCount = k / Q8_0GroupSize;
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int endRow = startRow + rowCount;
+
+        float* tile = stackalloc float[I2STileRows * I2STileTokens];
+
+        sbyte[] rowBuf = ArrayPool<sbyte>.Shared.Rent(k * I2STileRows);
+        try
+        {
+            fixed (sbyte* w = rowBuf)
+            {
+                int r = startRow;
+                for (; r + I2STileRows <= endRow; r += I2STileRows)
+                {
+                    for (int i = 0; i < I2STileRows; i++)
+                        UnpackRowI8(weights + (long)(r + i) * rowBytes, w + (long)i * k, k);
+
+                    int t = 0;
+                    for (; t + I2STileTokens <= n; t += I2STileTokens)
+                    {
+                        VecDotI2SQ8Tile4x4(w, k, bQ8 + (long)t * q8RowBytes, q8RowBytes, blockCount, tile);
+                        for (int i = 0; i < I2STileRows; i++)
+                            for (int j = 0; j < I2STileTokens; j++)
+                                c[(long)(t + j) * m + r + i] = tile[i * I2STileTokens + j] * scale;
+                    }
+
+                    // Token remainder (n % 4) — per-cell, same kernel as the untiled path.
+                    for (; t < n; t++)
+                    {
+                        byte* xQ8 = bQ8 + (long)t * q8RowBytes;
+                        for (int i = 0; i < I2STileRows; i++)
+                            c[(long)t * m + r + i] = VecDotI2SQ8(w + (long)i * k, xQ8, blockCount) * scale;
+                    }
+                }
+
+                // Row remainder (rowCount % 4).
+                for (; r < endRow; r++)
+                {
+                    UnpackRowI8(weights + (long)r * rowBytes, w, k);
+                    for (int t = 0; t < n; t++)
+                        c[(long)t * m + r] = VecDotI2SQ8(w, bQ8 + (long)t * q8RowBytes, blockCount) * scale;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<sbyte>.Shared.Return(rowBuf);
+        }
+    }
+
+    /// <summary>
+    /// One 4x4 cell of <see cref="VecDotI2SQ8Tile4x4"/>: <c>acc += d_t · (Σ absW·sign(w)·q)</c>,
+    /// operation-for-operation identical to the body of <see cref="VecDotI2SQ8"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> I2STileCell(Vector256<sbyte> absW, Vector256<sbyte> vw,
+                                                Vector256<sbyte> vq, Vector256<float> bscale,
+                                                Vector256<float> acc, bool useVnni,
+                                                Vector256<short> ones)
+    {
+        Vector256<sbyte> adjQ = Avx2.Sign(vq, vw);
+
+        Vector256<int> isum;
+        if (useVnni)
+            isum = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absW.AsByte(), adjQ);
+        else
+            isum = Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(absW.AsByte(), adjQ), ones);
+
+        Vector256<float> fsum = Avx.ConvertToVector256Single(isum);
+        return Fma.IsSupported ? Fma.MultiplyAdd(bscale, fsum, acc) : acc + fsum * bscale;
+    }
+
+    /// <summary>
+    /// Register-blocked 4x4 W2A8 dot (issue #232): 4 unpacked int8 ternary weight rows
+    /// (<paramref name="w"/>, stride <paramref name="wStride"/> elements) against 4 Q8_0 activation
+    /// rows (<paramref name="x"/>, stride <paramref name="xStride"/> bytes). Writes 16 unscaled dot
+    /// products to <paramref name="outTile"/> in row-major <c>[r·4 + t]</c> order.
+    /// The activation block scale <c>d_b</c> is fetched, converted and broadcast once per
+    /// (block, token) and reused across all 4 weight rows.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void VecDotI2SQ8Tile4x4(sbyte* w, int wStride, byte* x, int xStride,
+                                           int blockCount, float* outTile)
+    {
+        Vector256<float> a00 = Vector256<float>.Zero, a01 = Vector256<float>.Zero,
+                         a02 = Vector256<float>.Zero, a03 = Vector256<float>.Zero;
+        Vector256<float> a10 = Vector256<float>.Zero, a11 = Vector256<float>.Zero,
+                         a12 = Vector256<float>.Zero, a13 = Vector256<float>.Zero;
+        Vector256<float> a20 = Vector256<float>.Zero, a21 = Vector256<float>.Zero,
+                         a22 = Vector256<float>.Zero, a23 = Vector256<float>.Zero;
+        Vector256<float> a30 = Vector256<float>.Zero, a31 = Vector256<float>.Zero,
+                         a32 = Vector256<float>.Zero, a33 = Vector256<float>.Zero;
+
+        bool useVnni = AvxVnni.IsSupported;
+        Vector256<short> ones = Vector256.Create((short)1);
+
+        sbyte* w0 = w;
+        sbyte* w1 = w + wStride;
+        sbyte* w2 = w + 2 * wStride;
+        sbyte* w3 = w + 3 * wStride;
+
+        byte* x0 = x;
+        byte* x1 = x + xStride;
+        byte* x2 = x + 2 * xStride;
+        byte* x3 = x + 3 * xStride;
+
+        for (int block = 0; block < blockCount; block++)
+        {
+            int xoff = block * Q8_0BlockBytes;
+            byte* xb0 = x0 + xoff;
+            byte* xb1 = x1 + xoff;
+            byte* xb2 = x2 + xoff;
+            byte* xb3 = x3 + xoff;
+
+            // Row-invariant per-block activation scales: fetched + broadcast once for all 4 rows.
+            Vector256<float> s0 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb0));
+            Vector256<float> s1 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb1));
+            Vector256<float> s2 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb2));
+            Vector256<float> s3 = Vector256.Create((float)Unsafe.ReadUnaligned<Half>(xb3));
+
+            Vector256<sbyte> q0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb0 + 2);
+            Vector256<sbyte> q1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb1 + 2);
+            Vector256<sbyte> q2 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb2 + 2);
+            Vector256<sbyte> q3 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xb3 + 2);
+
+            int woff = block * Q8_0GroupSize;
+
+            Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(w0 + woff);
+            Vector256<sbyte> absW = Avx2.Sign(vw, vw);
+            a00 = I2STileCell(absW, vw, q0, s0, a00, useVnni, ones);
+            a01 = I2STileCell(absW, vw, q1, s1, a01, useVnni, ones);
+            a02 = I2STileCell(absW, vw, q2, s2, a02, useVnni, ones);
+            a03 = I2STileCell(absW, vw, q3, s3, a03, useVnni, ones);
+
+            vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(w1 + woff);
+            absW = Avx2.Sign(vw, vw);
+            a10 = I2STileCell(absW, vw, q0, s0, a10, useVnni, ones);
+            a11 = I2STileCell(absW, vw, q1, s1, a11, useVnni, ones);
+            a12 = I2STileCell(absW, vw, q2, s2, a12, useVnni, ones);
+            a13 = I2STileCell(absW, vw, q3, s3, a13, useVnni, ones);
+
+            vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(w2 + woff);
+            absW = Avx2.Sign(vw, vw);
+            a20 = I2STileCell(absW, vw, q0, s0, a20, useVnni, ones);
+            a21 = I2STileCell(absW, vw, q1, s1, a21, useVnni, ones);
+            a22 = I2STileCell(absW, vw, q2, s2, a22, useVnni, ones);
+            a23 = I2STileCell(absW, vw, q3, s3, a23, useVnni, ones);
+
+            vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(w3 + woff);
+            absW = Avx2.Sign(vw, vw);
+            a30 = I2STileCell(absW, vw, q0, s0, a30, useVnni, ones);
+            a31 = I2STileCell(absW, vw, q1, s1, a31, useVnni, ones);
+            a32 = I2STileCell(absW, vw, q2, s2, a32, useVnni, ones);
+            a33 = I2STileCell(absW, vw, q3, s3, a33, useVnni, ones);
+        }
+
+        outTile[0] = HorizontalSumAvx2Float(a00);
+        outTile[1] = HorizontalSumAvx2Float(a01);
+        outTile[2] = HorizontalSumAvx2Float(a02);
+        outTile[3] = HorizontalSumAvx2Float(a03);
+        outTile[4] = HorizontalSumAvx2Float(a10);
+        outTile[5] = HorizontalSumAvx2Float(a11);
+        outTile[6] = HorizontalSumAvx2Float(a12);
+        outTile[7] = HorizontalSumAvx2Float(a13);
+        outTile[8] = HorizontalSumAvx2Float(a20);
+        outTile[9] = HorizontalSumAvx2Float(a21);
+        outTile[10] = HorizontalSumAvx2Float(a22);
+        outTile[11] = HorizontalSumAvx2Float(a23);
+        outTile[12] = HorizontalSumAvx2Float(a30);
+        outTile[13] = HorizontalSumAvx2Float(a31);
+        outTile[14] = HorizontalSumAvx2Float(a32);
+        outTile[15] = HorizontalSumAvx2Float(a33);
     }
 
     /// <summary>
