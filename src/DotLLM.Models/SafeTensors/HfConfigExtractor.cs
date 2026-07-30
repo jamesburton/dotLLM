@@ -169,12 +169,12 @@ public static class HfConfigExtractor
 
         // RoPE element-pairing convention — identical to GgufModelConfigExtractor.
         // Llama/Mistral/Mixtral/DeepSeek-V2 use interleaved (Norm); Qwen/Qwen-MoE/Phi
-        // use non-interleaved (NeoX). SmolLM3 inherits rotate_half from Llama in
-        // modeling_smollm3.py (HF rotate_half = halves-pair = our NeoX), so it
-        // diverges from the Llama default for this extractor.
+        // use non-interleaved (NeoX). SmolLM3 is Llama-shaped and llama.cpp's
+        // llama_model_rope_type maps LLM_ARCH_SMOLLM3 to LLAMA_ROPE_TYPE_NORM
+        // alongside LLM_ARCH_LLAMA — so SmolLM3 falls through the Llama default.
         RoPEType ropeType = architecture switch
         {
-            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi or Architecture.SmolLM3 => RoPEType.NeoX,
+            Architecture.Qwen or Architecture.QwenMoe or Architecture.Phi => RoPEType.NeoX,
             _ => RoPEType.Norm,
         };
 

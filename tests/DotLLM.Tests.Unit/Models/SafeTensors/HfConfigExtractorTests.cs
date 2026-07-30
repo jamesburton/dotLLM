@@ -552,8 +552,9 @@ public sealed class HfConfigExtractorTests
     /// <summary>
     /// SmolLM3-3B detection on the real-world HF config (2026-05 snapshot).
     /// <c>architectures[0]=SmolLM3ForCausalLM</c>, <c>model_type=smollm3</c>,
-    /// GQA-4, NeoX RoPE, NoPE on every 4th layer (indices 3, 7, 11, ... in
-    /// the 36-layer SKU).
+    /// GQA-4, Norm RoPE (Llama-shaped, per llama.cpp's <c>LLM_ARCH_SMOLLM3</c>
+    /// → <c>LLAMA_ROPE_TYPE_NORM</c>), NoPE on every 4th layer (indices
+    /// 3, 7, 11, ... in the 36-layer SKU).
     /// </summary>
     [Fact]
     public void SmolLM3_3B_DetectsArchAndParsesNoPeLayers()
@@ -595,8 +596,9 @@ public sealed class HfConfigExtractorTests
         Assert.Equal(128256, cfg.VocabSize);
         Assert.Equal(65536, cfg.MaxSequenceLength);
         Assert.Equal(5_000_000.0f, cfg.RoPEConfig!.Value.Theta);
-        // HF transformers' SmolLM3 inherits rotate_half from Llama.
-        Assert.Equal(RoPEType.NeoX, cfg.RoPEConfig.Value.Type);
+        // SmolLM3 is Llama-shaped; llama.cpp's llama_model_rope_type maps
+        // LLM_ARCH_SMOLLM3 to LLAMA_ROPE_TYPE_NORM alongside LLM_ARCH_LLAMA.
+        Assert.Equal(RoPEType.Norm, cfg.RoPEConfig.Value.Type);
         Assert.True(cfg.TiedEmbeddings);
 
         // NoPE mask: HF stores 1 = apply RoPE, 0 = skip RoPE. Extractor
