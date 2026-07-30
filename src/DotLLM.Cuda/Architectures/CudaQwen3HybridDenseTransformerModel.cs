@@ -157,6 +157,13 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
     private nint _attnGqaSplitPartialOut;
     private long _attnGqaSplitPartialHeadsAllocated;
     private int _attnGqaSplitMaxSplitAllocated;
+    // Composed tensor-core decode kernel (issue #199 v2) -- FP16 Q scratch. Reuses the
+    // #197/#198 GQA-split partial-max/sum/out scratch above (identical [numHeads, kvSplit(,
+    // headDim)] layout, per CudaAttentionMmaDecodeGqaSplit's own doc) rather than duplicating
+    // it; EnsureAttentionGqaSplitScratch already grows-if-needed for whichever kernel asks.
+    private nint _attnMmaDecodeQF16;
+    private long _attnMmaDecodeQF16ElemsAllocated;
+    private readonly DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit _mmaDecodeGqaSplit;
 
     private bool _disposed;
 
@@ -222,6 +229,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _kernels = kernels;
         _deviceId = deviceId;
         _dequantScratchF16Weight = dequantScratchDevice;
+        _mmaDecodeGqaSplit = new DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit(kernels);
 
         _gdnLayerOrdinal = new int[config.NumLayers];
         int gdnOrdinal = 0;
@@ -1305,6 +1313,39 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                 && seqKv >= CudaKernels.AttentionSplitKvMinSeqKv
                 && _kernels.IsAttentionSplitKvSafe(numHeads, headDim);
 
+            // Opt-in composed tensor-core decode attention (issue #199 v2): same grid design as
+            // the GQA-split kernel above (numKvHeads x runtime-tuned kvSplit), but packs the
+            // GQA group into the mma.sync tile's M dimension for real tensor-core throughput
+            // instead of one query row per warp. Measured 2-2.6x faster than the plain F32
+            // kernel and 2-2.5x faster than the GQA-split kernel itself at depth >=512 (see
+            // docs/CUDA.md's "2026-07-30 re-profile"/issue #199 v2 entries) -- but ONLY when
+            // there's a real group to pack (numKvHeads < numHeads); at group=1 this kernel
+            // degenerates to v1's exact failure mode (one row wasted in a 16-row mma tile,
+            // ~4% occupancy), so it deliberately requires the same "real GQA" gate the sibling
+            // F32 kernel uses, not just IsGqaGroupShapeSupported alone. Requires FP16 Q
+            // (converted just below) and reads K/V straight from the FP16 KV cache -- no F32
+            // staging needed for this path, though kStage/vStage above are still populated
+            // unconditionally for the fallback tiers. Off by default
+            // (DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1) -- see CudaAttentionMmaDecodeGqaSplit's doc
+            // for the full precision/scope story. Takes priority over every tier below when
+            // eligible (strictly faster whenever it applies, per the real A/B); the #226
+            // fp64-combine research toggle above still wins over this when ITS flag is
+            // explicitly set (deliberately mutually exclusive, not meant to compose).
+            // "Real GQA" (numKvHeads < numHeads) and the shared min-seqKv gate are checked here
+            // rather than inside CudaAttentionMmaDecodeGqaSplit.CanUse (which stays a pure
+            // per-launch shape/precondition check, mirroring CudaKernels.IsAttentionSplitKvSafe's
+            // split of concerns) -- at group=1 there is no query-head group to pack into the mma
+            // tile's M dimension, so this kernel would degenerate to v1's exact failure mode (one
+            // row wasted in a 16-row tile, ~4% occupancy) rather than its real ~2-2.5x win.
+            bool mmaEligible = seqLen == 1
+                && numKvHeads < numHeads
+                && seqKv >= CudaKernels.AttentionGqaSplitMinSeqKv
+                && _mmaDecodeGqaSplit.CanUse(seqLen, seqKv, slidingWindow: 0, numHeads, numKvHeads, headDim);
+            int mmaKvSplit = mmaEligible
+                ? _mmaDecodeGqaSplit.ComputeSafeKvSplit(numKvHeads, numHeads / numKvHeads, seqKv)
+                : 0;
+            bool useMmaDecodeGqaSplitAttn = mmaEligible && mmaKvSplit >= 1;
+
             // Issue #226 spike: fp64-combine variant, mutually exclusive with (checked before, so
             // it wins over) the plain split-KV and GQA-split tiers when its own flag is set --
             // this is a research A/B toggle, not meant to compose with the other opt-in kernels.
@@ -1321,6 +1362,15 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
                     seqKv, numHeads, numKvHeads, headDim,
                     positionOffset: positionOffset, slidingWindow: 0,
                     _attnSplitKvPartialMax, _attnSplitKvPartialSum, _attnSplitKvPartialOut, streamH);
+            }
+            else if (useMmaDecodeGqaSplitAttn)
+            {
+                EnsureAttentionMmaDecodeQF16Scratch(numHeads, headDim);
+                EnsureAttentionGqaSplitScratch(numHeads, headDim, mmaKvSplit);
+                _kernels.LaunchConvertF32ToF16(q, _attnMmaDecodeQF16, numHeads * headDim, streamH);
+                _mmaDecodeGqaSplit.Run(_attnMmaDecodeQF16, _f16KCache![slot], _f16VCache![slot], attnOut,
+                    seqKv, numHeads, numKvHeads, mmaKvSplit,
+                    _attnGqaSplitPartialMax, _attnGqaSplitPartialSum, _attnGqaSplitPartialOut, streamH);
             }
             else if (useGqaSplitAttn)
             {
@@ -1537,6 +1587,20 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         _attnGqaSplitPartialOut = AllocDevice(outCount * sizeof(float));
         _attnGqaSplitPartialHeadsAllocated = neededHeads;
         _attnGqaSplitMaxSplitAllocated = maxSplit;
+    }
+
+    /// <summary>FP16 Q scratch for the composed tensor-core decode kernel (issue #199 v2) --
+    /// <see cref="CudaKernels.LaunchAttentionMmaDecodeGqaSplit"/> requires FP16 Q, but this
+    /// model's projected Q (<c>_state.QScratch</c>) is F32 like every other attention tier
+    /// here, so it needs its own one-shot conversion immediately before that launch.</summary>
+    private void EnsureAttentionMmaDecodeQF16Scratch(int numHeads, int headDim)
+    {
+        long needed = (long)numHeads * headDim;
+        if (needed <= _attnMmaDecodeQF16ElemsAllocated) return;
+
+        FreeIfNonZero(ref _attnMmaDecodeQF16);
+        _attnMmaDecodeQF16 = AllocDevice(needed * sizeof(ushort));
+        _attnMmaDecodeQF16ElemsAllocated = needed;
     }
 
     private void WriteF16KvRows(int layerSlot, nint kSrcF32, nint vSrcF32,
@@ -1921,6 +1985,7 @@ public sealed unsafe class CudaQwen3HybridDenseTransformerModel : IModel
         FreeIfNonZero(ref _attnGqaSplitPartialMax);
         FreeIfNonZero(ref _attnGqaSplitPartialSum);
         FreeIfNonZero(ref _attnGqaSplitPartialOut);
+        FreeIfNonZero(ref _attnMmaDecodeQF16);
 
         _state.Dispose();
         _gdnCache.Dispose();

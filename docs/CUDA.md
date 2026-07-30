@@ -940,6 +940,62 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   #197/#198/#199 investigation family** — worth prioritizing model integration + a real
   generation-parity pass as the next step, ahead of any of the other still-opt-in kernels this
   investigation produced.
+
+  **Model integration + real generation-parity (2026-07-30, same day, branch
+  `issue/199-tensor-core-decode-attention-v2`): wired into `CudaQwen3HybridDenseTransformerModel`
+  and validated at real generation scale — PASSES, with two real debugging-methodology lessons
+  worth recording.** Wired as a new top-priority dispatch tier (above `attention_f32_gqa_split_kv`,
+  below the #226 fp64-combine research toggle) — requires `numKvHeads < numHeads` in addition to
+  `CudaAttentionMmaDecodeGqaSplit.CanUse`'s own shape checks (at group=1 there's no query-head
+  group to pack into the mma tile's M dimension, degenerating to v1's exact failure mode), converts
+  Q to FP16 into a new dedicated scratch buffer, and reads K/V straight from the FP16 KV cache
+  (skips the F32 staging conversion this call doesn't need, though that conversion still runs
+  unconditionally for the fallback tiers below it).
+
+  A dedicated generation-parity test
+  (`tests/DotLLM.Tests.Integration/Cuda/CudaAttentionMmaDecodeGqaSplitGenerationParityTests.cs`,
+  same harness shape as #222's `CudaAttentionSplitKvGenerationParityTests`) found real bugs twice
+  before landing a trustworthy result:
+  1. **First wiring attempt dispatched the kernel via `_kernels.LaunchAttentionMmaDecodeGqaSplit`
+     directly** (matching this file's existing style for the other opt-in tiers, which don't use
+     `CudaAttentionMmaDecodeGqaSplit`'s wrapper class at all) — but the test's own correctness
+     check (`DispatchCount` increasing, added specifically to prove the branch fires rather than
+     silently falling through — this project's standing lesson from the BitNet-session GQA-split
+     false-correlation, see `[[bitnet-support]]`) failed: `DispatchCount` only increments inside the
+     wrapper class's own `Run()` method, which the direct-call wiring never touched. Root cause was
+     in the *test's* assumption, not the dispatch logic itself (confirmed by a real CLI diagnostic:
+     the gating math was correct and dispatching real kernel launches all along) — fixed by routing
+     the model's dispatch through `CudaAttentionMmaDecodeGqaSplit.Run()` instead of calling
+     `CudaKernels` directly, which both fixes the counter and removes a small amount of duplicated
+     eligibility logic.
+  2. **The pre-gate bit-exactness assertion then failed for real**: `Assert.Equal(0.0,
+     maxPreGateStepDiff)` — a stricter check than #222's own test has (that one only prints the
+     value, never asserts on it) — found a nonzero diff at the exact gate boundary. Isolated via a
+     throwaway diagnostic test (two fresh model loads compared pairwise: false-vs-false,
+     true-vs-true, and false-vs-true, at a token count safely below vs. exactly spanning the gate)
+     that the underlying dispatch was bit-identical in all cases through step index `gate-2`,
+     first differing at step index `gate-1`. Root cause: the test's `depth = t` step-index proxy
+     (copied verbatim from #222's test, which carries the same approximation in a comment: "seqKv
+     at the step scoring token t+1 is t+1; use t as a depth proxy") undercounts by exactly one —
+     the KV write for position `t` lands before that step's attention read, so the real `seqKv` at
+     step `t` is `t+1`, not `t`. Fixed to `depth = t + 1`; pre-gate diff is now exactly `0.0`.
+     #222's own test likely carries the identical off-by-one at its own gate boundary, silently
+     tolerated because it was never asserted on — not fixed here (out of scope), flagged for
+     whoever next touches that file.
+
+  **Result, corrected methodology, real Bonsai-27B, 1040-token corpus, fresh model loads per
+  pass**: pre-gate (depth<256, 255 steps) bit-identical (`0.0` exactly) — confirms the gate is
+  airtight, no accidental engagement below threshold. Post-gate (depth>=256, 784 steps) perplexity
+  **improves** slightly (ratio 0.998270, -0.173%) rather than regressing. Overall -0.1305%. Greedy
+  generation first diverges at generated-step 225 (decode depth 257) — the SAME step/depth #222's
+  original split-KV investigation documented for `attention_f32_gqa_split_kv`'s own sibling kernel,
+  and a small, borderline-margin flip (baseline margin 7.59e-2 vs variant 7.94e-2, both far from a
+  confident decision) consistent with that already-characterized, already-accepted reassociation
+  sensitivity rather than a new correctness problem this kernel introduces. Full CUDA unit suite
+  (423 tests, 380 real + 43 env-gated skips) passes with zero regressions from the model-file
+  changes. **Still opt-in/default-OFF** (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) pending a maintainer
+  decision on default-on, but the precondition that gap existed for (#222-style real generation
+  validation) is now satisfied.
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
