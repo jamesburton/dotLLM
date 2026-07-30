@@ -714,6 +714,49 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
 - **MLA FP16/quantized weight paths**: current Phase A is F32 throughout. FP16 follow-up; quantized extends `Project` patterns from the GQA path.
 - **Flash Attention**: replace naive attention kernel with tiled flash attention (shared memory, online softmax). Full Tensor Core access via `wmma` intrinsics in PTX. **Elevated `ncu --set full` data (2026-07-27, RTX 3060, `attention_f32` decode launches, Bonsai-27B, grid=(24,1,1)/block=(256,1,1))**: Compute (SM) Throughput ~4.2-4.3%, Memory Throughput ~8.6-8.7%, Achieved Occupancy 16.5-16.8% vs. 100% Theoretical (ncu's own analysis flags ~83% Est. Speedup from occupancy alone), Waves Per SM only 0.14 (grid=24=`numHeads` badly underfills the 3060's 28 SMs), Warp Cycles Per Issued Instruction ~42.3-42.8 — i.e. the kernel is genuinely **latency-bound**, not compute- or memory-bandwidth-bound; both throughput metrics sit near-idle simultaneously. This is the same root cause #180/#182's "grid too small" fixes addressed elsewhere in the decode path (see the `prismml-bonsai-model` project memory), now confirmed quantitatively for attention specifically rather than inferred from category-level `DOTLLM_HYBRID_PROFILE` percentages. **This also explains, not just motivates, issue #183's inconclusive real-world result**: #183 shipped an opt-in split-KV ("Flash-Decoding") kernel that splits the KV-tile loop across more cooperating blocks specifically to raise occupancy — the real A/B (depth 256-1024) came back within noise (+0.5% to +2% best-of, not a clean win). Given this ncu data, that outcome makes sense: splitting into more blocks helps an occupancy-bound kernel, but a kernel this deep into the latency-bound regime (42 cycles stalled per issued instruction, both compute AND memory sitting under 9%) needs fewer, larger, better-pipelined memory transactions — i.e. an actual flash-attention rewrite (tiled shared-memory staging, online softmax, deeper software pipelining to hide the per-access latency) — not just more parallel blocks replaying the same latency-bound access pattern. Treat #183's split-KV kernel as a proven-safe but low-value stepping stone, not a substitute for this item.
 
+  **2026-07-30 re-profile, post-#197/#198 (PR #201), at realistic depth — corrects the picture above.**
+  The 2026-07-27 numbers were measured at shallow depth (`-p 8 -n 12`, no `--depth`, so `seq_kv` was
+  effectively ~8-20) with no launch-skip verification of which kernel/phase was actually captured —
+  worth flagging since a first re-profile attempt this session initially mis-captured **prefill**
+  `attention_f32` launches (`seq_q=8`, grid=192) while believing it had captured decode (a live
+  instance of exactly the "verify a flag/kernel is actually wired into the code path you're testing"
+  lesson from the BitNet session's GQA-split false-correlation — see `[[bitnet-support]]`). Corrected
+  methodology: `--kernel-name` filtering (not `--launch-skip` guessing) plus `--depth 512` (clears
+  `AttentionGqaSplitMinSeqKv=256`, the opt-in gate `DOTLLM_ATTN_GQA_SPLIT=1` needs to even dispatch
+  `attention_f32_gqa_split_kv` instead of falling through to the plain kernel) confirmed by grid-shape
+  before trusting any number.
+
+  | Metric | Baseline `attention_f32` (grid=24) | `attention_f32_gqa_split_kv` (grid=4×8, `DOTLLM_ATTN_GQA_SPLIT=1`) |
+  |---|---:|---:|
+  | Duration | 191.97 us | 180.48 us (**-6.0%**) |
+  | Compute (SM) Throughput | 9.74% | 20.61% (**+112%**) |
+  | Memory Throughput | 48.93% | 25.15% (**-48.6%**, i.e. real reduction in redundant KV traffic) |
+  | Achieved Occupancy | 16.65% | 19.00% |
+  | Theoretical Occupancy | 100% | 83.33% (grouped-warp kernel needs more registers/shared mem per block) |
+  | Waves Per SM | 0.14 | 0.23 |
+  | Warp Cycles Per Issued Instruction | 24.60 | 15.24 (**-38%**) |
+  | Dominant stall reason | 75.7% L1TEX/global-memory scoreboard wait | 44.2% CTA-barrier wait (6.7 of 15.24 cycles) |
+
+  Reading: #197/#198 (the GQA-group + tuned split-KV kernel) is real and working as designed — it
+  substantially cuts redundant KV reads (compute throughput +112%, memory traffic -49%, per-instruction
+  stall -38%) — but the wall-clock win per launch is modest (~6%) because occupancy barely moves
+  (16.65%→19.00%) and the theoretical ceiling actually drops (100%→83.33%) from the grouped kernel's
+  higher per-block resource cost. Critically, **the dominant stall reason changed category**: the
+  plain kernel is bottlenecked on raw memory-load latency (waiting for K/V reads to land), the
+  GQA-split kernel is now bottlenecked on **CTA-barrier synchronization** (warps waiting for siblings
+  in the same block, "commonly caused by diverging code paths before a barrier" per `ncu`'s own
+  analysis) — a different, more specific, more actionable diagnosis than the original "generically
+  latency-bound" read. This means #199's own stated precondition ("implement after #198 lands and
+  the kernel is out of the latency-bound regime") is only **partially** satisfied: #198 helped, but
+  the kernel is still deep in an underutilized regime, just via a different mechanism. Worth
+  considering a smaller, lower-risk fix first — reducing warp divergence/barrier count in
+  `attention_f32_gqa_split_kv`'s grouped-warp code specifically — before committing to #199's full
+  FP16 tensor-core rewrite (HIGH risk, precision-sensitive, per that issue's own scoping). Not yet
+  investigated at the SASS/source level; the barrier-stall *hypothesis* itself should get the same
+  "verify before trusting" treatment #218 gave a superficially similar `ncu` hypothesis (which turned
+  out wrong) before either path is chosen. Raw `.ncu-rep` reports and this session's methodology notes
+  are in `.perf-runs/ncu-2026-07-30-post197198/` (not committed — binary, ~250 MB combined).
+
   **Follow-up (issues #197+#198, same session): GQA-group register-blocking + tuned split-KV,
   composed into one kernel.** `attention_f32_gqa_split_kv` grids `(numKvHeads, kv_split)` instead
   of `(numHeads, ATTN_KV_SPLIT=4)` -- each block owns one KV head and register-blocks the QK/PV
