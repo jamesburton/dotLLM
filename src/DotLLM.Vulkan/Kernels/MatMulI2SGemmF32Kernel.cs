@@ -51,6 +51,23 @@ public readonly record struct I2SGemmVariant(
     public static I2SGemmVariant Coopmat =>
         new("matmul_i2_s_f32_gemm_coopmat.spv", 16, 16, RequiresCooperativeMatrix: true);
 
+    /// <summary>
+    /// Cooperative-matrix probe with a 32-thread workgroup and workgroup-size-agnostic staging.
+    /// </summary>
+    /// <remarks>
+    /// Diagnostic for why <see cref="Coopmat"/> underperforms. That kernel declares a 64-thread
+    /// workgroup (copied from the Q8_0 coopmat kernel, sized for AMD's 64-wide wave), so on a
+    /// 32-wide device it contains TWO subgroups — and because the coopmat ops are at
+    /// <c>gl_ScopeSubgroup</c>, both subgroups redundantly compute the SAME 16x16 tile and both
+    /// store it. Correct, but roughly double the necessary compute. This variant uses one
+    /// 32-thread workgroup so a wave32 device gets exactly one subgroup.
+    /// Not portable as-is: on a 64-wide device a 32-thread workgroup is half a wave. The real fix
+    /// is a specialization constant for the workgroup size, set per device from
+    /// <see cref="VulkanDevice.SubgroupSize"/>.
+    /// </remarks>
+    public static I2SGemmVariant Coopmat32 =>
+        new("matmul_i2_s_f32_gemm_coopmat32.spv", 16, 16, RequiresCooperativeMatrix: true);
+
     /// <summary>The variant used by the production forward path.</summary>
     public static I2SGemmVariant Production => RegisterBlocked;
 }
