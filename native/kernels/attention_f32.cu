@@ -472,6 +472,209 @@ extern "C" __global__ void attention_f32_split_kv(
     }
 }
 
+// ─── Issue #226 spike: fp64 cross-split COMBINE only, fast_exp_neg untouched ───────────────────────
+//
+// #222 found attention_f32_split_kv's real-generation divergence from baseline (#183's known,
+// accepted "not bit-exact" reassociation tradeoff, quantified at generation scale): a genuine
+// argmax flip at decode depth 257 (the first step split-KV can engage), fully compounding from
+// there (774/775 subsequent tokens differ), plus a +0.30% post-gate perplexity regression.
+// attention_f32.cu's own header (see above) already documents the root cause as the COMBINE step's
+// cross-split reassociation (independent partial sums merged, not one sequential accumulation) --
+// NOT the per-tile fast_exp_neg approximation, which is identical, in the identical accumulation
+// order, in both the baseline attention_f32 and every split-KV variant.
+//
+// This is a byte-for-byte copy of attention_f32_split_kv EXCEPT the combine block (after
+// grid.sync(), guarded by `if (s != 0) return`) accumulates the cross-split partial_sum ("l") and
+// partial_out ("o") merges in double precision instead of float -- fast_exp_neg itself still
+// computes and returns a float (untouched, per issue #226's explicit scope), only the SUMMATION of
+// its already-computed float outputs across the (up to) ATTN_KV_SPLIT=4 terms happens in double.
+// This isolates the one specific hypothesis #226 asks about: does the reassociation error in this
+// specific 4-term combine sum (not the exp approximation, not the per-tile accumulation within a
+// split) meaningfully explain the #222 divergence.
+//
+// Kept as a SEPARATE kernel (not a modification of attention_f32_split_kv in place) specifically so
+// both can be A/B'd directly without a rebuild-swap dance -- opt-in via DOTLLM_ATTN_SPLIT_KV_HP=1,
+// mutually exclusive with (and takes priority over, when both would apply) plain split-KV. See
+// issue #226 for the correctness/precision/perf verdict once measured.
+extern "C" __global__ void attention_f32_split_kv_hp(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, float* __restrict__ output,
+    const int seq_kv,
+    const int num_heads, const int num_kv_heads, const int head_dim,
+    const int position_offset, const int sliding_window,
+    float* __restrict__ partial_max,   // [num_heads, ATTN_KV_SPLIT]
+    float* __restrict__ partial_sum,   // [num_heads, ATTN_KV_SPLIT]
+    float* __restrict__ partial_out)   // [num_heads, ATTN_KV_SPLIT, head_dim]
+{
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+
+    int hq = blockIdx.x;
+    int s  = blockIdx.y;
+    int hkv = hq / (num_heads / num_kv_heads);
+    float scale = rsqrtf((float)head_dim);
+    int pos_q = position_offset; // seq_q == 1 (decode-only kernel)
+
+    int kv_stride = num_kv_heads * head_dim; // q has no stride use here: seqQ==1, so q_vec below indexes by head only
+
+    extern __shared__ float smem[];
+    float* q_shared    = smem;
+    float* score_tile  = smem + head_dim;
+    float* out_accum   = score_tile + TILE_KV;
+    float* warp_scratch = out_accum + head_dim;
+
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    // This split's contiguous KV sub-range: [kv_lo, kv_hi).
+    int chunk = (seq_kv + ATTN_KV_SPLIT - 1) / ATTN_KV_SPLIT;
+    int kv_lo = s * chunk;
+    int kv_hi = kv_lo + chunk;
+    if (kv_hi > seq_kv) kv_hi = seq_kv;
+    if (kv_lo > seq_kv) kv_lo = seq_kv;
+
+    const float* q_vec = q + (size_t)hq * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        q_shared[d] = q_vec[d];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        out_accum[d] = 0.0f;
+    __syncthreads();
+
+    float running_max = -FLT_MAX;
+    float running_sum = 0.0f;
+
+    for (int t_start = kv_lo; t_start < kv_hi; t_start += TILE_KV)
+    {
+        int t_end = t_start + TILE_KV;
+        if (t_end > kv_hi) t_end = kv_hi;
+        int tile_len = t_end - t_start;
+
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+        {
+            int tkv = t_start + t;
+            if (tkv > pos_q || (sliding_window > 0 && pos_q - tkv >= sliding_window))
+            { score_tile[t] = -FLT_MAX; continue; }
+
+            const float* k_vec = k + (size_t)tkv * kv_stride + hkv * head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                score += q_shared[d] * k_vec[d];
+            score_tile[t] = score * scale;
+        }
+        __syncthreads();
+
+        float tile_max = -FLT_MAX;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x)
+            tile_max = fmaxf(tile_max, score_tile[t]);
+
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        if (lane == 0) warp_scratch[warp_id] = tile_max;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_max = (lane < nw) ? warp_scratch[lane] : -FLT_MAX;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, off));
+        }
+        if (threadIdx.x == 0) warp_scratch[0] = tile_max;
+        __syncthreads();
+        tile_max = warp_scratch[0];
+
+        float new_max = fmaxf(running_max, tile_max);
+        float correction = (running_max > -FLT_MAX + 1.0f)
+                           ? fast_exp_neg(running_max - new_max) : 0.0f;
+        running_sum *= correction;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out_accum[d] *= correction;
+        running_max = new_max;
+        __syncthreads();
+
+        float tile_sum = 0.0f;
+        for (int t = threadIdx.x; t < tile_len; t += blockDim.x) {
+            float w = (score_tile[t] > -FLT_MAX + 1.0f)
+                      ? fast_exp_neg(score_tile[t] - running_max) : 0.0f;
+            score_tile[t] = w;
+            tile_sum += w;
+        }
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+        if (lane == 0) warp_scratch[warp_id] = tile_sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            int nw = (blockDim.x + warpSize - 1) / warpSize;
+            tile_sum = (lane < nw) ? warp_scratch[lane] : 0.0f;
+            for (int off = warpSize / 2; off > 0; off >>= 1)
+                tile_sum += __shfl_down_sync(0xFFFFFFFF, tile_sum, off);
+            if (lane == 0) warp_scratch[0] = tile_sum;
+        }
+        __syncthreads();
+        running_sum += warp_scratch[0];
+
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float v_acc = 0.0f;
+            for (int t = 0; t < tile_len; t++)
+                if (score_tile[t] > 0.0f)
+                    v_acc += score_tile[t] * (v + (size_t)(t_start + t) * kv_stride + hkv * head_dim)[d];
+            out_accum[d] += v_acc;
+        }
+        __syncthreads();
+    }
+
+    // Publish this split's partial (UNNORMALIZED — no division by running_sum here).
+    if (threadIdx.x == 0)
+    {
+        partial_max[(size_t)hq * ATTN_KV_SPLIT + s] = running_max;
+        partial_sum[(size_t)hq * ATTN_KV_SPLIT + s] = running_sum;
+    }
+    float* partial_out_vec = partial_out + ((size_t)hq * ATTN_KV_SPLIT + s) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        partial_out_vec[d] = out_accum[d];
+
+    grid.sync();   // ALL blocks (every head, every split) must have published before any combine.
+
+    if (s != 0) return; // only the split=0 block per head performs the final combine.
+
+    // ── fp64 combine (issue #226): only this block differs from attention_f32_split_kv ──
+    __shared__ float s_combined_max;
+    __shared__ double s_combined_sum;
+    if (threadIdx.x == 0)
+    {
+        float m = -FLT_MAX;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+            m = fmaxf(m, partial_max[(size_t)hq * ATTN_KV_SPLIT + i]);
+
+        double l = 0.0;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+        {
+            float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
+            float li = partial_sum[(size_t)hq * ATTN_KV_SPLIT + i];
+            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            l += (double)li * (double)w;
+        }
+        s_combined_max = m;
+        s_combined_sum = l;
+    }
+    __syncthreads();
+
+    float m = s_combined_max;
+    double sum_d = s_combined_sum;
+    double sum_inv = (sum_d > 1e-10) ? (1.0 / sum_d) : 0.0;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+    {
+        double o = 0.0;
+        for (int i = 0; i < ATTN_KV_SPLIT; i++)
+        {
+            float mi = partial_max[(size_t)hq * ATTN_KV_SPLIT + i];
+            float w = (mi > -FLT_MAX + 1.0f) ? fast_exp_neg(mi - m) : 0.0f;
+            float oi = partial_out[((size_t)hq * ATTN_KV_SPLIT + i) * head_dim + d];
+            o += (double)oi * (double)w;
+        }
+        output[(size_t)hq * head_dim + d] = (float)(o * sum_inv);
+    }
+}
+
 // ─── OPT-IN GQA-group + split-KV composed kernel (issues #197 + #198) ──────────────────────────────
 //
 // `attention_f32_split_kv` above (issue #183) grids one block per QUERY head (grid.x=numHeads).
