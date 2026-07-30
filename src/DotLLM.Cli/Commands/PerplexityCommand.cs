@@ -58,6 +58,19 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [DefaultValue("sliding-window")]
         public string Mode { get; set; } = "sliding-window";
 
+        [CommandOption("--tokens-file")]
+        [Description("Read pre-tokenized whitespace-separated ids instead of tokenizing --corpus. Isolates scoring from tokenization when comparing against another implementation.")]
+        public string? TokensFile { get; set; }
+
+        [CommandOption("--dump-tokens")]
+        [Description("Write the tokenized corpus ids to this path, whitespace-separated, then continue. Diagnostic.")]
+        public string? DumpTokens { get; set; }
+
+        [CommandOption("--per-window")]
+        [Description("Print each window's perplexity. Use to localize a disagreement with another implementation to specific corpus content.")]
+        [DefaultValue(false)]
+        public bool PerWindow { get; set; }
+
         [CommandOption("--bos")]
         [Description("Substitute BOS at the start of each window. Match the model's add_bos setting: llama.cpp only does this when the tokenizer requests it.")]
         [DefaultValue(false)]
@@ -114,8 +127,18 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         // Streamed, then buffered once: scoring needs random access across windows, but the file
         // itself is never held in memory and the token list is bounded by --max-tokens.
         var tokens = new List<int>();
-        using (var reader = new StreamReader(settings.Corpus))
+        if (settings.TokensFile is not null)
         {
+            foreach (string part in File.ReadAllText(settings.TokensFile)
+                         .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                tokens.Add(int.Parse(part));
+                if (settings.MaxTokens > 0 && tokens.Count >= settings.MaxTokens) break;
+            }
+        }
+        else
+        {
+            using var reader = new StreamReader(settings.Corpus);
             foreach (int id in CorpusReader.StreamTokens(reader, tokenizer, settings.MaxTokens))
                 tokens.Add(id);
         }
@@ -126,6 +149,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
             return 1;
         }
 
+        if (settings.DumpTokens is not null)
+            File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
+
         var perplexityModel = new TransformerPerplexityModel(model, deviceId: -1);
         int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
         var options = new PerplexityOptions(
@@ -135,7 +161,14 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         PerplexityResult result;
         try
         {
-            result = PerplexityEvaluator.Evaluate(perplexityModel, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tokens), options);
+            PerplexityEvaluator.WindowObserver? observer = settings.PerWindow
+                ? (i, ppl, n) => Console.WriteLine($"window {i}: ppl={ppl:F6} scored={n}")
+                : null;
+            result = PerplexityEvaluator.Evaluate(
+                perplexityModel,
+                System.Runtime.InteropServices.CollectionsMarshal.AsSpan(tokens),
+                options,
+                observer);
         }
         catch (ArgumentException ex)
         {

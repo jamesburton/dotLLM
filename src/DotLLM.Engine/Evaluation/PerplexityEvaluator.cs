@@ -13,12 +13,24 @@ namespace DotLLM.Engine.Evaluation;
 /// </remarks>
 public static class PerplexityEvaluator
 {
+    /// <summary>
+    /// Per-window callback. Intended for diagnosis — differencing per-window figures against
+    /// another implementation localizes a disagreement to specific corpus content, which an
+    /// aggregate figure cannot.
+    /// </summary>
+    /// <param name="windowIndex">Zero-based index of the window just scored.</param>
+    /// <param name="windowPerplexity">Perplexity over that window's scored targets alone.</param>
+    /// <param name="scoredInWindow">Number of targets scored in that window.</param>
+    public delegate void WindowObserver(int windowIndex, double windowPerplexity, int scoredInWindow);
+
     /// <summary>Scores <paramref name="tokens"/> and returns the aggregate result.</summary>
     /// <param name="model">An already-constructed model. Not owned; not disposed here.</param>
     /// <param name="tokens">Token ids to score.</param>
     /// <param name="options">Mode and window geometry.</param>
+    /// <param name="onWindow">Optional per-window diagnostic callback.</param>
     public static PerplexityResult Evaluate(
-        IPerplexityModel model, ReadOnlySpan<int> tokens, PerplexityOptions options)
+        IPerplexityModel model, ReadOnlySpan<int> tokens, PerplexityOptions options,
+        WindowObserver? onWindow = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         if (tokens.Length < 2)
@@ -32,7 +44,7 @@ public static class PerplexityEvaluator
         {
             PerplexityMode.TeacherForced => EvaluateTeacherForced(model, tokens, context),
             PerplexityMode.SlidingWindow => EvaluateSlidingWindow(
-                model, tokens, context, options.Stride, options.UnscoredPrefix, options.BosTokenId),
+                model, tokens, context, options.Stride, options.UnscoredPrefix, options.BosTokenId, onWindow),
             _ => throw new NotSupportedException($"Unknown mode {options.Mode}."),
         };
     }
@@ -81,7 +93,7 @@ public static class PerplexityEvaluator
     // and "fixing" that would break the comparability this mode exists to provide.
     private static unsafe PerplexityResult EvaluateSlidingWindow(
         IPerplexityModel model, ReadOnlySpan<int> tokens, int context, int stride, int unscoredPrefix,
-        int bosTokenId)
+        int bosTokenId, WindowObserver? onWindow)
     {
         if (stride < 1 || stride > context)
             throw new ArgumentException(
@@ -132,15 +144,23 @@ public static class PerplexityEvaluator
             using ITensor logits = model.Forward(window, positions);
             windows++;
 
+            double windowNll = 0;
+            int windowScored = 0;
+
             // Absolute targets [start + prefix, start + context); row for target t is t-start-1.
             for (int t = start + prefix; t < start + context; t++)
             {
                 int row = t - start - 1;
                 var span = new ReadOnlySpan<float>(
                     (void*)(logits.DataPointer + (nint)row * vocab * sizeof(float)), vocab);
-                sumNll += -LogProb.OfTarget(span, tokens[t]);
+                double nll = -LogProb.OfTarget(span, tokens[t]);
+                windowNll += nll;
+                windowScored++;
+                sumNll += nll;
                 scored++;
             }
+
+            onWindow?.Invoke(windows - 1, Math.Exp(windowNll / windowScored), windowScored);
         }
 
         if (scored == 0)
