@@ -84,9 +84,9 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
     /// Compiled pre-tokenization regex that splits input at word/punctuation boundaries
     /// before BPE merges. Null means no pre-tokenization (whole text = one segment).
     /// </summary>
-    private readonly Regex? _preRegex;
+    private readonly Regex[]? _preRegexes;
 
-    internal Gpt2TiktokenEncoding(string[] tokens, string[] merges, int[]? tokenTypes, Regex? preRegex = null)
+    internal Gpt2TiktokenEncoding(string[] tokens, string[] merges, int[]? tokenTypes, Regex[]? preRegexes = null)
     {
         _idToToken = tokens;
         _byteToTokenId = BpeCore.BuildByteToTokenId(tokens);
@@ -117,7 +117,7 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
                 mergeRanks[(idA, idB)] = rank;
         }
         _mergeRanks = mergeRanks;
-        _preRegex = preRegex;
+        _preRegexes = preRegexes;
     }
 
     public int[] Encode(string text)
@@ -134,7 +134,7 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
         // byte count of the whole text is an upper bound for any chunk — to
         // eliminate the per-regex-match string allocation that the previous
         // ByteMap-returns-string implementation incurred.
-        if (_preRegex is null)
+        if (_preRegexes is null || _preRegexes.Length == 0)
         {
             // No pre-tokenization: byte-map the whole string and feed it as one
             // segment. Only hit by ByteLevel(use_regex:false) with no
@@ -157,9 +157,9 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
         char[] byteMapBuf = ArrayPool<char>.Shared.Rent(maxChars);
         try
         {
-            foreach (var match in _preRegex.EnumerateMatches(text))
+            foreach ((int start, int length) in PreTokenize(text.AsSpan(), _preRegexes))
             {
-                ReadOnlySpan<char> rawChunk = text.AsSpan(match.Index, match.Length);
+                ReadOnlySpan<char> rawChunk = text.AsSpan(start, length);
                 if (rawChunk.IsEmpty) continue;
                 ByteMapIntoSpan(rawChunk, byteMapBuf, out int written);
                 EncodeSegmentInto(byteMapBuf.AsSpan(0, written), result);
@@ -170,6 +170,49 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
             ArrayPool<char>.Shared.Return(byteMapBuf);
         }
         return result.ToArray();
+    }
+
+    /// <summary>
+    ///     /// Splits <paramref name="text"/> into pre-token spans by applying each regex in
+    /// <paramref name="pipeline"/> in order, every stage further splitting the previous stage's
+    /// spans.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Unmatched text is preserved as its own span.</b> Matching only, and encoding just
+    /// the matches, silently drops any input a pattern does not cover. That is safe for the GPT-2
+    /// expression, which ends in <c>|\s+</c> and therefore matches everything — but not for the
+    /// StarCoder/SmolLM pattern, which deliberately omits that alternative. Dropping characters
+    /// there would corrupt the token stream rather than merely re-split it.</para>
+    /// <para>Mirrors llama.cpp's <c>unicode_regex_split</c> over its <c>regex_exprs</c> list.</para>
+    /// </remarks>
+    private static List<(int Start, int Length)> PreTokenize(ReadOnlySpan<char> text, Regex[] pipeline)
+    {
+        var spans = new List<(int Start, int Length)>(text.Length) { (0, text.Length) };
+
+        foreach (Regex regex in pipeline)
+        {
+            var next = new List<(int Start, int Length)>(spans.Count * 2);
+            foreach ((int start, int length) in spans)
+            {
+                if (length == 0) continue;
+
+                int cursor = 0;
+                foreach (ValueMatch match in regex.EnumerateMatches(text.Slice(start, length)))
+                {
+                    if (match.Length == 0) continue;
+                    if (match.Index > cursor)
+                        next.Add((start + cursor, match.Index - cursor));   // unmatched gap
+                    next.Add((start + match.Index, match.Length));
+                    cursor = match.Index + match.Length;
+                }
+
+                if (cursor < length)
+                    next.Add((start + cursor, length - cursor));            // unmatched tail
+            }
+            spans = next;
+        }
+
+        return spans;
     }
 
     /// <summary>
