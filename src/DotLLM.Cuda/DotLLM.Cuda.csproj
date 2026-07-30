@@ -50,7 +50,7 @@
          "libcu++ requires at least C++ 17" otherwise. Mirrors build_ptx.bat's CXX17 list
          (issue #180's gdn_scan_step_f32_coop_split4; issue #183's attention_f32_split_kv adds
          the same need to attention_f32.cu). Scoped to only the kernels that need it. -->
-    <CudaKernel Update="$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\attention_f32.cu">
+    <CudaKernel Update="$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\attention_f32.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu">
       <CxxStdFlag>-std=c++17</CxxStdFlag>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->

@@ -900,6 +900,46 @@ This is well-proven — llama.cpp, vLLM, and every CUDA inference engine uses th
   answer #199's precondition question in the affirmative. #199's tensor-core rewrite (or accepting
   the GQA-split kernel's current form as a non-default, marginal-value opt-in alongside #183)
   remain the only levers left that could plausibly move the needle further on this kernel.
+
+  **#199 v2 (branch `issue/199-tensor-core-decode-attention-v2`, not merged): the tensor-core
+  rewrite, composed with #197/#198's grid — a real, reproducible WIN.** v1 (branch
+  `issue/199-tensor-core-decode-attention`, not merged) built a decode-only tensor-core kernel
+  with genuine HMMA/LDSM SASS but scoped to one warp/block, grid=numHeads=24 — deliberately not
+  composed with #197/#198's grid per the original issue's own design comment, to keep the new
+  FP16/tensor-core precision axis separable while bringing the kernel up. Real A/B found it
+  **4-5x SLOWER** than `attention_f32` at every realistic depth (~4% theoretical occupancy,
+  worse than the baseline's own ~16.5% achieved). v2 (clean-room, based on `dev`, not a port of
+  v1's branch) composes the tensor-core math with the GQA-group + split-KV grid design, the
+  follow-up v1's own writeup named and declined to attempt: grid = `(numKvHeads, kvSplit)`,
+  identical shape to `attention_f32_gqa_split_kv`, with the `group` query heads sharing a KV
+  head packed into the mma.sync instruction's M=16 dimension itself (free — same instruction
+  count as v1's single-head version, up to `MAX_GQA_GROUP`=8x more useful throughput) and PV
+  work split 8-way across warps within each block (real intra-block parallelism v1's single
+  warp and the sibling kernel's sequential per-head reduction loop both lack). `ptxas -v`: 55
+  registers/thread, 0 spill, 42696B static shared (group-independent, unlike a naive
+  per-warp-per-head duplication). `cuobjdump --dump-sass`: 20 static HMMA + 37 static LDSM,
+  matching the hand-computed expectation exactly. Correctness: 5e-3 abs-OR-rel vs both the CPU
+  oracle and the F32 GPU baseline at seqKv in {1,256,512,1024,2048} using the real occupancy-
+  tuned `kvSplit` (not just the trivial split=1 case), plus a new three-way agreement check vs
+  `attention_f32_gqa_split_kv` itself and a 300-step non-compounding-drift check — all pass (see
+  `tests/DotLLM.Tests.Unit/Cuda/CudaAttentionMmaDecodeGqaSplitTests.cs`,
+  `.perf-runs/issue199-v2-mma-decode-gqa-split/README.md`). **Real interleaved wall-clock, 5
+  independent runs, real Bonsai-27B shape**: at depth >= 512 this kernel is a clean **2-2.6x win
+  over `attention_f32`** and a **2-2.5x win over `attention_f32_gqa_split_kv`**, reproduced
+  every run with no overlap between win/loss ranges; depth 256 is noisier (4/5 runs win
+  1.2-2.1x, 1/5 runs showed a 0.80x loss at that shallowest depth specifically while 512-2048
+  stayed positive in the same run) — consistent with #219/#230's own prior finding that the
+  shallowest depth is where fixed per-launch/grid.sync overhead is least amortized. Kept
+  opt-in/default-OFF (`DOTLLM_ATTN_MMA_DECODE_GQA_SPLIT=1`) per the standing #180/#183
+  precedent — this session validated synthetic-fixture parity and wall-clock, not real
+  end-to-end generation parity (the #222-style test that caught #183's real-world precision
+  problem despite it passing synthetic parity), so a default-on flip should wait on that. Not
+  wired into any model's forward pass this session (kernel-level validation was the scope,
+  matching the precedent that `attention_f32_gqa_split_kv` itself also isn't wired into
+  `CudaQwen3MoeHybridTransformerModel`). **This is the first positive wall-clock result in the
+  #197/#198/#199 investigation family** — worth prioritizing model integration + a real
+  generation-parity pass as the next step, ahead of any of the other still-opt-in kernels this
+  investigation produced.
 - **BitNet decode CUDA-graph capture, and the generic `attention_f16_dyn` slowdown behind it** (issues #212/#213/#218/#221, PRs #214/#217/#223/#224, 2026-07-28): BitNet was the only supported architecture excluded from the project's default-on decode CUDA-graph capture (the generic captured body omitted BitNet's FP32-residual/Sub-LN/ReLU² ops). #214 ported those ops in and removed the exclusion — bit-exact vs eager, +9-11% decode at shallow depth on both real BitNet models (2B-4T, `bitnet_b1_58-xl`). This surfaced a real depth-dependent regression, fixed for BitNet specifically via #217's depth ceiling (`BitNetGraphCaptureMaxDepth`, default 384).
 
   **#218 then found and fixed the underlying kernel-level cause, and generalized the mitigation to every architecture.** An elevated `ncu --set full` capture (`.perf-runs/ncu-2026-07-28/README.md`) first suggested a CTA-barrier-stall hypothesis (the `seq_kv`/`position_offset` device-pointer reads landing too close to a sync point) — **this was refuted** by direct SASS inspection (`ptxas -arch=sm_86` + `cuobjdump --dump-sass`, no elevation needed): `ptxas` already schedules both loads as the first two real instructions, with 50-90 independent instructions before first use. The actual cause: all 256 threads in `attention_f16_dyn` each independently re-read the same block-uniform pointer values — 8x the redundant memory-latency exposure `attention_f16` doesn't pay (it reads from the near-free constant/parameter bank instead). Fixed by templating the shared kernel body on a `DeviceIndirect` compile-time bool; the `_dyn` instantiation has only thread 0 dereference the pointers once, broadcasting via the dead tail of the existing `warp_scratch[32]` shared buffer — no new shared memory, no new barrier, and `attention_f16`'s SASS is byte-for-byte unaffected (verified via SASS diff). This closed roughly a third of the regression on its own; the rest was closed by generalizing #217's pattern into a new `GraphCaptureMaxDepth` (default 512, `DOTLLM_GRAPH_MAX_DEPTH` override) covering every graph-capable architecture, with BitNet keeping its own tighter, separately-validated ceiling. Falcon-E-3B/Falcon3-3B regression fully closed at every depth ≥512 tested; shallow-depth graph win preserved (+2.8% to +7.9%).
