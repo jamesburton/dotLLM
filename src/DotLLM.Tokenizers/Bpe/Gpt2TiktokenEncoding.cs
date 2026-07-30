@@ -120,44 +120,78 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
         _preRegexes = preRegexes;
     }
 
+    /// <summary>
+    /// Pre-tokenizes the <b>raw</b> text, then byte-encodes and BPEs each segment independently
+    /// so merges cannot cross segment boundaries.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Order matters: split first, byte-encode second.</b> The GPT-2 byte-level mapping
+    /// sends byte 0x20 to U+0120, not to a literal space, so a pre-tokenization regex applied to
+    /// already-encoded text can never match <c>\s</c>, a leading <c>' ?'</c>, or
+    /// <c>\s+(?!\S)</c> — every whitespace-dependent alternative in every pattern silently dies.
+    /// llama.cpp splits the raw text and byte-encodes each segment afterwards; this mirrors that.
+    /// </para>
+    /// </remarks>
     public int[] Encode(string text)
     {
-        // Convert text to GPT-2 byte-level Unicode encoding:
-        // each UTF-8 byte of the input maps to a specific Unicode char (byte_encoder in GPT-2).
-        // Uses ArrayPool for both byte[] and char[] to avoid heap allocations.
-        int utf8Len = Encoding.UTF8.GetByteCount(text);
+        if (_preRegexes is null || _preRegexes.Length == 0)
+            return EncodeRawSegment(text.AsSpan());
+
+        var spans = PreTokenize(text.AsSpan(), _preRegexes);
+        var result = new List<int>(text.Length);
+        foreach ((int start, int length) in spans)
+            EncodeRawSegmentInto(text.AsSpan(start, length), result);
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// Maps a raw text segment through the GPT-2 byte-level encoding (each UTF-8 byte becomes a
+    /// specific Unicode char) and BPEs it. Uses <see cref="ArrayPool{T}"/> for both buffers.
+    /// </summary>
+    private int[] EncodeRawSegment(ReadOnlySpan<char> raw)
+    {
+        if (raw.IsEmpty) return [];
+
+        int utf8Len = Encoding.UTF8.GetByteCount(raw);
         byte[] rentedUtf8 = ArrayPool<byte>.Shared.Rent(utf8Len);
         try
         {
-            Encoding.UTF8.GetBytes(text, rentedUtf8);
+            Encoding.UTF8.GetBytes(raw, rentedUtf8);
             char[] rentedGpt2 = ArrayPool<char>.Shared.Rent(utf8Len);
             try
             {
                 for (int i = 0; i < utf8Len; i++)
                     rentedGpt2[i] = Gpt2ByteToUnicode[rentedUtf8[i]];
-                ReadOnlySpan<char> gpt2Text = rentedGpt2.AsSpan(0, utf8Len);
-
-                if (_preRegexes is null || _preRegexes.Length == 0)
-                    return EncodeSegment(gpt2Text);
-
-                // Pre-tokenize, then BPE each segment independently so merges cannot cross
-                // boundaries. Tokens are collected directly into the list — no intermediate
-                // int[] per segment.
-                var spans = PreTokenize(gpt2Text, _preRegexes);
-                var result = new List<int>(gpt2Text.Length);
-                foreach ((int start, int length) in spans)
-                    EncodeSegmentInto(gpt2Text.Slice(start, length), result);
-                return result.ToArray();
+                return EncodeSegment(rentedGpt2.AsSpan(0, utf8Len));
             }
-            finally
-            {
-                ArrayPool<char>.Shared.Return(rentedGpt2);
-            }
+            finally { ArrayPool<char>.Shared.Return(rentedGpt2); }
         }
-        finally
+        finally { ArrayPool<byte>.Shared.Return(rentedUtf8); }
+    }
+
+    /// <summary>
+    /// <see cref="EncodeRawSegment"/>, appending directly to <paramref name="dest"/> to avoid an
+    /// intermediate <c>int[]</c> per segment.
+    /// </summary>
+    private void EncodeRawSegmentInto(ReadOnlySpan<char> raw, List<int> dest)
+    {
+        if (raw.IsEmpty) return;
+
+        int utf8Len = Encoding.UTF8.GetByteCount(raw);
+        byte[] rentedUtf8 = ArrayPool<byte>.Shared.Rent(utf8Len);
+        try
         {
-            ArrayPool<byte>.Shared.Return(rentedUtf8);
+            Encoding.UTF8.GetBytes(raw, rentedUtf8);
+            char[] rentedGpt2 = ArrayPool<char>.Shared.Rent(utf8Len);
+            try
+            {
+                for (int i = 0; i < utf8Len; i++)
+                    rentedGpt2[i] = Gpt2ByteToUnicode[rentedUtf8[i]];
+                EncodeSegmentInto(rentedGpt2.AsSpan(0, utf8Len), dest);
+            }
+            finally { ArrayPool<char>.Shared.Return(rentedGpt2); }
         }
+        finally { ArrayPool<byte>.Shared.Return(rentedUtf8); }
     }
 
     /// <summary>
