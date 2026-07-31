@@ -301,15 +301,18 @@ public sealed unsafe class TransformerModel : IModel
                 preQuantAttn, in rwO);
             AddBias(lw.OBias, normOut, lw.OOutputDim, seqLen);
 
-            // g. Residual add: in-place `hidden[i] += normOut[i]` per token.
+            // g. Residual add: in-place `hidden[i] += normOut[i]`.
             //    This replaces the prior `hidden = residualCopy + normOut` pattern; the
             //    saved-residual copy is unnecessary because the only writer to `hidden`
-            //    inside this sub-block was the residual-copy itself. TensorPrimitives.Add
-            //    supports exact in-place aliasing (output == first input).
-            for (int t = 0; t < seqLen; t++)
+            //    inside this sub-block was the residual-copy itself. `Add.Execute` is
+            //    contractually exact-in-place-aliasing safe (destination may alias the
+            //    first input element-for-element); ResidualInPlaceAddTests enforces that
+            //    the aliased result is bit-identical to the out-of-place one.
+            //    Both buffers are contiguous [seqLen × hiddenSize], so this is a single
+            //    call over the whole range rather than seqLen per-token dispatches.
             {
-                var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
-                Add.Execute(row, new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize), row);
+                var all = new Span<float>(hidden, seqLen * hiddenSize);
+                Add.Execute(all, new ReadOnlySpan<float>(normOut, seqLen * hiddenSize), all);
             }
 
             // h. (residual is the updated `hidden` itself — no copy needed; FFN RMSNorm
@@ -384,11 +387,10 @@ public sealed unsafe class TransformerModel : IModel
                 preQuantSilu, in rwDown);
             AddBias(lw.DownBias, normOut, lw.DownOutputDim, seqLen);
 
-            // k. Residual add: in-place `hidden[i] += normOut[i]` per token (see step g).
-            for (int t = 0; t < seqLen; t++)
+            // k. Residual add: in-place `hidden[i] += normOut[i]` (see step g).
             {
-                var row = new Span<float>(hidden + t * hiddenSize, hiddenSize);
-                Add.Execute(row, new ReadOnlySpan<float>(normOut + t * hiddenSize, hiddenSize), row);
+                var all = new Span<float>(hidden, seqLen * hiddenSize);
+                Add.Execute(all, new ReadOnlySpan<float>(normOut, seqLen * hiddenSize), all);
             }
         }
 

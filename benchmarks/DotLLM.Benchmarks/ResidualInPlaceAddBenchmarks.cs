@@ -1,5 +1,3 @@
-using System.Buffers;
-using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using DotLLM.Cpu.Kernels;
 
@@ -79,11 +77,12 @@ public class ResidualInPlaceAddBenchmarks
     }
 
     /// <summary>
-    /// Optimization: skip the saved-residual copy, accumulate `normOut` into `hidden`
-    /// in place. Mirrors the new TransformerModel.Forward step-g.
+    /// Optimization, step 1: skip the saved-residual copy, accumulate `normOut` into
+    /// `hidden` in place, still dispatched once per token. Isolates the saving that
+    /// comes purely from dropping the copy.
     /// </summary>
     [Benchmark]
-    public void InPlace_AccumulateAdd()
+    public void InPlace_AccumulateAdd_PerToken()
     {
         _hiddenInit.AsSpan().CopyTo(_hidden);
 
@@ -92,5 +91,21 @@ public class ResidualInPlaceAddBenchmarks
             var row = new Span<float>(_hidden, t * HiddenSize, HiddenSize);
             Add.Execute(row, new ReadOnlySpan<float>(_normOut, t * HiddenSize, HiddenSize), row);
         }
+    }
+
+    /// <summary>
+    /// Optimization, step 2 (the shipped path): both buffers are contiguous
+    /// [SeqLen × HiddenSize], so the per-token loop collapses into a single
+    /// <c>Add.Execute</c> over the whole range. Mirrors TransformerModel.Forward
+    /// steps g and k, and isolates the additional saving from removing the
+    /// per-token dispatch.
+    /// </summary>
+    [Benchmark]
+    public void InPlace_AccumulateAdd_SingleCall()
+    {
+        _hiddenInit.AsSpan().CopyTo(_hidden);
+
+        var all = _hidden.AsSpan();
+        Add.Execute(all, _normOut, all);
     }
 }

@@ -63,7 +63,31 @@ public class ResidualInPlaceAddTests
             Add.Execute(row, new ReadOnlySpan<float>(normOut, t * hiddenSize, hiddenSize), row);
         }
 
-        for (int i = 0; i < n; i++)
-            Assert.Equal(baselineHidden[i], optHidden[i]);
+        // Optimization as shipped: both buffers are contiguous, so the per-token loop
+        // collapses into a single whole-range call. Must also be bit-exact.
+        var singleCallHidden = new float[n];
+        hiddenIn.AsSpan().CopyTo(singleCallHidden);
+        Add.Execute(singleCallHidden, normOut, singleCallHidden);
+
+        AssertBitExact(baselineHidden, optHidden, hiddenSize, "per-token in-place");
+        AssertBitExact(baselineHidden, singleCallHidden, hiddenSize, "single-call in-place");
+    }
+
+    /// <summary>
+    /// Element-wise bit-exact comparison with an index-aware failure message —
+    /// a bare per-element <c>Assert.Equal</c> would only report the failing line,
+    /// not which of the (up to 2M) elements diverged.
+    /// </summary>
+    private static void AssertBitExact(float[] expected, float[] actual, int hiddenSize, string variant)
+    {
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(expected[i]) != BitConverter.SingleToInt32Bits(actual[i]))
+            {
+                Assert.Fail(
+                    $"{variant} diverged at index {i} (token {i / hiddenSize}, lane {i % hiddenSize}): " +
+                    $"expected {expected[i]:R}, actual {actual[i]:R}");
+            }
+        }
     }
 }
