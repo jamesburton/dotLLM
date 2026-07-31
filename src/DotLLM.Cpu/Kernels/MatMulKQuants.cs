@@ -108,13 +108,24 @@ public static unsafe partial class MatMul
     /// does not take an explicit rounding mode — it uses the current MXCSR rounding
     /// control field. .NET initialises MXCSR to round-to-nearest-even on every
     /// managed thread, which matches the scalar fallback that uses
-    /// <see cref="MathF.Round(float)"/>. The kernel does not save / restore MXCSR
-    /// around its conversions; if another library or runtime call has left MXCSR in
-    /// a different rounding mode on the same thread, the AVX2 path will diverge
-    /// from the scalar reference. No supported caller currently changes MXCSR, but
-    /// any future P/Invoke into native code that toggles rounding mode must restore
-    /// it (or, if MXCSR is no longer reliable, switch to an explicit
-    /// <c>vcvtps2dq</c>-with-truncation followed by a rounding helper).
+    /// <see cref="MathF.Round(float)"/>.
+    /// </para>
+    /// <para>
+    /// <b>Invariant.</b> Correctness of this kernel requires the calling thread's
+    /// MXCSR rounding-control field to be round-to-nearest-even for the duration of
+    /// the call. The kernel does not save / restore MXCSR around its conversions, so
+    /// any code that changes the rounding mode — most plausibly a P/Invoke into
+    /// native code — must restore it before calling in; otherwise the AVX2 path will
+    /// diverge from the scalar reference.
+    /// </para>
+    /// <para>
+    /// If that invariant ever becomes impractical to guarantee, the fix is to stop
+    /// depending on MXCSR: use the truncating convert <c>vcvttps2dq</c>
+    /// (<see cref="Avx.ConvertToVector256Int32WithTruncation(Vector256{float})"/>),
+    /// whose semantics are fixed to round-toward-zero, and apply explicit
+    /// round-to-nearest-even beforehand via
+    /// <see cref="Avx.RoundToNearestInteger(Vector256{float})"/> (<c>vroundps</c>
+    /// with an immediate rounding mode, likewise independent of MXCSR).
     /// </para>
     /// </remarks>
     [SkipLocalsInit]
