@@ -144,8 +144,8 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
             try
             {
                 ByteMapIntoSpan(text, wholeBuf, out int wholeWritten);
-                var queue = new PriorityQueue<BgramEntry, (int, int)>();
-                return EncodeSegment(wholeBuf.AsSpan(0, wholeWritten), queue);
+                var wholeQueue = new PriorityQueue<BgramEntry, (int, int)>();
+                return EncodeSegment(wholeBuf.AsSpan(0, wholeWritten), wholeQueue);
             }
             finally
             {
