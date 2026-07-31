@@ -356,11 +356,11 @@ public class LlamaForwardPassTests
         => System.Numerics.Tensors.TensorPrimitives.IndexOfMax(span);
 
     /// <summary>
-    /// Bit-exact parity between the legacy <c>Forward</c> (allocates a new
-    /// <c>UnmanagedTensor</c> and memcpys logits in) and the new <c>ForwardInto</c>
-    /// (writes the LM-head matmul output directly into a caller-provided span,
-    /// skipping the allocation and the copy). Both paths invoke the same internal
-    /// <c>ForwardCore</c>, so the produced floats must be identical.
+    /// Bit-exact parity between <c>Forward</c> (allocates a new <c>UnmanagedTensor</c>
+    /// per call and has the LM head write into it) and the new <c>ForwardInto</c>
+    /// (LM head writes into a caller-provided span, no allocation). Both paths invoke
+    /// the same internal <c>ForwardCore</c> with only the destination pointer differing,
+    /// so the produced floats must be identical.
     /// </summary>
     [Fact]
     public void ForwardInto_BitExactWithLegacyForward()
@@ -426,5 +426,27 @@ public class LlamaForwardPassTests
             for (int i = 0; i < totalLogits; i++)
                 Assert.Equal(legacy[i], into[i]);
         }
+    }
+
+    /// <summary>
+    /// The destination-size guard rejects an undersized span rather than writing past
+    /// its end. Exercises the boundary at seqLen × vocabSize − 1.
+    /// </summary>
+    [Fact]
+    public void ForwardInto_TooSmallSpan_Throws()
+    {
+        var (model, gguf, tokenizer) = LoadModel();
+        using var _ = gguf;
+        using var __ = model;
+
+        int[] tokenIds = tokenizer.Encode("The capital of France is");
+        int[] positions = new int[tokenIds.Length];
+        for (int i = 0; i < positions.Length; i++)
+            positions[i] = i;
+
+        var tooSmall = new float[tokenIds.Length * model.Config.VocabSize - 1];
+        var ex = Assert.Throws<ArgumentException>(
+            () => model.ForwardInto(tokenIds, positions, kvCache: null, tooSmall));
+        Assert.Equal("logitsOut", ex.ParamName);
     }
 }

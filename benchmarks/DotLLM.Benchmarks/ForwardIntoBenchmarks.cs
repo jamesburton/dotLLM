@@ -1,29 +1,28 @@
-using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using DotLLM.Core.Tensors;
 
 namespace DotLLM.Benchmarks;
 
 /// <summary>
-/// Microbenchmarks for the LM-head buffer routing change.
+/// Microbenchmarks for the LM-head buffer routing change. Three return paths are measured,
+/// all with the (identical, unmeasured) LM-head matmul excluded so only the per-call
+/// buffer overhead shows up:
+/// <list type="number">
+///   <item><b><c>PreRefactor_AllocCopyFree</c></b> — the shape of the return path <i>before</i>
+///     this PR: allocate a fresh <see cref="UnmanagedTensor"/>, memcpy
+///     <c>vocabSize × sizeof(float)</c> bytes from <c>_state.Logits</c> into it, free on
+///     <see cref="IDisposable.Dispose"/>. Kept for historical context only — no current
+///     code path does this.</item>
+///   <item><b><c>Forward_AllocOnly</c></b> — what <c>TransformerModel.Forward</c> does
+///     <i>today</i>: the matmul writes straight into the freshly-allocated tensor, so the
+///     copy is gone but the per-call allocate/free remains. This is the baseline
+///     <c>ForwardInto</c> is actually compared against.</item>
+///   <item><b><c>ForwardInto_DirectWrite</c></b> — the matmul writes straight into the
+///     caller's pinned span: no allocation, no copy, no free.</item>
+/// </list>
 /// <para>
-/// The legacy <c>TransformerModel.Forward</c> return path:
-/// (1) allocates a fresh <see cref="UnmanagedTensor"/> via
-///     <see cref="System.Runtime.InteropServices.NativeMemory.AlignedAlloc(nuint, nuint)"/>,
-/// (2) memcpys <c>vocabSize × sizeof(float)</c> bytes from <c>_state.Logits</c> into
-///     the new tensor, and
-/// (3) frees the tensor on <see cref="IDisposable.Dispose"/>.
-/// </para>
-/// <para>
-/// <c>TransformerModel.ForwardInto</c> writes the LM-head matmul output directly
-/// into the caller's pre-pinned span — so none of (1) (2) (3) happen per call.
-/// The matmul itself runs in both paths and is identical, so this microbench
-/// isolates only the eliminated overhead: alloc + copy + free.
-/// </para>
-/// <para>
-/// At per-token decode rates (TextGenerator hot path), this overhead runs once per
-/// generated token. <see cref="MemoryDiagnoserAttribute"/> tracks the native-alloc
-/// elimination too.
+/// At per-token decode rates (TextGenerator hot path) this overhead runs once per generated
+/// token. <see cref="MemoryDiagnoserAttribute"/> tracks the native-alloc elimination too.
 /// </para>
 /// </summary>
 [MemoryDiagnoser]
@@ -48,12 +47,13 @@ public unsafe class ForwardIntoBenchmarks
     }
 
     /// <summary>
-    /// Legacy return-path overhead: NativeMemory.AlignedAlloc + memcpy from
-    /// _state.Logits + Dispose (which calls NativeMemory.AlignedFree).
+    /// Historical (pre-PR) return-path overhead: NativeMemory.AlignedAlloc + memcpy from
+    /// _state.Logits + Dispose (which calls NativeMemory.AlignedFree). No current code
+    /// path does this; it is here to show what the copy alone cost.
     /// Touches the destination to prevent dead-code elimination.
     /// </summary>
-    [Benchmark(Baseline = true)]
-    public void Legacy_AllocAndCopy()
+    [Benchmark]
+    public void PreRefactor_AllocCopyFree()
     {
         var shape = new TensorShape(1, VocabSize);
         using var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
@@ -64,10 +64,25 @@ public unsafe class ForwardIntoBenchmarks
     }
 
     /// <summary>
+    /// Current <c>Forward</c> return-path overhead: NativeMemory.AlignedAlloc + Dispose
+    /// (NativeMemory.AlignedFree), with no copy — the LM-head matmul (not part of this
+    /// microbench) writes directly into the allocated tensor. This is the meaningful
+    /// baseline for <see cref="ForwardInto_DirectWrite"/>.
+    /// </summary>
+    [Benchmark(Baseline = true)]
+    public void Forward_AllocOnly()
+    {
+        var shape = new TensorShape(1, VocabSize);
+        using var result = UnmanagedTensor.Allocate(shape, DType.Float32, deviceId: -1);
+
+        // Touch the destination to keep the allocation live.
+        ((float*)result.DataPointer)[0] += 0f;
+    }
+
+    /// <summary>
     /// ForwardInto return path: no allocation, no copy — the LM-head matmul writes
     /// directly into the caller's buffer. The only operation in this benchmark body
-    /// is the equivalent "touch" to keep the comparison fair (Legacy's final touch
-    /// is matched here).
+    /// is the equivalent "touch" so the comparison stays fair.
     /// </summary>
     [Benchmark]
     public void ForwardInto_DirectWrite()
