@@ -614,7 +614,24 @@ public class BpeTokenizerTests
         // A fresh instance has a fresh queue; a reused one must not differ from it.
         Assert.Equal(BuildMinimalTiktokenVocab("gpt2").Encode(Text), second);
 
+        // The real leak check: one queue serving every segment of a call must give what a
+        // never-reused queue gives. Encoding each pre-token piece through its OWN tokenizer
+        // instance and concatenating exercises exactly that difference — pre-tokenization splits
+        // where merges cannot cross, so the two must agree token for token.
+        var perSegment = new List<int>();
+        foreach (ValueMatch match in Gpt2PreTokenRegex.EnumerateMatches(Text))
+        {
+            string piece = Text.Substring(match.Index, match.Length);
+            perSegment.AddRange(BuildMinimalTiktokenVocab("gpt2").Encode(piece));
+        }
+        Assert.Equal(perSegment, first);
+
         // Round-trip: whatever the segmentation, the text must come back intact.
         Assert.Equal(Text, tokenizer.Decode(first));
     }
+
+    /// <summary>GPT-2 pre-tokenization pattern, mirroring <c>TiktokenPreTokenizer</c> (internal).</summary>
+    private static readonly Regex Gpt2PreTokenRegex =
+        new(@"(?:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+            RegexOptions.Compiled);
 }

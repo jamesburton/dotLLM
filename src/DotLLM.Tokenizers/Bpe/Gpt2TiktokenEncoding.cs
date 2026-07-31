@@ -148,11 +148,13 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
                 // then BPE each segment independently so merges cannot cross boundaries.
                 // Tokens are collected directly into the list — no intermediate int[] per segment.
                 //
-                // The list is sized by an estimate of the TOKEN count, not the character count:
-                // reserving one slot per character over-reserves by roughly the 4:1
-                // characters-per-token ratio, and at 32k characters that is a 128 KB int[] on
-                // the LOH. Growth from a low estimate costs a few doublings; over-reserving
-                // costs an LOH allocation on every call.
+                // The capacity is the character count, which over-reserves by roughly the 4:1
+                // characters-per-token ratio of English prose. Sizing it by an estimated token
+                // count instead was measured at a further 2.66x less garbage on prose — but it
+                // costs MORE on a vocabulary emitting ~1 token per character, where growth by
+                // doubling exceeds the over-reserve it avoids (40.0 -> 43.0 bytes/char measured).
+                // That makes it a heuristic trade rather than a strict win, so it is deliberately
+                // left out of this change; see the discussion on #413.
                 var result = new List<int>(gpt2Text.Length);
                 foreach (var match in _preRegex.EnumerateMatches(gpt2Text))
                 {
