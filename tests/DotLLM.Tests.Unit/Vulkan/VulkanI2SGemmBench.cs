@@ -95,6 +95,13 @@ public sealed class VulkanI2SGemmBench
             ("register-blocked -> wide-load unpack", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedWide),
             // Bank-conflict fix: sharedW row stride 128 -> 129 words. Also bit-exact.
             ("register-blocked -> bank-padded sharedW", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedPadded),
+            // Profile-driven: VTune says 86.9% XVE stalled at 73.3% occupancy, i.e. latency-bound
+            // with threads resident. Tests ILP (4x4 micro-tile, 64 threads) at CONSTANT shared memory.
+            ("register-blocked -> 4x4 ILP", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlocked4x4),
+            // Control: halves shared memory. The profile predicts this is FLAT (occupancy is fine).
+            ("register-blocked -> f16 shared (occupancy control)", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedF16Shared),
+            // Bit-exact: only the weight tile is F16. Halves weight-side SLM traffic (footprint 24 KB).
+            ("register-blocked -> f16 weight tile (bit-exact)", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedWeightF16),
         };
         if (device.HasCooperativeMatrix)
         {
@@ -108,6 +115,15 @@ public sealed class VulkanI2SGemmBench
         }
         else
             _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — coopmat comparison skipped.");
+
+        // Optional substring filter so a profiler run (VTune gpu-hotspots) can target one
+        // comparison instead of the whole sweep — under a profiler the full matrix is far too slow.
+        string? only = Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMM_BENCH_FILTER");
+        if (!string.IsNullOrEmpty(only))
+        {
+            comparisons.RemoveAll(cmp => !cmp.Label.Contains(only, StringComparison.OrdinalIgnoreCase));
+            _output.WriteLine($"FILTER: '{only}' -> {comparisons.Count} comparison(s)");
+        }
 
         foreach (var (label, refVariant, challVariant) in comparisons)
         {
