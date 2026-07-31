@@ -46,7 +46,7 @@ public sealed unsafe class ComputeThreadPool : IDisposable
     /// <param name="end">Exclusive end of this thread's range. Equals <paramref name="start"/>
     /// when there is no work for this thread.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void PartitionRange(
+    internal static void PartitionRange(
         int totalItems, int threadIdx, int threadCount, out int start, out int end)
     {
         int baseCount = totalItems / threadCount;
