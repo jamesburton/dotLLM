@@ -56,8 +56,22 @@ internal sealed class SentencePieceEncoding : IBpeEncoding
             MemoryExtensions.Replace(rentedNorm.AsSpan(offset, text.Length), ' ', SpaceMarker);
             ReadOnlySpan<char> normalized = rentedNorm.AsSpan(0, normalizedLen);
 
-            // 2. Build initial symbol list: one symbol per Unicode code point.
-            Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(normalizedLen);
+            // 2. Build initial symbol list.
+            //
+            // Capacity is 3x the char count, NOT the char count. The natural reading — one symbol
+            // per code point — holds only for code points the vocab contains. On byte fallback
+            // BuildInitialSymbols emits one symbol per UTF-8 BYTE, so a single char can produce up
+            // to 3 symbols (a BMP code point is at most 3 UTF-8 bytes; a surrogate pair is 2 chars
+            // for 4 bytes, i.e. only 2 per char). 3x is therefore a tight upper bound.
+            //
+            // Sizing this by char count overflowed for real inputs, and did so ERRATICALLY, which
+            // is what made it hard to see: ArrayPool.Rent returns power-of-two buckets, so a
+            // 70,000-char request gets 131,072 slots and its slack silently absorbs the expansion,
+            // while a 65,536-char request gets exactly 65,536 and overflows on the first
+            // fallback char. Perplexity scoring reads the corpus in 65,536-char chunks — precisely
+            // the pathological size — so it crashed on any SentencePiece model whose vocab misses
+            // a character in the corpus, while the same text tokenized fine through other paths.
+            Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(normalizedLen * 3);
             int symbolCount;
             try
             {
