@@ -49,6 +49,9 @@ public sealed class TopPSampler : ISamplerStep
             // from the subsequent sort, turning O(V log V) into O(V) (single pass to
             // build the candidate set) + O(K log K) (sort the much smaller candidate set,
             // typically a few hundred entries).
+            //
+            // The filter can empty the candidate set outright when topP < 1/vocabSize;
+            // that degenerate case is handled explicitly after the loop.
             float cutoff = vocabSize > 1 ? (1.0f - topP) / (vocabSize - 1) : 0.0f;
 
             int candidateCount = 0;
@@ -60,6 +63,26 @@ public sealed class TopPSampler : ISamplerStep
                     rentedIndices[candidateCount] = i;
                     candidateCount++;
                 }
+            }
+
+            if (candidateCount == 0)
+            {
+                // Every probability fell below the cutoff. Reachable only when
+                // topP < 1/vocabSize: summing `p_i < (1 - topP) / (n - 1)` over all n
+                // tokens gives 1 < n(1 - topP)/(n - 1), i.e. topP < 1/n. In that regime
+                // the un-filtered algorithm keeps exactly one token, because
+                // max(p) >= 1/n > topP terminates the cumulative walk on its first step.
+                // Seed the candidate set with the argmax so the outcome matches instead
+                // of masking the entire vocabulary. (Hit by e.g. topP = 0, or a 2-token
+                // vocab with topP = 0.1 where cutoff = 0.9 exceeds both probabilities.)
+                //
+                // NOTE: no compaction has happened yet, so `rentedProbs` still holds the
+                // full softmax and `probs` is a valid view over it.
+                int argmax = TensorPrimitives.IndexOfMax(probs);
+                float argmaxProb = probs[argmax];
+                rentedProbs[0] = argmaxProb;
+                rentedIndices[0] = argmax;
+                candidateCount = 1;
             }
 
             // Sort the filtered candidates ascending by probability (IntroSort — O(K log K)).

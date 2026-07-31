@@ -95,6 +95,14 @@ public class TopPSamplerTests
     /// Bit-exact parity test: the pre-cutoff optimization must produce identical masked
     /// logits to the original full-sort algorithm for a realistically large vocab with
     /// random (non-tied) probabilities. This is the key correctness guarantee.
+    /// <para>
+    /// Ties are deliberately out of scope: neither algorithm defines which of several
+    /// equal-probability tokens wins, because <c>Array.Sort</c> is an unstable IntroSort.
+    /// This matters more than it looks at large vocab — with a near-uniform distribution
+    /// over 32K+ tokens, distinct logits can round to the <i>same</i> float probability,
+    /// so a test that pins a specific surviving index would be asserting sort internals.
+    /// The spread used here (~[-10, 10)) keeps probabilities well separated.
+    /// </para>
     /// </summary>
     [Theory]
     [InlineData(32_000, 0.9f, 1)]
@@ -129,6 +137,140 @@ public class TopPSamplerTests
             Assert.Equal(refMasked, optMasked);
             if (!refMasked)
                 Assert.Equal(refLogits[i], optLogits[i]);
+        }
+    }
+
+    /// <summary>
+    /// Degenerate regime the pre-filter alone cannot handle: when <c>topP &lt; 1/vocabSize</c>
+    /// the cutoff <c>(1 - topP) / (n - 1)</c> exceeds every probability, so the filter empties
+    /// the candidate set. Top-p must still keep at least one token (the argmax) rather than
+    /// masking the whole vocabulary. Cases below are all in that regime — e.g. vocab=2 with
+    /// topP=0.1 gives cutoff=0.9 against two probabilities that cannot both reach it.
+    /// </summary>
+    [Theory]
+    [InlineData(2, 0.1f)]
+    [InlineData(2, 0.4f)]
+    [InlineData(3, 0.2f)]
+    [InlineData(4, 0.1f)]
+    [InlineData(4, 0f)]
+    public void Apply_CutoffFiltersEverything_KeepsArgmax(int vocabSize, float topP)
+    {
+        var rng = new Random(vocabSize * 31 + (int)(topP * 1000));
+        var refLogits = new float[vocabSize];
+        var optLogits = new float[vocabSize];
+        for (int i = 0; i < vocabSize; i++)
+        {
+            // Near-uniform: small spread keeps every probability under the cutoff while
+            // still giving a unique argmax (no ties to disambiguate).
+            float v = (float)(rng.NextDouble() * 0.01);
+            refLogits[i] = v;
+            optLogits[i] = v;
+        }
+
+        int expectedArgmax = TensorPrimitives.IndexOfMax(optLogits);
+        float expectedValue = optLogits[expectedArgmax];
+
+        var context = new SamplerContext(
+            Temperature: 1.0f, TopK: 0, TopP: topP, MinP: 0f, Seed: null);
+
+        ApplyReference(refLogits, topP);
+        _sampler.Apply(optLogits, context);
+
+        // Exactly one survivor, and it is the argmax.
+        Assert.Equal(expectedValue, optLogits[expectedArgmax]);
+        for (int i = 0; i < vocabSize; i++)
+        {
+            if (i != expectedArgmax)
+                Assert.True(float.IsNegativeInfinity(optLogits[i]),
+                    $"token {i} should be masked (vocab={vocabSize}, topP={topP})");
+        }
+
+        // ...and that matches what the un-filtered full-sort algorithm does.
+        for (int i = 0; i < vocabSize; i++)
+        {
+            Assert.Equal(float.IsNegativeInfinity(refLogits[i]), float.IsNegativeInfinity(optLogits[i]));
+            if (!float.IsNegativeInfinity(refLogits[i]))
+                Assert.Equal(refLogits[i], optLogits[i]);
+        }
+    }
+
+    /// <summary>
+    /// The same "filter empties the candidate set" regime, but at production vocab size:
+    /// a perfectly uniform distribution puts every probability at <c>1/n</c>, which is
+    /// strictly below the cutoff <c>1/(n - 1)</c> when <c>topP = 0</c>. Exactly one token
+    /// must survive. Which one is unspecified here — every probability is tied, so the
+    /// un-filtered reference's choice depends on an unstable sort — hence this asserts the
+    /// survivor count rather than a specific index.
+    /// </summary>
+    [Fact]
+    public void Apply_UniformLargeVocabWithZeroTopP_KeepsExactlyOneToken()
+    {
+        const int vocabSize = 32_000;
+        var logits = new float[vocabSize]; // all zero → perfectly uniform softmax
+
+        var context = new SamplerContext(
+            Temperature: 1.0f, TopK: 0, TopP: 0f, MinP: 0f, Seed: null);
+
+        _sampler.Apply(logits, context);
+
+        int survivors = 0;
+        for (int i = 0; i < vocabSize; i++)
+            if (!float.IsNegativeInfinity(logits[i]))
+                survivors++;
+
+        Assert.Equal(1, survivors);
+    }
+
+    /// <summary>
+    /// Differential fuzz: sweeps small vocab sizes (where the cutoff is coarse and the
+    /// boundary cases cluster) against a wide range of topP values, asserting bit-exact
+    /// parity with the un-filtered reference on every draw. Small vocabs make this cheap
+    /// while covering far more of the input space than a handful of large fixed cases.
+    /// </summary>
+    [Fact]
+    public void Apply_SmallVocabFuzz_BitExactParityWithFullSort()
+    {
+        float[] topPs = [0f, 0.01f, 0.1f, 0.25f, 0.5f, 0.75f, 0.9f, 0.99f];
+        var rng = new Random(20250730);
+
+        for (int vocabSize = 2; vocabSize <= 64; vocabSize++)
+        {
+            foreach (float topP in topPs)
+            {
+                for (int trial = 0; trial < 8; trial++)
+                {
+                    var refLogits = new float[vocabSize];
+                    var optLogits = new float[vocabSize];
+                    // Spread varies per trial: tight spreads give near-uniform
+                    // distributions (cutoff-empties-everything regime), wide spreads
+                    // give peaked ones (normal regime).
+                    double spread = trial % 2 == 0 ? 0.05 : 12.0;
+                    for (int i = 0; i < vocabSize; i++)
+                    {
+                        float v = (float)((rng.NextDouble() - 0.5) * spread);
+                        refLogits[i] = v;
+                        optLogits[i] = v;
+                    }
+
+                    var context = new SamplerContext(
+                        Temperature: 1.0f, TopK: 0, TopP: topP, MinP: 0f, Seed: null);
+
+                    ApplyReference(refLogits, topP);
+                    _sampler.Apply(optLogits, context);
+
+                    for (int i = 0; i < vocabSize; i++)
+                    {
+                        bool refMasked = float.IsNegativeInfinity(refLogits[i]);
+                        bool optMasked = float.IsNegativeInfinity(optLogits[i]);
+                        if (refMasked != optMasked || (!refMasked && refLogits[i] != optLogits[i]))
+                        {
+                            Assert.Fail(
+                                $"divergence at token {i} (vocab={vocabSize}, topP={topP}, " +
+                                $"trial={trial}): reference={refLogits[i]}, optimized={optLogits[i]}");
+                        }
+                    }
+                }
+            }
         }
     }
 }
