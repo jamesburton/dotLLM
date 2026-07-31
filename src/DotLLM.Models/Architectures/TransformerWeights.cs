@@ -473,17 +473,22 @@ internal sealed class TransformerWeights : IDisposable
     /// produce pointers past the tensor's allocated bytes, corrupting later
     /// layers and crashing inference.
     /// </summary>
-    /// <param name="shape">Shape of the fused tensor. GGUF convention: <c>Shape[0]</c> = input dim, <c>Shape[1]</c> = output dim.</param>
+    /// <param name="shape">Shape of the fused tensor. Must be rank-2; GGUF convention: <c>Shape[0]</c> = input dim, <c>Shape[1]</c> = output dim.</param>
     /// <param name="qDim">Expected Q rows (<c>NumAttentionHeads * HeadDim</c>).</param>
     /// <param name="kvDim">Expected K (and V) rows (<c>NumKvHeads * HeadDim</c>).</param>
     /// <param name="tensorName">Tensor name for the error message.</param>
-    /// <exception cref="InvalidDataException">Thrown when the shape does not match the expected output rows.</exception>
+    /// <exception cref="InvalidDataException">Thrown when the shape is not rank-2 or does not match the expected output rows.</exception>
     internal static void ValidateFusedQkvShape(TensorShape shape, int qDim, int kvDim, string tensorName)
     {
-        if (shape.Rank < 2)
+        // Exactly rank-2: the caller splits the tensor by row offset using only
+        // Shape[0] (input dim) and Shape[1] (output rows). A higher-rank tensor would
+        // validate against the wrong axis and then be split with pointer arithmetic
+        // that ignores the remaining dimensions. GGUF stores matrices with n_dims
+        // trimmed of trailing 1s, so a fused QKV weight is always exactly 2-D.
+        if (shape.Rank != 2)
         {
             throw new InvalidDataException(
-                $"Fused QKV tensor '{tensorName}' has rank {shape.Rank}; expected at least 2 dimensions.");
+                $"Fused QKV tensor '{tensorName}' has shape {shape} (rank {shape.Rank}); expected exactly 2 dimensions.");
         }
 
         int expectedRows = qDim + 2 * kvDim;
@@ -491,7 +496,7 @@ internal sealed class TransformerWeights : IDisposable
         if (actualRows != expectedRows)
         {
             throw new InvalidDataException(
-                $"Fused QKV tensor '{tensorName}' has output dim {actualRows}, " +
+                $"Fused QKV tensor '{tensorName}' has shape {shape} (output dim {actualRows}), " +
                 $"but ModelConfig requires {expectedRows} (= {qDim} Q + {kvDim} K + {kvDim} V). " +
                 $"GGUF metadata (NumAttentionHeads, NumKvHeads, HeadDim) may be incorrect.");
         }
@@ -514,7 +519,7 @@ internal sealed class TransformerWeights : IDisposable
         if (actualElements != expectedElements)
         {
             throw new InvalidDataException(
-                $"Fused QKV bias tensor '{tensorName}' has {actualElements} elements, " +
+                $"Fused QKV bias tensor '{tensorName}' has shape {shape} ({actualElements} elements), " +
                 $"but ModelConfig requires {expectedElements} (= {qDim} Q + {kvDim} K + {kvDim} V). " +
                 $"GGUF metadata (NumAttentionHeads, NumKvHeads, HeadDim) may be incorrect.");
         }

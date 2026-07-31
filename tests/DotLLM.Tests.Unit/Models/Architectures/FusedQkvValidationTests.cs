@@ -64,6 +64,22 @@ public class FusedQkvValidationTests
     }
 
     /// <summary>
+    /// Verifies the validator throws on a rank-3 tensor. The split path interprets only
+    /// <c>Shape[0]</c>/<c>Shape[1]</c> and ignores trailing dimensions, so accepting a
+    /// higher-rank shape would validate against the wrong axis and then split with
+    /// pointer arithmetic that runs past the tensor's allocated bytes.
+    /// </summary>
+    [Fact]
+    public void ValidateFusedQkvShape_Rank3Tensor_Throws()
+    {
+        // Output rows on axis 1 match qDim + 2*kvDim, so only the rank check can reject this.
+        var shape = new TensorShape(512, 768, 4);
+        var ex = Assert.Throws<InvalidDataException>(
+            () => TransformerWeights.ValidateFusedQkvShape(shape, 512, 128, "blk.0.attn_qkv.weight"));
+        Assert.Contains("rank", ex.Message);
+    }
+
+    /// <summary>
     /// Verifies the bias validator throws when the fused bias's element count does not
     /// match <c>qDim + 2 * kvDim</c>. Without validation, the K/V bias dequant pointers
     /// would read past the allocated bias bytes.
