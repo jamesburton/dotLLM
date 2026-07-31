@@ -86,6 +86,11 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         [Description("Quantization to select when resolving a HuggingFace repo ID.")]
         public string? Quant { get; set; }
 
+        [CommandOption("--device|-d")]
+        [Description("Compute device: 'cpu' (default), 'vulkan', 'cuda' / 'cuda:1' ('gpu' is an alias for cuda).")]
+        [DefaultValue("cpu")]
+        public string Device { get; set; } = "cpu";
+
         [CommandOption("--threads")]
         [Description("Compute threads. 0 = auto.")]
         [DefaultValue(0)]
@@ -131,8 +136,51 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         using GgufFile gguf = GgufFile.Open(resolvedPath);
         ModelConfig config = GgufModelConfigExtractor.Extract(gguf.Metadata);
         var tokenizer = GgufBpeTokenizerFactory.Load(gguf.Metadata);
-        using TransformerModel model = TransformerModel.LoadFromGguf(
-            gguf, config, new ThreadingConfig(settings.Threads));
+
+        if (!TryParseDevice(settings.Device, out string backend, out int gpuId))
+        {
+            AnsiConsole.MarkupLine(
+                $"[red]Unknown --device '{Markup.Escape(settings.Device)}'. Expected 'cpu', 'vulkan', 'cuda' or 'cuda:N'.[/]");
+            return 1;
+        }
+
+        // Both are owned here and released in the finally below. The previous CPU-only code got
+        // this from `using TransformerModel`; with a backend switch the model's static type is
+        // IModel (itself IDisposable) and Vulkan additionally owns a device handle.
+        IModel model;
+        IDisposable? ownedDevice = null;
+        int forwardDeviceId;
+        string deviceLabel;
+        switch (backend)
+        {
+            case "cuda":
+            {
+                var cudaModel = DotLLM.Cuda.CudaTransformerModel.LoadFromGguf(gguf, config, gpuId);
+                model = cudaModel;
+                forwardDeviceId = gpuId;
+                deviceLabel = DotLLM.Cuda.CudaDevice.GetDevice(gpuId).Name;
+                break;
+            }
+
+            case "vulkan":
+            {
+                var vkDevice = DotLLM.Vulkan.VulkanDevice.Create();
+                ownedDevice = vkDevice;
+                model = DotLLM.Vulkan.VulkanTransformerModel.LoadFromGguf(
+                    vkDevice, gguf, config, ResolveSpvDir());
+                forwardDeviceId = 0;
+                deviceLabel = vkDevice.DeviceName;
+                break;
+            }
+
+            default:
+            {
+                model = TransformerModel.LoadFromGguf(gguf, config, new ThreadingConfig(settings.Threads));
+                forwardDeviceId = -1;
+                deviceLabel = $"cpu-{new ThreadingConfig(settings.Threads).EffectiveThreadCount}t";
+                break;
+            }
+        }
 
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
         // Defaults reproduce llama.cpp: non-overlapping chunks, scoring the second half of each.
@@ -173,7 +221,16 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         if (settings.DumpTokens is not null)
             File.WriteAllText(settings.DumpTokens, string.Join(' ', tokens));
 
-        var perplexityModel = new TransformerPerplexityModel(model, deviceId: -1);
+        try
+        {
+        // Probed, not assumed: the CPU transformer returns [seqLen, vocab] but the CUDA model
+        // returns only the final row, and that difference silently changes the perplexity rather
+        // than raising. See BackendPerplexityModel.Probe.
+        bool returnsAllRows = BackendPerplexityModel.Probe(model, forwardDeviceId);
+        var perplexityModel = new BackendPerplexityModel(model, forwardDeviceId, returnsAllRows);
+        AnsiConsole.MarkupLine(
+            $"[grey]device: {Markup.Escape(deviceLabel)}  all-rows logits: {returnsAllRows} "
+            + $"({(returnsAllRows ? "single-pass O(n)" : "growing-prefix O(n^2)")})[/]");
         int bosTokenId = settings.Bos ? tokenizer.BosTokenId : -1;
         var options = new PerplexityOptions(
             mode, effectiveContext, effectiveStride, settings.MaxTokens, effectivePrefix, bosTokenId);
@@ -219,6 +276,57 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
         await Task.CompletedTask;
         return 0;
+        }
+        finally
+        {
+            model.Dispose();
+            ownedDevice?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Parses <c>--device</c> into a backend name and GPU ordinal, mirroring <c>bench</c>'s syntax so
+    /// the two commands accept the same strings (<c>cpu</c>, <c>vulkan</c>, <c>cuda</c>, <c>cuda:1</c>,
+    /// and <c>gpu</c> as an alias for cuda).
+    /// </summary>
+    /// <param name="device">Raw option value.</param>
+    /// <param name="backend">Normalized backend name.</param>
+    /// <param name="gpuId">Device ordinal; 0 unless an explicit <c>:N</c> suffix is given.</param>
+    /// <returns><see langword="true"/> when the value names a supported backend.</returns>
+    private static bool TryParseDevice(string device, out string backend, out int gpuId)
+    {
+        backend = (device ?? "cpu").Split(':')[0].ToLowerInvariant();
+        if (backend.Length == 0) backend = "cpu";
+        if (backend == "gpu") backend = "cuda";
+
+        gpuId = 0;
+        string[] parts = (device ?? string.Empty).Split(':');
+        if (parts.Length > 1 && int.TryParse(parts[1], out int ordinal) && ordinal >= 0)
+            gpuId = ordinal;
+
+        return backend is "cpu" or "cuda" or "vulkan";
+    }
+
+    /// <summary>
+    /// Resolves the SPIR-V blob directory for Vulkan: <c>spv/</c> next to the running assembly,
+    /// falling back to the in-repo <c>native/vulkan/spv</c> when running from the source tree.
+    /// </summary>
+    /// <returns>Absolute path to a directory containing compiled SPIR-V.</returns>
+    private static string ResolveSpvDir()
+    {
+        string[] candidates =
+        {
+            Path.Combine(AppContext.BaseDirectory, "spv"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "native", "vulkan", "spv"),
+        };
+        foreach (string c in candidates)
+        {
+            string full = Path.GetFullPath(c);
+            if (Directory.Exists(full) && Directory.GetFiles(full, "*.spv").Length > 0)
+                return full;
+        }
+        throw new InvalidOperationException(
+            "Vulkan SPIR-V directory not found. Run native/vulkan/build.sh (or build.ps1) after installing the Vulkan SDK.");
     }
 
     private static bool TryParseMode(string value, out PerplexityMode mode)
