@@ -23,6 +23,12 @@ namespace DotLLM.Cli.Commands;
 /// </remarks>
 internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Settings>
 {
+    /// <summary>
+    /// Delimiters accepted in a <c>--tokens-file</c>: whitespace plus the punctuation of a
+    /// JSON array, so a reference implementation's dump parses as-is.
+    /// </summary>
+    private static readonly char[] TokenIdSeparators = [' ', '\t', '\r', '\n', ',', '[', ']'];
+
     public sealed class Settings : CommandSettings
     {
         [CommandArgument(0, "<model>")]
@@ -88,13 +94,24 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings)
     {
-        if (string.IsNullOrWhiteSpace(settings.Corpus))
+        // --tokens-file supplies the token stream directly, so it replaces --corpus rather than
+        // supplementing it. Requiring both would defeat the flag's purpose: scoring a reference
+        // implementation's exact ids to separate a tokenizer difference from a scoring one.
+        if (settings.TokensFile is not null)
         {
-            AnsiConsole.MarkupLine("[red]--corpus is required.[/]");
+            if (!File.Exists(settings.TokensFile))
+            {
+                AnsiConsole.MarkupLine(
+                    $"[red]Tokens file not found: {Markup.Escape(settings.TokensFile)}[/]");
+                return 1;
+            }
+        }
+        else if (string.IsNullOrWhiteSpace(settings.Corpus))
+        {
+            AnsiConsole.MarkupLine("[red]--corpus is required (or --tokens-file).[/]");
             return 1;
         }
-
-        if (!File.Exists(settings.Corpus))
+        else if (!File.Exists(settings.Corpus))
         {
             AnsiConsole.MarkupLine($"[red]Corpus not found: {Markup.Escape(settings.Corpus)}[/]");
             return 1;
@@ -120,17 +137,21 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         int effectiveContext = Math.Min(settings.Context, config.MaxSequenceLength);
         // Defaults reproduce llama.cpp: non-overlapping chunks, scoring the second half of each.
         int effectiveStride = settings.Stride > 0 ? settings.Stride : effectiveContext;
+        // context/2 + 1, not context/2: llama.cpp scores targets (n_ctx/2, n_ctx), leaving the token
+        // at n_ctx/2 as context only. See PerplexityOptions.LlamaCppDefault.
         int effectivePrefix = settings.UnscoredPrefix >= 0
             ? settings.UnscoredPrefix
-            : Math.Max(1, effectiveContext / 2);
+            : Math.Min(effectiveContext - 1, Math.Max(1, effectiveContext / 2 + 1));
 
         // Streamed, then buffered once: scoring needs random access across windows, but the file
         // itself is never held in memory and the token list is bounded by --max-tokens.
         var tokens = new List<int>();
         if (settings.TokensFile is not null)
         {
+            // Accept both bare whitespace-separated ids and the JSON-array form that reference
+            // tools print, so a dump can be pasted in without reformatting.
             foreach (string part in File.ReadAllText(settings.TokensFile)
-                         .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+                         .Split(TokenIdSeparators, StringSplitOptions.RemoveEmptyEntries))
             {
                 tokens.Add(int.Parse(part));
                 if (settings.MaxTokens > 0 && tokens.Count >= settings.MaxTokens) break;
@@ -182,7 +203,9 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         var table = new Table().Border(TableBorder.Rounded);
         table.AddColumn("Metric");
         table.AddColumn(new TableColumn("Value").RightAligned());
-        table.AddRow("Perplexity", $"{result.Perplexity:F4}");
+        // Printed as "PPL +/- err" in llama.cpp's own format so the two can be compared by eye.
+        // Without the error bar a reader has no way to tell a regression from sampling noise.
+        table.AddRow("Perplexity", $"{result.Perplexity:F4} +/- {result.StandardError:F5}");
         table.AddRow("Mean NLL (nats)", $"{result.MeanNegativeLogLikelihood:F6}");
         table.AddRow("Scored tokens", $"{result.ScoredTokens:N0}");
         table.AddRow("Windows", $"{result.WindowCount:N0}");
