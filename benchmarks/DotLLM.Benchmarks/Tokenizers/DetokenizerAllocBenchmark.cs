@@ -33,6 +33,21 @@ public class DetokenizerAllocBenchmark
         _spmIds = [10, 1, 11]; // "▁hello ▁world"-ish
         _tiktokenIds = [11, 5, 15]; // "hello world"
         _scratch = new char[256];
+
+        // Fail fast if _scratch can no longer hold either decode. The measured loops
+        // deliberately ignore the TryDecode result to keep the benchmark body minimal;
+        // without this guard a vocab change would silently make them time the
+        // buffer-too-small failure path (written == 0) and report meaningless numbers.
+        EnsureFits(_spm, _spmIds, nameof(_spmIds));
+        EnsureFits(_tiktoken, _tiktokenIds, nameof(_tiktokenIds));
+
+        void EnsureFits(ITokenizer tokenizer, int[] ids, string name)
+        {
+            if (!tokenizer.TryDecode(ids, stripBosSpace: false, _scratch, out int written) || written == 0)
+                throw new InvalidOperationException(
+                    $"Scratch buffer ({_scratch.Length} chars) is too small to decode {name}; " +
+                    "the benchmark would measure the failure path.");
+        }
     }
 
     [Benchmark(Baseline = true, Description = "SPM.Decode (allocating)")]

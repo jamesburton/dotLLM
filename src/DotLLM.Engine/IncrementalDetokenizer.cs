@@ -91,7 +91,7 @@ internal sealed class IncrementalDetokenizer : IDisposable
             // Overflow: grow and retry. ArrayPool.Rent rounds up to a power of two,
             // so growth converges quickly even on multi-byte glyph runs.
             char[] larger = ArrayPool<char>.Shared.Rent(buffer.Length * 2);
-            ArrayPool<char>.Shared.Return(buffer);
+            ArrayPool<char>.Shared.Return(buffer, clearArray: true);
             buffer = larger;
         }
     }
@@ -104,7 +104,7 @@ internal sealed class IncrementalDetokenizer : IDisposable
             if (_tokenizer.TryDecode(ids, stripBosSpace: false, _tailBuf, out written))
                 return;
             char[] larger = ArrayPool<char>.Shared.Rent(_tailBuf.Length * 2);
-            ArrayPool<char>.Shared.Return(_tailBuf);
+            ArrayPool<char>.Shared.Return(_tailBuf, clearArray: true);
             _tailBuf = larger;
         }
     }
@@ -194,17 +194,25 @@ internal sealed class IncrementalDetokenizer : IDisposable
             });
     }
 
-    /// <summary>Returns pooled buffers to <see cref="ArrayPool{T}.Shared"/>. Idempotent.</summary>
+    /// <summary>
+    /// Returns pooled buffers to <see cref="ArrayPool{T}.Shared"/>. Idempotent.
+    /// </summary>
+    /// <remarks>
+    /// Buffers are returned with <c>clearArray: true</c> so decoded model output (which may
+    /// contain user prompt text or other sensitive content) is not left readable by an unrelated
+    /// renter of the shared pool. The buffers are small (tens to a few hundred chars) and this
+    /// runs once per generation, not per token, so it is off the hot path.
+    /// </remarks>
     public void Dispose()
     {
         if (_windowBuf is { Length: > 0 } wb)
         {
-            ArrayPool<char>.Shared.Return(wb);
+            ArrayPool<char>.Shared.Return(wb, clearArray: true);
             _windowBuf = [];
         }
         if (_tailBuf is { Length: > 0 } tb)
         {
-            ArrayPool<char>.Shared.Return(tb);
+            ArrayPool<char>.Shared.Return(tb, clearArray: true);
             _tailBuf = [];
         }
         _windowLen = 0;

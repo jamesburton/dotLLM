@@ -201,7 +201,10 @@ public sealed class IncrementalDetokenizerTests
         // resolves cleanly each step and no byte-fallback run is held back.
         int[] cycle = [2, 3, 4, 4, 5];
 
-        using var detok = new IncrementalDetokenizer(tok);
+        // Pre-size the committed StringBuilder well beyond the ~232 chars this test produces,
+        // so incidental chunk growth cannot contribute to the measured delta and the assertion
+        // reflects only per-Append allocation behaviour.
+        using var detok = new IncrementalDetokenizer(tok, initialCapacity: 4096);
         // Warm-up: pay any one-off ArrayPool rent / first-call costs outside the window.
         for (int i = 0; i < 32; i++)
             detok.Append(cycle[i % cycle.Length]);
@@ -213,9 +216,10 @@ public sealed class IncrementalDetokenizerTests
 
         long delta = after - before;
         // 200 Append calls under the previous path = ~400 small string allocs ~= O(few KB).
-        // The new path's only steady-state allocation source is the committed StringBuilder
-        // chunk growth (amortized — typically zero across 200 calls once warm). Assert a
-        // conservative ceiling well below the previous baseline.
+        // With the buffer pre-sized above, the new path has no steady-state allocation source at
+        // all; the ceiling stays deliberately generous (10 bytes/call vs the previous ~20+) so the
+        // test cannot flake on runtime bookkeeping while still failing loudly if per-Append
+        // string decoding ever returns.
         Assert.True(delta < 2_048,
             $"Append() allocated {delta} bytes across 200 calls — expected far less than the pre-PR ~4 KB+ baseline");
     }

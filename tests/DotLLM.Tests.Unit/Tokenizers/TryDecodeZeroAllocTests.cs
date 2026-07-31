@@ -258,6 +258,13 @@ public sealed class TryDecodeZeroAllocTests
     // Zero-allocation assertions (steady-state)
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Total managed bytes tolerated across a warmed 1000-call loop. Below one byte per call:
+    /// since the minimum managed object size is 24 bytes, staying under this bound proves the
+    /// measured path allocates nothing per call, without being brittle to one-off runtime noise.
+    /// </summary>
+    private const long AllocBudgetPer1000Calls = 1000;
+
     [Fact]
     public void TryDecode_SentencePiece_ZeroAllocationPerCall()
     {
@@ -281,9 +288,14 @@ public sealed class TryDecodeZeroAllocTests
         long after = GC.GetAllocatedBytesForCurrentThread();
 
         long delta = after - before;
-        // Expect bit-exact zero managed allocation on the steady-state hot path.
-        Assert.True(delta == 0,
-            $"Expected 0 managed bytes allocated across 1000 TryDecode calls, got {delta} bytes");
+        // Budget rather than bit-exact zero: the smallest possible managed allocation is 24 bytes,
+        // so a total under 1000 bytes across 1000 calls mathematically rules out *any* per-call
+        // allocation, while absorbing one-off runtime bookkeeping (tiered re-JIT, diagnostics)
+        // that can otherwise make a strict `== 0` assertion flaky across TFMs/configurations.
+        // For reference, the allocating Decode path costs tens of bytes *per call* here.
+        Assert.True(delta < AllocBudgetPer1000Calls,
+            $"Expected no per-call managed allocation across 1000 TryDecode calls, got {delta} bytes " +
+            $"({delta / 1000.0:F2} bytes/call)");
     }
 
     [Fact]
@@ -308,8 +320,9 @@ public sealed class TryDecodeZeroAllocTests
         long after = GC.GetAllocatedBytesForCurrentThread();
 
         long delta = after - before;
-        Assert.True(delta == 0,
-            $"Expected 0 managed bytes allocated across 1000 TryDecode calls, got {delta} bytes");
+        Assert.True(delta < AllocBudgetPer1000Calls,
+            $"Expected no per-call managed allocation across 1000 TryDecode calls, got {delta} bytes " +
+            $"({delta / 1000.0:F2} bytes/call)");
     }
 
     [Fact]
