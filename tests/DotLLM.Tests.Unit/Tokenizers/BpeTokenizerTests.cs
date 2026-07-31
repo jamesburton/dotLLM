@@ -338,6 +338,42 @@ public class BpeTokenizerTests
             bosId: 0, eosId: 0, addBosSpace: false);
     }
 
+    /// <summary>
+    /// Long text whose characters fall back to bytes must not overflow the symbol buffer.
+    /// </summary>
+    /// <remarks>
+    /// <para>Regression for an <see cref="IndexOutOfRangeException"/> in
+    /// <c>SentencePieceEncoding.BuildInitialSymbols</c>. The symbol array was sized by CHARACTER
+    /// count, but byte fallback emits one symbol per UTF-8 BYTE — up to 3 per char — so any text
+    /// containing characters outside the vocab could write past the end.</para>
+    /// <para>The length is the load-bearing part of this test. <c>ArrayPool.Rent</c> hands back
+    /// power-of-two buckets, so most sizes come with slack that silently absorbs the overflow;
+    /// the bug only surfaces when the requested length sits just under a bucket boundary.
+    /// 65,536 is exactly such a size — and it is the chunk size the perplexity corpus reader uses,
+    /// which is how this shipped undetected. A shorter or rounder string does NOT reproduce it.</para>
+    /// </remarks>
+    [Theory]
+    [InlineData(65536)]   // exact ArrayPool bucket — zero slack, the pathological case
+    [InlineData(65500)]   // just under the bucket
+    [InlineData(32768)]
+    public void ByteFallback_LongText_DoesNotOverflowSymbolBuffer(int length)
+    {
+        var tok = BuildChatMlVocab();
+
+        // 'h' and 'i' are in the vocab; every other char must go through byte fallback. Mixing
+        // them means the symbol count exceeds the char count without being a trivial 3x.
+        var sb = new System.Text.StringBuilder(length);
+        for (int i = 0; i < length; i++)
+            sb.Append((i % 4) switch { 0 => 'h', 1 => 'i', 2 => 'z', _ => 'ä' });
+
+        int[] ids = tok.Encode(sb.ToString());
+
+        Assert.NotEmpty(ids);
+        // Fallback expands, so there must be at least as many ids as characters.
+        Assert.True(ids.Length >= length,
+            $"expected >= {length} ids from {length} chars with byte fallback, got {ids.Length}");
+    }
+
     [Fact]
     public void SpecialToken_EmittedAsSingleId_NotBpeEncoded()
     {
