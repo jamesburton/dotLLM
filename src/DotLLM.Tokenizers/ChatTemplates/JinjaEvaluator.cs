@@ -595,38 +595,28 @@ internal sealed class JinjaEvaluator
             return s;
         if (value is int or double or long)
             return value.ToString()!;
-        if (value is IList list)
+        // Lists and dictionaries share one cycle guard: same visited-set bookkeeping and
+        // the same message shape, so a future change to either cannot drift between them.
+        // Reference identity is what matters — a self-referencing container is the same
+        // instance seen again, not an equal-by-value one.
+        if (value is IList or Dictionary<string, object?>)
         {
+            string containerKind = value is IList ? "list" : "dictionary";
             visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
-            if (!visited.Add(list))
+            if (!visited.Add(value))
             {
                 throw new JinjaException(
-                    "Circular reference detected while stringifying a list — context contains self-referencing data.");
+                    $"Circular reference detected while stringifying a {containerKind} — context contains self-referencing data.");
             }
             try
             {
-                return "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item, visited))) + "]";
+                return value is IList list
+                    ? "[" + string.Join(", ", list.Cast<object?>().Select(item => StringifyRepr(item, visited))) + "]"
+                    : "{" + string.Join(", ", ((Dictionary<string, object?>)value).Select(kvp => $"'{kvp.Key}': {StringifyRepr(kvp.Value, visited)}")) + "}";
             }
             finally
             {
-                visited.Remove(list);
-            }
-        }
-        if (value is Dictionary<string, object?> dict)
-        {
-            visited ??= new HashSet<object>(ReferenceEqualityComparer.Instance);
-            if (!visited.Add(dict))
-            {
-                throw new JinjaException(
-                    "Circular reference detected while stringifying a dict — context contains self-referencing data.");
-            }
-            try
-            {
-                return "{" + string.Join(", ", dict.Select(kvp => $"'{kvp.Key}': {StringifyRepr(kvp.Value, visited)}")) + "}";
-            }
-            finally
-            {
-                visited.Remove(dict);
+                visited.Remove(value);
             }
         }
         return value.ToString() ?? "";

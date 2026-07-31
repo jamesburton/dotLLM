@@ -43,6 +43,7 @@ public class JinjaEvaluatorCycleTests
 
         var ex = Assert.Throws<JinjaException>(() => JinjaEvaluator.Stringify(dict));
         Assert.Contains("Circular reference", ex.Message);
+        Assert.Contains("dictionary", ex.Message); // container kind named consistently, not abbreviated
     }
 
     /// <summary>
