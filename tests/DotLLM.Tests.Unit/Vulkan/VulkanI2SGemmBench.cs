@@ -90,6 +90,11 @@ public sealed class VulkanI2SGemmBench
         var comparisons = new List<(string Label, I2SGemmVariant Reference, I2SGemmVariant Challenger)>
         {
             ("scalar -> register-blocked", I2SGemmVariant.Scalar, I2SGemmVariant.RegisterBlocked),
+            // Attacks the unpack rather than the multiply — the bottleneck the coopmat
+            // attempts identified (#229). Bit-exact vs RegisterBlocked, so this is pure perf.
+            ("register-blocked -> wide-load unpack", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedWide),
+            // Bank-conflict fix: sharedW row stride 128 -> 129 words. Also bit-exact.
+            ("register-blocked -> bank-padded sharedW", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedPadded),
         };
         if (device.HasCooperativeMatrix)
         {

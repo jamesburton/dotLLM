@@ -85,6 +85,36 @@ public readonly record struct I2SGemmVariant(
     public static I2SGemmVariant CoopmatWarptile =>
         new("matmul_i2_s_f32_gemm_coopmat_wt.spv", 32, 32, RequiresCooperativeMatrix: true);
 
+    /// <summary>
+    /// Register-blocked with a wide weight unpack: one aligned 32-bit load per thread
+    /// (4 packed bytes = 16 ternary codes) instead of four redundant loads of the same word.
+    /// </summary>
+    /// <remarks>
+    /// Same 32x32 tile and 2x2 micro-tile as <see cref="RegisterBlocked"/>; only the unpack
+    /// differs. Motivated by the coopmat findings (issue #229): three cooperative-matrix attempts
+    /// all lost to the F32 kernel because this GEMM is bound by I2_S unpacking and shared staging
+    /// rather than by the multiply, so the unpack is where the remaining time actually is.
+    /// The four byte offsets the baseline fetched separately are provably one aligned word —
+    /// <c>rowBytes = K/4</c> is a multiple of 32 (K is a multiple of 128), and both
+    /// <c>blk*32</c> and the 4-aligned in-block offset preserve alignment.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWide => new("matmul_i2_s_f32_gemm_rb_w4.spv", 32, 32);
+
+    /// <summary>
+    /// Register-blocked with one padding word on the <c>sharedW</c> row stride (129 instead of 128)
+    /// to eliminate shared-memory bank conflicts in the inner loop.
+    /// </summary>
+    /// <remarks>
+    /// Shared memory has 32 four-byte banks, so bank = word index mod 32. A 128-word row stride is
+    /// 0 mod 32, so all 16 distinct <c>lx</c> values read the SAME bank for a given <c>j</c> — a
+    /// 16-way conflict on every one of the 128 inner iterations. A 129-word stride gives
+    /// bank = (lx + j) mod 32 (since 129 = 1 mod 32), spreading the 16 lanes across 16 banks.
+    /// <c>sharedB</c> stays unpadded: threads in a warp share <c>ly</c>, so those reads broadcast
+    /// one address and are already conflict-free.
+    /// Bit-exact with <see cref="RegisterBlocked"/> — only the shared layout changes.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedPadded => new("matmul_i2_s_f32_gemm_rb_pad.spv", 32, 32);
+
     /// <summary>The variant used by the production forward path.</summary>
     public static I2SGemmVariant Production => RegisterBlocked;
 }
