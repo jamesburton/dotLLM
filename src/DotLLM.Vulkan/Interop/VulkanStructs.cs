@@ -67,6 +67,16 @@ internal static class VkStructureType
     internal const int PhysicalDeviceSubgroupSizeControlProperties = 1000225000;
     internal const int PhysicalDeviceSubgroupSizeControlFeatures = 1000225001;
     internal const int PipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225002;
+    // VK_KHR_pipeline_executable_properties. The Features struct (chained off
+    // VkPhysicalDeviceFeatures2 at device create) carries `pipelineExecutableInfo`;
+    // VkPipelineInfoKHR names the pipeline to introspect; VkPipelineExecutablePropertiesKHR
+    // is the per-executable result and — uniquely among the introspection APIs we
+    // already have — reports the `subgroupSize` the driver ACTUALLY compiled the
+    // stage for. VK_AMD_shader_info's statistics do not expose the wave width, and
+    // it is invisible to timing A/Bs and to SPIR-V disassembly (issue #241).
+    internal const int PhysicalDevicePipelineExecutablePropertiesFeaturesKhr = 1000269000;
+    internal const int PipelineInfoKhr = 1000269001;
+    internal const int PipelineExecutablePropertiesKhr = 1000269002;
     // VK_KHR_external_semaphore (core 1.1) — VkExportSemaphoreCreateInfo chains
     // off VkSemaphoreCreateInfo.pNext to declare which handle type(s) the
     // semaphore may be exported as. Drives the M3 Vulkan→CUDA async handoff.
@@ -788,6 +798,44 @@ internal struct VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
     internal int sType;
     internal nint pNext;
     internal uint requiredSubgroupSize;
+}
+
+// VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR — chained off
+// VkPhysicalDeviceFeatures2.pNext at device create. `pipelineExecutableInfo` must
+// be VK_TRUE before vkGetPipelineExecutablePropertiesKHR may be called.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPhysicalDevicePipelineExecutablePropertiesFeaturesKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal uint pipelineExecutableInfo; // VkBool32
+}
+
+// VkPipelineInfoKHR — argument to vkGetPipelineExecutablePropertiesKHR naming the
+// pipeline whose compiled executables are to be enumerated.
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkPipelineInfoKhr
+{
+    internal int sType;
+    internal nint pNext;
+    internal nint pipeline; // VkPipeline
+}
+
+// VkPipelineExecutablePropertiesKHR — one entry per compiled executable in a
+// pipeline. `subgroupSize` is the wave width the driver actually compiled the
+// stage for — the only API in this codebase that reports it (issue #241).
+// `name`/`description` are fixed VK_MAX_DESCRIPTION_SIZE (256) char arrays.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPipelineExecutablePropertiesKhr
+{
+    internal const int MaxDescriptionSize = 256;
+
+    internal int sType;
+    internal nint pNext;
+    internal uint stages; // VkShaderStageFlags
+    internal fixed byte name[MaxDescriptionSize];
+    internal fixed byte description[MaxDescriptionSize];
+    internal uint subgroupSize;
 }
 
 // VkCooperativeMatrixPropertiesKHR — one entry per driver-supported tile shape

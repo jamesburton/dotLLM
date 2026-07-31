@@ -62,7 +62,16 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
     /// the device does not advertise integer-dot-product support — the router
     /// falls back to <see cref="MatMulQ8_0Kernel"/> in either case.
     /// </summary>
-    public static MatMulQ8_0MmvqKernel? TryCreate(VulkanDevice device, string spvDir)
+    /// <param name="device">Target device.</param>
+    /// <param name="spvDir">Directory containing the compiled SPIR-V modules.</param>
+    /// <param name="requiredSubgroupSizeOverride">
+    /// Diagnostic-only wave-width override for issue #241's instrument-validity
+    /// check (pin the SAME SPIR-V to 32 vs 64 and see whether the driver's
+    /// reported ISA changes at all). <c>null</c> — the only value production
+    /// passes — keeps the <see cref="Wave32SubgroupControl"/> decision.
+    /// </param>
+    public static MatMulQ8_0MmvqKernel? TryCreate(
+        VulkanDevice device, string spvDir, uint? requiredSubgroupSizeOverride = null)
     {
         if (!device.HasIntegerDotProduct)
             return null;
@@ -77,7 +86,8 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
         // never globally — matches llama.cpp's K-quant decode strategy. Gated
         // on device support so it cleanly falls back to the driver default
         // (subgroupSize=0 = unset) elsewhere, and on an env opt-out for A/B.
-        uint requiredSubgroupSize = Wave32SubgroupControl.RequiredSubgroupSizeFor(device);
+        uint requiredSubgroupSize =
+            requiredSubgroupSizeOverride ?? Wave32SubgroupControl.RequiredSubgroupSizeFor(device);
 
         var module = VulkanModule.LoadFromFile(device, path);
         ComputePipeline pipeline;
@@ -106,6 +116,9 @@ public sealed class MatMulQ8_0MmvqKernel : IDisposable
 
     /// <summary>Drops every cached descriptor set; call when scratch buffers have been re-allocated.</summary>
     internal void InvalidateDescriptorCache() => _descriptorCache.Reset();
+
+    /// <summary>Raw <c>VkPipeline</c> handle — for diagnostics only (e.g. <see cref="VulkanDevice.GetPipelineSubgroupSizes"/>).</summary>
+    internal nint PipelineHandle => _pipeline.Pipeline;
 
     /// <summary>
     /// Records the MMVQ GEMV into <paramref name="cmdBuf"/>.

@@ -100,6 +100,26 @@ public sealed class VulkanI2SGemmBench
             comparisons.Add(("coopmat32 -> warptile (tile size only)", I2SGemmVariant.Coopmat32, I2SGemmVariant.CoopmatWarptile));
             // And against the production bar, which is what decides promotion.
             comparisons.Add(("register-blocked -> warptile", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.CoopmatWarptile));
+
+            // Issue #239: the 32-thread workgroup and the wave32 pin are a PAIR. Every
+            // coopmat row above runs UNPINNED, so on a wave64 device (gfx1151) each of
+            // those 32-thread workgroups is half a wave. These rows isolate the pin —
+            // same SPIR-V, same tile, only requiredSubgroupSize differs — and then put
+            // the pinned kernel against the production bar, which is what decides
+            // promotion.
+            if (device.SupportsRequiredSubgroupSize(32, DotLLM.Vulkan.Interop.VkShaderStageFlags.Compute))
+            {
+                comparisons.Add(("coopmat32 -> coopmat32+wave32 (pin only)",
+                    I2SGemmVariant.Coopmat32, I2SGemmVariant.Coopmat32Wave32));
+                comparisons.Add(("warptile -> warptile+wave32 (pin only)",
+                    I2SGemmVariant.CoopmatWarptile, I2SGemmVariant.CoopmatWarptileWave32));
+                comparisons.Add(("register-blocked -> coopmat32+wave32",
+                    I2SGemmVariant.RegisterBlocked, I2SGemmVariant.Coopmat32Wave32));
+                comparisons.Add(("register-blocked -> warptile+wave32 (PRODUCTION DECISION)",
+                    I2SGemmVariant.RegisterBlocked, I2SGemmVariant.CoopmatWarptileWave32));
+            }
+            else
+                _output.WriteLine("NOTE: device cannot pin a compute subgroup size of 32 — wave32 comparisons skipped.");
         }
         else
             _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — coopmat comparison skipped.");
