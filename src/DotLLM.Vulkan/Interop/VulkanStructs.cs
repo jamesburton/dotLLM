@@ -198,11 +198,16 @@ internal unsafe struct VkPhysicalDeviceProperties
 internal unsafe struct VkPhysicalDeviceMemoryProperties
 {
     internal uint memoryTypeCount;
-    // 32 * VkMemoryType (each 8 bytes: propertyFlags + heapIndex)
-    internal fixed byte memoryTypes[32 * 8];
+    // 32 * VkMemoryType, each 2 u32 words: [i*2] = propertyFlags, [i*2+1] = heapIndex.
+    // Declared as uint (not byte) so consumers index naturally-aligned words rather than
+    // reinterpreting a byte buffer through a uint* — which would be an unaligned read on
+    // targets that require it (some ARM configurations).
+    internal fixed uint memoryTypeWords[32 * 2];
     internal uint memoryHeapCount;
-    // 16 * VkMemoryHeap (each 16 bytes: size(u64) + flags(u32) + padding)
-    internal fixed byte memoryHeaps[16 * 16];
+    // 16 * VkMemoryHeap, each 2 u64 words: [i*2] = size, [i*2+1] = flags (u32 + padding).
+    // ulong element type also gives the struct the 8-byte alignment VkMemoryHeap carries
+    // in the C layout, keeping memoryHeaps at the same offset the loader writes.
+    internal fixed ulong memoryHeapWords[16 * 2];
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -20,14 +20,17 @@ public sealed class AddKernel : IDisposable
     private readonly VulkanModule _module;
     private readonly ComputePipeline _pipeline;
     private readonly nint _descriptorPool;
+    private readonly nint _descriptorSet;
     private bool _disposed;
 
-    private AddKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline, nint pool)
+    private AddKernel(VulkanDevice device, VulkanModule module, ComputePipeline pipeline,
+                      nint pool, nint descriptorSet)
     {
         _device = device;
         _module = module;
         _pipeline = pipeline;
         _descriptorPool = pool;
+        _descriptorSet = descriptorSet;
     }
 
     /// <summary>Loads <c>add.spv</c> from the given directory and creates the pipeline.</summary>
@@ -56,11 +59,24 @@ public sealed class AddKernel : IDisposable
             throw;
         }
 
-        // Single, small descriptor pool with one set for this kernel. A real
-        // implementation pools descriptors across launches; for the proof-of-
-        // pipeline scaffold, one set per kernel instance is fine.
-        nint pool = CreateDescriptorPool(device);
-        return new AddKernel(device, module, pipeline, pool);
+        // One descriptor set, allocated once and re-written per launch. The pool is sized
+        // maxSets = 1, so allocating per Launch would fail on the second dispatch with
+        // VK_ERROR_OUT_OF_POOL_MEMORY; re-writing the same set is both valid and cheaper.
+        nint pool = 0;
+        try
+        {
+            pool = CreateDescriptorPool(device);
+            nint descriptorSet = AllocateDescriptorSet(device, pool, pipeline.DescriptorSetLayout);
+            return new AddKernel(device, module, pipeline, pool, descriptorSet);
+        }
+        catch
+        {
+            if (pool != 0)
+                VulkanApi.vkDestroyDescriptorPool(device.Handle, pool, 0);
+            pipeline.Dispose();
+            module.Dispose();
+            throw;
+        }
     }
 
     private static unsafe nint CreateDescriptorPool(VulkanDevice device)
@@ -80,28 +96,35 @@ public sealed class AddKernel : IDisposable
         return pool;
     }
 
-    /// <summary>
-    /// Dispatches the add kernel: <c>c[i] = a[i] + b[i]</c> for <paramref name="n"/>
-    /// FP32 elements. All three buffers must be at least <c>n * sizeof(float)</c> bytes.
-    /// Synchronous — the call returns after <c>vkQueueWaitIdle</c>.
-    /// </summary>
-    public unsafe void Launch(VulkanDevice.Buffer a, VulkanDevice.Buffer b, VulkanDevice.Buffer c, int n)
+    private static unsafe nint AllocateDescriptorSet(VulkanDevice device, nint pool, nint setLayout)
     {
-        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
-
-        // 1. Allocate one descriptor set.
-        nint setLayout = _pipeline.DescriptorSetLayout;
         var dsai = new VkDescriptorSetAllocateInfo
         {
             sType = VkStructureType.DescriptorSetAllocateInfo,
-            descriptorPool = _descriptorPool,
+            descriptorPool = pool,
             descriptorSetCount = 1,
             pSetLayouts = (nint)(&setLayout),
         };
-        VulkanApi.vkAllocateDescriptorSets(_device.Handle, dsai, out nint descriptorSet)
+        VulkanApi.vkAllocateDescriptorSets(device.Handle, dsai, out nint descriptorSet)
             .ThrowOnError("vkAllocateDescriptorSets");
+        return descriptorSet;
+    }
 
-        // 2. Write buffer bindings into the descriptor set.
+    /// <summary>
+    /// Dispatches the add kernel: <c>c[i] = a[i] + b[i]</c> for <paramref name="n"/>
+    /// FP32 elements. All three buffers must be at least <c>n * sizeof(float)</c> bytes.
+    /// Synchronous — the call returns after <c>vkQueueWaitIdle</c>. May be called repeatedly
+    /// on the same instance; the single descriptor set is re-written each time, which is legal
+    /// precisely because no prior submission can still be in flight after the wait.
+    /// </summary>
+    public unsafe void Launch(VulkanDevice.Buffer a, VulkanDevice.Buffer b, VulkanDevice.Buffer c, int n)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
+
+        nint descriptorSet = _descriptorSet;
+
+        // 1. (Re-)write buffer bindings into the pre-allocated descriptor set.
         Span<VkDescriptorBufferInfo> bufferInfos = stackalloc VkDescriptorBufferInfo[3];
         bufferInfos[0] = new VkDescriptorBufferInfo { buffer = a.Handle, offset = 0, range = ulong.MaxValue }; // VK_WHOLE_SIZE
         bufferInfos[1] = new VkDescriptorBufferInfo { buffer = b.Handle, offset = 0, range = ulong.MaxValue };

@@ -4,11 +4,15 @@ using DotLLM.Vulkan.Interop;
 namespace DotLLM.Vulkan;
 
 /// <summary>
-/// Loads a SPIR-V compute shader into a <c>VkShaderModule</c> and caches compute
-/// pipelines keyed by kernel entry-point name. One <see cref="VulkanModule"/>
-/// corresponds to one .spv file (one kernel), mirroring how <c>CudaModule</c>
-/// wraps a single .ptx file.
+/// Loads a SPIR-V compute shader into a <c>VkShaderModule</c> and creates compute
+/// pipelines from it. One <see cref="VulkanModule"/> corresponds to one .spv file
+/// (one kernel), mirroring how <c>CudaModule</c> wraps a single .ptx file.
 /// </summary>
+/// <remarks>
+/// <see cref="CreateComputePipeline"/> creates a fresh <see cref="ComputePipeline"/> on
+/// every call — nothing is cached at this layer, and the caller owns disposal. Kernels are
+/// expected to create their pipeline once at construction time and reuse it across launches.
+/// </remarks>
 /// <remarks>
 /// SPIR-V is architecturally analogous to PTX: a forward-compatible shader IR
 /// that the Vulkan driver translates to the vendor-specific ISA at pipeline-creation time.

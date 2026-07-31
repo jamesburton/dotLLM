@@ -36,6 +36,11 @@ public sealed class VulkanException : Exception
         -11 => "VK_ERROR_FORMAT_NOT_SUPPORTED",
         -12 => "VK_ERROR_FRAGMENTED_POOL",
         -13 => "VK_ERROR_UNKNOWN",
+        // Promoted-to-core extension codes keep their original large negative values.
+        -1000069000 => "VK_ERROR_OUT_OF_POOL_MEMORY",
+        -1000072003 => "VK_ERROR_INVALID_EXTERNAL_HANDLE",
+        -1000161000 => "VK_ERROR_FRAGMENTATION",
+        -1000257000 => "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS",
         _ => "VK_ERROR_UNMAPPED"
     };
 }

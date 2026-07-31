@@ -66,6 +66,55 @@ public class VulkanAddKernelTests
     }
 
     [SkippableFact]
+    public void AddKernel_LaunchesRepeatedly_OnSameInstance()
+    {
+        // Regression: the descriptor set used to be allocated inside Launch from a
+        // maxSets = 1 pool, so a second dispatch on the same instance failed with
+        // VK_ERROR_OUT_OF_POOL_MEMORY. The set is now allocated once and re-written.
+        Skip.If(
+            Environment.GetEnvironmentVariable("DOTLLM_SKIP_VULKAN") == "1",
+            "DOTLLM_SKIP_VULKAN=1");
+        Skip.IfNot(
+            VulkanDevice.IsAvailable(),
+            "No Vulkan loader or physical device available on this host.");
+
+        string? spvDir = FindSpvDir();
+        Skip.If(
+            spvDir == null,
+            "SPIR-V blobs not found. Run native/vulkan/build.sh (or build.ps1) with the Vulkan SDK installed.");
+
+        const int n = 256;
+        using var device = VulkanDevice.Create();
+        using var kernel = AddKernel.Create(device, spvDir!);
+
+        using var bufA = device.Allocate(n * sizeof(float));
+        using var bufB = device.Allocate(n * sizeof(float));
+        using var bufC = device.Allocate(n * sizeof(float));
+
+        var a = new float[n];
+        var b = new float[n];
+        var result = new float[n];
+
+        // Three dispatches with different data, re-binding the same descriptor set each time.
+        for (int pass = 1; pass <= 3; pass++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                a[i] = i * pass;
+                b[i] = -i * 0.5f;
+            }
+            device.Upload(a, bufA);
+            device.Upload(b, bufB);
+
+            kernel.Launch(bufA, bufB, bufC, n);
+
+            device.Download(bufC, result);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(a[i] + b[i], result[i]);
+        }
+    }
+
+    [SkippableFact]
     public void Device_ReportsName()
     {
         Skip.If(

@@ -69,12 +69,9 @@ public sealed class VulkanDevice : IDisposable
     {
         try
         {
-            string lib = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                ? "vulkan-1.dll"
-                : RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
-                    ? "libvulkan.dylib"
-                    : "libvulkan.so.1";
-            if (!NativeLibrary.TryLoad(lib, out nint handle))
+            // Probe through the same candidate list the DllImport resolver uses, so
+            // availability can never disagree with what actually loads at runtime.
+            if (!VulkanLibraryResolver.TryLoadLoader(out nint handle))
                 return false;
             NativeLibrary.Free(handle);
 
@@ -382,12 +379,11 @@ public sealed class VulkanDevice : IDisposable
     private unsafe uint FindMemoryType(uint typeBits, VkMemoryPropertyFlags required)
     {
         VulkanApi.vkGetPhysicalDeviceMemoryProperties(_physicalDevice, out var mem);
-        // memoryTypes is an array of 8-byte entries: u32 propertyFlags, u32 heapIndex.
-        uint* types = (uint*)mem.memoryTypes;
+        // Each VkMemoryType is two u32 words: propertyFlags, heapIndex.
         for (uint i = 0; i < mem.memoryTypeCount; i++)
         {
             if ((typeBits & (1u << (int)i)) == 0) continue;
-            var flags = (VkMemoryPropertyFlags)types[i * 2];
+            var flags = (VkMemoryPropertyFlags)mem.memoryTypeWords[i * 2];
             if ((flags & required) == required)
                 return i;
         }
