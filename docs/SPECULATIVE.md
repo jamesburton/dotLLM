@@ -47,6 +47,12 @@ if all K accepted:
 
 **Key property**: `q` and `p` are computed from the same post-transform distribution the sampler pipeline actually draws from. The decoder applies the pipeline's transforms (processors then sampler steps) to both draft and target logits before softmax, and uses the pipeline's RNG path for `SampleFromTransformed`. The repetition-penalty context for position `i` in the verify pass is rebuilt to match the draft pass — `generatedIds + draft_0 … draft_{i-1}` — so both penalty applications see the same history. The scheme then produces samples from the target distribution exactly — not an approximation.
 
+Exactness rests on three conditions, all of which the implementation holds to:
+
+1. **`q` is the true proposal marginal.** `q` is softmaxed over the draft's *full* vocab, not over the shared prefix. Renormalising a truncated slice would inflate `q` and shrink `min(1, p/q)`, biasing acceptance whenever the draft vocab is the wider one.
+2. **Out-of-shared-range draft tokens go through the residual, not raw `p`.** Such a token has `p = 0` (the target has no such id), so it is an unconditional reject; the replacement is drawn from `normalize(max(0, p - q))` like any other reject. Sampling raw `p` instead would over-weight tokens the draft distribution already covered.
+3. **The acceptance RNG is independent of the proposal RNG.** `SamplerPipeline` and `SpeculativeDecoder` are both seeded from `options.Seed`, so the decoder mixes it (SplitMix64 avalanche) before use. Sharing the raw seed makes both `Random` instances emit the same sequence, and the `i`-th acceptance test would then reuse the exact uniform that inverse-CDF-selected draft token `i` — correlating acceptance with the token's CDF position.
+
 ## ISpeculativeDecoder Interface
 
 ```

@@ -35,6 +35,10 @@ namespace DotLLM.Engine;
 /// Supports draft models with slightly different vocab sizes (up to 128 token difference,
 /// matching llama.cpp's tolerance). Probability comparison uses the shared vocab range;
 /// tokens beyond the draft's vocab can only be produced by the target (as corrected/bonus tokens).
+/// When the draft vocab is the wider one, <c>q</c> is still softmaxed over the draft's full support so
+/// it is the true proposal marginal, and a draft token landing outside the shared range is rejected
+/// through the same residual distribution as any other reject — so exactness holds for unequal vocabs
+/// too, not merely when the tail mass happens to be zero.
 /// Zero-allocation on the hot path: all buffers are caller-owned or pool-rented, no per-call arrays.
 /// </para>
 /// </remarks>
@@ -49,11 +53,36 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
     /// <see cref="DraftAndVerify"/>.
     /// </summary>
     /// <param name="greedy">Ignored; pipeline mode governs acceptance. Kept for API stability.</param>
-    /// <param name="seed">Random seed for rejection sampling. Null = non-deterministic.</param>
+    /// <param name="seed">
+    /// Random seed for rejection sampling. Null = non-deterministic. The value is deterministically
+    /// mixed (see <see cref="DeriveAcceptanceSeed"/>) so callers can pass the same seed they gave the
+    /// <see cref="SamplerPipeline"/> without the two RNG streams coinciding.
+    /// </param>
     public SpeculativeDecoder(bool greedy, int? seed = null)
     {
         _ = greedy;
-        _rng = seed.HasValue ? new Random(seed.Value) : new Random();
+        _rng = seed.HasValue ? new Random(DeriveAcceptanceSeed(seed.Value)) : new Random();
+    }
+
+    /// <summary>
+    /// Derives the accept/reject RNG seed from the pipeline seed.
+    /// </summary>
+    /// <remarks>
+    /// Modified rejection sampling requires the acceptance draw <c>u ~ U(0,1)</c> to be independent of
+    /// the draw that produced the proposal token. <see cref="SamplerPipeline"/> seeds its own
+    /// <see cref="Random"/> from the same <c>options.Seed</c>; without mixing, both streams emit the
+    /// identical sequence, so the <c>i</c>-th acceptance test would reuse the very uniform that
+    /// inverse-CDF-selected draft token <c>i</c> — correlating acceptance with the token's position in
+    /// the sorted CDF and breaking the distributional guarantee. A SplitMix64-style avalanche keeps the
+    /// two streams reproducible but statistically independent.
+    /// </remarks>
+    private static int DeriveAcceptanceSeed(int pipelineSeed)
+    {
+        ulong z = (ulong)(uint)pipelineSeed + 0x9E3779B97F4A7C15UL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+        z ^= z >> 31;
+        return (int)(uint)z;
     }
 
     /// <inheritdoc/>
@@ -87,6 +116,14 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
         // Flat buffer for draft probabilities: k rows × sharedVocab columns
         int[] draftTokens = ArrayPool<int>.Shared.Rent(k);
         float[] draftProbsFlat = greedy ? [] : ArrayPool<float>.Shared.Rent(k * sharedVocab);
+
+        // One scratch buffer for the whole verify pass — renting per accepted token churned the pool
+        // K times per speculative step. Only the non-greedy path softmaxes the target logits.
+        float[] targetProbs = greedy ? [] : ArrayPool<float>.Shared.Rent(targetVocabSize);
+
+        // Only needed when the draft vocab is wider than the target's — see the draft-loop softmax.
+        bool needsFullDraftProbs = !greedy && draftVocabSize > sharedVocab;
+        float[] draftFullProbs = needsFullDraftProbs ? ArrayPool<float>.Shared.Rent(draftVocabSize) : [];
 
         // Clone constraint for draft phase
         IDecodingConstraint? draftConstraint = constraint?.Clone();
@@ -126,7 +163,22 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
                         if (!greedy)
                         {
                             var probSlice = draftProbsFlat.AsSpan(i * sharedVocab, sharedVocab);
-                            TensorPrimitives.SoftMax(logitSpan.Slice(0, sharedVocab), probSlice);
+                            if (draftVocabSize == sharedVocab)
+                            {
+                                TensorPrimitives.SoftMax(logitSpan, probSlice);
+                            }
+                            else
+                            {
+                                // Draft vocab is wider than the target's. Softmax over the *full* draft
+                                // support and keep the shared prefix, so q is the true proposal marginal.
+                                // Softmaxing the truncated slice would renormalise away the tail mass and
+                                // inflate q, biasing min(1, p/q) — the rejection scheme would no longer be
+                                // exact. The tail mass stays accounted for: a draft token landing outside
+                                // the shared range is rejected below with q taken from this same marginal.
+                                var fullSlice = draftFullProbs.AsSpan(0, draftVocabSize);
+                                TensorPrimitives.SoftMax(logitSpan, fullSlice);
+                                fullSlice.Slice(0, sharedVocab).CopyTo(probSlice);
+                            }
                         }
 
                         draftToken = pipeline.SampleFromTransformed(logitSpan);
@@ -199,11 +251,26 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
                         // holds (original + draft_0 … draft_{i-1}) — identical to the draft-loop context.
                         pipeline.ApplyTransforms(targetLogitSpan, generatedIds);
 
-                        // If draft token is beyond shared range, auto-reject. Corrected token is sampled
-                        // from the transformed target distribution (not raw logits).
+                        // Draft token beyond the shared range: the target cannot emit it, so p = 0 and
+                        // min(1, p/q) = 0 — an unconditional reject. The replacement must still come from
+                        // the residual normalize(max(0, p - q)), exactly as an ordinary reject does;
+                        // sampling raw p here would over-weight tokens the draft already covered.
                         if (draftTok >= sharedVocab)
                         {
-                            int corrected = pipeline.SampleFromTransformed(targetLogitSpan);
+                            int corrected;
+                            if (greedy)
+                            {
+                                corrected = pipeline.SampleFromTransformed(targetLogitSpan);
+                            }
+                            else
+                            {
+                                var targetProbSpanOut = targetProbs.AsSpan(0, targetVocabSize);
+                                TensorPrimitives.SoftMax(targetLogitSpan, targetProbSpanOut);
+                                corrected = SampleCorrected(
+                                    targetProbSpanOut,
+                                    draftProbsFlat.AsSpan(i * sharedVocab, sharedVocab),
+                                    targetVocabSize, sharedVocab);
+                            }
                             outputBuffer[acceptedCount++] = corrected;
                             constraint?.Advance(corrected);
                             RollbackCaches(kvCacheTarget, kvCacheDraft, position + acceptedCount, k);
@@ -230,36 +297,29 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
                         else
                         {
                             var draftProbSlice = draftProbsFlat.AsSpan(i * sharedVocab, sharedVocab);
-                            float[] targetProbs = ArrayPool<float>.Shared.Rent(targetVocabSize);
-                            try
+                            var targetProbSpan = targetProbs.AsSpan(0, targetVocabSize);
+                            TensorPrimitives.SoftMax(targetLogitSpan, targetProbSpan);
+
+                            float p = targetProbSpan[draftTok];
+                            float q = draftProbSlice[draftTok];
+                            float acceptanceProb = q > 0 ? Math.Min(1.0f, p / q) : 0f;
+
+                            if ((float)_rng.NextDouble() < acceptanceProb)
                             {
-                                TensorPrimitives.SoftMax(targetLogitSpan, targetProbs.AsSpan(0, targetVocabSize));
-
-                                float p = targetProbs[draftTok];
-                                float q = draftProbSlice[draftTok];
-                                float acceptanceProb = q > 0 ? Math.Min(1.0f, p / q) : 0f;
-
-                                if ((float)_rng.NextDouble() < acceptanceProb)
-                                {
-                                    outputBuffer[acceptedCount++] = draftTok;
-                                    constraint?.Advance(draftTok);
-                                    generatedIds.Add(draftTok);
-                                }
-                                else
-                                {
-                                    int corrected = SampleCorrected(
-                                        targetProbs.AsSpan(0, targetVocabSize),
-                                        draftProbSlice,
-                                        targetVocabSize, sharedVocab);
-                                    outputBuffer[acceptedCount++] = corrected;
-                                    constraint?.Advance(corrected);
-                                    RollbackCaches(kvCacheTarget, kvCacheDraft, position + acceptedCount, k);
-                                    return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
-                                }
+                                outputBuffer[acceptedCount++] = draftTok;
+                                constraint?.Advance(draftTok);
+                                generatedIds.Add(draftTok);
                             }
-                            finally
+                            else
                             {
-                                ArrayPool<float>.Shared.Return(targetProbs);
+                                int corrected = SampleCorrected(
+                                    targetProbSpan,
+                                    draftProbSlice,
+                                    targetVocabSize, sharedVocab);
+                                outputBuffer[acceptedCount++] = corrected;
+                                constraint?.Advance(corrected);
+                                RollbackCaches(kvCacheTarget, kvCacheDraft, position + acceptedCount, k);
+                                return new SpeculativeResult(acceptedCount, draftTicks, verifyTicks, k);
                             }
                         }
                     }
@@ -295,7 +355,12 @@ public sealed class SpeculativeDecoder : ISpeculativeDecoder
         {
             ArrayPool<int>.Shared.Return(draftTokens);
             if (!greedy)
+            {
                 ArrayPool<float>.Shared.Return(draftProbsFlat);
+                ArrayPool<float>.Shared.Return(targetProbs);
+                if (needsFullDraftProbs)
+                    ArrayPool<float>.Shared.Return(draftFullProbs);
+            }
         }
     }
 
