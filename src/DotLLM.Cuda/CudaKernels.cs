@@ -160,6 +160,7 @@ public sealed unsafe class CudaKernels : IDisposable
     private int _attnGqaSplitCachedHeadDim = -1;      // headDim the cached query above is valid for
     private int _attnGqaSplitCachedGroup = -1;        // group (numHeads/numKvHeads) the cache is valid for
     private readonly nint _swigluF32Func;
+    private readonly nint _relu2GluF32Func;
     private readonly nint _biasAddF32Func;
     private readonly nint _perHeadRmsNormF32Func;
     private readonly nint _ropeFunc;
@@ -333,6 +334,8 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _moeAxpyScaledPerTokenF32Func;
     private readonly nint _moeSigmoidLogitF32Func;
     private readonly nint _moeGatherTokenRowsF32Func;
+    // Issue #246 (BitNet-ternary MoE): additive router bias, applied before softmax/top-k.
+    private readonly nint _moeGateBiasAddF32Func;
 
     // ── MoE grouped-GEMV kernels (Phase B — single launch across K_active experts) ──
     // One kernel computes (K_active × M) F16 outputs by walking K_active raw-quant
@@ -609,6 +612,7 @@ public sealed unsafe class CudaKernels : IDisposable
         // false and callers fall back to attention_f32_split_kv / LaunchAttentionF32.
         _attentionF32GqaSplitKvFunc = _attentionF32Module.TryGetFunction("attention_f32_gqa_split_kv");
         _swigluF32Func = _swigluF32Module.GetFunction("swiglu_f32");
+        _relu2GluF32Func = _swigluF32Module.GetFunction("relu2glu_f32");
         _biasAddF32Func = _biasAddF32Module.GetFunction("bias_add_f32");
         _perHeadRmsNormF32Func = _perHeadRmsNormF32Module.GetFunction("per_head_rmsnorm_f32");
         _ropeFunc = _ropeModule.GetFunction("rope_f16");
@@ -817,6 +821,7 @@ public sealed unsafe class CudaKernels : IDisposable
             _moeAxpyScaledPerTokenF32Func = _moeFfnModule.TryGetFunction("moe_axpy_scaled_per_token_f32");
             _moeSigmoidLogitF32Func = _moeFfnModule.TryGetFunction("moe_sigmoid_logit_f32");
             _moeGatherTokenRowsF32Func = _moeFfnModule.TryGetFunction("moe_gather_token_rows_f32");
+            _moeGateBiasAddF32Func = _moeFfnModule.TryGetFunction("moe_gate_bias_add_f32");
         }
 
         // MoE grouped-GEMV (Phase B). One kernel walks K_active raw-quant per-expert
@@ -1030,6 +1035,25 @@ public sealed unsafe class CudaKernels : IDisposable
         && _moeZeroF32Func != 0 && _moeAxpyScaledRowF32Func != 0
         && _moeAxpyUnweightedF32Func != 0 && _moeAxpyScaledPerTokenF32Func != 0
         && _moeSigmoidLogitF32Func != 0 && _moeGatherTokenRowsF32Func != 0;
+
+    /// <summary>
+    /// True when the additive router-bias kernel (<see cref="LaunchMoeGateBiasAddF32"/>,
+    /// issue #246) is available. Required only when the MoE layer's router carries a
+    /// non-null <c>gate.bias</c> (identity-MoTE / Qwen3 aux-loss-free routing); harmless
+    /// (unused) otherwise.
+    /// </summary>
+    public bool HasMoeGateBiasAdd => _moeGateBiasAddF32Func != 0;
+
+    /// <summary>
+    /// True when all kernels needed by <see cref="CudaMoeFfn"/>'s BitNet-ternary (I2_S)
+    /// MoE forward path (issue #246) are available: the shared MoE orchestration kernels
+    /// (<see cref="HasMoeKernels"/>), the F32 I2_S GEMV, the relu²·GLU activation, and F32
+    /// RMSNorm (per-expert FFN Sub-LN). The additive router-bias kernel is checked
+    /// separately via <see cref="HasMoeGateBiasAdd"/> — only required when the layer's
+    /// router actually carries a bias.
+    /// </summary>
+    public bool HasBitNetMoeKernels =>
+        HasMoeKernels && _i2sGemvF32InFunc != 0 && _relu2GluF32Func != 0 && _rmsnormF32Func != 0;
 
     /// <summary>
     /// True when all Qwen3MoeHybrid recurrence-path FP32 kernels (causal conv1d,
@@ -2497,6 +2521,25 @@ public sealed unsafe class CudaKernels : IDisposable
         uint gridDim = (uint)((n * seqLen + BlockSize - 1) / BlockSize);
 
         CudaDriverApi.cuLaunchKernel(_swigluF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>
+    /// FP32 BitNet-MoE gate activation: <c>out = relu(gate)^2 * up</c> (issue #246). Replaces
+    /// <see cref="LaunchSwiGLUF32"/> for ternary I2_S expert bodies — same launch shape (one
+    /// thread per element, grid-strided over <c>n * seqLen</c>).
+    /// </summary>
+    public void LaunchReLU2GLUF32(nint gate, nint up, nint output,
+                                    int n, int seqLen, nint stream)
+    {
+        nint gateArg = gate, upArg = up, outArg = output;
+        int nArg = n, slArg = seqLen;
+
+        void** args = stackalloc void*[] {&gateArg, &upArg, &outArg, &nArg, &slArg};
+        uint gridDim = (uint)((n * seqLen + BlockSize - 1) / BlockSize);
+
+        CudaDriverApi.cuLaunchKernel(_relu2GluF32Func,
                 gridDim, 1, 1, BlockSize, 1, 1,
                 0, stream, (nint)args, 0).ThrowOnError();
     }
@@ -5006,6 +5049,26 @@ public sealed unsafe class CudaKernels : IDisposable
     }
 
     // ── MoE launchers ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Additive router-bias add (issue #246): <c>logits[t, e] += bias[e]</c> for every
+    /// token. Must be called BEFORE <see cref="LaunchMoeSoftmaxTopk"/> — mirrors
+    /// <c>MoeSwiGluMlp.Route</c>'s CPU ordering (bias added to raw logits, then
+    /// softmax, then top-k). Used by identity-MoTE / Qwen3 aux-loss-free routing.
+    /// </summary>
+    public void LaunchMoeGateBiasAddF32(nint logits, nint bias, int seqLen, int numExperts, nint stream)
+    {
+        if (_moeGateBiasAddF32Func == 0)
+            throw new InvalidOperationException("MoE gate-bias-add kernel not available.");
+
+        nint logitsArg = logits, biasArg = bias;
+        int slArg = seqLen, neArg = numExperts;
+        void** args = stackalloc void*[] {&logitsArg, &biasArg, &slArg, &neArg};
+        uint gridDim = (uint)((seqLen * numExperts + BlockSize - 1) / BlockSize);
+        CudaDriverApi.cuLaunchKernel(_moeGateBiasAddF32Func,
+                gridDim, 1, 1, BlockSize, 1, 1,
+                0, stream, (nint)args, 0).ThrowOnError();
+    }
 
     /// <summary>
     /// Per-token softmax + top-k selection for MoE routing. Reads

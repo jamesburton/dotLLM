@@ -205,6 +205,131 @@ internal static unsafe class CudaMoeWeightsLoader
             sharedDownProjQuantType: sdQt);
     }
 
+    /// <summary>
+    /// Loads a single BitNet-ternary (I2_S) MoE layer's routed experts to GPU (issue #246).
+    /// Companion to <see cref="LoadLayer"/> / <see cref="LoadLayerQuant"/> for the third
+    /// <see cref="MoeLayerWeights.RoutedExpertQuantType"/> value: the CPU bundle carries
+    /// CONTIGUOUS per-projection packed-trit banks (<c>GateExpsI2SBase</c> + stride, no inline
+    /// tail scale) plus a parallel per-expert absmean scale vector
+    /// (<c>GateExpsI2SScales</c>) — see <c>MoeSwiGluMlp.ExecuteBitNetMoe</c> and
+    /// <c>MatMul.MoeIndexedMatmulI2_S</c> for the exact layout this mirrors.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Design deviation from the original plan (repack kernel → simple two-copy upload).</b>
+    /// <see cref="CudaKernels.LaunchI2_SGemvF32In"/> (the existing, proven GEMV kernel — see
+    /// <c>native/kernels/i2_s_gemv.cu</c>) expects its <c>quantWeight</c> buffer to be a single
+    /// self-contained tensor: packed-trit payload immediately followed by ONE trailing F32
+    /// scale at byte offset <c>n·(k/4)</c>. The CPU BitNet-MoE bundle instead keeps ALL experts'
+    /// payloads in one contiguous bank (no inline scale) plus a SEPARATE per-expert scale array
+    /// — a mismatch the issue anticipated solving with a <c>pq2_0_repack.cu</c>-style device
+    /// kernel that physically reorders bytes at load time.
+    /// </para>
+    /// <para>
+    /// That repack-kernel approach was NOT needed here: unlike PQ2_0's problem (an interleaved
+    /// per-group scale+payload layout that needs byte-level re-interleaving to fix a coalescing
+    /// bug — see <c>pq2_0_repack.cu</c>'s file header), I2_S's per-expert scale is a single
+    /// SCALAR being ATTACHED to an already-contiguous payload slice, not data being reordered
+    /// within a tensor. That is exactly two independent host-to-device copies into one
+    /// pre-sized allocation: (1) the payload bytes (a mmap/host-side slice of the CPU bank,
+    /// analogous to <see cref="UploadRawBytes"/> below) and (2) the 4-byte scale immediately
+    /// after it. No kernel launch, no device-side data movement, no extra synchronization —
+    /// see <see cref="UploadI2SExpertWithTailScale"/>. This costs 4 bytes/expert/projection of
+    /// device memory (negligible) and one extra tiny HtoD copy per expert per projection at
+    /// load time (a few thousand copies total for even a 64-expert model — load-time only,
+    /// never on the inference hot path).
+    /// </para>
+    /// </remarks>
+    public static unsafe CudaMoeLayerWeights LoadLayerBitNetI2S(
+        in TransformerLayerWeights cpuLayer, List<nint> allocs, float rmsEps)
+    {
+        var moe = cpuLayer.Moe
+            ?? throw new InvalidOperationException(
+                "CudaMoeWeightsLoader.LoadLayerBitNetI2S called with non-MoE layer.");
+        if (!moe.IsBitNetI2S)
+            throw new InvalidOperationException(
+                "CudaMoeWeightsLoader.LoadLayerBitNetI2S requires RoutedExpertQuantType == I2_S.");
+
+        int numExperts = moe.NumExperts;
+        int hidden = moe.HiddenSize;
+        int moeIntermediate = moe.IntermediateSize;
+
+        // Router stays F32 (small — numExperts × hidden floats), plus the optional additive
+        // bias (identity-MoTE / Qwen3 aux-loss-free routing).
+        nint router = UploadF32Array(moe.Gate, allocs);
+        nint gateBias = moe.GateBias is float[] biasArr ? UploadF32Array(biasArr, allocs) : (nint)0;
+
+        var gateProj = new nint[numExperts];
+        var upProj = new nint[numExperts];
+        var downProj = new nint[numExperts];
+        var ffnSubNorm = new nint[numExperts];
+
+        var gateScales = moe.GateExpsI2SScales
+            ?? throw new InvalidOperationException("BitNet-MoE layer missing GateExpsI2SScales.");
+        var upScales = moe.UpExpsI2SScales
+            ?? throw new InvalidOperationException("BitNet-MoE layer missing UpExpsI2SScales.");
+        var downScales = moe.DownExpsI2SScales
+            ?? throw new InvalidOperationException("BitNet-MoE layer missing DownExpsI2SScales.");
+        var subNorm = moe.ExpertFfnSubNorm
+            ?? throw new InvalidOperationException("BitNet-MoE layer missing ExpertFfnSubNorm.");
+
+        for (int e = 0; e < numExperts; e++)
+        {
+            gateProj[e] = UploadI2SExpertWithTailScale(
+                moe.GateExpsI2SBase + (nint)(e * moe.GateExpsI2SRowBytes),
+                moe.GateExpsI2SRowBytes, gateScales[e], allocs);
+            upProj[e] = UploadI2SExpertWithTailScale(
+                moe.UpExpsI2SBase + (nint)(e * moe.UpExpsI2SRowBytes),
+                moe.UpExpsI2SRowBytes, upScales[e], allocs);
+            downProj[e] = UploadI2SExpertWithTailScale(
+                moe.DownExpsI2SBase + (nint)(e * moe.DownExpsI2SRowBytes),
+                moe.DownExpsI2SRowBytes, downScales[e], allocs);
+            ffnSubNorm[e] = UploadF32Array(subNorm[e], allocs);
+        }
+
+        return new CudaMoeLayerWeights(
+            numExperts, moe.NumExpertsPerTok, hidden, moeIntermediate,
+            moe.NormTopKProb,
+            router,
+            gateProj, upProj, downProj,
+            numSharedExperts: 0, sharedIntermediateSize: 0,
+            sharedGateProj: null, sharedUpProj: null, sharedDownProj: null,
+            sharedExpertGate: 0,
+            precision: MoePrecision.BitNetI2S,
+            gateProjQuantType: QuantizationType.I2_S,
+            upProjQuantType: QuantizationType.I2_S,
+            downProjQuantType: QuantizationType.I2_S,
+            sharedGateProjQuantType: QuantizationType.F32,
+            sharedUpProjQuantType: QuantizationType.F32,
+            sharedDownProjQuantType: QuantizationType.F32,
+            expertFfnSubNormF32: ffnSubNorm,
+            gateBiasF32: gateBias,
+            rmsEps: rmsEps);
+    }
+
+    /// <summary>
+    /// Uploads one BitNet-MoE expert's I2_S payload slice (<paramref name="payloadBytes"/>
+    /// bytes at host pointer <paramref name="hostPayloadPtr"/>) into a fresh device buffer
+    /// sized <c>payloadBytes + sizeof(float)</c>, with <paramref name="scale"/> appended as a
+    /// trailing F32 — the exact self-contained-tensor layout
+    /// <see cref="CudaKernels.LaunchI2_SGemvF32In"/> expects (see
+    /// <see cref="LoadLayerBitNetI2S"/>'s remarks for why this replaces a device-side repack
+    /// kernel). Two small, load-time-only HtoD copies; no kernel launch.
+    /// </summary>
+    private static unsafe nint UploadI2SExpertWithTailScale(
+        nint hostPayloadPtr, long payloadBytes, float scale, List<nint> allocs)
+    {
+        if (hostPayloadPtr == 0)
+            throw new InvalidOperationException("UploadI2SExpertWithTailScale called with null host pointer.");
+        long totalBytes = payloadBytes + sizeof(float);
+        CudaDriverApi.cuMemAlloc_v2(out nint devPtr, (nuint)totalBytes).ThrowOnError();
+        allocs.Add(devPtr);
+        CudaDriverApi.cuMemcpyHtoD_v2(devPtr, hostPayloadPtr, (nuint)payloadBytes).ThrowOnError();
+        CudaDriverApi.cuMemcpyHtoD_v2(
+            devPtr + (nint)payloadBytes, (nint)(&scale), (nuint)sizeof(float)).ThrowOnError();
+        return devPtr;
+    }
+
     private static unsafe nint UploadRawBytes(nint hostPtr, long bytes, List<nint> allocs)
     {
         if (hostPtr == 0)

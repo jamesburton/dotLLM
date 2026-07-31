@@ -16,6 +16,13 @@ public enum MoePrecision
     F32 = 0,
     /// <summary>Raw GGUF quant bytes per expert; dequant per call.</summary>
     Quantized = 1,
+    /// <summary>
+    /// Ternary I2_S (BitNet) expert weights (issue #246): per-expert packed-trit banks with
+    /// a per-expert tail scale, dispatched through <see cref="CudaKernels.LaunchI2_SGemvF32In"/>
+    /// (one GEMV call per assigned row — see <see cref="CudaMoeFfn"/>'s BitNet-MoE forward).
+    /// The expert body is <c>down( ffn_sub_norm( relu²(gate(x)) * up(x) ) )</c>, not SwiGLU.
+    /// </summary>
+    BitNetI2S = 2,
 }
 
 /// <summary>
@@ -80,14 +87,43 @@ public sealed class CudaMoeLayerWeights
     /// <summary>F32 router weight device pointer <c>[numExperts × hiddenSize]</c>.</summary>
     public nint Router { get; }
 
-    /// <summary>Per-routed-expert F32 gate_proj device pointers — length <see cref="NumExperts"/>.</summary>
+    /// <summary>
+    /// Per-routed-expert device pointers — length <see cref="NumExperts"/>. Meaning depends on
+    /// <see cref="Precision"/>: F32 → row-major F32 <c>gate_proj</c> weight; Quantized → raw GGUF
+    /// quant bytes; <see cref="MoePrecision.BitNetI2S"/> → a self-contained per-expert I2_S
+    /// buffer of <c>rowBytes + sizeof(float)</c> bytes, packed-trit payload followed by that
+    /// expert's own tail scale (issue #246 — see <see cref="CudaMoeWeightsLoader.LoadLayerBitNetI2S"/>
+    /// for why the scale is repacked per-expert rather than read from a shared array).
+    /// </summary>
     public nint[] GateProj { get; }
 
-    /// <summary>Per-routed-expert F32 up_proj device pointers — length <see cref="NumExperts"/>.</summary>
+    /// <summary>Per-routed-expert <c>up_proj</c> device pointers. See <see cref="GateProj"/> for
+    /// the precision-dependent meaning.</summary>
     public nint[] UpProj { get; }
 
-    /// <summary>Per-routed-expert F32 down_proj device pointers — length <see cref="NumExperts"/>.</summary>
+    /// <summary>Per-routed-expert <c>down_proj</c> device pointers. See <see cref="GateProj"/> for
+    /// the precision-dependent meaning.</summary>
     public nint[] DownProj { get; }
+
+    /// <summary>
+    /// Per-routed-expert F32 BitNet FFN Sub-LN weight device pointers — length
+    /// <see cref="NumExperts"/>, each <c>[moeIntermediateSize]</c>. Only populated when
+    /// <see cref="Precision"/> == <see cref="MoePrecision.BitNetI2S"/>; empty otherwise.
+    /// </summary>
+    public nint[] ExpertFfnSubNormF32 { get; }
+
+    /// <summary>
+    /// Optional F32 additive router-bias device pointer <c>[numExperts]</c> (identity-MoTE /
+    /// Qwen3 aux-loss-free routing). 0 when the router has no bias. Applied to the router
+    /// logits before softmax/top-k — see <see cref="CudaKernels.LaunchMoeGateBiasAddF32"/>.
+    /// </summary>
+    public nint GateBiasF32 { get; }
+
+    /// <summary>
+    /// RMSNorm epsilon for the per-expert FFN Sub-LN. Only meaningful when
+    /// <see cref="Precision"/> == <see cref="MoePrecision.BitNetI2S"/>.
+    /// </summary>
+    public float RmsEps { get; }
 
     /// <summary>Number of shared experts (1+ for DeepSeek + Qwen1.5-MoE; 0 for Mixtral / Phi-3.5-MoE).</summary>
     public int NumSharedExperts { get; }
@@ -169,13 +205,20 @@ public sealed class CudaMoeLayerWeights
         QuantizationType downProjQuantType,
         QuantizationType sharedGateProjQuantType,
         QuantizationType sharedUpProjQuantType,
-        QuantizationType sharedDownProjQuantType)
+        QuantizationType sharedDownProjQuantType,
+        nint[]? expertFfnSubNormF32 = null,
+        nint gateBiasF32 = 0,
+        float rmsEps = 0f)
     {
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (numExpertsPerTok <= 0 || numExpertsPerTok > numExperts)
             throw new ArgumentOutOfRangeException(nameof(numExpertsPerTok));
         if (gateProj.Length != numExperts || upProj.Length != numExperts || downProj.Length != numExperts)
             throw new ArgumentException("Per-expert pointer arrays must have numExperts entries.");
+        if (precision == MoePrecision.BitNetI2S
+            && (expertFfnSubNormF32 is null || expertFfnSubNormF32.Length != numExperts))
+            throw new ArgumentException(
+                "expertFfnSubNormF32 must have numExperts entries when precision is BitNetI2S.");
         if (numSharedExperts > 0)
         {
             if (sharedIntermediateSize <= 0)
@@ -208,5 +251,8 @@ public sealed class CudaMoeLayerWeights
         SharedGateProjQuantType = sharedGateProjQuantType;
         SharedUpProjQuantType = sharedUpProjQuantType;
         SharedDownProjQuantType = sharedDownProjQuantType;
+        ExpertFfnSubNormF32 = expertFfnSubNormF32 ?? Array.Empty<nint>();
+        GateBiasF32 = gateBiasF32;
+        RmsEps = rmsEps;
     }
 }
