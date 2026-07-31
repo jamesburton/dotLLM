@@ -38,3 +38,15 @@ the ternary unpack loop, not a phantom lever. **Validated as a legitimate next t
 as a fresh implementation attempt (see git history / issue tracker for the outcome).
 
 Raw `.ncu-rep` files kept local only (~30MB), not committed.
+
+## Outcome (2026-07-31, issue #244)
+
+**Correction**: this README's framing was wrong — the ALU-reduction candidate it "validated as a
+legitimate next target" had already been implemented and shipped nine days earlier, 2026-07-22,
+commit `7c7101c` ("algebraic ALU reduction in PQ2_0 GEMV decode loop (#161)"). The 75.10% compute
+figure measured above is headroom REMAINING AFTER that identity, not evidence it was still unapplied
+— this session profiled the already-reduced kernels without checking `pq2_0_gemv.cu`'s own source
+first. See that file's `#244: re-investigated, found ALREADY IMPLEMENTED — no code change` section
+for the fresh re-verification (correctness + benchmark) done in place of a redundant reimplementation.
+Issue #244 should be closed as a duplicate of #161's already-merged work, not left open awaiting a
+fresh implementation that would just recreate what's already there.

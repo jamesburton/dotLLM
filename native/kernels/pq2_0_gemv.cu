@@ -910,6 +910,53 @@
 // fix here has a small absolute ceiling — worth a look only as a low-effort, low-risk follow-up
 // (e.g. batching multiple small per-layer projections into fewer, larger launches), not worth
 // reopening the broader kernel-level investigation over.
+//
+// ───────────────────────── #244: re-investigated, found ALREADY IMPLEMENTED — no code change ─────────────────────────
+// Issue #244 (filed 2026-07-31, seeded by a fresh re-profile at
+// `.perf-runs/ncu-2026-07-30-ffn-gemv-post161/README.md`) proposed the identity
+// `acc = Sum(raw_code * x) - Sum(x)` for the ternary unpack/accumulate loop, citing the
+// 2026-07-22 advisor review's "algebraic ALU reduction" candidate as still untried post-#161.
+// That premise was WRONG: this is the exact same candidate as the "Algebraic ALU reduction
+// (#161 continued, advisor candidate #4/5)" section above, same identity, same file — and it was
+// already implemented and shipped on 2026-07-22, commit 7c7101c ("perf(cuda): algebraic ALU
+// reduction in PQ2_0 GEMV decode loop (#161)"), nine days before #244 was filed. Every production
+// kernel in this file (`pq2_0_gemv_f16in`/`_small`, `pq2_0_gemv2_f16in`/`_small`,
+// `pq2_0_gemv_f32io`/`_small`, `pq2_0_gemv2_f32io`/`_small` — 8 entry points, confirmed by
+// grepping for `pq2_0_code_dot(p, gx)`) already calls `pq2_0_load_group_x`/`pq2_0_code_dot`
+// exactly as described above; only `pq2_0_gemv_f32in` (the deliberately-untouched CPU-vs-GPU
+// exact-reference kernel, see the file's v1/v2 note near the top) still uses the older per-code
+// `code - 1` decode. The `.perf-runs` README that seeded #244 re-ran `ncu` against these ALREADY-
+// REDUCED kernels and correctly measured 75.10% compute-bound headroom on the dominant FFN
+// kernel — but that number describes headroom REMAINING AFTER this identity, not evidence the
+// identity itself was still unapplied; nobody checked the kernel source before writing the issue.
+//
+// No functional change was made for #244 — instead, the already-shipped implementation was
+// independently re-verified fresh:
+//   * Correctness: full `CudaPQ2_0GemvTest` suite, 21/21 passed on real hardware (RTX 3060, driver
+//     present, nothing skipped), including `PQ2_0GemvF32Native_MatchesCpuFloatReference` and
+//     `PQ2_0GemvFusedDecodeF32Native_MatchesSeparateLaunches` at real Bonsai-27B dims (n=512/37/3,
+//     k=5120/17408/5248) — max abs diff stays within the existing 5e-2/1e-2 tolerance bar. That
+//     bar is NOT new and is NOT specific to the algebraic identity: it was set by `xs[]` staying
+//     `half`-precision internally (unchanged either way), the same bar `PQ2_0GemvF16In_...`
+//     already used before commit 7c7101c existed. This session did not need to characterize a new
+//     tolerance because none was introduced.
+//   * Benchmark: fresh `bench --device cuda -p 64 -n 16 -r 3` against the real
+//     `Ternary-Bonsai-27B-Q2_0.gguf`, RTX 3060, GPU otherwise idle (~800 MiB baseline VRAM) ->
+//     18.30-18.40 tok/s decode (median 18.37, best 18.40; prefill 101-102 tok/s). Consistent with,
+//     and modestly ahead of, the ~17.2-18.4 tok/s range this file's history has held at since the
+//     algebraic reduction landed (commit 7c7101c's own recorded +1.9% mean win, 16.98 -> 17.30
+//     tok/s, persisted through every subsequent negative-result round in this file without
+//     regressing) — no throughput regression, nothing to revert.
+//
+// Recommendation for whoever triages #244: close as a duplicate of the work already merged under
+// #161 (commit 7c7101c), referencing this note. The only remaining untried candidate in this
+// specific vein is candidate (B) from the "Algebraic ALU reduction" section's own "Scope decision"
+// paragraph above (a broader LUT/wider-bit-trick ternary decode) — deliberately not attempted
+// here either, for the same reasons already given there (advisor-flagged per-lane divergent
+// constant-memory risk, not modeled/measured, and identity (A)'s real win already came in under
+// the advisor's original estimate). Also worth doing: updating the `prismml-bonsai-model` project
+// memory to record this candidate as DONE rather than pending, so a third session doesn't
+// rediscover the same "untried candidate" framing a second time.
 
 #include <cuda_fp16.h>
 #include <stdint.h>
