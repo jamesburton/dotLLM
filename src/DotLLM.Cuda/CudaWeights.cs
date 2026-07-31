@@ -473,12 +473,25 @@ internal sealed class CudaWeights : IDisposable
             }
             else if (isMoeLayer)
             {
-                // GGUF source with raw quant view → upload Q4_K bytes per expert
-                // (~26 GB at full V2-Lite Q4_K_M scale; the next perf milestone
-                // is grouped-GEMM compaction). Safetensors source → F32 path.
-                moeLayers![i] = lw.Moe!.HasRawQuantView
-                    ? CudaMoeWeightsLoader.LoadLayerQuant(lw, allocs)
-                    : CudaMoeWeightsLoader.LoadLayer(lw, allocs);
+                // BitNet-ternary (I2_S) MoE (identity-MoTE, issue #246): per-expert packed-trit
+                // banks + per-expert absmean scales + per-expert FFN Sub-LN, dispatched through
+                // CudaMoeFfn's BitNetI2S precision branch. Checked FIRST — a BitNet-MoE layer's
+                // W1/W2/W3 F32 arrays are empty (Array.Empty<nint>()) and its raw-quant-view
+                // fields are unset, so falling through to LoadLayer/LoadLayerQuant below would
+                // throw or upload garbage.
+                if (lw.Moe!.IsBitNetI2S)
+                {
+                    moeLayers![i] = CudaMoeWeightsLoader.LoadLayerBitNetI2S(lw, allocs, config.NormEpsilon);
+                }
+                else
+                {
+                    // GGUF source with raw quant view → upload Q4_K bytes per expert
+                    // (~26 GB at full V2-Lite Q4_K_M scale; the next perf milestone
+                    // is grouped-GEMM compaction). Safetensors source → F32 path.
+                    moeLayers![i] = lw.Moe!.HasRawQuantView
+                        ? CudaMoeWeightsLoader.LoadLayerQuant(lw, allocs)
+                        : CudaMoeWeightsLoader.LoadLayer(lw, allocs);
+                }
             }
         }
 
