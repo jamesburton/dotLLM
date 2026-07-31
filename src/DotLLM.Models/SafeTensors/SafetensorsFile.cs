@@ -138,12 +138,18 @@ public sealed unsafe class SafetensorsFile : IDisposable
             if (8 + headerLen > fileLength)
                 throw new InvalidDataException(
                     $"Safetensors header length {headerLen} exceeds file length {fileLength} (header would read past EOF).");
+            // The header is buffered into a managed byte[] and read with int-counted
+            // FileStream.Read calls, so bound it before any narrowing happens.
+            if (headerLen > int.MaxValue)
+                throw new InvalidDataException(
+                    $"Safetensors header length {headerLen} exceeds Int32.MaxValue; refusing to buffer it.");
 
-            headerJsonBytes = new byte[headerLen];
+            int headerLenInt = (int)headerLen;
+            headerJsonBytes = new byte[headerLenInt];
             int headerRead = 0;
-            while (headerRead < headerLen)
+            while (headerRead < headerLenInt)
             {
-                int n = fs.Read(headerJsonBytes, headerRead, (int)(headerLen - headerRead));
+                int n = fs.Read(headerJsonBytes, headerRead, headerLenInt - headerRead);
                 if (n <= 0)
                     throw new InvalidDataException(
                         $"Safetensors file '{filePath}': unexpected EOF while reading header (got {headerRead} of {headerLen} bytes).");
@@ -278,8 +284,8 @@ public sealed unsafe class SafetensorsFile : IDisposable
                 long begin, end;
                 {
                     var itr = offEl.EnumerateArray();
-                    itr.MoveNext(); begin = itr.Current.GetInt64();
-                    itr.MoveNext(); end = itr.Current.GetInt64();
+                    itr.MoveNext(); begin = ReadOffset(itr.Current, name, "begin");
+                    itr.MoveNext(); end = ReadOffset(itr.Current, name, "end");
                 }
 
                 if (begin < 0 || end < begin)
@@ -293,9 +299,24 @@ public sealed unsafe class SafetensorsFile : IDisposable
                 int elemSize = dtype.ElementSizeInBytes();
                 if (elemSize > 0)
                 {
-                    long n = 1;
-                    for (int i = 0; i < shape.Length; i++) n *= shape[i];
-                    long expected = n * elemSize;
+                    // Hostile headers can declare dimensions whose product wraps Int64 and
+                    // thereby forges an `expected` that matches byteCount. Compute checked.
+                    long expected;
+                    try
+                    {
+                        checked
+                        {
+                            long n = 1;
+                            for (int i = 0; i < shape.Length; i++) n *= shape[i];
+                            expected = n * elemSize;
+                        }
+                    }
+                    catch (OverflowException ex)
+                    {
+                        throw new InvalidDataException(
+                            $"Safetensors tensor '{name}': declared shape overflows the element count.", ex);
+                    }
+
                     if (byteCount != expected)
                         throw new InvalidDataException(
                             $"Safetensors tensor '{name}': declared shape/dtype implies {expected} bytes but data_offsets span {byteCount}.");
@@ -306,6 +327,19 @@ public sealed unsafe class SafetensorsFile : IDisposable
 
             return (metadata, tensors);
         }
+    }
+
+    /// <summary>
+    /// Reads one <c>data_offsets</c> entry, surfacing non-numeric or out-of-range values as
+    /// <see cref="InvalidDataException"/> rather than letting <c>System.Text.Json</c>
+    /// exceptions escape the parser's error contract.
+    /// </summary>
+    private static long ReadOffset(JsonElement element, string tensorName, string which)
+    {
+        if (element.ValueKind != JsonValueKind.Number || !element.TryGetInt64(out long value))
+            throw new InvalidDataException(
+                $"Safetensors tensor '{tensorName}': '{which}' data offset is not an Int64 number.");
+        return value;
     }
 
     /// <summary>

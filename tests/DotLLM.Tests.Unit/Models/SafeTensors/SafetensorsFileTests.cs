@@ -144,6 +144,33 @@ public sealed class SafetensorsFileTests : IDisposable
         Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(path));
     }
 
+    [Theory]
+    // Non-numeric, fractional, and Int64-overflowing offsets must all surface as
+    // InvalidDataException rather than leaking System.Text.Json exceptions.
+    [InlineData("[\"0\",\"4\"]")]
+    [InlineData("[null,4]")]
+    [InlineData("[0,1.5]")]
+    [InlineData("[0,99999999999999999999]")]
+    public void ParseHeader_NonIntegerDataOffsets_ThrowsInvalidData(string offsets)
+    {
+        string header = "{\"t\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":" + offsets + "}}";
+        byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
+        Assert.Throws<InvalidDataException>(() => SafetensorsFile.ParseHeader(headerBytes, 4096));
+    }
+
+    [Fact]
+    public void ParseHeader_ShapeProductOverflowsInt64_ThrowsInvalidData()
+    {
+        // 4 × Int32.MaxValue-ish dims: the element count wraps Int64 in unchecked
+        // arithmetic, which would otherwise forge an `expected` byte count.
+        string header =
+            "{\"t\":{\"dtype\":\"F32\",\"shape\":[2147483647,2147483647,2147483647,2147483647]," +
+            "\"data_offsets\":[0,4]}}";
+        byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
+        var ex = Assert.Throws<InvalidDataException>(() => SafetensorsFile.ParseHeader(headerBytes, 4096));
+        Assert.Contains("overflows", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void DTypeExtensions_ParsesAllCanonicalTokens()
     {
