@@ -1,3 +1,4 @@
+using System.Globalization;
 using DotLLM.Models.Architectures;
 using Xunit;
 
@@ -22,7 +23,10 @@ public class TensorSizeOverflowTests
     public void ToInt32SizeChecked_2Pow32_ThrowsInsteadOfSilentlyWrappingToZero()
     {
         long elementCount = 1L << 32; // 4,294,967,296 — wraps to 0 unchecked.
-        Assert.Equal(0, (int)elementCount); // confirms the silent-wrap scenario.
+        // Explicitly unchecked: this line documents the ORIGINAL buggy behaviour, so it must
+        // keep wrapping even if the project ever turns on CheckForOverflowUnderflow (which
+        // would otherwise make it throw and fail the test for the wrong reason).
+        Assert.Equal(0, unchecked((int)elementCount)); // confirms the silent-wrap scenario.
 
         var ex = Assert.Throws<OverflowException>(
             () => TransformerWeights.ToInt32SizeChecked(elementCount, "blk.0.attn_q.bias"));
@@ -46,6 +50,27 @@ public class TensorSizeOverflowTests
 
         Assert.Contains("blk.0.attn_v.bias", ex.Message);
         Assert.Contains("2147483648", ex.Message);
+    }
+
+    /// <summary>
+    /// A negative count is in <see cref="int"/> range, so a bare <c>checked</c> cast lets it
+    /// through and the failure surfaces much later as <c>new float[negative]</c> — an
+    /// <see cref="OverflowException"/> naming neither the tensor nor the count. It is
+    /// reachable: <c>TensorShape.ElementCount</c> multiplies dimensions in unchecked
+    /// <see cref="long"/> arithmetic, so a crafted GGUF with individually-valid dimensions
+    /// whose product passes <see cref="long.MaxValue"/> can wrap negative.
+    /// </summary>
+    [Theory]
+    [InlineData(-1L)]
+    [InlineData(-4096L)]
+    [InlineData(long.MinValue)]
+    public void ToInt32SizeChecked_NegativeCount_Throws(long elementCount)
+    {
+        var ex = Assert.Throws<OverflowException>(
+            () => TransformerWeights.ToInt32SizeChecked(elementCount, "blk.0.ffn_up.bias"));
+
+        Assert.Contains("blk.0.ffn_up.bias", ex.Message);
+        Assert.Contains(elementCount.ToString(CultureInfo.InvariantCulture), ex.Message);
     }
 
     /// <summary>
