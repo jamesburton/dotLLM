@@ -174,16 +174,87 @@ public sealed class PerplexityEvaluatorTests
         var tokens = Enumerable.Range(0, 40).ToArray();
         using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
 
-        // L=16 => chunks at 0, 16 (32 would need tokens up to 48). Each scores its last 8.
+        // L=16 => chunks at 0, 16 (32 would need tokens up to 48). Each scores 7, not 8:
+        // llama.cpp's count is n_ctx - n_ctx/2 - 1.
         var result = PerplexityEvaluator.Evaluate(
             model, tokens, PerplexityOptions.LlamaCppDefault(contextLength: 16));
 
         Assert.Equal(2, result.WindowCount);
-        Assert.Equal(16, result.ScoredTokens);   // 2 chunks x 8 scored
+        Assert.Equal(14, result.ScoredTokens);   // 2 chunks x 7 scored
         Assert.Equal(2, model.ForwardCalls.Count);
         Assert.Equal(0, model.ForwardCalls[0][0]);
         Assert.Equal(16, model.ForwardCalls[1][0]);   // advances by the FULL window, not by 8
     }
+
+    [Fact]
+    public void LlamaCppDefault_ScoresOneFewerTargetThanHalfTheWindow()
+    {
+        // llama.cpp: first = n_ctx/2, then `count += n_ctx - first - 1`, and the target for row j is
+        // token j+1 — so the token AT n_ctx/2 is context only and is never scored. Scoring it too
+        // would give n_ctx/2 targets per chunk instead of n_ctx/2 - 1: the same name, a different
+        // measurement, and a figure that is not comparable to a published one.
+        foreach (int context in new[] { 16, 64, 512 })
+        {
+            var options = PerplexityOptions.LlamaCppDefault(context);
+            Assert.Equal(context / 2 + 1, options.UnscoredPrefix);
+            Assert.Equal(context / 2 - 1, context - options.UnscoredPrefix);
+        }
+    }
+
+    [Fact]
+    public void StandardError_MatchesTheSampleVarianceOfPerTokenNll()
+    {
+        // Every target is token 0, and every row's only non-zero logit is at index 0 — so the
+        // target is always the argmax and its NLL depends solely on the row's peak height. That
+        // makes the whole set of per-token NLLs predictable in closed form, without reaching
+        // into the evaluator or replaying tensors.
+        static float[] Rows(int position, int vocab)
+        {
+            var row = new float[vocab];
+            row[0] = position % 2 == 0 ? 2f : 0f;
+            return row;
+        }
+
+        static double Nll(int position)
+        {
+            double peak = position % 2 == 0 ? 2.0 : 0.0;
+            return Math.Log(Math.Exp(peak) + (Vocab - 1)) - peak;
+        }
+
+        var tokens = new int[40];   // all zero
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, Rows);
+
+        var result = PerplexityEvaluator.Evaluate(model, tokens, PerplexityOptions.LlamaCppDefault(16));
+
+        // L=16 => windows at 0 and 16; prefix 9 scores targets [s+9, s+16), i.e. rows 8..14.
+        var expectedNlls = new List<double>();
+        for (int window = 0; window < 2; window++)
+            for (int row = 8; row <= 14; row++)
+                expectedNlls.Add(Nll(row));
+
+        double mean = expectedNlls.Average();
+        double variance = expectedNlls.Sum(v => (v - mean) * (v - mean)) / expectedNlls.Count;
+        double expected = Math.Sqrt(variance / (expectedNlls.Count - 1)) * Math.Exp(mean);
+
+        Assert.Equal(expectedNlls.Count, result.ScoredTokens);
+        Assert.Equal(mean, result.MeanNegativeLogLikelihood, 9);
+        Assert.Equal(expected, result.StandardError, 9);
+        Assert.True(result.StandardError > 0);
+    }
+
+    [Fact]
+    public void StandardError_IsZeroWhenEveryScoredTokenHasTheSameNll()
+    {
+        // A uniform distribution gives every target an identical NLL: zero variance, so the error
+        // bar must be exactly 0 rather than a NaN out of a negative rounding residue.
+        var tokens = Enumerable.Range(0, 40).ToArray();
+        using var model = new FakePerplexityModel(Vocab, 64, returnsAllRows: true, FakePerplexityModel.Uniform);
+
+        var result = PerplexityEvaluator.Evaluate(model, tokens, PerplexityOptions.LlamaCppDefault(16));
+
+        Assert.Equal(0, result.StandardError);
+    }
+
 
     [Fact]
     public void LlamaCppDefault_AndContiguousTiling_ScoreDifferentTokenSets()
