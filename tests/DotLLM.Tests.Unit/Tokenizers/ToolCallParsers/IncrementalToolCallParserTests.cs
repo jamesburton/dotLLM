@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using DotLLM.Tokenizers;
 using DotLLM.Tokenizers.ToolCallParsers;
 using Xunit;
@@ -35,6 +36,31 @@ public class IncrementalToolCallParserTests
     // ─────────────────────────────────────────────────────────────────────
     // Hermes / XML — full fragmenting incremental parser
     // ─────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A block the host parser cannot parse emits no fragment, so it must not consume an index.
+    /// Bumping the counter on parse failure leaves a hole in the tool_calls[] stream — a consumer
+    /// indexing by <c>index</c> materialises a slot for a call that never arrived — and desyncs the
+    /// generated <c>call_{n}</c> ids from the fragments actually on the wire.
+    /// </summary>
+    [Fact]
+    public void Hermes_UnparseableBlock_DoesNotConsumeAnIndex()
+    {
+        var parser = new HermesToolCallParser().CreateIncremental();
+
+        var (_, fragments) = RunStream(parser,
+            "<tool_call>",
+            "not json at all",
+            "</tool_call>",
+            "<tool_call>",
+            """{"name": "lookup", "arguments": {"id": 7}}""",
+            "</tool_call>");
+
+        var fragment = Assert.Single(fragments);
+        Assert.Equal("lookup", fragment.Name);
+        Assert.Equal(0, fragment.Index);
+        Assert.Equal("call_0", fragment.Id);
+    }
 
     [Fact]
     public void Hermes_SingleToolCall_NoLeakedContent()
@@ -81,9 +107,19 @@ public class IncrementalToolCallParserTests
 
         Assert.Equal(string.Empty, safe);
         Assert.True(parser.HasEmittedAnyFragment);
-        Assert.Equal("search", fragments[0].Name);
-        Assert.Equal("call_0", fragments[0].Id);
-        Assert.Equal("function", "function"); // sanity
+
+        // The point of the test is that sentinels split across chunk boundaries still yield one
+        // complete, well-formed call — so assert the whole fragment, not just its name.
+        var fragment = Assert.Single(fragments);
+        Assert.Equal("search", fragment.Name);
+        Assert.Equal("call_0", fragment.Id);
+        Assert.Equal(0, fragment.Index);
+        Assert.True(fragment.IsLast);
+
+        // Arguments must survive reassembly as valid JSON — clients json.loads the concatenation.
+        Assert.NotNull(fragment.ArgumentsDelta);
+        using var args = JsonDocument.Parse(fragment.ArgumentsDelta!);
+        Assert.Equal("abc", args.RootElement.GetProperty("q").GetString());
     }
 
     [Fact]

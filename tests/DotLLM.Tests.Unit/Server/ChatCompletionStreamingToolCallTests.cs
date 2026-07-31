@@ -120,21 +120,72 @@ public class ChatCompletionStreamingToolCallTests
 
         string json = JsonSerializer.Serialize(chunk, ServerJsonContext.Default.ChatCompletionChunk);
 
-        Assert.Contains("\"index\":0", json);
-        Assert.Contains("\"arguments\":", json);
+        // Navigate the DOM rather than slicing the raw text: the previous `IndexOf("}]")` bound the
+        // segment to the first "}]" after tool_calls, so any nested object appearing before the end
+        // of the array — an arguments payload ending in `}]`, or a second parallel call — would
+        // truncate the segment and silently weaken every DoesNotContain below it.
+        using var doc = JsonDocument.Parse(json);
+        var toolCalls = doc.RootElement
+            .GetProperty("choices")[0]
+            .GetProperty("delta")
+            .GetProperty("tool_calls");
 
-        // Locate the tool_calls element in the wire JSON and assert that its
-        // fields drop id / type / function.name. We can't just `DoesNotContain`
-        // those keys at chunk scope because the parent chunk has its own `id`.
-        int tcStart = json.IndexOf("\"tool_calls\":[{", StringComparison.Ordinal);
-        Assert.True(tcStart >= 0, $"Expected tool_calls array in JSON, got: {json}");
-        int tcEnd = json.IndexOf("}]", tcStart, StringComparison.Ordinal);
-        Assert.True(tcEnd >= 0);
-        string tcSegment = json[tcStart..(tcEnd + 2)];
+        var tc = Assert.Single(toolCalls.EnumerateArray().ToList());
+        Assert.Equal(0, tc.GetProperty("index").GetInt32());
 
-        Assert.DoesNotContain("\"id\":", tcSegment);
-        Assert.DoesNotContain("\"type\":", tcSegment);
-        Assert.DoesNotContain("\"name\":", tcSegment);
+        // An arguments-only fragment carries neither the call id nor the opening `type`.
+        Assert.False(tc.TryGetProperty("id", out _));
+        Assert.False(tc.TryGetProperty("type", out _));
+
+        var function = tc.GetProperty("function");
+        Assert.False(function.TryGetProperty("name", out _));
+        Assert.Equal("\"Berlin\"}", function.GetProperty("arguments").GetString());
+    }
+
+    /// <summary>
+    /// A fragment carrying only an id must not emit <c>"function":{}</c>. Building the function DTO
+    /// for any "opening" fragment produces an all-null object which WhenWritingNull collapses to an
+    /// empty object — a shape the DTO contract documents as null and no OpenAI client expects.
+    /// </summary>
+    [Fact]
+    public void ToToolCallDeltaDto_IdOnly_OmitsFunctionEntirely()
+    {
+        var dto = RequestConverter.ToToolCallDeltaDto(new ToolCallFragment(
+            Index: 0, Id: "call_0", Name: null, ArgumentsDelta: null, IsLast: false));
+
+        Assert.Null(dto.Function);
+        Assert.Equal("function", dto.Type);
+
+        var chunk = new ChatCompletionChunk
+        {
+            Id = "chatcmpl-x",
+            Model = "test",
+            Choices = [new ChatChunkChoiceDto { Delta = new ChatDeltaDto { ToolCalls = [dto] } }],
+        };
+        string json = JsonSerializer.Serialize(chunk, ServerJsonContext.Default.ChatCompletionChunk);
+
+        // Check the key via the DOM: a substring test for "function" also matches the *value* of
+        // "type", which is legitimately present on this fragment.
+        using var doc = JsonDocument.Parse(json);
+        var tc = doc.RootElement.GetProperty("choices")[0]
+            .GetProperty("delta").GetProperty("tool_calls")[0];
+        Assert.False(tc.TryGetProperty("function", out _));
+        Assert.Equal("function", tc.GetProperty("type").GetString());
+    }
+
+    /// <summary>
+    /// <c>type:"function"</c> marks the chunk that opens a call, and on the wire that is the chunk
+    /// carrying <c>id</c>. A name-only fragment must not announce a call the client cannot address.
+    /// </summary>
+    [Fact]
+    public void ToToolCallDeltaDto_NameWithoutId_OmitsType()
+    {
+        var dto = RequestConverter.ToToolCallDeltaDto(new ToolCallFragment(
+            Index: 0, Id: null, Name: "get_weather", ArgumentsDelta: null, IsLast: false));
+
+        Assert.Null(dto.Type);
+        Assert.Null(dto.Id);
+        Assert.Equal("get_weather", dto.Function?.Name);
     }
 
     // ─────────────────────────────────────────────────────────────────────

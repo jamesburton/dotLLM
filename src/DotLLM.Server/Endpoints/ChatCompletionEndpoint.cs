@@ -246,8 +246,20 @@ public static class ChatCompletionEndpoint
                     {
                         // Tools attached — split this token into safe text and any tool-call fragments.
                         var parseResult = incrementalParser.AppendChunk(token.Text);
+
+                        // tokenLogprobs describe the whole of token.Text. The parser may split it
+                        // (prose + sentinel), hold part of it back as a possible sentinel prefix, or
+                        // release text held back from an earlier token — in all of those the content
+                        // chunk is no longer this token, and attaching its logprobs would report
+                        // per-token probabilities against text they don't cover. Emit them only when
+                        // the safe text is exactly the token and nothing was routed to a tool call.
+                        bool logprobsCoverEmission =
+                            parseResult.Fragments.Count == 0 &&
+                            string.Equals(parseResult.SafeText, token.Text, StringComparison.Ordinal);
+
                         await EmitSplitChunksAsync(
-                            httpContext, requestId, modelId, parseResult, tokenLogprobs, ct);
+                            httpContext, requestId, modelId, parseResult,
+                            logprobsCoverEmission ? tokenLogprobs : null, ct);
                     }
                 }
 

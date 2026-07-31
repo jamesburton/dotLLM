@@ -53,6 +53,17 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
     private State _state = State.OutsideCall;
     private int _callIndex;
 
+    /// <summary>
+    /// Index into <see cref="_callBuffer"/> from which the close-sentinel search resumes.
+    /// The outside buffer is self-limiting — <see cref="SafePrefixLength"/> drains everything that
+    /// cannot begin a sentinel, so it never exceeds <c>openSentinel.Length - 1</c> and rescanning it
+    /// is O(1). The call buffer has no such bound: it accumulates the whole tool-call payload, so
+    /// rescanning it from zero on every appended character would be quadratic in payload size. Any
+    /// match beginning before this offset would have lain wholly inside an already-scanned region
+    /// and been found then, so the search can safely resume here.
+    /// </summary>
+    private int _callSearchFrom;
+
     /// <inheritdoc/>
     public bool HasEmittedAnyFragment { get; private set; }
 
@@ -125,6 +136,7 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
             // Unterminated tool call — close it with whatever is buffered.
             EmitClosingFragments(ref fragments);
             _callBuffer.Clear();
+            _callSearchFrom = 0;
             _state = State.OutsideCall;
         }
 
@@ -152,6 +164,7 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
             int residueStart = openIdx + _openSentinel.Length;
             int residueLen = _outsideBuffer.Length - residueStart;
             _callBuffer.Clear();
+            _callSearchFrom = 0;
             if (residueLen > 0)
                 _callBuffer.Append(_outsideBuffer, residueStart, residueLen);
 
@@ -178,9 +191,15 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
 
     private void TryTransitionInside(StringBuilder safeText, ref List<ToolCallFragment>? fragments)
     {
-        int closeIdx = IndexOf(_callBuffer, _closeSentinel);
+        int closeIdx = IndexOf(_callBuffer, _closeSentinel, _callSearchFrom);
         if (closeIdx < 0)
-            return; // wait for more bytes; nothing to suppress that isn't already buffered
+        {
+            // Wait for more bytes; nothing to suppress that isn't already buffered. Only the last
+            // (closeSentinel.Length - 1) characters can still take part in a future match, so the
+            // next scan resumes there — amortised O(1) per character instead of a full rescan.
+            _callSearchFrom = Math.Max(0, _callBuffer.Length - _closeSentinel.Length + 1);
+            return;
+        }
 
         // Trim the call buffer at the close sentinel and emit closing fragments.
         int residueStart = closeIdx + _closeSentinel.Length;
@@ -190,6 +209,7 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
 
         EmitClosingFragments(ref fragments);
         _callBuffer.Clear();
+        _callSearchFrom = 0;
         _state = State.OutsideCall;
 
         // Push residue back into the outside buffer and re-run the outside
@@ -230,12 +250,11 @@ internal sealed class SentinelIncrementalToolCallParser : IIncrementalToolCallPa
                 _callIndex++;
             }
         }
-        else
-        {
-            // Couldn't parse — bump the index so a subsequent call has a fresh
-            // slot, but don't emit a junk fragment.
-            _callIndex++;
-        }
+        // Nothing parsed: no fragment was emitted, so no index was consumed. Bumping _callIndex
+        // here would leave a hole in the tool_calls[] stream — a consumer indexing by `index`
+        // would materialise a gap for a call that never existed — and would desync the generated
+        // `call_{n}` ids from the fragments actually on the wire. Indices stay contiguous over
+        // emitted fragments, which is what the Index contract promises.
     }
 
     // ─────────────────────────────────────────────────────────────────────
