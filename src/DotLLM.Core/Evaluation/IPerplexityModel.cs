@@ -46,8 +46,13 @@ public interface IPerplexityModel
     /// </summary>
     /// <param name="tokens">Input token ids for this window.</param>
     /// <param name="positions">
-    /// Absolute position ids, one per token. Passed explicitly rather than derived, so a sliding
-    /// window can score at its true absolute positions instead of restarting at zero.
+    /// Position ids, one per token, passed explicitly rather than derived so the caller controls
+    /// them.
+    /// <para><b>Do not assume they are absolute corpus offsets.</b> Sliding-window scoring passes
+    /// window-relative positions restarting at <c>0</c> for every window, because llama.cpp
+    /// evaluates each chunk as an independent sequence and matching it is the point of that mode.
+    /// It is also what lets a corpus longer than <see cref="MaxContextLength"/> be scored at all —
+    /// absolute positions would run past the model's limit on the second window.</para>
     /// </param>
     /// <returns>
     /// Logits, owned by the caller. Row layout is governed by <see cref="ReturnsAllRows"/>.

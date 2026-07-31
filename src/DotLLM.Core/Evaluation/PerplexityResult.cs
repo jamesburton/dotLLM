@@ -7,14 +7,19 @@ namespace DotLLM.Core.Evaluation;
 public enum PerplexityMode
 {
     /// <summary>
-    /// Teacher-forced scoring over one window per stride step, each scored from a single forward
-    /// pass where the backend permits it. The established in-tree methodology (the "G1 precedent"
-    /// referenced by the CUDA prefill harnesses); preserved so existing quality gates keep their
-    /// meaning after consolidation.
+    /// Teacher-forced scoring over a single window — the first <see cref="PerplexityOptions.ContextLength"/>
+    /// tokens, clamped to the model's maximum — scored from one forward pass where the backend
+    /// permits it. The established in-tree methodology (the "G1 precedent" referenced by the CUDA
+    /// prefill harnesses); preserved so existing quality gates keep their meaning after consolidation.
     /// </summary>
     /// <remarks>
-    /// Ratio-oriented: the load-bearing signal is the OFF/ON perplexity ratio on identical tokens,
-    /// not the absolute value. Not comparable to published figures.
+    /// <para><see cref="PerplexityOptions.Stride"/> and <see cref="PerplexityOptions.UnscoredPrefix"/>
+    /// are <b>ignored</b> in this mode: it scores one window and stops. That is deliberate — the mode
+    /// exists to reproduce the pre-existing harnesses bit for bit, and giving it window geometry
+    /// would change the numbers those gates were calibrated against. Use
+    /// <see cref="SlidingWindow"/> to walk a corpus.</para>
+    /// <para>Ratio-oriented: the load-bearing signal is the OFF/ON perplexity ratio on identical
+    /// tokens, not the absolute value. Not comparable to published figures.</para>
     /// </remarks>
     TeacherForced,
 

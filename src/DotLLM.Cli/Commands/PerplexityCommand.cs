@@ -17,9 +17,13 @@ namespace DotLLM.Cli.Commands;
 /// Computes perplexity over a text corpus: load → stream-tokenize → score.
 /// </summary>
 /// <remarks>
-/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context / 2</c>, which
-/// reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure is directly
-/// comparable to published numbers for the same model, corpus, context and stride.
+/// Defaults to <see cref="PerplexityMode.SlidingWindow"/> with <c>stride = context</c> and
+/// <c>unscored prefix = context / 2 + 1</c> — non-overlapping chunks, each scoring the targets after
+/// its midpoint. That reproduces llama.cpp's <c>--perplexity</c> methodology, so the reported figure
+/// is directly comparable to published numbers for the same model, corpus and context.
+/// <para>Advance and scored span are separate knobs on purpose: llama.cpp advances by the whole
+/// window yet scores only part of it, so its scored ranges have gaps. A single "stride" cannot
+/// express that.</para>
 /// </remarks>
 internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Settings>
 {
@@ -50,7 +54,7 @@ internal sealed class PerplexityCommand : AsyncCommand<PerplexityCommand.Setting
         public int Stride { get; set; }
 
         [CommandOption("--unscored-prefix")]
-        [Description("Leading tokens of each window used as context only. -1 selects context/2 (llama.cpp's default).")]
+        [Description("Leading tokens of each window used as context only. -1 selects context/2 + 1, which scores the same targets as llama.cpp.")]
         [DefaultValue(-1)]
         public int UnscoredPrefix { get; set; } = -1;
 
