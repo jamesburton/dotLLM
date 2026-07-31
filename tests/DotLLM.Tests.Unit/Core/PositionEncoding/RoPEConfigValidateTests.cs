@@ -2,6 +2,10 @@ using DotLLM.Core.Configuration;
 using DotLLM.Core.PositionEncoding;
 using Xunit;
 
+// Deliberately NOT `DotLLM.Tests.Unit.Core.PositionEncoding`, despite the folder path:
+// introducing a `DotLLM.Tests.Unit.Core` namespace makes every fully-qualified
+// `DotLLM.Core.*` reference elsewhere in this assembly bind to it instead of the real
+// `DotLLM.Core` (C# name lookup walks enclosing namespaces first), breaking unrelated files.
 namespace DotLLM.Tests.Unit.CorePositionEncoding;
 
 /// <summary>

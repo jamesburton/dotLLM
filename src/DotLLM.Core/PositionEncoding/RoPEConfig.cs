@@ -55,27 +55,29 @@ public readonly record struct RoPEConfig(
 
         if (!IsDefault(AttnFactor, DefaultAttnFactor))
         {
-            throw new InvalidRoPEConfigException(
-                nameof(AttnFactor),
-                $"is set to {AttnFactor} but {nameof(ScalingType)} is {ScalingType} (only YaRN consumes YaRN-specific fields).");
+            throw new InvalidRoPEConfigException(nameof(AttnFactor), Reason(AttnFactor, ScalingType));
         }
         if (!IsDefault(BetaFast, DefaultBetaFast))
         {
-            throw new InvalidRoPEConfigException(
-                nameof(BetaFast),
-                $"is set to {BetaFast} but {nameof(ScalingType)} is {ScalingType} (only YaRN consumes YaRN-specific fields).");
+            throw new InvalidRoPEConfigException(nameof(BetaFast), Reason(BetaFast, ScalingType));
         }
         if (!IsDefault(BetaSlow, DefaultBetaSlow))
         {
-            throw new InvalidRoPEConfigException(
-                nameof(BetaSlow),
-                $"is set to {BetaSlow} but {nameof(ScalingType)} is {ScalingType} (only YaRN consumes YaRN-specific fields).");
+            throw new InvalidRoPEConfigException(nameof(BetaSlow), Reason(BetaSlow, ScalingType));
         }
     }
 
-    // Bit-exact comparison: defaults are written as compile-time `float` literals,
-    // so the bit pattern distinguishes a genuinely-defaulted value from one set
-    // explicitly to a different value.
+    // Invariant culture so the message reads the same regardless of the ambient
+    // culture's decimal separator — these strings end up in logs and bug reports.
+    private static string Reason(float value, RoPEScalingType scalingType) =>
+        FormattableString.Invariant(
+            $"is set to {value} but {nameof(ScalingType)} is {scalingType} (only YaRN consumes YaRN-specific fields).");
+
+    // Bit-exact comparison against the compile-time default literal. This cannot (and
+    // does not try to) tell whether the caller explicitly passed the default value —
+    // it only answers "does this field still hold the documented default bit pattern".
+    // Comparing bits rather than using `==` keeps the check exact and total: no
+    // tolerance to pick, and no float-equality edge cases (NaN, ±0) to reason about.
     private static bool IsDefault(float actual, float expected) =>
         BitConverter.SingleToInt32Bits(actual) == BitConverter.SingleToInt32Bits(expected);
 }
