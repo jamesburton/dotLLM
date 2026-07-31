@@ -68,6 +68,17 @@ public static unsafe class CudaMoeFfn
 
         if (seqLen <= 0) return;
 
+        // BitNet-ternary (I2_S) routed experts (issue #246): entirely different per-expert
+        // body (relu²·GLU + per-expert FFN Sub-LN, ternary GEMV instead of cuBLAS SwiGLU
+        // GEMM) — dispatched to a dedicated method rather than threading a third branch
+        // through every step below (mirrors CudaGemma4Ffn's precedent of a sibling forward
+        // method for a structurally-different MoE variant).
+        if (weights.Precision == MoePrecision.BitNetI2S)
+        {
+            ForwardBitNetI2S(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream);
+            return;
+        }
+
         int hidden = weights.HiddenSize;
         int E = weights.NumExperts;
         int K = weights.NumExpertsPerTok;
@@ -300,74 +311,13 @@ public static unsafe class CudaMoeFfn
                 gemvInputF16: scratch.GemvInputF16, gemvOutputF16: scratch.GemvOutputF16,
                 outputF32: scratch.DownBatch);
 
-            // 6. Per-slot axpy (group by slot to amortise weight lookups).
-            //    The fast common case is K=2..8; we walk slots 0..K-1 and
-            //    upload only the rows that belong to this (expert, slot)
-            //    combo. For decode (seqLen=1, batch=1) this collapses to one
-            //    launch.
-            //
-            //    Sub-bucket by slot. We reuse scratch.SlotBuckets as
-            //    temporary host scratch.
-            //
-            //    Alternative implementation (simpler, slightly more launches):
-            //    walk every batch row and issue one axpy per row. We pick the
-            //    slot-grouped path because typical K is small, so the number
-            //    of launches per expert is bounded by K rather than batch.
-
-            for (int slot = 0; slot < K; slot++)
-            {
-                // Count + collect bucket rows for this (expert, slot).
-                int slotBatchCount = 0;
-                for (int b = 0; b < batch; b++)
-                    if (bucketSlots[start + b] == slot) slotBatchCount++;
-                if (slotBatchCount == 0) continue;
-
-                if (slotBatchCount == batch)
-                {
-                    // All assignments in this expert's bucket share the same
-                    // slot — issue the axpy directly, no second-level
-                    // bucketing needed. Common for decode (seqLen=1) and
-                    // for sparse routing patterns.
-                    kernels.LaunchMoeAxpyScaledRowF32(
-                        outputF32, scratch.DownBatch,
-                        scratch.TopkWeight,
-                        scratch.TokenIndices + (nint)((long)start * sizeof(int)),
-                        batch, hidden, K, slot, stream);
-                }
-                else
-                {
-                    // Mixed slots in this expert's bucket. Build a per-slot
-                    // sub-bucket of (down_row_index, token_id) pairs:
-                    //   subTokens[k] = bucketTokens[start + b]   (the dst token)
-                    //   subDownRows[k] = b                       (the row in DownBatch)
-                    // Then we need to gather down[subDownRows] into a sub-batch
-                    // before the axpy. To keep Phase 1 simple, we issue per-
-                    // row axpys for the mixed-slot case (very rare for K≥2 if
-                    // routing has any token spread, but a safety net for
-                    // adversarial inputs).
-                    for (int b = 0; b < batch; b++)
-                    {
-                        if (bucketSlots[start + b] != slot) continue;
-                        int tokenId = bucketTokens[start + b];
-                        // Upload single (tokenId) ⇒ TokenIndices scratch slot.
-                        // Use the synchronous HtoD here so the source stack
-                        // local can be safely overwritten on the next loop
-                        // iteration. Async HtoD from non-pinned host memory
-                        // would also serialise via the driver staging buffer
-                        // but the sync variant makes the contract obvious.
-                        CudaDriverApi.cuMemcpyHtoD_v2(
-                            scratch.SingleTokenScratch,
-                            (nint)(&tokenId), sizeof(int)).ThrowOnError();
-                        // Issue an axpy for the single down row at index b.
-                        kernels.LaunchMoeAxpyScaledRowF32(
-                            outputF32,
-                            scratch.DownBatch + (nint)((long)b * hidden * sizeof(float)),
-                            scratch.TopkWeight,
-                            scratch.SingleTokenScratch,
-                            1, hidden, K, slot, stream);
-                    }
-                }
-            }
+            // 6. Per-slot axpy (group by slot to amortise weight lookups). See
+            //    DispatchExpertAxpySlots for the slot-grouping strategy.
+            DispatchExpertAxpySlots(
+                outputF32, scratch.DownBatch, scratch.TopkWeight,
+                scratch.TokenIndices, scratch.SingleTokenScratch,
+                bucketTokens, bucketSlots, start, batch, hidden, K,
+                kernels, stream);
         }
 
         // ── Step 8: shared-expert path (DeepSeek / Qwen1.5-MoE) ──
@@ -422,6 +372,282 @@ public static unsafe class CudaMoeFfn
                         outputF32, scratch.SharedDownBatch, seqLen, hidden, stream);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Per-(expert, slot) weighted accumulation into <paramref name="outputF32"/>, extracted
+    /// from the routed-expert loop so both the F32/Quantized <see cref="Forward"/> path and
+    /// <see cref="ForwardBitNetI2S"/> (issue #246) share one implementation. Groups by slot
+    /// (typical <c>K</c> is small — 2..8) to amortise weight lookups: when every assignment in
+    /// this expert's bucket shares one slot (the common case for decode, or sparse routing),
+    /// one launch does the whole batch; otherwise falls back to per-row axpys for the mixed-
+    /// slot case (rare, a correctness safety net rather than the expected hot path).
+    /// </summary>
+    private static unsafe void DispatchExpertAxpySlots(
+        nint outputF32, nint downBatch, nint topkWeight,
+        nint tokenIndices, nint singleTokenScratch,
+        int[] bucketTokens, int[] bucketSlots,
+        int start, int batch, int hidden, int K,
+        CudaKernels kernels, nint stream)
+    {
+        for (int slot = 0; slot < K; slot++)
+        {
+            // Count + collect bucket rows for this (expert, slot).
+            int slotBatchCount = 0;
+            for (int b = 0; b < batch; b++)
+                if (bucketSlots[start + b] == slot) slotBatchCount++;
+            if (slotBatchCount == 0) continue;
+
+            if (slotBatchCount == batch)
+            {
+                // All assignments in this expert's bucket share the same
+                // slot — issue the axpy directly, no second-level
+                // bucketing needed. Common for decode (seqLen=1) and
+                // for sparse routing patterns.
+                kernels.LaunchMoeAxpyScaledRowF32(
+                    outputF32, downBatch,
+                    topkWeight,
+                    tokenIndices + (nint)((long)start * sizeof(int)),
+                    batch, hidden, K, slot, stream);
+            }
+            else
+            {
+                // Mixed slots in this expert's bucket. Build a per-slot
+                // sub-bucket of (down_row_index, token_id) pairs:
+                //   subTokens[k] = bucketTokens[start + b]   (the dst token)
+                //   subDownRows[k] = b                       (the row in DownBatch)
+                // Then we need to gather down[subDownRows] into a sub-batch
+                // before the axpy. To keep Phase 1 simple, we issue per-
+                // row axpys for the mixed-slot case (very rare for K≥2 if
+                // routing has any token spread, but a safety net for
+                // adversarial inputs).
+                for (int b = 0; b < batch; b++)
+                {
+                    if (bucketSlots[start + b] != slot) continue;
+                    int tokenId = bucketTokens[start + b];
+                    // Upload single (tokenId) ⇒ TokenIndices scratch slot.
+                    // Use the synchronous HtoD here so the source stack
+                    // local can be safely overwritten on the next loop
+                    // iteration. Async HtoD from non-pinned host memory
+                    // would also serialise via the driver staging buffer
+                    // but the sync variant makes the contract obvious.
+                    CudaDriverApi.cuMemcpyHtoD_v2(
+                        singleTokenScratch,
+                        (nint)(&tokenId), sizeof(int)).ThrowOnError();
+                    // Issue an axpy for the single down row at index b.
+                    kernels.LaunchMoeAxpyScaledRowF32(
+                        outputF32,
+                        downBatch + (nint)((long)b * hidden * sizeof(float)),
+                        topkWeight,
+                        singleTokenScratch,
+                        1, hidden, K, slot, stream);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// BitNet-ternary (I2_S) routed-expert MoE forward (issue #246) — the GPU port of
+    /// <c>DotLLM.Cpu.Kernels.MoeSwiGluMlp.ExecuteBitNetMoe</c>. Shares the router GEMV +
+    /// softmax/top-k + host-side bucketing strategy with <see cref="Forward"/> (steps 1-6
+    /// below mirror it exactly, plus an additive router-bias step BitNet/identity-MoTE
+    /// needs and the F32 path doesn't), but the per-expert body differs in three numerically
+    /// load-bearing ways — see <see cref="MoePrecision.BitNetI2S"/>:
+    /// <list type="number">
+    ///   <item>Experts are ternary I2_S, dispatched through
+    ///     <see cref="CudaKernels.LaunchI2_SGemvF32In"/> — a GEMV (one input row per call), so
+    ///     each touched expert's batch is projected with ONE GEMV LAUNCH PER ROW rather than a
+    ///     single GEMM. This only matters for prefill (seqLen&gt;1 routes multiple rows to the
+    ///     same expert); decode (seqLen=1) is a single row per touched expert regardless.
+    ///     Explicitly out of scope for this pass: a batched/grouped I2_S GEMM kernel — see the
+    ///     CPU oracle's own per-call-not-batched precedent and this method's remarks.</item>
+    ///   <item>The gate non-linearity is relu² (<see cref="CudaKernels.LaunchReLU2GLUF32"/>),
+    ///     not SiLU.</item>
+    ///   <item>A per-expert BitNet FFN Sub-LN (<see cref="CudaKernels.LaunchRmsNormF32"/> with
+    ///     <see cref="CudaMoeLayerWeights.ExpertFfnSubNormF32"/>) is applied to the gated
+    ///     intermediate before <c>down_proj</c>. RMSNorm is a per-row-independent op, so calling
+    ///     the existing kernel once per touched-expert batch (with that expert's Sub-LN weight
+    ///     and <c>rows = batch</c>) needs no new kernel — verified in-place-safe by reading
+    ///     <c>rmsnorm_f32.cu</c>: pass 1 fully reduces sum-of-squares over the (still
+    ///     untouched) input before pass 2 reads-then-writes each element exactly once.</item>
+    /// </list>
+    /// </summary>
+    /// <remarks>
+    /// <b>Design deviation from the issue's suggested per-expert scale-attach mechanism.</b>
+    /// The issue anticipated a <c>pq2_0_repack.cu</c>-style device kernel to reconcile
+    /// <see cref="CudaKernels.LaunchI2_SGemvF32In"/>'s single-trailing-scale-per-tensor
+    /// contract with the CPU bundle's separate per-expert scale array. This turned out to need
+    /// no device kernel at all — see <see cref="CudaMoeWeightsLoader.LoadLayerBitNetI2S"/>'s
+    /// remarks for why a load-time two-copy upload (payload + scale into one pre-sized device
+    /// buffer) suffices; PQ2_0's repack kernel solves a different problem (byte-level
+    /// re-interleaving for coalescing), not "attach a scalar to a slice".
+    /// </remarks>
+    private static unsafe void ForwardBitNetI2S(
+        nint hiddenF32, nint outputF32,
+        int seqLen,
+        CudaMoeLayerWeights weights,
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream)
+    {
+        if (!kernels.HasBitNetMoeKernels)
+            throw new InvalidOperationException(
+                "BitNet-MoE CUDA kernels not available (I2_S GEMV / relu²GLU / RMSNorm F32 / "
+              + "shared MoE orchestration kernels). Recompile native/kernels/{i2_s_gemv,"
+              + "swiglu_f32,rmsnorm_f32,moe_ffn}.cu to PTX.");
+        if (weights.GateBiasF32 != 0 && !kernels.HasMoeGateBiasAdd)
+            throw new InvalidOperationException(
+                "MoE layer has a router bias but moe_gate_bias_add_f32 is not available. "
+              + "Recompile native/kernels/moe_ffn.cu to PTX.");
+
+        int hidden = weights.HiddenSize;
+        int E = weights.NumExperts;
+        int K = weights.NumExpertsPerTok;
+        int I = weights.MoeIntermediateSize;
+        int totalAssign = seqLen * K;
+
+        // I2_S's aligned GEMV kernels require k % 128 == 0 (see i2_s_gemv.cu) — the same
+        // invariant the CPU oracle documents ("hiddenSize/intermediateSize a multiple of
+        // 128"). No ragged fallback wired here (explicitly out of scope for this pass — see
+        // LaunchI2_SGemvF32InRagged for the CPU-parity twin if a non-128-aligned BitNet-MoE
+        // checkpoint ever surfaces).
+        if ((hidden % 128) != 0 || (I % 128) != 0)
+            throw new InvalidOperationException(
+                $"BitNet-MoE CUDA forward requires hiddenSize ({hidden}) and moeIntermediateSize "
+              + $"({I}) to be multiples of 128 (I2_S block size). Ragged-K is not wired for the "
+              + "MoE path yet — see CudaKernels.LaunchI2_SGemvF32InRagged for the dense twin.");
+
+        scratch.EnsureCapacity(seqLen, weights);
+
+        // ── Step 1: clear output ──
+        kernels.LaunchMoeZeroF32(outputF32, seqLen * hidden, stream);
+
+        // ── Step 2: routing GEMV — logits[seqLen, numExperts] = hidden @ router^T ──
+        // Router stays F32 (small: numExperts × hidden floats) — same cuBLAS LinearF32 path
+        // as the F32/Quantized MoE forward.
+        CudaGemm.LinearF32(
+            cublasHandle, hiddenF32, weights.Router, scratch.Logits,
+            seqLen, hidden, E, stream);
+
+        // ── Step 2b: additive router bias (identity-MoTE / Qwen3 aux-loss-free routing) ──
+        // MUST run before softmax/top-k — mirrors MoeSwiGluMlp.Route's CPU ordering exactly
+        // (bias shifts both the top-k argmax AND the softmax probabilities feeding assignWeight).
+        if (weights.GateBiasF32 != 0)
+            kernels.LaunchMoeGateBiasAddF32(scratch.Logits, weights.GateBiasF32, seqLen, E, stream);
+
+        // ── Step 3: per-token softmax + top-k selection → device buffers ──
+        kernels.LaunchMoeSoftmaxTopk(
+            scratch.Logits, scratch.TopkIdx, scratch.TopkWeight,
+            seqLen, E, K, stream);
+
+        // ── Step 4: optional renorm of top-k weights ──
+        if (weights.NormTopKProb)
+            kernels.LaunchMoeRenormTopk(scratch.TopkWeight, seqLen, K, stream);
+
+        // ── Step 5: download top-k indices to host for per-expert bucketing (same strategy
+        // as Forward — see its Step 5/6 comments for the full rationale). ──
+        CudaDriverApi.cuStreamSynchronize(stream).ThrowOnError();
+
+        int[] topkIdxHost = new int[totalAssign];
+        fixed (int* p = topkIdxHost)
+            CudaDriverApi.cuMemcpyDtoH_v2(
+                (nint)p, scratch.TopkIdx,
+                (nuint)((long)totalAssign * sizeof(int))).ThrowOnError();
+
+        Span<int> counts = stackalloc int[E];
+        counts.Clear();
+        for (int i = 0; i < totalAssign; i++)
+        {
+            int e = topkIdxHost[i];
+            if ((uint)e < (uint)E) counts[e]++;
+        }
+
+        Span<int> offsets = stackalloc int[E + 1];
+        int running = 0;
+        for (int e = 0; e < E; e++)
+        {
+            offsets[e] = running;
+            running += counts[e];
+        }
+        offsets[E] = running;
+
+        int[] bucketTokens = new int[totalAssign];
+        int[] bucketSlots = new int[totalAssign];
+        Span<int> cursor = stackalloc int[E];
+        for (int e = 0; e < E; e++) cursor[e] = offsets[e];
+        for (int t = 0; t < seqLen; t++)
+        {
+            for (int slot = 0; slot < K; slot++)
+            {
+                int e = topkIdxHost[t * K + slot];
+                if ((uint)e >= (uint)E) continue;
+                int pos = cursor[e]++;
+                bucketTokens[pos] = t;
+                bucketSlots[pos] = slot;
+            }
+        }
+
+        // ── Step 6: per-expert body — down( ffn_sub_norm( relu²(gate(x)) * up(x) ) ) ──
+        for (int e = 0; e < E; e++)
+        {
+            int batch = counts[e];
+            if (batch == 0) continue;
+            int start = offsets[e];
+
+            // 1. Upload this expert's bucketTokens slice + gather hidden rows (identical to
+            //    the F32/Quantized path's steps 1-2).
+            fixed (int* tp = bucketTokens)
+            {
+                CudaDriverApi.cuMemcpyHtoD_v2(
+                    scratch.TokenIndices + (nint)((long)start * sizeof(int)),
+                    (nint)(tp + start),
+                    (nuint)((long)batch * sizeof(int))).ThrowOnError();
+            }
+            kernels.LaunchMoeGatherTokenRowsF32(
+                hiddenF32, scratch.GatheredInput,
+                scratch.TokenIndices + (nint)((long)start * sizeof(int)),
+                batch, hidden, stream);
+
+            // 2. gate / up projections: ternary I2_S GEMV, one launch PER ROW (issue #246 scope
+            //    — no batched/grouped I2_S GEMM kernel this pass; decode is batch=1 anyway).
+            long hiddenRowBytes = (long)hidden * sizeof(float);
+            long iRowBytes = (long)I * sizeof(float);
+            for (int b = 0; b < batch; b++)
+            {
+                nint xRow = scratch.GatheredInput + (nint)((long)b * hiddenRowBytes);
+                kernels.LaunchI2_SGemvF32In(
+                    weights.GateProj[e], xRow, scratch.GateBatch + (nint)((long)b * iRowBytes),
+                    n: I, k: hidden, stream);
+                kernels.LaunchI2_SGemvF32In(
+                    weights.UpProj[e], xRow, scratch.UpBatch + (nint)((long)b * iRowBytes),
+                    n: I, k: hidden, stream);
+            }
+
+            // 3. inter = ffn_sub_norm_e( relu²(gate) * up ). relu²·GLU is elementwise over the
+            //    whole [batch, I] block in one launch (same shape as LaunchSwiGLUF32); the
+            //    per-expert Sub-LN is RMSNorm — per-row-independent, so one call over
+            //    rows=batch with this expert's Sub-LN weight covers the whole bucket, in-place.
+            kernels.LaunchReLU2GLUF32(scratch.GateBatch, scratch.UpBatch, scratch.SiluBatch, I, batch, stream);
+            kernels.LaunchRmsNormF32(
+                scratch.SiluBatch, weights.ExpertFfnSubNormF32[e], scratch.SiluBatch,
+                I, weights.RmsEps, batch, stream);
+
+            // 4. down projection: ternary I2_S GEMV, one launch per row (same scope note as
+            //    gate/up above).
+            for (int b = 0; b < batch; b++)
+            {
+                kernels.LaunchI2_SGemvF32In(
+                    weights.DownProj[e],
+                    scratch.SiluBatch + (nint)((long)b * iRowBytes),
+                    scratch.DownBatch + (nint)((long)b * hiddenRowBytes),
+                    n: hidden, k: I, stream);
+            }
+
+            // 5. Per-slot weighted axpy into output — shared with the F32/Quantized path.
+            DispatchExpertAxpySlots(
+                outputF32, scratch.DownBatch, scratch.TopkWeight,
+                scratch.TokenIndices, scratch.SingleTokenScratch,
+                bucketTokens, bucketSlots, start, batch, hidden, K,
+                kernels, stream);
         }
     }
 
