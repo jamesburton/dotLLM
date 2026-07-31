@@ -46,7 +46,8 @@ internal struct DfaSimulator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Regex constraints currently only support BMP code points (U+0000–U+FFFF). The
+    /// Regex constraints currently only support BMP Unicode scalar values — U+0000–U+D7FF
+    /// and U+E000–U+FFFF, i.e. the BMP excluding surrogate code units. The
     /// DFA is built against equivalence classes over <see cref="char"/> (UTF-16 code
     /// units). A supplementary code point (e.g. U+1F600) arrives as a surrogate pair
     /// (high + low surrogate); without explicit handling, each half would index
