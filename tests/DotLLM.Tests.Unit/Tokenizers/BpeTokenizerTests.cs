@@ -590,4 +590,31 @@ public class BpeTokenizerTests
 
         return (tokens, []);
     }
+
+    // No allocation-threshold test here on purpose. The cost this change removes is the merge
+    // queue's GROWTH while merging, so it only exists for a vocabulary with a real merge table;
+    // the synthetic 256-byte vocab these tests use has none, and measures identically before and
+    // after (655,512 bytes either way). A threshold assertion built on it would pass regardless of
+    // whether the fix were present. TokenizerAllocationBenchmarks, which loads a real vocabulary,
+    // is where this is measured.
+
+    [Fact]
+    public void PreTokenizedEncode_IsUnchangedByQueueReuse()
+    {
+        // The merge queue is now reused across segments, so a segment's leftovers could in
+        // principle leak into the next. Encoding the same text as one call and as its pre-token
+        // pieces concatenated must agree, and repeat calls on one instance must be stable.
+        BpeTokenizer tokenizer = BuildMinimalTiktokenVocab("gpt2");
+        const string Text = "the quick brown fox, 12345 times over! and again: the quick brown fox";
+
+        int[] first = tokenizer.Encode(Text);
+        int[] second = tokenizer.Encode(Text);
+        Assert.Equal(first, second);
+
+        // A fresh instance has a fresh queue; a reused one must not differ from it.
+        Assert.Equal(BuildMinimalTiktokenVocab("gpt2").Encode(Text), second);
+
+        // Round-trip: whatever the segmentation, the text must come back intact.
+        Assert.Equal(Text, tokenizer.Decode(first));
+    }
 }

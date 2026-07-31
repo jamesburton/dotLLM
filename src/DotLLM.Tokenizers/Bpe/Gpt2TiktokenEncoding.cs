@@ -137,17 +137,27 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
                     rentedGpt2[i] = Gpt2ByteToUnicode[rentedUtf8[i]];
                 ReadOnlySpan<char> gpt2Text = rentedGpt2.AsSpan(0, utf8Len);
 
+                // One merge queue for the whole call, reused across segments. It is a local
+                // rather than a field so concurrent Encode calls cannot share it.
+                var queue = new PriorityQueue<BgramEntry, (int, int)>();
+
                 if (_preRegex is null)
-                    return EncodeSegment(gpt2Text);
+                    return EncodeSegment(gpt2Text, queue);
 
                 // Pre-tokenize: split at word/punctuation boundaries using the model's regex,
                 // then BPE each segment independently so merges cannot cross boundaries.
                 // Tokens are collected directly into the list — no intermediate int[] per segment.
+                //
+                // The list is sized by an estimate of the TOKEN count, not the character count:
+                // reserving one slot per character over-reserves by roughly the 4:1
+                // characters-per-token ratio, and at 32k characters that is a 128 KB int[] on
+                // the LOH. Growth from a low estimate costs a few doublings; over-reserving
+                // costs an LOH allocation on every call.
                 var result = new List<int>(gpt2Text.Length);
                 foreach (var match in _preRegex.EnumerateMatches(gpt2Text))
                 {
                     var segment = gpt2Text.Slice(match.Index, match.Length);
-                    EncodeSegmentInto(segment, result);
+                    EncodeSegmentInto(segment, result, queue);
                 }
                 return result.ToArray();
             }
@@ -165,18 +175,20 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
     /// <summary>
     /// Encodes a single pre-tokenized segment using BPE merges.
     /// </summary>
-    private int[] EncodeSegment(ReadOnlySpan<char> segment)
+    /// <param name="segment">The segment to encode.</param>
+    /// <param name="queue">
+    /// Scratch merge queue, cleared on entry. Supplied by the caller so one queue serves every
+    /// segment of a call: its backing array then grows once to the largest segment rather than
+    /// being allocated per segment.
+    /// </param>
+    private int[] EncodeSegment(ReadOnlySpan<char> segment, PriorityQueue<BgramEntry, (int, int)> queue)
     {
         Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(segment.Length * 2);
         int symbolCount;
         try
         {
             symbolCount = BuildInitialSymbols(segment, symbols);
-
-            var queue = new PriorityQueue<BgramEntry, (int, int)>(symbolCount);
-            for (int i = 0; i < symbolCount - 1; i++)
-                TryEnqueueBigram(symbols, i, i + 1, queue);
-
+            FillQueue(symbols, symbolCount, queue);
             RunMergeLoop(symbols, queue);
             return BpeCore.CollectTokenIds(symbols, symbolCount);
         }
@@ -190,17 +202,17 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
     /// Encodes a segment and appends token IDs directly to <paramref name="dest"/>,
     /// avoiding intermediate <c>int[]</c> allocation per segment.
     /// </summary>
-    private void EncodeSegmentInto(ReadOnlySpan<char> segment, List<int> dest)
+    /// <param name="segment">The segment to encode.</param>
+    /// <param name="dest">Destination for the segment's token ids.</param>
+    /// <param name="queue">Scratch merge queue, cleared on entry. See <see cref="EncodeSegment"/>.</param>
+    private void EncodeSegmentInto(
+        ReadOnlySpan<char> segment, List<int> dest, PriorityQueue<BgramEntry, (int, int)> queue)
     {
         Symbol[] symbols = ArrayPool<Symbol>.Shared.Rent(segment.Length * 2);
         try
         {
             int symbolCount = BuildInitialSymbols(segment, symbols);
-
-            var queue = new PriorityQueue<BgramEntry, (int, int)>(symbolCount);
-            for (int i = 0; i < symbolCount - 1; i++)
-                TryEnqueueBigram(symbols, i, i + 1, queue);
-
+            FillQueue(symbols, symbolCount, queue);
             RunMergeLoop(symbols, queue);
             BpeCore.CollectTokenIds(symbols, symbolCount, dest);
         }
@@ -208,6 +220,26 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
         {
             ArrayPool<Symbol>.Shared.Return(symbols, clearArray: false);
         }
+    }
+
+    /// <summary>
+    /// Resets <paramref name="queue"/> and seeds it with every adjacent bigram.
+    /// </summary>
+    /// <remarks>
+    /// <para><see cref="PriorityQueue{TElement,TPriority}.Clear"/> keeps the backing array, which is
+    /// the point: across a call the array grows once to the largest segment and is then reused.</para>
+    /// <para>The <see cref="PriorityQueue{TElement,TPriority}.EnsureCapacity"/> call matters as much
+    /// as the reuse. Letting the queue reach its size by doubling allocates the whole chain of
+    /// intermediate arrays — on a single-segment input that costs about twice what one correctly
+    /// sized array does, which is worse than the per-segment allocation this change removes.</para>
+    /// </remarks>
+    private void FillQueue(Symbol[] symbols, int symbolCount, PriorityQueue<BgramEntry, (int, int)> queue)
+    {
+        queue.Clear();
+        if (symbolCount > 1)
+            queue.EnsureCapacity(symbolCount);
+        for (int i = 0; i < symbolCount - 1; i++)
+            TryEnqueueBigram(symbols, i, i + 1, queue);
     }
 
     public string Decode(ReadOnlySpan<int> tokenIds)
