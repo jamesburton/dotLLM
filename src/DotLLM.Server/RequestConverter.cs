@@ -130,9 +130,13 @@ public static class RequestConverter
             };
         }
 
+        // Same kind-guards as IsToolChoiceSupported — a malformed `function` object must degrade to
+        // Auto, not throw out of the converter.
         if (element.Value.ValueKind == JsonValueKind.Object &&
             element.Value.TryGetProperty("function", out var funcProp) &&
-            funcProp.TryGetProperty("name", out var nameProp))
+            funcProp.ValueKind == JsonValueKind.Object &&
+            funcProp.TryGetProperty("name", out var nameProp) &&
+            nameProp.ValueKind == JsonValueKind.String)
         {
             return new ToolChoice.Function(nameProp.GetString()!);
         }
@@ -168,9 +172,16 @@ public static class RequestConverter
             return false;
         }
 
+        // Every kind is checked before it is read: TryGetProperty raises InvalidOperationException
+        // on a non-object and GetString() on a non-string, and a request-validation gate must not be
+        // able to throw on malformed input — a 500 there would mask the 400 this method exists to
+        // produce. Shapes that don't match fall through to the catch-all below and are reported by
+        // kind, which is still an accurate "unsupported" answer.
         if (element.Value.ValueKind == JsonValueKind.Object &&
             element.Value.TryGetProperty("function", out var funcProp) &&
-            funcProp.TryGetProperty("name", out var nameProp))
+            funcProp.ValueKind == JsonValueKind.Object &&
+            funcProp.TryGetProperty("name", out var nameProp) &&
+            nameProp.ValueKind == JsonValueKind.String)
         {
             rejectedValue = $"function:{nameProp.GetString()}";
             return false;
