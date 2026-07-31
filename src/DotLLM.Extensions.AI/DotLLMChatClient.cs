@@ -64,6 +64,11 @@ public sealed class DotLLMChatClient : IChatClient
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // TextGenerator.Generate is synchronous and runs for the whole completion, so it
+            // is offloaded rather than run inline: an async API must not block its caller's
+            // thread (an ASP.NET request thread, a UI thread) for seconds at a time. The
+            // token therefore only gates scheduling — it cannot abort a running generation.
+            // Use GetStreamingResponseAsync when mid-generation cancellation is required.
             result = await Task.Run(
                 () => _generator.Generate(prompt, inferenceOptions), cancellationToken).ConfigureAwait(false);
         }
@@ -110,6 +115,13 @@ public sealed class DotLLMChatClient : IChatClient
         var accumulated = new StringBuilder();
         var finishReason = FinishReason.Length;
 
+        // Tool calls are only recognisable once the full completion is available, so when
+        // detection is active the text is buffered instead of streamed. Streaming it would
+        // leak the model's raw tool-call syntax to the caller, and would make the coalesced
+        // stream (ChatResponseUpdate.ToChatResponse) disagree with GetResponseAsync, which
+        // drops the text whenever tool calls are present.
+        bool detectToolCalls = _toolCallParser is not null && tools is { Length: > 0 };
+
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -119,14 +131,17 @@ public sealed class DotLLMChatClient : IChatClient
                 if (token.Text.Length > 0)
                 {
                     accumulated.Append(token.Text);
-                    yield return new ChatResponseUpdate
+                    if (!detectToolCalls)
                     {
-                        Role = ChatRole.Assistant,
-                        Contents = [new TextContent(token.Text)],
-                        ResponseId = responseId,
-                        MessageId = responseId,
-                        ModelId = modelId,
-                    };
+                        yield return new ChatResponseUpdate
+                        {
+                            Role = ChatRole.Assistant,
+                            Contents = [new TextContent(token.Text)],
+                            ResponseId = responseId,
+                            MessageId = responseId,
+                            ModelId = modelId,
+                        };
+                    }
                 }
 
                 if (token.FinishReason.HasValue)
@@ -139,16 +154,20 @@ public sealed class DotLLMChatClient : IChatClient
         }
 
         // Post-generation tool-call detection (mirrors the server streaming endpoints).
+        string text = accumulated.ToString();
         EngineToolCall[]? toolCalls = null;
-        if (_toolCallParser is not null && tools is { Length: > 0 })
+        if (detectToolCalls)
         {
-            toolCalls = _toolCallParser.TryParse(accumulated.ToString());
+            toolCalls = _toolCallParser!.TryParse(text);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
 
-        var finalContents = toolCalls is { Length: > 0 }
-            ? ChatClientMapping.ToResponseContents("", toolCalls)
+        // Buffered path: the final update carries the whole message (text or tool calls),
+        // built by the same mapping the non-streaming path uses. Streamed path: the text has
+        // already been delivered, so the final update carries only the finish reason.
+        List<AIContent> finalContents = detectToolCalls
+            ? ChatClientMapping.ToResponseContents(text, toolCalls)
             : [];
 
         yield return new ChatResponseUpdate

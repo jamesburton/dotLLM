@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using DotLLM.Core.Configuration;
 using DotLLM.Engine;
@@ -76,6 +77,12 @@ public sealed class DotLLMChatClientMappingTests
         Assert.Equal(role, ChatClientMapping.ToRole(new ChatRole(role)));
     }
 
+    [Fact]
+    public void ToRole_UnknownRole_IsPreservedNotCoercedToUser()
+    {
+        Assert.Equal("developer", ChatClientMapping.ToRole(new ChatRole("developer")));
+    }
+
     // --- Options ------------------------------------------------------------
 
     [Fact]
@@ -124,6 +131,33 @@ public sealed class DotLLMChatClientMappingTests
 
         Assert.Equal(0.05f, io.MinP, 3);
         Assert.Equal(1.1f, io.RepetitionPenalty, 3);
+    }
+
+    [Fact]
+    public void ToInferenceOptions_StringKnobs_ParseUnderCommaDecimalCulture()
+    {
+        var original = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = new CultureInfo("pl-PL"); // ',' decimal separator
+        try
+        {
+            var options = new ChatOptions
+            {
+                AdditionalProperties = new AdditionalPropertiesDictionary
+                {
+                    ["min_p"] = "0.05",
+                    ["repetition_penalty"] = "1.1",
+                },
+            };
+
+            var io = ChatClientMapping.ToInferenceOptions(options);
+
+            Assert.Equal(0.05f, io.MinP, 3);
+            Assert.Equal(1.1f, io.RepetitionPenalty, 3);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 
     [Fact]

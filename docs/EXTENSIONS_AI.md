@@ -73,6 +73,16 @@ Both expose the same `IChatClient` surface to MAF, so agent code is identical.
   matching the dotLLM server's single-request model.
 - Streaming tool calls are detected post-generation (like the server endpoints),
   so `FunctionCallContent` is emitted in the final update rather than incrementally.
+  Consequently, **when a tool-call parser is configured and the request carries tools,
+  text is buffered instead of streamed** and delivered in that same final update. Streaming
+  it would leak the model's raw tool-call syntax to the caller, and would make the coalesced
+  stream (`ToChatResponse()`) disagree with `GetResponseAsync`, which drops text when tool
+  calls are present. Requests without tools (or without a parser) stream token-by-token as
+  usual.
+- `GetResponseAsync` offloads the synchronous `TextGenerator.Generate` to the thread pool so
+  it does not block the caller. The `CancellationToken` therefore only gates scheduling; it
+  cannot abort a generation already in flight. Use `GetStreamingResponseAsync`, which
+  cancels cooperatively between decode steps, when mid-generation cancellation matters.
 - `ChatOptions.FrequencyPenalty`/`PresencePenalty` have no direct engine
   equivalent and are not applied; use `RepetitionPenalty` via `AdditionalProperties`.
 - For automatic tool execution, wrap the client with MEAI's

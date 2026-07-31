@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DotLLM.Core.Configuration;
@@ -76,12 +77,18 @@ public static class ChatClientMapping
         return [.. result];
     }
 
-    /// <summary>Maps a Microsoft.Extensions.AI role to the engine role string.</summary>
+    /// <summary>
+    /// Maps a Microsoft.Extensions.AI role to the engine role string. Non-standard roles
+    /// (e.g. <c>developer</c>) are passed through verbatim rather than coerced to
+    /// <c>user</c>, so the chat template — not this adapter — decides how to render them.
+    /// </summary>
     public static string ToRole(ChatRole role) =>
         role == ChatRole.System ? "system"
         : role == ChatRole.Assistant ? "assistant"
         : role == ChatRole.Tool ? "tool"
-        : "user";
+        : role == ChatRole.User ? "user"
+        : string.IsNullOrWhiteSpace(role.Value) ? "user"
+        : role.Value;
 
     /// <summary>Builds <see cref="InferenceOptions"/> from <see cref="ChatOptions"/>.</summary>
     public static InferenceOptions ToInferenceOptions(ChatOptions? options)
@@ -261,7 +268,10 @@ public static class ChatClientMapping
             int i => i,
             long l => l,
             JsonElement je when je.ValueKind == JsonValueKind.Number => je.GetSingle(),
-            string s when float.TryParse(s, out var r) => r,
+            // Invariant culture: these values are JSON/config-adjacent, so "0.9" must parse
+            // identically on a machine whose current culture uses ',' as the decimal separator.
+            string s when float.TryParse(
+                s, NumberStyles.Float, CultureInfo.InvariantCulture, out var r) => r,
             _ => null,
         };
     }
