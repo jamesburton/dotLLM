@@ -64,7 +64,7 @@ REM Kernels that emit Ampere-only PTX (mma.sync / cp.async) and so MUST be built
 REM at compute_86 instead of the global default. These are dispatch-gated to
 REM Ampere+ GPUs in C# (the PTX never loads on Turing), so overriding their arch
 REM does not affect portability of the rest of the tree. See ARCH POLICY above.
-set "ARCH_86=attention_flash_mma"
+set "ARCH_86=attention_flash_mma attention_flash_mma_decode_gqa_split"
 
 REM Kernels that #include <cooperative_groups.h> (needed for grid.sync() — see
 REM gated_delta_net_scan.cu's gdn_scan_step_f32_coop_split4, issue #180, and
@@ -75,7 +75,7 @@ REM requires at least C++ 17" otherwise. Scoped to ONLY the kernels that need
 REM it (a per-kernel flag list, same pattern as ARCH_86) rather than bumping
 REM the global default, to avoid any risk of -std=c++17 subtly changing SASS
 REM for the other ~40 kernel files that don't need it.
-set "CXX17=gated_delta_net_scan attention_f32"
+set "CXX17=gated_delta_net_scan attention_f32 attention_flash_mma_decode_gqa_split"
 
 echo Using nvcc: %NVCC%
 echo Compiling CUDA kernels -^> PTX (target: %ARCH%)...

@@ -429,6 +429,18 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly CudaModule? _attentionFlashMmaModule;
     private readonly nint _attentionFlashMmaFunc;
 
+    // Tensor-core (mma.sync) FP16 DECODE attention composed with the #197/#198 GQA-group +
+    // split-KV grid design (issue #199 v2 — see native/kernels/attention_flash_mma_decode_gqa_split.cu).
+    // v1 (single warp/block, grid=numHeads) was 4-5x slower than the F32 baseline at every
+    // realistic depth due to ~4% occupancy; this kernel packs the GQA group into the mma
+    // tile's M dimension (free — same instruction count as v1, up to 8x more useful
+    // throughput) and grids (numKvHeads, kvSplit) like attention_f32_gqa_split_kv. Optional
+    // PTX, Ampere-only (mma.sync is sm_80+).
+    private readonly CudaModule? _attentionMmaDecodeGqaSplitModule;
+    private readonly nint _attentionMmaDecodeGqaSplitFunc;
+    private int _attnMmaDecodeGqaSplitMaxCoResidentGrid = -1; // -1 = not yet queried
+    private int _attnMmaDecodeGqaSplitCachedGroup = -1;        // group the cached query above is valid for
+
 
     /// <summary>
     /// Loads all PTX modules from the specified directory.
@@ -920,6 +932,27 @@ public sealed unsafe class CudaKernels : IDisposable
                 // Pre-Ampere driver rejected the sm_86 module — leave flash disabled.
                 _attentionFlashMmaModule = null;
                 _attentionFlashMmaFunc = 0;
+            }
+        }
+
+        // Tensor-core FP16 decode attention composed with the GQA-group + split-KV grid
+        // (issue #199 v2). Same best-effort load pattern as attention_flash_mma above and for
+        // the same reason (mma.sync PTX is sm_80+; cuModuleLoadData JITs eagerly and would
+        // throw on Turing) — a failure leaves HasAttentionMmaDecodeGqaSplit false and the
+        // gate/dispatch wrapper (CudaAttentionMmaDecodeGqaSplit) never selects it.
+        string attentionMmaDecodeGqaSplitPath = Path.Combine(ptxDir, "attention_flash_mma_decode_gqa_split.ptx");
+        if (File.Exists(attentionMmaDecodeGqaSplitPath))
+        {
+            try
+            {
+                var mmaDecodeGqaSplitModule = CudaModule.LoadFromFile(attentionMmaDecodeGqaSplitPath);
+                _attentionMmaDecodeGqaSplitFunc = mmaDecodeGqaSplitModule.TryGetFunction("attention_flash_mma_decode_gqa_split_f16");
+                _attentionMmaDecodeGqaSplitModule = mmaDecodeGqaSplitModule;
+            }
+            catch (CudaException)
+            {
+                _attentionMmaDecodeGqaSplitModule = null;
+                _attentionMmaDecodeGqaSplitFunc = 0;
             }
         }
     }
@@ -2336,6 +2369,120 @@ public sealed unsafe class CudaKernels : IDisposable
         CudaDriverApi.cuLaunchCooperativeKernel(_attentionF32GqaSplitKvFunc,
                 (uint)numKvHeads, (uint)kvSplit, 1, BlockSize, 1, 1,
                 sharedBytes, stream, (nint)args).ThrowOnError();
+    }
+
+    // ─── OPT-IN tensor-core (mma.sync) FP16 decode attention, composed with the GQA-group +
+    // split-KV grid (issue #199 v2) ─────────────────────────────────────────────────────────
+    //
+    // Same grid shape as attention_f32_gqa_split_kv above -- (numKvHeads, kvSplit) via
+    // cuLaunchCooperativeKernel -- but each block packs the `group` query heads sharing its
+    // KV head into ONE mma.sync.m16n8k16 tile's M dimension instead of register-blocking them
+    // (see attention_flash_mma_decode_gqa_split.cu's header for the full design and why this
+    // keeps the kernel's STATIC shared-memory footprint group-independent, unlike the sibling
+    // kernel's dynamic per-group shared arrays). Reads Q/K/V as FP16 (K/V straight from the
+    // FP16 KV cache) and writes F32 output directly, same convention as v1
+    // (attention_flash_mma_decode.cu, issue #199 v1, not merged).
+
+    /// <summary>Block size (NUM_WARPS*32) the composed tensor-core decode kernel is compiled
+    /// with -- MUST match <c>NUM_WARPS</c> in <c>attention_flash_mma_decode_gqa_split.cu</c>.</summary>
+    public const int AttentionMmaDecodeGqaSplitBlockSize = 256;
+
+    /// <summary>Head dimension the composed tensor-core decode kernel is compiled for
+    /// (Bonsai-27B's qwen35moe shape) -- MUST match <c>HEAD_DIM</c> in
+    /// <c>attention_flash_mma_decode_gqa_split.cu</c>.</summary>
+    public const int AttentionMmaDecodeGqaSplitHeadDim = 256;
+
+    /// <summary>
+    /// True when the composed tensor-core decode kernel (issue #199 v2) is loaded
+    /// (<c>attention_flash_mma_decode_gqa_split.ptx</c> present and the sm_86 module loaded
+    /// successfully on this device). Presence alone does not mean it's safe to launch for a
+    /// given shape -- call <see cref="MaxSafeAttentionMmaDecodeGqaSplit"/> first. See
+    /// <see cref="DotLLM.Cuda.CudaAttentionMmaDecodeGqaSplit"/> for the gating/dispatch wrapper.
+    /// </summary>
+    public bool HasAttentionMmaDecodeGqaSplit => _attentionMmaDecodeGqaSplitFunc != 0;
+
+    /// <summary>
+    /// Queries (once per distinct <paramref name="group"/>, cached) the maximum safe
+    /// <c>kvSplit</c> for <see cref="LaunchAttentionMmaDecodeGqaSplit"/> at this
+    /// (numKvHeads, group) shape on THIS GPU -- i.e. the largest S such that
+    /// <c>numKvHeads*S</c> blocks can be co-resident simultaneously (the same hard
+    /// <c>cuLaunchCooperativeKernel</c> requirement <see cref="MaxSafeAttentionGqaSplit"/>
+    /// already guards for the sibling FP32 kernel). Unlike that kernel, this one's shared
+    /// memory is STATIC and group-independent (see the .cu file's header), so the occupancy
+    /// query passes <c>dynamicSMemSize=0</c> -- the driver already knows the static footprint
+    /// from the compiled module. <paramref name="headDim"/> is accepted for API symmetry with
+    /// <see cref="MaxSafeAttentionGqaSplit"/> but is not used in the query (the kernel is
+    /// compiled for a single fixed <see cref="AttentionMmaDecodeGqaSplitHeadDim"/>). Returns 0
+    /// if the kernel isn't loaded, cooperative launch isn't supported, or the shape doesn't
+    /// fit even at split=1.
+    /// </summary>
+    public int MaxSafeAttentionMmaDecodeGqaSplit(int numKvHeads, int headDim, int group)
+    {
+        if (_attentionMmaDecodeGqaSplitFunc == 0 || numKvHeads <= 0 || group <= 0) return 0;
+
+        if (_attnMmaDecodeGqaSplitMaxCoResidentGrid < 0 || _attnMmaDecodeGqaSplitCachedGroup != group)
+        {
+            CudaDriverApi.cuCtxGetDevice(out int device);
+            int coopSupported = 0;
+            CudaDriverApi.cuDeviceGetAttribute(out coopSupported,
+                CudaDriverApi.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device);
+            if (coopSupported == 0)
+            {
+                _attnMmaDecodeGqaSplitMaxCoResidentGrid = 0;
+            }
+            else
+            {
+                CudaDriverApi.cuDeviceGetAttribute(out int numSms,
+                    CudaDriverApi.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+                int rc = CudaDriverApi.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    out int maxBlocksPerSm, _attentionMmaDecodeGqaSplitFunc,
+                    AttentionMmaDecodeGqaSplitBlockSize, dynamicSMemSize: 0);
+                _attnMmaDecodeGqaSplitMaxCoResidentGrid = rc == 0 ? numSms * maxBlocksPerSm : 0;
+            }
+            _attnMmaDecodeGqaSplitCachedGroup = group;
+        }
+
+        if (_attnMmaDecodeGqaSplitMaxCoResidentGrid <= 0) return 0;
+        return _attnMmaDecodeGqaSplitMaxCoResidentGrid / numKvHeads; // integer floor; 0 = unsafe at any split
+    }
+
+    /// <summary>
+    /// OPT-IN, default-OFF composed tensor-core decode kernel (issue #199 v2), decode-only
+    /// (<c>seqQ==1</c> implicit). Grid = <c>(numKvHeads, kvSplit)</c> using CUDA Cooperative
+    /// Groups <c>grid.sync()</c> -- still exactly ONE kernel launch, same shape and combine
+    /// algebra as <see cref="LaunchAttentionF32GqaSplit"/> (ported verbatim -- see the .cu
+    /// file's header). Callers MUST have confirmed <see cref="CudaKernels.IsGqaGroupShapeSupported"/>
+    /// and clamped <paramref name="kvSplit"/> to <see cref="MaxSafeAttentionMmaDecodeGqaSplit"/>'s
+    /// result before calling (exceeding the cooperative-launch co-residency ceiling is a hard
+    /// CUDA error).
+    /// </summary>
+    /// <param name="q">Device pointer to this step's query, FP16, <c>[numHeads, headDim]</c> (seqQ=1).</param>
+    /// <param name="k">Device pointer to the FP16 KV cache's keys, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="v">Device pointer to the FP16 KV cache's values, <c>[seqKv, numKvHeads, headDim]</c>.</param>
+    /// <param name="output">Device pointer to the F32 output, <c>[numHeads, headDim]</c>. Overwritten.</param>
+    /// <param name="seqKv">Cached KV length.</param>
+    /// <param name="numHeads">Number of query attention heads.</param>
+    /// <param name="numKvHeads">Number of KV heads (GQA group = numHeads/numKvHeads).</param>
+    /// <param name="kvSplit">KV-dimension split factor -- see <see cref="ComputeAttentionKvSplit"/>.</param>
+    /// <param name="partialMax">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialSum">Scratch, <c>[numHeads, kvSplit]</c> floats.</param>
+    /// <param name="partialOut">Scratch, <c>[numHeads, kvSplit, headDim]</c> floats.</param>
+    /// <param name="stream">CUDA stream handle.</param>
+    public void LaunchAttentionMmaDecodeGqaSplit(nint q, nint k, nint v, nint output,
+        int seqKv, int numHeads, int numKvHeads, int kvSplit,
+        nint partialMax, nint partialSum, nint partialOut, nint stream)
+    {
+        nint qArg = q, kArg = k, vArg = v, outArg = output;
+        int skvArg = seqKv, nhArg = numHeads, nkvArg = numKvHeads, ksArg = kvSplit;
+        float scArg = 1.0f / MathF.Sqrt(AttentionMmaDecodeGqaSplitHeadDim);
+        nint pmArg = partialMax, psArg = partialSum, poutArg = partialOut;
+
+        void** args = stackalloc void*[] {&qArg, &kArg, &vArg, &outArg,
+                        &skvArg, &nhArg, &nkvArg, &scArg, &ksArg, &pmArg, &psArg, &poutArg};
+
+        CudaDriverApi.cuLaunchCooperativeKernel(_attentionMmaDecodeGqaSplitFunc,
+                (uint)numKvHeads, (uint)kvSplit, 1, AttentionMmaDecodeGqaSplitBlockSize, 1, 1,
+                0, stream, (nint)args).ThrowOnError();
     }
 
 

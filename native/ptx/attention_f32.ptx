@@ -17,7 +17,7 @@
 // _ZZ25attention_f32_split_kv_hpE14s_combined_sum has been demoted
 // _ZZ26attention_f32_gqa_split_kvE14s_combined_max has been demoted
 // _ZZ26attention_f32_gqa_split_kvE14s_combined_sum has been demoted
-.global .align 1 .b8 _ZN47_INTERNAL_051203f9_16_attention_f32_cu_1cd535884cuda3std3__45__cpo9iter_swapE[1];
+.global .align 1 .b8 _ZN47_INTERNAL_376e1d8f_16_attention_f32_cu_1cd535884cuda3std3__45__cpo9iter_swapE[1];
 .extern .shared .align 16 .b8 smem[];
 
 .visible .entry attention_f32(
@@ -3393,7 +3393,6 @@ $L__BB3_102:
 	st.shared.f32 	[%r469], %f34;
 
 $L__BB3_104:
-	bar.sync 	0;
 	add.s32 	%r507, %r507, 1;
 	setp.lt.s32 	%p82, %r507, %r2;
 	@%p82 bra 	$L__BB3_63;

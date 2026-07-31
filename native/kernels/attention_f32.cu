@@ -874,7 +874,34 @@ extern "C" __global__ void __launch_bounds__(256) attention_f32_gqa_split_kv(
             running_sum += warp_scratch[0];
 
             if (threadIdx.x == 0) { running_max_s[g] = new_max; running_sum_s[g] = running_sum; }
-            __syncthreads();
+            // NOTE (issue #230): no __syncthreads() here. This barrier existed only to guard
+            // `warp_scratch` reuse across loop iterations (next g's max-phase write at the top of
+            // this loop vs this g's sum-phase read just above) -- a WAR hazard on the SCRATCH
+            // BUFFER, not a real data dependency. It is already provably redundant:
+            //   - Within one head, `warp_scratch` is next touched by the NEXT head's max-phase
+            //     write, which is immediately followed by a REAL barrier (the `__syncthreads()`
+            //     after the `warp_scratch[warp_id] = tile_max` write, a few lines below the top of
+            //     this loop). That barrier requires every thread in the block to have reached it,
+            //     which (single-threaded-per-thread program order) is only possible after every
+            //     thread has already finished this g's entire body, INCLUDING the read above --
+            //     so the WAR hazard is already closed by that barrier, transitively.
+            //   - On the LAST iteration (g == group-1), nothing between here and the PV phase
+            //     below touches `warp_scratch`, `score_tile[g]`, or `out_accum[g]` for this head --
+            //     those were already made block-visible by the real barrier a few lines up (the one
+            //     guarding `warp_scratch[lane] = tile_sum` / the cross-warp sum combine), so the PV
+            //     phase's reads are safe without an additional rendezvous here.
+            // ncu (`.perf-runs/ncu-2026-07-30-post197198/`) attributed 44.2% of this kernel's
+            // per-instruction stall cycles to CTA-barrier waits; SASS inspection (ptxas -arch=sm_86
+            // + cuobjdump --dump-sass / nvdisasm -g, no elevation needed, matching issue #218's
+            // verify-before-trusting precedent) confirmed this per-head reduction loop -- run
+            // sequentially `group` times per KV tile, as the kernel's own header already flags as
+            // the one place this design doesn't parallelize across the group -- accounts for the
+            // large majority of the kernel's dynamic barrier count (36 of ~39-51 barrier hits per
+            // decode step at Bonsai-27B's group=6). This specific barrier was one of six per
+            // iteration; removing it is a pure dependency-graph correction (no change to any
+            // floating-point value, order, or the kv_split==1 bit-exactness contract) validated by
+            // CudaAttentionF32GqaSplitTests (all group sizes 1..8) and
+            // CudaAttentionSplitKvGenerationParityTests.
         }
 
         // -- Register-blocked PV: each V element read from global ONCE, reused `group` times. --

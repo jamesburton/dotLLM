@@ -848,6 +848,11 @@ internal sealed class RepackedLayerWeights : IDisposable
 {
     public WeightRepacking.RepackedWeight Q, K, V, O, Gate, Up, Down;
 
+    /// <summary>Total unmanaged bytes held by this layer's R4 buffers. Unrepacked projections contribute 0.</summary>
+    public long AllocatedBytes =>
+        Q.AllocatedBytes + K.AllocatedBytes + V.AllocatedBytes + O.AllocatedBytes
+        + Gate.AllocatedBytes + Up.AllocatedBytes + Down.AllocatedBytes;
+
     public void Dispose()
     {
         Q.Dispose(); K.Dispose(); V.Dispose(); O.Dispose();
@@ -930,6 +935,17 @@ internal sealed class TransformerWeights : IDisposable
     /// is null (pure-mmap GGUF load with nothing to own).
     /// </summary>
     private readonly HashSet<nint>? _liveOwnedAllocations;
+
+    /// <summary>
+    /// Total unmanaged bytes held by R4-interleaved buffers. Zero until <see cref="RepackWeights"/> runs,
+    /// and zero for models whose weights are not repackable (F32/F16).
+    /// </summary>
+    /// <remarks>
+    /// These buffers are a second copy of the weights, held in committed memory alongside the
+    /// memory-mapped originals — reporting that counts only the mapped file understates the
+    /// process footprint by roughly 2x.
+    /// </remarks>
+    public long RepackedBytes { get; private set; }
 
     private TransformerWeights(
         nint tokenEmbedWeight, QuantizationType tokenEmbedQuantType, int vocabSize, int hiddenSize,
@@ -1215,6 +1231,12 @@ internal sealed class TransformerWeights : IDisposable
 
         if (WeightRepacking.IsRepackable(OutputQuantType))
             RepackedOutput = WeightRepacking.RepackR4(OutputWeight, OutputQuantType, OutputOutputDim, OutputInputDim);
+
+        long total = 0;
+        foreach (var rl in repacked)
+            total += rl.AllocatedBytes;
+        total += RepackedOutput?.AllocatedBytes ?? 0;
+        RepackedBytes = total;
     }
 
     private static WeightRepacking.RepackedWeight TryRepack(nint ptr, QuantizationType qt, int m, int k)
