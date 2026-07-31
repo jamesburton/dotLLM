@@ -23,8 +23,11 @@ public static class ReluSquared
         // A previous version did Multiply(input,input,result) first and then a scalar
         // zero-out step that read input[i], but in-place that read saw the already-
         // squared (non-negative) value and the zero-out became a no-op; fixed here.
-        TensorPrimitives.Max(input, 0.0f, result);
-        TensorPrimitives.Multiply(result, result, result);
+        // Slice to input.Length first: result may legitimately be longer (pooled
+        // scratch buffer), and squaring the whole span would corrupt the tail.
+        Span<float> dest = result[..input.Length];
+        TensorPrimitives.Max(input, 0.0f, dest);
+        TensorPrimitives.Multiply(dest, dest, dest);
     }
 
     /// <summary>Scalar reference for correctness verification.</summary>
