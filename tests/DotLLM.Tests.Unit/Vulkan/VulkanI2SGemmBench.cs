@@ -109,6 +109,15 @@ public sealed class VulkanI2SGemmBench
         else
             _output.WriteLine("NOTE: VK_KHR_cooperative_matrix absent — coopmat comparison skipped.");
 
+        // Optional substring filter so a profiler run (VTune gpu-hotspots) can target one
+        // comparison instead of the whole sweep — under a profiler the full matrix is far too slow.
+        string? only = Environment.GetEnvironmentVariable("DOTLLM_I2S_GEMM_BENCH_FILTER");
+        if (!string.IsNullOrEmpty(only))
+        {
+            comparisons.RemoveAll(cmp => !cmp.Label.Contains(only, StringComparison.OrdinalIgnoreCase));
+            _output.WriteLine($"FILTER: '{only}' -> {comparisons.Count} comparison(s)");
+        }
+
         foreach (var (label, refVariant, challVariant) in comparisons)
         {
             using var refKernel = MatMulI2SGemmF32Kernel.Create(device, spvDir, refVariant);

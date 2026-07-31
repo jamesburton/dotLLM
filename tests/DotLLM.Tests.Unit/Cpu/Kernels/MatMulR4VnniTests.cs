@@ -27,7 +27,9 @@ public sealed unsafe class MatMulR4VnniTests
     /// <summary>True when the hardware can execute <c>VecDotQ8_0Vnni_4RowsR4</c> at all.</summary>
     private static bool VnniAvailable => Avx512BW.IsSupported && AvxVnni.IsSupported;
 
-    public static TheoryData<int> DiscriminatingBlockCounts() => [1, 2, 3, 8, 17, 18, 48, 128];
+    // Explicit initializer rather than a collection expression: MA0005 misfires on
+    // `=> [...]` targeting TheoryData<T> and fails the build as "Use Array.Empty<T>()".
+    public static TheoryData<int> DiscriminatingBlockCounts() => new() { 1, 2, 3, 8, 17, 18, 48, 128 };
 
     [Theory]
     [MemberData(nameof(DiscriminatingBlockCounts))]
