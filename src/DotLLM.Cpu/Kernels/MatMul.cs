@@ -303,6 +303,104 @@ public static unsafe partial class MatMul
     }
 
     /// <summary>
+    /// AVX-VNNI 4-row Q8_0 dot product for the R4-interleaved layout — the VNNI counterpart of
+    /// <see cref="VecDotQ8_0Avx2_4RowsR4"/>, replacing each <c>vpmaddubsw</c> + <c>vpmaddwd(ones)</c>
+    /// pair with a single <c>vpdpbusd</c> and accumulating in <see cref="Vector512{T}"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Not dispatched to — measurably slower.</strong> On an AVX-512 host
+    /// (AVX-512F+CD+BW+DQ+VL+VBMI, .NET 10.0.10) this is <em>1.8-1.9x slower</em> than
+    /// <see cref="VecDotQ8_0Avx2_4RowsR4"/> as a microkernel (K=512: 176.6ns vs 93.1ns; K=4096:
+    /// 1344ns vs 743ns) and 1.7x slower at prefill scale. <c>ComputeRowsQ8_0Interleaved</c>
+    /// therefore keeps the AVX2 kernel. Retained because <c>R4VnniMicroBenchmarks</c> measures it,
+    /// so the comparison can be re-run on other microarchitectures with one command — the result
+    /// above is one CPU, and Zen5 / Meteor Lake may well order these differently.
+    /// </para>
+    /// <para>
+    /// The cost is the per-dual-block assembly, not <c>vpdpbusd</c> itself: two
+    /// <see cref="Vector256{T}"/>-to-<see cref="Vector512{T}"/> inserts plus a broadcast-and-insert
+    /// to build the scale vector, paid per row per block pair, against a single broadcast in the
+    /// 256-bit path. Q8_0's per-block fp16 scale forces a convert-scale-FMA after every 32
+    /// elements, so the long int32 accumulation chain that VNNI exists to feed never forms.
+    /// </para>
+    /// <para>
+    /// Blocks are consumed in pairs along K so two 32-element blocks fill one 512-bit accumulator,
+    /// mirroring <see cref="VecDotQ8_0Vnni_4Rows"/>. The odd trailing block, if any, falls back to
+    /// the AVX2 single-block helper.
+    /// </para>
+    /// <para>
+    /// The integer reduction is exact: both <c>vpdpbusd</c> and the <c>vpmaddubsw</c> +
+    /// <c>vpmaddwd(ones)</c> pair group 4 consecutive byte products into one int32 lane, the i16
+    /// intermediate saturates only above 32767, and |x|,|w| &lt;= 127 bounds each lane at
+    /// 2*127*127 = 32258, so no saturation occurs on either path.
+    /// </para>
+    /// <para>
+    /// Results are <em>not</em> bit-identical to <see cref="VecDotQ8_0Avx2_4RowsR4"/>, because the
+    /// per-block <c>dw*dx</c> products are summed in a different order and width — 16 lanes of one
+    /// <see cref="Vector512{T}"/> here against 8 lanes of <see cref="Vector256{T}"/> there. The
+    /// difference is FP32 reassociation only, not a difference in the arithmetic performed.
+    /// </para>
+    /// </remarks>
+    [SkipLocalsInit]
+    internal static void VecDotQ8_0Vnni_4RowsR4(
+        byte* groupBase, byte* x, int blockCount, float* results)
+    {
+        Vector512<float> acc0 = Vector512<float>.Zero;
+        Vector512<float> acc1 = Vector512<float>.Zero;
+        Vector512<float> acc2 = Vector512<float>.Zero;
+        Vector512<float> acc3 = Vector512<float>.Zero;
+        const int wStride = 4 * Q8_0BlockBytes;
+
+        int block = 0;
+
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* xBlock0 = x + block * Q8_0BlockBytes;
+            byte* xBlock1 = x + (block + 1) * Q8_0BlockBytes;
+            float dx0 = (float)Unsafe.ReadUnaligned<Half>(xBlock0);
+            float dx1 = (float)Unsafe.ReadUnaligned<Half>(xBlock1);
+
+            // Load x data once and share it across all 4 rows.
+            Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock0 + 2);
+            Vector256<sbyte> vx1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock1 + 2);
+            Vector256<sbyte> absX0 = Avx2.Sign(vx0, vx0);
+            Vector256<sbyte> absX1 = Avx2.Sign(vx1, vx1);
+
+            // Row r's block b lives at groupBase + b * wStride + r * Q8_0BlockBytes, so each row
+            // is a fixed offset from the group base with the interleave stride between its blocks.
+            ProcessVnniDualBlock(groupBase, block, wStride,
+                vx0, vx1, absX0, absX1, dx0, dx1, ref acc0);
+            ProcessVnniDualBlock(groupBase + Q8_0BlockBytes, block, wStride,
+                vx0, vx1, absX0, absX1, dx0, dx1, ref acc1);
+            ProcessVnniDualBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride,
+                vx0, vx1, absX0, absX1, dx0, dx1, ref acc2);
+            ProcessVnniDualBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride,
+                vx0, vx1, absX0, absX1, dx0, dx1, ref acc3);
+        }
+
+        results[0] = HorizontalSumAvx512Float(acc0);
+        results[1] = HorizontalSumAvx512Float(acc1);
+        results[2] = HorizontalSumAvx512Float(acc2);
+        results[3] = HorizontalSumAvx512Float(acc3);
+
+        // Handle odd trailing block via AVX2.
+        if (block < blockCount)
+        {
+            byte* xBlock = x + block * Q8_0BlockBytes;
+            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
+            Vector256<sbyte> absX = Avx2.Sign(vx, vx);
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            results[0] += ProcessAvx2SingleBlock(groupBase, block, wStride, vx, absX, dx, ones);
+            results[1] += ProcessAvx2SingleBlock(groupBase + Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
+            results[2] += ProcessAvx2SingleBlock(groupBase + 2 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
+            results[3] += ProcessAvx2SingleBlock(groupBase + 3 * Q8_0BlockBytes, block, wStride, vx, absX, dx, ones);
+        }
+    }
+
+    /// <summary>
     /// Processes R4-interleaved Q8_0 weights where groups of 4 rows have their blocks
     /// stored contiguously: [r0_b0][r1_b0][r2_b0][r3_b0][r0_b1][r1_b1]...
     /// Reads sequentially instead of striding, improving cache and prefetch behavior.
@@ -314,6 +412,8 @@ public static unsafe partial class MatMul
     {
         int groupBytes = 4 * blockCount * Q8_0BlockBytes;
 
+        // AVX2 is deliberately preferred over the wider tiers here — see the measurements on
+        // VecDotQ8_0Vnni_4RowsR4, which is 1.7-1.9x SLOWER than this kernel on AVX-512 hardware.
         if (Avx2.IsSupported)
         {
             for (int g = 0; g < fullGroups; g++)
@@ -341,6 +441,144 @@ public static unsafe partial class MatMul
                 result[fullGroups * 4 + r] = Avx2.IsSupported
                     ? VecDotQ8_0Avx2(tailBase + (long)r * rowBytes, xQ8, blockCount)
                     : VecDotQ8_0Scalar(tailBase + (long)r * rowBytes, xQ8, blockCount);
+        }
+    }
+
+    /// <summary>
+    /// L2-tiled multi-token GEMM over R4-interleaved Q8_0 weights.
+    /// C is [N x M] row-major (<c>C[token * m + row]</c>), matching <see cref="ComputeGemmTiled"/>.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately mirrors <see cref="ComputeGemmTiled"/>'s shape — tile over rows, iterate all
+    /// tokens inside the tile so a tile's weights are streamed once and reused across the batch —
+    /// rather than the outer-product microkernel approach in <c>OuterProductGemmQ8_0</c>,
+    /// which measured slower than the row-major tiled GEMM on both AVX2 (Step 26, #61) and
+    /// AVX-512. Tiling is over 4-row groups since that is the R4 interleave unit.
+    /// </remarks>
+    /// <param name="repackedWeights">R4-interleaved weight data.</param>
+    /// <param name="inputQ8">Pre-quantized Q8_0 input, [N x q8RowBytes].</param>
+    /// <param name="c">Output [N x M], row-major.</param>
+    /// <param name="fullGroups">Complete 4-row groups (M / 4).</param>
+    /// <param name="tailRows">Leftover rows (M % 4), stored row-major after the interleaved data.</param>
+    /// <param name="blockCount">Blocks per row (K / 32).</param>
+    /// <param name="m">Total output rows.</param>
+    /// <param name="n">Token count.</param>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void GemmR4TiledQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
+        int fullGroups, int tailRows, int blockCount, int m, int n)
+    {
+        int q8RowBytes = blockCount * Q8_0BlockBytes;
+        int groupBytes = 4 * q8RowBytes;
+        // Same L2 budget as the row-major path, expressed in groups rather than rows.
+        int tileGroups = Math.Max(1, ComputeTileM(q8RowBytes) / 4);
+
+        for (int gStart = 0; gStart < fullGroups; gStart += tileGroups)
+        {
+            int gCount = Math.Min(tileGroups, fullGroups - gStart);
+            byte* tileWeights = repackedWeights + (long)gStart * groupBytes;
+
+            for (int t = 0; t < n; t++)
+            {
+                ComputeRowsQ8_0Interleaved(
+                    tileWeights,
+                    inputQ8 + (long)t * q8RowBytes,
+                    c + (long)t * m + gStart * 4,
+                    gCount, tailRows: 0, blockCount);
+            }
+        }
+
+        // Tail rows live row-major after all interleaved groups, so the row-major kernel applies.
+        if (tailRows > 0)
+        {
+            byte* tailBase = repackedWeights + (long)fullGroups * groupBytes;
+            for (int t = 0; t < n; t++)
+            {
+                ComputeRows(
+                    tailBase,
+                    inputQ8 + (long)t * q8RowBytes,
+                    c + (long)t * m + fullGroups * 4,
+                    tailRows, blockCount);
+            }
+        }
+    }
+
+    private struct GemmR4TiledQ8Ctx
+    {
+        public byte* RepackedWeights;
+        public byte* InputQ8;
+        public float* C;
+        public int FullGroups;
+        public int TailRows;
+        public int BlockCount;
+        public int M;
+        public int N;
+        public int TileGroups;
+    }
+
+    /// <summary>
+    /// Parallel <c>GemmR4TiledQ8_0</c>. Partitions row-group tiles across threads; each
+    /// thread owns a disjoint row range of C, so no synchronisation is needed.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static void GemmR4TiledQ8_0(byte* repackedWeights, byte* inputQ8, float* c,
+        int fullGroups, int tailRows, int blockCount, int m, int n, ComputeThreadPool? pool)
+    {
+        if (pool is null || m < ParallelMinRows)
+        {
+            GemmR4TiledQ8_0(repackedWeights, inputQ8, c, fullGroups, tailRows, blockCount, m, n);
+            return;
+        }
+
+        var ctx = new GemmR4TiledQ8Ctx
+        {
+            RepackedWeights = repackedWeights, InputQ8 = inputQ8, C = c,
+            FullGroups = fullGroups, TailRows = tailRows, BlockCount = blockCount,
+            M = m, N = n, TileGroups = Math.Max(1, ComputeTileM(blockCount * Q8_0BlockBytes) / 4),
+        };
+        pool.Dispatch((nint)(&ctx), &GemmR4TiledQ8Worker);
+    }
+
+    private static void GemmR4TiledQ8Worker(nint ctxPtr, int threadIdx, int threadCount)
+    {
+        ref var ctx = ref Unsafe.AsRef<GemmR4TiledQ8Ctx>((void*)ctxPtr);
+
+        int q8RowBytes = ctx.BlockCount * Q8_0BlockBytes;
+        int groupBytes = 4 * q8RowBytes;
+
+        // Partition groups across threads, then tile within each thread's share.
+        int groupsPerThread = (ctx.FullGroups + threadCount - 1) / threadCount;
+        int startGroup = threadIdx * groupsPerThread;
+        int endGroup = Math.Min(startGroup + groupsPerThread, ctx.FullGroups);
+
+        for (int gStart = startGroup; gStart < endGroup; gStart += ctx.TileGroups)
+        {
+            int gCount = Math.Min(ctx.TileGroups, endGroup - gStart);
+            byte* tileWeights = ctx.RepackedWeights + (long)gStart * groupBytes;
+
+            for (int t = 0; t < ctx.N; t++)
+            {
+                ComputeRowsQ8_0Interleaved(
+                    tileWeights,
+                    ctx.InputQ8 + (long)t * q8RowBytes,
+                    ctx.C + (long)t * ctx.M + gStart * 4,
+                    gCount, tailRows: 0, ctx.BlockCount);
+            }
+        }
+
+        // Thread 0 handles the row-major tail rows.
+        if (threadIdx == 0 && ctx.TailRows > 0)
+        {
+            byte* tailBase = ctx.RepackedWeights + (long)ctx.FullGroups * groupBytes;
+            for (int t = 0; t < ctx.N; t++)
+            {
+                ComputeRows(
+                    tailBase,
+                    ctx.InputQ8 + (long)t * q8RowBytes,
+                    ctx.C + (long)t * ctx.M + ctx.FullGroups * 4,
+                    ctx.TailRows, ctx.BlockCount);
+            }
         }
     }
 
@@ -676,10 +914,10 @@ public static unsafe partial class MatMul
             Vector256<sbyte> absX = Avx2.Sign(vx, vx);
             Vector256<short> ones = Vector256.Create((short)1);
 
-            results[0] += ProcessAvx2SingleBlock(w0, block, vx, absX, dx, ones);
-            results[1] += ProcessAvx2SingleBlock(w1, block, vx, absX, dx, ones);
-            results[2] += ProcessAvx2SingleBlock(w2, block, vx, absX, dx, ones);
-            results[3] += ProcessAvx2SingleBlock(w3, block, vx, absX, dx, ones);
+            results[0] += ProcessAvx2SingleBlock(w0, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[1] += ProcessAvx2SingleBlock(w1, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[2] += ProcessAvx2SingleBlock(w2, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[3] += ProcessAvx2SingleBlock(w3, block, Q8_0BlockBytes, vx, absX, dx, ones);
         }
     }
 
@@ -718,13 +956,111 @@ public static unsafe partial class MatMul
         acc = Avx512F.FusedMultiplyAdd(fsum512, scale, acc);
     }
 
+    /// <summary>
+    /// AVX-VNNI multi-row (4 rows) Q8_0 dot product. Identical to
+    /// <see cref="VecDotQ8_0Avx512_4Rows"/> except the u8xi8 widening pair
+    /// (<c>vpmaddubsw</c> + <c>vpmaddwd</c>) is replaced by a single <c>vpdpbusd</c>.
+    /// </summary>
+    /// <remarks>
+    /// Both forms group 4 consecutive byte products into one int32 lane, so results match
+    /// bit-for-bit over the Q8_0 value range: the i16 intermediate in the non-VNNI path
+    /// saturates only above 32767, and |x|,|w| &lt;= 127 bounds each lane at 2*127*127 = 32258.
+    /// <c>vpdpbusd</c> accumulates directly in int32 and cannot saturate at all.
+    /// </remarks>
+    [SkipLocalsInit]
+    internal static void VecDotQ8_0Vnni_4Rows(
+        byte* w0, byte* w1, byte* w2, byte* w3,
+        byte* x, int blockCount, float* results)
+    {
+        Vector512<float> acc0 = Vector512<float>.Zero;
+        Vector512<float> acc1 = Vector512<float>.Zero;
+        Vector512<float> acc2 = Vector512<float>.Zero;
+        Vector512<float> acc3 = Vector512<float>.Zero;
+
+        int block = 0;
+
+        for (; block + 1 < blockCount; block += 2)
+        {
+            byte* xBlock0 = x + block * Q8_0BlockBytes;
+            byte* xBlock1 = x + (block + 1) * Q8_0BlockBytes;
+            float dx0 = (float)Unsafe.ReadUnaligned<Half>(xBlock0);
+            float dx1 = (float)Unsafe.ReadUnaligned<Half>(xBlock1);
+
+            Vector256<sbyte> vx0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock0 + 2);
+            Vector256<sbyte> vx1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock1 + 2);
+            Vector256<sbyte> absX0 = Avx2.Sign(vx0, vx0);
+            Vector256<sbyte> absX1 = Avx2.Sign(vx1, vx1);
+
+            ProcessVnniDualBlock(w0, block, Q8_0BlockBytes, vx0, vx1, absX0, absX1, dx0, dx1, ref acc0);
+            ProcessVnniDualBlock(w1, block, Q8_0BlockBytes, vx0, vx1, absX0, absX1, dx0, dx1, ref acc1);
+            ProcessVnniDualBlock(w2, block, Q8_0BlockBytes, vx0, vx1, absX0, absX1, dx0, dx1, ref acc2);
+            ProcessVnniDualBlock(w3, block, Q8_0BlockBytes, vx0, vx1, absX0, absX1, dx0, dx1, ref acc3);
+        }
+
+        results[0] = HorizontalSumAvx512Float(acc0);
+        results[1] = HorizontalSumAvx512Float(acc1);
+        results[2] = HorizontalSumAvx512Float(acc2);
+        results[3] = HorizontalSumAvx512Float(acc3);
+
+        if (block < blockCount)
+        {
+            byte* xBlock = x + block * Q8_0BlockBytes;
+            float dx = (float)Unsafe.ReadUnaligned<Half>(xBlock);
+            Vector256<sbyte> vx = Unsafe.ReadUnaligned<Vector256<sbyte>>(xBlock + 2);
+            Vector256<sbyte> absX = Avx2.Sign(vx, vx);
+            Vector256<short> ones = Vector256.Create((short)1);
+
+            results[0] += ProcessAvx2SingleBlock(w0, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[1] += ProcessAvx2SingleBlock(w1, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[2] += ProcessAvx2SingleBlock(w2, block, Q8_0BlockBytes, vx, absX, dx, ones);
+            results[3] += ProcessAvx2SingleBlock(w3, block, Q8_0BlockBytes, vx, absX, dx, ones);
+        }
+    }
+
+    // blockStride is the byte distance between consecutive blocks of the same row:
+    // Q8_0BlockBytes for row-major weights, 4 * Q8_0BlockBytes for R4-interleaved groups where
+    // three other rows' blocks sit between them. Always a constant at the call site, so it folds.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ProcessVnniDualBlock(
+        byte* w, int block, int blockStride,
+        Vector256<sbyte> vx0, Vector256<sbyte> vx1,
+        Vector256<sbyte> absX0, Vector256<sbyte> absX1,
+        float dx0, float dx1,
+        ref Vector512<float> acc)
+    {
+        byte* wBlock0 = w + block * blockStride;
+        byte* wBlock1 = w + (block + 1) * blockStride;
+        float dw0 = (float)Unsafe.ReadUnaligned<Half>(wBlock0);
+        float dw1 = (float)Unsafe.ReadUnaligned<Half>(wBlock1);
+
+        Vector256<sbyte> vw0 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock0 + 2);
+        Vector256<sbyte> vw1 = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock1 + 2);
+
+        Vector256<sbyte> adjW0 = Avx2.Sign(vw0, vx0);
+        Vector256<sbyte> adjW1 = Avx2.Sign(vw1, vx1);
+
+        // Single vpdpbusd each, replacing vpmaddubsw + vpmaddwd.
+        Vector256<int> isum0 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absX0.AsByte(), adjW0);
+        Vector256<int> isum1 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, absX1.AsByte(), adjW1);
+
+        Vector512<int> isum512 = Vector512.Create(isum0, isum1);
+        Vector512<float> fsum512 = Avx512F.ConvertToVector512Single(isum512);
+
+        Vector512<float> scale = Vector512.Create(
+            Vector256.Create(dx0 * dw0),
+            Vector256.Create(dx1 * dw1));
+
+        acc = Avx512F.FusedMultiplyAdd(fsum512, scale, acc);
+    }
+
+    // blockStride as in ProcessVnniDualBlock.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float ProcessAvx2SingleBlock(
-        byte* w, int block,
+        byte* w, int block, int blockStride,
         Vector256<sbyte> vx, Vector256<sbyte> absX,
         float dx, Vector256<short> ones)
     {
-        byte* wBlock = w + block * Q8_0BlockBytes;
+        byte* wBlock = w + block * blockStride;
         float dw = (float)Unsafe.ReadUnaligned<Half>(wBlock);
         Vector256<sbyte> vw = Unsafe.ReadUnaligned<Vector256<sbyte>>(wBlock + 2);
         Vector256<sbyte> adjW = Avx2.Sign(vw, vx);

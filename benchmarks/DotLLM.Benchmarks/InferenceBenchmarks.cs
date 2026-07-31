@@ -27,7 +27,10 @@ public enum BenchmarkModel
 /// End-to-end inference benchmarks measuring prefill + decode throughput.
 /// Custom BDN columns display tok/s via a file-based metrics bridge.
 /// </summary>
-[SimpleJob(warmupCount: 2, iterationCount: 5)]
+// Job configuration lives in MultiRuntimeConfig so a single run can span several .NET
+// runtimes (DOTLLM_BENCH_RUNTIMES). It carries the same warmup/iteration counts the
+// [SimpleJob(warmupCount: 2, iterationCount: 5)] attribute used to set here.
+[Config(typeof(MultiRuntimeConfig))]
 public class InferenceBenchmarks
 {
     private static readonly Dictionary<BenchmarkModel, (string RepoId, string Filename, int ApproxSizeMB)> s_models = new()
@@ -115,18 +118,26 @@ public class InferenceBenchmarks
         }
         else
         {
+            // DOTLLM_BENCH_THREADS lets the harness pin the thread count so cross-engine
+            // comparisons are like-for-like; 0/unset keeps auto (all logical cores).
+            var threading = int.TryParse(
+                Environment.GetEnvironmentVariable("DOTLLM_BENCH_THREADS"), out int envThreads)
+                && envThreads > 0
+                ? new ThreadingConfig(envThreads)
+                : ThreadingConfig.Auto;
+
             // Architecture-aware dispatch — TransformerModel handles dense (Llama/Mistral/Phi/Qwen)
             // and DeepSeek-V2/V3, but hybrid SSM+attention models like Qwen3MoeHybrid have
             // their own concrete IModel type.
             if (config.Architecture == Architecture.Qwen3MoeHybrid)
             {
-                _model = Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config, ThreadingConfig.Auto);
+                _model = Qwen3MoeHybridTransformerModel.LoadFromGguf(_gguf, config, threading);
             }
             else
             {
-                _model = TransformerModel.LoadFromGguf(_gguf, config, ThreadingConfig.Auto);
+                _model = TransformerModel.LoadFromGguf(_gguf, config, threading);
             }
-            Console.WriteLine($"Device: CPU ({ThreadingConfig.Auto.EffectiveThreadCount} threads)");
+            Console.WriteLine($"Device: CPU ({threading.EffectiveThreadCount} threads)");
         }
 
         _generator = new TextGenerator(_model, _tokenizer, kvFactory);
@@ -230,7 +241,11 @@ public class InferenceBenchmarks
                 AllDecodeMs: decodeMsAll,
                 AllPrefillMs: prefillMsAll);
 
+            // Write both the plain key (single-runtime runs, and backward compatibility) and a
+            // runtime-qualified one, so a multi-runtime run keeps each job's metrics separate.
             InferenceMetricsFile.Write(_metricsKey, metrics);
+            InferenceMetricsFile.Write(
+                InferenceMetricsFile.ComposeKey(_metricsKey, InferenceMetricsFile.CurrentTfm), metrics);
         }
 
         _model?.Dispose();
