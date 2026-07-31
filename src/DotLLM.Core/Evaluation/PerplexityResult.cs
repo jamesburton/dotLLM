@@ -77,8 +77,13 @@ public readonly record struct PerplexityOptions(
     /// non-overlapping chunks of <paramref name="contextLength"/>, scoring the second half of each.
     /// </summary>
     /// <remarks>
-    /// This is the configuration whose output is directly comparable to published llama.cpp
-    /// figures. Verified against llama.cpp build 8683 (<c>d0a6dfeb2</c>).
+    /// <para>This is the configuration whose output is directly comparable to published llama.cpp
+    /// figures. Verified against llama.cpp build 8683 (<c>d0a6dfeb2</c>).</para>
+    /// <para>The unscored prefix is <c>contextLength / 2 + 1</c>, not <c>contextLength / 2</c>.
+    /// llama.cpp sets <c>first = n_ctx/2</c> and then accumulates <c>count += n_ctx - first - 1</c>,
+    /// scoring targets <c>[first + 1, n_ctx)</c> — the token at index <c>first</c> is context, never
+    /// a target. Scoring it too yields <c>n_ctx/2</c> targets where llama.cpp has
+    /// <c>n_ctx/2 - 1</c>, which is a different measurement wearing the same name.</para>
     /// </remarks>
     /// <param name="contextLength">Window size.</param>
     /// <param name="maxTokens">Corpus token cap; <c>0</c> for unbounded.</param>
@@ -87,7 +92,7 @@ public readonly record struct PerplexityOptions(
     /// </param>
     public static PerplexityOptions LlamaCppDefault(int contextLength, int maxTokens = 0, int bosTokenId = -1) =>
         new(PerplexityMode.SlidingWindow, contextLength, Stride: contextLength, maxTokens,
-            UnscoredPrefix: contextLength / 2, BosTokenId: bosTokenId);
+            UnscoredPrefix: contextLength / 2 + 1, BosTokenId: bosTokenId);
 }
 
 /// <summary>Outcome of a perplexity run.</summary>
@@ -103,8 +108,22 @@ public readonly record struct PerplexityOptions(
 /// matches: a perplexity computed over a different token count is a different measurement.
 /// </param>
 /// <param name="WindowCount">Number of forward windows evaluated.</param>
+/// <param name="StandardError">
+/// One standard error of <see cref="Perplexity"/>, from the sample variance of the per-token NLL:
+/// <c>sqrt(Var(nll) / (ScoredTokens - 1)) * Perplexity</c>. <c>0</c> when fewer than two tokens
+/// were scored, or when the variance is non-positive through rounding.
+/// </param>
+/// <remarks>
+/// <para><b>Read the error bar before comparing two perplexities.</b> It is the difference between
+/// a real regression and sampling noise, and on short corpora it is far wider than intuition
+/// suggests: on a 2,286-token corpus this model's figure carries roughly &#177;6.5%, so a 3%
+/// "discrepancy" against another implementation is not evidence of anything. The same model and
+/// corpus family at wikitext-2 scale (150,195 scored tokens) narrows that to &#177;0.8%.</para>
+/// <para>Matches llama.cpp's <c>+/-</c> figure, so the two are directly comparable.</para>
+/// </remarks>
 public readonly record struct PerplexityResult(
     double Perplexity,
     double MeanNegativeLogLikelihood,
     int ScoredTokens,
-    int WindowCount);
+    int WindowCount,
+    double StandardError = 0);

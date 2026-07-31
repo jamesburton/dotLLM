@@ -49,6 +49,57 @@ public static class PerplexityEvaluator
         };
     }
 
+    /// <summary>
+    /// Streaming mean and variance of the per-token NLL, by Welford's algorithm.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not the textbook <c>E[x²] - E[x]²</c>: the per-token NLL of a converged model is
+    /// tightly clustered about a mean of a few nats, so the two terms agree to most of their
+    /// significant digits and their difference is mostly rounding error. On a constant NLL that form
+    /// returns ~1e-6 where the true variance is 0 — small in absolute terms, but it is the whole
+    /// signal. Welford accumulates the deviation directly and stays exact there, while agreeing with
+    /// the closed form (and so with llama.cpp's figure) everywhere else.
+    /// </remarks>
+    private struct NllAccumulator
+    {
+        private double _mean;
+        private double _sumSquaredDeviation;
+
+        public int Count { get; private set; }
+
+        public double Mean => _mean;
+
+        public void Add(double value)
+        {
+            Count++;
+            double delta = value - _mean;
+            _mean += delta / Count;
+            _sumSquaredDeviation += delta * (value - _mean);
+        }
+
+        /// <summary>
+        /// One standard error of <c>exp(Mean)</c>: the standard error of the mean NLL, carried
+        /// through <c>exp</c> by the delta method. Matches llama.cpp's <c>+/-</c> figure.
+        /// </summary>
+        public readonly double StandardErrorOfPerplexity(double perplexity)
+        {
+            if (Count < 2)
+                return 0;
+            double variance = _sumSquaredDeviation / Count;
+            return variance > 0 ? Math.Sqrt(variance / (Count - 1)) * perplexity : 0;
+        }
+    }
+
+    /// <summary>Builds the result from the accumulated per-token NLL statistics.</summary>
+    /// <param name="nll">Accumulated per-token NLL statistics.</param>
+    /// <param name="windows">Number of forward windows evaluated.</param>
+    private static PerplexityResult Summarize(in NllAccumulator nll, int windows)
+    {
+        double perplexity = Math.Exp(nll.Mean);
+        return new PerplexityResult(
+            perplexity, nll.Mean, nll.Count, windows, nll.StandardErrorOfPerplexity(perplexity));
+    }
+
     private static PerplexityResult EvaluateTeacherForced(
         IPerplexityModel model, ReadOnlySpan<int> tokens, int context)
         => model.ReturnsAllRows
@@ -66,18 +117,15 @@ public static class PerplexityEvaluator
         var positions = new int[length];
         for (int i = 0; i < length; i++) positions[i] = i;
 
-        double sumNll = 0;
-        int scored = 0;
+        var accumulator = new NllAccumulator();
         for (int prefix = 1; prefix < length; prefix++)
         {
             using ITensor logits = model.Forward(tokens[..prefix], positions.AsSpan(0, prefix));
             var row = new ReadOnlySpan<float>((void*)logits.DataPointer, vocab);
-            sumNll += -LogProb.OfTarget(row, tokens[prefix]);
-            scored++;
+            accumulator.Add(-LogProb.OfTarget(row, tokens[prefix]));
         }
 
-        double meanNll = sumNll / scored;
-        return new PerplexityResult(Math.Exp(meanNll), meanNll, scored, WindowCount: scored);
+        return Summarize(accumulator, windows: accumulator.Count);
     }
 
     // Window w starts at w*Stride and covers [start, start + L); it scores the absolute targets
@@ -114,8 +162,8 @@ public static class PerplexityEvaluator
 
         int vocab = model.VocabSize;
         var positions = new int[context];
-        double sumNll = 0;
-        int scored = 0, windows = 0;
+        var accumulator = new NllAccumulator();
+        int windows = 0;
 
         // Positions restart at 0 for every window: each is an independent sequence, exactly as
         // llama.cpp evaluates each chunk. This is also what lets a corpus longer than the model's
@@ -156,19 +204,17 @@ public static class PerplexityEvaluator
                 double nll = -LogProb.OfTarget(span, tokens[t]);
                 windowNll += nll;
                 windowScored++;
-                sumNll += nll;
-                scored++;
+                accumulator.Add(nll);
             }
 
             onWindow?.Invoke(windows - 1, Math.Exp(windowNll / windowScored), windowScored);
         }
 
-        if (scored == 0)
+        if (accumulator.Count == 0)
             throw new ArgumentException(
                 $"Corpus of {tokens.Length} tokens is shorter than one context window of {context}.", nameof(tokens));
 
-        double meanNll = sumNll / scored;
-        return new PerplexityResult(Math.Exp(meanNll), meanNll, scored, windows);
+        return Summarize(accumulator, windows);
     }
 
     // Backend returns every row, so one forward pass scores every target: row i predicts token i+1.
@@ -179,8 +225,7 @@ public static class PerplexityEvaluator
         Span<int> positions = length <= 512 ? stackalloc int[length] : new int[length];
         for (int i = 0; i < length; i++) positions[i] = i;
 
-        double sumNll = 0;
-        int scored = 0;
+        var accumulator = new NllAccumulator();
 
         using ITensor logits = model.Forward(tokens[..length], positions);
         int vocab = model.VocabSize;
@@ -189,11 +234,9 @@ public static class PerplexityEvaluator
         {
             var row = new ReadOnlySpan<float>(
                 (void*)(logits.DataPointer + (nint)i * vocab * sizeof(float)), vocab);
-            sumNll += -LogProb.OfTarget(row, tokens[i + 1]);
-            scored++;
+            accumulator.Add(-LogProb.OfTarget(row, tokens[i + 1]));
         }
 
-        double meanNll = sumNll / scored;
-        return new PerplexityResult(Math.Exp(meanNll), meanNll, scored, WindowCount: 1);
+        return Summarize(accumulator, windows: 1);
     }
 }
