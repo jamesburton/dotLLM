@@ -40,6 +40,30 @@ public class StopSuffixTrimmerTests
     }
 
     /// <summary>
+    /// Ordering discriminator: an EOS condition registered BEFORE the matching
+    /// <see cref="StopStringCondition"/>. <c>TextGenerator</c> decides whether to keep
+    /// the last token via <see cref="StopSuffixTrimmer.MatchedSuffixLength"/> over all
+    /// conditions, not via the type of the first condition to return <c>Stop</c> — with
+    /// the latter, this registration order would drop the whole last token and lose the
+    /// <c>"ld"</c> prefix again. A list with the stop-string condition first does not
+    /// discriminate, since both formulations agree there.
+    /// </summary>
+    [Fact]
+    public void MatchedSuffixLength_NonStopStringConditionListedFirst_StillMatches()
+    {
+        const string fullText = "Hello, world<|im_end|>";
+        var conditions = new List<IStopCondition>
+        {
+            new EosStopCondition(eosTokenId: 2),
+            new MaxTokensStopCondition(maxTokens: 100),
+            new StopStringCondition("<|im_end|>"),
+        };
+
+        Assert.Equal("<|im_end|>".Length, StopSuffixTrimmer.MatchedSuffixLength(fullText, conditions));
+        Assert.Equal("Hello, world", StopSuffixTrimmer.TrimMatchedSuffix(fullText, conditions));
+    }
+
+    /// <summary>
     /// Reports the matched-suffix character count for callers that need it.
     /// </summary>
     [Fact]
@@ -94,6 +118,12 @@ public class StopSuffixTrimmerTests
 
         string trimmed = StopSuffixTrimmer.TrimMatchedSuffix(fullText, conditions);
 
+        Assert.Equal(fullText, trimmed);
+        // Reference equality is asserted on purpose, not as an accident of the current
+        // implementation: the no-match path is the common case (every EOS / max-tokens
+        // stop reaches it), so returning the input instance rather than re-allocating an
+        // identical string is part of the contract. If a refactor breaks this, the trim
+        // has started allocating on a hot path and should be revisited, not the test.
         Assert.Same(fullText, trimmed);
     }
 

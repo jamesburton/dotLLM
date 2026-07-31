@@ -63,7 +63,25 @@ public sealed class TextGenerator
     /// </summary>
     /// <param name="prompt">Input text prompt.</param>
     /// <param name="options">Inference options controlling sampling and stopping. Null uses defaults.</param>
-    /// <param name="onTokenGenerated">Optional callback invoked after each token is generated, receiving the token ID.</param>
+    /// <param name="onTokenGenerated">
+    /// Optional callback invoked after each token is generated, receiving the token ID.
+    /// <para>
+    /// It is a token-level progress hook, not an output stream: the token that triggers a
+    /// stop condition is never passed to it. That is deliberate for stop-string stops —
+    /// the terminating token's text is only <em>partly</em> output (e.g. it decodes to
+    /// <c>"ld&lt;|im_end|&gt;"</c> for stop string <c>"&lt;|im_end|&gt;"</c>), and an
+    /// <see cref="Action{T}"/> over token IDs cannot express "emit part of this token".
+    /// Handing the ID over would leak the stop string into the consumer's text, which
+    /// <see cref="StopStringCondition"/> exists to prevent.
+    /// </para>
+    /// <para>
+    /// Consequence: the callback stream can be a strict prefix of
+    /// <see cref="InferenceResponse.Text"/>. Consumers needing exact output must use
+    /// <see cref="InferenceResponse.Text"/>, which has the stop-string suffix trimmed at
+    /// the character boundary. A text-level streaming callback that can emit partial
+    /// token text is future work.
+    /// </para>
+    /// </param>
     /// <returns>The inference response with generated text, metadata, and timings.</returns>
     public InferenceResponse Generate(string prompt, InferenceOptions? options = null,
         Action<int>? onTokenGenerated = null)
@@ -245,11 +263,11 @@ public sealed class TextGenerator
             generatedIds.Add(firstTokenId);
             detok.Append(firstTokenId);
 
-            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds,
-                detok.GetTailView(stopTailSize, stopScratch), out int firstMatchedIdx);
+            ReadOnlySpan<char> firstTail = detok.GetTailView(stopTailSize, stopScratch);
+            var stopResult = CheckStopConditions(stopConditions, firstTokenId, generatedIds, firstTail);
             if (stopResult != StopResult.Continue)
             {
-                bool isStopStringMatch = IsStopStringMatch(stopConditions, firstMatchedIdx);
+                bool isStopStringMatch = HasStopStringSuffix(firstTail, stopConditions);
                 if (stopResult == StopResult.Stop)
                 {
                     if (!isStopStringMatch)
@@ -315,11 +333,11 @@ public sealed class TextGenerator
                             generatedIds.Add(tokenId);
                             detok.Append(tokenId);
 
-                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds,
-                                detok.GetTailView(stopTailSize, stopScratch), out int specMatchedIdx);
+                            ReadOnlySpan<char> specTail = detok.GetTailView(stopTailSize, stopScratch);
+                            stopResult = CheckStopConditions(stopConditions, tokenId, generatedIds, specTail);
                             if (stopResult != StopResult.Continue)
                             {
-                                bool isStopStringMatch = IsStopStringMatch(stopConditions, specMatchedIdx);
+                                bool isStopStringMatch = HasStopStringSuffix(specTail, stopConditions);
                                 if (stopResult == StopResult.Stop)
                                 {
                                     if (!isStopStringMatch)
@@ -386,11 +404,11 @@ public sealed class TextGenerator
                     generatedIds.Add(nextTokenId);
                     detok.Append(nextTokenId);
 
-                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds,
-                        detok.GetTailView(stopTailSize, stopScratch), out int decMatchedIdx);
+                    ReadOnlySpan<char> decTail = detok.GetTailView(stopTailSize, stopScratch);
+                    stopResult = CheckStopConditions(stopConditions, nextTokenId, generatedIds, decTail);
                     if (stopResult != StopResult.Continue)
                     {
-                        bool isStopStringMatch = IsStopStringMatch(stopConditions, decMatchedIdx);
+                        bool isStopStringMatch = HasStopStringSuffix(decTail, stopConditions);
                         if (stopResult == StopResult.Stop)
                         {
                             if (!isStopStringMatch)
@@ -923,37 +941,33 @@ public sealed class TextGenerator
         List<IStopCondition> conditions, int tokenId,
         IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail)
     {
-        return CheckStopConditions(conditions, tokenId, generatedTokens, decodedTail, out _);
-    }
-
-    private static StopResult CheckStopConditions(
-        List<IStopCondition> conditions, int tokenId,
-        IReadOnlyList<int> generatedTokens, ReadOnlySpan<char> decodedTail,
-        out int matchedIndex)
-    {
         for (int i = 0; i < conditions.Count; i++)
         {
             var result = conditions[i].ShouldStop(tokenId, generatedTokens, decodedTail);
             if (result != StopResult.Continue)
-            {
-                matchedIndex = i;
                 return result;
-            }
         }
-        matchedIndex = -1;
         return StopResult.Continue;
     }
 
     /// <summary>
-    /// True when a <see cref="StopResult.Stop"/> result came from a
-    /// <see cref="StopStringCondition"/> match. Determines whether the last token
-    /// should be kept in <c>generatedIds</c> (true — its text contains a partial
-    /// suffix overlap with the stop string and must be character-trimmed later) or
-    /// removed (false — EOS / similar single-token termination where the token's
-    /// text is conceptually the terminator itself).
+    /// True when some registered <see cref="StopStringCondition"/>'s stop string is a
+    /// suffix of <paramref name="decodedTail"/>. Determines whether the last token is
+    /// kept in <c>generatedIds</c> (true — its text carries a partial overlap with the
+    /// stop string and must be character-trimmed in <c>BuildResponse</c>) or removed
+    /// (false — EOS / similar single-token termination where the token's text is
+    /// conceptually the terminator itself).
     /// </summary>
-    private static bool IsStopStringMatch(List<IStopCondition> conditions, int matchedIndex)
-        => matchedIndex >= 0 && matchedIndex < conditions.Count && conditions[matchedIndex] is StopStringCondition;
+    /// <remarks>
+    /// Deliberately independent of <em>which</em> condition <see cref="CheckStopConditions"/>
+    /// matched first: that would make the outcome depend on the order conditions were
+    /// registered, so an EOS condition placed ahead of a stop-string condition matching
+    /// the same tail would drop the whole last token and resurrect the over-trim bug.
+    /// The suffix test here uses exactly the predicate <see cref="StopStringCondition"/>
+    /// itself uses (ordinal <c>EndsWith</c> on the same tail window).
+    /// </remarks>
+    private static bool HasStopStringSuffix(ReadOnlySpan<char> decodedTail, List<IStopCondition> conditions)
+        => StopSuffixTrimmer.MatchedSuffixLength(decodedTail, conditions) > 0;
 
     // Tail window passed to stop conditions. Must cover the longest stop string currently
     // registered; a safety cushion absorbs future stop strings added via custom conditions.
