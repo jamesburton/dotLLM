@@ -117,6 +117,81 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void RegisterBlockedPadded_IsBitIdenticalToRegisterBlocked(int m, int k, int n)
         => AssertBitIdentical(I2SGemmVariant.RegisterBlockedPadded, m, k, n);
 
+    /// <summary>
+    /// The 4x4 ILP variant must be bit-identical to the production kernel: it changes the
+    /// thread-to-output mapping and the number of threads, but not the per-cell accumulation order.
+    /// </summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(17, 256, 47)]
+    [InlineData(2560, 2560, 5)]
+    public void RegisterBlocked4x4_IsBitIdenticalToRegisterBlocked(int m, int k, int n)
+        => AssertBitIdentical(I2SGemmVariant.RegisterBlocked4x4, m, k, n);
+
+    /// <summary>
+    /// Parity for the 4x4 ILP variant against the scalar reference, stressing the SUB=8 micro-tile
+    /// stride. With 4x4 cells per thread there are 16 separate bounds checks per thread, and a
+    /// stride error shows up only on shapes not aligned to 32 in both dimensions.
+    /// </summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 128, 32)]     // exactly one tile
+    [InlineData(64, 256, 64)]     // 2x2 tiles
+    [InlineData(48, 768, 12)]     // partial in both dims
+    [InlineData(33, 128, 33)]     // one past a full tile
+    [InlineData(17, 256, 47)]     // ragged, straddles the SUB=8 stride
+    [InlineData(15, 128, 3)]      // below the micro-tile stride
+    [InlineData(2560, 2560, 5)]   // BitNet hidden x hidden
+    public void RegisterBlocked4x4_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.RegisterBlocked4x4, m, k, n);
+
+    /// <summary>
+    /// Parity for the F16-shared variant. NOT bit-exact, so this runs at a widened tolerance —
+    /// but it is the only thing standing between "1.3x faster" and "1.3x faster and wrong".
+    /// </summary>
+    /// <remarks>
+    /// Only the activations round: sharedW holds raw ternary {-1, 0, +1}, all exact in F16, so the
+    /// weight side is lossless. The activation cast costs ~2^-11 relative per element, accumulating
+    /// as a sqrt(K) random walk — at K=2560 that is ~50 x 2^-11 ~ 2.4e-2 relative on a unit-scale
+    /// dot product, hence the 3e-2 absolute allowance, matching the coopmat variants which round
+    /// activations the same way.
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(16, 128, 4)]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(33, 128, 33)]
+    [InlineData(17, 256, 47)]
+    [InlineData(15, 128, 3)]
+    [InlineData(2560, 2560, 5)]
+    public void RegisterBlockedF16Shared_MatchesScalarReference(int m, int k, int n)
+        => RunParity(I2SGemmVariant.RegisterBlockedF16Shared, m, k, n, absTol: 3e-2f, relTol: 5e-3f);
+
+    /// <summary>
+    /// The F16 weight tile must be bit-identical to production: ternary is exactly representable in
+    /// F16, so staging it there changes no value and no accumulation order. Exact equality is the
+    /// right gate — it proves the F16 round-trip is lossless rather than merely close.
+    /// </summary>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(17, 256, 47)]
+    [InlineData(2560, 2560, 5)]
+    public void RegisterBlockedWeightF16_IsBitIdenticalToRegisterBlocked(int m, int k, int n)
+        => AssertBitIdentical(I2SGemmVariant.RegisterBlockedWeightF16, m, k, n);
+
     private static void AssertBitIdentical(I2SGemmVariant variant, int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);

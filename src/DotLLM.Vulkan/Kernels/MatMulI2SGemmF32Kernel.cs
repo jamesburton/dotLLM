@@ -115,8 +115,63 @@ public readonly record struct I2SGemmVariant(
     /// </remarks>
     public static I2SGemmVariant RegisterBlockedPadded => new("matmul_i2_s_f32_gemm_rb_pad.spv", 32, 32);
 
+    /// <summary>
+    /// Occupancy probe: identical tiling to <see cref="RegisterBlocked"/> but both shared tiles are
+    /// stored as F16, halving shared memory from 32 KB to 16 KB per workgroup.
+    /// </summary>
+    /// <remarks>
+    /// Discriminates the two readings of VTune's "XVE Array Stalled/Idle: 88.8%" on the Arc, which
+    /// an unprivileged collection cannot split. If the kernel is <i>idle</i> (occupancy-limited),
+    /// halving shared memory raises resident workgroups per Xe-core and throughput should rise; if
+    /// it is <i>stalled</i> on latency with threads already resident, this measures flat. Opposite
+    /// fixes, so the experiment is worth running either way.
+    /// NOT bit-exact and not a shipping candidate: the ternary weights are lossless in F16, but the
+    /// activations in <c>sharedB</c> do round. A shipping version would keep activations at F32 and
+    /// shrink only the weight tile (32 KB to 24 KB), or pack the weights as int8 (to 20 KB).
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedF16Shared => new("matmul_i2_s_f32_gemm_rb_f16s.spv", 32, 32);
+
+    /// <summary>
+    /// 4x4 register-blocked (ILP) variant: same 32x32 output tile and same 32 KB of shared memory
+    /// as <see cref="RegisterBlocked"/>, but 64 threads instead of 256, each owning a 4x4 micro-tile.
+    /// </summary>
+    /// <remarks>
+    /// Chosen from profile data rather than guesswork. Elevated VTune gpu-hotspots on the Arc reports
+    /// the production 2x2 kernel at 86.9% XVE stalled/idle with occupancy at 73.3% of peak — occupancy
+    /// is high, so those are threads STALLED on memory, not idle. Footprint fixes therefore cannot
+    /// help; the lever is instruction-level parallelism. Each thread here issues 8 shared loads to feed
+    /// 16 FMAs across 16 INDEPENDENT accumulator chains, so many loads stay outstanding instead of
+    /// stalling one at a time. Shared memory is held constant deliberately, isolating ILP as the only
+    /// changed variable. The trade is fewer threads per workgroup; at 73.3% of peak there is occupancy
+    /// headroom to spend, and whether ILP buys more than it costs is exactly what the benchmark decides.
+    /// Accumulation order per output cell is unchanged, so results are bit-identical to
+    /// <see cref="RegisterBlocked"/>.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlocked4x4 => new("matmul_i2_s_f32_gemm_rb4.spv", 32, 32);
+
+    /// <summary>
+    /// Register-blocked with the WEIGHT tile stored as F16 (activations stay F32). Bit-exact with
+    /// <see cref="RegisterBlocked"/>; shared memory 32 KB -> 24 KB and weight-side SLM traffic halved.
+    /// </summary>
+    /// <remarks>
+    /// Bit-exact because the staged values are raw ternary {-1, 0, +1}, each exactly representable in
+    /// F16, so <c>float(float16_t(v)) == v</c> and neither the products nor the accumulation order
+    /// change. Activations are never rounded.
+    /// Also discriminates why <see cref="RegisterBlockedF16Shared"/> won: that halves both footprint
+    /// (to 16 KB) and SLM bytes-per-access. This halves only weight traffic and takes footprint to
+    /// 24 KB, so recovering most of the win implicates SLM TRAFFIC, while a much smaller gain would
+    /// implicate footprint/occupancy instead.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWeightF16 => new("matmul_i2_s_f32_gemm_rb_wf16.spv", 32, 32);
+
     /// <summary>The variant used by the production forward path.</summary>
-    public static I2SGemmVariant Production => RegisterBlocked;
+    /// <remarks>
+    /// <see cref="RegisterBlockedWeightF16"/>: bit-identical to <see cref="RegisterBlocked"/> and
+    /// measured 1.22-1.50x faster on Meteor-Lake Arc. Halving weight-side SLM traffic recovers the
+    /// full win of the all-F16 probe without rounding activations, which identified SLM read traffic
+    /// (not occupancy, not bank conflicts, not global loads) as the real bottleneck.
+    /// </remarks>
+    public static I2SGemmVariant Production => RegisterBlockedWeightF16;
 }
 
 /// <summary>
