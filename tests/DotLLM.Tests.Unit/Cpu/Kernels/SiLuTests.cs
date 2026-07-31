@@ -107,4 +107,38 @@ public sealed class SiLuTests
         for (int i = 0; i < n; i++)
             Assert.Equal(reference[i], buffer[i], 1e-4f);
     }
+
+    [Theory]
+    // Shifts smaller and larger than the 256-float tile, in both directions.
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(255)]
+    [InlineData(300)]
+    [InlineData(-1)]
+    [InlineData(-7)]
+    [InlineData(-255)]
+    [InlineData(-300)]
+    public void Execute_ShiftedOverlap_ProducesCorrectOutput(int shift)
+    {
+        // Shifted (non-exact) aliasing: result starts `shift` elements after input within the
+        // same array. A naive tiled loop clobbers input elements a later tile still needs.
+        var rng = new Random(1234);
+        const int n = 1000;
+        int pad = 512;
+        float[] backing = new float[n + 2 * pad];
+        for (int i = 0; i < backing.Length; i++)
+            backing[i] = rng.NextSingle() * 20f - 10f;
+
+        var inputSlice = backing.AsSpan(pad, n);
+        float[] originalInput = inputSlice.ToArray();
+
+        float[] reference = new float[n];
+        SiLu.ExecuteScalar(originalInput, reference);
+
+        SiLu.Execute(backing.AsSpan(pad, n), backing.AsSpan(pad + shift, n));
+
+        var actual = backing.AsSpan(pad + shift, n);
+        for (int i = 0; i < n; i++)
+            Assert.Equal(reference[i], actual[i], 1e-4f);
+    }
 }

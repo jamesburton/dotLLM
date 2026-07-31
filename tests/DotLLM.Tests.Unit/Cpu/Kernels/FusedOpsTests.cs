@@ -164,6 +164,35 @@ public sealed unsafe class FusedOpsTests
             Assert.Equal(reference[i], upAlias[i], 1e-4f);
     }
 
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(true, -1)]
+    [InlineData(false, 1)]
+    [InlineData(false, -1)]
+    public void SwiGLU_ShiftedOverlap_Throws(bool shiftUp, int shift)
+    {
+        // Only exact aliasing is supported; a partially overlapping input would be silently
+        // corrupted by the tile writes, so it must be rejected rather than mis-computed.
+        const int n = 512;
+        int pad = 8;
+        float[] backing = new float[n + 2 * pad];
+        float[] other = new float[n];
+
+        // Span<T> can't be captured by a lambda, so assert via try/catch.
+        try
+        {
+            if (shiftUp)
+                FusedOps.SwiGLU(other, backing.AsSpan(pad + shift, n), backing.AsSpan(pad, n));
+            else
+                FusedOps.SwiGLU(backing.AsSpan(pad + shift, n), other, backing.AsSpan(pad, n));
+            Assert.Fail("Expected ArgumentException for a shifted-overlap span.");
+        }
+        catch (ArgumentException)
+        {
+            // expected
+        }
+    }
+
     // ──────────────────── RmsNormQuantize Q8_0 Tests ────────────────────
 
     [Theory]

@@ -27,9 +27,16 @@ public static unsafe class FusedOps
     /// Uses tiled <see cref="TensorPrimitives.Sigmoid"/> for exact precision, with the
     /// sigmoid intermediate staying in L1 via a small stack buffer. Eliminates one full
     /// memory pass over intermediateSize compared to separate SiLU + Multiply calls.
-    /// Safe to call when <paramref name="up"/> aliases <paramref name="result"/>
-    /// (the common in-place pattern <c>SwiGLU(gate, y, y)</c>).
+    /// Safe to call when <paramref name="gate"/> and/or <paramref name="up"/> is the *same* span as
+    /// <paramref name="result"/> (the common in-place patterns <c>SwiGLU(gate, y, y)</c> and
+    /// <c>SwiGLU(y, up, y)</c>). Partially overlapping spans that do not start at the same address
+    /// are rejected with <see cref="ArgumentException"/> — a tile-local snapshot cannot protect the
+    /// input elements that a later tile still has to read.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="gate"/> or <paramref name="up"/> overlaps <paramref name="result"/> at a
+    /// non-zero element offset.
+    /// </exception>
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void SwiGLU(ReadOnlySpan<float> gate, ReadOnlySpan<float> up, Span<float> result)
@@ -38,10 +45,17 @@ public static unsafe class FusedOps
 
         // If up aliases result, the second Multiply below would compute SiLU(gate)² (reading
         // and writing the same buffer) instead of SiLU(gate) * up. Snapshot up per tile.
-        bool upAliases = up.Overlaps(result);
+        bool upAliases = up.Overlaps(result, out int upOffset);
+        if ((upAliases && upOffset != 0) || (gate.Overlaps(result, out int gateOffset) && gateOffset != 0))
+        {
+            throw new ArgumentException(
+                "SwiGLU supports exact in-place aliasing only; gate/up must either be disjoint from " +
+                "result or start at the same address.", nameof(result));
+        }
 
         Span<float> sigBuf = stackalloc float[SwiGLUTileSize];
-        Span<float> upBuf = stackalloc float[SwiGLUTileSize];
+        // Only the aliased path needs the snapshot buffer — keep the common path's stack frame small.
+        Span<float> upBuf = upAliases ? stackalloc float[SwiGLUTileSize] : default;
 
         int i = 0;
         for (; i + SwiGLUTileSize <= length; i += SwiGLUTileSize)
@@ -66,7 +80,8 @@ public static unsafe class FusedOps
             var uTile = up.Slice(i, remaining);
             var rTile = result.Slice(i, remaining);
             var sigTail = sigBuf.Slice(0, remaining);
-            var upTail = upBuf.Slice(0, remaining);
+
+            Span<float> upTail = upAliases ? upBuf.Slice(0, remaining) : default;
 
             if (upAliases) uTile.CopyTo(upTail);
             ReadOnlySpan<float> uReadable = upAliases ? (ReadOnlySpan<float>)upTail : uTile;
