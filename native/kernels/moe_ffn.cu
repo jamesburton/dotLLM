@@ -19,6 +19,11 @@
 //                                    accumulate weight[slot] * down[hidden].
 //   moe_sigmoid_logit_f32         — y = 1 / (1 + exp(-Σ x[k] * g[k])) for one
 //                                    token (Qwen1.5-MoE shared_expert_gate).
+//   moe_gate_bias_add_f32         — logits[t, e] += bias[e] (issue #246: identity-MoTE /
+//                                    Qwen3 aux-loss-free additive router bias, applied BEFORE
+//                                    moe_softmax_topk_f32 so it shifts both the top-k argmax
+//                                    AND the softmax probabilities — matches MoeSwiGluMlp.Route's
+//                                    CPU ordering exactly).
 
 #include <math.h>
 
@@ -72,6 +77,25 @@ __device__ __forceinline__ float block_reduce_max_128(float v, float* shared)
     }
     __syncthreads();
     return shared[0];
+}
+
+// ── moe_gate_bias_add_f32 ────────────────────────────────────────────────
+//
+// logits[t * num_experts + e] += bias[e], for every (t, e). Must run BEFORE
+// moe_softmax_topk_f32 — see MoeSwiGluMlp.Route's CPU ordering (bias added to the raw
+// logits, then softmax, then top-k, then optional renorm). One thread per (t, e) element;
+// num_experts is small (≤ a few hundred) so a flat grid-stride loop is simplest and the
+// kernel is call-count-negligible next to the router GEMV / per-expert GEMVs either side of it.
+extern "C" __global__ void __launch_bounds__(256) moe_gate_bias_add_f32(
+    float* __restrict__ logits,            // [seq_len, num_experts], in-place
+    const float* __restrict__ bias,        // [num_experts]
+    const int seq_len, const int num_experts)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * num_experts;
+    int stride = gridDim.x * blockDim.x;
+    for (int i = idx; i < total; i += stride)
+        logits[i] += bias[i % num_experts];
 }
 
 // ── moe_softmax_topk_f32 ─────────────────────────────────────────────────
