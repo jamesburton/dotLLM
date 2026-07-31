@@ -70,6 +70,7 @@ internal static class ColumnHelpers
     {
         if (!benchmarkCase.HasParameters) return null;
 
+
         LoraVariant? variant = null;
         LoraScenario? scenario = null;
         foreach (var item in benchmarkCase.Parameters.Items)
