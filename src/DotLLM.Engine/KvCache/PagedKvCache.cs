@@ -184,6 +184,9 @@ public sealed unsafe class PagedKvCache : IKvCache
         kDst = default;
         vDst = default;
 
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+
         int seqLen = positions.Length;
         if (seqLen == 0) return false;
 
@@ -195,9 +198,11 @@ public sealed unsafe class PagedKvCache : IKvCache
             if (positions[i] != start + i) return false;
         }
 
-        // Bounds: entire run must fit within MaxLength.
+        // Bounds: entire run must fit within MaxLength. Written as a subtraction so it
+        // cannot overflow for large _maxSeqLen (start < _maxSeqLen is checked first, so
+        // _maxSeqLen - start is positive). This also makes start + seqLen safe below.
         if ((uint)start >= (uint)_maxSeqLen) return false;
-        if (start + seqLen > _maxSeqLen) return false;
+        if (seqLen > _maxSeqLen - start) return false;
 
         // Single-block run only: the run must not cross a block boundary, otherwise the
         // in-place slot wouldn't be physically contiguous. Decode (seqLen=1) always

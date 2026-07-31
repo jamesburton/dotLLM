@@ -89,6 +89,9 @@ public interface IKvCache : IDisposable
     /// Undefined on failure.</param>
     /// <returns><c>true</c> when a slot was reserved and <paramref name="kDst"/>/<paramref name="vDst"/>
     /// are valid in-place targets; <c>false</c> otherwise.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Implementations that expose raw layer
+    /// storage throw when <paramref name="layerIndex"/> is outside the cache's layer range.
+    /// An out-of-range layer is a caller bug, not a "cannot reserve" condition.</exception>
     bool TryReserveSlot(
         int layerIndex,
         ReadOnlySpan<int> positions,

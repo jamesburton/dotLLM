@@ -161,6 +161,9 @@ public sealed unsafe class SimpleKvCache : IKvCache
         kDst = default;
         vDst = default;
 
+        if ((uint)layerIndex >= (uint)_numLayers)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+
         int seqLen = positions.Length;
         if (seqLen == 0) return false;
 
@@ -173,12 +176,11 @@ public sealed unsafe class SimpleKvCache : IKvCache
             if (positions[i] != start + i) return false;
         }
 
-        // Bounds: the entire run must fit within the cache.
+        // Bounds: the entire run must fit within the cache. Written as a subtraction so
+        // it cannot overflow for large _maxSeqLen (start < _maxSeqLen is checked first,
+        // so _maxSeqLen - start is positive).
         if ((uint)start >= (uint)_maxSeqLen) return false;
-        if (start + seqLen > _maxSeqLen) return false;
-
-        if ((uint)layerIndex >= (uint)_numLayers)
-            throw new ArgumentOutOfRangeException(nameof(layerIndex));
+        if (seqLen > _maxSeqLen - start) return false;
 
         int totalFloats = seqLen * _kvStride;
         kDst = new Span<float>((float*)_keys[layerIndex] + (long)start * _kvStride, totalFloats);

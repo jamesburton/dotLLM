@@ -64,6 +64,19 @@ public sealed unsafe class ReserveSlotTests
     }
 
     [Fact]
+    public void Simple_TryReserveSlot_LayerIndexOutOfRange_Throws()
+    {
+        const int MaxSeqLen = 16;
+        using var cache = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
+
+        int[] positions = [0, 1, 2];
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => cache.TryReserveSlot(NumLayers, positions, out _, out _));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => cache.TryReserveSlot(-1, positions, out _, out _));
+    }
+
+    [Fact]
     public void Simple_TryReserveSlot_EmptyPositions_ReturnsFalse()
     {
         const int MaxSeqLen = 16;
@@ -100,8 +113,8 @@ public sealed unsafe class ReserveSlotTests
         using var cacheSlot = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
 
         // Deterministic synthetic K/V.
-        nint kSrc = (nint)NativeMemory.AlignedAlloc((nuint)(SeqLen * KvStride * sizeof(float)), 64);
-        nint vSrc = (nint)NativeMemory.AlignedAlloc((nuint)(SeqLen * KvStride * sizeof(float)), 64);
+        nint kSrc = AllocFloats(SeqLen * KvStride);
+        nint vSrc = AllocFloats(SeqLen * KvStride);
         try
         {
             for (int t = 0; t < SeqLen; t++)
@@ -164,8 +177,8 @@ public sealed unsafe class ReserveSlotTests
         using var cacheUpdate = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
         using var cacheSlot = new SimpleKvCache(NumLayers, NumKvHeads, HeadDim, MaxSeqLen);
 
-        nint kStep = (nint)NativeMemory.AlignedAlloc((nuint)(KvStride * sizeof(float)), 64);
-        nint vStep = (nint)NativeMemory.AlignedAlloc((nuint)(KvStride * sizeof(float)), 64);
+        nint kStep = AllocFloats(KvStride);
+        nint vStep = AllocFloats(KvStride);
         try
         {
             for (int step = 0; step < Steps; step++)
@@ -228,6 +241,23 @@ public sealed unsafe class ReserveSlotTests
         Assert.True(ok);
         Assert.Equal(3 * KvStride, kDst.Length);
         Assert.Equal(3 * KvStride, vDst.Length);
+    }
+
+    [Fact]
+    public void Paged_TryReserveSlot_LayerIndexOutOfRange_Throws()
+    {
+        const int BlockSize = 4;
+        const int TotalBlocks = 8;
+        const int MaxSeqLen = 16;
+        using var pool = new KvBlockPool(NumLayers, NumKvHeads, HeadDim, BlockSize, TotalBlocks);
+        using var cache = new PagedKvCache(pool, NumLayers, KvStride, MaxSeqLen);
+
+        // Must be rejected before any pointer arithmetic against the pool's layer buffers.
+        int[] positions = [0, 1, 2];
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => cache.TryReserveSlot(NumLayers, positions, out _, out _));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => cache.TryReserveSlot(-1, positions, out _, out _));
     }
 
     [Fact]
@@ -301,8 +331,8 @@ public sealed unsafe class ReserveSlotTests
         using var cacheUpdate = new PagedKvCache(poolA, NumLayers, KvStride, MaxSeqLen);
         using var cacheSlot = new PagedKvCache(poolB, NumLayers, KvStride, MaxSeqLen);
 
-        nint kStep = (nint)NativeMemory.AlignedAlloc((nuint)(KvStride * sizeof(float)), 64);
-        nint vStep = (nint)NativeMemory.AlignedAlloc((nuint)(KvStride * sizeof(float)), 64);
+        nint kStep = AllocFloats(KvStride);
+        nint vStep = AllocFloats(KvStride);
         try
         {
             for (int step = 0; step < Steps; step++)
@@ -364,8 +394,8 @@ public sealed unsafe class ReserveSlotTests
         using var cacheUpdate = new PagedKvCache(poolA, NumLayers, KvStride, MaxSeqLen);
         using var cacheSlot = new PagedKvCache(poolB, NumLayers, KvStride, MaxSeqLen);
 
-        nint kSrc = (nint)NativeMemory.AlignedAlloc((nuint)(SeqLen * KvStride * sizeof(float)), 64);
-        nint vSrc = (nint)NativeMemory.AlignedAlloc((nuint)(SeqLen * KvStride * sizeof(float)), 64);
+        nint kSrc = AllocFloats(SeqLen * KvStride);
+        nint vSrc = AllocFloats(SeqLen * KvStride);
         try
         {
             for (int t = 0; t < SeqLen; t++)
@@ -427,6 +457,17 @@ public sealed unsafe class ReserveSlotTests
     }
 
     // ── Helpers ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Allocates a 64-byte-aligned native float buffer, failing the test cleanly if the
+    /// allocation returns null rather than access-violating on the first write.
+    /// </summary>
+    private static nint AllocFloats(int floatCount)
+    {
+        nint ptr = (nint)NativeMemory.AlignedAlloc((nuint)(floatCount * sizeof(float)), 64);
+        Assert.True(ptr != 0, "NativeMemory.AlignedAlloc returned null.");
+        return ptr;
+    }
 
     private static void AssertBytesEqual(nint a, nint b, int floatCount)
     {
