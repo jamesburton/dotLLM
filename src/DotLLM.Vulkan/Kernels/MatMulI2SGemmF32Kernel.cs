@@ -117,15 +117,111 @@ public readonly record struct I2SGemmVariant(
             RequiresCooperativeMatrix: true, RequiredSubgroupSize: 32);
 
     /// <summary>
+    /// Register-blocked with a wide weight unpack: one aligned 32-bit load per thread
+    /// (4 packed bytes = 16 ternary codes) instead of four redundant loads of the same word.
+    /// </summary>
+    /// <remarks>
+    /// Same 32x32 tile and 2x2 micro-tile as <see cref="RegisterBlocked"/>; only the unpack
+    /// differs. Motivated by the coopmat findings (issue #229): three cooperative-matrix attempts
+    /// all lost to the F32 kernel because this GEMM is bound by I2_S unpacking and shared staging
+    /// rather than by the multiply, so the unpack is where the remaining time actually is.
+    /// The four byte offsets the baseline fetched separately are provably one aligned word —
+    /// <c>rowBytes = K/4</c> is a multiple of 32 (K is a multiple of 128), and both
+    /// <c>blk*32</c> and the 4-aligned in-block offset preserve alignment.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWide => new("matmul_i2_s_f32_gemm_rb_w4.spv", 32, 32);
+
+    /// <summary>
+    /// Register-blocked with one padding word on the <c>sharedW</c> row stride (129 instead of 128)
+    /// to eliminate shared-memory bank conflicts in the inner loop.
+    /// </summary>
+    /// <remarks>
+    /// Shared memory has 32 four-byte banks, so bank = word index mod 32. A 128-word row stride is
+    /// 0 mod 32, so all 16 distinct <c>lx</c> values read the SAME bank for a given <c>j</c> — a
+    /// 16-way conflict on every one of the 128 inner iterations. A 129-word stride gives
+    /// bank = (lx + j) mod 32 (since 129 = 1 mod 32), spreading the 16 lanes across 16 banks.
+    /// <c>sharedB</c> stays unpadded: threads in a warp share <c>ly</c>, so those reads broadcast
+    /// one address and are already conflict-free.
+    /// Bit-exact with <see cref="RegisterBlocked"/> — only the shared layout changes.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedPadded => new("matmul_i2_s_f32_gemm_rb_pad.spv", 32, 32);
+
+    /// <summary>
+    /// Occupancy probe: identical tiling to <see cref="RegisterBlocked"/> but both shared tiles are
+    /// stored as F16, halving shared memory from 32 KB to 16 KB per workgroup.
+    /// </summary>
+    /// <remarks>
+    /// Discriminates the two readings of VTune's "XVE Array Stalled/Idle: 88.8%" on the Arc, which
+    /// an unprivileged collection cannot split. If the kernel is <i>idle</i> (occupancy-limited),
+    /// halving shared memory raises resident workgroups per Xe-core and throughput should rise; if
+    /// it is <i>stalled</i> on latency with threads already resident, this measures flat. Opposite
+    /// fixes, so the experiment is worth running either way.
+    /// NOT bit-exact and not a shipping candidate: the ternary weights are lossless in F16, but the
+    /// activations in <c>sharedB</c> do round. A shipping version would keep activations at F32 and
+    /// shrink only the weight tile (32 KB to 24 KB), or pack the weights as int8 (to 20 KB).
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedF16Shared => new("matmul_i2_s_f32_gemm_rb_f16s.spv", 32, 32);
+
+    /// <summary>
+    /// 4x4 register-blocked (ILP) variant: same 32x32 output tile and same 32 KB of shared memory
+    /// as <see cref="RegisterBlocked"/>, but 64 threads instead of 256, each owning a 4x4 micro-tile.
+    /// </summary>
+    /// <remarks>
+    /// Chosen from profile data rather than guesswork. Elevated VTune gpu-hotspots on the Arc reports
+    /// the production 2x2 kernel at 86.9% XVE stalled/idle with occupancy at 73.3% of peak — occupancy
+    /// is high, so those are threads STALLED on memory, not idle. Footprint fixes therefore cannot
+    /// help; the lever is instruction-level parallelism. Each thread here issues 8 shared loads to feed
+    /// 16 FMAs across 16 INDEPENDENT accumulator chains, so many loads stay outstanding instead of
+    /// stalling one at a time. Shared memory is held constant deliberately, isolating ILP as the only
+    /// changed variable. The trade is fewer threads per workgroup; at 73.3% of peak there is occupancy
+    /// headroom to spend, and whether ILP buys more than it costs is exactly what the benchmark decides.
+    /// Accumulation order per output cell is unchanged, so results are bit-identical to
+    /// <see cref="RegisterBlocked"/>.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlocked4x4 => new("matmul_i2_s_f32_gemm_rb4.spv", 32, 32);
+
+    /// <summary>
+    /// Register-blocked with the WEIGHT tile stored as F16 (activations stay F32). Bit-exact with
+    /// <see cref="RegisterBlocked"/>; shared memory 32 KB -> 24 KB and weight-side SLM traffic halved.
+    /// </summary>
+    /// <remarks>
+    /// Bit-exact because the staged values are raw ternary {-1, 0, +1}, each exactly representable in
+    /// F16, so <c>float(float16_t(v)) == v</c> and neither the products nor the accumulation order
+    /// change. Activations are never rounded.
+    /// Also discriminates why <see cref="RegisterBlockedF16Shared"/> won: that halves both footprint
+    /// (to 16 KB) and SLM bytes-per-access. This halves only weight traffic and takes footprint to
+    /// 24 KB, so recovering most of the win implicates SLM TRAFFIC, while a much smaller gain would
+    /// implicate footprint/occupancy instead.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWeightF16 => new("matmul_i2_s_f32_gemm_rb_wf16.spv", 32, 32);
+
+    /// <summary>
+    /// Register-blocked with the WEIGHT tile stored as int8 (activations stay F32). Bit-exact with
+    /// <see cref="RegisterBlocked"/>; shared memory 32 KB -> 20 KB and weight-side SLM traffic quartered.
+    /// </summary>
+    /// <remarks>
+    /// Follow-on from the SLM-traffic finding: F32 moves 4 bytes per weight access, F16 moves 2 and
+    /// won 1.22-1.50x, so int8 at 1 byte tests whether the gain keeps scaling with bytes moved.
+    /// Bit-exact for the same reason as F16 — ternary {-1, 0, +1} is exactly representable in int8,
+    /// so <c>float(int8_t(v)) == v</c>, leaving products and accumulation order unchanged.
+    /// Requires <c>GL_EXT_shader_8bit_storage</c>; see <see cref="ProductionPreference"/> for how a
+    /// device lacking it degrades.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWeightInt8 => new("matmul_i2_s_f32_gemm_rb_wi8.spv", 32, 32);
+
+    /// <summary>
     /// The variant used by the production forward path when no device-specific selection is
-    /// made. Bit-exact F32 throughout; the correctness oracle for every coopmat challenger.
+    /// made. Bit-exact F32 throughout; the correctness oracle for every coopmat and reduced-
+    /// precision-storage challenger.
     /// </summary>
     public static I2SGemmVariant Production => RegisterBlocked;
 
     /// <summary>
     /// Picks the I2_S GEMM variant for <paramref name="device"/>, preferring a coopmat variant
     /// only where the device can supply BOTH cooperative matrix and a pinned wave32 compute
-    /// subgroup size, and falling back to <see cref="RegisterBlocked"/> otherwise.
+    /// subgroup size, and falling back to <see cref="RegisterBlocked"/> otherwise (the caller,
+    /// <see cref="MatMulI2SGemmF32Kernel.Create(VulkanDevice, string)"/>, then tries
+    /// <see cref="ProductionPreference"/> instead of stopping at that fallback).
     /// </summary>
     /// <param name="device">Device the pipeline will be created on.</param>
     /// <remarks>
@@ -192,6 +288,25 @@ public readonly record struct I2SGemmVariant(
 
     private static bool IsCoopmatForced() =>
         string.Equals(Environment.GetEnvironmentVariable(ForceCoopmatEnvVar), "1", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Production variants in preference order for devices where <see cref="SelectFor"/> does not
+    /// pick a coopmat variant, each falling back to the next when the device cannot create it. The
+    /// final entry requires no optional features and is always creatable.
+    /// </summary>
+    /// <remarks>
+    /// The faster variants narrow the weight tile to shrink SLM traffic, which needs small-type
+    /// storage: F16 needs 16-bit storage, int8 needs 8-bit storage (int8 measured no further gain
+    /// over F16 on Xe-LPG — see <see cref="RegisterBlockedWeightInt8"/> — so it is not in this
+    /// chain). Those are optional Vulkan features, so rather than probe each one this chain simply
+    /// attempts creation and degrades. Every entry is bit-identical to <see cref="RegisterBlocked"/>,
+    /// so which one a device picks changes speed only — never results.
+    /// </remarks>
+    public static IReadOnlyList<I2SGemmVariant> ProductionPreference { get; } =
+    [
+        RegisterBlockedWeightF16,
+        RegisterBlocked,
+    ];
 }
 
 /// <summary>
@@ -239,14 +354,54 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
     }
 
     /// <summary>
-    /// Creates the pipeline for the variant <see cref="I2SGemmVariant.SelectFor"/> picks for
-    /// <paramref name="device"/> — the coopmat + wave32 variant where the device supplies both
-    /// and the opt-in is set, else the bit-exact register-blocked F32 kernel.
+    /// Creates the fastest production I2_S GEMM variant for <paramref name="device"/>: the
+    /// coopmat + wave32 variant where <see cref="I2SGemmVariant.SelectFor"/> picks it (AMD only,
+    /// issue #239), else the best creatable entry in
+    /// <see cref="I2SGemmVariant.ProductionPreference"/> (F16 weight-tile where the device
+    /// supports 16-bit storage, else the bit-exact register-blocked F32 kernel that needs no
+    /// optional feature).
     /// </summary>
     /// <param name="device">Device to create the pipeline on.</param>
     /// <param name="spvDir">Directory holding the compiled SPIR-V modules.</param>
+    /// <returns>A kernel bound to the best creatable variant.</returns>
+    /// <remarks>
+    /// The two tracks are independent and vendor-disjoint in practice (coopmat32wave32 is
+    /// measured only on AMD gfx1151; the F16 weight-tile win is measured on Intel Xe-LPG), so
+    /// <see cref="I2SGemmVariant.SelectFor"/> is tried first and, if it declines (returns the
+    /// plain <see cref="I2SGemmVariant.RegisterBlocked"/> fallback), <see cref="I2SGemmVariant.ProductionPreference"/>
+    /// takes over rather than stopping at that fallback immediately. Every candidate across both
+    /// tracks is bit-identical (coopmat is held to 1 ULP instead — see <see cref="I2SGemmVariant.SelectFor"/>),
+    /// so which one a device ends up on changes speed only — never results.
+    /// </remarks>
     public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir)
-        => Create(device, spvDir, I2SGemmVariant.SelectFor(device));
+    {
+        I2SGemmVariant coopmatPick = I2SGemmVariant.SelectFor(device);
+        if (coopmatPick != I2SGemmVariant.RegisterBlocked)
+        {
+            // SelectFor already verified every precondition for this exact variant (coopmat
+            // support, the wave32 pin, vendor/opt-in), so creation is expected to succeed.
+            return Create(device, spvDir, coopmatPick);
+        }
+
+        var candidates = I2SGemmVariant.ProductionPreference;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            // The final candidate requires no optional feature — let its failure surface.
+            if (i == candidates.Count - 1)
+                return Create(device, spvDir, candidates[i]);
+
+            try
+            {
+                return Create(device, spvDir, candidates[i]);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or VulkanException)
+            {
+                // Device lacks the storage feature, or the SPIR-V predates this build. Try the next.
+            }
+        }
+
+        throw new InvalidOperationException("No I2_S GEMM variant could be created.");
+    }
 
     /// <summary>Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline.</summary>
     /// <param name="device">Device to create the pipeline on.</param>

@@ -1,0 +1,149 @@
+#version 450
+// I2_S (BitNet b1.58 ternary) prefill GEMM — 4x4 REGISTER-BLOCKED (ILP) variant.
+//
+//   C[N, M] = B[N, K] @ W_i2s[M, K]^T      with W_i2s dequantized on the fly.
+//
+// Motivated directly by profiling, not by guesswork (issue #229). Elevated VTune
+// gpu-hotspots on the Meteor-Lake Arc reports, for the production 2x2 kernel:
+//
+//     XVE Array Stalled/Idle : 86.9% of elapsed time with GPU busy
+//     Occupancy              : 73.3% of peak
+//
+// Occupancy is HIGH, so the 86.9% is threads STALLED (resident, waiting on
+// memory), not IDLE (no threads to run). The kernel is memory-latency-bound.
+// That rules out the shared-memory-footprint fixes — more resident workgroups
+// cannot help when workgroups are already resident — and points instead at
+// INSTRUCTION-LEVEL PARALLELISM: give each thread more independent loads and
+// accumulators in flight so SLM latency is covered by useful work.
+//
+// So: same 32x32 output tile and the SAME 32 KB of shared memory as
+// matmul_i2_s_f32_gemm_rb.comp, but 64 threads instead of 256, each owning a
+// 4x4 micro-tile.
+//
+//   per thread, per K step:  4 sharedB loads + 4 sharedW loads -> 16 FMAs
+//                            = 2.0 MAC per shared load (2x the 2x2 kernel)
+//                            and 16 INDEPENDENT accumulator chains
+//
+// The 16 accumulators are the point: they are mutually independent, so the
+// compiler can keep many loads outstanding rather than stalling on each one.
+// Holding shared memory constant is deliberate — it isolates ILP as the single
+// changed variable, since the profile says footprint is not the constraint.
+//
+// Trade-off being tested: 64 threads/workgroup is fewer threads, so raw thread
+// occupancy falls. At 73.3% of peak there is headroom to spend, and the bet is
+// that ILP buys more than the lost occupancy costs. That is an empirical
+// question, which is why this is measured rather than assumed.
+//
+// Bit-exactness: the accumulation order per output cell is unchanged (a
+// sequential sum over k within each K-block, blocks in order), so results are
+// bit-identical to the 2x2 kernel. Verified by an exact-equality test.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 128
+    uint N;
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+const uint TILE_M = 32u;
+const uint TILE_N = 32u;
+const uint SUB    = 8u;           // micro-tile stride (= workgroup dim)
+const uint RB     = 4u;           // 4x4 micro-tile per thread
+const uint I2S_BLOCK = 128u;
+const uint I2S_BLOCK_BYTES = 32u;
+const uint WG_SIZE = SUB * SUB;   // 64 threads
+
+shared float sharedB[TILE_N * I2S_BLOCK];   // 32 x 128 token tile      (16 KB)
+shared float sharedW[TILE_M * I2S_BLOCK];   // 32 x 128 weight tile     (16 KB)
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;   // 0..7 -> weight rows {lx, lx+8, lx+16, lx+24}
+    uint ly = gl_LocalInvocationID.y;   // 0..7 -> token  rows {ly, ly+8, ly+16, ly+24}
+    uint tid = ly * SUB + lx;           // 0..63
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowBytes = pc.K >> 2u;
+    float scale = uintBitsToFloat(weight[(pc.M * rowBytes) >> 2u]);
+
+    // 16 independent accumulators — the ILP this variant is testing.
+    float acc[RB][RB];
+    for (uint i = 0u; i < RB; i++)
+        for (uint j = 0u; j < RB; j++)
+            acc[i][j] = 0.0;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint kBase = blk * I2S_BLOCK;
+
+        // ── 1. Stage sharedB[TILE_N, 128] = 4096 floats over 64 threads. ──
+        for (uint idx = tid; idx < TILE_N * I2S_BLOCK; idx += WG_SIZE) {
+            uint row = idx >> 7u;            // 0..31 token within tile
+            uint col = idx & 127u;           // 0..127 element within block
+            uint tGlobal = tBase + row;
+            sharedB[idx] = (tGlobal < pc.N) ? b[tGlobal * pc.K + kBase + col] : 0.0;
+        }
+
+        // ── 2. Dequantise sharedW[TILE_M, 128]: 32 rows x 32 bytes over 64 threads. ──
+        for (uint byteFlat = tid; byteFlat < TILE_M * I2S_BLOCK_BYTES; byteFlat += WG_SIZE) {
+            uint rowLocal = byteFlat >> 5u;  // 0..31 weight row within tile
+            uint gp       = byteFlat & 31u;  // 0..31 byte within block
+            uint mGlobal  = mBase + rowLocal;
+            uint sBase    = rowLocal * I2S_BLOCK;
+
+            if (mGlobal < pc.M) {
+                uint pk = readByte(mGlobal * rowBytes + blk * I2S_BLOCK_BYTES + gp);
+                sharedW[sBase + gp]        = float(int((pk >> 6u) & 3u) - 1);
+                sharedW[sBase + gp + 32u]  = float(int((pk >> 4u) & 3u) - 1);
+                sharedW[sBase + gp + 64u]  = float(int((pk >> 2u) & 3u) - 1);
+                sharedW[sBase + gp + 96u]  = float(int( pk        & 3u) - 1);
+            } else {
+                sharedW[sBase + gp]        = 0.0;
+                sharedW[sBase + gp + 32u]  = 0.0;
+                sharedW[sBase + gp + 64u]  = 0.0;
+                sharedW[sBase + gp + 96u]  = 0.0;
+            }
+        }
+
+        barrier();
+
+        // ── 3. 4x4 micro-tile: 8 shared loads feed 16 independent FMAs. ──
+        for (uint k = 0u; k < I2S_BLOCK; k++) {
+            float bv[RB];
+            float wv[RB];
+            for (uint i = 0u; i < RB; i++) {
+                bv[i] = sharedB[(ly + i * SUB) * I2S_BLOCK + k];
+                wv[i] = sharedW[(lx + i * SUB) * I2S_BLOCK + k];
+            }
+            for (uint i = 0u; i < RB; i++)
+                for (uint j = 0u; j < RB; j++)
+                    acc[i][j] += bv[i] * wv[j];
+        }
+
+        barrier();
+    }
+
+    // ── 4. Store the 4x4 micro-tile, bounds-guarded per cell. ──
+    for (uint i = 0u; i < RB; i++) {
+        uint tGlobal = tBase + ly + i * SUB;
+        if (tGlobal >= pc.N) continue;
+        for (uint j = 0u; j < RB; j++) {
+            uint mGlobal = mBase + lx + j * SUB;
+            if (mGlobal < pc.M)
+                c[tGlobal * pc.M + mGlobal] = acc[i][j] * scale;
+        }
+    }
+}
