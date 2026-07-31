@@ -548,9 +548,7 @@ public static unsafe partial class MatMul
         int groupBytes = 4 * q8RowBytes;
 
         // Partition groups across threads, then tile within each thread's share.
-        int groupsPerThread = (ctx.FullGroups + threadCount - 1) / threadCount;
-        int startGroup = threadIdx * groupsPerThread;
-        int endGroup = Math.Min(startGroup + groupsPerThread, ctx.FullGroups);
+        ComputeThreadPool.PartitionRange(ctx.FullGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
 
         for (int gStart = startGroup; gStart < endGroup; gStart += ctx.TileGroups)
         {
@@ -2169,9 +2167,7 @@ public static unsafe partial class MatMul
 
         // Partition groups across threads
         int totalGroups = ctx.FullGroups + (ctx.TailRows > 0 ? 1 : 0);
-        int groupsPerThread = (totalGroups + threadCount - 1) / threadCount;
-        int startGroup = threadIdx * groupsPerThread;
-        int endGroup = Math.Min(startGroup + groupsPerThread, totalGroups);
+        ComputeThreadPool.PartitionRange(totalGroups, threadIdx, threadCount, out int startGroup, out int endGroup);
 
         if (startGroup >= totalGroups) return;
 
@@ -2500,9 +2496,7 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF32Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
 
         for (int tile = startTile; tile < endTile; tile++)
         {
@@ -2518,9 +2512,7 @@ public static unsafe partial class MatMul
     {
         ref var ctx = ref Unsafe.AsRef<GemmTiledF16Ctx>((void*)ctxPtr);
         int totalTiles = (ctx.M + ctx.TileM - 1) / ctx.TileM;
-        int tilesPerThread = (totalTiles + threadCount - 1) / threadCount;
-        int startTile = threadIdx * tilesPerThread;
-        int endTile = Math.Min(startTile + tilesPerThread, totalTiles);
+        ComputeThreadPool.PartitionRange(totalTiles, threadIdx, threadCount, out int startTile, out int endTile);
 
         Half* weightsHalf = (Half*)ctx.Weights;
         float* rowBuf = (float*)ctx.ScratchPtrs[threadIdx];
