@@ -25,6 +25,7 @@ internal sealed class JinjaParser
     public JinjaTemplate Parse()
     {
         _pos = 0;
+        _depth = 0; // reset alongside _pos so a parse after a caught failure starts clean
         var nodes = ParseBody();
         return new JinjaTemplate(nodes);
     }
@@ -752,20 +753,28 @@ internal sealed class JinjaParser
 
     /// <summary>
     /// Increments the recursion depth counter and throws when the configured maximum
-    /// is exceeded. Called from every recursive parse entry point so that malicious or
+    /// would be exceeded. Called from every recursive parse entry point so that malicious or
     /// pathological templates (deeply nested parens, brackets, or if/for) raise a
     /// catchable <see cref="JinjaException"/> rather than a fatal
     /// <see cref="StackOverflowException"/>.
     /// </summary>
+    /// <remarks>
+    /// The limit is checked <i>before</i> incrementing. Callers wrap the recursive step in
+    /// <c>try { … } finally { ExitRecursion(); }</c> with this call outside the <c>try</c>,
+    /// so a throw here never runs the matching <c>finally</c>. Incrementing first would
+    /// therefore leak one level onto <c>_depth</c> permanently, leaving the counter
+    /// inconsistent for any later parse on the same instance.
+    /// </remarks>
     private void EnterRecursion()
     {
-        _depth++;
-        if (_depth > MaxRecursionDepth)
+        if (_depth >= MaxRecursionDepth)
         {
             throw Error(
                 $"Jinja template parser exceeded maximum recursion depth ({MaxRecursionDepth}). " +
                 $"Template is too deeply nested.");
         }
+
+        _depth++;
     }
 
     private void ExitRecursion()

@@ -21,8 +21,8 @@ public class JinjaParserRecursionTests
     /// <summary>
     /// A template with paren nesting well past the depth limit must raise a catchable
     /// <see cref="JinjaException"/>, not crash the process with a stack overflow.
-    /// The chosen depth (5000) is well beyond <c>MaxRecursionDepth = 100</c> and
-    /// enough to overflow the default thread stack on unfixed code.
+    /// The chosen depth is well beyond the configured depth limit and enough to
+    /// overflow the default thread stack on unfixed code.
     /// </summary>
     [Fact]
     public void DeeplyNestedParens_ThrowsJinjaException_NotStackOverflow()
@@ -36,7 +36,7 @@ public class JinjaParserRecursionTests
         sb.Append(" }}");
 
         var ex = Assert.Throws<JinjaException>(() => Parse(sb.ToString()));
-        Assert.Contains("recursion depth", ex.Message);
+        AssertDepthLimitMessage(ex);
     }
 
     /// <summary>
@@ -52,7 +52,7 @@ public class JinjaParserRecursionTests
         for (int i = 0; i < depth; i++) sb.Append("{% endif %}");
 
         var ex = Assert.Throws<JinjaException>(() => Parse(sb.ToString()));
-        Assert.Contains("recursion depth", ex.Message);
+        AssertDepthLimitMessage(ex);
     }
 
     /// <summary>
@@ -79,10 +79,10 @@ public class JinjaParserRecursionTests
     [Fact]
     public void NestingBelowLimit_ParsesWithoutError()
     {
-        // 50 paren-levels — under the 100 limit. Should succeed.
+        // Half the configured limit — comfortably inside it, so this must succeed.
         var sb = new StringBuilder();
         sb.Append("{{ ");
-        const int depth = 50;
+        int depth = JinjaParser.MaxRecursionDepth / 2;
         for (int i = 0; i < depth; i++) sb.Append('(');
         sb.Append('1');
         for (int i = 0; i < depth; i++) sb.Append(')');
@@ -91,5 +91,43 @@ public class JinjaParserRecursionTests
         var ast = Parse(sb.ToString());
         Assert.NotNull(ast);
         Assert.Single(ast.Nodes);
+    }
+
+    /// <summary>
+    /// The depth counter must be left consistent after the guard fires: repeatedly parsing
+    /// over-nested templates must not accumulate leaked depth that eventually rejects a
+    /// perfectly ordinary template.
+    /// </summary>
+    [Fact]
+    public void RepeatedGuardTrips_DoNotLeakDepth()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{{ ");
+        int depth = JinjaParser.MaxRecursionDepth + 5;
+        for (int i = 0; i < depth; i++) sb.Append('(');
+        sb.Append('1');
+        for (int i = 0; i < depth; i++) sb.Append(')');
+        sb.Append(" }}");
+        string overNested = sb.ToString();
+
+        // Far more trips than the depth limit — a one-level-per-trip leak would exceed it.
+        for (int i = 0; i < JinjaParser.MaxRecursionDepth * 2; i++)
+        {
+            Assert.Throws<JinjaException>(() => Parse(overNested));
+        }
+
+        var ast = Parse("{{ 1 }}");
+        Assert.Single(ast.Nodes);
+    }
+
+    /// <summary>
+    /// Asserts the failure is the depth guard rather than some other parse error, without
+    /// pinning exact wording or casing. The configured limit value is the stable signal —
+    /// it is asserted from the constant, so retuning the limit cannot stale the test.
+    /// </summary>
+    private static void AssertDepthLimitMessage(JinjaException ex)
+    {
+        Assert.Contains("recursion depth", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(JinjaParser.MaxRecursionDepth.ToString(), ex.Message, StringComparison.Ordinal);
     }
 }
