@@ -164,6 +164,20 @@ public readonly record struct I2SGemmVariant(
     /// </remarks>
     public static I2SGemmVariant RegisterBlockedWeightF16 => new("matmul_i2_s_f32_gemm_rb_wf16.spv", 32, 32);
 
+    /// <summary>
+    /// Register-blocked with the WEIGHT tile stored as int8 (activations stay F32). Bit-exact with
+    /// <see cref="RegisterBlocked"/>; shared memory 32 KB -> 20 KB and weight-side SLM traffic quartered.
+    /// </summary>
+    /// <remarks>
+    /// Follow-on from the SLM-traffic finding: F32 moves 4 bytes per weight access, F16 moves 2 and
+    /// won 1.22-1.50x, so int8 at 1 byte tests whether the gain keeps scaling with bytes moved.
+    /// Bit-exact for the same reason as F16 — ternary {-1, 0, +1} is exactly representable in int8,
+    /// so <c>float(int8_t(v)) == v</c>, leaving products and accumulation order unchanged.
+    /// Requires <c>GL_EXT_shader_8bit_storage</c>; see <see cref="ProductionPreference"/> for how a
+    /// device lacking it degrades.
+    /// </remarks>
+    public static I2SGemmVariant RegisterBlockedWeightInt8 => new("matmul_i2_s_f32_gemm_rb_wi8.spv", 32, 32);
+
     /// <summary>The variant used by the production forward path.</summary>
     /// <remarks>
     /// <see cref="RegisterBlockedWeightF16"/>: bit-identical to <see cref="RegisterBlocked"/> and
@@ -172,6 +186,23 @@ public readonly record struct I2SGemmVariant(
     /// (not occupancy, not bank conflicts, not global loads) as the real bottleneck.
     /// </remarks>
     public static I2SGemmVariant Production => RegisterBlockedWeightF16;
+
+    /// <summary>
+    /// Production variants in preference order, each falling back to the next when the device cannot
+    /// create it. The final entry requires no optional features and is always creatable.
+    /// </summary>
+    /// <remarks>
+    /// The faster variants narrow the weight tile to shrink SLM traffic, which needs small-type
+    /// storage: F16 needs 16-bit storage, int8 needs 8-bit storage. Those are optional Vulkan
+    /// features, so rather than probe each one this chain simply attempts creation and degrades.
+    /// Every entry is bit-identical to <see cref="RegisterBlocked"/>, so which one a device picks
+    /// changes speed only — never results.
+    /// </remarks>
+    public static IReadOnlyList<I2SGemmVariant> ProductionPreference { get; } =
+    [
+        RegisterBlockedWeightF16,
+        RegisterBlocked,
+    ];
 }
 
 /// <summary>
@@ -218,9 +249,42 @@ public sealed class MatMulI2SGemmF32Kernel : IDisposable
         _descriptorCache = new DescriptorSetCache(device, pool, pipeline, buffersPerSet: 3);
     }
 
-    /// <summary>Loads the production I2_S GEMM variant and creates the pipeline.</summary>
+    /// <summary>
+    /// Creates the fastest production I2_S GEMM variant the device can actually run, degrading
+    /// through <see cref="I2SGemmVariant.ProductionPreference"/>.
+    /// </summary>
+    /// <param name="device">Device to create the pipeline on.</param>
+    /// <param name="spvDir">Directory holding the compiled SPIR-V modules.</param>
+    /// <returns>A kernel bound to the best creatable variant.</returns>
+    /// <remarks>
+    /// The faster variants narrow the weight tile to cut SLM traffic and so depend on optional
+    /// small-type storage features (16-bit for F16, 8-bit for int8). A device without them fails at
+    /// pipeline creation, and an older build may simply not have the SPIR-V on disk, so both cases
+    /// fall through to the next candidate rather than breaking the forward pass. The last entry
+    /// needs no optional feature. Every candidate is bit-identical, so the fallback changes
+    /// performance only — never results.
+    /// </remarks>
     public static MatMulI2SGemmF32Kernel Create(VulkanDevice device, string spvDir)
-        => Create(device, spvDir, I2SGemmVariant.Production);
+    {
+        var candidates = I2SGemmVariant.ProductionPreference;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            // The final candidate requires no optional feature — let its failure surface.
+            if (i == candidates.Count - 1)
+                return Create(device, spvDir, candidates[i]);
+
+            try
+            {
+                return Create(device, spvDir, candidates[i]);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or VulkanException)
+            {
+                // Device lacks the storage feature, or the SPIR-V predates this build. Try the next.
+            }
+        }
+
+        throw new InvalidOperationException("No I2_S GEMM variant could be created.");
+    }
 
     /// <summary>Loads the SPIR-V for <paramref name="variant"/> and creates the pipeline.</summary>
     /// <param name="device">Device to create the pipeline on.</param>

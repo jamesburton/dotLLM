@@ -192,6 +192,25 @@ public class VulkanMatMulI2SGemmF32KernelTests
     public void RegisterBlockedWeightF16_IsBitIdenticalToRegisterBlocked(int m, int k, int n)
         => AssertBitIdentical(I2SGemmVariant.RegisterBlockedWeightF16, m, k, n);
 
+    /// <summary>
+    /// The int8 weight tile must be bit-identical to production: ternary is exactly representable in
+    /// int8, so staging it there changes no value and no accumulation order.
+    /// </summary>
+    /// <remarks>
+    /// Skipped when the device lacks 8-bit storage — pipeline creation throws in that case, which is
+    /// the same condition the production fallback chain handles.
+    /// </remarks>
+    /// <param name="m">Weight rows (output columns of C).</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    /// <param name="n">Token rows (batch).</param>
+    [SkippableTheory]
+    [InlineData(32, 256, 8)]
+    [InlineData(48, 768, 12)]
+    [InlineData(17, 256, 47)]
+    [InlineData(2560, 2560, 5)]
+    public void RegisterBlockedWeightInt8_IsBitIdenticalToRegisterBlocked(int m, int k, int n)
+        => AssertBitIdentical(I2SGemmVariant.RegisterBlockedWeightInt8, m, k, n);
+
     private static void AssertBitIdentical(I2SGemmVariant variant, int m, int k, int n)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
@@ -206,7 +225,16 @@ public class VulkanMatMulI2SGemmF32KernelTests
 
         using var device = VulkanDevice.Create();
         float[] baseline = RunVariant(device, spvDir, I2SGemmVariant.RegisterBlocked, weightsI2S, inputB, m, k, n);
-        float[] candidate = RunVariant(device, spvDir, variant, weightsI2S, inputB, m, k, n);
+        float[] candidate;
+        try
+        {
+            candidate = RunVariant(device, spvDir, variant, weightsI2S, inputB, m, k, n);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or DotLLM.Vulkan.Interop.VulkanException)
+        {
+            // Device lacks the small-type storage feature this variant needs (e.g. 8-bit storage).
+            throw new SkipException($"{variant.SpvFileName} not creatable on this device: {ex.Message}");
+        }
 
         for (int i = 0; i < baseline.Length; i++)
         {
