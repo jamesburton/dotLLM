@@ -146,4 +146,19 @@ public sealed class InvalidModelConfigException : Exception
     {
         FieldName = fieldName;
     }
+
+    /// <summary>
+    /// Creates a new exception describing the invalid field and the reason, wrapping the
+    /// lower-level failure that surfaced it. Use this when a loader detects the invalid
+    /// value while handling another exception (e.g. a metadata parse or conversion error),
+    /// so the original stack and context are not lost.
+    /// </summary>
+    /// <param name="fieldName">Name of the offending <see cref="ModelConfig"/> field.</param>
+    /// <param name="reason">Human-readable reason the field is invalid.</param>
+    /// <param name="innerException">The exception that caused this validation failure.</param>
+    public InvalidModelConfigException(string fieldName, string reason, Exception innerException)
+        : base($"{nameof(ModelConfig)}.{fieldName} {reason}", innerException)
+    {
+        FieldName = fieldName;
+    }
 }

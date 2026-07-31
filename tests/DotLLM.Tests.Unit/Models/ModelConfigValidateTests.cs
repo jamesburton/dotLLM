@@ -97,7 +97,8 @@ public class ModelConfigValidateTests
             nameof(ModelConfig.NumKvHeads) => ValidBase() with { NumKvHeads = 0 },
             nameof(ModelConfig.HeadDim) => ValidBase() with { HeadDim = -8 },
             nameof(ModelConfig.MaxSequenceLength) => ValidBase() with { MaxSequenceLength = 0 },
-            _ => throw new System.Exception("unhandled"),
+            _ => throw new InvalidOperationException(
+                $"Test data error: no invalid-config case defined for field '{fieldName}'."),
         };
         var ex = Assert.Throws<InvalidModelConfigException>(config.Validate);
         Assert.Equal(fieldName, ex.FieldName);
