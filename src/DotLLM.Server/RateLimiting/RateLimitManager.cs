@@ -65,8 +65,13 @@ public sealed class RateLimitManager : IDisposable
 
         var state = _keys.GetOrAdd(apiKey, static (k, p) => new KeyState(p), policy);
 
+        // Intermediate leases are held as the raw BCL/gate leases and disposed
+        // directly on any rejection path. They are only wrapped in a
+        // RateLimitLease bundle once all three limiters have admitted.
+        System.Threading.RateLimiting.RateLimitLease? reqLease = null;
+        System.Threading.RateLimiting.RateLimitLease? tokLease = null;
+
         // --- 1. Requests/min ---
-        RateLimitLease? reqLease = null;
         if (state.Requests is { } reqLimiter)
         {
             var lease = await reqLimiter.AcquireAsync(resource: 0, permitCount: 1, ct).ConfigureAwait(false);
@@ -76,11 +81,10 @@ public sealed class RateLimitManager : IDisposable
                 lease.Dispose();
                 return AcquireResult.Reject(LimiterKind.Requests, retryAfter);
             }
-            reqLease = new RateLimitLease(null!, apiKey, 0, lease, null, null);
+            reqLease = lease;
         }
 
         // --- 2. Tokens/min ---
-        RateLimitLease? tokLease = null;
         if (state.Tokens is { } tokLimiter && estimatedTokens > 0)
         {
             var lease = await tokLimiter.AcquireAsync(resource: 0, permitCount: estimatedTokens, ct).ConfigureAwait(false);
@@ -91,7 +95,7 @@ public sealed class RateLimitManager : IDisposable
                 reqLease?.Dispose();
                 return AcquireResult.Reject(LimiterKind.Tokens, retryAfter);
             }
-            tokLease = new RateLimitLease(null!, apiKey, 0, null, lease, null);
+            tokLease = lease;
         }
 
         // --- 3. Concurrency (priority-aware) ---
@@ -104,22 +108,22 @@ public sealed class RateLimitManager : IDisposable
             }
             catch
             {
-                reqLease?.Dispose();
                 tokLease?.Dispose();
+                reqLease?.Dispose();
                 throw;
             }
             if (concLease is null)
             {
-                reqLease?.Dispose();
                 tokLease?.Dispose();
-                return AcquireResult.Reject(LimiterKind.Concurrency, (int)policy.QueueTimeout.TotalSeconds);
+                reqLease?.Dispose();
+                return AcquireResult.Reject(LimiterKind.Concurrency, RetryAfterSeconds(policy.QueueTimeout));
             }
         }
 
         return AcquireResult.Admit(new RateLimitLease(
             this, apiKey, estimatedTokens,
-            requestsLease: reqLease?.RequestsLease,
-            tokensLease: tokLease?.TokensLease,
+            requestsLease: reqLease,
+            tokensLease: tokLease,
             concurrencyLease: concLease));
     }
 
@@ -149,9 +153,17 @@ public sealed class RateLimitManager : IDisposable
     private static int ExtractRetryAfter(System.Threading.RateLimiting.RateLimitLease lease, int defaultSec)
     {
         if (lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
-            return Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
+            return RetryAfterSeconds(retryAfter);
         return defaultSec;
     }
+
+    /// <summary>
+    /// Converts a wait duration to a <c>Retry-After</c> value in whole seconds.
+    /// Rounds up and floors at 1 — truncation would emit <c>Retry-After: 0</c>
+    /// for sub-second waits, telling the client to retry immediately.
+    /// </summary>
+    private static int RetryAfterSeconds(TimeSpan wait) =>
+        Math.Max(1, (int)Math.Ceiling(wait.TotalSeconds));
 
     /// <inheritdoc/>
     public void Dispose()
@@ -185,28 +197,44 @@ public sealed class RateLimitManager : IDisposable
 
         private static PartitionedRateLimiter<int> BuildRequestsLimiter(int permitsPerMinute) =>
             // Single-partition key=0 — we already partition per API key at the
-            // KeyState level. Using a TokenBucket lets bursts up to one minute
-            // of permits replenishing at rate/sec.
-            PartitionedRateLimiter.Create<int, int>(_ =>
+            // KeyState level. A TokenBucket lets a caller burst up to one full
+            // minute of permits, then refill at exactly permitsPerMinute/min.
+            BuildPerMinuteLimiter(permitsPerMinute);
+
+        private static PartitionedRateLimiter<int> BuildTokensLimiter(int tokensPerMinute) =>
+            BuildPerMinuteLimiter(tokensPerMinute);
+
+        /// <summary>
+        /// Builds a token bucket whose replenishment rate is exactly
+        /// <paramref name="permitsPerMinute"/> per minute.
+        /// </summary>
+        /// <remarks>
+        /// The naive form (<c>TokensPerPeriod = permitsPerMinute / 60</c> every
+        /// second) is wrong in both directions because of integer division and
+        /// the <c>Max(1, …)</c> floor: 2/min replenished at 1/s → 60/min, and
+        /// 100/min replenished at 1/s → 60/min. Instead the period is derived
+        /// from the chosen batch size, so
+        /// <c>TokensPerPeriod / ReplenishmentPeriod == permitsPerMinute / 60s</c>
+        /// exactly. The batch is ⌊permitsPerMinute/60⌋ (≥ 1), which keeps the
+        /// period at ≈ 1 s for large limits and stretches it out for small ones
+        /// (2/min → one permit every 30 s) rather than firing a sub-millisecond
+        /// replenishment timer.
+        /// </remarks>
+        private static PartitionedRateLimiter<int> BuildPerMinuteLimiter(int permitsPerMinute)
+        {
+            int tokensPerPeriod = Math.Max(1, permitsPerMinute / 60);
+            var period = TimeSpan.FromSeconds(60.0 * tokensPerPeriod / permitsPerMinute);
+
+            return PartitionedRateLimiter.Create<int, int>(_ =>
                 RateLimitPartition.GetTokenBucketLimiter(0, _ => new TokenBucketRateLimiterOptions
                 {
                     TokenLimit = permitsPerMinute,
-                    TokensPerPeriod = Math.Max(1, permitsPerMinute / 60),
-                    ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+                    TokensPerPeriod = tokensPerPeriod,
+                    ReplenishmentPeriod = period,
                     QueueLimit = 0,            // Fail-fast — middleware translates to 429.
                     AutoReplenishment = true,
                 }));
-
-        private static PartitionedRateLimiter<int> BuildTokensLimiter(int tokensPerMinute) =>
-            PartitionedRateLimiter.Create<int, int>(_ =>
-                RateLimitPartition.GetTokenBucketLimiter(0, _ => new TokenBucketRateLimiterOptions
-                {
-                    TokenLimit = tokensPerMinute,
-                    TokensPerPeriod = Math.Max(1, tokensPerMinute / 60),
-                    ReplenishmentPeriod = TimeSpan.FromSeconds(1),
-                    QueueLimit = 0,
-                    AutoReplenishment = true,
-                }));
+        }
 
         public void Dispose()
         {

@@ -201,6 +201,43 @@ public class RateLimitManagerTests
         foreach (var l in leases) l.Dispose();
     }
 
+    /// <summary>
+    /// Regression: the bucket used to replenish <c>max(1, permitsPerMinute/60)</c>
+    /// permits every second, so a 2/min policy actually refilled at 60/min. The
+    /// replenishment period is now derived from the batch size, giving an exact
+    /// per-minute rate — a 2/min key gets one permit back every 30 s, so nothing
+    /// is admitted within a second of exhausting the budget.
+    /// </summary>
+    [Fact]
+    public async Task RequestsPerMinute_SmallLimit_DoesNotRefillWithinASecond()
+    {
+        var cfg = new RateLimitConfig
+        {
+            Enabled = true,
+            DefaultPolicy = new RateLimitPolicy { RequestsPerMinute = 2 },
+        };
+        using var mgr = new RateLimitManager(cfg);
+
+        var leases = new List<RateLimitLease>();
+        for (int i = 0; i < 2; i++)
+        {
+            var ok = await mgr.TryAcquireAsync("key", 0, default);
+            Assert.True(ok.IsAcquired);
+            leases.Add(ok.Lease!);
+        }
+
+        Assert.False((await mgr.TryAcquireAsync("key", 0, default)).IsAcquired);
+
+        // Comfortably past the old 1-second replenishment tick.
+        await Task.Delay(1200);
+
+        var afterWait = await mgr.TryAcquireAsync("key", 0, default);
+        Assert.False(afterWait.IsAcquired);
+        Assert.Equal(LimiterKind.Requests, afterWait.Rejected);
+
+        foreach (var l in leases) l.Dispose();
+    }
+
     [Fact]
     public async Task ReportActualTokens_DoesNotThrow_WhenLeaseDisposed()
     {

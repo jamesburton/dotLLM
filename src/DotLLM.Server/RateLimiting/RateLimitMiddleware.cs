@@ -78,7 +78,7 @@ public sealed class RateLimitMiddleware
 
         if (!result.IsAcquired)
         {
-            await WriteRejection(context, result, apiKey).ConfigureAwait(false);
+            await WriteRejection(context, result).ConfigureAwait(false);
             return;
         }
 
@@ -185,7 +185,9 @@ public sealed class RateLimitMiddleware
         return null;
     }
 
-    private static async Task WriteRejection(HttpContext context, AcquireResult result, string apiKey)
+    // The rejected API key is deliberately absent from the response body and
+    // headers — it is a caller credential, not diagnostic output.
+    private static async Task WriteRejection(HttpContext context, AcquireResult result)
     {
         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
         context.Response.Headers["Retry-After"] = result.RetryAfter.ToString(CultureInfo.InvariantCulture);
@@ -215,9 +217,18 @@ public static class RateLimitMiddlewareExtensions
 {
     /// <summary>
     /// Add the dotLLM rate-limit middleware to the request pipeline. Must
-    /// be placed before <c>MapDotLLMEndpoints</c>. No-op when the manager
-    /// is null or disabled.
+    /// be placed before <c>MapDotLLMEndpoints</c>.
     /// </summary>
+    /// <remarks>
+    /// The middleware is always wired, including when
+    /// <see cref="RateLimitConfig.Enabled"/> is <c>false</c>: it short-circuits
+    /// internally on a single bool check, so a disabled configuration costs one
+    /// branch per request and can be toggled without rebuilding the pipeline.
+    /// <paramref name="manager"/> and <paramref name="resolver"/> are required.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="manager"/> or <paramref name="resolver"/> is <c>null</c>.
+    /// </exception>
     public static IApplicationBuilder UseDotLLMRateLimiting(this IApplicationBuilder app,
         RateLimitManager manager, IApiKeyResolver resolver)
     {
