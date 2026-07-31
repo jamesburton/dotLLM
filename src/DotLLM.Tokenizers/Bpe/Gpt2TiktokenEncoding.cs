@@ -81,9 +81,19 @@ internal sealed class Gpt2TiktokenEncoding : IBpeEncoding
     private readonly int _unkId;
 
     /// <summary>
-    /// Compiled pre-tokenization regex that splits input at word/punctuation boundaries
-    /// before BPE merges. Null means no pre-tokenization (whole text = one segment).
+    /// Ordered pre-tokenization pipeline, applied to RAW text before byte-encoding: each expression
+    /// further splits the spans the previous one produced, so merges cannot cross a boundary the
+    /// model was trained to respect.
     /// </summary>
+    /// <remarks>
+    /// <para><see langword="null"/> or empty means <b>no pre-tokenization at all</b> — the whole
+    /// input becomes one segment and merges run across it. That is rarely what an unrecognized
+    /// pre-type should mean: the resulting stream mostly matches the reference and diverges at a
+    /// handful of sites, which is the failure mode that motivated this change (see #237).</para>
+    /// <para>An array rather than a single expression because a pre-type maps to a <i>pipeline</i>:
+    /// the StarCoder/SmolLM family isolates every digit before applying its main pattern, and
+    /// collapsing that to one expression silently mis-tokenizes.</para>
+    /// </remarks>
     private readonly Regex[]? _preRegexes;
 
     internal Gpt2TiktokenEncoding(string[] tokens, string[] merges, int[]? tokenTypes, Regex[]? preRegexes = null)
