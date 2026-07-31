@@ -53,6 +53,12 @@ public sealed class PrefixCacheIntegrationTests
         var first = generator.Generate("hello", new InferenceOptions { Temperature = 0f, MaxTokens = 2 });
         Assert.Equal(2, first.GeneratedTokenIds.Length);
 
+        // Baseline the counter rather than testing an absolute total: an absolute `allocCount >= 2`
+        // would also be satisfied by the first call allocating twice and the second reusing the
+        // undersized cache — exactly the regression under test.
+        int allocAfterFirst = allocCount;
+        Assert.True(allocAfterFirst == 1, $"expected one allocation for the first call, got {allocAfterFirst}");
+
         // Second request: same prompt, much larger max_tokens. Required cache = 5 + 20 = 25,
         // far exceeds the stored cache's MaxLength of 7. Before the fix, the
         // `entry.KvCache.MaxLength >= promptLen` clause accepted the small cache and decode ran out
@@ -60,7 +66,11 @@ public sealed class PrefixCacheIntegrationTests
         // resolver falls through to allocation and the request completes fully.
         var second = generator.Generate("hello", new InferenceOptions { Temperature = 0f, MaxTokens = 20 });
         Assert.Equal(20, second.GeneratedTokenIds.Length);
-        Assert.True(allocCount >= 2, $"expected reallocation on second call, allocCount={allocCount}");
+
+        int allocDelta = allocCount - allocAfterFirst;
+        Assert.True(allocDelta == 1,
+            $"expected the second call to allocate exactly one new cache, delta={allocDelta} " +
+            $"(allocAfterFirst={allocAfterFirst}, allocCount={allocCount})");
     }
 
     /// <summary>
