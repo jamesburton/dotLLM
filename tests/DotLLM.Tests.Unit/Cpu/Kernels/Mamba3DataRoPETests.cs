@@ -181,6 +181,29 @@ public sealed class Mamba3DataRoPETests
     /// Even-dimension invariant: d_state must be even so adjacent pairs make sense.
     /// Passing odd <c>dState</c> must throw.
     /// </summary>
+    /// <summary>
+    /// B and C are each rotated in place, so a shared/overlapping buffer would be
+    /// rotated twice. That must be rejected, not silently mis-rotated.
+    /// </summary>
+    [Fact]
+    public void OverlappingBAndC_Throws()
+    {
+        const int seqLen = 2, nHead = 1, dState = 4;
+        float[] buffer = new float[seqLen * nHead * dState];
+        float[] dt = new float[seqLen * nHead];
+        float[] theta = new float[seqLen * dState / 2];
+
+        Assert.Throws<ArgumentException>(() =>
+            Mamba3DataRoPE.Execute(buffer, buffer, dt, theta, seqLen, nHead, dState));
+
+        // Partial overlap is rejected too (spans need not be identical).
+        float[] wide = new float[seqLen * nHead * dState + 1];
+        Assert.Throws<ArgumentException>(() =>
+            Mamba3DataRoPE.Execute(
+                wide.AsSpan(0, buffer.Length), wide.AsSpan(1, buffer.Length),
+                dt, theta, seqLen, nHead, dState));
+    }
+
     [Fact]
     public void OddDState_Throws()
     {

@@ -150,7 +150,10 @@ public static class Mamba3DataRoPE
     /// When non-empty, both must have length <c>n_head · d_state/2</c> and row-major
     /// layout <c>[n_head, d_state/2]</c>. <paramref name="cumAnglePrev"/> and
     /// <paramref name="cumAngleOut"/> may alias (same buffer is fine — it is read in
-    /// full before any writes).
+    /// full before any writes). <paramref name="b"/> and <paramref name="c"/>, by
+    /// contrast, must <b>not</b> overlap: each is rotated in place, so a shared
+    /// buffer would be rotated twice. Overlap is rejected with an
+    /// <see cref="ArgumentException"/>.
     /// </para>
     /// </remarks>
     /// <param name="b">As in the no-offset overload.</param>
@@ -195,6 +198,11 @@ public static class Mamba3DataRoPE
             throw new ArgumentException($"b length {b.Length} < T*n_head*d_state = {bcLen}.", nameof(b));
         if (c.Length < bcLen)
             throw new ArgumentException($"c length {c.Length} < T*n_head*d_state = {bcLen}.", nameof(c));
+        // B and C are rotated by the same angles but are distinct tensors. If they
+        // overlapped, the second rotation would re-rotate already-rotated data and
+        // silently produce wrong values, so reject it rather than guess the intent.
+        if (b.Overlaps(c))
+            throw new ArgumentException("b and c must not overlap; each is rotated in place.", nameof(c));
         if (dt.Length < dtLen)
             throw new ArgumentException($"dt length {dt.Length} < T*n_head = {dtLen}.", nameof(dt));
         if (theta.Length < thetaLen)
@@ -542,6 +550,9 @@ public static class Mamba3DataRoPE
             throw new ArgumentException($"b length {b.Length} < T*R*H*N = {bcLen}.", nameof(b));
         if (c.Length < bcLen)
             throw new ArgumentException($"c length {c.Length} < T*R*H*N = {bcLen}.", nameof(c));
+        // See Execute: overlapping b/c would be rotated twice.
+        if (b.Overlaps(c))
+            throw new ArgumentException("b and c must not overlap; each is rotated in place.", nameof(c));
         if (anglesRaw.Length < angLen)
             throw new ArgumentException($"anglesRaw length {anglesRaw.Length} < T*numRopeAngles = {angLen}.", nameof(anglesRaw));
         if (dt.Length < dtLen)

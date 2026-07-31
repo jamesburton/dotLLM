@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 
 namespace DotLLM.Cpu.Kernels;
@@ -66,6 +67,66 @@ namespace DotLLM.Cpu.Kernels;
 /// </remarks>
 public static class Mamba3CanonicalSsd
 {
+    /// <summary>Stackalloc threshold in floats for the per-head rank-sum scratch.</summary>
+    private const int StackAllocFloatThreshold = 2048;
+
+    /// <summary>
+    /// State update for one <c>(t, h)</c> pair:
+    /// <c>h[p, n] = decay · h[p, n] + V[p] · (Σ_r K_r[n]) · scale</c>.
+    /// </summary>
+    /// <remarks>
+    /// The rank sum depends only on <c>n</c>, so it is materialised once per head
+    /// rather than recomputed for every channel <c>p</c> — dropping an
+    /// <c>O(headDim)</c> factor from the rank reduction. The summation order over
+    /// <c>r</c> is unchanged, so results are bit-identical to the naive form.
+    /// Also used by the streaming chunk-boundary adjustment with
+    /// <paramref name="decay"/> = 1 and <paramref name="scale"/> = the boundary
+    /// coefficient, which has exactly the same shape.
+    /// </remarks>
+    [SkipLocalsInit]
+    private static void UpdateStateRankSummed(
+        Span<float> state,
+        ReadOnlySpan<float> k,
+        ReadOnlySpan<float> vSlice,
+        int stateBase,
+        int kHeadBase,
+        int kRankStride,
+        float decay,
+        float scale,
+        int nRank,
+        int headDim,
+        int dState)
+    {
+        float[]? rented = null;
+        Span<float> kSum = dState <= StackAllocFloatThreshold
+            ? stackalloc float[dState]
+            : (rented = ArrayPool<float>.Shared.Rent(dState)).AsSpan(0, dState);
+
+        try
+        {
+            for (int n = 0; n < dState; n++)
+            {
+                float s = 0f;
+                for (int r = 0; r < nRank; r++)
+                    s += k[kHeadBase + r * kRankStride + n];
+                kSum[n] = s * scale;
+            }
+
+            for (int p = 0; p < headDim; p++)
+            {
+                float vp = vSlice[p];
+                int row = stateBase + p * dState;
+                for (int n = 0; n < dState; n++)
+                    state[row + n] = decay * state[row + n] + vp * kSum[n];
+            }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<float>.Shared.Return(rented);
+        }
+    }
+
     /// <summary>
     /// Runs the canonical SISO SSD scan over <paramref name="seqLen"/> tokens.
     /// </summary>
@@ -326,22 +387,13 @@ public static class Mamba3CanonicalSsd
                 ReadOnlySpan<float> vSlice = v.Slice(vBase, headDim);
 
                 // h update: h_new[p,n] = decay * h_old[p,n] + V[p] * (Σ_r K_r[n]) * scale
-                for (int p = 0; p < headDim; p++)
-                {
-                    float vp = vSlice[p];
-                    int stateRowBase = stateBase + p * dState;
-                    for (int n = 0; n < dState; n++)
-                    {
-                        float kSum = 0f;
-                        for (int r = 0; r < nRank; r++)
-                        {
-                            int kIdx = bcTokBase + r * bcRankStride + h * bcHeadStride + n;
-                            kSum += kRoped[kIdx];
-                        }
-                        float newState = decay * state[stateRowBase + n] + vp * (kSum * scl);
-                        state[stateRowBase + n] = newState;
-                    }
-                }
+                // Σ_r K_r[n] depends only on (t, h, n), so it is rank-summed once
+                // per head instead of once per (p, n) — the summation order is
+                // unchanged, so results stay bit-identical.
+                UpdateStateRankSummed(
+                    state, kRoped, vSlice,
+                    stateBase, bcTokBase + h * bcHeadStride, bcRankStride,
+                    decay, scl, nRank, headDim, dState);
 
                 // Per-rank readout and contraction.
                 for (int p = 0; p < headDim; p++)
@@ -495,7 +547,15 @@ public static class Mamba3CanonicalSsd
         if (dt.Length < hdrElems) throw new ArgumentException("dt too small.", nameof(dt));
         if (trap.Length < hdrElems) throw new ArgumentException("trap too small.", nameof(trap));
 
-        if (!kState.IsEmpty || !vState.IsEmpty)
+        // kState/vState are a pair: both empty disables the streaming boundary,
+        // both non-empty enables it. Reject the half-configured case explicitly
+        // rather than reporting it as "vState too small".
+        if (kState.IsEmpty != vState.IsEmpty)
+            throw new ArgumentException(
+                "kState and vState must both be empty (streaming boundary disabled) or both non-empty.",
+                kState.IsEmpty ? nameof(kState) : nameof(vState));
+
+        if (!kState.IsEmpty)
         {
             long kStateElems = (long)nRank * nHead * dState;
             long vStateElems = (long)nHead * headDim;
@@ -503,6 +563,18 @@ public static class Mamba3CanonicalSsd
                 throw new ArgumentException("kState too small.", nameof(kState));
             if (vState.Length < vStateElems)
                 throw new ArgumentException("vState too small.", nameof(vState));
+
+            // The boundary adjustment below MUTATES state, and the persist step
+            // reads v/kRoped, all before ExecuteMimo validates anything. Check the
+            // buffers those steps touch up front so an undersized argument raises
+            // ArgumentException instead of IndexOutOfRangeException against a
+            // half-updated state.
+            if (state.Length < (long)nHead * headDim * dState)
+                throw new ArgumentException("state too small.", nameof(state));
+            if (v.Length < (long)seqLen * nHead * headDim)
+                throw new ArgumentException("v too small.", nameof(v));
+            if (kRoped.Length < (long)seqLen * nRank * nHead * dState)
+                throw new ArgumentException("kRoped too small.", nameof(kRoped));
         }
 
         // ── Chunk-boundary adjustment (canonical mamba3_mimo_fwd rank-sum form) ──
@@ -523,24 +595,12 @@ public static class Mamba3CanonicalSsd
                 float coef = dt[h] * (1f - trap[h]);
                 if (coef == 0f) continue;
 
-                int vBase = h * vHeadStride;
-                int stateBase = h * stateHeadStride;
-
-                for (int p = 0; p < headDim; p++)
-                {
-                    float vpC = vState[vBase + p] * coef;
-                    if (vpC == 0f) continue;
-                    int row = stateBase + p * dState;
-                    for (int n = 0; n < dState; n++)
-                    {
-                        float kSum = 0f;
-                        for (int r = 0; r < nRank; r++)
-                        {
-                            kSum += kState[r * kRankStride + h * kHeadStride + n];
-                        }
-                        state[row + n] += vpC * kSum;
-                    }
-                }
+                // Same shape as the scan's state update with decay = 1, so the
+                // rank sum is shared (and hoisted out of the channel loop).
+                UpdateStateRankSummed(
+                    state, kState, vState.Slice(h * vHeadStride, headDim),
+                    h * stateHeadStride, h * kHeadStride, kRankStride,
+                    decay: 1f, scale: coef, nRank, headDim, dState);
             }
         }
 
@@ -567,7 +627,6 @@ public static class Mamba3CanonicalSsd
             int kTokStride = nRank * nHead * dState;
             int kSrcRankStride = nHead * dState;
             int kDstRankStride = nHead * dState;
-            int kHeadStride = dState;
             for (int r = 0; r < nRank; r++)
             {
                 ReadOnlySpan<float> src = kRoped.Slice(
@@ -579,7 +638,6 @@ public static class Mamba3CanonicalSsd
             // vState: [H, P] from v[lastTok, :, :] which is [T, H, P] row-major.
             ReadOnlySpan<float> vSrc = v.Slice(lastTok * nHead * headDim, nHead * headDim);
             vSrc.CopyTo(vState);
-            _ = kHeadStride; // stride kept for documentation/alignment parity; loop indexes directly.
         }
     }
 }

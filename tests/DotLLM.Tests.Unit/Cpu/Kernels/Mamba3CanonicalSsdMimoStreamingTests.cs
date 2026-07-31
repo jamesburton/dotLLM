@@ -216,6 +216,73 @@ public sealed class Mamba3CanonicalSsdMimoStreamingTests
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// kState/vState are a pair; supplying only one is a caller error and must be
+    /// reported as such rather than as a confusing "too small" message.
+    /// </summary>
+    [Fact]
+    public void Streaming_HalfConfiguredBoundaryBuffers_Throws()
+    {
+        var args = MakeMinimalArgs();
+        float[] kState = new float[NRank * NHead * DState];
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            args.Invoke(kState, [], state: new float[NHead * HeadDim * DState]));
+        Assert.Contains("both", ex.Message);
+    }
+
+    /// <summary>
+    /// The chunk-boundary adjustment mutates state before the inner scan validates
+    /// anything, so an undersized state must be rejected up front — not surface as
+    /// IndexOutOfRangeException from a half-applied boundary update.
+    /// </summary>
+    [Fact]
+    public void Streaming_UndersizedState_ThrowsArgumentException()
+    {
+        var args = MakeMinimalArgs();
+        float[] kState = new float[NRank * NHead * DState];
+        float[] vState = new float[NHead * HeadDim];
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            args.Invoke(kState, vState, state: new float[NHead * HeadDim * DState - 1]));
+        Assert.Equal("state", ex.ParamName);
+    }
+
+    /// <summary>Well-formed inputs for the argument-validation tests.</summary>
+    private static StreamingArgs MakeMinimalArgs()
+    {
+        float[] adt = new float[SeqLen * NHead];
+        for (int i = 0; i < adt.Length; i++) adt[i] = -0.02f - 0.001f * i;
+
+        return new StreamingArgs(
+            v: Ramp(SeqLen * NHead * HeadDim, 0.03f, 0),
+            q: Ramp(SeqLen * NRank * NHead * DState, 0.02f, 1),
+            k: Ramp(SeqLen * NRank * NHead * DState, 0.02f, 2),
+            qkSum: Ramp(SeqLen * NHead, 0.1f, 3),
+            scale: Ramp(SeqLen * NHead, 0.05f, 4),
+            gamma: Ramp(SeqLen * NHead, 0.05f, 5),
+            adt: adt,
+            dt: Ramp(SeqLen * NHead, 0.02f, 6),
+            trap: Ramp(SeqLen * NHead, 0.5f, 7),
+            d: Ramp(NHead, 0.1f, 8),
+            z: Ramp(SeqLen * NHead * HeadDim, 0.1f, 9),
+            mimoZ: Ramp(NHead * NRank * HeadDim, 0.3f, 10),
+            mimoO: Ramp(NHead * NRank * HeadDim, 0.3f, 11));
+    }
+
+    private sealed record StreamingArgs(
+        float[] v, float[] q, float[] k, float[] qkSum, float[] scale,
+        float[] gamma, float[] adt, float[] dt, float[] trap, float[] d,
+        float[] z, float[] mimoZ, float[] mimoO)
+    {
+        public void Invoke(float[] kState, float[] vState, float[] state) =>
+            Mamba3CanonicalSsd.ExecuteMimoStreaming(
+                state, v, q, k, qkSum, scale, gamma, adt, dt, trap, d, z, mimoZ, mimoO,
+                kState, vState,
+                new float[SeqLen * NHead * HeadDim], yPerRank: Span<float>.Empty,
+                SeqLen, NRank, NHead, HeadDim, DState);
+    }
+
     private static float[] Ramp(int count, float amplitude, int seed)
     {
         float[] r = new float[count];
