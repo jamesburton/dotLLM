@@ -1480,8 +1480,12 @@ public sealed class VulkanTransformerModel : IModel
         var matmulI2S = MatMulI2SGemvF32Kernel.Create(device, spvDir);
         var matmulI2SGemm = MatMulI2SGemmF32Kernel.Create(device, spvDir);
         // PQ2_0 GEMV + GEMM — PrismML Bonsai ternary. Always created; the
-        // dispatcher routes per device-side QuantizationType. The GEMM is the
-        // register-blocked port of the I2_S prefill kernel (#233).
+        // dispatcher routes per device-side QuantizationType. The GEMM variant is
+        // chosen per device by PQ2_0GemmVariant.SelectFor: the wave32-pinned coopmat
+        // kernel where VK_KHR_cooperative_matrix and a pinnable compute subgroup size
+        // are both available (1.81-2.15x over register-blocked on gfx1151, #236),
+        // the 64-thread coopmat kernel where the pin is not available, and #233's
+        // register-blocked F32 kernel everywhere else.
         var matmulPQ2_0 = MatMulPQ2_0GemvF32Kernel.Create(device, spvDir);
         var matmulPQ2_0Gemm = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
         // F16 / BF16 native matmul kernels — Phase 8. Always created; the

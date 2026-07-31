@@ -8,14 +8,17 @@ using Xunit;
 namespace DotLLM.Tests.Unit.Vulkan;
 
 /// <summary>
-/// Correctness gates for the Vulkan PQ2_0 (PrismML Bonsai ternary) register-blocked prefill
-/// GEMM (issue #233). Three layers, in increasing order of authority:
+/// Correctness gates for the Vulkan PQ2_0 (PrismML Bonsai ternary) prefill GEMM — every variant
+/// <see cref="PQ2_0GemmVariant.AvailableOn"/> reports for the device, so the register-blocked F32
+/// kernel of issue #233 and the coopmat kernels of issue #236 are held to the same gates. Three
+/// layers, in increasing order of authority:
 /// <list type="number">
 /// <item><see cref="Launch_MatchesScalarReference"/> — synthetic parity against a
 /// double-precision ground truth across tile-ragged shapes.</item>
 /// <item><see cref="RealBonsaiTensor_DequantIsBitExactVsCpuOracle"/> — <b>bit-exact</b>
-/// agreement with the CPU oracle on a real Bonsai-27B tensor, via a one-hot activation
-/// matrix that makes every output cell a single exact product.</item>
+/// agreement with the CPU oracle on a real Bonsai-27B tensor (1 ULP for the coopmat variants;
+/// see that method's remarks for why the gap is the device's), via a one-hot activation matrix
+/// that makes every output cell a single exact product.</item>
 /// <item><see cref="RealBonsaiTensor_MatchesCpuGemmReference"/> — full GEMM against
 /// <c>MatMul.GemmPQ2_0</c> on real Bonsai-27B weights.</item>
 /// </list>
@@ -110,30 +113,49 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
             }
         }
 
-        float[] actual = RunGemm(spvDir, weights, inputB, m, k, n);
-
-        for (int t = 0; t < n; t++)
+        foreach (var (variant, actual) in RunAllVariants(spvDir, weights, inputB, m, k, n))
         {
-            for (int r = 0; r < m; r++)
+            for (int t = 0; t < n; t++)
             {
-                long idx = (long)t * m + r;
-                float diff = MathF.Abs(expected[idx] - actual[idx]);
-                float tol = AbsTol + RelTol * MathF.Abs(expected[idx]);
-                Assert.True(diff <= tol,
-                    $"cell t={t} m={r} (m={m}, k={k}, n={n}): expected {expected[idx]:G9}, got {actual[idx]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
+                for (int r = 0; r < m; r++)
+                {
+                    long idx = (long)t * m + r;
+                    float diff = MathF.Abs(expected[idx] - actual[idx]);
+                    float tol = AbsTol + RelTol * MathF.Abs(expected[idx]);
+                    Assert.True(diff <= tol,
+                        $"[{variant.SpvFileName}] cell t={t} m={r} (m={m}, k={k}, n={n}): expected {expected[idx]:G9}, got {actual[idx]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
+                }
             }
         }
     }
 
     /// <summary>
-    /// <b>Bit-exactness gate.</b> Feeds a one-hot activation matrix
+    /// <b>Dequantisation gate.</b> Feeds a one-hot activation matrix
     /// (<c>B[t, c] = 1.0 when c == k0 + t, else 0</c>) against a slice of a <i>real</i>
     /// Bonsai-27B PQ2_0 tensor, so every output cell reduces to one exact product
-    /// <c>dequant(W[m, k0+t]) · 1.0</c> plus exact zeros. The result must therefore equal the
-    /// CPU oracle's dequantised weight bit-for-bit — this pins the 34-byte group stride, the
+    /// <c>dequant(W[m, k0+t]) · 1.0</c> plus exact zeros. This pins the 34-byte group stride, the
     /// unaligned little-endian fp16 group-scale read, the {6,4,2,0} bit unpack and the code−1
     /// mapping against real packed bytes, with no reduction-order escape hatch.
     /// </summary>
+    /// <remarks>
+    /// <para><b>The F32 kernels are held to bit-exactness; the coopmat kernels are held to 1 ULP,
+    /// and that gap is the device's, not ours (issue #236).</b> On gfx1151 (Radeon 8060S, RDNA3.5)
+    /// <c>coopMatMulAdd</c> is <i>not</i> IEEE-exact even when the exact result is representable:
+    /// with an F16 A operand of exactly ±1.0, an F16 B operand of exactly 1.0 and an F32
+    /// accumulator seeded to zero, roughly a third of cells come back one F32 ULP toward −∞
+    /// (1.0 → 0x3F7FFFFF, −3.0 → 0xC0400001). Measured properties: independent of K
+    /// (identical counts at K = 128, 256 and 1024, so it is not accumulation order), independent of
+    /// the scale value, unchanged by pinning the pipeline to wave32 via
+    /// <c>VkPipelineShaderStageRequiredSubgroupSizeCreateInfo</c>, and — decisively — reproduced
+    /// byte-for-byte by the pre-existing, untouched <c>matmul_i2_s_f32_gemm_coopmat.spv</c>, which
+    /// stages raw ternary and applies its scale afterwards. So it is a property of the driver's
+    /// coopmat path, not of PQ2_0 decode or of any scale folding.</para>
+    /// <para>A 1-ULP envelope still gates the decode as hard as bit-exactness would: no wrong group
+    /// stride, wrong scale byte offset, wrong bit position or wrong code mapping can land within one
+    /// F32 ULP of the right answer on 6144 consecutive real-weight cells. What the envelope gives up
+    /// is only the ability to detect a device that rounds — which is exactly what it is
+    /// documenting.</para>
+    /// </remarks>
     [SkippableFact]
     public unsafe void RealBonsaiTensor_DequantIsBitExactVsCpuOracle()
     {
@@ -154,17 +176,28 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
         float[] inputB = new float[(long)n * k];
         for (int t = 0; t < n; t++) inputB[(long)t * k + t] = 1.0f;
 
-        float[] actual = RunGemm(spvDir, weights, inputB, m, k, n);
-
-        for (int t = 0; t < n; t++)
+        foreach (var (variant, actual) in RunAllVariants(spvDir, weights, inputB, m, k, n))
         {
-            for (int r = 0; r < m; r++)
+            // F32 kernels must be bit-identical. Coopmat kernels get 1 ULP, and only 1 — see
+            // the remarks: the device's coopMatMulAdd rounds, our decode does not.
+            long ulpBudget = variant.RequiresCooperativeMatrix ? 1 : 0;
+
+            for (int t = 0; t < n; t++)
             {
-                float expected = cpuDequant[(long)r * k + t];
-                float got = actual[(long)t * m + r];
-                Assert.True(BitConverter.SingleToInt32Bits(expected) == BitConverter.SingleToInt32Bits(got),
-                    $"NOT bit-exact at row {r}, col {t}: CPU oracle {expected:G9} (0x{BitConverter.SingleToUInt32Bits(expected):X8}), "
-                    + $"GPU {got:G9} (0x{BitConverter.SingleToUInt32Bits(got):X8}).");
+                for (int r = 0; r < m; r++)
+                {
+                    float expected = cpuDequant[(long)r * k + t];
+                    float got = actual[(long)t * m + r];
+                    int e = BitConverter.SingleToInt32Bits(expected);
+                    int g = BitConverter.SingleToInt32Bits(got);
+                    // Both operands share a sign here (the coopmat drift is sub-ULP, never a sign
+                    // flip), so the raw bit-pattern distance is a valid ULP distance.
+                    long ulps = Math.Abs((long)e - g);
+                    Assert.True(ulps <= ulpBudget,
+                        $"[{variant.SpvFileName}] {ulps} ULP > budget {ulpBudget} at row {r}, col {t}: "
+                        + $"CPU oracle {expected:G9} (0x{BitConverter.SingleToUInt32Bits(expected):X8}), "
+                        + $"GPU {got:G9} (0x{BitConverter.SingleToUInt32Bits(got):X8}).");
+                }
             }
         }
     }
@@ -196,27 +229,42 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
         fixed (float* cPtr = expected)
             MatMul.GemmPQ2_0(wPtr, bPtr, cPtr, m, k, n, threadPool: null);
 
-        float[] actual = RunGemm(spvDir, weights, inputB, m, k, n);
-
-        double maxAbs = 0, maxRel = 0;
-        for (long i = 0; i < expected.LongLength; i++)
+        foreach (var (variant, actual) in RunAllVariants(spvDir, weights, inputB, m, k, n))
         {
-            float diff = MathF.Abs(expected[i] - actual[i]);
-            float tol = AbsTol + RelTol * MathF.Abs(expected[i]);
-            maxAbs = Math.Max(maxAbs, diff);
-            if (expected[i] != 0f) maxRel = Math.Max(maxRel, diff / MathF.Abs(expected[i]));
-            Assert.True(diff <= tol,
-                $"cell {i} (m={m}, k={k}, n={n}): CPU {expected[i]:G9}, GPU {actual[i]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
-        }
+            double maxAbs = 0, maxRel = 0;
+            for (long i = 0; i < expected.LongLength; i++)
+            {
+                float diff = MathF.Abs(expected[i] - actual[i]);
+                float tol = AbsTol + RelTol * MathF.Abs(expected[i]);
+                maxAbs = Math.Max(maxAbs, diff);
+                if (expected[i] != 0f) maxRel = Math.Max(maxRel, diff / MathF.Abs(expected[i]));
+                Assert.True(diff <= tol,
+                    $"[{variant.SpvFileName}] cell {i} (m={m}, k={k}, n={n}): CPU {expected[i]:G9}, GPU {actual[i]:G9}, |Δ|={diff:G9} > tol {tol:G9}");
+            }
 
-        Assert.True(maxAbs < AbsTol, $"max |Δ| {maxAbs:G6}, max relative {maxRel:G6}");
+            Assert.True(maxAbs < AbsTol, $"[{variant.SpvFileName}] max |Δ| {maxAbs:G6}, max relative {maxRel:G6}");
+        }
     }
 
-    /// <summary>Uploads, dispatches and downloads one GEMM.</summary>
-    private static float[] RunGemm(string spvDir, byte[] weights, float[] inputB, int m, int k, int n)
+    /// <summary>
+    /// Every GEMM variant this device can actually create: always the register-blocked F32
+    /// kernel, plus the coopmat variants when <c>VK_KHR_cooperative_matrix</c> is advertised
+    /// and the declared workgroup size maps to one subgroup here.
+    /// </summary>
+    /// <remarks>
+    /// Each correctness gate runs over ALL of them rather than only
+    /// <see cref="PQ2_0GemmVariant.SelectFor"/>'s pick, so a variant cannot rot unmeasured while
+    /// a benchmark still selects it.
+    /// </remarks>
+    private static IEnumerable<PQ2_0GemmVariant> AvailableVariants(VulkanDevice device)
+        => PQ2_0GemmVariant.AvailableOn(device);
+
+    /// <summary>Uploads, dispatches and downloads one GEMM per available variant.</summary>
+    /// <returns>One (variant, result) pair per variant the device can run.</returns>
+    private static List<(PQ2_0GemmVariant Variant, float[] Result)> RunAllVariants(
+        string spvDir, byte[] weights, float[] inputB, int m, int k, int n)
     {
         using var device = VulkanDevice.Create();
-        using var kernel = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir);
 
         long weightsBufBytes = ((long)weights.Length + 3) & ~3L;
         using var bufW = device.Allocate(weightsBufBytes);
@@ -225,11 +273,18 @@ public class VulkanMatMulPQ2_0GemmF32KernelTests
 
         device.Upload(new ReadOnlySpan<byte>(weights), bufW);
         device.Upload(inputB, bufB);
-        kernel.Launch(bufW, bufB, bufC, m, k, n);
 
-        float[] actual = new float[(long)n * m];
-        device.Download(bufC, actual);
-        return actual;
+        var results = new List<(PQ2_0GemmVariant, float[])>();
+        foreach (var variant in AvailableVariants(device))
+        {
+            using var kernel = MatMulPQ2_0GemmF32Kernel.Create(device, spvDir, variant);
+            kernel.Launch(bufW, bufB, bufC, m, k, n);
+
+            float[] actual = new float[(long)n * m];
+            device.Download(bufC, actual);
+            results.Add((variant, actual));
+        }
+        return results;
     }
 
     /// <summary>
