@@ -17,6 +17,31 @@ namespace DotLLM.Cpu.Kernels;
 /// </summary>
 public static unsafe partial class MatMul
 {
+    /// <summary>
+    /// Issue #232 — runs the I2_S W2A8 <b>GEMM</b> (prefill) path with the 4x4 register-blocked
+    /// inner kernel explicitly on or off, so a harness can A/B both forms <b>within a single run</b>
+    /// (baselines drift enough between runs that cross-run ratios are unsound) and can assert the
+    /// two are <b>bit-exact</b>. Bypasses the <c>DOTLLM_I2S_TILE</c> gate and the n==1 GEMV
+    /// short-circuit; <paramref name="k"/> must be a multiple of 128.
+    /// </summary>
+    /// <param name="weights">Packed I2_S payload (<c>m·k/4</c> bytes) followed by the per-tensor f32 scale.</param>
+    /// <param name="b">F32 activations [n × k], row-major.</param>
+    /// <param name="c">F32 output [n × m], row-major.</param>
+    /// <param name="m">Weight rows (output features).</param>
+    /// <param name="k">Input dimension (multiple of 128).</param>
+    /// <param name="n">Token count.</param>
+    /// <param name="tiled"><c>true</c> for the register-blocked tile, <c>false</c> for the per-cell baseline.</param>
+    /// <param name="threadPool">Optional worker pool; <c>null</c> runs single-threaded.</param>
+    public static void BenchGemmI2_SW2A8(byte* weights, float* b, float* c, int m, int k, int n,
+                                         bool tiled, DotLLM.Cpu.Threading.ComputeThreadPool? threadPool)
+    {
+        float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+        GemmI2_SW2A8(weights, b, c, m, k, n, scale, threadPool, tiled);
+    }
+
+    /// <summary>True when the 4x4 register-blocked I2_S GEMM tile (issue #232) is the default path on this box.</summary>
+    public static bool I2SGemmTileEnabled => I2SGemmTile;
+
     /// <summary>Times just the UnpackRowI8 loop (AVX2 fast path, or scalar on non-AVX2 hardware) over <paramref name="m"/> rows (no dot).</summary>
     public static void BenchUnpackRowI8Only(byte* weights, int m, int k)
     {
