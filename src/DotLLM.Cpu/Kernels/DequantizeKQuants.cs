@@ -228,6 +228,11 @@ public static unsafe partial class Dequantize
         if (elementCount % KQuantGroupSize != 0)
             throw new ArgumentException(
                 $"Q2_K requires elementCount to be a multiple of {KQuantGroupSize}.", nameof(elementCount));
+        // Bounds the int destination index below: dest.Length is an int, so this also
+        // guarantees elementCount <= int.MaxValue when called directly (not via ToFloat32).
+        if (dest.Length < elementCount)
+            throw new ArgumentException(
+                $"Destination span too small: {dest.Length} < {elementCount}", nameof(dest));
 
         long superBlocks = elementCount / KQuantGroupSize;
         byte* basePtr = (byte*)src;
@@ -272,6 +277,11 @@ public static unsafe partial class Dequantize
             throw new ArgumentException(
                 $"Q3_K element count must be a multiple of {KQuantGroupSize}, got {elementCount}",
                 nameof(elementCount));
+        // Bounds the int destination index below: dest.Length is an int, so this also
+        // guarantees elementCount <= int.MaxValue when called directly (not via ToFloat32).
+        if (dest.Length < elementCount)
+            throw new ArgumentException(
+                $"Destination span too small: {dest.Length} < {elementCount}", nameof(dest));
         DequantizeQ3_KScalar(src, elementCount, dest);
     }
 
@@ -285,7 +295,9 @@ public static unsafe partial class Dequantize
     {
         long numBlocks = elementCount / KQuantGroupSize;
         byte* blockBase = (byte*)src;
-        long destOffset = 0;
+        // int base index, mirroring DequantizeQ2_K's outOffset — callers have already
+        // validated elementCount <= dest.Length, so this cannot overflow.
+        int destOffset = 0;
         Span<byte> scales = stackalloc byte[16];
 
         for (long b = 0; b < numBlocks; b++)
@@ -328,7 +340,7 @@ public static unsafe partial class Dequantize
                     int qBits = (qs[e / 4] >> ((e % 4) * 2)) & 0x03;
                     int hBit = (hmask[e / 8] >> (e % 8)) & 0x01;
                     int signed3 = ((hBit << 2) | qBits) - 4;  // [-4, 3]
-                    dest[(int)(destOffset + e)] = scaleD * signed3;
+                    dest[destOffset + e] = scaleD * signed3;
                 }
             }
 

@@ -12,6 +12,10 @@ public sealed class CudaModule : IDisposable
     private nint _module;
     private readonly Dictionary<string, nint> _functions = new();
 
+    // Misses are tracked separately from _functions: caching a miss as 0 in _functions
+    // would make GetFunction return 0 for that name instead of throwing.
+    private readonly HashSet<string> _missingFunctions = new();
+
     /// <summary>
     /// Loads a PTX module from a file path.
     /// </summary>
@@ -75,13 +79,16 @@ public sealed class CudaModule : IDisposable
     {
         if (_functions.TryGetValue(name, out nint func))
             return func;
+        if (_missingFunctions.Contains(name))
+            return 0;
 
         int result = CudaDriverApi.cuModuleGetFunction(out func, _module, name);
 
-        // CUDA_ERROR_NOT_FOUND = 500: symbol absent from PTX (older build).
-        if (result == 500)
+        // Symbol absent from PTX (older build) — record it in the miss set, never in
+        // _functions, so a later GetFunction(name) still performs a real lookup and throws.
+        if (result == CudaResult.NotFound)
         {
-            _functions[name] = 0;
+            _missingFunctions.Add(name);
             return 0;
         }
 
@@ -99,6 +106,7 @@ public sealed class CudaModule : IDisposable
         {
             CudaDriverApi.cuModuleUnload(module);
             _functions.Clear();
+            _missingFunctions.Clear();
         }
     }
 }

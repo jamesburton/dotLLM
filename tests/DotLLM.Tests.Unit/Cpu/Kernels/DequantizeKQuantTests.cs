@@ -337,6 +337,17 @@ public sealed unsafe class DequantizeKQuantTests
     }
 
     [Fact]
+    public void Q2_K_ComputeByteCount_MatchesRowByteSize()
+    {
+        // QuantizationTypeExtensions must agree with the CPU block size (84 bytes / 256).
+        Assert.Equal(84L, QuantizationType.Q2_K.ComputeByteCount(256));
+        Assert.Equal(336L, QuantizationType.Q2_K.ComputeByteCount(1024));
+        Assert.Equal(
+            Dequantize.RowByteSize(1024, QuantizationType.Q2_K),
+            QuantizationType.Q2_K.ComputeByteCount(1024));
+    }
+
+    [Fact]
     public void Q2_K_NonAlignedCount_Throws()
     {
         float[] dest = new float[100];
