@@ -102,6 +102,8 @@ public sealed class VulkanI2SGemmBench
             ("register-blocked -> f16 shared (occupancy control)", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedF16Shared),
             // Bit-exact: only the weight tile is F16. Halves weight-side SLM traffic (footprint 24 KB).
             ("register-blocked -> f16 weight tile (bit-exact)", I2SGemmVariant.RegisterBlocked, I2SGemmVariant.RegisterBlockedWeightF16),
+            // Does the SLM-traffic win keep scaling? f32=4 bytes, f16=2 (1.22-1.50x), int8=1.
+            ("f16 weight tile -> int8 weight tile", I2SGemmVariant.RegisterBlockedWeightF16, I2SGemmVariant.RegisterBlockedWeightInt8),
         };
         if (device.HasCooperativeMatrix)
         {
