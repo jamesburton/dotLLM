@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using DotLLM.Cpu.Kernels;
 using DotLLM.Cpu.Threading;
 using Xunit;
@@ -79,6 +80,7 @@ public sealed unsafe class I2SRegisterBlockedGemmTests
     [Fact]
     public void Tile4x4_IsBitExact_AtLargeOutputCount()
     {
+        if (!Avx2.IsSupported) return;
         var (mismatches, idx, fb, ft) = CompareKernels(m: 2560, k: 1024, n: 256, seed: 232, pool: null);
         Assert.True(mismatches == 0,
             $"{mismatches}/655360 outputs differ; first at {idx}: baseline={fb:R} tiled={ft:R}");
@@ -96,6 +98,7 @@ public sealed unsafe class I2SRegisterBlockedGemmTests
     [InlineData(6912, 2560, 33)]    // tall m (BitNet ffn_up), n just past one tile
     public void Tile4x4_IsBitExact_ForRaggedTileRemainders(int m, int k, int n)
     {
+        if (!Avx2.IsSupported) return;
         var (mismatches, idx, fb, ft) = CompareKernels(m, k, n, seed: m * 31 + n, pool: null);
         Assert.True(mismatches == 0,
             $"m={m} k={k} n={n}: {mismatches}/{(long)m * n} outputs differ; first at {idx}: baseline={fb:R} tiled={ft:R}");
@@ -108,6 +111,7 @@ public sealed unsafe class I2SRegisterBlockedGemmTests
     [Fact]
     public void Tile4x4_IsBitExact_UnderThreadPoolPartitioning()
     {
+        if (!Avx2.IsSupported) return;
         using var pool = new ComputeThreadPool(6); // 2560 % 6 != 0 → uneven, non-multiple-of-4 chunks
         var (mismatches, idx, fb, ft) = CompareKernels(m: 2560, k: 1024, n: 256, seed: 4321, pool: pool);
         Assert.True(mismatches == 0,
@@ -118,6 +122,7 @@ public sealed unsafe class I2SRegisterBlockedGemmTests
     [Fact]
     public void Tile4x4_ProducesNonZeroOutput()
     {
+        if (!Avx2.IsSupported) return;
         const int m = 256, k = 512, n = 8;
         var rng = new Random(9);
         int rowBytes = k / 4;
