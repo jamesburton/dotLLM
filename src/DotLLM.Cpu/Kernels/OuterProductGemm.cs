@@ -352,12 +352,10 @@ public static unsafe class OuterProductGemm
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float HorizontalSum(Vector256<float> v)
     {
-        // 8 → 4 via cross-lane add, then 4 → 2 via hadd, then 2 → 1 via hadd.
-        Vector128<float> lo = v.GetLower();
-        Vector128<float> hi = v.GetUpper();
-        Vector128<float> sum128 = Sse.Add(lo, hi);
-        sum128 = Sse3.HorizontalAdd(sum128, sum128);
-        sum128 = Sse3.HorizontalAdd(sum128, sum128);
-        return sum128.ToScalar();
+        // 8 → 4 via a cross-lane add, then a 4-wide reduction. Expressed on the
+        // cross-platform Vector128 surface (not Sse/Sse3 intrinsics) so the
+        // reduction needs no ISA guard of its own beyond the Avx2/Fma check the
+        // public entrypoint already makes.
+        return Vector128.Sum(v.GetLower() + v.GetUpper());
     }
 }

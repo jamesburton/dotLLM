@@ -422,9 +422,11 @@ public sealed unsafe class OuterProductGemmTests
     //   2. `MatMul.GemmF32` — the production tiled path, FMA-enabled.
     //   3. `OuterProductGemm.OuterProductGemmF32Scalar` — internal cross-check.
     //
-    // FMA vs separate-mul-add reorders the rounding, so we use a relative
-    // tolerance that scales with K (the contraction dim accumulates error
-    // linearly in K for uniformly-distributed inputs).
+    // The scalar path accumulates in the same order as the reference and is
+    // compared bit-exactly. The vector path uses FMA plus a horizontal
+    // reduction, which reorders the rounding, so it is compared with an
+    // *absolute* tolerance that scales with √K — for unit-magnitude operands
+    // the error of an unbiased K-term float32 sum grows as √K, not linearly.
 
     [Theory]
     [InlineData(4, 3, 8)]        // smallest fully-vectorisable tile
@@ -438,7 +440,15 @@ public sealed unsafe class OuterProductGemmTests
         RunF32ParityCase(m, n, k, useVector: false);
     }
 
-    [Theory]
+    // AVX2/FMA is the only hardware requirement of the vector path. Where it is
+    // absent the kernel falls back to scalar, so a vector-only case has nothing
+    // to assert — report it as *skipped* rather than passed, so a run on a
+    // non-AVX2 agent is visibly distinguishable from a real validation.
+    private static bool Avx2FmaSupported => Avx2.IsSupported && Fma.IsSupported;
+
+    private const string NoAvx2 = "AVX2/FMA not supported on this machine";
+
+    [SkippableTheory]
     [InlineData(4, 3, 8)]
     [InlineData(4, 3, 64)]
     [InlineData(8, 6, 64)]
@@ -448,6 +458,7 @@ public sealed unsafe class OuterProductGemmTests
     [InlineData(128, 32, 1024)]  // bigger prefill
     public void OuterProductGemmF32_Avx2_MatchesReference(int m, int n, int k)
     {
+        Skip.IfNot(Avx2FmaSupported, NoAvx2);
         RunF32ParityCase(m, n, k, useVector: true);
     }
 
@@ -464,7 +475,9 @@ public sealed unsafe class OuterProductGemmTests
     [InlineData(17, 9, 65)]      // K tail with FMA group
     public void OuterProductGemmF32_HandlesAllTails(int m, int n, int k)
     {
-        RunF32ParityCase(m, n, k, useVector: true);
+        // Scalar half always asserts, so this stays a plain Theory.
+        if (Avx2FmaSupported)
+            RunF32ParityCase(m, n, k, useVector: true);
         RunF32ParityCase(m, n, k, useVector: false);
     }
 
@@ -478,18 +491,14 @@ public sealed unsafe class OuterProductGemmTests
     [InlineData(4, 3, 1)]        // K=1 — every tile collapses to single FMA
     public void OuterProductGemmF32_EdgeCases(int m, int n, int k)
     {
-        RunF32ParityCase(m, n, k, useVector: true);
+        // Scalar half always asserts, so this stays a plain Theory.
+        if (Avx2FmaSupported)
+            RunF32ParityCase(m, n, k, useVector: true);
         RunF32ParityCase(m, n, k, useVector: false);
     }
 
     private static void RunF32ParityCase(int m, int n, int k, bool useVector)
     {
-        if (useVector && (!Avx2.IsSupported || !Fma.IsSupported))
-        {
-            // Vector path falls back to scalar; covered by the scalar case.
-            return;
-        }
-
         var rng = new Random(0xC0FFEE ^ (m * 31 + n) * 31 + k);
         long aLen = (long)m * k;
         long bLen = (long)n * k;
