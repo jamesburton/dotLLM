@@ -201,6 +201,30 @@ public sealed class AnthropicConverterTests
         Assert.False(el.EnumerateObject().MoveNext());
     }
 
+    [Theory]
+    [InlineData("\"hi\"")]
+    [InlineData("[]")]
+    [InlineData("[1,2]")]
+    [InlineData("42")]
+    [InlineData("null")]
+    [InlineData("true")]
+    public void ParseInput_NonObjectRoot_ReturnsEmptyObject(string arguments)
+    {
+        // Anthropic requires tool_use.input to be an object — a model that emits a bare
+        // scalar or array must not produce an invalid wire shape.
+        var el = AnthropicConverter.ParseInput(arguments);
+        Assert.Equal(JsonValueKind.Object, el.ValueKind);
+        Assert.False(el.EnumerateObject().MoveNext());
+    }
+
+    [Fact]
+    public void ParseInput_ObjectRoot_PassesThrough()
+    {
+        var el = AnthropicConverter.ParseInput("""{"city":"Paris"}""");
+        Assert.Equal(JsonValueKind.Object, el.ValueKind);
+        Assert.Equal("Paris", el.GetProperty("city").GetString());
+    }
+
     // --- Request validation -------------------------------------------------
 
     [Fact]
@@ -228,6 +252,52 @@ public sealed class AnthropicConverterTests
             MaxTokens = 0,
         };
         Assert.NotNull(MessagesEndpoint.ValidateRequest(req, requireMaxTokens: true));
+    }
+
+    [Theory]
+    [InlineData("system")]
+    [InlineData("tool")]
+    [InlineData("developer")]
+    [InlineData("")]
+    public void ValidateRequest_UnsupportedRole_Fails(string role)
+    {
+        // Roles flow straight into the chat template; only user/assistant are addressable
+        // by a client (the system prompt is the top-level `system` field).
+        var req = Parse($$"""
+        {"model":"m","max_tokens":16,"messages":[{"role":"{{role}}","content":"hi"}]}
+        """);
+        Assert.NotNull(MessagesEndpoint.ValidateRequest(req, requireMaxTokens: true));
+    }
+
+    [Theory]
+    [InlineData("123")]
+    [InlineData("null")]
+    [InlineData("true")]
+    [InlineData("""{"type":"text"}""")]
+    public void ValidateRequest_NonStringNonArrayContent_Fails(string content)
+    {
+        var req = Parse($$"""
+        {"model":"m","max_tokens":16,"messages":[{"role":"user","content":{{content}}}]}
+        """);
+        Assert.NotNull(MessagesEndpoint.ValidateRequest(req, requireMaxTokens: true));
+    }
+
+    [Fact]
+    public void ValidateRequest_MissingContent_Fails()
+    {
+        var req = Parse("""{"model":"m","max_tokens":16,"messages":[{"role":"user"}]}""");
+        Assert.NotNull(MessagesEndpoint.ValidateRequest(req, requireMaxTokens: true));
+    }
+
+    [Fact]
+    public void ValidateRequest_BlockArrayContent_ReturnsNull()
+    {
+        var req = Parse("""
+        {"model":"m","max_tokens":16,"messages":[
+          {"role":"user","content":[{"type":"text","text":"hi"}]},
+          {"role":"assistant","content":"yes"}]}
+        """);
+        Assert.Null(MessagesEndpoint.ValidateRequest(req, requireMaxTokens: true));
     }
 
     [Fact]

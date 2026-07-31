@@ -39,8 +39,7 @@ non-streaming (JSON) and streaming (named SSE events).
      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
   ],
   "tool_choice": {"type": "auto"},
-  "stream": false,
-  "lora_adapter": "customer-support"
+  "stream": false
 }
 ```
 
@@ -51,8 +50,12 @@ non-streaming (JSON) and streaming (named SSE events).
   (`text`, `tool_use`, `tool_result`).
 - `tool_choice`: `{"type":"auto"}`, `{"type":"any"}` (→ required),
   `{"type":"none"}`, or `{"type":"tool","name":"..."}`.
-- `lora_adapter` is a dotLLM extension (parity with the OpenAI surface).
+- `messages[].role` must be `user` or `assistant`; any other role → `400`.
+  (The top-level `system` field is the only way to set a system prompt.)
 - `image` content blocks are not yet supported (no multimodal pipeline).
+- `lora_adapter` is **not** honoured by this endpoint — per-request adapter
+  selection is not implemented on the server yet (the OpenAI surface does not
+  honour it either). Unknown fields are ignored, not rejected.
 
 **Response** (non-streaming):
 ```json

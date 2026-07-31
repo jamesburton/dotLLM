@@ -255,23 +255,37 @@ public static class AnthropicConverter
         return blocks;
     }
 
-    /// <summary>Parses a tool-call argument JSON string into a JSON object element.</summary>
+    /// <summary>
+    /// Parses a tool-call argument JSON string into a JSON object element.
+    /// </summary>
+    /// <remarks>
+    /// Anthropic requires <c>tool_use.input</c> to be an object, so a non-object root
+    /// (a bare string, array or number emitted by a model that ignored the schema)
+    /// collapses to <c>{}</c> rather than being passed through as an invalid wire shape
+    /// that clients would reject or mis-handle.
+    /// </remarks>
     public static JsonElement ParseInput(string? arguments)
     {
         if (string.IsNullOrWhiteSpace(arguments))
-            return EmptyObject();
+            return EmptyObject;
         try
         {
             using var doc = JsonDocument.Parse(arguments);
-            return doc.RootElement.Clone();
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                ? doc.RootElement.Clone()
+                : EmptyObject;
         }
         catch (JsonException)
         {
-            return EmptyObject();
+            return EmptyObject;
         }
     }
 
-    private static JsonElement EmptyObject()
+    // A cloned JsonElement is detached and immutable, so one instance can be shared
+    // across every empty/invalid tool input instead of reparsing "{}" per tool call.
+    private static readonly JsonElement EmptyObject = ParseEmptyObject();
+
+    private static JsonElement ParseEmptyObject()
     {
         using var doc = JsonDocument.Parse("{}");
         return doc.RootElement.Clone();

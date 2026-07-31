@@ -164,10 +164,43 @@ public static class MessagesEndpoint
         ToolDefinition[]? tools,
         int promptTokenCount,
         CancellationToken ct)
+        => await WriteMessageStreamAsync(
+            httpContext,
+            innerCt => generator.GenerateStreamingTokensAsync(prompt, options, innerCt),
+            state.ExecuteAsync,
+            tools is { Length: > 0 } ? state.ToolCallParser : null,
+            request.StopSequences,
+            messageId, modelId, promptTokenCount, ct);
+
+    /// <summary>
+    /// Emits the Anthropic SSE event sequence for one streaming request:
+    /// <c>message_start</c>, <c>content_block_start</c> + <c>ping</c>, a
+    /// <c>content_block_delta</c> per generated token, <c>content_block_stop</c>,
+    /// an optional start/delta/stop trio per detected <c>tool_use</c> block, then
+    /// <c>message_delta</c> and <c>message_stop</c>.
+    /// </summary>
+    /// <remarks>
+    /// The token source and the model-serialisation gate are injected rather than read
+    /// from <see cref="ServerState"/> so the emitted event sequence can be asserted in
+    /// unit tests without loading a model. <paramref name="execute"/> wraps only the
+    /// generation loop, so <c>message_start</c> still reaches the client before the
+    /// request queues behind the model lock.
+    /// </remarks>
+    internal static async Task WriteMessageStreamAsync(
+        HttpContext httpContext,
+        Func<CancellationToken, IAsyncEnumerable<GenerationToken>> tokenSource,
+        Func<Func<Task>, CancellationToken, Task> execute,
+        IToolCallParser? toolCallParser,
+        string[]? requestStopSequences,
+        string messageId,
+        string modelId,
+        int promptTokenCount,
+        CancellationToken ct)
     {
         httpContext.Response.ContentType = "text/event-stream";
+        // No `Connection: keep-alive` — it is a connection-specific header that is
+        // illegal over HTTP/2 and HTTP/3, and content-type + no-cache is all SSE needs.
         httpContext.Response.Headers.CacheControl = "no-cache";
-        httpContext.Response.Headers.Connection = "keep-alive";
 
         // message_start — input_tokens known up front from the prompt.
         var startMessage = new AnthropicMessageResponse
@@ -198,9 +231,9 @@ public static class MessagesEndpoint
         FinishReason finishReason = FinishReason.Length;
         int completionTokens = 0;
 
-        await state.ExecuteAsync(async () =>
+        await execute(async () =>
         {
-            await foreach (var token in generator.GenerateStreamingTokensAsync(prompt, options, ct))
+            await foreach (var token in tokenSource(ct))
             {
                 if (token.Text.Length > 0)
                 {
@@ -228,9 +261,9 @@ public static class MessagesEndpoint
         // Post-generation tool-call detection (mirrors the OpenAI streaming endpoint).
         string text = sb.ToString();
         ToolCall[]? toolCalls = null;
-        if (state.ToolCallParser is not null && tools is { Length: > 0 })
+        if (toolCallParser is not null)
         {
-            toolCalls = state.ToolCallParser.TryParse(text);
+            toolCalls = toolCallParser.TryParse(text);
             if (toolCalls is { Length: > 0 })
                 finishReason = FinishReason.ToolCalls;
         }
@@ -275,11 +308,11 @@ public static class MessagesEndpoint
 
         bool matchedStopSequence = false;
         if (finishReason == FinishReason.Stop)
-            matchedStopSequence = MatchStopSequence(text, request.StopSequences) is not null;
+            matchedStopSequence = MatchStopSequence(text, requestStopSequences) is not null;
 
         string stopReason = AnthropicConverter.ToStopReason(finishReason, matchedStopSequence);
         string? stopSequence = stopReason == "stop_sequence"
-            ? MatchStopSequence(text, request.StopSequences)
+            ? MatchStopSequence(text, requestStopSequences)
             : null;
 
         await WriteEventAsync(httpContext, "message_delta",
@@ -342,6 +375,24 @@ public static class MessagesEndpoint
                 return "max_tokens: field required";
             if (request.MaxTokens.Value <= 0)
                 return "max_tokens: must be a positive integer";
+        }
+
+        // Roles and content kinds are checked here rather than left to the converter:
+        // ToMessages passes `role` straight through to the chat template, so an unchecked
+        // `system` (or arbitrary) role would let a caller inject a system turn mid-
+        // conversation, and an unchecked content kind would silently flatten to an empty
+        // message instead of surfacing the client's mistake as a 400.
+        for (int i = 0; i < request.Messages.Length; i++)
+        {
+            var msg = request.Messages[i];
+            if (msg is null)
+                return $"messages[{i}]: must be an object";
+
+            if (msg.Role is not ("user" or "assistant"))
+                return $"messages[{i}].role: must be one of \"user\", \"assistant\"";
+
+            if (msg.Content.ValueKind is not (JsonValueKind.String or JsonValueKind.Array))
+                return $"messages[{i}].content: must be a string or an array of content blocks";
         }
 
         return null;
