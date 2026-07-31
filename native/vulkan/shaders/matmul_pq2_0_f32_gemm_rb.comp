@@ -1,0 +1,174 @@
+#version 450
+// PQ2_0 (PrismML Bonsai ternary) prefill GEMM — REGISTER-BLOCKED.
+//
+//   C[N, M] = B[N, K] @ W_pq2_0[M, K]^T      with W dequantized on the fly.
+//
+// Port of matmul_i2_s_f32_gemm_rb.comp — the shipped, proven register-blocked
+// I2_S design — to PQ2_0's packing. The thread-to-output mapping, tile sizes,
+// shared-memory budget and staging schedule are IDENTICAL; only the weight
+// decode changes. See that shader for the arithmetic-intensity rationale
+// (2x2 micro-tile => 1.0 MAC per shared load, vs 0.5 for one-thread-per-cell).
+//
+// The coopmat line is deliberately NOT taken here: issue #229 (commit a1161cbc)
+// showed the multi-fragment coopmat warptile still loses to F32 on gfx1151, and
+// commit 0ea1bd7f showed plain I2_S coopmat loses to register-blocked on an
+// RTX 3060. Two independent negatives — start from what won.
+//
+// PQ2_0 vs I2_S weight layout (the only functional difference):
+//   I2_S : row stride K/4 bytes of packed codes; ONE per-tensor float32 scale at
+//          the buffer tail (byte offset M*(K/4)), applied once to the finished
+//          accumulator.
+//   PQ2_0: each 128 contiguous elements of a row form a 34-byte group —
+//            bytes [0..1]  : little-endian IEEE-754 binary16 group scale
+//            bytes [2..33] : 32 packed code bytes, byte gp (0..31) holding the
+//                            ternary codes for group-relative elements
+//                            {gp, gp+32, gp+64, gp+96} at bit offsets {6,4,2,0};
+//                            value = code - 1.
+//          Row stride = (K/128)*34 bytes. There is NO tensor-tail scale.
+//
+// Because each group owns its scale, the scale is folded into sharedW during
+// staging (sharedW holds already-scaled floats), exactly mirroring the CPU
+// reference DotLLM.Cpu.Kernels.MatMul.UnpackPQ2_0Row, which writes
+// (code - 1) * scale before the dot. Since the K-chunk is exactly one PQ2_0
+// group, every value staged in a given pass shares one scale per weight row —
+// so folding at stage time costs one extra multiply per staged element and
+// keeps the inner MAC loop identical to the I2_S kernel's.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer BufW { uint  weight[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer BufB { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer BufC { float c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;             // multiple of 128
+    uint N;
+    uint blocksPerRow;  // = K / 128
+    uint rowUints;      // unused here; kept for push-constant layout parity
+} pc;
+
+const uint TILE_M = 32u;
+const uint TILE_N = 32u;
+const uint SUB    = 16u;          // micro-tile stride (= workgroup dim)
+const uint PQ2_GROUP_SIZE  = 128u;   // K-chunk = one PQ2_0 group
+const uint PQ2_GROUP_BYTES = 34u;    // 2 (fp16 scale) + 32 (packed codes)
+const uint PQ2_CODE_BYTES  = 32u;
+
+shared float sharedB[TILE_N * PQ2_GROUP_SIZE];   // 32 x 128 token tile
+shared float sharedW[TILE_M * PQ2_GROUP_SIZE];   // 32 x 128 scaled weight tile
+
+uint readByte(uint absByteOff) {
+    uint u = weight[absByteOff >> 2u];
+    uint shift = (absByteOff & 3u) * 8u;
+    return (u >> shift) & 0xFFu;
+}
+
+// Little-endian fp16 group scale at absolute byte offset `off`. `off` is not
+// generally 4-byte aligned: 34-byte groups straddle uint-word boundaries after
+// the first group, so this reads byte-wise rather than via a uint load.
+float readGroupScale(uint off) {
+    uint lo = readByte(off);
+    uint hi = readByte(off + 1u);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;   // 0..15 -> weight rows {lx, lx+16}
+    uint ly = gl_LocalInvocationID.y;   // 0..15 -> token rows  {ly, ly+16}
+    uint tid = ly * SUB + lx;           // 0..255
+
+    uint mBase = gl_WorkGroupID.x * TILE_M;
+    uint tBase = gl_WorkGroupID.y * TILE_N;
+
+    uint rowBytes = pc.blocksPerRow * PQ2_GROUP_BYTES;
+
+    float acc00 = 0.0;   // (token ly,      weight lx)
+    float acc01 = 0.0;   // (token ly,      weight lx+16)
+    float acc10 = 0.0;   // (token ly+16,   weight lx)
+    float acc11 = 0.0;   // (token ly+16,   weight lx+16)
+
+    // Each thread stages 4 CONSECUTIVE code bytes (tid*4 .. tid*4+3). 4-byte
+    // alignment against a 32-byte-per-row code span means all four belong to the
+    // same weight row, so the group scale is read once per thread per K-chunk.
+    uint byteFlat0 = tid * 4u;         // 0..1020
+    uint rowLocal  = byteFlat0 >> 5u;  // 0..31  (weight row within tile)
+    uint gp0       = byteFlat0 & 31u;  // 0..28  (first byte within the group)
+    uint mGlobal   = mBase + rowLocal;
+    uint sBase     = rowLocal * PQ2_GROUP_SIZE;
+    bool rowValid  = mGlobal < pc.M;
+    uint rowByteBase = mGlobal * rowBytes;
+
+    for (uint blk = 0u; blk < pc.blocksPerRow; blk++) {
+        uint kBase = blk * PQ2_GROUP_SIZE;
+
+        // ── 1. Stage sharedB[TILE_N, 128] (32x128 floats). 256 threads load 16 each. ──
+        for (uint i = 0u; i < 16u; i++) {
+            uint bIdx = tid * 16u + i;         // 0..4095
+            uint row  = bIdx >> 7u;            // 0..31  (token within tile)
+            uint col  = bIdx & 127u;           // 0..127 (element within group)
+            uint tGlobal = tBase + row;
+            sharedB[bIdx] = (tGlobal < pc.N) ? b[tGlobal * pc.K + kBase + col] : 0.0;
+        }
+
+        // ── 2. Dequantise sharedW[TILE_M, 128], scale folded in. 32 rows x 32 ──
+        //       code bytes = 1024 bytes; 256 threads decode 4 bytes each.
+        if (rowValid) {
+            uint groupByteBase = rowByteBase + blk * PQ2_GROUP_BYTES;
+            float scale = readGroupScale(groupByteBase);
+            uint codeBase = groupByteBase + 2u;
+
+            for (uint i = 0u; i < 4u; i++) {
+                uint gp = gp0 + i;             // 0..31 within the group's code bytes
+                uint pk = readByte(codeBase + gp);
+                sharedW[sBase + gp]       = float(int((pk >> 6u) & 3u) - 1) * scale;
+                sharedW[sBase + gp + 32u] = float(int((pk >> 4u) & 3u) - 1) * scale;
+                sharedW[sBase + gp + 64u] = float(int((pk >> 2u) & 3u) - 1) * scale;
+                sharedW[sBase + gp + 96u] = float(int( pk        & 3u) - 1) * scale;
+            }
+        } else {
+            for (uint i = 0u; i < 4u; i++) {
+                uint gp = gp0 + i;
+                sharedW[sBase + gp]       = 0.0;
+                sharedW[sBase + gp + 32u] = 0.0;
+                sharedW[sBase + gp + 64u] = 0.0;
+                sharedW[sBase + gp + 96u] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // ── 3. Partial dot products for this K-chunk — 4 loads feed 4 MACs. ──
+        uint bOff0 = ly * PQ2_GROUP_SIZE;
+        uint bOff1 = (ly + SUB) * PQ2_GROUP_SIZE;
+        uint wOff0 = lx * PQ2_GROUP_SIZE;
+        uint wOff1 = (lx + SUB) * PQ2_GROUP_SIZE;
+
+        for (uint j = 0u; j < PQ2_GROUP_SIZE; j++) {
+            float b0 = sharedB[bOff0 + j];
+            float b1 = sharedB[bOff1 + j];
+            float w0 = sharedW[wOff0 + j];
+            float w1 = sharedW[wOff1 + j];
+            acc00 += b0 * w0;
+            acc01 += b0 * w1;
+            acc10 += b1 * w0;
+            acc11 += b1 * w1;
+        }
+
+        barrier();
+    }
+
+    uint m0 = mBase + lx;
+    uint m1 = mBase + lx + SUB;
+    uint t0 = tBase + ly;
+    uint t1 = tBase + ly + SUB;
+
+    if (t0 < pc.N) {
+        if (m0 < pc.M) c[t0 * pc.M + m0] = acc00;
+        if (m1 < pc.M) c[t0 * pc.M + m1] = acc01;
+    }
+    if (t1 < pc.N) {
+        if (m0 < pc.M) c[t1 * pc.M + m0] = acc10;
+        if (m1 < pc.M) c[t1 * pc.M + m1] = acc11;
+    }
+}

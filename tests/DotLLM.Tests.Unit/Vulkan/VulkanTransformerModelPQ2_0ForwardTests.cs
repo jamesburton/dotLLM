@@ -30,9 +30,11 @@ namespace DotLLM.Tests.Unit.Vulkan;
 /// both backends derive their view of the weights from the same packed bytes.
 /// </para>
 /// <para>
-/// <b>Decode-only scope.</b> Only <c>seqLen == 1</c> (single-token decode) is exercised —
-/// PQ2_0 GEMM/prefill is not yet implemented on Vulkan (#205 explicit follow-on); the
-/// dispatcher throws <see cref="NotSupportedException"/> for <c>seqLen &gt; 1</c> today.
+/// <b>Scope.</b> Both dispatch branches are exercised: <c>seqLen == 1</c> takes the GEMV
+/// decode kernel, <c>seqLen &gt; 1</c> takes the register-blocked GEMM added in #233 (before
+/// which the dispatcher threw <see cref="NotSupportedException"/> for <c>seqLen &gt; 1</c> and
+/// prefill had to be fed one token at a time). The multi-token case is what proves the GEMM is
+/// wired into the real forward path rather than only into its own kernel test.
 /// </para>
 /// <para>
 /// <b>Dimensions.</b> All PQ2_0 contraction axes are bumped to multiples of 128 (the PQ2_0
@@ -71,16 +73,28 @@ public sealed class VulkanTransformerModelPQ2_0ForwardTests : IDisposable
 
     [SkippableFact]
     public void Forward_PQ2_0_SingleToken_MatchesCpuReference()
-        => AssertVulkanMatchesCpu(seed: 205);
+        => AssertVulkanMatchesCpu(seed: 205, seqLen: 1);
 
-    private void AssertVulkanMatchesCpu(int seed)
+    /// <summary>
+    /// Multi-token prefill parity — the <c>seqLen &gt; 1</c> branch, which routes every PQ2_0
+    /// projection through the register-blocked GEMM added in #233. The token count is
+    /// deliberately not a multiple of the GEMM's 32-token tile, so the partial-tile store guards
+    /// are exercised through the production dispatch path and not only in the kernel test.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2)]
+    [InlineData(5)]
+    [InlineData(8)]
+    public void Forward_PQ2_0_MultiTokenPrefill_MatchesCpuReference(int seqLen)
+        => AssertVulkanMatchesCpu(seed: 233, seqLen: seqLen);
+
+    private void AssertVulkanMatchesCpu(int seed, int seqLen)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
 
         ModelConfig config = BuildConfig();
         var blob = StagePQ2_0Blob(seed);
 
-        const int seqLen = 1;
         int[] tokenIds = new int[seqLen];
         int[] positions = new int[seqLen];
         for (int i = 0; i < seqLen; i++) { tokenIds[i] = i % VocabSize; positions[i] = i; }
