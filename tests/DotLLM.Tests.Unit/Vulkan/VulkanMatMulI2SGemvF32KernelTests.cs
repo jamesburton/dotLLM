@@ -55,6 +55,103 @@ public class VulkanMatMulI2SGemvF32KernelTests
     public void Subgroup_MatchesScalarReference(int m, int k)
         => RunParity("matmul_i2_s_f32_gemv_sg.spv", m, k);
 
+    /// <summary>
+    /// Parity for the multi-row decode GEMV (4 output rows per workgroup).
+    /// </summary>
+    /// <remarks>
+    /// The rows deliberately include m values that are NOT multiples of 4 (1, 15, 2049, 577), because
+    /// the variant's tail guard (<c>if (m &gt;= pc.M) break;</c> plus the guarded store) is the one
+    /// thing a multi-row mapping can get wrong: a workgroup covering the final partial group must
+    /// write only the rows that exist. m=1 is the extreme case — a whole workgroup for a single row.
+    /// </remarks>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    [SkippableTheory]
+    [InlineData(1, 128)]      // single row — 3 of 4 lanes must be suppressed
+    [InlineData(4, 128)]      // exactly one full group
+    [InlineData(8, 128)]
+    [InlineData(15, 256)]     // ragged tail (15 = 3*4 + 3)
+    [InlineData(16, 768)]
+    [InlineData(577, 1024)]   // ragged at scale
+    [InlineData(2049, 256)]   // ragged, large m
+    [InlineData(2560, 2560)]  // BitNet hidden × hidden
+    public void MultiRow_MatchesScalarReference(int m, int k)
+        => RunParity("matmul_i2_s_f32_gemv_mr4.spv", m, k);
+
+    /// <summary>Parity for the 8-row decode GEMV. Same tail-guard risk as the 4-row variant.</summary>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    [SkippableTheory]
+    [InlineData(1, 128)]      // 7 of 8 lanes suppressed
+    [InlineData(8, 128)]      // exactly one group
+    [InlineData(15, 256)]     // ragged tail
+    [InlineData(577, 1024)]
+    [InlineData(2049, 256)]
+    [InlineData(2560, 2560)]
+    public void MultiRow8_MatchesScalarReference(int m, int k)
+        => RunParity("matmul_i2_s_f32_gemv_mr8.spv", m, k);
+
+    /// <summary>
+    /// The multi-row GEMV variants must be <b>bit-identical</b> to the production kernel, not merely
+    /// within tolerance: each output element accumulates over the same k in the same per-thread
+    /// stride order and through the same tree reduce, so only the row-to-workgroup mapping changes.
+    /// </summary>
+    /// <remarks>
+    /// This is the sharp gate for a multi-row mapping. A row-indexing slip would put a correct-looking
+    /// value in the wrong output row, which a tolerance check against a scalar reference can mask when
+    /// neighbouring rows have similar magnitudes, but bitwise comparison against the production kernel
+    /// cannot.
+    /// </remarks>
+    /// <param name="spv">Variant SPIR-V to compare.</param>
+    /// <param name="m">Output rows.</param>
+    /// <param name="k">Shared dimension; must be a multiple of 128.</param>
+    [SkippableTheory]
+    [InlineData("matmul_i2_s_f32_gemv_mr4.spv", 2560, 2560)]
+    [InlineData("matmul_i2_s_f32_gemv_mr4.spv", 577, 1024)]
+    [InlineData("matmul_i2_s_f32_gemv_mr4.spv", 2049, 256)]
+    [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 2560, 2560)]
+    [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 577, 1024)]
+    [InlineData("matmul_i2_s_f32_gemv_mr8.spv", 2049, 256)]
+    public void MultiRow_IsBitIdenticalToProduction(string spv, int m, int k)
+    {
+        VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
+
+        var rng = new Random(0x5E_ED ^ (m * 7 + k * 11));
+        sbyte[] ternary = new sbyte[(long)m * k];
+        for (long i = 0; i < ternary.LongLength; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        float scale = rng.NextSingle() * 0.05f + 0.01f;
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+        byte[] weightsI2S = PackI2S(ternary, m, k, scale);
+
+        using var device = VulkanDevice.Create();
+        float[] baseline = RunVariantRaw(device, spvDir, "matmul_i2_s_f32_gemv.spv", weightsI2S, x, m, k);
+        float[] candidate = RunVariantRaw(device, spvDir, spv, weightsI2S, x, m, k);
+
+        for (int i = 0; i < baseline.Length; i++)
+        {
+            Assert.True(
+                BitConverter.SingleToInt32Bits(baseline[i]) == BitConverter.SingleToInt32Bits(candidate[i]),
+                $"{spv} row {i} (m={m}, k={k}) differs: production {baseline[i]:G9} vs variant {candidate[i]:G9}");
+        }
+    }
+
+    private static float[] RunVariantRaw(
+        VulkanDevice device, string spvDir, string spvFileName, byte[] weightsI2S, float[] x, int m, int k)
+    {
+        using var kernel = MatMulI2SGemvF32Kernel.Create(device, spvDir, spvFileName);
+        long weightsBufBytes = ((long)weightsI2S.Length + 3) & ~3L;
+        using var bufW = device.Allocate(weightsBufBytes);
+        using var bufX = device.Allocate((long)k * sizeof(float));
+        using var bufY = device.Allocate((long)m * sizeof(float));
+        device.Upload(new ReadOnlySpan<byte>(weightsI2S), bufW);
+        device.Upload(x, bufX);
+        kernel.Launch(bufW, bufX, bufY, m, k);
+        float[] y = new float[m];
+        device.Download(bufY, y);
+        return y;
+    }
+
     private static void RunParity(string spvFileName, int m, int k)
     {
         VulkanMatMulF32KernelTests.SkipIfUnavailable(out string spvDir);
