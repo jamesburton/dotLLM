@@ -162,6 +162,22 @@ __device__ __forceinline__ void mma_m16n8k16(
 // leaves HasAttentionFlashMma false, falling back to G3 with no visible symptom). Added the
 // same per-file %(CudaKernel.Arch) override to the csproj so plain `dotnet build` now matches
 // build_ptx.bat's output.
+//
+// Post-fix `ncu` confirmation (same day): a second elevated `ncu --set full` capture on this
+// exact kernel/shape directly confirms the mechanism, not just the wall-clock effect. Shared
+// LOAD bank conflicts (9.7-way, 84% of wavefronts pre-fix) are now fully gone -- `ncu` no
+// longer flags them at all. Shared STORE conflicts improved but did not fully clear: 4.0-way
+// (72% of wavefronts) -> 2.5-way (60%), Est. Speedup dropped 66.4% -> 29.3%. Duration this
+// launch: 1.55ms -> 0.959ms (-38%). Checked whether a different pad size closes the remaining
+// store gap: it can't -- `ldmatrix`'s 16-byte alignment forces the stride to stay a multiple
+// of 8 halfwords, which forces the bank-stride to a multiple of 4 banks, capping the
+// achievable distribution period at 32/4=8 rows. +8 already hits that ceiling (verified +16
+// and +32 are WORSE -- period 4 and 2 respectively -- and +24/+40 only tie it). The residual
+// store conflict most likely comes from sScore/sP's per-LANE sequential write in the online-
+// softmax loop (`wP[lane * KV_TILE_PAD + j]` inside a `for j` loop) -- a different access
+// shape than the row-parallel ldmatrix reads this padding targeted. A real further lever, but
+// needs a softmax-write restructure, not a stride tweak -- not attempted this pass. See
+// docs/perf/CUDA_OPTIMIZATION_SWEEP_2026-08.md for the full writeup.
 extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_flash_mma_f16(
     const half* __restrict__ q,   // [seq, numHeads,   headDim] row-major
     const half* __restrict__ k,   // [seq, numKvHeads, headDim] row-major

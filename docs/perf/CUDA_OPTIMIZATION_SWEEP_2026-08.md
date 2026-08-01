@@ -178,27 +178,62 @@ the whole tree, or (b) do that migration deliberately (rebuild + fully retest ev
 one commit, not an incidental side effect of an unrelated fix). Not done here — out of scope
 for this session's actual goal.
 
-## 6. Where to look next
+## 6a. Post-fix `ncu` confirmation (2026-08-01, same session)
+
+Captured a second elevated `ncu --set full` pass on the FIXED kernel
+(`.perf-runs/flash_mma_s1024_postfix_details.txt`) to confirm the bank-conflict fix's mechanism
+directly, not just infer it from wall-clock. Direct before/after:
+
+| Metric | Pre-fix | Post-fix |
+|---|---|---|
+| Duration (this launch) | 1.55 ms | 0.959 ms (**-38%**) |
+| Shared-**load** bank conflicts | 9.7-way, 84% of wavefronts, Est. Speedup 77.4% | **Eliminated** — no longer flagged by `ncu` at all |
+| Shared-**store** bank conflicts | 4.0-way, 72% of wavefronts, Est. Speedup 66.4% | 2.5-way, 60% of wavefronts, Est. Speedup 29.3% (improved, not eliminated) |
+| Warp Cycles Per Issued Instruction | 17.21 | 8.45 (nearly halved) |
+| Memory Throughput | 86.35% | 44.79% (kernel is no longer memory-bound the way it was) |
+| Compute (SM) Throughput | 26.87% | 44.79% |
+| Achieved Occupancy | 36.71% | 30.03% (small drop — expected, padding costs a little shared memory; `Block Limit Shared Mem` 5→4 blocks/SM) |
+
+The end-to-end whole-model benchmark also moved: pp1024 prefill 11,559 → 12,588 tok/s on the
+same Llama-3.2-1B/RTX 3060 run (real, not isolated-kernel — the win is visible at the full
+model level, not just the microbenchmark).
+
+**Checked whether more padding would close the remaining store-conflict gap — it would not.**
+`ldmatrix` forces the padded stride to stay a multiple of 8 halfwords (16-byte alignment), which
+forces the resulting bank-stride to always be a multiple of 4 banks — capping the achievable
+bank-distribution period at 32/4 = 8 rows, **which +8 already achieves**. Checked +16/+24/+32/+40
+directly: +16 and +32 are actually WORSE (period 4 and 2 respectively); +24 and +40 tie +8's
+period-8 ceiling. So +8 is already optimal within the alignment constraint for the four
+`ldmatrix`-accessed arrays — this specific lever is exhausted, not under-tuned.
+
+The residual 2.5-way store conflict most likely comes from `sScore`/`sP`'s per-LANE sequential
+write pattern in the online-softmax loop (`wP[lane * KV_TILE_PAD + j]` inside a `for j` loop —
+a different access shape than the row-parallel `ldmatrix` reads the padding was designed
+around). Chasing this further would need a genuinely different fix (e.g. restructuring the
+softmax loop's write pattern, not a stride tweak) — flagged as a real but smaller, separate
+lever below, not attempted this session per this project's own "stop once the big win is
+captured and confirmed, don't chase diminishing returns blindly" precedent
+(see `[[prismml-bonsai-model]]`'s many documented negative results from exactly this kind of
+over-tuning).
+
+## 6b. Where to look next
 
 Genuinely open CUDA-relevant items remaining, roughly in priority order:
 
-1. **A fresh `ncu` capture confirming the #248 bank-conflict metric itself dropped**, not just
-   the wall-clock win (the wall-clock evidence is already decisive and reproducible without
-   this, but direct confirmation of the mechanism would be a nice close-out). Needs elevated
-   `ncu` — see `[[ncu-elevation-workflow]]` / `[[gflash-bank-conflict-fix]]` for the working
-   command pattern.
-2. **G-flash tuning has more headroom** per the corrected floor/flash ratio (still 1.4-1.75x
-   off the theoretical ceiling, down from ~3x) — a fresh `ncu` pass on the fixed kernel would
-   show what the NEW dominant bottleneck is (may no longer be memory-bound at all; could be
-   genuinely compute/MMA-utilization-bound now, in which case the remaining lever is different
-   — e.g. warp/tile shape, not shared-memory layout).
-3. **No batched/grouped I2_S GEMM for BitNet-MoE prefill** (#246's known limitation) — real
+1. **The residual 2.5-way shared-store bank conflict** (see 6a) — real, confirmed, but likely
+   needs a softmax-write-pattern restructure rather than a stride tweak (that lever is
+   exhausted). Est. Speedup only 29.3% and the loop it's in is a small fraction of the
+   kernel's total work, so expect a modest, not dramatic, further win if pursued — model the
+   actual instruction/sync cost first, don't just try it blind (see this project's own
+   documented "5 negative results from ungrounded occupancy/layout tweaks" pattern before
+   attempting).
+2. **No batched/grouped I2_S GEMM for BitNet-MoE prefill** (#246's known limitation) — real
    perf concern only if BitNet-MoE prefill becomes a hot path; no current checkpoint exercises
    it, so low urgency.
-4. **BitNet-ternary MoE end-to-end validation** blocked on a real checkpoint not existing yet
+3. **BitNet-ternary MoE end-to-end validation** blocked on a real checkpoint not existing yet
    — training/exporting one (via the identity-MoTE pipeline, issue #117) would unlock real
    generation-parity testing beyond synthetic CPU-reference parity.
-5. Issue #200 (native paged-KV decode kernel) and #125 (Q4_K MMVQ coalesced kernel) remain
+4. Issue #200 (native paged-KV decode kernel) and #125 (Q4_K MMVQ coalesced kernel) remain
    open but are lower-confidence / bigger scope (paged KV-cache doesn't exist on CUDA at all
    yet; MMVQ is parked pending a Kaggle T4 A/B per prior session notes) — not pursued this
    session, flagged for explicit prioritization if wanted.
