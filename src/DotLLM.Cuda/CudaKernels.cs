@@ -193,6 +193,11 @@ public sealed unsafe class CudaKernels : IDisposable
     private readonly nint _i2sGemv3F16InFunc;
     private readonly nint _i2sGemvNormF16InFunc;
     private readonly nint _i2sGemvF32InFunc;
+    // Batched GEMM (issue #250): decode-row-once-reuse-across-tokens twin of i2_s_gemv_f32in,
+    // used by CudaMoeFfn.ForwardBitNetI2S's prefill path (seqLen>1 routes multiple tokens to the
+    // same expert). TryGetFunction'd so a stale PTX (not yet recompiled) still loads gracefully —
+    // gate any use on HasI2SBatchedGemm.
+    private readonly nint _i2sGemmF32InFunc;
     private readonly nint _i2sGemvA8Func;
     private readonly nint _i2sGemvA8DeviceScaleFunc;
     private readonly nint _quantizeF16ToI8AbsMaxFunc;
@@ -648,6 +653,7 @@ public sealed unsafe class CudaKernels : IDisposable
         _i2sGemv3F16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv3_f16in");
         _i2sGemvNormF16InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_norm_f16in");
         _i2sGemvF32InFunc = _i2sGemvModule.GetFunction("i2_s_gemv_f32in");
+        _i2sGemmF32InFunc = _i2sGemvModule.TryGetFunction("i2_s_gemm_f32in");
         _i2sGemvA8Func = _i2sGemvModule.GetFunction("i2_s_gemv_a8");
         _i2sGemvA8DeviceScaleFunc = _i2sGemvModule.GetFunction("i2_s_gemv_a8_device_scale");
         _quantizeF16ToI8AbsMaxFunc = _i2sGemvModule.GetFunction("quantize_f16_to_i8_absmax");
@@ -670,6 +676,10 @@ public sealed unsafe class CudaKernels : IDisposable
             SetMaxDynamicSharedBytes(_i2sGemvF32InFunc, _maxDynamicSharedBytesOptIn);
             SetMaxDynamicSharedBytes(_i2sGemvF16InRaggedFunc, _maxDynamicSharedBytesOptIn);
             SetMaxDynamicSharedBytes(_i2sGemvF32InRaggedFunc, _maxDynamicSharedBytesOptIn);
+            // i2_s_gemm_f32in's shared cache is int8 (rowsPerBlock * k bytes) — strictly smaller
+            // than the GEMV kernels' k*sizeof(float) staging buffer for the same k at
+            // rowsPerBlock<=4, so this opt-in is a safety margin rather than a hard requirement.
+            SetMaxDynamicSharedBytes(_i2sGemmF32InFunc, _maxDynamicSharedBytesOptIn);
         }
         _pq2_0GemvF32InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f32in");
         _pq2_0GemvF16InFunc = _pq2_0GemvModule.GetFunction("pq2_0_gemv_f16in");
@@ -1056,6 +1066,18 @@ public sealed unsafe class CudaKernels : IDisposable
         HasMoeKernels && _i2sGemvF32InFunc != 0 && _relu2GluF32Func != 0 && _rmsnormF32Func != 0;
 
     /// <summary>
+    /// True when the batched I2_S GEMM kernel (<see cref="LaunchI2_SGemmF32In"/>, issue #250) is
+    /// available. Lets <see cref="CudaMoeFfn.ForwardBitNetI2S"/>'s prefill path (seqLen&gt;1, multiple
+    /// tokens routed to the same expert) decode each expert's gate/up/down weight row ONCE and reuse
+    /// it across all routed tokens, instead of the original per-row-GEMV-call loop (issue #246 scope
+    /// note) that re-decoded the weight matrix once per token. Independent of
+    /// <see cref="HasBitNetMoeKernels"/> so a stale PTX (not yet recompiled) still runs correctly via
+    /// the per-row-loop fallback — this is a pure prefill-throughput optimization, never a correctness
+    /// requirement.
+    /// </summary>
+    public bool HasI2SBatchedGemm => _i2sGemmF32InFunc != 0;
+
+    /// <summary>
     /// True when all Qwen3MoeHybrid recurrence-path FP32 kernels (causal conv1d,
     /// per-token GDN scan step, per-head L2 normalize) are available. Required
     /// by the CUDA Qwen3MoeHybrid forward path.
@@ -1378,6 +1400,56 @@ public sealed unsafe class CudaKernels : IDisposable
         CheckDynamicSharedBudget(dynShmem, $"I2_S GEMV-f32 k={k}");
         CudaDriverApi.cuLaunchKernel(_i2sGemvF32InFunc,
                 (uint)((n + I2sRowsPerBlock - 1) / I2sRowsPerBlock), 1, 1, BlockSize, 1, 1,
+                dynShmem, stream, (nint)args, 0).ThrowOnError();
+    }
+
+    /// <summary>Weight rows decoded per block for <see cref="LaunchI2_SGemmF32In"/> (issue #250), before
+    /// any shared-memory-budget shrink. One warp owns exactly one row (no ROWS_PER_WARP multiplier —
+    /// see i2_s_gemv.cu's Variant C remarks for why).</summary>
+    private const int I2sGemmMaxRowsPerBlock = 8;
+
+    /// <summary>
+    /// Batched I2_S ternary GEMM (issue #250): <c>C[t,row] = scale · dot(ternary(W[row,:]), B[t,:])</c>
+    /// for <c>row in [0,n)</c>, <c>t in [0,numTokens)</c>. <paramref name="bF32"/> is <c>[numTokens,k]</c>
+    /// row-major; <paramref name="cF32"/> is <c>[numTokens,n]</c> row-major (token-major — matches
+    /// <c>CudaMoeScratch.GateBatch</c>/<c>UpBatch</c>/<c>DownBatch</c>'s layout). Decodes each weight row
+    /// ONCE (into a per-warp shared int8 cache) and reuses it across every token, instead of the
+    /// per-row-GEMV-call loop <see cref="CudaMoeFfn"/> used before this issue — see
+    /// <c>i2_s_gemm_f32in</c> in i2_s_gemv.cu for the full rationale.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="numTokens"/> == 1 degrades to a plain <see cref="LaunchI2_SGemvF32In"/> call: decoding
+    /// a row to shared just to dot it once is strictly extra work versus the single-pass GEMV kernel.
+    /// Caller must check <see cref="HasI2SBatchedGemm"/> first (this method assumes the kernel is loaded).
+    /// </remarks>
+    public void LaunchI2_SGemmF32In(nint quantWeight, nint bF32, nint cF32, int n, int k, int numTokens, nint stream)
+    {
+        if (numTokens <= 0) return;
+        if (numTokens == 1)
+        {
+            LaunchI2_SGemvF32In(quantWeight, bF32, cF32, n, k, stream);
+            return;
+        }
+
+        // The shared row cache costs rowsPerBlock * k BYTES (int8) — shrink rowsPerBlock so this
+        // fits the device's dynamic-shared opt-in cap for large k (e.g. big FFN intermediate sizes)
+        // instead of failing the launch. Skipped (keeps the max) if the cap couldn't be queried,
+        // matching CheckDynamicSharedBudget's own "unknown cap → don't block" convention below.
+        int rowsPerBlock = I2sGemmMaxRowsPerBlock;
+        if (_maxDynamicSharedBytesOptIn > 0)
+        {
+            int maxRowsForBudget = _maxDynamicSharedBytesOptIn / k;
+            if (maxRowsForBudget < 1) maxRowsForBudget = 1;
+            if (maxRowsForBudget < rowsPerBlock) rowsPerBlock = maxRowsForBudget;
+        }
+
+        nint wArg = quantWeight, bArg = bF32, cArg = cF32;
+        int nArg = n, kArg = k, tArg = numTokens, rpbArg = rowsPerBlock;
+        void** args = stackalloc void*[] {&wArg, &bArg, &cArg, &nArg, &kArg, &tArg, &rpbArg};
+        uint dynShmem = (uint)(rowsPerBlock * k); // int8 ternary cache, 1 byte/element
+        CheckDynamicSharedBudget(dynShmem, $"I2_S GEMM-f32 k={k} rowsPerBlock={rowsPerBlock}");
+        CudaDriverApi.cuLaunchKernel(_i2sGemmF32InFunc,
+                (uint)((n + rowsPerBlock - 1) / rowsPerBlock), 1, 1, BlockSize, 1, 1,
                 dynShmem, stream, (nint)args, 0).ThrowOnError();
     }
 

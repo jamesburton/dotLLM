@@ -46,6 +46,23 @@ namespace DotLLM.Cuda;
 public static unsafe class CudaMoeFfn
 {
     /// <summary>
+    /// Runtime gate for the batched I2_S GEMM kernel (issue #250) in <see cref="ForwardBitNetI2S"/>'s
+    /// per-expert gate/up/down projections. Mirrors <c>MatMul.I2S.I2SGemmTile</c>'s
+    /// <c>DOTLLM_I2S_TILE</c> convention on the CPU side: defaults to on (when the kernel is loaded —
+    /// see <see cref="CudaKernels.HasI2SBatchedGemm"/>), overridable via
+    /// <c>DOTLLM_I2S_MOE_BATCHED_GEMM=0</c> to force the original per-row-GEMV-call loop for A/B
+    /// comparison (this is exactly how <c>CudaMoeFfnBitNetI2SBatchedGemmTests</c> exercises both
+    /// paths against the CPU oracle and each other within one test process).
+    /// </summary>
+    private static readonly bool UseI2SBatchedGemm = ResolveUseI2SBatchedGemm();
+
+    private static bool ResolveUseI2SBatchedGemm()
+    {
+        string? env = Environment.GetEnvironmentVariable("DOTLLM_I2S_MOE_BATCHED_GEMM");
+        return env is not ("0" or "false" or "off");
+    }
+
+    /// <summary>
     /// Runs one MoE SwiGLU FFN layer's forward pass on the GPU.
     /// </summary>
     /// <param name="hiddenF32">Device pointer to F32 input <c>[seqLen, hiddenSize]</c>.</param>
@@ -56,11 +73,21 @@ public static unsafe class CudaMoeFfn
     /// <param name="cublasHandle">cuBLAS handle for F32 GEMM/GEMV.</param>
     /// <param name="kernels">Loaded PTX kernel module.</param>
     /// <param name="stream">CUDA stream.</param>
+    /// <param name="forceUseI2SBatchedGemm">
+    /// Test-only override for the <see cref="MoePrecision.BitNetI2S"/> path's batched-GEMM-vs-
+    /// per-row-loop choice (issue #250). <c>null</c> (the production default) defers to
+    /// <see cref="UseI2SBatchedGemm"/> (env-var-gated, resolved once per process). Non-null forces
+    /// one path within a single process regardless of the env var — <c>UseI2SBatchedGemm</c> is a
+    /// <c>static readonly</c> resolved once at type-load, so it cannot be toggled per-call at
+    /// runtime; this parameter exists so a single test can three-way-compare the CPU oracle against
+    /// BOTH GPU paths without spawning separate processes. Ignored for non-BitNetI2S precisions.
+    /// </param>
     public static void Forward(
         nint hiddenF32, nint outputF32,
         int seqLen,
         CudaMoeLayerWeights weights,
-        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream)
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
+        bool? forceUseI2SBatchedGemm = null)
     {
         if (!kernels.HasMoeKernels)
             throw new InvalidOperationException(
@@ -75,7 +102,8 @@ public static unsafe class CudaMoeFfn
         // method for a structurally-different MoE variant).
         if (weights.Precision == MoePrecision.BitNetI2S)
         {
-            ForwardBitNetI2S(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream);
+            ForwardBitNetI2S(hiddenF32, outputF32, seqLen, weights, scratch, cublasHandle, kernels, stream,
+                forceUseI2SBatchedGemm);
             return;
         }
 
@@ -455,13 +483,16 @@ public static unsafe class CudaMoeFfn
     /// needs and the F32 path doesn't), but the per-expert body differs in three numerically
     /// load-bearing ways — see <see cref="MoePrecision.BitNetI2S"/>:
     /// <list type="number">
-    ///   <item>Experts are ternary I2_S, dispatched through
-    ///     <see cref="CudaKernels.LaunchI2_SGemvF32In"/> — a GEMV (one input row per call), so
-    ///     each touched expert's batch is projected with ONE GEMV LAUNCH PER ROW rather than a
-    ///     single GEMM. This only matters for prefill (seqLen&gt;1 routes multiple rows to the
-    ///     same expert); decode (seqLen=1) is a single row per touched expert regardless.
-    ///     Explicitly out of scope for this pass: a batched/grouped I2_S GEMM kernel — see the
-    ///     CPU oracle's own per-call-not-batched precedent and this method's remarks.</item>
+    ///   <item>Experts are ternary I2_S. Decode (seqLen=1) dispatches through
+    ///     <see cref="CudaKernels.LaunchI2_SGemvF32In"/> — a single-row GEMV, since batch is always
+    ///     1 per touched expert. Prefill (seqLen&gt;1, multiple tokens routed to the same expert)
+    ///     originally issued one GEMV LAUNCH PER ROW (issue #246 scope note) — that re-decoded the
+    ///     whole weight matrix once per token. Issue #250 added
+    ///     <see cref="CudaKernels.LaunchI2_SGemmF32In"/>, a real batched GEMM that decodes each
+    ///     weight row ONCE and reuses it across every routed token (the same unpack-once-reuse
+    ///     strategy as the CPU GEMM oracle's <c>GemmI2_SRows</c>/<c>GemmI2_SW2A8Rows</c>); gated on
+    ///     <see cref="CudaKernels.HasI2SBatchedGemm"/> with the original per-row loop kept as a
+    ///     fallback for stale PTX.</item>
     ///   <item>The gate non-linearity is relu² (<see cref="CudaKernels.LaunchReLU2GLUF32"/>),
     ///     not SiLU.</item>
     ///   <item>A per-expert BitNet FFN Sub-LN (<see cref="CudaKernels.LaunchRmsNormF32"/> with
@@ -487,7 +518,8 @@ public static unsafe class CudaMoeFfn
         nint hiddenF32, nint outputF32,
         int seqLen,
         CudaMoeLayerWeights weights,
-        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream)
+        CudaMoeScratch scratch, nint cublasHandle, CudaKernels kernels, nint stream,
+        bool? forceUseI2SBatchedGemm = null)
     {
         if (!kernels.HasBitNetMoeKernels)
             throw new InvalidOperationException(
@@ -607,19 +639,35 @@ public static unsafe class CudaMoeFfn
                 scratch.TokenIndices + (nint)((long)start * sizeof(int)),
                 batch, hidden, stream);
 
-            // 2. gate / up projections: ternary I2_S GEMV, one launch PER ROW (issue #246 scope
-            //    — no batched/grouped I2_S GEMM kernel this pass; decode is batch=1 anyway).
+            // 2. gate / up projections: ternary I2_S. Batched GEMM (issue #250) decodes each
+            //    weight row ONCE and reuses it across all `batch` tokens routed to this expert —
+            //    the original per-row-GEMV-call loop (issue #246 scope note) re-decoded the whole
+            //    weight matrix once PER TOKEN, which only mattered for prefill (decode is batch=1
+            //    either way, and LaunchI2_SGemmF32In itself degrades batch=1 to the GEMV call).
             long hiddenRowBytes = (long)hidden * sizeof(float);
             long iRowBytes = (long)I * sizeof(float);
-            for (int b = 0; b < batch; b++)
+            bool useBatchedGemm = (forceUseI2SBatchedGemm ?? UseI2SBatchedGemm) && kernels.HasI2SBatchedGemm;
+            if (useBatchedGemm)
             {
-                nint xRow = scratch.GatheredInput + (nint)((long)b * hiddenRowBytes);
-                kernels.LaunchI2_SGemvF32In(
-                    weights.GateProj[e], xRow, scratch.GateBatch + (nint)((long)b * iRowBytes),
-                    n: I, k: hidden, stream);
-                kernels.LaunchI2_SGemvF32In(
-                    weights.UpProj[e], xRow, scratch.UpBatch + (nint)((long)b * iRowBytes),
-                    n: I, k: hidden, stream);
+                kernels.LaunchI2_SGemmF32In(
+                    weights.GateProj[e], scratch.GatheredInput, scratch.GateBatch,
+                    n: I, k: hidden, numTokens: batch, stream);
+                kernels.LaunchI2_SGemmF32In(
+                    weights.UpProj[e], scratch.GatheredInput, scratch.UpBatch,
+                    n: I, k: hidden, numTokens: batch, stream);
+            }
+            else
+            {
+                for (int b = 0; b < batch; b++)
+                {
+                    nint xRow = scratch.GatheredInput + (nint)((long)b * hiddenRowBytes);
+                    kernels.LaunchI2_SGemvF32In(
+                        weights.GateProj[e], xRow, scratch.GateBatch + (nint)((long)b * iRowBytes),
+                        n: I, k: hidden, stream);
+                    kernels.LaunchI2_SGemvF32In(
+                        weights.UpProj[e], xRow, scratch.UpBatch + (nint)((long)b * iRowBytes),
+                        n: I, k: hidden, stream);
+                }
             }
 
             // 3. inter = ffn_sub_norm_e( relu²(gate) * up ). relu²·GLU is elementwise over the
@@ -631,15 +679,24 @@ public static unsafe class CudaMoeFfn
                 scratch.SiluBatch, weights.ExpertFfnSubNormF32[e], scratch.SiluBatch,
                 I, weights.RmsEps, batch, stream);
 
-            // 4. down projection: ternary I2_S GEMV, one launch per row (same scope note as
+            // 4. down projection: ternary I2_S (same batched-GEMM-vs-per-row-loop choice as
             //    gate/up above).
-            for (int b = 0; b < batch; b++)
+            if (useBatchedGemm)
             {
-                kernels.LaunchI2_SGemvF32In(
-                    weights.DownProj[e],
-                    scratch.SiluBatch + (nint)((long)b * iRowBytes),
-                    scratch.DownBatch + (nint)((long)b * hiddenRowBytes),
-                    n: hidden, k: I, stream);
+                kernels.LaunchI2_SGemmF32In(
+                    weights.DownProj[e], scratch.SiluBatch, scratch.DownBatch,
+                    n: hidden, k: I, numTokens: batch, stream);
+            }
+            else
+            {
+                for (int b = 0; b < batch; b++)
+                {
+                    kernels.LaunchI2_SGemvF32In(
+                        weights.DownProj[e],
+                        scratch.SiluBatch + (nint)((long)b * iRowBytes),
+                        scratch.DownBatch + (nint)((long)b * hiddenRowBytes),
+                        n: hidden, k: I, stream);
+                }
             }
 
             // 5. Per-slot weighted axpy into output — shared with the F32/Quantized path.
