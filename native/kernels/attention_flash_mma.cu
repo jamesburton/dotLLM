@@ -178,6 +178,62 @@ __device__ __forceinline__ void mma_m16n8k16(
 // shape than the row-parallel ldmatrix reads this padding targeted. A real further lever, but
 // needs a softmax-write restructure, not a stride tweak -- not attempted this pass. See
 // docs/perf/CUDA_OPTIMIZATION_SWEEP_2026-08.md for the full writeup.
+//
+// 2026-08-01 -- #249 follow-up investigation of the residual 2.5-way store conflict above.
+// No elevated `ncu` access in this session (background agent, can't satisfy the UAC prompt),
+// so root-caused by hand-deriving the actual per-instruction bank-conflict multiplicity for
+// every shared STORE in the kernel body (bank(lane) = (word-offset(lane)) mod 32, then
+// checking which lane pairs collide). Two distinct store patterns contribute, and the dominant
+// one turned out to be DIFFERENT from the wP hypothesis recorded above:
+//
+//   1. The QK-spill scale-write into sScore (`wScore[r0*KV_TILE_PAD_SCORE+kcol] = ...`, 8 store
+//      statements/KV-tile, ALL 32 lanes active, r0=lane>>2, kcol=(lane&3)*2+{0,1}+ns*8). With
+//      KV_TILE_PAD_SCORE=17 (chosen for the read pattern below), hand-deriving bank(lane) for
+//      all 32 lanes shows up to a 4-WAY conflict (e.g. lanes {3,10,17,24} all map to bank 6) --
+//      worse than the 2-way this file's own +8-padding ceiling reasoning was built around.
+//   2. wP's per-lane sequential write (`wP[lane*KV_TILE_PAD+j]`, 16 store statements/KV-tile,
+//      only lanes<Q_TILE active) -- the pattern this file already flagged above. Uniform 2-way
+//      (lanes 8 apart collide), forced by ldmatrix's 8-halfword-multiple alignment requirement.
+//
+// Checked whether a bigger/different KV_TILE_PAD_SCORE could kill #1 too: sScore has NO
+// ldmatrix alignment constraint (plain scalar float access only), so its stride is fully free
+// unlike sK/sQ/sVt/sP. Reformulating the QK-spill's address as e(m,sub)=m*S+sub mod16 (m=r0/2,
+// sub=lane%4) shows odd S in {3,5,7,9,11,13} mod 16 caps the QK-spill conflict at 2-way (down
+// from 4-way) -- S=19 (KV_TILE+3) is such a value, and PROVABLY no odd S can do better than
+// 2-way here (a perfect bijection needs {0,S,2S,3S} mod 16 = {0,4,8,12}, which forces S even --
+// incompatible with S odd, which the read pattern below needs). So S=17 (this file's actual
+// choice, ≡1 mod16) is provably the WORST odd choice for the QK-spill pattern specifically --
+// but it was chosen correctly for a different, more-frequent pattern: the online-softmax loop
+// reads wScore[lane*S+j] for the SAME 16 active lanes twice per KV-tile (m_cur loop + p loop,
+// 32 read instructions vs the QK-spill's 8 writes) and needs gcd(S,32)<=2 to stay conflict-free
+// across lanes 0..15 -- true for ANY odd S, so switching to S=19 would have fixed the write
+// side without breaking the read side. Implemented and tested (S=19, correctness-clean,
+// FlashMmaPath_MatchesAttentionF16 still 5e-3 tolerance-clean at s=512/1024/2048).
+//
+// Real A/B (CompletePathTimingVsAttentionF16, DOTLLM_CUDA_ATTN_BENCH=1, RTX 3060, interleaved
+// same-session runs, 4 samples per config to bound this box's clock-drift noise): flashMMA
+// absolute ms, S=17 baseline vs S=19 candidate --
+//   s=1024: baseline {0.657,0.681,0.666,0.664} mean 0.667 | S=19 {0.665,0.666,0.667,0.647}
+//     mean 0.661 (~1% better, inside per-config spread)
+//   s=2048: baseline {2.435,2.418,2.347,2.419} mean 2.405 | S=19 {2.352,2.351,2.343,2.372}
+//     mean 2.355 (~2% better)
+//   s=4096: baseline {10.994,10.402,10.195,10.455} mean 10.512 | S=19 {10.210,10.564,9.898,
+//     11.013} mean 10.421 (~1% better, but S=19's own run-to-run spread here is 9.898-11.013,
+//     i.e. 11% -- LARGER than the ~1-2% mean delta being measured)
+// Verdict: NOT a clear win. The ~1-2% mean deltas are smaller than this box's own measured
+// run-to-run noise band (4-11% peak-to-trough per config, consistent with the documented GPU
+// clock drift under repeated heavy kernel launches). A mathematically real, provable reduction
+// in worst-case per-instruction bank-conflict multiplicity (4-way -> 2-way) for a genuine,
+// previously mis-attributed conflict source did NOT translate into a measurable real speedup.
+// Cross-checked against the post-#248 `ncu` capture's Scheduler Statistics
+// (flash_mma_s1024_postfix_details.txt): only 0.58 of 12 warps/scheduler were eligible per
+// cycle (Est. Local Speedup 55.21% from occupancy/latency-hiding alone) -- i.e. this kernel is
+// now bottlenecked on warp-issue eligibility (latency hiding), not on shared-store throughput,
+// so further reducing store bank conflicts has little room left to matter at the wall-clock
+// level. REVERTED (KV_TILE_PAD_SCORE stayed at KV_TILE+1); no code change shipped from this
+// investigation. The bigger, still-open lever for this kernel is the occupancy/latency-hiding
+// gap (see docs/perf/CUDA_OPTIMIZATION_SWEEP_2026-08.md section 6b item 1's own "small
+// fraction of kernel work" caveat) -- out of scope for #249, tracked separately.
 extern "C" __global__ void __launch_bounds__(MAX_GROUP_WARPS * 32) attention_flash_mma_f16(
     const half* __restrict__ q,   // [seq, numHeads,   headDim] row-major
     const half* __restrict__ k,   // [seq, numKvHeads, headDim] row-major
