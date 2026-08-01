@@ -207,6 +207,32 @@ public static unsafe partial class MatMul
         GemvI2_SCore(weights, x, result, m, k, scale, threadPool);
     }
 
+    /// <summary>
+    /// Benchmark/test-only entry point that always takes the float reference tier (unpack row to
+    /// f32 + <see cref="TensorPrimitives.Dot"/>), bypassing the <see cref="I2SUseW2A8"/> SIMD
+    /// dispatch that <see cref="GemvI2_S(byte*, float*, float*, int, int, ComputeThreadPool?)"/>
+    /// otherwise always takes on AVX2 hardware. The per-tensor scale is read from the weight-tensor
+    /// tail, exactly as the dispatching entry does.
+    ///
+    /// <para>Exists because the GPU I2_S GEMV kernels are <b>F32-in</b>: comparing them against the
+    /// dispatching CPU entry compares float32-activation GPU against int8-activation CPU — an
+    /// algorithm mismatch, not a reduction-order difference, and the activation-quant error swamps
+    /// the fp32 divergence being asserted on. Mirrors <c>GemvPQ2_0Scalar</c>.</para>
+    /// </summary>
+    [SkipLocalsInit]
+    internal static void GemvI2_SScalar(byte* weights, float* x, float* result, int m, int k)
+    {
+        float scale = Unsafe.ReadUnaligned<float>(weights + (long)m * k / 4);
+
+        if (k % I2SBlockSize != 0)
+        {
+            GemvI2_SRaggedRows(weights, x, result, 0, m, k, scale);
+            return;
+        }
+
+        GemvI2_SRows(weights, x, result, 0, m, k, scale);
+    }
+
     [SkipLocalsInit]
     private static void GemvI2_SCore(byte* weights, float* x, float* result, int m, int k,
                                      float scale, ComputeThreadPool? threadPool)

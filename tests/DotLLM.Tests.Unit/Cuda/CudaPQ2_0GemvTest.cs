@@ -9,10 +9,17 @@ namespace DotLLM.Tests.Unit.Cuda;
 
 /// <summary>
 /// Validates the CUDA PQ2_0 (PrismML Bonsai ternary) GEMV against the CPU float reference
-/// (<see cref="MatMul.GemvPQ2_0"/>). The F32-in kernel is an exact analog of the CPU path, so it
+/// (<c>MatMul.GemvPQ2_0Scalar</c>). The F32-in kernel is an exact analog of that CPU path, so it
 /// must match to fp32 reduction-order error. Uses synthetic packed tensors at real Bonsai-27B
 /// dims (hidden=5120, ffn=17408 — see <c>qwen35.embedding_length</c>/<c>qwen35.feed_forward_length</c>
 /// in the real GGUF) — no model file needed.
+///
+/// <para><b>Reference tier matters (issue #229).</b> The comparison MUST use
+/// <c>MatMul.GemvPQ2_0Scalar</c>, not the dispatching <see cref="MatMul.GemvPQ2_0"/>. The latter
+/// takes the <b>W2A8 int8-activation</b> tier on any AVX2 host (<c>MatMul.PQ2S.cs</c>:
+/// <c>PQ2_0UseW2A8</c>), while the kernels under test are <b>F32-in</b>. Comparing them measures
+/// per-token activation-quantization error — a different algorithm — not the fp32 divergence the
+/// assertions are about, and it silently changes with the host's ISA.</para>
 /// </summary>
 [Trait("Category", "GPU")]
 [Collection(CudaCollection.Name)]
@@ -106,11 +113,12 @@ public class CudaPQ2_0GemvTest
         float[] x = new float[k];
         for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
 
-        // CPU reference — full-precision float, same math the kernel approximates via half xs[].
+        // CPU reference — full-precision float (the *scalar* tier; see class remarks), same math
+        // the kernel approximates via half xs[].
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = x, py = cpu)
-            MatMul.GemvPQ2_0(w, px, py, n, k, null);
+            MatMul.GemvPQ2_0Scalar(w, px, py, n, k);
 
         // GPU — F32-native in/out production path (#161): x/y stay float end-to-end, no Half
         // marshaling on the C# side and no convert_f32_to_f16/convert_f16_to_f32 kernel launches.
@@ -194,11 +202,12 @@ public class CudaPQ2_0GemvTest
         Half[] xh = new Half[k];
         for (int i = 0; i < k; i++) xh[i] = (Half)x[i];
 
-        // CPU reference — full-precision float, same math the kernel approximates in F16.
+        // CPU reference — full-precision float (the *scalar* tier; see class remarks), same math
+        // the kernel approximates in F16.
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = x, py = cpu)
-            MatMul.GemvPQ2_0(w, px, py, n, k, null);
+            MatMul.GemvPQ2_0Scalar(w, px, py, n, k);
 
         // GPU — F16 in/out production path.
         Half[] gpu;
@@ -365,11 +374,11 @@ public class CudaPQ2_0GemvTest
         float[] x = new float[k];
         for (int i = 0; i < k; i++) x[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
 
-        // CPU reference.
+        // CPU reference — the *scalar* float tier; see class remarks.
         float[] cpu = new float[n];
         fixed (byte* w = packed)
         fixed (float* px = x, py = cpu)
-            MatMul.GemvPQ2_0(w, px, py, n, k, null);
+            MatMul.GemvPQ2_0Scalar(w, px, py, n, k);
 
         // GPU.
         float[] gpu;
@@ -416,8 +425,16 @@ public class CudaPQ2_0GemvTest
         float meanDiff = sumDiff / n;
         _out.WriteLine($"PQ2_0 GEMV {n}×{k}: max abs diff={maxDiff:E4}, mean={meanDiff:E4}");
 
-        Assert.True(maxDiff <= 1e-3f, $"max abs diff {maxDiff} exceeds 1e-3 (CPU vs GPU should match to fp32)");
-        Assert.True(meanDiff <= 1e-4f, $"mean abs diff {meanDiff} exceeds 1e-4");
+        // Both sides are end-to-end fp32, so the only divergence is reduction order — which scales
+        // with sqrt(k) (the result magnitude of a k-term zero-mean dot product does), not as a fixed
+        // absolute. Issue #229: against the float tier (GemvPQ2_0Scalar, not the dispatching
+        // GemvPQ2_0, which takes W2A8 on AVX2) the measured max|diff|/√k is 1.4e-8 (k=5120) and
+        // 2.4e-8 (k=17408); 5e-7 leaves ~20x headroom. The old fixed 1e-3 was ~300x looser than the
+        // real divergence, so it could not have discriminated much short of a gross defect.
+        float maxTol = 5e-7f * MathF.Sqrt(k);
+        float meanTol = 1e-7f * MathF.Sqrt(k);
+        Assert.True(maxDiff <= maxTol, $"max abs diff {maxDiff} exceeds {maxTol} (5e-7·√k, k={k})");
+        Assert.True(meanDiff <= meanTol, $"mean abs diff {meanDiff} exceeds {meanTol} (1e-7·√k, k={k})");
     }
 
     /// <summary>

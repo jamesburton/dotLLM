@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.X86;
 using DotLLM.Core.Configuration;
 using DotLLM.Cpu.Kernels;
 using Xunit;
@@ -116,6 +117,107 @@ public sealed unsafe class I2STests
                 float acc = 0f;
                 for (int c = 0; c < k; c++) acc += ternary[r * k + c] * scale * x[c];
                 Assert.Equal(acc, y[r], 1e-3f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    // ──────────────────── Float reference tier (GemvI2_SScalar) ────────────────────
+
+    /// <summary>
+    /// <see cref="MatMul.GemvI2_SScalar"/> is the float tier used as the ground-truth reference by
+    /// the F32-in GPU parity tests (CUDA + Vulkan). It must agree with a double-accumulated exact
+    /// dot to fp32 rounding — far tighter than the activation-quant envelope the dispatching
+    /// <c>GemvI2_S</c> needs — otherwise those parity bounds are calibrated against a moving target.
+    /// </summary>
+    [Fact]
+    public void GemvI2SScalar_MatchesExactDot_ToFp32Rounding()
+    {
+        var rng = new Random(31337);
+        const int m = 6;
+        const int k = 512;
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.037f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] y = new float[m];
+            fixed (float* xp = x)
+            fixed (float* yp = y)
+                MatMul.GemvI2_SScalar(w, xp, yp, m, k);
+
+            for (int r = 0; r < m; r++)
+            {
+                // Double accumulation, so the reference itself contributes no fp32 error.
+                double acc = 0;
+                for (int c = 0; c < k; c++) acc += ternary[r * k + c] * (double)x[c];
+                Assert.Equal((float)(acc * scale), y[r], 1e-5f);
+            }
+        }
+        finally { NativeMemory.Free(w); }
+    }
+
+    /// <summary>
+    /// Issue #229 regression guard: <c>GemvI2_S</c> and <see cref="MatMul.GemvI2_SScalar"/> are NOT
+    /// interchangeable. On an AVX2 host the dispatching entry takes the W2A8 int8-activation tier,
+    /// so it diverges from the float tier by orders of magnitude more than fp32 rounding. The GPU
+    /// parity tests were previously pointed at the dispatching entry and so measured that
+    /// activation-quant error instead of the kernel divergence they assert on.
+    ///
+    /// <para>This test <b>discriminates</b>: swapping either call back to the other entry makes it
+    /// fail. On a pre-AVX2 host both entries take the float tier and the difference vanishes
+    /// legitimately — which is exactly why the defect was invisible on the T5500 — so the
+    /// divergence assertion is gated on <see cref="Avx2.IsSupported"/>.</para>
+    /// </summary>
+    [Fact]
+    public void GemvI2S_DispatchingEntry_IsNotTheFloatTier_OnAvx2()
+    {
+        var rng = new Random(20229);
+        const int m = 8;
+        const int k = 2560;   // a real BitNet projection width, where the effect is clearly visible
+        sbyte[] ternary = new sbyte[m * k];
+        for (int i = 0; i < ternary.Length; i++) ternary[i] = (sbyte)(rng.Next(3) - 1);
+        const float scale = 0.024f;
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = rng.NextSingle() * 2f - 1f;
+
+        byte* w = PackI2S(ternary, scale);
+        try
+        {
+            float[] dispatched = new float[m];
+            float[] floatTier = new float[m];
+            fixed (float* xp = x)
+            fixed (float* dp = dispatched)
+            fixed (float* fp = floatTier)
+            {
+                MatMul.GemvI2_S(w, xp, dp, m, k, null);
+                MatMul.GemvI2_SScalar(w, xp, fp, m, k);
+            }
+
+            float maxDiff = 0f;
+            for (int r = 0; r < m; r++) maxDiff = MathF.Max(maxDiff, MathF.Abs(dispatched[r] - floatTier[r]));
+
+            // The float tier's own fp32-rounding envelope at this k (cf. the GPU parity bound
+            // 5e-7·√k ≈ 2.5e-5). Anything above this is a different algorithm, not rounding.
+            const float floatTierEnvelope = 1e-4f;
+
+            if (Avx2.IsSupported)
+            {
+                Assert.True(maxDiff > floatTierEnvelope,
+                    $"expected the dispatching entry to take the W2A8 tier on AVX2 and diverge from " +
+                    $"the float tier by more than {floatTierEnvelope}, but max |Δ| was {maxDiff}. " +
+                    $"If the W2A8 gate moved, the GPU parity tests' reference choice needs revisiting.");
+            }
+            else
+            {
+                Assert.True(maxDiff <= floatTierEnvelope,
+                    $"without AVX2 both entries take the float tier, so they should agree; max |Δ| {maxDiff}");
             }
         }
         finally { NativeMemory.Free(w); }
