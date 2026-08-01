@@ -121,6 +121,37 @@ __device__ __forceinline__ void i2s_accum_u4(float& acc, uint4 w, const float* x
     }
 }
 
+// ─────────────── Decode-to-cache variants (issue #250: batched I2_S GEMM) ───────────────
+//
+// Same bit layout / code-1 mapping as i2s_accum_byte/i2s_accum_u4 above, but instead of
+// immediately FMA-ing against one shared activation vector, these WRITE the decoded ternary
+// value ({-1,0,+1} as int8) to a per-warp shared row cache. This lets a warp decode a weight
+// row ONCE and then dot it against many token activation vectors (the CPU GEMM's "unpack once,
+// reuse across N tokens" strategy — MatMul.I2S.cs's GemmI2_SRows / GemmI2_SW2A8Rows — ported to
+// the GPU's per-row-GEMV kernel family instead of the per-row-per-call GEMV loop
+// CudaMoeFfn.ForwardBitNetI2S used before this issue).
+__device__ __forceinline__ void i2s_decode_byte_to_cache(int8_t* cache, unsigned int p, int blkBase, int xb)
+{
+    cache[blkBase + xb     ] = (int8_t)(((p >> 6) & 0x3) - 1);
+    cache[blkBase + xb + 32] = (int8_t)(((p >> 4) & 0x3) - 1);
+    cache[blkBase + xb + 64] = (int8_t)(((p >> 2) & 0x3) - 1);
+    cache[blkBase + xb + 96] = (int8_t)(( p        & 0x3) - 1);
+}
+
+__device__ __forceinline__ void i2s_decode_u4_to_cache(int8_t* cache, uint4 w, int blkBase, int gp0)
+{
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        unsigned int word = (&w.x)[j];
+        int gpw = gp0 + j * 4;
+        i2s_decode_byte_to_cache(cache, (word      ) & 0xFF, blkBase, gpw    );
+        i2s_decode_byte_to_cache(cache, (word >>  8) & 0xFF, blkBase, gpw + 1);
+        i2s_decode_byte_to_cache(cache, (word >> 16) & 0xFF, blkBase, gpw + 2);
+        i2s_decode_byte_to_cache(cache, (word >> 24) & 0xFF, blkBase, gpw + 3);
+    }
+}
+
 // ───────────────────────── Variant A: W2A16, FP16 activations ─────────────────────────
 extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f16in(
     const uint8_t* __restrict__ weight,   // packed codes [n × k/4 bytes] + trailing f32 scale
@@ -504,6 +535,89 @@ extern "C" __global__ void __launch_bounds__(256) i2_s_gemv_f32in(
         float a = i2s_warp_reduce(acc[rr]);
         int row = rowBase + rr;
         if (lane == 0 && row < n) y[row] = a * scale;
+    }
+}
+
+// ───────────────────────── Variant C: batched GEMM, FP32 activations (issue #250) ─────────────────────────
+//
+// C[t,row] = scale * dot(ternary(W[row,:]), B[t,:])  for row in [0,n), t in [0,numTokens).
+// B is [numTokens, k] row-major; C is [numTokens, n] row-major (token-major — matches
+// CudaMoeFfn's scratch.GateBatch/UpBatch/DownBatch layout, which indexes by token then feature).
+//
+// Ported from CudaMoeFfn.ForwardBitNetI2S's original per-row-GEMV-call loop (issue #246), which
+// re-decoded (and re-read) each expert's gate/up/down weight matrix from scratch once PER TOKEN
+// routed to that expert during prefill (seqLen>1, multiple tokens sharing one expert) — O(batch)
+// redundant re-reads/re-decodes of the SAME weight matrix. This mirrors the CPU GEMM's proven
+// unpack-once-reuse-across-N-tokens strategy (MatMul.I2S.cs's GemmI2_SRows / GemmI2_SW2A8Rows,
+// and the register-blocked issue #232 tile) instead of inventing a new algorithm: each warp
+// decodes ONE weight row into a per-warp SHARED int8 cache exactly once, then loops over all
+// `numTokens` activation vectors dotting the cached row against each — the weight decode (the
+// expensive part; issue #128's CPU profiling showed row-unpack at 80-84% of GEMV wall time for a
+// fresh per-call unpack) is now amortized over the whole batch instead of repeated per token.
+//
+// `rowsPerBlock` is a caller-computed runtime parameter (not the compile-time
+// I2S_ROWS_PER_BLOCK/I2S_ROWS_PER_WARP constants above) because the shared row cache costs
+// `rowsPerBlock * k` BYTES (int8, vs the GEMV kernels' `k * sizeof(float)` for staging one
+// activation vector) — for large intermediate sizes this must shrink to fit the device's
+// dynamic-shared-memory opt-in cap; see LaunchI2_SGemmF32In in CudaKernels.cs. One warp owns
+// exactly one row (no ROWS_PER_WARP multiplier) since the entire point is amortizing the row
+// decode over tokens, not over multiple rows.
+//
+// `numTokens == 1` is NOT specially handled here — the host wrapper degrades that case to a
+// plain LaunchI2_SGemvF32In call instead, since decoding a row to shared just to immediately
+// dot it once is strictly extra work versus the proven single-pass GEMV kernel.
+extern "C" __global__ void __launch_bounds__(256) i2_s_gemm_f32in(
+    const uint8_t* __restrict__ weight,   // packed codes [n × k/4 bytes] + trailing f32 scale
+    const float*   __restrict__ b,        // [numTokens, k] row-major token activations
+    float*         __restrict__ c,        // [numTokens, n] row-major output
+    const int n,
+    const int k,
+    const int numTokens,
+    const int rowsPerBlock)
+{
+    extern __shared__ int8_t rowCache[];   // rowsPerBlock * k bytes, one row per warp
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (wid >= rowsPerBlock) return;
+
+    const int row = blockIdx.x * rowsPerBlock + wid;
+    if (row >= n) return;
+
+    const int row_bytes = k >> 2;             // k / 4
+    const int num_u4    = row_bytes >> 4;      // 16 bytes per uint4
+
+    int8_t* cache = rowCache + wid * k;
+    const uint4* w_row = reinterpret_cast<const uint4*>(weight + (size_t)row * row_bytes);
+
+    // Decode this row ONCE into the per-warp shared cache. Same {gp,+32,+64,+96}/code-1
+    // addressing as i2s_accum_u4, just writing instead of accumulating.
+    for (int u = lane; u < num_u4; u += warpSize)
+    {
+        uint4 w    = w_row[u];
+        int boff   = u << 4;
+        int blkBase = (boff >> 5) << 7;
+        int gp0    = boff & 31;
+        i2s_decode_u4_to_cache(cache, w, blkBase, gp0);
+    }
+    // All 32 lanes wrote disjoint slices of this warp's cache region; make them visible to
+    // every lane before the dot-product loop below reads across the whole row.
+    __syncwarp();
+
+    const float scale = *reinterpret_cast<const float*>(weight + (size_t)n * row_bytes);
+
+    // Reuse the decoded row across every token — the amortization this kernel exists for.
+    // x is read fresh from global per (row, token) pair, same as the CPU GEMM's b[t] reads;
+    // it is tiny relative to the weight matrix and stays L2-resident across the many blocks
+    // that touch the same token column.
+    for (int t = 0; t < numTokens; t++)
+    {
+        const float* xt = b + (size_t)t * k;
+        float acc = 0.0f;
+        for (int i = lane; i < k; i += warpSize)
+            acc += (float)cache[i] * xt[i];
+        acc = i2s_warp_reduce(acc);
+        if (lane == 0) c[(size_t)t * n + row] = acc * scale;
     }
 }
 
