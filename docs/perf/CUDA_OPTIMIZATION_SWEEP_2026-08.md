@@ -220,13 +220,23 @@ over-tuning).
 
 Genuinely open CUDA-relevant items remaining, roughly in priority order:
 
-1. **The residual 2.5-way shared-store bank conflict** (see 6a) — real, confirmed, but likely
-   needs a softmax-write-pattern restructure rather than a stride tweak (that lever is
-   exhausted). Est. Speedup only 29.3% and the loop it's in is a small fraction of the
-   kernel's total work, so expect a modest, not dramatic, further win if pursued — model the
-   actual instruction/sync cost first, don't just try it blind (see this project's own
-   documented "5 negative results from ungrounded occupancy/layout tweaks" pattern before
-   attempting).
+1. ~~**The residual 2.5-way shared-store bank conflict**~~ — investigated in #249
+   (2026-08-01). Hand-derived the actual per-instruction conflict for every shared store in the
+   kernel (no elevated `ncu` available to this session): found the dominant contributor is
+   actually the QK-spill scale-write into `sScore` (up to 4-way, not the wP loop originally
+   suspected, which is a uniform 2-way). Found and implemented a genuinely low-risk stride fix
+   (`KV_TILE_PAD_SCORE` 17→19, provably caps the QK-spill conflict at its achievable 2-way
+   ceiling without touching the read pattern's conflict-free property — `sScore` has no
+   `ldmatrix` alignment constraint so, unlike sK/sQ/sVt/sP, its stride was a free lever).
+   Correctness-clean, but the real interleaved A/B (4 samples/config, same-session) showed only
+   ~1-2% mean deltas — smaller than this box's own 4-11% run-to-run noise band — so **not a
+   clear win, reverted**. Cross-checked against the existing `ncu` Scheduler Statistics: only
+   0.58/12 warps eligible per cycle (55% Est. Local Speedup from occupancy/latency-hiding
+   alone), i.e. this kernel is now bottlenecked on warp-issue eligibility, not shared-store
+   throughput, so the remaining store-conflict lever has little wall-clock room left. Full
+   writeup in the kernel's own header (`native/kernels/attention_flash_mma.cu`, 2026-08-01 /
+   #249 entry). Occupancy/latency-hiding is the real next lever here, not further store-layout
+   tuning — a new, separate item, not yet scoped as an issue.
 2. **No batched/grouped I2_S GEMM for BitNet-MoE prefill** (#246's known limitation) — real
    perf concern only if BitNet-MoE prefill becomes a hot path; no current checkpoint exercises
    it, so low urgency.
