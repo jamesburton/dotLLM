@@ -38,12 +38,13 @@
     <CudaAllowUnsupportedCompiler Condition="'$(DOTLLM_NVCC_ALLOW_UNSUPPORTED_COMPILER)' == '1'">-allow-unsupported-compiler</CudaAllowUnsupportedCompiler>
   </PropertyGroup>
 
-  <!-- All .cu kernel files, default to precise math -->
+  <!-- All .cu kernel files, default to precise math and the global arch -->
   <ItemGroup>
     <CudaKernel Include="$(CudaKernelDir)\*.cu">
       <FastMathFlag></FastMathFlag>
       <FmadFlag></FmadFlag>
       <CxxStdFlag></CxxStdFlag>
+      <Arch>$(CudaArch)</Arch>
     </CudaKernel>
     <!-- Kernels using CUDA Cooperative Groups (grid.sync()) need libcu++ (cccl), which requires
          at least C++17 — nvcc's default dialect for this MSVC toolchain is lower, failing with
@@ -52,6 +53,21 @@
          the same need to attention_f32.cu). Scoped to only the kernels that need it. -->
     <CudaKernel Update="$(CudaKernelDir)\gated_delta_net_scan.cu;$(CudaKernelDir)\attention_f32.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu">
       <CxxStdFlag>-std=c++17</CxxStdFlag>
+    </CudaKernel>
+    <!-- Ampere-only kernels (mma.sync.m16n8k16 / cp.async is sm_80+): the global compute_75
+         default cannot express these instructions, so nvcc silently produces a PTX file that
+         parses fine at build time but fails to JIT at module-load time on the actual device
+         (CudaKernels.cs catches that as CudaException and leaves the kernel unloaded/disabled —
+         no build error, no crash, just the kernel silently never dispatching). Found 2026-08-01
+         when editing attention_flash_mma.cu for a bank-conflict fix: dotnet build alone (without
+         this override) regenerated wrong-arch PTX and the flash-attention parity test failed with
+         "Flash mma kernel not loaded" — build_ptx.bat's ARCH_86 list already had the fix, this
+         mirrors it into the MSBuild path so plain `dotnet build` cannot silently regress it again.
+         These kernels are dispatch-gated to GeForce-Ampere-or-newer devices in C# (see
+         CudaFlashAttention.ConfigureDefault / CudaAttentionMmaDecodeGqaSplit), so raising their
+         arch does not reduce portability for the rest of the PTX tree. -->
+    <CudaKernel Update="$(CudaKernelDir)\attention_flash_mma.cu;$(CudaKernelDir)\attention_flash_mma_decode_gqa_split.cu">
+      <Arch>compute_86</Arch>
     </CudaKernel>
     <!-- Element-wise kernels: safe for fast_math (no expf/rsqrtf/sinf/cosf accumulation) -->
     <CudaKernel Update="$(CudaKernelDir)\add.cu;$(CudaKernelDir)\add_f32.cu;$(CudaKernelDir)\swiglu.cu;$(CudaKernelDir)\swiglu_f32.cu;$(CudaKernelDir)\convert.cu;$(CudaKernelDir)\bias_add.cu;$(CudaKernelDir)\bias_add_f32.cu;$(CudaKernelDir)\embedding.cu;$(CudaKernelDir)\embedding_f32out.cu;$(CudaKernelDir)\dequant.cu;$(CudaKernelDir)\quant_kv.cu">
@@ -102,7 +118,7 @@
     <MakeDir Condition="'$(_NvccExitCode)' == '0'" Directories="$(PtxOutputDir)" />
     <Message Condition="'$(_NvccExitCode)' == '0'" Importance="high" Text="Compiling %(CudaKernel.Filename).cu to PTX" />
     <Exec Condition="'$(_NvccExitCode)' == '0'"
-          Command="nvcc -ptx -arch=$(CudaArch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) %(CudaKernel.CxxStdFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
+          Command="nvcc -ptx -arch=%(CudaKernel.Arch) $(CudaAllowUnsupportedCompiler) %(CudaKernel.FastMathFlag) %(CudaKernel.FmadFlag) %(CudaKernel.CxxStdFlag) $(_CompilerBinDir) -o &quot;$(PtxOutputDir)/%(CudaKernel.Filename).ptx&quot; &quot;%(CudaKernel.FullPath)&quot;"
           StandardOutputImportance="low" />
   </Target>
 
